@@ -1787,22 +1787,36 @@
             {:else if $filteredSegments.length === 0}
               <div
                 data-testid="segments-empty-state"
-                class="flex flex-col items-center justify-center h-full text-cortex-500 text-sm space-y-2"
+                class="flex h-full flex-col items-center justify-center gap-3 px-6 text-center animate-fade-in"
               >
-                <svg
-                  class="w-8 h-8 opacity-30"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="1.5"
-                    d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-                  />
-                </svg>
-                <span>{$searchQuery ? $t('noResultsFound') : $t('noSegmentsLoaded')}</span>
+                {#if $searchQuery}
+                  <div class="flex h-12 w-12 items-center justify-center rounded-full bg-surface-2 text-subtle">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                      <circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" />
+                    </svg>
+                  </div>
+                  <div>
+                    <p class="text-sm font-medium text-default">{$t('noResultsFound')}</p>
+                    <p class="mt-1 max-w-[14rem] truncate text-xs text-subtle">“{$searchQuery}”</p>
+                  </div>
+                {:else}
+                  <div class="flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-soft text-accent">
+                    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M12 18a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v10a3 3 0 0 0 3 3Z" />
+                      <path d="M19 11a7 7 0 0 1-14 0M12 18v4M8 22h8" />
+                    </svg>
+                  </div>
+                  <div class="max-w-[15rem]">
+                    <p class="text-sm font-semibold text-default">{$t('noSegmentsLoaded')}</p>
+                    <p class="mt-1 text-xs leading-relaxed text-muted">{$t('emptyStateHint')}</p>
+                  </div>
+                  {#if tauriAvailable}
+                    <div class="mt-1 flex gap-2">
+                      <button class="btn-primary !text-xs" onclick={handleImport}>{$t('import')}</button>
+                      <button class="btn-secondary !text-xs" onclick={handleOpenFile}>{$t('open')}</button>
+                    </div>
+                  {/if}
+                {/if}
               </div>
             {/if}
           </div>
