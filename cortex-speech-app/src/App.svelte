@@ -67,6 +67,7 @@
   import DiffView from './lib/DiffView.svelte';
   import CommandPalette from './lib/CommandPalette.svelte';
   import EmptyState from './lib/EmptyState.svelte';
+  import ActivityRail from './lib/ActivityRail.svelte';
   import PanelSplitter from './lib/PanelSplitter.svelte';
   import HistoryPanel from './lib/HistoryPanel.svelte';
   import {
@@ -359,6 +360,7 @@
     selectSegment(list[targetIndex]);
   }
 
+  let viewMode = $state<'curate' | 'insights'>('curate');
   let showCommandPalette = $state(false);
 
   function registerShortcuts(km: ReturnType<typeof initKeyboardManager>) {
@@ -1569,6 +1571,14 @@
   {/if}
 
   <div class="flex flex-1 overflow-hidden">
+    <ActivityRail
+      view={viewMode}
+      onSelect={(id) => {
+        if (id === 'review') showReviewInbox.set(true);
+        else if (id === 'settings') openSettings();
+        else viewMode = id as 'curate' | 'insights';
+      }}
+    />
     <!-- Left Panel: Segment List -->
     <ErrorBoundary>
       <aside
@@ -1843,7 +1853,9 @@
         data-testid="center-panel"
         class="flex-1 flex flex-col gap-3 p-4 overflow-y-auto min-w-0"
       >
-        {#if $selectedSegment}
+        {#if viewMode === 'insights'}
+          <StatsDashboard />
+        {:else if $selectedSegment}
           <div class="card overflow-hidden">
             <Waveform
               waveform={waveformData}
