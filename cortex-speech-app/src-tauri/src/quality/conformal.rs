@@ -140,6 +140,7 @@ pub fn calibrate_and_certify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn mock_segment(id: &str, confidence: f64, ctc: f64, verified: bool, raw: &str, ann: &str) -> SpeechSegment {
         SpeechSegment {
@@ -193,5 +194,68 @@ mod tests {
         assert!(cert.threshold > 0.0);
         // The unverified segments have low score so they should be certified
         assert!(cert.certified_segment_ids.contains(&"u1".to_string()));
+    }
+
+    /// The whole point of the conformal certificate: when calibrated, the reported
+    /// Hoeffding upper bound must not exceed the requested target error.
+    #[test]
+    fn calibrated_certificate_bound_never_exceeds_target() {
+        let mut segs = Vec::new();
+        for i in 0..40 {
+            let correct = i % 5 != 0; // 80% correct
+            let (raw, ann) = if correct { ("کورد", "کورد") } else { ("خراب", "جوان") };
+            segs.push(mock_segment(&format!("c{i}"), 0.9, -1.0, true, raw, ann));
+        }
+        let cert = calibrate_and_certify(&segs, 0.3, 0.90);
+        if cert.is_calibrated {
+            assert!(
+                cert.expected_error_bound <= 0.3 + 1e-9,
+                "calibrated Hoeffding bound {} must not exceed target 0.3",
+                cert.expected_error_bound
+            );
+        }
+    }
+
+    /// Monotonicity: a more lenient target error can only certify more (never fewer)
+    /// segments — a sanity property the threshold search must preserve.
+    #[test]
+    fn more_lenient_target_certifies_at_least_as_many() {
+        let mut segs = Vec::new();
+        for i in 0..50 {
+            let correct = i % 4 != 0;
+            let (raw, ann) = if correct { ("کورد", "کورد") } else { ("خراب", "جوان") };
+            let ctc = if correct { -1.0 } else { -8.0 }; // spread the nonconformity scores
+            segs.push(mock_segment(&format!("c{i}"), 0.9, ctc, true, raw, ann));
+        }
+        let strict = calibrate_and_certify(&segs, 0.1, 0.90);
+        let lenient = calibrate_and_certify(&segs, 0.4, 0.90);
+        assert!(
+            lenient.total_certified >= strict.total_certified,
+            "lenient target certified {} but strict certified {} (must be monotone)",
+            lenient.total_certified,
+            strict.total_certified
+        );
+    }
+
+    /// With too little calibration data the certificate must declare itself
+    /// uncalibrated and fall back to the conservative heuristic threshold.
+    #[test]
+    fn too_few_verified_falls_back_to_uncalibrated() {
+        let segs: Vec<_> =
+            (0..5).map(|i| mock_segment(&format!("c{i}"), 0.9, -1.0, true, "کورد", "کورد")).collect();
+        let cert = calibrate_and_certify(&segs, 0.2, 0.90);
+        assert!(!cert.is_calibrated, "fewer than 10 verified segments must be uncalibrated");
+        assert!((cert.threshold - 0.35).abs() < 1e-9, "fallback heuristic threshold is 0.35");
+    }
+
+    proptest! {
+        #[test]
+        fn nonconformity_score_is_always_nonnegative(
+            conf in -2.0f64..2.0,
+            ctc in -20.0f64..20.0,
+        ) {
+            let s = mock_segment("p", conf, ctc, true, "a", "a");
+            prop_assert!(compute_nonconformity_score(&s) >= 0.0);
+        }
     }
 }
