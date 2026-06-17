@@ -1,6 +1,10 @@
 # OmniASR (Meta Omnilingual ASR) Migration Design
 
-**Status:** Implemented (2026-05-30). Runtime uses **Meta OmniASR CTC 300M** via **sherpa-onnx**; Whisper Sorani path removed from `asr.rs`.
+**Status:** ✅ **Implemented.** The runtime uses **Meta OmniASR CTC** via **sherpa-onnx**: `Cargo.toml` depends on `sherpa-onnx`/`sherpa-onnx-sys` `1.13.2`, and `asr.rs` builds an `OfflineRecognizer` with `OfflineOmnilingualAsrCtcModelConfig` (`use sherpa_onnx::{OfflineOmnilingualAsrCtcModelConfig, OfflineRecognizer, OfflineRecognizerConfig};`). The custom Whisper-Sorani `ort` encoder/decoder path has been removed from the runtime.
+
+> **Reading guide — the body below is a historical snapshot.** Everything from "Executive summary" onward is the **original migration design & investigation (2026-05-30)**, kept for history. Where it says "what runs today is Whisper Sorani," "OmniASR is not wired," or "`sherpa-onnx` is not in `Cargo.toml`," that describes the **pre-migration** state and is **no longer true** — the five-step plan has since been carried out.
+
+> **Remaining gap (roadmap M2b).** `settings.language = "ckb"` is still **not passed** into the sherpa OmniASR config — `asr.rs` sets no language/locale field. Wiring the Central Kurdish hint (and confirming whether it changes output) is the only unfinished part of this migration.
 
 ---
 
@@ -182,7 +186,8 @@ Smallest valuable increment:
 
 | Date | Decision |
 |------|----------|
-| 2026-05-30 | Investigation only; no backend swap in this change. |
+| 2026-05-30 | Investigation only; no backend swap in this change _(original design snapshot)_. |
+| _(completed)_ | Backend swap **carried out**: `sherpa-onnx`/`sherpa-onnx-sys` `1.13.2` added to `Cargo.toml`; `asr.rs` runs `OfflineRecognizer` + `OfflineOmnilingualAsrCtcModelConfig`; custom Whisper `ort` decode removed. Remaining: pass `language="ckb"` (roadmap M2b). |
 | | Recommended path: **sherpa-onnx official Rust crate**, not custom `ort` CTC. |
 | | UI `ctc-*` values align with **Meta OmniASR CTC sizes**, not Whisper — naming is legacy/mislabeled. |
 

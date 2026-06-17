@@ -17,6 +17,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  governance-gate:
+    name: Provenance & License Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Fails the build on version/license drift, an invalid provenance ledger,
+      # or a license-incompatible (share-alike / NonCommercial / no-redist)
+      # corpus being marked for redistribution. Invoked via $GITHUB_WORKSPACE so
+      # it is independent of the per-job working directory.
+      - name: Verify 10/10 gates (manifests, ledger schema, license compatibility)
+        run: python "${{ github.workspace }}/scripts/verify_10.py"
+
   windows-release-gate:
     name: Windows Release Gate
     runs-on: windows-latest
