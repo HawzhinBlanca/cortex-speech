@@ -113,12 +113,11 @@ pub fn bootstrap_ci(
     rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let alpha = (1.0 - confidence) / 2.0;
-    ConfidenceInterval {
-        point,
-        lower: percentile(&rates, alpha),
-        upper: percentile(&rates, 1.0 - alpha),
-        confidence,
-    }
+    let lower = percentile(&rates, alpha);
+    // `upper` is mathematically >= `lower`; `.max` only absorbs <=1-ULP float noise,
+    // guaranteeing a well-ordered interval for every possible input.
+    let upper = percentile(&rates, 1.0 - alpha).max(lower);
+    ConfidenceInterval { point, lower, upper, confidence }
 }
 
 /// Linear-interpolated percentile of a pre-sorted slice. `q` in `[0, 1]`.
@@ -132,7 +131,9 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     let pos = q * (sorted.len() - 1) as f64;
     let lo = pos.floor() as usize;
     let hi = pos.ceil() as usize;
-    if lo == hi {
+    if lo == hi || sorted[lo] == sorted[hi] {
+        // Equal endpoints: return the exact value rather than interpolating, which can
+        // introduce sub-ULP float noise (e.g. when every resample yields one rate).
         return sorted[lo];
     }
     let frac = pos - lo as f64;
