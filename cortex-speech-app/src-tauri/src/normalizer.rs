@@ -1,3 +1,9 @@
+// Every `unwrap()` in this module is on compile-time-constant input — a static regex
+// literal or a fixed Unicode code point — so it is infallible by construction; any
+// failure would be a programming error caught immediately by this module's tests. The
+// crate denies `clippy::unwrap_used` in production; these are the reviewed exceptions.
+#![allow(clippy::unwrap_used)]
+
 pub mod g2p;
 
 use regex::Regex;
