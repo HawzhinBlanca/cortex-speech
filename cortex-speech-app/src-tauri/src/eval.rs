@@ -207,6 +207,46 @@ pub fn run_gold_eval(
     Ok(EvalRunResult { run: stored, segments: seg_results })
 }
 
+/// Run the gold-set eval end-to-end by producing each hypothesis through `transcribe`.
+///
+/// Closed-loop counterpart to [`run_gold_eval`]: instead of trusting caller-supplied
+/// hypotheses, the closure produces a hypothesis from each gold segment — in production
+/// this runs the real ASR engine on the segment audio (see
+/// `ProcessingPipeline::run_gold_eval_asr`). The loop is generic over the transcriber so
+/// it is fully unit-testable without loading any model. Segments whose transcription
+/// fails are logged and skipped — never silently scored as an empty hypothesis, which
+/// would understate WER/CER.
+pub fn run_gold_eval_with_transcriber<F>(
+    db: &Database,
+    model_id: &str,
+    mut transcribe: F,
+) -> AppResult<EvalRunResult>
+where
+    F: FnMut(&GoldSegment) -> AppResult<String>,
+{
+    let gold = list_gold_segments(db)?;
+    let total = gold.len();
+    let mut hypotheses: Vec<(String, String)> = Vec::with_capacity(total);
+    let mut failed = 0usize;
+    for seg in &gold {
+        match transcribe(seg) {
+            Ok(hyp) => hypotheses.push((seg.id.clone(), hyp)),
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(
+                    "gold eval: transcription failed for {} ({}): {e}",
+                    seg.id,
+                    seg.audio_path
+                );
+            }
+        }
+    }
+    if failed > 0 {
+        tracing::warn!("gold eval: {failed}/{total} segments failed to transcribe and were skipped");
+    }
+    run_gold_eval(db, model_id, hypotheses)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
@@ -265,6 +305,61 @@ mod tests {
         // Wrong hypothesis → WER > 0
         let result2 = run_gold_eval(&db, "bad-model", vec![(gold_id, "خراب".into())]).unwrap();
         assert!(result2.run.wer > 0.0, "Wrong hypothesis should have WER > 0");
+    }
+
+    #[test]
+    fn run_gold_eval_with_transcriber_runs_per_segment_and_scores() {
+        let db = open_mem_db();
+        import_gold_segments(
+            &db,
+            vec![
+                GoldSegmentInput { audio_path: "/tmp/a.wav".into(), reference: "کوردستان".into(), is_holdout: true },
+                GoldSegmentInput { audio_path: "/tmp/b.wav".into(), reference: "ئەمە دەنگە".into(), is_holdout: true },
+            ],
+        )
+        .unwrap();
+
+        // Fake transcriber: perfect on the first reference, wrong on the second.
+        let mut calls = 0usize;
+        let result = run_gold_eval_with_transcriber(&db, "fake-asr", |seg| {
+            calls += 1;
+            Ok(if seg.reference == "کوردستان" { "کوردستان".to_string() } else { "خراب".to_string() })
+        })
+        .unwrap();
+
+        assert_eq!(calls, 2, "transcriber must be invoked exactly once per gold segment");
+        assert_eq!(result.run.num_segs, 2);
+        assert_eq!(result.run.model_id, "fake-asr");
+        assert!(result.run.wer > 0.0, "one wrong hypothesis should yield a non-zero mean WER");
+        assert_eq!(result.segments.len(), 2);
+    }
+
+    #[test]
+    fn run_gold_eval_with_transcriber_skips_failures_without_scoring_them() {
+        let db = open_mem_db();
+        import_gold_segments(
+            &db,
+            vec![
+                GoldSegmentInput { audio_path: "/tmp/ok.wav".into(), reference: "کوردستان".into(), is_holdout: true },
+                GoldSegmentInput { audio_path: "/missing.wav".into(), reference: "ئەمە".into(), is_holdout: true },
+            ],
+        )
+        .unwrap();
+
+        let result = run_gold_eval_with_transcriber(&db, "partial-asr", |seg| {
+            if seg.audio_path.contains("missing") {
+                Err(crate::error::AppError::Other("decode failed".into()))
+            } else {
+                Ok("کوردستان".to_string())
+            }
+        })
+        .unwrap();
+
+        // Only the successfully-transcribed segment is scored; the failed one is skipped,
+        // not counted as an empty hypothesis (which would understate accuracy).
+        assert_eq!(result.run.num_segs, 1);
+        assert_eq!(result.segments.len(), 1);
+        assert!(result.run.wer < 0.01);
     }
 
     #[test]

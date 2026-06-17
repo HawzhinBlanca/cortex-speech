@@ -2251,6 +2251,20 @@ pub fn run_gold_eval(
     crate::eval::run_gold_eval(&db, &model_id, hypotheses).map_err(|e| e.to_string())
 }
 
+/// Closed-loop gold eval: runs the real local ASR over the gold set's audio and scores
+/// the produced hypotheses (no caller-supplied text). This is the honest-CER entrypoint.
+/// `model_id` defaults to the active local model when omitted.
+#[tauri::command]
+pub fn run_gold_eval_asr(
+    state: State<'_, AppState>,
+    model_id: Option<String>,
+) -> Result<crate::eval::EvalRunResult, String> {
+    RATE_LIMITER.check("run_gold_eval_asr")?;
+    // Clone the Arc so the (potentially long) ASR loop does not hold the pipeline lock.
+    let pipeline = state.lock_pipeline().clone();
+    pipeline.run_gold_eval_asr(model_id.as_deref()).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn list_eval_runs(state: State<'_, AppState>) -> Result<Vec<crate::eval::EvalRun>, String> {
     RATE_LIMITER.check("list_eval_runs")?;
