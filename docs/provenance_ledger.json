@@ -1,0 +1,42 @@
+[
+  {
+    "corpus": "fleurs_ckb",
+    "sourceUrl": "https://huggingface.co/datasets/google/fleurs",
+    "spdxLicense": "CC-BY-4.0",
+    "shareAlike": false,
+    "attributionString": "FLEURS Kurdish Dataset, Google LLC, licensed under CC BY 4.0.",
+    "consentBasis": "public_terms_of_service",
+    "redistributionRights": "redistributable_with_attribution",
+    "takedownContact": "https://github.com/google/fleurs/issues"
+  },
+  {
+    "corpus": "asosoft_600",
+    "sourceUrl": "https://github.com/AsoSoft/AsoSoft-Library-py",
+    "spdxLicense": "CC-BY-SA-4.0",
+    "shareAlike": true,
+    "attributionString": "AsoSoft Kurdish Corpus, AsoSoft Team, licensed under CC BY-SA 4.0.",
+    "consentBasis": "academic_release",
+    "redistributionRights": "share_alike_contaminating",
+    "takedownContact": "asosoft@asosoft.com"
+  },
+  {
+    "corpus": "cordi_sorani",
+    "sourceUrl": "academic_distribution",
+    "spdxLicense": "CC-BY-NC-SA-4.0",
+    "shareAlike": true,
+    "attributionString": "CORDI Dialect Corpus, UKH.",
+    "consentBasis": "academic_research_only",
+    "redistributionRights": "train_only_no_redist",
+    "takedownContact": "cordi-corpus@ukh.edu.krd"
+  },
+  {
+    "corpus": "common_voice_ckb",
+    "sourceUrl": "https://commonvoice.mozilla.org/ckb",
+    "spdxLicense": "CC0-1.0",
+    "shareAlike": false,
+    "attributionString": "Mozilla Common Voice Kurdish Dataset, Public Domain.",
+    "consentBasis": "explicit_voice_donation",
+    "redistributionRights": "permissive_public_domain",
+    "takedownContact": "commonvoice@mozilla.com"
+  }
+]

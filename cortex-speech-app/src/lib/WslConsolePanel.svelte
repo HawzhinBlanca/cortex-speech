@@ -1,0 +1,312 @@
+<script lang="ts">
+  import { onMount, onDestroy } from 'svelte';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import * as api from './commands';
+  import { showWslConsole } from './stores/uiStore';
+  import { notifications } from './stores/notificationStore';
+  import { segments } from './stores/segmentStore';
+  import { appendBoundedLogLine } from './logBuffer';
+
+  let running = $state(false);
+  let status = $state<'idle' | 'running' | 'completed' | 'failed' | 'cancelled'>('idle');
+  let exitCode = $state<number | null>(null);
+
+  // Options
+  let limitFiles = $state<number | undefined>(undefined);
+  let limitSegments = $state<number | undefined>(undefined);
+  let dryRun = $state(false);
+  let testOne = $state(false);
+
+  // Console Logs
+  let logs = $state<string[]>([]);
+  let consoleContainer = $state<HTMLDivElement | null>(null);
+
+  let unlistenLog: UnlistenFn | null = null;
+  let unlistenStatus: UnlistenFn | null = null;
+
+  function appendLog(line: string) {
+    logs = appendBoundedLogLine(logs, line);
+    // Auto scroll to bottom
+    if (consoleContainer) {
+      setTimeout(() => {
+        if (consoleContainer) {
+          consoleContainer.scrollTop = consoleContainer.scrollHeight;
+        }
+      }, 30);
+    }
+  }
+
+  async function startRefinement() {
+    if (running) return;
+
+    running = true;
+    status = 'running';
+    exitCode = null;
+    logs = [];
+    appendLog(">>> Spawning configured external ASR provider via WSL...");
+    appendLog(`>>> Command: wsl /root/cortex_env/bin/python3 <configured-provider-script>` +
+      (limitFiles ? ` --limit-files ${limitFiles}` : '') +
+      (limitSegments ? ` --limit-segments ${limitSegments}` : '') +
+      (dryRun ? ' --dry-run' : '') +
+      (testOne ? ' --test-one' : '')
+    );
+
+    try {
+      await api.runWslRefinement({
+        limit_files: limitFiles,
+        limit_segments: limitSegments,
+        dry_run: dryRun,
+        test_one: testOne
+      });
+    } catch (e) {
+      appendLog(`[SYSTEM ERROR] Failed to start refinement: ${e}`);
+      status = 'failed';
+      running = false;
+      notifications.error("Failed to start WSL refinement process", { detail: String(e) });
+    }
+  }
+
+  async function stopRefinement() {
+    if (!running) return;
+    appendLog("\n>>> Aborting process by user request...");
+    try {
+      await api.cancelWslRefinement();
+      status = 'cancelled';
+    } catch (e) {
+      appendLog(`[SYSTEM ERROR] Abort failed: ${e}`);
+      notifications.error("Failed to cancel WSL refinement", { detail: String(e) });
+    }
+  }
+
+  function clearLogs() {
+    logs = [];
+  }
+
+  function copyLogs() {
+    const text = logs.join('\n');
+    navigator.clipboard.writeText(text);
+    notifications.success("Console logs copied to clipboard");
+  }
+
+  function close() {
+    if (running) {
+      notifications.warning("Refinement is still running. Please cancel or wait for it to complete.");
+      return;
+    }
+    showWslConsole.set(false);
+  }
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') close();
+  }
+
+  onMount(async () => {
+    // Listen to log events from Rust subprocess
+    unlistenLog = await listen<string>('wsl-log', (event) => {
+      appendLog(event.payload);
+    });
+
+    // Listen to exit status from Rust subprocess
+    unlistenStatus = await listen<{ status: 'completed' | 'failed' | 'cancelled'; exit_code: number }>('wsl-status', (event) => {
+      status = event.payload.status;
+      exitCode = event.payload.exit_code;
+      running = false;
+
+      if (status === 'completed') {
+        notifications.success("WSL Local 7B ASR Batch transcription complete!");
+        segments.load();
+      } else if (status === 'cancelled') {
+        notifications.warning("WSL Local 7B ASR transcription was cancelled.");
+      } else {
+        notifications.error(`WSL Local 7B ASR transcription failed (Exit Code: ${exitCode}).`);
+      }
+    });
+  });
+
+  onDestroy(() => {
+    if (unlistenLog) unlistenLog();
+    if (unlistenStatus) unlistenStatus();
+  });
+</script>
+
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+<div
+  class="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md"
+  role="dialog"
+  aria-modal="true"
+  tabindex="-1"
+  onkeydown={handleKeydown}
+  onclick={(e) => { if (e.target === e.currentTarget) close(); }}
+>
+  <div
+    class="card p-0 max-w-3xl w-full mx-4 max-h-[85vh] flex flex-col shadow-2xl border border-cortex-800/40 bg-cortex-950/90 text-gray-100"
+  >
+    <!-- Header -->
+    <div class="flex items-center justify-between px-6 py-4 border-b border-cortex-800/50">
+      <div class="flex items-center gap-3">
+        <svg class="w-5 h-5 text-cortex-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+        </svg>
+        <h2 class="text-md font-semibold text-gray-100">Meta OmniASR 7B v2 Local Transcription (WSL)</h2>
+      </div>
+      <button
+        class="text-gray-400 hover:text-gray-200 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+        onclick={close}
+        disabled={running}
+        aria-label="Close"
+      >
+        ✕
+      </button>
+    </div>
+
+    <!-- Body -->
+    <div class="flex-1 overflow-y-auto p-6 space-y-4 min-h-0 flex flex-col">
+      <!-- Description & Config -->
+      <div class="bg-cortex-900/50 border border-cortex-800/40 rounded-xl p-4 space-y-3 shrink-0">
+        <p class="text-xs text-cortex-300">
+          Run high-accuracy offline transcription on the GPU using Meta's 7B encoder-decoder model. This process executes inside WSL (Ubuntu) and updates segment transcripts directly in the database.
+        </p>
+
+        <div class="grid grid-cols-2 gap-4">
+          <label class="flex flex-col gap-1 text-xs text-gray-300">
+            <span>Limit Files (Leave blank for all)</span>
+            <input
+              type="number"
+              min="1"
+              bind:value={limitFiles}
+              placeholder="e.g., 5"
+              class="input !py-1"
+              disabled={running}
+            />
+          </label>
+          <label class="flex flex-col gap-1 text-xs text-gray-300">
+            <span>Limit Segments per file (Leave blank for all)</span>
+            <input
+              type="number"
+              min="1"
+              bind:value={limitSegments}
+              placeholder="e.g., 20"
+              class="input !py-1"
+              disabled={running}
+            />
+          </label>
+        </div>
+
+        <div class="flex gap-6 pt-1">
+          <label class="flex items-center gap-2 cursor-pointer text-xs text-gray-300">
+            <input
+              type="checkbox"
+              bind:checked={dryRun}
+              class="accent-cortex-500"
+              disabled={running}
+            />
+            <span>Dry Run (No database writes)</span>
+          </label>
+
+          <label class="flex items-center gap-2 cursor-pointer text-xs text-gray-300">
+            <input
+              type="checkbox"
+              bind:checked={testOne}
+              class="accent-cortex-500"
+              disabled={running}
+            />
+            <span>Test Mode (Process exactly 1 segment & exit)</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Log Terminal Console -->
+      <div class="flex-1 min-h-[250px] flex flex-col min-h-0">
+        <div class="flex items-center justify-between text-xs text-cortex-400 mb-1 px-1">
+          <span>Terminal Logs</span>
+          <div class="flex items-center gap-2">
+            {#if status === 'running'}
+              <span class="flex items-center gap-1.5 text-cyan-400 font-semibold">
+                <svg class="animate-spin h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                </svg>
+                Processing...
+              </span>
+            {:else if status === 'completed'}
+              <span class="text-emerald-400 font-semibold">● Completed Successfully</span>
+            {:else if status === 'failed'}
+              <span class="text-red-400 font-semibold">● Process Failed</span>
+            {:else if status === 'cancelled'}
+              <span class="text-amber-400 font-semibold">● Cancelled</span>
+            {:else}
+              <span class="text-cortex-500">Idle</span>
+            {/if}
+          </div>
+        </div>
+
+        <!-- Monospace Log Container -->
+        <div
+          bind:this={consoleContainer}
+          class="flex-1 overflow-y-auto bg-black font-mono text-[11px] p-4 rounded-xl border border-cortex-800/60 space-y-1 select-text scrollbar-thin scrollbar-thumb-cortex-800 scrollbar-track-transparent min-h-0"
+        >
+          {#if logs.length === 0}
+            <div class="text-cortex-600 italic">No console logs to display. Press "Start local 7B batch ASR" below.</div>
+          {:else}
+            {#each logs as log}
+              {#if log.startsWith('>>>')}
+                <div class="text-cyan-400 font-semibold select-all">{log}</div>
+              {:else if log.includes('[ERROR]') || log.includes('[SYSTEM ERROR]')}
+                <div class="text-red-400 font-semibold select-all">{log}</div>
+              {:else if log.includes('loaded successfully') || log.includes('Complete!')}
+                <div class="text-emerald-400 select-all">{log}</div>
+              {:else}
+                <div class="text-gray-300 select-all">{log}</div>
+              {/if}
+            {/each}
+          {/if}
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="flex items-center justify-between px-6 py-4 border-t border-cortex-800/50 bg-cortex-900/20 rounded-b-2xl">
+      <div class="flex gap-2">
+        <button
+          class="btn-secondary !text-xs disabled:opacity-30"
+          onclick={clearLogs}
+          disabled={logs.length === 0}
+        >
+          Clear Logs
+        </button>
+        <button
+          class="btn-secondary !text-xs disabled:opacity-30"
+          onclick={copyLogs}
+          disabled={logs.length === 0}
+        >
+          Copy Logs
+        </button>
+      </div>
+
+      <div class="flex gap-3">
+        <button
+          class="btn-secondary !text-xs"
+          onclick={close}
+          disabled={running}
+        >
+          Close
+        </button>
+        {#if running}
+          <button
+            class="btn-primary !bg-red-600 hover:!bg-red-500 !border-red-700 !text-xs"
+            onclick={stopRefinement}
+          >
+            Cancel/Stop
+          </button>
+        {:else}
+          <button
+            class="btn-primary !text-xs"
+            onclick={startRefinement}
+          >
+            Start local 7B batch ASR
+          </button>
+        {/if}
+      </div>
+    </div>
+  </div>
+</div>

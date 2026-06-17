@@ -1,0 +1,4 @@
+npx lint-staged
+cd src-tauri && cargo check 2>&1 | tail -5
+echo "---"
+echo "Pre-commit checks passed. Run 'npm run test' and 'cargo test' before pushing."

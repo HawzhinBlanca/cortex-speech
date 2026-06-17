@@ -1,0 +1,1195 @@
+use crate::atomic_file::{remove_file_on_error, replace_file};
+use crate::settings::AsrModelSize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static USER_MODELS_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Subdirectory under the models root for Meta OmniASR CTC 300M (sherpa-onnx bundle).
+pub const OMNIASR_CTC_300M_DIR: &str = "omniasr-ctc-300m";
+pub const OMNIASR_CTC_300M_MODEL: &str = "omniasr-ctc-300m/model.int8.onnx";
+pub const OMNIASR_CTC_300M_TOKENS: &str = "omniasr-ctc-300m/tokens.txt";
+pub const OMNIASR_CTC_300M_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12.tar.bz2";
+pub const OMNIASR_CTC_300M_ARCHIVE_SHA256: &str = "";
+
+/// Subdirectory under the models root for Meta OmniASR CTC 1B (sherpa-onnx bundle).
+pub const OMNIASR_CTC_1B_DIR: &str = "omniasr-ctc-1b";
+pub const OMNIASR_CTC_1B_MODEL: &str = "omniasr-ctc-1b/model.int8.onnx";
+pub const OMNIASR_CTC_1B_TOKENS: &str = "omniasr-ctc-1b/tokens.txt";
+pub const OMNIASR_CTC_1B_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-omnilingual-asr-1600-languages-1B-ctc-int8-2025-11-12.tar.bz2";
+pub const OMNIASR_CTC_1B_ARCHIVE_SHA256: &str = "";
+
+/// Subdirectory for CAM++ speaker embedding model.
+pub const CAMPP_DIR: &str = "campp";
+pub const CAMPP_MODEL: &str = "campp/model.onnx";
+pub const CAMPP_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/sherpa-onnx-3dspeaker-campp-zh-en-rdino-tiny-2023-12-05.tar.bz2";
+pub const CAMPP_ARCHIVE_SHA256: &str = "";
+
+/// Subdirectory for the AI Audio Denoiser model.
+pub const DENOISER_DIR: &str = "denoiser";
+pub const DENOISER_MODEL: &str = "denoiser/model.onnx";
+pub const DENOISER_ARCHIVE_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-denoiser-v1-2025-11-12.tar.bz2";
+pub const DENOISER_ARCHIVE_SHA256: &str = "";
+
+/// Bundled models shipped with the app / used during development.
+pub fn bundled_models_dir() -> PathBuf {
+    select_bundled_models_dir(bundled_model_dir_candidates())
+}
+
+/// Register the user AppData models directory (call once at startup).
+pub fn init_user_models_dir(dir: PathBuf) {
+    let _ = USER_MODELS_DIR.set(dir);
+}
+
+/// Directory containing ONNX weights: user AppData first, then bundled fallback.
+pub fn active_models_dir() -> PathBuf {
+    USER_MODELS_DIR.get().map(|d| resolve_models_dir(d)).unwrap_or_else(bundled_models_dir)
+}
+
+fn bundled_model_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("models"));
+            candidates.push(exe_dir.join("resources").join("models"));
+            if let Some(parent) = exe_dir.parent() {
+                candidates.push(parent.join("models"));
+                candidates.push(parent.join("resources").join("models"));
+            }
+        }
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("models"));
+        candidates.push(current_dir.join("src-tauri").join("models"));
+    }
+
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("models"));
+    dedupe_paths(candidates)
+}
+
+fn select_bundled_models_dir(candidates: Vec<PathBuf>) -> PathBuf {
+    let fallback = candidates.first().cloned().unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("models"));
+    candidates
+        .into_iter()
+        .find(|candidate| omniasr_ctc_300m_present_in(candidate) || omniasr_ctc_1b_present_in(candidate))
+        .unwrap_or(fallback)
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut unique = Vec::new();
+    for path in paths {
+        if !unique.iter().any(|existing: &PathBuf| existing == &path) {
+            unique.push(path);
+        }
+    }
+    unique
+}
+
+/// Prefer `user_dir` when OmniASR model and tokens exist there; else bundled dev models.
+pub fn resolve_models_dir(user_dir: &Path) -> PathBuf {
+    if omniasr_ctc_300m_present_in(user_dir) || omniasr_ctc_1b_present_in(user_dir) {
+        return user_dir.to_path_buf();
+    }
+    let bundled = bundled_models_dir();
+    if omniasr_ctc_300m_present_in(&bundled) || omniasr_ctc_1b_present_in(&bundled) {
+        return bundled;
+    }
+    user_dir.to_path_buf()
+}
+
+pub struct ModelInfo {
+    pub name: &'static str,
+    pub filename: &'static str,
+    pub url: &'static str,
+    pub sha256: &'static str,
+    pub min_size_bytes: u64,
+    pub version: &'static str,
+}
+
+pub const MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        name: "Silero VAD v4",
+        filename: "silero_vad_v4.onnx",
+        url: "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx",
+        sha256: "1a153a22f4509e292a94d67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+        min_size_bytes: 1_000_000,
+        version: "4.0",
+    },
+    ModelInfo {
+        name: "Meta OmniASR CTC 300M (model)",
+        filename: OMNIASR_CTC_300M_MODEL,
+        url: "",
+        sha256: "",
+        min_size_bytes: 50_000_000,
+        version: "2.0",
+    },
+    ModelInfo {
+        name: "Meta OmniASR CTC 300M (tokens)",
+        filename: OMNIASR_CTC_300M_TOKENS,
+        url: "",
+        sha256: "",
+        min_size_bytes: 100,
+        version: "2.0",
+    },
+    ModelInfo {
+        name: "Meta OmniASR CTC 1B (model)",
+        filename: OMNIASR_CTC_1B_MODEL,
+        url: "",
+        sha256: "",
+        min_size_bytes: 500_000_000,
+        version: "2.0",
+    },
+    ModelInfo {
+        name: "Meta OmniASR CTC 1B (tokens)",
+        filename: OMNIASR_CTC_1B_TOKENS,
+        url: "",
+        sha256: "",
+        min_size_bytes: 100,
+        version: "2.0",
+    },
+    ModelInfo {
+        name: "CAM++ Speaker Embedding",
+        filename: CAMPP_MODEL,
+        url: "",
+        sha256: "",
+        min_size_bytes: 10_000_000,
+        version: "1.0",
+    },
+    ModelInfo {
+        name: "AI Audio Denoiser",
+        filename: DENOISER_MODEL,
+        url: "",
+        sha256: "",
+        min_size_bytes: 10_000_000,
+        version: "1.0",
+    },
+    ModelInfo {
+        name: "WavLM Speech OOD Detector",
+        filename: "wavlm_ood.onnx",
+        url: "",
+        sha256: "",
+        min_size_bytes: 5_000_000,
+        version: "1.0",
+    },
+];
+
+fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
+    if expected.is_empty() {
+        remove_model_temp_file(path, "unpinned model download");
+        return Err(missing_pinned_sha256_error("model download"));
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| format!("Open for hash: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("Hash read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let hash = format!("{:x}", hasher.finalize());
+    if hash != expected {
+        remove_model_temp_file(path, "SHA256-mismatched model download");
+        return Err(format!("SHA256 mismatch: expected {expected}, got {hash}"));
+    }
+    Ok(())
+}
+
+fn ensure_pinned_sha256(label: &str, expected: &str) -> Result<(), String> {
+    if expected.is_empty() {
+        return Err(missing_pinned_sha256_error(label));
+    }
+    Ok(())
+}
+
+fn missing_pinned_sha256_error(label: &str) -> String {
+    format!("Missing pinned SHA256 for {label}; refusing to download unverifiable artifact")
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ModelMeta {
+    pub filename: String,
+    pub downloaded_at: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub version: String,
+}
+
+pub struct ModelManager {
+    pub models_dir: PathBuf,
+}
+
+impl ModelManager {
+    pub fn new(models_dir: PathBuf) -> Self {
+        Self { models_dir }
+    }
+
+    pub fn ensure_dir(&self) -> Result<(), String> {
+        fs::create_dir_all(&self.models_dir).map_err(|e| format!("Failed to create models directory: {e}"))
+    }
+
+    pub fn missing_models(&self) -> Vec<&ModelInfo> {
+        let model_dir = self.resolved_dir();
+        MODELS
+            .iter()
+            .filter(|m| {
+                let (_, size) = model_file_state(&model_dir, m.filename);
+                size.unwrap_or(0) < m.min_size_bytes
+            })
+            .collect()
+    }
+
+    pub fn missing_required_model_names(&self) -> Vec<&'static str> {
+        missing_required_model_names_in(&self.resolved_dir())
+    }
+
+    pub fn missing_optional_model_names(&self) -> Vec<&'static str> {
+        let model_dir = self.resolved_dir();
+        let has_any_asr = omniasr_ctc_300m_present_in(&model_dir) || omniasr_ctc_1b_present_in(&model_dir);
+        self.missing_models()
+            .into_iter()
+            .filter(|model| {
+                model.filename != "silero_vad_v4.onnx" && (has_any_asr || !model.filename.starts_with("omniasr-ctc-"))
+            })
+            .map(|model| model.name)
+            .collect()
+    }
+
+    pub fn downloadable_missing_models(&self) -> Vec<&ModelInfo> {
+        let model_dir = self.resolved_dir();
+        MODELS
+            .iter()
+            .filter(|model| !model_available_in(&model_dir, model) && model_download_supported(model))
+            .collect()
+    }
+
+    pub fn all_models_present(&self) -> bool {
+        self.missing_required_model_names().is_empty()
+    }
+
+    pub fn model_path(&self, filename: &str) -> PathBuf {
+        let path = self.models_dir.join(filename);
+        ensure_model_parent_dir(&path);
+        path
+    }
+
+    /// Resolved directory where inference loads ONNX files from.
+    pub fn resolved_dir(&self) -> PathBuf {
+        resolve_models_dir(&self.models_dir)
+    }
+
+    fn meta_path(&self) -> PathBuf {
+        self.models_dir.join("models_meta.json")
+    }
+
+    pub fn save_meta(&self, entries: &[ModelMeta]) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(entries).map_err(|e| format!("Serialize meta: {e}"))?;
+        let meta_path = self.meta_path();
+        let tmp_path = meta_path.with_extension("json.tmp");
+        remove_file_on_error(
+            &tmp_path,
+            (|| -> Result<(), String> {
+                std::fs::write(&tmp_path, &json).map_err(|e| format!("Write meta tmp: {e}"))?;
+                replace_file(&tmp_path, &meta_path).map_err(|e| format!("Replace meta: {e}"))?;
+                Ok(())
+            })(),
+        )
+    }
+
+    pub fn load_meta(&self) -> Result<Vec<ModelMeta>, String> {
+        let content = std::fs::read_to_string(self.meta_path()).map_err(|e| format!("Read meta: {e}"))?;
+        serde_json::from_str(&content).map_err(|e| format!("Parse meta: {e}"))
+    }
+
+    fn load_meta_for_update(&self) -> Vec<ModelMeta> {
+        match std::fs::read_to_string(self.meta_path()) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    tracing::warn!("Failed to parse existing model metadata before update; starting fresh: {error}");
+                    Vec::new()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                tracing::warn!("Failed to read existing model metadata before update; starting fresh: {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    pub fn omniasr_ctc_300m_present(&self) -> bool {
+        omniasr_ctc_300m_present_in(&self.models_dir)
+    }
+
+    pub fn omniasr_ctc_1b_present(&self) -> bool {
+        omniasr_ctc_1b_present_in(&self.models_dir)
+    }
+
+    /// Download and extract the official sherpa-onnx OmniASR CTC archive.
+    pub fn download_omniasr(&self, size: AsrModelSize, progress_cb: impl Fn(f32)) -> Result<(), String> {
+        let (dir_name, archive_url, archive_sha256, model_file, tokens_file) = match size {
+            AsrModelSize::CTC300M => (
+                OMNIASR_CTC_300M_DIR,
+                OMNIASR_CTC_300M_ARCHIVE_URL,
+                OMNIASR_CTC_300M_ARCHIVE_SHA256,
+                OMNIASR_CTC_300M_MODEL,
+                OMNIASR_CTC_300M_TOKENS,
+            ),
+            AsrModelSize::CTC1B => (
+                OMNIASR_CTC_1B_DIR,
+                OMNIASR_CTC_1B_ARCHIVE_URL,
+                OMNIASR_CTC_1B_ARCHIVE_SHA256,
+                OMNIASR_CTC_1B_MODEL,
+                OMNIASR_CTC_1B_TOKENS,
+            ),
+            AsrModelSize::WSL7B => {
+                return Err("The 7B model runs locally via WSL; no download is required from this panel.".to_string());
+            }
+        };
+
+        if self.models_dir.join(model_file).exists() && self.models_dir.join(tokens_file).exists() {
+            progress_cb(1.0);
+            return Ok(());
+        }
+
+        ensure_pinned_sha256(&format!("Meta OmniASR {size:?} archive"), archive_sha256)?;
+
+        self.ensure_dir()?;
+        let dest_dir = self.models_dir.join(dir_name);
+        fs::create_dir_all(&dest_dir).map_err(|e| format!("Create OmniASR dir: {e}"))?;
+
+        let tmp_archive = self.models_dir.join(format!("{dir_name}.downloading.tar.bz2"));
+
+        tracing::info!("Downloading Meta OmniASR {:?} from {}", size, archive_url);
+
+        let response = ureq::get(archive_url).call().map_err(|e| format!("OmniASR archive download failed: {e}"))?;
+
+        let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+
+        write_reader_to_temp(
+            response.into_reader(),
+            &tmp_archive,
+            total_size,
+            0.9,
+            &progress_cb,
+            "Archive read error",
+            "Archive write error",
+        )?;
+
+        let archive_size = fs::metadata(&tmp_archive).map(|m| m.len()).unwrap_or(0);
+        if archive_size < 50_000_000 {
+            remove_model_temp_file(&tmp_archive, "undersized OmniASR archive");
+            return Err(format!("Downloaded OmniASR archive too small: {archive_size} bytes"));
+        }
+
+        verify_sha256(&tmp_archive, archive_sha256)?;
+        progress_cb(0.92);
+        self.extract_model_archive(&tmp_archive, &dest_dir, "model.int8.onnx", true)?;
+        remove_model_temp_file(&tmp_archive, "completed OmniASR archive");
+        progress_cb(1.0);
+
+        if !self.model_path(model_file).exists() || !self.model_path(tokens_file).exists() {
+            return Err(format!(
+                "OmniASR archive extracted but model.int8.onnx or tokens.txt is missing in {}",
+                dest_dir.display()
+            ));
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut meta_entries = self.load_meta_for_update();
+        for model in MODELS.iter().filter(|m| m.filename.starts_with(dir_name)) {
+            let path = self.model_path(model.filename);
+            if !path.exists() {
+                continue;
+            }
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let sha256 = compute_file_sha256(&path)?;
+            let entry = ModelMeta {
+                filename: model.filename.to_string(),
+                downloaded_at: now.clone(),
+                sha256,
+                size_bytes: size,
+                version: model.version.to_string(),
+            };
+            if let Some(pos) = meta_entries.iter().position(|m| m.filename == model.filename) {
+                meta_entries[pos] = entry;
+            } else {
+                meta_entries.push(entry);
+            }
+        }
+        if let Err(e) = self.save_meta(&meta_entries) {
+            tracing::warn!("Failed to save OmniASR model metadata: {e}");
+        }
+
+        tracing::info!("Meta OmniASR {:?} installed under {}", size, dest_dir.display());
+        Ok(())
+    }
+
+    fn extract_model_archive(
+        &self,
+        archive_path: &Path,
+        dest_dir: &Path,
+        model_output_name: &str,
+        require_tokens: bool,
+    ) -> Result<(), String> {
+        let file = fs::File::open(archive_path).map_err(|e| format!("Open archive: {e}"))?;
+        let decoder = bzip2::read::BzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+
+        let mut model_written = false;
+        let mut tokens_written = false;
+        let mut staged_files: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+        for entry in archive.entries().map_err(|e| format!("Read archive entries: {e}"))? {
+            let mut entry = entry.map_err(|e| format!("Archive entry: {e}"))?;
+            let path = entry.path().map_err(|e| format!("Archive path: {e}"))?;
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            match name {
+                "model.int8.onnx" | "model.onnx" => {
+                    let dest = dest_dir.join(model_output_name);
+                    let tmp = extraction_tmp_path(&dest);
+                    remove_model_temp_file(&tmp, "stale model extraction temp");
+                    if let Err(e) = entry.unpack(&tmp) {
+                        remove_model_temp_file(&tmp, "failed model extraction temp");
+                        cleanup_staged_files(&staged_files);
+                        return Err(format!("Extract model: {e}"));
+                    }
+                    model_written = true;
+                    staged_files.push((tmp, dest));
+                }
+                "tokens.txt" => {
+                    let dest = dest_dir.join("tokens.txt");
+                    let tmp = extraction_tmp_path(&dest);
+                    remove_model_temp_file(&tmp, "stale token extraction temp");
+                    if let Err(e) = entry.unpack(&tmp) {
+                        remove_model_temp_file(&tmp, "failed token extraction temp");
+                        cleanup_staged_files(&staged_files);
+                        return Err(format!("Extract tokens: {e}"));
+                    }
+                    tokens_written = true;
+                    staged_files.push((tmp, dest));
+                }
+                _ => {}
+            }
+        }
+
+        if !model_written || (require_tokens && !tokens_written) {
+            cleanup_staged_files(&staged_files);
+            return Err(if require_tokens {
+                "Archive did not contain model.int8.onnx (or model.onnx) and tokens.txt".to_string()
+            } else {
+                "Archive did not contain model.int8.onnx or model.onnx".to_string()
+            });
+        }
+
+        for (tmp, dest) in staged_files {
+            if let Err(e) = replace_file(&tmp, &dest) {
+                remove_model_temp_file(&tmp, "failed extracted model promotion temp");
+                return Err(format!("Promote extracted model artifact: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn campp_present(&self) -> bool {
+        model_file_meets_min_size(&self.models_dir, CAMPP_MODEL, 10_000_000)
+    }
+
+    /// Download and extract the CAM++ speaker embedding archive.
+    pub fn download_campp(&self, progress_cb: impl Fn(f32)) -> Result<(), String> {
+        if self.models_dir.join(CAMPP_MODEL).exists() {
+            progress_cb(1.0);
+            return Ok(());
+        }
+
+        ensure_pinned_sha256("CAM++ archive", CAMPP_ARCHIVE_SHA256)?;
+
+        self.ensure_dir()?;
+        let dest_dir = self.models_dir.join(CAMPP_DIR);
+        fs::create_dir_all(&dest_dir).map_err(|e| format!("Create CAM++ dir: {e}"))?;
+
+        let tmp_archive = self.models_dir.join("campp.downloading.tar.bz2");
+        tracing::info!("Downloading CAM++ from {}", CAMPP_ARCHIVE_URL);
+
+        let response = ureq::get(CAMPP_ARCHIVE_URL).call().map_err(|e| format!("CAM++ download failed: {e}"))?;
+
+        let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+
+        write_reader_to_temp(
+            response.into_reader(),
+            &tmp_archive,
+            total_size,
+            0.9,
+            &progress_cb,
+            "Archive read error",
+            "Archive write error",
+        )?;
+
+        verify_sha256(&tmp_archive, CAMPP_ARCHIVE_SHA256)?;
+        progress_cb(0.92);
+        self.extract_model_archive(&tmp_archive, &dest_dir, "model.onnx", false)?;
+        remove_model_temp_file(&tmp_archive, "completed CAM++ archive");
+        progress_cb(1.0);
+
+        if !self.campp_present() {
+            return Err("CAM++ archive extracted but model.onnx is missing".into());
+        }
+
+        tracing::info!("CAM++ installed under {}", dest_dir.display());
+        Ok(())
+    }
+
+    pub fn denoiser_present(&self) -> bool {
+        model_file_meets_min_size(&self.models_dir, DENOISER_MODEL, 10_000_000)
+    }
+
+    /// Download and extract the AI Denoiser archive.
+    pub fn download_denoiser(&self, progress_cb: impl Fn(f32)) -> Result<(), String> {
+        if self.models_dir.join(DENOISER_MODEL).exists() {
+            progress_cb(1.0);
+            return Ok(());
+        }
+
+        ensure_pinned_sha256("AI Denoiser archive", DENOISER_ARCHIVE_SHA256)?;
+
+        self.ensure_dir()?;
+        let dest_dir = self.models_dir.join(DENOISER_DIR);
+        fs::create_dir_all(&dest_dir).map_err(|e| format!("Create Denoiser dir: {e}"))?;
+
+        let tmp_archive = self.models_dir.join("denoiser.downloading.tar.bz2");
+        tracing::info!("Downloading AI Denoiser from {}", DENOISER_ARCHIVE_URL);
+
+        let response = ureq::get(DENOISER_ARCHIVE_URL).call().map_err(|e| format!("Denoiser download failed: {e}"))?;
+
+        let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+
+        write_reader_to_temp(
+            response.into_reader(),
+            &tmp_archive,
+            total_size,
+            0.9,
+            &progress_cb,
+            "Archive read error",
+            "Archive write error",
+        )?;
+
+        verify_sha256(&tmp_archive, DENOISER_ARCHIVE_SHA256)?;
+        progress_cb(0.92);
+        self.extract_model_archive(&tmp_archive, &dest_dir, "model.onnx", false)?;
+        remove_model_temp_file(&tmp_archive, "completed denoiser archive");
+        progress_cb(1.0);
+
+        if !self.denoiser_present() {
+            return Err("Denoiser archive extracted but model.onnx is missing".into());
+        }
+
+        tracing::info!("AI Denoiser installed under {}", dest_dir.display());
+        Ok(())
+    }
+
+    pub fn download_model(&self, model: &ModelInfo, progress_cb: impl Fn(f32)) -> Result<(), String> {
+        if model.filename.starts_with(OMNIASR_CTC_300M_DIR) {
+            return self.download_omniasr(AsrModelSize::CTC300M, progress_cb);
+        }
+        if model.filename.starts_with(OMNIASR_CTC_1B_DIR) {
+            return self.download_omniasr(AsrModelSize::CTC1B, progress_cb);
+        }
+        if model.filename.starts_with(CAMPP_DIR) {
+            return self.download_campp(progress_cb);
+        }
+        if model.filename.starts_with(DENOISER_DIR) {
+            return self.download_denoiser(progress_cb);
+        }
+
+        if model.url.is_empty() {
+            return Err(format!("No download URL configured for {}; use Download All or manual install", model.name));
+        }
+
+        ensure_pinned_sha256(model.name, model.sha256)?;
+
+        self.ensure_dir()?;
+
+        let dest = self.model_path(model.filename);
+        let tmp = dest.with_extension("downloading");
+
+        let response = ureq::get(model.url).call().map_err(|e| format!("Download failed for {}: {}", model.name, e))?;
+
+        let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+
+        write_reader_to_temp(
+            response.into_reader(),
+            &tmp,
+            total_size,
+            1.0,
+            &progress_cb,
+            "Download read error",
+            "Write error",
+        )?;
+
+        let size = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        if size < model.min_size_bytes {
+            remove_model_temp_file(&tmp, "undersized model download");
+            return Err(format!("Downloaded file too small: {} bytes (expected > {})", size, model.min_size_bytes));
+        }
+
+        verify_sha256(&tmp, model.sha256)?;
+
+        replace_file(&tmp, &dest).map_err(|e| format!("Replace downloaded model: {e}"))?;
+
+        let actual_sha256 = model.sha256.to_string();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let meta_entry = ModelMeta {
+            filename: model.filename.to_string(),
+            downloaded_at: now,
+            sha256: actual_sha256,
+            size_bytes: size,
+            version: model.version.to_string(),
+        };
+
+        let mut meta_entries = self.load_meta_for_update();
+        if let Some(pos) = meta_entries.iter().position(|m| m.filename == model.filename) {
+            meta_entries[pos] = meta_entry;
+        } else {
+            meta_entries.push(meta_entry);
+        }
+        if let Err(e) = self.save_meta(&meta_entries) {
+            tracing::warn!("Failed to save model metadata: {e}");
+        }
+
+        tracing::info!("Downloaded {} ({} bytes)", model.name, size);
+        Ok(())
+    }
+
+    pub fn warmup(&self) -> Result<(), String> {
+        let vad_path = self.resolved_dir().join("silero_vad_v4.onnx");
+        if vad_path.exists() {
+            match ort::session::Session::builder().and_then(|mut b| b.commit_from_file(&vad_path)) {
+                Ok(_) => tracing::info!("Silero VAD warmed up successfully"),
+                Err(e) => tracing::warn!("VAD warm-up failed: {e}"),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn status(&self) -> Vec<serde_json::Value> {
+        let active_dir = self.resolved_dir();
+        MODELS
+            .iter()
+            .map(|m| {
+                let path = active_dir.join(m.filename);
+                let (exists, size) = model_file_state(&active_dir, m.filename);
+                let available = size.unwrap_or(0) >= m.min_size_bytes;
+                let source = if !available {
+                    "missing"
+                } else if active_dir == self.models_dir {
+                    "user"
+                } else {
+                    "bundled"
+                };
+                serde_json::json!({
+                    "name": m.name,
+                    "filename": m.filename,
+                    "downloaded": available,
+                    "exists": exists,
+                    "size_bytes": size,
+                    "min_size_bytes": m.min_size_bytes,
+                    "version": m.version,
+                    "source": source,
+                    "downloadable": model_download_supported(m),
+                    "path": path,
+                })
+            })
+            .collect()
+    }
+}
+
+fn model_file_state(model_dir: &Path, filename: &str) -> (bool, Option<u64>) {
+    let path = model_dir.join(filename);
+    let size = path.metadata().map(|m| m.len()).ok();
+    (size.is_some(), size)
+}
+
+fn model_file_meets_min_size(model_dir: &Path, filename: &str, min_size_bytes: u64) -> bool {
+    model_file_state(model_dir, filename).1.unwrap_or(0) >= min_size_bytes
+}
+
+fn model_available_in(model_dir: &Path, model: &ModelInfo) -> bool {
+    model_file_meets_min_size(model_dir, model.filename, model.min_size_bytes)
+}
+
+fn model_download_supported(model: &ModelInfo) -> bool {
+    if model.filename.starts_with(OMNIASR_CTC_300M_DIR) {
+        return !OMNIASR_CTC_300M_ARCHIVE_SHA256.is_empty();
+    }
+    if model.filename.starts_with(OMNIASR_CTC_1B_DIR) {
+        return !OMNIASR_CTC_1B_ARCHIVE_SHA256.is_empty();
+    }
+    if model.filename.starts_with(CAMPP_DIR) {
+        return !CAMPP_ARCHIVE_SHA256.is_empty();
+    }
+    if model.filename.starts_with(DENOISER_DIR) {
+        return !DENOISER_ARCHIVE_SHA256.is_empty();
+    }
+    !model.url.is_empty() && !model.sha256.is_empty()
+}
+
+fn missing_required_model_names_in(model_dir: &Path) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !model_file_meets_min_size(model_dir, "silero_vad_v4.onnx", 1_000_000) {
+        missing.push("Silero VAD v4");
+    }
+    if !omniasr_ctc_300m_present_in(model_dir) && !omniasr_ctc_1b_present_in(model_dir) {
+        missing.push("Meta OmniASR CTC model and tokens");
+    }
+    missing
+}
+
+fn omniasr_ctc_300m_present_in(model_dir: &Path) -> bool {
+    model_file_meets_min_size(model_dir, OMNIASR_CTC_300M_MODEL, 50_000_000)
+        && model_file_meets_min_size(model_dir, OMNIASR_CTC_300M_TOKENS, 100)
+}
+
+fn omniasr_ctc_1b_present_in(model_dir: &Path) -> bool {
+    model_file_meets_min_size(model_dir, OMNIASR_CTC_1B_MODEL, 500_000_000)
+        && model_file_meets_min_size(model_dir, OMNIASR_CTC_1B_TOKENS, 100)
+}
+
+fn compute_file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| format!("Open for hash: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("Hash read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn write_reader_to_temp<R: Read>(
+    mut reader: R,
+    tmp_path: &Path,
+    total_size: u64,
+    progress_scale: f32,
+    progress_cb: &impl Fn(f32),
+    read_context: &str,
+    write_context: &str,
+) -> Result<u64, String> {
+    let result = (|| -> Result<u64, String> {
+        let mut file = fs::File::create(tmp_path).map_err(|e| format!("Create temp file: {e}"))?;
+        let mut downloaded: u64 = 0;
+        let mut buffer = [0u8; 8192];
+        loop {
+            let n = reader.read(&mut buffer).map_err(|e| format!("{read_context}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buffer[..n]).map_err(|e| format!("{write_context}: {e}"))?;
+            downloaded += n as u64;
+            if total_size > 0 {
+                progress_cb((downloaded as f32 / total_size as f32) * progress_scale);
+            }
+        }
+        file.flush().map_err(|e| format!("{write_context}: {e}"))?;
+        Ok(downloaded)
+    })();
+    if result.is_err() {
+        remove_model_temp_file(tmp_path, "partial model download");
+    }
+    result
+}
+
+fn extraction_tmp_path(dest: &Path) -> PathBuf {
+    let file_name = dest.file_name().and_then(|name| name.to_str()).unwrap_or("model-artifact");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    dest.with_file_name(format!("{file_name}.extracting-{}-{nonce}", std::process::id()))
+}
+
+fn cleanup_staged_files(staged_files: &[(PathBuf, PathBuf)]) {
+    for (tmp, _) in staged_files {
+        remove_model_temp_file(tmp, "staged model extraction temp");
+    }
+}
+
+fn ensure_model_parent_dir(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Err(error) = fs::create_dir_all(parent) {
+        tracing::warn!("Failed to create model artifact parent directory {}: {error}", parent.display());
+    }
+}
+
+fn remove_model_temp_file(path: &Path, context: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!("Failed to remove {context} file {}: {error}", path.display()),
+    }
+}
+
+/// Automatically locate `onnxruntime.dll` on Windows and programmatically
+/// set the `ORT_DYLIB_PATH` environment variable if not already set.
+pub fn init_ort_dylib_path() {
+    #[cfg(target_os = "windows")]
+    {
+        if std::env::var("ORT_DYLIB_PATH").is_err() {
+            let mut resolved_path = None;
+
+            // 1. Check next to current exe or in its parent directory
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    let p1 = exe_dir.join("onnxruntime.dll");
+                    if p1.exists() {
+                        resolved_path = Some(p1);
+                    } else if let Some(parent_dir) = exe_dir.parent() {
+                        let p2 = parent_dir.join("onnxruntime.dll");
+                        if p2.exists() {
+                            resolved_path = Some(p2);
+                        }
+                    }
+                }
+            }
+
+            // 2. Check models directory
+            if resolved_path.is_none() {
+                let active_dir = active_models_dir();
+                let p3 = active_dir.join("onnxruntime.dll").join("onnxruntime.dll");
+                if p3.exists() {
+                    resolved_path = Some(p3);
+                } else {
+                    let p3_root = active_dir.join("onnxruntime.dll");
+                    if p3_root.exists() {
+                        resolved_path = Some(p3_root);
+                    }
+                }
+            }
+
+            // 3. Check current working directory
+            if resolved_path.is_none() {
+                let p4 = Path::new("onnxruntime.dll");
+                if p4.exists() {
+                    if let Ok(abs) = p4.canonicalize() {
+                        resolved_path = Some(abs);
+                    }
+                }
+            }
+
+            if let Some(path) = resolved_path {
+                tracing::info!("Setting ORT_DYLIB_PATH programmatically to {:?}", path);
+                std::env::set_var("ORT_DYLIB_PATH", path);
+            } else {
+                tracing::warn!("onnxruntime.dll not found in standard paths; ORT dynamic loading may fail");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::fs::File;
+    use std::io;
+
+    #[test]
+    fn omniasr_download_refuses_unpinned_archive_before_side_effects() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let manager = ModelManager::new(models_dir.clone());
+        let progress_calls = Cell::new(0);
+
+        let err = manager
+            .download_omniasr(AsrModelSize::CTC300M, |_| progress_calls.set(progress_calls.get() + 1))
+            .expect_err("unpinned archive must fail before download");
+
+        assert!(err.contains("Missing pinned SHA256 for Meta OmniASR CTC300M archive"));
+        assert_eq!(progress_calls.get(), 0, "preflight failure must not emit progress");
+        assert!(!models_dir.exists(), "preflight failure must not create model directories");
+    }
+
+    #[test]
+    fn routed_archive_download_refuses_unpinned_archive_before_side_effects() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let manager = ModelManager::new(models_dir.clone());
+        let progress_calls = Cell::new(0);
+        let model = MODELS.iter().find(|model| model.filename == CAMPP_MODEL).expect("CAM++ model entry");
+
+        let err = manager
+            .download_model(model, |_| progress_calls.set(progress_calls.get() + 1))
+            .expect_err("unpinned archive must fail before download");
+
+        assert!(err.contains("Missing pinned SHA256 for CAM++ archive"));
+        assert_eq!(progress_calls.get(), 0, "preflight failure must not emit progress");
+        assert!(!models_dir.exists(), "preflight failure must not create model directories");
+    }
+
+    #[test]
+    fn model_status_checks_are_read_only_for_empty_user_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let manager = ModelManager::new(models_dir.clone());
+
+        let _ = manager.status();
+        let _ = manager.missing_models();
+        let _ = manager.all_models_present();
+
+        assert!(!models_dir.exists(), "read-only model checks must not create user model directories");
+    }
+
+    #[test]
+    fn save_meta_replaces_existing_metadata_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+        manager.ensure_dir().expect("ensure dir");
+        std::fs::write(manager.meta_path(), "[{\"filename\":\"old\"}]").expect("seed meta");
+        let entries = vec![ModelMeta {
+            filename: "new-model.onnx".to_string(),
+            downloaded_at: "2026-06-16T00:00:00Z".to_string(),
+            sha256: "abc123".to_string(),
+            size_bytes: 42,
+            version: "1.0".to_string(),
+        }];
+
+        manager.save_meta(&entries).expect("save meta");
+
+        let loaded = manager.load_meta().expect("load meta");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].filename, "new-model.onnx");
+        assert!(!manager.meta_path().with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn load_meta_for_update_treats_missing_as_empty_but_surfaces_corrupt_to_strict_loader() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+
+        assert!(manager.load_meta_for_update().is_empty());
+
+        manager.ensure_dir().expect("ensure dir");
+        std::fs::write(manager.meta_path(), "{not valid json").expect("seed corrupt meta");
+
+        assert!(manager.load_meta_for_update().is_empty());
+        match manager.load_meta() {
+            Ok(_) => panic!("strict meta loader should reject corrupt JSON"),
+            Err(error) => assert!(error.contains("Parse meta")),
+        }
+    }
+
+    #[test]
+    fn write_reader_to_temp_writes_file_and_reports_progress() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("model.downloading");
+        let progress_calls = Cell::new(0);
+
+        let written = write_reader_to_temp(
+            std::io::Cursor::new(b"model-bytes".to_vec()),
+            &path,
+            11,
+            1.0,
+            &|_| progress_calls.set(progress_calls.get() + 1),
+            "read",
+            "write",
+        )
+        .expect("write temp");
+
+        assert_eq!(written, 11);
+        assert_eq!(std::fs::read(&path).expect("read temp"), b"model-bytes");
+        assert!(progress_calls.get() > 0);
+    }
+
+    #[test]
+    fn write_reader_to_temp_removes_partial_file_on_read_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("model.downloading");
+
+        let err = write_reader_to_temp(
+            FailingReader { first_read_done: false },
+            &path,
+            100,
+            1.0,
+            &|_| {},
+            "download read",
+            "download write",
+        )
+        .expect_err("reader failure should error");
+
+        assert!(err.contains("download read"));
+        assert!(!path.exists(), "partial download temp file should be removed on read failure");
+    }
+
+    #[test]
+    fn extract_model_archive_missing_tokens_leaves_no_final_or_staged_artifact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+        let archive_path = tmp.path().join("missing-tokens.tar.bz2");
+        write_bzip2_tar(&archive_path, &[("nested/model.int8.onnx", b"model bytes")]);
+        let dest_dir = tmp.path().join("extract");
+        std::fs::create_dir_all(&dest_dir).expect("dest dir");
+
+        let err = manager
+            .extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true)
+            .expect_err("missing tokens should fail");
+
+        assert!(err.contains("tokens.txt"));
+        assert!(!dest_dir.join("model.int8.onnx").exists());
+        assert_no_extracting_files(&dest_dir);
+    }
+
+    #[test]
+    fn extract_model_archive_promotes_complete_required_pair() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+        let archive_path = tmp.path().join("complete.tar.bz2");
+        write_bzip2_tar(&archive_path, &[("nested/model.int8.onnx", b"model bytes"), ("nested/tokens.txt", b"tokens")]);
+        let dest_dir = tmp.path().join("extract");
+        std::fs::create_dir_all(&dest_dir).expect("dest dir");
+
+        manager.extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true).expect("extract");
+
+        assert_eq!(std::fs::read(dest_dir.join("model.int8.onnx")).expect("model"), b"model bytes");
+        assert_eq!(std::fs::read(dest_dir.join("tokens.txt")).expect("tokens"), b"tokens");
+        assert_no_extracting_files(&dest_dir);
+    }
+
+    #[test]
+    fn bundled_runtime_models_count_as_available_when_user_dir_is_empty() {
+        assert!(
+            omniasr_ctc_300m_present_in(&bundled_models_dir())
+                && model_file_meets_min_size(&bundled_models_dir(), "silero_vad_v4.onnx", 1_000_000),
+            "repository fixture must include bundled VAD and OmniASR 300M models"
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+
+        assert!(manager.all_models_present(), "runtime should see bundled essential models");
+
+        let missing_names = manager.missing_models().into_iter().map(|model| model.name).collect::<Vec<_>>();
+        assert!(!missing_names.contains(&"Silero VAD v4"));
+        assert!(!missing_names.contains(&"Meta OmniASR CTC 300M (model)"));
+        assert!(!missing_names.contains(&"Meta OmniASR CTC 300M (tokens)"));
+        let missing_optional_names = manager.missing_optional_model_names();
+        assert!(!missing_optional_names.contains(&"Silero VAD v4"));
+        if !omniasr_ctc_1b_present_in(&bundled_models_dir()) {
+            assert!(missing_optional_names.contains(&"Meta OmniASR CTC 1B (model)"));
+        }
+
+        let status = manager.status();
+        let ctc_300m =
+            status.iter().find(|model| model["filename"] == OMNIASR_CTC_300M_MODEL).expect("300M model status");
+        assert_eq!(ctc_300m["downloaded"], true);
+        assert_eq!(ctc_300m["source"], "bundled");
+    }
+
+    struct FailingReader {
+        first_read_done: bool,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.first_read_done {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "synthetic read failure"));
+            }
+            self.first_read_done = true;
+            buf[..7].copy_from_slice(b"partial");
+            Ok(7)
+        }
+    }
+
+    #[test]
+    fn unpinned_optional_models_are_not_bulk_download_candidates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+
+        let missing_names = manager.missing_models().into_iter().map(|model| model.name).collect::<Vec<_>>();
+        assert!(missing_names.contains(&"CAM++ Speaker Embedding"));
+        assert!(missing_names.contains(&"AI Audio Denoiser"));
+
+        let downloadable = manager.downloadable_missing_models();
+        assert!(downloadable.is_empty(), "bulk download must skip missing models without pinned checksums");
+
+        let status = manager.status();
+        let campp = status.iter().find(|model| model["filename"] == CAMPP_MODEL).expect("CAM++ status");
+        assert_eq!(campp["downloaded"], false);
+        assert_eq!(campp["downloadable"], false);
+        assert_eq!(campp["source"], "missing");
+    }
+
+    #[test]
+    fn bundled_model_selector_prefers_first_candidate_with_runtime_asr_pair() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing_candidate = tmp.path().join("exe").join("models");
+        let resource_candidate = tmp.path().join("exe").join("resources").join("models");
+        create_minimal_300m_model_pair(&resource_candidate);
+
+        let selected = select_bundled_models_dir(vec![missing_candidate.clone(), resource_candidate.clone()]);
+
+        assert_eq!(selected, resource_candidate);
+        assert!(!selected.starts_with(missing_candidate));
+    }
+
+    #[test]
+    fn resolve_models_dir_falls_back_when_user_dir_has_truncated_model_pair() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user_dir = tmp.path().join("user-models");
+        std::fs::create_dir_all(user_dir.join(OMNIASR_CTC_300M_DIR)).expect("user model dir");
+        std::fs::write(user_dir.join(OMNIASR_CTC_300M_MODEL), b"too small").expect("truncated model");
+        std::fs::write(user_dir.join(OMNIASR_CTC_300M_TOKENS), b"tokens").expect("truncated tokens");
+
+        assert_ne!(resolve_models_dir(&user_dir), user_dir);
+    }
+
+    fn create_minimal_300m_model_pair(model_dir: &Path) {
+        std::fs::create_dir_all(model_dir.join(OMNIASR_CTC_300M_DIR)).expect("model dir");
+        File::create(model_dir.join(OMNIASR_CTC_300M_MODEL))
+            .expect("model file")
+            .set_len(50_000_000)
+            .expect("model size");
+        File::create(model_dir.join(OMNIASR_CTC_300M_TOKENS)).expect("tokens file").set_len(100).expect("tokens size");
+    }
+
+    fn write_bzip2_tar(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).expect("archive file");
+        let encoder = bzip2::write::BzEncoder::new(file, bzip2::Compression::best());
+        let mut builder = tar::Builder::new(encoder);
+        for (entry_path, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, *entry_path, &mut std::io::Cursor::new(*bytes))
+                .expect("append archive entry");
+        }
+        let encoder = builder.into_inner().expect("finish tar");
+        encoder.finish().expect("finish bzip2");
+    }
+
+    fn assert_no_extracting_files(dir: &Path) {
+        let extracting_left = std::fs::read_dir(dir)
+            .expect("read extract dir")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".extracting-"));
+        assert!(!extracting_left, "staged extraction files should be promoted or removed");
+    }
+}

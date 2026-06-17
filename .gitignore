@@ -1,0 +1,72 @@
+# Dependencies and build targets
+node_modules/
+cortex-speech-app/node_modules/
+dist/
+cortex-speech-app/dist/
+target/
+cortex-speech-app/target/
+cortex-speech-app/src-tauri/target/
+
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Environment & credentials
+.env
+.env.local
+.env.*
+
+# Logs, coverage, and reports
+*.log
+logs/
+reports/
+playwright-report/
+test-results/
+coverage/
+
+# Temporary and backup files
+*.tmp
+*.temp
+*.tar
+*.tar.gz
+*.tar.bz2
+*.zip
+*.7z
+
+# Audio model weights & media
+*.onnx
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.aac
+*.opus
+*.mp4
+*.mov
+*.webm
+*.wma
+cortex-speech-app/src-tauri/models/*
+!cortex-speech-app/src-tauri/models/.gitkeep
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Tauri icons
+cortex-speech-app/src-tauri/icons/*.png
+cortex-speech-app/src-tauri/icons/*.ico
+!cortex-speech-app/src-tauri/icons/icon.png
+!cortex-speech-app/src-tauri/icons/icon.ico
+
+# Binaries and local execution logs
+*.exe
+sherpa-onnx-v1.13.2-win-x64-shared-MD-Release/
+cortex-speech-app/src-tauri/sherpa-onnx-v1.13.2-win-x64-shared-MD-Release/
+*.txt
+!docs/*.txt
+screenshot_now.png
+db_rs_original.rs

@@ -1,0 +1,46 @@
+[package]
+name = "cortex-speech-app-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cortex-speech-app = { path = ".." }
+
+[profile.release]
+opt-level = 3
+debug = 1
+
+[[bin]]
+name = "normalizer"
+path = "fuzz_targets/normalizer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "diff"
+path = "fuzz_targets/diff.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "validation"
+path = "fuzz_targets/validation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "features"
+path = "fuzz_targets/features.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cache"
+path = "fuzz_targets/cache.rs"
+test = false
+doc = false

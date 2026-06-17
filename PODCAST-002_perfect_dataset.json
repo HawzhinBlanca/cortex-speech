@@ -1,0 +1,312 @@
+[
+  {
+    "id": "1ce476a8",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "امشيروكي ك حساب وتامباسكم  لسر",
+    "normalizedTranscript": "امشیروکی ک حساب وتامباسکم لسر",
+    "annotatedTranscript": "امشیروکی ک حساب وتامباسکم لسر",
+    "durationMs": 3342,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 13502, \"source_end_ms\": 16844}"
+  },
+  {
+    "id": "22b07894",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "ئەم چیرۆکەی کە ئێسا بۆتامباسەکەم لە نامەیەکی پچووکۆ دەستی پێکرد وو بەماوەیەکی کەم وو لەگەڵ چەندین کەس بوو بە بابەتێکی گەورە و پرۆژێکی جدی",
+    "normalizedTranscript": "ئەم چیرۆکەی کە ئێستا بۆتان باس دەکەم لە نامەیەکی بچووکەوە دەستی پێکرد و بە ماوەیەکی کەم و لەگەڵ چەندین کەس بوو بە بابەتێکی گەورە و پرۆژەیەکی جدی",
+    "annotatedTranscript": "ئەم چیرۆکەی کە ئێستا بۆتان باس دەکەم لە نامەیەکی بچووکەوە دەستی پێکرد و بە ماوەیەکی کەم و لەگەڵ چەندین کەس بوو بە بابەتێکی گەورە و پرۆژەیەکی جدی",
+    "durationMs": 7629,
+    "verified": true,
+    "alignmentJson": "{\"source_start_ms\": 19006, \"source_end_ms\": 26636}"
+  },
+  {
+    "id": "9cd938a1",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "حەفتی پێشوم لە بێئیشیا سەری نامەکانی پێجی زارمەکردو بینیم ئەم لامەیەمان بۆ هاتبوو",
+    "normalizedTranscript": "حەفتی پێشوم لە بێئیشیا سەری نامەکانی پێجی زارمەکردو بینیم ئەم لامەیەمان بۆ هاتبوو",
+    "annotatedTranscript": "حەفتی پێشوم لە بێئیشیا سەری نامەکانی پێجی زارمەکردو بینیم ئەم لامەیەمان بۆ هاتبوو",
+    "durationMs": 4333,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 27838, \"source_end_ms\": 32171}"
+  },
+  {
+    "id": "5f5bc71e",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "داوەی کرد کە ناوێکی بۆ هۆڵ بژێرین بۆ بزنسێکی ساردەمەنی و شیرینی و حەزیکرد ناوەکە کوردی و ما نادار بێت و کاری خۆی بکات",
+    "normalizedTranscript": "داوەی کرد کە ناوێکی بۆ هۆڵ بژێرین بۆ بزنسێکی ساردەمەنی و شیرینی و حەزیکرد ناوەکە کوردی و ما نادار بێت و کاری خۆی بکات",
+    "annotatedTranscript": "داوەی کرد کە ناوێکی بۆ هۆڵ بژێرین بۆ بزنسێکی ساردەمەنی و شیرینی و حەزیکرد ناوەکە کوردی و ما نادار بێت و کاری خۆی بکات",
+    "durationMs": 8045,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 34590, \"source_end_ms\": 42636}"
+  },
+  {
+    "id": "2bb4c990",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "تەبعان زۆرن پێخۆش بجارێ داوەیەکی زۆر سادەبوو و زۆر زۆرن پێخۆشە کە کەسێک دەبینم برەندین و مارکەتینگی بەلاوە گرنگە و ئەزانێت سەردەم سەردەمی سۆشیڵ میدیایە ئەگەبی لە دانانی بسنیسەکەیتەوە",
+    "normalizedTranscript": "تەبعان زۆرن پێخۆش بجارێ داوەیەکی زۆر سادەبوو و زۆر زۆرن پێخۆشە کە کەسێک دەبینم برەندین و مارکەتینگی بەلاوە گرنگە و ئەزانێت سەردەم سەردەمی سۆشیڵ میدیایە ئەگەبی لە دانانی بسنیسەکەیتەوە",
+    "annotatedTranscript": "تەبعان زۆرن پێخۆش بجارێ داوەیەکی زۆر سادەبوو و زۆر زۆرن پێخۆشە کە کەسێک دەبینم برەندین و مارکەتینگی بەلاوە گرنگە و ئەزانێت سەردەم سەردەمی سۆشیڵ میدیایە ئەگەبی لە دانانی بسنیسەکەیتەوە",
+    "durationMs": 11310,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 44574, \"source_end_ms\": 55884}"
+  },
+  {
+    "id": "dce5354b",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "خەریك بوهەر لەوییا پچمە مۆدی بیرکردنەوە و سەرەك لە هەمبانە بۆنی نبدەم و یەك دووشت پێشنیا بکەم تا برادەری وتی وەڵا داواکەی زۆر جوانە پۆستی کە قەینابا خەڵکیش قسرێکی تیا بکەن ئەیتر وەڵە وامانکرد لە ماوەی چاند ڕۆژێکی کەمدا پێشنیاری ناوی زۆر جوان نووسرا بۆ نموونە",
+    "normalizedTranscript": "خەریک بوهەر لەوییا پچمە مۆدی بیرکردنەوە و سەرەک لە هەمبانە بۆنی نبدەم و یەک دووشت پێشنیا بکەم تا برادەری وتی وەڵا داواکەی زۆر جوانە پۆستی کە قەینابا خەڵکیش قسرێکی تیا بکەن ئەیتر وەڵە وامانکرد لە ماوەی چاند ڕۆژێکی کەمدا پێشنیاری ناوی زۆر جوان نووسرا بۆ نموونە",
+    "annotatedTranscript": "خەریک بوهەر لەوییا پچمە مۆدی بیرکردنەوە و سەرەک لە هەمبانە بۆنی نبدەم و یەک دووشت پێشنیا بکەم تا برادەری وتی وەڵا داواکەی زۆر جوانە پۆستی کە قەینابا خەڵکیش قسرێکی تیا بکەن ئەیتر وەڵە وامانکرد لە ماوەی چاند ڕۆژێکی کەمدا پێشنیاری ناوی زۆر جوان نووسرا بۆ نموونە",
+    "durationMs": 16686,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 57118, \"source_end_ms\": 73804}"
+  },
+  {
+    "id": "8a8d9af4",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "ئەم بەرێزە پێشناری کرد بزنسەکی ناوبنێتشەختە",
+    "normalizedTranscript": "ئەم بەرێزە پێشناری کرد بزنسەکی ناوبنێتشەختە",
+    "annotatedTranscript": "ئەم بەرێزە پێشناری کرد بزنسەکی ناوبنێتشەختە",
+    "durationMs": 3469,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 74878, \"source_end_ms\": 78348}"
+  },
+  {
+    "id": "dc540aca",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "دكتور هويسدركوتت نيبن بصلك",
+    "normalizedTranscript": "دکتور هویسدرکوتت نیبن بصلک",
+    "annotatedTranscript": "دکتور هویسدرکوتت نیبن بصلک",
+    "durationMs": 2573,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 78974, \"source_end_ms\": 81548}"
+  },
+  {
+    "id": "26e3725e",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "شەک رۆکە و شەو چەرە و مەستەک و لە بزینە و پەپکە و یەك دنانایەی جوانی دیکەی کوردی شاتن",
+    "normalizedTranscript": "شەک رۆکە و شەو چەرە و مەستەک و لە بزینە و پەپکە و یەک دنانایەی جوانی دیکەی کوردی شاتن",
+    "annotatedTranscript": "شەک رۆکە و شەو چەرە و مەستەک و لە بزینە و پەپکە و یەک دنانایەی جوانی دیکەی کوردی شاتن",
+    "durationMs": 5870,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 88350, \"source_end_ms\": 94220}"
+  },
+  {
+    "id": "a3c53b30",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "یەك ناوهەبوو کە خۆمان زۆرمان بەلاوەجان بوو یاک دنیاب برادەرم هێنەیە سەرخەت و بۆچوونی ئەوانێشیمورگرد ئەویش پێشنیازی ئەم بەڕێزە بوو کە ناوی کاکومێدە و پێشنیاری فێنکۆی کرد",
+    "normalizedTranscript": "یەک ناوهەبوو کە خۆمان زۆرمان بەلاوەجان بوو یاک دنیاب برادەرم هێنەیە سەرخەت و بۆچوونی ئەوانێشیمورگرد ئەویش پێشنیازی ئەم بەڕێزە بوو کە ناوی کاکومێدە و پێشنیاری فێنکۆی کرد",
+    "annotatedTranscript": "یەک ناوهەبوو کە خۆمان زۆرمان بەلاوەجان بوو یاک دنیاب برادەرم هێنەیە سەرخەت و بۆچوونی ئەوانێشیمورگرد ئەویش پێشنیازی ئەم بەڕێزە بوو کە ناوی کاکومێدە و پێشنیاری فێنکۆی کرد",
+    "durationMs": 11438,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 95998, \"source_end_ms\": 107436}"
+  },
+  {
+    "id": "f4c1a688",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "كجان وناو",
+    "normalizedTranscript": "کجان وناو",
+    "annotatedTranscript": "کجان وناو",
+    "durationMs": 941,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 108926, \"source_end_ms\": 109868}"
+  },
+  {
+    "id": "c5859cc9",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "فێنکی تیا کە وشەکی کوردی جوان و قەت بە مانەیەکی ناخۆش نایبیستیت بۆنومونە هەندێ جەڕ کە ئەوترێ گەرم بیر لە گەرمایە هاوەی دەکەیتەو و گرییانتدێ یان کە ئەوترێ سارد سەرمایەکی زۆر ناخۆشت لەوانەی بیر بێهێنێتەوە بەڵام خوودی وشەی فێنک دائیمەن بەهاران و سەیران و جێوێکی خۆشت بیرەخاتەوە",
+    "normalizedTranscript": "فێنکی تیا کە وشەکی کوردی جوان و قەت بە مانەیەکی ناخۆش نایبیستیت بۆنومونە هەندێ جەڕ کە ئەوترێ گەرم بیر لە گەرمایە هاوەی دەکەیتەو و گرییانتدێ یان کە ئەوترێ سارد سەرمایەکی زۆر ناخۆشت لەوانەی بیر بێهێنێتەوە بەڵام خوودی وشەی فێنک دائیمەن بەهاران و سەیران و جێوێکی خۆشت بیرەخاتەوە",
+    "annotatedTranscript": "فێنکی تیا کە وشەکی کوردی جوان و قەت بە مانەیەکی ناخۆش نایبیستیت بۆنومونە هەندێ جەڕ کە ئەوترێ گەرم بیر لە گەرمایە هاوەی دەکەیتەو و گرییانتدێ یان کە ئەوترێ سارد سەرمایەکی زۆر ناخۆشت لەوانەی بیر بێهێنێتەوە بەڵام خوودی وشەی فێنک دائیمەن بەهاران و سەیران و جێوێکی خۆشت بیرەخاتەوە",
+    "durationMs": 18702,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 110942, \"source_end_ms\": 129644}"
+  },
+  {
+    "id": "2bda5a3f",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "زیاتکردنی پتی ش لە کۆتایدا زۆر بە شێوەکی جوان لە وشیەکی ئاساییەوە کردووێتی بەناوێک کە لە بزنسێکی وای چاوەڕێلێئەکەی",
+    "normalizedTranscript": "زیاتکردنی پتی ش لە کۆتایدا زۆر بە شێوەکی جوان لە وشیەکی ئاساییەوە کردووێتی بەناوێک کە لە بزنسێکی وای چاوەڕێلێئەکەی",
+    "annotatedTranscript": "زیاتکردنی پتی ش لە کۆتایدا زۆر بە شێوەکی جوان لە وشیەکی ئاساییەوە کردووێتی بەناوێک کە لە بزنسێکی وای چاوەڕێلێئەکەی",
+    "durationMs": 8686,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 130461, \"source_end_ms\": 139148}"
+  },
+  {
+    "id": "ed62ac70",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "ناوێکی کووڵە و لەمێشکتا ئەمێنێتە و یەک سەر خۆی جیائەکاتەو لە براندەکانی تر",
+    "normalizedTranscript": "ناوێکی کووڵە و لەمێشکتا ئەمێنێتە و یەک سەر خۆی جیائەکاتەو لە براندەکانی تر",
+    "annotatedTranscript": "ناوێکی کووڵە و لەمێشکتا ئەمێنێتە و یەک سەر خۆی جیائەکاتەو لە براندەکانی تر",
+    "durationMs": 4333,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 139806, \"source_end_ms\": 144140}"
+  },
+  {
+    "id": "467d1612",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "ئینجە بەوە نەوەستانو خەڵکە ماڵیاناوابێت کاکەژان پێژناری ئەم تاگڵاینەی کرد فێنکۆ کە لە تەزێنە",
+    "normalizedTranscript": "ئینجە بەوە نەوەستانو خەڵکە ماڵیاناوابێت کاکەژان پێژناری ئەم تاگڵاینەی کرد فێنکۆ کە لە تەزێنە",
+    "annotatedTranscript": "ئینجە بەوە نەوەستانو خەڵکە ماڵیاناوابێت کاکەژان پێژناری ئەم تاگڵاینەی کرد فێنکۆ کە لە تەزێنە",
+    "durationMs": 7373,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 145534, \"source_end_ms\": 152908}"
+  },
+  {
+    "id": "0cf85dde",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "کاک بینەریش داخڵی موناقەشەکە بوو و گرافیک دیزاینەرێکی بەتوانایە و لە براندینگە ئیشەکانیم زۆرزۆ بەدڵە و ووتی وەعد من هەر ئەم شە و براندینگە کیشی بە خۆڕایی بۆ دروستەکەم بە لۆگۆ و فۆنت و پالێتی ڕەنگ و داروبرد سەیدی ئەم ئیشە جوانە بکەن کە دروستی کردوە",
+    "normalizedTranscript": "کاک بینەریش داخڵی موناقەشەکە بوو و گرافیک دیزاینەرێکی بەتوانایە و لە براندینگە ئیشەکانیم زۆرزۆ بەدڵە و ووتی وەعد من هەر ئەم شە و براندینگە کیشی بە خۆڕایی بۆ دروستەکەم بە لۆگۆ و فۆنت و پالێتی ڕەنگ و داروبرد سەیدی ئەم ئیشە جوانە بکەن کە دروستی کردوە",
+    "annotatedTranscript": "کاک بینەریش داخڵی موناقەشەکە بوو و گرافیک دیزاینەرێکی بەتوانایە و لە براندینگە ئیشەکانیم زۆرزۆ بەدڵە و ووتی وەعد من هەر ئەم شە و براندینگە کیشی بە خۆڕایی بۆ دروستەکەم بە لۆگۆ و فۆنت و پالێتی ڕەنگ و داروبرد سەیدی ئەم ئیشە جوانە بکەن کە دروستی کردوە",
+    "durationMs": 14798,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 154014, \"source_end_ms\": 168812}"
+  },
+  {
+    "id": "f4f0873b",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "پدویست سرتایکانی براندێك الێرێ",
+    "normalizedTranscript": "پدویست سرتایکانی براندێک الێرێ",
+    "annotatedTranscript": "پدویست سرتایکانی براندێک الێرێ",
+    "durationMs": 2286,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 181278, \"source_end_ms\": 183564}"
+  },
+  {
+    "id": "67a8cb6e",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "ناوەکەی و لۆگۆی چۆن پێکەو دروست کراون و چۆن چوکڵی نووسینە کوردیەکانی فێنکۆی ئەهنا",
+    "normalizedTranscript": "ناوەکەی و لۆگۆی چۆن پێکەو دروست کراون و چۆن چوکڵی نووسینە کوردیەکانی فێنکۆی ئەهنا",
+    "annotatedTranscript": "ناوەکەی و لۆگۆی چۆن پێکەو دروست کراون و چۆن چوکڵی نووسینە کوردیەکانی فێنکۆی ئەهنا",
+    "durationMs": 6542,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 184478, \"source_end_ms\": 191020}"
+  },
+  {
+    "id": "9fab4b61",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "ناوەکەی و لۆگۆکەی چۆن پێکەوە دروست کراون و چۆن چکڵەی نووسی نە کوردیەکەی فێنکۆیی هێناوە بۆ ئینگلیزەکەی زیاکردو",
+    "normalizedTranscript": "ناوەکەی و لۆگۆکەی چۆن پێکەوە دروست کراون و چۆن چکڵەی نووسی نە کوردیەکەی فێنکۆیی هێناوە بۆ ئینگلیزەکەی زیاکردو",
+    "annotatedTranscript": "ناوەکەی و لۆگۆکەی چۆن پێکەوە دروست کراون و چۆن چکڵەی نووسی نە کوردیەکەی فێنکۆیی هێناوە بۆ ئینگلیزەکەی زیاکردو",
+    "durationMs": 6957,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 193438, \"source_end_ms\": 200396}"
+  },
+  {
+    "id": "6e89e3a8",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "لێرەیە پێماندەڵێ ڕەنگە سەرەکەکانی براندەکە چین ساوزەکی فستەقی جوان پەمەیەکی کاڵی شلیکی",
+    "normalizedTranscript": "لێرەیە پێماندەڵێ ڕەنگە سەرەکەکانی براندەکە چین ساوزەکی فستەقی جوان پەمەیەکی کاڵی شلیکی",
+    "annotatedTranscript": "لێرەیە پێماندەڵێ ڕەنگە سەرەکەکانی براندەکە چین ساوزەکی فستەقی جوان پەمەیەکی کاڵی شلیکی",
+    "durationMs": 6030,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 201406, \"source_end_ms\": 207436}"
+  },
+  {
+    "id": "bc5efc60",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "أويتريش",
+    "normalizedTranscript": "أویتریش",
+    "annotatedTranscript": "أویتریش",
+    "durationMs": 750,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 208030, \"source_end_ms\": 208780}"
+  },
+  {
+    "id": "845e20af",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "نعظمتشوخ بس لشتك خوشت",
+    "normalizedTranscript": "نعظمتشوخ بس لشتک خوشت",
+    "annotatedTranscript": "نعظمتشوخ بس لشتک خوشت",
+    "durationMs": 2317,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 209854, \"source_end_ms\": 212172}"
+  },
+  {
+    "id": "01d6bd3f",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "ئایکۆنی براندەکەشی کردوو بە چوکەڵەکانی وشەی فێنکۆ لە زمانی کوردی بەراستی ئەمە ڕێگایەکی زۆر جوانە بۆ ڕێزگرتن لە زمانی کوردی و بیکەی بەشتێکی گرنگی",
+    "normalizedTranscript": "ئایکۆنی براندەکەشی کردوو بە چوکەڵەکانی وشەی فێنکۆ لە زمانی کوردی بەراستی ئەمە ڕێگایەکی زۆر جوانە بۆ ڕێزگرتن لە زمانی کوردی و بیکەی بەشتێکی گرنگی",
+    "annotatedTranscript": "ئایکۆنی براندەکەشی کردوو بە چوکەڵەکانی وشەی فێنکۆ لە زمانی کوردی بەراستی ئەمە ڕێگایەکی زۆر جوانە بۆ ڕێزگرتن لە زمانی کوردی و بیکەی بەشتێکی گرنگی",
+    "durationMs": 9518,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 213502, \"source_end_ms\": 223020}"
+  },
+  {
+    "id": "49f9a638",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "ئایکۆنی براندەکەشی کردووە بە چوکوڵەکانی وشەی فێنکۆ لە زمانی کوردی بڕاستی ئەمەن ڕێگایەکی زۆر جوانە بۆ ڕێزگرتن لە زمانی کوردی و بیکەیت بە بەشێکی گرنگی براندینگەکەت",
+    "normalizedTranscript": "ئایکۆنی براندەکەشی کردووە بە چوکوڵەکانی وشەی فێنکۆ لە زمانی کوردی بڕاستی ئەمەن ڕێگایەکی زۆر جوانە بۆ ڕێزگرتن لە زمانی کوردی و بیکەیت بە بەشێکی گرنگی براندینگەکەت",
+    "annotatedTranscript": "ئایکۆنی براندەکەشی کردووە بە چوکوڵەکانی وشەی فێنکۆ لە زمانی کوردی بڕاستی ئەمەن ڕێگایەکی زۆر جوانە بۆ ڕێزگرتن لە زمانی کوردی و بیکەیت بە بەشێکی گرنگی براندینگەکەت",
+    "durationMs": 10222,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 226302, \"source_end_ms\": 236524}"
+  },
+  {
+    "id": "116ca153",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "ئەمە ژ سلۆگان و ئەمە ش پێشنیاری ناری فۆنتەکە",
+    "normalizedTranscript": "ئەمە ژ سلۆگان و ئەمە ش پێشنیاری ناری فۆنتەکە",
+    "annotatedTranscript": "ئەمە ژ سلۆگان و ئەمە ش پێشنیاری ناری فۆنتەکە",
+    "durationMs": 4045,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 237726, \"source_end_ms\": 241772}"
+  },
+  {
+    "id": "de84711a",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "پالێتی ڕەنگبی زۆر گرنگە و پێ دەڵێ کە لەداتوو دا دەتوانیت ئەم ڕەنگانە هەمووی بەکار بهێنیی چوکە لە ڕوی زانستیو هەمویان لەگەڵ یەکاک هونجان کە سێرەکی مورتاحیت بەبینینیان",
+    "normalizedTranscript": "پالێتی ڕەنگبی زۆر گرنگە و پێ دەڵێ کە لەداتوو دا دەتوانیت ئەم ڕەنگانە هەمووی بەکار بهێنیی چوکە لە ڕوی زانستیو هەمویان لەگەڵ یەکاک هونجان کە سێرەکی مورتاحیت بەبینینیان",
+    "annotatedTranscript": "پالێتی ڕەنگبی زۆر گرنگە و پێ دەڵێ کە لەداتوو دا دەتوانیت ئەم ڕەنگانە هەمووی بەکار بهێنیی چوکە لە ڕوی زانستیو هەمویان لەگەڵ یەکاک هونجان کە سێرەکی مورتاحیت بەبینینیان",
+    "durationMs": 8781,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 242430, \"source_end_ms\": 251212}"
+  },
+  {
+    "id": "434d5a1c",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "ئەمە ش نموونەی قتو پاکەجنگی داهاتو",
+    "normalizedTranscript": "ئەمە ش نموونەی قتو پاکەجنگی داهاتو",
+    "annotatedTranscript": "ئەمە ش نموونەی قتو پاکەجنگی داهاتو",
+    "durationMs": 2286,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 252190, \"source_end_ms\": 254476}"
+  },
+  {
+    "id": "aef89f52",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "spاsبي enرgيا",
+    "normalizedTranscript": "سوپاسی ئێنێرجی",
+    "annotatedTranscript": "سوپاسی ئێنێرجی",
+    "durationMs": 909,
+    "verified": true,
+    "alignmentJson": "{\"source_start_ms\": 255006, \"source_end_ms\": 255916}"
+  },
+  {
+    "id": "c9b3793f",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "لە کۆتایدا ئەو بە ڕێزەشی کە داوەکەی کردبوو سپاسی کردین ئێستا ش نازان مناییچ بڕواتان هەبێت ئەونقوڵ بوبووینە و لە بابەتەکە بشتەمان بەلاوە گرنگنەبوو ئێمەش پێما و لە خزمەتتاین بێگومان  داوەمان لێکرد کە ئێم ۆخڵکە چەنێ جدی بوون لەوەی کارمان نەسەر ئەم براندینگە کردوە پێکەوە هیوادارین ئەویش ئەوەندە جدی بێک لە دانانی خودی بزنسەکە و ئەمە ببێتە پاڵنەرێک بۆی",
+    "normalizedTranscript": "لە کۆتایدا ئەو بە ڕێزەشی کە داوەکەی کردبوو سپاسی کردین ئێستا ش نازان مناییچ بڕواتان هەبێت ئەونقوڵ بوبووینە و لە بابەتەکە بشتەمان بەلاوە گرنگنەبوو ئێمەش پێما و لە خزمەتتاین بێگومان داوەمان لێکرد کە ئێم ۆخڵکە چەنێ جدی بوون لەوەی کارمان نەسەر ئەم براندینگە کردوە پێکەوە هیوادارین ئەویش ئەوەندە جدی بێک لە دانانی خودی بزنسەکە و ئەمە ببێتە پاڵنەرێک بۆی",
+    "annotatedTranscript": "لە کۆتایدا ئەو بە ڕێزەشی کە داوەکەی کردبوو سپاسی کردین ئێستا ش نازان مناییچ بڕواتان هەبێت ئەونقوڵ بوبووینە و لە بابەتەکە بشتەمان بەلاوە گرنگنەبوو ئێمەش پێما و لە خزمەتتاین بێگومان داوەمان لێکرد کە ئێم ۆخڵکە چەنێ جدی بوون لەوەی کارمان نەسەر ئەم براندینگە کردوە پێکەوە هیوادارین ئەویش ئەوەندە جدی بێک لە دانانی خودی بزنسەکە و ئەمە ببێتە پاڵنەرێک بۆی",
+    "durationMs": 21502,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 257853, \"source_end_ms\": 279356}"
+  },
+  {
+    "id": "fb7d6a1d",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "کە بە بڕۆبەخۆبوونێکی گەورترەوە دەست پێ بکات طەبعا دواتریش کە سەر کوتوب و خۆم جەماعتێك کوەکەمو ڕوین یەکەم جار داواتەبین",
+    "normalizedTranscript": "کە بە بڕۆبەخۆبوونێکی گەورترەوە دەست پێ بکات طەبعا دواتریش کە سەر کوتوب و خۆم جەماعتێک کوەکەمو ڕوین یەکەم جار داواتەبین",
+    "annotatedTranscript": "کە بە بڕۆبەخۆبوونێکی گەورترەوە دەست پێ بکات طەبعا دواتریش کە سەر کوتوب و خۆم جەماعتێک کوەکەمو ڕوین یەکەم جار داواتەبین",
+    "durationMs": 8206,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 279774, \"source_end_ms\": 287980}"
+  },
+  {
+    "id": "0a5e4ca4",
+    "audioPath": "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\PODCAST-002.WAV",
+    "rawTranscript": "شم بل",
+    "normalizedTranscript": "شم بل",
+    "annotatedTranscript": "شم بل",
+    "durationMs": 589,
+    "verified": false,
+    "alignmentJson": "{\"source_start_ms\": 293726, \"source_end_ms\": 294316}"
+  }
+]

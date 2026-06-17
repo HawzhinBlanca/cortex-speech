@@ -1,0 +1,62 @@
+name: Nightly Real Audio
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      real_audio_dir:
+        description: 'Path to folder with Kurdish MP4/WAV fixtures'
+        required: false
+        type: string
+
+concurrency:
+  group: nightly-real-audio
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-audio:
+    name: Real audio + ASR (optional fixtures)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Run ignored real-audio tests when fixtures available
+        env:
+          CORTEX_REAL_AUDIO_DIR: ${{ github.event.inputs.real_audio_dir || vars.CORTEX_REAL_AUDIO_DIR || '' }}
+        run: |
+          if [ -z "$CORTEX_REAL_AUDIO_DIR" ] || [ ! -d "$CORTEX_REAL_AUDIO_DIR" ]; then
+            echo "No CORTEX_REAL_AUDIO_DIR - skipping real-audio suite"
+            exit 0
+          fi
+          cd src-tauri
+          cargo test --test real_audio -- --ignored --nocapture
+
+      - name: Soak import stability
+        run: cargo test --test soak -- --nocapture
+        working-directory: src-tauri
