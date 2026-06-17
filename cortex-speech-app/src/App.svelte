@@ -89,8 +89,18 @@
   let segmentsLoading = $state(true);
   let sidebarOpen = $state(true);
   let statsOpen = $state(true);
-  let sidebarWidth = $state(288);
-  let statsWidth = $state(288);
+  function loadPanelWidth(key: string, fallback: number): number {
+    if (typeof localStorage === 'undefined') return fallback;
+    const v = Number(localStorage.getItem(key));
+    return Number.isFinite(v) && v >= 200 && v <= 600 ? v : fallback;
+  }
+  let sidebarWidth = $state(loadPanelWidth('cortex.sidebarWidth', 288));
+  let statsWidth = $state(loadPanelWidth('cortex.statsWidth', 288));
+  $effect(() => {
+    if (typeof localStorage === 'undefined') return;
+    localStorage.setItem('cortex.sidebarWidth', String(sidebarWidth));
+    localStorage.setItem('cortex.statsWidth', String(statsWidth));
+  });
   let verifyInFlight = $state(false);
   let batchSpeakerId = $state('');
   let editorTab = $state<'interactive' | 'raw'>('interactive');
