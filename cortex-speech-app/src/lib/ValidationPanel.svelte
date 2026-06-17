@@ -59,8 +59,12 @@
 
   async function loadActiveLearningQueue() {
     activeQueueLoading = true;
+    // Clamp user inputs — HTML min/max don't prevent typed values
+    const clampedTarget = Math.max(0.01, Math.min(0.50, targetError));
+    const clampedConf = Math.max(0.50, Math.min(0.99, confidenceLevel));
+    const clampedLimit = Math.max(1, Math.min(100, Math.floor(queueLimit)));
     try {
-      const queue = await api.getActiveLearningQueue(targetError, confidenceLevel, queueLimit);
+      const queue = await api.getActiveLearningQueue(clampedTarget, clampedConf, clampedLimit);
       activeQueue = queue;
     } catch (e) {
       notifications.error($t('validation.failed'), { detail: String(e) });
@@ -90,6 +94,7 @@
         .sort((a, b) => (b.oodScore || 0) - (a.oodScore || 0));
     } catch (e) {
       console.error("Failed to load OOD segments", e);
+      notifications.error($t('validation.failed'), { detail: String(e) });
     }
   }
 
@@ -164,7 +169,7 @@
         type="button"
         class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all duration-200 border-0 cursor-pointer
           {activeTab === 'ood' ? 'bg-cortex-700 text-white shadow-sm font-bold' : 'bg-transparent text-cortex-400 hover:text-cortex-200 hover:bg-cortex-800/30'}"
-        onclick={() => { activeTab = 'ood'; reloadOodSegments(); }}
+        onclick={() => { const wasOod = activeTab === 'ood'; activeTab = 'ood'; if (!wasOod) reloadOodSegments(); }}
       >
         {$t('validation.tab.ood')}
       </button>

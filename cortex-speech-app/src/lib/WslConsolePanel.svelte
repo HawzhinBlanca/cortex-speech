@@ -139,7 +139,7 @@
   onclick={(e) => { if (e.target === e.currentTarget) close(); }}
 >
   <div
-    class="card p-0 max-w-3xl w-full mx-4 max-h-[85vh] flex flex-col shadow-2xl border border-cortex-800/40 bg-cortex-950/90 text-gray-100"
+    class="card p-0 max-w-3xl w-full mx-4 max-h-[85vh] flex flex-col shadow-2xl border border-cortex-800/40 bg-cortex-950/90 text-default"
   >
     <!-- Header -->
     <div class="flex items-center justify-between px-6 py-4 border-b border-cortex-800/50">
@@ -147,10 +147,10 @@
         <svg class="w-5 h-5 text-cortex-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
         </svg>
-        <h2 class="text-md font-semibold text-gray-100">Meta OmniASR 7B v2 Local Transcription (WSL)</h2>
+        <h2 class="text-md font-semibold text-default">Meta OmniASR 7B v2 Local Transcription (WSL)</h2>
       </div>
       <button
-        class="text-gray-400 hover:text-gray-200 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+        class="text-muted hover:text-default transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
         onclick={close}
         disabled={running}
         aria-label="Close"
@@ -168,7 +168,7 @@
         </p>
 
         <div class="grid grid-cols-2 gap-4">
-          <label class="flex flex-col gap-1 text-xs text-gray-300">
+          <label class="flex flex-col gap-1 text-xs text-muted">
             <span>Limit Files (Leave blank for all)</span>
             <input
               type="number"
@@ -179,7 +179,7 @@
               disabled={running}
             />
           </label>
-          <label class="flex flex-col gap-1 text-xs text-gray-300">
+          <label class="flex flex-col gap-1 text-xs text-muted">
             <span>Limit Segments per file (Leave blank for all)</span>
             <input
               type="number"
@@ -193,7 +193,7 @@
         </div>
 
         <div class="flex gap-6 pt-1">
-          <label class="flex items-center gap-2 cursor-pointer text-xs text-gray-300">
+          <label class="flex items-center gap-2 cursor-pointer text-xs text-muted">
             <input
               type="checkbox"
               bind:checked={dryRun}
@@ -203,7 +203,7 @@
             <span>Dry Run (No database writes)</span>
           </label>
 
-          <label class="flex items-center gap-2 cursor-pointer text-xs text-gray-300">
+          <label class="flex items-center gap-2 cursor-pointer text-xs text-muted">
             <input
               type="checkbox"
               bind:checked={testOne}
@@ -256,7 +256,7 @@
               {:else if log.includes('loaded successfully') || log.includes('Complete!')}
                 <div class="text-emerald-400 select-all">{log}</div>
               {:else}
-                <div class="text-gray-300 select-all">{log}</div>
+                <div class="text-muted select-all">{log}</div>
               {/if}
             {/each}
           {/if}
