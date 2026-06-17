@@ -1,0 +1,47 @@
+# Normalize line endings: store text as LF in the repo, check out native.
+# Set at repo creation so the tree is consistent across Windows/macOS/Linux CI.
+* text=auto eol=lf
+
+# Explicit text types (authoritative regardless of heuristics)
+*.rs      text eol=lf
+*.ts      text eol=lf
+*.tsx     text eol=lf
+*.js      text eol=lf
+*.svelte  text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.toml    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.html    text eol=lf
+*.css     text eol=lf
+*.ps1     text eol=lf
+*.sh      text eol=lf
+
+# Shell scripts must stay LF even on Windows checkouts
+*.sh      text eol=lf
+
+# Binary assets — never normalize or diff as text
+*.png     binary
+*.ico     binary
+*.icns    binary
+*.onnx    binary
+*.wav     binary
+*.mp3     binary
+*.flac    binary
+*.m4a     binary
+*.ogg     binary
+*.opus    binary
+*.mp4     binary
+*.mov     binary
+*.webm    binary
+*.wma     binary
+*.tar     binary
+*.tar.gz  binary
+*.tar.bz2 binary
+*.zip     binary
+*.parquet binary
+
+# Lockfiles: keep as-is, collapse in PR diffs
+package-lock.json linguist-generated=true
+Cargo.lock        linguist-generated=true

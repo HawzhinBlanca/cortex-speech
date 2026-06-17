@@ -15,11 +15,12 @@ pub struct AsrLoadConfig {
     pub model_size: AsrModelSize,
     pub enable_gpu: bool,
     pub num_threads: u32,
+    pub language: String,
 }
 
 impl Default for AsrLoadConfig {
     fn default() -> Self {
-        Self { model_size: AsrModelSize::default(), enable_gpu: true, num_threads: 4 }
+        Self { model_size: AsrModelSize::default(), enable_gpu: true, num_threads: 4, language: "ckb".to_string() }
     }
 }
 
@@ -207,6 +208,7 @@ pub fn check_model_integrity() -> Vec<String> {
 
 pub struct KurdishAsrService {
     recognizer: Option<OfflineRecognizer>,
+    language: String,
 }
 
 impl KurdishAsrService {
@@ -266,11 +268,11 @@ impl KurdishAsrService {
             config.num_threads
         );
 
-        Ok(Self { recognizer: Some(recognizer) })
+        Ok(Self { recognizer: Some(recognizer), language: config.language.clone() })
     }
 
     pub fn new_unavailable() -> Self {
-        Self { recognizer: None }
+        Self { recognizer: None, language: String::new() }
     }
 
     pub fn is_available(&self) -> bool {
@@ -388,6 +390,9 @@ impl KurdishAsrService {
         }
 
         let stream = recognizer.create_stream();
+        if !self.language.is_empty() {
+            stream.set_option("language", &self.language);
+        }
 
         stream.accept_waveform(sample_rate as i32, audio);
         recognizer.decode(&stream);
@@ -677,6 +682,27 @@ mod tests {
 
         assert_eq!(min_energy, 0.0);
         assert!((472000..=504000).contains(&best_cut));
+    }
+
+    #[test]
+    fn test_offline_stream_language_hint() {
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = project_root.join("models");
+        let config = AsrLoadConfig {
+            model_size: AsrModelSize::CTC300M,
+            enable_gpu: false,
+            num_threads: 1,
+            language: "ckb".to_string(),
+        };
+
+        if omniasr_model_present(&model_dir, &AsrModelSize::CTC300M) {
+            let service = KurdishAsrService::new_with_config(&model_dir, &config).unwrap();
+            let recognizer = service.recognizer.as_ref().unwrap();
+            let stream = recognizer.create_stream();
+            stream.set_option("language", "ckb");
+            let lang_opt = stream.get_option("language");
+            assert_eq!(lang_opt, "ckb");
+        }
     }
 
     fn write_sized_file(path: &Path, size_bytes: u64) {

@@ -61,6 +61,26 @@ struct LearningRow {
 /// Excludes examples linked to `is_gold = 1` segments so the permanent
 /// holdout is never used for training.
 pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
+    // Load holdout hashes
+    let mut stmt_gold = db.connection().prepare(
+        "SELECT audio_path FROM gold_segments WHERE is_holdout = 1",
+    )?;
+    let gold_paths = stmt_gold.query_map([], |row| {
+        let path: String = row.get(0)?;
+        Ok(path)
+    })?;
+
+    let mut holdout_hashes = std::collections::HashSet::new();
+    for path_res in gold_paths {
+        let path_str = path_res?;
+        let path = Path::new(&path_str);
+        if path.exists() {
+            if let Ok(identity) = crate::pipeline::source_audio_identity(path) {
+                holdout_hashes.insert(identity.content_hash);
+            }
+        }
+    }
+
     let mut stmt = db.connection().prepare(
         "SELECT ae.segment_id,
                 ae.wrong_transcript,
@@ -109,6 +129,21 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
         if wrong.is_empty() || fix.is_empty() || learning_text_key(wrong) == learning_text_key(fix) {
             continue;
         }
+
+        // Gold-Holdout Hash Exclusion
+        let audio_path = Path::new(&row.audio_path);
+        if audio_path.exists() {
+            if let Ok(identity) = crate::pipeline::source_audio_identity(audio_path) {
+                if holdout_hashes.contains(&identity.content_hash) {
+                    tracing::warn!(
+                        "Excluding segment {} from DPO export: matches holdout gold audio hash",
+                        row.segment_id
+                    );
+                    continue;
+                }
+            }
+        }
+
         let prompt = build_learning_prompt(db, &row)?;
         pairs.push(DpoPair { prompt, chosen: fix.to_string(), rejected: wrong.to_string() });
     }
@@ -695,5 +730,56 @@ mod tests {
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 0);
         assert!(result.jsonl.is_empty());
+    }
+
+    #[test]
+    fn test_build_dpo_excludes_holdout_hash() {
+        let db = open_mem_db();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let audio_path = temp.path().join("source.wav");
+        std::fs::write(&audio_path, b"holdout check audio bytes").expect("write audio");
+        let audio_path_str = audio_path.to_string_lossy().to_string();
+
+        // 1. Insert segment into speech_segments and agent_examples
+        let segment = SpeechSegment {
+            id: "seg-holdout".to_string(),
+            audio_path: audio_path_str.clone(),
+            raw_transcript: "wrong text".to_string(),
+            duration_ms: 1000,
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&segment).expect("insert segment");
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["ex-holdout", "seg-holdout", "wrong text", "corrected text"],
+            )
+            .expect("insert example");
+
+        // 2. Insert into gold_segments with is_holdout = 1
+        db.connection()
+            .execute(
+                "INSERT INTO gold_segments (id, audio_path, reference, is_holdout)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["gold-holdout", audio_path_str.clone(), "corrected text", 1i32],
+            )
+            .expect("insert gold");
+
+        // 3. Verify that build_dpo_dataset excludes it
+        let result = build_dpo_dataset(&db).expect("build DPO");
+        assert_eq!(result.pair_count, 0, "should exclude segment matching holdout hash");
+
+        // 4. Update to is_holdout = 0
+        db.connection()
+            .execute(
+                "UPDATE gold_segments SET is_holdout = 0 WHERE id = 'gold-holdout'",
+                [],
+            )
+            .expect("update gold");
+
+        // 5. Verify it is now included
+        let result2 = build_dpo_dataset(&db).expect("build DPO");
+        assert_eq!(result2.pair_count, 1, "should include segment when is_holdout is 0");
     }
 }

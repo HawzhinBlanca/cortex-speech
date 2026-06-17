@@ -40,6 +40,7 @@ blake3 = "1"
 rayon = "1"
 lru = "0.16"
 sysinfo = "0.33"
+unicode-normalization = "0.1.23"
 
 # Async runtime
 tokio = { version = "1", features = ["sync"] }
@@ -53,6 +54,7 @@ symphonia = { version = "0.5", features = ["all"] }
 
 # WAV/FLAC audio export
 hound = "3"
+flacenc = "0.4"
 
 # ONNX Runtime for Silero VAD (dynamic load avoids CRT clash with sherpa-onnx on Windows)
 ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }

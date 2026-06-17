@@ -285,6 +285,7 @@ impl ProcessingPipeline {
             model_size: self.active_local_asr_model_size(),
             enable_gpu: self.settings.enable_gpu,
             num_threads: self.settings.num_asr_threads,
+            language: self.settings.language.clone(),
         }
     }
 
@@ -1573,6 +1574,51 @@ impl ProcessingPipeline {
         Ok((raw_text, final_text, confidence))
     }
 
+    pub fn run_gold_eval_local(&self, db: &Database, model_id: &str) -> AppResult<crate::eval::EvalRunResult> {
+        let gold_segments = crate::eval::list_gold_segments(db)?;
+        let mut hypotheses = Vec::new();
+
+        let model_dir = self.model_manager.resolved_dir();
+        let config = self.asr_config();
+        self.asr_pool.warmup(&model_dir, &config)?;
+
+        for gold in &gold_segments {
+            let path = std::path::Path::new(&gold.audio_path);
+            if !path.exists() {
+                tracing::warn!("Gold segment audio path does not exist: {}", gold.audio_path);
+                continue;
+            }
+
+            let (_sr, full_pcm) = match audio::decode_to_pcm(path) {
+                Ok(pcm) => pcm,
+                Err(e) => {
+                    tracing::warn!("Failed to decode gold segment {}: {}", gold.id, e);
+                    continue;
+                }
+            };
+
+            let f32_pcm: Vec<f32> = full_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+
+            let res = self.asr_pool.with_service(&model_dir, &config, |asr| {
+                if !asr.is_available() {
+                    return Err("ASR service unavailable".to_string());
+                }
+                asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
+            });
+
+            match res {
+                Ok((text, _conf)) => {
+                    hypotheses.push((gold.id.clone(), text));
+                }
+                Err(e) => {
+                    tracing::warn!("ASR failed for gold segment {}: {}", gold.id, e);
+                }
+            }
+        }
+
+        crate::eval::run_gold_eval(db, model_id, hypotheses)
+    }
+
     pub fn populate_hypotheses(&self, db: &Database, segment_id: &str, f32_pcm: &[f32]) -> AppResult<()> {
         let model_dir = self.model_manager.resolved_dir();
 
@@ -1582,6 +1628,7 @@ impl ProcessingPipeline {
             model_size: crate::settings::AsrModelSize::CTC300M,
             enable_gpu: self.settings.enable_gpu,
             num_threads: self.settings.num_asr_threads,
+            language: self.settings.language.clone(),
         };
         let res_300m = self.asr_pool.with_service(&model_dir, &config_300m, |asr| {
             if !asr.is_available() {
@@ -1603,6 +1650,7 @@ impl ProcessingPipeline {
             model_size: crate::settings::AsrModelSize::CTC1B,
             enable_gpu: self.settings.enable_gpu,
             num_threads: self.settings.num_asr_threads,
+            language: self.settings.language.clone(),
         };
         let res_1b = self.asr_pool.with_service(&model_dir, &config_1b, |asr| {
             if !asr.is_available() {
