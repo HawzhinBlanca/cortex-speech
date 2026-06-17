@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { focusTrap } from './actions/focusTrap';
   import * as api from './commands';
   import type { ValidationIssue } from './commands';
   import type { SpeechSegment } from './types';
@@ -133,6 +134,7 @@
   aria-modal="true"
   aria-labelledby="validation-title"
   tabindex="-1"
+  use:focusTrap
   onclick={(e) => { if (e.target === e.currentTarget) close(); }}
   onkeydown={(e) => { if (e.key === 'Escape') close(); }}
 >

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { focusTrap } from './actions/focusTrap';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import * as api from './commands';
   import { showWslConsole } from './stores/uiStore';
@@ -135,6 +136,7 @@
   role="dialog"
   aria-modal="true"
   tabindex="-1"
+  use:focusTrap
   onkeydown={handleKeydown}
   onclick={(e) => { if (e.target === e.currentTarget) close(); }}
 >
