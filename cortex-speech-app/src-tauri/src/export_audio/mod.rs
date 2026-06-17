@@ -4,6 +4,7 @@ use crate::chunking::{self, SegmentSourceMeta};
 use crate::db::{Database, SpeechSegment};
 use crate::error::{AppError, AppResult};
 use crate::validation::input as validate;
+use flacenc::error::Verify;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,11 +57,7 @@ pub fn export_audio_segments(
             options.sample_rate
         )));
     }
-    if !matches!(options.format, AudioExportFormat::Wav) {
-        return Err(AppError::Validation(
-            "FLAC audio export is not implemented yet; choose WAV to avoid mislabeled audio files".to_string(),
-        ));
-    }
+
     let validated = validate::validate_output_path(&options.output_dir).map_err(AppError::Validation)?;
     let options = AudioExportOptions { output_dir: validated, ..options.clone() };
     let output_dir = Path::new(&options.output_dir);
@@ -140,36 +137,83 @@ fn export_single_segment(
 
     // Determine output filename
     let stem = source_path.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = "wav";
+    let ext = match options.format {
+        AudioExportFormat::Wav => "wav",
+        AudioExportFormat::Flac => "flac",
+    };
     let safe_segment_id = validate::sanitize_filename(segment_id);
     let output_filename = format!("{stem}_{safe_segment_id}.{ext}");
     let output_path = Path::new(&options.output_dir).join(&output_filename);
     let tmp_path = temporary_output_path(&output_path);
 
-    // Write WAV file (16-bit mono PCM)
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: options.sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
+    match options.format {
+        AudioExportFormat::Wav => {
+            // Write WAV file (16-bit mono PCM)
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: options.sample_rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
 
-    remove_file_on_error(
-        &tmp_path,
-        (|| -> AppResult<()> {
-            let mut writer = hound::WavWriter::create(&tmp_path, spec)
-                .map_err(|e| AppError::Other(format!("Failed to create temporary WAV file: {e}")))?;
+            remove_file_on_error(
+                &tmp_path,
+                (|| -> AppResult<()> {
+                    let mut writer = hound::WavWriter::create(&tmp_path, spec)
+                        .map_err(|e| AppError::Other(format!("Failed to create temporary WAV file: {e}")))?;
 
-            for &sample in &pcm_samples {
-                writer.write_sample(sample).map_err(|e| AppError::Other(format!("Failed to write sample: {e}")))?;
-            }
+                    for &sample in &pcm_samples {
+                        writer.write_sample(sample).map_err(|e| AppError::Other(format!("Failed to write sample: {e}")))?;
+                    }
 
-            writer.finalize().map_err(|e| AppError::Other(format!("Failed to finalize WAV: {e}")))?;
-            replace_file(&tmp_path, &output_path)
-                .map_err(|e| AppError::Other(format!("Failed to promote exported WAV file: {e}")))?;
-            Ok(())
-        })(),
-    )?;
+                    writer.finalize().map_err(|e| AppError::Other(format!("Failed to finalize WAV: {e}")))?;
+                    replace_file(&tmp_path, &output_path)
+                        .map_err(|e| AppError::Other(format!("Failed to promote exported WAV file: {e}")))?;
+                    Ok(())
+                })(),
+            )?;
+        }
+        AudioExportFormat::Flac => {
+            // Write FLAC file using flacenc
+            let config = flacenc::config::Encoder::default()
+                .into_verified()
+                .map_err(|e| AppError::Other(format!("FLAC encoder config error: {:?}", e)))?;
+
+            // Convert i16 samples to i32 for flacenc
+            let i32_samples: Vec<i32> = pcm_samples.iter().map(|&s| s as i32).collect();
+
+            // MemSource::from_samples(samples, channels, bits_per_sample, sample_rate)
+            let source = flacenc::source::MemSource::from_samples(
+                &i32_samples,
+                1,
+                16,
+                options.sample_rate as usize,
+            );
+
+            let flac_stream = flacenc::encode_with_fixed_block_size(
+                &config,
+                source,
+                config.block_size,
+            )
+            .map_err(|e| AppError::Other(format!("FLAC encoding failed: {:?}", e)))?;
+
+            use flacenc::component::BitRepr;
+            let mut sink = flacenc::bitsink::ByteSink::new();
+            flac_stream.write(&mut sink)
+                .map_err(|e| AppError::Other(format!("Failed to write FLAC stream to sink: {:?}", e)))?;
+
+            remove_file_on_error(
+                &tmp_path,
+                (|| -> AppResult<()> {
+                    std::fs::write(&tmp_path, sink.as_slice())
+                        .map_err(|e| AppError::Other(format!("Failed to write temporary FLAC file: {e}")))?;
+                    replace_file(&tmp_path, &output_path)
+                        .map_err(|e| AppError::Other(format!("Failed to promote exported FLAC file: {e}")))?;
+                    Ok(())
+                })(),
+            )?;
+        }
+    }
 
     Ok(ExportedAudioFile { filename: output_filename, segment: seg })
 }
@@ -218,6 +262,10 @@ fn write_metadata_csv(
                 let snr_db = optional_f64(seg.snr_db);
                 let ood_score = optional_f64(seg.ood_score);
                 let export_sample_rate = options.sample_rate.to_string();
+                let export_format = match options.format {
+                    AudioExportFormat::Wav => "wav",
+                    AudioExportFormat::Flac => "flac",
+                };
                 wtr.write_record([
                     item.filename.as_str(),
                     seg.id.as_str(),
@@ -238,7 +286,7 @@ fn write_metadata_csv(
                     seg.verdict.as_deref().unwrap_or(""),
                     seg.alignment_quality.as_deref().unwrap_or(""),
                     export_sample_rate.as_str(),
-                    "wav",
+                    export_format,
                 ])?;
             }
 
@@ -421,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_rejects_flac_until_encoder_exists() {
+    fn test_export_audio_segment_flac() {
         let tmp = TempDir::new().unwrap();
         let wav_path = tmp.path().join("test.wav");
         make_wav_file(&wav_path);
@@ -431,7 +479,7 @@ mod tests {
         insert_test_segment(&db, "exp1", &wav_path);
 
         let out_dir = tmp.path().join("out");
-        let err = export_audio_segments(
+        let result = export_audio_segments(
             &db,
             &["exp1".to_string()],
             &AudioExportOptions {
@@ -441,9 +489,16 @@ mod tests {
                 include_metadata: true,
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.to_string().contains("FLAC audio export is not implemented"));
+        assert_eq!(result.succeeded, 1);
+        let flac_file = out_dir.join(&result.files[0]);
+        assert!(flac_file.exists());
+
+        // Verify it can be decoded back to PCM using the app's decoder
+        let (sample_rate, samples) = crate::audio::decode_to_pcm(&flac_file).unwrap();
+        assert_eq!(sample_rate, 16000);
+        assert!(!samples.is_empty());
     }
 
     #[test]

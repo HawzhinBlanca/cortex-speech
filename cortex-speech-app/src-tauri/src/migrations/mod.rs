@@ -325,6 +325,27 @@ pub static MIGRATIONS: &[Migration] = &[
                         ALTER TABLE source_transcripts DROP COLUMN audio_size_bytes;",
         ),
     },
+    Migration {
+        version: 18,
+        description: "Add eval_segment_results table for detailed evaluation records",
+        up_sql: "CREATE TABLE IF NOT EXISTS eval_segment_results (
+            id            TEXT PRIMARY KEY,
+            eval_run_id   TEXT NOT NULL,
+            gold_id       TEXT NOT NULL,
+            audio_path    TEXT NOT NULL,
+            reference     TEXT NOT NULL,
+            hypothesis    TEXT NOT NULL,
+            wer           REAL NOT NULL,
+            cer           REAL NOT NULL,
+            word_distance INTEGER NOT NULL,
+            word_ref_len  INTEGER NOT NULL,
+            char_distance INTEGER NOT NULL,
+            char_ref_len  INTEGER NOT NULL,
+            FOREIGN KEY(eval_run_id) REFERENCES eval_runs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_eval_seg_run ON eval_segment_results(eval_run_id);",
+        down_sql: Some("DROP TABLE IF EXISTS eval_segment_results;"),
+    },
 ];
 
 #[cfg(test)]

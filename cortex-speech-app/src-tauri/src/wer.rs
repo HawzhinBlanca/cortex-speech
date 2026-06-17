@@ -16,41 +16,84 @@ pub fn tokenize_chars(text: &str) -> Vec<char> {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// Normalize text before comparison: lowercase + collapse whitespace.
+use crate::normalizer::{NormalizationConfig, SoraniNormalizer};
+use std::sync::LazyLock;
+use unicode_normalization::UnicodeNormalization;
+
+static METRICS_NORMALIZER: LazyLock<SoraniNormalizer> = LazyLock::new(|| {
+    SoraniNormalizer::with_config(NormalizationConfig {
+        normalize_numbers: true,
+        verbalize_numbers: false, // Keep numbers as digits for WER/CER calculations
+        normalize_hamza: true,
+        remove_diacritics: true,
+    })
+});
+
+/// Normalize text before comparison: Sorani-normalization + Unicode NFC + lowercase + collapse whitespace.
 pub fn normalize_for_metrics(text: &str) -> String {
-    text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    let normalized = METRICS_NORMALIZER.normalize(text);
+    let nfc_normalized: String = normalized.nfc().collect();
+    nfc_normalized.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Word Error Rate in \[0, 1\]. Returns `1.0` when reference is empty but hypothesis is not.
-/// The raw edit-distance ratio is clamped to 1.0 so callers never observe a WER above 100%.
-pub fn compute_wer(reference: &str, hypothesis: &str) -> f64 {
+#[derive(Debug, Clone, Copy)]
+pub struct EditDistanceResult {
+    pub distance: usize,
+    pub ref_len: usize,
+}
+
+pub fn word_edit_distance(reference: &str, hypothesis: &str) -> EditDistanceResult {
     let reference = normalize_for_metrics(reference);
     let hypothesis = normalize_for_metrics(hypothesis);
     let ref_words = tokenize_words(&reference);
     let hyp_words = tokenize_words(&hypothesis);
 
     if ref_words.is_empty() {
-        return if hyp_words.is_empty() { 0.0 } else { 1.0 };
+        return EditDistanceResult {
+            distance: if hyp_words.is_empty() { 0 } else { 1 },
+            ref_len: 0,
+        };
     }
 
-    let dist = levenshtein(&ref_words, &hyp_words);
-    (dist as f64 / ref_words.len() as f64).min(1.0)
+    let distance = levenshtein(&ref_words, &hyp_words);
+    EditDistanceResult { distance, ref_len: ref_words.len() }
 }
 
-/// Character Error Rate in \[0, 1\].
-/// The raw edit-distance ratio is clamped to 1.0 so callers never observe a CER above 100%.
-pub fn compute_cer(reference: &str, hypothesis: &str) -> f64 {
+pub fn char_edit_distance(reference: &str, hypothesis: &str) -> EditDistanceResult {
     let reference = normalize_for_metrics(reference);
     let hypothesis = normalize_for_metrics(hypothesis);
     let ref_chars = tokenize_chars(&reference);
     let hyp_chars = tokenize_chars(&hypothesis);
 
     if ref_chars.is_empty() {
-        return if hyp_chars.is_empty() { 0.0 } else { 1.0 };
+        return EditDistanceResult {
+            distance: if hyp_chars.is_empty() { 0 } else { 1 },
+            ref_len: 0,
+        };
     }
 
-    let dist = levenshtein(&ref_chars, &hyp_chars);
-    (dist as f64 / ref_chars.len() as f64).min(1.0)
+    let distance = levenshtein(&ref_chars, &hyp_chars);
+    EditDistanceResult { distance, ref_len: ref_chars.len() }
+}
+
+/// Word Error Rate in \[0, 1\]. Returns `1.0` when reference is empty but hypothesis is not.
+/// The raw edit-distance ratio is clamped to 1.0 so callers never observe a WER above 100%.
+pub fn compute_wer(reference: &str, hypothesis: &str) -> f64 {
+    let res = word_edit_distance(reference, hypothesis);
+    if res.ref_len == 0 {
+        return res.distance as f64;
+    }
+    (res.distance as f64 / res.ref_len as f64).min(1.0)
+}
+
+/// Character Error Rate in \[0, 1\].
+/// The raw edit-distance ratio is clamped to 1.0 so callers never observe a CER above 100%.
+pub fn compute_cer(reference: &str, hypothesis: &str) -> f64 {
+    let res = char_edit_distance(reference, hypothesis);
+    if res.ref_len == 0 {
+        return res.distance as f64;
+    }
+    (res.distance as f64 / res.ref_len as f64).min(1.0)
 }
 
 fn levenshtein<T: Eq>(a: &[T], b: &[T]) -> usize {
@@ -144,5 +187,24 @@ mod tests {
         // Single character swap in Kurdish script.
         let cer = compute_cer("کوردی", "کوردێ");
         assert!(cer > 0.0 && cer <= 1.0, "CER must be in (0, 1] for single char substitution: {cer}");
+    }
+
+    #[test]
+    fn test_orthographic_equivalence() {
+        // Kaf equivalence
+        assert_eq!(compute_wer("كوردستان", "کوردستان"), 0.0);
+        assert_eq!(compute_cer("كوردستان", "کوردستان"), 0.0);
+
+        // Yeh equivalence
+        assert_eq!(compute_wer("على", "علی"), 0.0);
+        assert_eq!(compute_cer("على", "علی"), 0.0);
+
+        // ZWNJ equivalence
+        assert_eq!(compute_wer("ئەو\u{200C}کەسە", "ئەو کەسە"), 0.0);
+        assert_eq!(compute_cer("ئەو\u{200C}کەسە", "ئەو کەسە"), 0.0);
+        
+        // Diacritics equivalence
+        assert_eq!(compute_wer("كُورْدِي", "کوردی"), 0.0);
+        assert_eq!(compute_cer("كُورْدِي", "کوردی"), 0.0);
     }
 }

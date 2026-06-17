@@ -2252,6 +2252,17 @@ pub fn run_gold_eval(
 }
 
 #[tauri::command]
+pub fn run_gold_eval_local(
+    state: State<'_, AppState>,
+    model_id: String,
+) -> Result<crate::eval::EvalRunResult, String> {
+    RATE_LIMITER.check("run_gold_eval_local")?;
+    let pipeline = state.lock_pipeline();
+    let db = state.lock_db();
+    pipeline.run_gold_eval_local(&db, &model_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn list_eval_runs(state: State<'_, AppState>) -> Result<Vec<crate::eval::EvalRun>, String> {
     RATE_LIMITER.check("list_eval_runs")?;
     let db = state.lock_db();
