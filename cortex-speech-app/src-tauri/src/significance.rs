@@ -15,6 +15,8 @@
 //! the same eval rows — a hard requirement for a stranger-reproducible scorecard. We
 //! never touch the OS RNG, which would make a published interval unrepeatable.
 
+use serde::{Deserialize, Serialize};
+
 /// Per-segment error counts for one system: edit distance and reference length.
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentError {
@@ -61,7 +63,8 @@ impl XorShift64 {
 }
 
 /// A bootstrap confidence-interval estimate for an error rate.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConfidenceInterval {
     pub point: f64,
     pub lower: f64,
