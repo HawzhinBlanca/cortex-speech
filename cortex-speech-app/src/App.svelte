@@ -66,6 +66,7 @@
   import ReviewInbox from './lib/ReviewInbox.svelte';
   import DiffView from './lib/DiffView.svelte';
   import CommandPalette from './lib/CommandPalette.svelte';
+  import EmptyState from './lib/EmptyState.svelte';
   import PanelSplitter from './lib/PanelSplitter.svelte';
   import HistoryPanel from './lib/HistoryPanel.svelte';
   import {
@@ -2167,32 +2168,14 @@
             </div>
           </div>
         {:else}
-          <div class="flex-1 flex items-center justify-center">
-            <div class="text-center space-y-4">
-              <svg
-                class="w-16 h-16 mx-auto text-cortex-700"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="1"
-                  d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-                />
-              </svg>
-              <div class="space-y-1">
-                <p class="text-sm text-cortex-400">{$t('selectSegment')}</p>
-                <div class="flex gap-3 justify-center text-xs text-cortex-600">
-                  <span><kbd>⌘O</kbd> {$t('openFile')}</span>
-                  <span><kbd>⌘I</kbd> {$t('import')}</span>
-                  <span><kbd>⌘T</kbd> {$t('transcribe')}</span>
-                  <span><kbd>/</kbd> {$t('shortcuts')}</span>
-                </div>
-              </div>
+          <EmptyState variant="mic" title={$t('selectSegment')}>
+            <div class="flex flex-wrap justify-center gap-x-3 gap-y-1 text-xs text-subtle">
+              <span><kbd>⌘O</kbd> {$t('openFile')}</span>
+              <span><kbd>⌘I</kbd> {$t('import')}</span>
+              <span><kbd>⌘T</kbd> {$t('transcribe')}</span>
+              <span><kbd>⌘K</kbd> {$t('shortcuts')}</span>
             </div>
-          </div>
+          </EmptyState>
         {/if}
       </main>
     </ErrorBoundary>
