@@ -49,10 +49,17 @@ Toggle the theme in Settings, press **Cmd-K**, resize panels and relaunch.
 2. **RTL** (Kurdish): the header/search/badges use a mix of physical + logical spacing;
    a `ms-/me-/ps-/pe-/start-/end-` sweep would make Sorani pixel-perfect.
 
-## Bigger items that genuinely need your eyes (deferred on purpose)
+## Information architecture — DONE (the audit's #1 structural item)
 
-- **Activity rail + `viewMode` IA** — turn the ~13-button toolbar into navigable
-  workspaces (Library / Review / Insights / Settings); the dead `ViewMode` union in
-  `uiStore.ts` is ready to wire. (The audit's #1 structural item.)
+A persistent **activity rail** (Curate / Insights / Review + Settings) bound to a
+`viewMode` store now turns the toolbar into a navigable, mode-aware product:
+- **Curate** (default) — the transcript workspace, byte-identical (zero regression).
+- **Insights** — the StatsDashboard promoted to a first-class in-`main` workspace.
+- **Review / Settings** — open from the rail.
+
+## Bigger items still open (need your eyes / iteration)
+
 - Adopt `lucide-svelte` to replace the ~32 inline SVGs + emoji for one icon language.
 - Multi-select segment **action bar**; rebuild **ReviewInbox** on the design system.
+- Promote more destinations into `viewMode` workspaces if you want the rail to own
+  more of the modal long-tail.
