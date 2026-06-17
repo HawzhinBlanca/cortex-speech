@@ -16,6 +16,7 @@ export const ckb: Record<string, string> = {
   speakers: 'قسەکەران',
   merge: 'تێکەڵکردن',
   reviewInbox: 'سندوقی پێداچوونەوە',
+  emptyStateHint: 'فۆڵدەرێک هاوردە بکە یان فایلێک بکەرەوە بۆ دەستپێکردنی نووسینەوە.',
   cancel: 'هەڵوەشاندنەوە',
   confirm: 'دڵنیاکردنەوە',
   loading: 'بارکردن...',

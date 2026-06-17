@@ -16,6 +16,7 @@ export const en: Record<string, string> = {
   speakers: 'Speakers',
   merge: 'Merge',
   reviewInbox: 'Review Inbox',
+  emptyStateHint: 'Import a folder or open a single file to start transcribing.',
   cancel: 'Cancel',
   confirm: 'Confirm',
   loading: 'Loading...',
