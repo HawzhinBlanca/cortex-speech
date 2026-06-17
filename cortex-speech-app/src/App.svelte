@@ -1483,9 +1483,9 @@
         onclick={openReviewInbox}
         disabled={!tauriAvailable || $isProcessing}
         title={tauriAvailable ? 'Review Inbox (Ctrl+Shift+R)' : $t('desktopRuntimeRequired')}
-        aria-label="Review Inbox"
+        aria-label={$t('reviewInbox')}
       >
-        📬 Review Inbox
+        {$t('reviewInbox')}
         {#if showHotkeyOverlay}
           <span
             class="absolute -top-1.5 -right-1.5 bg-purple-400 text-black text-[8px] font-mono font-bold px-1 rounded shadow-md border border-purple-500 select-none z-50 pointer-events-none"
@@ -1534,8 +1534,28 @@
   </header>
 
   {#if $activeOperations.size > 0}
-    <div class="h-0.5 bg-cortex-400/30 overflow-hidden shrink-0">
-      <div class="h-full bg-cortex-400 animate-pulse rounded-full" style="width: 30%"></div>
+    {@const pct =
+      $batchProgress.total > 0
+        ? $batchProgress.percent
+        : $pipelineTotal > 0
+          ? Math.round(($filesProcessed / $pipelineTotal) * 100)
+          : -1}
+    <div
+      class="h-0.5 shrink-0 overflow-hidden bg-accent-soft"
+      role="progressbar"
+      aria-valuemin="0"
+      aria-valuemax="100"
+      aria-valuenow={pct >= 0 ? pct : undefined}
+    >
+      {#if pct >= 0}
+        <div
+          class="h-full rounded-full bg-accent transition-[width] duration-300 ease-smooth"
+          style="width: {Math.min(100, Math.max(2, pct))}%"
+        ></div>
+      {:else}
+        <!-- Unknown total: a true sliding indeterminate bar, not a frozen 30% -->
+        <div class="h-full w-2/5 rounded-full bg-accent animate-progress-indeterminate"></div>
+      {/if}
     </div>
   {/if}
 
@@ -1649,14 +1669,14 @@
                 onclick={openSpeakerPanel}
                 disabled={!tauriAvailable || $isProcessing}
                 title={tauriAvailable ? 'Speaker Management' : $t('desktopRuntimeRequired')}
-                >Speakers</button
+                >{$t('speakers')}</button
               >
               <button
                 class="btn-secondary !text-[10px] flex-1"
                 onclick={openDatasetMerge}
                 disabled={!tauriAvailable || $isProcessing}
                 title={tauriAvailable ? 'Merge Dataset JSON' : $t('desktopRuntimeRequired')}
-                >Merge</button
+                >{$t('merge')}</button
               >
               <button
                 class="btn-danger !text-[10px] flex-1"
@@ -2079,10 +2099,10 @@
                         d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                       /></svg
                     >
-                    Saving...
+                    {$t('saving')}
                   </span>
                 {:else if saveState === 'saved'}
-                  <span class="text-emerald-300">✓ Saved</span>
+                  <span class="text-success">✓ {$t('saved')}</span>
                 {:else}
                   {$t('save')}
                 {/if}
