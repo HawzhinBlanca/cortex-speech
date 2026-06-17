@@ -1,0 +1,56 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+      - if: startsWith(matrix.os, 'macos')
+        run: brew install gtk+3
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.8 --locked
+      - run: npm ci
+      - if: startsWith(matrix.os, 'ubuntu')
+        run: npx playwright install --with-deps chromium
+      - if: ${{ !startsWith(matrix.os, 'ubuntu') }}
+        run: npx playwright install chromium
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run test:python-policies
+      - run: npm run lint
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: npm run test:e2e
+      - run: npm audit --omit=dev
+      - run: cargo deny --manifest-path src-tauri/Cargo.toml check
+      - name: Build Tauri app
+        run: npm run tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cortex-speech-${{ matrix.os }}
+          path: src-tauri/target/release/bundle/**
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: src-tauri/target/release/bundle/**
+          generate_release_notes: true

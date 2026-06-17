@@ -1,0 +1,33 @@
+﻿{
+    "created_at":  "2026-06-16T14:19:41.3164202+03:00",
+    "workspace":  ".",
+    "policy":  "Only generated/recreatable artifacts selected. No source, models, transcripts, or original audio files selected.",
+    "candidates":  [
+                       {
+                           "path":  "src-tauri\\target",
+                           "type":  "directory",
+                           "bytes":  56615651003,
+                           "mb":  53992.9,
+                           "reason":  "Generated Rust/Tauri build output; reproducible with cargo/npm build.",
+                           "approved_safety_class":  "generated_recreatable_artifact"
+                       },
+                       {
+                           "path":  "dev-server.out.log",
+                           "type":  "file",
+                           "bytes":  216,
+                           "mb":  0,
+                           "reason":  "Generated local dev-server log.",
+                           "approved_safety_class":  "generated_recreatable_artifact"
+                       },
+                       {
+                           "path":  "dev-server.err.log",
+                           "type":  "file",
+                           "bytes":  0,
+                           "mb":  0,
+                           "reason":  "Generated local dev-server log.",
+                           "approved_safety_class":  "generated_recreatable_artifact"
+                       }
+                   ],
+    "total_bytes":  56615651219,
+    "total_mb":  53992.9
+}
