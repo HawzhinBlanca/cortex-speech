@@ -39,6 +39,7 @@ pub mod runs;
 pub mod secret_redaction;
 pub mod session;
 pub mod settings;
+pub mod significance;
 pub mod stats;
 pub mod telemetry;
 pub mod throttle;
