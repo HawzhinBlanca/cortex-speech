@@ -44,8 +44,10 @@
   const labelHeight = 18;
 
   onMount(() => {
-    ctx = canvas.getContext('2d')!;
+    ctx = canvas.getContext('2d');
+    if (!ctx) { console.error('Waveform: failed to acquire canvas 2D context'); return; }
     const ro = new ResizeObserver(() => {
+      if (!scrollContainer) return;
       containerWidth = scrollContainer.clientWidth ?? 600;
       updateCanvasDimensions();
       draw();
@@ -85,9 +87,14 @@
     draw();
   });
 
+  // Data-change effect: redraw when waveform data, regions, or word timestamps change
   $effect(() => {
-    track(waveform, currentTime, regions, wordTimestamps);
+    track(waveform, regions, wordTimestamps);
     draw();
+  });
+
+  // Playback animation loop: only start/stop when `playing` changes
+  $effect(() => {
     if (playing) {
       cancelAnimationFrame(animationId);
       const animate = () => {
@@ -107,6 +114,9 @@
     const w = containerWidth * zoom;
     const h = height;
     ctx.clearRect(0, 0, w, h);
+
+    // Guard: prevent division by zero and NaN propagation
+    if (duration <= 0 || waveform.length === 0) return;
 
     // Waveform Background
     ctx.fillStyle = 'rgba(15, 23, 42, 0.4)'; // Slate-900 / 40%
@@ -158,7 +168,9 @@
     ctx.textAlign = 'center';
 
     let t = 0.0;
-    while (t <= duration) {
+    let tickCount = 0;
+    const maxTicks = 500;
+    while (t <= duration && tickCount++ < maxTicks) {
       const tx = (t / duration) * w;
       ctx.fillRect(tx - 0.5, 0, 1, rulerHeight - 4);
       if (t % (timeStep * 2.0) === 0.0 || zoom > 3) {

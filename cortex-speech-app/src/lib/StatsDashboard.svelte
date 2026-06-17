@@ -16,6 +16,7 @@
     model_load_ms: number;
   } | null>(null);
   let loading = $state(true);
+  let errorMessage = $state<string | null>(null);
   const tauriAvailable = isTauriRuntime();
 
   function buildLocalStats(items: SpeechSegment[]): DatasetStats {
@@ -69,6 +70,7 @@
       return;
     }
     loading = true;
+    errorMessage = null;
     try {
       [stats, quality] = await Promise.all([
         api.getDatasetStats(),
@@ -80,6 +82,7 @@
         console.error("Failed to load conformal certificate", err);
       }
     } catch (e) {
+      errorMessage = String(e);
       notifications.error($t('stats.failed'), { detail: String(e) });
     } finally {
       loading = false;
@@ -105,10 +108,14 @@
     fetchInferenceStats();
   });
 
+  let fetchDebounceTimer: ReturnType<typeof setTimeout>;
   $effect(() => {
     track($segments);
-    fetchStats();
-    fetchInferenceStats();
+    clearTimeout(fetchDebounceTimer);
+    fetchDebounceTimer = setTimeout(() => {
+      fetchStats();
+      fetchInferenceStats();
+    }, 500);
   });
 
   function fmt(s: number) {
@@ -345,6 +352,14 @@
         {/if}
       </div>
     {/if}
+  {:else if errorMessage}
+    <div class="flex flex-col items-center justify-center py-8 text-red-400 space-y-2">
+      <svg class="w-10 h-10 opacity-60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+      </svg>
+      <span class="text-sm font-medium">{$t('stats.failed')}</span>
+      <p class="text-xs text-red-500/80 max-w-xs text-center break-words">{errorMessage}</p>
+    </div>
   {:else}
     <div class="flex flex-col items-center justify-center py-8 text-cortex-500 space-y-2">
       <svg class="w-10 h-10 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">

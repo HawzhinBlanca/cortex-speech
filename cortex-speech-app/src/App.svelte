@@ -1247,15 +1247,13 @@
 </script>
 
 <div
-  class="h-screen flex flex-col bg-cortex-950 text-gray-100"
+  class="h-screen flex flex-col bg-app text-default"
   data-testid="app-root"
-  class:dark={$settings.theme !== 'light'}
-  class:light={$settings.theme === 'light'}
 >
   <!-- Top Bar -->
   <header
     data-testid="top-bar"
-    class="flex items-center justify-between px-4 py-2 bg-cortex-950/80 backdrop-blur-md border-b border-cortex-800/30 shrink-0 z-30"
+    class="flex items-center justify-between px-4 py-2 glass border-b border-line shrink-0 z-30"
   >
     <div class="flex items-center gap-3">
       <h1 class="text-sm font-bold tracking-tight">
@@ -2230,7 +2228,7 @@
   <!-- Status Bar -->
   <footer
     data-testid="status-bar"
-    class="flex items-center justify-between px-4 py-1 bg-cortex-950/80 border-t border-cortex-800/30 shrink-0"
+    class="flex items-center justify-between px-4 py-1 glass border-t border-line shrink-0"
   >
     <div class="flex items-center gap-3 text-[10px] text-cortex-500">
       <span>{$statusMessage}</span>

@@ -4,13 +4,16 @@ import * as api from '../commands';
 
 function createSegmentsStore() {
   const { subscribe, set, update } = writable<SpeechSegment[]>([]);
+  let loadSeq = 0;
   return {
     subscribe,
     set,
     update,
     async load() {
+      const seq = ++loadSeq;
       try {
         const data = await api.getSegments();
+        if (seq !== loadSeq) return; // stale load — a newer one is in flight
         set(data);
         // Refresh threshold after loading segments
         await refreshConformalThreshold();
@@ -28,10 +31,9 @@ export const filterVerified = writable<boolean | null>(null);
 export const searchQuery = writable('');
 export const searchResults = writable<SpeechSegment[] | null>(null);
 export const searchLoading = writable(false);
-export const sortOrder = writable<'newest' | 'oldest' | 'duration' | 'verified' | 'confidence' | 'activeLearning'>('newest');
+export type SortOrder = 'newest' | 'oldest' | 'duration' | 'verified' | 'confidence' | 'activeLearning';
+export const sortOrder = writable<SortOrder>('newest');
 export const conformalThreshold = writable<number>(0.35);
-
-type SortOrder = 'newest' | 'oldest' | 'duration' | 'verified' | 'confidence' | 'activeLearning';
 
 export async function refreshConformalThreshold(targetError = 0.05, confidence = 0.95) {
   try {
@@ -102,8 +104,8 @@ export const filteredSegments = derived(
       } else {
         const q = $searchQuery.toLowerCase();
         result = result.filter(s =>
-          s.audioPath.toLowerCase().includes(q) ||
-          s.rawTranscript.toLowerCase().includes(q) ||
+          s.audioPath?.toLowerCase().includes(q) ||
+          (s.rawTranscript?.toLowerCase() ?? '').includes(q) ||
           (s.normalizedTranscript?.toLowerCase() ?? '').includes(q) ||
           (s.annotatedTranscript?.toLowerCase() ?? '').includes(q) ||
           (s.speakerId?.toLowerCase() ?? '').includes(q)
@@ -114,10 +116,12 @@ export const filteredSegments = derived(
   }
 );
 
-export const segmentStats = derived(segments, ($segments) => ({
-  total: $segments.length,
-  verified: $segments.filter(s => s.verified).length,
-  pending: $segments.filter(s => !s.verified).length,
-  withAnnotations: $segments.filter(s => s.annotatedTranscript).length,
-  totalDurationMs: $segments.reduce((sum, s) => sum + s.durationMs, 0),
-}));
+export const segmentStats = derived(segments, ($segments) => {
+  let verified = 0, pending = 0, withAnnotations = 0, totalDurationMs = 0;
+  for (const s of $segments) {
+    if (s.verified) verified++; else pending++;
+    if (s.annotatedTranscript) withAnnotations++;
+    totalDurationMs += s.durationMs;
+  }
+  return { total: $segments.length, verified, pending, withAnnotations, totalDurationMs };
+});

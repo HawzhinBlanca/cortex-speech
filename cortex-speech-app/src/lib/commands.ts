@@ -69,7 +69,12 @@ export async function alignSegment(
 }
 
 export async function getSegments(verified?: boolean): Promise<SpeechSegment[]> {
-  return invoke<SpeechSegment[]>('get_segments', { verified });
+  const data = await invoke<SpeechSegment[]>('get_segments', { verified });
+  if (!Array.isArray(data)) {
+    console.error('getSegments: expected array, got', typeof data);
+    return [];
+  }
+  return data;
 }
 
 export async function searchSegments(query: string): Promise<SpeechSegment[]> {
@@ -390,8 +395,11 @@ export async function getSettings(): Promise<AppSettings> {
   return mapBackendToFrontend(raw);
 }
 
-export async function updateSettings(settings: AppSettings): Promise<void> {
-  const existing = await invoke<BackendSettings>('get_settings');
+export async function updateSettings(
+  settings: AppSettings,
+  existingBackend?: BackendSettings,
+): Promise<void> {
+  const existing = existingBackend ?? await invoke<BackendSettings>('get_settings');
   const backend = mapFrontendToBackend(settings, existing);
   return invoke<void>('update_settings', { settings: backend });
 }

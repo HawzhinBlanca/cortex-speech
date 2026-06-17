@@ -62,6 +62,20 @@
   --font-sans: 'Inter', 'Vazirmatn', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
   --font-kurdish: 'Vazirmatn', 'Inter', system-ui, sans-serif;
+
+  /* Brand scale as RGB channels so every `cortex-*` class (incl. /opacity) is
+     theme-aware. These dark values are byte-identical to the previous palette. */
+  --cortex-50-rgb: 238 245 251;
+  --cortex-100-rgb: 221 233 243;
+  --cortex-200-rgb: 189 212 231;
+  --cortex-300-rgb: 144 182 211;
+  --cortex-400-rgb: 93 148 188;
+  --cortex-500-rgb: 62 121 163;
+  --cortex-600-rgb: 47 93 131;
+  --cortex-700-rgb: 34 56 78;
+  --cortex-800-rgb: 25 33 47;
+  --cortex-900-rgb: 13 18 27;
+  --cortex-950-rgb: 9 13 20;
 }
 
 /* Light theme — applied when <html> carries the .light class. Token-driven
@@ -98,6 +112,20 @@
   --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
   --shadow-md: 0 6px 20px -6px rgba(15, 23, 42, 0.12), 0 2px 6px -3px rgba(15, 23, 42, 0.08);
   --shadow-lg: 0 22px 60px -16px rgba(15, 23, 42, 0.18);
+
+  /* Inverted brand scale for light: surfaces at 900–950, text at 50–300,
+     muted slate in between — so cortex-* surfaces go light and cortex text goes dark. */
+  --cortex-50-rgb: 15 23 42;
+  --cortex-100-rgb: 30 41 59;
+  --cortex-200-rgb: 51 65 85;
+  --cortex-300-rgb: 71 85 105;
+  --cortex-400-rgb: 100 116 139;
+  --cortex-500-rgb: 71 85 105;
+  --cortex-600-rgb: 51 65 85;
+  --cortex-700-rgb: 203 213 225;
+  --cortex-800-rgb: 226 232 240;
+  --cortex-900-rgb: 255 255 255;
+  --cortex-950-rgb: 245 247 250;
 }
 
 /* ------------------------------------------------------------------ BASE -- */
