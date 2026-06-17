@@ -1,5 +1,6 @@
 <script lang="ts">
   import { settings, showSettings, settingsTab, type AppSettings } from './stores/settingsStore';
+  import { focusTrap } from './actions/focusTrap';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import { segments } from './stores/segmentStore';
@@ -171,6 +172,7 @@
   role="dialog"
   aria-modal="true"
   tabindex="-1"
+  use:focusTrap
   onkeydown={handleKeydown}
 >
   <!-- svelte-ignore a11y_no_static_element_interactions -->
