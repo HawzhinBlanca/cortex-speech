@@ -26,8 +26,23 @@ export class KeyboardManager {
     this.shortcuts.push(...shortcuts);
   }
 
+  /** True while the user is typing into a field or composing text (IME). */
+  private isFromEditable(e: KeyboardEvent): boolean {
+    if (e.isComposing) return true;
+    const t = e.target as HTMLElement | null;
+    if (!t) return false;
+    const tag = t.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable === true;
+  }
+
   private handleKeydown(e: KeyboardEvent) {
     const mod = e.metaKey || e.ctrlKey;
+
+    // Don't let bare shortcuts (Delete, j/k, '/', '?', Space…) fire while the user is
+    // typing in a field or composing Kurdish/Arabic text — only modifier shortcuts
+    // (Ctrl/Cmd + …) pass through. Prevents editing from silently mutating data.
+    if (!mod && this.isFromEditable(e)) return;
+
     for (const s of this.shortcuts) {
       const keyMatch = e.key.toLowerCase() === s.key.toLowerCase();
       const ctrlMatch = !!s.ctrl === mod;

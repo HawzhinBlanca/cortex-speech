@@ -102,3 +102,41 @@ export function openSettings(tab: SettingsTab = 'general'): void {
   settingsTab.set(tab);
   showSettings.set(true);
 }
+
+// ---------------------------------------------------------------------------
+// Theme application — keeps the <html> theme class in sync with the setting,
+// so the design-system tokens (and Tailwind's `dark:` variants) switch live.
+// 'system' follows the OS preference and updates when the OS changes.
+// ---------------------------------------------------------------------------
+export type ResolvedTheme = 'dark' | 'light';
+
+function resolveTheme(theme: Theme): ResolvedTheme {
+  if (theme === 'system') {
+    return typeof window !== 'undefined' &&
+      window.matchMedia('(prefers-color-scheme: light)').matches
+      ? 'light'
+      : 'dark';
+  }
+  return theme;
+}
+
+export function applyTheme(theme: Theme): void {
+  if (typeof document === 'undefined') return;
+  const resolved = resolveTheme(theme);
+  const root = document.documentElement;
+  root.classList.toggle('dark', resolved === 'dark');
+  root.classList.toggle('light', resolved === 'light');
+  root.style.colorScheme = resolved;
+}
+
+let activeTheme: Theme = defaultSettings.theme;
+settings.subscribe((s) => {
+  activeTheme = s.theme;
+  applyTheme(s.theme);
+});
+
+if (typeof window !== 'undefined' && window.matchMedia) {
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (activeTheme === 'system') applyTheme('system');
+  });
+}
