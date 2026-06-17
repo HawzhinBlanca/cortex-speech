@@ -4,7 +4,7 @@ Branch `agent/wave0` (off `f89dc4a`) delivers the agent-safe slice of the 10/10
 roadmap, fully isolated from the in-flight `m02-sorani-metrics` working tree. Every
 change was verified locally; nothing here was shipped unverified.
 
-## What landed (7 commits)
+## What landed
 
 | Commit | Area | Summary |
 |--------|------|---------|
@@ -15,6 +15,8 @@ change was verified locally; nothing here was shipped unverified.
 | `b925fd2` | **M6** Rigor | Crate-root `deny(clippy::unwrap_used, clippy::expect_used)` outside tests — a new prod `.unwrap()` now fails CI. 13 sites resolved (12 justified static-regex allows, 1 converted to `let-else`). |
 | `2053ee3` | **M6** Rigor | proptest property tests for the statistics layer (the verifiable substitute for libfuzzer). |
 | `4a5adb5` | Fix | The property test caught a real 1-ULP float bug (degenerate single-segment bootstrap CI); fixed at the root. |
+| `760cabd` | **M6** Supply-chain | All 8 GitHub Actions pinned to commit SHAs across the 3 workflows (version kept as a comment for Dependabot/Renovate). |
+| `d990b3f` | **M3** Accuracy | `#[ignore]`-gated real-audio test: drives `run_gold_eval_with_transcriber` through the **real** OmniASR engine → non-blank transcript + valid CER (runs in the nightly job; compile-verified here). |
 
 ## Verification (the three ship gates)
 
@@ -40,11 +42,10 @@ docs) is in files not touched on `m02` → clean.
 
 ## Intentionally deferred (not shipped — would be unverifiable or risky here)
 
-- **libfuzzer fuzz targets** — need nightly + `cargo-fuzz` (not installable offline).
-  proptest property tests were added as the verifiable substitute.
-- **SHA-pinning GitHub Actions** — needs the exact commit SHAs and a GitHub runner to
-  confirm the pins don't break CI; pinning to an unverified SHA risks silently breaking
-  CI. Do it where the network + runner exist (track: task "M6 remainder").
+- **libfuzzer fuzz targets** — need nightly + `cargo-fuzz` (not installable offline), so
+  they can't be compile-verified here. The proptest property tests are the verifiable
+  substitute; the libfuzzer harnesses are the only piece of "M6 remainder" still open.
+  *(SHA-pinning — the other half of M6 remainder — is now done: commit `760cabd`.)*
 - **M2b** (`language="ckb"` hint) and **M5** (FLAC + holdout-by-hash) overlap files you
   are actively editing (`asr.rs`, `export_audio/mod.rs`, `jury/learning.rs`).
 - **M8b Autonomy Dial** — wiring it requires changing `run_t0_gate`'s signature, which
