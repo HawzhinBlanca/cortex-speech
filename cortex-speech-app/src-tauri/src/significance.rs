@@ -266,3 +266,61 @@ mod tests {
         assert!((compute_wer("a b c", "a x b c") - 1.0 / 3.0).abs() < 1e-9);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A segment with errors in `[0, ref_len]` and a positive reference length.
+    fn seg() -> impl Strategy<Value = SegmentError> {
+        (1.0f64..100.0).prop_flat_map(|len| (0.0f64..=len).prop_map(move |e| SegmentError::new(e, len)))
+    }
+
+    proptest! {
+        #[test]
+        fn micro_rate_stays_in_unit_interval(segs in proptest::collection::vec(seg(), 1..50)) {
+            let r = micro_rate(&segs);
+            prop_assert!((0.0..=1.0).contains(&r), "micro_rate out of range: {r}");
+        }
+
+        #[test]
+        fn bootstrap_ci_is_ordered_and_bounded(
+            segs in proptest::collection::vec(seg(), 1..40),
+            seed in any::<u64>(),
+        ) {
+            let ci = bootstrap_ci(&segs, 256, 0.95, seed);
+            prop_assert!(ci.lower <= ci.upper, "lower {} > upper {}", ci.lower, ci.upper);
+            prop_assert!(ci.lower >= 0.0 && ci.upper <= 1.0);
+            prop_assert!((0.0..=1.0).contains(&ci.point));
+        }
+
+        #[test]
+        fn bootstrap_ci_is_reproducible(
+            segs in proptest::collection::vec(seg(), 1..40),
+            seed in any::<u64>(),
+        ) {
+            // The same seed must yield byte-identical intervals — a published CI has to
+            // be reproducible from the same eval rows.
+            prop_assert_eq!(
+                bootstrap_ci(&segs, 128, 0.9, seed),
+                bootstrap_ci(&segs, 128, 0.9, seed)
+            );
+        }
+
+        #[test]
+        fn mapsswe_p_value_stays_in_unit_interval(
+            a in proptest::collection::vec(seg(), 0..40),
+            b in proptest::collection::vec(seg(), 0..40),
+        ) {
+            let p = mapsswe(&a, &b);
+            prop_assert!((0.0..=1.0).contains(&p), "p out of range: {p}");
+        }
+
+        #[test]
+        fn mapsswe_self_comparison_is_never_significant(a in proptest::collection::vec(seg(), 1..40)) {
+            // A system compared to itself has zero per-segment difference -> p = 1.
+            prop_assert_eq!(mapsswe(&a, &a), 1.0);
+        }
+    }
+}
