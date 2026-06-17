@@ -1,3 +1,8 @@
+// Production code must handle errors explicitly: `.unwrap()`/`.expect()` are denied
+// outside of tests. Reviewed, infallible exceptions are grandfathered with a local
+// `#[allow(clippy::unwrap_used)]` plus justification (see e.g. `normalizer.rs`).
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod agentic;
 pub mod aligner;
 pub mod asr;
@@ -36,9 +41,11 @@ pub mod perf;
 pub mod pipeline;
 pub mod quality;
 pub mod runs;
+pub mod scorecard;
 pub mod secret_redaction;
 pub mod session;
 pub mod settings;
+pub mod significance;
 pub mod stats;
 pub mod telemetry;
 pub mod throttle;
@@ -441,6 +448,8 @@ pub fn run() {
             commands::import_gold_segments,
             commands::run_gold_eval,
             commands::run_gold_eval_local,
+            commands::run_gold_eval_asr,
+            commands::build_scorecard,
             commands::list_eval_runs,
             commands::list_gold_segments,
             // Phase 2 — T0 Gate + Jury

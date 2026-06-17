@@ -323,6 +323,40 @@ impl ProcessingPipeline {
         self.asr_pool.with_service(&model_dir, &self.asr_config(), f)
     }
 
+    /// Run the permanent gold-set eval end-to-end against the live local ASR engine.
+    ///
+    /// Unlike the model-agnostic [`crate::eval::run_gold_eval`] (which trusts caller
+    /// hypotheses), this loads each gold clip, decodes + resamples it exactly like the
+    /// import path, runs the pooled OmniASR CTC recognizer, and scores the *raw* ASR
+    /// output against the gold reference — the only way a published WER/CER is
+    /// reproducible from audio rather than asserted. Opens its own DB connection so no
+    /// `AppState` lock is held across the (slow) ASR loop.
+    pub fn run_gold_eval_asr(&self, model_id: Option<&str>) -> AppResult<crate::eval::EvalRunResult> {
+        let db = self.open_db()?;
+        let model_id = model_id
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.local_asr_model_id().to_string());
+        crate::eval::run_gold_eval_with_transcriber(&db, &model_id, |seg| {
+            self.transcribe_audio_file_raw(&seg.audio_path)
+        })
+    }
+
+    /// Decode an audio file and return the *raw* local-ASR transcript — no LLM
+    /// refinement, no normalization — i.e. the exact hypothesis used for gold WER/CER.
+    pub fn transcribe_audio_file_raw(&self, audio_path: &str) -> AppResult<String> {
+        let (sample_rate, pcm) = audio::decode_to_pcm(audio_path)?;
+        let (_sr, pcm16) = audio::ensure_pcm_16khz(sample_rate, pcm)?;
+        let f32_pcm: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
+        self.with_asr(|asr| {
+            if !asr.is_available() {
+                return Err(AppError::Other("ASR model not loaded".into()));
+            }
+            asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
+                .map(|(text, _confidence)| text)
+                .map_err(AppError::Other)
+        })
+    }
+
     pub fn import_status_handle(&self) -> Arc<Mutex<ImportStatus>> {
         Arc::clone(&self.import_status)
     }

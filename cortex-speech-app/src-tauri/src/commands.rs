@@ -2251,6 +2251,43 @@ pub fn run_gold_eval(
     crate::eval::run_gold_eval(&db, &model_id, hypotheses).map_err(|e| e.to_string())
 }
 
+/// Closed-loop gold eval: runs the real local ASR over the gold set's audio and scores
+/// the produced hypotheses (no caller-supplied text). This is the honest-CER entrypoint.
+/// `model_id` defaults to the active local model when omitted.
+#[tauri::command]
+pub fn run_gold_eval_asr(
+    state: State<'_, AppState>,
+    model_id: Option<String>,
+) -> Result<crate::eval::EvalRunResult, String> {
+    RATE_LIMITER.check("run_gold_eval_asr")?;
+    // Clone the Arc so the (potentially long) ASR loop does not hold the pipeline lock.
+    let pipeline = state.lock_pipeline().clone();
+    pipeline.run_gold_eval_asr(model_id.as_deref()).map_err(|e| e.to_string())
+}
+
+/// Response for `build_scorecard`: the structured scorecard plus a ready-to-paste
+/// Markdown rendering (for a README / HuggingFace model card).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScorecardResponse {
+    pub scorecard: crate::scorecard::Scorecard,
+    pub markdown: String,
+}
+
+/// Build a reproducible accuracy scorecard from already-computed gold-eval results:
+/// micro WER/CER with bootstrap confidence intervals, plus an optional MAPSSWE
+/// significance comparison against a baseline run. Pure and deterministic.
+#[tauri::command]
+pub fn build_scorecard(
+    system: crate::eval::EvalRunResult,
+    baseline: Option<crate::eval::EvalRunResult>,
+) -> Result<ScorecardResponse, String> {
+    RATE_LIMITER.check("build_scorecard")?;
+    let scorecard = crate::scorecard::build_scorecard(&system, baseline.as_ref(), Default::default());
+    let markdown = crate::scorecard::render_markdown(&scorecard);
+    Ok(ScorecardResponse { scorecard, markdown })
+}
+
 #[tauri::command]
 pub fn run_gold_eval_local(
     state: State<'_, AppState>,
