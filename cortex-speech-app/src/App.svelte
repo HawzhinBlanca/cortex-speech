@@ -2414,15 +2414,11 @@
   </ErrorBoundary>
 {/if}
 
-{#if $showKeyboardHelp}
-  <KeyboardShortcuts />
-{/if}
+<KeyboardShortcuts />
 
 <CommandPalette open={showCommandPalette} onClose={() => (showCommandPalette = false)} />
 
-{#if $showConfirmDialog}
-  <ConfirmDialog />
-{/if}
+<ConfirmDialog />
 
 {#if $showValidationPanel}
   <ErrorBoundary>
