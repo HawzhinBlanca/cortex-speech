@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hawzh/cortex-speech/docs/provenance_ledger.schema.json",
+  "title": "Cortex Speech dataset provenance ledger",
+  "description": "Per-corpus license, consent, attribution and redistribution policy for every speech corpus the project ingests. Validated and enforced by scripts/verify_10.py: the license-compatibility gate fails the build when a share-alike-contaminating, NonCommercial, or no-redistribution corpus is marked for redistribution.",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "corpus",
+      "sourceUrl",
+      "spdxLicense",
+      "shareAlike",
+      "attributionString",
+      "consentBasis",
+      "redistributionRights",
+      "takedownContact",
+      "datasetUsage"
+    ],
+    "properties": {
+      "corpus": { "type": "string", "minLength": 1, "description": "Stable corpus identifier (snake_case)." },
+      "sourceUrl": { "type": "string", "minLength": 1, "description": "Canonical source / homepage / acquisition URL." },
+      "spdxLicense": { "type": "string", "minLength": 1, "description": "SPDX license id of the source corpus." },
+      "shareAlike": { "type": "boolean", "description": "True if the license is copyleft / share-alike (contaminates redistributed bundles)." },
+      "attributionString": { "type": "string", "minLength": 1, "description": "Exact attribution text to reproduce in dataset cards and exports." },
+      "consentBasis": { "type": "string", "minLength": 1, "description": "Legal/ethical basis under which the speech was collected (e.g. explicit_voice_donation, public_terms_of_service, academic_release)." },
+      "redistributionRights": {
+        "type": "string",
+        "enum": [
+          "redistributable_with_attribution",
+          "share_alike_contaminating",
+          "train_only_no_redist",
+          "permissive_public_domain"
+        ],
+        "description": "What the project may legally do with the corpus."
+      },
+      "takedownContact": { "type": "string", "minLength": 1, "description": "Contact (URL or email) for takedown / consent-withdrawal requests." },
+      "datasetUsage": {
+        "type": "string",
+        "enum": ["redistribute", "train_only", "reference_only", "excluded"],
+        "description": "How build/export targets actually use this corpus. 'redistribute' = included in published dataset bundles; 'train_only' = used to fine-tune models but never shipped as data; 'reference_only' = used to compute reference transcripts/metrics; 'excluded' = present in the ledger but not used. The license-compatibility gate fails the build if a share-alike-contaminating, NonCommercial, or no-redistribution corpus is set to 'redistribute'."
+      }
+    }
+  }
+}
