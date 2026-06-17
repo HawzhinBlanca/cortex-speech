@@ -2,6 +2,7 @@
   import { showKeyboardHelp } from './stores/uiStore';
   import { globalKeyboardManager } from './keyboard';
   import { t } from './i18n';
+  import Modal from './Modal.svelte';
 
   let shortcuts = $state<ReturnType<NonNullable<typeof globalKeyboardManager>['getAll']> | null>(null);
 
@@ -12,6 +13,7 @@
   });
 
   const categories = [
+    { id: 'general', labelKey: 'general' },
     { id: 'file', labelKey: 'fileOperations' },
     { id: 'edit', labelKey: 'editing' },
     { id: 'navigation', labelKey: 'navigation' },
@@ -27,49 +29,33 @@
     return parts.join('+');
   }
 
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') showKeyboardHelp.set(false);
+  function close() {
+    showKeyboardHelp.set(false);
   }
 </script>
 
-<div
-  class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-  data-testid="shortcuts-modal"
-  role="dialog"
-  aria-modal="true"
-  aria-labelledby="shortcuts-title"
-  tabindex="-1"
-  onkeydown={handleKeydown}
->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div role="presentation" class="card p-6 max-w-lg w-full mx-4 max-h-[80vh] overflow-y-auto shadow-2xl" onclick={(e) => e.stopPropagation()}>
-    <div class="flex items-center justify-between mb-4">
-      <h2 id="shortcuts-title" class="text-lg font-semibold text-gray-100">{$t('keyboardShortcuts')}</h2>
-      <button class="text-gray-400 hover:text-gray-200" onclick={() => showKeyboardHelp.set(false)} aria-label={$t('close')}>✕</button>
-    </div>
-
+<Modal open={$showKeyboardHelp} title={$t('keyboardShortcuts')} size="lg" onClose={close}>
+  <div class="space-y-5 px-5 py-4" data-testid="shortcuts-modal">
     {#if shortcuts}
-      {#each categories as cat}
-        {#if shortcuts.filter(s => s.category === cat.id).length > 0}
-          <div class="mb-4">
-            <h3 class="text-xs font-semibold text-cortex-400 uppercase tracking-wider mb-2">{$t(cat.labelKey)}</h3>
-            <div class="space-y-1">
-              {#each shortcuts.filter(s => s.category === cat.id) as s}
-                <div class="flex items-center justify-between text-sm">
-                  <span class="text-gray-300">{s.description}</span>
-                  <kbd class="text-xs">{modLabel(s)}</kbd>
+      {#each categories as cat (cat.id)}
+        {#if shortcuts.filter((s) => s.category === cat.id).length > 0}
+          <section>
+            <h3 class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-subtle">
+              {$t(cat.labelKey)}
+            </h3>
+            <div class="space-y-0.5">
+              {#each shortcuts.filter((s) => s.category === cat.id) as s (s.description)}
+                <div class="flex items-center justify-between gap-4 rounded-token px-2 py-1.5 text-sm transition-colors hover:bg-surface-2">
+                  <span class="text-muted">{s.description}</span>
+                  <kbd class="shrink-0">{modLabel(s)}</kbd>
                 </div>
               {/each}
             </div>
-          </div>
+          </section>
         {/if}
       {/each}
     {:else}
-      <p class="text-sm text-cortex-400">{$t('shortcuts.none')}</p>
+      <p class="text-sm text-subtle">{$t('shortcuts.none')}</p>
     {/if}
-
-    <p class="text-xs text-cortex-500 mt-4">
-      {$t('shortcuts.closeHint', { key: $t('shortcuts.esc') })}
-    </p>
   </div>
-</div>
+</Modal>
