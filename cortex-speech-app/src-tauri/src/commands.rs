@@ -2265,6 +2265,29 @@ pub fn run_gold_eval_asr(
     pipeline.run_gold_eval_asr(model_id.as_deref()).map_err(|e| e.to_string())
 }
 
+/// Response for `build_scorecard`: the structured scorecard plus a ready-to-paste
+/// Markdown rendering (for a README / HuggingFace model card).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScorecardResponse {
+    pub scorecard: crate::scorecard::Scorecard,
+    pub markdown: String,
+}
+
+/// Build a reproducible accuracy scorecard from already-computed gold-eval results:
+/// micro WER/CER with bootstrap confidence intervals, plus an optional MAPSSWE
+/// significance comparison against a baseline run. Pure and deterministic.
+#[tauri::command]
+pub fn build_scorecard(
+    system: crate::eval::EvalRunResult,
+    baseline: Option<crate::eval::EvalRunResult>,
+) -> Result<ScorecardResponse, String> {
+    RATE_LIMITER.check("build_scorecard")?;
+    let scorecard = crate::scorecard::build_scorecard(&system, baseline.as_ref(), Default::default());
+    let markdown = crate::scorecard::render_markdown(&scorecard);
+    Ok(ScorecardResponse { scorecard, markdown })
+}
+
 #[tauri::command]
 pub fn list_eval_runs(state: State<'_, AppState>) -> Result<Vec<crate::eval::EvalRun>, String> {
     RATE_LIMITER.check("list_eval_runs")?;

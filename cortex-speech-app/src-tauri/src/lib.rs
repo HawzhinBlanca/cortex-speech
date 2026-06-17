@@ -41,6 +41,7 @@ pub mod perf;
 pub mod pipeline;
 pub mod quality;
 pub mod runs;
+pub mod scorecard;
 pub mod secret_redaction;
 pub mod session;
 pub mod settings;
@@ -447,6 +448,7 @@ pub fn run() {
             commands::import_gold_segments,
             commands::run_gold_eval,
             commands::run_gold_eval_asr,
+            commands::build_scorecard,
             commands::list_eval_runs,
             commands::list_gold_segments,
             // Phase 2 — T0 Gate + Jury
