@@ -29,14 +29,30 @@ npm run dev   →   http://localhost:1420
 
 Toggle the theme in Settings, press **Cmd-K**, resize panels and relaunch.
 
-## Highest-value next (best done with the live preview)
+## Overnight pass — theming everywhere + states + a11y (3 more commits)
 
-These are deliberately deferred — they're structural layout changes that need visual
-iteration (the audit's biggest item):
+- **Real light/dark on every surface**: `cortex-*` is now driven by RGB-channel CSS
+  vars (`--cortex-NNN-rgb`) with an inverted light set — so *every* `bg/text/border-cortex`
+  class switches with the theme. **Dark values are byte-identical** (zero regression).
+  All `text-gray-*` migrated to semantic tokens; shell chrome → `bg-app` / `.glass` /
+  `border-line`; removed the broken `class:dark/light` (theming lives on `<html>`).
+- **`EmptyState.svelte`** — one reusable, theme-aware empty/no-results/error/mic state
+  with optional CTA snippet; wired into the center placeholder.
+- **Focus-trap on every dialog** — Settings, Validation, WSL now match the Modal-routed
+  ones (focus in / cycle / restore).
+
+## Verify visually when you're back (`npm run dev` → localhost:1420)
+
+1. **Light mode** (Settings → theme → Light): the *status* colors (red/amber/emerald/
+   indigo badges for confidence/speaker) are still raw Tailwind shades — they read fine
+   in dark but want a token pass for ideal light-mode contrast. Everything else themes.
+2. **RTL** (Kurdish): the header/search/badges use a mix of physical + logical spacing;
+   a `ms-/me-/ps-/pe-/start-/end-` sweep would make Sorani pixel-perfect.
+
+## Bigger items that genuinely need your eyes (deferred on purpose)
 
 - **Activity rail + `viewMode` IA** — turn the ~13-button toolbar into navigable
   workspaces (Library / Review / Insights / Settings); the dead `ViewMode` union in
-  `uiStore.ts` is already there to wire.
-- Route the remaining 5 panels (Settings, Validation, Speaker, Merge, WSL) through `Modal`.
+  `uiStore.ts` is ready to wire. (The audit's #1 structural item.)
 - Adopt `lucide-svelte` to replace the ~32 inline SVGs + emoji for one icon language.
 - Multi-select segment **action bar**; rebuild **ReviewInbox** on the design system.
