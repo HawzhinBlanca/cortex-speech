@@ -440,6 +440,7 @@ pub fn run() {
             // Phase 1 — Gold-Set Eval Harness
             commands::import_gold_segments,
             commands::run_gold_eval,
+            commands::run_gold_eval_asr,
             commands::list_eval_runs,
             commands::list_gold_segments,
             // Phase 2 — T0 Gate + Jury
