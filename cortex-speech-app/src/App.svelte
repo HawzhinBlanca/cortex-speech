@@ -65,6 +65,7 @@
   import WslConsolePanel from './lib/WslConsolePanel.svelte';
   import ReviewInbox from './lib/ReviewInbox.svelte';
   import DiffView from './lib/DiffView.svelte';
+  import CommandPalette from './lib/CommandPalette.svelte';
   import PanelSplitter from './lib/PanelSplitter.svelte';
   import HistoryPanel from './lib/HistoryPanel.svelte';
   import {
@@ -261,39 +262,56 @@
     const km = initKeyboardManager();
     registerShortcuts(km);
     setImportCompleteHandler(async (payload) => {
-      await loadSegments();
-      await loadLatestAgentReport();
-      await loadLatestAgentStageEvents();
-      if (payload.segmentIds?.length) {
-        selectedSegmentId.set(payload.segmentIds[0]);
-      }
-      statusMessage.set($t('ready'));
-      if (payload.source === 'file') {
-        if (payload.failed > 0) {
-          notifications.error($t('openFile.failed'));
-        } else if (payload.segmentCount && payload.segmentCount > 1) {
-          notifications.success($t('openFile.multiChunk', { count: String(payload.segmentCount) }));
-        } else if (payload.succeeded > 0) {
-          notifications.success($t('openFile.imported'));
+      try {
+        await loadSegments();
+        await loadLatestAgentReport();
+        await loadLatestAgentStageEvents();
+        if (payload.segmentIds?.length) {
+          selectedSegmentId.set(payload.segmentIds[0]);
         }
-        endOperation('open-file');
-      } else {
-        statusMessage.set($t('importComplete'));
-        endOperation('import');
+        statusMessage.set($t('ready'));
+        if (payload.source === 'file') {
+          if (payload.failed > 0) {
+            notifications.error($t('openFile.failed'));
+          } else if (payload.segmentCount && payload.segmentCount > 1) {
+            notifications.success($t('openFile.multiChunk', { count: String(payload.segmentCount) }));
+          } else if (payload.succeeded > 0) {
+            notifications.success($t('openFile.imported'));
+          }
+        } else {
+          statusMessage.set($t('importComplete'));
+        }
+      } catch (e) {
+        console.error('Import complete handler error:', e);
+        notifications.error('Failed to refresh after import', { detail: String(e) });
+      } finally {
+        if (payload.source === 'file') {
+          endOperation('open-file');
+        } else {
+          endOperation('import');
+        }
+        isProcessing.set(false);
       }
     });
     setBatchCompleteHandler(async (payload) => {
-      if (payload.operation === 'transcribe') {
-        await loadSegments();
-        statusMessage.set($t('ready'));
-        endOperation('batch-transcribe');
-      } else if (payload.operation === 'verify') {
-        await loadSegments();
-        statusMessage.set($t('ready'));
-        endOperation('batch-verify');
-      } else if (payload.operation === 'assign_speaker' || payload.operation === 'normalize') {
-        await loadSegments();
-        statusMessage.set($t('ready'));
+      try {
+        if (payload.operation === 'transcribe') {
+          await loadSegments();
+          statusMessage.set($t('ready'));
+          endOperation('batch-transcribe');
+        } else if (payload.operation === 'verify') {
+          await loadSegments();
+          statusMessage.set($t('ready'));
+          endOperation('batch-verify');
+        } else if (payload.operation === 'assign_speaker' || payload.operation === 'normalize') {
+          await loadSegments();
+          statusMessage.set($t('ready'));
+        }
+      } catch (e) {
+        console.error('Batch complete handler error:', e);
+        notifications.error('Failed to refresh after batch operation', { detail: String(e) });
+      } finally {
+        isProcessing.set(false);
       }
     });
     if (isTauriRuntime()) {
@@ -316,6 +334,7 @@
   onDestroy(() => {
     stopEventListeners();
     globalKeyboardManager?.destroy();
+    if (saveTimeout) clearTimeout(saveTimeout);
   });
 
   function navigateSegment(direction: 'up' | 'down') {
@@ -328,6 +347,8 @@
       direction === 'down' ? Math.min(list.length - 1, startIdx + 1) : Math.max(0, startIdx - 1);
     selectSegment(list[targetIndex]);
   }
+
+  let showCommandPalette = $state(false);
 
   function registerShortcuts(km: ReturnType<typeof initKeyboardManager>) {
     const shortcuts = [
@@ -482,6 +503,13 @@
         description: 'Forward 5s',
         action: () => (currentTime = Math.min(playerDuration, currentTime + 5)),
         category: 'playback',
+      },
+      {
+        key: 'k',
+        ctrl: true,
+        description: 'Command palette',
+        action: () => (showCommandPalette = true),
+        category: 'general',
       },
     ];
     km.registerAll(shortcuts);
@@ -956,12 +984,14 @@
 
     startOperation('batch-transcribe');
     pipelinePhase.set('transcribing');
+    isProcessing.set(true);
     statusMessage.set($t('batchTranscribe.progress', { n: String(ids.length) }));
     try {
       await api.batchTranscribe(ids);
     } catch (e) {
       notifyActionableError(e, $t('batchTranscribe.failed'));
       pipelinePhase.set('idle');
+      isProcessing.set(false);
       statusMessage.set($t('ready'));
       endOperation('batch-transcribe');
     }
@@ -2368,6 +2398,8 @@
   <KeyboardShortcuts />
 {/if}
 
+<CommandPalette open={showCommandPalette} onClose={() => (showCommandPalette = false)} />
+
 {#if $showConfirmDialog}
   <ConfirmDialog />
 {/if}
@@ -2379,9 +2411,7 @@
 {/if}
 
 {#if $showReviewInbox}
-  <div
-    style="position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.75);display:flex;align-items:stretch;justify-content:center;padding:24px;"
-  >
+  <div class="fixed inset-0 z-[100] flex items-stretch justify-center p-6 glass">
     <ErrorBoundary>
       <ReviewInbox onClose={() => showReviewInbox.set(false)} />
     </ErrorBoundary>
