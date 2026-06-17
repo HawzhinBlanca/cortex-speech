@@ -17,6 +17,8 @@ change was verified locally; nothing here was shipped unverified.
 | `4a5adb5` | Fix | The property test caught a real 1-ULP float bug (degenerate single-segment bootstrap CI); fixed at the root. |
 | `760cabd` | **M6** Supply-chain | All 8 GitHub Actions pinned to commit SHAs across the 3 workflows (version kept as a comment for Dependabot/Renovate). |
 | `d990b3f` | **M3** Accuracy | `#[ignore]`-gated real-audio test: drives `run_gold_eval_with_transcriber` through the **real** OmniASR engine → non-blank transcript + valid CER (runs in the nightly job; compile-verified here). |
+| `e941739` | Rigor | Property tests proving the conformal Hoeffding guarantees (bound never exceeds target, monotonicity, fallback). |
+| `8c5a3ca` | **Scorecard** | `scorecard.rs` + `build_scorecard` command — the synthesis: fuses M3 eval + M2 stats into a reproducible artifact. Micro WER/CER with bootstrap CIs + paired MAPSSWE significance vs a baseline + a `beats_baseline` flag (lower AND p<0.05) + Markdown for a model card. |
 
 ## Verification (the three ship gates)
 
