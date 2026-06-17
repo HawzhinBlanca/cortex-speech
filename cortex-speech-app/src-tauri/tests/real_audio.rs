@@ -4,6 +4,7 @@ use cortex_speech_app_lib::asr::KurdishAsrService;
 use cortex_speech_app_lib::audio::{self, check_audio_file, voice_activity_detection};
 use cortex_speech_app_lib::cache::TranscriptCache;
 use cortex_speech_app_lib::db::Database;
+use cortex_speech_app_lib::eval;
 use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
@@ -542,4 +543,56 @@ fn test_omniasr_on_real_audio() {
     assert!(transcript.1.is_some(), "ASR confidence score should be returned (not None)");
     let conf = transcript.1.unwrap();
     assert!(conf > 0.0 && conf <= 1.0, "ASR confidence score {} should be in (0.0, 1.0]", conf);
+}
+
+// ── M3: closed-loop gold eval against the REAL OmniASR engine ───────────
+
+#[test]
+#[ignore]
+fn test_gold_eval_real_asr_closes_the_loop() {
+    // End-to-end proof of M3: `run_gold_eval_with_transcriber` drives the real OmniASR
+    // engine over a gold clip and scores the produced hypothesis — an honest CER from
+    // audio, never caller-supplied text. Runs in the nightly real-audio job (the WER/CER
+    // math itself is covered by the unit + property tests).
+    let path = fixture_path(&omniasr_fixture());
+    if !path.exists() {
+        eprintln!("[gold-asr] skip: fixture {} not found", path.display());
+        return;
+    }
+    let model_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+    if !model_dir.join("omniasr-ctc-300m/model.int8.onnx").exists() {
+        eprintln!("[gold-asr] skip: OmniASR models not found under {}", model_dir.display());
+        return;
+    }
+
+    let db = Database::open(":memory:").expect("open db");
+    db.initialize().expect("init db");
+    eval::import_gold_segments(
+        &db,
+        vec![eval::GoldSegmentInput {
+            audio_path: path.to_string_lossy().to_string(),
+            reference: String::new(), // unknown reference: assert a non-blank hypothesis + valid score
+            is_holdout: true,
+        }],
+    )
+    .expect("import gold");
+
+    let mut asr = KurdishAsrService::new(&model_dir, false).expect("ASR init with real models");
+    assert!(asr.is_available(), "ASR should be available");
+
+    let result = eval::run_gold_eval_with_transcriber(&db, "omniasr-ctc-300m", |seg| {
+        let (sr, pcm) = audio::decode_to_pcm(&seg.audio_path)?;
+        let (_sr, pcm16) = audio::ensure_pcm_16khz(sr, pcm)?;
+        let f32_pcm: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
+        asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
+            .map(|(text, _conf)| text)
+            .map_err(cortex_speech_app_lib::error::AppError::Other)
+    })
+    .expect("gold eval with real ASR");
+
+    assert_eq!(result.run.num_segs, 1, "the gold clip should be transcribed and scored");
+    let hyp = &result.segments[0].hypothesis;
+    eprintln!("[gold-asr] hypothesis ({} chars): {}", hyp.len(), hyp);
+    assert!(!hyp.trim().is_empty(), "real OmniASR must produce a non-blank transcript");
+    assert!((0.0..=1.0).contains(&result.run.cer), "CER must be a valid rate in [0,1]");
 }

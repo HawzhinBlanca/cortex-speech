@@ -1,0 +1,22 @@
+# Code ownership for Cortex Speech.
+# Every PR requests a review from the listed owners for the paths it touches.
+# See https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything in the repo.
+*                                   @hawzh
+
+# Security, governance, and the verification gate are sensitive — always review.
+/SECURITY.md                        @hawzh
+/DATA_GOVERNANCE.md                 @hawzh
+/NOTICE                             @hawzh
+/LICENSE                            @hawzh
+/scripts/verify_10.py               @hawzh
+/docs/provenance_ledger.json        @hawzh
+/docs/provenance_ledger.schema.json @hawzh
+
+# ASR engine, jury, and quality/eval are the correctness-critical core.
+/cortex-speech-app/src-tauri/src/asr.rs       @hawzh
+/cortex-speech-app/src-tauri/src/eval.rs      @hawzh
+/cortex-speech-app/src-tauri/src/wer.rs       @hawzh
+/cortex-speech-app/src-tauri/src/quality/     @hawzh
+/cortex-speech-app/src-tauri/src/jury/        @hawzh

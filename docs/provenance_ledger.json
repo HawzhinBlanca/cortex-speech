@@ -7,7 +7,8 @@
     "attributionString": "FLEURS Kurdish Dataset, Google LLC, licensed under CC BY 4.0.",
     "consentBasis": "public_terms_of_service",
     "redistributionRights": "redistributable_with_attribution",
-    "takedownContact": "https://github.com/google/fleurs/issues"
+    "takedownContact": "https://github.com/google/fleurs/issues",
+    "datasetUsage": "redistribute"
   },
   {
     "corpus": "asosoft_600",
@@ -17,7 +18,8 @@
     "attributionString": "AsoSoft Kurdish Corpus, AsoSoft Team, licensed under CC BY-SA 4.0.",
     "consentBasis": "academic_release",
     "redistributionRights": "share_alike_contaminating",
-    "takedownContact": "asosoft@asosoft.com"
+    "takedownContact": "asosoft@asosoft.com",
+    "datasetUsage": "train_only"
   },
   {
     "corpus": "cordi_sorani",
@@ -27,7 +29,8 @@
     "attributionString": "CORDI Dialect Corpus, UKH.",
     "consentBasis": "academic_research_only",
     "redistributionRights": "train_only_no_redist",
-    "takedownContact": "cordi-corpus@ukh.edu.krd"
+    "takedownContact": "cordi-corpus@ukh.edu.krd",
+    "datasetUsage": "train_only"
   },
   {
     "corpus": "common_voice_ckb",
@@ -37,6 +40,7 @@
     "attributionString": "Mozilla Common Voice Kurdish Dataset, Public Domain.",
     "consentBasis": "explicit_voice_donation",
     "redistributionRights": "permissive_public_domain",
+    "datasetUsage": "redistribute",
     "takedownContact": "commonvoice@mozilla.com"
   }
 ]
