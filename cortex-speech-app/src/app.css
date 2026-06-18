@@ -76,6 +76,16 @@
   --cortex-800-rgb: 25 33 47;
   --cortex-900-rgb: 13 18 27;
   --cortex-950-rgb: 9 13 20;
+
+  /* Status palettes — theme-aware. Dark channels = Tailwind defaults
+     (byte-identical, zero dark regression). Light overrides live in .light. */
+  --red-50-rgb:254 242 242; --red-100-rgb:254 226 226; --red-200-rgb:254 202 202; --red-300-rgb:252 165 165; --red-400-rgb:248 113 113; --red-500-rgb:239 68 68; --red-600-rgb:220 38 38; --red-700-rgb:185 28 28; --red-800-rgb:153 27 27; --red-900-rgb:127 29 29; --red-950-rgb:69 10 10;
+  --amber-50-rgb:255 251 235; --amber-100-rgb:254 243 199; --amber-200-rgb:253 230 138; --amber-300-rgb:252 211 77; --amber-400-rgb:251 191 36; --amber-500-rgb:245 158 11; --amber-600-rgb:217 119 6; --amber-700-rgb:180 83 9; --amber-800-rgb:146 64 14; --amber-900-rgb:120 53 15; --amber-950-rgb:69 26 3;
+  --emerald-50-rgb:236 253 245; --emerald-100-rgb:209 250 229; --emerald-200-rgb:167 243 208; --emerald-300-rgb:110 231 183; --emerald-400-rgb:52 211 153; --emerald-500-rgb:16 185 129; --emerald-600-rgb:5 150 105; --emerald-700-rgb:4 120 87; --emerald-800-rgb:6 95 70; --emerald-900-rgb:6 78 59; --emerald-950-rgb:2 44 34;
+  --cyan-50-rgb:236 254 255; --cyan-100-rgb:207 250 254; --cyan-200-rgb:165 243 252; --cyan-300-rgb:103 232 249; --cyan-400-rgb:34 211 238; --cyan-500-rgb:6 182 212; --cyan-600-rgb:8 145 178; --cyan-700-rgb:14 116 144; --cyan-800-rgb:21 94 117; --cyan-900-rgb:22 78 99; --cyan-950-rgb:8 51 68;
+  --indigo-50-rgb:238 242 255; --indigo-100-rgb:224 231 255; --indigo-200-rgb:199 210 254; --indigo-300-rgb:165 180 252; --indigo-400-rgb:129 140 248; --indigo-500-rgb:99 102 241; --indigo-600-rgb:79 70 229; --indigo-700-rgb:67 56 202; --indigo-800-rgb:55 48 163; --indigo-900-rgb:49 46 129; --indigo-950-rgb:30 27 75;
+  --orange-50-rgb:255 247 237; --orange-100-rgb:255 237 213; --orange-200-rgb:254 215 170; --orange-300-rgb:253 186 116; --orange-400-rgb:251 146 60; --orange-500-rgb:249 115 22; --orange-600-rgb:234 88 12; --orange-700-rgb:194 65 12; --orange-800-rgb:154 52 18; --orange-900-rgb:124 45 18; --orange-950-rgb:67 20 7;
+  --blue-50-rgb:239 246 255; --blue-100-rgb:219 234 254; --blue-200-rgb:191 219 254; --blue-300-rgb:147 197 253; --blue-400-rgb:96 165 250; --blue-500-rgb:59 130 246; --blue-600-rgb:37 99 235; --blue-700-rgb:29 78 216; --blue-800-rgb:30 64 175; --blue-900-rgb:30 58 138; --blue-950-rgb:23 37 84;
 }
 
 /* Light theme — applied when <html> carries the .light class. Token-driven
@@ -126,6 +136,16 @@
   --cortex-800-rgb: 226 232 240;
   --cortex-900-rgb: 255 255 255;
   --cortex-950-rgb: 245 247 250;
+
+  /* Status palettes — light mode: contrast-biased shade inversion so text
+     shades (300-500) read dark and bg/opacity shades (800-950) read light. */
+  --red-50-rgb:69 10 10; --red-100-rgb:127 29 29; --red-200-rgb:153 27 27; --red-300-rgb:185 28 28; --red-400-rgb:185 28 28; --red-500-rgb:185 28 28; --red-600-rgb:252 165 165; --red-700-rgb:254 202 202; --red-800-rgb:254 202 202; --red-900-rgb:254 226 226; --red-950-rgb:254 242 242;
+  --amber-50-rgb:69 26 3; --amber-100-rgb:120 53 15; --amber-200-rgb:146 64 14; --amber-300-rgb:180 83 9; --amber-400-rgb:180 83 9; --amber-500-rgb:180 83 9; --amber-600-rgb:252 211 77; --amber-700-rgb:253 230 138; --amber-800-rgb:253 230 138; --amber-900-rgb:254 243 199; --amber-950-rgb:255 251 235;
+  --emerald-50-rgb:2 44 34; --emerald-100-rgb:6 78 59; --emerald-200-rgb:6 95 70; --emerald-300-rgb:4 120 87; --emerald-400-rgb:4 120 87; --emerald-500-rgb:4 120 87; --emerald-600-rgb:110 231 183; --emerald-700-rgb:167 243 208; --emerald-800-rgb:167 243 208; --emerald-900-rgb:209 250 229; --emerald-950-rgb:236 253 245;
+  --cyan-50-rgb:8 51 68; --cyan-100-rgb:22 78 99; --cyan-200-rgb:21 94 117; --cyan-300-rgb:14 116 144; --cyan-400-rgb:14 116 144; --cyan-500-rgb:14 116 144; --cyan-600-rgb:103 232 249; --cyan-700-rgb:165 243 252; --cyan-800-rgb:165 243 252; --cyan-900-rgb:207 250 254; --cyan-950-rgb:236 254 255;
+  --indigo-50-rgb:30 27 75; --indigo-100-rgb:49 46 129; --indigo-200-rgb:55 48 163; --indigo-300-rgb:67 56 202; --indigo-400-rgb:67 56 202; --indigo-500-rgb:67 56 202; --indigo-600-rgb:165 180 252; --indigo-700-rgb:199 210 254; --indigo-800-rgb:199 210 254; --indigo-900-rgb:224 231 255; --indigo-950-rgb:238 242 255;
+  --orange-50-rgb:67 20 7; --orange-100-rgb:124 45 18; --orange-200-rgb:154 52 18; --orange-300-rgb:194 65 12; --orange-400-rgb:194 65 12; --orange-500-rgb:194 65 12; --orange-600-rgb:253 186 116; --orange-700-rgb:254 215 170; --orange-800-rgb:254 215 170; --orange-900-rgb:255 237 213; --orange-950-rgb:255 247 237;
+  --blue-50-rgb:23 37 84; --blue-100-rgb:30 58 138; --blue-200-rgb:30 64 175; --blue-300-rgb:29 78 216; --blue-400-rgb:29 78 216; --blue-500-rgb:29 78 216; --blue-600-rgb:147 197 253; --blue-700-rgb:191 219 254; --blue-800-rgb:191 219 254; --blue-900-rgb:219 234 254; --blue-950-rgb:239 246 255;
 }
 
 /* ------------------------------------------------------------------ BASE -- */
