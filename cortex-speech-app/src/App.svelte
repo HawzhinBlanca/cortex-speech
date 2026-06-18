@@ -2017,7 +2017,7 @@
                     : 'text-cortex-400 hover:text-cortex-200'}"
                   onclick={() => (editorTab = 'interactive')}
                 >
-                  Interactive
+                  {$t('editorInteractive')}
                 </button>
                 <button
                   class="px-2.5 py-1 text-[10px] uppercase font-bold tracking-wider rounded-md transition-colors
@@ -2026,7 +2026,7 @@
                     : 'text-cortex-400 hover:text-cortex-200'}"
                   onclick={() => (editorTab = 'raw')}
                 >
-                  Text Editor
+                  {$t('editorTextEditor')}
                 </button>
               </div>
             </div>
