@@ -204,6 +204,18 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
 - **Status:** happy path + common edge cases verified defect-free. Remaining work is
   the two task chips (comprehensive i18n sweep; ReviewInbox legacy-purple retheme).
 
+## Iteration 12 — deep a11y/data checks (no new defect)
+
+- ✅ Empty-dataset NaN-safe: stats display provided values; `buildLocalStats` guards
+  `length ? … : 0`; no unguarded client-side division.
+- ✅ ARIA labeling complete: **0** unlabeled icon buttons (all have text/aria-label/title).
+- ✅ DiffView themes + localizes: insert/delete chips use the theme-aware emerald/red
+  palette; labels via `$t('diff.*')`.
+- **Honest status:** multiple iterations now finding no new frontend defects — the app
+  is verified clean on happy path + deep edge cases. Remaining = the 2 task chips
+  (i18n sweep, ReviewInbox retheme) + real-backend ASR/export correctness (needs the
+  Tauri app + models, out of preview scope).
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
