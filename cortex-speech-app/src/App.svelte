@@ -302,7 +302,7 @@
         }
       } catch (e) {
         console.error('Import complete handler error:', e);
-        notifications.error('Failed to refresh after import', { detail: String(e) });
+        notifications.error($t('notify.refreshFailedImport'), { detail: String(e) });
       } finally {
         if (payload.source === 'file') {
           endOperation('open-file');
@@ -328,7 +328,7 @@
         }
       } catch (e) {
         console.error('Batch complete handler error:', e);
-        notifications.error('Failed to refresh after batch operation', { detail: String(e) });
+        notifications.error($t('notify.refreshFailedBatch'), { detail: String(e) });
       } finally {
         isProcessing.set(false);
       }
@@ -1280,7 +1280,7 @@
     <div class="flex items-center gap-3">
       <h1 class="text-sm font-bold tracking-tight">
         <span class="text-cortex-400">CORTEX</span>
-        <span class="text-cortex-200 ms-1">Kurdish Speech Processor</span>
+        <span class="text-cortex-200 ms-1">{$t('app.subtitle')}</span>
       </h1>
       <span
         class="text-[10px] text-cortex-500 bg-cortex-900 px-2 py-0.5 rounded-full border border-cortex-800/50"
@@ -2222,7 +2222,7 @@
                 {#if showHotkeyOverlay}
                   <span
                     class="absolute -top-1.5 -right-1.5 bg-cyan-400 text-black text-[8px] font-mono font-bold px-1 rounded shadow-md border border-cyan-500 select-none z-50 pointer-events-none"
-                    >Del</span
+                    >{$t('app.deleteHint')}</span
                   >
                 {/if}
               </button>

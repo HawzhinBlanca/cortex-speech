@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import { parseActionableError, type ActionableError } from './errors';
+  import { t } from './i18n';
 
   let {
     children,
@@ -46,7 +47,7 @@
         <p class="text-xs text-red-400/80 font-mono break-words">{actionableError.detail}</p>
       {/if}
       <div class="flex items-center gap-3">
-        <button class="text-xs text-red-400 underline" onclick={retry}>Retry</button>
+        <button class="text-xs text-red-400 underline" onclick={retry}>{$t('retry')}</button>
         {#if actionableError.action}
           <button
             class="text-xs text-cortex-300 underline"

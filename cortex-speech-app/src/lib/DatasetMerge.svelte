@@ -4,25 +4,31 @@
   import { showDatasetMerge } from './stores/uiStore';
   import { notifications } from './stores/notificationStore';
   import { segments } from './stores/segmentStore';
+  import { t } from './i18n';
 
   let jsonContent = $state('');
   let merging = $state(false);
 
   async function handleMerge() {
     if (!jsonContent.trim()) {
-      notifications.error('Please paste dataset JSON content');
+      notifications.error($t('merge.pasteRequired'));
       return;
     }
 
     merging = true;
     try {
       const result = await api.mergeDatasetJson(jsonContent.trim());
-      notifications.success(`Merge complete: ${result.created} created, ${result.updated} updated`);
+      notifications.success(
+        $t('merge.complete', {
+          created: String(result.created),
+          updated: String(result.updated),
+        }),
+      );
       jsonContent = '';
       showDatasetMerge.set(false);
       segments.load();
     } catch (e) {
-      notifications.error('Merge failed: ' + e);
+      notifications.error($t('merge.failed'), { detail: String(e) });
     } finally {
       merging = false;
     }
@@ -49,14 +55,13 @@
 >
   <div class="card w-full max-w-2xl shadow-2xl flex flex-col max-h-[80vh]">
     <header class="flex items-center justify-between p-4 border-b border-cortex-800/50">
-      <h2 class="text-sm font-bold text-cortex-200 uppercase tracking-widest">Merge Dataset</h2>
+      <h2 class="text-sm font-bold text-cortex-200 uppercase tracking-widest">{$t('merge.title')}</h2>
       <button class="text-cortex-500 hover:text-cortex-300" onclick={close}>✕</button>
     </header>
 
     <div class="flex-1 p-4 space-y-4 flex flex-col overflow-hidden">
       <p class="text-xs text-cortex-400">
-        Paste a CORTEX dataset JSON blob below to merge it into your master database. Existing
-        segments with matching IDs will be updated; new segments will be created.
+        {$t('merge.bodyHint')}
       </p>
 
       <textarea
@@ -68,9 +73,11 @@
     </div>
 
     <footer class="p-4 border-t border-cortex-800/50 flex justify-end gap-2">
-      <button class="btn btn-secondary !text-xs" onclick={close} disabled={merging}>Cancel</button>
+      <button class="btn btn-secondary !text-xs" onclick={close} disabled={merging}
+        >{$t('cancel')}</button
+      >
       <button class="btn btn-primary !text-xs" onclick={handleMerge} disabled={merging}>
-        {merging ? 'Merging...' : 'Merge Dataset'}
+        {merging ? $t('merge.merging') : $t('merge.title')}
       </button>
     </footer>
   </div>

@@ -297,16 +297,16 @@
         <h3
           class="text-xs font-semibold text-cortex-300 uppercase tracking-wider flex items-center justify-between"
         >
-          <span>Conformal Quality Certification</span>
+          <span>{$t('stats.conformalTitle')}</span>
           {#if cert.isCalibrated}
             <span
               class="text-[9px] px-1.5 py-0.5 rounded bg-emerald-950/50 text-emerald-400 border border-emerald-800/40 font-mono"
-              >Calibrated</span
+              >{$t('stats.calibrated')}</span
             >
           {:else}
             <span
               class="text-[9px] px-1.5 py-0.5 rounded bg-amber-950/50 text-amber-400 border border-amber-800/40 font-mono"
-              >Heuristic</span
+              >{$t('stats.heuristic')}</span
             >
           {/if}
         </h3>
@@ -315,7 +315,7 @@
           <div class="grid grid-cols-2 gap-2 text-center">
             <div class="bg-cortex-950/40 p-2 rounded-lg border border-cortex-800/20">
               <div class="text-lg font-bold text-cyan-400">{cert.totalCertified}</div>
-              <div class="text-[9px] text-cortex-400">Certified Segments</div>
+              <div class="text-[9px] text-cortex-400">{$t('stats.certifiedSegments')}</div>
             </div>
             <div class="bg-cortex-950/40 p-2 rounded-lg border border-cortex-800/20">
               <div class="text-lg font-bold text-cortex-200">{cert.threshold.toFixed(3)}</div>

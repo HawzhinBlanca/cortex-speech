@@ -1,6 +1,7 @@
 <script lang="ts">
   import { historyStore } from './stores/historyStore';
   import { onDestroy } from 'svelte';
+  import { t } from './i18n';
 
   // We can track local session edits
   interface EditRecord {
@@ -61,7 +62,7 @@
 >
   <!-- Undo/Redo Action Bar -->
   <div class="flex items-center justify-between border-b border-cortex-800/60 pb-3">
-    <h3 class="text-xs font-bold text-cortex-400 uppercase tracking-widest">History Stack</h3>
+    <h3 class="text-xs font-bold text-cortex-400 uppercase tracking-widest">{$t('history.stack')}</h3>
     <div class="flex gap-1.5">
       <button
         class="px-3 py-1.5 rounded-lg border text-xs font-medium transition-all duration-150 flex items-center gap-1 relative
@@ -86,7 +87,7 @@
             d="M4.066 11.2a1 1 0 000 1.6l5.334 4A1 1 0 0011 16V8a1 1 0 00-1.6-.8l-5.334 4z"
           />
         </svg>
-        <span>Undo</span>
+        <span>{$t('undo')}</span>
         {#if showHotkeyOverlay && canUndo}
           <span
             class="absolute -top-1.5 -right-1.5 bg-cyan-400 text-black text-[8px] font-mono font-bold px-1 rounded shadow-md border border-cyan-500 select-none z-50 pointer-events-none"
@@ -104,7 +105,7 @@
         disabled={!canRedo}
         title="Redo (Ctrl+Shift+Z)"
       >
-        <span>Redo</span>
+        <span>{$t('redo')}</span>
         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path
             stroke-linecap="round"
@@ -136,7 +137,7 @@
   >
     {#if localEdits.length === 0}
       <div class="flex flex-col items-center justify-center h-32 text-cortex-600 text-xs italic">
-        <span>No edits in this session</span>
+        <span>{$t('history.noEdits')}</span>
       </div>
     {:else}
       <div class="space-y-1.5">
