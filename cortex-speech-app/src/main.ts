@@ -78,7 +78,7 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
       return Math.max(0.02, Math.min(1, env * osc));
     });
 
-  const mockInvoke = async (cmd: string): Promise<unknown> => {
+  const mockInvoke = async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
     if (cmd.startsWith('plugin:')) return null;
     if (cmd === 'get_segments') return sampleSegments();
     if (cmd === 'get_waveform') return sampleWaveform();
@@ -86,12 +86,21 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     if (cmd === 'get_stats' || cmd === 'compute_stats') return sampleStats();
     if (cmd === 'count_segments' || cmd === 'get_segment_count') return SAMPLE.length;
     if (cmd === 'get_speakers') return ['SPEAKER_00', 'SPEAKER_01', 'SPEAKER_02'];
+    if (cmd === 'search_segments') {
+      const q = String(args?.query ?? '').toLowerCase();
+      return sampleSegments().filter(
+        (s) =>
+          s.rawTranscript.toLowerCase().includes(q) ||
+          s.audioPath.toLowerCase().includes(q) ||
+          (s.speakerId ?? '').toLowerCase().includes(q),
+      );
+    }
     if (listKinds.test(cmd)) return [];
     if (objKinds.test(cmd)) return {};
     return null;
   };
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
-    invoke: (cmd: string) => mockInvoke(cmd),
+    invoke: (cmd: string, args?: Record<string, unknown>) => mockInvoke(cmd, args),
     transformCallback: (cb: unknown) => {
       const id = Math.floor(Math.random() * 1e9);
       const w = window as unknown as Record<string, Record<number, unknown>>;
