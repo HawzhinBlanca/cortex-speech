@@ -292,12 +292,12 @@
 </script>
 
 <div
-  class="relative w-full bg-slate-950/40 backdrop-blur-md rounded-xl border border-slate-800/50 p-3 flex flex-col gap-2"
+  class="relative w-full bg-cortex-950/40 backdrop-blur-md rounded-xl border border-cortex-800/50 p-3 flex flex-col gap-2"
 >
   <!-- Timeline Zoom Control bar -->
-  <div class="flex items-center justify-between text-[10px] text-slate-400 font-mono px-1">
+  <div class="flex items-center justify-between text-[10px] text-cortex-400 font-mono px-1">
     <div class="flex items-center gap-1.5">
-      <svg class="w-3 h-3 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <svg class="w-3 h-3 text-cortex-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path
           stroke-linecap="round"
           stroke-linejoin="round"
@@ -314,7 +314,7 @@
         max="10.0"
         step="0.5"
         bind:value={zoom}
-        class="w-32 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 focus:outline-none"
+        class="w-32 h-1 bg-cortex-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 focus:outline-none"
         aria-label="Waveform zoom slider"
       />
       <span class="w-8 text-end font-bold text-indigo-400">{zoom.toFixed(1)}x</span>
@@ -324,7 +324,7 @@
   <!-- Audio Waveform Canvas Box -->
   <div
     bind:this={scrollContainer}
-    class="w-full overflow-x-auto relative rounded-lg border border-slate-800/30 scroll-smooth shadow-inner"
+    class="w-full overflow-x-auto relative rounded-lg border border-cortex-800/30 scroll-smooth shadow-inner"
     style="scrollbar-width: thin; scrollbar-color: #4f46e5 transparent;"
   >
     <canvas
