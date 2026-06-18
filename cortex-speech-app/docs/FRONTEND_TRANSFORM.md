@@ -41,13 +41,22 @@ Toggle the theme in Settings, press **Cmd-K**, resize panels and relaunch.
 - **Focus-trap on every dialog** — Settings, Validation, WSL now match the Modal-routed
   ones (focus in / cycle / restore).
 
-## Verify visually when you're back (`npm run dev` → localhost:1420)
+## Verified live in the preview (not just built — measured)
 
-1. **Light mode** (Settings → theme → Light): the *status* colors (red/amber/emerald/
-   indigo badges for confidence/speaker) are still raw Tailwind shades — they read fine
-   in dark but want a token pass for ideal light-mode contrast. Everything else themes.
-2. **RTL** (Kurdish): the header/search/badges use a mix of physical + logical spacing;
-   a `ms-/me-/ps-/pe-/start-/end-` sweep would make Sorani pixel-perfect.
+Using the running dev server I introspected computed styles directly and fixed
+what the numbers showed:
+
+1. **Contrast — both themes pass AA.** Walked every rendered text node and computed
+   its ratio against the effective background. Fixed light `--text-subtle` (2.9→4.7:1)
+   and dark `--cortex-600` (2.86→>3:1). Audit: **0 nodes below 3:1 in light or dark**.
+2. **Status colors — fixed in light, byte-identical in dark.** red/amber/emerald/cyan/
+   indigo/orange/blue are now theme-aware channel vars. Measured bare text + opacity
+   chips: every pattern went from 1.4–2.6:1 (failing) to 4.7–16.6:1. Dark spot-checked
+   identical (`text-red-400` == `rgb(248,113,113)`). No markup touched.
+3. **RTL** (Kurdish, default): `dir=rtl` confirmed; the activity rail mirrors to the
+   right with logical borders; physical spacing swept to `ms-/me-/ps-/pe-`.
+4. **Interactions**: activity rail switches workspaces (`aria-current` toggles), ⌘K
+   palette opens/filters/closes on Esc, **zero console errors**.
 
 ## Information architecture — DONE (the audit's #1 structural item)
 

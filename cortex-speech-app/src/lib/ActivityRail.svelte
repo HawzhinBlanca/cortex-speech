@@ -24,7 +24,7 @@
   {#each items as it (it.id)}
     <button
       type="button"
-      class="relative flex h-10 w-10 items-center justify-center rounded-token transition-colors duration-150
+      class="ring-focus relative flex h-10 w-10 items-center justify-center rounded-token transition-colors duration-150
         {view === it.id ? 'bg-accent-soft text-accent' : 'text-subtle hover:bg-surface-3 hover:text-default'}"
       aria-current={view === it.id ? 'page' : undefined}
       title={$t(it.labelKey)}
@@ -44,7 +44,7 @@
 
   <button
     type="button"
-    class="flex h-10 w-10 items-center justify-center rounded-token text-subtle transition-colors duration-150 hover:bg-surface-3 hover:text-default"
+    class="ring-focus flex h-10 w-10 items-center justify-center rounded-token text-subtle transition-colors duration-150 hover:bg-surface-3 hover:text-default"
     title={$t('settings')}
     aria-label={$t('settings')}
     onclick={() => onSelect('settings')}
