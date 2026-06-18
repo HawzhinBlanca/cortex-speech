@@ -80,7 +80,7 @@
     <input
       type="search"
       data-testid="search-input"
-      class="input pl-9 pr-8"
+      class="input ps-9 pe-8"
       placeholder={$t('searchPlaceholder')}
       bind:value={query}
       oninput={handleInput}
@@ -111,7 +111,7 @@
         >{opt.label}</button>
       {/each}
     </div>
-    <div class="ml-auto">
+    <div class="ms-auto">
       <select class="text-xs bg-cortex-800 border border-cortex-700 rounded px-2 py-1 text-cortex-300" value={$sortOrder} oninput={(e) => sortOrder.set((e.target as HTMLSelectElement).value as 'newest' | 'oldest' | 'duration' | 'verified' | 'confidence' | 'activeLearning')}>
         <option value="newest">{$t('sortNewest')}</option>
         <option value="oldest">{$t('sortOldest')}</option>

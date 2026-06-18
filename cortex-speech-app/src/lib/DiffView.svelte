@@ -66,7 +66,7 @@
   <div class="rounded-lg border border-cortex-800/50 bg-cortex-950/40 overflow-hidden">
     <button
       type="button"
-      class="w-full flex items-center justify-between px-3 py-2 text-left hover:bg-cortex-800/30 transition-colors"
+      class="w-full flex items-center justify-between px-3 py-2 text-start hover:bg-cortex-800/30 transition-colors"
       onclick={() => collapsed = !collapsed}
       aria-expanded={!collapsed}
     >

@@ -307,7 +307,7 @@
         class="w-32 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 focus:outline-none"
         aria-label="Waveform zoom slider"
       />
-      <span class="w-8 text-right font-bold text-indigo-400">{zoom.toFixed(1)}x</span>
+      <span class="w-8 text-end font-bold text-indigo-400">{zoom.toFixed(1)}x</span>
     </div>
   </div>
 

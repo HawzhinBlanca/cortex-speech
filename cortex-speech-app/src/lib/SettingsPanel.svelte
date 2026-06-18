@@ -186,7 +186,7 @@
       <nav class="w-40 shrink-0 p-2 border-r border-cortex-800/50 space-y-1">
         {#each tabs as tab}
           <button
-            class="w-full text-left px-3 py-2 rounded-lg text-sm transition-colors {activeTab === tab.id ? 'bg-cortex-700 text-cortex-100' : 'text-cortex-300 hover:text-cortex-100 hover:bg-cortex-800/50'}"
+            class="w-full text-start px-3 py-2 rounded-lg text-sm transition-colors {activeTab === tab.id ? 'bg-cortex-700 text-cortex-100' : 'text-cortex-300 hover:text-cortex-100 hover:bg-cortex-800/50'}"
             disabled={!tauriAvailable && tab.id === 'models'}
             title={!tauriAvailable && tab.id === 'models' ? $t('desktopRuntimeRequired') : ''}
             onclick={() => activeTab = tab.id}
@@ -222,7 +222,7 @@
             <span class="text-sm text-muted">{$t('autoNormalize')}</span>
           </label>
           {#if localSettings.autoNormalize}
-            <label class="flex items-center gap-3 cursor-pointer pl-6">
+            <label class="flex items-center gap-3 cursor-pointer ps-6">
               <input type="checkbox" bind:checked={localSettings.verbalizeNumbers} class="accent-cortex-500">
               <span class="text-sm text-muted">{$t('verbalizeNumbers')}</span>
             </label>
@@ -248,7 +248,7 @@
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('threads')}</span>
             <input type="range" min="1" max="16" bind:value={localSettings.numThreads} class="flex-1 accent-cortex-500">
-            <span class="text-xs font-mono text-cortex-300 w-6 text-right">{localSettings.numThreads}</span>
+            <span class="text-xs font-mono text-cortex-300 w-6 text-end">{localSettings.numThreads}</span>
           </label>
           <label class="flex items-center gap-3 cursor-pointer">
             <input type="checkbox" bind:checked={localSettings.enableGpu} class="accent-cortex-500">
@@ -259,7 +259,7 @@
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('vadThreshold')}</span>
             <input type="range" min="0" max="1" step="0.05" bind:value={localSettings.vadThreshold} class="flex-1 accent-cortex-500">
-            <span class="text-xs font-mono text-cortex-300 w-8 text-right">{localSettings.vadThreshold}</span>
+            <span class="text-xs font-mono text-cortex-300 w-8 text-end">{localSettings.vadThreshold}</span>
           </label>
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('minSegment')}</span>
@@ -296,12 +296,12 @@
             <label class="flex items-center gap-3">
               <span class="text-sm text-muted w-32">{$t('maxWer')}</span>
               <input type="range" min="0.05" max="0.80" step="0.05" bind:value={localSettings.maxWerThreshold} class="flex-1 accent-cortex-500">
-              <span class="text-xs font-mono text-cortex-300 w-10 text-right">{Math.round(localSettings.maxWerThreshold * 100)}%</span>
+              <span class="text-xs font-mono text-cortex-300 w-10 text-end">{Math.round(localSettings.maxWerThreshold * 100)}%</span>
             </label>
             <label class="flex items-center gap-3">
               <span class="text-sm text-muted w-32">{$t('maxCer')}</span>
               <input type="range" min="0.05" max="0.80" step="0.05" bind:value={localSettings.maxCerThreshold} class="flex-1 accent-cortex-500">
-              <span class="text-xs font-mono text-cortex-300 w-10 text-right">{Math.round(localSettings.maxCerThreshold * 100)}%</span>
+              <span class="text-xs font-mono text-cortex-300 w-10 text-end">{Math.round(localSettings.maxCerThreshold * 100)}%</span>
             </label>
           </div>
 
@@ -367,7 +367,7 @@
                 <input type="text" class="input w-full" bind:value={localSettings.llmModel} onblur={saveQuietly} onchange={saveQuietly} placeholder="heretic-final:latest" />
                 <span class="text-[10px] text-subtle">
                   Quick select: 
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 mr-2" onclick={() => { localSettings.llmModel = 'heretic-final:latest'; saveQuietly(); }}>heretic-final:latest</button>
+                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 me-2" onclick={() => { localSettings.llmModel = 'heretic-final:latest'; saveQuietly(); }}>heretic-final:latest</button>
                   <button type="button" class="underline text-cortex-400 hover:text-cortex-300" onclick={() => { localSettings.llmModel = 'qwen2.5-coder:7b'; saveQuietly(); }}>qwen2.5-coder:7b</button>
                 </span>
               </label>
@@ -391,7 +391,7 @@
                 <input type="text" class="input w-full" bind:value={localSettings.llmModel} onblur={saveQuietly} onchange={saveQuietly} placeholder="gemini-2.5-pro" />
                 <span class="text-[10px] text-subtle">
                   Quick select: 
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 mr-2" onclick={() => { localSettings.llmModel = 'gemini-2.5-pro'; saveQuietly(); }}>Gemini 2.5 Pro (Recommended)</button>
+                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 me-2" onclick={() => { localSettings.llmModel = 'gemini-2.5-pro'; saveQuietly(); }}>Gemini 2.5 Pro (Recommended)</button>
                   <button type="button" class="underline text-cortex-400 hover:text-cortex-300" onclick={() => { localSettings.llmModel = 'gemini-2.5-flash'; saveQuietly(); }}>Gemini 2.5 Flash</button>
                 </span>
               </label>
@@ -449,7 +449,7 @@
                 onchange={saveQuietly}
                 class="flex-1 accent-cortex-500"
               >
-              <span class="text-xs font-mono text-cortex-300 w-10 text-right">{Math.round(localSettings.juryT1Threshold * 100)}%</span>
+              <span class="text-xs font-mono text-cortex-300 w-10 text-end">{Math.round(localSettings.juryT1Threshold * 100)}%</span>
             </label>
             <p class="text-[10px] text-subtle -mt-3">Segments below this combined lexicon+perplexity score escalate to T2. Raise to reduce cloud calls.</p>
 
@@ -461,7 +461,7 @@
                   onblur={saveQuietly} placeholder="gemini-2.5-pro" />
                 <span class="text-[10px] text-subtle">
                   Quick select:
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 mr-2"
+                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 me-2"
                     onclick={() => { localSettings.juryModel = 'gemini-2.5-pro'; saveQuietly(); }}
                   >2.5 Pro (Recommended)</button>
                   <button type="button" class="underline text-cortex-400 hover:text-cortex-300"
@@ -477,7 +477,7 @@
                   placeholder="gemini-2.5-pro, gemini-2.5-flash" />
                 <span class="text-[10px] text-subtle">
                   Quick select:
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 mr-2"
+                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 me-2"
                     onclick={() => { sourceReferenceModelsInput = 'gemini-2.5-pro, gemini-2.5-flash'; saveSourceReferenceModels(); }}
                   >2.5 Pro + Flash</button>
                   <button type="button" class="underline text-cortex-400 hover:text-cortex-300"
