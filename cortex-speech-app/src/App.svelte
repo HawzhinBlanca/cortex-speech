@@ -860,8 +860,8 @@
     if (!seg) return;
     if (!requireDesktopRuntime()) return;
     showConfirmDialog.set({
-      title: 'Delete Segment',
-      message: `Delete segment "${seg.audioPath.split(/[/\\]/).pop()}"?`,
+      title: $t('deleteSegment'),
+      message: $t('deleteSegmentConfirm').replace('{name}', seg.audioPath.split(/[/\\]/).pop() ?? ''),
       onConfirm: handleDelete,
     });
   }
@@ -2194,6 +2194,7 @@
               </button>
 
               <button
+                data-testid="verify-btn"
                 class="btn btn-secondary !text-xs relative"
                 onclick={handleToggleVerify}
                 disabled={verifyInFlight || $isProcessing}
