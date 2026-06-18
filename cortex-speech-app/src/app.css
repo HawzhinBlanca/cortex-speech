@@ -29,7 +29,7 @@
   /* Text */
   --text: #e8eef6;
   --text-muted: #97a4b6;
-  --text-subtle: #61707f;
+  --text-subtle: #6d7c8c;
   --text-on-accent: #04121d;
 
   /* Accent — vivid sky, used with restraint */
@@ -81,7 +81,7 @@
   --cortex-200-rgb: 189 212 231;
   --cortex-300-rgb: 144 182 211;
   --cortex-400-rgb: 93 148 188;
-  --cortex-500-rgb: 62 121 163;
+  --cortex-500-rgb: 76 138 180;
   --cortex-600-rgb: 54 107 151;
   --cortex-700-rgb: 34 56 78;
   --cortex-800-rgb: 25 33 47;
@@ -214,7 +214,7 @@
   --cortex-100-rgb: 30 41 59;
   --cortex-200-rgb: 51 65 85;
   --cortex-300-rgb: 71 85 105;
-  --cortex-400-rgb: 100 116 139;
+  --cortex-400-rgb: 90 106 130;
   --cortex-500-rgb: 71 85 105;
   --cortex-600-rgb: 51 65 85;
   --cortex-700-rgb: 203 213 225;
