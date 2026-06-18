@@ -252,3 +252,19 @@ errors. Remaining work is OUT of preview scope:
   - native Sorani review of the new i18n strings
   - real Tauri end-to-end (ASR/export correctness) — needs `npm run tauri dev` +
     model download (models/ empty) + computer-use MCP to drive the desktop app.
+
+## D17 — real backend e2e: UTF-8 char-boundary panic in real_audio test (FIXED)
+
+First REAL backend run (not the vite mock): `CORTEX_REAL_AUDIO_DIR=<dir with
+podcast.wav> cargo test --test real_audio -- --ignored --nocapture`. The real
+OmniASR/sherpa-onnx pipeline works end-to-end — decode→16kHz, Silero VAD, fbank
+(29551×80), normalizer (ك→ک, ي→ی, tatweel strip), and ASR transcribed the file
+into 20 Sorani segments (CPU fallback, ~257-273s/file). 13/14 passed.
+
+The 1 failure was test-only: `real_audio.rs:374/375/411` printed transcripts via
+`&seg.raw_transcript[..len.min(80)]` — slicing Kurdish text at a raw BYTE index,
+which panics when byte 80 lands inside a 2-byte glyph ('ی', bytes 79..81). The
+pipeline import itself succeeded; only the debug `eprintln!` crashed. Fixed by
+truncating with `.chars().take(40).collect::<String>()` (char-safe) at all 3 sites.
+Re-ran → 14/14 pass. Production code is clean: every byte-slice there is on ASCII
+(hashes `&hash[..12]`, UUIDs `&id[..8]`) or `Vec::truncate`, never on transcript text.
