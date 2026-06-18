@@ -494,6 +494,18 @@
     gap: 0.3rem;
     border-radius: var(--r-sm);
   }
+  /* Always-dark terminal surface (bg-black) — pin the palette to dark values so
+     log text stays light-on-black regardless of the app theme. */
+  .terminal-dark {
+    --cortex-400-rgb: 93 148 188;
+    --cortex-500-rgb: 76 138 180;
+    --cortex-600-rgb: 54 107 151;
+    --cyan-400-rgb: 34 211 238;
+    --red-400-rgb: 248 113 113;
+    --emerald-400-rgb: 52 211 153;
+    --text-muted: #97a4b6;
+    --text-subtle: #6d7c8c;
+  }
 
   /* Compact square icon button */
   .icon-btn {
