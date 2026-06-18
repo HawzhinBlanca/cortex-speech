@@ -39,29 +39,30 @@
     icon: string;
     color: string;
   } {
-    if (conf == null) return { label: 'Unknown confidence', icon: '❓', color: '#6b7280' };
+    if (conf == null)
+      return { label: 'Unknown confidence', icon: '❓', color: 'var(--text-subtle)' };
     if (conf >= 0.9)
       return {
         label: `AI is very confident (${Math.round(conf * 100)}%) — quick glance 👀`,
         icon: '✅',
-        color: '#22c55e',
+        color: 'var(--success)',
       };
     if (conf >= 0.75)
       return {
         label: `AI is fairly sure (${Math.round(conf * 100)}%) — quick listen 👂`,
         icon: '🟡',
-        color: '#eab308',
+        color: 'var(--warning)',
       };
     if (conf >= 0.55)
       return {
         label: `AI is unsure (${Math.round(conf * 100)}%) — listen carefully ⚠`,
         icon: '⚠️',
-        color: '#f97316',
+        color: 'rgb(var(--orange-400-rgb))',
       };
     return {
       label: `AI has low confidence (${Math.round(conf * 100)}%) — careful review needed 🔴`,
       icon: '🔴',
-      color: '#ef4444',
+      color: 'var(--danger)',
     };
   }
 
@@ -93,7 +94,8 @@
         return;
       }
       const report = await api.runJuryPipeline(targetIds);
-      statusMsg = `⚡ Jury finished! T0 accepted: ${report.t0AutoAccepted}, T1 committed: ${report.t1Committed}, T2 committed: ${report.t2Committed}, Escalated: ${report.humanInbox}`;
+      if (!report) throw new Error('Jury pipeline returned no result');
+      statusMsg = `⚡ Jury finished! T0 accepted: ${report.t0AutoAccepted ?? 0}, T1 committed: ${report.t1Committed ?? 0}, T2 committed: ${report.t2Committed ?? 0}, Escalated: ${report.humanInbox ?? 0}`;
       await loadQueue();
     } catch (e) {
       statusMsg = `❌ Jury pipeline failed: ${e}`;
@@ -284,7 +286,7 @@
 
     <!-- Run Jury Button -->
     <button
-      class="run-jury-btn"
+      class="btn btn-primary btn-sm"
       onclick={triggerJuryPipeline}
       disabled={isRunningJury}
       title="Run full T0->T1->T2 pipeline on all unverified segments"
@@ -321,10 +323,10 @@
       <h3>Inbox zero!</h3>
       <p>No segments need review right now.</p>
       <div style="display: flex; gap: 10px; margin-top: 10px;">
-        <button class="btn-primary" onclick={triggerJuryPipeline} disabled={isRunningJury}>
+        <button class="btn btn-primary" onclick={triggerJuryPipeline} disabled={isRunningJury}>
           {isRunningJury ? 'Running Jury...' : '⚡ Run Jury Pipeline'}
         </button>
-        <button class="btn-secondary" onclick={loadQueue}>Refresh</button>
+        <button class="btn btn-secondary" onclick={loadQueue}>Refresh</button>
       </div>
     </div>
   {:else}
@@ -441,8 +443,8 @@
                 rows={3}
               ></textarea>
               <div class="edit-actions">
-                <button class="btn-primary" onclick={commitEdit}>Save edit (Ctrl+↵)</button>
-                <button class="btn-secondary" onclick={() => (isEditing = false)}
+                <button class="btn btn-primary" onclick={commitEdit}>Save edit (Ctrl+↵)</button>
+                <button class="btn btn-secondary" onclick={() => (isEditing = false)}
                   >Cancel (Esc)</button
                 >
               </div>
@@ -497,9 +499,9 @@
     display: flex;
     flex-direction: column;
     height: 100%;
-    background: #0e1117;
-    color: #e2e8f0;
-    font-family: 'Inter', system-ui, sans-serif;
+    background: var(--app-bg);
+    color: var(--text);
+    font-family: var(--font-sans);
     border-radius: 12px;
     overflow: hidden;
   }
@@ -510,8 +512,8 @@
     align-items: center;
     gap: 12px;
     padding: 12px 16px;
-    background: #161b27;
-    border-bottom: 1px solid #2d3748;
+    background: var(--surface-1);
+    border-bottom: 1px solid var(--border);
     flex-shrink: 0;
   }
   .inbox-title {
@@ -524,14 +526,14 @@
     margin: 0;
     font-size: 0.95rem;
     font-weight: 600;
-    color: #a78bfa;
+    color: var(--accent);
   }
   .inbox-icon {
     font-size: 1.1rem;
   }
   .inbox-badge {
-    background: #7c3aed;
-    color: #fff;
+    background: var(--accent);
+    color: var(--text-on-accent);
     font-size: 0.7rem;
     font-weight: 700;
     padding: 1px 7px;
@@ -540,39 +542,13 @@
   .close-btn {
     background: none;
     border: none;
-    color: #6b7280;
+    color: var(--text-muted);
     cursor: pointer;
     font-size: 1rem;
     padding: 4px;
   }
   .close-btn:hover {
-    color: #e2e8f0;
-  }
-
-  .run-jury-btn {
-    background: linear-gradient(135deg, #7c3aed, #4f46e5);
-    color: #fff;
-    border: 1px solid #6d28d9;
-    font-size: 0.7rem;
-    font-weight: 600;
-    padding: 4px 10px;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: all 0.2s;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    white-space: nowrap;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-  }
-  .run-jury-btn:hover:not(:disabled) {
-    background: linear-gradient(135deg, #8b5cf6, #6366f1);
-    transform: translateY(-1px);
-    box-shadow: 0 0 10px rgba(124, 58, 237, 0.4);
-  }
-  .run-jury-btn:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
+    color: var(--text);
   }
 
   /* ── Autonomy Dial ───────────────────────────────────────────────────────────── */
@@ -581,9 +557,9 @@
     gap: 4px;
   }
   .dial-btn {
-    background: #1e2536;
-    border: 1px solid #2d3748;
-    color: #94a3b8;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
     font-size: 0.65rem;
     padding: 3px 8px;
     border-radius: 6px;
@@ -592,13 +568,13 @@
     white-space: nowrap;
   }
   .dial-btn:hover {
-    border-color: #7c3aed;
-    color: #e2e8f0;
+    border-color: var(--accent);
+    color: var(--text);
   }
   .dial-btn.active {
-    background: #7c3aed;
-    border-color: #7c3aed;
-    color: #fff;
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--text-on-accent);
   }
 
   /* ── Loading / Empty ─────────────────────────────────────────────────────────── */
@@ -610,7 +586,7 @@
     justify-content: center;
     flex: 1;
     gap: 12px;
-    color: #94a3b8;
+    color: var(--text-muted);
     font-size: 0.9rem;
   }
   .empty-icon {
@@ -618,7 +594,7 @@
   }
   .inbox-empty h3 {
     margin: 0;
-    color: #e2e8f0;
+    color: var(--text);
   }
   .inbox-empty p {
     margin: 0;
@@ -629,7 +605,7 @@
     display: inline-block;
     width: 18px;
     height: 18px;
-    border: 2px solid #7c3aed;
+    border: 2px solid currentColor;
     border-top-color: transparent;
     border-radius: 50%;
     animation: spin 0.7s linear infinite;
@@ -651,8 +627,8 @@
   .queue-rail {
     width: 140px;
     flex-shrink: 0;
-    background: #0d1117;
-    border-right: 1px solid #2d3748;
+    background: var(--surface-1);
+    border-right: 1px solid var(--border);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -661,10 +637,10 @@
     padding: 8px 10px;
     font-size: 0.65rem;
     font-weight: 600;
-    color: #6b7280;
+    color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    border-bottom: 1px solid #1e2536;
+    border-bottom: 1px solid var(--border);
   }
   .rail-list {
     flex: 1;
@@ -685,7 +661,7 @@
     cursor: pointer;
     transition: background 0.1s;
     font-size: 0.72rem;
-    color: #94a3b8;
+    color: var(--text-muted);
     border-radius: 4px;
     margin: 1px 4px;
     user-select: none;
@@ -695,11 +671,11 @@
     text-align: left;
   }
   .rail-item:hover {
-    background: #1e2536;
+    background: var(--surface-3);
   }
   .rail-item.active {
-    background: #2d1f5e;
-    color: #c4b5fd;
+    background: var(--accent-soft);
+    color: var(--accent);
   }
   .rail-item.done {
     opacity: 0.45;
@@ -709,14 +685,14 @@
   }
   .rail-id {
     flex: 1;
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 0.65rem;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .rail-done {
-    color: #22c55e;
+    color: var(--success);
     font-size: 0.7rem;
   }
 
@@ -740,23 +716,23 @@
   .meta-id,
   .meta-dur,
   .meta-speaker {
-    background: #1e2536;
-    border: 1px solid #2d3748;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
     padding: 2px 8px;
     border-radius: 4px;
     font-size: 0.7rem;
-    font-family: monospace;
-    color: #94a3b8;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
   }
 
   /* ── Waveform zone ───────────────────────────────────────────────────────────── */
   .waveform-zone {
-    background: #161b27;
-    border: 1px solid #2d3748;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px 16px;
     font-size: 0.8rem;
-    color: #6b7280;
+    color: var(--text-muted);
   }
   .waveform-stub {
     font-size: 0.8rem;
@@ -774,27 +750,27 @@
     margin: 0;
     font-size: 0.72rem;
     font-weight: 600;
-    color: #6b7280;
+    color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
 
   .hyp-raw,
   .hyp-norm {
-    background: #161b27;
-    border: 1px solid #2d3748;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 10px 14px;
-    font-family: 'Vazirmatn', 'Noto Naskh Arabic', system-ui, sans-serif;
+    font-family: var(--font-kurdish);
     font-size: 1.05rem;
     line-height: 1.9;
-    color: #cbd5e1;
+    color: var(--text);
     text-align: start;
   }
   .hyp-label-inline {
     font-size: 0.65rem;
-    color: #6b7280;
-    font-family: monospace;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
     display: inline-block;
     margin-inline-end: 8px;
   }
@@ -804,40 +780,40 @@
   }
 
   .verdict-text {
-    background: #1a1f2e;
-    border: 1px solid #4c1d95;
+    background: var(--accent-soft);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
     border-radius: 8px;
     padding: 12px 16px;
-    font-family: 'Vazirmatn', 'Noto Naskh Arabic', system-ui, sans-serif;
+    font-family: var(--font-kurdish);
     font-size: 1.1rem;
     line-height: 1.9;
-    color: #c4b5fd;
+    color: var(--text);
     text-align: start;
   }
 
   /* ── Rationale ────────────────────────────────────────────────────────────────── */
   .rationale-details {
-    background: #0d1117;
-    border: 1px solid #2d3748;
+    background: var(--surface-inset);
+    border: 1px solid var(--border);
     border-radius: 6px;
     padding: 8px 12px;
     font-size: 0.8rem;
   }
   .rationale-details summary {
     cursor: pointer;
-    color: #94a3b8;
+    color: var(--text-muted);
   }
   .rationale-text {
-    color: #cbd5e1;
+    color: var(--text-muted);
     margin: 6px 0 0;
     line-height: 1.6;
   }
   .evidence-pre {
-    background: #161b27;
+    background: var(--surface-inset);
     border-radius: 4px;
     padding: 8px;
     font-size: 0.7rem;
-    color: #94a3b8;
+    color: var(--text-muted);
     overflow-x: auto;
     white-space: pre-wrap;
     word-break: break-all;
@@ -848,13 +824,13 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    background: #161b27;
-    border: 1px solid #2d3748;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
     border-left-width: 3px;
     border-radius: 6px;
     padding: 8px 14px;
     font-size: 0.8rem;
-    color: #94a3b8;
+    color: var(--text);
   }
   .conf-icon {
     font-size: 1rem;
@@ -868,23 +844,23 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    background: #161b27;
-    border: 1px solid #7c3aed;
+    background: var(--surface-2);
+    border: 1px solid var(--accent);
     border-radius: 8px;
     padding: 12px 16px;
   }
   .edit-label {
     font-size: 0.75rem;
-    color: #94a3b8;
+    color: var(--text-muted);
   }
   .edit-textarea {
-    background: #0d1117;
-    border: 1px solid #2d3748;
+    background: var(--surface-inset);
+    border: 1px solid var(--border);
     border-radius: 6px;
-    color: #e2e8f0;
+    color: var(--text);
     padding: 8px 12px;
     resize: vertical;
-    font-family: 'Vazirmatn', 'Noto Naskh Arabic', system-ui, sans-serif;
+    font-family: var(--font-kurdish);
     font-size: 1rem;
     line-height: 1.9;
     direction: rtl;
@@ -902,8 +878,8 @@
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
-    background: #0d1117;
-    border-top: 1px solid #2d3748;
+    background: var(--surface-1);
+    border-top: 1px solid var(--border);
     padding: 12px 0 4px;
     position: sticky;
     bottom: 0;
@@ -914,7 +890,7 @@
     gap: 6px;
     padding: 8px 16px;
     border-radius: 8px;
-    border: 1px solid;
+    border: 1px solid transparent;
     font-size: 0.8rem;
     font-weight: 600;
     cursor: pointer;
@@ -926,67 +902,70 @@
     cursor: not-allowed;
   }
   .verb-key {
-    background: rgba(255, 255, 255, 0.1);
+    background: color-mix(in srgb, currentColor 16%, transparent);
     border-radius: 4px;
     padding: 1px 5px;
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: 0.7rem;
   }
+  /* Semantic verb buttons use the theme-aware status palettes (channels defined
+     in app.css :root/.light) so each tint + label clears ≥3:1 in both themes. */
   .verb-btn.accept {
-    background: #14532d;
-    border-color: #16a34a;
-    color: #86efac;
+    background: rgb(var(--emerald-500-rgb) / 0.12);
+    border-color: rgb(var(--emerald-500-rgb) / 0.35);
+    color: rgb(var(--emerald-400-rgb));
   }
   .verb-btn.accept:hover:not(:disabled) {
-    background: #166534;
+    background: rgb(var(--emerald-500-rgb) / 0.2);
   }
   .verb-btn.edit {
-    background: #1e3a5f;
-    border-color: #2563eb;
-    color: #93c5fd;
+    background: rgb(var(--blue-500-rgb) / 0.12);
+    border-color: rgb(var(--blue-500-rgb) / 0.35);
+    color: rgb(var(--blue-400-rgb));
   }
   .verb-btn.edit:hover:not(:disabled) {
-    background: #1e40af;
+    background: rgb(var(--blue-500-rgb) / 0.2);
   }
   .verb-btn.reject {
-    background: #4c1d1d;
-    border-color: #dc2626;
-    color: #fca5a5;
+    background: rgb(var(--red-500-rgb) / 0.12);
+    border-color: rgb(var(--red-500-rgb) / 0.35);
+    color: rgb(var(--red-400-rgb));
   }
   .verb-btn.reject:hover:not(:disabled) {
-    background: #7f1d1d;
+    background: rgb(var(--red-500-rgb) / 0.2);
   }
   .verb-btn.skip {
-    background: #1e2536;
-    border-color: #475569;
-    color: #94a3b8;
+    background: var(--surface-2);
+    border-color: var(--border);
+    color: var(--text-muted);
   }
   .verb-btn.skip:hover:not(:disabled) {
-    background: #2d3748;
+    background: var(--surface-3);
+    color: var(--text);
   }
   .verb-btn.flag {
-    background: #451a03;
-    border-color: #ea580c;
-    color: #fdba74;
+    background: rgb(var(--amber-500-rgb) / 0.12);
+    border-color: rgb(var(--amber-500-rgb) / 0.35);
+    color: rgb(var(--amber-400-rgb));
   }
   .verb-btn.flag:hover:not(:disabled) {
-    background: #7c2d12;
+    background: rgb(var(--amber-500-rgb) / 0.2);
   }
   .verb-btn.undo {
-    background: #1e1e1e;
-    border-color: #374151;
-    color: #6b7280;
+    background: var(--surface-2);
+    border-color: var(--border);
+    color: var(--text-subtle);
   }
   .verb-btn.undo:hover:not(:disabled) {
-    background: #2d3748;
-    color: #e2e8f0;
+    background: var(--surface-3);
+    color: var(--text);
   }
 
   /* ── Status bar ─────────────────────────────────────────────────────────────── */
   .status-bar {
     text-align: center;
     font-size: 0.78rem;
-    color: #a78bfa;
+    color: var(--accent);
     padding: 4px 0;
     animation: fadeIn 0.2s ease;
   }
@@ -998,34 +977,5 @@
     to {
       opacity: 1;
     }
-  }
-
-  /* ── Shared button styles ─────────────────────────────────────────────────────── */
-  .btn-primary {
-    background: #7c3aed;
-    color: #fff;
-    border: none;
-    padding: 8px 18px;
-    border-radius: 8px;
-    font-size: 0.82rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-  .btn-primary:hover {
-    background: #6d28d9;
-  }
-  .btn-secondary {
-    background: #1e2536;
-    color: #94a3b8;
-    border: 1px solid #2d3748;
-    padding: 8px 18px;
-    border-radius: 8px;
-    font-size: 0.82rem;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-  .btn-secondary:hover {
-    background: #2d3748;
   }
 </style>
