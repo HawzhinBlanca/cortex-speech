@@ -102,6 +102,20 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
   collapse the cortex scale and brighten dark past the byte-identical baseline.
 - **Net:** both themes AA-large clean everywhere; light fully strict-AA (4.5).
 
+## Iteration 4 — A→Z feature drive
+
+### ✅ Search pipeline verified (+ mock now implements it)
+- **Found:** in the preview, every search returned 0 results. Root cause: NOT an
+  app bug — `filteredSegments` correctly prefers backend `$searchResults` over
+  local matching, but the dev mock returned `[]` for `search_segments` (and
+  ignored args), so `searchResults=[]` filtered everything out.
+- **Fix (test infra):** mock `invoke` now passes args; `search_segments` filters
+  the sample data by query (text/filename/speaker). Verified the full search
+  pipeline live: speaker `SPEAKER_00`→3, `clip_2`→1, `هەولێر`→1, no-match→0
+  (no-results state shown), clear→8. Confirms the search feature's frontend wiring
+  is correct end-to-end.
+- **Note:** backend match quality itself still needs the real Tauri app to verify.
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
