@@ -83,7 +83,8 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     if (cmd === 'get_segments') return sampleSegments();
     if (cmd === 'get_waveform') return sampleWaveform();
     if (cmd === 'get_audio_duration') return 6.2;
-    if (cmd === 'get_stats' || cmd === 'compute_stats') return sampleStats();
+    if (cmd === 'get_stats' || cmd === 'compute_stats' || cmd === 'get_dataset_stats')
+      return sampleStats();
     if (cmd === 'count_segments' || cmd === 'get_segment_count') return SAMPLE.length;
     if (cmd === 'get_speakers') return ['SPEAKER_00', 'SPEAKER_01', 'SPEAKER_02'];
     if (cmd === 'search_segments') {
