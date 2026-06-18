@@ -71,7 +71,7 @@
   --cortex-300-rgb: 144 182 211;
   --cortex-400-rgb: 93 148 188;
   --cortex-500-rgb: 62 121 163;
-  --cortex-600-rgb: 47 93 131;
+  --cortex-600-rgb: 54 107 151;
   --cortex-700-rgb: 34 56 78;
   --cortex-800-rgb: 25 33 47;
   --cortex-900-rgb: 13 18 27;
@@ -95,7 +95,7 @@
 
   --text: #0f1729;
   --text-muted: #52607a;
-  --text-subtle: #8593a6;
+  --text-subtle: #647085;
   --text-on-accent: #ffffff;
 
   --accent: #0284c7;
