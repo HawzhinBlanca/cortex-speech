@@ -149,6 +149,16 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
 - Mock returned verificationRate as 0–1 ratio → Insights showed "0.5%" for 4/8.
   App uses 0–100 (buildLocalStats *100). Mock now *100 → shows "50.0%".
 
+## Iteration 7 — review/merge/export (fast)
+
+- ✅ **D12** — `DatasetMerge` was a bare `.fixed` overlay (no role=dialog/focus-trap/
+  Esc). Added dialog a11y; verified opens as role=dialog ("MERGE DATASET").
+- ✅ **D13** — `ReviewInbox` deref'd `runJuryPipeline()` result unguarded (raw error
+  on null + "undefined" fields). Guard + `?? 0`.
+- ✅ Verified no-crash: export button (save-dialog cancel path), `?` opens shortcuts
+  help. All 6 `.fixed` modal components now have role=dialog (Modal/Settings/Speaker/
+  Validation/WSL/DatasetMerge).
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
