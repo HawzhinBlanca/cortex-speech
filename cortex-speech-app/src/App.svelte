@@ -1615,9 +1615,9 @@
                 >^F</span
               >
             {/if}
-            <div class="flex gap-1">
+            <div class="flex flex-wrap gap-1">
               <button
-                class="btn btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary btn-sm !text-[10px] flex-1"
                 onclick={() => handleBatchTranscribe('empty')}
                 disabled={!tauriAvailable ||
                   $isProcessing ||
@@ -1626,7 +1626,7 @@
                 >{$t('batchTranscribe.empty')}</button
               >
               <button
-                class="btn btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary btn-sm !text-[10px] flex-1"
                 onclick={() => handleBatchTranscribe('selected')}
                 disabled={!tauriAvailable || $isProcessing || !$selectedSegmentId}
                 title={tauriAvailable
@@ -1634,7 +1634,7 @@
                   : $t('desktopRuntimeRequired')}>{$t('batchTranscribe.selected')}</button
               >
               <button
-                class="btn btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary btn-sm !text-[10px] flex-1"
                 onclick={() => handleBatchTranscribe('filtered')}
                 disabled={!tauriAvailable || $isProcessing || $filteredSegments.length === 0}
                 title={tauriAvailable
@@ -1642,23 +1642,23 @@
                   : $t('desktopRuntimeRequired')}>{$t('batchTranscribe.filtered')}</button
               >
             </div>
-            <div class="flex gap-1">
+            <div class="flex flex-wrap gap-1">
               <button
-                class="btn btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary btn-sm !text-[10px] flex-1"
                 onclick={() => handleBatchVerify('pending')}
                 disabled={!tauriAvailable || $isProcessing || $segmentStats.pending === 0}
                 title={tauriAvailable ? $t('batchVerify.allPending') : $t('desktopRuntimeRequired')}
                 >{$t('batchVerify.allPending')}</button
               >
               <button
-                class="btn btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary btn-sm !text-[10px] flex-1"
                 onclick={() => handleBatchVerify('selected')}
                 disabled={!tauriAvailable || $isProcessing || !$selectedSegmentId}
                 title={tauriAvailable ? $t('batchVerify.selected') : $t('desktopRuntimeRequired')}
                 >{$t('batchVerify.selected')}</button
               >
             </div>
-            <div class="flex gap-1 items-center">
+            <div class="flex flex-wrap gap-1 items-center">
               <input
                 class="input !text-[10px] flex-1 !py-1 !px-2 font-mono"
                 placeholder={$t('batchAssignSpeaker.placeholder')}
@@ -1666,7 +1666,7 @@
                 aria-label={$t('batchAssignSpeaker.placeholder')}
               />
               <button
-                class="btn btn-secondary !text-[10px] shrink-0"
+                class="btn btn-secondary btn-sm !text-[10px] shrink-0"
                 onclick={handleBatchAssignSpeaker}
                 disabled={!tauriAvailable || $isProcessing || $filteredSegments.length === 0}
                 title={tauriAvailable
@@ -1674,9 +1674,9 @@
                   : $t('desktopRuntimeRequired')}>{$t('batchAssignSpeaker.label')}</button
               >
             </div>
-            <div class="flex gap-1">
+            <div class="flex flex-wrap gap-1">
               <button
-                class="btn btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary btn-sm !text-[10px] flex-1"
                 onclick={handleBatchNormalize}
                 disabled={!tauriAvailable ||
                   $isProcessing ||
@@ -1685,14 +1685,14 @@
                 >{$t('batchNormalize.label')}</button
               >
               <button
-                class="btn btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary btn-sm !text-[10px] flex-1"
                 onclick={() => handleRediarize('filtered')}
                 disabled={!tauriAvailable || $isProcessing || $filteredSegments.length === 0}
                 title={tauriAvailable ? $t('rediarize.filtered') : $t('desktopRuntimeRequired')}
                 >{$t('rediarize.filtered')}</button
               >
               <button
-                class="btn btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary btn-sm !text-[10px] flex-1"
                 onclick={() => handleRediarize('selected')}
                 disabled={!tauriAvailable || $isProcessing || !$selectedSegmentId}
                 title={tauriAvailable ? $t('rediarize.selected') : $t('desktopRuntimeRequired')}
@@ -1701,23 +1701,23 @@
             </div>
 
             <!-- Data & AI Tools -->
-            <div class="flex gap-1 border-t border-cortex-800/30 pt-2">
+            <div class="flex flex-wrap gap-1 border-t border-cortex-800/30 pt-2">
               <button
-                class="btn btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary btn-sm !text-[10px] flex-1"
                 onclick={openSpeakerPanel}
                 disabled={!tauriAvailable || $isProcessing}
                 title={tauriAvailable ? 'Speaker Management' : $t('desktopRuntimeRequired')}
                 >{$t('speakers')}</button
               >
               <button
-                class="btn btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary btn-sm !text-[10px] flex-1"
                 onclick={openDatasetMerge}
                 disabled={!tauriAvailable || $isProcessing}
                 title={tauriAvailable ? 'Merge Dataset JSON' : $t('desktopRuntimeRequired')}
                 >{$t('merge')}</button
               >
               <button
-                class="btn btn-danger !text-[10px] flex-1"
+                class="btn btn-danger btn-sm !text-[10px] flex-1"
                 onclick={handleDeleteFilteredWithConfirm}
                 disabled={!tauriAvailable || $isProcessing || $filteredSegments.length === 0}
                 title={tauriAvailable ? $t('batchDelete.filtered') : $t('desktopRuntimeRequired')}
