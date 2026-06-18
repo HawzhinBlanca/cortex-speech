@@ -180,6 +180,19 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
   ModelDownload×5, SpeakerPanel×2, WslConsole) — spawned as a task chip
   (task_092f46ed) for a focused localization sweep.
 
+## Iteration 10 — editor/review + i18n scope (fast)
+
+- ✅ **D16** — editor mode tabs "Interactive"/"Text Editor" were hardcoded English;
+  localized (en+ckb → کارلێک / دەستکاریی دەق). Verified.
+- ✅ Interactive editor renders + crash-safe on interaction. ReviewInbox opens, no
+  crash (its dialog-a11y folds into the legacy-purple retheme chip).
+- ✅ Pattern sweep clean: null-deref guarded everywhere; all 6 modals role=dialog;
+  `bg-black` hits are just modal backdrops.
+- 📋 **Broad i18n gap** — many hardcoded-English inline labels remain (Waveform
+  Timeline/Zoom, INTERACTIVE TEXT EDITOR, MERGE DATASET, History Stack, Terminal
+  Logs, panel/button labels) + the ~12 notifications. Consolidated into one
+  comprehensive task chip (task_41f33d86); narrower notif-only chip dismissed.
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
