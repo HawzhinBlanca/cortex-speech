@@ -4,7 +4,9 @@
   import { t } from './i18n';
   import Modal from './Modal.svelte';
 
-  let shortcuts = $state<ReturnType<NonNullable<typeof globalKeyboardManager>['getAll']> | null>(null);
+  let shortcuts = $state<ReturnType<NonNullable<typeof globalKeyboardManager>['getAll']> | null>(
+    null,
+  );
 
   $effect(() => {
     if (globalKeyboardManager) {
@@ -45,7 +47,9 @@
             </h3>
             <div class="space-y-0.5">
               {#each shortcuts.filter((s) => s.category === cat.id) as s (s.description)}
-                <div class="flex items-center justify-between gap-4 rounded-token px-2 py-1.5 text-sm transition-colors hover:bg-surface-2">
+                <div
+                  class="flex items-center justify-between gap-4 rounded-token px-2 py-1.5 text-sm transition-colors hover:bg-surface-2"
+                >
                   <span class="text-muted">{s.description}</span>
                   <kbd class="shrink-0">{modLabel(s)}</kbd>
                 </div>

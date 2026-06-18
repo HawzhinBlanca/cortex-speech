@@ -55,7 +55,10 @@
         });
       } else {
         notifications.success('Verified model downloads completed', {
-          detail: result.skipped > 0 ? `${result.skipped} unavailable model files were skipped.` : undefined,
+          detail:
+            result.skipped > 0
+              ? `${result.skipped} unavailable model files were skipped.`
+              : undefined,
         });
       }
       await loadStatus();
@@ -73,24 +76,29 @@
       return;
     }
     loadStatus();
-    
-    const unlisten = listen<ModelDownloadProgress>('model-download-progress', (event: Event<ModelDownloadProgress>) => {
-      const payload = event.payload;
-      if (payload.type === 'started') {
-        overallProgress.total = payload.total;
-        overallProgress.current = 0;
-      } else if (payload.type === 'progress') {
-        overallProgress.current = payload.current;
-        overallProgress.status = payload.status;
-        if (payload.filename) {
-          modelProgress[payload.filename] = payload.progress;
-        }
-      } else if (payload.type === 'completed') {
-        downloading = false;
-      }
-    });
 
-    return () => { unlisten.then(u => u()); };
+    const unlisten = listen<ModelDownloadProgress>(
+      'model-download-progress',
+      (event: Event<ModelDownloadProgress>) => {
+        const payload = event.payload;
+        if (payload.type === 'started') {
+          overallProgress.total = payload.total;
+          overallProgress.current = 0;
+        } else if (payload.type === 'progress') {
+          overallProgress.current = payload.current;
+          overallProgress.status = payload.status;
+          if (payload.filename) {
+            modelProgress[payload.filename] = payload.progress;
+          }
+        } else if (payload.type === 'completed') {
+          downloading = false;
+        }
+      },
+    );
+
+    return () => {
+      unlisten.then((u) => u());
+    };
   });
 </script>
 
@@ -114,8 +122,8 @@
         <span class="text-cortex-500">{overallProgress.current} / {overallProgress.total}</span>
       </div>
       <div class="h-1 bg-cortex-900 rounded-full overflow-hidden">
-        <div 
-          class="h-full bg-cortex-400 transition-all duration-300" 
+        <div
+          class="h-full bg-cortex-400 transition-all duration-300"
           style="width: {(overallProgress.current / overallProgress.total) * 100}%"
         ></div>
       </div>
@@ -129,7 +137,9 @@
     </div>
   {:else}
     {#each models as model}
-      <div class="flex flex-col gap-1.5 p-2 bg-cortex-900/50 rounded border border-transparent hover:border-cortex-800/50 transition-colors">
+      <div
+        class="flex flex-col gap-1.5 p-2 bg-cortex-900/50 rounded border border-transparent hover:border-cortex-800/50 transition-colors"
+      >
         <div class="flex items-center gap-2 text-xs">
           {#if model.downloaded}
             <span class="text-emerald-400">✓</span>
@@ -147,8 +157,8 @@
         </div>
         {#if modelProgress[model.filename] !== undefined && !model.downloaded}
           <div class="h-0.5 bg-cortex-900 rounded-full overflow-hidden">
-            <div 
-              class="h-full bg-cortex-500 transition-all" 
+            <div
+              class="h-full bg-cortex-500 transition-all"
               style="width: {modelProgress[model.filename] * 100}%"
             ></div>
           </div>

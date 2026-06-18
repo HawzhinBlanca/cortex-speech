@@ -110,14 +110,20 @@
 
   function attemptPlay(failureMessage: string) {
     if (!audioEl) return;
-    audioEl.play().then(() => playing = true).catch((e: unknown) => {
-      reportPlaybackFailure(failureMessage, e);
-    });
+    audioEl
+      .play()
+      .then(() => (playing = true))
+      .catch((e: unknown) => {
+        reportPlaybackFailure(failureMessage, e);
+      });
   }
 
   function play() {
     if (!audioEl) return;
-    if (startTime > 0 && (audioEl.currentTime < startTime || (endTime > 0 && audioEl.currentTime >= endTime))) {
+    if (
+      startTime > 0 &&
+      (audioEl.currentTime < startTime || (endTime > 0 && audioEl.currentTime >= endTime))
+    ) {
       audioEl.currentTime = startTime;
     }
     attemptPlay('Playback blocked or file not found');
@@ -195,7 +201,6 @@
   }
 </script>
 
-
 <div class="flex items-center gap-3 p-3 card" role="toolbar" aria-label="Audio player controls">
   {#if loading}
     <div class="flex items-center gap-3 w-full">
@@ -207,37 +212,41 @@
     <div class="flex items-center gap-2 text-red-300 text-xs w-full">
       <span class="text-red-400 font-bold" aria-hidden="true">!</span>
       <span>{error}</span>
-      <button type="button" class="ms-auto text-xs text-cortex-400 hover:text-cortex-200" onclick={() => { error = null; loading = true; resolveAudioUrl(audioPath); }}>Retry</button>
+      <button
+        type="button"
+        class="ms-auto text-xs text-cortex-400 hover:text-cortex-200"
+        onclick={() => {
+          error = null;
+          loading = true;
+          resolveAudioUrl(audioPath);
+        }}>Retry</button
+      >
     </div>
   {:else}
     <button
       type="button"
-      class="btn-primary !p-2 !rounded-full"
+      class="btn btn-primary !p-2 !rounded-full"
       onclick={playing ? pause : play}
       aria-label={playing ? 'Pause' : 'Play'}
     >
       {#if playing}
-        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg>
+        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"
+          ><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg
+        >
       {:else}
-        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg
+        >
       {/if}
     </button>
 
     <span class="text-xs font-mono text-cortex-300 min-w-12">{fmt(currentTime)}</span>
 
-    <input
-      type="range"
-      min="0"
-      max={duration}
-      value={currentTime}
-      oninput={seek}
-      class="flex-1"
-    />
+    <input type="range" min="0" max={duration} value={currentTime} oninput={seek} class="flex-1" />
 
     <span class="text-xs font-mono text-cortex-300 min-w-12">{fmt(duration)}</span>
     <button
       type="button"
-      class="btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono min-w-10 rounded-lg hover:bg-cortex-700/50 hover:text-white transition-colors border border-cortex-700/50 shadow-sm ms-1"
+      class="btn btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono min-w-10 rounded-lg hover:bg-cortex-700/50 hover:text-white transition-colors border border-cortex-700/50 shadow-sm ms-1"
       onclick={toggleRate}
       aria-label="Playback Speed"
       title="Playback Speed"
@@ -246,8 +255,10 @@
     </button>
     <button
       type="button"
-      class="btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono rounded-lg hover:bg-cortex-700/50 hover:text-white transition-colors border shadow-sm ms-1 {loop ? 'bg-indigo-600/30 text-indigo-200 border-indigo-500/40 hover:bg-indigo-600/40' : 'border-cortex-700/50 text-cortex-300'}"
-      onclick={() => loop = !loop}
+      class="btn btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono rounded-lg hover:bg-cortex-700/50 hover:text-white transition-colors border shadow-sm ms-1 {loop
+        ? 'bg-indigo-600/30 text-indigo-200 border-indigo-500/40 hover:bg-indigo-600/40'
+        : 'border-cortex-700/50 text-cortex-300'}"
+      onclick={() => (loop = !loop)}
       aria-label="Toggle Loop Playback"
       title="Toggle Loop Playback"
     >

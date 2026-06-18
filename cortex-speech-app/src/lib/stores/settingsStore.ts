@@ -66,7 +66,7 @@ export const defaultSettings: AppSettings = {
   maxSpeakers: 8,
   assignSpeakerFromFilename: true,
   maxWerThreshold: 0.35,
-  maxCerThreshold: 0.20,
+  maxCerThreshold: 0.2,
   enforceQualityGates: false,
   autoplaySegments: false,
   hfTrainRatio: 0.8,
@@ -80,7 +80,8 @@ export const defaultSettings: AppSettings = {
   llmApiKey: '',
   llmApiKeyConfigured: false,
   cloudLlmOptIn: false,
-  llmSystemPrompt: 'You are an expert Kurdish linguist. Fix the phonetic transcription errors in the following text, preserving the exact meaning. Output ONLY the corrected text, no explanations.',
+  llmSystemPrompt:
+    'You are an expert Kurdish linguist. Fix the phonetic transcription errors in the following text, preserving the exact meaning. Output ONLY the corrected text, no explanations.',
   llmModel: 'heretic-final:latest',
   externalAsrScriptPath: '',
   // Listening Jury defaults

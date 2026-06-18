@@ -36,7 +36,9 @@
       <span class="absolute inset-y-0 start-0 w-1 {BAR[notif.type] ?? 'bg-accent'}"></span>
 
       <span
-        class="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-surface-3 text-sm {TINT[notif.type] ?? 'text-accent'}"
+        class="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-surface-3 text-sm {TINT[
+          notif.type
+        ] ?? 'text-accent'}"
       >
         {ICONS[notif.type] ?? '•'}
       </span>
@@ -58,7 +60,8 @@
         {#if notif.progress !== undefined}
           <div class="mt-2 h-1 overflow-hidden rounded-full bg-surface-3">
             <div
-              class="h-full rounded-full {BAR[notif.type] ?? 'bg-accent'} transition-[width] duration-300 ease-smooth"
+              class="h-full rounded-full {BAR[notif.type] ??
+                'bg-accent'} transition-[width] duration-300 ease-smooth"
               style="width: {notif.progress}%"
             ></div>
           </div>
@@ -70,7 +73,15 @@
         onclick={() => notifications.dismiss(notif.id)}
         aria-label="Dismiss"
       >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+        >
           <path d="M18 6 6 18M6 6l12 12" />
         </svg>
       </button>

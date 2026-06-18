@@ -1,36 +1,39 @@
 <script lang="ts">
-import type { Snippet } from 'svelte';
-import { parseActionableError, type ActionableError } from './errors';
+  import type { Snippet } from 'svelte';
+  import { parseActionableError, type ActionableError } from './errors';
 
-let { children, fallback }: {
-  children: Snippet;
-  fallback?: Snippet<[{ error: ActionableError; retry: () => void }]>;
-} = $props();
+  let {
+    children,
+    fallback,
+  }: {
+    children: Snippet;
+    fallback?: Snippet<[{ error: ActionableError; retry: () => void }]>;
+  } = $props();
 
-let hasError = $state(false);
-let actionableError = $state<ActionableError>({ message: 'Unknown error' });
+  let hasError = $state(false);
+  let actionableError = $state<ActionableError>({ message: 'Unknown error' });
 
-function handleError(e: ErrorEvent) {
-  const message = e.message || '';
-  if (message.includes('ResizeObserver') || message.includes('Resize observer')) {
-    return;
+  function handleError(e: ErrorEvent) {
+    const message = e.message || '';
+    if (message.includes('ResizeObserver') || message.includes('Resize observer')) {
+      return;
+    }
+    e.preventDefault();
+    actionableError = parseActionableError(e.error ?? e.message);
+    hasError = true;
   }
-  e.preventDefault();
-  actionableError = parseActionableError(e.error ?? e.message);
-  hasError = true;
-}
 
-function retry() {
-  hasError = false;
-  actionableError = { message: '' };
-}
-
-$effect(() => {
-  if (typeof window !== 'undefined') {
-    window.addEventListener('error', handleError, true);
-    return () => window.removeEventListener('error', handleError, true);
+  function retry() {
+    hasError = false;
+    actionableError = { message: '' };
   }
-});
+
+  $effect(() => {
+    if (typeof window !== 'undefined') {
+      window.addEventListener('error', handleError, true);
+      return () => window.removeEventListener('error', handleError, true);
+    }
+  });
 </script>
 
 {#if hasError}
@@ -45,7 +48,10 @@ $effect(() => {
       <div class="flex items-center gap-3">
         <button class="text-xs text-red-400 underline" onclick={retry}>Retry</button>
         {#if actionableError.action}
-          <button class="text-xs text-cortex-300 underline" onclick={actionableError.action.handler}>
+          <button
+            class="text-xs text-cortex-300 underline"
+            onclick={actionableError.action.handler}
+          >
             {actionableError.action.label}
           </button>
         {/if}

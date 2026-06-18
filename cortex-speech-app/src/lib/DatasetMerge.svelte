@@ -41,10 +41,10 @@
 
     <div class="flex-1 p-4 space-y-4 flex flex-col overflow-hidden">
       <p class="text-xs text-cortex-400">
-        Paste a CORTEX dataset JSON blob below to merge it into your master database. 
-        Existing segments with matching IDs will be updated; new segments will be created.
+        Paste a CORTEX dataset JSON blob below to merge it into your master database. Existing
+        segments with matching IDs will be updated; new segments will be created.
       </p>
-      
+
       <textarea
         class="flex-1 bg-cortex-900 border border-cortex-800 rounded-lg p-3 text-[10px] font-mono text-cortex-300 focus:outline-none focus:border-cortex-600 resize-none"
         placeholder={'[{"id": "...", "rawTranscript": "..." }, ...]'}
@@ -54,8 +54,8 @@
     </div>
 
     <footer class="p-4 border-t border-cortex-800/50 flex justify-end gap-2">
-      <button class="btn-secondary !text-xs" onclick={close} disabled={merging}>Cancel</button>
-      <button class="btn-primary !text-xs" onclick={handleMerge} disabled={merging}>
+      <button class="btn btn-secondary !text-xs" onclick={close} disabled={merging}>Cancel</button>
+      <button class="btn btn-primary !text-xs" onclick={handleMerge} disabled={merging}>
         {merging ? 'Merging...' : 'Merge Dataset'}
       </button>
     </footer>

@@ -29,7 +29,7 @@
 
   {#snippet footer()}
     <!-- svelte-ignore a11y_autofocus -->
-    <button class="btn-secondary" autofocus onclick={cancel}>{$t('cancel')}</button>
-    <button class="btn-danger" onclick={confirm}>{$t('confirm')}</button>
+    <button class="btn btn-secondary" autofocus onclick={cancel}>{$t('cancel')}</button>
+    <button class="btn btn-danger" onclick={confirm}>{$t('confirm')}</button>
   {/snippet}
 </Modal>

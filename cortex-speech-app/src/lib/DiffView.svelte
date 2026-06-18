@@ -49,15 +49,21 @@
         if (!cancelled) loading = false;
       });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   });
 
   function opClass(op: string): string {
     switch (op) {
-      case 'Insert': return 'bg-emerald-900/50 text-emerald-200 rounded px-0.5';
-      case 'Delete': return 'bg-red-900/50 text-red-300 line-through rounded px-0.5';
-      case 'Replace': return 'bg-amber-900/50 text-amber-200 rounded px-0.5';
-      default: return 'text-cortex-200';
+      case 'Insert':
+        return 'bg-emerald-900/50 text-emerald-200 rounded px-0.5';
+      case 'Delete':
+        return 'bg-red-900/50 text-red-300 line-through rounded px-0.5';
+      case 'Replace':
+        return 'bg-amber-900/50 text-amber-200 rounded px-0.5';
+      default:
+        return 'text-cortex-200';
     }
   }
 </script>
@@ -67,18 +73,30 @@
     <button
       type="button"
       class="w-full flex items-center justify-between px-3 py-2 text-start hover:bg-cortex-800/30 transition-colors"
-      onclick={() => collapsed = !collapsed}
+      onclick={() => (collapsed = !collapsed)}
       aria-expanded={!collapsed}
     >
-      <span class="text-[11px] font-semibold text-cortex-300 uppercase tracking-wider">{$t('diff.title')}</span>
+      <span class="text-[11px] font-semibold text-cortex-300 uppercase tracking-wider"
+        >{$t('diff.title')}</span
+      >
       <span class="text-[10px] text-cortex-500 flex items-center gap-2">
         {#if loading}
           {$t('loading')}
         {:else if diff}
           {$t('diff.similarity', { pct: diff.stats.similarity.toFixed(0) })}
         {/if}
-        <svg class="w-3 h-3 transition-transform {collapsed ? '' : 'rotate-180'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        <svg
+          class="w-3 h-3 transition-transform {collapsed ? '' : 'rotate-180'}"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            d="M19 9l-7 7-7-7"
+          />
         </svg>
       </span>
     </button>
