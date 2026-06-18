@@ -57,6 +57,21 @@ what the numbers showed:
    right with logical borders; physical spacing swept to `ms-/me-/ps-/pe-`.
 4. **Interactions**: activity rail switches workspaces (`aria-current` toggles), ⌘K
    palette opens/filters/closes on Esc, **zero console errors**.
+5. **Buttons** — found 68 variant buttons (`.btn-secondary` etc.) used WITHOUT the
+   base `.btn` class: they rendered `display:block`, 0 padding, no focus ring, no
+   active/disabled states (a header button measured 14×16px). Restored the base
+   everywhere → proper padding, 31–33px height, focus rings, states. Sub-24px
+   interactive targets: 3 → 0. Likely a big part of the old "basic" feel.
+6. **a11y focus rings** — the global `:focus-visible{outline:none}` left custom
+   elements (incl. the new rail) with no keyboard indicator; added a scoped default
+   ring (no double-rings, no container outlines).
+7. **`.btn-danger`** now themes (was hardcoded light-pink, failed on light); compact
+   `.btn-sm` + `flex-wrap` so the sidebar's Kurdish filter chips wrap, not overflow.
+
+Final settled audit (transitions waited out): **0 text nodes < 3:1 in light or dark**.
+Open: a benign phantom horizontal scroll (scrollWidth 1390 vs 1280 but nothing
+actually past the viewport — no visible cutoff); left sidebar content is tight at its
+default 287px (resizable). Both worth a glance but neither cuts off content.
 
 ## Information architecture — DONE (the audit's #1 structural item)
 
