@@ -59,7 +59,7 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
       avgDurationSeconds: totalSec / segs.length,
       verifiedCount: verified,
       pendingCount: segs.length - verified,
-      verificationRate: verified / segs.length,
+      verificationRate: (verified / segs.length) * 100,
       uniqueSpeakers: 3,
       totalChars: segs.reduce((a, s) => a + s.rawTranscript.length, 0),
       avgCharsPerSegment: 38,
