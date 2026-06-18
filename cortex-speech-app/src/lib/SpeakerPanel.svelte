@@ -16,7 +16,7 @@
     loading = true;
     try {
       const stats = await api.getDatasetStats();
-      speakers = stats.topSpeakers;
+      speakers = stats?.topSpeakers ?? [];
     } catch (e) {
       notifications.error('Failed to load speakers: ' + e);
     } finally {
