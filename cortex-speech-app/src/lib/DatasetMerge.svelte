@@ -1,5 +1,6 @@
 <script lang="ts">
   import * as api from './commands';
+  import { focusTrap } from './actions/focusTrap';
   import { showDatasetMerge } from './stores/uiStore';
   import { notifications } from './stores/notificationStore';
   import { segments } from './stores/segmentStore';
@@ -32,7 +33,20 @@
   }
 </script>
 
-<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+<div
+  class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+  role="dialog"
+  aria-modal="true"
+  tabindex="-1"
+  use:focusTrap
+  onkeydown={(e) => {
+    if (e.key === 'Escape') close();
+  }}
+  onclick={(e) => {
+    if (e.target === e.currentTarget) close();
+  }}
+>
   <div class="card w-full max-w-2xl shadow-2xl flex flex-col max-h-[80vh]">
     <header class="flex items-center justify-between p-4 border-b border-cortex-800/50">
       <h2 class="text-sm font-bold text-cortex-200 uppercase tracking-widest">Merge Dataset</h2>
