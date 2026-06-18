@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { t } from './i18n';
 
   interface Props {
     waveform: number[];
@@ -305,7 +306,7 @@
           d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v6m4-3H6"
         />
       </svg>
-      <span>Timeline Zoom</span>
+      <span>{$t('waveform.timelineZoom')}</span>
     </div>
     <div class="flex items-center gap-2">
       <input
