@@ -226,3 +226,17 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
   `models/` (currently empty); backend `cargo check` passes, so the app is
   buildable. Real audio fixtures exist on disk (`Desktop/CORTEX/podcast.wav`,
   `Desktop/HalwestVS/*.wav`).
+
+## Comprehensive i18n localization sweep — DONE
+
+Done via an isolated-worktree subagent, merged into m02-sorani-metrics (user's
+uncommitted WIP in ModelDownload/Modal/KeyboardShortcuts/events.ts preserved via
+stash-around-merge). 48 new keys (en + ckb), 11 components, ~60 hardcoded-English
+strings localized (notifications + inline labels). Build + typecheck green.
+Verified live: 0 remaining English labels in the main view; "Timeline Zoom" →
+"زووم کردنی هێڵی کات", "Failed to load audio file" → Kurdish.
+
+Intentionally left (out of scope / niche): ReviewInbox (separate retheme chip);
+technical/proper nouns (CSV/Parquet/Gemini/LLM/CORTEX/model IDs/Esc); the WSL
+header + 2 long description paragraphs + 1 WSL failure toast with mid-sentence
+interpolation. Sorani strings are a first pass — worth a native review.
