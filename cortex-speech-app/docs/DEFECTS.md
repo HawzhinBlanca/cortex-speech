@@ -268,3 +268,19 @@ pipeline import itself succeeded; only the debug `eprintln!` crashed. Fixed by
 truncating with `.chars().take(40).collect::<String>()` (char-safe) at all 3 sites.
 Re-ran → 14/14 pass. Production code is clean: every byte-slice there is on ASCII
 (hashes `&hash[..12]`, UUIDs `&id[..8]`) or `Vec::truncate`, never on transcript text.
+
+## D18 — command palette: light-mode AA fail on category hint (FIXED)
+
+Heartbeat surface-rotation [A] audited the Cmd-K command palette (a modal). Live
+contrast audit (transitions off) found 1 light-mode fail: the per-row category hint
+`<span class="text-xs text-subtle">· {category}</span>` (CommandPalette.svelte:154)
+measured 4.42 (< AA 4.5) when it sits on the active row's `surface-3` background —
+`text-subtle` clears 4.5 on the modal's `surface-1` but not on `surface-3`. Fixed by
+bumping that hint to `text-muted` (more contrast, still subdued). Re-audited live:
+light 0 fails (worst 5.0), dark 0 fails (worst 4.12). Build + typecheck green.
+
+Also REPORTED (not fixed — needs WIP Modal.svelte): the palette's [role=dialog] has
+no accessible name. Modal derives aria-label only from a visible `title`, and the
+palette intentionally has no title header. Low severity: focus auto-lands on the
+search input (aria-label "Search commands"), so SR users still get context. Clean
+fix is a dedicated `ariaLabel` prop on Modal — deferred since Modal is user WIP.
