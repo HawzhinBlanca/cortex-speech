@@ -159,6 +159,16 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
   help. All 6 `.fixed` modal components now have role=dialog (Modal/Settings/Speaker/
   Validation/WSL/DatasetMerge).
 
+## Iteration 8 — destructive confirms + i18n (fast)
+
+- ✅ **Delete is data-safe** (verified): Delete key → confirm dialog, segment NOT
+  deleted (8→8), Cancel is the focused default.
+- ✅ **D14** — delete-confirm title/message were hardcoded English in Kurdish mode.
+  Localized via `$t('deleteSegment')` + new `deleteSegmentConfirm` (en+ckb) + "cannot
+  be undone". Verified Kurdish now renders.
+- ✅ Swept hardcoded hex / `bg-cortex-700 text-white` across all components — clean
+  (only ReviewInbox legacy purple remains; separate retheme task).
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
