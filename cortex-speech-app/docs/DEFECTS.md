@@ -74,6 +74,34 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
   light-400 darker) and re-audit. Deferred to next iteration for a clean, fully
   re-verified pass (avoid half-tuning the scale).
 
+## Iteration 3 — strict AA-4.5 contrast pass (transitions-disabled audit)
+
+### ✅ D5 — cortex mid-tier text just under strict AA
+- **Found (clean audit):** light `cortex-400` 4.43 (timestamps/filter chips, ×10);
+  dark `cortex-500` 4.14 (transcript previews, ×~11); dark `--text-subtle` 3.83.
+- **Fix:** dark `--cortex-500` 62,121,163→76,138,180; light `--cortex-400`
+  100,116,139→90,106,130; dark `--text-subtle` #61707f→#6d7c8c.
+- **Verified:** light **0 fails at 4.5**; dark below-3.0 = **0**.
+
+### ✅ D6 — HistoryPanel + Waveform hardcoded `slate-*` (not theme-aware)
+- **Found:** `text-slate-400`=2.39/2.56 (light), `slate-600`=2.57 (dark). These two
+  components used Tailwind `slate-*` (never made theme-aware), so they didn't
+  invert and failed contrast.
+- **Fix:** migrated `-slate-` → `-cortex-` (theme-aware) across both files; they now
+  theme correctly and inherit the tuned contrast.
+
+### ✅ D7 — Editor tab toggle: white text invisible in light
+- **Found:** active tab `bg-cortex-700 text-white` = **1.48** in light (bg-cortex-700
+  is light gray in light mode; white text on it is invisible). App.svelte ×3.
+- **Fix:** `text-white` → `text-default` (themes both ways).
+
+### 🛈 Accepted — dark `text-cortex-600` hint tier (3.1–4.5, AA-large)
+- Remaining sub-4.5 dark elements (×9) are all `text-cortex-600`: the ⌘/hotkey
+  hint tier + micro-labels. All ≥3.0 (AA-large). Kept as deliberate de-emphasis
+  (hints are also surfaced via ⌘K + the shortcuts modal); pushing to 4.5 would
+  collapse the cortex scale and brighten dark past the byte-identical baseline.
+- **Net:** both themes AA-large clean everywhere; light fully strict-AA (4.5).
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
