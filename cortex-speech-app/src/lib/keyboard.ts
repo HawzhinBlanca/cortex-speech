@@ -32,7 +32,9 @@ export class KeyboardManager {
     const t = e.target as HTMLElement | null;
     if (!t) return false;
     const tag = t.tagName;
-    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable === true;
+    return (
+      tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable === true
+    );
   }
 
   private handleKeydown(e: KeyboardEvent) {
@@ -61,7 +63,7 @@ export class KeyboardManager {
   }
 
   getByCategory(category: string): Shortcut[] {
-    return this.shortcuts.filter(s => s.category === category);
+    return this.shortcuts.filter((s) => s.category === category);
   }
 
   destroy() {

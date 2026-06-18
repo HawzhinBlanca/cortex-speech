@@ -45,7 +45,10 @@
 
   onMount(() => {
     ctx = canvas.getContext('2d');
-    if (!ctx) { console.error('Waveform: failed to acquire canvas 2D context'); return; }
+    if (!ctx) {
+      console.error('Waveform: failed to acquire canvas 2D context');
+      return;
+    }
     const ro = new ResizeObserver(() => {
       if (!scrollContainer) return;
       containerWidth = scrollContainer.clientWidth ?? 600;
@@ -200,7 +203,7 @@
         if (wx_end - wx_start > 14) {
           ctx.fillStyle = '#94a3b8'; // Slate-400
           const textWidth = ctx.measureText(word.word).width;
-          if (textWidth < (wx_end - wx_start)) {
+          if (textWidth < wx_end - wx_start) {
             ctx.fillText(word.word, mid_x, h - 6);
           }
         }
@@ -288,12 +291,19 @@
   }
 </script>
 
-<div class="relative w-full bg-slate-950/40 backdrop-blur-md rounded-xl border border-slate-800/50 p-3 flex flex-col gap-2">
+<div
+  class="relative w-full bg-slate-950/40 backdrop-blur-md rounded-xl border border-slate-800/50 p-3 flex flex-col gap-2"
+>
   <!-- Timeline Zoom Control bar -->
   <div class="flex items-center justify-between text-[10px] text-slate-400 font-mono px-1">
     <div class="flex items-center gap-1.5">
       <svg class="w-3 h-3 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v6m4-3H6"/>
+        <path
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          stroke-width="2"
+          d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v6m4-3H6"
+        />
       </svg>
       <span>Timeline Zoom</span>
     </div>

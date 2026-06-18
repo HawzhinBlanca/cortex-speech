@@ -11,12 +11,7 @@
     onSelect?: (item: SpeechSegment) => void;
     selectedId?: string | null;
   }
-  let {
-    items,
-    itemHeight = 64,
-    overscan = 5,
-    children,
-  }: Props = $props();
+  let { items, itemHeight = 64, overscan = 5, children }: Props = $props();
 
   let container: HTMLDivElement;
   let scrollTop = $state(0);
@@ -24,7 +19,9 @@
   let totalHeight = $derived(items.length * itemHeight);
 
   let startIndex = $derived(Math.max(0, Math.floor(scrollTop / itemHeight) - overscan));
-  let endIndex = $derived(Math.min(items.length, Math.ceil((scrollTop + containerHeight) / itemHeight) + overscan));
+  let endIndex = $derived(
+    Math.min(items.length, Math.ceil((scrollTop + containerHeight) / itemHeight) + overscan),
+  );
   let visibleItems = $derived(items.slice(startIndex, endIndex));
   let offsetY = $derived(startIndex * itemHeight);
 

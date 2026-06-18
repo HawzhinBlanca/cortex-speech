@@ -139,7 +139,7 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
     maxSpeakers: raw.max_speakers ?? 8,
     assignSpeakerFromFilename: raw.assign_speaker_from_filename ?? true,
     maxWerThreshold: raw.max_wer_threshold ?? 0.35,
-    maxCerThreshold: raw.max_cer_threshold ?? 0.20,
+    maxCerThreshold: raw.max_cer_threshold ?? 0.2,
     enforceQualityGates: raw.enforce_quality_gates ?? false,
     autoplaySegments: false,
     hfTrainRatio: raw.hf_train_ratio ?? 0.8,
@@ -153,7 +153,9 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
     llmApiKey: raw.llm_api_key ?? '',
     llmApiKeyConfigured: raw.llm_api_key_configured ?? false,
     cloudLlmOptIn: raw.cloud_llm_opt_in ?? false,
-    llmSystemPrompt: raw.llm_system_prompt ?? 'You are an expert Kurdish linguist. Fix the phonetic transcription errors in the following text, preserving the exact meaning. Output ONLY the corrected text, no explanations.',
+    llmSystemPrompt:
+      raw.llm_system_prompt ??
+      'You are an expert Kurdish linguist. Fix the phonetic transcription errors in the following text, preserving the exact meaning. Output ONLY the corrected text, no explanations.',
     llmModel: raw.llm_model ?? 'omniASR_LLM_7B_v2',
     externalAsrScriptPath: raw.external_asr_script_path ?? '',
     // Listening Jury
@@ -166,10 +168,7 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
   };
 }
 
-export function mapFrontendToBackend(
-  ui: AppSettings,
-  existing: BackendSettings,
-): BackendSettings {
+export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings): BackendSettings {
   return {
     ...existing,
     theme: themeToBackend(ui.theme),

@@ -1,7 +1,12 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import * as api from './lib/commands';
-  import type { AgenticReadiness, AgentImportReport, AgentOrchestrationStage, AgentStageEvent } from './lib/commands';
+  import type {
+    AgenticReadiness,
+    AgentImportReport,
+    AgentOrchestrationStage,
+    AgentStageEvent,
+  } from './lib/commands';
   import type { SpeechSegment } from './lib/types';
   import {
     segments,
@@ -286,7 +291,9 @@
           if (payload.failed > 0) {
             notifications.error($t('openFile.failed'));
           } else if (payload.segmentCount && payload.segmentCount > 1) {
-            notifications.success($t('openFile.multiChunk', { count: String(payload.segmentCount) }));
+            notifications.success(
+              $t('openFile.multiChunk', { count: String(payload.segmentCount) }),
+            );
           } else if (payload.succeeded > 0) {
             notifications.success($t('openFile.imported'));
           }
@@ -1215,9 +1222,7 @@
       const ts = await api.alignSegment(seg.audioPath, text, seg.alignmentJson);
       wordTimestamps.set(ts);
       const alignmentJson = mergeWordTimestamps(seg.alignmentJson, ts);
-      segments.update((arr) =>
-        arr.map((s) => (s.id === seg.id ? { ...s, alignmentJson } : s)),
-      );
+      segments.update((arr) => arr.map((s) => (s.id === seg.id ? { ...s, alignmentJson } : s)));
       const updatedSeg = { ...seg, alignmentJson };
       await api.updateSegment(updatedSeg);
       notifications.success($t('notifications.alignmentComplete'));
@@ -1266,10 +1271,7 @@
   }
 </script>
 
-<div
-  class="h-screen flex flex-col bg-app text-default"
-  data-testid="app-root"
->
+<div class="h-screen flex flex-col bg-app text-default" data-testid="app-root">
   <!-- Top Bar -->
   <header
     data-testid="top-bar"
@@ -1314,7 +1316,7 @@
       <span class="text-[10px] text-cortex-600">|</span>
       {#if !sidebarOpen}
         <button
-          class="btn-secondary !text-xs relative"
+          class="btn btn-secondary !text-xs relative"
           onclick={() => (sidebarOpen = true)}
           title="Show segments (⇧S)"
           aria-label={$t('showSegments')}
@@ -1337,7 +1339,7 @@
       {/if}
       {#if !statsOpen}
         <button
-          class="btn-secondary !text-xs relative"
+          class="btn btn-secondary !text-xs relative"
           onclick={() => (statsOpen = true)}
           title="Show stats (⇧D)"
           aria-label={$t('showStats')}
@@ -1359,7 +1361,7 @@
         </button>
       {/if}
       <button
-        class="btn-secondary !text-xs relative"
+        class="btn btn-secondary !text-xs relative"
         onclick={handleOpenFile}
         disabled={!tauriAvailable || $isProcessing}
         title={tauriAvailable ? 'Ctrl+O' : $t('desktopRuntimeRequired')}
@@ -1382,7 +1384,7 @@
         {/if}
       </button>
       <button
-        class="btn-secondary !text-xs relative"
+        class="btn btn-secondary !text-xs relative"
         onclick={handleImport}
         disabled={!tauriAvailable || $isProcessing}
         title={tauriAvailable ? 'Ctrl+I' : $t('desktopRuntimeRequired')}
@@ -1405,7 +1407,7 @@
         {/if}
       </button>
       <button
-        class="btn-secondary !text-xs"
+        class="btn btn-secondary !text-xs"
         onclick={handleExport}
         disabled={!tauriAvailable || $isProcessing || $segmentStats.total === 0}
         title={!tauriAvailable ? $t('desktopRuntimeRequired') : $t('export')}
@@ -1423,7 +1425,7 @@
       </button>
       <button
         data-testid="hf-export-btn"
-        class="btn-secondary !text-xs"
+        class="btn btn-secondary !text-xs"
         onclick={handleExportHuggingface}
         disabled={!tauriAvailable ||
           $isProcessing ||
@@ -1448,7 +1450,7 @@
         {$t('exportHuggingface.label')}
       </button>
       <button
-        class="btn-secondary !text-xs"
+        class="btn btn-secondary !text-xs"
         onclick={handleExportAudio}
         disabled={!tauriAvailable || $isProcessing || $segmentStats.verified === 0}
         title={!tauriAvailable ? $t('desktopRuntimeRequired') : $t('exportAudio.label')}
@@ -1466,7 +1468,7 @@
       </button>
       <button
         data-testid="wsl-btn"
-        class="btn-secondary !text-xs relative"
+        class="btn btn-secondary !text-xs relative"
         onclick={openWslConsole}
         disabled={!tauriAvailable || $isProcessing}
         title={tauriAvailable ? 'Local 7B ASR (WSL)' : $t('desktopRuntimeRequired')}
@@ -1483,7 +1485,7 @@
       </button>
       <button
         data-testid="validate-btn"
-        class="btn-secondary !text-xs relative"
+        class="btn btn-secondary !text-xs relative"
         onclick={openValidationPanel}
         disabled={!tauriAvailable || $isProcessing || $segmentStats.total === 0}
         title={tauriAvailable ? 'Ctrl+Shift+V' : $t('desktopRuntimeRequired')}
@@ -1507,7 +1509,7 @@
       </button>
       <button
         data-testid="review-inbox-btn"
-        class="btn-secondary !text-xs relative"
+        class="btn btn-secondary !text-xs relative"
         onclick={openReviewInbox}
         disabled={!tauriAvailable || $isProcessing}
         title={tauriAvailable ? 'Review Inbox (Ctrl+Shift+R)' : $t('desktopRuntimeRequired')}
@@ -1523,7 +1525,7 @@
       </button>
       <button
         data-testid="settings-btn"
-        class="btn-primary !text-xs relative"
+        class="btn btn-primary !text-xs relative"
         onclick={() => openSettings()}
         title="⌘,"
         aria-label={$t('openSettings')}
@@ -1551,7 +1553,7 @@
       </button>
       <button
         data-testid="locale-toggle"
-        class="btn-secondary !text-xs"
+        class="btn btn-secondary !text-xs"
         onclick={() => locale.set($locale === 'en' ? 'ckb' : 'en')}
         title={$t('localeToggle')}
         aria-label={$t('localeToggle')}
@@ -1615,7 +1617,7 @@
             {/if}
             <div class="flex gap-1">
               <button
-                class="btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary !text-[10px] flex-1"
                 onclick={() => handleBatchTranscribe('empty')}
                 disabled={!tauriAvailable ||
                   $isProcessing ||
@@ -1624,7 +1626,7 @@
                 >{$t('batchTranscribe.empty')}</button
               >
               <button
-                class="btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary !text-[10px] flex-1"
                 onclick={() => handleBatchTranscribe('selected')}
                 disabled={!tauriAvailable || $isProcessing || !$selectedSegmentId}
                 title={tauriAvailable
@@ -1632,7 +1634,7 @@
                   : $t('desktopRuntimeRequired')}>{$t('batchTranscribe.selected')}</button
               >
               <button
-                class="btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary !text-[10px] flex-1"
                 onclick={() => handleBatchTranscribe('filtered')}
                 disabled={!tauriAvailable || $isProcessing || $filteredSegments.length === 0}
                 title={tauriAvailable
@@ -1642,14 +1644,14 @@
             </div>
             <div class="flex gap-1">
               <button
-                class="btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary !text-[10px] flex-1"
                 onclick={() => handleBatchVerify('pending')}
                 disabled={!tauriAvailable || $isProcessing || $segmentStats.pending === 0}
                 title={tauriAvailable ? $t('batchVerify.allPending') : $t('desktopRuntimeRequired')}
                 >{$t('batchVerify.allPending')}</button
               >
               <button
-                class="btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary !text-[10px] flex-1"
                 onclick={() => handleBatchVerify('selected')}
                 disabled={!tauriAvailable || $isProcessing || !$selectedSegmentId}
                 title={tauriAvailable ? $t('batchVerify.selected') : $t('desktopRuntimeRequired')}
@@ -1664,7 +1666,7 @@
                 aria-label={$t('batchAssignSpeaker.placeholder')}
               />
               <button
-                class="btn-secondary !text-[10px] shrink-0"
+                class="btn btn-secondary !text-[10px] shrink-0"
                 onclick={handleBatchAssignSpeaker}
                 disabled={!tauriAvailable || $isProcessing || $filteredSegments.length === 0}
                 title={tauriAvailable
@@ -1674,7 +1676,7 @@
             </div>
             <div class="flex gap-1">
               <button
-                class="btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary !text-[10px] flex-1"
                 onclick={handleBatchNormalize}
                 disabled={!tauriAvailable ||
                   $isProcessing ||
@@ -1683,14 +1685,14 @@
                 >{$t('batchNormalize.label')}</button
               >
               <button
-                class="btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary !text-[10px] flex-1"
                 onclick={() => handleRediarize('filtered')}
                 disabled={!tauriAvailable || $isProcessing || $filteredSegments.length === 0}
                 title={tauriAvailable ? $t('rediarize.filtered') : $t('desktopRuntimeRequired')}
                 >{$t('rediarize.filtered')}</button
               >
               <button
-                class="btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary !text-[10px] flex-1"
                 onclick={() => handleRediarize('selected')}
                 disabled={!tauriAvailable || $isProcessing || !$selectedSegmentId}
                 title={tauriAvailable ? $t('rediarize.selected') : $t('desktopRuntimeRequired')}
@@ -1701,21 +1703,21 @@
             <!-- Data & AI Tools -->
             <div class="flex gap-1 border-t border-cortex-800/30 pt-2">
               <button
-                class="btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary !text-[10px] flex-1"
                 onclick={openSpeakerPanel}
                 disabled={!tauriAvailable || $isProcessing}
                 title={tauriAvailable ? 'Speaker Management' : $t('desktopRuntimeRequired')}
                 >{$t('speakers')}</button
               >
               <button
-                class="btn-secondary !text-[10px] flex-1"
+                class="btn btn-secondary !text-[10px] flex-1"
                 onclick={openDatasetMerge}
                 disabled={!tauriAvailable || $isProcessing}
                 title={tauriAvailable ? 'Merge Dataset JSON' : $t('desktopRuntimeRequired')}
                 >{$t('merge')}</button
               >
               <button
-                class="btn-danger !text-[10px] flex-1"
+                class="btn btn-danger !text-[10px] flex-1"
                 onclick={handleDeleteFilteredWithConfirm}
                 disabled={!tauriAvailable || $isProcessing || $filteredSegments.length === 0}
                 title={tauriAvailable ? $t('batchDelete.filtered') : $t('desktopRuntimeRequired')}
@@ -1826,8 +1828,18 @@
                 class="flex h-full flex-col items-center justify-center gap-3 px-6 text-center animate-fade-in"
               >
                 {#if $searchQuery}
-                  <div class="flex h-12 w-12 items-center justify-center rounded-full bg-surface-2 text-subtle">
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                  <div
+                    class="flex h-12 w-12 items-center justify-center rounded-full bg-surface-2 text-subtle"
+                  >
+                    <svg
+                      width="22"
+                      height="22"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      stroke-linecap="round"
+                    >
                       <circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" />
                     </svg>
                   </div>
@@ -1836,8 +1848,19 @@
                     <p class="mt-1 max-w-[14rem] truncate text-xs text-subtle">“{$searchQuery}”</p>
                   </div>
                 {:else}
-                  <div class="flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-soft text-accent">
-                    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <div
+                    class="flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-soft text-accent"
+                  >
+                    <svg
+                      width="26"
+                      height="26"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    >
                       <path d="M12 18a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v10a3 3 0 0 0 3 3Z" />
                       <path d="M19 11a7 7 0 0 1-14 0M12 18v4M8 22h8" />
                     </svg>
@@ -1848,8 +1871,12 @@
                   </div>
                   {#if tauriAvailable}
                     <div class="mt-1 flex gap-2">
-                      <button class="btn-primary !text-xs" onclick={handleImport}>{$t('import')}</button>
-                      <button class="btn-secondary !text-xs" onclick={handleOpenFile}>{$t('open')}</button>
+                      <button class="btn btn-primary !text-xs" onclick={handleImport}
+                        >{$t('import')}</button
+                      >
+                      <button class="btn btn-secondary !text-xs" onclick={handleOpenFile}
+                        >{$t('open')}</button
+                      >
                     </div>
                   {/if}
                 {/if}
@@ -1910,7 +1937,7 @@
               </h2>
               <div class="flex gap-2">
                 <button
-                  class="btn-secondary !text-xs relative"
+                  class="btn btn-secondary !text-xs relative"
                   onclick={handleTranscribe}
                   disabled={$isProcessing}
                 >
@@ -1942,7 +1969,7 @@
                     >
                   {/if}
                 </button>
-                <button class="btn-secondary !text-xs" onclick={handleNormalize}
+                <button class="btn btn-secondary !text-xs" onclick={handleNormalize}
                   >{$t('normalize')}</button
                 >
               </div>
@@ -2100,7 +2127,7 @@
                   }}
                 />
               </div>
-              <button class="btn-secondary !text-xs shrink-0" onclick={handleSaveSpeaker}
+              <button class="btn btn-secondary !text-xs shrink-0" onclick={handleSaveSpeaker}
                 >{$t('speaker.save')}</button
               >
             </div>
@@ -2134,7 +2161,7 @@
             {/if}
 
             <div class="flex gap-2 pt-1">
-              <button class="btn-primary !text-xs relative" onclick={handleSaveAnnotation}>
+              <button class="btn btn-primary !text-xs relative" onclick={handleSaveAnnotation}>
                 {#if saveState === 'saving'}
                   <span class="flex items-center gap-1">
                     <svg class="animate-spin w-3 h-3" fill="none" viewBox="0 0 24 24"
@@ -2167,7 +2194,7 @@
               </button>
 
               <button
-                class="btn-secondary !text-xs relative"
+                class="btn btn-secondary !text-xs relative"
                 onclick={handleToggleVerify}
                 disabled={verifyInFlight || $isProcessing}
               >
@@ -2179,11 +2206,15 @@
                   >
                 {/if}
               </button>
-              <button class="btn-secondary !text-xs" onclick={handleAlign} disabled={$isProcessing}>
+              <button
+                class="btn btn-secondary !text-xs"
+                onclick={handleAlign}
+                disabled={$isProcessing}
+              >
                 {$t('align')}
               </button>
               <button
-                class="btn-danger !text-xs ms-auto relative"
+                class="btn btn-danger !text-xs ms-auto relative"
                 onclick={handleDeleteWithConfirm}
               >
                 {$t('delete')}

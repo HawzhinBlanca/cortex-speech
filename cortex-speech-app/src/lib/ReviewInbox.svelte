@@ -31,15 +31,38 @@
   let isSubmitting = false;
 
   $: current = queue[currentIndex] ?? null;
-  $: pendingCount = queue.filter(s => !s.humanDecision).length;
+  $: pendingCount = queue.filter((s) => !s.humanDecision).length;
 
   // ── Confidence bands ─────────────────────────────────────────────────────────
-  function confidenceBand(conf: number | null | undefined): { label: string; icon: string; color: string } {
+  function confidenceBand(conf: number | null | undefined): {
+    label: string;
+    icon: string;
+    color: string;
+  } {
     if (conf == null) return { label: 'Unknown confidence', icon: '❓', color: '#6b7280' };
-    if (conf >= 0.90) return { label: `AI is very confident (${Math.round(conf * 100)}%) — quick glance 👀`, icon: '✅', color: '#22c55e' };
-    if (conf >= 0.75) return { label: `AI is fairly sure (${Math.round(conf * 100)}%) — quick listen 👂`, icon: '🟡', color: '#eab308' };
-    if (conf >= 0.55) return { label: `AI is unsure (${Math.round(conf * 100)}%) — listen carefully ⚠`, icon: '⚠️', color: '#f97316' };
-    return { label: `AI has low confidence (${Math.round(conf * 100)}%) — careful review needed 🔴`, icon: '🔴', color: '#ef4444' };
+    if (conf >= 0.9)
+      return {
+        label: `AI is very confident (${Math.round(conf * 100)}%) — quick glance 👀`,
+        icon: '✅',
+        color: '#22c55e',
+      };
+    if (conf >= 0.75)
+      return {
+        label: `AI is fairly sure (${Math.round(conf * 100)}%) — quick listen 👂`,
+        icon: '🟡',
+        color: '#eab308',
+      };
+    if (conf >= 0.55)
+      return {
+        label: `AI is unsure (${Math.round(conf * 100)}%) — listen carefully ⚠`,
+        icon: '⚠️',
+        color: '#f97316',
+      };
+    return {
+      label: `AI has low confidence (${Math.round(conf * 100)}%) — careful review needed 🔴`,
+      icon: '🔴',
+      color: '#ef4444',
+    };
   }
 
   // ── Queue loading ─────────────────────────────────────────────────────────────
@@ -63,7 +86,7 @@
     statusMsg = '⏳ Running Jury Pipeline...';
     try {
       const allSegs = await api.getSegments();
-      const targetIds = allSegs.filter(s => !s.verified).map(s => s.id);
+      const targetIds = allSegs.filter((s) => !s.verified).map((s) => s.id);
       if (targetIds.length === 0) {
         statusMsg = 'ℹ️ No unverified segments to run jury on.';
         isRunningJury = false;
@@ -78,7 +101,6 @@
       isRunningJury = false;
     }
   }
-
 
   // ── Actions ──────────────────────────────────────────────────────────────────
   async function accept() {
@@ -110,7 +132,11 @@
     try {
       history.push({ id: current.id, decision: 'edit', prev: { ...current } });
       await api.recordHumanDecision(current.id, 'edit', editText.trim());
-      queue[currentIndex] = { ...current, humanDecision: 'edit', verdictTranscript: editText.trim() };
+      queue[currentIndex] = {
+        ...current,
+        humanDecision: 'edit',
+        verdictTranscript: editText.trim(),
+      };
       isEditing = false;
       statusMsg = '✏️ Edited';
       advance();
@@ -143,7 +169,15 @@
     if (!current || isSubmitting) return;
     isSubmitting = true;
     try {
-      await api.writeSegmentVerdict(current.id, 'escalated', null, 'Flagged for second-pass adjudication', null, null, true);
+      await api.writeSegmentVerdict(
+        current.id,
+        'escalated',
+        null,
+        'Flagged for second-pass adjudication',
+        null,
+        null,
+        true,
+      );
       queue[currentIndex] = { ...current, escalated: true };
       statusMsg = '🚩 Flagged for second pass';
       advance();
@@ -158,7 +192,7 @@
     // P3-3: Clear the human decision entirely (set to NULL) instead of
     // overwriting it with a fake 'accept' — that was corrupting agent_examples.
     await api.clearHumanDecision(last.id);
-    const idx = queue.findIndex(s => s.id === last.id);
+    const idx = queue.findIndex((s) => s.id === last.id);
     if (idx >= 0) {
       queue[idx] = { ...last.prev };
       // Navigate directly to the undone segment, not blindly to currentIndex-1.
@@ -167,7 +201,6 @@
     }
     statusMsg = '↩ Undone';
   }
-
 
   function advance() {
     if (currentIndex < queue.length - 1) {
@@ -178,22 +211,51 @@
   // ── Keyboard handler ─────────────────────────────────────────────────────────
   function handleKey(e: KeyboardEvent) {
     if (isEditing) {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); commitEdit(); }
-      if (e.key === 'Escape') { e.preventDefault(); isEditing = false; }
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        commitEdit();
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        isEditing = false;
+      }
       return;
     }
     switch (e.key) {
-      case 'a': e.preventDefault(); accept(); break;
-      case 'e': e.preventDefault(); startEdit(); break;
-      case 'x': e.preventDefault(); reject(); break;
-      case ' ': e.preventDefault(); skip(); break;
-      case 'f': e.preventDefault(); flag(); break;
-      case 'Backspace': e.preventDefault(); undo(); break;
-      case 'Escape': e.preventDefault(); onClose(); break;
+      case 'a':
+        e.preventDefault();
+        accept();
+        break;
+      case 'e':
+        e.preventDefault();
+        startEdit();
+        break;
+      case 'x':
+        e.preventDefault();
+        reject();
+        break;
+      case ' ':
+        e.preventDefault();
+        skip();
+        break;
+      case 'f':
+        e.preventDefault();
+        flag();
+        break;
+      case 'Backspace':
+        e.preventDefault();
+        undo();
+        break;
+      case 'Escape':
+        e.preventDefault();
+        onClose();
+        break;
       default:
         if (e.key >= '1' && e.key <= '9') {
           const idx = parseInt(e.key) - 1;
-          if (idx < queue.length) { currentIndex = idx; }
+          if (idx < queue.length) {
+            currentIndex = idx;
+          }
         }
     }
   }
@@ -236,13 +298,13 @@
 
     <!-- Autonomy Dial -->
     <div class="autonomy-dial" role="group" aria-label="Autonomy level">
-      {#each [['observe','👁 Observe'],['propose','💡 Propose'],['act_confirm','✅ Act+Confirm'],['act_auto','🤖 Act Auto']] as [val, label]}
+      {#each [['observe', '👁 Observe'], ['propose', '💡 Propose'], ['act_confirm', '✅ Act+Confirm'], ['act_auto', '🤖 Act Auto']] as [val, label]}
         <button
           class="dial-btn"
           class:active={autonomyLevel === val}
           onclick={() => (autonomyLevel = val as typeof autonomyLevel)}
-          title={val}
-        >{label}</button>
+          title={val}>{label}</button
+        >
       {/each}
     </div>
 
@@ -265,7 +327,6 @@
         <button class="btn-secondary" onclick={loadQueue}>Refresh</button>
       </div>
     </div>
-
   {:else}
     <div class="inbox-body">
       <!-- Queue Rail -->
@@ -284,11 +345,11 @@
                 aria-label="Segment {i + 1}"
                 aria-current={i === currentIndex ? 'true' : undefined}
               >
-              <span class="rail-icon" style="color:{band.color}">{band.icon}</span>
-              <span class="rail-id">{seg.id.slice(0, 8)}…</span>
-              {#if seg.humanDecision}
-                <span class="rail-done">✓</span>
-              {/if}
+                <span class="rail-icon" style="color:{band.color}">{band.icon}</span>
+                <span class="rail-id">{seg.id.slice(0, 8)}…</span>
+                {#if seg.humanDecision}
+                  <span class="rail-done">✓</span>
+                {/if}
               </button>
             </li>
           {/each}
@@ -348,12 +409,15 @@
                   <p class="rationale-text">{current.rationale}</p>
                 {/if}
                 {#if current.evidenceJson}
-                  <pre class="evidence-pre">{JSON.stringify(JSON.parse(current.evidenceJson ?? '[]'), null, 2)}</pre>
+                  <pre class="evidence-pre">{JSON.stringify(
+                      JSON.parse(current.evidenceJson ?? '[]'),
+                      null,
+                      2,
+                    )}</pre>
                 {/if}
               </details>
             </section>
           {/if}
-
 
           <!-- Confidence band -->
           <div class="confidence-strip" style="border-left-color:{band.color}">
@@ -364,7 +428,9 @@
           <!-- Edit area (shown when e pressed) -->
           {#if isEditing}
             <div class="edit-area">
-              <label class="edit-label" for="edit-textarea">Edit transcript (Ctrl+Enter to save, Esc to cancel):</label>
+              <label class="edit-label" for="edit-textarea"
+                >Edit transcript (Ctrl+Enter to save, Esc to cancel):</label
+              >
               <textarea
                 id="edit-textarea"
                 class="edit-textarea"
@@ -376,7 +442,9 @@
               ></textarea>
               <div class="edit-actions">
                 <button class="btn-primary" onclick={commitEdit}>Save edit (Ctrl+↵)</button>
-                <button class="btn-secondary" onclick={() => (isEditing = false)}>Cancel (Esc)</button>
+                <button class="btn-secondary" onclick={() => (isEditing = false)}
+                  >Cancel (Esc)</button
+                >
               </div>
             </div>
           {/if}
@@ -395,10 +463,21 @@
             <button class="verb-btn skip" onclick={skip} title="Skip (space)" id="inbox-skip">
               <span class="verb-key">⎵</span> Skip
             </button>
-            <button class="verb-btn flag" onclick={flag} title="Flag for second pass (f)" id="inbox-flag">
+            <button
+              class="verb-btn flag"
+              onclick={flag}
+              title="Flag for second pass (f)"
+              id="inbox-flag"
+            >
               <span class="verb-key">F</span> Flag
             </button>
-            <button class="verb-btn undo" onclick={undo} title="Undo (⌫)" id="inbox-undo" disabled={history.length === 0}>
+            <button
+              class="verb-btn undo"
+              onclick={undo}
+              title="Undo (⌫)"
+              id="inbox-undo"
+              disabled={history.length === 0}
+            >
               <span class="verb-key">⌫</span> Undo
             </button>
           </div>
@@ -441,8 +520,15 @@
     gap: 8px;
     flex: 1;
   }
-  .inbox-title h2 { margin: 0; font-size: 0.95rem; font-weight: 600; color: #a78bfa; }
-  .inbox-icon { font-size: 1.1rem; }
+  .inbox-title h2 {
+    margin: 0;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #a78bfa;
+  }
+  .inbox-icon {
+    font-size: 1.1rem;
+  }
   .inbox-badge {
     background: #7c3aed;
     color: #fff;
@@ -452,17 +538,30 @@
     border-radius: 999px;
   }
   .close-btn {
-    background: none; border: none; color: #6b7280;
-    cursor: pointer; font-size: 1rem; padding: 4px;
+    background: none;
+    border: none;
+    color: #6b7280;
+    cursor: pointer;
+    font-size: 1rem;
+    padding: 4px;
   }
-  .close-btn:hover { color: #e2e8f0; }
+  .close-btn:hover {
+    color: #e2e8f0;
+  }
 
   .run-jury-btn {
     background: linear-gradient(135deg, #7c3aed, #4f46e5);
-    color: #fff; border: 1px solid #6d28d9;
-    font-size: 0.7rem; font-weight: 600; padding: 4px 10px;
-    border-radius: 6px; cursor: pointer; transition: all 0.2s;
-    display: inline-flex; align-items: center; gap: 6px;
+    color: #fff;
+    border: 1px solid #6d28d9;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     white-space: nowrap;
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
   }
@@ -472,210 +571,461 @@
     box-shadow: 0 0 10px rgba(124, 58, 237, 0.4);
   }
   .run-jury-btn:disabled {
-    opacity: 0.6; cursor: not-allowed;
+    opacity: 0.6;
+    cursor: not-allowed;
   }
-
 
   /* ── Autonomy Dial ───────────────────────────────────────────────────────────── */
-  .autonomy-dial { display: flex; gap: 4px; }
+  .autonomy-dial {
+    display: flex;
+    gap: 4px;
+  }
   .dial-btn {
-    background: #1e2536; border: 1px solid #2d3748;
-    color: #94a3b8; font-size: 0.65rem; padding: 3px 8px;
-    border-radius: 6px; cursor: pointer; transition: all 0.15s;
+    background: #1e2536;
+    border: 1px solid #2d3748;
+    color: #94a3b8;
+    font-size: 0.65rem;
+    padding: 3px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s;
     white-space: nowrap;
   }
-  .dial-btn:hover { border-color: #7c3aed; color: #e2e8f0; }
-  .dial-btn.active { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+  .dial-btn:hover {
+    border-color: #7c3aed;
+    color: #e2e8f0;
+  }
+  .dial-btn.active {
+    background: #7c3aed;
+    border-color: #7c3aed;
+    color: #fff;
+  }
 
   /* ── Loading / Empty ─────────────────────────────────────────────────────────── */
-  .inbox-loading, .inbox-empty {
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    flex: 1; gap: 12px; color: #94a3b8; font-size: 0.9rem;
+  .inbox-loading,
+  .inbox-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+    gap: 12px;
+    color: #94a3b8;
+    font-size: 0.9rem;
   }
-  .empty-icon { font-size: 3rem; }
-  .inbox-empty h3 { margin: 0; color: #e2e8f0; }
-  .inbox-empty p { margin: 0; text-align: center; max-width: 300px; }
+  .empty-icon {
+    font-size: 3rem;
+  }
+  .inbox-empty h3 {
+    margin: 0;
+    color: #e2e8f0;
+  }
+  .inbox-empty p {
+    margin: 0;
+    text-align: center;
+    max-width: 300px;
+  }
   .spinner {
-    display: inline-block; width: 18px; height: 18px;
-    border: 2px solid #7c3aed; border-top-color: transparent;
-    border-radius: 50%; animation: spin 0.7s linear infinite;
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    border: 2px solid #7c3aed;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
   }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
 
   /* ── Body ───────────────────────────────────────────────────────────────────── */
   .inbox-body {
-    display: flex; flex: 1; overflow: hidden;
+    display: flex;
+    flex: 1;
+    overflow: hidden;
   }
 
   /* ── Queue Rail ─────────────────────────────────────────────────────────────── */
   .queue-rail {
-    width: 140px; flex-shrink: 0; background: #0d1117;
-    border-right: 1px solid #2d3748; display: flex; flex-direction: column;
+    width: 140px;
+    flex-shrink: 0;
+    background: #0d1117;
+    border-right: 1px solid #2d3748;
+    display: flex;
+    flex-direction: column;
     overflow: hidden;
   }
   .rail-header {
-    padding: 8px 10px; font-size: 0.65rem; font-weight: 600;
-    color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em;
+    padding: 8px 10px;
+    font-size: 0.65rem;
+    font-weight: 600;
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
     border-bottom: 1px solid #1e2536;
   }
   .rail-list {
-    flex: 1; overflow-y: auto; list-style: none; margin: 0; padding: 4px 0;
+    flex: 1;
+    overflow-y: auto;
+    list-style: none;
+    margin: 0;
+    padding: 4px 0;
   }
-  .rail-row { margin: 0; padding: 0; }
+  .rail-row {
+    margin: 0;
+    padding: 0;
+  }
   .rail-item {
-    display: flex; align-items: center; gap: 6px;
-    padding: 6px 10px; cursor: pointer; transition: background 0.1s;
-    font-size: 0.72rem; color: #94a3b8; border-radius: 4px; margin: 1px 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: background 0.1s;
+    font-size: 0.72rem;
+    color: #94a3b8;
+    border-radius: 4px;
+    margin: 1px 4px;
     user-select: none;
-    width: calc(100% - 8px); border: 0; background: transparent; text-align: left;
+    width: calc(100% - 8px);
+    border: 0;
+    background: transparent;
+    text-align: left;
   }
-  .rail-item:hover { background: #1e2536; }
-  .rail-item.active { background: #2d1f5e; color: #c4b5fd; }
-  .rail-item.done { opacity: 0.45; }
-  .rail-icon { font-size: 0.8rem; }
-  .rail-id { flex: 1; font-family: monospace; font-size: 0.65rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .rail-done { color: #22c55e; font-size: 0.7rem; }
+  .rail-item:hover {
+    background: #1e2536;
+  }
+  .rail-item.active {
+    background: #2d1f5e;
+    color: #c4b5fd;
+  }
+  .rail-item.done {
+    opacity: 0.45;
+  }
+  .rail-icon {
+    font-size: 0.8rem;
+  }
+  .rail-id {
+    flex: 1;
+    font-family: monospace;
+    font-size: 0.65rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rail-done {
+    color: #22c55e;
+    font-size: 0.7rem;
+  }
 
   /* ── Focus Card ─────────────────────────────────────────────────────────────── */
   .focus-card {
-    flex: 1; overflow-y: auto; padding: 20px 24px;
-    display: flex; flex-direction: column; gap: 16px;
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
   }
 
   /* ── Meta ────────────────────────────────────────────────────────────────────── */
   .card-meta {
-    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
   }
-  .meta-id, .meta-dur, .meta-speaker {
-    background: #1e2536; border: 1px solid #2d3748;
-    padding: 2px 8px; border-radius: 4px;
-    font-size: 0.7rem; font-family: monospace; color: #94a3b8;
+  .meta-id,
+  .meta-dur,
+  .meta-speaker {
+    background: #1e2536;
+    border: 1px solid #2d3748;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-family: monospace;
+    color: #94a3b8;
   }
 
   /* ── Waveform zone ───────────────────────────────────────────────────────────── */
   .waveform-zone {
-    background: #161b27; border: 1px solid #2d3748;
-    border-radius: 8px; padding: 12px 16px;
-    font-size: 0.8rem; color: #6b7280;
+    background: #161b27;
+    border: 1px solid #2d3748;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.8rem;
+    color: #6b7280;
   }
-  .waveform-stub { font-size: 0.8rem; }
+  .waveform-stub {
+    font-size: 0.8rem;
+  }
 
   /* ── Sections ────────────────────────────────────────────────────────────────── */
-  .hyp-section, .verdict-section, .rationale-section { display: flex; flex-direction: column; gap: 8px; }
+  .hyp-section,
+  .verdict-section,
+  .rationale-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
   .section-label {
-    margin: 0; font-size: 0.72rem; font-weight: 600;
-    color: #6b7280; text-transform: uppercase; letter-spacing: 0.04em;
+    margin: 0;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
 
-  .hyp-raw, .hyp-norm {
-    background: #161b27; border: 1px solid #2d3748; border-radius: 8px;
-    padding: 10px 14px; font-family: 'Vazirmatn', 'Noto Naskh Arabic', system-ui, sans-serif;
-    font-size: 1.05rem; line-height: 1.9; color: #cbd5e1;
+  .hyp-raw,
+  .hyp-norm {
+    background: #161b27;
+    border: 1px solid #2d3748;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-family: 'Vazirmatn', 'Noto Naskh Arabic', system-ui, sans-serif;
+    font-size: 1.05rem;
+    line-height: 1.9;
+    color: #cbd5e1;
     text-align: start;
   }
   .hyp-label-inline {
-    font-size: 0.65rem; color: #6b7280; font-family: monospace;
-    display: inline-block; margin-inline-end: 8px;
+    font-size: 0.65rem;
+    color: #6b7280;
+    font-family: monospace;
+    display: inline-block;
+    margin-inline-end: 8px;
   }
-  .hyp-text { direction: rtl; unicode-bidi: embed; }
+  .hyp-text {
+    direction: rtl;
+    unicode-bidi: embed;
+  }
 
   .verdict-text {
-    background: #1a1f2e; border: 1px solid #4c1d95;
-    border-radius: 8px; padding: 12px 16px;
+    background: #1a1f2e;
+    border: 1px solid #4c1d95;
+    border-radius: 8px;
+    padding: 12px 16px;
     font-family: 'Vazirmatn', 'Noto Naskh Arabic', system-ui, sans-serif;
-    font-size: 1.1rem; line-height: 1.9; color: #c4b5fd;
+    font-size: 1.1rem;
+    line-height: 1.9;
+    color: #c4b5fd;
     text-align: start;
   }
 
   /* ── Rationale ────────────────────────────────────────────────────────────────── */
   .rationale-details {
-    background: #0d1117; border: 1px solid #2d3748;
-    border-radius: 6px; padding: 8px 12px;
+    background: #0d1117;
+    border: 1px solid #2d3748;
+    border-radius: 6px;
+    padding: 8px 12px;
     font-size: 0.8rem;
   }
-  .rationale-details summary { cursor: pointer; color: #94a3b8; }
-  .rationale-text { color: #cbd5e1; margin: 6px 0 0; line-height: 1.6; }
+  .rationale-details summary {
+    cursor: pointer;
+    color: #94a3b8;
+  }
+  .rationale-text {
+    color: #cbd5e1;
+    margin: 6px 0 0;
+    line-height: 1.6;
+  }
   .evidence-pre {
-    background: #161b27; border-radius: 4px; padding: 8px;
-    font-size: 0.7rem; color: #94a3b8; overflow-x: auto;
-    white-space: pre-wrap; word-break: break-all;
+    background: #161b27;
+    border-radius: 4px;
+    padding: 8px;
+    font-size: 0.7rem;
+    color: #94a3b8;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
   }
 
   /* ── Confidence strip ─────────────────────────────────────────────────────────── */
   .confidence-strip {
-    display: flex; align-items: center; gap: 8px;
-    background: #161b27; border: 1px solid #2d3748;
-    border-left-width: 3px; border-radius: 6px;
-    padding: 8px 14px; font-size: 0.8rem; color: #94a3b8;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #161b27;
+    border: 1px solid #2d3748;
+    border-left-width: 3px;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 0.8rem;
+    color: #94a3b8;
   }
-  .conf-icon { font-size: 1rem; }
-  .conf-label { flex: 1; }
+  .conf-icon {
+    font-size: 1rem;
+  }
+  .conf-label {
+    flex: 1;
+  }
 
   /* ── Edit area ───────────────────────────────────────────────────────────────── */
   .edit-area {
-    display: flex; flex-direction: column; gap: 8px;
-    background: #161b27; border: 1px solid #7c3aed;
-    border-radius: 8px; padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #161b27;
+    border: 1px solid #7c3aed;
+    border-radius: 8px;
+    padding: 12px 16px;
   }
-  .edit-label { font-size: 0.75rem; color: #94a3b8; }
+  .edit-label {
+    font-size: 0.75rem;
+    color: #94a3b8;
+  }
   .edit-textarea {
-    background: #0d1117; border: 1px solid #2d3748; border-radius: 6px;
-    color: #e2e8f0; padding: 8px 12px; resize: vertical;
+    background: #0d1117;
+    border: 1px solid #2d3748;
+    border-radius: 6px;
+    color: #e2e8f0;
+    padding: 8px 12px;
+    resize: vertical;
     font-family: 'Vazirmatn', 'Noto Naskh Arabic', system-ui, sans-serif;
-    font-size: 1rem; line-height: 1.9;
-    direction: rtl; text-align: start;
-    width: 100%; box-sizing: border-box;
+    font-size: 1rem;
+    line-height: 1.9;
+    direction: rtl;
+    text-align: start;
+    width: 100%;
+    box-sizing: border-box;
   }
-  .edit-actions { display: flex; gap: 8px; }
+  .edit-actions {
+    display: flex;
+    gap: 8px;
+  }
 
   /* ── Verb bar ────────────────────────────────────────────────────────────────── */
   .verb-bar {
-    display: flex; gap: 8px; flex-wrap: wrap;
-    background: #0d1117; border-top: 1px solid #2d3748;
-    padding: 12px 0 4px; position: sticky; bottom: 0;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    background: #0d1117;
+    border-top: 1px solid #2d3748;
+    padding: 12px 0 4px;
+    position: sticky;
+    bottom: 0;
   }
   .verb-btn {
-    display: flex; align-items: center; gap: 6px;
-    padding: 8px 16px; border-radius: 8px; border: 1px solid;
-    font-size: 0.8rem; font-weight: 600; cursor: pointer;
-    transition: all 0.15s; letter-spacing: 0.02em;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: 8px;
+    border: 1px solid;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.02em;
   }
-  .verb-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .verb-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
   .verb-key {
-    background: rgba(255,255,255,0.1); border-radius: 4px;
-    padding: 1px 5px; font-family: monospace; font-size: 0.7rem;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: monospace;
+    font-size: 0.7rem;
   }
-  .verb-btn.accept { background: #14532d; border-color: #16a34a; color: #86efac; }
-  .verb-btn.accept:hover:not(:disabled) { background: #166534; }
-  .verb-btn.edit { background: #1e3a5f; border-color: #2563eb; color: #93c5fd; }
-  .verb-btn.edit:hover:not(:disabled) { background: #1e40af; }
-  .verb-btn.reject { background: #4c1d1d; border-color: #dc2626; color: #fca5a5; }
-  .verb-btn.reject:hover:not(:disabled) { background: #7f1d1d; }
-  .verb-btn.skip { background: #1e2536; border-color: #475569; color: #94a3b8; }
-  .verb-btn.skip:hover:not(:disabled) { background: #2d3748; }
-  .verb-btn.flag { background: #451a03; border-color: #ea580c; color: #fdba74; }
-  .verb-btn.flag:hover:not(:disabled) { background: #7c2d12; }
-  .verb-btn.undo { background: #1e1e1e; border-color: #374151; color: #6b7280; }
-  .verb-btn.undo:hover:not(:disabled) { background: #2d3748; color: #e2e8f0; }
+  .verb-btn.accept {
+    background: #14532d;
+    border-color: #16a34a;
+    color: #86efac;
+  }
+  .verb-btn.accept:hover:not(:disabled) {
+    background: #166534;
+  }
+  .verb-btn.edit {
+    background: #1e3a5f;
+    border-color: #2563eb;
+    color: #93c5fd;
+  }
+  .verb-btn.edit:hover:not(:disabled) {
+    background: #1e40af;
+  }
+  .verb-btn.reject {
+    background: #4c1d1d;
+    border-color: #dc2626;
+    color: #fca5a5;
+  }
+  .verb-btn.reject:hover:not(:disabled) {
+    background: #7f1d1d;
+  }
+  .verb-btn.skip {
+    background: #1e2536;
+    border-color: #475569;
+    color: #94a3b8;
+  }
+  .verb-btn.skip:hover:not(:disabled) {
+    background: #2d3748;
+  }
+  .verb-btn.flag {
+    background: #451a03;
+    border-color: #ea580c;
+    color: #fdba74;
+  }
+  .verb-btn.flag:hover:not(:disabled) {
+    background: #7c2d12;
+  }
+  .verb-btn.undo {
+    background: #1e1e1e;
+    border-color: #374151;
+    color: #6b7280;
+  }
+  .verb-btn.undo:hover:not(:disabled) {
+    background: #2d3748;
+    color: #e2e8f0;
+  }
 
   /* ── Status bar ─────────────────────────────────────────────────────────────── */
   .status-bar {
-    text-align: center; font-size: 0.78rem; color: #a78bfa;
-    padding: 4px 0; animation: fadeIn 0.2s ease;
+    text-align: center;
+    font-size: 0.78rem;
+    color: #a78bfa;
+    padding: 4px 0;
+    animation: fadeIn 0.2s ease;
   }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+  @keyframes fadeIn {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+    }
+  }
 
   /* ── Shared button styles ─────────────────────────────────────────────────────── */
   .btn-primary {
-    background: #7c3aed; color: #fff; border: none;
-    padding: 8px 18px; border-radius: 8px; font-size: 0.82rem;
-    font-weight: 600; cursor: pointer; transition: background 0.15s;
+    background: #7c3aed;
+    color: #fff;
+    border: none;
+    padding: 8px 18px;
+    border-radius: 8px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
   }
-  .btn-primary:hover { background: #6d28d9; }
+  .btn-primary:hover {
+    background: #6d28d9;
+  }
   .btn-secondary {
-    background: #1e2536; color: #94a3b8; border: 1px solid #2d3748;
-    padding: 8px 18px; border-radius: 8px; font-size: 0.82rem;
-    cursor: pointer; transition: background 0.15s;
+    background: #1e2536;
+    color: #94a3b8;
+    border: 1px solid #2d3748;
+    padding: 8px 18px;
+    border-radius: 8px;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: background 0.15s;
   }
-  .btn-secondary:hover { background: #2d3748; }
+  .btn-secondary:hover {
+    background: #2d3748;
+  }
 </style>

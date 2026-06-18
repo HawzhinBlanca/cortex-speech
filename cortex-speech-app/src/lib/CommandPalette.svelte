@@ -48,7 +48,10 @@
     const q = query.trim().toLowerCase();
     if (!q) return commands;
     return commands.filter(
-      (c) => fuzzy(c.label.toLowerCase(), q) || c.category.toLowerCase().includes(q) || c.label.toLowerCase().includes(q),
+      (c) =>
+        fuzzy(c.label.toLowerCase(), q) ||
+        c.category.toLowerCase().includes(q) ||
+        c.label.toLowerCase().includes(q),
     );
   });
 
@@ -66,7 +69,9 @@
 
   function scrollActiveIntoView() {
     requestAnimationFrame(() => {
-      listEl?.querySelector<HTMLElement>('[data-active="true"]')?.scrollIntoView({ block: 'nearest' });
+      listEl
+        ?.querySelector<HTMLElement>('[data-active="true"]')
+        ?.scrollIntoView({ block: 'nearest' });
     });
   }
 
@@ -96,9 +101,24 @@
 
 <Modal {open} {onClose} size="lg">
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div role="combobox" aria-expanded="true" aria-controls="cmdk-list" tabindex="-1" onkeydown={onKeydown}>
+  <div
+    role="combobox"
+    aria-expanded="true"
+    aria-controls="cmdk-list"
+    tabindex="-1"
+    onkeydown={onKeydown}
+  >
     <div class="flex items-center gap-3 border-b border-line px-4 py-3.5">
-      <svg class="text-subtle" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <svg
+        class="text-subtle"
+        width="18"
+        height="18"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+      >
         <circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" />
       </svg>
       <!-- svelte-ignore a11y_autofocus -->
@@ -122,7 +142,9 @@
           aria-selected={i === activeIndex}
           data-active={i === activeIndex}
           class="flex w-full items-center justify-between gap-3 rounded-token px-3 py-2 text-start text-sm transition-colors duration-100
-                 {i === activeIndex ? 'bg-surface-3 text-default' : 'text-muted hover:bg-surface-2'}"
+                 {i === activeIndex
+            ? 'bg-surface-3 text-default'
+            : 'text-muted hover:bg-surface-2'}"
           onmouseenter={() => (activeIndex = i)}
           onclick={() => run(i)}
         >

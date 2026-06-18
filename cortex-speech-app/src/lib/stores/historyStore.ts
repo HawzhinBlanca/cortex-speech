@@ -21,7 +21,7 @@ function createHistoryStore() {
 
   async function refresh() {
     if (!isTauriRuntime()) {
-      store.update(s => ({ ...s, canUndo: false, canRedo: false }));
+      store.update((s) => ({ ...s, canUndo: false, canRedo: false }));
       return;
     }
 
@@ -30,9 +30,9 @@ function createHistoryStore() {
         invoke<boolean>('can_undo'),
         invoke<boolean>('can_redo'),
       ]);
-      store.update(s => ({ ...s, canUndo, canRedo }));
+      store.update((s) => ({ ...s, canUndo, canRedo }));
     } catch {
-      store.update(s => ({ ...s, canUndo: false, canRedo: false }));
+      store.update((s) => ({ ...s, canUndo: false, canRedo: false }));
     }
   }
 
@@ -40,32 +40,32 @@ function createHistoryStore() {
     subscribe: store.subscribe,
     async undo(): Promise<string | null> {
       if (!isTauriRuntime()) {
-        store.update(s => ({ ...s, canUndo: false, canRedo: false, processing: false }));
+        store.update((s) => ({ ...s, canUndo: false, canRedo: false, processing: false }));
         return null;
       }
 
-      store.update(s => ({ ...s, processing: true }));
+      store.update((s) => ({ ...s, processing: true }));
       try {
         const description = await invoke<string | null>('undo');
         await refresh();
         return description;
       } finally {
-        store.update(s => ({ ...s, processing: false }));
+        store.update((s) => ({ ...s, processing: false }));
       }
     },
     async redo(): Promise<string | null> {
       if (!isTauriRuntime()) {
-        store.update(s => ({ ...s, canUndo: false, canRedo: false, processing: false }));
+        store.update((s) => ({ ...s, canUndo: false, canRedo: false, processing: false }));
         return null;
       }
 
-      store.update(s => ({ ...s, processing: true }));
+      store.update((s) => ({ ...s, processing: true }));
       try {
         const description = await invoke<string | null>('redo');
         await refresh();
         return description;
       } finally {
-        store.update(s => ({ ...s, processing: false }));
+        store.update((s) => ({ ...s, processing: false }));
       }
     },
     refresh,

@@ -14,7 +14,9 @@
   import { isTauriRuntime } from './runtime';
 
   let localSettings: AppSettings = $state({ ...$settings });
-  let activeTab = $state<'general' | 'asr' | 'audio' | 'export' | 'models' | 'ai' | 'jury'>($settingsTab);
+  let activeTab = $state<'general' | 'asr' | 'audio' | 'export' | 'models' | 'ai' | 'jury'>(
+    $settingsTab,
+  );
   let saving = $state(false);
   let exportingAudio = $state(false);
   let sourceReferenceModelsInput = $state('');
@@ -25,7 +27,9 @@
     localSettings = { ...nextSettings };
     sourceReferenceModelsInput = nextSettings.sourceReferenceModels.join(', ');
   });
-  $effect(() => { activeTab = $settingsTab; });
+  $effect(() => {
+    activeTab = $settingsTab;
+  });
 
   onDestroy(() => {
     applySourceReferenceModelsInput();
@@ -51,7 +55,7 @@
     try {
       await api.updateSettings(localSettings);
     } catch (e) {
-      console.error("Auto-save settings failed:", e);
+      console.error('Auto-save settings failed:', e);
     }
   }
 
@@ -115,7 +119,9 @@
       notifications.info($t('desktopRuntimeRequired'));
       return;
     }
-    const verifiedIds = get(segments).filter((s) => s.verified).map((s) => s.id);
+    const verifiedIds = get(segments)
+      .filter((s) => s.verified)
+      .map((s) => s.id);
     if (verifiedIds.length === 0) {
       notifications.warning($t('exportAudio.noVerified'));
       return;
@@ -145,10 +151,9 @@
           { detail: result.output_dir },
         );
       } else {
-        notifications.success(
-          $t('exportAudio.success', { count: String(result.succeeded) }),
-          { detail: result.output_dir },
-        );
+        notifications.success($t('exportAudio.success', { count: String(result.succeeded) }), {
+          detail: result.output_dir,
+        });
       }
     } catch (e) {
       notifications.error($t('exportAudio.failed'), { detail: String(e) });
@@ -176,27 +181,42 @@
   onkeydown={handleKeydown}
 >
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div role="presentation" class="card p-0 max-w-2xl w-full mx-4 max-h-[85vh] flex flex-col shadow-2xl" onclick={(e) => e.stopPropagation()}>
+  <div
+    role="presentation"
+    class="card p-0 max-w-2xl w-full mx-4 max-h-[85vh] flex flex-col shadow-2xl"
+    onclick={(e) => e.stopPropagation()}
+  >
     <div class="flex items-center justify-between px-6 py-4 border-b border-cortex-800/50">
       <h2 class="text-lg font-semibold text-default">{$t('settings')}</h2>
-      <button data-testid="settings-close-btn" class="text-muted hover:text-default transition-colors" onclick={() => showSettings.set(false)} aria-label={$t('close')}>✕</button>
+      <button
+        data-testid="settings-close-btn"
+        class="text-muted hover:text-default transition-colors"
+        onclick={() => showSettings.set(false)}
+        aria-label={$t('close')}>✕</button
+      >
     </div>
 
     <div class="flex gap-0 flex-1 min-h-0">
       <nav class="w-40 shrink-0 p-2 border-r border-cortex-800/50 space-y-1">
         {#each tabs as tab}
           <button
-            class="w-full text-start px-3 py-2 rounded-lg text-sm transition-colors {activeTab === tab.id ? 'bg-cortex-700 text-cortex-100' : 'text-cortex-300 hover:text-cortex-100 hover:bg-cortex-800/50'}"
+            class="w-full text-start px-3 py-2 rounded-lg text-sm transition-colors {activeTab ===
+            tab.id
+              ? 'bg-cortex-700 text-cortex-100'
+              : 'text-cortex-300 hover:text-cortex-100 hover:bg-cortex-800/50'}"
             disabled={!tauriAvailable && tab.id === 'models'}
             title={!tauriAvailable && tab.id === 'models' ? $t('desktopRuntimeRequired') : ''}
-            onclick={() => activeTab = tab.id}
-          >{tab.id === 'ai' ? 'AI Post-Processing' : $t(tab.labelKey)}</button>
+            onclick={() => (activeTab = tab.id)}
+            >{tab.id === 'ai' ? 'AI Post-Processing' : $t(tab.labelKey)}</button
+          >
         {/each}
       </nav>
 
       <div class="flex-1 p-6 overflow-y-auto space-y-5">
         {#if !tauriAvailable}
-          <div class="rounded-md border border-amber-500/30 bg-amber-950/20 p-3 text-xs text-amber-100">
+          <div
+            class="rounded-md border border-amber-500/30 bg-amber-950/20 p-3 text-xs text-amber-100"
+          >
             {$t('settingsPreviewOnly')}
           </div>
         {/if}
@@ -218,24 +238,39 @@
             </select>
           </label>
           <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" bind:checked={localSettings.autoNormalize} class="accent-cortex-500">
+            <input
+              type="checkbox"
+              bind:checked={localSettings.autoNormalize}
+              class="accent-cortex-500"
+            />
             <span class="text-sm text-muted">{$t('autoNormalize')}</span>
           </label>
           {#if localSettings.autoNormalize}
             <label class="flex items-center gap-3 cursor-pointer ps-6">
-              <input type="checkbox" bind:checked={localSettings.verbalizeNumbers} class="accent-cortex-500">
+              <input
+                type="checkbox"
+                bind:checked={localSettings.verbalizeNumbers}
+                class="accent-cortex-500"
+              />
               <span class="text-sm text-muted">{$t('verbalizeNumbers')}</span>
             </label>
           {/if}
           <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" bind:checked={localSettings.autoAlign} class="accent-cortex-500">
+            <input
+              type="checkbox"
+              bind:checked={localSettings.autoAlign}
+              class="accent-cortex-500"
+            />
             <span class="text-sm text-muted">{$t('autoAlign')}</span>
           </label>
           <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" bind:checked={localSettings.autoplaySegments} class="accent-cortex-500">
+            <input
+              type="checkbox"
+              bind:checked={localSettings.autoplaySegments}
+              class="accent-cortex-500"
+            />
             <span class="text-sm text-muted">Autoplay Segments on Selection</span>
           </label>
-
         {:else if activeTab === 'asr'}
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('asrModel')}</span>
@@ -247,64 +282,137 @@
           </label>
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('threads')}</span>
-            <input type="range" min="1" max="16" bind:value={localSettings.numThreads} class="flex-1 accent-cortex-500">
-            <span class="text-xs font-mono text-cortex-300 w-6 text-end">{localSettings.numThreads}</span>
+            <input
+              type="range"
+              min="1"
+              max="16"
+              bind:value={localSettings.numThreads}
+              class="flex-1 accent-cortex-500"
+            />
+            <span class="text-xs font-mono text-cortex-300 w-6 text-end"
+              >{localSettings.numThreads}</span
+            >
           </label>
           <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" bind:checked={localSettings.enableGpu} class="accent-cortex-500">
+            <input
+              type="checkbox"
+              bind:checked={localSettings.enableGpu}
+              class="accent-cortex-500"
+            />
             <span class="text-sm text-muted">{$t('gpuAcceleration')}</span>
           </label>
-
         {:else if activeTab === 'audio'}
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('vadThreshold')}</span>
-            <input type="range" min="0" max="1" step="0.05" bind:value={localSettings.vadThreshold} class="flex-1 accent-cortex-500">
-            <span class="text-xs font-mono text-cortex-300 w-8 text-end">{localSettings.vadThreshold}</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              bind:value={localSettings.vadThreshold}
+              class="flex-1 accent-cortex-500"
+            />
+            <span class="text-xs font-mono text-cortex-300 w-8 text-end"
+              >{localSettings.vadThreshold}</span
+            >
           </label>
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('minSegment')}</span>
-            <input type="number" bind:value={localSettings.minSegmentSec} class="input w-20" min="1" max="60">
+            <input
+              type="number"
+              bind:value={localSettings.minSegmentSec}
+              class="input w-20"
+              min="1"
+              max="60"
+            />
             <span class="text-xs text-cortex-400">{$t('seconds')}</span>
           </label>
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('maxSegment')}</span>
-            <input type="number" bind:value={localSettings.maxSegmentSec} class="input w-20" min="1" max="300">
+            <input
+              type="number"
+              bind:value={localSettings.maxSegmentSec}
+              class="input w-20"
+              min="1"
+              max="300"
+            />
             <span class="text-xs text-cortex-400">{$t('seconds')}</span>
           </label>
           <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" bind:checked={localSettings.enableDenoising} class="accent-cortex-500">
+            <input
+              type="checkbox"
+              bind:checked={localSettings.enableDenoising}
+              class="accent-cortex-500"
+            />
             <span class="text-sm text-muted">AI Audio Cleanup (Denoise before ASR)</span>
           </label>
           <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" bind:checked={localSettings.enableDiarization} class="accent-cortex-500">
+            <input
+              type="checkbox"
+              bind:checked={localSettings.enableDiarization}
+              class="accent-cortex-500"
+            />
             <span class="text-sm text-muted">{$t('enableDiarization')}</span>
           </label>
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('maxSpeakers')}</span>
-            <input type="number" bind:value={localSettings.maxSpeakers} class="input w-20" min="1" max="32">
+            <input
+              type="number"
+              bind:value={localSettings.maxSpeakers}
+              class="input w-20"
+              min="1"
+              max="32"
+            />
           </label>
           <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" bind:checked={localSettings.assignSpeakerFromFilename} class="accent-cortex-500">
+            <input
+              type="checkbox"
+              bind:checked={localSettings.assignSpeakerFromFilename}
+              class="accent-cortex-500"
+            />
             <span class="text-sm text-muted">{$t('assignSpeakerFromFilename')}</span>
           </label>
           <div class="pt-3 border-t border-cortex-800/50 space-y-3">
-            <p class="text-xs font-semibold text-cortex-300 uppercase tracking-wider">{$t('qualityGates')}</p>
+            <p class="text-xs font-semibold text-cortex-300 uppercase tracking-wider">
+              {$t('qualityGates')}
+            </p>
             <label class="flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" bind:checked={localSettings.enforceQualityGates} class="accent-cortex-500">
+              <input
+                type="checkbox"
+                bind:checked={localSettings.enforceQualityGates}
+                class="accent-cortex-500"
+              />
               <span class="text-sm text-muted">{$t('enforceQualityGates')}</span>
             </label>
             <label class="flex items-center gap-3">
               <span class="text-sm text-muted w-32">{$t('maxWer')}</span>
-              <input type="range" min="0.05" max="0.80" step="0.05" bind:value={localSettings.maxWerThreshold} class="flex-1 accent-cortex-500">
-              <span class="text-xs font-mono text-cortex-300 w-10 text-end">{Math.round(localSettings.maxWerThreshold * 100)}%</span>
+              <input
+                type="range"
+                min="0.05"
+                max="0.80"
+                step="0.05"
+                bind:value={localSettings.maxWerThreshold}
+                class="flex-1 accent-cortex-500"
+              />
+              <span class="text-xs font-mono text-cortex-300 w-10 text-end"
+                >{Math.round(localSettings.maxWerThreshold * 100)}%</span
+              >
             </label>
             <label class="flex items-center gap-3">
               <span class="text-sm text-muted w-32">{$t('maxCer')}</span>
-              <input type="range" min="0.05" max="0.80" step="0.05" bind:value={localSettings.maxCerThreshold} class="flex-1 accent-cortex-500">
-              <span class="text-xs font-mono text-cortex-300 w-10 text-end">{Math.round(localSettings.maxCerThreshold * 100)}%</span>
+              <input
+                type="range"
+                min="0.05"
+                max="0.80"
+                step="0.05"
+                bind:value={localSettings.maxCerThreshold}
+                class="flex-1 accent-cortex-500"
+              />
+              <span class="text-xs font-mono text-cortex-300 w-10 text-end"
+                >{Math.round(localSettings.maxCerThreshold * 100)}%</span
+              >
             </label>
           </div>
-
         {:else if activeTab === 'export'}
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('exportFormat')}</span>
@@ -320,7 +428,7 @@
           <div class="pt-2 border-t border-cortex-800/50 space-y-2">
             <p class="text-xs text-cortex-400">{$t('exportAudio.description')}</p>
             <button
-              class="btn-secondary !text-xs"
+              class="btn btn-secondary !text-xs"
               onclick={handleExportAudioFromSettings}
               disabled={!tauriAvailable || exportingAudio || $isProcessing}
               title={tauriAvailable ? $t('exportAudio.label') : $t('desktopRuntimeRequired')}
@@ -328,24 +436,37 @@
               {exportingAudio ? $t('exportAudio.progress') : $t('exportAudio.label')}
             </button>
           </div>
-
         {:else if activeTab === 'models'}
           {#if tauriAvailable}
             <ModelDownload />
           {:else}
-            <div class="rounded-md border border-cortex-700/40 bg-cortex-900/30 p-3 text-xs text-muted">
+            <div
+              class="rounded-md border border-cortex-700/40 bg-cortex-900/30 p-3 text-xs text-muted"
+            >
               {$t('desktopRuntimeRequired')}
             </div>
           {/if}
-
         {:else if activeTab === 'ai'}
           <div class="space-y-4">
-            <h3 class="text-md font-semibold text-default">Dual-Pass Transcription (LLM Refiner)</h3>
-            <p class="text-xs text-muted">Use a local LLM by default. Cloud providers are opt-in and send text to the provider.</p>
+            <h3 class="text-md font-semibold text-default">
+              Dual-Pass Transcription (LLM Refiner)
+            </h3>
+            <p class="text-xs text-muted">
+              Use a local LLM by default. Cloud providers are opt-in and send text to the provider.
+            </p>
             <label class="flex flex-col gap-1">
               <span class="text-sm text-muted">External ASR Provider Script</span>
-              <input type="text" class="input w-full" bind:value={localSettings.externalAsrScriptPath} onblur={saveQuietly} onchange={saveQuietly} placeholder="/mnt/c/path/to/provider_refine.py" />
-              <span class="text-[10px] text-subtle">Required only for the WSL 7B provider. Use a WSL-visible path.</span>
+              <input
+                type="text"
+                class="input w-full"
+                bind:value={localSettings.externalAsrScriptPath}
+                onblur={saveQuietly}
+                onchange={saveQuietly}
+                placeholder="/mnt/c/path/to/provider_refine.py"
+              />
+              <span class="text-[10px] text-subtle"
+                >Required only for the WSL 7B provider. Use a WSL-visible path.</span
+              >
             </label>
             <label class="flex items-center gap-3">
               <span class="text-sm text-muted w-32">LLM Engine</span>
@@ -359,65 +480,146 @@
             {#if localSettings.llmMode === 'Local'}
               <label class="flex flex-col gap-1">
                 <span class="text-sm text-muted">Local API Endpoint</span>
-                <input type="text" class="input w-full" bind:value={localSettings.llmEndpoint} onblur={saveQuietly} onchange={saveQuietly} placeholder="http://127.0.0.1:11434/v1/chat/completions" />
-                <span class="text-[10px] text-subtle">Must be an OpenAI-compatible /v1/chat/completions endpoint.</span>
+                <input
+                  type="text"
+                  class="input w-full"
+                  bind:value={localSettings.llmEndpoint}
+                  onblur={saveQuietly}
+                  onchange={saveQuietly}
+                  placeholder="http://127.0.0.1:11434/v1/chat/completions"
+                />
+                <span class="text-[10px] text-subtle"
+                  >Must be an OpenAI-compatible /v1/chat/completions endpoint.</span
+                >
               </label>
               <label class="flex flex-col gap-1 mt-2">
                 <span class="text-sm text-muted">Model Name</span>
-                <input type="text" class="input w-full" bind:value={localSettings.llmModel} onblur={saveQuietly} onchange={saveQuietly} placeholder="heretic-final:latest" />
+                <input
+                  type="text"
+                  class="input w-full"
+                  bind:value={localSettings.llmModel}
+                  onblur={saveQuietly}
+                  onchange={saveQuietly}
+                  placeholder="heretic-final:latest"
+                />
                 <span class="text-[10px] text-subtle">
-                  Quick select: 
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 me-2" onclick={() => { localSettings.llmModel = 'heretic-final:latest'; saveQuietly(); }}>heretic-final:latest</button>
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300" onclick={() => { localSettings.llmModel = 'qwen2.5-coder:7b'; saveQuietly(); }}>qwen2.5-coder:7b</button>
+                  Quick select:
+                  <button
+                    type="button"
+                    class="underline text-cortex-400 hover:text-cortex-300 me-2"
+                    onclick={() => {
+                      localSettings.llmModel = 'heretic-final:latest';
+                      saveQuietly();
+                    }}>heretic-final:latest</button
+                  >
+                  <button
+                    type="button"
+                    class="underline text-cortex-400 hover:text-cortex-300"
+                    onclick={() => {
+                      localSettings.llmModel = 'qwen2.5-coder:7b';
+                      saveQuietly();
+                    }}>qwen2.5-coder:7b</button
+                  >
                 </span>
               </label>
             {:else if localSettings.llmMode === 'Gemini'}
-              <label class="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-950/20 p-3">
-                <input type="checkbox" class="mt-1" bind:checked={localSettings.cloudLlmOptIn} onchange={saveQuietly} />
+              <label
+                class="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-950/20 p-3"
+              >
+                <input
+                  type="checkbox"
+                  class="mt-1"
+                  bind:checked={localSettings.cloudLlmOptIn}
+                  onchange={saveQuietly}
+                />
                 <span class="text-xs text-amber-100">
-                  I understand Gemini sends transcript text to Google. Keep this disabled for fully offline dataset work.
+                  I understand Gemini sends transcript text to Google. Keep this disabled for fully
+                  offline dataset work.
                 </span>
               </label>
               <label class="flex flex-col gap-1">
                 <span class="text-sm text-muted">Gemini API Key</span>
-                <input type="password" class="input w-full" bind:value={localSettings.llmApiKey} onblur={saveQuietly} onchange={saveQuietly} placeholder="AIzaSy..." />
+                <input
+                  type="password"
+                  class="input w-full"
+                  bind:value={localSettings.llmApiKey}
+                  onblur={saveQuietly}
+                  onchange={saveQuietly}
+                  placeholder="AIzaSy..."
+                />
                 <span class="text-[10px] text-subtle">
                   The key is used for this session and is not written to settings.json.
-                  {#if localSettings.llmApiKeyConfigured} A cloud key was previously configured. {/if}
+                  {#if localSettings.llmApiKeyConfigured}
+                    A cloud key was previously configured.
+                  {/if}
                 </span>
               </label>
               <label class="flex flex-col gap-1 mt-2">
                 <span class="text-sm text-muted">Gemini Model</span>
-                <input type="text" class="input w-full" bind:value={localSettings.llmModel} onblur={saveQuietly} onchange={saveQuietly} placeholder="gemini-2.5-pro" />
+                <input
+                  type="text"
+                  class="input w-full"
+                  bind:value={localSettings.llmModel}
+                  onblur={saveQuietly}
+                  onchange={saveQuietly}
+                  placeholder="gemini-2.5-pro"
+                />
                 <span class="text-[10px] text-subtle">
-                  Quick select: 
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 me-2" onclick={() => { localSettings.llmModel = 'gemini-2.5-pro'; saveQuietly(); }}>Gemini 2.5 Pro (Recommended)</button>
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300" onclick={() => { localSettings.llmModel = 'gemini-2.5-flash'; saveQuietly(); }}>Gemini 2.5 Flash</button>
+                  Quick select:
+                  <button
+                    type="button"
+                    class="underline text-cortex-400 hover:text-cortex-300 me-2"
+                    onclick={() => {
+                      localSettings.llmModel = 'gemini-2.5-pro';
+                      saveQuietly();
+                    }}>Gemini 2.5 Pro (Recommended)</button
+                  >
+                  <button
+                    type="button"
+                    class="underline text-cortex-400 hover:text-cortex-300"
+                    onclick={() => {
+                      localSettings.llmModel = 'gemini-2.5-flash';
+                      saveQuietly();
+                    }}>Gemini 2.5 Flash</button
+                  >
                 </span>
               </label>
             {/if}
 
             <label class="flex flex-col gap-1 mt-4">
               <span class="text-sm text-muted">System Prompt</span>
-              <textarea class="input w-full h-32 text-xs font-mono" bind:value={localSettings.llmSystemPrompt} onblur={saveQuietly} onchange={saveQuietly}></textarea>
-              <span class="text-[10px] text-subtle">The instructions sent to the LLM to process the transcription.</span>
+              <textarea
+                class="input w-full h-32 text-xs font-mono"
+                bind:value={localSettings.llmSystemPrompt}
+                onblur={saveQuietly}
+                onchange={saveQuietly}
+              ></textarea>
+              <span class="text-[10px] text-subtle"
+                >The instructions sent to the LLM to process the transcription.</span
+              >
             </label>
           </div>
-
         {:else if activeTab === 'jury'}
           <div class="space-y-5">
             <h3 class="text-md font-semibold text-default">📬 Listening Jury</h3>
             <p class="text-xs text-muted">
-              The Jury cascades segments from IRT consensus (T0) → text analysis (T1) → Gemini audio (T2) → human inbox.
-              Cloud tiers send audio to Google and require an opt-in.
+              The Jury cascades segments from IRT consensus (T0) → text analysis (T1) → Gemini audio
+              (T2) → human inbox. Cloud tiers send audio to Google and require an opt-in.
             </p>
 
             <!-- Cloud opt-in gate -->
-            <label class="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-950/20 p-3">
-              <input type="checkbox" class="mt-1 accent-cortex-500" bind:checked={localSettings.juryCloudOptIn} onchange={saveQuietly} />
+            <label
+              class="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-950/20 p-3"
+            >
+              <input
+                type="checkbox"
+                class="mt-1 accent-cortex-500"
+                bind:checked={localSettings.juryCloudOptIn}
+                onchange={saveQuietly}
+              />
               <span class="text-xs text-amber-100">
-                <strong>I understand</strong> that enabling T2 sends audio clips to Google Gemini.
-                Keep disabled for fully offline / air-gapped dataset work.
+                <strong>I understand</strong> that enabling T2 sends audio clips to Google Gemini. Keep
+                disabled for fully offline / air-gapped dataset work.
               </span>
             </label>
 
@@ -425,78 +627,132 @@
             <div class="space-y-2">
               <span class="text-sm text-muted block">Autonomy level</span>
               <div class="flex gap-2 flex-wrap">
-                {#each [['observe','👁 Observe'],['propose','💡 Propose'],['act_confirm','✅ Act+Confirm'],['act_auto','🤖 Act Auto']] as [val, label]}
+                {#each [['observe', '👁 Observe'], ['propose', '💡 Propose'], ['act_confirm', '✅ Act+Confirm'], ['act_auto', '🤖 Act Auto']] as [val, label]}
                   <button
                     type="button"
                     class="px-3 py-1.5 rounded-lg border text-xs font-medium transition-all
                       {localSettings.juryAutonomyLevel === val
-                        ? 'bg-purple-700 border-purple-500 text-white'
-                        : 'bg-cortex-900/40 border-cortex-700/50 text-cortex-300 hover:border-cortex-500'}"
-                    onclick={() => { localSettings = { ...localSettings, juryAutonomyLevel: val as typeof localSettings.juryAutonomyLevel }; saveQuietly(); }}
-                  >{label}</button>
+                      ? 'bg-purple-700 border-purple-500 text-white'
+                      : 'bg-cortex-900/40 border-cortex-700/50 text-cortex-300 hover:border-cortex-500'}"
+                    onclick={() => {
+                      localSettings = {
+                        ...localSettings,
+                        juryAutonomyLevel: val as typeof localSettings.juryAutonomyLevel,
+                      };
+                      saveQuietly();
+                    }}>{label}</button
+                  >
                 {/each}
               </div>
               <p class="text-[10px] text-subtle">
-                Observe: jury runs but humans decide everything. Act Auto: jury commits without review (requires high T1 threshold).
+                Observe: jury runs but humans decide everything. Act Auto: jury commits without
+                review (requires high T1 threshold).
               </p>
             </div>
 
             <!-- T1 commit threshold -->
             <label class="flex items-center gap-3">
               <span class="text-sm text-muted w-36">T1 commit threshold</span>
-              <input type="range" min="0.50" max="0.99" step="0.01"
+              <input
+                type="range"
+                min="0.50"
+                max="0.99"
+                step="0.01"
                 bind:value={localSettings.juryT1Threshold}
                 onchange={saveQuietly}
                 class="flex-1 accent-cortex-500"
+              />
+              <span class="text-xs font-mono text-cortex-300 w-10 text-end"
+                >{Math.round(localSettings.juryT1Threshold * 100)}%</span
               >
-              <span class="text-xs font-mono text-cortex-300 w-10 text-end">{Math.round(localSettings.juryT1Threshold * 100)}%</span>
             </label>
-            <p class="text-[10px] text-subtle -mt-3">Segments below this combined lexicon+perplexity score escalate to T2. Raise to reduce cloud calls.</p>
+            <p class="text-[10px] text-subtle -mt-3">
+              Segments below this combined lexicon+perplexity score escalate to T2. Raise to reduce
+              cloud calls.
+            </p>
 
             <!-- T2 model + self-consistency -->
             {#if localSettings.juryCloudOptIn}
               <label class="flex flex-col gap-1">
                 <span class="text-sm text-muted">Gemini model (T2 audio judge)</span>
-                <input type="text" class="input w-full" bind:value={localSettings.juryModel}
-                  onblur={saveQuietly} placeholder="gemini-2.5-pro" />
+                <input
+                  type="text"
+                  class="input w-full"
+                  bind:value={localSettings.juryModel}
+                  onblur={saveQuietly}
+                  placeholder="gemini-2.5-pro"
+                />
                 <span class="text-[10px] text-subtle">
                   Quick select:
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 me-2"
-                    onclick={() => { localSettings.juryModel = 'gemini-2.5-pro'; saveQuietly(); }}
-                  >2.5 Pro (Recommended)</button>
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300"
-                    onclick={() => { localSettings.juryModel = 'gemini-2.5-flash'; saveQuietly(); }}
-                  >2.5 Flash (Faster)</button>
+                  <button
+                    type="button"
+                    class="underline text-cortex-400 hover:text-cortex-300 me-2"
+                    onclick={() => {
+                      localSettings.juryModel = 'gemini-2.5-pro';
+                      saveQuietly();
+                    }}>2.5 Pro (Recommended)</button
+                  >
+                  <button
+                    type="button"
+                    class="underline text-cortex-400 hover:text-cortex-300"
+                    onclick={() => {
+                      localSettings.juryModel = 'gemini-2.5-flash';
+                      saveQuietly();
+                    }}>2.5 Flash (Faster)</button
+                  >
                 </span>
               </label>
 
               <label class="flex flex-col gap-1">
                 <span class="text-sm text-muted">Source reference models</span>
-                <input type="text" class="input w-full" bind:value={sourceReferenceModelsInput}
-                  onblur={saveSourceReferenceModels} onchange={saveSourceReferenceModels}
-                  placeholder="gemini-2.5-pro, gemini-2.5-flash" />
+                <input
+                  type="text"
+                  class="input w-full"
+                  bind:value={sourceReferenceModelsInput}
+                  onblur={saveSourceReferenceModels}
+                  onchange={saveSourceReferenceModels}
+                  placeholder="gemini-2.5-pro, gemini-2.5-flash"
+                />
                 <span class="text-[10px] text-subtle">
                   Quick select:
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300 me-2"
-                    onclick={() => { sourceReferenceModelsInput = 'gemini-2.5-pro, gemini-2.5-flash'; saveSourceReferenceModels(); }}
-                  >2.5 Pro + Flash</button>
-                  <button type="button" class="underline text-cortex-400 hover:text-cortex-300"
-                    onclick={() => { sourceReferenceModelsInput = 'gemini-2.5-pro'; saveSourceReferenceModels(); }}
-                  >2.5 Pro only</button>
+                  <button
+                    type="button"
+                    class="underline text-cortex-400 hover:text-cortex-300 me-2"
+                    onclick={() => {
+                      sourceReferenceModelsInput = 'gemini-2.5-pro, gemini-2.5-flash';
+                      saveSourceReferenceModels();
+                    }}>2.5 Pro + Flash</button
+                  >
+                  <button
+                    type="button"
+                    class="underline text-cortex-400 hover:text-cortex-300"
+                    onclick={() => {
+                      sourceReferenceModelsInput = 'gemini-2.5-pro';
+                      saveSourceReferenceModels();
+                    }}>2.5 Pro only</button
+                  >
                 </span>
               </label>
 
               <label class="flex items-center gap-3">
                 <span class="text-sm text-muted w-36">Self-consistency N</span>
-                <input type="number" min="1" max="5" class="input w-20"
+                <input
+                  type="number"
+                  min="1"
+                  max="5"
+                  class="input w-20"
                   bind:value={localSettings.jurySelfConsistencyN}
                   onblur={saveQuietly}
+                />
+                <span class="text-[10px] text-subtle"
+                  >Votes per segment. 3 = majority vote. Higher = more accurate, more API calls.</span
                 >
-                <span class="text-[10px] text-subtle">Votes per segment. 3 = majority vote. Higher = more accurate, more API calls.</span>
               </label>
             {:else}
               <div class="rounded-md border border-cortex-700/40 bg-cortex-900/30 p-3">
-                <p class="text-xs text-subtle">T2 Gemini audio judge is disabled. Enable the cloud opt-in above to configure it.</p>
+                <p class="text-xs text-subtle">
+                  T2 Gemini audio judge is disabled. Enable the cloud opt-in above to configure it.
+                </p>
               </div>
             {/if}
 
@@ -504,9 +760,16 @@
             {#if localSettings.juryCloudOptIn}
               <label class="flex flex-col gap-1">
                 <span class="text-sm text-muted">Gemini API Key</span>
-                <input type="password" class="input w-full" bind:value={localSettings.llmApiKey}
-                  onblur={saveQuietly} placeholder="AIzaSy…" />
-                <span class="text-[10px] text-subtle">Shared with the AI Post-Processing tab. Not written to disk.</span>
+                <input
+                  type="password"
+                  class="input w-full"
+                  bind:value={localSettings.llmApiKey}
+                  onblur={saveQuietly}
+                  placeholder="AIzaSy…"
+                />
+                <span class="text-[10px] text-subtle"
+                  >Shared with the AI Post-Processing tab. Not written to disk.</span
+                >
               </label>
             {/if}
           </div>
@@ -515,8 +778,10 @@
     </div>
 
     <div class="flex justify-end gap-3 px-6 py-4 border-t border-cortex-800/50">
-      <button class="btn-secondary" onclick={() => showSettings.set(false)}>{$t('cancel')}</button>
-      <button class="btn-primary" onclick={save} disabled={saving}>
+      <button class="btn btn-secondary" onclick={() => showSettings.set(false)}
+        >{$t('cancel')}</button
+      >
+      <button class="btn btn-primary" onclick={save} disabled={saving}>
         {saving ? $t('saving') : $t('save')}
       </button>
     </div>

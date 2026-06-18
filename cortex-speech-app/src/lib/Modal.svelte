@@ -51,7 +51,9 @@
   >
     <!-- Dialog -->
     <div
-      class="card relative flex max-h-[88vh] w-full flex-col overflow-hidden shadow-lift {widths[size]}"
+      class="card relative flex max-h-[88vh] w-full flex-col overflow-hidden shadow-lift {widths[
+        size
+      ]}"
       role="dialog"
       aria-modal="true"
       aria-label={title || undefined}
@@ -62,7 +64,9 @@
       transition:scale={{ duration: 180, start: 0.97, opacity: 0 }}
     >
       {#if title}
-        <header class="flex shrink-0 items-start justify-between gap-4 border-b border-line px-5 py-4">
+        <header
+          class="flex shrink-0 items-start justify-between gap-4 border-b border-line px-5 py-4"
+        >
           <div class="min-w-0">
             <h2 class="truncate text-sm font-semibold text-default">{title}</h2>
             {#if description}
@@ -70,7 +74,15 @@
             {/if}
           </div>
           <button class="icon-btn -me-1" aria-label="Close dialog" onclick={onClose}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+            >
               <path d="M18 6 6 18M6 6l12 12" />
             </svg>
           </button>
@@ -82,7 +94,9 @@
       </div>
 
       {#if footer}
-        <footer class="flex shrink-0 items-center justify-end gap-2 border-t border-line px-5 py-3.5">
+        <footer
+          class="flex shrink-0 items-center justify-end gap-2 border-t border-line px-5 py-3.5"
+        >
           {@render footer()}
         </footer>
       {/if}

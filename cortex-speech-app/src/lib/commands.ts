@@ -399,7 +399,7 @@ export async function updateSettings(
   settings: AppSettings,
   existingBackend?: BackendSettings,
 ): Promise<void> {
-  const existing = existingBackend ?? await invoke<BackendSettings>('get_settings');
+  const existing = existingBackend ?? (await invoke<BackendSettings>('get_settings'));
   const backend = mapFrontendToBackend(settings, existing);
   return invoke<void>('update_settings', { settings: backend });
 }

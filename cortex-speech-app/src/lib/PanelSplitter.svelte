@@ -4,10 +4,7 @@
     onResize: (delta: number) => void;
   }
 
-  let {
-    direction = 'horizontal',
-    onResize,
-  }: Props = $props();
+  let { direction = 'horizontal', onResize }: Props = $props();
 
   let isDragging = $state(false);
 
@@ -34,7 +31,9 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   class="relative flex items-center justify-center cursor-col-resize select-none group transition-all duration-150 shrink-0 z-20
-    {direction === 'horizontal' ? 'w-[3px] hover:w-1.5 bg-cortex-900/35 hover:bg-indigo-500/60 border-l border-r border-cortex-800/10' : 'h-[3px] hover:h-1.5 bg-cortex-900/35 hover:bg-indigo-500/60 border-t border-b border-cortex-800/10'}"
+    {direction === 'horizontal'
+    ? 'w-[3px] hover:w-1.5 bg-cortex-900/35 hover:bg-indigo-500/60 border-l border-r border-cortex-800/10'
+    : 'h-[3px] hover:h-1.5 bg-cortex-900/35 hover:bg-indigo-500/60 border-t border-b border-cortex-800/10'}"
   onpointerdown={handlePointerDown}
   onpointermove={handlePointerMove}
   onpointerup={handlePointerUp}
