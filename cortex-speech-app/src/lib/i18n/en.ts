@@ -94,6 +94,7 @@ export const en: Record<string, string> = {
   redo: 'Redo',
   toggleVerified: 'Toggle verified',
   deleteSegment: 'Delete segment',
+  deleteSegmentConfirm: 'Delete segment "{name}"? This cannot be undone.',
   focusSearch: 'Focus search',
   openSettings: 'Open settings',
   nextSegment: 'Next segment',

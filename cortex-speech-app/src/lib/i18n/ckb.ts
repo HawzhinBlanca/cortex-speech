@@ -94,6 +94,7 @@ export const ckb: Record<string, string> = {
   redo: 'دووبارەکردنەوە',
   toggleVerified: 'گۆڕینی دۆخی پشتڕاستکردن',
   deleteSegment: 'سڕینەوەی بەش',
+  deleteSegmentConfirm: 'بەشی "{name}" بسڕێتەوە؟ ئەمە ناگەڕێتەوە.',
   focusSearch: 'گەڕان',
   openSettings: 'کردنەوەی ڕێکخستنەکان',
   nextSegment: 'بەشی دواتر',
