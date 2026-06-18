@@ -73,6 +73,7 @@
   import CommandPalette from './lib/CommandPalette.svelte';
   import EmptyState from './lib/EmptyState.svelte';
   import ActivityRail from './lib/ActivityRail.svelte';
+  import ReviewMode from './lib/ReviewMode.svelte';
   import PanelSplitter from './lib/PanelSplitter.svelte';
   import HistoryPanel from './lib/HistoryPanel.svelte';
   import {
@@ -367,7 +368,7 @@
     selectSegment(list[targetIndex]);
   }
 
-  let viewMode = $state<'curate' | 'insights'>('curate');
+  let viewMode = $state<'curate' | 'insights' | 'review'>('curate');
   let showCommandPalette = $state(false);
 
   function registerShortcuts(km: ReturnType<typeof initKeyboardManager>) {
@@ -1593,9 +1594,15 @@
     <ActivityRail
       view={viewMode}
       onSelect={(id) => {
-        if (id === 'review') showReviewInbox.set(true);
-        else if (id === 'settings') openSettings();
-        else viewMode = id as 'curate' | 'insights';
+        if (id === 'settings') openSettings();
+        else {
+          viewMode = id as 'curate' | 'insights' | 'review';
+          // Review is a focused, distraction-free mode — collapse the side panels.
+          if (id === 'review') {
+            sidebarOpen = false;
+            statsOpen = false;
+          }
+        }
       }}
     />
     <!-- Left Panel: Segment List -->
@@ -1899,6 +1906,8 @@
       >
         {#if viewMode === 'insights'}
           <StatsDashboard />
+        {:else if viewMode === 'review'}
+          <ReviewMode />
         {:else if $selectedSegment}
           <div class="card overflow-hidden">
             <Waveform
