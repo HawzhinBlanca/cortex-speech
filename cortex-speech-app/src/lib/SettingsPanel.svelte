@@ -269,7 +269,7 @@
               bind:checked={localSettings.autoplaySegments}
               class="accent-cortex-500"
             />
-            <span class="text-sm text-muted">Autoplay Segments on Selection</span>
+            <span class="text-sm text-muted">{$t('settings.autoplaySegments')}</span>
           </label>
         {:else if activeTab === 'asr'}
           <label class="flex items-center gap-3">
@@ -455,7 +455,7 @@
               Use a local LLM by default. Cloud providers are opt-in and send text to the provider.
             </p>
             <label class="flex flex-col gap-1">
-              <span class="text-sm text-muted">External ASR Provider Script</span>
+              <span class="text-sm text-muted">{$t('settings.externalAsrScript')}</span>
               <input
                 type="text"
                 class="input w-full"
@@ -469,7 +469,7 @@
               >
             </label>
             <label class="flex items-center gap-3">
-              <span class="text-sm text-muted w-32">LLM Engine</span>
+              <span class="text-sm text-muted w-32">{$t('settings.llmEngine')}</span>
               <select class="input flex-1" bind:value={localSettings.llmMode}>
                 <option value="None">Disabled (Fastest)</option>
                 <option value="Local">Local API (e.g., LM Studio / Ollama)</option>
@@ -479,7 +479,7 @@
 
             {#if localSettings.llmMode === 'Local'}
               <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">Local API Endpoint</span>
+                <span class="text-sm text-muted">{$t('settings.localApiEndpoint')}</span>
                 <input
                   type="text"
                   class="input w-full"
@@ -493,7 +493,7 @@
                 >
               </label>
               <label class="flex flex-col gap-1 mt-2">
-                <span class="text-sm text-muted">Model Name</span>
+                <span class="text-sm text-muted">{$t('settings.modelName')}</span>
                 <input
                   type="text"
                   class="input w-full"
@@ -538,7 +538,7 @@
                 </span>
               </label>
               <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">Gemini API Key</span>
+                <span class="text-sm text-muted">{$t('settings.geminiApiKey')}</span>
                 <input
                   type="password"
                   class="input w-full"
@@ -555,7 +555,7 @@
                 </span>
               </label>
               <label class="flex flex-col gap-1 mt-2">
-                <span class="text-sm text-muted">Gemini Model</span>
+                <span class="text-sm text-muted">{$t('settings.geminiModel')}</span>
                 <input
                   type="text"
                   class="input w-full"
@@ -587,7 +587,7 @@
             {/if}
 
             <label class="flex flex-col gap-1 mt-4">
-              <span class="text-sm text-muted">System Prompt</span>
+              <span class="text-sm text-muted">{$t('settings.systemPrompt')}</span>
               <textarea
                 class="input w-full h-32 text-xs font-mono"
                 bind:value={localSettings.llmSystemPrompt}
@@ -625,7 +625,7 @@
 
             <!-- Autonomy dial -->
             <div class="space-y-2">
-              <span class="text-sm text-muted block">Autonomy level</span>
+              <span class="text-sm text-muted block">{$t('settings.autonomyLevel')}</span>
               <div class="flex gap-2 flex-wrap">
                 {#each [['observe', '👁 Observe'], ['propose', '💡 Propose'], ['act_confirm', '✅ Act+Confirm'], ['act_auto', '🤖 Act Auto']] as [val, label]}
                   <button
@@ -704,7 +704,7 @@
               </label>
 
               <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">Source reference models</span>
+                <span class="text-sm text-muted">{$t('settings.sourceReferenceModels')}</span>
                 <input
                   type="text"
                   class="input w-full"
@@ -759,7 +759,7 @@
             <!-- API key (shared with LLM) -->
             {#if localSettings.juryCloudOptIn}
               <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">Gemini API Key</span>
+                <span class="text-sm text-muted">{$t('settings.geminiApiKey')}</span>
                 <input
                   type="password"
                   class="input w-full"
