@@ -39,6 +39,41 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
 
 ---
 
+## Iteration 2 — populated curate UI (filters, badges, contrast)
+
+### ✅ Filters verified
+- All / Verified / Pending filters return correct counts (8 / 4 / 4 / back to 8)
+  against the sample dataset. No defect.
+
+### ✅ D3 — Status badges unreadable in light mode
+- **Found:** `.badge-verified` rendered light-emerald `#6ee7b7` on the light
+  success-soft background = **1.52:1** (invisible). Same for pending/danger/info —
+  the badge recipes hardcoded dark-theme text colors that don't invert.
+- **Fix:** badge text → `var(--success|warning|danger|info)` (theme-aware) +
+  `color-mix` borders. Then darkened the **light** semantic tokens so 11px-bold
+  badge text clears strict AA on the soft tints: success `#059669→#047857`,
+  warning `#d97706→#92400e`, danger `#e11d48→#be123c`, info `#2563eb→#1d4ed8`
+  (dark tokens untouched).
+- **Verified (transitions disabled):** light badges 1.52→**4.54** (verified),
+  **4.5+** pending, **5.01** danger, **5.45** info; dark 9.16. Build + typecheck green.
+
+### 🛈 D4 — "dim filename / timestamp" fails were measurement artifacts
+- My theme-flip audits toggled `html.className`, but the app's settingsStore
+  re-applies the real theme and elements have `transition: color`, so values read
+  mid-transition (e.g. filename showed 1.88). **Disabling CSS transitions before
+  measuring** gives the true values: filename 12.73 (dark) / 9.65 (light) — fine.
+- **Methodology fix:** all theme-flip contrast audits now inject
+  `*{transition:none!important}` first. This retroactively explains several
+  earlier phantom "fails".
+
+### 🔄 D5 — Small secondary text just under strict AA (4.5) — NEXT
+- With transitions disabled, content/secondary text sits at **4.0–4.4:1**:
+  transcript previews (`text-cortex-500`, ~4.14 dark), timestamps + filter chips
+  (`text-cortex-400`, ~4.43 light), version label. Passes AA-large (3.0) but
+  misses strict AA-normal. Fix = nudge the cortex mid-tiers (dark-500 brighter,
+  light-400 darker) and re-audit. Deferred to next iteration for a clean, fully
+  re-verified pass (avoid half-tuning the scale).
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
