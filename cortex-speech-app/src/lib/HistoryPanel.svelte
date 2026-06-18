@@ -57,17 +57,17 @@
 </script>
 
 <div
-  class="flex flex-col h-full bg-slate-950/40 backdrop-blur-md rounded-xl border border-slate-800/40 p-4 space-y-4"
+  class="flex flex-col h-full bg-cortex-950/40 backdrop-blur-md rounded-xl border border-cortex-800/40 p-4 space-y-4"
 >
   <!-- Undo/Redo Action Bar -->
-  <div class="flex items-center justify-between border-b border-slate-800/60 pb-3">
-    <h3 class="text-xs font-bold text-slate-400 uppercase tracking-widest">History Stack</h3>
+  <div class="flex items-center justify-between border-b border-cortex-800/60 pb-3">
+    <h3 class="text-xs font-bold text-cortex-400 uppercase tracking-widest">History Stack</h3>
     <div class="flex gap-1.5">
       <button
         class="px-3 py-1.5 rounded-lg border text-xs font-medium transition-all duration-150 flex items-center gap-1 relative
           {canUndo
           ? 'bg-indigo-600/20 text-indigo-300 border-indigo-500/30 hover:bg-indigo-600/30'
-          : 'bg-transparent text-slate-600 border-slate-900 cursor-not-allowed opacity-40'}"
+          : 'bg-transparent text-cortex-600 border-cortex-900 cursor-not-allowed opacity-40'}"
         onclick={handleUndo}
         disabled={!canUndo}
         title="Undo (Ctrl+Z)"
@@ -99,7 +99,7 @@
         class="px-3 py-1.5 rounded-lg border text-xs font-medium transition-all duration-150 flex items-center gap-1 relative
           {canRedo
           ? 'bg-indigo-600/20 text-indigo-300 border-indigo-500/30 hover:bg-indigo-600/30'
-          : 'bg-transparent text-slate-600 border-slate-900 cursor-not-allowed opacity-40'}"
+          : 'bg-transparent text-cortex-600 border-cortex-900 cursor-not-allowed opacity-40'}"
         onclick={handleRedo}
         disabled={!canRedo}
         title="Redo (Ctrl+Shift+Z)"
@@ -135,14 +135,14 @@
     style="scrollbar-width: thin; scrollbar-color: #475569 transparent;"
   >
     {#if localEdits.length === 0}
-      <div class="flex flex-col items-center justify-center h-32 text-slate-600 text-xs italic">
+      <div class="flex flex-col items-center justify-center h-32 text-cortex-600 text-xs italic">
         <span>No edits in this session</span>
       </div>
     {:else}
       <div class="space-y-1.5">
         {#each localEdits as log}
           <div
-            class="flex items-start gap-2.5 p-2 rounded-lg bg-slate-900/30 border border-slate-900/60 hover:bg-slate-900/50 transition-colors"
+            class="flex items-start gap-2.5 p-2 rounded-lg bg-cortex-900/30 border border-cortex-900/60 hover:bg-cortex-900/50 transition-colors"
           >
             <!-- Mini icon for type -->
             <span
@@ -157,10 +157,10 @@
             >
             </span>
             <div class="flex-1 min-w-0">
-              <p class="text-[11px] font-mono text-slate-300 leading-normal break-words">
+              <p class="text-[11px] font-mono text-cortex-300 leading-normal break-words">
                 {log.description}
               </p>
-              <span class="text-[9px] font-mono text-slate-500">{log.time}</span>
+              <span class="text-[9px] font-mono text-cortex-500">{log.time}</span>
             </div>
           </div>
         {/each}

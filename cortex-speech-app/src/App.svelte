@@ -2013,7 +2013,7 @@
                 <button
                   class="px-2.5 py-1 text-[10px] uppercase font-bold tracking-wider rounded-md transition-colors
                   {editorTab === 'interactive'
-                    ? 'bg-cortex-700 text-white shadow-sm'
+                    ? 'bg-cortex-700 text-default shadow-sm'
                     : 'text-cortex-400 hover:text-cortex-200'}"
                   onclick={() => (editorTab = 'interactive')}
                 >
@@ -2022,7 +2022,7 @@
                 <button
                   class="px-2.5 py-1 text-[10px] uppercase font-bold tracking-wider rounded-md transition-colors
                   {editorTab === 'raw'
-                    ? 'bg-cortex-700 text-white shadow-sm'
+                    ? 'bg-cortex-700 text-default shadow-sm'
                     : 'text-cortex-400 hover:text-cortex-200'}"
                   onclick={() => (editorTab = 'raw')}
                 >
@@ -2042,7 +2042,7 @@
                       <span
                         class="relative inline-block px-1.5 py-0.5 rounded cursor-pointer transition-all duration-150 group
                         {isActive
-                          ? 'bg-cortex-700 text-white font-bold border-b border-yellow-400'
+                          ? 'bg-cortex-700 text-default font-bold border-b border-yellow-400'
                           : 'text-cortex-200 hover:bg-cortex-800 hover:text-white'}"
                         onclick={() => (currentTime = w.start)}
                         ondblclick={() => (editingWordIndex = idx)}
