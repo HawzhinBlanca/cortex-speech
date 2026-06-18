@@ -116,6 +116,23 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
   is correct end-to-end.
 - **Note:** backend match quality itself still needs the real Tauri app to verify.
 
+### ✅ D8 — Validation crashed with a raw TypeError
+- **Found:** opening Validation flashed a toast "Validation failed: TypeError:
+  Cannot read properties of null (reading 'summary')" and the panel closed itself.
+- **Root cause:** `ValidationPanel.runValidation()` did `summary = result.summary`
+  with no guard; `validate_dataset_cmd` returns null in the mock / on backend
+  failure → raw TypeError surfaced to the user (same class as D1).
+- **Fix:** guard `if (!result) throw new Error(...)` + null-coalesce every field.
+  Mock now returns a real ValidationReport (derived from sample data) so the panel
+  renders + is testable.
+- **Verified:** panel opens, shows "8 segments checked · 1 error · 1 warning",
+  7 passed; no raw error.
+
+### ✅ D9 — ValidationPanel tabs: invisible white text in light (same as D7)
+- **Found:** active tab `bg-cortex-700 text-white` = **1.48:1** in light (×3 tabs).
+- **Fix:** `text-white` → `text-default`. Verified: validation panel **0 contrast
+  fails in BOTH themes**.
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
