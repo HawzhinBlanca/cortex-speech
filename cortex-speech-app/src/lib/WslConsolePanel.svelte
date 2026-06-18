@@ -7,6 +7,7 @@
   import { notifications } from './stores/notificationStore';
   import { segments } from './stores/segmentStore';
   import { appendBoundedLogLine } from './logBuffer';
+  import { t } from './i18n';
 
   let running = $state(false);
   let status = $state<'idle' | 'running' | 'completed' | 'failed' | 'cancelled'>('idle');
@@ -64,7 +65,7 @@
       appendLog(`[SYSTEM ERROR] Failed to start refinement: ${e}`);
       status = 'failed';
       running = false;
-      notifications.error('Failed to start WSL refinement process', { detail: String(e) });
+      notifications.error($t('wsl.startFailed'), { detail: String(e) });
     }
   }
 
@@ -76,7 +77,7 @@
       status = 'cancelled';
     } catch (e) {
       appendLog(`[SYSTEM ERROR] Abort failed: ${e}`);
-      notifications.error('Failed to cancel WSL refinement', { detail: String(e) });
+      notifications.error($t('wsl.cancelFailed'), { detail: String(e) });
     }
   }
 
@@ -87,14 +88,12 @@
   function copyLogs() {
     const text = logs.join('\n');
     navigator.clipboard.writeText(text);
-    notifications.success('Console logs copied to clipboard');
+    notifications.success($t('wsl.logsCopied'));
   }
 
   function close() {
     if (running) {
-      notifications.warning(
-        'Refinement is still running. Please cancel or wait for it to complete.',
-      );
+      notifications.warning($t('wsl.stillRunning'));
       return;
     }
     showWslConsole.set(false);
@@ -120,10 +119,10 @@
       running = false;
 
       if (status === 'completed') {
-        notifications.success('WSL Local 7B ASR Batch transcription complete!');
+        notifications.success($t('wsl.batchComplete'));
         segments.load();
       } else if (status === 'cancelled') {
-        notifications.warning('WSL Local 7B ASR transcription was cancelled.');
+        notifications.warning($t('wsl.batchCancelled'));
       } else {
         notifications.error(`WSL Local 7B ASR transcription failed (Exit Code: ${exitCode}).`);
       }
@@ -196,7 +195,7 @@
 
         <div class="grid grid-cols-2 gap-4">
           <label class="flex flex-col gap-1 text-xs text-muted">
-            <span>Limit Files (Leave blank for all)</span>
+            <span>{$t('wsl.limitFiles')}</span>
             <input
               type="number"
               min="1"
@@ -207,7 +206,7 @@
             />
           </label>
           <label class="flex flex-col gap-1 text-xs text-muted">
-            <span>Limit Segments per file (Leave blank for all)</span>
+            <span>{$t('wsl.limitSegments')}</span>
             <input
               type="number"
               min="1"
@@ -227,7 +226,7 @@
               class="accent-cortex-500"
               disabled={running}
             />
-            <span>Dry Run (No database writes)</span>
+            <span>{$t('wsl.dryRun')}</span>
           </label>
 
           <label class="flex items-center gap-2 cursor-pointer text-xs text-muted">
@@ -237,7 +236,7 @@
               class="accent-cortex-500"
               disabled={running}
             />
-            <span>Test Mode (Process exactly 1 segment & exit)</span>
+            <span>{$t('wsl.testMode')}</span>
           </label>
         </div>
       </div>
@@ -245,7 +244,7 @@
       <!-- Log Terminal Console -->
       <div class="flex-1 min-h-[250px] flex flex-col min-h-0">
         <div class="flex items-center justify-between text-xs text-cortex-400 mb-1 px-1">
-          <span>Terminal Logs</span>
+          <span>{$t('wsl.terminalLogs')}</span>
           <div class="flex items-center gap-2">
             {#if status === 'running'}
               <span class="flex items-center gap-1.5 text-cyan-400 font-semibold">
@@ -264,16 +263,16 @@
                     d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                   />
                 </svg>
-                Processing...
+                {$t('wsl.processing')}
               </span>
             {:else if status === 'completed'}
-              <span class="text-emerald-400 font-semibold">● Completed Successfully</span>
+              <span class="text-emerald-400 font-semibold">● {$t('wsl.completed')}</span>
             {:else if status === 'failed'}
-              <span class="text-red-400 font-semibold">● Process Failed</span>
+              <span class="text-red-400 font-semibold">● {$t('wsl.failed')}</span>
             {:else if status === 'cancelled'}
-              <span class="text-amber-400 font-semibold">● Cancelled</span>
+              <span class="text-amber-400 font-semibold">● {$t('wsl.cancelled')}</span>
             {:else}
-              <span class="text-cortex-500">Idle</span>
+              <span class="text-cortex-500">{$t('wsl.idle')}</span>
             {/if}
           </div>
         </div>
@@ -285,7 +284,7 @@
         >
           {#if logs.length === 0}
             <div class="text-cortex-600 italic">
-              No console logs to display. Press "Start local 7B batch ASR" below.
+              {$t('wsl.noLogs')}
             </div>
           {:else}
             {#each logs as log}
@@ -314,31 +313,31 @@
           onclick={clearLogs}
           disabled={logs.length === 0}
         >
-          Clear Logs
+          {$t('wsl.clearLogs')}
         </button>
         <button
           class="btn btn-secondary !text-xs disabled:opacity-30"
           onclick={copyLogs}
           disabled={logs.length === 0}
         >
-          Copy Logs
+          {$t('wsl.copyLogs')}
         </button>
       </div>
 
       <div class="flex gap-3">
         <button class="btn btn-secondary !text-xs" onclick={close} disabled={running}>
-          Close
+          {$t('close')}
         </button>
         {#if running}
           <button
             class="btn btn-primary !bg-red-600 hover:!bg-red-500 !border-red-700 !text-xs"
             onclick={stopRefinement}
           >
-            Cancel/Stop
+            {$t('wsl.cancelStop')}
           </button>
         {:else}
           <button class="btn btn-primary !text-xs" onclick={startRefinement}>
-            Start local 7B batch ASR
+            {$t('wsl.startBatch')}
           </button>
         {/if}
       </div>

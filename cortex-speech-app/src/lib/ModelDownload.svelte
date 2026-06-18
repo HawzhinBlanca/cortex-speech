@@ -30,7 +30,7 @@
     try {
       models = await modelsStatus();
     } catch (e: unknown) {
-      notifications.error('Failed to check models: ' + e);
+      notifications.error($t('models.checkFailed'), { detail: String(e) });
     } finally {
       loading = false;
     }
@@ -46,15 +46,15 @@
     try {
       const result = await modelsDownloadAll();
       if (result.total === 0 && result.skipped > 0) {
-        notifications.info('No verified model downloads available', {
+        notifications.info($t('models.noneAvailable'), {
           detail: `${result.skipped} missing optional model files require a pinned checksum before automatic download.`,
         });
       } else if (result.failed > 0) {
-        notifications.warning('Model download completed with failures', {
+        notifications.warning($t('models.completedWithFailures'), {
           detail: `${result.downloaded} downloaded, ${result.failed} failed, ${result.skipped} skipped.`,
         });
       } else {
-        notifications.success('Verified model downloads completed', {
+        notifications.success($t('models.completed'), {
           detail:
             result.skipped > 0
               ? `${result.skipped} unavailable model files were skipped.`
@@ -63,7 +63,7 @@
       }
       await loadStatus();
     } catch (e: unknown) {
-      notifications.error('Download failed: ' + e);
+      notifications.error($t('models.downloadFailed'), { detail: String(e) });
     } finally {
       downloading = false;
       overallProgress = { current: 0, total: 0, status: '' };
@@ -104,21 +104,21 @@
 
 <div class="p-4 space-y-3">
   <div class="flex items-center justify-between">
-    <h3 class="text-sm font-semibold text-cortex-200">AI Models</h3>
+    <h3 class="text-sm font-semibold text-cortex-200">{$t('models')}</h3>
     <button
       class="text-xs px-3 py-1 bg-cortex-700 hover:bg-cortex-600 rounded transition-colors disabled:opacity-50"
       onclick={downloadAll}
       disabled={!tauriAvailable || downloading}
-      title={tauriAvailable ? 'Download All' : $t('desktopRuntimeRequired')}
+      title={tauriAvailable ? $t('models.downloadAll') : $t('desktopRuntimeRequired')}
     >
-      {downloading ? 'Downloading...' : 'Download All'}
+      {downloading ? $t('models.downloading') : $t('models.downloadAll')}
     </button>
   </div>
 
   {#if downloading && overallProgress.total > 0}
     <div class="p-2 bg-cortex-800/40 rounded-lg border border-cortex-700/50 space-y-1.5">
       <div class="flex justify-between text-[10px]">
-        <span class="text-cortex-300">{overallProgress.status || 'Downloading...'}</span>
+        <span class="text-cortex-300">{overallProgress.status || $t('models.downloading')}</span>
         <span class="text-cortex-500">{overallProgress.current} / {overallProgress.total}</span>
       </div>
       <div class="h-1 bg-cortex-900 rounded-full overflow-hidden">
@@ -151,7 +151,7 @@
             {#if model.size_bytes}
               {(model.size_bytes / 1048576).toFixed(1)} MB
             {:else}
-              Not downloaded
+              {$t('models.notDownloaded')}
             {/if}
           </span>
         </div>
