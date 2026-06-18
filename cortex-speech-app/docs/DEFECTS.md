@@ -240,3 +240,15 @@ Intentionally left (out of scope / niche): ReviewInbox (separate retheme chip);
 technical/proper nouns (CSV/Parquet/Gemini/LLM/CORTEX/model IDs/Esc); the WSL
 header + 2 long description paragraphs + 1 WSL failure toast with mid-sentence
 interpolation. Sorani strings are a first pass — worth a native review.
+
+## Frontend smoke-test goal: MET
+
+After the i18n merge, full clean re-audit (transitions off): light 0 fails @4.5,
+dark 0 fails @3.0. ModelDownload (settings AI-model tab) renders, no crash, contrast
+clean. 3 consecutive iterations with no new defect. 16 defects fixed+verified;
+happy path + deep edge cases all clean in light+dark, EN+Sorani(RTL); zero console
+errors. Remaining work is OUT of preview scope:
+  - ReviewInbox legacy-purple retheme (task chip)
+  - native Sorani review of the new i18n strings
+  - real Tauri end-to-end (ASR/export correctness) — needs `npm run tauri dev` +
+    model download (models/ empty) + computer-use MCP to drive the desktop app.
