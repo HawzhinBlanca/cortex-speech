@@ -45,11 +45,12 @@
     loading = true;
     try {
       const result = await api.validateDataset();
-      summary = result.summary;
-      errors = result.errors;
-      warnings = result.warnings;
-      totalSegments = result.totalSegments;
-      passed = result.passed;
+      if (!result) throw new Error('Validation returned no result');
+      summary = result.summary ?? '';
+      errors = result.errors ?? [];
+      warnings = result.warnings ?? [];
+      totalSegments = result.totalSegments ?? 0;
+      passed = result.passed ?? 0;
     } catch (e) {
       notifications.error($t('validation.failed'), { detail: String(e) });
       showValidationPanel.set(false);
@@ -165,7 +166,7 @@
         type="button"
         class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all duration-200 border-0 cursor-pointer
           {activeTab === 'dataset'
-          ? 'bg-cortex-700 text-white shadow-sm font-bold'
+          ? 'bg-cortex-700 text-default shadow-sm font-bold'
           : 'bg-transparent text-cortex-400 hover:text-cortex-200 hover:bg-cortex-800/30'}"
         onclick={() => (activeTab = 'dataset')}
       >
@@ -175,7 +176,7 @@
         type="button"
         class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all duration-200 border-0 cursor-pointer
           {activeTab === 'active'
-          ? 'bg-cortex-700 text-white shadow-sm font-bold'
+          ? 'bg-cortex-700 text-default shadow-sm font-bold'
           : 'bg-transparent text-cortex-400 hover:text-cortex-200 hover:bg-cortex-800/30'}"
         onclick={() => {
           const wasActive = activeTab === 'active';
@@ -189,7 +190,7 @@
         type="button"
         class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all duration-200 border-0 cursor-pointer
           {activeTab === 'ood'
-          ? 'bg-cortex-700 text-white shadow-sm font-bold'
+          ? 'bg-cortex-700 text-default shadow-sm font-bold'
           : 'bg-transparent text-cortex-400 hover:text-cortex-200 hover:bg-cortex-800/30'}"
         onclick={() => {
           const wasOod = activeTab === 'ood';
