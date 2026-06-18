@@ -151,7 +151,7 @@
         >
           <span class="truncate">
             {cmd.label}
-            <span class="ms-1 text-xs text-subtle">· {cmd.category}</span>
+            <span class="ms-1 text-xs text-muted">· {cmd.category}</span>
           </span>
           {#if cmd.hint}<kbd class="shrink-0">{cmd.hint}</kbd>{/if}
         </button>
