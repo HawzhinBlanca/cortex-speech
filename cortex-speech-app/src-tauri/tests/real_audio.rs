@@ -371,8 +371,11 @@ fn test_pipeline_import_supported_audio_directory() {
             "  {} — {}ms, transcript='{}', normalized='{}'",
             seg.id,
             seg.duration_ms,
-            &seg.raw_transcript[..seg.raw_transcript.len().min(80)],
-            seg.normalized_transcript.as_deref().map(|s| &s[..s.len().min(80)]).unwrap_or("(none)")
+            seg.raw_transcript.chars().take(40).collect::<String>(),
+            seg.normalized_transcript
+                .as_deref()
+                .map(|s| s.chars().take(40).collect::<String>())
+                .unwrap_or_else(|| "(none)".to_string())
         );
     }
 
@@ -408,7 +411,7 @@ fn test_pipeline_process_single_supported_audio() {
         segments.len(),
         segment.id,
         segment.duration_ms,
-        &segment.raw_transcript[..segment.raw_transcript.len().min(80)],
+        segment.raw_transcript.chars().take(40).collect::<String>(),
         elapsed.as_secs_f64()
     );
     eprintln!("[single file] Normalized: '{}'", segment.normalized_transcript.as_deref().unwrap_or("(none)"));
