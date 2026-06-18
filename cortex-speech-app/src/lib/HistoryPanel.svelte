@@ -94,7 +94,7 @@
   </div>
 
   <!-- Session Edit Log -->
-  <div class="flex-1 overflow-y-auto space-y-2 pr-1" style="scrollbar-width: thin; scrollbar-color: #475569 transparent;">
+  <div class="flex-1 overflow-y-auto space-y-2 pe-1" style="scrollbar-width: thin; scrollbar-color: #475569 transparent;">
     {#if localEdits.length === 0}
       <div class="flex flex-col items-center justify-center h-32 text-slate-600 text-xs italic">
         <span>No edits in this session</span>

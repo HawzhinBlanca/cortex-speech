@@ -163,7 +163,7 @@
         type="button"
         class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all duration-200 border-0 cursor-pointer
           {activeTab === 'active' ? 'bg-cortex-700 text-white shadow-sm font-bold' : 'bg-transparent text-cortex-400 hover:text-cortex-200 hover:bg-cortex-800/30'}"
-        onclick={() => { activeTab = 'active'; if (activeQueue.length === 0) loadActiveLearningQueue(); }}
+        onclick={() => { const wasActive = activeTab === 'active'; activeTab = 'active'; if (!wasActive) loadActiveLearningQueue(); }}
       >
         {$t('validation.tab.activeLearning')}
       </button>
@@ -206,7 +206,7 @@
             <section>
               <button
                 type="button"
-                class="w-full flex items-center justify-between text-xs font-semibold text-red-300 uppercase tracking-wider mb-2 bg-transparent border-0 text-left p-0 cursor-pointer"
+                class="w-full flex items-center justify-between text-xs font-semibold text-red-300 uppercase tracking-wider mb-2 bg-transparent border-0 text-start p-0 cursor-pointer"
                 onclick={() => showErrors = !showErrors}
               >
                 <span>{$t('validation.errors')} ({errors.length})</span>
@@ -245,7 +245,7 @@
             <section>
               <button
                 type="button"
-                class="w-full flex items-center justify-between text-xs font-semibold text-amber-300 uppercase tracking-wider mb-2 bg-transparent border-0 text-left p-0 cursor-pointer"
+                class="w-full flex items-center justify-between text-xs font-semibold text-amber-300 uppercase tracking-wider mb-2 bg-transparent border-0 text-start p-0 cursor-pointer"
                 onclick={() => showWarnings = !showWarnings}
               >
                 <span>{$t('validation.warnings')} ({warnings.length})</span>

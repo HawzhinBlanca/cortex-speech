@@ -207,7 +207,7 @@
     <div class="flex items-center gap-2 text-red-300 text-xs w-full">
       <span class="text-red-400 font-bold" aria-hidden="true">!</span>
       <span>{error}</span>
-      <button type="button" class="ml-auto text-xs text-cortex-400 hover:text-cortex-200" onclick={() => { error = null; loading = true; resolveAudioUrl(audioPath); }}>Retry</button>
+      <button type="button" class="ms-auto text-xs text-cortex-400 hover:text-cortex-200" onclick={() => { error = null; loading = true; resolveAudioUrl(audioPath); }}>Retry</button>
     </div>
   {:else}
     <button
@@ -237,7 +237,7 @@
     <span class="text-xs font-mono text-cortex-300 min-w-12">{fmt(duration)}</span>
     <button
       type="button"
-      class="btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono min-w-10 rounded-lg hover:bg-cortex-700/50 hover:text-white transition-colors border border-cortex-700/50 shadow-sm ml-1"
+      class="btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono min-w-10 rounded-lg hover:bg-cortex-700/50 hover:text-white transition-colors border border-cortex-700/50 shadow-sm ms-1"
       onclick={toggleRate}
       aria-label="Playback Speed"
       title="Playback Speed"
@@ -246,7 +246,7 @@
     </button>
     <button
       type="button"
-      class="btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono rounded-lg hover:bg-cortex-700/50 hover:text-white transition-colors border shadow-sm ml-1 {loop ? 'bg-indigo-600/30 text-indigo-200 border-indigo-500/40 hover:bg-indigo-600/40' : 'border-cortex-700/50 text-cortex-300'}"
+      class="btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono rounded-lg hover:bg-cortex-700/50 hover:text-white transition-colors border shadow-sm ms-1 {loop ? 'bg-indigo-600/30 text-indigo-200 border-indigo-500/40 hover:bg-indigo-600/40' : 'border-cortex-700/50 text-cortex-300'}"
       onclick={() => loop = !loop}
       aria-label="Toggle Loop Playback"
       title="Toggle Loop Playback"

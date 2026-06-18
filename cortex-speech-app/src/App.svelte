@@ -179,16 +179,16 @@
 
     const seg = $selectedSegment;
     if (seg) {
-      seg.alignmentJson = mergeWordTimestamps(seg.alignmentJson, updatedWords);
-      seg.annotatedTranscript = updatedWords.map((w) => w.word).join(' ');
+      const alignmentJson = mergeWordTimestamps(seg.alignmentJson, updatedWords);
+      const annotatedTranscript = updatedWords.map((w) => w.word).join(' ');
       // Update store so auto-save picks it up
       segments.update((arr) =>
         arr.map((s) =>
           s.id === seg.id
             ? {
                 ...s,
-                alignmentJson: seg.alignmentJson,
-                annotatedTranscript: seg.annotatedTranscript,
+                alignmentJson,
+                annotatedTranscript,
               }
             : s,
         ),
@@ -714,20 +714,29 @@
     statusMessage.set($t('transcribing'));
     try {
       const result = await api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id);
-      seg.rawTranscript = result.rawTranscript;
-      seg.annotatedTranscript = result.text;
+      const rawTranscript = result.rawTranscript;
+      const annotatedTranscript = result.text;
+      let normalizedTranscript = seg.normalizedTranscript;
       if ($settings.autoNormalize) {
-        seg.normalizedTranscript = await api.normalizeText(result.text);
+        normalizedTranscript = await api.normalizeText(result.text);
       }
+      let alignmentJson = seg.alignmentJson;
       if ($settings.autoAlign) {
-        const alignText = seg.normalizedTranscript ?? result.text;
+        const alignText = normalizedTranscript ?? result.text;
         if (alignText?.trim()) {
           const ts = await api.alignSegment(seg.audioPath, alignText, seg.alignmentJson);
           wordTimestamps.set(ts);
-          seg.alignmentJson = mergeWordTimestamps(seg.alignmentJson, ts);
+          alignmentJson = mergeWordTimestamps(seg.alignmentJson, ts);
         }
       }
-      await api.updateSegment(seg);
+      const updatedSeg = {
+        ...seg,
+        rawTranscript,
+        annotatedTranscript,
+        normalizedTranscript,
+        alignmentJson,
+      };
+      await api.updateSegment(updatedSeg);
       await loadSegments();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
@@ -745,8 +754,12 @@
     if (!seg?.rawTranscript) return;
     if (!requireDesktopRuntime()) return;
     try {
-      seg.normalizedTranscript = await api.normalizeText(seg.rawTranscript);
-      await api.updateSegment(seg);
+      const normalizedTranscript = await api.normalizeText(seg.rawTranscript);
+      segments.update((arr) =>
+        arr.map((s) => (s.id === seg.id ? { ...s, normalizedTranscript } : s)),
+      );
+      const updatedSeg = { ...seg, normalizedTranscript };
+      await api.updateSegment(updatedSeg);
       notifications.success($t('notifications.textNormalized'));
     } catch (e) {
       notifications.error($t('notifications.normalizationFailed'), { detail: String(e) });
@@ -821,8 +834,8 @@
     }
 
     try {
-      seg.verified = nextVerified;
-      await api.updateSegment(seg);
+      const updatedSeg = { ...seg, verified: nextVerified };
+      await api.updateSegment(updatedSeg);
       await historyStore.refresh();
     } catch (e) {
       // Revert Svelte store state on error
@@ -1201,8 +1214,12 @@
     try {
       const ts = await api.alignSegment(seg.audioPath, text, seg.alignmentJson);
       wordTimestamps.set(ts);
-      seg.alignmentJson = mergeWordTimestamps(seg.alignmentJson, ts);
-      await api.updateSegment(seg);
+      const alignmentJson = mergeWordTimestamps(seg.alignmentJson, ts);
+      segments.update((arr) =>
+        arr.map((s) => (s.id === seg.id ? { ...s, alignmentJson } : s)),
+      );
+      const updatedSeg = { ...seg, alignmentJson };
+      await api.updateSegment(updatedSeg);
       notifications.success($t('notifications.alignmentComplete'));
     } catch (e) {
       notifications.error($t('notifications.alignmentFailed'), { detail: String(e) });
@@ -1261,7 +1278,7 @@
     <div class="flex items-center gap-3">
       <h1 class="text-sm font-bold tracking-tight">
         <span class="text-cortex-400">CORTEX</span>
-        <span class="text-cortex-200 ml-1">Kurdish Speech Processor</span>
+        <span class="text-cortex-200 ms-1">Kurdish Speech Processor</span>
       </h1>
       <span
         class="text-[10px] text-cortex-500 bg-cortex-900 px-2 py-0.5 rounded-full border border-cortex-800/50"
@@ -1348,7 +1365,7 @@
         title={tauriAvailable ? 'Ctrl+O' : $t('desktopRuntimeRequired')}
         aria-label={$t('openAudioFile')}
       >
-        <svg class="w-3.5 h-3.5 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
           ><path
             stroke-linecap="round"
             stroke-linejoin="round"
@@ -1371,7 +1388,7 @@
         title={tauriAvailable ? 'Ctrl+I' : $t('desktopRuntimeRequired')}
         aria-label={$t('importDirectory')}
       >
-        <svg class="w-3.5 h-3.5 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
           ><path
             stroke-linecap="round"
             stroke-linejoin="round"
@@ -1394,7 +1411,7 @@
         title={!tauriAvailable ? $t('desktopRuntimeRequired') : $t('export')}
         aria-label={$t('export')}
       >
-        <svg class="w-3.5 h-3.5 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
           ><path
             stroke-linecap="round"
             stroke-linejoin="round"
@@ -1415,7 +1432,7 @@
         aria-label={$t('exportHuggingface.label')}
         title={trainingExportTitle}
       >
-        <svg class="w-3.5 h-3.5 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
           ><path
             stroke-linecap="round"
             stroke-linejoin="round"
@@ -1437,7 +1454,7 @@
         title={!tauriAvailable ? $t('desktopRuntimeRequired') : $t('exportAudio.label')}
         aria-label={$t('exportAudio.label')}
       >
-        <svg class="w-3.5 h-3.5 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
           ><path
             stroke-linecap="round"
             stroke-linejoin="round"
@@ -1454,7 +1471,7 @@
         disabled={!tauriAvailable || $isProcessing}
         title={tauriAvailable ? 'Local 7B ASR (WSL)' : $t('desktopRuntimeRequired')}
       >
-        <svg class="w-3.5 h-3.5 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
           ><path
             stroke-linecap="round"
             stroke-linejoin="round"
@@ -1472,7 +1489,7 @@
         title={tauriAvailable ? 'Ctrl+Shift+V' : $t('desktopRuntimeRequired')}
         aria-label={$t('validate')}
       >
-        <svg class="w-3.5 h-3.5 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
           ><path
             stroke-linecap="round"
             stroke-linejoin="round"
@@ -1511,7 +1528,7 @@
         title="⌘,"
         aria-label={$t('openSettings')}
       >
-        <svg class="w-3.5 h-3.5 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
           ><path
             stroke-linecap="round"
             stroke-linejoin="round"
@@ -1717,7 +1734,7 @@
                 {@const sourceName = truncateFilename(segmentSourceFilename(item.audioPath))}
                 {@const chunkBadge = segmentChunkLabel(item.alignmentJson)}
                 <button
-                  class="w-full text-left p-2.5 rounded-xl transition-all duration-300 h-full flex items-start group
+                  class="w-full text-start p-2.5 rounded-xl transition-all duration-300 h-full flex items-start group
                 {item.id === $selectedSegmentId
                     ? 'bg-gradient-to-br from-cortex-800/80 to-cortex-900/80 ring-1 ring-cortex-400 shadow-[0_0_15px_rgba(56,189,248,0.15)] scale-[1.02] transform'
                     : 'hover:bg-cortex-800/40 hover:scale-[1.01] transform'}"
@@ -1884,7 +1901,7 @@
                 {$t('transcript')}
                 {#if chunkLabel}
                   <span
-                    class="ml-2 text-[10px] font-normal normal-case text-cortex-500 bg-cortex-900 px-1.5 py-0.5 rounded"
+                    class="ms-2 text-[10px] font-normal normal-case text-cortex-500 bg-cortex-900 px-1.5 py-0.5 rounded"
                   >
                     {$t('chunk')}
                     {chunkLabel}
@@ -2166,7 +2183,7 @@
                 {$t('align')}
               </button>
               <button
-                class="btn-danger !text-xs ml-auto relative"
+                class="btn-danger !text-xs ms-auto relative"
                 onclick={handleDeleteWithConfirm}
               >
                 {$t('delete')}

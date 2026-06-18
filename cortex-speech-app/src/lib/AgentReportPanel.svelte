@@ -138,7 +138,7 @@
       <div class="flex justify-between gap-2">
         <span>{$t('agentReport.referenceModels')}</span>
         <span
-          class="text-cortex-200 text-right truncate"
+          class="text-cortex-200 text-end truncate"
           title={report.summary.sourceReferenceModels.join(', ')}
         >
           {compactModels(report.summary.sourceReferenceModels)}
@@ -147,7 +147,7 @@
       <div class="flex justify-between gap-2">
         <span>{$t('agentReport.requiredReferenceModels')}</span>
         <span
-          class="text-cortex-200 text-right truncate"
+          class="text-cortex-200 text-end truncate"
           title={report.summary.requiredSourceReferenceModels.join(', ')}
         >
           {compactModels(report.summary.requiredSourceReferenceModels)}
@@ -156,7 +156,7 @@
       <div class="flex justify-between gap-2">
         <span>{$t('agentReport.hypothesisModels')}</span>
         <span
-          class="text-cortex-200 text-right truncate"
+          class="text-cortex-200 text-end truncate"
           title={report.summary.hypothesisModels.join(', ')}
         >
           {compactModels(report.summary.hypothesisModels)}
@@ -185,7 +185,7 @@
           <div class="flex justify-between gap-2">
             <span>{$t('agentReport.referenceModels')}</span>
             <span
-              class="text-cortex-200 text-right truncate"
+              class="text-cortex-200 text-end truncate"
               title={report.summary.agenticReadiness.sourceReferenceModels.join(', ')}
             >
               {compactModels(report.summary.agenticReadiness.sourceReferenceModels)}
@@ -194,7 +194,7 @@
           <div class="flex justify-between gap-2">
             <span>{$t('agentReport.readyHypothesisModels')}</span>
             <span
-              class="text-cortex-200 text-right truncate"
+              class="text-cortex-200 text-end truncate"
               title={report.summary.agenticReadiness.availableHypothesisModels.join(', ')}
             >
               {compactModels(report.summary.agenticReadiness.availableHypothesisModels)}
@@ -276,7 +276,7 @@
           </div>
         {/each}
         {#if sourceReferenceCoverage().length > 4}
-          <div class="text-[10px] text-cortex-500 text-right">
+          <div class="text-[10px] text-cortex-500 text-end">
             {$t('agentReport.more', { count: String(sourceReferenceCoverage().length - 4) })}
           </div>
         {/if}
@@ -307,7 +307,7 @@
                 {$t('agentReport.chunks')} - {dossier.trainingReadySegments}
                 {$t('agentReport.readyShort')}
               </span>
-              <span class="truncate text-right" title={dossier.promotionBlockers.join(', ')}>
+              <span class="truncate text-end" title={dossier.promotionBlockers.join(', ')}>
                 {#if dossier.promotionBlockers.length}
                   {dossier.promotionBlockers.slice(0, 2).join(', ')}
                 {:else}
@@ -318,7 +318,7 @@
           </div>
         {/each}
         {#if longFileDossiers().length > 3}
-          <div class="text-[10px] text-cortex-500 text-right">
+          <div class="text-[10px] text-cortex-500 text-end">
             {$t('agentReport.more', { count: String(longFileDossiers().length - 3) })}
           </div>
         {/if}
@@ -366,19 +366,19 @@
             title={`${reference.audioPath} | ${reference.transcriptPath} | ${sourceReferenceIdentity(reference)}`}
           >
             <span class="text-cyan-300 font-mono shrink-0 row-span-2">{reference.modelId}</span>
-            <span class="text-cortex-300 text-right truncate min-w-0">
+            <span class="text-cortex-300 text-end truncate min-w-0">
               {shortPath(reference.transcriptPath)} - {reference.textChars}
               {$t('agentReport.chars')}
             </span>
             {#if sourceReferenceIdentity(reference)}
-              <span class="text-cortex-500 text-right truncate min-w-0">
+              <span class="text-cortex-500 text-end truncate min-w-0">
                 {sourceReferenceIdentity(reference)}
               </span>
             {/if}
           </div>
         {/each}
         {#if report.summary.sourceReferences.length > 3}
-          <div class="text-[10px] text-cortex-500 text-right">
+          <div class="text-[10px] text-cortex-500 text-end">
             {$t('agentReport.more', { count: String(report.summary.sourceReferences.length - 3) })}
           </div>
         {/if}
@@ -446,7 +446,7 @@
           </div>
         {/each}
         {#if coverageBlockers().length > 4}
-          <div class="text-[10px] text-cortex-500 text-right">
+          <div class="text-[10px] text-cortex-500 text-end">
             {$t('agentReport.more', { count: String(coverageBlockers().length - 4) })}
           </div>
         {/if}
