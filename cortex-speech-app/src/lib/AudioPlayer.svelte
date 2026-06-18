@@ -51,8 +51,11 @@
     try {
       const grant = await registerMediaAsset(path);
       if (ctrl.signal.aborted) return;
-      const grantedPath = await getMediaAssetUrl(grant.id);
+      // Guard: the asset grant can be null/denied (missing file, permission,
+      // or no backend) — never deref blindly or we surface a raw TypeError.
+      const grantedPath = grant?.id ? await getMediaAssetUrl(grant.id) : null;
       if (ctrl.signal.aborted) return;
+      if (!grantedPath) throw new Error('audio asset unavailable');
       let cleanPath = grantedPath.replaceAll('\\', '/');
       if (cleanPath.startsWith('//?/')) {
         cleanPath = cleanPath.substring(4);
@@ -66,7 +69,10 @@
       }
     } catch (e) {
       if (!ctrl.signal.aborted) {
-        error = String(e);
+        // Keep the technical detail in the console; show the user a clean,
+        // consistent message instead of a raw "TypeError: …".
+        console.error('[AudioPlayer] could not resolve audio:', e);
+        error = 'Failed to load audio file';
         loading = false;
       }
     }
