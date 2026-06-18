@@ -95,6 +95,23 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
           (s.speakerId ?? '').toLowerCase().includes(q),
       );
     }
+    if (cmd === 'validate_dataset_cmd') {
+      const segs = sampleSegments();
+      const warnings = segs
+        .filter((s) => s.snrDb < 10)
+        .map((s) => ({ severity: 'Warning', category: 'audio_quality', segmentId: s.id, field: 'snrDb', message: `Low SNR: ${s.snrDb} dB`, details: s.audioPath }));
+      const errors = segs
+        .filter((s) => s.confidence < 0.5)
+        .map((s) => ({ severity: 'Error', category: 'transcript', segmentId: s.id, field: 'confidence', message: `Very low confidence: ${Math.round(s.confidence * 100)}%`, details: null }));
+      return {
+        totalSegments: segs.length,
+        totalAudioFiles: segs.length,
+        passed: segs.length - errors.length,
+        warnings,
+        errors,
+        summary: `${segs.length} segments checked · ${errors.length} error(s) · ${warnings.length} warning(s)`,
+      };
+    }
     if (listKinds.test(cmd)) return [];
     if (objKinds.test(cmd)) return {};
     return null;
