@@ -169,6 +169,17 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
 - ✅ Swept hardcoded hex / `bg-cortex-700 text-white` across all components — clean
   (only ReviewInbox legacy purple remains; separate retheme task).
 
+## Iteration 9 — WSL terminal + i18n sweep (fast)
+
+- ✅ **D15** — WSL terminal (`bg-black`, always dark) used theme-aware text → light
+  mode rendered dark-on-black (placeholder 2.03:1). Added `.terminal-dark` class
+  (pins palette vars to dark for the subtree) → light-on-black in both themes
+  (placeholder 2.03→3.71, AA-large; log lines cyan/red/emerald/muted now bright).
+- ✅ WSL console opens cleanly (no crash); export + shortcuts verified earlier.
+- 📋 **Notification i18n** — ~12 hardcoded-English toast messages (App, DatasetMerge,
+  ModelDownload×5, SpeakerPanel×2, WslConsole) — spawned as a task chip
+  (task_092f46ed) for a focused localization sweep.
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
