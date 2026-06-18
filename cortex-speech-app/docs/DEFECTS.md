@@ -193,6 +193,17 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
   Logs, panel/button labels) + the ~12 notifications. Consolidated into one
   comprehensive task chip (task_41f33d86); narrower notif-only chip dismissed.
 
+## Iteration 11 — edge cases (all clean, no new defect)
+
+- ✅ Rapid triple-Delete → exactly **1** confirm dialog (no double-fire/stacking).
+- ✅ Panel-width persistence + restore verified end-to-end (set 360 → reload →
+  applied 360; localStorage cortex.sidebarWidth).
+- ✅ AgentReportPanel + all `.fixed` overlays clean; no unchecked overlay components
+  remain. Recurring patterns (null-deref / white-on-light / fixed-dark / missing
+  role=dialog) all swept clean across the component tree.
+- **Status:** happy path + common edge cases verified defect-free. Remaining work is
+  the two task chips (comprehensive i18n sweep; ReviewInbox legacy-purple retheme).
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
