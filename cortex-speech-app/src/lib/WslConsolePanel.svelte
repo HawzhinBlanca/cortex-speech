@@ -131,8 +131,16 @@
   });
 
   onDestroy(() => {
-    if (unlistenLog) unlistenLog();
-    if (unlistenStatus) unlistenStatus();
+    try {
+      if (unlistenLog) unlistenLog();
+    } catch (e) {
+      // ignore
+    }
+    try {
+      if (unlistenStatus) unlistenStatus();
+    } catch (e) {
+      // ignore
+    }
   });
 </script>
 
@@ -273,7 +281,7 @@
         <!-- Monospace Log Container -->
         <div
           bind:this={consoleContainer}
-          class="flex-1 overflow-y-auto bg-black font-mono text-[11px] p-4 rounded-xl border border-cortex-800/60 space-y-1 select-text scrollbar-thin scrollbar-thumb-cortex-800 scrollbar-track-transparent min-h-0"
+          class="terminal-dark flex-1 overflow-y-auto bg-black font-mono text-[11px] p-4 rounded-xl border border-cortex-800/60 space-y-1 select-text scrollbar-thin scrollbar-thumb-cortex-800 scrollbar-track-transparent min-h-0"
         >
           {#if logs.length === 0}
             <div class="text-cortex-600 italic">
