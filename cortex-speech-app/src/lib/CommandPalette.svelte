@@ -1,6 +1,7 @@
 <script lang="ts">
   import Modal from './Modal.svelte';
   import { globalKeyboardManager } from './keyboard';
+  import { t } from './i18n';
 
   export interface Command {
     id: string;
@@ -155,7 +156,7 @@
           {#if cmd.hint}<kbd class="shrink-0">{cmd.hint}</kbd>{/if}
         </button>
       {:else}
-        <div class="px-4 py-10 text-center text-sm text-subtle">No matching commands</div>
+        <div class="px-4 py-10 text-center text-sm text-subtle">{$t('cmdk.noMatches')}</div>
       {/each}
     </div>
 

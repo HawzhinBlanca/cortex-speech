@@ -3,6 +3,7 @@
   import { getMediaAssetUrl, registerMediaAsset } from './commands';
   import { onDestroy } from 'svelte';
   import { notifications } from './stores/notificationStore';
+  import { t } from './i18n';
 
   interface Props {
     audioPath: string;
@@ -72,7 +73,7 @@
         // Keep the technical detail in the console; show the user a clean,
         // consistent message instead of a raw "TypeError: …".
         console.error('[AudioPlayer] could not resolve audio:', e);
-        error = 'Failed to load audio file';
+        error = $t('audio.loadFailed');
         loading = false;
       }
     }
@@ -225,7 +226,7 @@
           error = null;
           loading = true;
           resolveAudioUrl(audioPath);
-        }}>Retry</button
+        }}>{$t('retry')}</button
       >
     </div>
   {:else}
