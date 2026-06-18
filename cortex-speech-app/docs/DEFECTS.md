@@ -133,6 +133,22 @@ Legend: ✅ fixed & verified · 🔄 in progress · 📋 noted / deferred
 - **Fix:** `text-white` → `text-default`. Verified: validation panel **0 contrast
   fails in BOTH themes**.
 
+## Iteration 5/6 — speakers, stats (fast pass)
+
+### ✅ D10 — Speaker panel crashed (null-deref, recurring pattern)
+- `SpeakerPanel.loadSpeakers()` did `speakers = stats.topSpeakers` unguarded;
+  `get_dataset_stats` null → "Failed to load speakers: TypeError". Guarded
+  (`stats?.topSpeakers ?? []`). Mock now implements `get_dataset_stats` (also fixed
+  Insights showing "no data"). Verified: panel loads 3 speakers, no error.
+
+### ✅ D11 — SpeakerPanel wasn't a proper dialog
+- Bare `.fixed` overlay: no role=dialog, aria-modal, focus-trap, Escape/backdrop
+  close. Added all. Verified: proper dialog, Escape closes.
+
+### ✅ Mock fidelity — verificationRate scale
+- Mock returned verificationRate as 0–1 ratio → Insights showed "0.5%" for 4/8.
+  App uses 0–100 (buildLocalStats *100). Mock now *100 → shows "50.0%".
+
 ## Tooling
 
 - **Dev preview now serves sample Sorani data** (`src/main.ts` mock): 8 segments
