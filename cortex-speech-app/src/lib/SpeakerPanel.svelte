@@ -5,6 +5,7 @@
   import { showSpeakerPanel } from './stores/uiStore';
   import { notifications } from './stores/notificationStore';
   import { segments } from './stores/segmentStore';
+  import { t } from './i18n';
 
   let speakers = $state<
     { speakerId: string; segmentCount: number; totalDurationSeconds: number }[]
@@ -19,7 +20,7 @@
       const stats = await api.getDatasetStats();
       speakers = stats?.topSpeakers ?? [];
     } catch (e) {
-      notifications.error('Failed to load speakers: ' + e);
+      notifications.error($t('speaker.loadFailed'), { detail: String(e) });
     } finally {
       loading = false;
     }
@@ -29,14 +30,14 @@
     if (!newName.trim()) return;
     try {
       const count = await api.renameSpeaker(oldId, newName.trim());
-      notifications.success(`Updated ${count} segments`);
+      notifications.success($t('speaker.renameSuccess', { n: String(count) }));
       renamingId = null;
       newName = '';
       await loadSpeakers();
       // Force segments reload
       segments.load();
     } catch (e) {
-      notifications.error('Rename failed: ' + e);
+      notifications.error($t('speaker.renameFailed'), { detail: String(e) });
     }
   }
 
@@ -69,7 +70,7 @@
   <div class="card w-full max-w-lg shadow-2xl flex flex-col max-h-[80vh]">
     <header class="flex items-center justify-between p-4 border-b border-cortex-800/50">
       <h2 class="text-sm font-bold text-cortex-200 uppercase tracking-widest">
-        Speaker Management
+        {$t('speaker.title')}
       </h2>
       <button class="text-cortex-500 hover:text-cortex-300" onclick={close}>✕</button>
     </header>
@@ -81,7 +82,7 @@
           <div class="h-10 bg-cortex-800 rounded"></div>
         </div>
       {:else if speakers.length === 0}
-        <p class="text-center py-8 text-cortex-500">No speakers identified yet.</p>
+        <p class="text-center py-8 text-cortex-500">{$t('speaker.noneIdentified')}</p>
       {:else}
         {#each speakers as speaker}
           <div
@@ -97,9 +98,10 @@
                 <div>
                   <div class="text-sm font-medium text-cortex-100">{speaker.speakerId}</div>
                   <div class="text-[10px] text-cortex-500">
-                    {speaker.segmentCount} segments &middot; {(
-                      speaker.totalDurationSeconds / 60
-                    ).toFixed(1)} min
+                    {$t('speaker.segmentsMinutes', {
+                      count: String(speaker.segmentCount),
+                      minutes: (speaker.totalDurationSeconds / 60).toFixed(1),
+                    })}
                   </div>
                 </div>
               </div>
@@ -110,7 +112,7 @@
                   newName = speaker.speakerId;
                 }}
               >
-                Rename
+                {$t('speaker.rename')}
               </button>
             </div>
 
@@ -120,16 +122,16 @@
                   type="text"
                   class="input !text-xs flex-1"
                   bind:value={newName}
-                  placeholder="New speaker name..."
+                  placeholder={$t('speaker.newNamePlaceholder')}
                   use:focusOnMount
                 />
                 <button
                   class="btn btn-primary !text-[10px] !px-2"
-                  onclick={() => handleRename(speaker.speakerId)}>Save</button
+                  onclick={() => handleRename(speaker.speakerId)}>{$t('save')}</button
                 >
                 <button
                   class="btn btn-secondary !text-[10px] !px-2"
-                  onclick={() => (renamingId = null)}>Cancel</button
+                  onclick={() => (renamingId = null)}>{$t('cancel')}</button
                 >
               </div>
             {/if}
@@ -139,7 +141,7 @@
     </div>
 
     <footer class="p-4 border-t border-cortex-800/50 flex justify-end">
-      <button class="btn btn-secondary !text-xs" onclick={close}>Close</button>
+      <button class="btn btn-secondary !text-xs" onclick={close}>{$t('close')}</button>
     </footer>
   </div>
 </div>
