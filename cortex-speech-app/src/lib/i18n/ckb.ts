@@ -95,6 +95,8 @@ export const ckb: Record<string, string> = {
   toggleVerified: 'گۆڕینی دۆخی پشتڕاستکردن',
   deleteSegment: 'سڕینەوەی بەش',
   deleteSegmentConfirm: 'بەشی "{name}" بسڕێتەوە؟ ئەمە ناگەڕێتەوە.',
+  editorInteractive: 'کارلێک',
+  editorTextEditor: 'دەستکاریی دەق',
   focusSearch: 'گەڕان',
   openSettings: 'کردنەوەی ڕێکخستنەکان',
   nextSegment: 'بەشی دواتر',

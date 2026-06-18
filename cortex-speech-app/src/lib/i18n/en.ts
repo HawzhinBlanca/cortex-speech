@@ -95,6 +95,8 @@ export const en: Record<string, string> = {
   toggleVerified: 'Toggle verified',
   deleteSegment: 'Delete segment',
   deleteSegmentConfirm: 'Delete segment "{name}"? This cannot be undone.',
+  editorInteractive: 'Interactive',
+  editorTextEditor: 'Text Editor',
   focusSearch: 'Focus search',
   openSettings: 'Open settings',
   nextSegment: 'Next segment',
