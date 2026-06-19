@@ -312,6 +312,41 @@ impl AppSettings {
         }
     }
 
+    /// Validate frontend-supplied settings SERVER-SIDE before they take effect — the Rust
+    /// IPC layer, not the webview, is the trust boundary. A malicious or XSS-planted
+    /// settings payload could otherwise repoint every LLM/refiner request (and the bearer
+    /// API key) at an attacker-controlled server, or carry unbounded strings.
+    pub fn validate(&self) -> Result<(), crate::error::AppError> {
+        use crate::error::AppError;
+        const MAX_ENDPOINT_LEN: usize = 2048;
+        const MAX_MODEL_LEN: usize = 256;
+        const MAX_PROMPT_LEN: usize = 16_384;
+
+        if self.llm_endpoint.len() > MAX_ENDPOINT_LEN {
+            return Err(AppError::Validation("LLM endpoint URL is too long".into()));
+        }
+        let endpoint = self.llm_endpoint.trim();
+        if !endpoint.is_empty() {
+            let lower = endpoint.to_ascii_lowercase();
+            let is_https = lower.starts_with("https://");
+            let is_localhost = lower.starts_with("http://localhost")
+                || lower.starts_with("http://127.0.0.1")
+                || lower.starts_with("http://[::1]");
+            if !is_https && !is_localhost {
+                return Err(AppError::Validation(
+                    "LLM endpoint must be an https:// URL or a localhost http:// address".into(),
+                ));
+            }
+        }
+        if self.llm_model.len() > MAX_MODEL_LEN {
+            return Err(AppError::Validation("LLM model name is too long".into()));
+        }
+        if self.llm_system_prompt.len() > MAX_PROMPT_LEN {
+            return Err(AppError::Validation("LLM system prompt is too long".into()));
+        }
+        Ok(())
+    }
+
     pub fn save(&self, path: &std::path::Path) -> Result<(), crate::error::AppError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -396,6 +431,36 @@ mod tests {
     #[test]
     fn default_asr_model_matches_bundled_runtime_model() {
         assert_eq!(AppSettings::default().asr_model_size, AsrModelSize::CTC300M);
+    }
+
+    #[test]
+    fn validate_accepts_https_and_localhost_endpoints() {
+        // The default (Ollama localhost) must pass.
+        assert!(AppSettings::default().validate().is_ok());
+        for ep in [
+            "https://generativelanguage.googleapis.com/v1beta",
+            "http://localhost:11434/v1/chat/completions",
+            "http://127.0.0.1:8080/x",
+            "", // unset is fine
+        ] {
+            let s = AppSettings { llm_endpoint: ep.to_string(), ..AppSettings::default() };
+            assert!(s.validate().is_ok(), "endpoint should be accepted: {ep:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_https_remote_endpoint_and_oversized_fields() {
+        let remote_http = AppSettings { llm_endpoint: "http://evil.example.com/exfil".to_string(), ..AppSettings::default() };
+        assert!(
+            matches!(remote_http.validate(), Err(crate::error::AppError::Validation(_))),
+            "a non-https remote endpoint must be rejected (exfil risk)"
+        );
+
+        let huge_prompt = AppSettings { llm_system_prompt: "x".repeat(20_000), ..AppSettings::default() };
+        assert!(matches!(huge_prompt.validate(), Err(crate::error::AppError::Validation(_))));
+
+        let huge_endpoint = AppSettings { llm_endpoint: format!("https://{}", "a".repeat(3000)), ..AppSettings::default() };
+        assert!(matches!(huge_endpoint.validate(), Err(crate::error::AppError::Validation(_))));
     }
 
     #[test]

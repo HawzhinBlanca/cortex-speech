@@ -1233,6 +1233,9 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 #[tauri::command]
 pub fn update_settings(mut settings: AppSettings, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("update_settings")?;
+    // Server-side trust boundary: reject a malicious endpoint/oversized payload before it
+    // can take effect and redirect LLM requests (+ the API key) to an attacker's server.
+    settings.validate().map_err(|e| e.to_string())?;
     let settings_path = {
         let mut current = state.lock_settings();
         settings.merge_session_secret_from(&current);
