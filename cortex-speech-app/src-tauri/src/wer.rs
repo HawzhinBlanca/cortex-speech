@@ -208,6 +208,25 @@ mod tests {
     }
 
     #[test]
+    fn cer_counts_unicode_chars_not_utf8_bytes() {
+        // Each of these Sorani letters is 2 bytes in UTF-8, so a byte-level edit
+        // distance would report ref_len 6 and count every multi-byte edit as 2+,
+        // inflating CER for the target language. CER must operate on Unicode chars.
+        assert_eq!("ابج".len(), 6, "sanity: 3 Sorani letters are 6 UTF-8 bytes");
+
+        // One-character substitution (ج -> د): a single edit over a 3-char reference.
+        let sub = char_edit_distance("ابج", "ابد");
+        assert_eq!(sub.ref_len, 3, "ref_len must be the character count, not the byte count");
+        assert_eq!(sub.distance, 1, "one multi-byte-char substitution is a single edit");
+        assert!((compute_cer("ابج", "ابد") - 1.0 / 3.0).abs() < 1e-12);
+
+        // Deleting one multi-byte char is also a single edit, not its byte length.
+        let del = char_edit_distance("ابج", "اب");
+        assert_eq!(del.ref_len, 3);
+        assert_eq!(del.distance, 1, "deleting one multi-byte char is a single edit");
+    }
+
+    #[test]
     fn breakdown_classifies_substitution_and_deletion() {
         // ref "a b c d" vs hyp "a x c": b->x substitution, d deleted, nothing inserted.
         let bd = word_error_breakdown("a b c d", "a x c");
