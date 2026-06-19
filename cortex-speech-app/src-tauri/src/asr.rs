@@ -147,6 +147,28 @@ fn confidence_from_asr_result(text: &str, ys_log_probs: &[f64]) -> Option<f64> {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct RawAsrResult {
+    text: String,
+    // sherpa-onnx's OfflineRecognizerResult JSON emits the per-token acoustic LOG-probs
+    // under the key "ys_probs". The original code only read "ys_log_probs" — a key sherpa
+    // never emits — so with serde(default) the array was ALWAYS empty and confidence fell
+    // back to the 0.90 heuristic on every segment. The alias accepts sherpa's real key
+    // (and the alias can only make more JSON parse, never less, so it cannot regress).
+    #[serde(default, alias = "ys_probs")]
+    ys_log_probs: Vec<f64>,
+}
+
+/// Parse sherpa-onnx's offline-result JSON into `(text, confidence)`. Confidence is the
+/// mean per-token posterior (exp of the acoustic log-probs) when the model exposes them,
+/// otherwise the documented heuristic fallback.
+fn parse_asr_result_json(json_str: &str) -> Result<(String, Option<f64>), String> {
+    let res: RawAsrResult =
+        serde_json::from_str(json_str).map_err(|e| format!("Failed to parse ASR stream result JSON: {e}"))?;
+    let confidence = confidence_from_asr_result(&res.text, &res.ys_log_probs);
+    Ok((res.text, confidence))
+}
+
 pub fn check_models() -> Result<(), String> {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let models_dir = project_root.join("models");
@@ -417,20 +439,7 @@ impl KurdishAsrService {
 
             sherpa_onnx_sys::SherpaOnnxDestroyOfflineStreamResultJson(json_cstr);
 
-            #[derive(serde::Deserialize)]
-            struct RawAsrResult {
-                text: String,
-                #[serde(default)]
-                ys_log_probs: Vec<f64>,
-            }
-
-            match serde_json::from_str::<RawAsrResult>(&json_str) {
-                Ok(res) => {
-                    let confidence = confidence_from_asr_result(&res.text, &res.ys_log_probs);
-                    Ok((res.text, confidence))
-                }
-                Err(e) => Err(format!("Failed to parse ASR stream result JSON: {e}")),
-            }
+            parse_asr_result_json(&json_str)
         }
     }
 }
@@ -529,6 +538,29 @@ mod tests {
     #[test]
     fn nonempty_asr_text_gets_fallback_confidence_without_token_probs() {
         assert_eq!(confidence_from_asr_result("سڵاو", &[]), Some(0.90));
+    }
+
+    #[test]
+    fn sherpa_ys_probs_field_drives_real_confidence_not_the_constant() {
+        // sherpa-onnx emits per-token acoustic LOG-probs under "ys_probs". With the alias,
+        // these now flow into a REAL mean-posterior confidence instead of the 0.90 constant.
+        // mean(exp(-0.10536), exp(-0.22314)) = mean(0.900, 0.800) = 0.850.
+        let json = r#"{"text":"سڵاو","ys_probs":[-0.10536,-0.22314]}"#;
+        let (text, conf) = parse_asr_result_json(json).expect("parse");
+        assert_eq!(text, "سڵاو");
+        let c = conf.expect("confidence");
+        assert!((c - 0.85).abs() < 0.01, "expected real ~0.85 mean posterior, got {c}");
+        assert!((c - 0.90).abs() > 0.01, "must NOT be the 0.90 constant");
+    }
+
+    #[test]
+    fn asr_result_without_token_probs_uses_honest_heuristic() {
+        // When the model exposes no posteriors, confidence is the documented 0.90 heuristic.
+        let (_t, conf) = parse_asr_result_json(r#"{"text":"سڵاو"}"#).expect("parse");
+        assert_eq!(conf, Some(0.90));
+        // Empty text → zero confidence, never the heuristic.
+        let (_t, conf) = parse_asr_result_json(r#"{"text":"  "}"#).expect("parse");
+        assert_eq!(conf, Some(0.0));
     }
 
     #[test]
