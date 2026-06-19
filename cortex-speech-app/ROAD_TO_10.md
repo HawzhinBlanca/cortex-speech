@@ -1,0 +1,224 @@
+# Cortex Speech Studio — Road to 10/10
+
+_Source: multi-agent audit (11 agents, ~1.4M tokens, 449 file reads). Critical claims verified firsthand. Generated for branch worktree-cortex-10x._
+
+## Honest grade: 6/10
+
+Cortex Speech Studio is a genuinely impressive, hardened engineering effort dressed in a not-yet-shippable, not-yet-best-in-class product surface — a strong 6. The backend is well above typical (418 tests, lock-poison recovery, SAVEPOINT writes, SHA-pinned model integrity, proptests/fuzzers, a CSP-locked Tauri capability set) and the curation stack (IRT consensus, conformal certificates, MAPSSWE significance, a tiered jury) is genuinely novel. But the grade is held down by a hard truth the audits converge on: the app's three most load-bearing claims are partly hollow. (1) The ASR *core* is not best-in-class for Sorani — confidence is a hard-coded 0.90 constant (verified), so the entire conformal/jury/autonomy machinery calibrates on a fake number; forced alignment is dead scaffolding that linearly interpolates timestamps yet labels them 'ctc_forced' (verified); and there is no LM/beam-search/calibration. (2) It cannot actually ship: CI workflows sit in a nested .github GitHub never scans (verified — effectively zero CI enforcement), there is no auto-updater, and every model archive's SHA256 pin is an empty string (verified), so first-run model download is structurally impossible. (3) It silently scales only to demo size — every read loads the whole table into memory with no pagination. For THIS app, 10/10 means: a publication-grade Sorani ASR dataset tool whose confidence numbers are real and calibrated, whose timestamps are truly forced-aligned, that cannot lose or corrupt a single human-verified label across crashes/power-loss, that stays instant at 100k segments, that ships signed and auto-updating to a Sorani-first user who hears their own language on every consent-critical screen, and whose accuracy regressions are physically impossible to merge because a gold-WER gate blocks the PR.
+
+### Dimension grades
+
+- **8/10** `backend-reliability` — This is a genuinely hardened Rust backend — well above typical. Lock poisoning is recovered everywhere via `unwrap_or_else(|p| p.into_inner())`, DB writes use SAVEPOINT-with-rollback closures under WAL+busy_timeout, model downloads are SHA256-pinned and verified, atomic file replacement is crash-resilient on Windows, the WSL subprocess has a recv_timeout guard, and the hottest DSP/stats paths (audio, features, wer, significance, conformal, irt) are bounds-guarded with proptests. `unwrap`/`expect` are clippy-denied outside tests. What keeps it off a 10 is a small cluster of un-hardened edges: the forced aligner (aligner.rs) is the one numeric module that never got the panic-total + proptest treatment and carries a real divide-by-zero and slice-index panic on a corrupt-but-loadable ONNX model; every outbound HTTP call uses a timeout-less ureq agent so a stalled server hangs a worker thread forever; durable writes lack fsync; and there are two narrow process/thread leaks on error/timeout paths.
+- **7/10** `data-integrity` — This is a genuinely strong, above-average persistence layer: WAL mode, busy_timeout, integrity-check-on-open with corrupt-DB quarantine (including -wal/-shm sidecars), SAVEPOINT-wrapped batch writes with rollback-on-error, atomic temp-then-rename file writes (with a correct Windows replace path), a deterministic seed-reproducible split assigner, a SHA256SUMS manifest for export byte-verification, and human-decision-protecting merge guards. What separates it from a 10/10 "never loses or silently corrupts" guarantee: (1) a dual-connection architecture where the pipeline opens its own un-mutexed SQLite connections to the same file, so cross-connection writes rely entirely on busy_timeout rather than a single serialized writer; (2) schema migrations are not wrapped in a transaction, so a crash mid-migration leaves a half-applied schema with no version row; (3) no WAL checkpoint or session flush on app shutdown, and synchronous=NORMAL, so an OS crash can silently drop the last committed transactions; (4) merge/import accepts arbitrary untrusted field values with zero validation; (5) duplicate detection lives only in an in-memory map that is wiped every restart and never persisted; (6) backup exists but there is no restore command and no automatic/scheduled backup.
+- **5/10** `asr-ml-quality` — The pipeline is competently engineered and panic-hardened, with a genuinely novel curation stack (IRT confusion-network consensus, conformal risk certificates, MAPSSWE significance, a 3-tier jury). But the ASR *core* is not yet best-in-class for Sorani: ASR confidence is a hard-coded 0.90 constant (CTC token probs are never extracted), the forced aligner ships only as a never-installed scaffold so every timestamp is linear interpolation, the "multi-model" jury is two members of the same OmniASR family plus an optional cloud LLM (no acoustic diversity), there is no beam search / KenLM shallow-fusion / pronunciation lexicon, no calibration measurement (ECE/temperature), and the g2p + number normalizer have real Sorani-linguistic gaps. These are the difference between "very good demo" and "publication-grade Sorani ASR."
+- **6/10** `frontend-reliability-ux` — This is a genuinely good, thoughtfully-built UI: a real token-driven dark/light/system theme, focus-trapped modals with focus restoration, optimistic updates with rollback, indeterminate progress, skeleton loaders, error boundaries, reduced-motion support, and broad i18n key parity (409/409). But it is not yet world-class. The single biggest gap is accessibility for the app's own primary audience: a Sorani (RTL) screen-reader user hits dozens of hardcoded English aria-labels, the main segment list has no real listbox semantics or roving-tabindex/scroll-into-view, the waveform slider can be focused but not keyboard-operated, error toasts announce only "politely," there is no global unhandledrejection trap, and the virtualized list never reacts to resize. These are concrete, fixable items that separate a 6 from a 10.
+- **6/10** `frontend-architecture` — Runes usage is solid: zero any, well-typed props and bindable, correct effect cleanup via AbortController and onDestroy, no derived-as-effect misuse, strict TS. But the architecture is held back by a 2530-line god-component (App.svelte), a duplicated segment-load path that bypasses the store stale-guard and conformal-threshold refresh, dead store code kept alive by tests, stringly-typed i18n with no compile-time key safety, a single 328KB monolithic bundle with no code-splitting, and a dev IPC mock that returns bare null for about 60 of 81 real commands.
+- **5/10** `performance-scalability` — The hot paths are built for hundreds-to-low-thousands of segments, not 10k–100k. The frontend list IS virtualized (good), WAL + pragmas are set, FTS is trigger-backed, and waveform/VAD-fallback use rayon — but the whole-dataset-into-memory model is pervasive: every read command (`get_segments`, stats, quality, export, jury) does an unbounded full-table SELECT with no LIMIT/pagination, ships the entire table across the Tauri IPC bridge as JSON, re-sorts a full copy of the array in JS on every filter keystroke, and re-fetches everything after every single mutation. Backend throughput is gated by a single global ASR mutex (the "pool" serializes all inference) and fully serial file/chunk loops, while the jury T0 gate is quadratic over hypotheses and commits one un-batched write per segment. This is a solid 5: correct and smooth at demo scale, but several of these are O(N) or O(N²) walls that will make 50k+ segments visibly janky and long recordings memory-heavy.
+- **7/10** `security-privacy` — This is a genuinely well-hardened desktop app — better than the vast majority of shipping Tauri apps. The core threats are handled: SHA256-pinned, fail-closed model integrity with no tar-slip; strictly parameterized SQL; a locked-down CSP and a minimal capability set (no shell/fs/http plugins, local-only, no remote URLs); consistent API-key redaction on every cloud error path with the key sent as a header (never in a query string); the API key is never persisted to disk (session-only, cleared before save); cloud egress is fail-closed opt-in; media playback is gated to already-imported files copied into a scoped, TTL-expiring cache; and CI runs cargo-deny + npm audit. The residual gaps to a 10/10 "publication-grade, safe-to-ship-to-the-public" bar are real but bounded: absolute filesystem paths (containing the curator's username) leak into shared CSV/JSONL/Parquet exports; FE-supplied settings (LLM endpoint, WSL script path, model) are persisted and used with zero server-side validation, leaving a compromised-renderer exfiltration path; the telemetry/tracing layer applies no secret-or-PII redaction; and the DATA_GOVERNANCE consent/license-gating + Consent-Revocation-List are documented as if enforced but have no runtime implementation in the export path.
+- **7/10** `testing-verification` — This is a genuinely strong, well-above-average test suite: 418 lib tests + reliability suite (crash recovery, lock-ordering deadlock probes, concurrent DB, import rollback), real proptest generators in 7 sites, 5 libfuzzer targets, a held-out gold-WER harness, SHA-pinned multi-platform CI that gates PRs, supply-chain gates (cargo-deny, npm audit), and FE tests that render real Svelte components. But it is NOT yet at the "regressions are impossible to merge" bar. The two decisive gaps: (1) the accuracy/quality eval (gold WER, real-audio) is entirely #[ignore] and silently no-ops without fixtures, asserts only num_segs>0 (never a WER threshold), and the nightly job exit-0s when no corpus is present — so no model-quality regression can ever fail a build; (2) there is zero coverage gating, zero mutation testing, and the fuzz targets are never invoked by any CI/Makefile/script and ship without a seed corpus, so they catch nothing automatically.
+- **4/10** `build-release-ops` — The build/release surface looks more finished than it is. There is genuine craft (atomic settings writes, SHA-pinned third-party Actions, a cargo-deny gate, a release checklist, an in-memory tracer, panic hook), but three load-bearing pillars of a shippable auto-updating product are simply absent or broken: (1) the CI/release workflows are placed in cortex-speech-app/.github/workflows/ inside a repo whose root is one level up, so GitHub never runs them — there is effectively no CI; (2) there is no auto-updater of any kind (no tauri-plugin-updater, no signing pubkey, no update endpoint), so every shipped build is a dead-end the user must manually re-download; (3) the entire model-download UX is non-functional in production because every downloadable archive's SHA256 is an empty string, which the code deliberately refuses to download. Add no persisted/rotated logging, no crash reporting, no settings schema/migration, placeholder icons, and a Windows-only bundle target on a 3-OS release matrix, and this sits at a 4 — a demo-grade packaging story, not a supportable product.
+- **5/10** `docs-i18n-polish` — The i18n machinery is solid (en/ckb at perfect 409-key parity, document-level RTL/lang switching, default locale = Sorani) and there are zero TODO/FIXME/HACK markers in app source — but the finish is half-applied. Two shipped, reachable components — the entire ReviewInbox.svelte review workflow (0 of its strings translated) and the AI/Jury/cloud-consent settings tab — are hardcoded English, so a Sorani-first user hits raw English on consent-critical and core-review screens. The README documents a much smaller app than what ships (no mention of WSL 7B, Gemini jury, Autonomy Dial, Review Inbox, diarization, conformal/OOD/active-learning), the AsoSoft MIT attribution required by its own ported code is missing from NOTICE, there is no in-app About/credits/version surface, and the repo root has 22 undocumented Python pipeline scripts with no README. This is "very good engineering, unfinished product surface" — a 5.
+
+### Top risks
+
+1. CI is inert: all three workflows live in cortex-speech-app/.github/ while the repo root is one level up (verified), so clippy/418 tests/typecheck/cargo-deny/e2e run on NOTHING. Every 'green to ship' claim is unenforced — a regression, a panic, or a clippy violation can merge undetected. This invalidates the safety story of every other dimension.
+2. First-run is dead on a clean install: every OmniASR/CAM++/Denoiser archive SHA256 pin is an empty string (verified) and the code fail-closes on empty pins, so model download reports '0 models available'. The app only runs because 300M weights are committed as repo fixtures that won't exist for any real user. The headline capability cannot bootstrap.
+3. Confidence is a fabricated constant (verified: Some(0.90) fallback) that drives auto-accept, escalation, the conformal 'risk certificate', and IRT consensus. The product makes calibrated-risk claims on top of a flat score with zero ECE/reliability measurement — the autonomy dial's accept rate is statistically meaningless and the certificate certifies against noise.
+4. Silent data loss on crash/power-loss: durable writes never fsync before atomic rename (verified — no sync_all in atomic_file/export), synchronous=NORMAL with no checkpoint-on-shutdown, and schema migrations aren't transactional (a crash mid-migration leaves a half-applied schema that open_with_retry then quarantines as 'corrupt', starting the user from an empty DB). For a tool whose whole value is human-verified labels, this is the cardinal sin.
+5. No auto-updater of any kind (verified — no tauri-plugin-updater, no signing pubkey, no update endpoint) plus no code signing, so every shipped build is an unsigned SmartScreen-flagged dead-end that can never receive a security or model-pin fix without a full manual re-download.
+6. Timestamps are a lie in the dataset's provenance: forced alignment is unreachable scaffolding, every word boundary is uniform linear interpolation, yet alignment_quality is written as 'ctc_forced' (verified) — poisoning the published dataset's metadata with a false accuracy claim.
+7. Scale wall: every read command does an unbounded full-table SELECT shipped as JSON over IPC, re-sorted in JS on every keystroke, re-fetched after every mutation. Smooth at hundreds of segments, visibly janky and memory-heavy at 50k+. The whole-dataset-in-memory model is pervasive.
+8. Privacy/consent gaps for an at-risk-minority-language tool: absolute filesystem paths (with the curator's username) leak into shared CSV/JSONL/Parquet exports; the Gemini cloud-consent checkbox is hardcoded English on a Sorani-first app (a consent failure); and the DATA_GOVERNANCE license/consent-revocation gating is documented as enforced but has no runtime implementation in the export path.
+
+### Quickest wins (do first)
+
+1. Relocate .github/workflows to the repo root with `defaults.run.working-directory: cortex-speech-app` — turns on the entire existing quality-gate suite (clippy/tests/typecheck/cargo-deny) with one move. Prerequisite for every other guarantee. (build-release-ops, testing) Effort S, impact critical.
+2. Strip absolute filesystem paths from the CSV/JSONL/Parquet exporters — emit basename/hash exactly as the HF exporter already does — and add a regression test asserting no path-separator/'Users' appears in any exported row. Closes a real PII-in-published-artifact leak. (security) Effort S.
+3. Add fsync(sync_all) to the temp file inside atomic_file::replace_file (+ parent-dir fsync on Linux), with a write→fsync→size>0 test. One syscall converts the already-excellent atomic-rename machinery from crash-fragile to crash-durable. (data-integrity) Effort S–M.
+4. Wrap each schema migration's up_sql + its schema_migrations INSERT in a single transaction so a mid-migration crash is all-or-nothing; add a fault-injection test. Removes the half-migrated→quarantine-as-corrupt→empty-DB data-loss path. (data-integrity) Effort M.
+5. Stop labeling linear-interpolation alignment as 'ctc_forced' — write 'heuristic_linear' and surface confidence 0.5 honestly. Zero-cost honesty fix that de-poisons dataset provenance immediately, independent of the real-aligner work. (asr-ml-quality, data-integrity) Effort S.
+6. Add validate_segment() at the write boundary (insert/batch/merge): non-empty id, duration_ms>=0, verdict/split/human_decision ∈ known enums; reject with AppError::Validation. Backs the import path against silently corrupting downstream split/grade math. (data-integrity) Effort M.
+7. Route every ureq call through one shared agent with connect/read/write timeouts — eliminates the unbounded-blocking-I/O thread-hang on a stalled LLM/CDN. (backend-reliability) Effort M.
+8. Localize ReviewInbox.svelte (0→full $t) and the AI/Jury settings tab incl. the Gemini cloud-consent string, then add a CI guard that fails on any untranslated rendered text/aria-label. The primary annotator screen and the consent gate are currently all-English on a Sorani-default app. (docs-i18n, frontend-ux) Effort M.
+9. Add a top-level unhandledrejection + error trap and split toasts into assertive(error)/polite(success) live regions — catches the whole class of async IPC-rejection failures that currently blank panels silently, and makes failures actually announced to AT users. (frontend-ux) Effort S–M.
+
+### Gaps the audits flagged as under-covered
+
+1. No end-to-end provenance/reproducibility manifest binding model-version + normalizer-version + g2p-version + decoder-config to each exported segment. The audits flag a SHA256SUMS for bytes and a model_manifest, but nothing pins WHICH normalizer/g2p/alignment code produced a label, so two app versions silently produce divergent gold sets that look identical — a reproducibility hole for a publication-grade dataset.
+2. Sorani-specific encoding/normalization hazards beyond g2p: no audit checks Unicode normalization form (NFC vs NFD) at the DB write boundary, ZWNJ (U+200C) handling for Kurdish suffix joining, Arabic-Indic (٠-٩) vs Eastern-Arabic vs ASCII digit unification, or Yeh/Kaf/Heh codepoint variant collapsing (ي vs ی, ك vs ک). Inconsistent codepoints silently fragment FTS search, dedup, and WER references — a correctness bug invisible to byte-level checks.
+3. Memory/OOM ceiling on long recordings is under-quantified: the audits note full-file decode and a 10-entry full-file PCM cache, but nobody computed the actual worst case — a multi-hour 48kHz stereo import decoded to i16 PCM plus the rayon waveform copy plus the whole-table segment Vec can plausibly exhaust RAM on a modest laptop. No memory budget, no streaming decode, no max-file-duration guard is defined.
+4. Speaker-privacy / re-identification beyond filesystem paths: a speech dataset's biggest privacy risk is the VOICE itself. There is no discussion of speaker-anonymization options, no PII-in-transcript scrubbing (names, phone numbers, addresses spoken aloud get verbatim-transcribed into a shareable dataset), and no per-speaker consent linkage — a real ethical/legal gap for the stated minority-language mandate.
+5. Accessibility of RTL data rendering correctness (not just labels): no audit verifies bidi handling when Sorani transcript text is interleaved with LTR content (Latin proper nouns, digits, the diff view's +/- markers, timestamps). RTL+LTR mixing in the editor/diff/waveform-label is a notorious source of visually-scrambled-but-stored-correctly (or vice versa) bugs that corrupt what the human thinks they verified.
+6. Concurrency correctness of the dual-connection model under WAL is asserted-broken but never reproduced: there is no test that actually races a background import thread against a foreground edit to prove the SQLITE_BUSY / lost-write failure mode and bound its probability. The fix is scoped but the bug is unquantified, so its real-world severity is a guess.
+7. No backpressure / cancellation correctness audit for the autonomy 'Act Auto' path: if the jury auto-accepts at high autonomy, what stops a miscalibrated run from auto-committing thousands of wrong verdicts before a human notices? There is no rate cap, no 'auto-accepted N, sample M for human spot-check' safety valve, no kill-switch audited — a trust failure mode distinct from per-call hangs.
+8. Floating-point determinism across platforms for the 'reproducible' scorecard: WER/significance/conformal math run on different OS/CPU (the release matrix is 3-OS) can yield bit-different f64 results from reordered sums/rayon non-determinism, so a 'reproducible' certificate may not reproduce across machines. No cross-platform determinism test exists.
+9. Disk-space exhaustion handling: the scoped media cache (TTL) and exports write large WAVs with no pre-flight free-space check or graceful ENOSPC handling — a full disk mid-export could interact badly with the atomic-rename path (tmp write fails after partial work). Not covered by any dimension.
+10. Time/timezone and clock-skew assumptions: created_at ordering, TTL cache expiry, and consent-receipt timestamps all assume a monotonic, correct system clock; nothing audits behavior under DST shifts or a backwards clock adjustment, which can reorder the keyset-pagination cursor the perf plan proposes.
+
+## Phase 1 — Make it real & make it safe (correctness, data durability, CI)
+
+**Goal:** Turn on enforcement and close every path that silently loses/corrupts a human-verified label or crashes on bad input. Nothing else matters until the safety net is real and the gates actually run.
+
+### 1. Relocate CI/release/nightly workflows to the repo root with working-directory: cortex-speech-app; prove with a green PR run
+- **impact:** critical · **effort:** S · **dims:** build-release-ops, testing-verification
+- All quality gates currently execute on nothing. This is the single highest-leverage action in the entire plan: it activates clippy -D warnings, 418 tests, typecheck, and cargo-deny on every change, making every other 'we tested it' claim true. Must be first.
+
+### 2. Make all durable writes crash-safe: fsync temp file (and parent dir on Linux) inside atomic_file::replace_file, add checkpoint+session-flush on RunEvent::ExitRequested, and bump human-decision/verdict writes toward synchronous=FULL
+- **impact:** critical · **effort:** M · **dims:** data-integrity, backend-reliability
+- A curation tool must never lose the last N verifications to a power cut. The atomic-rename machinery already exists; it stops one syscall short of durable. Prove with a kill -9 / reopen test asserting committed rows survive.
+
+### 3. Wrap each schema migration (up_sql + schema_migrations INSERT) in one transaction; fault-inject a failing statement and assert all-or-nothing
+- **impact:** critical · **effort:** M · **dims:** data-integrity
+- A crash mid-migration currently yields a half-applied schema that open_with_retry quarantines as corrupt, dropping the user into a fresh EMPTY database — total data loss masquerading as 'recovery'. SQLite DDL is transactional; not using it throws the guarantee away.
+
+### 4. Validate all incoming segment fields at the write boundary (insert/batch/merge_dataset_json): non-empty id, duration_ms>=0, verdict/split/human_decision ∈ known enums; reject with AppError::Validation
+- **impact:** high · **effort:** M · **dims:** data-integrity, backend-reliability
+- Import currently trusts arbitrary JSON; negative durations and unknown verdicts silently corrupt the split/grade math every downstream stage branches on. Back with adversarial-import tests.
+
+### 5. Harden aligner.rs to the DSP-layer standard: guard output_shape[1]/[2] > 0 before any division, replace inputs()[0]/outputs()[0] with checked .first(), fall back to the energy aligner on any degenerate model; add corrupt-model + zero-vocab proptests
+- **impact:** high · **effort:** M · **dims:** backend-reliability
+- The one numeric module that escaped the panic-hardening pass has a live divide-by-zero and slice-index panic on a corrupt-but-loadable ONNX model, reachable on a pipeline thread. 'Cannot crash on corrupt input' must extend from corrupt audio to corrupt models.
+
+### 6. Route every ureq call through one shared agent with connect/read/write timeouts + bounded retry/backoff for idempotent GETs; close the two WSL process/thread leaks (stdout-take error path + per-segment timeout) by killing+reaping the child
+- **impact:** high · **effort:** M · **dims:** backend-reliability
+- A stalled LLM/CDN currently hangs a worker thread forever (the WSL path already learned this lesson); the leaks accumulate zombie processes on a sick host. World-class backends have no unbounded blocking I/O and leak no OS resources on error paths.
+
+### 7. Wrap long-lived spawned worker closures in catch_unwind that emits a terminal failure event + clears shared state on panic
+- **impact:** medium · **effort:** M · **dims:** backend-reliability
+- A panic in the WSL monitor silently kills the thread and never emits the final status, leaving the UI stuck on 'running' forever — cannot-crash also means cannot-silently-stall.
+
+### 8. Normalize Sorani text at the DB write boundary: enforce NFC, unify digit systems (Arabic-Indic/Eastern/ASCII), collapse Yeh/Kaf/Heh codepoint variants and ZWNJ handling; add a fuzz/property test over codepoint variants
+- **impact:** high · **effort:** M · **dims:** data-integrity, asr-ml-quality
+- MISSED BY AUDITS. Inconsistent Unicode silently fragments FTS search, content-dedup, and WER references — a correctness bug invisible to byte-level SHA checks, directly undermining the dataset's integrity for the target language.
+
+
+## Phase 2 — The core value: publication-grade Sorani ASR
+
+**Goal:** Make the accuracy numbers real, calibrated, and regression-proof, and make the dataset's labels/timestamps genuinely best-in-class. This is why the app exists.
+
+### 1. Commit a small hand-verified gold audio+transcript subset and make gold-WER/CER a NON-ignored, PR-gating test that fails when WER exceeds a checked-in baseline (reuse significance.rs bootstrap-CI/MAPSSWE)
+- **impact:** critical · **effort:** L · **dims:** testing-verification, asr-ml-quality
+- The one regression that matters most — model accuracy silently degrading after a normalizer/aligner/decoder change — is currently structurally unobservable (all eval is #[ignore], asserts only num_segs>0, nightly exit-0s without a corpus). Without this gate, a change that doubles WER merges green.
+
+### 2. Extract REAL CTC token posteriors from OmniASR (or decode logits directly); delete the 0.90 constant, tag confidence_source(RealPosterior|Heuristic), and refuse to calibrate on heuristic-only data
+- **impact:** critical · **effort:** L · **dims:** asr-ml-quality
+- Verified: confidence is a hard-coded constant. It is the spine of auto-accept, escalation, the conformal certificate, and IRT consensus — all currently calibrated on noise. The certificate is meaningless until the score is real.
+
+### 3. Add a calibration module: ECE + reliability diagram + temperature scaling on the gold set, rendered in the scorecard; gate the autonomy dial on measured ECE below threshold
+- **impact:** high · **effort:** L · **dims:** asr-ml-quality
+- A conformal certificate is only honest if scores are calibrated and exchangeable. 'Confidence 0.9' must mean '90% correct'. This converts the autonomy dial from a vibe into a statistically-defensible control. Depends on real posteriors.
+
+### 4. Ship a real forced aligner (reuse OmniASR CTC logits via the existing ctc_align, or bundle+pin MMS) so word timestamps are truly aligned; until then write alignment_quality='heuristic_linear' not 'ctc_forced'
+- **impact:** high · **effort:** L · **dims:** asr-ml-quality, data-integrity
+- Verified mislabeling: 100% of timestamps are uniform interpolation written as 'ctc_forced', poisoning provenance. Publication-grade datasets require accurate boundaries; the honesty fix (relabel) lands in Phase 1, the real aligner here.
+
+### 5. Add a safety valve + audit trail to the autonomy 'Act Auto' path: a rate cap, an 'auto-accepted N, sampled M for human spot-check' loop, and a kill-switch
+- **impact:** high · **effort:** M · **dims:** asr-ml-quality, frontend-ux
+- MISSED BY AUDITS. At high autonomy a miscalibrated jury can auto-commit thousands of wrong verdicts before a human notices. The trust failure mode of bulk auto-acceptance is distinct from per-call hangs and is the scariest thing the autonomy dial enables.
+
+### 6. Add an architecturally-diverse acoustic voter (Whisper-large-v3-ckb or MMS-ckb) to the IRT jury; learn abilities from gold agreement not name heuristics; measure inter-model error correlation
+- **impact:** high · **effort:** XL · **dims:** asr-ml-quality
+- IRT/Dawid-Skene consensus only de-biases when raters are conditionally independent; two sizes of the same OmniASR family confidently agree on the same wrong Sorani spelling. A true second opinion is the difference between 'consensus' and 'shared bias'.
+
+### 7. Add beam search + Sorani KenLM shallow fusion + lexicon/hotword biasing; A/B via the existing MAPSSWE machinery and make decoding a setting
+- **impact:** high · **effort:** XL · **dims:** asr-ml-quality
+- For a morphologically-rich low-resource language, an n-gram LM with beam search is the single highest-leverage WER win over greedy CTC — typically several absolute WER points.
+
+### 8. Replace linear resampling with a band-limited (sinc/polyphase) resampler; add overlap-decode-and-stitch for long-form ASR; upgrade SNR to a VAD-gated/spectral estimator
+- **impact:** medium · **effort:** M · **dims:** asr-ml-quality
+- Linear resampling aliases >8kHz energy into the speech band before VAD/ASR; hard 30s non-overlapping cuts hallucinate/truncate tokens at seams; the crude top-10/bottom-10 SNR gates auto-accept on a deceptive number. Each is a measurable real-world WER/quality leak.
+
+### 9. Upgrade Sorani normalization: number-class-aware verbalization (years/ordinals/decimals/percent/phone) and a linguistically-complete g2p (bizroke epenthesis, gemination, ع/ح/ئ) with a feature-based phone distance; replace T1 placeholder tools with a real Sorani dictionary + LM perplexity
+- **impact:** medium · **effort:** L · **dims:** asr-ml-quality, docs-i18n-polish
+- Mis-verbalized numbers inject systematic errors into the gold references; g2p gaps propagate into IRT slot alignment and consensus equality; the T1 lexicon currently passes any Arabic-script gibberish. These are the linguistic 'last mile' to defensible Sorani output.
+
+### 10. Report unclamped S/D/I decomposition + micro AND macro WER + stratified WER (SNR/duration/speaker) in the scorecard; state empty-reference policy
+- **impact:** medium · **effort:** M · **dims:** asr-ml-quality, testing-verification
+- Clamping per-segment WER to 1.0 before macro-averaging quietly flatters the number; a reviewer expects an error decomposition and stratified breakdown. Persist a baseline scorecard and diff every gold run against it (ties to the Phase-2 gate).
+
+### 11. Implement the DATA_GOVERNANCE policy in code: a runtime license/consent gate + Consent-Revocation-List (by audio hash) consulted by export.rs/export_bundle.rs that hard-blocks NC/ShareAlike-incompatible and revoked segments; add per-file cloud-egress consent receipts
+- **impact:** high · **effort:** L · **dims:** security-privacy, asr-ml-quality
+- For a tool whose headline mandate is protecting an at-risk minority language, an NC-licensed or revoked-consent segment can currently be exported into a redistributable dataset because nothing consults the ledger. The gap between written policy and enforced code is itself a publication risk.
+
+### 12. Add transcript-PII scrubbing (spoken names/phones/addresses) and document speaker re-identification/anonymization options
+- **impact:** medium · **effort:** L · **dims:** security-privacy, asr-ml-quality
+- MISSED BY AUDITS. The biggest privacy risk in a speech dataset is the voice and the spoken content itself; verbatim-transcribing spoken PII into a shareable artifact is a real ethical/legal gap distinct from the filesystem-path leak.
+
+
+## Phase 3 — Scale & defense-in-depth (perf, concurrency, security)
+
+**Goal:** Stay instant and correct at 100k segments and multi-hour files, serialize writers, and make the Rust IPC layer the real trust boundary.
+
+### 1. Introduce true end-to-end pagination/windowing: a keyset-cursor SQL query + COUNT, a store holding only the visible window + total, and a VirtualList that fetches pages on scroll; push filter/sort/search into indexed SQL/FTS; add composite covering indexes
+- **impact:** high · **effort:** XL · **dims:** performance-scalability, frontend-architecture
+- Every read currently loads the whole table into memory, ships it as JSON over IPC, re-sorts a full copy in JS on every keystroke, and re-fetches after every mutation. This O(N)→O(viewport) conversion is the difference between demo-scale and 100k-segment-instant. Validate with an EXPLAIN-QUERY-PLAN perf fixture.
+
+### 2. Collapse to a single serialized writer (shared Mutex<Database> or a dedicated writer channel) so the pipeline never opens an independent un-mutexed connection; add a concurrent import+edit stress test that reproduces and then proves-absent the lost-write/SQLITE_BUSY race
+- **impact:** high · **effort:** L · **dims:** data-integrity, performance-scalability
+- Two independent writer connections to one WAL file coordinate only by a 10s busy_timeout, and the pipeline never acquires the AppState mutex. MISSED-ADJACENT: the bug is asserted but never reproduced — the stress test must first demonstrate the failure, then prove the fix.
+
+### 3. Make the ASR engine genuinely concurrent (a pool of K warm sessions handed out per worker) and parallelize the file/chunk processing loops with a bounded rayon/thread pool; de-quadratic the jury (index hypotheses by segment_id once; batch all verdict writes in one transaction)
+- **impact:** high · **effort:** XL · **dims:** performance-scalability
+- Import throughput is capped at one inference at a time regardless of cores, the chunk loop is serial, and the T0 gate is O(segments×hypotheses) with one un-batched write per segment. On a 100-hour corpus this leaves most cores idle and makes a full jury run superlinear.
+
+### 4. Replace in-Rust full-table reductions (stats, quality) with streaming SQL aggregates on a read-only connection; precompute+persist decimated per-segment waveforms at import and cache a peak buffer so playback only repaints the playhead; stop full-dataset refetch after every mutation (mutate store in place / fetch affected ids)
+- **impact:** medium · **effort:** M · **dims:** performance-scalability, frontend-architecture
+- Stats recompute the whole histogram while holding the global DB mutex; clicking a segment re-decodes and re-BLAKE3-hashes the entire source file; the waveform re-scans the full array 60×/sec just to move a 1px playhead. Each is wasted O(N) work on a hot interaction.
+
+### 5. Validate all frontend-supplied settings server-side in update_settings (https-only or localhost-allow-list LLM endpoint, sanitized/constrained WSL script path, bounded model/prompt strings) and add a structural redaction layer over tracing+telemetry (scrub secrets + rewrite absolute/home paths)
+- **impact:** high · **effort:** M · **dims:** security-privacy
+- Settings flow unvalidated from the webview into ureq::post and Command::new("wsl"); a single XSS or malicious settings.json repoints the LLM endpoint to an exfil server or runs arbitrary WSL Python. The Rust IPC layer — not the JS — must be the trust boundary; and redaction must be structural so it can't be forgotten at a call site.
+
+### 6. Add a memory budget + streaming decode + max-file-duration guard for long recordings; pre-flight free-space check and graceful ENOSPC handling for exports
+- **impact:** medium · **effort:** M · **dims:** performance-scalability, backend-reliability
+- MISSED BY AUDITS. A multi-hour 48kHz stereo file decoded to i16 PCM + the rayon waveform copy + the full-table Vec can plausibly OOM a modest laptop; a full disk mid-export can interact badly with the atomic-rename tmp path. Neither has a defined ceiling.
+
+### 7. Run a full (incl. dev) npm audit that fails CI on high/critical, enable cargo-deny unmaintained detection, and ship an SBOM (cargo-auditable)
+- **impact:** low · **effort:** S · **dims:** security-privacy, build-release-ops
+- npm audit currently omits the build toolchain (a growing supply-chain target) and cargo-deny disables unmaintained-crate advisories. Cheap to close once CI actually runs.
+
+
+## Phase 4 — Ship-ready: release, accessibility, architecture, docs
+
+**Goal:** Make it a signed, auto-updating, fully-localized, accessible product a Sorani-first user can install, trust, and operate — and that a contributor can maintain.
+
+### 1. Pin real SHA256 for all OmniASR/CAM++/Denoiser archives (enforced in verify_10.py), make download resumable (HTTP Range + retry/backoff), and add a first-run onboarding gate that detects missing models via app_health and guides acquisition
+- **impact:** critical · **effort:** M · **dims:** build-release-ops
+- Verified: empty SHA pins make production model download structurally impossible; the app only runs off committed fixtures. Without real pins + resumable ~1GB downloads + an onboarding gate, a clean install is unusable.
+
+### 2. Add tauri-plugin-updater with a signed (minisign) update channel + createUpdaterArtifacts in release.yml + an in-app update prompt and version surfacing; add Windows Authenticode (and mac Developer-ID if shipping mac) code signing
+- **impact:** critical · **effort:** L · **dims:** build-release-ops, security-privacy
+- Verified: no updater and no signing. Every shipped build is an unsigned, SmartScreen-flagged dead-end that can never receive a security or model-pin fix. This is table-stakes for a supportable product.
+
+### 3. Decide and execute the cross-platform stance: either honestly Windows-only (drop mac/linux from the matrix + the DLL-on-non-Windows bundle) or fully multi-OS with cfg-gated ORT libs, per-target bundle formats, and signing/notarization on every platform; add cross-platform f64 determinism tests for the scorecard
+- **impact:** high · **effort:** L · **dims:** build-release-ops, testing-verification
+- The release matrix builds 3 OSes but the bundle is Windows-only and ships onnxruntime.dll to mac/linux — wasted CI and a false cross-platform impression. MISSED: a '3-OS reproducible' certificate may not reproduce bit-for-bit across CPUs/OSes (reordered sums, rayon non-determinism).
+
+### 4. Add durable rotating file logging to AppData + opt-in crash reporting + persist the panic payload before exit; version settings.json with a tested migration ladder and corrupt-file preservation (never silently reset to defaults)
+- **impact:** high · **effort:** M · **dims:** build-release-ops
+- A GUI MSI build has no console, so every panic/log vanishes — there's nothing to attach to a bug report. And a future settings field rename silently resets the user's entire config to defaults with only an unseen log line.
+
+### 5. Promote the segment VirtualList to a true accessible listbox (role=listbox/option, aria-selected, aria-activedescendant, roving tabindex, Arrow/Home/End, scroll-into-view), make every role=slider keyboard-operable, add a ResizeObserver, and route every aria-label/title/string through $t (ckb+en) enforced by a lint
+- **impact:** high · **effort:** L · **dims:** frontend-reliability-ux, docs-i18n-polish
+- The app defaults to Sorani yet a blind ckb user hits dozens of hardcoded English labels and an unlabeled, non-keyboard-traversable core list whose selection can scroll off-screen. RTL+LTR bidi correctness in the editor/diff (MISSED) belongs here too. Accessibility for the actual primary audience is the gap between 6 and 10 on the UX axis.
+
+### 6. Eliminate silent FE data loss: per-segment dirty tracking, flush-on-switch/close, an unsaved indicator, a Tauri close-requested guard, and undo for batch delete + typed/echoed confirmation for large destructive batches
+- **impact:** high · **effort:** M · **dims:** frontend-reliability-ux
+- A curation tool's cardinal sin is silent data loss; rapid navigation can drop a pending debounced auto-save, and bulk delete of arbitrary N is one click on a red button with no undo. Friction must scale with blast radius.
+
+### 7. Decompose the 2530-line App.svelte god-component into a thin layout shell + SegmentList/EditorPane/Toolbar + per-domain action modules; unify segment loading on the single canonical store action (delete App's duplicate loadSegments so the stale-guard + conformal-threshold refresh always run); make i18n type-safe; delete dead store code
+- **impact:** medium · **effort:** XL · **dims:** frontend-architecture
+- The god-component is the dominant maintainability/testability ceiling; the duplicate load path silently ranks active-learning against a stale conformal threshold; untyped i18n ships mistyped keys as garbage. World-class FE leaves App.svelte a ~300-line shell with one source of truth.
+
+### 8. Add the missing test coverage: Tauri IPC-boundary round-trip tests for every command (pins the FE/BE contract), wire the 5 fuzz targets into CI with seed corpora, enforce coverage floors + cargo-mutants on core logic, rewrite proptest_audio.rs as real generators, and add render tests for ReviewInbox/ValidationPanel/ErrorBoundary/VirtualList + one full-loop e2e
+- **impact:** high · **effort:** L · **dims:** testing-verification
+- 94 commands have zero IPC-boundary coverage (a renamed field breaks users silently), fuzzers never run in CI (so they rot and catch nothing), there's no coverage/mutation gating, and the deepest e2e never imports or exports a file. 'Regressions impossible to merge' requires all of these.
+
+### 9. Add a thin typed service layer (segmentsService/datasetService/settingsService) so components depend on app concepts not Tauri command names; replace module-singleton event handlers with a typed event store; restore dev-mock fidelity (type against command return shapes, warn on unhandled)
+- **impact:** medium · **effort:** L · **dims:** frontend-architecture
+- 13 leaf components import commands directly with copy-pasted error/notification policy and no mock seam; the dev IPC mock returns bare null for ~60 of 81 commands, giving false preview coverage. A typed service interposes the seam and pins the contract.
+
+### 10. Close the docs/licensing/attribution loop: rewrite README to cover every shipped flagship feature + add a top-level repo README and a PIPELINE doc for the 22 Python scripts; add AsoSoft (MIT) to NOTICE + a THIRD_PARTY_LICENSES file + an in-app localized About/credits/version screen; reconcile PROGRESS_LEDGER/CHANGELOG and fix the 'Gemini 3.1 Pro' mislabel and the three product names
+- **impact:** medium · **effort:** M · **dims:** docs-i18n-polish, security-privacy
+- The README documents a much smaller app than ships; the normalizer is a port of MIT AsoSoft with no attribution (a license-compliance defect that disqualifies a 'publication-grade' release); and self-contradicting status docs erode the very trust story the project is built on. Add a provenance/reproducibility manifest (MISSED) binding model+normalizer+g2p+decoder versions to each export.
+
