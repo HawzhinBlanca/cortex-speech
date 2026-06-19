@@ -1,4 +1,12 @@
 name: Release
+
+# Lives at the repo root so GitHub Actions discovers it. The Tauri app is in the
+# cortex-speech-app/ subdirectory, so the matrix job sets
+# defaults.run.working-directory: cortex-speech-app for its shell steps. The
+# setup-node cache-dependency-path and the artifact/release globs are resolved
+# relative to the workspace (they do NOT honor that default), so they carry
+# explicit cortex-speech-app/ prefixes.
+
 on:
   push:
     tags: ['v*']
@@ -13,13 +21,19 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: cortex-speech-app
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with: { node-version: 22, cache: npm }
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cortex-speech-app/package-lock.json
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.12' }
       - if: startsWith(matrix.os, 'ubuntu')
@@ -48,9 +62,9 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cortex-speech-${{ matrix.os }}
-          path: src-tauri/target/release/bundle/**
+          path: cortex-speech-app/src-tauri/target/release/bundle/**
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: src-tauri/target/release/bundle/**
+          files: cortex-speech-app/src-tauri/target/release/bundle/**
           generate_release_notes: true
