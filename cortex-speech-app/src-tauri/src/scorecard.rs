@@ -225,6 +225,58 @@ pub fn render_markdown(sc: &Scorecard) -> String {
     out
 }
 
+/// "Annotation drift": how much human reviewers had to change the raw ASR output.
+///
+/// The human-corrected transcript is the reference and the raw ASR transcript the
+/// hypothesis, so a *low* drift WER means the model needed little correction (high
+/// quality) and a *high* drift means heavy human editing. Unlike the gold scorecard this
+/// needs no held-out eval run — it reads directly off the dataset the user is already
+/// curating, and like the gold scorecard it carries bootstrap CIs so the figure is
+/// defensible rather than a bare average. Deterministic given the seed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationDriftScorecard {
+    /// Number of segments carrying a non-empty human annotation (the basis of the figure).
+    pub num_segments: usize,
+    pub micro_wer: f64,
+    pub micro_cer: f64,
+    pub wer_ci: ConfidenceInterval,
+    pub cer_ci: ConfidenceInterval,
+    pub bootstrap_resamples: usize,
+    pub confidence: f64,
+    pub seed: u64,
+}
+
+/// Build the annotation-drift scorecard from the dataset's segments. Segments without a
+/// (non-blank) human annotation are skipped — they have no reference to score against.
+pub fn annotation_drift_scorecard(
+    segments: &[crate::db::SpeechSegment],
+    opts: ScorecardOptions,
+) -> AnnotationDriftScorecard {
+    let mut word_errs = Vec::new();
+    let mut char_errs = Vec::new();
+    for seg in segments {
+        let reference = match seg.annotated_transcript.as_deref() {
+            Some(r) if !r.trim().is_empty() => r,
+            _ => continue,
+        };
+        word_errs.push(word_error(reference, &seg.raw_transcript));
+        char_errs.push(char_error(reference, &seg.raw_transcript));
+    }
+
+    AnnotationDriftScorecard {
+        num_segments: word_errs.len(),
+        micro_wer: micro_rate(&word_errs),
+        micro_cer: micro_rate(&char_errs),
+        wer_ci: bootstrap_ci(&word_errs, opts.bootstrap_resamples, opts.confidence, opts.seed),
+        // Vary the seed for CER so its interval is not an artifact of the WER resampling.
+        cer_ci: bootstrap_ci(&char_errs, opts.bootstrap_resamples, opts.confidence, opts.seed ^ 0x9E37_79B9),
+        bootstrap_resamples: opts.bootstrap_resamples,
+        confidence: opts.confidence,
+        seed: opts.seed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +406,49 @@ mod tests {
         let json = serde_json::to_string(&sc).unwrap();
         let back: Scorecard = serde_json::from_str(&json).unwrap();
         assert_eq!(back.system.model_id, "omniasr-ctc-300m");
+    }
+
+    fn seg_with(raw: &str, annotated: Option<&str>) -> crate::db::SpeechSegment {
+        crate::db::SpeechSegment {
+            raw_transcript: raw.to_string(),
+            annotated_transcript: annotated.map(|s| s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn annotation_drift_scores_only_annotated_segments() {
+        let segs = vec![
+            // Human kept the ASR output verbatim → 0 drift.
+            seg_with("ئەمە باشە", Some("ئەمە باشە")),
+            // One word of two changed by the reviewer → 1 error over 2 reference words.
+            seg_with("ئەمە خراپە", Some("ئەمە باشە")),
+            // No annotation and blank annotation → both excluded (no reference to score).
+            seg_with("هیچ شت", None),
+            seg_with("هیچ شت", Some("   ")),
+        ];
+        let card = annotation_drift_scorecard(&segs, ScorecardOptions::default());
+
+        assert_eq!(card.num_segments, 2, "only the two non-blank annotated segments count");
+        // 1 word error over 4 reference words = 0.25 micro WER.
+        assert!((card.micro_wer - 0.25).abs() < 1e-9, "micro_wer was {}", card.micro_wer);
+        // The bootstrap CI brackets the point estimate and is well-ordered in [0, 1].
+        assert!(card.wer_ci.lower <= card.micro_wer && card.micro_wer <= card.wer_ci.upper);
+        assert!(card.cer_ci.lower >= 0.0 && card.cer_ci.upper <= 1.0);
+    }
+
+    #[test]
+    fn annotation_drift_empty_is_zeroed_not_nan() {
+        // No annotated segments must yield a finite, zeroed scorecard (no 0/0 = NaN).
+        let card = annotation_drift_scorecard(&[seg_with("ئەمە", None)], ScorecardOptions::default());
+        assert_eq!(card.num_segments, 0);
+        assert_eq!(card.micro_wer, 0.0);
+        assert_eq!(card.micro_cer, 0.0);
+        assert!(card.micro_wer.is_finite() && card.micro_cer.is_finite());
+
+        // Round-trips through JSON (it is an IPC return type).
+        let json = serde_json::to_string(&card).unwrap();
+        let back: AnnotationDriftScorecard = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.num_segments, 0);
     }
 }
