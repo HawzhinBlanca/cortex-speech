@@ -1799,7 +1799,7 @@ impl ProcessingPipeline {
         audio_path: &str,
         text: &str,
         alignment_json: Option<&str>,
-    ) -> AppResult<Vec<aligner::WordTimestamp>> {
+    ) -> AppResult<(Vec<aligner::WordTimestamp>, aligner::AlignmentQuality)> {
         let (sample_rate, pcm) = audio::decode_to_pcm_with_timeout(audio_path, Duration::from_secs(120))?;
         let (sample_rate, pcm) = audio::ensure_pcm_16khz(sample_rate, pcm)?;
         if pcm.is_empty() {

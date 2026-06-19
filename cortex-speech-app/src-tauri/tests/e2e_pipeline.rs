@@ -126,9 +126,11 @@ fn test_e2e_alignment() {
     let (sample_rate, pcm) = audio::decode_to_pcm(&wav_path).unwrap();
 
     let aligner = cortex_speech_app_lib::aligner::ForcedAligner::new(tmp.path(), false).unwrap();
-    let timestamps = aligner.align(&pcm, sample_rate, "ئەم تاقیکردنەیە").unwrap();
+    let (timestamps, quality) = aligner.align(&pcm, sample_rate, "ئەم تاقیکردنەیە").unwrap();
 
     assert!(!timestamps.is_empty(), "Aligner should return timestamps");
+    // No model is present in this temp dir, so the result is the heuristic fallback.
+    assert_eq!(quality, cortex_speech_app_lib::aligner::AlignmentQuality::EnergyHeuristic);
 
     for ts in &timestamps {
         assert!(ts.end > ts.start, "Word end should be after start");
