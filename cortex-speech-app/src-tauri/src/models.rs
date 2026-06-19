@@ -9,6 +9,20 @@ use std::sync::OnceLock;
 
 static USER_MODELS_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+// Model integrity pinning has two independent layers:
+//   1. Archive pins (`*_ARCHIVE_SHA256`) gate the FIRST-RUN download:
+//      `ensure_pinned_sha256` refuses to fetch an archive whose hash is unpinned,
+//      and `verify_sha256` checks the downloaded `.tar.bz2` before extraction.
+//      These stay empty until the canonical archive hash is recorded — the
+//      archives are deleted after extraction, so the hash cannot be recovered
+//      from the on-disk extracted files; it needs a download-and-hash pass or an
+//      upstream-published checksum. While empty, `model_download_supported`
+//      reports the model as not auto-downloadable instead of fetching it unverified.
+//   2. Extracted-file pins (`MODELS[].sha256`) verify the unpacked `.onnx`/tokens
+//      after extraction and CAN be computed directly from on-disk models. A
+//      mismatch fails the install (`verify_extracted_against_pin`); an empty pin
+//      is treated as "not yet pinned" and accepted.
+
 /// Subdirectory under the models root for Meta OmniASR CTC 300M (sherpa-onnx bundle).
 pub const OMNIASR_CTC_300M_DIR: &str = "omniasr-ctc-300m";
 pub const OMNIASR_CTC_300M_MODEL: &str = "omniasr-ctc-300m/model.int8.onnx";
@@ -118,7 +132,7 @@ pub const MODELS: &[ModelInfo] = &[
         name: "Silero VAD v4",
         filename: "silero_vad_v4.onnx",
         url: "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx",
-        sha256: "1a153a22f4509e292a94d67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+        sha256: "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
         min_size_bytes: 1_000_000,
         version: "4.0",
     },
@@ -126,7 +140,7 @@ pub const MODELS: &[ModelInfo] = &[
         name: "Meta OmniASR CTC 300M (model)",
         filename: OMNIASR_CTC_300M_MODEL,
         url: "",
-        sha256: "",
+        sha256: "e7c4e54ee4c4c47829cc6667d5d00ed8ea7bef1dcfeef0fce766f77752a2726c",
         min_size_bytes: 50_000_000,
         version: "2.0",
     },
@@ -134,7 +148,7 @@ pub const MODELS: &[ModelInfo] = &[
         name: "Meta OmniASR CTC 300M (tokens)",
         filename: OMNIASR_CTC_300M_TOKENS,
         url: "",
-        sha256: "",
+        sha256: "a7a044c52cb29cbe8b0dc1953e92cefd4ca16b0ed968177b6beab21f9a7d0b31",
         min_size_bytes: 100,
         version: "2.0",
     },
@@ -142,7 +156,7 @@ pub const MODELS: &[ModelInfo] = &[
         name: "Meta OmniASR CTC 1B (model)",
         filename: OMNIASR_CTC_1B_MODEL,
         url: "",
-        sha256: "",
+        sha256: "f7b74c964039162423b83e3fa950ce24810c9a635d9ff8468b5f4d142b7c1e8c",
         min_size_bytes: 500_000_000,
         version: "2.0",
     },
@@ -150,7 +164,7 @@ pub const MODELS: &[ModelInfo] = &[
         name: "Meta OmniASR CTC 1B (tokens)",
         filename: OMNIASR_CTC_1B_TOKENS,
         url: "",
-        sha256: "",
+        sha256: "a7a044c52cb29cbe8b0dc1953e92cefd4ca16b0ed968177b6beab21f9a7d0b31",
         min_size_bytes: 100,
         version: "2.0",
     },
@@ -212,6 +226,23 @@ fn ensure_pinned_sha256(label: &str, expected: &str) -> Result<(), String> {
 
 fn missing_pinned_sha256_error(label: &str) -> String {
     format!("Missing pinned SHA256 for {label}; refusing to download unverifiable artifact")
+}
+
+/// Verifies a freshly-extracted/installed model file's computed SHA256 against its
+/// pinned value (`MODELS[].sha256`). An empty pin means "not yet pinned" and is
+/// accepted as a no-op so archive-sourced files without an on-disk-computed pin
+/// still install; a non-empty pin that mismatches fails the install so a corrupted
+/// or tampered extraction is caught at the point of install rather than at runtime.
+fn verify_extracted_against_pin(filename: &str, computed: &str, pinned: &str) -> Result<(), String> {
+    if pinned.is_empty() {
+        return Ok(());
+    }
+    if computed != pinned {
+        return Err(format!(
+            "Installed model {filename} failed integrity check: expected SHA256 {pinned}, got {computed}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -413,6 +444,7 @@ impl ModelManager {
             }
             let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             let sha256 = compute_file_sha256(&path)?;
+            verify_extracted_against_pin(model.filename, &sha256, model.sha256)?;
             let entry = ModelMeta {
                 filename: model.filename.to_string(),
                 downloaded_at: now.clone(),
@@ -941,6 +973,40 @@ mod tests {
         assert!(err.contains("Missing pinned SHA256 for CAM++ archive"));
         assert_eq!(progress_calls.get(), 0, "preflight failure must not emit progress");
         assert!(!models_dir.exists(), "preflight failure must not create model directories");
+    }
+
+    #[test]
+    fn verify_extracted_against_pin_semantics() {
+        // Empty pin is "not yet pinned" → accepted as a no-op so archive-sourced
+        // files without an on-disk-computed pin still install.
+        assert!(verify_extracted_against_pin("f.onnx", "abc123", "").is_ok());
+        // Matching hash → accepted.
+        assert!(verify_extracted_against_pin("f.onnx", "abc123", "abc123").is_ok());
+        // Mismatch → rejected with a descriptive, both-sided error.
+        let err = verify_extracted_against_pin("f.onnx", "deadbeef", "abc123")
+            .expect_err("mismatched hash must fail the install");
+        assert!(err.contains("f.onnx"));
+        assert!(err.contains("integrity check"));
+        assert!(err.contains("abc123"));
+        assert!(err.contains("deadbeef"));
+    }
+
+    #[test]
+    fn omniasr_extracted_files_are_sha256_pinned() {
+        // The OmniASR model/token files are extracted from the archive bundle, so
+        // their extracted-file pins are computed directly from the on-disk models
+        // and must stay populated — an empty pin would silently disable the
+        // post-extract integrity check in `verify_extracted_against_pin`.
+        for filename in [
+            OMNIASR_CTC_300M_MODEL,
+            OMNIASR_CTC_300M_TOKENS,
+            OMNIASR_CTC_1B_MODEL,
+            OMNIASR_CTC_1B_TOKENS,
+        ] {
+            let model = MODELS.iter().find(|m| m.filename == filename).expect("model entry present");
+            assert_eq!(model.sha256.len(), 64, "{filename} must carry a 64-hex-char SHA256 pin");
+            assert!(model.sha256.chars().all(|c| c.is_ascii_hexdigit()), "{filename} pin must be hex");
+        }
     }
 
     #[test]
