@@ -14,9 +14,10 @@ export interface SpeechSegment {
   // type-checker forces a null-aware guard before any `.toFixed()`.
   confidence?: number | null;
   ctcScore?: number | null;
-  clippingRatio?: number;
-  rmsDb?: number;
-  snrDb?: number;
+  // Also Rust Option<f64> → may arrive as JSON null (see confidence/ctcScore above).
+  clippingRatio?: number | null;
+  rmsDb?: number | null;
+  snrDb?: number | null;
   split?: string | null;
   oodScore?: number | null;
   // Jury fields (Migration v11)
