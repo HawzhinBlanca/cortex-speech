@@ -354,6 +354,17 @@ pub static MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_eval_seg_run ON eval_segment_results(eval_run_id);",
         down_sql: Some("DROP TABLE IF EXISTS eval_segment_results;"),
     },
+    Migration {
+        version: 19,
+        description: "Composite index for the verified-filtered, created_at-ordered segment list",
+        // The main segment-list query (`WHERE verified=? ORDER BY created_at DESC`, run on
+        // every load and after every mutation) was served by separate single-column indexes
+        // — good for the filter OR the sort, not both. This composite covers both in one
+        // index scan, the difference between demo-scale and 100k-segment-instant.
+        up_sql: "CREATE INDEX IF NOT EXISTS idx_segments_verified_created
+                 ON speech_segments(verified, created_at);",
+        down_sql: Some("DROP INDEX IF EXISTS idx_segments_verified_created;"),
+    },
 ];
 
 #[cfg(test)]
@@ -422,6 +433,21 @@ mod tests {
         let again = run_migrations(&db).unwrap();
         assert!(again.is_empty());
         assert_eq!(get_current_version(&db).unwrap(), max_version);
+    }
+
+    #[test]
+    fn migration_v19_creates_verified_created_index() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let exists: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_segments_verified_created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "the v19 composite index must exist after initialize()");
     }
 
     #[test]
