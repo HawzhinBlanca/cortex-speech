@@ -287,6 +287,63 @@ pub fn assign_splits(
     out
 }
 
+/// Lowercase-hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Write a standard `SHA256SUMS` file covering every file under `dir`, so a published
+/// dataset can be integrity-checked (truncation, corruption, partial copies) with
+/// `sha256sum -c SHA256SUMS`. Lines are `<hex>  <relative/path>`, sorted by path with
+/// forward slashes, deterministic regardless of filesystem walk order. Excludes the
+/// `SHA256SUMS` file itself and any `.tmp` staging files.
+fn write_sha256sums(dir: &std::path::Path) -> AppResult<()> {
+    fn collect(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        out: &mut Vec<(String, String)>,
+    ) -> AppResult<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                collect(&path, root, out)?;
+            } else if ft.is_file() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name == "SHA256SUMS" || name.ends_with(".tmp") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, sha256_hex(&std::fs::read(&path)?)));
+            }
+        }
+        Ok(())
+    }
+    let mut files: Vec<(String, String)> = Vec::new();
+    collect(dir, dir, &mut files)?;
+    files.sort();
+    let mut body = String::new();
+    for (rel, hash) in &files {
+        body.push_str(hash);
+        body.push_str("  ");
+        body.push_str(rel);
+        body.push('\n');
+    }
+    write_text_atomic(&dir.join("SHA256SUMS"), &body)
+}
+
 /// Export a HuggingFace Datasets–compatible directory (split folders + metadata + dataset card).
 pub fn export_huggingface_dataset(
     db: &Database,
@@ -560,6 +617,10 @@ This dataset was exported from Cortex Speech Processor.
         }
     });
     write_text_atomic(&dir.join("dataset_infos.json"), &serde_json::to_string_pretty(&info)?)?;
+
+    // Integrity manifest, written last so it covers every artifact: a consumer can run
+    // `sha256sum -c SHA256SUMS` to detect any corrupted / truncated / partially-copied file.
+    write_sha256sums(dir)?;
 
     Ok(())
 }
@@ -1015,6 +1076,34 @@ mod tests {
     }
 
     #[test]
+    fn sha256sums_manifest_covers_files_and_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"abc").unwrap();
+        std::fs::create_dir_all(dir.path().join("data/train")).unwrap();
+        std::fs::write(dir.path().join("data/train/clip.wav"), b"hello world").unwrap();
+        std::fs::write(dir.path().join("metadata.csv.tmp"), b"staging").unwrap();
+
+        write_sha256sums(dir.path()).unwrap();
+        let sums = std::fs::read_to_string(dir.path().join("SHA256SUMS")).unwrap();
+
+        // Known vector for sha256("abc").
+        assert!(sums.contains(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  a.txt"
+        ));
+        // Nested file present with a forward-slash relative path.
+        assert!(sums.lines().any(|l| l.ends_with("  data/train/clip.wav")));
+        // .tmp staging files and the manifest itself are excluded.
+        assert!(!sums.contains(".tmp"));
+        assert!(!sums.contains("SHA256SUMS"));
+        // Every listed hash matches an independent recompute.
+        for line in sums.lines() {
+            let (hash, rel) = line.split_once("  ").unwrap();
+            let bytes = std::fs::read(dir.path().join(rel)).unwrap();
+            assert_eq!(hash, sha256_hex(&bytes), "hash mismatch for {rel}");
+        }
+    }
+
+    #[test]
     fn export_json_replaces_existing_file() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("dataset.json");
@@ -1141,6 +1230,14 @@ mod tests {
         let metadata = std::fs::read_to_string(out_dir.path().join("data/train/metadata.csv")).unwrap();
         assert!(metadata.contains("training_grade"));
         assert!(metadata.contains("gold"));
+
+        // The real export emits a correct integrity manifest covering every artifact.
+        let sums = std::fs::read_to_string(out_dir.path().join("SHA256SUMS")).unwrap();
+        assert!(sums.lines().any(|l| l.ends_with("  README.md")));
+        for line in sums.lines() {
+            let (hash, rel) = line.split_once("  ").unwrap();
+            assert_eq!(hash, sha256_hex(&std::fs::read(out_dir.path().join(rel)).unwrap()));
+        }
     }
 
     #[test]
