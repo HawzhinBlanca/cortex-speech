@@ -224,4 +224,43 @@ mod tests {
         assert_eq!(g2p("چوار"), "c w A r");
         assert_eq!(g2p("دوو"), "d U");
     }
+
+    // The 4-pass role resolver does heavy roles[i-1]/roles[i+1]/roles[i+2] indexing.
+    // These adversarial inputs exercise every boundary (n=0/1/2, runs of the
+    // ambiguous 'و'/'ی', non-Kurdish scripts, diacritics, control chars, multi-byte
+    // graphemes) and assert the converter is TOTAL — never panics, always returns.
+    #[test]
+    fn g2p_is_total_on_adversarial_input() {
+        let cases = [
+            "",                 // empty
+            "   \t\n ",         // whitespace only
+            "و",                // lone ambiguous waw (n=1, undetermined at start)
+            "ی",                // lone ambiguous yeh
+            "وو",               // double waw (Pass-2 pair logic, n=2)
+            "ووو",              // triple waw (odd run — last falls through to end-rule)
+            "وووو",             // quad waw
+            "ییی",              // run of yeh
+            "ووییوو",           // alternating ambiguous run
+            "ـــ",              // tatweel only
+            "\u{200C}\u{200C}", // ZWNJ run
+            "ًٌٍَُِّْ",          // Arabic diacritics only (combining marks)
+            "١٢٣٤٥",            // Arabic-Indic digits
+            "abcdef",           // Latin (all-undetermined to the Kurdish classifier)
+            "a و b ی c",        // mixed scripts with ambiguous letters
+            "😀🎧",             // multi-byte emoji graphemes
+            "\u{0}\u{1}\u{7}",  // control characters
+            "کوردوووووستان",    // long internal waw run inside a real word
+        ];
+        for c in cases {
+            let out = g2p(c); // must not panic
+            // Sanity: output is finite text; empty in → empty out.
+            if c.trim().is_empty() {
+                assert!(out.is_empty(), "empty/whitespace input should yield empty: {c:?} -> {out:?}");
+            }
+        }
+
+        // A huge single token must also be handled without panic or pathological blowup.
+        let huge = "و".repeat(5000);
+        let _ = word_to_g2p(&huge);
+    }
 }
