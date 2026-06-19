@@ -6,7 +6,8 @@
   import Waveform from './Waveform.svelte';
   import AudioPlayer from './AudioPlayer.svelte';
   import EmptyState from './EmptyState.svelte';
-  import type { SpeechSegment } from './types';
+  import { parseWordTimestamps } from './alignment';
+  import type { SpeechSegment, WordTimestamp } from './types';
 
   // Simple, focused review queue: one clip at a time. Pending (unverified) first,
   // then the rest — so a reviewer always lands on work that needs doing.
@@ -28,6 +29,14 @@
   let playing = $state(false);
   let saving = $state(false);
   let lastLoadedId = $state<string | null>(null);
+
+  // Word-level alignment for the current clip (forced or heuristic). When present it
+  // powers the listen-strip: tap a word to hear it, colour the low-confidence ones so
+  // the reviewer's eye lands on likely errors, and karaoke-highlight the active word.
+  const words = $derived<WordTimestamp[]>(parseWordTimestamps(current?.alignmentJson));
+  const activeWordIndex = $derived(
+    words.findIndex((w) => currentTime >= w.start && currentTime < w.end),
+  );
 
   function originalText(seg: SpeechSegment): string {
     return seg.annotatedTranscript ?? seg.normalizedTranscript ?? seg.rawTranscript ?? '';
@@ -74,16 +83,34 @@
   }
 
   function advance() {
-    // Re-derive: after marking verified the item moves to the "done" tail, so the
-    // next pending naturally surfaces at the same-ish index; clamp to range.
-    if (index < queue.length - 1) index = Math.min(index, queue.length - 1);
-    else index = Math.max(0, queue.length - 1);
+    // After a save the just-verified clip drops to the done tail; jump to the next
+    // clip that still needs a human (the first remaining pending), else stay put.
+    const nextPending = queue.findIndex((s) => !s.verified);
+    index = nextPending >= 0 ? nextPending : Math.min(index, Math.max(0, queue.length - 1));
   }
   function go(delta: number) {
     index = Math.max(0, Math.min(queue.length - 1, index + delta));
   }
   function resetToOriginal() {
     if (current) editText = originalText(current);
+  }
+
+  // Tap a word → seek there and play, so a reviewer can verify it by ear instantly.
+  function playFromWord(w: WordTimestamp) {
+    currentTime = w.start;
+    playing = true;
+  }
+  function replay() {
+    currentTime = 0;
+    playing = true;
+  }
+
+  // 3-bin confidence → style class (research: discrete bins scan faster than a gradient).
+  function confClass(c: number | undefined | null): string {
+    if (c == null) return '';
+    if (c < 0.6) return 'conf-low';
+    if (c < 0.85) return 'conf-mid';
+    return '';
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -132,7 +159,8 @@
           waveform={waveformData}
           {currentTime}
           duration={playerDuration}
-          wordTimestamps={[]}
+          {playing}
+          wordTimestamps={words}
           onSeek={(time) => (currentTime = time)}
         />
       </div>
@@ -145,6 +173,44 @@
         bind:playing
         autoplay={false}
       />
+
+      <!-- Listen-strip: tap a word to hear it; low-confidence words are highlighted -->
+      {#if words.length > 0}
+        <div class="card p-4">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <div class="text-xs font-semibold uppercase tracking-wider text-muted">
+                {$t('review.listen')}
+              </div>
+              <p class="mt-0.5 text-xs text-subtle">{$t('review.listenHint')}</p>
+            </div>
+            <button
+              type="button"
+              class="ring-focus shrink-0 rounded-token px-2 py-1 text-xs text-subtle transition-colors hover:text-default"
+              onclick={replay}
+            >
+              ↻ {$t('review.replay')}
+            </button>
+          </div>
+          <div
+            dir="rtl"
+            class="font-kurdish mt-3 flex flex-wrap items-center gap-x-1 gap-y-2 text-2xl leading-loose"
+          >
+            {#each words as w, i (i)}
+              <button
+                type="button"
+                class="review-word {confClass(w.confidence)} {i === activeWordIndex
+                  ? 'word-active'
+                  : ''}"
+                onclick={() => playFromWord(w)}
+                title={`${w.start.toFixed(2)}s · ${Math.round((w.confidence ?? 1) * 100)}%`}
+              >
+                {w.word}
+              </button>
+            {/each}
+          </div>
+        </div>
+      {/if}
 
       <!-- Transcript: big, directly editable -->
       <div class="card p-5">
@@ -210,3 +276,31 @@
     </div>
   </div>
 {/if}
+
+<style>
+  .review-word {
+    border-radius: 0.375rem;
+    padding: 0.05rem 0.4rem;
+    color: var(--text);
+    cursor: pointer;
+    transition:
+      background-color 120ms ease,
+      color 120ms ease;
+  }
+  .review-word:hover {
+    background: var(--surface-3);
+  }
+  /* Low confidence = likely ASR error → draw the eye. Mid = worth a glance. */
+  .conf-mid {
+    background: color-mix(in srgb, var(--warning) 18%, transparent);
+  }
+  .conf-low {
+    background: color-mix(in srgb, var(--danger) 20%, transparent);
+  }
+  /* Karaoke highlight of the word currently being heard. Two classes so it always
+     wins over the single-class confidence tints (.conf-low / .conf-mid). */
+  .review-word.word-active {
+    background: var(--accent);
+    color: #fff;
+  }
+</style>

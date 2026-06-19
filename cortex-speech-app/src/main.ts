@@ -25,6 +25,28 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     ['ئەو گۆرانییەی گوێم لێبوو دەنگێکی خۆشی هەبوو', 0.81, null, false, 7200],
     ['پرۆژەکە سەرکەوتووانە تەواو بوو سوپاس بۆ هەمووان', 0.99, 'SPEAKER_00', true, 4200],
   ];
+  // Dev-only: synthesize per-word timestamps + confidence from a clip's text so the
+  // Review listen-strip (click-to-seek, karaoke, confidence heatmap) renders without a
+  // backend aligner. A few words are pushed low/mid to exercise the colour bins.
+  const makeAlignment = (text: string, durMs: number, segConf: number): string => {
+    const ws = text.split(/\s+/).filter(Boolean);
+    const dur = durMs / 1000;
+    const per = ws.length ? dur / ws.length : dur;
+    const words = ws.map((word, i) => {
+      const jitter = ((i * 37) % 100) / 100; // deterministic pseudo-random in [0,1)
+      let c: number;
+      if (jitter < 0.18) c = Math.min(segConf, 0.5); // a few low → red
+      else if (jitter < 0.45) c = Math.min(0.82, segConf); // some mid → amber
+      else c = Math.min(0.99, segConf + 0.1); // most high → neutral
+      return {
+        word,
+        start: +(i * per).toFixed(3),
+        end: +((i + 1) * per).toFixed(3),
+        confidence: +c.toFixed(2),
+      };
+    });
+    return JSON.stringify({ words });
+  };
   const sampleSegments = () =>
     SAMPLE.map(([text, conf, spk, ver, dur], i) => ({
       id: `seg_${String(i + 1).padStart(3, '0')}`,
@@ -33,7 +55,7 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
       rawTranscript: text,
       normalizedTranscript: text,
       annotatedTranscript: ver ? text : null,
-      alignmentJson: null,
+      alignmentJson: makeAlignment(text, dur, conf),
       durationMs: dur,
       speakerId: spk,
       verified: ver,
