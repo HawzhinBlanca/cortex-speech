@@ -191,17 +191,25 @@
   async function undo() {
     const last = history.pop();
     if (!last) return;
-    // P3-3: Clear the human decision entirely (set to NULL) instead of
-    // overwriting it with a fake 'accept' — that was corrupting agent_examples.
-    await api.clearHumanDecision(last.id);
-    const idx = queue.findIndex((s) => s.id === last.id);
-    if (idx >= 0) {
-      queue[idx] = { ...last.prev };
-      // Navigate directly to the undone segment, not blindly to currentIndex-1.
-      // If the user accepted seg#5 then scrolled to seg#10, undo should show seg#5.
-      currentIndex = idx;
+    try {
+      // P3-3: Clear the human decision entirely (set to NULL) instead of
+      // overwriting it with a fake 'accept' — that was corrupting agent_examples.
+      await api.clearHumanDecision(last.id);
+      const idx = queue.findIndex((s) => s.id === last.id);
+      if (idx >= 0) {
+        queue[idx] = { ...last.prev };
+        // Navigate directly to the undone segment, not blindly to currentIndex-1.
+        // If the user accepted seg#5 then scrolled to seg#10, undo should show seg#5.
+        currentIndex = idx;
+      }
+      statusMsg = '↩ Undone';
+    } catch (e) {
+      // The decision was NOT cleared — put the history entry back so the undo can be
+      // retried, and tell the user instead of failing silently (which previously also
+      // dropped the entry, making the undo permanently unretryable).
+      history.push(last);
+      statusMsg = `Failed to undo: ${e}`;
     }
-    statusMsg = '↩ Undone';
   }
 
   function advance() {
