@@ -2288,6 +2288,19 @@ pub fn build_scorecard(
     Ok(ScorecardResponse { scorecard, markdown })
 }
 
+/// Compute the annotation-drift scorecard for the current dataset: how much human
+/// reviewers had to change the raw ASR output (micro WER/CER with bootstrap CIs). Reads
+/// the live segments directly — unlike `build_scorecard` it needs no held-out eval run.
+#[tauri::command]
+pub fn compute_annotation_drift_scorecard(
+    state: State<'_, AppState>,
+) -> Result<crate::scorecard::AnnotationDriftScorecard, String> {
+    RATE_LIMITER.check("compute_annotation_drift_scorecard")?;
+    let db = state.lock_db();
+    let segments = db.get_segments(None).map_err(|e| e.to_string())?;
+    Ok(crate::scorecard::annotation_drift_scorecard(&segments, Default::default()))
+}
+
 #[tauri::command]
 pub fn run_gold_eval_local(
     state: State<'_, AppState>,
