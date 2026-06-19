@@ -106,7 +106,9 @@ impl FbankExtractor {
             if self.preemphasis > 0.0 { apply_preemphasis(audio, self.preemphasis) } else { audio.to_vec() };
 
         let frame_length = (self.sample_rate as f32 * self.frame_length_ms / 1000.0) as usize;
-        let frame_shift = (self.sample_rate as f32 * self.frame_shift_ms / 1000.0) as usize;
+        // Never 0: it is a divisor in the frame-count computation below (a tiny sample
+        // rate could otherwise floor it to 0 and divide-by-zero panic).
+        let frame_shift = ((self.sample_rate as f32 * self.frame_shift_ms / 1000.0) as usize).max(1);
 
         let mut features = if self.centered {
             self.compute_centered(&preemphasized, frame_length, frame_shift)
@@ -126,7 +128,7 @@ impl FbankExtractor {
         let mut padded = vec![0.0f32; pad + audio.len() + pad];
         padded[pad..pad + audio.len()].copy_from_slice(audio);
 
-        let num_frames = 1 + (padded.len() - frame_length) / frame_shift;
+        let num_frames = 1 + padded.len().saturating_sub(frame_length) / frame_shift;
         let num_frames = if num_frames > 0 { num_frames - 1 } else { num_frames };
 
         let mut planner = FftPlanner::new();
@@ -139,13 +141,17 @@ impl FbankExtractor {
 
             let mut frame = vec![0.0f32; self.fft_length];
             let available = padded.len().saturating_sub(start);
-            let copy_len = frame_length.min(available);
+            // Clamp to the frame buffer: an out-of-range fft_length < frame_length config
+            // must not slice past the fft-sized buffer.
+            let copy_len = frame_length.min(available).min(frame.len());
             if copy_len > 0 {
                 frame[..copy_len].copy_from_slice(&padded[start..start + copy_len]);
             }
 
-            for (i, w) in self.window.iter().enumerate() {
-                frame[i] *= w;
+            // Zip rather than index by window length: the window is frame_length long,
+            // which may exceed the fft-sized frame under a degenerate config.
+            for (f, w) in frame.iter_mut().zip(self.window.iter()) {
+                *f *= w;
             }
 
             let mut buf: Vec<Complex<f32>> = frame.iter().map(|&s| Complex::new(s, 0.0)).collect();
@@ -178,13 +184,14 @@ impl FbankExtractor {
 
             let mut frame = vec![0.0f32; self.fft_length];
             let available = audio.len().saturating_sub(start);
-            let copy_len = frame_length.min(available);
+            // Clamp to the frame buffer (see compute_centered): guards fft_length < frame_length.
+            let copy_len = frame_length.min(available).min(frame.len());
             if copy_len > 0 {
                 frame[..copy_len].copy_from_slice(&audio[start..start + copy_len]);
             }
 
-            for (i, w) in self.window.iter().enumerate() {
-                frame[i] *= w;
+            for (f, w) in frame.iter_mut().zip(self.window.iter()) {
+                *f *= w;
             }
 
             let mut buf: Vec<Complex<f32>> = frame.iter().map(|&s| Complex::new(s, 0.0)).collect();
@@ -316,6 +323,24 @@ mod tests {
         let features = fbank.compute(&audio);
         assert_eq!(features.shape()[1], 80);
         assert!(features.shape()[0] >= 1);
+    }
+
+    #[test]
+    fn compute_total_under_degenerate_small_fft_config() {
+        // fft_length (64) smaller than the fixed 25ms frame_length (400 @ 16kHz) is a
+        // constructible-but-nonsensical config; combined with short audio it used to
+        // underflow (centered path) or index past the fft-sized frame buffer and window
+        // (both paths). Mel extraction must be total: a well-shaped, finite matrix and
+        // never a panic, for any config the public constructor accepts.
+        for centered in [true, false] {
+            let ex = FbankExtractor::new_custom(
+                16000, 80, 64, 0.0, 0.0, 1e-10, centered, true, true, false, false,
+            );
+            let audio = vec![0.1f32; 100];
+            let feats = ex.compute(&audio);
+            assert_eq!(feats.ncols(), 80, "centered={centered}");
+            assert!(feats.iter().all(|v| v.is_finite()), "centered={centered}");
+        }
     }
 
     #[test]
