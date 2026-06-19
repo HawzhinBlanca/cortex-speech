@@ -134,16 +134,26 @@ fn file_meets_min_size(path: &Path, min_size_bytes: u64) -> bool {
     path.metadata().map(|metadata| metadata.len() >= min_size_bytes).unwrap_or(false)
 }
 
-fn confidence_from_asr_result(text: &str, ys_log_probs: &[f64]) -> Option<f64> {
+/// Whether a clip's confidence came from real model token-posteriors or the heuristic
+/// fallback. Downstream calibration (the conformal certificate, IRT consensus, the
+/// autonomy dial) must NOT treat a Heuristic confidence as calibrated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceSource {
+    /// Mean per-token posterior derived from the model's exposed `ys_probs`.
+    RealPosterior,
+    /// The 0.90 / 0.0 fallback, used when the model exposed no token probabilities.
+    #[default]
+    Heuristic,
+}
+
+fn confidence_from_asr_result(text: &str, ys_log_probs: &[f64]) -> (Option<f64>, ConfidenceSource) {
     if ys_log_probs.is_empty() {
-        if text.trim().is_empty() {
-            Some(0.0)
-        } else {
-            Some(0.90) // Fallback baseline confidence for CTC models where token probabilities are not exposed.
-        }
+        let conf = if text.trim().is_empty() { Some(0.0) } else { Some(0.90) };
+        (conf, ConfidenceSource::Heuristic)
     } else {
         let sum_prob: f64 = ys_log_probs.iter().map(|&lp| lp.exp()).sum();
-        Some(sum_prob / ys_log_probs.len() as f64)
+        (Some(sum_prob / ys_log_probs.len() as f64), ConfidenceSource::RealPosterior)
     }
 }
 
@@ -159,14 +169,14 @@ struct RawAsrResult {
     ys_log_probs: Vec<f64>,
 }
 
-/// Parse sherpa-onnx's offline-result JSON into `(text, confidence)`. Confidence is the
-/// mean per-token posterior (exp of the acoustic log-probs) when the model exposes them,
-/// otherwise the documented heuristic fallback.
-fn parse_asr_result_json(json_str: &str) -> Result<(String, Option<f64>), String> {
+/// Parse sherpa-onnx's offline-result JSON into `(text, confidence, source)`. Confidence is
+/// the mean per-token posterior (exp of the acoustic log-probs) when the model exposes them
+/// (source = RealPosterior), otherwise the documented heuristic fallback (source = Heuristic).
+fn parse_asr_result_json(json_str: &str) -> Result<(String, Option<f64>, ConfidenceSource), String> {
     let res: RawAsrResult =
         serde_json::from_str(json_str).map_err(|e| format!("Failed to parse ASR stream result JSON: {e}"))?;
-    let confidence = confidence_from_asr_result(&res.text, &res.ys_log_probs);
-    Ok((res.text, confidence))
+    let (confidence, source) = confidence_from_asr_result(&res.text, &res.ys_log_probs);
+    Ok((res.text, confidence, source))
 }
 
 pub fn check_models() -> Result<(), String> {
@@ -439,7 +449,12 @@ impl KurdishAsrService {
 
             sherpa_onnx_sys::SherpaOnnxDestroyOfflineStreamResultJson(json_cstr);
 
-            parse_asr_result_json(&json_str)
+            let (text, confidence, _source) = parse_asr_result_json(&json_str)?;
+            // TODO(confidence-source): thread `_source` up to the segment write (migration
+            // v20) so conformal/IRT/autonomy can distinguish real posteriors from the
+            // heuristic fallback. transcribe()/transcribe_chunk() signatures kept stable
+            // for now to avoid rippling through pipeline/commands.
+            Ok((text, confidence))
         }
     }
 }
@@ -531,13 +546,13 @@ mod tests {
 
     #[test]
     fn empty_asr_text_has_zero_confidence_without_token_probs() {
-        assert_eq!(confidence_from_asr_result("", &[]), Some(0.0));
-        assert_eq!(confidence_from_asr_result("   ", &[]), Some(0.0));
+        assert_eq!(confidence_from_asr_result("", &[]), (Some(0.0), ConfidenceSource::Heuristic));
+        assert_eq!(confidence_from_asr_result("   ", &[]), (Some(0.0), ConfidenceSource::Heuristic));
     }
 
     #[test]
     fn nonempty_asr_text_gets_fallback_confidence_without_token_probs() {
-        assert_eq!(confidence_from_asr_result("سڵاو", &[]), Some(0.90));
+        assert_eq!(confidence_from_asr_result("سڵاو", &[]), (Some(0.90), ConfidenceSource::Heuristic));
     }
 
     #[test]
@@ -546,8 +561,9 @@ mod tests {
         // these now flow into a REAL mean-posterior confidence instead of the 0.90 constant.
         // mean(exp(-0.10536), exp(-0.22314)) = mean(0.900, 0.800) = 0.850.
         let json = r#"{"text":"سڵاو","ys_probs":[-0.10536,-0.22314]}"#;
-        let (text, conf) = parse_asr_result_json(json).expect("parse");
+        let (text, conf, source) = parse_asr_result_json(json).expect("parse");
         assert_eq!(text, "سڵاو");
+        assert_eq!(source, ConfidenceSource::RealPosterior, "real ys_probs ⇒ RealPosterior");
         let c = conf.expect("confidence");
         assert!((c - 0.85).abs() < 0.01, "expected real ~0.85 mean posterior, got {c}");
         assert!((c - 0.90).abs() > 0.01, "must NOT be the 0.90 constant");
@@ -556,17 +572,18 @@ mod tests {
     #[test]
     fn asr_result_without_token_probs_uses_honest_heuristic() {
         // When the model exposes no posteriors, confidence is the documented 0.90 heuristic.
-        let (_t, conf) = parse_asr_result_json(r#"{"text":"سڵاو"}"#).expect("parse");
+        let (_t, conf, source) = parse_asr_result_json(r#"{"text":"سڵاو"}"#).expect("parse");
         assert_eq!(conf, Some(0.90));
+        assert_eq!(source, ConfidenceSource::Heuristic, "no ys_probs ⇒ Heuristic");
         // Empty text → zero confidence, never the heuristic.
-        let (_t, conf) = parse_asr_result_json(r#"{"text":"  "}"#).expect("parse");
+        let (_t, conf, _source) = parse_asr_result_json(r#"{"text":"  "}"#).expect("parse");
         assert_eq!(conf, Some(0.0));
     }
 
     #[test]
     fn token_probs_drive_asr_confidence_when_present() {
         let probs = [0.25f64.ln(), 0.75f64.ln()];
-        assert_eq!(confidence_from_asr_result("سڵاو", &probs), Some(0.5));
+        assert_eq!(confidence_from_asr_result("سڵاو", &probs), (Some(0.5), ConfidenceSource::RealPosterior));
     }
 
     #[test]
