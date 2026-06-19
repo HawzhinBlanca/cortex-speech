@@ -1089,6 +1089,46 @@ mod tests {
     }
 
     #[test]
+    fn decode_paths_return_err_not_panic_on_corrupt_input() {
+        use tempfile::TempDir;
+
+        clear_pcm_cache();
+        let dir = TempDir::new().unwrap();
+
+        // A spread of hostile inputs a user could feed in (renamed file, partial
+        // download, wrong format, zero-byte). Every decode entry point must surface a
+        // graceful Err — never panic the worker thread that owns the app's audio work.
+        let fixtures: &[(&str, &[u8])] = &[
+            ("empty.wav", b""),
+            ("garbage.wav", b"\x00\x01\x02\xff\xfe\xfd not audio at all \x7f\x80"),
+            ("text.wav", b"this is plainly a text file, not a RIFF container"),
+            ("truncated_riff.wav", b"RIFF\x10\x00\x00\x00WAVE"), // header start, then nothing
+            ("bogus_fmt.wav", b"RIFFxxxxWAVEfmt \xff\xff\xff\xff\x01\x00\x99\x99garbage"),
+            ("empty.mp3", b""),
+            ("garbage.flac", b"fLaC\x00\x00\x00\x22 corrupt stream info \xde\xad\xbe\xef"),
+        ];
+
+        for (name, bytes) in fixtures {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+
+            assert!(decode_to_pcm(&path).is_err(), "decode_to_pcm must Err on {name}");
+            assert!(check_audio_file(&path).is_err(), "check_audio_file must Err on {name}");
+            assert!(get_duration_ms(&path).is_err(), "get_duration_ms must Err on {name}");
+            let windows = decode_pcm_windows(&path, 1000, |_| Ok(()));
+            assert!(windows.is_err(), "decode_pcm_windows must Err on {name}");
+        }
+
+        // A path that doesn't exist at all must also Err, not panic.
+        let missing = dir.path().join("does_not_exist.wav");
+        assert!(decode_to_pcm(&missing).is_err());
+        assert!(check_audio_file(&missing).is_err());
+        assert!(get_duration_ms(&missing).is_err());
+
+        clear_pcm_cache();
+    }
+
+    #[test]
     fn pcm_cache_clear_recovers_poisoned_lock() {
         {
             let mut cache = lock_pcm_cache();
