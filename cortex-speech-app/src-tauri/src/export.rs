@@ -1210,6 +1210,46 @@ mod tests {
     }
 
     #[test]
+    fn export_writers_error_cleanly_on_unwritable_destination() {
+        // Use an existing FILE as the would-be parent directory: writing the temp file
+        // underneath it must fail with a clean Err — never panic, never half-write.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let blocker = tmp_dir.path().join("blocker");
+        std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+        let seg = [sample_segment("x")];
+
+        assert!(export_json(&blocker.join("d.json"), &sample_metadata(), &seg).is_err());
+        assert!(export_jsonl(&blocker.join("d.jsonl"), &seg).is_err());
+        assert!(export_csv(&blocker.join("d.csv"), &seg).is_err());
+        assert!(export_parquet(&blocker.join("d.parquet"), &seg).is_err());
+
+        // The blocker is untouched and no stray artifact was created.
+        assert_eq!(std::fs::read_to_string(&blocker).unwrap(), "i am a file, not a directory");
+    }
+
+    #[test]
+    fn export_writers_handle_empty_dataset() {
+        // Exporting a dataset with zero segments must produce well-formed, non-panicking
+        // output (a fresh install or a fully-filtered export hits this).
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let d = tmp_dir.path();
+        let empty: [SpeechSegment; 0] = [];
+
+        export_json(&d.join("e.json"), &sample_metadata(), &empty).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("e.json")).unwrap()).unwrap();
+        assert!(parsed.get("segments").is_some_and(|s| s.as_array().is_some_and(|a| a.is_empty())));
+
+        export_jsonl(&d.join("e.jsonl"), &empty).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("e.jsonl")).unwrap(), "");
+
+        export_csv(&d.join("e.csv"), &empty).unwrap();
+        assert!(d.join("e.csv").exists());
+
+        export_parquet(&d.join("e.parquet"), &empty).unwrap();
+        assert!(d.join("e.parquet").exists());
+    }
+
+    #[test]
     fn export_huggingface_writes_dataset_files() {
         let db_tmp = NamedTempFile::new().unwrap();
         let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
