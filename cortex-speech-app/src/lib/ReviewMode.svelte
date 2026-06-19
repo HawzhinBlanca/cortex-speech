@@ -298,9 +298,12 @@
     background: color-mix(in srgb, var(--danger) 20%, transparent);
   }
   /* Karaoke highlight of the word currently being heard. Two classes so it always
-     wins over the single-class confidence tints (.conf-low / .conf-mid). */
+     wins over the single-class confidence tints. Uses an accent ring + faint tint +
+     bold (not an inverted fill) so the word keeps its high-contrast text colour in
+     both themes — a solid-accent fill would put light text on a light accent. */
   .review-word.word-active {
-    background: var(--accent);
-    color: #fff;
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    box-shadow: inset 0 0 0 2px var(--accent);
+    font-weight: 700;
   }
 </style>
