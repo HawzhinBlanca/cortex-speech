@@ -40,6 +40,14 @@ pub struct SystemScore {
     pub num_segments: usize,
     pub micro_wer: f64,
     pub micro_cer: f64,
+    /// Macro (per-segment-mean) WER over UNCLAMPED per-segment rates — short clips with
+    /// many insertions push it above the (length-weighted) micro WER, which a reviewer
+    /// expects to see rather than have hidden by clamping.
+    pub macro_wer: f64,
+    /// Aggregate word-error decomposition over all segments.
+    pub substitutions: usize,
+    pub deletions: usize,
+    pub insertions: usize,
     pub wer_ci: ConfidenceInterval,
     pub cer_ci: ConfidenceInterval,
 }
@@ -114,6 +122,21 @@ fn char_errors(result: &EvalRunResult) -> Vec<SegmentError> {
     result.segments.iter().map(|s| char_error(&s.reference, &s.hypothesis)).collect()
 }
 
+/// Aggregate the per-segment word-error decomposition: the macro (per-segment-mean)
+/// UNCLAMPED WER plus total substitutions/deletions/insertions across all segments.
+fn word_breakdown_aggregate(result: &EvalRunResult) -> (f64, usize, usize, usize) {
+    let (mut subs, mut dels, mut ins, mut rate_sum) = (0usize, 0usize, 0usize, 0.0f64);
+    for s in &result.segments {
+        let bd = wer::word_error_breakdown(&s.reference, &s.hypothesis);
+        subs += bd.substitutions;
+        dels += bd.deletions;
+        ins += bd.insertions;
+        rate_sum += bd.rate();
+    }
+    let macro_wer = if result.segments.is_empty() { 0.0 } else { rate_sum / result.segments.len() as f64 };
+    (macro_wer, subs, dels, ins)
+}
+
 /// Build a scorecard from a gold-eval result (and an optional baseline run).
 pub fn build_scorecard(
     result: &EvalRunResult,
@@ -122,12 +145,17 @@ pub fn build_scorecard(
 ) -> Scorecard {
     let word_errs = word_errors(result);
     let char_errs = char_errors(result);
+    let (macro_wer, substitutions, deletions, insertions) = word_breakdown_aggregate(result);
 
     let system = SystemScore {
         model_id: result.run.model_id.clone(),
         num_segments: result.segments.len(),
         micro_wer: micro_rate(&word_errs),
         micro_cer: micro_rate(&char_errs),
+        macro_wer,
+        substitutions,
+        deletions,
+        insertions,
         wer_ci: bootstrap_ci(&word_errs, opts.bootstrap_resamples, opts.confidence, opts.seed),
         // Vary the seed for CER so its interval is not an artifact of the WER resampling.
         cer_ci: bootstrap_ci(&char_errs, opts.bootstrap_resamples, opts.confidence, opts.seed ^ 0x9E37_79B9),
@@ -204,6 +232,11 @@ pub fn render_markdown(sc: &Scorecard) -> String {
         pct(s.micro_cer),
         pct(s.cer_ci.lower),
         pct(s.cer_ci.upper)
+    ));
+    out.push_str(&format!("| **WER** (macro) | {} | — |\n", pct(s.macro_wer)));
+    out.push_str(&format!(
+        "\nWord errors: **{}** substitutions · **{}** deletions · **{}** insertions\n",
+        s.substitutions, s.deletions, s.insertions
     ));
     if let Some(b) = &sc.vs_baseline {
         out.push_str(&format!(
@@ -406,6 +439,27 @@ mod tests {
         let json = serde_json::to_string(&sc).unwrap();
         let back: Scorecard = serde_json::from_str(&json).unwrap();
         assert_eq!(back.system.model_id, "omniasr-ctc-300m");
+    }
+
+    #[test]
+    fn scorecard_reports_macro_wer_and_sdi_decomposition() {
+        // seg1 perfect; seg2 = "x" → "x y z" (2 insertions). micro is length-weighted
+        // (2/5 = 0.4); macro is the per-segment mean of UNCLAMPED rates ((0 + 2.0)/2 = 1.0).
+        let result = eval_with(&[("/a.wav", "a b c d"), ("/b.wav", "x")], &["a b c d", "x y z"], "omniasr-ctc-300m");
+        let sc = build_scorecard(&result, None, ScorecardOptions::default());
+
+        assert_eq!(sc.system.substitutions, 0);
+        assert_eq!(sc.system.deletions, 0);
+        assert_eq!(sc.system.insertions, 2);
+        assert!((sc.system.micro_wer - 0.4).abs() < 1e-9, "micro was {}", sc.system.micro_wer);
+        assert!((sc.system.macro_wer - 1.0).abs() < 1e-9, "macro was {}", sc.system.macro_wer);
+
+        // The decomposition + macro survive into the rendered + serialized artifact.
+        let md = render_markdown(&sc);
+        assert!(md.contains("macro"));
+        assert!(md.contains("**2** insertions"));
+        let back: Scorecard = serde_json::from_str(&serde_json::to_string(&sc).unwrap()).unwrap();
+        assert_eq!(back.system.insertions, 2);
     }
 
     fn seg_with(raw: &str, annotated: Option<&str>) -> crate::db::SpeechSegment {
