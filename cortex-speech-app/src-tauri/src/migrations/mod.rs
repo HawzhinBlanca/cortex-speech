@@ -379,4 +379,60 @@ mod tests {
         let list = list_migrations(&db).unwrap();
         assert!(!list.is_empty());
     }
+
+    #[test]
+    fn migration_versions_are_strictly_ascending_and_unique() {
+        // run_migrations applies anything with version > current and tracks MAX(version);
+        // a duplicate or out-of-order version would silently skip a migration or hit a
+        // PRIMARY KEY conflict. Catch that developer mistake here, at the source.
+        for pair in MIGRATIONS.windows(2) {
+            assert!(
+                pair[0].version < pair[1].version,
+                "migrations must be strictly ascending and unique: v{} is not < v{}",
+                pair[0].version,
+                pair[1].version,
+            );
+        }
+        assert_eq!(MIGRATIONS.first().map(|m| m.version), Some(1), "migrations should start at v1");
+    }
+
+    #[test]
+    fn initialize_applies_every_migration_and_is_idempotent() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let max_version = MIGRATIONS.iter().map(|m| m.version).max().unwrap();
+
+        // Every migration was applied and the schema is at the latest version.
+        assert_eq!(get_current_version(&db).unwrap(), max_version);
+        let recorded: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded as usize, MIGRATIONS.len(), "every migration must be recorded exactly once");
+
+        // Re-running migrates nothing and leaves the version untouched.
+        let again = run_migrations(&db).unwrap();
+        assert!(again.is_empty());
+        assert_eq!(get_current_version(&db).unwrap(), max_version);
+    }
+
+    #[test]
+    fn rollback_then_reapply_restores_schema() {
+        // The whole migration set must be round-trip safe: rolling back the latest
+        // migration (running its down_sql) and re-applying it (its up_sql) returns to the
+        // same version with no error. This also exercises that down_sql actually runs in
+        // the bundled SQLite build.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let max_version = MIGRATIONS.iter().map(|m| m.version).max().unwrap();
+        let prev_version = MIGRATIONS[MIGRATIONS.len() - 2].version;
+
+        let reverted = rollback(&db, 1).unwrap();
+        assert_eq!(reverted, vec![max_version], "rollback(1) must revert exactly the latest migration");
+        assert_eq!(get_current_version(&db).unwrap(), prev_version);
+
+        let reapplied = run_migrations(&db).unwrap();
+        assert_eq!(reapplied, vec![max_version], "the rolled-back migration must re-apply");
+        assert_eq!(get_current_version(&db).unwrap(), max_version);
+    }
 }
