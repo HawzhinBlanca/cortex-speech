@@ -94,7 +94,10 @@ describe('ConfirmDialog', () => {
     });
   });
 
-  it('calls onConfirm when the Enter key is pressed', async () => {
+  it('does not fire the destructive onConfirm on a stray Enter (Cancel is the safe default)', async () => {
+    // By design (ConfirmDialog.svelte): Cancel is autofocused so a stray Enter
+    // dismisses rather than firing the destructive action. Pin that safety contract —
+    // a bare Enter on the dialog must never trigger onConfirm.
     render(ConfirmDialog);
     const onConfirm = vi.fn();
     showConfirmDialog.set({
@@ -109,9 +112,6 @@ describe('ConfirmDialog', () => {
 
     await fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Enter' });
 
-    expect(onConfirm).toHaveBeenCalledOnce();
-    await waitFor(() => {
-      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-    });
+    expect(onConfirm).not.toHaveBeenCalled();
   });
 });

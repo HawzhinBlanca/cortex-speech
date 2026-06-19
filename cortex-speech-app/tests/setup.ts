@@ -1,6 +1,50 @@
 import { vi } from 'vitest';
 import '@testing-library/jest-dom';
 
+// jsdom does not implement the Web Animations API, but Svelte 5's transition
+// runtime calls element.animate()/getAnimations() (e.g. Modal's intro/outro).
+// Without this, every test that renders an animated component throws
+// "element.animate is not a function" and the assertions never run. Provide a
+// minimal Animation that completes immediately — fire onfinish on a microtask
+// (after Svelte assigns its handler) so outros resolve and nodes leave the DOM.
+if (typeof Element !== 'undefined' && !Element.prototype.animate) {
+  class MockAnimation {
+    currentTime = 0;
+    startTime = 0;
+    playState = 'finished';
+    pending = false;
+    onfinish: (() => unknown) | null = null;
+    oncancel: (() => unknown) | null = null;
+    finished: Promise<MockAnimation>;
+    constructor() {
+      this.finished = Promise.resolve(this);
+      queueMicrotask(() => this.onfinish?.());
+    }
+    cancel() {
+      this.oncancel?.();
+    }
+    finish() {}
+    play() {}
+    pause() {}
+    reverse() {}
+    persist() {}
+    commitStyles() {}
+    updatePlaybackRate() {}
+    addEventListener() {}
+    removeEventListener() {}
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  Element.prototype.animate = function (): any {
+    return new MockAnimation();
+  };
+  if (!Element.prototype.getAnimations) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    Element.prototype.getAnimations = function (): any {
+      return [];
+    };
+  }
+}
+
 // Mock Tauri invoke for tests
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
