@@ -85,4 +85,50 @@ mod tests {
 
         assert_eq!(redacted, message);
     }
+
+    // --- Multi-byte / Sorani robustness ------------------------------------
+    // Redaction runs over arbitrary log lines, which in this app routinely carry
+    // Sorani (every character is multi-byte UTF-8). The byte-offset arithmetic here
+    // must stay on char boundaries: a regression to naive byte slicing would either
+    // panic or, worse, slice a key in half and leak it. These pin the invariant.
+
+    #[test]
+    fn redacts_query_key_embedded_in_sorani_text() {
+        // A real-looking failure log: Sorani prose on both sides of the URL.
+        let message = "هەڵە لە داواکاری ?key=AIzaSyLEAK&alt=json بۆ مۆدێل";
+        let redacted = redact_api_key(message, "");
+        assert!(!redacted.contains("AIzaSyLEAK"), "secret must be gone: {redacted}");
+        assert!(redacted.contains(REDACTED_API_KEY));
+        // Surrounding Sorani must survive intact (proves boundary-correct slicing).
+        assert!(redacted.contains("هەڵە لە داواکاری"));
+        assert!(redacted.contains("بۆ مۆدێل"));
+    }
+
+    #[test]
+    fn sorani_letter_directly_before_key_is_not_a_query_param() {
+        // "key=" glued to a Sorani letter (no delimiter) is NOT a query param start.
+        // This exercises the bytes[start-1] read landing on a UTF-8 continuation byte:
+        // it must compare false against the ASCII delimiters, leaving the text untouched.
+        let message = "ووشەkey=AIzaSyKEEP";
+        let redacted = redact_api_key(message, "");
+        assert_eq!(redacted, message, "must not redact a non-delimited key= and must not panic");
+    }
+
+    #[test]
+    fn redacts_exact_key_surrounded_by_sorani() {
+        let message = "سەرکەوتوو نەبوو بە کلیلی AIzaSySECRET لە کاتی پرۆسێس";
+        let redacted = redact_api_key(message, "AIzaSySECRET");
+        assert!(!redacted.contains("AIzaSySECRET"));
+        assert!(redacted.contains(REDACTED_API_KEY));
+        assert!(redacted.contains("سەرکەوتوو نەبوو"));
+    }
+
+    #[test]
+    fn empty_and_pathological_inputs_never_panic() {
+        // No boundary, no key, just multibyte and edge cases — must return, not panic.
+        for msg in ["", "ـ", "key=", "key=کلیل", "؟key=AIza", "key=key=key=", "ک"] {
+            let _ = redact_api_key(msg, "");
+            let _ = redact_api_key(msg, "AIza");
+        }
+    }
 }
