@@ -878,60 +878,88 @@ fn remove_model_temp_file(path: &Path, context: &str) {
     }
 }
 
-/// Automatically locate `onnxruntime.dll` on Windows and programmatically
-/// set the `ORT_DYLIB_PATH` environment variable if not already set.
-pub fn init_ort_dylib_path() {
+/// The platform-specific ONNX Runtime shared-library filename that the `ort`
+/// crate's `load-dynamic` backend dlopen's at runtime (sherpa-onnx links its own
+/// copy; this is the standalone library used for the Silero VAD path).
+pub(crate) fn ort_dylib_filename() -> &'static str {
     #[cfg(target_os = "windows")]
     {
-        if std::env::var("ORT_DYLIB_PATH").is_err() {
-            let mut resolved_path = None;
+        "onnxruntime.dll"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "libonnxruntime.dylib"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        "libonnxruntime.so"
+    }
+}
 
-            // 1. Check next to current exe or in its parent directory
-            if let Ok(exe_path) = std::env::current_exe() {
-                if let Some(exe_dir) = exe_path.parent() {
-                    let p1 = exe_dir.join("onnxruntime.dll");
-                    if p1.exists() {
-                        resolved_path = Some(p1);
-                    } else if let Some(parent_dir) = exe_dir.parent() {
-                        let p2 = parent_dir.join("onnxruntime.dll");
-                        if p2.exists() {
-                            resolved_path = Some(p2);
-                        }
-                    }
+/// Locate the ONNX Runtime shared library next to the executable, in the active
+/// models directory, or in the working directory, and set `ORT_DYLIB_PATH` if it
+/// is not already set. Runs on every platform using the per-OS library name; if
+/// nothing is found it leaves the variable unset so `ort` falls back to the
+/// system loader's default search (this is purely additive — it never overrides
+/// an existing `ORT_DYLIB_PATH`).
+pub fn init_ort_dylib_path() {
+    if std::env::var("ORT_DYLIB_PATH").is_ok() {
+        return;
+    }
+
+    let dylib = ort_dylib_filename();
+    let mut resolved_path = None;
+
+    // 1. Next to the current exe, or in its parent directory.
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let p1 = exe_dir.join(dylib);
+            if p1.exists() {
+                resolved_path = Some(p1);
+            } else if let Some(parent_dir) = exe_dir.parent() {
+                let p2 = parent_dir.join(dylib);
+                if p2.exists() {
+                    resolved_path = Some(p2);
                 }
-            }
-
-            // 2. Check models directory
-            if resolved_path.is_none() {
-                let active_dir = active_models_dir();
-                let p3 = active_dir.join("onnxruntime.dll").join("onnxruntime.dll");
-                if p3.exists() {
-                    resolved_path = Some(p3);
-                } else {
-                    let p3_root = active_dir.join("onnxruntime.dll");
-                    if p3_root.exists() {
-                        resolved_path = Some(p3_root);
-                    }
-                }
-            }
-
-            // 3. Check current working directory
-            if resolved_path.is_none() {
-                let p4 = Path::new("onnxruntime.dll");
-                if p4.exists() {
-                    if let Ok(abs) = p4.canonicalize() {
-                        resolved_path = Some(abs);
-                    }
-                }
-            }
-
-            if let Some(path) = resolved_path {
-                tracing::info!("Setting ORT_DYLIB_PATH programmatically to {:?}", path);
-                std::env::set_var("ORT_DYLIB_PATH", path);
-            } else {
-                tracing::warn!("onnxruntime.dll not found in standard paths; ORT dynamic loading may fail");
             }
         }
+    }
+
+    // 2. Bundled under the active models directory. On Windows the library is
+    //    packaged inside a directory literally named `onnxruntime.dll`; all
+    //    platforms also accept it placed flat in the models directory.
+    if resolved_path.is_none() {
+        let active_dir = active_models_dir();
+        #[cfg(target_os = "windows")]
+        {
+            let nested = active_dir.join("onnxruntime.dll").join(dylib);
+            if nested.exists() {
+                resolved_path = Some(nested);
+            }
+        }
+        if resolved_path.is_none() {
+            let flat = active_dir.join(dylib);
+            if flat.exists() {
+                resolved_path = Some(flat);
+            }
+        }
+    }
+
+    // 3. Current working directory.
+    if resolved_path.is_none() {
+        let p4 = Path::new(dylib);
+        if p4.exists() {
+            if let Ok(abs) = p4.canonicalize() {
+                resolved_path = Some(abs);
+            }
+        }
+    }
+
+    if let Some(path) = resolved_path {
+        tracing::info!("Setting ORT_DYLIB_PATH programmatically to {:?}", path);
+        std::env::set_var("ORT_DYLIB_PATH", path);
+    } else {
+        tracing::warn!("{dylib} not found next to exe, in models dir, or cwd; ORT will fall back to the system loader search");
     }
 }
 
@@ -1007,6 +1035,18 @@ mod tests {
             assert_eq!(model.sha256.len(), 64, "{filename} must carry a 64-hex-char SHA256 pin");
             assert!(model.sha256.chars().all(|c| c.is_ascii_hexdigit()), "{filename} pin must be hex");
         }
+    }
+
+    #[test]
+    fn ort_dylib_filename_is_platform_appropriate() {
+        let name = ort_dylib_filename();
+        assert!(name.contains("onnxruntime"), "name should reference onnxruntime: {name}");
+        #[cfg(target_os = "windows")]
+        assert_eq!(name, "onnxruntime.dll");
+        #[cfg(target_os = "macos")]
+        assert_eq!(name, "libonnxruntime.dylib");
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        assert_eq!(name, "libonnxruntime.so");
     }
 
     #[test]
