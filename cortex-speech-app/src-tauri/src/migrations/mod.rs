@@ -21,8 +21,7 @@ pub fn run_migrations(db: &Database) -> AppResult<Vec<i64>> {
     for migration in MIGRATIONS {
         if migration.version > current_version {
             tracing::info!("Applying migration v{}: {}", migration.version, migration.description);
-            db.connection().execute_batch(migration.up_sql)?;
-            record_migration(db, migration.version, migration.description)?;
+            apply_migration(db, migration)?;
             applied.push(migration.version);
         }
     }
@@ -48,11 +47,20 @@ fn ensure_migrations_table(db: &Database) -> AppResult<()> {
     Ok(())
 }
 
-fn record_migration(db: &Database, version: i64, description: &str) -> AppResult<()> {
-    db.connection().execute(
+/// Apply one migration atomically: its DDL and the schema_migrations version row commit
+/// together or not at all. Without this, a crash/failure between the schema change and
+/// the version INSERT leaves a half-applied schema that `open_with_retry` quarantines as
+/// corrupt — silently starting the user from an empty database. SQLite DDL is
+/// transactional, so any error rolls the whole migration back.
+fn apply_migration(db: &Database, migration: &Migration) -> AppResult<()> {
+    let conn = db.connection();
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(migration.up_sql)?;
+    tx.execute(
         "INSERT INTO schema_migrations (version, description) VALUES (?1, ?2)",
-        rusqlite::params![version, description],
+        rusqlite::params![migration.version, migration.description],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -414,6 +422,40 @@ mod tests {
         let again = run_migrations(&db).unwrap();
         assert!(again.is_empty());
         assert_eq!(get_current_version(&db).unwrap(), max_version);
+    }
+
+    #[test]
+    fn failed_migration_is_all_or_nothing() {
+        // A migration whose DDL partly succeeds then hits invalid SQL must roll back
+        // COMPLETELY — no partial table, no version row, version unchanged. Otherwise a
+        // half-applied schema gets quarantined as corrupt → user starts from an empty DB.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let before = get_current_version(&db).unwrap();
+
+        let bad = Migration {
+            version: 99_999,
+            description: "intentionally broken migration",
+            up_sql: "CREATE TABLE should_not_persist (id INTEGER); THIS IS NOT VALID SQL;",
+            down_sql: None,
+        };
+        assert!(apply_migration(&db, &bad).is_err(), "a broken migration must fail");
+
+        assert_eq!(get_current_version(&db).unwrap(), before, "version must be unchanged");
+        let version_rows: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM schema_migrations WHERE version = 99999", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version_rows, 0, "no version row may be left behind");
+        let leaked_table: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='should_not_persist'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_table, 0, "the partial table must have been rolled back");
     }
 
     #[test]
