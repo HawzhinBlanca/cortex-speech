@@ -77,8 +77,18 @@ impl ForcedAligner {
             .ok_or_else(|| Box::<dyn std::error::Error>::from("Aligner session missing"))?
             .lock()
             .map_err(|e| format!("Aligner lock: {e}"))?;
-        let input_name = session_guard.inputs()[0].name().to_string();
-        let output_name = session_guard.outputs()[0].name().to_string();
+        let input_name = session_guard
+            .inputs()
+            .first()
+            .ok_or_else(|| Box::<dyn std::error::Error>::from("Aligner model exposes no inputs"))?
+            .name()
+            .to_string();
+        let output_name = session_guard
+            .outputs()
+            .first()
+            .ok_or_else(|| Box::<dyn std::error::Error>::from("Aligner model exposes no outputs"))?
+            .name()
+            .to_string();
 
         let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
         let input_nd = ndarray::Array2::from_shape_vec((1, f32_pcm.len()), f32_pcm)
@@ -97,11 +107,16 @@ impl ForcedAligner {
         let (output_shape, logits) = extract_res;
 
         if output_shape.len() < 3 {
-            return Err("Invalid aligner output shape".into());
+            return Ok(fallback_align(pcm, sample_rate, text));
         }
 
         let num_frames = output_shape[1] as usize;
         let vocab_size = output_shape[2] as usize;
+        // A corrupt-but-loadable model can report a zero frame/vocab dim, which would
+        // divide-by-zero in ctc_align; degrade to the energy aligner instead of panicking.
+        if num_frames == 0 || vocab_size == 0 {
+            return Ok(fallback_align(pcm, sample_rate, text));
+        }
         let blank_idx = self.tokens.iter().position(|t| t == "<pad>" || t == "_" || t == "<blank>").unwrap_or(0);
 
         // Tokenize text
@@ -211,8 +226,18 @@ impl ForcedAligner {
             .ok_or_else(|| "Aligner session missing".to_string())?
             .lock()
             .map_err(|e| format!("Aligner lock: {e}"))?;
-        let input_name = session_guard.inputs()[0].name().to_string();
-        let output_name = session_guard.outputs()[0].name().to_string();
+        let input_name = session_guard
+            .inputs()
+            .first()
+            .ok_or_else(|| "Aligner model exposes no inputs".to_string())?
+            .name()
+            .to_string();
+        let output_name = session_guard
+            .outputs()
+            .first()
+            .ok_or_else(|| "Aligner model exposes no outputs".to_string())?
+            .name()
+            .to_string();
 
         let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
         let input_nd = ndarray::Array2::from_shape_vec((1, f32_pcm.len()), f32_pcm)
@@ -231,10 +256,13 @@ impl ForcedAligner {
         let (output_shape, logits) = extract_res;
 
         if output_shape.len() < 3 {
-            return Err("Invalid aligner output shape".into());
+            return Ok(-5.0);
         }
 
         let vocab_size = output_shape[2] as usize;
+        if vocab_size == 0 {
+            return Ok(-5.0);
+        }
         let blank_idx = self.tokens.iter().position(|t| t == "<pad>" || t == "_" || t == "<blank>").unwrap_or(0);
 
         let words: Vec<&str> = text.split_whitespace().collect();
@@ -277,6 +305,9 @@ fn get_log_prob(logits: &[f32], vocab_size: usize, frame: usize, token: usize) -
 }
 
 fn ctc_align(logits: &[f32], vocab_size: usize, target_tokens: &[usize], blank_idx: usize) -> (Vec<usize>, f32) {
+    if vocab_size == 0 {
+        return (Vec::new(), f32::NEG_INFINITY);
+    }
     let num_frames = logits.len() / vocab_size;
     if num_frames == 0 || target_tokens.is_empty() {
         return (Vec::new(), f32::NEG_INFINITY);
@@ -381,6 +412,9 @@ fn log_sum_exp(a: f32, b: f32) -> f32 {
 }
 
 pub fn forward_backward_ctc_score(logits: &[f32], vocab_size: usize, target_tokens: &[usize], blank_idx: usize) -> f64 {
+    if vocab_size == 0 {
+        return -20.0;
+    }
     let num_frames = logits.len() / vocab_size;
     if num_frames == 0 || target_tokens.is_empty() {
         return -20.0;
@@ -480,5 +514,15 @@ mod tests {
         let score = forward_backward_ctc_score(&logits, 3, &target_tokens, 0);
         assert!(score > f64::MIN);
         assert!(score <= 0.0);
+    }
+
+    #[test]
+    fn ctc_functions_are_total_on_zero_vocab() {
+        // A corrupt-but-loadable ONNX model can report vocab_size = 0 (output dim 2);
+        // `logits.len() / vocab_size` would divide-by-zero panic on a pipeline thread.
+        // Both CTC kernels must return their no-result sentinel instead of panicking.
+        let logits = vec![0.1f32, 0.2, 0.3];
+        assert_eq!(ctc_align(&logits, 0, &[1], 0), (Vec::new(), f32::NEG_INFINITY));
+        assert_eq!(forward_backward_ctc_score(&logits, 0, &[1], 0), -20.0);
     }
 }
