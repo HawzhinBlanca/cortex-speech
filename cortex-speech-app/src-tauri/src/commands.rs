@@ -1926,8 +1926,24 @@ pub fn run_wsl_refinement(
 
     let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn WSL process: {}", e))?;
 
-    let stdout = child.stdout.take().ok_or_else(|| "Failed to capture stdout".to_string())?;
-    let stderr = child.stderr.take().ok_or_else(|| "Failed to capture stderr".to_string())?;
+    // If we can't capture the pipes, kill + reap the child before bailing — otherwise the
+    // spawned `wsl` process is orphaned, since Child::drop does NOT terminate it.
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Failed to capture stdout".to_string());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Failed to capture stderr".to_string());
+        }
+    };
 
     // Save the child handle
     {

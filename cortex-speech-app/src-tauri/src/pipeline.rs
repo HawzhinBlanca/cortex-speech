@@ -57,15 +57,6 @@ fn subprocess_error_preview(output: &str) -> String {
     preview
 }
 
-fn send_wsl_subprocess_result(
-    tx: std::sync::mpsc::Sender<std::io::Result<std::process::Output>>,
-    result: std::io::Result<std::process::Output>,
-) {
-    if tx.send(result).is_err() {
-        tracing::warn!("WSL subprocess worker could not send output; receiver was dropped or timed out");
-    }
-}
-
 fn lock_decoded_windows(windows: &Mutex<Vec<audio::PcmWindow>>) -> MutexGuard<'_, Vec<audio::PcmWindow>> {
     windows.lock().unwrap_or_else(|poisoned| {
         tracing::warn!("Recovering poisoned decoded PCM window accumulator");
@@ -1758,22 +1749,65 @@ impl ProcessingPipeline {
         }
 
         let output = {
-            // Spawn cmd.output() on a thread so we can apply a timeout.
-            // A hung WSL process previously held the pipeline Mutex indefinitely.
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                send_wsl_subprocess_result(tx, cmd.output());
+            // Spawn with explicit pipes so we keep a KILLABLE Child handle. The previous
+            // cmd.output()-on-a-thread approach gave no handle: on timeout the reader
+            // thread stayed blocked in output() and the wsl subprocess kept running,
+            // leaking one thread + one zombie process per timed-out segment. Now we poll
+            // for exit and, on timeout, kill + reap the child so nothing is left running.
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            let mut child =
+                cmd.spawn().map_err(|e| AppError::Other(format!("WSL subprocess launch failed: {e}")))?;
+
+            // Drain both pipes on threads so a chatty child can't deadlock on a full pipe
+            // buffer; the readers finish when the pipes close (child exit or kill).
+            let mut child_stdout = child.stdout.take();
+            let mut child_stderr = child.stderr.take();
+            let stdout_reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(ref mut s) = child_stdout {
+                    use std::io::Read;
+                    let _ = s.read_to_end(&mut buf);
+                }
+                buf
             });
-            match rx.recv_timeout(Duration::from_secs(300)) {
-                Ok(Ok(out)) => out,
-                Ok(Err(e)) => return Err(AppError::Other(format!("WSL subprocess launch failed: {e}"))),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let stderr_reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(ref mut s) = child_stderr {
+                    use std::io::Read;
+                    let _ = s.read_to_end(&mut buf);
+                }
+                buf
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(300);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break None;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(AppError::Other(format!("WSL subprocess wait failed: {e}")));
+                    }
+                }
+            };
+
+            let stdout = stdout_reader.join().unwrap_or_default();
+            let stderr = stderr_reader.join().unwrap_or_default();
+            match status {
+                Some(status) => std::process::Output { status, stdout, stderr },
+                None => {
                     return Err(AppError::Other(
                         "WSL 7B ASR process timed out after 5 minutes. Check WSL health.".into(),
                     ))
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(AppError::Other("WSL subprocess thread disconnected unexpectedly.".into()))
                 }
             }
         };
