@@ -10,6 +10,26 @@ pub struct WordTimestamp {
     pub confidence: f64,
 }
 
+/// Which algorithm actually produced a clip's word timestamps. Recorded as the dataset's
+/// `alignment_quality` so provenance is honest — heuristic output is never published as
+/// CTC forced alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignmentQuality {
+    /// Real CTC forced alignment against a loaded acoustic model.
+    CtcForced,
+    /// Linear/energy heuristic fallback (no aligner model loaded, or CTC found no path).
+    EnergyHeuristic,
+}
+
+impl AlignmentQuality {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::CtcForced => "ctc_forced",
+            Self::EnergyHeuristic => "energy_heuristic",
+        }
+    }
+}
+
 pub struct ForcedAligner {
     session: Option<std::sync::Mutex<ort::session::Session>>,
     #[allow(dead_code)]
@@ -66,9 +86,9 @@ impl ForcedAligner {
         pcm: &[i16],
         sample_rate: u32,
         text: &str,
-    ) -> Result<Vec<WordTimestamp>, Box<dyn std::error::Error>> {
+    ) -> Result<(Vec<WordTimestamp>, AlignmentQuality), Box<dyn std::error::Error>> {
         if self.session.is_none() || text.trim().is_empty() || pcm.is_empty() {
-            return Ok(fallback_align(pcm, sample_rate, text));
+            return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
         }
 
         let mut session_guard = self
@@ -107,7 +127,7 @@ impl ForcedAligner {
         let (output_shape, logits) = extract_res;
 
         if output_shape.len() < 3 {
-            return Ok(fallback_align(pcm, sample_rate, text));
+            return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
         }
 
         let num_frames = output_shape[1] as usize;
@@ -115,7 +135,7 @@ impl ForcedAligner {
         // A corrupt-but-loadable model can report a zero frame/vocab dim, which would
         // divide-by-zero in ctc_align; degrade to the energy aligner instead of panicking.
         if num_frames == 0 || vocab_size == 0 {
-            return Ok(fallback_align(pcm, sample_rate, text));
+            return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
         }
         let blank_idx = self.tokens.iter().position(|t| t == "<pad>" || t == "_" || t == "<blank>").unwrap_or(0);
 
@@ -141,12 +161,12 @@ impl ForcedAligner {
         }
 
         if target_tokens.is_empty() {
-            return Ok(fallback_align(pcm, sample_rate, text));
+            return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
         }
 
         let (path, _best_val) = ctc_align(logits, vocab_size, &target_tokens, blank_idx);
         if path.is_empty() {
-            return Ok(fallback_align(pcm, sample_rate, text));
+            return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
         }
 
         // Map path back to character index ranges
@@ -212,7 +232,7 @@ impl ForcedAligner {
             });
         }
 
-        Ok(word_timestamps)
+        Ok((word_timestamps, AlignmentQuality::CtcForced))
     }
 
     pub fn score_consistency(&self, pcm: &[i16], _sample_rate: u32, text: &str) -> Result<f64, String> {
@@ -514,6 +534,22 @@ mod tests {
         let score = forward_backward_ctc_score(&logits, 3, &target_tokens, 0);
         assert!(score > f64::MIN);
         assert!(score <= 0.0);
+    }
+
+    #[test]
+    fn align_reports_energy_heuristic_when_no_model_is_loaded() {
+        // With no mms_aligner.onnx present, ForcedAligner falls back to linear timestamps.
+        // The provenance label MUST be energy_heuristic, never ctc_forced — otherwise the
+        // published dataset claims real forced alignment for heuristic output.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let aligner = ForcedAligner::new(tmp.path(), false).expect("aligner");
+        assert!(!aligner.is_available(), "no model should be available in an empty dir");
+
+        let pcm = vec![0i16; 16_000];
+        let (timestamps, quality) = aligner.align(&pcm, 16_000, "سڵاو جیهان").expect("align");
+        assert_eq!(quality, AlignmentQuality::EnergyHeuristic);
+        assert_eq!(quality.as_db_str(), "energy_heuristic");
+        assert!(!timestamps.is_empty(), "fallback still yields per-word timestamps");
     }
 
     #[test]

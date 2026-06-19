@@ -864,17 +864,18 @@ pub fn align_segment(
         return Err("Alignment text cannot be empty".to_string());
     }
     validate::validate_text(&text, 100000, "Alignment text")?;
-    let timestamps = {
+    let (timestamps, quality) = {
         let pipeline = state.lock_pipeline();
         pipeline.align(&audio_path, &text, alignment_json.as_deref()).map_err(|e| e.to_string())?
     };
-    // Write alignment_quality back to the segment so validation can distinguish
-    // precision-aligned segments from energy-heuristic ones.
+    // Write the HONEST alignment_quality back to the segment so validation/provenance can
+    // distinguish real CTC forced alignment from the linear/energy heuristic fallback —
+    // never label heuristic output as 'ctc_forced'.
     if let Some(ref id) = segment_id {
         if !timestamps.is_empty() {
             let db = state.lock_db();
-            db.update_alignment_quality(id, "ctc_forced")
-                .map_err(|error| format!("Failed to stamp CTC alignment quality for {id}: {error}"))?;
+            db.update_alignment_quality(id, quality.as_db_str())
+                .map_err(|error| format!("Failed to stamp alignment quality for {id}: {error}"))?;
         }
     }
     Ok(timestamps)
