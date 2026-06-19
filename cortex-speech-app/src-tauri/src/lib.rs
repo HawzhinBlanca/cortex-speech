@@ -4,6 +4,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod agentic;
+pub mod align_text;
 pub mod aligner;
 pub mod asr;
 pub mod atomic_file;
