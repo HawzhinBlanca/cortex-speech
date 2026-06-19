@@ -191,6 +191,102 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     }
 }
 
+/// Deterministic, leakage-safe train/val/test assignment for the HuggingFace export.
+///
+/// Two properties a training dataset must have, both of which the previous inline logic
+/// broke:
+/// 1. **No source-recording leakage** — every segment cut from the same source recording
+///    lands in the same split; otherwise near-identical acoustic content leaks train→test.
+///    With `speaker_disjoint`, a *known* speaker is the grouping unit instead (so no speaker
+///    spans two splits); unknown-speaker segments fall back to their source recording.
+/// 2. **Seed reproducibility** — groups are visited in sorted-then-seed-shuffled order, so the
+///    same segments + seed always yield the same split. (The old code shuffled `HashMap`
+///    keys, whose iteration order is randomised per run, so the seed pinned nothing.)
+///
+/// Greedily fills each split toward its duration-proportional target. Returns
+/// `(segment_id, split)` for every input segment.
+pub fn assign_splits(
+    segments: &[SpeechSegment],
+    train_ratio: f64,
+    val_ratio: f64,
+    test_ratio: f64,
+    seed: u64,
+    speaker_disjoint: bool,
+) -> Vec<(String, &'static str)> {
+    let (mut tr, mut vr, mut te) = (train_ratio, val_ratio, test_ratio);
+    let sum = tr + vr + te;
+    if sum > 0.0 {
+        tr /= sum;
+        vr /= sum;
+        te /= sum;
+    } else {
+        tr = 0.8;
+        vr = 0.1;
+        te = 0.1;
+    }
+
+    fn source_name(path: &str) -> &str {
+        path.rsplit(['/', '\\']).next().unwrap_or(path)
+    }
+
+    // Group into leakage-safe units. BTreeMap keeps keys in a stable sorted order.
+    let mut groups: std::collections::BTreeMap<String, Vec<&SpeechSegment>> =
+        std::collections::BTreeMap::new();
+    for seg in segments {
+        let spk = seg.speaker_id.as_deref().unwrap_or("").trim();
+        let key = if speaker_disjoint && !spk.is_empty() {
+            format!("spk::{spk}")
+        } else {
+            format!("src::{}", source_name(&seg.audio_path))
+        };
+        groups.entry(key).or_default().push(seg);
+    }
+
+    // Sorted keys, then a seeded Fisher–Yates shuffle → reproducible from `seed` alone.
+    let mut keys: Vec<&String> = groups.keys().collect();
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        // splitmix64 step — strong distribution, fully deterministic.
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for i in (1..keys.len()).rev() {
+        let j = (next() % (i as u64 + 1)) as usize;
+        keys.swap(i, j);
+    }
+
+    let total: i64 = segments.iter().map(|s| s.duration_ms).sum();
+    let target_train = (total as f64 * tr) as i64;
+    let target_val = (total as f64 * vr) as i64;
+    let target_test = (total as f64 * te) as i64;
+    let (mut d_train, mut d_val, mut d_test) = (0i64, 0i64, 0i64);
+
+    let mut out: Vec<(String, &'static str)> = Vec::with_capacity(segments.len());
+    for key in keys {
+        let segs = &groups[key];
+        let group_dur: i64 = segs.iter().map(|s| s.duration_ms).sum();
+        let (def_train, def_val, def_test) =
+            (target_train - d_train, target_val - d_val, target_test - d_test);
+        let split = if def_train >= def_val && def_train >= def_test {
+            d_train += group_dur;
+            "train"
+        } else if def_val >= def_train && def_val >= def_test {
+            d_val += group_dur;
+            "validation"
+        } else {
+            d_test += group_dur;
+            "test"
+        };
+        for seg in segs {
+            out.push((seg.id.clone(), split));
+        }
+    }
+    out
+}
+
 /// Export a HuggingFace Datasets–compatible directory (split folders + metadata + dataset card).
 pub fn export_huggingface_dataset(
     db: &Database,
@@ -216,98 +312,31 @@ pub fn export_huggingface_dataset(
     let ready_agentic_segment_ids = ready_agentic_huggingface_segment_ids(db)?;
     let required_source_reference_models = settings.source_reference_models();
 
-    // Normalize ratios
-    let mut train_ratio = settings.hf_train_ratio;
-    let mut val_ratio = settings.hf_val_ratio;
-    let mut test_ratio = settings.hf_test_ratio;
-    let ratio_sum = train_ratio + val_ratio + test_ratio;
-    if ratio_sum > 0.0 {
-        train_ratio /= ratio_sum;
-        val_ratio /= ratio_sum;
-        test_ratio /= ratio_sum;
-    } else {
-        train_ratio = 0.8;
-        val_ratio = 0.1;
-        test_ratio = 0.1;
-    }
-
-    // Group segments
-    let mut groups: std::collections::HashMap<String, Vec<SpeechSegment>> = std::collections::HashMap::new();
-    if settings.hf_speaker_disjoint {
-        for seg in segments.clone() {
-            let spk = seg.speaker_id.as_deref().unwrap_or("").trim().to_string();
-            let key = if spk.is_empty() { format!("__unknown_{}", seg.id) } else { spk };
-            groups.entry(key).or_default().push(seg);
-        }
-    } else {
-        for seg in segments.clone() {
-            groups.insert(seg.id.clone(), vec![seg]);
-        }
-    }
-
-    // Shuffling using custom LCG PRNG (Fisher-Yates)
-    struct Lcg {
-        state: u64,
-    }
-    impl Lcg {
-        fn new(seed: u64) -> Self {
-            Self { state: seed }
-        }
-        fn next_u32(&mut self) -> u32 {
-            self.state = self.state.wrapping_mul(1664525).wrapping_add(1013904223);
-            (self.state >> 32) as u32
-        }
-        fn shuffle<T>(&mut self, slice: &mut [T]) {
-            for i in (1..slice.len()).rev() {
-                let j = (self.next_u32() as usize) % (i + 1);
-                slice.swap(i, j);
-            }
-        }
-    }
-
-    let mut group_keys: Vec<String> = groups.keys().cloned().collect();
-    let mut lcg = Lcg::new(settings.hf_split_seed);
-    lcg.shuffle(&mut group_keys);
-
-    let total_duration: i64 = segments.iter().map(|s| s.duration_ms).sum();
-    let target_train = (total_duration as f64 * train_ratio) as i64;
-    let target_val = (total_duration as f64 * val_ratio) as i64;
-    let target_test = (total_duration as f64 * test_ratio) as i64;
-
-    let mut train_dur = 0i64;
-    let mut val_dur = 0i64;
-    let mut test_dur = 0i64;
+    // Assign each segment to a split — deterministic (seed-reproducible) and without
+    // splitting a source recording across train/val/test. See assign_splits().
+    let assignments = assign_splits(
+        &segments,
+        settings.hf_train_ratio,
+        settings.hf_val_ratio,
+        settings.hf_test_ratio,
+        settings.hf_split_seed,
+        settings.hf_speaker_disjoint,
+    );
+    let split_of: std::collections::HashMap<&str, &'static str> =
+        assignments.iter().map(|(id, s)| (id.as_str(), *s)).collect();
 
     let mut train_segs = Vec::new();
     let mut val_segs = Vec::new();
     let mut test_segs = Vec::new();
-
-    for key in group_keys {
-        let segs = &groups[&key];
-        let group_dur: i64 = segs.iter().map(|s| s.duration_ms).sum();
-
-        let train_deficit = target_train - train_dur;
-        let val_deficit = target_val - val_dur;
-        let test_deficit = target_test - test_dur;
-
-        let assigned_split = if train_deficit >= val_deficit && train_deficit >= test_deficit {
-            train_dur += group_dur;
-            train_segs.extend(segs.clone());
-            "train"
-        } else if val_deficit >= train_deficit && val_deficit >= test_deficit {
-            val_dur += group_dur;
-            val_segs.extend(segs.clone());
-            "validation"
-        } else {
-            test_dur += group_dur;
-            test_segs.extend(segs.clone());
-            "test"
-        };
-
-        for seg in segs {
-            db.update_segment_split(&seg.id, assigned_split).map_err(|error| {
-                AppError::Other(format!("Failed to persist split {assigned_split} for {}: {error}", seg.id))
-            })?;
+    for seg in &segments {
+        let split = split_of.get(seg.id.as_str()).copied().unwrap_or("train");
+        db.update_segment_split(&seg.id, split).map_err(|error| {
+            AppError::Other(format!("Failed to persist split {split} for {}: {error}", seg.id))
+        })?;
+        match split {
+            "validation" => val_segs.push(seg.clone()),
+            "test" => test_segs.push(seg.clone()),
+            _ => train_segs.push(seg.clone()),
         }
     }
 
@@ -931,6 +960,58 @@ mod tests {
             writer.write_sample(0i16).unwrap();
         }
         writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn assign_splits_reproducible_and_no_recording_leakage() {
+        use std::collections::HashMap;
+        let mk = |id: &str, src: &str, spk: Option<&str>, dur: i64| SpeechSegment {
+            id: id.to_string(),
+            audio_path: format!("/data/{src}"),
+            speaker_id: spk.map(str::to_string),
+            duration_ms: dur,
+            ..SpeechSegment::default()
+        };
+        let mut segs = Vec::new();
+        for (src, spk) in [
+            ("recA.wav", Some("S1")),
+            ("recB.wav", Some("S2")),
+            ("recC.wav", None),
+            ("recD.wav", Some("S1")), // same speaker as recA — disjoint must keep S1 together
+        ] {
+            for i in 0..6 {
+                segs.push(mk(&format!("{src}-{i}"), src, spk, 5000));
+            }
+        }
+
+        // 1. Reproducible: same segments + seed → identical assignment, every run.
+        let a = assign_splits(&segs, 0.8, 0.1, 0.1, 7, false);
+        let b = assign_splits(&segs, 0.8, 0.1, 0.1, 7, false);
+        assert_eq!(a, b, "same seed must yield the same split");
+
+        // 2. No source recording leaks across splits (non-disjoint groups by recording).
+        let split_of: HashMap<&str, &str> = a.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+        let mut rec_split: HashMap<&str, &str> = HashMap::new();
+        for s in &segs {
+            let src = s.audio_path.rsplit(['/', '\\']).next().unwrap();
+            let split = split_of[s.id.as_str()];
+            if let Some(prev) = rec_split.insert(src, split) {
+                assert_eq!(prev, split, "recording {src} leaked across splits");
+            }
+        }
+
+        // 3. Speaker-disjoint: a known speaker never spans two splits (S1 is in recA + recD).
+        let d = assign_splits(&segs, 0.8, 0.1, 0.1, 7, true);
+        let dsplit: HashMap<&str, &str> = d.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+        let mut spk_split: HashMap<&str, &str> = HashMap::new();
+        for s in &segs {
+            if let Some(spk) = s.speaker_id.as_deref() {
+                let split = dsplit[s.id.as_str()];
+                if let Some(prev) = spk_split.insert(spk, split) {
+                    assert_eq!(prev, split, "speaker {spk} leaked across splits");
+                }
+            }
+        }
     }
 
     #[test]
