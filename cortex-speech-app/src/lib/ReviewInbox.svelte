@@ -114,6 +114,11 @@
       queue[currentIndex] = { ...current, humanDecision: 'accept' };
       statusMsg = '✅ Accepted';
       advance();
+    } catch (e) {
+      // The decision did not persist: drop the phantom undo entry pushed above and
+      // tell the reviewer, rather than silently swallowing it (unhandled rejection).
+      history.pop();
+      statusMsg = `Failed to accept: ${e}`;
     } finally {
       isSubmitting = false;
     }
@@ -142,6 +147,9 @@
       isEditing = false;
       statusMsg = '✏️ Edited';
       advance();
+    } catch (e) {
+      history.pop();
+      statusMsg = `Failed to save edit: ${e}`;
     } finally {
       isSubmitting = false;
     }
@@ -156,6 +164,9 @@
       queue[currentIndex] = { ...current, humanDecision: 'reject' };
       statusMsg = '❌ Rejected';
       advance();
+    } catch (e) {
+      history.pop();
+      statusMsg = `Failed to reject: ${e}`;
     } finally {
       isSubmitting = false;
     }
@@ -183,6 +194,9 @@
       queue[currentIndex] = { ...current, escalated: true };
       statusMsg = '🚩 Flagged for second pass';
       advance();
+    } catch (e) {
+      // flag() records no undo history, so just surface the failure.
+      statusMsg = `Failed to flag: ${e}`;
     } finally {
       isSubmitting = false;
     }
