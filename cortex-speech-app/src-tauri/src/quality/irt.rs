@@ -227,7 +227,14 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
         let mut grad_theta = HashMap::new();
         let mut grad_b = HashMap::new();
 
-        for (segment_id, seg_slots) in &segment_slots_map {
+        // Accumulate gradients in a deterministic segment order. grad_theta sums a
+        // per-model gradient across segments, and f64 addition is not associative,
+        // so iterating segment_slots_map in HashMap order (randomized per run) would
+        // make the fitted abilities — and the published confidences they drive —
+        // nondeterministic, breaking the reproducible-scorecard guarantee.
+        let mut m_step_segments: Vec<(&String, &SegmentSlots)> = segment_slots_map.iter().collect();
+        m_step_segments.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (segment_id, seg_slots) in m_step_segments {
             let b_i = *segment_difficulties.get(segment_id).unwrap_or(&0.0);
 
             for slot in &seg_slots.slots {
@@ -342,5 +349,51 @@ mod tests {
         let ability_gemini = res.model_abilities.get("gemini").unwrap();
         let ability_whisper = res.model_abilities.get("whisper-noisy").unwrap();
         assert!(ability_gemini > ability_whisper);
+    }
+
+    #[test]
+    fn fit_irt_consensus_is_deterministic_across_runs() {
+        // 12 segments (>= the 10-segment threshold that enables ability updates),
+        // two models each with diverging transcripts so the M-step accumulates
+        // nonzero per-model gradients across segments. The gradient sum is over
+        // segment_slots_map (a HashMap whose iteration order is randomized per run),
+        // and f64 addition is not associative — so without a deterministic order the
+        // resulting abilities and published confidences differ bit-for-bit per run,
+        // breaking the "reproducible scorecard" guarantee.
+        let mut hyps = Vec::new();
+        for i in 0..12u32 {
+            let seg = format!("seg{i:02}");
+            // Vary the transcripts per segment so each contributes a DIFFERENT
+            // per-model gradient; a constant fixture would sum identically in any
+            // order and hide the HashMap-ordering bug.
+            let agree = "خۆش ".repeat((i % 3 + 1) as usize);
+            let disagree = "خراپ ".repeat((i % 4 + 1) as usize);
+            hyps.push(SegmentHypothesis {
+                segment_id: seg.clone(),
+                model_id: "gemini".to_string(),
+                transcript: format!("ئەمە دەنگە {agree}باشە"),
+                confidence: Some(0.9),
+            });
+            hyps.push(SegmentHypothesis {
+                segment_id: seg,
+                model_id: "whisper-noisy".to_string(),
+                transcript: format!("ئەمە ڕەنگە {disagree}گەورە"),
+                confidence: Some(0.4),
+            });
+        }
+
+        let snapshot = |r: &IrtResults| {
+            let mut conf: Vec<(String, f64)> = r.segment_confidences.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            conf.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut ab: Vec<(String, f64)> = r.model_abilities.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            ab.sort_by(|a, b| a.0.cmp(&b.0));
+            (conf, ab)
+        };
+
+        let a = snapshot(&fit_irt_consensus(&hyps));
+        let b = snapshot(&fit_irt_consensus(&hyps));
+        let c = snapshot(&fit_irt_consensus(&hyps));
+        assert_eq!(a, b, "IRT confidences/abilities must be reproducible run-to-run");
+        assert_eq!(b, c, "IRT confidences/abilities must be reproducible run-to-run");
     }
 }
