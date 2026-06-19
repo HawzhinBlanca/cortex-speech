@@ -352,6 +352,30 @@ export async function getDatasetStats(): Promise<DatasetStats> {
   return invoke<DatasetStats>('get_dataset_stats');
 }
 
+export interface ConfidenceInterval {
+  point: number;
+  lower: number;
+  upper: number;
+  confidence: number;
+}
+
+/** How much human reviewers had to change the raw ASR output (reference = human
+ *  annotation, hypothesis = raw ASR), with bootstrap confidence intervals. */
+export interface AnnotationDriftScorecard {
+  numSegments: number;
+  microWer: number;
+  microCer: number;
+  werCi: ConfidenceInterval;
+  cerCi: ConfidenceInterval;
+  bootstrapResamples: number;
+  confidence: number;
+  seed: number;
+}
+
+export async function computeAnnotationDriftScorecard(): Promise<AnnotationDriftScorecard> {
+  return invoke<AnnotationDriftScorecard>('compute_annotation_drift_scorecard');
+}
+
 export interface DatasetQuality {
   totalSegments: number;
   emptyTranscriptCount: number;

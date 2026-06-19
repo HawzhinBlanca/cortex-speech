@@ -451,6 +451,7 @@ pub fn run() {
             commands::run_gold_eval_local,
             commands::run_gold_eval_asr,
             commands::build_scorecard,
+            commands::compute_annotation_drift_scorecard,
             commands::list_eval_runs,
             commands::list_gold_segments,
             // Phase 2 — T0 Gate + Jury
