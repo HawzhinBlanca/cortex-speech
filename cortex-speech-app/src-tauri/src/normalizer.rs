@@ -9,6 +9,7 @@ pub mod g2p;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
+use unicode_normalization::UnicodeNormalization;
 
 /// Pure-Rust Sorani Kurdish normalizer implementing the character-mapping rules
 /// from the MIT-licensed AsoSoft library. Bypasses copyleft restrictions of KLPT/KurdishHunspell.
@@ -69,7 +70,10 @@ impl SoraniNormalizer {
             return String::new();
         }
 
-        let mut result = text.to_string();
+        // Step 0: Unicode canonical composition (NFC) up front, so every downstream rule
+        // (and every consumer that reuses this output) sees one canonical form — composed
+        // letters, no stray combining sequences. Mirrors the NFC applied in wer.rs.
+        let mut result: String = text.nfc().collect();
 
         // Arabic Punctuation Unification
         result = result.replace(',', "،");
@@ -341,6 +345,16 @@ mod tests {
         assert_eq!(n.normalize("گوناهـ"), "گوناھ");
         assert_eq!(n.normalize("گوناهــ"), "گوناھ");
         assert_eq!(n.normalize("گوناهـ دار"), "گوناھ دار");
+    }
+
+    #[test]
+    fn test_nfc_canonical_composition() {
+        let n = SoraniNormalizer::new();
+        // Decomposed "é" (e + combining acute) must come out canonically composed (U+00E9).
+        assert_eq!(n.normalize("e\u{0301}"), "\u{00E9}");
+        // Output must already be in NFC: normalizing again is a no-op (composition is stable).
+        let once = n.normalize("ئەو کەسە e\u{0301}");
+        assert_eq!(once, once.nfc().collect::<String>(), "normalizer output must be NFC");
     }
 
     #[test]
