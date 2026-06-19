@@ -29,9 +29,9 @@ pub struct DatasetMetadata {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ExportSegmentRecord<'a> {
+struct ExportSegmentRecord {
     #[serde(flatten)]
-    segment: &'a SpeechSegment,
+    segment: SpeechSegment,
     training_transcript: String,
     transcript_source: String,
     training_grade: String,
@@ -39,11 +39,15 @@ struct ExportSegmentRecord<'a> {
     training_reasons: Vec<String>,
 }
 
-impl<'a> ExportSegmentRecord<'a> {
-    fn new(segment: &'a SpeechSegment) -> Self {
+impl ExportSegmentRecord {
+    fn new(segment: &SpeechSegment) -> Self {
         let report = quality::training_grade_for_segment(segment);
+        // Privacy: never publish the curator's absolute filesystem path — it embeds the
+        // OS username and drive layout. Emit only the basename, like the HF exporter.
+        let mut sanitized = segment.clone();
+        sanitized.audio_path = export_audio_ref(&segment.audio_path).to_string();
         Self {
-            segment,
+            segment: sanitized,
             training_transcript: report.transcript,
             transcript_source: report.transcript_source,
             training_grade: report.grade,
@@ -51,6 +55,12 @@ impl<'a> ExportSegmentRecord<'a> {
             training_reasons: report.reasons,
         }
     }
+}
+
+/// The published reference for an audio file: just its basename, never the curator's
+/// absolute path (which leaks the OS username and directory layout into a shared dataset).
+fn export_audio_ref(audio_path: &str) -> &str {
+    audio_path.rsplit(['/', '\\']).next().unwrap_or(audio_path)
 }
 
 fn is_training_ready_for_huggingface_export(
@@ -704,7 +714,7 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 let reasons = grade.reasons.join("; ");
                 wtr.write_record([
                     seg.id.as_str(),
-                    seg.audio_path.as_str(),
+                    export_audio_ref(&seg.audio_path),
                     seg.raw_transcript.as_str(),
                     seg.normalized_transcript.as_deref().unwrap_or(""),
                     seg.annotated_transcript.as_deref().unwrap_or(""),
@@ -726,7 +736,7 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
     )
 }
 
-fn export_records(segments: &[SpeechSegment]) -> Vec<ExportSegmentRecord<'_>> {
+fn export_records(segments: &[SpeechSegment]) -> Vec<ExportSegmentRecord> {
     segments.iter().map(ExportSegmentRecord::new).collect()
 }
 
@@ -797,7 +807,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
     let grade_reports: Vec<TrainingGradeReport> = segments.iter().map(quality::training_grade_for_segment).collect();
     let grade_reasons: Vec<String> = grade_reports.iter().map(|report| report.reasons.join("; ")).collect();
     let ids: StringArray = segments.iter().map(|s| Some(s.id.as_str())).collect();
-    let audio_paths: StringArray = segments.iter().map(|s| Some(s.audio_path.as_str())).collect();
+    let audio_paths: StringArray = segments.iter().map(|s| Some(export_audio_ref(&s.audio_path))).collect();
     let raw: StringArray = segments.iter().map(|s| Some(s.raw_transcript.as_str())).collect();
     let normalized: StringArray = segments.iter().map(|s| s.normalized_transcript.as_deref()).collect();
     let annotated: StringArray = segments.iter().map(|s| s.annotated_transcript.as_deref()).collect();
@@ -1207,6 +1217,37 @@ mod tests {
         assert!(out_path.exists());
         assert!(out_path.metadata().unwrap().len() > "__stale_parquet_payload__".len() as u64);
         assert!(!out_path.with_extension("parquet.tmp").exists());
+    }
+
+    #[test]
+    fn exports_never_leak_absolute_paths() {
+        // The curator's absolute path embeds their OS username + drive layout; publishing
+        // it into a shared CSV/JSONL/JSON/Parquet is a real PII leak. Every exporter must
+        // emit only the audio basename.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let d = tmp_dir.path();
+        let mut seg = sample_segment("p1");
+        seg.audio_path = "C:\\Users\\hawzhin\\private_recordings\\clip_001.wav".to_string();
+        let segs = [seg];
+
+        export_json(&d.join("o.json"), &sample_metadata(), &segs).unwrap();
+        export_jsonl(&d.join("o.jsonl"), &segs).unwrap();
+        export_csv(&d.join("o.csv"), &segs).unwrap();
+        export_parquet(&d.join("o.parquet"), &segs).unwrap();
+
+        for name in ["o.json", "o.jsonl", "o.csv"] {
+            let body = std::fs::read_to_string(d.join(name)).unwrap();
+            assert!(body.contains("clip_001.wav"), "{name} should keep the basename");
+            assert!(!body.contains("hawzhin"), "{name} leaked the OS username: {body}");
+            assert!(!body.contains("Users"), "{name} leaked an absolute path");
+            assert!(!body.contains("private_recordings"), "{name} leaked a directory");
+        }
+        // Parquet is binary — scan the raw bytes for the same leaked substrings.
+        let pq = std::fs::read(d.join("o.parquet")).unwrap();
+        let has = |needle: &str| pq.windows(needle.len()).any(|w| w == needle.as_bytes());
+        assert!(has("clip_001.wav"), "parquet should keep the basename");
+        assert!(!has("hawzhin"), "parquet leaked the OS username");
+        assert!(!has("private_recordings"), "parquet leaked a directory");
     }
 
     #[test]
