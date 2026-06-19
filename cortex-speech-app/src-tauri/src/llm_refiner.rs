@@ -55,7 +55,7 @@ impl LlmRefiner {
             "temperature": 0.1
         });
 
-        let mut req = ureq::post(&self.endpoint).set("Content-Type", "application/json");
+        let mut req = crate::http::API_AGENT.post(&self.endpoint).set("Content-Type", "application/json");
 
         if !self.api_key.is_empty() {
             req = req.set("Authorization", &format!("Bearer {}", self.api_key));
@@ -101,7 +101,7 @@ impl LlmRefiner {
             }
         });
 
-        let resp = gemini_api::with_api_key(ureq::post(&url), &self.api_key)
+        let resp = gemini_api::with_api_key(crate::http::API_AGENT.post(&url), &self.api_key)
             .set("Content-Type", "application/json")
             .send_json(payload)
             .map_err(|e| format!("Gemini API request failed: {}", redact_api_key(&e.to_string(), &self.api_key)))?;

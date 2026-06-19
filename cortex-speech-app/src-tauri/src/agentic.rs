@@ -247,7 +247,7 @@ fn transcribe_inline_audio(
     });
 
     let url = gemini_api::generate_content_url(model);
-    let response = gemini_api::with_api_key(ureq::post(&url), api_key)
+    let response = gemini_api::with_api_key(crate::http::API_AGENT.post(&url), api_key)
         .set("Content-Type", "application/json")
         .send_json(payload)
         .map_err(|e| format!("Gemini inline audio request failed: {}", redact_for_user(e, api_key)))?;
@@ -283,7 +283,7 @@ fn upload_gemini_file(audio_path: &Path, api_key: &str, mime_type: &str) -> Resu
     let start_payload = json!({ "file": { "display_name": display_name } });
 
     let start_response =
-        gemini_api::with_api_key(ureq::post("https://generativelanguage.googleapis.com/upload/v1beta/files"), api_key)
+        gemini_api::with_api_key(crate::http::API_AGENT.post("https://generativelanguage.googleapis.com/upload/v1beta/files"), api_key)
             .set("X-Goog-Upload-Protocol", "resumable")
             .set("X-Goog-Upload-Command", "start")
             .set("X-Goog-Upload-Header-Content-Length", &size.to_string())
@@ -300,7 +300,7 @@ fn upload_gemini_file(audio_path: &Path, api_key: &str, mime_type: &str) -> Resu
 
     let file = std::fs::File::open(audio_path)
         .map_err(|e| format!("Cannot open audio file '{}': {e}", audio_path.display()))?;
-    let upload_response = ureq::post(&upload_url)
+    let upload_response = crate::http::API_AGENT.post(&upload_url)
         .set("Content-Length", &size.to_string())
         .set("X-Goog-Upload-Offset", "0")
         .set("X-Goog-Upload-Command", "upload, finalize")
@@ -352,7 +352,7 @@ fn generate_from_uploaded_file(
     });
 
     let url = gemini_api::generate_content_url(model);
-    let response = gemini_api::with_api_key(ureq::post(&url), api_key)
+    let response = gemini_api::with_api_key(crate::http::API_AGENT.post(&url), api_key)
         .set("Content-Type", "application/json")
         .send_json(payload)
         .map_err(|e| format!("Gemini uploaded audio request failed: {}", redact_for_user(e, api_key)))?;

@@ -409,7 +409,7 @@ pub fn run_dpo_update(db: &Database, endpoint: &str) -> AppResult<String> {
         return Ok("No preference pairs to export.".into());
     }
 
-    let resp = ureq::post(endpoint)
+    let resp = crate::http::API_AGENT.post(endpoint)
         .set("Content-Type", "application/x-ndjson")
         .send_string(&export.jsonl)
         .map_err(|e| crate::error::AppError::Other(format!("DPO update POST failed: {e}")))?;
