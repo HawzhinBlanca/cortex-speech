@@ -6,8 +6,9 @@
 //   CORTEX_MODELS_DIR=<dir containing omniasr-ctc-300m/> \
 //   CORTEX_GOLD_MAX=<n>  (optional cap) \
 //   cargo test --test gold_wer_eval -- --ignored --nocapture
-use cortex_speech_app_lib::asr::KurdishAsrService;
+use cortex_speech_app_lib::asr::{AsrLoadConfig, KurdishAsrService};
 use cortex_speech_app_lib::audio;
+use cortex_speech_app_lib::settings::AsrModelSize;
 use cortex_speech_app_lib::db::Database;
 use cortex_speech_app_lib::error::AppError;
 use cortex_speech_app_lib::eval;
@@ -196,6 +197,108 @@ fn gold_wer_real_omniasr() {
     }
 
     assert!(result.run.num_segs > 0, "should score at least one clip");
+}
+
+// Head-to-head: 300M vs 1B OmniASR on the same clips. Absolute CER is inflated by the
+// dataset's alignment caveat, but the RELATIVE comparison (same audio, both models,
+// normalized) is valid — a model that consistently lowers CER is genuinely better.
+#[test]
+#[ignore]
+fn compare_300m_vs_1b() {
+    let manifest = match std::env::var("CORTEX_GOLD_MANIFEST") {
+        Ok(m) => m,
+        Err(_) => {
+            eprintln!("[cmp] skip: set CORTEX_GOLD_MANIFEST");
+            return;
+        }
+    };
+    let model_dir = PathBuf::from(
+        std::env::var("CORTEX_MODELS_DIR").unwrap_or_else(|_| "models".to_string()),
+    );
+    let max: usize = std::env::var("CORTEX_GOLD_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    if !model_dir.join("omniasr-ctc-300m/model.int8.onnx").exists()
+        || !model_dir.join("omniasr-ctc-1b/model.int8.onnx").exists()
+    {
+        eprintln!("[cmp] skip: need both omniasr-ctc-300m and omniasr-ctc-1b under model_dir");
+        return;
+    }
+
+    let content = std::fs::read_to_string(&manifest).expect("read manifest");
+    let mut rows: Vec<GoldRow> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("parse jsonl"))
+        .collect();
+    rows.truncate(max);
+
+    let mut a300 = KurdishAsrService::new(&model_dir, false).expect("300M init");
+    let mut a1b = KurdishAsrService::new_with_config(
+        &model_dir,
+        &AsrLoadConfig {
+            model_size: AsrModelSize::CTC1B,
+            enable_gpu: false,
+            ..AsrLoadConfig::default()
+        },
+    )
+    .expect("1B init");
+    assert!(a300.is_available() && a1b.is_available());
+
+    let norm = SoraniNormalizer::new();
+    let pct = |d: &wer::EditDistanceResult| {
+        if d.ref_len > 0 {
+            (d.distance as f64 / d.ref_len as f64).min(1.0)
+        } else {
+            0.0
+        }
+    };
+    let (mut c3d, mut c3r, mut c1d, mut c1r) = (0usize, 0usize, 0usize, 0usize);
+    let (mut n, mut wins1b, mut wins300, mut ties) = (0usize, 0usize, 0usize, 0usize);
+    let t0 = std::time::Instant::now();
+    for r in rows.iter().filter(|r| Path::new(&r.audio_filepath).exists()) {
+        let (sr, pcm) = match audio::decode_to_pcm(&r.audio_filepath) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let (_sr, p16) = audio::ensure_pcm_16khz(sr, pcm).expect("16khz");
+        let f32_pcm: Vec<f32> = p16.iter().map(|&s| s as f32 / 32768.0).collect();
+        let h3 = a300
+            .transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
+            .map(|(t, _)| t)
+            .unwrap_or_default();
+        let h1 = a1b
+            .transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
+            .map(|(t, _)| t)
+            .unwrap_or_default();
+        let refn = norm.normalize(&r.text);
+        let c3 = wer::char_edit_distance(&refn, &norm.normalize(&h3));
+        let c1 = wer::char_edit_distance(&refn, &norm.normalize(&h1));
+        c3d += c3.distance;
+        c3r += c3.ref_len;
+        c1d += c1.distance;
+        c1r += c1.ref_len;
+        let (p3, p1) = (pct(&c3), pct(&c1));
+        if (p1 - p3).abs() < 0.005 {
+            ties += 1;
+        } else if p1 < p3 {
+            wins1b += 1;
+        } else {
+            wins300 += 1;
+        }
+        n += 1;
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    let micro = |d: usize, r: usize| if r > 0 { (d as f64 / r as f64).min(1.0) } else { 0.0 };
+    eprintln!("\n========== 300M vs 1B — normalized CER on {n} gold clips ==========");
+    eprintln!("300M  micro CER : {:.4}", micro(c3d, c3r));
+    eprintln!("1B    micro CER : {:.4}", micro(c1d, c1r));
+    eprintln!(
+        "per-clip: 1B better {wins1b}  |  300M better {wins300}  |  ties {ties}  (of {n})"
+    );
+    eprintln!("elapsed: {elapsed:.1}s (both models)");
+    assert!(n > 0);
 }
 
 // Whole-file WER: transcribe a complete recording and score against its complete
