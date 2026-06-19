@@ -2,6 +2,7 @@ use crate::error::{AppError, AppResult};
 use rusqlite::{backup, params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +74,23 @@ fn human_verdict_for_decision(decision: &str) -> AppResult<&'static str> {
         "reject" => Ok("human_reject"),
         other => Err(AppError::Validation(format!("Unknown human decision: {other}"))),
     }
+}
+
+/// Canonicalize stored text to Unicode NFC. Sorani/Arabic combining marks (diacritics,
+/// madda, hamza) can arrive decomposed from ASR or import; storing inconsistent forms
+/// silently fragments FTS search, content-dedup, and WER references that all assume one
+/// canonical spelling. Idempotent — NFC of already-NFC text is unchanged.
+fn to_nfc(s: &str) -> String {
+    s.nfc().collect()
+}
+
+/// NFC-canonicalize a segment's three transcript fields for storage.
+fn nfc_transcripts(seg: &SpeechSegment) -> (String, Option<String>, Option<String>) {
+    (
+        to_nfc(&seg.raw_transcript),
+        seg.normalized_transcript.as_deref().map(to_nfc),
+        seg.annotated_transcript.as_deref().map(to_nfc),
+    )
 }
 
 /// The only split labels the export/stats math understands.
@@ -222,6 +240,7 @@ impl Database {
 
     pub fn insert_segment(&self, seg: &SpeechSegment) -> AppResult<()> {
         validate_segment(seg)?;
+        let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
         self.conn.execute(
             "INSERT INTO speech_segments
                 (id, audio_path, raw_transcript, normalized_transcript,
@@ -246,8 +265,8 @@ impl Database {
                 alignment_quality=excluded.alignment_quality,
                 updated_at=datetime('now')",
             params![
-                seg.id, seg.audio_path, seg.raw_transcript,
-                seg.normalized_transcript, seg.annotated_transcript,
+                seg.id, seg.audio_path, raw_nfc,
+                normalized_nfc, annotated_nfc,
                 seg.alignment_json, seg.duration_ms, seg.speaker_id,
                 seg.verified as i32, seg.confidence, seg.ctc_score,
                 seg.clipping_ratio, seg.rms_db, seg.snr_db, seg.split,
@@ -309,12 +328,13 @@ impl Database {
             )?;
             for seg in segments {
                 validate_segment(seg)?;
+                let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
                 stmt.execute(params![
                     seg.id,
                     seg.audio_path,
-                    seg.raw_transcript,
-                    seg.normalized_transcript,
-                    seg.annotated_transcript,
+                    raw_nfc,
+                    normalized_nfc,
+                    annotated_nfc,
                     seg.alignment_json,
                     seg.duration_ms,
                     seg.speaker_id,
@@ -371,14 +391,15 @@ impl Database {
 
             for seg in &external_segments {
                 validate_segment(seg)?;
+                let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
                 let exists = check_stmt.exists(params![seg.id])?;
                 if exists {
                     update_stmt.execute(params![
                         seg.id,
                         seg.audio_path,
-                        seg.raw_transcript,
-                        seg.normalized_transcript,
-                        seg.annotated_transcript,
+                        raw_nfc,
+                        normalized_nfc,
+                        annotated_nfc,
                         seg.alignment_json,
                         seg.duration_ms,
                         seg.speaker_id,
@@ -396,9 +417,9 @@ impl Database {
                     insert_stmt.execute(params![
                         seg.id,
                         seg.audio_path,
-                        seg.raw_transcript,
-                        seg.normalized_transcript,
-                        seg.annotated_transcript,
+                        raw_nfc,
+                        normalized_nfc,
+                        annotated_nfc,
                         seg.alignment_json,
                         seg.duration_ms,
                         seg.speaker_id,
@@ -1114,6 +1135,26 @@ mod tests {
             duration_ms: 1000,
             ..SpeechSegment::default()
         }
+    }
+
+    #[test]
+    fn stored_transcripts_are_nfc_canonicalized() {
+        // Arabic "آ" (U+0622) can arrive decomposed as Alef (U+0627) + combining madda
+        // (U+0653). Stored non-canonically it fragments FTS/dedup/WER. The write boundary
+        // must store the composed NFC form regardless of the input form.
+        let db = make_db();
+        let decomposed = "\u{0627}\u{0653}\u{0628}"; // ا + ◌ٓ + ب  (NFD of "آب")
+        let composed = "\u{0622}\u{0628}"; // آب (NFC)
+        assert_ne!(decomposed, composed, "fixture must actually differ before NFC");
+
+        let mut seg = make_segment("nfc1", "/a.wav");
+        seg.raw_transcript = decomposed.to_string();
+        seg.annotated_transcript = Some(decomposed.to_string());
+        db.insert_segment(&seg).unwrap();
+
+        let stored = db.get_segment_by_audio_path("/a.wav").unwrap().unwrap();
+        assert_eq!(stored.raw_transcript, composed, "raw_transcript must be stored NFC-composed");
+        assert_eq!(stored.annotated_transcript.as_deref(), Some(composed), "annotated must be NFC too");
     }
 
     #[test]
