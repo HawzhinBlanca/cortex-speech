@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { get } from 'svelte/store';
 import AudioPlayer from '../../src/lib/AudioPlayer.svelte';
 import { notifications } from '../../src/lib/stores/notificationStore';
+import { locale } from '../../src/lib/i18n';
 
 const invokeMock = vi.mocked(invoke);
 
@@ -30,6 +31,9 @@ describe('AudioPlayer', () => {
   let pauseMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
+    // The error + retry copy is i18n; pin English here (app defaults to Sorani) and
+    // restore the default in afterEach so other files' Sorani assertions are unaffected.
+    locale.set('en');
     invokeMock.mockReset();
     loadMock = vi.fn();
     playMock = vi.fn(() => Promise.resolve());
@@ -50,6 +54,7 @@ describe('AudioPlayer', () => {
   });
 
   afterEach(() => {
+    locale.set('ckb');
     vi.restoreAllMocks();
   });
 
@@ -79,8 +84,10 @@ describe('AudioPlayer', () => {
 
     render(AudioPlayer, { props: { audioPath: 'C:\\input\\broken.wav' } });
 
+    // The component deliberately surfaces a clean, consistent message (the raw error
+    // stays in the console) — see AudioPlayer.svelte error handling.
     await waitFor(() => {
-      expect(screen.getByText('Error: media grant failed')).toBeInTheDocument();
+      expect(screen.getByText('Failed to load audio file')).toBeInTheDocument();
     });
 
     mockMediaResolution('C:\\media\\recovered.wav');
