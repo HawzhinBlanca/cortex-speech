@@ -29,6 +29,7 @@ pub mod flock;
 pub mod gemini_api;
 pub mod health;
 pub mod history;
+pub mod http;
 pub mod inference;
 pub mod integration_runner;
 pub mod jury;

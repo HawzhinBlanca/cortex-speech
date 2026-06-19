@@ -139,7 +139,7 @@ fn call_gemini_audio(
         }
     });
 
-    let resp = gemini_api::with_api_key(ureq::post(&url), api_key)
+    let resp = gemini_api::with_api_key(crate::http::API_AGENT.post(&url), api_key)
         .set("Content-Type", "application/json")
         .send_json(payload)
         .map_err(|e| format!("Gemini API request failed: {}", redact_api_key(&e.to_string(), api_key)))?;

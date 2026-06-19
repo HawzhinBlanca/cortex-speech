@@ -371,7 +371,7 @@ impl ModelManager {
 
         tracing::info!("Downloading Meta OmniASR {:?} from {}", size, archive_url);
 
-        let response = ureq::get(archive_url).call().map_err(|e| format!("OmniASR archive download failed: {e}"))?;
+        let response = crate::http::DOWNLOAD_AGENT.get(archive_url).call().map_err(|e| format!("OmniASR archive download failed: {e}"))?;
 
         let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
 
@@ -523,7 +523,7 @@ impl ModelManager {
         let tmp_archive = self.models_dir.join("campp.downloading.tar.bz2");
         tracing::info!("Downloading CAM++ from {}", CAMPP_ARCHIVE_URL);
 
-        let response = ureq::get(CAMPP_ARCHIVE_URL).call().map_err(|e| format!("CAM++ download failed: {e}"))?;
+        let response = crate::http::DOWNLOAD_AGENT.get(CAMPP_ARCHIVE_URL).call().map_err(|e| format!("CAM++ download failed: {e}"))?;
 
         let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
 
@@ -571,7 +571,7 @@ impl ModelManager {
         let tmp_archive = self.models_dir.join("denoiser.downloading.tar.bz2");
         tracing::info!("Downloading AI Denoiser from {}", DENOISER_ARCHIVE_URL);
 
-        let response = ureq::get(DENOISER_ARCHIVE_URL).call().map_err(|e| format!("Denoiser download failed: {e}"))?;
+        let response = crate::http::DOWNLOAD_AGENT.get(DENOISER_ARCHIVE_URL).call().map_err(|e| format!("Denoiser download failed: {e}"))?;
 
         let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
 
@@ -624,7 +624,7 @@ impl ModelManager {
         let dest = self.model_path(model.filename);
         let tmp = dest.with_extension("downloading");
 
-        let response = ureq::get(model.url).call().map_err(|e| format!("Download failed for {}: {}", model.name, e))?;
+        let response = crate::http::DOWNLOAD_AGENT.get(model.url).call().map_err(|e| format!("Download failed for {}: {}", model.name, e))?;
 
         let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
 
