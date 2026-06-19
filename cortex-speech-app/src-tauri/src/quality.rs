@@ -447,6 +447,41 @@ pub fn is_placeholder_transcript(text: &str) -> bool {
         || trimmed.eq_ignore_ascii_case("null")
 }
 
+/// Alignment-quality tier for a clip, decided by the character error rate (CER) between its
+/// reference text and an ASR hypothesis of that same clip. This is the gate that both cleans
+/// a dataset and yields an honest CER — once a clip's audio and text genuinely match, a low
+/// CER means a good pair, a high CER means the cut drifted (or the speech is hard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipTier {
+    /// CER ≤ 0.05 — clean, training-grade pair.
+    Gold,
+    /// 0.05 < CER ≤ 0.20 — usable but worth a human glance.
+    Review,
+    /// CER > 0.20 — likely misaligned or unusable; keep out of the clean set.
+    Reject,
+}
+
+/// Thresholds follow low-resource TTS/ASR dataset practice (e.g. ManaTTS): ≤0.05 gold,
+/// ≤0.20 review, else reject. Returns the tier plus the measured CER. CER uses the shared
+/// `wer` module so reference and hypothesis are normalised + NFC-folded identically.
+pub fn clip_cer_tier(reference: &str, hypothesis: &str) -> (ClipTier, f64) {
+    let d = crate::wer::char_edit_distance(reference, hypothesis);
+    let cer = if d.ref_len > 0 {
+        (d.distance as f64 / d.ref_len as f64).min(1.0)
+    } else {
+        0.0
+    };
+    let tier = if cer <= 0.05 {
+        ClipTier::Gold
+    } else if cer <= 0.20 {
+        ClipTier::Review
+    } else {
+        ClipTier::Reject
+    };
+    (tier, cer)
+}
+
 fn add_audio_quality_reasons(seg: &SpeechSegment, reasons: &mut Vec<String>) -> bool {
     let mut severe = false;
     if let Some(clipping) = seg.clipping_ratio {
@@ -751,6 +786,27 @@ mod tests {
         let report = training_grade_for_segment(&seg("p1", "[ASR unavailable: oom]", 4000));
         assert!(!report.training_ready);
         assert!(report.reasons.iter().any(|r| r == "placeholder_transcript"));
+    }
+
+    #[test]
+    fn clip_cer_tier_classifies_by_cer() {
+        // Identical reference + hypothesis → gold (CER 0).
+        assert_eq!(
+            clip_cer_tier("ئەمڕۆ هەوا زۆر خۆشە", "ئەمڕۆ هەوا زۆر خۆشە").0,
+            ClipTier::Gold
+        );
+        // Completely different content → reject (CER well above 0.20).
+        let (tier, cer) = clip_cer_tier("ئەمڕۆ هەوا زۆر خۆشە", "پۆلیس و هێزی ئەمنی هاتن");
+        assert_eq!(tier, ClipTier::Reject);
+        assert!(cer > 0.20);
+        // Empty hypothesis against a real reference → every char deleted → reject.
+        assert_eq!(clip_cer_tier("ئەمڕۆ هەوا", "").0, ClipTier::Reject);
+        // A single dropped char in a long line stays gold/review, never reject.
+        let (tier, _) = clip_cer_tier(
+            "ڕێکخراوی مافی مرۆڤی هەنگاو دەڵێت ئەمانەی کە لە سنە گیراون",
+            "ڕێکخراوی مافی مرۆڤی هەنگاو دەڵێت ئەمانەی کە لە سنە گیران",
+        );
+        assert_ne!(tier, ClipTier::Reject);
     }
 
     #[test]
