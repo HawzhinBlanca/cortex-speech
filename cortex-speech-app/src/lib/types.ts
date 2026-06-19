@@ -9,8 +9,11 @@ export interface SpeechSegment {
   durationMs: number;
   speakerId: string | null;
   verified: boolean;
-  confidence?: number;
-  ctcScore?: number;
+  // Backend sends these as Rust Option<f64> with no skip_serializing_if, so an
+  // unset value arrives as JSON `null` (not `undefined`). Type them honestly so the
+  // type-checker forces a null-aware guard before any `.toFixed()`.
+  confidence?: number | null;
+  ctcScore?: number | null;
   clippingRatio?: number;
   rmsDb?: number;
   snrDb?: number;

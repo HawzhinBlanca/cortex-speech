@@ -408,10 +408,10 @@
                         class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-cortex-400 pt-1"
                       >
                         <span>{$t('duration')}: {(segment.durationMs / 1000).toFixed(2)}s</span>
-                        {#if segment.confidence !== undefined}
+                        {#if segment.confidence != null}
                           <span>Confidence: {segment.confidence.toFixed(2)}</span>
                         {/if}
-                        {#if segment.ctcScore !== undefined}
+                        {#if segment.ctcScore != null}
                           <span>CTC Match: {segment.ctcScore.toFixed(2)}</span>
                         {/if}
                         {#if segment.oodScore !== undefined && segment.oodScore !== null}
