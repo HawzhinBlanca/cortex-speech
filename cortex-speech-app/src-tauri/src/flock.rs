@@ -66,6 +66,11 @@ impl Drop for InstanceLock {
                 libc::flock(file.as_raw_fd(), libc::LOCK_UN);
             }
         }
+        // Close the file handle BEFORE removing the lockfile. On Windows the handle is
+        // opened with share_mode(0) (no delete sharing), so the file cannot be deleted
+        // while it is still open — dropping it first lets the removal succeed instead of
+        // leaking a stale lockfile on disk until the next startup recovers it.
+        self.file.take();
         remove_lock_file(&PathBuf::from(&self.path), "released instance lock");
     }
 }
@@ -75,5 +80,36 @@ fn remove_lock_file(path: &Path, context: &str) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => tracing::warn!("Failed to remove {context} file {}: {error}", path.display()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_lock_is_rejected_and_released_on_drop() {
+        // The single-instance lock is what stops two app processes from racing on the
+        // same SQLite database. Pin the full lifecycle: acquire → reject a concurrent
+        // attempt → release on drop (RAII, so it also frees on panic/unwind) → re-acquire.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock_path = dir.path().join("cortex.lock");
+
+        let first = InstanceLock::try_lock(dir.path()).expect("first lock should acquire");
+        assert!(lock_path.exists(), "lock file should exist while the lock is held");
+
+        match InstanceLock::try_lock(dir.path()) {
+            Ok(_) => panic!("a concurrent second lock must be rejected"),
+            Err(e) => assert!(e.contains("Another instance"), "rejection should report another instance: {e}"),
+        }
+
+        // Dropping the holder releases the lock and removes the lockfile.
+        drop(first);
+        assert!(!lock_path.exists(), "lock file should be removed on drop");
+
+        // The slot is free again.
+        let third = InstanceLock::try_lock(dir.path()).expect("lock should re-acquire after release");
+        drop(third);
+        assert!(!lock_path.exists(), "lock file should be removed after the re-acquired lock drops");
     }
 }
