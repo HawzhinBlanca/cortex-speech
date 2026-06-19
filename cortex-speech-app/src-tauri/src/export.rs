@@ -401,16 +401,16 @@ pub fn export_huggingface_dataset(
     let process_split = |split_segs: &[SpeechSegment],
                          _split_name: &str,
                          dest_dir: &std::path::Path|
-     -> AppResult<(usize, f64)> {
+     -> AppResult<(usize, f64, usize)> {
         if split_segs.is_empty() {
-            return Ok((0, 0.0));
+            return Ok((0, 0.0, 0));
         }
 
         let csv_path = dest_dir.join("metadata.csv");
         let csv_tmp = csv_path.with_extension("csv.tmp");
         remove_file_on_error(
             &csv_tmp,
-            (|| -> AppResult<(usize, f64)> {
+            (|| -> AppResult<(usize, f64, usize)> {
                 let mut csv_wtr = csv::Writer::from_path(&csv_tmp)?;
                 csv_wtr.write_record([
                     "file_name",
@@ -426,6 +426,9 @@ pub fn export_huggingface_dataset(
 
                 let mut total_exported_dur = 0.0;
                 let mut count = 0;
+                // Segments dropped because their source audio is unavailable (missing or
+                // undecodable) — real, previously-silent data loss, surfaced after export.
+                let mut dropped_unavailable = 0usize;
 
                 // Group segments by source audio_path so each source file is decoded only once.
                 // For a 2-hour podcast split into N segments, this avoids N full re-decodes.
@@ -441,6 +444,7 @@ pub fn export_huggingface_dataset(
                         for seg in &segs {
                             tracing::warn!("Skipping segment {} in HF export: audio not found", seg.id);
                         }
+                        dropped_unavailable += segs.len();
                         continue;
                     }
 
@@ -449,6 +453,7 @@ pub fn export_huggingface_dataset(
                         Ok(res) => res,
                         Err(e) => {
                             tracing::error!("Failed to decode {source_path_str} in HF export: {e}");
+                            dropped_unavailable += segs.len();
                             continue;
                         }
                     };
@@ -531,17 +536,25 @@ pub fn export_huggingface_dataset(
                 csv_wtr.flush()?;
                 drop(csv_wtr);
                 replace_file(&csv_tmp, &csv_path)?;
-                Ok((count, total_exported_dur))
+                Ok((count, total_exported_dur, dropped_unavailable))
             })(),
         )
     };
 
-    let (train_count, train_secs) = process_split(&train_segs, "train", &train_dir)?;
-    let (val_count, val_secs) = process_split(&val_segs, "validation", &val_dir)?;
-    let (test_count, test_secs) = process_split(&test_segs, "test", &test_dir)?;
+    let (train_count, train_secs, train_dropped) = process_split(&train_segs, "train", &train_dir)?;
+    let (val_count, val_secs, val_dropped) = process_split(&val_segs, "validation", &val_dir)?;
+    let (test_count, test_secs, test_dropped) = process_split(&test_segs, "test", &test_dir)?;
 
     let total_count = train_count + val_count + test_count;
     let total_secs = train_secs + val_secs + test_secs;
+    let dropped_unavailable = train_dropped + val_dropped + test_dropped;
+    if dropped_unavailable > 0 {
+        tracing::warn!(
+            "HF export: {dropped_unavailable} segment(s) dropped — source audio unavailable \
+             (missing or undecodable). They are NOT in the exported dataset; the count is \
+             recorded as droppedUnavailableAudio in dataset_infos.json."
+        );
+    }
 
     // Write dataset card (README.md)
     let model_str = format!("{:?}", settings.asr_model_size);
@@ -613,7 +626,8 @@ This dataset was exported from Cortex Speech Processor.
                 "train": {"num_examples": train_count},
                 "validation": {"num_examples": val_count},
                 "test": {"num_examples": test_count}
-            }
+            },
+            "droppedUnavailableAudio": dropped_unavailable
         }
     });
     write_text_atomic(&dir.join("dataset_infos.json"), &serde_json::to_string_pretty(&info)?)?;
@@ -1237,6 +1251,31 @@ mod tests {
         for line in sums.lines() {
             let (hash, rel) = line.split_once("  ").unwrap();
             assert_eq!(hash, sha256_hex(&std::fs::read(out_dir.path().join(rel)).unwrap()));
+        }
+    }
+
+    #[test]
+    fn export_huggingface_counts_dropped_missing_audio() {
+        let db_tmp = NamedTempFile::new().unwrap();
+        let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+
+        // A segment whose source audio simply does not exist on disk.
+        let mut seg = sample_segment("missing-1");
+        seg.audio_path = "/nonexistent/does_not_exist.wav".to_string();
+        db.insert_segment(&seg).unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let settings = crate::settings::AppSettings::default();
+        export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+
+        // The drop is surfaced (no longer silent) in dataset_infos.json, and the segment
+        // is absent from the exported metadata.
+        let info = std::fs::read_to_string(out_dir.path().join("dataset_infos.json")).unwrap();
+        assert!(info.contains("\"droppedUnavailableAudio\": 1"), "info: {info}");
+        let train_meta = out_dir.path().join("data/train/metadata.csv");
+        if train_meta.exists() {
+            assert!(!std::fs::read_to_string(train_meta).unwrap().contains("missing-1"));
         }
     }
 
