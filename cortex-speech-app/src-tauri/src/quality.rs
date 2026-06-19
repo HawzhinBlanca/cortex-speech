@@ -580,7 +580,13 @@ pub fn check_quality_gates(
 
 /// Normalize transcript text for duplicate detection (case/whitespace insensitive).
 pub fn normalize_transcript_for_hash(text: &str) -> String {
-    text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    // Unify Sorani codepoint variants (Kaf/Yeh/Heh, ZWNJ, tatweel, digit systems)
+    // through the canonical normalizer first, so two transcripts that are visually
+    // identical but differ only by codepoint hash to the same value and dedup
+    // correctly instead of fragmenting. Then lowercase any Latin content and
+    // collapse whitespace, preserving the previous behaviour for non-Sorani text.
+    let canonical = crate::normalizer::SoraniNormalizer::new().normalize(text);
+    canonical.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn transcript_hash(text: &str) -> String {
@@ -770,6 +776,22 @@ mod tests {
     #[test]
     fn normalize_transcript_collapses_whitespace_and_case() {
         assert_eq!(normalize_transcript_for_hash("  Hello   WORLD  "), "hello world");
+    }
+
+    #[test]
+    fn transcript_hash_unifies_sorani_codepoint_variants() {
+        // The same Kurdish word written with Arabic Kaf (ك U+0643) + Arabic Yeh
+        // (ي U+064A) versus Kurdish Keheh (ک U+06A9) + Kurdish Yeh (ی U+06CC). These
+        // are visually identical and semantically one word; content-dedup must not
+        // treat them as distinct, or duplicate Sorani transcripts fragment silently.
+        let arabic_form = "كوردي"; // U+0643 ... U+064A
+        let kurdish_form = "کوردی"; // U+06A9 ... U+06CC
+        assert_ne!(arabic_form, kurdish_form, "sanity: the two forms are distinct codepoints");
+        assert_eq!(
+            transcript_hash(arabic_form),
+            transcript_hash(kurdish_form),
+            "dedup hash must unify Sorani Kaf/Yeh codepoint variants"
+        );
     }
 
     #[test]
