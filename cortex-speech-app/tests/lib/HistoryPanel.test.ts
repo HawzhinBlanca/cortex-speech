@@ -2,10 +2,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 import HistoryPanel from '../../src/lib/HistoryPanel.svelte';
 import { historyStore } from '../../src/lib/stores/historyStore';
+import { locale } from '../../src/lib/i18n';
 import { invoke } from '@tauri-apps/api/core';
 
 describe('HistoryPanel', () => {
   beforeEach(() => {
+    // This file asserts the English title copy; the app defaults to Sorani, so pin
+    // English here and restore the default afterwards (other files assert ckb text).
+    locale.set('en');
     window.__TAURI__ = {};
     vi.mocked(invoke).mockReset();
     vi.mocked(invoke).mockImplementation((cmd: string) => {
@@ -18,6 +22,7 @@ describe('HistoryPanel', () => {
 
   afterEach(() => {
     cleanup();
+    locale.set('ckb');
     delete window.__TAURI__;
     delete window.__TAURI_INTERNALS__;
   });
