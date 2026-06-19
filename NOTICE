@@ -19,3 +19,17 @@ This product includes or makes use of the following third-party components:
    Developed by Silero
    License: Apache License 2.0
    Project URL: https://github.com/snakers4/silero-vad
+
+4. AsoSoft Library (Sorani/Kurdish text normalization)
+   The Sorani normalizer and grapheme-to-phoneme logic in this product
+   (src-tauri/src/normalizer.rs and normalizer/g2p.rs) is a pure-Rust
+   reimplementation of normalization rules derived from the AsoSoft Library.
+   Developed by the AsoSoft Team
+   License: MIT (as identified in this project's source notes — see the header
+   comment in src-tauri/src/normalizer.rs; verify against upstream before
+   redistribution)
+   Reference: https://github.com/AsoSoft
+
+   Note: The AsoSoft-600 benchmark *corpus* is a separate work licensed
+   CC BY-SA 4.0 (share-alike) and is governed by DATA_GOVERNANCE.md. It is a
+   dataset used for evaluation, not source code bundled into the application.
