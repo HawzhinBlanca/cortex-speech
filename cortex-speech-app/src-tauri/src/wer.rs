@@ -120,6 +120,84 @@ fn levenshtein<T: Eq>(a: &[T], b: &[T]) -> usize {
     prev[m]
 }
 
+/// Substitution / deletion / insertion decomposition of the word-error alignment.
+/// `rate()` is the HONEST unclamped error rate — it may exceed 1.0 (e.g. a hypothesis with
+/// many spurious insertions), unlike [`compute_wer`] which clamps to 1.0 for display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ErrorBreakdown {
+    pub substitutions: usize,
+    pub deletions: usize,
+    pub insertions: usize,
+    pub ref_len: usize,
+}
+
+impl ErrorBreakdown {
+    /// Total errors S + D + I (equals the raw edit distance).
+    pub fn total(&self) -> usize {
+        self.substitutions + self.deletions + self.insertions
+    }
+
+    /// Unclamped error rate `total / ref_len` (can exceed 1.0). An empty reference yields
+    /// 0.0 when the hypothesis is also empty, else 1.0.
+    pub fn rate(&self) -> f64 {
+        if self.ref_len == 0 {
+            return if self.total() == 0 { 0.0 } else { 1.0 };
+        }
+        self.total() as f64 / self.ref_len as f64
+    }
+}
+
+/// Full O(n·m) edit DP with backtracking to classify each error as a substitution,
+/// deletion (a reference token missing from the hypothesis), or insertion (a spurious
+/// hypothesis token). `a` is the reference, `b` the hypothesis.
+fn levenshtein_breakdown<T: Eq>(a: &[T], b: &[T]) -> (usize, usize, usize) {
+    let n = a.len();
+    let m = b.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in dp.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in dp[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            dp[i][j] = (dp[i - 1][j] + 1).min(dp[i][j - 1] + 1).min(dp[i - 1][j - 1] + cost);
+        }
+    }
+
+    let (mut i, mut j) = (n, m);
+    let (mut subs, mut dels, mut ins) = (0usize, 0usize, 0usize);
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && a[i - 1] == b[j - 1] && dp[i][j] == dp[i - 1][j - 1] {
+            i -= 1; // match — no error
+            j -= 1;
+        } else if i > 0 && j > 0 && dp[i][j] == dp[i - 1][j - 1] + 1 {
+            subs += 1;
+            i -= 1;
+            j -= 1;
+        } else if i > 0 && dp[i][j] == dp[i - 1][j] + 1 {
+            dels += 1;
+            i -= 1;
+        } else {
+            ins += 1;
+            j -= 1;
+        }
+    }
+    (subs, dels, ins)
+}
+
+/// Word-level S/D/I decomposition after the shared metric normalization.
+pub fn word_error_breakdown(reference: &str, hypothesis: &str) -> ErrorBreakdown {
+    let reference = normalize_for_metrics(reference);
+    let hypothesis = normalize_for_metrics(hypothesis);
+    let ref_words = tokenize_words(&reference);
+    let hyp_words = tokenize_words(&hypothesis);
+    let (substitutions, deletions, insertions) = levenshtein_breakdown(&ref_words, &hyp_words);
+    ErrorBreakdown { substitutions, deletions, insertions, ref_len: ref_words.len() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +205,59 @@ mod tests {
     #[test]
     fn identical_text_zero_wer() {
         assert_eq!(compute_wer("hello world", "hello world"), 0.0);
+    }
+
+    #[test]
+    fn breakdown_classifies_substitution_and_deletion() {
+        // ref "a b c d" vs hyp "a x c": b->x substitution, d deleted, nothing inserted.
+        let bd = word_error_breakdown("a b c d", "a x c");
+        assert_eq!(bd.substitutions, 1);
+        assert_eq!(bd.deletions, 1);
+        assert_eq!(bd.insertions, 0);
+        assert_eq!(bd.ref_len, 4);
+        assert_eq!(bd.total(), 2);
+        assert!((bd.rate() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn breakdown_classifies_insertion() {
+        let bd = word_error_breakdown("a b", "a b c");
+        assert_eq!(bd.insertions, 1);
+        assert_eq!(bd.substitutions, 0);
+        assert_eq!(bd.deletions, 0);
+        assert_eq!(bd.total(), 1);
+    }
+
+    #[test]
+    fn breakdown_total_equals_edit_distance_for_nonempty_ref() {
+        for (r, h) in [
+            ("the quick brown fox", "the slow brown cat jumped"),
+            ("کوردی زمانی شیرینە", "کوردی زمان شیرین"),
+            ("a b c", ""),
+        ] {
+            let bd = word_error_breakdown(r, h);
+            assert_eq!(bd.total(), word_edit_distance(r, h).distance, "S+D+I must equal edit distance for ({r:?},{h:?})");
+        }
+    }
+
+    #[test]
+    fn breakdown_reports_true_insertions_for_empty_reference() {
+        // word_edit_distance clamps empty-ref to distance 1; the breakdown is HONEST and
+        // reports the true insertion count instead.
+        let bd = word_error_breakdown("", "one two");
+        assert_eq!(bd.insertions, 2);
+        assert_eq!(bd.deletions, 0);
+        assert_eq!(bd.substitutions, 0);
+        assert_eq!(bd.ref_len, 0);
+        assert_eq!(bd.total(), 2);
+    }
+
+    #[test]
+    fn breakdown_rate_is_unclamped_unlike_compute_wer() {
+        // Many spurious insertions → honest rate > 1.0, while compute_wer clamps to 1.0.
+        let bd = word_error_breakdown("word", "word one two three four five");
+        assert!(bd.rate() > 1.0, "unclamped rate should exceed 1.0: {}", bd.rate());
+        assert_eq!(compute_wer("word", "word one two three four five"), 1.0);
     }
 
     #[test]
