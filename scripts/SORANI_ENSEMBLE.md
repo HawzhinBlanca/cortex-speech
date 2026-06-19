@@ -12,10 +12,11 @@ differently, their **agreement is a real confidence signal** — not a hard-code
 | Central-Kurdish-XLSR | wav2vec2 CTC | `Akashpb13/Central_kurdish_xlsr` (HF) |
 
 Per segment it reports every engine's transcript, a **mean pairwise
-character-agreement** score (0–1), and a consensus. Segments below the agreement
-threshold are flagged `REVIEW`. The three transcripts are exactly the diverse
-hypotheses the app's IRT confusion-network consensus (`quality/irt.rs`) is built
-to fuse.
+character-agreement** score (0–1), and a **ROVER-fused consensus** (`rover_fuse`):
+a word-level confusion-network majority vote that lets two agreeing voters
+restore content the primary dropped. Segments below the agreement threshold are
+flagged `REVIEW`. The three transcripts are also exactly the diverse hypotheses
+the app's IRT confusion-network consensus (`quality/irt.rs`) is built to fuse.
 
 ## Why diversity matters — validated on a real 36 s Kurdish clip (Nawras)
 
@@ -45,9 +46,9 @@ Requires: `omnilingual_asr`, `transformers~=4.46`, `huggingface_hub~=0.32`
 
 ## Next (fusion + integration)
 
-- Replace the naive "7B-primary" consensus field with token-level ROVER / the
-  app's IRT consensus over all three hypotheses (so the year the 7B dropped is
-  filled from the agreeing voters).
+- [done] Token-level ROVER fusion (`rover_fuse`) — validated recovering the year
+  the 7B dropped on Nawras seg 1. Future: weight votes by per-engine reliability
+  learned from a gold set, and reconcile against the app's IRT consensus.
 - Wire as the app's primary ASR via `external_asr_script_path`, emitting the
   per-engine hypotheses + agreement confidence into `segment_hypotheses`.
 - Use agreement confidence to drive the autonomy gate / escalation instead of the

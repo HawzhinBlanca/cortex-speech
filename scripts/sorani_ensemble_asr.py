@@ -69,6 +69,59 @@ def agreement(texts):
     return sims / n
 
 
+def _align_to_anchor(anchor, other):
+    """Word-level alignment of `other` onto `anchor`; returns, per anchor slot,
+    the aligned word from `other` ('' = deletion). Insertions in other are dropped."""
+    n, m = len(anchor), len(other)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            c = 0 if anchor[i - 1] == other[j - 1] else 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + c)
+    aligned = [''] * n
+    i, j = n, m
+    while i > 0 and j > 0:
+        c = 0 if anchor[i - 1] == other[j - 1] else 1
+        if dp[i][j] == dp[i - 1][j - 1] + c:
+            aligned[i - 1] = other[j - 1]; i -= 1; j -= 1
+        elif dp[i][j] == dp[i - 1][j] + 1:
+            i -= 1            # deletion: anchor slot unmatched by other
+        else:
+            j -= 1            # insertion in other: dropped (anchor is longest)
+    return aligned
+
+
+def rover_fuse(hyps):
+    """ROVER-style confusion-network majority vote over the diverse hypotheses.
+    Anchor = longest hyp (captures every content slot, e.g. a year the primary
+    dropped); each other hyp aligns to it and votes per slot; the majority word
+    wins, ties prefer a non-empty token. Equal votes (a strong primary does not
+    get extra weight) is what lets two agreeing voters restore content the
+    primary missed."""
+    from collections import Counter
+    toks = [h.split() for h in hyps if h.strip()]
+    if not toks:
+        return ""
+    if len(toks) == 1:
+        return " ".join(toks[0])
+    anchor = max(toks, key=len)
+    cols = [Counter() for _ in anchor]
+    for t in toks:
+        aligned = anchor if t is anchor else _align_to_anchor(anchor, t)
+        for k, word in enumerate(aligned):
+            cols[k][word] += 1
+    out = []
+    for c in cols:
+        best = max(c.items(), key=lambda kv: (kv[1], kv[0] != ''))
+        if best[0]:
+            out.append(best[0])
+    return " ".join(out)
+
+
 # --- prep audio: 16k mono, sliced ---
 import soundfile as sf
 print("Converting audio to 16k mono...", flush=True)
@@ -148,7 +201,7 @@ for i in range(len(slices)):
     r = results[i]
     o = r.get("omniasr_7b", ""); w = r.get("whisper_ckb", ""); x = r.get("xlsr_ckb", "")
     conf = agreement([o, w, x])
-    consensus = o or w or x  # 7B primary
+    consensus = rover_fuse([o, w, x])  # ROVER majority vote across the diverse engines
     r["agreement_confidence"] = round(conf, 3)
     r["consensus"] = consensus
     flag = "REVIEW" if conf < 0.6 else "OK"
