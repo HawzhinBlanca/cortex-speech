@@ -18,6 +18,7 @@ use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use cortex_speech_app_lib::pipeline::ProcessingPipeline;
 use cortex_speech_app_lib::settings::AppSettings;
+use cortex_speech_app_lib::significance::{bootstrap_ci, mapsswe, SegmentError};
 use cortex_speech_app_lib::wer;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -256,6 +257,8 @@ fn compare_300m_vs_1b() {
     };
     let (mut c3d, mut c3r, mut c1d, mut c1r) = (0usize, 0usize, 0usize, 0usize);
     let (mut n, mut wins1b, mut wins300, mut ties) = (0usize, 0usize, 0usize, 0usize);
+    let mut worksheet = String::from("clip\taudio_path\tscript_hint\tasr_300m\tasr_1b\tverbatim\n");
+    let clean = |x: &str| x.replace(['\t', '\n', '\r'], " ");
     let t0 = std::time::Instant::now();
     for r in rows.iter().filter(|r| Path::new(&r.audio_filepath).exists()) {
         let (sr, pcm) = match audio::decode_to_pcm(&r.audio_filepath) {
@@ -272,6 +275,14 @@ fn compare_300m_vs_1b() {
             .transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
             .map(|(t, _)| t)
             .unwrap_or_default();
+        worksheet.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t\n",
+            n + 1,
+            clean(&r.audio_filepath),
+            clean(&r.text),
+            clean(&h3),
+            clean(&h1)
+        ));
         let refn = norm.normalize(&r.text);
         let c3 = wer::char_edit_distance(&refn, &norm.normalize(&h3));
         let c1 = wer::char_edit_distance(&refn, &norm.normalize(&h1));
@@ -298,6 +309,10 @@ fn compare_300m_vs_1b() {
         "per-clip: 1B better {wins1b}  |  300M better {wins300}  |  ties {ties}  (of {n})"
     );
     eprintln!("elapsed: {elapsed:.1}s (both models)");
+    if let Ok(out) = std::env::var("CORTEX_WORKSHEET_OUT") {
+        std::fs::write(&out, &worksheet).expect("write worksheet");
+        eprintln!("[worksheet] wrote {n} rows (asr_300m + asr_1b) to {out}");
+    }
     assert!(n > 0);
 }
 
@@ -476,60 +491,71 @@ fn verbatim_wer_from_worksheet() {
     };
     let content = std::fs::read_to_string(&tsv).expect("read worksheet");
     let norm = SoraniNormalizer::new();
-    let pct = |d: &wer::EditDistanceResult| {
-        if d.ref_len > 0 {
-            (d.distance as f64 / d.ref_len as f64).min(1.0)
-        } else {
-            0.0
-        }
-    };
-    let (mut wd, mut wr, mut cd, mut cr, mut n) = (0usize, 0usize, 0usize, 0usize, 0usize);
-    let (mut nwd, mut nwr, mut ncd, mut ncr) = (0usize, 0usize, 0usize, 0usize);
 
-    eprintln!("\n===== VERBATIM WER — real OmniASR-300M vs hand-verified refs =====");
+    // Per-clip SegmentError vectors (word + char) for each model vs the verbatim ref.
+    let mut w300: Vec<SegmentError> = Vec::new();
+    let mut c300: Vec<SegmentError> = Vec::new();
+    let mut w1b: Vec<SegmentError> = Vec::new();
+    let mut c1b: Vec<SegmentError> = Vec::new();
+    let mut has_1b = false;
+
     for (li, line) in content.lines().enumerate() {
         if li == 0 || line.trim().is_empty() {
             continue; // header / blank
         }
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 5 {
-            continue;
-        }
-        let asr = cols[3].trim();
-        let verbatim = cols[4].trim();
+        // 6-col: clip, audio_path, script_hint, asr_300m, asr_1b, verbatim
+        // 5-col (legacy): clip, audio_path, script_hint, asr_300m, verbatim
+        let (asr3, asr1, verbatim) = match cols.len() {
+            n if n >= 6 => (cols[3].trim(), cols[4].trim(), cols[5].trim()),
+            5 => (cols[3].trim(), "", cols[4].trim()),
+            _ => continue,
+        };
         if verbatim.is_empty() {
             continue; // not yet verified
         }
-        let raw_w = wer::word_edit_distance(verbatim, asr);
-        let raw_c = wer::char_edit_distance(verbatim, asr);
-        let (vn, an) = (norm.normalize(verbatim), norm.normalize(asr));
-        let n_w = wer::word_edit_distance(&vn, &an);
-        let n_c = wer::char_edit_distance(&vn, &an);
-        wd += raw_w.distance;
-        wr += raw_w.ref_len;
-        cd += raw_c.distance;
-        cr += raw_c.ref_len;
-        nwd += n_w.distance;
-        nwr += n_w.ref_len;
-        ncd += n_c.distance;
-        ncr += n_c.ref_len;
-        n += 1;
-        eprintln!(
-            "  clip {:>3}  WER {:.2}  CER {:.2}   (norm WER {:.2} CER {:.2})",
-            cols[0],
-            pct(&raw_w),
-            pct(&raw_c),
-            pct(&n_w),
-            pct(&n_c)
-        );
+        let vn = norm.normalize(verbatim);
+        let w = wer::word_edit_distance(&vn, &norm.normalize(asr3));
+        let c = wer::char_edit_distance(&vn, &norm.normalize(asr3));
+        w300.push(SegmentError::new(w.distance as f64, w.ref_len as f64));
+        c300.push(SegmentError::new(c.distance as f64, c.ref_len as f64));
+        if !asr1.is_empty() {
+            has_1b = true;
+            let w1 = wer::word_edit_distance(&vn, &norm.normalize(asr1));
+            let c1 = wer::char_edit_distance(&vn, &norm.normalize(asr1));
+            w1b.push(SegmentError::new(w1.distance as f64, w1.ref_len as f64));
+            c1b.push(SegmentError::new(c1.distance as f64, c1.ref_len as f64));
+        }
     }
+    let n = w300.len();
     assert!(n > 0, "no rows with a filled `verbatim` column — fill the worksheet first");
-    let micro = |d: usize, r: usize| if r > 0 { (d as f64 / r as f64).min(1.0) } else { 0.0 };
-    eprintln!("\n----- {n} hand-verified clips -----");
-    eprintln!("RAW   micro WER {:.4}   CER {:.4}", micro(wd, wr), micro(cd, cr));
+
+    const RESAMPLES: usize = 2000;
+    const CONF: f64 = 0.95;
+    const SEED: u64 = 0xC0FFEE;
+    let fmt = |ci: cortex_speech_app_lib::significance::ConfidenceInterval| {
+        format!("{:.4} [{:.4}, {:.4}]", ci.point, ci.lower, ci.upper)
+    };
+
     eprintln!(
-        "NORM  micro WER {:.4}   CER {:.4}   (SoraniNormalizer on both sides)",
-        micro(nwd, nwr),
-        micro(ncd, ncr)
+        "\n===== VERBATIM WER/CER — hand-verified refs (n={n}, normalized, 95% bootstrap CI) ====="
     );
+    eprintln!("300M  WER {}", fmt(bootstrap_ci(&w300, RESAMPLES, CONF, SEED)));
+    eprintln!("300M  CER {}", fmt(bootstrap_ci(&c300, RESAMPLES, CONF, SEED)));
+    if has_1b && w1b.len() == n {
+        eprintln!("1B    WER {}", fmt(bootstrap_ci(&w1b, RESAMPLES, CONF, SEED)));
+        eprintln!("1B    CER {}", fmt(bootstrap_ci(&c1b, RESAMPLES, CONF, SEED)));
+        let p = mapsswe(&w300, &w1b);
+        eprintln!(
+            "MAPSSWE 300M vs 1B (word): p = {:.4}  ->  {}",
+            p,
+            if p < 0.05 {
+                "significant difference"
+            } else {
+                "not statistically distinguishable"
+            }
+        );
+    } else {
+        eprintln!("(1B column absent — fill asr_1b to get the 300M-vs-1B significance test)");
+    }
 }
