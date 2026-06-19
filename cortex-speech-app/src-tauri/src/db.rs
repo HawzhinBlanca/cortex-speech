@@ -93,6 +93,23 @@ fn nfc_transcripts(seg: &SpeechSegment) -> (String, Option<String>, Option<Strin
     )
 }
 
+/// Fold Sorani codepoint variants (Kaf ك/ک, Yeh ي/ی, Heh, Hamza, ZWNJ, tatweel) in a
+/// full-text search query so it matches the canonical `normalized_transcript` column
+/// regardless of which keyboard variant the user typed — the FTS index stores the
+/// normalizer's unified form, but a raw query in a different codepoint would never
+/// match it. Digit conversion/verbalization is intentionally skipped so a digit query
+/// still matches the raw transcript; the letter rules mirror those applied to the
+/// stored normalized text.
+fn normalize_search_query(text: &str) -> String {
+    crate::normalizer::SoraniNormalizer::with_config(crate::normalizer::NormalizationConfig {
+        normalize_numbers: false,
+        verbalize_numbers: false,
+        normalize_hamza: true,
+        remove_diacritics: false,
+    })
+    .normalize(text)
+}
+
 /// The only split labels the export/stats math understands.
 const VALID_SPLITS: &[&str] = &["train", "validation", "test"];
 
@@ -569,6 +586,7 @@ impl Database {
     }
 
     pub fn search_segments(&self, text: &str) -> AppResult<Vec<SpeechSegment>> {
+        let query = normalize_search_query(text);
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, audio_path, raw_transcript, normalized_transcript,
                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
@@ -580,7 +598,7 @@ impl Database {
              WHERE id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?1)
              ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map(params![text], Self::map_row)?;
+        let rows = stmt.query_map(params![query], Self::map_row)?;
         let mut segments = Vec::new();
         for row in rows {
             segments.push(row?);
@@ -1331,6 +1349,24 @@ mod tests {
         let after_delete = db.search_segments("hawzhin").expect("search after delete");
         assert_eq!(after_delete.len(), 1, "FTS should track batch deletes");
         assert_eq!(after_delete[0].id, "fts-2");
+    }
+
+    #[test]
+    fn fts_search_matches_sorani_codepoint_variants() {
+        let db = make_db();
+        // The canonical normalized_transcript uses Kurdish Keheh (ک U+06A9) + Yeh
+        // (ی U+06CC). raw_transcript is deliberately non-matching Latin so the test
+        // isolates whether a query typed with the Arabic Kaf/Yeh variant still
+        // matches the canonical normalized text.
+        let mut seg = make_segment("fts-var", "/data/audio/fts-var.wav");
+        seg.raw_transcript = "zzz".to_string();
+        seg.normalized_transcript = Some("کوردی".to_string());
+        db.insert_segment(&seg).expect("insert segment");
+
+        // Query uses Arabic Kaf (ك U+0643) + Arabic Yeh (ي U+064A) — distinct codepoints.
+        let hits = db.search_segments("كوردي").expect("variant search");
+        assert_eq!(hits.len(), 1, "a variant-typed query must match the canonical normalized transcript");
+        assert_eq!(hits[0].id, "fts-var");
     }
 
     #[test]
