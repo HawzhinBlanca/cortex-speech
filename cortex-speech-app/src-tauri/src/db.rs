@@ -75,6 +75,34 @@ fn human_verdict_for_decision(decision: &str) -> AppResult<&'static str> {
     }
 }
 
+/// The only split labels the export/stats math understands.
+const VALID_SPLITS: &[&str] = &["train", "validation", "test"];
+
+/// Reject structurally-invalid segments at the DB write boundary, before they can
+/// corrupt the downstream split/stats/training-grade math that every later stage
+/// branches on. Guards the fields these insert paths actually persist; verdict and
+/// human_decision are validated at their own dedicated write paths.
+fn validate_segment(seg: &SpeechSegment) -> AppResult<()> {
+    if seg.id.trim().is_empty() {
+        return Err(AppError::Validation("Segment id must not be empty".into()));
+    }
+    if seg.duration_ms < 0 {
+        return Err(AppError::Validation(format!(
+            "Segment '{}' has a negative duration_ms ({})",
+            seg.id, seg.duration_ms
+        )));
+    }
+    if let Some(split) = seg.split.as_deref() {
+        if !VALID_SPLITS.contains(&split) {
+            return Err(AppError::Validation(format!(
+                "Segment '{}' has invalid split '{split}' (expected one of {VALID_SPLITS:?})",
+                seg.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn learning_text_key(text: &str) -> String {
     text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -193,6 +221,7 @@ impl Database {
     }
 
     pub fn insert_segment(&self, seg: &SpeechSegment) -> AppResult<()> {
+        validate_segment(seg)?;
         self.conn.execute(
             "INSERT INTO speech_segments
                 (id, audio_path, raw_transcript, normalized_transcript,
@@ -279,6 +308,7 @@ impl Database {
                     updated_at=datetime('now')"
             )?;
             for seg in segments {
+                validate_segment(seg)?;
                 stmt.execute(params![
                     seg.id,
                     seg.audio_path,
@@ -340,6 +370,7 @@ impl Database {
             )?;
 
             for seg in &external_segments {
+                validate_segment(seg)?;
                 let exists = check_stmt.exists(params![seg.id])?;
                 if exists {
                     update_stmt.execute(params![
@@ -1083,6 +1114,40 @@ mod tests {
             duration_ms: 1000,
             ..SpeechSegment::default()
         }
+    }
+
+    #[test]
+    fn write_boundary_rejects_invalid_segments() {
+        let db = make_db();
+
+        // Empty id, negative duration, and an unknown split are all rejected with a
+        // clean AppError::Validation — never silently persisted to corrupt later math.
+        let mut s = make_segment("", "/a.wav");
+        assert!(matches!(db.insert_segment(&s), Err(AppError::Validation(_))), "empty id");
+
+        s = make_segment("s1", "/a.wav");
+        s.duration_ms = -1;
+        assert!(matches!(db.insert_segment(&s), Err(AppError::Validation(_))), "negative duration");
+
+        s = make_segment("s2", "/a.wav");
+        s.split = Some("trainn".to_string());
+        assert!(matches!(db.insert_segment(&s), Err(AppError::Validation(_))), "bogus split");
+
+        // A valid segment (known split) inserts fine.
+        s = make_segment("s3", "/a.wav");
+        s.split = Some("validation".to_string());
+        db.insert_segment(&s).expect("valid segment should insert");
+
+        // A batch containing ANY invalid segment is rejected atomically — the savepoint
+        // rolls back, so even the valid sibling does not persist.
+        let good = make_segment("b1", "/b1.wav");
+        let mut bad = make_segment("b2", "/b2.wav");
+        bad.duration_ms = -10;
+        assert!(db.insert_segments_batch(&[good, bad]).is_err(), "batch with an invalid segment must fail");
+        assert!(
+            db.get_segment_by_audio_path("/b1.wav").unwrap().is_none(),
+            "the whole batch must roll back, including the valid segment"
+        );
     }
 
     #[test]
