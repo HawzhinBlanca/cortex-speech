@@ -10,11 +10,25 @@ use std::path::{Path, PathBuf};
 /// path.
 #[cfg(not(target_os = "windows"))]
 pub fn replace_file(tmp_path: &Path, final_path: &Path) -> io::Result<()> {
-    fs::rename(tmp_path, final_path)
+    // Flush the staged bytes to stable storage before the rename: atomic rename makes
+    // the swap atomic, but only fsync makes the *data* durable — without it a power-loss
+    // right after the rename can expose a zero-length file where a curated artifact
+    // should be (the cardinal sin for a tool whose output is human-verified labels).
+    fsync_path(tmp_path)?;
+    fs::rename(tmp_path, final_path)?;
+    // Make the rename itself durable by fsyncing the containing directory.
+    if let Some(parent) = final_path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
 pub fn replace_file(tmp_path: &Path, final_path: &Path) -> io::Result<()> {
+    // Flush the staged bytes to disk before any rename — see the non-Windows variant.
+    fsync_path(tmp_path)?;
     if !final_path.exists() {
         return fs::rename(tmp_path, final_path);
     }
@@ -49,6 +63,15 @@ pub fn replace_file(tmp_path: &Path, final_path: &Path) -> io::Result<()> {
 fn replacement_backup_path(final_path: &Path) -> PathBuf {
     let file_name = final_path.file_name().and_then(|name| name.to_str()).unwrap_or("target");
     final_path.with_file_name(format!("{file_name}.replace-bak-{}", std::process::id()))
+}
+
+/// fsync a file's contents to stable storage. The atomic-rename machinery guarantees the
+/// *swap* is atomic; this guarantees the *bytes* are on disk first, so a crash or power-
+/// loss can never leave a renamed-but-empty/partial file.
+fn fsync_path(path: &Path) -> io::Result<()> {
+    // Open for write: on Windows sync_all() maps to FlushFileBuffers, which requires a
+    // write-access handle (a read-only handle returns ERROR_ACCESS_DENIED).
+    fs::OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 pub fn remove_file_on_error<T, E>(path: &Path, result: Result<T, E>) -> Result<T, E> {
@@ -100,6 +123,22 @@ mod tests {
             .flatten()
             .any(|entry| entry.file_name().to_string_lossy().contains(".replace-bak-"));
         assert!(!backup_left, "replacement backup should be cleaned up");
+    }
+
+    #[test]
+    fn replace_file_fsyncs_and_preserves_exact_bytes() {
+        // Exercises the durability path (fsync tmp → rename → fsync dir) and asserts the
+        // promoted file holds exactly the staged bytes — a non-trivial multi-block payload.
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let tmp_path = tmp_dir.path().join("dataset.parquet.tmp");
+        let final_path = tmp_dir.path().join("dataset.parquet");
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&tmp_path, &payload).expect("write tmp");
+
+        replace_file(&tmp_path, &final_path).expect("replace file");
+
+        assert_eq!(fs::read(&final_path).expect("read final"), payload);
+        assert!(!tmp_path.exists());
     }
 
     #[test]
