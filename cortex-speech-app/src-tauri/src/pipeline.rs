@@ -1137,14 +1137,19 @@ impl ProcessingPipeline {
                     }
                 });
 
-                let entry = crate::cache::CacheEntry {
-                    audio_hash: String::new(),
-                    raw_transcript: text.clone(),
-                    normalized_transcript: None,
-                    created_at: chrono::Utc::now(),
-                    model_id: model_id.clone(),
-                };
-                self.cache.set_chunk(path, Some(&chunk_suffix), entry);
+                // Only cache a genuine transcription. Never bake a transient failure (model
+                // unavailable → empty, or a transcribe error → "[ASR unavailable: …]") into the
+                // cache, or every later retry would just replay the failure forever.
+                if !text.trim().is_empty() && !crate::quality::is_placeholder_transcript(&text) {
+                    let entry = crate::cache::CacheEntry {
+                        audio_hash: String::new(),
+                        raw_transcript: text.clone(),
+                        normalized_transcript: None,
+                        created_at: chrono::Utc::now(),
+                        model_id: model_id.clone(),
+                    };
+                    self.cache.set_chunk(path, Some(&chunk_suffix), entry);
+                }
                 (text, conf)
             };
 

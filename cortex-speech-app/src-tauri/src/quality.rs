@@ -436,7 +436,10 @@ fn evidence_transcript_matches(candidate: Option<&serde_json::Value>, transcript
     !expected.is_empty() && expected == actual
 }
 
-fn is_placeholder_transcript(text: &str) -> bool {
+/// True when a stored "transcript" is actually a failure/placeholder marker (ASR error,
+/// pending status, or an explicit n/a), not real speech content. Used to keep such markers
+/// out of training/export and out of the transcript cache.
+pub fn is_placeholder_transcript(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed.starts_with("[ASR unavailable")
         || trimmed.starts_with("[Pending")
@@ -732,6 +735,22 @@ mod tests {
     #[test]
     fn normalize_transcript_collapses_whitespace_and_case() {
         assert_eq!(normalize_transcript_for_hash("  Hello   WORLD  "), "hello world");
+    }
+
+    #[test]
+    fn placeholder_transcript_detection() {
+        // Failure/pending markers must be recognised (kept out of cache + training/export).
+        assert!(is_placeholder_transcript("[ASR unavailable: transcribe timed out]"));
+        assert!(is_placeholder_transcript("[Pending WSL 7B ASR]"));
+        assert!(is_placeholder_transcript("N/A"));
+        assert!(is_placeholder_transcript("  null "));
+        // Real Sorani content (and a plain empty string) must NOT be flagged as a placeholder.
+        assert!(!is_placeholder_transcript("ئەمڕۆ هەوا زۆر خۆشە"));
+        assert!(!is_placeholder_transcript(""));
+        // A failed-transcript segment is graded reject / not training-ready (excluded from export).
+        let report = training_grade_for_segment(&seg("p1", "[ASR unavailable: oom]", 4000));
+        assert!(!report.training_ready);
+        assert!(report.reasons.iter().any(|r| r == "placeholder_transcript"));
     }
 
     #[test]
