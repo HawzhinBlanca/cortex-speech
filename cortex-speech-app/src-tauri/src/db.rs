@@ -876,12 +876,17 @@ impl Database {
         self.conn.execute("SAVEPOINT consensus_batch", [])?;
         let result: AppResult<()> = (|| {
             let mut stmt = self.conn.prepare(
-                "UPDATE speech_segments 
+                // Guard: never overwrite a human-reviewed/edited segment with machine consensus —
+                // mirrors update_asr_transcript_if_unreviewed and merge_dataset_json. Without this,
+                // running the consensus refinery silently discards human corrections.
+                "UPDATE speech_segments
                  SET raw_transcript = ?2,
                      normalized_transcript = ?3,
                      confidence = ?4,
                      updated_at = datetime('now')
-                 WHERE id = ?1",
+                 WHERE id = ?1
+                   AND (human_decision IS NULL OR human_decision = '')
+                   AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
             )?;
             for (seg_id, cons, norm, conf) in updates {
                 stmt.execute(params![seg_id, cons, norm, conf])?;
@@ -1557,6 +1562,54 @@ mod tests {
         assert_eq!(db.search_segments("\"hello\"").unwrap().len(), 1, "quoted token matches too");
         // Whitespace-only input is an empty result, not an error.
         assert!(db.search_segments("   ").unwrap().is_empty(), "blank query -> empty, not error");
+    }
+
+    #[test]
+    fn consensus_batch_preserves_human_reviewed_transcripts() {
+        // Hardening-audit MEDIUM (silent data loss): the consensus refinery overwrote human-corrected
+        // transcripts because update_segment_consensus_batch lacked the human-review guard that every
+        // other transcript-write path (e.g. update_asr_transcript_if_unreviewed) enforces.
+        let db = make_db();
+        let mut locked = make_segment("locked-1", "/a.wav");
+        locked.raw_transcript = "human corrected text".to_string();
+        locked.normalized_transcript = Some("human corrected text".to_string());
+        db.insert_segment(&locked).expect("insert locked");
+        db.conn
+            .execute(
+                "UPDATE speech_segments SET verdict='human_edit', human_decision='edit' WHERE id='locked-1'",
+                [],
+            )
+            .expect("lock as human-reviewed");
+
+        // The refinery's batch write tries to replace the locked segment with machine consensus.
+        db.update_segment_consensus_batch(&[(
+            "locked-1".to_string(),
+            "machine consensus text".to_string(),
+            "machine consensus text".to_string(),
+            0.9,
+        )])
+        .expect("consensus batch");
+
+        let after = db.get_segment_by_id("locked-1").unwrap().expect("segment exists");
+        assert_eq!(after.raw_transcript, "human corrected text", "human correction must NOT be clobbered");
+        assert_eq!(after.normalized_transcript.as_deref(), Some("human corrected text"));
+
+        // An UNREVIEWED segment is still refined normally (the guard only protects human-locked rows).
+        let mut fresh = make_segment("fresh-1", "/b.wav");
+        fresh.raw_transcript = "old asr".to_string();
+        db.insert_segment(&fresh).expect("insert fresh");
+        db.update_segment_consensus_batch(&[(
+            "fresh-1".to_string(),
+            "new consensus".to_string(),
+            "new consensus".to_string(),
+            0.8,
+        )])
+        .expect("consensus batch 2");
+        assert_eq!(
+            db.get_segment_by_id("fresh-1").unwrap().unwrap().raw_transcript,
+            "new consensus",
+            "an unreviewed segment is still refined"
+        );
     }
 
     #[test]
