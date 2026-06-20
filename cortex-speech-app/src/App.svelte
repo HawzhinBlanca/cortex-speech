@@ -1800,7 +1800,7 @@
                           {item.speakerId}
                         </span>
                       {/if}
-                      <span class="text-[11px] text-cortex-500 truncate mt-0.5">
+                      <span class="text-[11px] text-cortex-500 truncate mt-0.5" dir="rtl" lang="ckb">
                         {item.annotatedTranscript ??
                           item.normalizedTranscript ??
                           item.rawTranscript ??
@@ -1989,7 +1989,9 @@
                 <label for="raw-ts" class="text-[11px] text-cortex-400">{$t('rawAsr')}</label>
                 <textarea
                   id="raw-ts"
-                  class="input h-28 resize-none font-mono text-xs"
+                  dir="rtl"
+                  lang="ckb"
+                  class="input h-28 resize-none font-mono text-xs text-right"
                   value={$selectedSegment.rawTranscript}
                   readonly
                 ></textarea>
@@ -1998,7 +2000,9 @@
                 <label for="norm-ts" class="text-[11px] text-cortex-400">{$t('normalized')}</label>
                 <textarea
                   id="norm-ts"
-                  class="input h-28 resize-none font-mono text-xs"
+                  dir="rtl"
+                  lang="ckb"
+                  class="input h-28 resize-none font-mono text-xs text-right"
                   value={$selectedSegment.normalizedTranscript ?? ''}
                   readonly
                 ></textarea>
@@ -2045,7 +2049,10 @@
                 class="p-5 rounded-2xl bg-gradient-to-b from-cortex-900/50 to-cortex-950/80 border border-white/5 shadow-inner font-mono text-[15px] leading-loose min-h-32 select-text transition-all duration-300 hover:border-cortex-500/30 hover:shadow-[inset_0_0_20px_rgba(56,189,248,0.05)]"
               >
                 {#if $wordTimestamps.length > 0}
-                  <div class="flex flex-wrap gap-x-1.5 gap-y-2">
+                  <!-- Kurdish is RTL: this flex row of word-chips must be dir=rtl so the chips
+                       lay out right-to-left; otherwise the first spoken word sits leftmost and the
+                       words read reversed. -->
+                  <div class="flex flex-wrap gap-x-1.5 gap-y-2" dir="rtl" lang="ckb">
                     {#each $wordTimestamps as w, idx}
                       {@const isActive = currentTime >= w.start && currentTime <= w.end}
                       <span
@@ -2068,7 +2075,9 @@
                         {#if editingWordIndex === idx}
                           <input
                             type="text"
-                            class="bg-cortex-800 text-white text-xs px-1 border border-cortex-500 rounded outline-none focus:ring-1 focus:ring-cortex-400 w-16"
+                            dir="rtl"
+                            lang="ckb"
+                            class="bg-cortex-800 text-white text-xs px-1 border border-cortex-500 rounded outline-none focus:ring-1 focus:ring-cortex-400 w-16 text-right"
                             value={w.word}
                             onblur={(e) =>
                               finishEditingWord(idx, (e.target as HTMLInputElement).value)}
@@ -2098,7 +2107,9 @@
               </div>
             {:else}
               <textarea
-                class="input h-32 resize-none font-mono text-sm"
+                dir="rtl"
+                lang="ckb"
+                class="input h-32 resize-none font-mono text-sm text-right"
                 value={$selectedSegment.annotatedTranscript ?? ''}
                 placeholder={$t('editTranscript')}
                 oninput={(e) => {
@@ -2149,7 +2160,7 @@
             {#if $wordTimestamps.length > 0}
               <div class="space-y-1">
                 <span class="text-[11px] text-cortex-400">{$t('wordTimestamps')}</span>
-                <div class="flex flex-wrap gap-1 max-h-20 overflow-y-auto" role="list">
+                <div class="flex flex-wrap gap-1 max-h-20 overflow-y-auto" role="list" dir="rtl" lang="ckb">
                   {#each $wordTimestamps as w}
                     <button
                       type="button"
