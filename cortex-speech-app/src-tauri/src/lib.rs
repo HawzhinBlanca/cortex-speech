@@ -404,6 +404,7 @@ pub fn run() {
             commands::import_model_checkpoint,
             commands::create_gold_from_file,
             commands::get_configured_providers,
+            commands::transcribe_audio_with_scribe,
             commands::get_blocking_validation_issues,
             commands::register_media_asset,
             commands::get_media_asset_url,
