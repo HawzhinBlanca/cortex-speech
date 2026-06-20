@@ -96,7 +96,13 @@ pub struct AppState {
     pub settings: Mutex<AppSettings>,
     pub data_dir: Mutex<Option<PathBuf>>,
     pub model_manager: Mutex<ModelManager>,
-    pub cancel_token: Mutex<Option<CancellationToken>>,
+    /// Separate cancellation slots per long-running operation kind. Imports (start_cancel_token) and
+    /// batches (ensure_cancel_token) run under independent gates, so sharing ONE slot let starting one
+    /// detach the other's token — a Cancel could then miss a still-running operation or hit the wrong
+    /// one. With a slot each, cancel_current_operation cancels BOTH, so the single Cancel control
+    /// reliably stops everything that is running.
+    pub import_cancel_token: Mutex<Option<CancellationToken>>,
+    pub batch_cancel_token: Mutex<Option<CancellationToken>>,
     pub import_state: Mutex<ImportState>,
     pub batch_state: Mutex<BatchState>,
     pub media_registry: Mutex<MediaRegistry>,
@@ -112,9 +118,16 @@ impl AppState {
         })
     }
 
-    fn lock_cancel_token(&self) -> MutexGuard<'_, Option<CancellationToken>> {
-        self.cancel_token.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("Recovering poisoned cancellation token lock");
+    fn lock_import_cancel_token(&self) -> MutexGuard<'_, Option<CancellationToken>> {
+        self.import_cancel_token.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned import cancellation token lock");
+            poisoned.into_inner()
+        })
+    }
+
+    fn lock_batch_cancel_token(&self) -> MutexGuard<'_, Option<CancellationToken>> {
+        self.batch_cancel_token.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned batch cancellation token lock");
             poisoned.into_inner()
         })
     }
@@ -196,9 +209,10 @@ impl AppState {
         }
     }
 
-    /// Returns an active cancellation token, creating one if none exists.
+    /// Returns the active BATCH cancellation token, creating one if none exists. Batches reuse a
+    /// token for the operation's duration (so a cancel request stays in effect), hence reuse-or-create.
     pub fn ensure_cancel_token(&self) -> Result<CancellationToken, String> {
-        let mut guard = self.lock_cancel_token();
+        let mut guard = self.lock_batch_cancel_token();
         if let Some(token) = guard.as_ref() {
             return Ok(token.clone());
         }
@@ -207,23 +221,31 @@ impl AppState {
         Ok(token)
     }
 
+    /// Arms a fresh IMPORT cancellation token (imports always get a new one per run).
     pub fn start_cancel_token(&self) -> CancellationToken {
         let token = CancellationToken::new();
-        *self.lock_cancel_token() = Some(token.clone());
+        *self.lock_import_cancel_token() = Some(token.clone());
         token
     }
 
+    /// Cancel every running operation. Both slots are signalled so the single Cancel control reliably
+    /// stops a running import AND a running batch, regardless of which started last.
     pub fn cancel_current_operation(&self) -> bool {
-        if let Some(token) = self.lock_cancel_token().as_ref() {
+        let mut cancelled_any = false;
+        if let Some(token) = self.lock_import_cancel_token().as_ref() {
             token.cancel();
-            true
-        } else {
-            false
+            cancelled_any = true;
         }
+        if let Some(token) = self.lock_batch_cancel_token().as_ref() {
+            token.cancel();
+            cancelled_any = true;
+        }
+        cancelled_any
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.lock_cancel_token().as_ref().map(|t| t.is_cancelled()).unwrap_or(false)
+        self.lock_import_cancel_token().as_ref().is_some_and(|t| t.is_cancelled())
+            || self.lock_batch_cancel_token().as_ref().is_some_and(|t| t.is_cancelled())
     }
 
     pub fn try_start_import(&self) -> Result<(), String> {
@@ -382,7 +404,8 @@ pub fn run() {
             settings: Mutex::new(settings),
             data_dir: Mutex::new(Some(data_dir)),
             model_manager: Mutex::new(model_manager),
-            cancel_token: Mutex::new(None),
+            import_cancel_token: Mutex::new(None),
+            batch_cancel_token: Mutex::new(None),
             import_state: Mutex::new(ImportState::Idle),
             batch_state: Mutex::new(BatchState::Idle),
             media_registry: Mutex::new(MediaRegistry::default()),
@@ -596,7 +619,8 @@ mod tests {
             settings: Mutex::new(settings),
             data_dir: Mutex::new(Some(data_dir)),
             model_manager: Mutex::new(model_manager),
-            cancel_token: Mutex::new(None),
+            import_cancel_token: Mutex::new(None),
+            batch_cancel_token: Mutex::new(None),
             import_state: Mutex::new(ImportState::Idle),
             batch_state: Mutex::new(BatchState::Idle),
             media_registry: Mutex::new(MediaRegistry::default()),
@@ -611,7 +635,7 @@ mod tests {
         token.cancel();
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = state.cancel_token.lock().expect("lock cancel token");
+            let _guard = state.batch_cancel_token.lock().expect("lock cancel token");
             panic!("poison cancel token");
         }));
 
@@ -625,7 +649,7 @@ mod tests {
         let state = test_app_state(dir.path().to_path_buf());
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = state.cancel_token.lock().expect("lock cancel token");
+            let _guard = state.import_cancel_token.lock().expect("lock cancel token");
             panic!("poison cancel token");
         }));
 
@@ -633,6 +657,24 @@ mod tests {
         assert!(!token.is_cancelled());
         assert!(state.cancel_current_operation());
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_reaches_both_a_running_import_and_batch() {
+        // Hardening-audit MEDIUM: an import (start_cancel_token) and a batch (ensure_cancel_token) run
+        // under separate gates and used to SHARE one cancel slot, so starting one detached the other's
+        // token and the single Cancel control could miss a still-running operation. With independent
+        // slots, cancel_current_operation signals BOTH.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+
+        let batch = state.ensure_cancel_token().expect("batch token"); // batch slot
+        let import = state.start_cancel_token(); // import slot — must NOT detach the batch token
+        assert!(!batch.is_cancelled() && !import.is_cancelled(), "both live before cancel");
+
+        assert!(state.cancel_current_operation());
+        assert!(batch.is_cancelled(), "the batch is cancelled (its token was lost before the fix)");
+        assert!(import.is_cancelled(), "the import is cancelled too");
     }
 
     #[test]
