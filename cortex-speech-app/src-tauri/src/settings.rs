@@ -470,6 +470,23 @@ mod tests {
     }
 
     #[test]
+    fn cloud_stt_opt_in_persists_through_save_load_and_is_backward_compatible() {
+        // Backward-compat: a settings.json written before this field existed must still load, with
+        // the field defaulting to OFF (no surprise cloud STT calls for existing users).
+        let mut v = serde_json::to_value(AppSettings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("cloud_stt_opt_in");
+        let legacy: AppSettings = serde_json::from_value(v).expect("legacy settings (no field) must load");
+        assert!(!legacy.cloud_stt_opt_in, "a missing field defaults to OFF");
+
+        // Restart-safety: the toggle must survive the REAL persistence path (atomic write + key
+        // scrub), not just a raw serde round-trip — otherwise it would silently reset every launch.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() }.save(&path).expect("save");
+        assert!(AppSettings::load(&path).cloud_stt_opt_in, "the Scribe toggle must survive save -> load");
+    }
+
+    #[test]
     fn validate_accepts_https_and_localhost_endpoints() {
         // The default (Ollama localhost) must pass.
         assert!(AppSettings::default().validate().is_ok());
