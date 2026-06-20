@@ -149,6 +149,62 @@ pub fn get_model_version(db: &Database, id: &str) -> AppResult<Option<ModelVersi
     }
 }
 
+/// The champion's gold CER, if a champion exists for the family and has been evaluated. This is the
+/// CER baseline the promotion gate compares a challenger against (`decide_promotion`'s `champion_cer`).
+pub fn champion_gold_cer(db: &Database, family: &str) -> AppResult<Option<f64>> {
+    let conn = db.connection();
+    let value: Option<f64> = conn
+        .query_row(
+            "SELECT gold_cer FROM model_versions WHERE family = ?1 AND status = 'champion'",
+            params![family],
+            |row| row.get(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    Ok(value)
+}
+
+/// Record a version's gold-set evaluation onto its registry row (the scorecard + headline metrics
+/// the promotion gate reads). Errors if the version id is unknown, so an eval can never silently
+/// attach to nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn record_eval_result(
+    db: &Database,
+    version_id: &str,
+    gold_wer: f64,
+    gold_cer: f64,
+    gold_ci_low: f64,
+    gold_ci_high: f64,
+    mapsswe_p_vs_active: Option<f64>,
+    scorecard_json: &str,
+    eval_run_id: Option<&str>,
+) -> AppResult<()> {
+    let updated = db.connection().execute(
+        "UPDATE model_versions
+         SET gold_wer = ?2, gold_cer = ?3, gold_ci_low = ?4, gold_ci_high = ?5,
+             mapsswe_p_vs_active = ?6, scorecard_json = ?7, eval_run_id = ?8
+         WHERE id = ?1",
+        params![
+            version_id,
+            gold_wer,
+            gold_cer,
+            gold_ci_low,
+            gold_ci_high,
+            mapsswe_p_vs_active,
+            scorecard_json,
+            eval_run_id,
+        ],
+    )?;
+    if updated == 0 {
+        return Err(AppError::Validation(format!(
+            "cannot record an eval result for unknown model version '{version_id}'"
+        )));
+    }
+    Ok(())
+}
+
 /// The policy a challenger must satisfy to be promoted over the current champion. Defaults encode
 /// the doc's reconciled gate: the challenger must *significantly* beat the champion on WER (the
 /// existing scorecard `beats_baseline` rule) AND must not regress CER. The optional reduction
@@ -350,6 +406,36 @@ mod tests {
         assert!(promote_to_champion(&db, "ghost").is_err(), "promoting a nonexistent id must error");
         // The real champion is untouched.
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "v1");
+    }
+
+    #[test]
+    fn record_eval_result_persists_gold_metrics_and_feeds_champion_cer() {
+        let db = open();
+        register_candidate(&db, &candidate("v1", "omniasr-7b", "user-finetuned", "sha")).unwrap();
+        record_eval_result(&db, "v1", 0.18, 0.07, 0.05, 0.09, Some(0.01), "{\"k\":1}", None).unwrap();
+
+        let (wer, cer, scj): (f64, f64, String) = db
+            .connection()
+            .query_row(
+                "SELECT gold_wer, gold_cer, scorecard_json FROM model_versions WHERE id = 'v1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!((wer - 0.18).abs() < 1e-9);
+        assert!((cer - 0.07).abs() < 1e-9);
+        assert_eq!(scj, "{\"k\":1}");
+
+        // Once promoted, champion_gold_cer surfaces that CER as the gate's baseline.
+        assert!(champion_gold_cer(&db, "omniasr-7b").unwrap().is_none(), "no champion yet");
+        promote_to_champion(&db, "v1").unwrap();
+        assert!((champion_gold_cer(&db, "omniasr-7b").unwrap().unwrap() - 0.07).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_eval_result_errors_for_unknown_version() {
+        let db = open();
+        assert!(record_eval_result(&db, "ghost", 0.1, 0.1, 0.0, 0.2, None, "{}", None).is_err());
     }
 
     // --- promotion gate ---
