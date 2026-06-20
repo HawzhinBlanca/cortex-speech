@@ -451,6 +451,9 @@ fn learning_text_key(text: &str) -> String {
 
 /// POST the DPO preference dataset to a local fine-tuning endpoint.
 pub fn run_dpo_update(db: &Database, endpoint: &str) -> AppResult<String> {
+    // Same outbound allow-list the settings LLM endpoint enforces — this is a parallel channel that
+    // POSTs private preference pairs, so it must not be repointable at an arbitrary/non-https host.
+    crate::settings::validate_outbound_endpoint(endpoint)?;
     let export = build_dpo_dataset(db)?;
 
     if export.pair_count == 0 {
@@ -478,6 +481,22 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         db
+    }
+
+    #[test]
+    fn run_dpo_update_rejects_unsafe_endpoints_before_posting() {
+        // Hardening-audit MEDIUM (exfil channel): the DPO export must enforce the same outbound
+        // allow-list as the settings LLM endpoint, so it can't be repointed at an arbitrary host.
+        let db = open_mem_db();
+        assert!(
+            run_dpo_update(&db, "http://attacker.example.com/collect").is_err(),
+            "plain-http remote endpoint must be rejected up front"
+        );
+        assert!(run_dpo_update(&db, "").is_err(), "empty endpoint must be rejected");
+        // An allowed endpoint passes validation; with no preference pairs it's a clean no-op (no POST
+        // is attempted, so no network is touched in the test).
+        let msg = run_dpo_update(&db, "https://localhost:65535/ingest").expect("valid endpoint passes validation");
+        assert!(msg.contains("No preference pairs"), "expected no-op export, got: {msg}");
     }
 
     fn insert_current_source_reference(db: &Database, audio_path: &str, model_id: &str, transcript_text: &str) {
