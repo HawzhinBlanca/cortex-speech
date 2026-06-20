@@ -1571,7 +1571,8 @@ impl ProcessingPipeline {
 
         let model_id = self.local_asr_model_id().to_string();
         if let Some(cached) = self.cache.get_chunk(path, &model_id, chunk_suffix.as_deref()) {
-            return Ok((cached.raw_transcript.clone(), cached.raw_transcript, None));
+            let fired = self.fire_loop0_if_enabled(&cached.raw_transcript);
+            return Ok((cached.raw_transcript.clone(), fired, None));
         }
 
         let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
@@ -1626,7 +1627,24 @@ impl ProcessingPipeline {
             }
         }
 
+        let final_text = self.fire_loop0_if_enabled(&final_text);
         Ok((raw_text, final_text, confidence))
+    }
+
+    /// Apply LOOP-0 firing to a finalized transcript, opening a short-lived DB connection only when
+    /// the opt-in is enabled (so the default-off path pays nothing). Best-effort — a db-open failure
+    /// logs and returns the original text rather than failing transcription.
+    fn fire_loop0_if_enabled(&self, transcript: &str) -> String {
+        if !self.settings.loop0_firing_enabled {
+            return transcript.to_string();
+        }
+        match self.open_db() {
+            Ok(db) => apply_loop0_firing(true, &db, transcript),
+            Err(error) => {
+                tracing::warn!("LOOP-0 firing skipped (could not open db): {error}");
+                transcript.to_string()
+            }
+        }
     }
 
     pub fn run_gold_eval_local(&self, db: &Database, model_id: &str) -> AppResult<crate::eval::EvalRunResult> {
