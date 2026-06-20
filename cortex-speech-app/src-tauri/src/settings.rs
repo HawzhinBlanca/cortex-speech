@@ -70,6 +70,11 @@ pub struct AppSettings {
     pub llm_api_key_configured: bool,
     #[serde(default)]
     pub cloud_llm_opt_in: bool,
+    /// Gate for cloud speech-to-text (ElevenLabs Scribe). When on (and a Scribe key is configured),
+    /// imports transcribe the whole file via Scribe instead of the local ASR. Audio is sent to
+    /// ElevenLabs' API — off by default, like every other cloud gate.
+    #[serde(default)]
+    pub cloud_stt_opt_in: bool,
     #[serde(default = "default_llm_system_prompt")]
     pub llm_system_prompt: String,
     #[serde(default = "default_llm_model")]
@@ -281,6 +286,7 @@ impl Default for AppSettings {
             llm_api_key: "".to_string(),
             llm_api_key_configured: false,
             cloud_llm_opt_in: false,
+            cloud_stt_opt_in: false,
             llm_system_prompt: default_llm_system_prompt(),
             llm_model: default_llm_model(),
             external_asr_script_path: "".to_string(),
