@@ -1565,7 +1565,7 @@ impl ProcessingPipeline {
                     raw_transcript: s.text.clone(),
                     normalized_transcript: normalized,
                     alignment_json: Some(meta.to_alignment_json()),
-                    duration_ms: (end - start).max(0),
+                    duration_ms: end.saturating_sub(start).max(0),
                     ..Default::default()
                 }
             })
@@ -2296,6 +2296,16 @@ mod tests {
     #[test]
     fn build_scribe_segments_empty_input() {
         assert!(super::ProcessingPipeline::build_scribe_speech_segments(&[], "/x.wav", 1000, false, false).is_empty());
+    }
+
+    #[test]
+    fn build_scribe_segments_no_overflow_on_extreme_timestamps() {
+        use crate::scribe_api::ScribeSegment;
+        // Untrusted timestamps (saturated i64) must not overflow-panic the duration math.
+        let segs = vec![ScribeSegment { text: "x".into(), source_start_ms: i64::MIN, source_end_ms: i64::MAX }];
+        let out = super::ProcessingPipeline::build_scribe_speech_segments(&segs, "/x.wav", 1000, false, false);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].duration_ms >= 0, "duration is never negative and never overflows");
     }
 
     #[test]
