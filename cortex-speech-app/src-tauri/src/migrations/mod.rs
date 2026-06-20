@@ -445,6 +445,59 @@ pub static MIGRATIONS: &[Migration] = &[
              ALTER TABLE segment_hypotheses DROP COLUMN model_version_id;",
         ),
     },
+    Migration {
+        version: 23,
+        description: "Add model registry (model_versions + adapters) with DB-enforced invariants (P1)",
+        // The gated ingestion path for an externally fine-tuned model. model_versions gives
+        // version lineage + eval scorecard + promotion status; adapters records LoRA lineage
+        // (base SHA, adapter SHA, merged-checkpoint SHA) so a merge-to-base ingestion is
+        // reproducible. Invariants are enforced by the SCHEMA, not by hopeful code:
+        //   * CHECK on `source` and `status` — no garbage state can be written.
+        //   * partial UNIQUE index idx_model_versions_one_champion — AT MOST ONE champion per
+        //     family is physically impossible to violate (the promotion gate's core invariant).
+        //   * adapters.parent_model_version_id ON DELETE CASCADE — an adapter is a delta OF its
+        //     parent; it is meaningless without it, so it dies with the parent.
+        // The non-empty checkpoint_sha256 requirement for trusted promotion is enforced at the
+        // import code path (P1), not here, since empty-pin is legitimate for stock seeds.
+        up_sql: "CREATE TABLE IF NOT EXISTS model_versions (
+            id                  TEXT PRIMARY KEY,
+            family              TEXT NOT NULL,
+            model_card_name     TEXT,
+            checkpoint_sha256   TEXT NOT NULL,
+            checkpoint_path     TEXT NOT NULL,
+            base_version_id     TEXT REFERENCES model_versions(id) ON DELETE SET NULL,
+            source              TEXT NOT NULL
+                                CHECK (source IN ('meta-stock', 'user-finetuned', 'cortex-finetuned')),
+            license             TEXT NOT NULL,
+            eval_run_id         TEXT REFERENCES eval_runs(id) ON DELETE SET NULL,
+            gold_wer            REAL,
+            gold_cer            REAL,
+            gold_ci_low         REAL,
+            gold_ci_high        REAL,
+            mapsswe_p_vs_active REAL,
+            scorecard_json      TEXT,
+            status              TEXT NOT NULL DEFAULT 'candidate'
+                                CHECK (status IN ('candidate', 'challenger', 'champion', 'rolled_back', 'rejected')),
+            promoted_at         TEXT,
+            created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_versions_family ON model_versions(family, status);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_model_versions_one_champion
+            ON model_versions(family) WHERE status = 'champion';
+
+        CREATE TABLE IF NOT EXISTS adapters (
+            id                              TEXT PRIMARY KEY,
+            parent_model_version_id         TEXT NOT NULL REFERENCES model_versions(id) ON DELETE CASCADE,
+            base_checkpoint_sha             TEXT NOT NULL,
+            adapter_sha256                  TEXT NOT NULL,
+            merged_checkpoint_sha           TEXT,
+            training_corrections_query_hash TEXT,
+            recipe                          TEXT,
+            created_at                      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_adapters_parent ON adapters(parent_model_version_id);",
+        down_sql: Some("DROP TABLE IF EXISTS adapters; DROP TABLE IF EXISTS model_versions;"),
+    },
 ];
 
 #[cfg(test)]
@@ -725,6 +778,108 @@ mod tests {
             )
             .unwrap();
         assert_eq!(nulls, 0, "model_version_id must never be NULL (NOT NULL DEFAULT enforces the gate)");
+    }
+
+    #[test]
+    fn migration_v23_creates_model_registry() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+        for table in ["model_versions", "adapters"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "{table} table must exist after initialize()");
+        }
+        let champ_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_model_versions_one_champion'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(champ_idx, 1, "the one-champion-per-family partial index must exist");
+    }
+
+    /// Helper: insert a model_versions row, returning the rusqlite result so tests can assert
+    /// on success/failure of CHECK and UNIQUE constraints.
+    fn insert_model_version(
+        conn: &rusqlite::Connection,
+        id: &str,
+        family: &str,
+        source: &str,
+        status: &str,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO model_versions (id, family, checkpoint_sha256, checkpoint_path, source, license, status)
+             VALUES (?1, ?2, 'sha', '/p.pt', ?3, 'Apache-2.0', ?4)",
+            rusqlite::params![id, family, source, status],
+        )
+    }
+
+    #[test]
+    fn model_versions_check_constraints_reject_garbage() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+        // Valid source + status inserts cleanly.
+        assert!(insert_model_version(conn, "ok", "omniasr-7b", "user-finetuned", "candidate").is_ok());
+        // A bogus source is rejected by the CHECK constraint.
+        assert!(
+            insert_model_version(conn, "bad-src", "omniasr-7b", "pirated", "candidate").is_err(),
+            "an invalid source must be rejected by the CHECK constraint"
+        );
+        // A bogus status is rejected by the CHECK constraint.
+        assert!(
+            insert_model_version(conn, "bad-st", "omniasr-7b", "meta-stock", "the-best").is_err(),
+            "an invalid status must be rejected by the CHECK constraint"
+        );
+    }
+
+    #[test]
+    fn at_most_one_champion_per_family_is_db_enforced() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+
+        // One champion per family is fine...
+        assert!(insert_model_version(conn, "a-champ", "omniasr-7b", "meta-stock", "champion").is_ok());
+        // ...a SECOND champion in the SAME family is physically impossible (partial unique index).
+        assert!(
+            insert_model_version(conn, "a-champ2", "omniasr-7b", "user-finetuned", "champion").is_err(),
+            "two champions in one family must violate the partial unique index"
+        );
+        // A champion in a DIFFERENT family is allowed.
+        assert!(insert_model_version(conn, "w-champ", "whisper-ckb", "meta-stock", "champion").is_ok());
+        // Non-champion rows in the same family are unconstrained (many candidates allowed).
+        assert!(insert_model_version(conn, "cand1", "omniasr-7b", "user-finetuned", "candidate").is_ok());
+        assert!(insert_model_version(conn, "cand2", "omniasr-7b", "user-finetuned", "candidate").is_ok());
+    }
+
+    #[test]
+    fn adapter_dies_with_its_parent_model_version() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        insert_model_version(conn, "mv1", "omniasr-7b", "user-finetuned", "candidate").unwrap();
+        conn.execute(
+            "INSERT INTO adapters (id, parent_model_version_id, base_checkpoint_sha, adapter_sha256)
+             VALUES ('ad1', 'mv1', 'baseSHA', 'adapterSHA')",
+            [],
+        )
+        .unwrap();
+
+        // Deleting the parent model version cascades to its adapter (a delta is meaningless alone).
+        conn.execute("DELETE FROM model_versions WHERE id='mv1'", []).unwrap();
+        let remaining: i64 =
+            conn.query_row("SELECT COUNT(*) FROM adapters WHERE id='ad1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 0, "an adapter must be cascade-deleted with its parent model version");
     }
 
     #[test]
