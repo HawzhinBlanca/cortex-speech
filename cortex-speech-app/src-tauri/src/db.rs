@@ -1270,6 +1270,55 @@ mod tests {
     }
 
     #[test]
+    fn on_disk_boot_applies_all_migrations_and_survives_restart() {
+        // The real boot path (open_with_retry -> initialize) on a FILE-backed database, which the
+        // :memory: migration tests never exercise: WAL, persistence across a close, and a second
+        // open that must migrate nothing and still pass integrity_check. This is the end-to-end
+        // smoke test that the continual-learning schema (v20..v23) actually applies on a genuine
+        // app restart, not just in memory.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("cortex-speech.db");
+        let path_str = path.to_str().expect("db path");
+        let head = crate::migrations::MIGRATIONS.iter().map(|m| m.version).max().expect("migrations");
+
+        // First boot: open, migrate to head, persist, close.
+        {
+            let db = Database::open_with_retry(path_str).expect("first open");
+            db.initialize().expect("first initialize");
+            assert_eq!(crate::migrations::get_current_version(&db).expect("version"), head);
+            assert_eq!(db.integrity_check().expect("integrity").trim(), "ok");
+            db.wal_checkpoint().expect("checkpoint");
+        }
+
+        // Second boot (simulated restart): the persisted schema is already at head, so initialize
+        // migrates nothing, and the new continual-learning tables + provenance column are present.
+        let db = Database::open_with_retry(path_str).expect("reopen");
+        db.initialize().expect("reopen initialize");
+        assert_eq!(crate::migrations::get_current_version(&db).expect("version after restart"), head);
+        assert_eq!(db.integrity_check().expect("integrity after restart").trim(), "ok");
+
+        let conn = db.connection();
+        for table in ["correction_memory", "corrections", "model_versions", "adapters"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .expect("table query");
+            assert_eq!(exists, 1, "{table} must exist after an on-disk restart");
+        }
+        let has_stamp: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('segment_hypotheses') WHERE name='model_version_id'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("stamp query");
+        assert_eq!(has_stamp, 1, "the model_version_id provenance stamp must persist across a restart");
+    }
+
+    #[test]
     fn corrupt_backup_path_avoids_same_second_collision() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("recover.db");
