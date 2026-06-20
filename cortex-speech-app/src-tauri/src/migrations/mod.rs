@@ -365,6 +365,37 @@ pub static MIGRATIONS: &[Migration] = &[
                  ON speech_segments(verified, created_at);",
         down_sql: Some("DROP INDEX IF EXISTS idx_segments_verified_created;"),
     },
+    Migration {
+        version: 20,
+        description: "Add correction_memory table — the LOOP 0 instant error-memory store (P0)",
+        // The continual-learning flywheel's fastest loop: when a curator fixes a token, we
+        // persist a normalized slot key (the ±1 neighbor context) + a phonetic key
+        // (g2p(normalize(wrong_token))) so the *same* confusion is corrected on the next
+        // decode with NO retraining — engine-agnostic, fully auditable. The firing logic
+        // (a weighted vote into the ROVER confusion network) lands in a later phase; this is
+        // only the provenance-stamped store it reads from.
+        //
+        // `source_segment` is intentionally NULLABLE with ON DELETE SET NULL (not NOT NULL):
+        // a learned correction is a generalization that must OUTLIVE the clip that spawned it
+        // ("fix once -> right forever"), and a NOT NULL + RESTRICT FK would also block ordinary
+        // segment deletion once any memory exists. Provenance is best-effort; the memory is not.
+        up_sql: "CREATE TABLE IF NOT EXISTS correction_memory (
+            id               TEXT PRIMARY KEY,
+            wrong_token      TEXT NOT NULL,
+            human_token      TEXT NOT NULL,
+            slot_key         TEXT NOT NULL,
+            phonetic_key     TEXT NOT NULL,
+            source_segment   TEXT REFERENCES speech_segments(id) ON DELETE SET NULL,
+            model_version_id TEXT,
+            confidence       REAL NOT NULL DEFAULT 1.0,
+            hit_count        INTEGER NOT NULL DEFAULT 0,
+            last_fired_at    TEXT,
+            created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_corrmem_slot ON correction_memory(slot_key);
+        CREATE INDEX IF NOT EXISTS idx_corrmem_phon ON correction_memory(phonetic_key);",
+        down_sql: Some("DROP TABLE IF EXISTS correction_memory;"),
+    },
 ];
 
 #[cfg(test)]
@@ -448,6 +479,84 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exists, 1, "the v19 composite index must exist after initialize()");
+    }
+
+    #[test]
+    fn migration_v20_creates_correction_memory() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+
+        // The table and both lookup indexes exist after initialize().
+        let table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='correction_memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "correction_memory table must exist after initialize()");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                 AND name IN ('idx_corrmem_slot', 'idx_corrmem_phon')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2, "both correction_memory lookup indexes must exist");
+
+        // A row inserts with only the required columns; defaults fill confidence/hit_count/created_at.
+        conn.execute(
+            "INSERT INTO correction_memory (id, wrong_token, human_token, slot_key, phonetic_key)
+             VALUES ('m1', 'wrong', 'right', 'L|R', 'phon')",
+            [],
+        )
+        .unwrap();
+        let (conf, hits, created_set): (f64, i64, i64) = conn
+            .query_row(
+                "SELECT confidence, hit_count, created_at IS NOT NULL FROM correction_memory WHERE id='m1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(conf, 1.0, "confidence must default to 1.0");
+        assert_eq!(hits, 0, "hit_count must default to 0");
+        assert_eq!(created_set, 1, "created_at must be populated by its default");
+    }
+
+    #[test]
+    fn correction_memory_survives_source_segment_deletion() {
+        // A learned correction must OUTLIVE the clip that spawned it. With ON DELETE SET NULL
+        // (not CASCADE / not RESTRICT), deleting the source segment nulls the provenance but
+        // keeps the memory — and crucially does NOT block the segment deletion itself.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+        // FK enforcement must be on for the SET NULL action to fire (it is, per Database::open).
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("INSERT INTO speech_segments (id, audio_path) VALUES ('seg-x', '/tmp/a.wav')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO correction_memory (id, wrong_token, human_token, slot_key, phonetic_key, source_segment)
+             VALUES ('m1', 'wrong', 'right', 'L|R', 'phon', 'seg-x')",
+            [],
+        )
+        .unwrap();
+
+        // Deleting the source segment must succeed (not be blocked by the FK)...
+        conn.execute("DELETE FROM speech_segments WHERE id='seg-x'", []).unwrap();
+        // ...and the memory survives with its provenance nulled out.
+        let (count, src_is_null): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(source_segment IS NULL) FROM correction_memory WHERE id='m1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the learned correction must survive its source segment's deletion");
+        assert_eq!(src_is_null, 1, "source_segment provenance must be SET NULL on delete");
     }
 
     #[test]
