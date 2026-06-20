@@ -43,6 +43,27 @@ pub(crate) fn source_audio_identity(path: &Path) -> AppResult<SourceAudioIdentit
     Ok(SourceAudioIdentity { content_hash: hasher.finalize().to_hex().to_string(), size_bytes })
 }
 
+/// Apply LOOP-0 correction memories to a finalized transcript when the opt-in is enabled. Returns
+/// the transcript unchanged when disabled, empty, or when nothing fires. Best-effort: a memory-load
+/// failure logs and returns the original transcript rather than failing the transcription.
+pub(crate) fn apply_loop0_firing(enabled: bool, db: &crate::db::Database, transcript: &str) -> String {
+    if !enabled || transcript.trim().is_empty() {
+        return transcript.to_string();
+    }
+    match db.load_correction_memories() {
+        Ok(memories) if !memories.is_empty() => crate::corrections::apply_memories(
+            transcript,
+            &memories,
+            &crate::corrections::FiringConfig::default(),
+        ),
+        Ok(_) => transcript.to_string(),
+        Err(error) => {
+            tracing::warn!("LOOP-0 firing skipped: failed to load correction memories: {error}");
+            transcript.to_string()
+        }
+    }
+}
+
 fn subprocess_error_preview(output: &str) -> String {
     let trimmed = output.trim();
     if trimmed.is_empty() {
@@ -1535,6 +1556,10 @@ impl ProcessingPipeline {
                     raw_transcript.clone()
                 };
 
+                // LOOP 0: when enabled, correct previously-learned confusions in the final text
+                // before it is returned/stored (opt-in; default off; best-effort).
+                let final_text = apply_loop0_firing(self.settings.loop0_firing_enabled, &db, &final_text);
+
                 return Ok((raw_transcript, final_text, confidence));
             } else {
                 return Err(AppError::Other(
@@ -1978,6 +2003,33 @@ mod tests {
     use crate::settings::{AppSettings, AsrModelSize};
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn loop0_firing_respects_opt_in_and_fires_when_enabled() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        // Capture a CONFIRMED memory: the same confusion corrected on two segments -> hit_count 1,
+        // past the anti-one-off guard.
+        for id in ["pf-1", "pf-2"] {
+            let seg = SpeechSegment {
+                id: id.to_string(),
+                audio_path: format!("/audio/{id}.wav"),
+                raw_transcript: "ئەو ساڵە باش بوو".to_string(),
+                ..Default::default()
+            };
+            db.insert_segment(&seg).unwrap();
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو")).unwrap();
+        }
+        let input = "ئەو ساڵە باش بوو";
+        // Opt-in OFF -> the transcript is untouched.
+        assert_eq!(super::apply_loop0_firing(false, &db, input), input, "firing must be off by default");
+        // Opt-in ON -> the learned fix fires.
+        assert_eq!(
+            super::apply_loop0_firing(true, &db, input),
+            "ئەو ساڵە خراپ بوو",
+            "the learned correction must fire when enabled"
+        );
+    }
 
     fn test_pipeline_with_settings(settings: AppSettings) -> (super::ProcessingPipeline, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
