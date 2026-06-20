@@ -1542,7 +1542,25 @@ impl ProcessingPipeline {
                     self.settings.llm_model.clone(),
                 ) {
                     tracing::info!("Running LLM refinement on {} bytes...", raw_transcript.len());
-                    match refiner.refine_text(&raw_transcript) {
+                    let refine_result = if self.settings.ger_refinement_enabled {
+                        // Generative error correction: prime the refiner with the N-best (populated
+                        // just above) + relevant past corrections (relevance-ranked few-shot).
+                        let hyps: Vec<String> = db
+                            .get_hypotheses_for_segment(&id)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|h| h.transcript)
+                            .collect();
+                        let few_shot: Vec<(String, String)> = crate::jury::get_few_shot_examples(&db, &id, 3)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|e| (e.wrong_transcript, e.human_fix))
+                            .collect();
+                        refiner.refine_with_context(&raw_transcript, &hyps, &few_shot)
+                    } else {
+                        refiner.refine_text(&raw_transcript)
+                    };
+                    match refine_result {
                         Ok(refined) => {
                             tracing::info!("LLM Refinement successful.");
                             refined

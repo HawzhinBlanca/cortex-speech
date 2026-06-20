@@ -98,6 +98,12 @@ pub struct AppSettings {
     /// OFF — it rewrites ASR output, so it is a deliberate choice, never a silent surprise.
     #[serde(default)]
     pub loop0_firing_enabled: bool,
+
+    /// Opt-in: prime LLM refinement with the diverse N-best hypotheses + relevant past corrections
+    /// (generative error correction) instead of plain single-string refinement. Default OFF — it
+    /// changes the refinement prompt, so it is a deliberate, validate-on-your-data choice.
+    #[serde(default)]
+    pub ger_refinement_enabled: bool,
 }
 
 fn default_hf_train_ratio() -> f64 {
@@ -285,6 +291,7 @@ impl Default for AppSettings {
             jury_autonomy_level: AutonLevel::default(),
             jury_t1_threshold: default_jury_t1_threshold(),
             loop0_firing_enabled: false,
+            ger_refinement_enabled: false,
         }
     }
 }
@@ -442,8 +449,9 @@ mod tests {
 
     #[test]
     fn loop0_firing_defaults_off_and_is_backward_compatible() {
-        // Opt-in: rewriting ASR output must never be a surprise, so the default is OFF.
+        // Opt-in: rewriting ASR output / changing the refine prompt must never be a surprise -> OFF.
         assert!(!AppSettings::default().loop0_firing_enabled);
+        assert!(!AppSettings::default().ger_refinement_enabled);
         // A settings.json from before this field existed still loads (missing -> false), not an error.
         let mut v = serde_json::to_value(AppSettings::default()).unwrap();
         v.as_object_mut().unwrap().remove("loop0_firing_enabled");
