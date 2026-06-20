@@ -29,6 +29,7 @@ export interface BackendSettings {
   llm_api_key: string;
   llm_api_key_configured: boolean;
   cloud_llm_opt_in: boolean;
+  cloud_stt_opt_in?: boolean;
   llm_system_prompt: string;
   llm_model: string;
   external_asr_script_path: string;
@@ -153,6 +154,7 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
     llmApiKey: raw.llm_api_key ?? '',
     llmApiKeyConfigured: raw.llm_api_key_configured ?? false,
     cloudLlmOptIn: raw.cloud_llm_opt_in ?? false,
+    cloudSttOptIn: raw.cloud_stt_opt_in ?? false,
     llmSystemPrompt:
       raw.llm_system_prompt ??
       'You are an expert Kurdish linguist. Fix the phonetic transcription errors in the following text, preserving the exact meaning. Output ONLY the corrected text, no explanations.',
@@ -195,6 +197,7 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
     llm_api_key: ui.llmApiKey,
     llm_api_key_configured: ui.llmApiKeyConfigured || ui.llmApiKey.length > 0,
     cloud_llm_opt_in: ui.cloudLlmOptIn,
+    cloud_stt_opt_in: ui.cloudSttOptIn,
     llm_system_prompt: ui.llmSystemPrompt,
     llm_model: ui.llmModel,
     external_asr_script_path: ui.externalAsrScriptPath,

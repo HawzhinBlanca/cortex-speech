@@ -338,6 +338,22 @@
             />
             <span class="text-xs text-cortex-400">{$t('seconds')}</span>
           </label>
+          <label
+            class="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-950/20 p-3 cursor-pointer"
+          >
+            <input
+              type="checkbox"
+              class="mt-1 accent-cortex-500"
+              bind:checked={localSettings.cloudSttOptIn}
+              onchange={saveQuietly}
+            />
+            <span class="text-xs text-amber-100">
+              Cloud transcription (ElevenLabs Scribe). When on, importing a file sends its audio to
+              ElevenLabs and uses Scribe's transcript instead of the local model — one API call per
+              file. Requires an ElevenLabs key in secrets.env. Keep this off for fully offline dataset
+              work.
+            </span>
+          </label>
           <label class="flex items-center gap-3 cursor-pointer">
             <input
               type="checkbox"
