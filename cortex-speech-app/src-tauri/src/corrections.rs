@@ -198,6 +198,31 @@ pub fn apply_memories(transcript: &str, memories: &[MemoryEntry], cfg: &FiringCo
     out.join(" ")
 }
 
+/// Word-error count (substitutions + deletions + insertions) between two transcripts, compared on
+/// NORMALIZED words — the same alignment the firing rule uses.
+fn word_error_count(a: &str, b: &str) -> usize {
+    let normalizer = char_only_normalizer();
+    let na: Vec<String> = a.split_whitespace().map(|w| normalizer.normalize(w)).collect();
+    let nb: Vec<String> = b.split_whitespace().map(|w| normalizer.normalize(w)).collect();
+    align_words(&na, &nb).iter().filter(|op| !matches!(op, AlignOp::Match { .. })).count()
+}
+
+/// The net effect of LOOP-0 firing on a gold set: the change in total word-error count from applying
+/// firing to each ASR output. NEGATIVE means firing helped (fewer errors); POSITIVE means it hurt
+/// (over-triggered on already-correct words); zero means no net effect. This is the signal that
+/// gates whether firing is safe to enable for a given memory store + threshold config — run it on a
+/// held-out gold set and only enable firing (or keep a threshold) while the delta stays <= 0.
+pub fn firing_error_delta(gold: &[(String, String)], memories: &[MemoryEntry], cfg: &FiringConfig) -> i64 {
+    let mut delta = 0i64;
+    for (asr, reference) in gold {
+        let before = word_error_count(asr, reference) as i64;
+        let fired = apply_memories(asr, memories, cfg);
+        let after = word_error_count(&fired, reference) as i64;
+        delta += after - before;
+    }
+    delta
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +337,36 @@ mod tests {
         // Same slot "ساڵە|بوو" but the word sounds nothing like "باش" -> the phonetic gate blocks it.
         let out = apply_memories("ئەو ساڵە گەورە بوو", &[entry], &FiringConfig::default());
         assert_eq!(out, "ئەو ساڵە گەورە بوو", "a phonetically distant word must not be rewritten");
+    }
+
+    #[test]
+    fn firing_error_delta_is_negative_when_firing_helps() {
+        // The ASR repeated the SAME error the memory remembers; the gold reference is the human fix,
+        // so firing corrects a real error and lowers the error count.
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
+        let gold = vec![("ئەو ساڵە باش بوو".to_string(), "ئەو ساڵە خراپ بوو".to_string())];
+        assert!(
+            firing_error_delta(&gold, &[entry], &FiringConfig::default()) < 0,
+            "firing that corrects a real error must lower the error count"
+        );
+    }
+
+    #[test]
+    fn firing_error_delta_is_positive_on_over_trigger() {
+        // The memory rewrites باش->خراپ in this slot, but the gold reference KEEPS باش (the ASR was
+        // already correct). Firing wrongly changes it -> the error count goes UP.
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
+        let gold = vec![("ئەو ساڵە باش بوو".to_string(), "ئەو ساڵە باش بوو".to_string())];
+        assert!(
+            firing_error_delta(&gold, &[entry], &FiringConfig::default()) > 0,
+            "firing on an already-correct word must raise the error count (over-trigger signal)"
+        );
+    }
+
+    #[test]
+    fn firing_error_delta_is_zero_without_memories() {
+        let gold = vec![("ئەو باش بوو".to_string(), "ئەو خراپ بوو".to_string())];
+        assert_eq!(firing_error_delta(&gold, &[], &FiringConfig::default()), 0, "no memories -> no change");
     }
 
     #[test]
