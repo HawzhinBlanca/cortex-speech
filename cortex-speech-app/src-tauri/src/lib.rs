@@ -42,6 +42,7 @@ pub mod observer;
 pub mod perf;
 pub mod pipeline;
 pub mod quality;
+pub mod registry;
 pub mod runs;
 pub mod scorecard;
 pub mod secret_redaction;
