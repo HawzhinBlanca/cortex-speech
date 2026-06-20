@@ -22,7 +22,9 @@ pub struct SubstitutionMemory {
     /// `normalize(left_neighbor)|normalize(right_neighbor)` — the canonical windowed context that a
     /// future decode matches on. Empty sides mean the slot was at a sentence boundary.
     pub slot_key: String,
-    /// `g2p(normalize(wrong_token))` — the phonetic key for similarity-gated firing.
+    /// The normalized wrong token — the key for phonetic similarity-gated firing. The matcher
+    /// (`normalized_phonetic_word_distance`) applies g2p internally, so this stores the WORD, not
+    /// its phonemes (passing pre-g2p'd phonemes would double-g2p and collapse every distance to 0).
     pub phonetic_key: String,
 }
 
@@ -123,7 +125,7 @@ pub fn extract_substitution_memories(wrong: &str, right: &str) -> Vec<Substituti
             .unwrap_or_default();
         out.push(SubstitutionMemory {
             slot_key: format!("{left}|{right_ctx}"),
-            phonetic_key: crate::normalizer::g2p::g2p(&na[ai]),
+            phonetic_key: na[ai].clone(),
             wrong_token: a[ai].to_string(),
             human_token: b[bj].to_string(),
         });
@@ -131,9 +133,87 @@ pub fn extract_substitution_memories(wrong: &str, right: &str) -> Vec<Substituti
     out
 }
 
+/// A stored LOOP-0 memory as the firing rule sees it (a `correction_memory` row plus its
+/// confidence/hit-count gates).
+#[derive(Debug, Clone)]
+pub struct MemoryEntry {
+    pub wrong_token: String,
+    pub human_token: String,
+    pub slot_key: String,
+    pub phonetic_key: String,
+    pub confidence: f64,
+    pub hit_count: i64,
+}
+
+/// The firing gates. Defaults are the doc's starting points; all are tunable against the gold set's
+/// over-trigger rate.
+#[derive(Debug, Clone)]
+pub struct FiringConfig {
+    /// Max normalized phonetic distance between the candidate and the memory's wrong token.
+    pub phon_tau: f64,
+    /// Min confidence for a memory to fire.
+    pub tau_conf: f64,
+    /// Min hit_count (independent confirmations) — the anti-one-off guard.
+    pub min_hits: i64,
+}
+
+impl Default for FiringConfig {
+    fn default() -> Self {
+        Self { phon_tau: 0.2, tau_conf: 0.6, min_hits: 1 }
+    }
+}
+
+/// Apply LOOP-0 error memories to a (fused) transcript: for each word, if a memory's slot matches
+/// the normalized neighbor context AND the word is phonetically close to the memory's wrong token
+/// AND the memory clears the confidence/hit-count gates, replace it with the human token. Pure and
+/// deterministic. The gates — exact normalized slot match, phonetic similarity, confidence, and
+/// independent-confirmation count — are what keep "fix once -> right forever" from poisoning correct
+/// words. Returns the rewritten transcript (whitespace-normalized).
+pub fn apply_memories(transcript: &str, memories: &[MemoryEntry], cfg: &FiringConfig) -> String {
+    let normalizer = char_only_normalizer();
+    let words: Vec<&str> = transcript.split_whitespace().collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    let norm: Vec<String> = words.iter().map(|w| normalizer.normalize(w)).collect();
+    let mut out: Vec<String> = words.iter().map(|w| (*w).to_string()).collect();
+
+    for (i, word_norm) in norm.iter().enumerate() {
+        let left = if i > 0 { norm[i - 1].as_str() } else { "" };
+        let right = norm.get(i + 1).map(String::as_str).unwrap_or("");
+        let slot_key = format!("{left}|{right}");
+        // The closest-sounding memory at this slot that clears every gate wins. The distance
+        // function g2p's both inputs internally, so we pass the normalized WORDS, never phonemes.
+        let best = memories
+            .iter()
+            .filter(|m| m.slot_key == slot_key && m.confidence > cfg.tau_conf && m.hit_count >= cfg.min_hits)
+            .map(|m| (m, crate::diff::phonetic::normalized_phonetic_word_distance(word_norm, &m.phonetic_key)))
+            .filter(|(_, dist)| *dist <= cfg.phon_tau)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        if let Some((m, _)) = best {
+            out[i] = m.human_token.clone();
+        }
+    }
+    out.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a firing-ready MemoryEntry by capturing it from a correction (round-trip realism).
+    fn captured_entry(wrong_sentence: &str, right_sentence: &str, confidence: f64, hit_count: i64) -> MemoryEntry {
+        let m = extract_substitution_memories(wrong_sentence, right_sentence).remove(0);
+        MemoryEntry {
+            wrong_token: m.wrong_token,
+            human_token: m.human_token,
+            slot_key: m.slot_key,
+            phonetic_key: m.phonetic_key,
+            confidence,
+            hit_count,
+        }
+    }
 
     #[test]
     fn extracts_single_substitution_with_normalized_neighbors() {
@@ -193,5 +273,54 @@ mod tests {
         let wrongs: Vec<&str> = mems.iter().map(|m| m.wrong_token.as_str()).collect();
         assert!(wrongs.contains(&"پێنج"), "{wrongs:?}");
         assert!(wrongs.contains(&"بووم"), "{wrongs:?}");
+    }
+
+    // --- LOOP-0 firing ---
+
+    #[test]
+    fn memory_fires_and_corrects_the_same_confusion() {
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
+        let out = apply_memories("ئەو ساڵە باش بوو", &[entry], &FiringConfig::default());
+        assert_eq!(out, "ئەو ساڵە خراپ بوو", "the remembered fix must fire on the same confusion");
+    }
+
+    #[test]
+    fn memory_does_not_fire_in_a_different_slot() {
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
+        // "باش" appears but in a different neighbor context -> slot mismatch -> no fire.
+        let out = apply_memories("زۆر باش نییە", &[entry], &FiringConfig::default());
+        assert_eq!(out, "زۆر باش نییە", "a different slot must not fire");
+    }
+
+    #[test]
+    fn low_confidence_memory_does_not_fire() {
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 0.5, 5); // below tau_conf 0.6
+        let out = apply_memories("ئەو ساڵە باش بوو", &[entry], &FiringConfig::default());
+        assert_eq!(out, "ئەو ساڵە باش بوو", "a low-confidence memory must not fire");
+    }
+
+    #[test]
+    fn unconfirmed_memory_does_not_fire() {
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 0); // hit_count 0 < min 1
+        let out = apply_memories("ئەو ساڵە باش بوو", &[entry], &FiringConfig::default());
+        assert_eq!(out, "ئەو ساڵە باش بوو", "an unconfirmed (hit_count 0) memory must not fire");
+    }
+
+    #[test]
+    fn phonetically_distant_word_in_same_slot_does_not_fire() {
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
+        // Same slot "ساڵە|بوو" but the word sounds nothing like "باش" -> the phonetic gate blocks it.
+        let out = apply_memories("ئەو ساڵە گەورە بوو", &[entry], &FiringConfig::default());
+        assert_eq!(out, "ئەو ساڵە گەورە بوو", "a phonetically distant word must not be rewritten");
+    }
+
+    #[test]
+    fn near_homophone_in_same_slot_fires() {
+        // The generalization the phonetic gate exists for: the decode produced "پاش" (a p/b
+        // mishearing of the remembered wrong token "باش") in the same slot -> it is close enough
+        // to fire and gets the human fix. This is "learn the confusion, not just the exact string".
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
+        let out = apply_memories("ئەو ساڵە پاش بوو", &[entry], &FiringConfig::default());
+        assert_eq!(out, "ئەو ساڵە خراپ بوو", "a near-homophone of the wrong token must fire");
     }
 }
