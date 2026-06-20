@@ -205,6 +205,47 @@ pub fn record_eval_result(
     Ok(())
 }
 
+/// Import an external model checkpoint into the registry as a gated candidate: verify the file
+/// exists, compute its SHA-256 server-side (content-addressing it — the caller never supplies the
+/// hash), and register it. `register_candidate`'s import gate then guarantees a finetuned source can
+/// never enter unpinned. Returns the computed checkpoint hash.
+///
+/// This is the safe half of ingesting a fine-tuned model. Writing the fairseq2 asset-card and
+/// resolving the real base-card name (which must fail loudly rather than hardcode `…_v2`) are a
+/// follow-up that needs the WSL fairseq2 registry.
+#[allow(clippy::too_many_arguments)]
+pub fn import_checkpoint(
+    db: &Database,
+    id: &str,
+    family: &str,
+    checkpoint_path: &str,
+    source: &str,
+    license: &str,
+    model_card_name: Option<String>,
+) -> AppResult<String> {
+    let path = std::path::Path::new(checkpoint_path);
+    if !path.is_file() {
+        return Err(AppError::Validation(format!(
+            "cannot import checkpoint: no file at '{checkpoint_path}'"
+        )));
+    }
+    let sha = crate::models::compute_file_sha256(path)
+        .map_err(|e| AppError::Other(format!("hashing checkpoint '{checkpoint_path}': {e}")))?;
+    register_candidate(
+        db,
+        &NewModelVersion {
+            id: id.to_string(),
+            family: family.to_string(),
+            model_card_name,
+            checkpoint_sha256: sha.clone(),
+            checkpoint_path: checkpoint_path.to_string(),
+            source: source.to_string(),
+            license: license.to_string(),
+        },
+    )?;
+    Ok(sha)
+}
+
 /// The policy a challenger must satisfy to be promoted over the current champion. Defaults encode
 /// the doc's reconciled gate: the challenger must *significantly* beat the champion on WER (the
 /// existing scorecard `beats_baseline` rule) AND must not regress CER. The optional reduction
@@ -439,6 +480,43 @@ mod tests {
         assert!(promote_to_champion(&db, "ghost").is_err(), "promoting a nonexistent id must error");
         // The real champion is untouched.
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "v1");
+    }
+
+    #[test]
+    fn import_checkpoint_hashes_file_and_registers_gated_candidate() {
+        let db = open();
+        let tmp = tempfile::tempdir().unwrap();
+        let ckpt = tmp.path().join("model.pt");
+        std::fs::write(&ckpt, b"fake fine-tuned checkpoint bytes").unwrap();
+
+        let sha = import_checkpoint(
+            &db,
+            "u7b",
+            "omniasr-7b",
+            ckpt.to_str().unwrap(),
+            "user-finetuned",
+            "Apache-2.0",
+            Some("omniASR_ckb_v3".into()),
+        )
+        .unwrap();
+
+        assert_eq!(sha.len(), 64, "a SHA-256 hex digest is 64 chars");
+        assert_eq!(sha, crate::models::compute_file_sha256(&ckpt).unwrap(), "hash is deterministic over the bytes");
+        let v = get_model_version(&db, "u7b").unwrap().unwrap();
+        assert_eq!(v.checkpoint_sha256, sha, "the computed hash is stored, not a caller-supplied one");
+        assert_eq!(v.status, "candidate", "an import is a candidate, never an instant champion");
+        assert_eq!(v.source, "user-finetuned");
+    }
+
+    #[test]
+    fn import_checkpoint_errors_on_missing_file() {
+        let db = open();
+        assert!(
+            import_checkpoint(&db, "x", "omniasr-7b", "/no/such/file.pt", "user-finetuned", "Apache-2.0", None)
+                .is_err(),
+            "importing a nonexistent checkpoint must error, not register a phantom"
+        );
+        assert!(get_model_version(&db, "x").unwrap().is_none());
     }
 
     #[test]

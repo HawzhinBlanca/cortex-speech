@@ -799,7 +799,9 @@ fn omniasr_ctc_1b_present_in(model_dir: &Path) -> bool {
         && model_file_meets_min_size(model_dir, OMNIASR_CTC_1B_TOKENS, 100)
 }
 
-fn compute_file_sha256(path: &Path) -> Result<String, String> {
+/// Compute the SHA-256 of a file as a lowercase hex string — the content-address shared by archive
+/// verification and registry import (a model checkpoint is identified by exactly this hash).
+pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("Open for hash: {e}"))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536];
