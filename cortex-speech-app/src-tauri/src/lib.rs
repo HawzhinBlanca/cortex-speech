@@ -16,6 +16,7 @@ pub mod cancel;
 pub mod chunking;
 pub mod commands;
 pub mod corrections;
+pub mod crash;
 pub mod db;
 pub mod denoiser;
 pub mod diarization;
@@ -256,6 +257,9 @@ impl AppState {
     }
 }
 
+/// Where panic crash dumps are written — set once the app data dir exists (see `run`).
+static CRASH_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     std::panic::set_hook(Box::new(|info| {
@@ -272,6 +276,13 @@ pub fn run() {
             "Box<Any>"
         };
         tracing::error!("PANIC at {}: {}", location, message);
+        // Persist a crash dump before the process dies, so the panic is diagnosable, not silent.
+        if let Some(dir) = CRASH_DIR.get() {
+            let ts = chrono::Utc::now().to_rfc3339();
+            if let Some(path) = crash::write_crash_report(dir, &location, message, &ts) {
+                eprintln!("Crash report written to {}", path.display());
+            }
+        }
     }));
 
     tracing_subscriber::fmt()
@@ -289,6 +300,8 @@ pub fn run() {
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         fatal_app_error(format!("Failed to create app data directory at {:?}: {e}", data_dir));
     }
+    // The data dir now exists — let the panic hook write crash dumps there.
+    let _ = CRASH_DIR.set(data_dir.clone());
 
     models::init_user_models_dir(data_dir.join("models"));
 
