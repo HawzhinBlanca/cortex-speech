@@ -396,6 +396,39 @@ pub static MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_corrmem_phon ON correction_memory(phonetic_key);",
         down_sql: Some("DROP TABLE IF EXISTS correction_memory;"),
     },
+    Migration {
+        version: 21,
+        description: "Add corrections provenance ledger — reconstructable, attributable training set (P0)",
+        // The append-only audit trail for the flywheel: every human fix, the raw hypothesis,
+        // each engine's transcript, the cross-architecture agreement (a LOOP-1 signal), which
+        // model/adapter produced the corrected label, and which loop changed the output. This
+        // is what makes the training set reproducible and every published label attributable.
+        //
+        // `audio_content_hash` is NOT NULL — it is the DURABLE identity (the single source of
+        // truth for holdout exclusion, matching jury/learning.rs::build_dpo_dataset). The live
+        // `segment_id` pointer is NULLABLE with ON DELETE SET NULL so the audit row OUTLIVES a
+        // deleted segment (erasing audit history on delete would defeat the ledger's purpose),
+        // and so segment deletion is never blocked. The two indexes serve the load-bearing
+        // queries: holdout exclusion (by hash) and per-segment history (by segment_id).
+        up_sql: "CREATE TABLE IF NOT EXISTS corrections (
+            id                  TEXT PRIMARY KEY,
+            segment_id          TEXT REFERENCES speech_segments(id) ON DELETE SET NULL,
+            audio_content_hash  TEXT NOT NULL,
+            raw_hypothesis      TEXT NOT NULL,
+            ensemble_hyps_json  TEXT,
+            agreement_score     REAL,
+            jury_verdict        TEXT,
+            human_fix           TEXT NOT NULL,
+            model_version_id    TEXT,
+            adapter_id          TEXT,
+            reviewer_id         TEXT,
+            loop_applied        TEXT,
+            decided_at          TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_corrections_hash ON corrections(audio_content_hash);
+        CREATE INDEX IF NOT EXISTS idx_corrections_segment ON corrections(segment_id);",
+        down_sql: Some("DROP TABLE IF EXISTS corrections;"),
+    },
 ];
 
 #[cfg(test)]
@@ -557,6 +590,77 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "the learned correction must survive its source segment's deletion");
         assert_eq!(src_is_null, 1, "source_segment provenance must be SET NULL on delete");
+    }
+
+    #[test]
+    fn migration_v21_creates_corrections_ledger() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+
+        let table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='corrections'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "corrections ledger table must exist after initialize()");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                 AND name IN ('idx_corrections_hash', 'idx_corrections_segment')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2, "both corrections lookup indexes must exist");
+
+        // A row inserts with only the required columns; decided_at fills from its default.
+        conn.execute(
+            "INSERT INTO corrections (id, audio_content_hash, raw_hypothesis, human_fix)
+             VALUES ('c1', 'blake3hash', 'wrong text', 'right text')",
+            [],
+        )
+        .unwrap();
+        let decided_set: i64 = conn
+            .query_row("SELECT decided_at IS NOT NULL FROM corrections WHERE id='c1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(decided_set, 1, "decided_at must be populated by its default");
+    }
+
+    #[test]
+    fn corrections_ledger_survives_source_segment_deletion() {
+        // The audit ledger must OUTLIVE a deleted segment — its durable identity is the
+        // audio_content_hash, not the live segment_id pointer. Deleting the source segment
+        // must succeed (FK does not block it) and the audit row must remain, hash intact,
+        // with segment_id SET NULL.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("INSERT INTO speech_segments (id, audio_path) VALUES ('seg-y', '/tmp/b.wav')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO corrections (id, segment_id, audio_content_hash, raw_hypothesis, human_fix)
+             VALUES ('c1', 'seg-y', 'blake3hash', 'wrong', 'right')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM speech_segments WHERE id='seg-y'", []).unwrap();
+        let (count, seg_is_null, hash): (i64, i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(segment_id IS NULL), MAX(audio_content_hash)
+                 FROM corrections WHERE id='c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the audit row must survive its source segment's deletion");
+        assert_eq!(seg_is_null, 1, "segment_id must be SET NULL on delete");
+        assert_eq!(hash, "blake3hash", "the durable audio_content_hash must remain intact");
     }
 
     #[test]
