@@ -47,6 +47,7 @@ pub mod quality;
 pub mod registry;
 pub mod runs;
 pub mod scorecard;
+pub mod scribe_api;
 pub mod secret_redaction;
 pub mod session;
 pub mod settings;
