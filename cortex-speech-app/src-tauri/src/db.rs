@@ -1164,6 +1164,26 @@ impl Database {
         Ok(())
     }
 
+    /// Load all LOOP-0 correction memories for the firing rule. `apply_memories` applies the
+    /// confidence / hit-count / phonetic gates itself, so every stored row is returned here.
+    pub fn load_correction_memories(&self) -> AppResult<Vec<crate::corrections::MemoryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT wrong_token, human_token, slot_key, phonetic_key, confidence, hit_count
+             FROM correction_memory",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::corrections::MemoryEntry {
+                wrong_token: row.get(0)?,
+                human_token: row.get(1)?,
+                slot_key: row.get(2)?,
+                phonetic_key: row.get(3)?,
+                confidence: row.get(4)?,
+                hit_count: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Return escalated segments ordered riskiest-first (lowest agent_confidence).
     pub fn get_escalation_queue(&self, limit: usize) -> AppResult<Vec<SpeechSegment>> {
         let mut stmt = self.conn.prepare(
@@ -1715,6 +1735,47 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM correction_memory WHERE source_segment = 'mem-gold'", [], |r| r.get(0))
             .expect("count");
         assert_eq!(count, 0, "gold-segment edits must not populate LOOP-0 memory (eval-leak guard)");
+    }
+
+    #[test]
+    fn load_correction_memories_returns_captured_entries() {
+        let db = make_db();
+        let mut seg = make_segment("lm-1", "/data/audio/lm-1.wav");
+        seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+        db.insert_segment(&seg).expect("insert");
+        db.record_human_decision("lm-1", "edit", Some("ئەو ساڵە خراپ بوو")).expect("edit");
+
+        let mems = db.load_correction_memories().expect("load");
+        assert_eq!(mems.len(), 1);
+        assert_eq!(mems[0].wrong_token, "باش");
+        assert_eq!(mems[0].human_token, "خراپ");
+        assert!(mems[0].confidence >= 1.0, "fresh memory confidence defaults to 1.0");
+        assert_eq!(mems[0].hit_count, 0);
+    }
+
+    #[test]
+    fn loop0_round_trips_capture_to_fire_through_the_database() {
+        // The whole LOOP 0 minus the live-decode wiring. The same confusion is corrected on TWO
+        // segments so hit_count reaches 1 and clears the anti-one-off guard (a single correction,
+        // hit_count 0, deliberately does NOT fire — covered by unconfirmed_memory_does_not_fire).
+        let db = make_db();
+        for id in ["lm-2a", "lm-2b"] {
+            let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
+            seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+            db.insert_segment(&seg).expect("insert");
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو")).expect("edit");
+        }
+
+        let mems = db.load_correction_memories().expect("load");
+        assert_eq!(mems.len(), 1, "the repeated correction upserts to a single memory");
+        assert_eq!(mems[0].hit_count, 1, "confirmed twice -> hit_count 1, past the anti-one-off guard");
+
+        let out = crate::corrections::apply_memories(
+            "ئەو ساڵە باش بوو",
+            &mems,
+            &crate::corrections::FiringConfig::default(),
+        );
+        assert_eq!(out, "ئەو ساڵە خراپ بوو", "capture x2 -> DB -> load -> fire reproduces the human fix");
     }
 
     #[test]
