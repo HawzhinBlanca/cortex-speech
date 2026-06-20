@@ -561,4 +561,16 @@ mod tests {
         assert_eq!(ctc_align(&logits, 0, &[1], 0), (Vec::new(), f32::NEG_INFINITY));
         assert_eq!(forward_backward_ctc_score(&logits, 0, &[1], 0), -20.0);
     }
+
+    #[test]
+    fn ctc_functions_are_total_on_other_degenerate_inputs() {
+        // The remaining guard branches on the alignment hot path must also return the sentinel,
+        // never panic: logits shorter than vocab (num_frames == 0), empty targets, empty logits.
+        assert_eq!(ctc_align(&[0.1, 0.2], 5, &[1], 0), (Vec::new(), f32::NEG_INFINITY), "logits < vocab");
+        assert_eq!(forward_backward_ctc_score(&[0.1, 0.2], 5, &[1], 0), -20.0, "logits < vocab");
+        assert_eq!(ctc_align(&[0.1, 0.2, 0.3], 3, &[], 0), (Vec::new(), f32::NEG_INFINITY), "empty targets");
+        assert_eq!(forward_backward_ctc_score(&[0.1, 0.2, 0.3], 3, &[], 0), -20.0, "empty targets");
+        assert_eq!(forward_backward_ctc_score(&[], 3, &[1], 0), -20.0, "empty logits");
+        assert_eq!(ctc_align(&[], 3, &[1], 0), (Vec::new(), f32::NEG_INFINITY), "empty logits");
+    }
 }
