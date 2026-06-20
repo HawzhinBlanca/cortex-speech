@@ -117,6 +117,23 @@ fn normalize_search_query(text: &str) -> String {
     .normalize(text)
 }
 
+/// Convert free-text search input into a SAFE FTS5 `MATCH` string. FTS5 parses the bound value as a
+/// full-text *query*, so bare metacharacters (`"` `:` `*` `(` `)` `^` `-` and the bareword keywords
+/// `AND`/`OR`/`NEAR`) make it raise a hard error on ordinary punctuation — e.g. a user typing a
+/// single `"` or `:` in the transcript search box would get a low-level "fts5: syntax error" instead
+/// of results. We treat the box as literal text: split on whitespace and wrap each token as a quoted
+/// FTS5 string (internal `"` doubled), which FTS5 reads as a literal term. Tokens are implicitly
+/// AND-ed (matching the previous behaviour for multi-word queries). Returns `""` for whitespace-only
+/// input so the caller can short-circuit to an empty result.
+fn to_fts5_match(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The only split labels the export/stats math understands.
 const VALID_SPLITS: &[&str] = &["train", "validation", "test"];
 
@@ -593,7 +610,11 @@ impl Database {
     }
 
     pub fn search_segments(&self, text: &str) -> AppResult<Vec<SpeechSegment>> {
-        let query = normalize_search_query(text);
+        let match_query = to_fts5_match(&normalize_search_query(text));
+        // Whitespace-only / empty input is an empty result, not an FTS5 `MATCH ""` error.
+        if match_query.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, audio_path, raw_transcript, normalized_transcript,
                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
@@ -605,7 +626,7 @@ impl Database {
              WHERE id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?1)
              ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map(params![query], Self::map_row)?;
+        let rows = stmt.query_map(params![match_query], Self::map_row)?;
         let mut segments = Vec::new();
         for row in rows {
             segments.push(row?);
@@ -1515,6 +1536,27 @@ mod tests {
         let after_delete = db.search_segments("hawzhin").expect("search after delete");
         assert_eq!(after_delete.len(), 1, "FTS should track batch deletes");
         assert_eq!(after_delete[0].id, "fts-2");
+    }
+
+    #[test]
+    fn search_treats_fts5_metacharacters_as_literal_text_not_query_syntax() {
+        // Regression for the hardening-audit HIGH finding: FTS5 parses the bound value as a query,
+        // so ordinary punctuation used to raise a hard error (unterminated string / no such column /
+        // fts5: syntax error) and surface a confusing toast on every such keystroke.
+        let db = make_db();
+        let mut seg = make_segment("repro-1", "/a.wav");
+        seg.raw_transcript = "hello world foo bar".to_string();
+        db.insert_segment(&seg).expect("insert");
+
+        // Each of these errored BEFORE the fix; all must now be Ok (results or empty), never Err.
+        for q in ["\"hello", "foo:bar", "*", "(", "NEAR(a b", "a AND", "OR", "^", "-foo", ")"] {
+            assert!(db.search_segments(q).is_ok(), "query {q:?} must not error");
+        }
+        // A real token still finds the segment, and a quote next to it doesn't break matching.
+        assert_eq!(db.search_segments("hello").unwrap().len(), 1, "literal token still matches");
+        assert_eq!(db.search_segments("\"hello\"").unwrap().len(), 1, "quoted token matches too");
+        // Whitespace-only input is an empty result, not an error.
+        assert!(db.search_segments("   ").unwrap().is_empty(), "blank query -> empty, not error");
     }
 
     #[test]
