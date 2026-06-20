@@ -429,6 +429,22 @@ pub static MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_corrections_segment ON corrections(segment_id);",
         down_sql: Some("DROP TABLE IF EXISTS corrections;"),
     },
+    Migration {
+        version: 22,
+        description: "Stamp model_version_id on every hypothesis + verdict (P0 provenance gate)",
+        // The P0 attribution gate: no hypothesis or verdict may exist without naming WHICH model
+        // produced it. Rather than edit every INSERT path, the column is NOT NULL DEFAULT
+        // 'unknown@pre-registry' — SQLite back-fills every existing row to that sentinel, and any
+        // future INSERT that omits the column still receives it, so the gate ("no row lacks
+        // model_version_id") holds at the schema level. The registry (model_versions/adapters,
+        // P1) will turn this free-text id into a foreign key once those tables land.
+        up_sql: "ALTER TABLE segment_hypotheses ADD COLUMN model_version_id TEXT NOT NULL DEFAULT 'unknown@pre-registry';
+                 ALTER TABLE speech_segments ADD COLUMN model_version_id TEXT NOT NULL DEFAULT 'unknown@pre-registry';",
+        down_sql: Some(
+            "ALTER TABLE speech_segments DROP COLUMN model_version_id;
+             ALTER TABLE segment_hypotheses DROP COLUMN model_version_id;",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -661,6 +677,54 @@ mod tests {
         assert_eq!(count, 1, "the audit row must survive its source segment's deletion");
         assert_eq!(seg_is_null, 1, "segment_id must be SET NULL on delete");
         assert_eq!(hash, "blake3hash", "the durable audio_content_hash must remain intact");
+    }
+
+    #[test]
+    fn migration_v22_stamps_model_version_id_with_sentinel_default() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+
+        // Both tables carry the column.
+        for table in ["speech_segments", "segment_hypotheses"] {
+            let has_col: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name='model_version_id'",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(has_col, 1, "{table} must have a model_version_id column after v22");
+        }
+
+        // The gate: an INSERT that OMITS model_version_id still gets the sentinel — so no
+        // hypothesis or verdict row can ever lack attribution, without touching INSERT paths.
+        conn.execute("INSERT INTO speech_segments (id, audio_path) VALUES ('s1', '/a.wav')", []).unwrap();
+        conn.execute(
+            "INSERT INTO segment_hypotheses (segment_id, model_id, transcript)
+             VALUES ('s1', 'omniasr-ctc-300m', 'hi')",
+            [],
+        )
+        .unwrap();
+        let seg_mv: String = conn
+            .query_row("SELECT model_version_id FROM speech_segments WHERE id='s1'", [], |r| r.get(0))
+            .unwrap();
+        let hyp_mv: String = conn
+            .query_row("SELECT model_version_id FROM segment_hypotheses WHERE segment_id='s1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seg_mv, "unknown@pre-registry", "verdict rows default to the pre-registry sentinel");
+        assert_eq!(hyp_mv, "unknown@pre-registry", "hypothesis rows default to the pre-registry sentinel");
+
+        // No NULLs exist anywhere in either column.
+        let nulls: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM speech_segments WHERE model_version_id IS NULL)
+                      + (SELECT COUNT(*) FROM segment_hypotheses WHERE model_version_id IS NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 0, "model_version_id must never be NULL (NOT NULL DEFAULT enforces the gate)");
     }
 
     #[test]
