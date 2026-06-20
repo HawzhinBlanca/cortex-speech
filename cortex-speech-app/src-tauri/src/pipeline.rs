@@ -2309,6 +2309,43 @@ mod tests {
     }
 
     #[test]
+    fn scribe_segments_round_trip_through_the_database() {
+        // Smoke test: the Scribe import path persists segments AND their playback timing survives a
+        // real DB round-trip (migrate -> insert_segments_batch -> read back). Covers what the pure
+        // build test cannot: serialization of text, duration, and the SegmentSourceMeta alignment.
+        use crate::scribe_api::ScribeSegment;
+        let db = crate::db::Database::open(":memory:").expect("open in-memory db");
+        db.initialize().expect("migrate schema");
+        let scribe = vec![
+            ScribeSegment { text: "ئەمە یەکەمە".into(), source_start_ms: 0, source_end_ms: 1500 },
+            ScribeSegment { text: "دووەمین پارچە".into(), source_start_ms: 2000, source_end_ms: 5000 },
+        ];
+        let built = super::ProcessingPipeline::build_scribe_speech_segments(&scribe, "/audio/x.wav", 6000, false, false);
+        db.insert_segments_batch(&built).expect("insert batch");
+
+        let mut back = db.get_segments(None).expect("read back");
+        assert_eq!(back.len(), 2, "both Scribe segments persisted");
+        let start_of = |s: &crate::db::SpeechSegment| {
+            crate::chunking::SegmentSourceMeta::from_alignment_json(s.alignment_json.as_deref().unwrap_or(""))
+                .map_or(i64::MAX, |m| m.source_start_ms)
+        };
+        back.sort_by_key(start_of);
+        assert_eq!(back[0].raw_transcript, "ئەمە یەکەمە", "text survives the round-trip");
+        assert_eq!(back[0].audio_path, "/audio/x.wav");
+        assert_eq!(back[0].duration_ms, 1500);
+        let m0 =
+            crate::chunking::SegmentSourceMeta::from_alignment_json(back[0].alignment_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            (m0.source_start_ms, m0.source_end_ms, m0.chunk_index, m0.chunk_count),
+            (0, 1500, 0, 2),
+            "alignment time-range + chunk indices survive persistence — playback hits the right slice"
+        );
+        let m1 =
+            crate::chunking::SegmentSourceMeta::from_alignment_json(back[1].alignment_json.as_deref().unwrap()).unwrap();
+        assert_eq!((m1.source_start_ms, m1.source_end_ms), (2000, 5000));
+    }
+
+    #[test]
     fn scribe_key_gate_requires_opt_in() {
         // Key present but cloud STT NOT opted in -> None (no cloud calls without explicit opt-in).
         let (pipeline, dir) =
