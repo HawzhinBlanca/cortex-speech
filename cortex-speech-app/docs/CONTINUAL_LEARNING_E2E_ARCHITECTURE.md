@@ -10,6 +10,11 @@
 > 2. The on-device CTC engine is the sherpa-onnx OmniASR int8 bundle whose archive URL is dated **2025-11-12** (verified in `models.rs`: `OMNIASR_CTC_300M_ARCHIVE_URL` / `OMNIASR_CTC_1B_ARCHIVE_URL`), not a "v2".
 > 3. The string `omniASR_LLM_7B_v2` is what the **local** ensemble script actually passes — `ASRInferencePipeline(model_card="omniASR_LLM_7B_v2")` in `scripts/sorani_ensemble_asr.py` (the line reading `pipe7b = ASRInferencePipeline(model_card="omniASR_LLM_7B_v2")`). There is **no Meta release I can verify under either `omniASR_LLM_7B_v2` *or* `omniASR_LLM_7B`** — the canonical published base-card name is itself unconfirmed at my cutoff and **must be resolved at integration time** (see §3.2). The doc treats `…_v2` as an unresolved local override throughout, never as a usable card.
 
+> **Implementation status (shipped on `worktree-cortex-10x`).** The migration cascade has begun landing, and the *shipped* numbering differs slightly from the v22/v23 sketch in §3.3/§7.3 below — exactly the drift this doc warned about (trust the table/symbol names, not the integers):
+> - **v20** `correction_memory` (§2.3) · **v21** `corrections` ledger (§2.7) · **v22** `model_version_id` stamp on hypotheses + verdicts (the P0 attribution gate) · **v23** model registry — `model_versions` **and** `adapters` combined in one FK-coupled migration (§3.3).
+> - Control surface shipped: `registry.rs` — the import gate (non-empty checkpoint SHA required for `user-finetuned`/`cortex-finetuned` sources) and atomic champion promotion. The one-champion-per-family invariant is a DB-level partial unique index; the closed `source`/`status` vocabulary is CHECK-enforced.
+> - Proven on disk: an `open→initialize(all migrations)→restart→integrity_check` smoke test.
+
 ---
 
 ## Table of contents
