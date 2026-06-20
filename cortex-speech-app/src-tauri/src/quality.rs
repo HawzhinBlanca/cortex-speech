@@ -1,3 +1,4 @@
+pub mod calibration;
 pub mod conformal;
 pub mod irt;
 pub mod ood;
