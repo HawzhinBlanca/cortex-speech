@@ -261,6 +261,35 @@ pub fn import_checkpoint(
     Ok(sha)
 }
 
+/// Build the fairseq2 asset-card YAML that drops an imported checkpoint into the WSL inference path
+/// with zero change to the Python code. Enforces the two hard preconditions the architecture doc
+/// calls out:
+///   - `base` (the RESOLVED published base-card name) must be non-empty — never write an asset card
+///     pointing at an unresolved base, which would silently fail to load. Resolving the base from
+///     the installed fairseq2 registry is the caller's job; this refuses an empty one loudly rather
+///     than hardcoding `…_v2`.
+///   - `checkpoint_wsl_path` must be a WSL-visible `/mnt/...` path: the 7B runs in WSL, so a Windows
+///     `C:\...` path silently fails to load and is rejected here.
+pub fn build_fairseq2_asset_card(name: &str, base: &str, checkpoint_wsl_path: &str) -> AppResult<String> {
+    if name.trim().is_empty() {
+        return Err(AppError::Validation("asset-card name must not be empty".into()));
+    }
+    if base.trim().is_empty() {
+        return Err(AppError::Validation(
+            "asset-card base must be the RESOLVED fairseq2 base-card name — refusing to write an \
+             unresolved base (it would silently fail to load)"
+                .into(),
+        ));
+    }
+    if !checkpoint_wsl_path.starts_with("/mnt/") {
+        return Err(AppError::Validation(format!(
+            "checkpoint must be a WSL-visible /mnt/... path (the 7B runs in WSL; a Windows path \
+             silently fails): got '{checkpoint_wsl_path}'"
+        )));
+    }
+    Ok(format!("name: {name}\nbase: {base}\ncheckpoint: \"{checkpoint_wsl_path}\"\n"))
+}
+
 /// The policy a challenger must satisfy to be promoted over the current champion. Defaults encode
 /// the doc's reconciled gate: the challenger must *significantly* beat the champion on WER (the
 /// existing scorecard `beats_baseline` rule) AND must not regress CER. The optional reduction
@@ -534,6 +563,34 @@ mod tests {
         assert_eq!(all.len(), 3, "every registered version is listed");
         let ids: Vec<&str> = all.iter().map(|v| v.id.as_str()).collect();
         assert!(ids.contains(&"a") && ids.contains(&"b") && ids.contains(&"c"));
+    }
+
+    #[test]
+    fn asset_card_yaml_has_name_base_and_wsl_checkpoint() {
+        let yaml = build_fairseq2_asset_card(
+            "omniASR_ckb_v3@user",
+            "omniASR_LLM_7B",
+            "/mnt/c/models/abc/consolidated.pt",
+        )
+        .unwrap();
+        assert!(yaml.contains("name: omniASR_ckb_v3@user"), "{yaml}");
+        assert!(yaml.contains("base: omniASR_LLM_7B"), "{yaml}");
+        assert!(yaml.contains("checkpoint: \"/mnt/c/models/abc/consolidated.pt\""), "{yaml}");
+    }
+
+    #[test]
+    fn asset_card_refuses_unresolved_base() {
+        // An empty/blank base must fail loudly — never hardcode or silently accept an unresolved card.
+        assert!(build_fairseq2_asset_card("n", "", "/mnt/c/x.pt").is_err());
+        assert!(build_fairseq2_asset_card("n", "   ", "/mnt/c/x.pt").is_err());
+    }
+
+    #[test]
+    fn asset_card_refuses_windows_checkpoint_path() {
+        assert!(
+            build_fairseq2_asset_card("n", "base", "C:\\models\\x.pt").is_err(),
+            "a Windows checkpoint path must be rejected — it silently fails to load in WSL"
+        );
     }
 
     #[test]
