@@ -32,6 +32,25 @@ impl LlmRefiner {
         Some(Self { provider, endpoint, api_key, system_prompt, model })
     }
 
+    /// Build a refiner backed by OpenRouter — the VERIFIED gateway to Gemini 2.5 Pro, GPT-4o-mini,
+    /// etc. OpenRouter speaks the OpenAI-compatible API, so this is the `Local` provider pointed at
+    /// OpenRouter's endpoint with the user's OpenRouter key. Returns `None` if no key. This is the
+    /// way around the direct-Gemini 429 quota block. Default model (when unset) is the reliable,
+    /// cheap `openai/gpt-4o-mini`; pass `google/gemini-2.5-pro` for Gemini-class.
+    pub fn for_openrouter(api_key: String, model: String, system_prompt: String) -> Option<Self> {
+        if api_key.trim().is_empty() {
+            return None;
+        }
+        let model = if model.trim().is_empty() { "openai/gpt-4o-mini".to_string() } else { model };
+        Some(Self {
+            provider: LlmProvider::Local,
+            endpoint: "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            api_key,
+            system_prompt,
+            model,
+        })
+    }
+
     pub fn refine_text(&self, raw_text: &str) -> Result<String, String> {
         if raw_text.trim().is_empty() {
             return Ok(raw_text.to_string());
@@ -199,5 +218,16 @@ mod tests {
         assert!(!prompt.contains("Past corrections"), "no few-shot section when none given");
         assert!(!prompt.contains("Candidate transcriptions"), "no candidates section when none given");
         assert!(prompt.contains("دەق"), "primary still present");
+    }
+
+    #[test]
+    fn for_openrouter_targets_openrouter_with_a_default_model() {
+        let r = LlmRefiner::for_openrouter("k".into(), String::new(), "p".into()).unwrap();
+        assert_eq!(r.provider, LlmProvider::Local, "OpenRouter speaks the OpenAI-compatible API");
+        assert!(r.endpoint.contains("openrouter.ai"), "{}", r.endpoint);
+        assert_eq!(r.model, "openai/gpt-4o-mini", "empty model -> reliable default");
+        let g = LlmRefiner::for_openrouter("k".into(), "google/gemini-2.5-pro".into(), "p".into()).unwrap();
+        assert_eq!(g.model, "google/gemini-2.5-pro", "explicit model honored");
+        assert!(LlmRefiner::for_openrouter("   ".into(), "m".into(), "p".into()).is_none(), "no key -> None");
     }
 }
