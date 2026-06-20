@@ -10,6 +10,9 @@ use crate::error::{AppError, AppResult};
 const SCRIBE_URL: &str = "https://api.elevenlabs.io/v1/speech-to-text";
 /// The model verified working for Sorani in the live test.
 pub const DEFAULT_MODEL: &str = "scribe_v1";
+/// ElevenLabs' language code for Central Kurdish (Sorani) — verified working in the live test
+/// (`language_code="kur"` returned coherent, punctuated Sorani).
+pub const SORANI_LANGUAGE_CODE: &str = "kur";
 
 /// Build a `multipart/form-data` body for a Scribe request. Returns `(content_type, body_bytes)`.
 /// The boundary is a fixed constant (it contains no user data).

@@ -1304,26 +1304,64 @@ impl ProcessingPipeline {
             status: "Building whole-file reference transcript".into(),
         });
         let mut chunks_done = 0usize;
-        let result = self.process_single_file_with_progress(path, &db, cancel.as_ref(), |current, total| {
-            chunks_done = current;
-            let total = total.max(estimated_chunks);
-            self.set_import_status(current, total, &fname);
-            on_event(PipelineEvent::Phase { phase: "transcribing".into() });
-            on_event(agent_stage(
-                "audio_chunking",
-                "running",
-                fname.clone(),
-                format!("Preparing chunk {current}/{total}"),
-                current,
-                total,
-            ));
-            on_event(PipelineEvent::Progress {
-                current,
-                total,
-                file: fname.clone(),
-                status: format!("Transcribing chunk {current}/{total}"),
-            });
-        });
+        // Cloud STT (ElevenLabs Scribe) first when opted in and a key is configured: one API call,
+        // segmented from word timestamps. On ANY error, fall through to the local ASR path below so
+        // an import never fails just because the cloud is unavailable.
+        let result = 'transcribe: {
+            if let Some(scribe_key) = self.scribe_api_key_if_enabled() {
+                if let Some(token) = cancel.as_ref() {
+                    if let Err(e) = token.check() {
+                        break 'transcribe Err(e);
+                    }
+                }
+                on_event(PipelineEvent::Phase { phase: "transcribing".into() });
+                on_event(agent_stage(
+                    "audio_chunking",
+                    "running",
+                    fname.clone(),
+                    "Transcribing whole file with ElevenLabs Scribe (cloud)",
+                    0,
+                    1,
+                ));
+                match self.import_single_file_via_scribe(path, &db, &scribe_key) {
+                    Ok(segs) => {
+                        chunks_done = segs.len();
+                        break 'transcribe Ok(segs);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Scribe import failed ({e}); falling back to local ASR");
+                        on_event(agent_stage(
+                            "audio_chunking",
+                            "running",
+                            fname.clone(),
+                            "Scribe unavailable — using local ASR",
+                            0,
+                            estimated_chunks,
+                        ));
+                    }
+                }
+            }
+            self.process_single_file_with_progress(path, &db, cancel.as_ref(), |current, total| {
+                chunks_done = current;
+                let total = total.max(estimated_chunks);
+                self.set_import_status(current, total, &fname);
+                on_event(PipelineEvent::Phase { phase: "transcribing".into() });
+                on_event(agent_stage(
+                    "audio_chunking",
+                    "running",
+                    fname.clone(),
+                    format!("Preparing chunk {current}/{total}"),
+                    current,
+                    total,
+                ));
+                on_event(PipelineEvent::Progress {
+                    current,
+                    total,
+                    file: fname.clone(),
+                    status: format!("Transcribing chunk {current}/{total}"),
+                });
+            })
+        };
 
         match &result {
             Ok(segments) => {
@@ -1437,6 +1475,101 @@ impl ProcessingPipeline {
         self.finish_import_status();
         result
 
+    }
+
+    /// The ElevenLabs Scribe key to use for cloud STT, or `None` when cloud STT is not opted in or no
+    /// key is configured. Mirrors the cloud-LLM opt-in gate; the key lives in `secrets.env` next to
+    /// the database and is never read unless the user has explicitly opted in (privacy by default).
+    fn scribe_api_key_if_enabled(&self) -> Option<String> {
+        if !self.settings.cloud_stt_opt_in {
+            return None;
+        }
+        let data_dir = std::path::Path::new(&self.db_path).parent()?;
+        crate::api_keys::ApiKeys::load(data_dir).elevenlabs
+    }
+
+    /// Import a file using ElevenLabs Scribe as the transcriber: ONE API call for the whole file,
+    /// segmented from Scribe's word timestamps into source-file slices (no local ASR/VAD/diarization).
+    /// Persists and returns the segments. The caller falls back to the local path on error, so this
+    /// surfaces failures rather than masking them. Acoustic-quality/diarization fields are left unset.
+    pub fn import_single_file_via_scribe(
+        &self,
+        path: &Path,
+        db: &Database,
+        api_key: &str,
+    ) -> AppResult<Vec<SpeechSegment>> {
+        let duration_ms = audio::get_duration_ms(path)?;
+        if duration_ms == 0 {
+            return Err(AppError::Validation("Empty audio file".into()));
+        }
+        let audio_path = path.to_string_lossy().to_string();
+        let scribe_segs = crate::scribe_api::transcribe_segments(
+            &audio_path,
+            api_key,
+            crate::scribe_api::DEFAULT_MODEL,
+            crate::scribe_api::SORANI_LANGUAGE_CODE,
+        )?;
+        let segments = Self::build_scribe_speech_segments(
+            &scribe_segs,
+            &audio_path,
+            duration_ms,
+            self.settings.auto_normalize,
+            self.settings.verbalize_numbers,
+        );
+        if segments.is_empty() {
+            return Err(AppError::Other("Scribe returned no segments".into()));
+        }
+        db.insert_segments_batch(&segments)?;
+        Ok(segments)
+    }
+
+    /// Build persistable [`SpeechSegment`]s from Scribe segments. Each becomes a source-file slice
+    /// (`audio_path` + `SegmentSourceMeta` time range) so it plays back the right region; text is
+    /// stored in logical (reading) order and normalized when auto-normalize is on. A segment with an
+    /// open end (0) extends to the file duration. Acoustic-quality fields stay `None` — Scribe gives
+    /// text and timing, not waveform metrics.
+    fn build_scribe_speech_segments(
+        scribe_segs: &[crate::scribe_api::ScribeSegment],
+        audio_path: &str,
+        total_duration_ms: i64,
+        auto_normalize: bool,
+        verbalize_numbers: bool,
+    ) -> Vec<SpeechSegment> {
+        let chunk_count = scribe_segs.len() as u32;
+        scribe_segs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let start = s.source_start_ms.max(0);
+                let end = if s.source_end_ms > start { s.source_end_ms } else { total_duration_ms.max(start) };
+                let meta = crate::chunking::SegmentSourceMeta {
+                    source_start_ms: start,
+                    source_end_ms: end,
+                    chunk_index: i as u32,
+                    chunk_count,
+                };
+                let normalized = if auto_normalize && !s.text.trim().is_empty() {
+                    let cfg = crate::normalizer::NormalizationConfig {
+                        normalize_numbers: auto_normalize,
+                        verbalize_numbers,
+                        normalize_hamza: true,
+                        remove_diacritics: false,
+                    };
+                    Some(crate::normalizer::SoraniNormalizer::with_config(cfg).normalize(&s.text))
+                } else {
+                    None
+                };
+                SpeechSegment {
+                    id: Uuid::new_v4().to_string(),
+                    audio_path: audio_path.to_string(),
+                    raw_transcript: s.text.clone(),
+                    normalized_transcript: normalized,
+                    alignment_json: Some(meta.to_alignment_json()),
+                    duration_ms: (end - start).max(0),
+                    ..Default::default()
+                }
+            })
+            .collect()
     }
 
     /// Transcribe an audio file, optionally limited to a source-time range from chunk metadata.
@@ -2121,6 +2254,72 @@ mod tests {
         });
         std::fs::write(dir.path().join("secrets.env"), "OPENROUTER_API_KEY=test-or-key\n").unwrap();
         assert!(pipeline.build_refiner().is_none(), "cloud opt-out must disable refinement even with a key");
+    }
+
+    #[test]
+    fn build_scribe_segments_maps_timing_text_and_meta() {
+        use crate::scribe_api::ScribeSegment;
+        let segs = vec![
+            ScribeSegment { text: "ئەمە یەکەمە".into(), source_start_ms: 0, source_end_ms: 1500 },
+            ScribeSegment { text: "دووەم".into(), source_start_ms: 2000, source_end_ms: 3000 },
+        ];
+        let out = super::ProcessingPipeline::build_scribe_speech_segments(&segs, "/a/b.wav", 5000, false, false);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].raw_transcript, "ئەمە یەکەمە");
+        assert_eq!(out[0].audio_path, "/a/b.wav");
+        assert_eq!(out[0].duration_ms, 1500);
+        assert!(!out[0].id.is_empty(), "each segment gets an id");
+        assert!(out[0].normalized_transcript.is_none(), "auto_normalize=false -> no normalized text");
+        let m0 =
+            crate::chunking::SegmentSourceMeta::from_alignment_json(out[0].alignment_json.as_deref().unwrap()).unwrap();
+        assert_eq!((m0.source_start_ms, m0.source_end_ms, m0.chunk_index, m0.chunk_count), (0, 1500, 0, 2));
+        let m1 =
+            crate::chunking::SegmentSourceMeta::from_alignment_json(out[1].alignment_json.as_deref().unwrap()).unwrap();
+        assert_eq!((m1.source_start_ms, m1.source_end_ms), (2000, 3000));
+    }
+
+    #[test]
+    fn build_scribe_segments_fills_open_end_and_normalizes() {
+        use crate::scribe_api::ScribeSegment;
+        // An open end (0) extends to the file duration; auto-normalize folds the Arabic Kaf.
+        let segs = vec![ScribeSegment { text: "كوردی".into(), source_start_ms: 1000, source_end_ms: 0 }];
+        let out = super::ProcessingPipeline::build_scribe_speech_segments(&segs, "/x.wav", 4000, true, false);
+        assert_eq!(out.len(), 1);
+        let m =
+            crate::chunking::SegmentSourceMeta::from_alignment_json(out[0].alignment_json.as_deref().unwrap()).unwrap();
+        assert_eq!((m.source_start_ms, m.source_end_ms), (1000, 4000), "open end clamps to duration");
+        assert_eq!(out[0].duration_ms, 3000);
+        let norm = out[0].normalized_transcript.as_deref().unwrap();
+        assert_ne!(norm, "كوردی", "normalizer should fold the Arabic Kaf to Kurdish Kaf");
+    }
+
+    #[test]
+    fn build_scribe_segments_empty_input() {
+        assert!(super::ProcessingPipeline::build_scribe_speech_segments(&[], "/x.wav", 1000, false, false).is_empty());
+    }
+
+    #[test]
+    fn scribe_key_gate_requires_opt_in() {
+        // Key present but cloud STT NOT opted in -> None (no cloud calls without explicit opt-in).
+        let (pipeline, dir) =
+            test_pipeline_with_settings(AppSettings { cloud_stt_opt_in: false, ..AppSettings::default() });
+        std::fs::write(dir.path().join("secrets.env"), "ELEVENLABS_API_KEY=test-scribe-key\n").unwrap();
+        assert!(pipeline.scribe_api_key_if_enabled().is_none());
+    }
+
+    #[test]
+    fn scribe_key_gate_returns_key_when_opted_in() {
+        let (pipeline, dir) =
+            test_pipeline_with_settings(AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() });
+        std::fs::write(dir.path().join("secrets.env"), "ELEVENLABS_API_KEY=test-scribe-key\n").unwrap();
+        assert_eq!(pipeline.scribe_api_key_if_enabled().as_deref(), Some("test-scribe-key"));
+    }
+
+    #[test]
+    fn scribe_key_gate_none_without_key() {
+        let (pipeline, _dir) =
+            test_pipeline_with_settings(AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() });
+        assert!(pipeline.scribe_api_key_if_enabled().is_none(), "opted in but no key -> None");
     }
 
     #[test]
