@@ -92,6 +92,12 @@ pub struct AppSettings {
     pub jury_autonomy_level: AutonLevel,
     #[serde(default = "default_jury_t1_threshold")]
     pub jury_t1_threshold: f64,
+
+    /// Opt-in: apply LOOP-0 correction memories to the transcript after decoding/refinement, so a
+    /// previously corrected (and independently confirmed) confusion is fixed automatically. Default
+    /// OFF — it rewrites ASR output, so it is a deliberate choice, never a silent surprise.
+    #[serde(default)]
+    pub loop0_firing_enabled: bool,
 }
 
 fn default_hf_train_ratio() -> f64 {
@@ -278,6 +284,7 @@ impl Default for AppSettings {
             jury_self_consistency_n: default_jury_self_consistency_n(),
             jury_autonomy_level: AutonLevel::default(),
             jury_t1_threshold: default_jury_t1_threshold(),
+            loop0_firing_enabled: false,
         }
     }
 }
@@ -431,6 +438,21 @@ mod tests {
     #[test]
     fn default_asr_model_matches_bundled_runtime_model() {
         assert_eq!(AppSettings::default().asr_model_size, AsrModelSize::CTC300M);
+    }
+
+    #[test]
+    fn loop0_firing_defaults_off_and_is_backward_compatible() {
+        // Opt-in: rewriting ASR output must never be a surprise, so the default is OFF.
+        assert!(!AppSettings::default().loop0_firing_enabled);
+        // A settings.json from before this field existed still loads (missing -> false), not an error.
+        let mut v = serde_json::to_value(AppSettings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("loop0_firing_enabled");
+        let legacy: AppSettings = serde_json::from_value(v).expect("legacy settings (no field) must load");
+        assert!(!legacy.loop0_firing_enabled, "a missing field must default to OFF");
+        // It round-trips when explicitly enabled.
+        let on = AppSettings { loop0_firing_enabled: true, ..AppSettings::default() };
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(serde_json::from_str::<AppSettings>(&json).unwrap().loop0_firing_enabled);
     }
 
     #[test]
