@@ -435,7 +435,9 @@ impl Database {
                 let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
                 let exists = check_stmt.exists(params![seg.id])?;
                 if exists {
-                    update_stmt.execute(params![
+                    // Count only rows the guard actually changed — a human-reviewed row matches 0
+                    // rows here (the UPDATE skips it), so it must not be reported as "updated".
+                    let changed = update_stmt.execute(params![
                         seg.id,
                         seg.audio_path,
                         raw_nfc,
@@ -453,7 +455,9 @@ impl Database {
                         seg.split,
                         seg.ood_score,
                     ])?;
-                    updated += 1;
+                    if changed > 0 {
+                        updated += 1;
+                    }
                 } else {
                     insert_stmt.execute(params![
                         seg.id,
@@ -1609,6 +1613,35 @@ mod tests {
             db.get_segment_by_id("fresh-1").unwrap().unwrap().raw_transcript,
             "new consensus",
             "an unreviewed segment is still refined"
+        );
+    }
+
+    #[test]
+    fn merge_dataset_json_does_not_count_human_protected_rows_as_updated() {
+        // Hardening-audit LOW: the guarded merge UPDATE correctly skips human-reviewed rows, but the
+        // 'updated' counter incremented regardless of rows-affected — over-reporting to the UI.
+        let db = make_db();
+        let mut seg = make_segment("merge-1", "/a.wav");
+        seg.raw_transcript = "original".to_string();
+        db.insert_segment(&seg).expect("insert");
+        db.conn
+            .execute("UPDATE speech_segments SET verdict='human_accept' WHERE id='merge-1'", [])
+            .expect("lock as human-reviewed");
+
+        let incoming = vec![SpeechSegment {
+            id: "merge-1".to_string(),
+            audio_path: "/a.wav".to_string(),
+            raw_transcript: "incoming".to_string(),
+            duration_ms: 1000,
+            ..SpeechSegment::default()
+        }];
+        let json = serde_json::to_string(&incoming).expect("serialize");
+        let (created, updated) = db.merge_dataset_json(&json).expect("merge");
+        assert_eq!((created, updated), (0, 0), "a guard-skipped human-locked row must not count as updated");
+        assert_eq!(
+            db.get_segment_by_id("merge-1").unwrap().unwrap().raw_transcript,
+            "original",
+            "the locked row is genuinely unchanged"
         );
     }
 
