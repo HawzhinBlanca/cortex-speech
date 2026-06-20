@@ -526,9 +526,13 @@ impl ModelManager {
             });
         }
 
-        for (tmp, dest) in staged_files {
-            if let Err(e) = replace_file(&tmp, &dest) {
-                remove_model_temp_file(&tmp, "failed extracted model promotion temp");
+        for i in 0..staged_files.len() {
+            let (tmp, dest) = &staged_files[i];
+            if let Err(e) = replace_file(tmp, dest) {
+                // Clean up the failing temp AND every still-unpromoted staged temp (entries 0..i were
+                // already renamed away). Matches the other error paths; without it, a mid-loop failure
+                // leaks the remaining .extracting-* files into the models dir.
+                cleanup_staged_files(&staged_files[i..]);
                 return Err(format!("Promote extracted model artifact: {e}"));
             }
         }
@@ -1176,6 +1180,32 @@ mod tests {
 
         assert_eq!(std::fs::read(dest_dir.join("model.int8.onnx")).expect("model"), b"model bytes");
         assert_eq!(std::fs::read(dest_dir.join("tokens.txt")).expect("tokens"), b"tokens");
+        assert_no_extracting_files(&dest_dir);
+    }
+
+    #[test]
+    fn extract_model_archive_promotion_failure_leaves_no_orphan_temps() {
+        // Hardening-audit LOW: if an earlier replace_file in the promotion loop fails, the remaining
+        // staged extraction temps must still be cleaned up (matching the other error paths) rather
+        // than leaking into the models dir.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+        let archive_path = tmp.path().join("pair.tar.bz2");
+        // model first -> staged_files[0], promoted first; tokens second -> staged_files[1].
+        write_bzip2_tar(&archive_path, &[("nested/model.int8.onnx", b"model bytes"), ("nested/tokens.txt", b"tokens")]);
+        let dest_dir = tmp.path().join("extract");
+        std::fs::create_dir_all(&dest_dir).expect("dest dir");
+        // Force the FIRST promotion (model.int8.onnx) to fail by occupying its destination with a
+        // NON-EMPTY directory — replace_file errors on this on both Unix and Windows.
+        let blocking = dest_dir.join("model.int8.onnx");
+        std::fs::create_dir_all(&blocking).expect("blocking dir");
+        std::fs::write(blocking.join("sentinel"), b"x").expect("sentinel");
+
+        let err = manager
+            .extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true)
+            .expect_err("promotion should fail on the first artifact");
+        assert!(err.contains("Promote extracted model artifact"), "got: {err}");
+        // BEFORE the fix this fails: tokens.txt.extracting-* is orphaned. AFTER: it is cleaned up.
         assert_no_extracting_files(&dest_dir);
     }
 
