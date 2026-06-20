@@ -288,6 +288,39 @@ mod tests {
         assert!(parse_scribe_words(&serde_json::json!({"text": "x"})).is_empty());
     }
 
+    #[test]
+    fn parse_words_survives_malformed_entries() {
+        // A garbled/hostile response must degrade gracefully: drop every malformed entry, keep the
+        // valid ones, and never panic.
+        let json = serde_json::json!({
+            "words": [
+                {"text": "ok1", "start": 1.0, "end": 2.0, "type": "word"},          // valid
+                {"text": "nostart", "end": 2.0, "type": "word"},                    // missing start
+                {"text": "noend", "start": 1.0, "type": "word"},                    // missing end
+                {"start": 1.0, "end": 2.0, "type": "word"},                          // missing text
+                {"text": "   ", "start": 1.0, "end": 2.0, "type": "word"},          // blank text
+                {"text": "strstart", "start": "1.0", "end": 2.0, "type": "word"},   // start not a number
+                {"text": "notype", "start": 1.0, "end": 2.0},                        // no type field
+                {"text": "spacing", "start": 1.0, "end": 2.0, "type": "spacing"},   // not a word
+                "garbage-string",                                                    // non-object entry
+                42,                                                                  // non-object entry
+                {"text": "ok2", "start": 3.0, "end": 4.0, "type": "word"},          // valid
+            ]
+        });
+        let words = parse_scribe_words(&json);
+        assert_eq!(words.len(), 2, "only the two fully-valid words survive: {words:?}");
+        assert_eq!(words[0].text, "ok1");
+        assert_eq!(words[1], ScribeWord { text: "ok2".into(), start_ms: 3000, end_ms: 4000 });
+    }
+
+    #[test]
+    fn parse_words_handles_non_array_words_field() {
+        // `words` present but the wrong shape (object / string / number) -> empty, no panic.
+        for bad in [serde_json::json!({"words": {"a": 1}}), serde_json::json!({"words": "x"}), serde_json::json!({"words": 7})] {
+            assert!(parse_scribe_words(&bad).is_empty(), "non-array words -> empty: {bad}");
+        }
+    }
+
     fn w(text: &str, start_ms: i64, end_ms: i64) -> ScribeWord {
         ScribeWord { text: text.into(), start_ms, end_ms }
     }
