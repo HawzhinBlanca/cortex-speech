@@ -210,17 +210,54 @@ pub fn record_human_decision(
     db.record_human_decision(segment_id, decision, corrected_transcript)
 }
 
-/// Retrieve k nearest few-shot examples for a given segment.
-/// Currently uses recency (most recent first) as a proxy for similarity.
-/// Phase 6 will upgrade to embedding-based retrieval.
-pub fn get_few_shot_examples(db: &Database, _segment_id: &str, k: usize) -> AppResult<Vec<FewShotExample>> {
+/// The normalized word set of a transcript, for lexical-relevance scoring. Uses the char-only
+/// normalizer so orthographic variants (Kaf/Yeh/Heh) count as the same word.
+fn relevance_token_set(text: &str) -> std::collections::HashSet<String> {
+    let normalizer = crate::normalizer::SoraniNormalizer::with_config(crate::normalizer::NormalizationConfig {
+        normalize_numbers: false,
+        verbalize_numbers: false,
+        normalize_hamza: true,
+        remove_diacritics: false,
+    });
+    normalizer.normalize(text).split_whitespace().map(|w| w.to_string()).collect()
+}
+
+/// Jaccard similarity between two word sets (|∩| / |∪|), 0.0 when both are empty.
+fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f64 {
+    let union = a.union(b).count();
+    if union == 0 {
+        return 0.0;
+    }
+    a.intersection(b).count() as f64 / union as f64
+}
+
+/// Retrieve k few-shot examples for a segment, ranked by lexical relevance to that segment's text
+/// (not mere recency), so the LLM is primed on ON-TOPIC corrections. Falls back to recency when the
+/// segment has no text. A bounded recent pool is re-ranked, and ties keep recency order (the SQL
+/// already returns newest-first and the sort is stable). The doc's §2.4 upgrade over the old
+/// recency-only retrieval that ignored its segment_id.
+pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppResult<Vec<FewShotExample>> {
+    // The current segment's canonical text (prefer normalized), if present.
+    let segment_text: Option<String> = db
+        .connection()
+        .query_row(
+            "SELECT COALESCE(NULLIF(normalized_transcript, ''), raw_transcript)
+             FROM speech_segments WHERE id = ?1",
+            params![segment_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+
+    // Re-rank a bounded recent pool (keeps cost flat as the example store grows).
+    let pool = 200usize.max(k);
     let mut stmt = db.connection().prepare(
         "SELECT id, segment_id, wrong_transcript, human_fix, created_at
          FROM agent_examples
          ORDER BY created_at DESC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![k as i64], |row| {
+    let rows = stmt.query_map(params![pool as i64], |row| {
         Ok(FewShotExample {
             id: row.get(0)?,
             segment_id: row.get(1)?,
@@ -229,7 +266,21 @@ pub fn get_few_shot_examples(db: &Database, _segment_id: &str, k: usize) -> AppR
             created_at: row.get(4)?,
         })
     })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    let mut examples: Vec<FewShotExample> = rows.collect::<Result<Vec<_>, _>>()?;
+
+    if let Some(text) = segment_text.filter(|t| !t.trim().is_empty()) {
+        let query = relevance_token_set(&text);
+        // An example is relevant if either its ASR-side or its corrected text overlaps the segment.
+        let score = |ex: &FewShotExample| {
+            jaccard(&query, &relevance_token_set(&ex.wrong_transcript))
+                .max(jaccard(&query, &relevance_token_set(&ex.human_fix)))
+        };
+        // Stable sort by descending relevance; equal scores retain the newest-first SQL order.
+        examples.sort_by(|a, b| score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    examples.truncate(k);
+    Ok(examples)
 }
 
 /// Return escalated segments ordered by descending disagreement (riskiest first).
@@ -384,5 +435,45 @@ mod tests {
         // Low confidence → escalate
         let decision = t0_gate_segment(&seg, &hyps, "کوردستان", 0.45, 0.60);
         assert!(matches!(decision, T0Decision::EscalateToT1 { .. }));
+    }
+
+    #[test]
+    fn few_shot_examples_rank_by_relevance_not_just_recency() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        // Example-owning segments (FK) + the query segment whose text matches the relevant example.
+        for (id, text) in [("e-rel", "x"), ("e-old1", "x"), ("e-old2", "x"), ("seg-q", "ساڵی نوێ پیرۆز بێت")] {
+            db.insert_segment(&make_seg(id, text)).unwrap();
+        }
+        // The RELEVANT example is the OLDEST; two irrelevant examples are newer. Recency alone would
+        // surface the newer ones.
+        let conn = db.connection();
+        conn.execute(
+            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
+             VALUES ('a-rel', 'e-rel', 'ساڵی نوێ پیرۆز', 'ساڵی نوێ پیرۆز بێت', '2020-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
+             VALUES ('a-new1', 'e-old1', 'کتێبی مێژوو', 'کتێبی مێژووی کورد', '2025-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
+             VALUES ('a-new2', 'e-old2', 'ئاو هەوا', 'ئاو و هەوا', '2025-06-01')",
+            [],
+        )
+        .unwrap();
+
+        let top = get_few_shot_examples(&db, "seg-q", 1).unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].id, "a-rel", "the lexically relevant example must outrank the more recent ones");
+
+        // A segment with no text falls back to recency (newest first).
+        db.insert_segment(&make_seg("seg-empty", "")).unwrap();
+        let recency = get_few_shot_examples(&db, "seg-empty", 1).unwrap();
+        assert_eq!(recency[0].id, "a-new2", "no segment text -> recency fallback returns the newest");
     }
 }
