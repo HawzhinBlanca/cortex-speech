@@ -36,6 +36,7 @@ export interface AppSettings {
   llmApiKey: string;
   llmApiKeyConfigured: boolean;
   cloudLlmOptIn: boolean;
+  cloudSttOptIn: boolean;
   llmSystemPrompt: string;
   llmModel: string;
   externalAsrScriptPath: string;
@@ -80,6 +81,7 @@ export const defaultSettings: AppSettings = {
   llmApiKey: '',
   llmApiKeyConfigured: false,
   cloudLlmOptIn: false,
+  cloudSttOptIn: false,
   llmSystemPrompt:
     'You are an expert Kurdish linguist. Fix the phonetic transcription errors in the following text, preserving the exact meaning. Output ONLY the corrected text, no explanations.',
   llmModel: 'heretic-final:latest',
