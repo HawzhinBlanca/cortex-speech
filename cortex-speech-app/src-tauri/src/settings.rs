@@ -302,6 +302,33 @@ impl Default for AppSettings {
     }
 }
 
+/// Validate an outbound HTTP endpoint against the app's allow-list: at most 2048 chars and either an
+/// `https://` URL or a localhost `http://` address; empty is rejected (an outbound POST needs a real
+/// URL). Shared so every outbound channel — the LLM endpoint and the DPO export — enforces the same
+/// rule. The Rust IPC layer is the trust boundary, so a malicious/XSS-planted argument cannot repoint
+/// a request (and its payload) at an attacker-controlled host.
+pub fn validate_outbound_endpoint(endpoint: &str) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+    const MAX_ENDPOINT_LEN: usize = 2048;
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation("Endpoint URL must not be empty".into()));
+    }
+    if trimmed.len() > MAX_ENDPOINT_LEN {
+        return Err(AppError::Validation("Endpoint URL is too long".into()));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let is_https = lower.starts_with("https://");
+    let is_localhost = lower.starts_with("http://localhost")
+        || lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://[::1]");
+    if is_https || is_localhost {
+        Ok(())
+    } else {
+        Err(AppError::Validation("Endpoint must be an https:// URL or a localhost http:// address".into()))
+    }
+}
+
 impl AppSettings {
     pub fn load(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
@@ -498,6 +525,17 @@ mod tests {
         ] {
             let s = AppSettings { llm_endpoint: ep.to_string(), ..AppSettings::default() };
             assert!(s.validate().is_ok(), "endpoint should be accepted: {ep:?}");
+        }
+    }
+
+    #[test]
+    fn validate_outbound_endpoint_enforces_https_or_localhost() {
+        for ok in ["https://example.com/x", "http://localhost:8080", "http://127.0.0.1/y", "http://[::1]:9/z"] {
+            assert!(super::validate_outbound_endpoint(ok).is_ok(), "{ok} should pass");
+        }
+        // Empty, non-https remote, and non-http schemes are all rejected (exfil / SSRF surface).
+        for bad in ["", "   ", "http://attacker.example.com/collect", "ftp://x", "file:///etc/passwd"] {
+            assert!(super::validate_outbound_endpoint(bad).is_err(), "{bad:?} should be rejected");
         }
     }
 
