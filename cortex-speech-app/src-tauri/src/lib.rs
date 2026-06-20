@@ -14,6 +14,7 @@ pub mod cache;
 pub mod cancel;
 pub mod chunking;
 pub mod commands;
+pub mod corrections;
 pub mod db;
 pub mod denoiser;
 pub mod diarization;
