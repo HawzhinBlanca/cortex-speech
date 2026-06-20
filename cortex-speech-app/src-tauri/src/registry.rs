@@ -319,6 +319,39 @@ pub fn decide_promotion(
     PromotionDecision { promote, reasons }
 }
 
+/// Evaluate the promotion gate for a challenger and, if it passes, atomically promote it over the
+/// current champion. `challenger_scorecard` must compare the challenger against the CURRENT champion
+/// (its `vs_baseline`), as produced by the gold-eval harness. Returns the explainable decision in
+/// both the promote and block cases.
+///
+/// First-champion bootstrap: if the family has no champion yet there is no baseline to beat, so the
+/// challenger is promoted unconditionally as the family's first champion.
+pub fn gate_and_promote(
+    db: &Database,
+    challenger_id: &str,
+    challenger_scorecard: &Scorecard,
+    policy: &PromotionPolicy,
+) -> AppResult<PromotionDecision> {
+    let challenger = get_model_version(db, challenger_id)?
+        .ok_or_else(|| AppError::Validation(format!("cannot gate unknown model version '{challenger_id}'")))?;
+
+    let decision = match champion_gold_cer(db, &challenger.family)? {
+        None => PromotionDecision {
+            promote: true,
+            reasons: vec![format!(
+                "no incumbent champion for family '{}' — promoted as the first champion",
+                challenger.family
+            )],
+        },
+        Some(champion_cer) => decide_promotion(challenger_scorecard, champion_cer, policy),
+    };
+
+    if decision.promote {
+        promote_to_champion(db, challenger_id)?;
+    }
+    Ok(decision)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +555,57 @@ mod tests {
         card.vs_baseline = None;
         let decision = decide_promotion(&card, 0.08, &PromotionPolicy::default());
         assert!(!decision.promote, "no paired baseline comparison must block promotion by default");
+    }
+
+    // --- gate_and_promote integration ---
+
+    #[test]
+    fn gate_and_promote_crowns_first_champion_unconditionally() {
+        let db = open();
+        register_candidate(&db, &candidate("v1", "omniasr-7b", "user-finetuned", "sha")).unwrap();
+        // Even a weak scorecard with no baseline promotes when there is no incumbent to beat.
+        let mut card = challenger_card(0.5, 0.5, 0.5, false, 0.9);
+        card.vs_baseline = None;
+        let decision = gate_and_promote(&db, "v1", &card, &PromotionPolicy::default()).unwrap();
+        assert!(decision.promote, "the first model must become champion: {:?}", decision.reasons);
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "v1");
+    }
+
+    #[test]
+    fn gate_and_promote_swaps_in_a_qualified_challenger() {
+        let db = open();
+        // Incumbent champion with a recorded gold CER.
+        register_candidate(&db, &candidate("champ", "omniasr-7b", "meta-stock", "shaA")).unwrap();
+        record_eval_result(&db, "champ", 0.20, 0.10, 0.08, 0.12, None, "{}", None).unwrap();
+        promote_to_champion(&db, "champ").unwrap();
+        // Challenger that significantly beats WER and lowers CER (0.06 < 0.10).
+        register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
+        let card = challenger_card(0.10, 0.06, 0.20, true, 0.01);
+        let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
+        assert!(decision.promote, "a qualified challenger must promote: {:?}", decision.reasons);
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "chall");
+        assert_eq!(get_model_version(&db, "champ").unwrap().unwrap().status, "rolled_back");
+    }
+
+    #[test]
+    fn gate_and_promote_keeps_champion_when_challenger_regresses_cer() {
+        let db = open();
+        register_candidate(&db, &candidate("champ", "omniasr-7b", "meta-stock", "shaA")).unwrap();
+        record_eval_result(&db, "champ", 0.20, 0.10, 0.08, 0.12, None, "{}", None).unwrap();
+        promote_to_champion(&db, "champ").unwrap();
+        register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
+        // Beats WER but regresses CER (0.15 > 0.10) -> blocked; the champion is untouched.
+        let card = challenger_card(0.10, 0.15, 0.20, true, 0.01);
+        let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
+        assert!(!decision.promote, "a CER-regressing challenger must be blocked");
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "champ", "champion is unchanged");
+        assert_eq!(get_model_version(&db, "chall").unwrap().unwrap().status, "candidate");
+    }
+
+    #[test]
+    fn gate_and_promote_errors_for_unknown_challenger() {
+        let db = open();
+        let card = challenger_card(0.1, 0.05, 0.2, true, 0.01);
+        assert!(gate_and_promote(&db, "ghost", &card, &PromotionPolicy::default()).is_err());
     }
 }
