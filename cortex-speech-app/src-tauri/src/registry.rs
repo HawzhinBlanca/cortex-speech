@@ -137,6 +137,21 @@ pub fn get_champion(db: &Database, family: &str) -> AppResult<Option<ModelVersio
     }
 }
 
+/// All registered model versions, newest first within each family. The read surface a registry UI
+/// lists.
+pub fn list_model_versions(db: &Database) -> AppResult<Vec<ModelVersion>> {
+    let conn = db.connection();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM model_versions ORDER BY family ASC, created_at DESC, id ASC"
+    ))?;
+    let rows = stmt.query_map([], map_version)?;
+    let mut versions = Vec::new();
+    for row in rows {
+        versions.push(row?);
+    }
+    Ok(versions)
+}
+
 /// Fetch a single model version by id.
 pub fn get_model_version(db: &Database, id: &str) -> AppResult<Option<ModelVersion>> {
     let conn = db.connection();
@@ -506,6 +521,19 @@ mod tests {
         assert_eq!(v.checkpoint_sha256, sha, "the computed hash is stored, not a caller-supplied one");
         assert_eq!(v.status, "candidate", "an import is a candidate, never an instant champion");
         assert_eq!(v.source, "user-finetuned");
+    }
+
+    #[test]
+    fn list_model_versions_returns_all_registered() {
+        let db = open();
+        assert!(list_model_versions(&db).unwrap().is_empty(), "an empty registry lists nothing");
+        register_candidate(&db, &candidate("a", "omniasr-7b", "meta-stock", "s1")).unwrap();
+        register_candidate(&db, &candidate("b", "whisper-ckb", "meta-stock", "s2")).unwrap();
+        register_candidate(&db, &candidate("c", "omniasr-7b", "user-finetuned", "s3")).unwrap();
+        let all = list_model_versions(&db).unwrap();
+        assert_eq!(all.len(), 3, "every registered version is listed");
+        let ids: Vec<&str> = all.iter().map(|v| v.id.as_str()).collect();
+        assert!(ids.contains(&"a") && ids.contains(&"b") && ids.contains(&"c"));
     }
 
     #[test]
