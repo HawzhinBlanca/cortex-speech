@@ -76,6 +76,13 @@ fn human_verdict_for_decision(decision: &str) -> AppResult<&'static str> {
     }
 }
 
+/// The speech_segments columns loaded when recording a human decision, in SELECT order:
+/// `(is_gold, raw_transcript, normalized_transcript, annotated_transcript, verdict_transcript,
+/// prior_verdict, audio_path, model_version_id)`. Aliased to keep the `query_row` annotation
+/// readable (clippy::type_complexity).
+type HumanDecisionContext =
+    (i32, String, Option<String>, Option<String>, Option<String>, Option<String>, String, String);
+
 /// Canonicalize stored text to Unicode NFC. Sorani/Arabic combining marks (diacritics,
 /// madda, hamza) can arrive decomposed from ASR or import; storing inconsistent forms
 /// silently fragments FTS search, content-dedup, and WER references that all assume one
@@ -1007,19 +1014,35 @@ impl Database {
             return Err(AppError::Validation("Human edit decisions require a corrected transcript".into()));
         }
 
-        let (is_gold, raw_transcript, normalized_transcript, annotated_transcript, verdict_transcript): (
-            i32,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = self.conn.query_row(
-            "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript, verdict_transcript
-             FROM speech_segments
-             WHERE id = ?1",
-            params![segment_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        )?;
+        let (
+            is_gold,
+            raw_transcript,
+            normalized_transcript,
+            annotated_transcript,
+            verdict_transcript,
+            prior_verdict,
+            audio_path,
+            model_version_id,
+        ): HumanDecisionContext =
+            self.conn.query_row(
+                "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript,
+                        verdict_transcript, verdict, audio_path, model_version_id
+                 FROM speech_segments
+                 WHERE id = ?1",
+                params![segment_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )?;
 
         let rejected_learning_transcript = if decision == "edit" {
             corrected_transcript.and_then(|fix| {
@@ -1037,7 +1060,22 @@ impl Database {
             None
         };
 
-        self.conn.execute(
+        // For an edit, capture the durable audio identity for the corrections ledger. Best-effort:
+        // computed BEFORE the transaction (no file I/O while a write is open) and, if the audio is
+        // unavailable, the verdict still records — we skip the audit row rather than fail the
+        // human's correction over a missing file.
+        let ledger_hash = if decision == "edit" {
+            crate::pipeline::source_audio_identity(Path::new(&audio_path))
+                .ok()
+                .map(|identity| identity.content_hash)
+        } else {
+            None
+        };
+
+        // The human's verdict, the learning pair, and the audit-ledger row commit together as one
+        // atomic correction — a crash can never leave a verdict without its provenance, or vice versa.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE speech_segments
              SET human_decision     = ?2,
                  verdict            = ?3,
@@ -1053,9 +1091,9 @@ impl Database {
         // The rejected side must be the actual agent proposal when available,
         // not blindly the original raw ASR transcript.
         if is_gold == 0 {
-            if let (Some(wrong), Some(fix)) = (rejected_learning_transcript, corrected_transcript) {
+            if let (Some(wrong), Some(fix)) = (rejected_learning_transcript.clone(), corrected_transcript) {
                 let example_id = uuid::Uuid::new_v4().to_string();
-                self.conn.execute(
+                tx.execute(
                     "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
                      VALUES (?1, ?2, ?3, ?4)",
                     params![example_id, segment_id, wrong, fix],
@@ -1063,6 +1101,23 @@ impl Database {
             }
         }
 
+        // Append to the corrections provenance ledger for any edit with a concrete fix and a
+        // resolvable audio identity. Holdout exclusion is applied downstream by content hash, so
+        // the ledger records gold and non-gold alike — it is the full audit trail, keyed on the
+        // durable audio_content_hash, that makes the training set reconstructable and every label
+        // attributable to the model_version that produced it.
+        if let (Some(content_hash), Some(fix)) = (ledger_hash, corrected_transcript) {
+            let correction_id = uuid::Uuid::new_v4().to_string();
+            let raw_hypothesis = rejected_learning_transcript.unwrap_or(raw_transcript);
+            tx.execute(
+                "INSERT INTO corrections
+                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, jury_verdict, model_version_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![correction_id, segment_id, content_hash, raw_hypothesis, fix, prior_verdict, model_version_id],
+            )?;
+        }
+
+        tx.commit()?;
         self.track_write()?;
         Ok(())
     }
@@ -1478,6 +1533,87 @@ mod tests {
             })
             .expect("count examples");
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn record_human_decision_appends_to_corrections_ledger() {
+        let db = make_db();
+        // A real on-disk audio file so the durable content hash (the ledger's identity) can be
+        // computed, even though the database itself is in memory.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let audio = tmp.path().join("clip.wav");
+        std::fs::write(&audio, b"RIFF....fake-audio-bytes").expect("write audio");
+        let expected_hash = crate::pipeline::source_audio_identity(&audio).expect("identity").content_hash;
+
+        let mut seg = make_segment("led-1", audio.to_str().expect("audio path"));
+        seg.raw_transcript = "wrong text".to_string();
+        db.insert_segment(&seg).expect("insert segment");
+        // The agent verdict the human is about to override (captured into jury_verdict).
+        db.write_segment_verdict("led-1", "jury_accept", Some("agent guess"), None, None, Some(0.7), true)
+            .expect("write agent verdict");
+
+        db.record_human_decision("led-1", "edit", Some("right text")).expect("record edit");
+
+        let (segment_id, hash, raw_hyp, fix, jury, mv): (
+            Option<String>,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = db
+            .connection()
+            .query_row(
+                "SELECT segment_id, audio_content_hash, raw_hypothesis, human_fix, jury_verdict, model_version_id
+                 FROM corrections WHERE segment_id = ?1",
+                params!["led-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .expect("a corrections ledger row must exist after an edit");
+        assert_eq!(segment_id.as_deref(), Some("led-1"));
+        assert_eq!(hash, expected_hash, "the ledger must key on the durable audio content hash");
+        assert!(!raw_hyp.is_empty(), "raw_hypothesis must record what the model produced");
+        assert_eq!(fix, "right text");
+        assert_eq!(jury.as_deref(), Some("jury_accept"), "jury_verdict captures the pre-override agent verdict");
+        assert_eq!(mv.as_deref(), Some("unknown@pre-registry"), "model_version_id provenance is stamped");
+    }
+
+    #[test]
+    fn non_edit_decision_writes_no_corrections_ledger_row() {
+        let db = make_db();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let audio = tmp.path().join("clip.wav");
+        std::fs::write(&audio, b"bytes").expect("write audio");
+        let mut seg = make_segment("led-acc", audio.to_str().expect("path"));
+        seg.raw_transcript = "ok text".to_string();
+        db.insert_segment(&seg).expect("insert segment");
+
+        db.record_human_decision("led-acc", "accept", None).expect("record accept");
+
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM corrections WHERE segment_id = ?1", params!["led-acc"], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 0, "an accept (non-edit) decision records no correction");
+    }
+
+    #[test]
+    fn edit_with_missing_audio_still_records_verdict_without_ledger_row() {
+        // Best-effort ledger: a missing audio file must never block the human's correction.
+        let db = make_db();
+        let mut seg = make_segment("led-missing", "/nonexistent/gone.wav");
+        seg.raw_transcript = "wrong".to_string();
+        db.insert_segment(&seg).expect("insert segment");
+
+        db.record_human_decision("led-missing", "edit", Some("right")).expect("edit must still succeed");
+
+        let fresh = db.get_segment_by_id("led-missing").expect("load").expect("exists");
+        assert_eq!(fresh.human_decision.as_deref(), Some("edit"), "the verdict is recorded despite missing audio");
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM corrections WHERE segment_id = ?1", params!["led-missing"], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 0, "no ledger row when the audio identity cannot be computed");
     }
 
     #[test]
