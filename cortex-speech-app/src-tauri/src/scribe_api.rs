@@ -40,6 +40,58 @@ fn parse_scribe_text(json: &serde_json::Value) -> Option<String> {
     json.get("text").and_then(|t| t.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
+/// Bounded character-level similarity (0..1) over two strings (`1 - levenshtein/maxlen`).
+fn char_similarity(a: &str, b: &str) -> f64 {
+    let ca: Vec<char> = a.chars().collect();
+    let cb: Vec<char> = b.chars().collect();
+    let (n, m) = (ca.len(), cb.len());
+    if n == 0 && m == 0 {
+        return 1.0;
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = usize::from(ca[i - 1] != cb[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    1.0 - prev[m] as f64 / n.max(m) as f64
+}
+
+/// Scribe occasionally returns the WHOLE transcription twice (observed on a real Sorani clip). If the
+/// text splits into two halves whose openings are near-identical (a duplication restarts the same
+/// words), return just the first half; otherwise return it unchanged. Conservative and cost-bounded
+/// (compares only the first ~80 chars of each half), so it never mangles genuinely distinct content.
+pub fn dedupe_repeated(text: &str) -> String {
+    let trimmed = text.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let n = chars.len();
+    if n < 60 {
+        return trimmed.to_string();
+    }
+    let mid = n / 2;
+    // The whitespace CLOSEST to the midpoint — the boundary between two copies, not an internal space.
+    let split = (mid.saturating_sub(20)..=(mid + 20).min(n - 1))
+        .filter(|&i| chars[i].is_whitespace())
+        .min_by_key(|&i| (i as isize - mid as isize).unsigned_abs())
+        .unwrap_or(mid);
+    let first: String = chars[..split].iter().collect();
+    let second: String = chars[split..].iter().collect();
+    let (a, b) = (first.trim(), second.trim());
+    if a.is_empty() || b.is_empty() {
+        return trimmed.to_string();
+    }
+    let head = |s: &str| s.chars().take(80).collect::<String>();
+    if char_similarity(&head(a), &head(b)) >= 0.85 {
+        a.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Transcribe an audio file with ElevenLabs Scribe. Returns the transcription text. Errors carry the
 /// key redacted (defense in depth, though the key is only ever sent as a header).
 pub fn transcribe(audio_path: &str, api_key: &str, model_id: &str, language_code: &str) -> AppResult<String> {
@@ -57,7 +109,9 @@ pub fn transcribe(audio_path: &str, api_key: &str, model_id: &str, language_code
         .map_err(|e| AppError::Other(format!("Scribe request failed: {}", redact(e.to_string()))))?;
     let json: serde_json::Value =
         resp.into_json().map_err(|e| AppError::Other(format!("Scribe response parse: {e}")))?;
-    parse_scribe_text(&json).ok_or_else(|| AppError::Other("Scribe returned no transcription text".into()))
+    parse_scribe_text(&json)
+        .map(|text| dedupe_repeated(&text))
+        .ok_or_else(|| AppError::Other("Scribe returned no transcription text".into()))
 }
 
 #[cfg(test)]
@@ -82,5 +136,26 @@ mod tests {
         assert_eq!(parse_scribe_text(&json).as_deref(), Some("دەزگای ڕوانگە"));
         assert!(parse_scribe_text(&serde_json::json!({"text": "   "})).is_none(), "blank -> none");
         assert!(parse_scribe_text(&serde_json::json!({})).is_none(), "missing -> none");
+    }
+
+    #[test]
+    fn dedupe_collapses_a_full_duplication() {
+        let once = "ئەمە دەقێکی نموونەیە بۆ تاقیکردنەوەی دووبارەبوونەوەی دەنگ لە ئەپەکەدا";
+        let twice = format!("{once} {once}");
+        assert_eq!(dedupe_repeated(&twice), once, "the whole-text duplication collapses to one copy");
+    }
+
+    #[test]
+    fn dedupe_collapses_near_duplicate_halves() {
+        // Scribe's real behavior: the two copies differ in a few characters but are near-identical.
+        let a = "دەزگای ڕوانگە لە ڕەسمێکی شایستەدا ئەنجامی پێشبڕکێی خەڵاتەکان ڕادەگەیەنێت";
+        let b = "دەزگای ڕوانگە لە ڕەسمێکی شایستەدا ئەنجامی پێشبڕکەی خەڵاتەکان ڕادەگەیەنرێت";
+        assert_eq!(dedupe_repeated(&format!("{a} {b}")), a, "near-duplicate halves collapse to the first");
+    }
+
+    #[test]
+    fn dedupe_leaves_distinct_text_unchanged() {
+        let text = "ئەمە ڕستەی یەکەمە سەبارەت بە کوردستان، بەڵام ئەمەی دواتر سەبارەت بە ئاو و هەوای جیهانە بەتەواوی";
+        assert_eq!(dedupe_repeated(text), text, "genuinely distinct halves must not be collapsed");
     }
 }
