@@ -2049,6 +2049,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fire_loop0_if_enabled_method_uses_the_pipelines_own_db() {
+        // The method (used by the cached / non-WSL transcribe paths) opens its own DB connection.
+        let settings = AppSettings { loop0_firing_enabled: true, ..AppSettings::default() };
+        let (pipeline, _dir) = test_pipeline_with_settings(settings);
+        {
+            let db = pipeline.open_db().unwrap();
+            db.initialize().unwrap();
+            for id in ["fm-1", "fm-2"] {
+                let seg = SpeechSegment {
+                    id: id.to_string(),
+                    audio_path: format!("/a/{id}.wav"),
+                    raw_transcript: "ئەو ساڵە باش بوو".to_string(),
+                    ..Default::default()
+                };
+                db.insert_segment(&seg).unwrap();
+                db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو")).unwrap();
+            }
+        }
+        assert_eq!(
+            pipeline.fire_loop0_if_enabled("ئەو ساڵە باش بوو"),
+            "ئەو ساڵە خراپ بوو",
+            "the method fires the learned fix using the pipeline's own db when enabled"
+        );
+
+        // With the opt-in off, the method is a pure no-op (and never even opens the db).
+        let (off_pipeline, _dir2) =
+            test_pipeline_with_settings(AppSettings { loop0_firing_enabled: false, ..AppSettings::default() });
+        assert_eq!(
+            off_pipeline.fire_loop0_if_enabled("ئەو ساڵە باش بوو"),
+            "ئەو ساڵە باش بوو",
+            "the method is a no-op when the opt-in is off"
+        );
+    }
+
     fn test_pipeline_with_settings(settings: AppSettings) -> (super::ProcessingPipeline, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("db.sqlite").to_string_lossy().to_string();
