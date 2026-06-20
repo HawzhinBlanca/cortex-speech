@@ -1532,15 +1532,8 @@ impl ProcessingPipeline {
                     log_hypothesis_population_failure(&id, &error);
                 }
 
-                // Stage 2: Dual-Pass LLM Refinement
-                let llm_mode = self.settings.effective_llm_mode();
-                let final_text = if let Some(refiner) = crate::llm_refiner::LlmRefiner::new(
-                    &llm_mode,
-                    self.settings.llm_endpoint.clone(),
-                    self.settings.llm_api_key.clone(),
-                    self.settings.llm_system_prompt.clone(),
-                    self.settings.llm_model.clone(),
-                ) {
+                // Stage 2: Dual-Pass LLM Refinement (OpenRouter when configured + key present)
+                let final_text = if let Some(refiner) = self.build_refiner() {
                     tracing::info!("Running LLM refinement on {} bytes...", raw_transcript.len());
                     let refine_result = if self.settings.ger_refinement_enabled {
                         // Generative error correction: prime the refiner with the N-best (populated
@@ -1604,15 +1597,8 @@ impl ProcessingPipeline {
             result.map_err(AppError::Other)
         })?;
 
-        // Stage 2: Dual-Pass LLM Refinement
-        let llm_mode = self.settings.effective_llm_mode();
-        let final_text = if let Some(refiner) = crate::llm_refiner::LlmRefiner::new(
-            &llm_mode,
-            self.settings.llm_endpoint.clone(),
-            self.settings.llm_api_key.clone(),
-            self.settings.llm_system_prompt.clone(),
-            self.settings.llm_model.clone(),
-        ) {
+        // Stage 2: Dual-Pass LLM Refinement (OpenRouter when configured + key present)
+        let final_text = if let Some(refiner) = self.build_refiner() {
             tracing::info!("Running LLM refinement on {} bytes...", raw_text.len());
             match refiner.refine_text(&raw_text) {
                 Ok(refined) => {
@@ -1661,6 +1647,40 @@ impl ProcessingPipeline {
             Err(error) => {
                 tracing::warn!("LOOP-0 firing skipped (could not open db): {error}");
                 transcript.to_string()
+            }
+        }
+    }
+
+    /// Build the LLM refiner. When the configured mode is the cloud (Gemini) and an OPENROUTER_API_KEY
+    /// is present in secrets.env, route through OpenRouter instead — it is verified working and
+    /// reaches Gemini-class models, whereas direct Gemini is commonly 429 quota-blocked. Respects
+    /// `None` (refinement disabled) and `Local` (the user's own endpoint).
+    fn build_refiner(&self) -> Option<crate::llm_refiner::LlmRefiner> {
+        use crate::settings::LlmMode;
+        let refiner_from_settings = |mode: &LlmMode| {
+            crate::llm_refiner::LlmRefiner::new(
+                mode,
+                self.settings.llm_endpoint.clone(),
+                self.settings.llm_api_key.clone(),
+                self.settings.llm_system_prompt.clone(),
+                self.settings.llm_model.clone(),
+            )
+        };
+        match self.settings.effective_llm_mode() {
+            LlmMode::None => None,
+            LlmMode::Local => refiner_from_settings(&LlmMode::Local),
+            LlmMode::Gemini => {
+                // secrets.env lives in the app data dir, next to the database.
+                if let Some(data_dir) = std::path::Path::new(&self.db_path).parent() {
+                    if let Some(openrouter_key) = crate::api_keys::ApiKeys::load(data_dir).openrouter {
+                        return crate::llm_refiner::LlmRefiner::for_openrouter(
+                            openrouter_key,
+                            String::new(),
+                            self.settings.llm_system_prompt.clone(),
+                        );
+                    }
+                }
+                refiner_from_settings(&LlmMode::Gemini)
             }
         }
     }
@@ -2065,6 +2085,42 @@ mod tests {
             "ئەو ساڵە خراپ بوو",
             "the learned correction must fire when enabled"
         );
+    }
+
+    #[test]
+    fn build_refiner_routes_gemini_through_openrouter_when_key_present() {
+        use crate::settings::LlmMode;
+        let settings =
+            AppSettings { llm_mode: LlmMode::Gemini, cloud_llm_opt_in: true, ..AppSettings::default() };
+        let (pipeline, dir) = test_pipeline_with_settings(settings);
+        std::fs::write(dir.path().join("secrets.env"), "OPENROUTER_API_KEY=test-or-key\n").unwrap();
+        let refiner = pipeline.build_refiner().expect("a refiner should be built");
+        assert!(
+            refiner.endpoint.contains("openrouter.ai"),
+            "Gemini mode + OpenRouter key should route through OpenRouter, got: {}",
+            refiner.endpoint
+        );
+    }
+
+    #[test]
+    fn build_refiner_none_mode_disables_refinement() {
+        use crate::settings::LlmMode;
+        let (pipeline, _dir) =
+            test_pipeline_with_settings(AppSettings { llm_mode: LlmMode::None, ..AppSettings::default() });
+        assert!(pipeline.build_refiner().is_none());
+    }
+
+    #[test]
+    fn build_refiner_respects_cloud_opt_out() {
+        use crate::settings::LlmMode;
+        // Gemini selected but cloud NOT opted in -> no refiner, even with a key present (privacy).
+        let (pipeline, dir) = test_pipeline_with_settings(AppSettings {
+            llm_mode: LlmMode::Gemini,
+            cloud_llm_opt_in: false,
+            ..AppSettings::default()
+        });
+        std::fs::write(dir.path().join("secrets.env"), "OPENROUTER_API_KEY=test-or-key\n").unwrap();
+        assert!(pipeline.build_refiner().is_none(), "cloud opt-out must disable refinement even with a key");
     }
 
     #[test]
