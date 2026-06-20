@@ -100,6 +100,39 @@ pub fn t0_gate_segment(
     }
 }
 
+/// Modulate a base T0 routing decision by the curator's Autonomy Dial. This is what makes the dial
+/// REAL (it was previously read by no backend logic): the SAME segment routes differently per level.
+///   - Observe / Propose: never auto-commit — a would-be AutoAccept is staged (EscalateToT1) for the
+///     human. (Observe additionally writes NO verdict at all — handled in run_t0_gate.)
+///   - ActConfirm (default): the base decision — auto-accept agreements, escalate the rest.
+///   - ActAuto: fully unattended — a would-be EscalateToT1 is committed (AutoAccept).
+pub fn apply_autonomy(
+    decision: T0Decision,
+    autonomy: &crate::settings::AutonLevel,
+    consensus: &str,
+    hypotheses: &[SegmentHypothesis],
+    confidence: f64,
+) -> T0Decision {
+    use crate::settings::AutonLevel;
+    match autonomy {
+        AutonLevel::Observe | AutonLevel::Propose => match decision {
+            T0Decision::AutoAccept { segment_id, .. } => T0Decision::EscalateToT1 {
+                segment_id,
+                hypotheses: hypotheses.to_vec(),
+                disagreement_score: 1.0 - confidence,
+            },
+            escalate => escalate,
+        },
+        AutonLevel::ActConfirm => decision,
+        AutonLevel::ActAuto => match decision {
+            T0Decision::EscalateToT1 { segment_id, .. } => {
+                T0Decision::AutoAccept { segment_id, consensus: consensus.to_string(), confidence }
+            }
+            accept => accept,
+        },
+    }
+}
+
 /// Batch-run the T0 gate over a list of segment IDs.
 ///
 /// Steps:
@@ -108,7 +141,11 @@ pub fn t0_gate_segment(
 ///   3. Get the conformal threshold (from verified segments).
 ///   4. Route each segment to AutoAccept or EscalateToT1.
 ///   5. Write the verdict to the DB.
-pub fn run_t0_gate(db: &Database, segment_ids: &[String]) -> AppResult<T0GateReport> {
+pub fn run_t0_gate(
+    db: &Database,
+    segment_ids: &[String],
+    autonomy: &crate::settings::AutonLevel,
+) -> AppResult<T0GateReport> {
     // 1. Load only the requested segments (not the full dataset).
     let all_segs = db.get_segments_by_ids(segment_ids)?;
     let target_segs: Vec<&SpeechSegment> = all_segs.iter().collect();
@@ -143,7 +180,9 @@ pub fn run_t0_gate(db: &Database, segment_ids: &[String]) -> AppResult<T0GateRep
 
         let irt_confidence = irt_results.segment_confidences.get(&seg.id).copied().unwrap_or(0.0);
 
-        let decision = t0_gate_segment(seg, &seg_hyps, &consensus, irt_confidence, threshold);
+        let base_decision = t0_gate_segment(seg, &seg_hyps, &consensus, irt_confidence, threshold);
+        // The Autonomy Dial decides whether the gate may auto-commit.
+        let decision = apply_autonomy(base_decision, autonomy, &consensus, &seg_hyps, irt_confidence);
 
         // 5. Write verdict to DB
         match &decision {
@@ -152,7 +191,10 @@ pub fn run_t0_gate(db: &Database, segment_ids: &[String]) -> AppResult<T0GateRep
                 auto_accepted += 1;
             }
             T0Decision::EscalateToT1 { .. } => {
-                write_verdict(db, &seg.id, Verdict::Escalated, None, None, None, None)?;
+                // Observe is pure observation: it stages nothing and commits no verdict.
+                if !matches!(autonomy, crate::settings::AutonLevel::Observe) {
+                    write_verdict(db, &seg.id, Verdict::Escalated, None, None, None, None)?;
+                }
                 escalated += 1;
             }
         }
@@ -475,5 +517,56 @@ mod tests {
         db.insert_segment(&make_seg("seg-empty", "")).unwrap();
         let recency = get_few_shot_examples(&db, "seg-empty", 1).unwrap();
         assert_eq!(recency[0].id, "a-new2", "no segment text -> recency fallback returns the newest");
+    }
+
+    #[test]
+    fn apply_autonomy_changes_routing_per_dial() {
+        use crate::settings::AutonLevel;
+        let hyps = vec![make_hyp("s1", "m", "x")];
+        let accept = || T0Decision::AutoAccept { segment_id: "s1".into(), consensus: "x".into(), confidence: 0.9 };
+        let escalate =
+            || T0Decision::EscalateToT1 { segment_id: "s1".into(), hypotheses: hyps.clone(), disagreement_score: 0.4 };
+
+        // ActConfirm (default): base decisions pass through unchanged.
+        assert!(matches!(apply_autonomy(accept(), &AutonLevel::ActConfirm, "x", &hyps, 0.9), T0Decision::AutoAccept { .. }));
+        assert!(matches!(apply_autonomy(escalate(), &AutonLevel::ActConfirm, "x", &hyps, 0.4), T0Decision::EscalateToT1 { .. }));
+
+        // Propose / Observe: a confident accept is STAGED for the human instead of auto-committed.
+        assert!(matches!(apply_autonomy(accept(), &AutonLevel::Propose, "x", &hyps, 0.9), T0Decision::EscalateToT1 { .. }));
+        assert!(matches!(apply_autonomy(accept(), &AutonLevel::Observe, "x", &hyps, 0.9), T0Decision::EscalateToT1 { .. }));
+
+        // ActAuto: a low-confidence escalate is committed unattended.
+        assert!(matches!(apply_autonomy(escalate(), &AutonLevel::ActAuto, "x", &hyps, 0.4), T0Decision::AutoAccept { .. }));
+    }
+
+    #[test]
+    fn run_t0_gate_observe_writes_no_verdict_unlike_actconfirm() {
+        use crate::settings::AutonLevel;
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&make_seg("s-dial", "کوردستان")).unwrap();
+        // Two disagreeing hypotheses -> the base gate escalates this segment.
+        for (m, t) in [("gemini", "کوردستان"), ("asr-1b", "ئێران")] {
+            db.insert_hypothesis(&SegmentHypothesis {
+                segment_id: "s-dial".into(),
+                model_id: m.into(),
+                transcript: t.into(),
+                confidence: Some(0.8),
+            })
+            .unwrap();
+        }
+
+        // Observe: pure observation — the report counts the segment but NO verdict is committed.
+        let obs = run_t0_gate(&db, &["s-dial".to_string()], &AutonLevel::Observe).unwrap();
+        assert_eq!(obs.total, 1);
+        assert!(
+            db.get_segment_by_id("s-dial").unwrap().unwrap().verdict.unwrap_or_default().is_empty(),
+            "Observe must commit no verdict"
+        );
+
+        // ActConfirm: the SAME segment now gets its escalated verdict written — the dial changed backend behavior.
+        let act = run_t0_gate(&db, &["s-dial".to_string()], &AutonLevel::ActConfirm).unwrap();
+        assert_eq!(act.escalated, 1);
+        assert_eq!(db.get_segment_by_id("s-dial").unwrap().unwrap().verdict.as_deref(), Some("escalated"));
     }
 }
