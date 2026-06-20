@@ -2406,6 +2406,19 @@ pub fn run_t0_gate(state: State<'_, AppState>, segment_ids: Vec<String>) -> Resu
     crate::jury::run_t0_gate(&db, &segment_ids, &autonomy).map_err(|e| e.to_string())
 }
 
+/// Turn the human-corrected segments of one source file into a holdout GOLD benchmark entry. Run it
+/// after correcting a file in the Review inbox: it concatenates the corrected transcripts into the
+/// gold reference (excluded from all training). Returns the number of gold rows created.
+#[tauri::command]
+pub fn create_gold_from_file(audio_path: String, state: State<'_, AppState>) -> Result<usize, String> {
+    STRICT_RATE_LIMITER.check("create_gold_from_file")?;
+    if audio_path.contains('\0') {
+        return Err("Audio path contains null bytes".to_string());
+    }
+    let db = state.lock_db();
+    crate::eval::create_gold_from_verified_file(&db, &audio_path).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn get_escalation_queue(state: State<'_, AppState>, limit: usize) -> Result<Vec<crate::db::SpeechSegment>, String> {
     RATE_LIMITER.check("get_escalation_queue")?;
