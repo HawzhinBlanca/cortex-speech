@@ -60,6 +60,9 @@ pub fn ms_to_samples(ms: u32, sample_rate: u32) -> usize {
 }
 
 pub fn samples_to_ms(samples: usize, sample_rate: u32) -> i64 {
+    if sample_rate == 0 {
+        return 0;
+    }
     (samples as i64 * 1000) / sample_rate as i64
 }
 
@@ -283,6 +286,8 @@ mod tests {
     fn ms_to_samples_roundtrip() {
         assert_eq!(ms_to_samples(1000, 16000), 16000);
         assert_eq!(samples_to_ms(16000, 16000), 1000);
+        // Defense-in-depth: a zero sample rate must not divide-by-zero panic (pub leaf utility).
+        assert_eq!(samples_to_ms(16000, 0), 0);
     }
 
     #[test]
