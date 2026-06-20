@@ -187,8 +187,10 @@ pub fn segment_words(words: &[ScribeWord], pause_gap_ms: i64, max_segment_ms: i6
     let mut cur: Vec<&ScribeWord> = Vec::new();
     for w in words {
         if let Some(prev) = cur.last() {
-            let gap = w.start_ms - prev.end_ms;
-            let span = w.end_ms - cur[0].start_ms;
+            // Saturating: timestamps derive from an untrusted API response (f64 -> i64 saturates),
+            // so a hostile/garbled response must never overflow-panic the segmenter.
+            let gap = w.start_ms.saturating_sub(prev.end_ms);
+            let span = w.end_ms.saturating_sub(cur[0].start_ms);
             if gap > pause_gap_ms || span > max_segment_ms {
                 segments.push(flush_segment(&cur));
                 cur.clear();
@@ -323,6 +325,18 @@ mod tests {
     #[test]
     fn segment_words_handles_empty_input() {
         assert!(segment_words(&[], 600, 12_000).is_empty());
+    }
+
+    #[test]
+    fn segment_words_does_not_overflow_on_extreme_timestamps() {
+        // A malformed/hostile Scribe response can yield saturated i64 timestamps (f64 -> i64 saturates
+        // on out-of-range / non-finite values). The gap/span subtraction must not overflow-panic.
+        let words = vec![
+            ScribeWord { text: "a".into(), start_ms: i64::MIN, end_ms: i64::MIN },
+            ScribeWord { text: "b".into(), start_ms: i64::MAX, end_ms: i64::MAX },
+        ];
+        let segs = segment_words(&words, 600, 12_000);
+        assert!(!segs.is_empty(), "must still segment without panicking on extreme timestamps");
     }
 
     /// Live end-to-end proof against the real API. Off by default (network + key + audio); run with
