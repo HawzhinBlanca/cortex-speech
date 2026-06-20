@@ -1177,6 +1177,25 @@ mod tests {
     }
 
     #[test]
+    fn export_csv_survives_adversarial_transcript_content() {
+        // Dataset integrity: a Kurdish transcript containing a comma, double quotes, and a newline
+        // must NOT corrupt the CSV — the csv crate quotes/escapes it. This locks that contract so a
+        // future hand-rolled writer (which would silently split rows / inject) is caught immediately.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("adv.csv");
+        let mut seg = sample_segment("adv-1");
+        let nasty = "کوردی، \"دەربڕین\"\nدێڕی نوێ";
+        seg.raw_transcript = nasty.to_string();
+        export_csv(&path, &[seg]).unwrap();
+
+        let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_path(&path).unwrap();
+        let records: Vec<csv::StringRecord> = rdr.records().map(|r| r.unwrap()).collect();
+        assert_eq!(records.len(), 1, "the embedded comma/newline must not create extra rows");
+        assert_eq!(&records[0][0], "adv-1");
+        assert_eq!(&records[0][2], nasty, "the transcript round-trips intact through CSV escaping");
+    }
+
+    #[test]
     fn export_parquet_writes_valid_file() {
         let db_tmp = NamedTempFile::new().unwrap();
         let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
