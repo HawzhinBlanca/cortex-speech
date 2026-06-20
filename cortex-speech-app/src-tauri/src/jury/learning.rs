@@ -61,25 +61,8 @@ struct LearningRow {
 /// Excludes examples linked to `is_gold = 1` segments so the permanent
 /// holdout is never used for training.
 pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
-    // Load holdout hashes
-    let mut stmt_gold = db.connection().prepare(
-        "SELECT audio_path FROM gold_segments WHERE is_holdout = 1",
-    )?;
-    let gold_paths = stmt_gold.query_map([], |row| {
-        let path: String = row.get(0)?;
-        Ok(path)
-    })?;
-
-    let mut holdout_hashes = std::collections::HashSet::new();
-    for path_res in gold_paths {
-        let path_str = path_res?;
-        let path = Path::new(&path_str);
-        if path.exists() {
-            if let Ok(identity) = crate::pipeline::source_audio_identity(path) {
-                holdout_hashes.insert(identity.content_hash);
-            }
-        }
-    }
+    // Holdout hashes — never train on the permanent gold holdout (shared helper).
+    let holdout_hashes = holdout_content_hashes(db)?;
 
     let mut stmt = db.connection().prepare(
         "SELECT ae.segment_id,
@@ -151,6 +134,71 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
     let jsonl = pairs.iter().map(serde_json::to_string).collect::<Result<Vec<_>, _>>()?.join("\n");
 
     Ok(DpoExportResult { pair_count: pairs.len(), jsonl })
+}
+
+/// The audio content hashes of the permanent holdout gold clips — the single source of truth for
+/// excluding held-out audio from any training/LM export. Shared by the DPO and LM-corpus exports.
+fn holdout_content_hashes(db: &Database) -> AppResult<std::collections::HashSet<String>> {
+    let mut stmt = db.connection().prepare("SELECT audio_path FROM gold_segments WHERE is_holdout = 1")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut hashes = std::collections::HashSet::new();
+    for path_res in rows {
+        let path_str = path_res?;
+        let path = Path::new(&path_str);
+        if path.exists() {
+            if let Ok(identity) = crate::pipeline::source_audio_identity(path) {
+                hashes.insert(identity.content_hash);
+            }
+        }
+    }
+    Ok(hashes)
+}
+
+/// Export the LOOP-2 language-model training corpus: the human-confirmed-correct Sorani text from
+/// reviewed (`human_decision` = accept|edit), non-gold segments — the curated correct text the
+/// flywheel has accumulated. Each line is canonicalized with the char-only normalizer (Kaf/Yeh/Heh
+/// folding, numbers preserved) so the LM's tokens match the ASR surface forms it will rescore, and
+/// any segment whose audio matches a holdout gold clip is excluded by content hash. Run
+/// `kenlm lmplz` on these lines externally (the same prepare-here / train-externally pattern as the
+/// fine-tuned 7B).
+pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
+    let holdout = holdout_content_hashes(db)?;
+    let normalizer = crate::normalizer::SoraniNormalizer::with_config(crate::normalizer::NormalizationConfig {
+        normalize_numbers: false,
+        verbalize_numbers: false,
+        normalize_hamza: true,
+        remove_diacritics: false,
+    });
+
+    let mut stmt = db.connection().prepare(
+        "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(normalized_transcript, ''), raw_transcript),
+                audio_path
+         FROM speech_segments
+         WHERE is_gold = 0 AND human_decision IN ('accept', 'edit')
+         ORDER BY created_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)))?;
+
+    let mut corpus = Vec::new();
+    for row_res in rows {
+        let (text, audio_path) = row_res?;
+        let Some(text) = text.filter(|t| !t.trim().is_empty()) else { continue };
+
+        let path = Path::new(&audio_path);
+        if path.exists() {
+            if let Ok(identity) = crate::pipeline::source_audio_identity(path) {
+                if holdout.contains(&identity.content_hash) {
+                    continue;
+                }
+            }
+        }
+
+        let normalized = normalizer.normalize(&text);
+        if !normalized.trim().is_empty() {
+            corpus.push(normalized);
+        }
+    }
+    Ok(corpus)
 }
 
 fn build_learning_prompt(db: &Database, row: &LearningRow) -> AppResult<String> {
@@ -453,6 +501,52 @@ mod tests {
         let result = build_dpo_dataset(&db).unwrap();
         assert_eq!(result.pair_count, 0);
         assert!(result.jsonl.is_empty());
+    }
+
+    #[test]
+    fn export_lm_corpus_includes_reviewed_nongold_excludes_gold_and_unreviewed() {
+        let db = open_mem_db();
+        // Reviewed, non-gold -> included (correct text from verdict_transcript).
+        db.insert_segment(&SpeechSegment {
+            id: "c1".into(),
+            audio_path: "/x/c1.wav".into(),
+            raw_transcript: "raw1".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET human_decision='edit', verdict_transcript='کوردی نوێ', is_gold=0 WHERE id='c1'",
+                [],
+            )
+            .unwrap();
+        // Gold -> excluded even though reviewed.
+        db.insert_segment(&SpeechSegment {
+            id: "g1".into(),
+            audio_path: "/x/g1.wav".into(),
+            raw_transcript: "raw2".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET human_decision='accept', verdict_transcript='گۆڵدی نهێنی', is_gold=1 WHERE id='g1'",
+                [],
+            )
+            .unwrap();
+        // Unreviewed (no human_decision) -> excluded.
+        db.insert_segment(&SpeechSegment {
+            id: "u1".into(),
+            audio_path: "/x/u1.wav".into(),
+            raw_transcript: "ناوەندی پشت".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let corpus = export_lm_corpus(&db).unwrap();
+        assert!(corpus.iter().any(|l| l.contains("کوردی")), "reviewed non-gold text included: {corpus:?}");
+        assert!(!corpus.iter().any(|l| l.contains("گۆڵد")), "gold segment excluded");
+        assert!(!corpus.iter().any(|l| l.contains("ناوەند")), "unreviewed segment excluded");
     }
 
     #[test]
