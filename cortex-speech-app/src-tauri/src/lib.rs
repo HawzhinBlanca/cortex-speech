@@ -400,6 +400,7 @@ pub fn run() {
             commands::list_model_versions,
             commands::get_champion_model,
             commands::import_model_checkpoint,
+            commands::create_gold_from_file,
             commands::get_blocking_validation_issues,
             commands::register_media_asset,
             commands::get_media_asset_url,

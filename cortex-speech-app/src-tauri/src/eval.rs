@@ -89,6 +89,39 @@ pub fn import_gold_segments(db: &Database, inputs: Vec<GoldSegmentInput>) -> App
     Ok(count)
 }
 
+/// Create a gold benchmark entry from the human-corrected segments of one source audio file. Gathers
+/// the REVIEWED segments of `audio_path` (those the curator gave a decision on), in time order,
+/// concatenates their corrected transcripts into the full reference, and imports it as a single
+/// holdout gold clip (is_holdout = true, so the learning loop never trains on it). Returns the number
+/// of gold rows created. Errors if the file has no reviewed segments — correct it in the app first.
+pub fn create_gold_from_verified_file(db: &Database, audio_path: &str) -> AppResult<usize> {
+    let mut stmt = db.connection().prepare(
+        "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(normalized_transcript, ''), raw_transcript)
+         FROM speech_segments
+         WHERE audio_path = ?1 AND human_decision IS NOT NULL AND human_decision != ''
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![audio_path], |row| row.get::<_, Option<String>>(0))?;
+
+    let mut parts = Vec::new();
+    for row in rows {
+        if let Some(text) = row? {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(crate::error::AppError::Validation(format!(
+            "no human-reviewed segments found for '{audio_path}' — correct it in the app first, then mark it as gold"
+        )));
+    }
+
+    let reference = parts.join(" ");
+    import_gold_segments(db, vec![GoldSegmentInput { audio_path: audio_path.to_string(), reference, is_holdout: true }])
+}
+
 /// Load all gold segments from the DB.
 pub fn list_gold_segments(db: &Database) -> AppResult<Vec<GoldSegment>> {
     let conn = db.connection();
@@ -422,6 +455,53 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         db
+    }
+
+    #[test]
+    fn create_gold_from_verified_file_concatenates_corrected_segments() {
+        let db = open_mem_db();
+        // Two REVIEWED segments of the SAME source file, corrected (verdict_transcript), with explicit
+        // ordered timestamps so concatenation order is deterministic.
+        for (id, fix, at) in [
+            ("c1", "ساڵی نوێ پیرۆز", "2020-01-01 00:00:01"),
+            ("c2", "بەخێربێیت بۆ کوردستان", "2020-01-01 00:00:02"),
+        ] {
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: id.to_string(),
+                audio_path: "/clips/nawras.wav".to_string(),
+                raw_transcript: "draft".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET human_decision='edit', verdict_transcript=?2, created_at=?3 WHERE id=?1",
+                    params![id, fix, at],
+                )
+                .unwrap();
+        }
+        // An UNREVIEWED segment of the same file must be excluded from the gold reference.
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "c3".to_string(),
+            audio_path: "/clips/nawras.wav".to_string(),
+            raw_transcript: "ناوەند unreviewed".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let created = create_gold_from_verified_file(&db, "/clips/nawras.wav").unwrap();
+        assert_eq!(created, 1, "one whole-file gold entry");
+        let gold = list_gold_segments(&db).unwrap();
+        assert_eq!(gold.len(), 1);
+        assert!(gold[0].is_holdout, "gold must be holdout so the learning loop never trains on it");
+        assert_eq!(
+            gold[0].reference, "ساڵی نوێ پیرۆز بەخێربێیت بۆ کوردستان",
+            "corrected segments are concatenated in time order"
+        );
+        assert!(!gold[0].reference.contains("unreviewed"), "unreviewed segments are excluded");
+
+        // A file with no reviewed segments errors (correct it in the app first).
+        assert!(create_gold_from_verified_file(&db, "/clips/missing.wav").is_err());
     }
 
     #[test]
