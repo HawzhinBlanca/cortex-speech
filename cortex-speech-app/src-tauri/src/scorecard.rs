@@ -310,6 +310,59 @@ pub fn annotation_drift_scorecard(
     }
 }
 
+/// The verdict of the gold regression gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegressionGateResult {
+    pub passed: bool,
+    pub reasons: Vec<String>,
+}
+
+/// Decide whether `candidate` REGRESSES against a frozen `baseline` scorecard on the gold set. A
+/// metric fails only if its increase exceeds the candidate's bootstrap CI half-width — i.e. the
+/// regression is beyond measurement noise, not an unlucky wobble. Both micro-WER and micro-CER are
+/// gated (CER is the Sorani-primary metric, WER secondary). This is the gate that, once a frozen
+/// gold set + a checked-in baseline scorecard exist, makes a worse pipeline change un-mergeable:
+/// wire it into the de-`#[ignore]`'d gold_wer_eval test as a PR-blocking assertion.
+pub fn check_gold_regression(candidate: &Scorecard, baseline: &Scorecard) -> RegressionGateResult {
+    let mut reasons = Vec::new();
+    let mut passed = true;
+
+    let half_width = |ci: &crate::significance::ConfidenceInterval| ((ci.upper - ci.lower) / 2.0).max(0.0);
+
+    let wer_band = half_width(&candidate.system.wer_ci);
+    let wer_delta = candidate.system.micro_wer - baseline.system.micro_wer;
+    if wer_delta > wer_band {
+        passed = false;
+        reasons.push(format!(
+            "WER REGRESSED: {:.4} vs baseline {:.4} (+{:.4} exceeds CI noise band {:.4})",
+            candidate.system.micro_wer, baseline.system.micro_wer, wer_delta, wer_band
+        ));
+    } else {
+        reasons.push(format!(
+            "WER ok: {:.4} vs baseline {:.4} (change {:+.4} within noise band {:.4})",
+            candidate.system.micro_wer, baseline.system.micro_wer, wer_delta, wer_band
+        ));
+    }
+
+    let cer_band = half_width(&candidate.system.cer_ci);
+    let cer_delta = candidate.system.micro_cer - baseline.system.micro_cer;
+    if cer_delta > cer_band {
+        passed = false;
+        reasons.push(format!(
+            "CER REGRESSED: {:.4} vs baseline {:.4} (+{:.4} exceeds CI noise band {:.4})",
+            candidate.system.micro_cer, baseline.system.micro_cer, cer_delta, cer_band
+        ));
+    } else {
+        reasons.push(format!(
+            "CER ok: {:.4} vs baseline {:.4} (change {:+.4} within noise band {:.4})",
+            candidate.system.micro_cer, baseline.system.micro_cer, cer_delta, cer_band
+        ));
+    }
+
+    RegressionGateResult { passed, reasons }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +392,33 @@ mod tests {
         let hypotheses: Vec<(String, String)> =
             gold.iter().zip(hyps).map(|(g, h)| (g.id.clone(), (*h).to_string())).collect();
         run_gold_eval(&db, model_id, hypotheses).unwrap()
+    }
+
+    #[test]
+    fn gold_regression_gate_blocks_a_worse_change_but_allows_noise() {
+        let pairs = [
+            ("/a/1.wav", "ساڵی نوێ پیرۆز بێت"),
+            ("/a/2.wav", "ئەو لە کوردستان دەژی"),
+            ("/a/3.wav", "کتێبەکە زۆر باش بوو"),
+        ];
+        let perfect: Vec<&str> = pairs.iter().map(|(_, r)| *r).collect();
+        let opts = ScorecardOptions::default();
+
+        let baseline = build_scorecard(&eval_with(&pairs, &perfect, "baseline"), None, opts);
+
+        // An identical candidate -> no regression -> PASS.
+        let same = build_scorecard(&eval_with(&pairs, &perfect, "cand-same"), None, opts);
+        assert!(
+            check_gold_regression(&same, &baseline).passed,
+            "an identical result must not be flagged as a regression"
+        );
+
+        // A clearly worse candidate (every hypothesis wrong) -> regression beyond the CI -> FAIL.
+        let garbage = ["نا", "نا", "نا"];
+        let worse = build_scorecard(&eval_with(&pairs, &garbage, "cand-worse"), None, opts);
+        let verdict = check_gold_regression(&worse, &baseline);
+        assert!(!verdict.passed, "a clearly worse change must be blocked: {:?}", verdict.reasons);
+        assert!(verdict.reasons.iter().any(|r| r.contains("REGRESSED")), "{:?}", verdict.reasons);
     }
 
     /// Evaluate two hypothesis sets against the SAME gold set, so the `gold_id`s align
