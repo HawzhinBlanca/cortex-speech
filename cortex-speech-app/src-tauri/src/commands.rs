@@ -1097,6 +1097,54 @@ pub fn cancel_job(id: String, state: State<'_, AppState>) -> Result<(), String> 
     crate::runs::cancel_job(&db, &id).map_err(|e| e.to_string())
 }
 
+/// The model registry, newest-first within each family — what a registry panel lists.
+#[tauri::command]
+pub fn list_model_versions(state: State<'_, AppState>) -> Result<Vec<crate::registry::ModelVersion>, String> {
+    RATE_LIMITER.check("list_model_versions")?;
+    let db = state.lock_db();
+    crate::registry::list_model_versions(&db).map_err(|e| e.to_string())
+}
+
+/// The current champion for a family, if one is crowned.
+#[tauri::command]
+pub fn get_champion_model(
+    family: String,
+    state: State<'_, AppState>,
+) -> Result<Option<crate::registry::ModelVersion>, String> {
+    RATE_LIMITER.check("get_champion_model")?;
+    validate::validate_identifier(&family)?;
+    let db = state.lock_db();
+    crate::registry::get_champion(&db, &family).map_err(|e| e.to_string())
+}
+
+/// Import an externally fine-tuned checkpoint into the registry as a gated candidate. The SHA is
+/// computed server-side from the file; the caller never supplies it. Promotion is a separate,
+/// gated step (not exposed yet — it must run through the eval gate), so this can only ever add a
+/// candidate, never crown a champion.
+#[tauri::command]
+pub fn import_model_checkpoint(
+    id: String,
+    family: String,
+    checkpoint_path: String,
+    source: String,
+    license: String,
+    model_card_name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    STRICT_RATE_LIMITER.check("import_model_checkpoint")?;
+    validate::validate_identifier(&id)?;
+    validate::validate_identifier(&family)?;
+    validate::validate_identifier(&source)?;
+    validate::validate_identifier(&license)?;
+    if let Some(ref card) = model_card_name {
+        validate::validate_text(card, 256, "model_card_name")?;
+    }
+    let checkpoint_path = validate::validate_file_path(&checkpoint_path)?;
+    let db = state.lock_db();
+    crate::registry::import_checkpoint(&db, &id, &family, &checkpoint_path, &source, &license, model_card_name)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn get_blocking_validation_issues(
     warning_threshold: Option<usize>,
