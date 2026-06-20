@@ -41,3 +41,7 @@ src-tauri/icons/*.png
 src-tauri/icons/*.ico
 !src-tauri/icons/icon.png
 !src-tauri/icons/icon.ico
+
+# Local API keys — never commit
+secrets.env
+**/secrets.env

@@ -2419,6 +2419,16 @@ pub fn create_gold_from_file(audio_path: String, state: State<'_, AppState>) -> 
     crate::eval::create_gold_from_verified_file(&db, &audio_path).map_err(|e| e.to_string())
 }
 
+/// Report which cloud providers have an API key configured (provider NAMES only — never the key
+/// values), so the user can confirm the keys they pasted into secrets.env were detected.
+#[tauri::command]
+pub fn get_configured_providers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    RATE_LIMITER.check("get_configured_providers")?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    let keys = crate::api_keys::ApiKeys::load(&data_dir);
+    Ok(keys.configured_providers().into_iter().map(String::from).collect())
+}
+
 #[tauri::command]
 pub fn get_escalation_queue(state: State<'_, AppState>, limit: usize) -> Result<Vec<crate::db::SpeechSegment>, String> {
     RATE_LIMITER.check("get_escalation_queue")?;
