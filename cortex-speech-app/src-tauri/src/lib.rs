@@ -5,6 +5,7 @@
 
 pub mod agentic;
 pub mod align_text;
+pub mod api_keys;
 pub mod aligner;
 pub mod asr;
 pub mod atomic_file;
@@ -401,6 +402,7 @@ pub fn run() {
             commands::get_champion_model,
             commands::import_model_checkpoint,
             commands::create_gold_from_file,
+            commands::get_configured_providers,
             commands::get_blocking_validation_issues,
             commands::register_media_asset,
             commands::get_media_asset_url,
