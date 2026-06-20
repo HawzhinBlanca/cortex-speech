@@ -524,6 +524,44 @@ mod tests {
     }
 
     #[test]
+    fn reopening_a_populated_db_preserves_data_on_restart() {
+        // The real launch path reopens the existing DB file and calls initialize() (which re-runs
+        // migrations) every time. On an already-migrated, populated DB that must be a NO-OP for the
+        // data: a destructive/migrating-again bug here would silently lose user work on every start.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restart.db");
+        let path_str = path.to_str().unwrap();
+
+        // First launch: migrate + persist a rich segment, then "close".
+        {
+            let db = Database::open(path_str).unwrap();
+            db.initialize().unwrap();
+            let seg = crate::db::SpeechSegment {
+                id: "keep-1".into(),
+                audio_path: "/a/keep.wav".into(),
+                raw_transcript: "کوردی".into(),
+                duration_ms: 1234,
+                alignment_json: Some(
+                    "{\"source_start_ms\":0,\"source_end_ms\":1234,\"chunk_index\":0,\"chunk_count\":1}".into(),
+                ),
+                ..Default::default()
+            };
+            db.insert_segment(&seg).unwrap();
+        }
+
+        // Second launch (restart): reopen + initialize again.
+        let db = Database::open(path_str).unwrap();
+        assert!(run_migrations(&db).unwrap().is_empty(), "restart must not re-apply migrations");
+        db.initialize().unwrap(); // the actual launch path
+
+        let got = db.get_segment_by_id("keep-1").unwrap().expect("segment must survive the restart");
+        assert_eq!(got.raw_transcript, "کوردی", "transcript intact across restart");
+        assert_eq!(got.duration_ms, 1234, "duration intact");
+        assert_eq!(got.audio_path, "/a/keep.wav", "audio path intact");
+        assert!(got.alignment_json.is_some(), "playback alignment intact");
+    }
+
+    #[test]
     fn test_list_migrations() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
