@@ -92,9 +92,11 @@ pub fn dedupe_repeated(text: &str) -> String {
     }
 }
 
-/// Transcribe an audio file with ElevenLabs Scribe. Returns the transcription text. Errors carry the
-/// key redacted (defense in depth, though the key is only ever sent as a header).
-pub fn transcribe(audio_path: &str, api_key: &str, model_id: &str, language_code: &str) -> AppResult<String> {
+/// Send one Scribe request and return the parsed JSON response. Shared by [`transcribe`] (text only)
+/// and [`transcribe_segments`] (word timestamps). The key travels in a header; errors redact it.
+fn request_scribe_json(
+    audio_path: &str, api_key: &str, model_id: &str, language_code: &str,
+) -> AppResult<serde_json::Value> {
     let audio = std::fs::read(audio_path).map_err(|e| AppError::Other(format!("read audio {audio_path}: {e}")))?;
     let filename =
         std::path::Path::new(audio_path).file_name().and_then(|f| f.to_str()).unwrap_or("audio.wav");
@@ -107,11 +109,111 @@ pub fn transcribe(audio_path: &str, api_key: &str, model_id: &str, language_code
         .set("Content-Type", &content_type)
         .send_bytes(&body)
         .map_err(|e| AppError::Other(format!("Scribe request failed: {}", redact(e.to_string()))))?;
-    let json: serde_json::Value =
-        resp.into_json().map_err(|e| AppError::Other(format!("Scribe response parse: {e}")))?;
+    resp.into_json().map_err(|e| AppError::Other(format!("Scribe response parse: {e}")))
+}
+
+/// Transcribe an audio file with ElevenLabs Scribe. Returns the transcription text. Errors carry the
+/// key redacted (defense in depth, though the key is only ever sent as a header).
+pub fn transcribe(audio_path: &str, api_key: &str, model_id: &str, language_code: &str) -> AppResult<String> {
+    let json = request_scribe_json(audio_path, api_key, model_id, language_code)?;
     parse_scribe_text(&json)
         .map(|text| dedupe_repeated(&text))
         .ok_or_else(|| AppError::Other("Scribe returned no transcription text".into()))
+}
+
+/// One transcribed word with its timing in milliseconds from the start of the source audio.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScribeWord {
+    pub text: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// A contiguous run of words destined to become one annotatable segment, with its source time range.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScribeSegment {
+    pub text: String,
+    pub source_start_ms: i64,
+    pub source_end_ms: i64,
+}
+
+/// Silence gap (ms) before a word that ends the current segment — a natural pause between utterances.
+pub const DEFAULT_PAUSE_GAP_MS: i64 = 600;
+/// Maximum segment length (ms) — keeps each segment short enough to review and correct comfortably.
+pub const DEFAULT_MAX_SEGMENT_MS: i64 = 12_000;
+
+/// Extract word-level timestamps from a Scribe response. Only `type == "word"` entries are kept
+/// (`spacing` entries are layout, not content) and times convert seconds → ms. Unlike the `text`
+/// field (which Scribe sometimes duplicates), the words array is a single clean monotonic pass —
+/// verified on a real Sorani clip — so no de-duplication is needed here.
+fn parse_scribe_words(json: &serde_json::Value) -> Vec<ScribeWord> {
+    let Some(arr) = json.get("words").and_then(|w| w.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|w| w.get("type").and_then(|t| t.as_str()) == Some("word"))
+        .filter_map(|w| {
+            let text = w.get("text").and_then(|t| t.as_str())?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let start = w.get("start").and_then(serde_json::Value::as_f64)?;
+            let end = w.get("end").and_then(serde_json::Value::as_f64)?;
+            Some(ScribeWord {
+                text: text.to_string(),
+                start_ms: (start * 1000.0).round() as i64,
+                end_ms: (end * 1000.0).round() as i64,
+            })
+        })
+        .collect()
+}
+
+/// Join a non-empty run of words into a [`ScribeSegment`] spanning first.start..last.end.
+fn flush_segment(words: &[&ScribeWord]) -> ScribeSegment {
+    ScribeSegment {
+        text: words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "),
+        source_start_ms: words.first().map_or(0, |w| w.start_ms),
+        source_end_ms: words.last().map_or(0, |w| w.end_ms),
+    }
+}
+
+/// Group transcribed words into review-sized segments. A new segment begins when the silence before
+/// a word exceeds `pause_gap_ms`, or when extending the current one would pass `max_segment_ms`.
+pub fn segment_words(words: &[ScribeWord], pause_gap_ms: i64, max_segment_ms: i64) -> Vec<ScribeSegment> {
+    let mut segments = Vec::new();
+    let mut cur: Vec<&ScribeWord> = Vec::new();
+    for w in words {
+        if let Some(prev) = cur.last() {
+            let gap = w.start_ms - prev.end_ms;
+            let span = w.end_ms - cur[0].start_ms;
+            if gap > pause_gap_ms || span > max_segment_ms {
+                segments.push(flush_segment(&cur));
+                cur.clear();
+            }
+        }
+        cur.push(w);
+    }
+    if !cur.is_empty() {
+        segments.push(flush_segment(&cur));
+    }
+    segments
+}
+
+/// Transcribe a whole audio file with Scribe and split it into review-sized segments using the
+/// word-level timestamps — ONE Scribe API call per file (cost-efficient for long recordings). Falls
+/// back to a single whole-file segment (from the de-duplicated text) when no word timings are present.
+pub fn transcribe_segments(
+    audio_path: &str, api_key: &str, model_id: &str, language_code: &str,
+) -> AppResult<Vec<ScribeSegment>> {
+    let json = request_scribe_json(audio_path, api_key, model_id, language_code)?;
+    let words = parse_scribe_words(&json);
+    if words.is_empty() {
+        let text = parse_scribe_text(&json)
+            .map(|t| dedupe_repeated(&t))
+            .ok_or_else(|| AppError::Other("Scribe returned no words and no text".into()))?;
+        return Ok(vec![ScribeSegment { text, source_start_ms: 0, source_end_ms: 0 }]);
+    }
+    Ok(segment_words(&words, DEFAULT_PAUSE_GAP_MS, DEFAULT_MAX_SEGMENT_MS))
 }
 
 #[cfg(test)]
@@ -157,5 +259,89 @@ mod tests {
     fn dedupe_leaves_distinct_text_unchanged() {
         let text = "ئەمە ڕستەی یەکەمە سەبارەت بە کوردستان، بەڵام ئەمەی دواتر سەبارەت بە ئاو و هەوای جیهانە بەتەواوی";
         assert_eq!(dedupe_repeated(text), text, "genuinely distinct halves must not be collapsed");
+    }
+
+    #[test]
+    fn parse_words_keeps_words_drops_spacing_and_converts_to_ms() {
+        // Shape mirrors the real Scribe response (verified live): word + spacing entries, secs.
+        let json = serde_json::json!({
+            "words": [
+                {"text": "دەزگای", "start": 0.7, "end": 1.06, "type": "word"},
+                {"text": " ", "start": 1.06, "end": 1.12, "type": "spacing"},
+                {"text": "ڕوانگە", "start": 1.12, "end": 1.54, "type": "word"},
+                {"text": "  ", "start": 0.0, "end": 0.0, "type": "spacing"}
+            ]
+        });
+        let words = parse_scribe_words(&json);
+        assert_eq!(words.len(), 2, "spacing entries are dropped");
+        assert_eq!(words[0], ScribeWord { text: "دەزگای".into(), start_ms: 700, end_ms: 1060 });
+        assert_eq!(words[1].start_ms, 1120, "seconds round to ms");
+    }
+
+    #[test]
+    fn parse_words_empty_when_no_words_field() {
+        assert!(parse_scribe_words(&serde_json::json!({"text": "x"})).is_empty());
+    }
+
+    fn w(text: &str, start_ms: i64, end_ms: i64) -> ScribeWord {
+        ScribeWord { text: text.into(), start_ms, end_ms }
+    }
+
+    #[test]
+    fn segment_words_splits_on_a_long_pause() {
+        // Two words tight together, then a 1s pause, then a word -> two segments.
+        let words = vec![w("a", 0, 300), w("b", 350, 600), w("c", 1700, 2000)];
+        let segs = segment_words(&words, 600, 12_000);
+        assert_eq!(segs.len(), 2, "the >600ms gap before 'c' starts a new segment");
+        assert_eq!(segs[0], ScribeSegment { text: "a b".into(), source_start_ms: 0, source_end_ms: 600 });
+        assert_eq!(segs[1], ScribeSegment { text: "c".into(), source_start_ms: 1700, source_end_ms: 2000 });
+    }
+
+    #[test]
+    fn segment_words_splits_when_max_length_exceeded() {
+        // No pauses, but the run exceeds max_segment_ms -> it splits.
+        let words = vec![w("a", 0, 1000), w("b", 1000, 2000), w("c", 2000, 3000)];
+        let segs = segment_words(&words, 600, 1500);
+        assert!(segs.len() >= 2, "a 3s run with a 1.5s cap must split, got {}", segs.len());
+        assert_eq!(segs[0].source_start_ms, 0);
+        // Segments stay contiguous and ordered.
+        assert!(segs.windows(2).all(|p| p[1].source_start_ms >= p[0].source_end_ms));
+    }
+
+    #[test]
+    fn segment_words_keeps_one_segment_when_no_boundary() {
+        let words = vec![w("a", 0, 300), w("b", 400, 700), w("c", 800, 1100)];
+        let segs = segment_words(&words, 600, 12_000);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "a b c");
+        assert_eq!((segs[0].source_start_ms, segs[0].source_end_ms), (0, 1100));
+    }
+
+    #[test]
+    fn segment_words_handles_empty_input() {
+        assert!(segment_words(&[], 600, 12_000).is_empty());
+    }
+
+    /// Live end-to-end proof against the real API. Off by default (network + key + audio); run with
+    ///   ELEVENLABS_API_KEY=... SCRIBE_TEST_AUDIO=/path/to/clip.wav cargo test --lib -- --ignored live_transcribe_segments
+    /// Asserts the whole-file path yields ordered, in-range segments and prints them for inspection.
+    #[test]
+    #[ignore = "live: set ELEVENLABS_API_KEY and SCRIBE_TEST_AUDIO"]
+    fn live_transcribe_segments() {
+        let key = std::env::var("ELEVENLABS_API_KEY").expect("set ELEVENLABS_API_KEY");
+        let audio = std::env::var("SCRIBE_TEST_AUDIO").expect("set SCRIBE_TEST_AUDIO");
+        let segs = transcribe_segments(&audio, &key, DEFAULT_MODEL, "kur").expect("transcribe_segments");
+        assert!(!segs.is_empty(), "expected at least one segment");
+        for s in &segs {
+            assert!(s.source_end_ms >= s.source_start_ms, "each segment ends at/after it starts");
+            assert!(!s.text.trim().is_empty(), "no empty-text segments");
+        }
+        for pair in segs.windows(2) {
+            assert!(pair[1].source_start_ms >= pair[0].source_start_ms, "segments are time-ordered");
+        }
+        eprintln!("LIVE_SEGMENTS_COUNT::{}", segs.len());
+        for (i, s) in segs.iter().enumerate() {
+            eprintln!("SEG[{i}] {}..{}ms :: {}", s.source_start_ms, s.source_end_ms, s.text);
+        }
     }
 }
