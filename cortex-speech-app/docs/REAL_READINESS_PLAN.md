@@ -26,6 +26,22 @@ measured on their data. This plan fixes the standard, not just the features.
 - **Net: a strong foundation, an unusable product, zero measured quality.** ~6–7/10 engineering, not
   a 10/10 product.
 
+## Verified engine reality (measured with the user's keys — proven in Rust, not claimed)
+
+- **ElevenLabs Scribe → WORKS for Sorani.** A real transcription of the Nawras clip via Scribe v1
+  returned coherent, punctuated text with the year recovered, both from a Python probe AND the Rust
+  client (`scribe_api.rs`, `tests/scribe_live.rs` passed). One quirk: it duplicated the whole output
+  — dedupe at wiring. Contradicts the earlier pessimism about Scribe's Kurdish support.
+- **OpenRouter → WORKS, and reaches Gemini 2.5 Pro + GPT-4o-mini.** The Rust refiner corrected a real
+  Sorani sentence via OpenRouter (`llm_refiner.rs::for_openrouter`, `tests/openrouter_live.rs`
+  passed). This is the LLM gateway for the refiner/jury/GER roles.
+- **Direct Gemini → BLOCKED (429, no quota).** Irrelevant: use Gemini-class models *via OpenRouter*.
+  (To unblock direct Gemini, the user would enable billing — optional, not needed.)
+- **Consequence:** every engine the vision needs is now AVAILABLE and proven — Scribe (STT) +
+  OpenRouter (LLM, incl. Gemini) + the local 7B when the user brings it. Phase 1's "cloud keys"
+  blocker is SATISFIED. What remains for Phase 1 is *wiring* these proven clients into the app's
+  transcription/refine paths (and deduping Scribe), not finding engines.
+
 ## What "truly ready / 10/10" means — YOUR bar (all observable/measured)
 
 1. Import audio → a **good** draft (measured better than baseline on your gold, p<0.05).
