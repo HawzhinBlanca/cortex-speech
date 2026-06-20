@@ -1072,6 +1072,14 @@ impl Database {
             None
         };
 
+        // The model's wrong transcript for this edit (the agent proposal when available, else the
+        // raw ASR) — the shared "wrong" side of both the audit-ledger row and the LOOP-0 memory.
+        let wrong_side: Option<String> = if decision == "edit" {
+            Some(rejected_learning_transcript.clone().unwrap_or_else(|| raw_transcript.clone()))
+        } else {
+            None
+        };
+
         // The human's verdict, the learning pair, and the audit-ledger row commit together as one
         // atomic correction — a crash can never leave a verdict without its provenance, or vice versa.
         let tx = self.conn.unchecked_transaction()?;
@@ -1106,15 +1114,49 @@ impl Database {
         // the ledger records gold and non-gold alike — it is the full audit trail, keyed on the
         // durable audio_content_hash, that makes the training set reconstructable and every label
         // attributable to the model_version that produced it.
-        if let (Some(content_hash), Some(fix)) = (ledger_hash, corrected_transcript) {
+        if let (Some(content_hash), Some(fix), Some(wrong)) =
+            (ledger_hash, corrected_transcript, wrong_side.as_deref())
+        {
             let correction_id = uuid::Uuid::new_v4().to_string();
-            let raw_hypothesis = rejected_learning_transcript.unwrap_or(raw_transcript);
             tx.execute(
                 "INSERT INTO corrections
                     (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, jury_verdict, model_version_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![correction_id, segment_id, content_hash, raw_hypothesis, fix, prior_verdict, model_version_id],
+                params![correction_id, segment_id, content_hash, wrong, fix, prior_verdict, model_version_id],
             )?;
+        }
+
+        // LOOP 0: distil the edit into per-slot error memories so the SAME confusion is corrected on
+        // the next decode with no retraining. Gold is excluded — a memory firing on a held-out clip
+        // would leak into eval. Upsert on the natural key (slot + wrong + human): a repeated,
+        // independently confirmed correction bumps hit_count instead of inserting a duplicate.
+        if is_gold == 0 {
+            if let (Some(wrong), Some(fix)) = (wrong_side.as_deref(), corrected_transcript) {
+                for mem in crate::corrections::extract_substitution_memories(wrong, fix) {
+                    let bumped = tx.execute(
+                        "UPDATE correction_memory SET hit_count = hit_count + 1
+                         WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3",
+                        params![mem.slot_key, mem.wrong_token, mem.human_token],
+                    )?;
+                    if bumped == 0 {
+                        let mem_id = uuid::Uuid::new_v4().to_string();
+                        tx.execute(
+                            "INSERT INTO correction_memory
+                                (id, wrong_token, human_token, slot_key, phonetic_key, source_segment, model_version_id)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            params![
+                                mem_id,
+                                mem.wrong_token,
+                                mem.human_token,
+                                mem.slot_key,
+                                mem.phonetic_key,
+                                segment_id,
+                                model_version_id
+                            ],
+                        )?;
+                    }
+                }
+            }
         }
 
         tx.commit()?;
@@ -1614,6 +1656,65 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM corrections WHERE segment_id = ?1", params!["led-missing"], |r| r.get(0))
             .expect("count");
         assert_eq!(count, 0, "no ledger row when the audio identity cannot be computed");
+    }
+
+    #[test]
+    fn edit_populates_correction_memory_with_substitution() {
+        let db = make_db();
+        let mut seg = make_segment("mem-1", "/data/audio/mem-1.wav");
+        seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+        db.insert_segment(&seg).expect("insert");
+        db.record_human_decision("mem-1", "edit", Some("ئەو ساڵە خراپ بوو")).expect("edit");
+
+        let (wrong, human, hits): (String, String, i64) = db
+            .connection()
+            .query_row(
+                "SELECT wrong_token, human_token, hit_count FROM correction_memory WHERE source_segment = ?1",
+                params!["mem-1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("a correction memory row must exist after a substituting edit");
+        assert_eq!(wrong, "باش");
+        assert_eq!(human, "خراپ");
+        assert_eq!(hits, 0, "a freshly captured memory starts at hit_count 0");
+    }
+
+    #[test]
+    fn repeated_correction_bumps_hit_count_not_duplicates() {
+        let db = make_db();
+        for id in ["mem-a", "mem-b"] {
+            let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
+            seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+            db.insert_segment(&seg).expect("insert");
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو")).expect("edit");
+        }
+        let (rows, max_hits): (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(hit_count), 0) FROM correction_memory
+                 WHERE wrong_token = 'باش' AND human_token = 'خراپ'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query");
+        assert_eq!(rows, 1, "the same correction must upsert, not duplicate");
+        assert_eq!(max_hits, 1, "a second independent confirmation bumps hit_count to 1");
+    }
+
+    #[test]
+    fn gold_edit_does_not_populate_correction_memory() {
+        let db = make_db();
+        let mut seg = make_segment("mem-gold", "/data/audio/mem-gold.wav");
+        seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+        db.insert_segment(&seg).expect("insert");
+        db.connection().execute("UPDATE speech_segments SET is_gold = 1 WHERE id = 'mem-gold'", []).expect("mark gold");
+        db.record_human_decision("mem-gold", "edit", Some("ئەو ساڵە خراپ بوو")).expect("edit");
+
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM correction_memory WHERE source_segment = 'mem-gold'", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 0, "gold-segment edits must not populate LOOP-0 memory (eval-leak guard)");
     }
 
     #[test]
