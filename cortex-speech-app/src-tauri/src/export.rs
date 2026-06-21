@@ -404,14 +404,18 @@ pub fn export_huggingface_dataset(
     // that ALSO exists as a normal training-ready segment leaks into data/train, contaminating the
     // very eval set the promotion gate measures against.
     let holdout = crate::jury::learning::holdout_content_hashes(db)?;
+    let holdout_paths = crate::jury::learning::holdout_audio_paths(db)?;
     let segments: Vec<_> = segments
         .into_iter()
         .filter(|seg| {
             let path = std::path::Path::new(&seg.audio_path);
-            let held_out = path.exists()
-                && crate::pipeline::source_audio_identity(path)
-                    .map(|id| holdout.contains(&id.content_hash))
-                    .unwrap_or(false);
+            // Fail-closed: path match excludes a held-out clip even when its file is missing (so its
+            // content can no longer be re-hashed); hash match also catches the same content at any path.
+            let held_out = holdout_paths.contains(&seg.audio_path)
+                || (path.exists()
+                    && crate::pipeline::source_audio_identity(path)
+                        .map(|id| holdout.contains(&id.content_hash))
+                        .unwrap_or(false));
             if held_out {
                 tracing::warn!("Excluding segment {} from HF export: matches holdout gold audio", seg.id);
             }

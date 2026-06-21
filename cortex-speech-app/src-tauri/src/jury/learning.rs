@@ -61,8 +61,11 @@ struct LearningRow {
 /// Excludes examples linked to `is_gold = 1` segments so the permanent
 /// holdout is never used for training.
 pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
-    // Holdout hashes — never train on the permanent gold holdout (shared helper).
+    // Holdout exclusion — never train on the permanent gold holdout (shared helpers). Hash catches
+    // the same content at any path (when the file is present); path catches it fail-closed even when
+    // the training file is gone.
     let holdout_hashes = holdout_content_hashes(db)?;
+    let holdout_paths = holdout_audio_paths(db)?;
 
     let mut stmt = db.connection().prepare(
         "SELECT ae.segment_id,
@@ -113,7 +116,14 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
             continue;
         }
 
-        // Gold-Holdout Hash Exclusion
+        // Gold-Holdout exclusion (fail-closed). Path match works even when the file is gone.
+        if holdout_paths.contains(&row.audio_path) {
+            tracing::warn!(
+                "Excluding segment {} from DPO export: matches holdout gold audio path",
+                row.segment_id
+            );
+            continue;
+        }
         let audio_path = Path::new(&row.audio_path);
         if audio_path.exists() {
             if let Ok(identity) = crate::pipeline::source_audio_identity(audio_path) {
@@ -163,6 +173,21 @@ pub(crate) fn holdout_content_hashes(db: &Database) -> AppResult<std::collection
     Ok(hashes)
 }
 
+/// The audio paths of the permanent holdout gold clips. Used together with
+/// [`holdout_content_hashes`] so exclusion is fail-CLOSED: a training segment that shares a holdout
+/// clip's audio path is dropped even when its audio file is missing (so its content can no longer be
+/// re-hashed). Without this, a deleted/moved training-segment file made `path.exists()` false and the
+/// whole holdout check was skipped, silently leaking held-out content into the export.
+pub(crate) fn holdout_audio_paths(db: &Database) -> AppResult<std::collections::HashSet<String>> {
+    let mut stmt = db.connection().prepare("SELECT audio_path FROM gold_segments WHERE is_holdout = 1")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut paths = std::collections::HashSet::new();
+    for row in rows {
+        paths.insert(row?);
+    }
+    Ok(paths)
+}
+
 /// Export the LOOP-2 language-model training corpus: the human-confirmed-correct Sorani text from
 /// reviewed (`human_decision` = accept|edit), non-gold segments — the curated correct text the
 /// flywheel has accumulated. Each line is canonicalized with the char-only normalizer (Kaf/Yeh/Heh
@@ -172,6 +197,7 @@ pub(crate) fn holdout_content_hashes(db: &Database) -> AppResult<std::collection
 /// fine-tuned 7B).
 pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
     let holdout = holdout_content_hashes(db)?;
+    let holdout_paths = holdout_audio_paths(db)?;
     let normalizer = crate::normalizer::SoraniNormalizer::with_config(crate::normalizer::NormalizationConfig {
         normalize_numbers: false,
         verbalize_numbers: false,
@@ -193,6 +219,10 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
         let (text, audio_path) = row_res?;
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { continue };
 
+        // Fail-closed holdout exclusion: path match drops a held-out clip even if its file is gone.
+        if holdout_paths.contains(&audio_path) {
+            continue;
+        }
         let path = Path::new(&audio_path);
         if path.exists() {
             if let Ok(identity) = crate::pipeline::source_audio_identity(path) {
@@ -933,5 +963,80 @@ mod tests {
         // 5. Verify it is now included
         let result2 = build_dpo_dataset(&db).expect("build DPO");
         assert_eq!(result2.pair_count, 1, "should include segment when is_holdout is 0");
+    }
+
+    #[test]
+    fn build_dpo_excludes_holdout_even_when_audio_file_is_missing() {
+        // Round-6 fail-closed regression: a held-out clip whose on-disk file has been moved/deleted
+        // (routine in curation) must STILL be excluded. Previously, path.exists()==false skipped the
+        // whole holdout check and the held-out pair leaked into the DPO training set.
+        let db = open_mem_db();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let audio_path = temp.path().join("source.wav");
+        std::fs::write(&audio_path, b"holdout check audio bytes").expect("write audio");
+        let audio_path_str = audio_path.to_string_lossy().to_string();
+
+        let segment = SpeechSegment {
+            id: "seg-holdout".to_string(),
+            audio_path: audio_path_str.clone(),
+            raw_transcript: "wrong text".to_string(),
+            duration_ms: 1000,
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&segment).expect("insert segment");
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["ex-holdout", "seg-holdout", "wrong text", "corrected text"],
+            )
+            .expect("insert example");
+        db.connection()
+            .execute(
+                "INSERT INTO gold_segments (id, audio_path, reference, is_holdout)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["gold-holdout", audio_path_str.clone(), "corrected text", 1i32],
+            )
+            .expect("insert gold");
+
+        // The recording is deleted on disk before export.
+        std::fs::remove_file(&audio_path).expect("delete audio");
+
+        let result = build_dpo_dataset(&db).expect("build DPO");
+        assert_eq!(result.pair_count, 0, "missing file must not leak held-out content into DPO");
+    }
+
+    #[test]
+    fn export_lm_corpus_excludes_holdout_even_when_audio_file_is_missing() {
+        let db = open_mem_db();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let audio_path = temp.path().join("lm.wav");
+        std::fs::write(&audio_path, b"lm holdout audio").expect("write audio");
+        let audio_path_str = audio_path.to_string_lossy().to_string();
+
+        let segment = SpeechSegment {
+            id: "seg-lm".to_string(),
+            audio_path: audio_path_str.clone(),
+            raw_transcript: "کوردی".to_string(),
+            duration_ms: 1000,
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&segment).expect("insert segment");
+        // Mark as human-accepted so it qualifies for the LM corpus.
+        db.connection()
+            .execute("UPDATE speech_segments SET human_decision = 'accept' WHERE id = 'seg-lm'", [])
+            .expect("set decision");
+        db.connection()
+            .execute(
+                "INSERT INTO gold_segments (id, audio_path, reference, is_holdout)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["gold-lm", audio_path_str.clone(), "کوردی", 1i32],
+            )
+            .expect("insert gold");
+
+        std::fs::remove_file(&audio_path).expect("delete audio");
+
+        let corpus = export_lm_corpus(&db).expect("export lm");
+        assert!(corpus.is_empty(), "missing file must not leak held-out text into the LM corpus");
     }
 }
