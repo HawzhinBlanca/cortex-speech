@@ -444,17 +444,21 @@ pub fn gate_and_promote(
     let challenger = get_model_version(db, challenger_id)?
         .ok_or_else(|| AppError::Validation(format!("cannot gate unknown model version '{challenger_id}'")))?;
 
-    let decision = match champion_gold_cer(db, &challenger.family)? {
-        None => PromotionDecision {
+    // Distinguish "no champion exists" from "a champion exists" by the CHAMPION ROW itself — NOT by
+    // whether its gold_cer is non-NULL. Keying on gold_cer would read a champion with a NULL gold_cer
+    // as "no champion", letting the next challenger bypass the ENTIRE gate (a free promotion). The gate
+    // uses the PAIRED champion CER carried in the challenger scorecard's vs_baseline, so the champion's
+    // stored gold_cer value is not needed here at all.
+    let decision = if get_champion(db, &challenger.family)?.is_none() {
+        PromotionDecision {
             promote: true,
             reasons: vec![format!(
                 "no incumbent champion for family '{}' — promoted as the first champion",
                 challenger.family
             )],
-        },
-        // A champion exists — run the full gate. The CER baseline is the PAIRED champion CER carried
-        // in the challenger scorecard's vs_baseline, so the frozen gold_cer value is no longer needed.
-        Some(_) => decide_promotion(challenger_scorecard, policy),
+        }
+    } else {
+        decide_promotion(challenger_scorecard, policy)
     };
 
     if decision.promote {
@@ -835,6 +839,32 @@ mod tests {
         assert!(!decision.promote, "a CER-regressing challenger must be blocked");
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "champ", "champion is unchanged");
         assert_eq!(get_model_version(&db, "chall").unwrap().unwrap().status, "candidate");
+    }
+
+    #[test]
+    fn gate_and_promote_does_not_bypass_gate_when_champion_gold_cer_is_null() {
+        // Round-10 audit (latent, hardened pre-wiring): champion_gold_cer conflated "no champion" with
+        // "champion exists but gold_cer NULL", so a challenger arriving while the incumbent had a NULL
+        // gold_cer used to bypass the ENTIRE gate (free promotion). gate_and_promote now keys on the
+        // champion ROW, so even a NULL-gold_cer champion still forces the challenger through the gate.
+        let db = open();
+        register_candidate(&db, &candidate("champ", "omniasr-7b", "meta-stock", "shaA")).unwrap();
+        promote_to_champion(&db, "champ").unwrap(); // crowned WITHOUT record_eval_result -> gold_cer NULL
+        assert!(
+            champion_gold_cer(&db, "omniasr-7b").unwrap().is_none(),
+            "precondition: the champion's gold_cer is NULL"
+        );
+
+        register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
+        // A CER-regressing challenger (paired 0.15 > 0.10) must be BLOCKED, not free-promoted.
+        let card = challenger_card(0.10, 0.15, 0.20, 0.10, true, 0.01);
+        let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
+        assert!(
+            !decision.promote,
+            "a champion with NULL gold_cer must still gate the challenger: {:?}",
+            decision.reasons
+        );
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "champ", "champion unchanged");
     }
 
     #[test]
