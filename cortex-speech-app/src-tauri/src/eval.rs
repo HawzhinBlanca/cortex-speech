@@ -77,13 +77,18 @@ pub struct EvalRunResult {
 pub fn import_gold_segments(db: &Database, inputs: Vec<GoldSegmentInput>) -> AppResult<usize> {
     let conn = db.connection();
     let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO gold_segments (id, audio_path, reference, is_holdout)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR IGNORE INTO gold_segments (id, audio_path, reference, is_holdout, audio_content_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     let mut count = 0usize;
     for inp in &inputs {
         let id = Uuid::new_v4().to_string();
-        stmt.execute(params![id, inp.audio_path, inp.reference, inp.is_holdout as i32])?;
+        // Persist the audio content hash NOW — the file is present when the user marks it gold — so
+        // holdout exclusion no longer depends on the file still existing at export time (fail-closed).
+        let content_hash = crate::pipeline::source_audio_identity(std::path::Path::new(&inp.audio_path))
+            .ok()
+            .map(|identity| identity.content_hash);
+        stmt.execute(params![id, inp.audio_path, inp.reference, inp.is_holdout as i32, content_hash])?;
         count += 1;
     }
     Ok(count)

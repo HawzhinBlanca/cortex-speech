@@ -140,15 +140,23 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
 /// excluding held-out audio from any training/LM export. Shared by the DPO, LM-corpus, and
 /// HuggingFace exports.
 pub(crate) fn holdout_content_hashes(db: &Database) -> AppResult<std::collections::HashSet<String>> {
-    let mut stmt = db.connection().prepare("SELECT audio_path FROM gold_segments WHERE is_holdout = 1")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    // Prefer the hash persisted at import (migration v24): it is durable, so a moved/deleted gold
+    // file no longer silently drops its hash (fail-closed). Fall back to hashing from disk only for
+    // legacy rows written before the column existed.
+    let mut stmt =
+        db.connection().prepare("SELECT audio_path, audio_content_hash FROM gold_segments WHERE is_holdout = 1")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?;
     let mut hashes = std::collections::HashSet::new();
-    for path_res in rows {
-        let path_str = path_res?;
-        let path = Path::new(&path_str);
-        if path.exists() {
-            if let Ok(identity) = crate::pipeline::source_audio_identity(path) {
-                hashes.insert(identity.content_hash);
+    for row in rows {
+        let (path_str, persisted) = row?;
+        if let Some(hash) = persisted {
+            hashes.insert(hash);
+        } else {
+            let path = Path::new(&path_str);
+            if path.exists() {
+                if let Ok(identity) = crate::pipeline::source_audio_identity(path) {
+                    hashes.insert(identity.content_hash);
+                }
             }
         }
     }
@@ -498,6 +506,36 @@ mod tests {
         // is attempted, so no network is touched in the test).
         let msg = run_dpo_update(&db, "https://localhost:65535/ingest").expect("valid endpoint passes validation");
         assert!(msg.contains("No preference pairs"), "expected no-op export, got: {msg}");
+    }
+
+    #[test]
+    fn holdout_hashes_survive_a_deleted_gold_file() {
+        // Round-3 audit (gold side): the holdout hash is persisted at import (migration v24), so a
+        // moved/deleted gold file no longer silently drops it from the exclusion set (fail-closed).
+        let db = open_mem_db();
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("gold.wav");
+        std::fs::write(&audio, b"gold audio bytes").unwrap();
+
+        crate::eval::import_gold_segments(
+            &db,
+            vec![crate::eval::GoldSegmentInput {
+                audio_path: audio.to_string_lossy().to_string(),
+                reference: "ref".into(),
+                is_holdout: true,
+            }],
+        )
+        .unwrap();
+
+        let with_file = holdout_content_hashes(&db).unwrap();
+        assert_eq!(with_file.len(), 1, "hash present while the gold file exists");
+
+        std::fs::remove_file(&audio).unwrap(); // gold file moved/deleted after registration
+        assert_eq!(
+            holdout_content_hashes(&db).unwrap(),
+            with_file,
+            "the persisted holdout hash must survive a deleted gold file"
+        );
     }
 
     fn insert_current_source_reference(db: &Database, audio_path: &str, model_id: &str, transcript_text: &str) {
