@@ -2504,6 +2504,66 @@ pub fn transcribe_audio_with_scribe(audio_path: String, state: State<'_, AppStat
     crate::scribe_api::transcribe(&audio_path, &key, crate::scribe_api::DEFAULT_MODEL, "kur").map_err(|e| e.to_string())
 }
 
+/// Model id for the independent ElevenLabs Scribe vote. Scribe is architecturally INDEPENDENT of the
+/// OmniASR-CTC family, so (unlike the kin 300M/1B) its vote genuinely corroborates or contradicts the
+/// local consensus — the highest-value escalation signal and training pair per the research.
+const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v2";
+
+/// Add an independent ElevenLabs Scribe hypothesis for the given segments (typically the escalated,
+/// hard ones), so the IRT jury sees an architecturally-INDEPENDENT vote rather than only kin OmniASR
+/// models — closing the confidently-wrong-correlated-error hole. Opt-in and cost-bounded: it
+/// transcribes only the segments the caller chooses and skips any that already have a Scribe vote
+/// (idempotent). Scribe is a second opinion (~32% WER on Sorani), never auto-accepted as gold.
+/// Returns the number of votes added. Re-run the jury afterwards to fold the new votes into consensus.
+#[tauri::command]
+pub fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<usize, String> {
+    STRICT_RATE_LIMITER.check("add_scribe_votes")?;
+    for id in &ids {
+        validate::validate_identifier(id)?;
+    }
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    let key = crate::api_keys::ApiKeys::load(&data_dir)
+        .elevenlabs
+        .ok_or_else(|| "No ElevenLabs API key configured — add ELEVENLABS_API_KEY to secrets.env".to_string())?;
+
+    // Read which segments still need a Scribe vote, then RELEASE the db lock before any network call —
+    // never hold the global db mutex across a blocking cloud request (round-7 concurrency lesson).
+    let to_vote: Vec<(String, String)> = {
+        let db = state.lock_db();
+        let segs = db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for seg in &segs {
+            let existing = db.get_hypotheses_for_segment(&seg.id).map_err(|e| e.to_string())?;
+            if !existing.iter().any(|h| h.model_id == SCRIBE_VOTE_MODEL_ID) {
+                out.push((seg.id.clone(), seg.audio_path.clone()));
+            }
+        }
+        out
+    };
+
+    let mut added = 0usize;
+    for (segment_id, audio_path) in to_vote {
+        match crate::scribe_api::transcribe(&audio_path, &key, crate::scribe_api::DEFAULT_MODEL, "kur") {
+            Ok(transcript) => {
+                let hyp = crate::db::SegmentHypothesis {
+                    segment_id,
+                    model_id: SCRIBE_VOTE_MODEL_ID.to_string(),
+                    transcript,
+                    confidence: None,
+                };
+                let db = state.lock_db(); // brief lock for the local insert only
+                if let Err(e) = db.insert_hypothesis(&hyp) {
+                    tracing::warn!("Failed to store Scribe vote: {e}");
+                } else {
+                    added += 1;
+                }
+            }
+            Err(e) => tracing::warn!("Scribe vote failed for a segment: {e}"),
+        }
+    }
+    Ok(added)
+}
+
 #[tauri::command]
 pub fn get_escalation_queue(state: State<'_, AppState>, limit: usize) -> Result<Vec<crate::db::SpeechSegment>, String> {
     RATE_LIMITER.check("get_escalation_queue")?;
