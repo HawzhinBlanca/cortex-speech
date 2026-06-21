@@ -1940,12 +1940,14 @@ pub fn run_wsl_refinement(
 ) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("run_wsl_refinement")?;
 
-    // Check if a process is already running
-    {
-        let guard = lock_wsl_child();
-        if guard.is_some() {
-            return Err("WSL 7B refinement batch transcription is already running.".into());
-        }
+    // Hold the WSL_CHILD lock across BOTH the "already running" check AND the store below, so a
+    // second concurrent invocation cannot pass this check during the spawn window and orphan the
+    // first child (Child::drop does NOT kill the OS process, and the exit-monitors would cross-wire).
+    // The lock spans only the bounded settings read + spawn + pipe setup; early returns drop it,
+    // leaving the slot None.
+    let mut wsl_slot = lock_wsl_child();
+    if wsl_slot.is_some() {
+        return Err("WSL 7B refinement batch transcription is already running.".into());
     }
 
     let external_script = state
@@ -2005,11 +2007,10 @@ pub fn run_wsl_refinement(
         }
     };
 
-    // Save the child handle
-    {
-        let mut guard = lock_wsl_child();
-        *guard = Some(child);
-    }
+    // Save the child handle under the SAME guard acquired at the check above (closing the TOCTOU),
+    // then release it before the monitor thread (which re-locks to take() the child on exit).
+    *wsl_slot = Some(child);
+    drop(wsl_slot);
 
     let app_clone = app.clone();
 
