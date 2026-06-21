@@ -31,6 +31,23 @@ pub fn compute_nonconformity_score(seg: &SpeechSegment) -> f64 {
     nonconformity(seg.confidence.unwrap_or(0.5), seg.ctc_score)
 }
 
+/// Number of acoustic-condition (SNR) buckets the conformal threshold is calibrated within. A single
+/// global threshold is invalid across studio/field/noisy conditions, so the T0 gate calibrates a
+/// separate threshold per bucket (sparse buckets fall back to the global one).
+pub const N_SNR_BUCKETS: usize = 5;
+
+/// Map an SNR (dBFS) to a calibration bucket: 0 = <5 dB (very noisy), 1 = 5–15, 2 = 15–25,
+/// 3 = >25 dB (clean), 4 = unknown (no SNR measured). Also used as the per-condition slice key.
+pub fn snr_bucket(snr_db: Option<f64>) -> usize {
+    match snr_db {
+        None => 4,
+        Some(s) if s < 5.0 => 0,
+        Some(s) if s < 15.0 => 1,
+        Some(s) if s < 25.0 => 2,
+        Some(_) => 3,
+    }
+}
+
 /// Calibrate ONLY the conformal threshold from pre-scored calibration items `(nonconformity, cer)`.
 /// The caller supplies the exact score it will gate on, so the Hoeffding bound and the threshold are
 /// valid for that score. Returns `(threshold, expected_error_bound, is_calibrated)`.
@@ -168,6 +185,15 @@ mod tests {
         let (t, _b, cal) = calibrate_threshold(&scored, 0.4, 0.90);
         assert!(cal, "30 clean spread points should calibrate at target 0.4");
         assert!(t > 0.0);
+    }
+
+    #[test]
+    fn snr_buckets_partition_by_condition() {
+        assert_eq!(snr_bucket(None), 4, "unknown SNR");
+        assert_eq!(snr_bucket(Some(2.0)), 0, "very noisy");
+        assert_eq!(snr_bucket(Some(10.0)), 1);
+        assert_eq!(snr_bucket(Some(20.0)), 2);
+        assert_eq!(snr_bucket(Some(30.0)), 3, "clean");
     }
 
     #[test]
