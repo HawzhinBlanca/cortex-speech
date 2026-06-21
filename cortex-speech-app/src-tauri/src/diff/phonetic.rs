@@ -111,7 +111,12 @@ pub fn compute_phonetic_diff(raw: &str, annotated: &str) -> TextDiff {
             let sub_cost = normalized_phonetic_word_distance(raw_words[i - 1], ann_words[j - 1]);
             let current = dp[i][j];
             if (current - (dp[i - 1][j - 1] + sub_cost)).abs() < 1e-5 {
-                if sub_cost == 0.0 {
+                // `Equal` must mean the surfaces are IDENTICAL, not merely homophones. Two words can
+                // align at sub_cost 0 yet differ in spelling (e.g. Arabic heh ه vs Kurdish heh ھ,
+                // which g2p both map to "h"). Emitting Equal there would carry only the raw word and
+                // silently discard the annotated surface form — and a consumer like irt.rs records
+                // change.value as the other model's token, so it would log the wrong spelling.
+                if sub_cost == 0.0 && raw_words[i - 1] == ann_words[j - 1] {
                     changes.push(DiffChange { op: DiffOp::Equal, value: raw_words[i - 1].to_string() });
                 } else {
                     changes.push(DiffChange {
@@ -188,5 +193,24 @@ mod tests {
         // They should align via Replace because of phonetic closeness
         assert_eq!(diff2.changes.len(), 1);
         assert!(matches!(diff2.changes[0].op, DiffOp::Replace));
+    }
+
+    #[test]
+    fn homophone_with_different_spelling_is_replace_not_equal() {
+        // Arabic heh (ه U+0647) vs Kurdish heh (ھ U+06BE): identical phonemes, different spelling.
+        // Must be a Replace that preserves the annotated surface form — Equal would discard it and a
+        // consumer (irt.rs) would record the wrong token as the other model's output.
+        let diff = compute_phonetic_diff("هاتن", "ھاتن");
+        assert_eq!(diff.changes.len(), 1);
+        assert!(
+            matches!(diff.changes[0].op, DiffOp::Replace),
+            "phonetically-equal but textually-different words must be Replace, got {:?}",
+            diff.changes[0].op
+        );
+        assert!(diff.changes[0].value.contains("ھاتن"), "annotated surface form must be preserved");
+
+        // Truly identical words remain Equal.
+        let same = compute_phonetic_diff("هاتن", "هاتن");
+        assert!(matches!(same.changes[0].op, DiffOp::Equal));
     }
 }
