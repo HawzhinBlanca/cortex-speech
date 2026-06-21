@@ -99,7 +99,11 @@ mod tests {
 
     #[test]
     fn rate_limiter_allows_up_to_burst() {
-        let mut rl = RateLimiter::new_with_burst(10, 3);
+        // rate = 0 (no refill) makes this test DETERMINISTIC regardless of CPU scheduling. With a
+        // positive rate, more than 1/rate seconds of descheduling between the burst-exhausting call and
+        // the next one refills a token and flakes the `is_err()` assertion — at rate=10 that window is
+        // only 0.1s, reachable under load. A frozen bucket isolates the pure burst-exhaustion semantics.
+        let mut rl = RateLimiter::new_with_burst(0, 3);
         assert!(rl.check("a").is_ok());
         assert!(rl.check("a").is_ok());
         assert!(rl.check("a").is_ok());

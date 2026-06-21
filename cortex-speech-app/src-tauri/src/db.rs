@@ -1454,6 +1454,13 @@ mod tests {
             s.raw_transcript = "uniquesearchtoken body".to_string();
             db.insert_segment(&s).unwrap();
         }
+        // Pin all three created_at to ONE value so the tie is GUARANTEED. created_at defaults to
+        // datetime('now') at 1s resolution, so if the three inserts straddle a one-second clock tick
+        // they no longer tie, ORDER BY created_at DESC reorders them, and the id-tiebreaker assertions
+        // below flake (~1-in-N runs, under load). Forcing equal timestamps isolates the id tiebreaker.
+        db.conn
+            .execute("UPDATE speech_segments SET created_at = '2026-01-01 00:00:00'", [])
+            .unwrap();
         let by_search: Vec<String> =
             db.search_segments("uniquesearchtoken").unwrap().into_iter().map(|s| s.id).collect();
         assert_eq!(by_search, vec!["seg_a", "seg_m", "seg_z"], "tied search results must order by id");
