@@ -17,8 +17,10 @@ pub fn analyze_audio_quality(pcm: &[i16]) -> AudioQualityMetrics {
     for &sample in pcm {
         let val = sample as f64 / 32768.0;
         sum_sq += val * val;
-        // Check for clipping at or near the 16-bit integer boundary
-        if sample.abs() >= 32760 {
+        // Check for clipping at or near the 16-bit integer boundary. unsigned_abs (not abs) because
+        // i16::abs() overflow-panics in debug and wraps in release at the most-negative sample
+        // (-32768), which would silently MISS negative-rail clipping and undercount clipping_ratio.
+        if sample.unsigned_abs() >= 32760 {
             clipped_count += 1;
         }
     }
@@ -91,5 +93,17 @@ mod tests {
         }
         let metrics = analyze_audio_quality(&pcm);
         assert_eq!(metrics.clipping_ratio, 0.1);
+    }
+
+    #[test]
+    fn negative_rail_clipping_is_counted_symmetrically() {
+        // Hardening-audit HIGH: i16::abs() overflows at -32768 (debug panic / release wrap-and-miss).
+        // Negative-rail hard clipping (i16::MIN) must be counted just like +32767.
+        let mut pcm = vec![0i16; 1000];
+        for sample in pcm.iter_mut().take(100) {
+            *sample = i16::MIN; // -32768
+        }
+        let metrics = analyze_audio_quality(&pcm);
+        assert_eq!(metrics.clipping_ratio, 0.1, "negative-rail (-32768) clipping must be counted");
     }
 }
