@@ -173,7 +173,7 @@ fn run_audiobook_pipeline(app: &tauri::AppHandle) -> Result<(), String> {
     let import_result = {
         let state = app.state::<AppState>();
         let pipeline = state.lock_pipeline();
-        pipeline.import_single_file_with_events(mp3_path, None, move |event| match event {
+        pipeline.import_single_file_with_events(mp3_path, None, Some(&agent_run_id), move |event| match event {
             PipelineEvent::AgentStage { stage, status, file, detail, current, total } => {
                 eprintln!("[audiobook] agent {stage}:{status} ({current}/{total}) {detail}");
                 import_stage_events

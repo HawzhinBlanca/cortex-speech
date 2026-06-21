@@ -453,7 +453,7 @@ pub fn import_audio_file(
         }
         let _guard = ImportGuard { app: app_clone.clone() };
 
-        let result = pipeline.import_single_file_with_events(&file_path, cancel, |event| {
+        let result = pipeline.import_single_file_with_events(&file_path, cancel, Some(&agent_run_id), |event| {
             emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "file");
         });
         match result {
