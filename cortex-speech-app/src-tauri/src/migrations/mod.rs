@@ -498,6 +498,15 @@ pub static MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_adapters_parent ON adapters(parent_model_version_id);",
         down_sql: Some("DROP TABLE IF EXISTS adapters; DROP TABLE IF EXISTS model_versions;"),
     },
+    Migration {
+        version: 24,
+        description: "Persist gold clip audio content hash so holdout exclusion survives a moved/deleted file",
+        // holdout_content_hashes re-read each gold file from disk, so a moved/deleted gold file
+        // silently dropped its hash and a same-content training clip leaked into DPO/HF exports
+        // (fail-open). Persisting the hash at import makes the holdout set durable (fail-closed).
+        up_sql: "ALTER TABLE gold_segments ADD COLUMN audio_content_hash TEXT;",
+        down_sql: Some("ALTER TABLE gold_segments DROP COLUMN audio_content_hash;"),
+    },
 ];
 
 #[cfg(test)]
