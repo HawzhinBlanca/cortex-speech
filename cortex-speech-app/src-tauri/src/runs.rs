@@ -257,7 +257,9 @@ pub fn list_agent_import_reports(db: &Database, limit: Option<usize>) -> AppResu
     let mut stmt = db.connection().prepare(
         "SELECT id, source, status, audio_paths_json, segment_ids_json, report_json, created_at
          FROM agent_import_reports
-         ORDER BY datetime(created_at) DESC
+         -- `, id DESC` tiebreaker: created_at is 1s-resolution, so same-second reports tie and LIMIT 1
+         -- would otherwise pick an arbitrary one — flipping the HF-export SILVER readiness allow-list.
+         ORDER BY datetime(created_at) DESC, id DESC
          LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit as i64], map_agent_import_report)?;
