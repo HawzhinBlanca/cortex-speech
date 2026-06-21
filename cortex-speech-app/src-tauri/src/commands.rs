@@ -67,6 +67,43 @@ fn model_downloaded(model_status: &[serde_json::Value], filename: &str) -> bool 
     })
 }
 
+/// Probe `wsl --status` with a bounded timeout. `wsl --status` is known to hang indefinitely when
+/// the WSL/LxssManager subsystem is wedged; a bare `.output()` would then block the import/jury path
+/// (and the check_* command handlers) forever. This mirrors the kill+reap hardening already on the
+/// real WSL ASR subprocess: on timeout, kill+reap the child and degrade to "not available".
+fn wsl_status_available() -> bool {
+    let mut cmd = std::process::Command::new("wsl");
+    cmd.arg("--status").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false; // wedged WSL -> degrade, never hang
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 pub(crate) fn external_provider_status(settings: &AppSettings) -> serde_json::Value {
     let Some(script) = settings.external_asr_script_path() else {
         return serde_json::json!({
@@ -75,8 +112,7 @@ pub(crate) fn external_provider_status(settings: &AppSettings) -> serde_json::Va
         });
     };
 
-    let wsl_available =
-        std::process::Command::new("wsl").arg("--status").output().map(|o| o.status.success()).unwrap_or(false);
+    let wsl_available = wsl_status_available();
     serde_json::json!({
         "available": wsl_available,
         "script": script,
