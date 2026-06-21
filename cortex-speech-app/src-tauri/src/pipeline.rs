@@ -928,6 +928,7 @@ impl ProcessingPipeline {
             embedding_service,
             denoiser_service,
             &mut on_chunk,
+            None, // non-streaming: the whole file is one call, so diarization clusters in-place
         )?;
         let mut persisted = self.persist_segments(db, segments)?;
         self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
@@ -971,6 +972,9 @@ impl ProcessingPipeline {
 
         let mut segments = Vec::new();
         let mut all_pcm_cache = Vec::new();
+        // Accumulate one speaker embedding per retained segment across ALL decode windows, so speakers
+        // are clustered over the WHOLE file once (below) rather than re-clustered per 90s window.
+        let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
         for window in windows {
             if let Some(token) = cancel {
                 token.check()?;
@@ -1028,6 +1032,7 @@ impl ProcessingPipeline {
                 embedding_service,
                 denoiser_service,
                 &mut window_progress,
+                Some(&mut all_embeddings), // streaming: defer clustering to the whole-file pass below
             )?;
             segments.extend(window_segs);
             all_pcm_cache.extend(window_pcm_cache);
@@ -1045,6 +1050,20 @@ impl ProcessingPipeline {
                 meta.chunk_index = idx as u32;
                 meta.chunk_count = chunk_count;
                 seg.alignment_json = Some(meta.to_alignment_json());
+            }
+        }
+
+        // Whole-file speaker clustering: cluster every retained segment's embedding TOGETHER so a
+        // physical speaker keeps ONE SPEAKER_xx label across decode-window boundaries (per-window
+        // clustering relabels the first speaker of each window as SPEAKER_00). all_embeddings is in
+        // lockstep with `segments`, so labels back-fill by index; a None label keeps any
+        // filename-derived speaker hint, and it is a no-op when diarization is off.
+        if self.settings.enable_diarization && all_embeddings.len() == segments.len() {
+            let labels = crate::diarization::cluster_embeddings(&all_embeddings, self.settings.max_speakers);
+            for (seg, label) in segments.iter_mut().zip(labels) {
+                if let Some(spk) = label {
+                    seg.speaker_id = Some(spk);
+                }
             }
         }
 
@@ -1070,6 +1089,10 @@ impl ProcessingPipeline {
         embedding_service: &crate::diarization::SpeakerEmbeddingService,
         denoiser_service: &crate::denoiser::DenoiserService,
         on_chunk: &mut impl FnMut(usize, usize),
+        // When `Some`, this is the STREAMING path: diarization clustering is DEFERRED — one embedding
+        // per retained segment is appended here (in segment order) so the caller can cluster the WHOLE
+        // file once. When `None`, clustering happens per-call (the non-streaming whole-file path).
+        mut embedding_sink: Option<&mut Vec<Vec<f32>>>,
     ) -> AppResult<(Vec<SpeechSegment>, Vec<(String, Vec<f32>)>)> {
         let chunk_count = chunk_ranges.len() as u32;
         let chunk_total = chunk_ranges.len().max(1);
@@ -1086,28 +1109,30 @@ impl ProcessingPipeline {
             None
         };
 
-        let diarization_labels = if self.settings.enable_diarization {
+        let (diarization_labels, chunk_embeddings) = if self.settings.enable_diarization {
             // chunk_ranges are in GLOBAL sample coordinates, but `pcm` is the window-local buffer in
-            // the streaming path (global_base_sample > 0). label_chunk_speakers slices `pcm` directly,
-            // so rebase the ranges to local coords first — exactly like the transcription slice below.
-            // Without this, every chunk past the first 90s window indexes beyond pcm.len(), clamps to
-            // an empty slice, and silently gets NO speaker label. No-op when global_base_sample == 0
-            // (the non-streaming path).
+            // the streaming path (global_base_sample > 0). Embeddings slice `pcm` directly, so rebase
+            // the ranges to local coords first — exactly like the transcription slice below. Without
+            // this, every chunk past the first 90s window indexes beyond pcm.len(), clamps to an empty
+            // slice, and silently gets NO speaker label. No-op when global_base_sample == 0.
             let local_ranges: Vec<(usize, usize)> = chunk_ranges
                 .iter()
                 .map(|&(gs, ge)| {
                     (gs.saturating_sub(global_base_sample), ge.saturating_sub(global_base_sample).min(pcm.len()))
                 })
                 .collect();
-            crate::diarization::label_chunk_speakers(
-                pcm,
-                sample_rate,
-                &local_ranges,
-                self.settings.max_speakers,
-                embedding_service,
-            )
+            let embeddings =
+                crate::diarization::compute_chunk_embeddings(pcm, sample_rate, &local_ranges, embedding_service);
+            if embedding_sink.is_some() {
+                // Streaming: defer clustering to the caller's whole-file pass; no per-window labels.
+                (vec![None; chunk_ranges.len()], Some(embeddings))
+            } else {
+                // Non-streaming: the whole file is this one call, so cluster in place and drop the
+                // embeddings (the deferred sink is unused here).
+                (crate::diarization::cluster_embeddings(&embeddings, self.settings.max_speakers), None)
+            }
         } else {
-            vec![None; chunk_ranges.len()]
+            (vec![None; chunk_ranges.len()], None)
         };
 
         let mut segments = Vec::with_capacity(chunk_ranges.len());
@@ -1207,6 +1232,15 @@ impl ProcessingPipeline {
 
             let seg_id = Uuid::new_v4().to_string();
             pcm_cache.push((seg_id.clone(), f32_pcm));
+
+            // Streaming defer: accumulate this segment's embedding (in segment order) so the caller can
+            // cluster the whole file once. The push stays in lockstep with `segments` — both happen only
+            // for a RETAINED chunk — so the back-filled labels align by index.
+            if let Some(sink) = embedding_sink.as_mut() {
+                if let Some(embs) = chunk_embeddings.as_ref() {
+                    sink.push(embs.get(chunk_index).cloned().unwrap_or_default());
+                }
+            }
 
             segments.push(SpeechSegment {
                 id: seg_id,
