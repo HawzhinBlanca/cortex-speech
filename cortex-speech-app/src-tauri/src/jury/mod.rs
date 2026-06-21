@@ -266,6 +266,27 @@ pub fn write_verdict(
             (verdict == Verdict::Escalated) as i32,
         ],
     )?;
+
+    // Flywheel capture: when the jury ACCEPTS a transcript that differs from the raw ASR, the model
+    // corrected OmniASR — record it as a provenance-tagged PSEUDO example (never auto-trained; gated
+    // behind human review). Best-effort: a capture failure must not fail the verdict write.
+    if matches!(verdict, Verdict::AutoAccept | Verdict::JuryAccept) {
+        if let Some(corrected) = transcript {
+            let raw: Option<String> = db
+                .connection()
+                .query_row(
+                    "SELECT raw_transcript FROM speech_segments WHERE id = ?1",
+                    params![segment_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(raw) = raw {
+                if raw.trim() != corrected.trim() {
+                    let _ = db.record_model_correction(segment_id, &raw, corrected, "jury");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -322,9 +343,12 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
     // Re-rank a bounded recent pool (keeps cost flat as the example store grows).
     let pool = 200usize.max(k);
     let mut stmt = db.connection().prepare(
+        // Only human-verified examples seed the LLM corrector's few-shot context; model pseudo-labels
+        // (verified_by_human=0) are captured but never used as exemplars until a human signs off.
         "SELECT id, segment_id, wrong_transcript, human_fix, created_at
          FROM agent_examples
-         ORDER BY created_at DESC
+         WHERE verified_by_human = 1
+         ORDER BY created_at DESC, id ASC
          LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![pool as i64], |row| {

@@ -84,8 +84,8 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
                 ss.agent_confidence
          FROM agent_examples ae
          JOIN speech_segments ss ON ae.segment_id = ss.id
-         WHERE ss.is_gold = 0
-         ORDER BY ae.created_at DESC",
+         WHERE ss.is_gold = 0 AND ae.verified_by_human = 1
+         ORDER BY ae.created_at DESC, ae.id ASC",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -589,6 +589,40 @@ mod tests {
         let result = build_dpo_dataset(&db).unwrap();
         assert_eq!(result.pair_count, 0);
         assert!(result.jsonl.is_empty());
+    }
+
+    #[test]
+    fn build_dpo_trains_on_human_corrections_only_not_model_pseudo_labels() {
+        // Blueprint #3: model corrections are captured (provenance-tagged pseudo) but NEVER enter the
+        // training set, or training on model-generated labels causes model collapse. Only human
+        // verbatim edits (verified_by_human=1) become DPO pairs.
+        let db = open_mem_db();
+        db.insert_segment(&SpeechSegment {
+            id: "seg-1".into(),
+            audio_path: "/a.wav".into(),
+            raw_transcript: "wrong asr text".into(),
+            duration_ms: 1000,
+            ..Default::default()
+        })
+        .unwrap();
+        // A HUMAN correction — verified_by_human defaults to 1 (trainable).
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
+                 VALUES ('h1', 'seg-1', 'wrong asr text', 'human verified fix')",
+                [],
+            )
+            .unwrap();
+        // A MODEL correction — captured as pseudo (verified_by_human=0, NOT trainable).
+        db.record_model_correction("seg-1", "wrong asr text", "model proposed fix", "jury").unwrap();
+
+        let result = build_dpo_dataset(&db).expect("build dpo");
+        assert_eq!(result.pair_count, 1, "only the human-verified correction trains");
+        assert!(result.jsonl.contains("human verified fix"));
+        assert!(
+            !result.jsonl.contains("model proposed fix"),
+            "a model pseudo-label must never enter the DPO training set"
+        );
     }
 
     #[test]
