@@ -65,6 +65,12 @@ pub struct BaselineComparison {
     pub significant_at_05: bool,
     /// True only if the system's paired WER is lower AND the difference is significant.
     pub beats_baseline: bool,
+    /// Human-readable description of any per-condition SLICE on which the challenger REGRESSES vs the
+    /// baseline (e.g. a length class), even though the aggregate improved. A non-empty list blocks
+    /// promotion: shipping a model that is better on average but worse on a slice trades one
+    /// population's accuracy for another. Empty = no slice regressed (or too little data to slice).
+    #[serde(default)]
+    pub slice_regressions: Vec<String>,
 }
 
 /// A complete, reproducible scorecard.
@@ -175,16 +181,33 @@ pub fn build_scorecard(
 /// Paired comparison: align segments by `gold_id`, compute per-segment word errors for
 /// both systems on the shared set, and run MAPSSWE. Only the intersection is used —
 /// the only statistically valid basis for a paired test.
+/// Utterance-length difficulty slice — a per-condition slice that needs no extra gold metadata.
+fn length_slice(reference: &str) -> &'static str {
+    match reference.split_whitespace().count() {
+        0..=4 => "short (≤4 words)",
+        5..=15 => "medium (5–15 words)",
+        _ => "long (>15 words)",
+    }
+}
+
 fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> BaselineComparison {
     let base_by_id: HashMap<&str, &crate::eval::EvalSegmentResult> =
         baseline.segments.iter().map(|s| (s.gold_id.as_str(), s)).collect();
 
     let mut sys_errs = Vec::new();
     let mut base_errs = Vec::new();
+    // Per-condition slice accumulation (challenger vs baseline word errors, grouped by slice).
+    let mut by_slice: std::collections::BTreeMap<&'static str, (Vec<SegmentError>, Vec<SegmentError>)> =
+        std::collections::BTreeMap::new();
     for s in &system.segments {
         if let Some(b) = base_by_id.get(s.gold_id.as_str()) {
-            sys_errs.push(word_error(&s.reference, &s.hypothesis));
-            base_errs.push(word_error(&b.reference, &b.hypothesis));
+            let se = word_error(&s.reference, &s.hypothesis);
+            let be = word_error(&b.reference, &b.hypothesis);
+            sys_errs.push(se);
+            base_errs.push(be);
+            let slot = by_slice.entry(length_slice(&s.reference)).or_default();
+            slot.0.push(se);
+            slot.1.push(be);
         }
     }
 
@@ -192,6 +215,24 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
     let baseline_micro_wer = micro_rate(&base_errs);
     let p = mapsswe(&sys_errs, &base_errs);
     let significant = p < 0.05;
+
+    // A challenger that beats the aggregate must not REGRESS a slice with enough data to be meaningful.
+    const MIN_SLICE_SEGS: usize = 5;
+    const SLICE_REGRESSION_TOL: f64 = 0.05; // absolute WER
+    let mut slice_regressions = Vec::new();
+    for (name, (s_errs, b_errs)) in &by_slice {
+        if s_errs.len() < MIN_SLICE_SEGS {
+            continue; // too few to slice without noise
+        }
+        let s_wer = micro_rate(s_errs);
+        let b_wer = micro_rate(b_errs);
+        if s_wer > b_wer + SLICE_REGRESSION_TOL {
+            slice_regressions.push(format!(
+                "{name}: challenger WER {s_wer:.4} vs baseline {b_wer:.4} over {} segments",
+                s_errs.len()
+            ));
+        }
+    }
 
     BaselineComparison {
         baseline_model_id: baseline.run.model_id.clone(),
@@ -201,6 +242,7 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
         mapsswe_p_value: p,
         significant_at_05: significant,
         beats_baseline: significant && system_micro_wer < baseline_micro_wer,
+        slice_regressions,
     }
 }
 

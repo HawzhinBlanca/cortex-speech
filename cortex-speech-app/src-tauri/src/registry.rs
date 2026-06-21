@@ -401,6 +401,20 @@ pub fn decide_promotion(
         }
     }
 
+    // --- Slice gate: never ship a model that improves the aggregate while REGRESSING a slice. ---
+    if let Some(cmp) = &challenger.vs_baseline {
+        if cmp.slice_regressions.is_empty() {
+            reasons.push("Slice gate ok: no per-condition slice regressed beyond tolerance".to_string());
+        } else {
+            promote = false;
+            reasons.push(format!(
+                "Slice gate FAILED: challenger regresses {} slice(s) despite a better aggregate — {}",
+                cmp.slice_regressions.len(),
+                cmp.slice_regressions.join("; ")
+            ));
+        }
+    }
+
     PromotionDecision { promote, reasons }
 }
 
@@ -666,6 +680,7 @@ mod tests {
                 mapsswe_p_value: p,
                 significant_at_05: p < 0.05,
                 beats_baseline: beats,
+                slice_regressions: Vec::new(),
             }),
             bootstrap_resamples: 1000,
             confidence: 0.95,
@@ -688,6 +703,19 @@ mod tests {
         let decision = decide_promotion(&card, 0.08, &PromotionPolicy::default());
         assert!(!decision.promote, "a CER regression must block promotion despite a WER win");
         assert!(decision.reasons.iter().any(|r| r.contains("CER gate FAILED")), "{:?}", decision.reasons);
+    }
+
+    #[test]
+    fn blocks_slice_regression_even_when_aggregate_wins() {
+        // Beats the champion on aggregate WER and CER, but regresses a per-condition slice -> blocked.
+        let mut card = challenger_card(0.10, 0.05, 0.20, true, 0.01);
+        if let Some(cmp) = card.vs_baseline.as_mut() {
+            cmp.slice_regressions
+                .push("short (≤4 words): challenger WER 0.4000 vs baseline 0.2000 over 12 segments".into());
+        }
+        let decision = decide_promotion(&card, 0.08, &PromotionPolicy::default());
+        assert!(!decision.promote, "a slice regression must block promotion despite an aggregate win");
+        assert!(decision.reasons.iter().any(|r| r.contains("Slice gate FAILED")), "{:?}", decision.reasons);
     }
 
     #[test]
