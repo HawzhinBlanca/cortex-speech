@@ -1035,6 +1035,45 @@ impl Database {
         Ok(())
     }
 
+    /// Capture a MODEL correction (the jury auto-correcting OmniASR) as a provenance-tagged PSEUDO
+    /// example: `source='model'`, `verified_by_human=0`. Unlike a human edit, this is NOT trusted
+    /// training data — it is a candidate for human review / a future gated pseudo-label pass, and is
+    /// excluded from the DPO export and few-shot context until a human signs off. Training directly
+    /// on model-generated corrections causes model collapse (Shumailov et al., Nature 2024), so this
+    /// path only RECORDS; it never promotes a label into the trainable pool.
+    ///
+    /// No-ops when the corrected text equals the wrong text (not a real correction) or the segment is
+    /// gold/holdout (quarantined at capture). Best-effort: returns Ok even when it records nothing.
+    pub fn record_model_correction(
+        &self,
+        segment_id: &str,
+        wrong_transcript: &str,
+        corrected_transcript: &str,
+        corrector_model_id: &str,
+    ) -> AppResult<()> {
+        let wrong = wrong_transcript.trim();
+        let fix = corrected_transcript.trim();
+        if fix.is_empty() || wrong == fix {
+            return Ok(()); // not a correction
+        }
+        // Quarantine gold at capture time (holdout exclusion is also applied at every export).
+        let is_gold: i64 = self
+            .conn
+            .query_row("SELECT is_gold FROM speech_segments WHERE id = ?1", params![segment_id], |r| r.get(0))
+            .unwrap_or(0);
+        if is_gold != 0 {
+            return Ok(());
+        }
+        let example_id = uuid::Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO agent_examples
+                 (id, segment_id, wrong_transcript, human_fix, source, verified_by_human, corrector_model_id)
+             VALUES (?1, ?2, ?3, ?4, 'model', 0, ?5)",
+            params![example_id, segment_id, wrong, fix, corrector_model_id],
+        )?;
+        Ok(())
+    }
+
     /// Record a human decision (accept/edit/reject) and optionally store a
     /// corrected transcript.  Gold segments are updated but never written to
     /// agent_examples.

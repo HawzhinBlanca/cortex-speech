@@ -507,6 +507,23 @@ pub static MIGRATIONS: &[Migration] = &[
         up_sql: "ALTER TABLE gold_segments ADD COLUMN audio_content_hash TEXT;",
         down_sql: Some("ALTER TABLE gold_segments DROP COLUMN audio_content_hash;"),
     },
+    Migration {
+        version: 25,
+        description: "Provenance-tier agent_examples: human=gold (trainable) vs model=pseudo (gated)",
+        // The flywheel must distinguish trust tiers. Human verbatim edits are gold and may train the
+        // model; MODEL corrections (the jury auto-correcting OmniASR) are pseudo-labels that must NOT
+        // train weights until a human signs off, or training on model-generated labels causes model
+        // collapse (Shumailov et al., Nature 2024). Existing rows are all human edits, so the
+        // defaults (source='human', verified_by_human=1) classify them correctly.
+        up_sql: "ALTER TABLE agent_examples ADD COLUMN source TEXT NOT NULL DEFAULT 'human';
+                 ALTER TABLE agent_examples ADD COLUMN verified_by_human INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE agent_examples ADD COLUMN corrector_model_id TEXT;",
+        down_sql: Some(
+            "ALTER TABLE agent_examples DROP COLUMN source;
+             ALTER TABLE agent_examples DROP COLUMN verified_by_human;
+             ALTER TABLE agent_examples DROP COLUMN corrector_model_id;",
+        ),
+    },
 ];
 
 #[cfg(test)]
