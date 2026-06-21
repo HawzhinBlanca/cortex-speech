@@ -458,6 +458,7 @@ pub fn run() {
             commands::get_waveform,
             commands::get_import_status,
             commands::get_dataset_stats,
+            commands::get_speakers,
             commands::get_dataset_quality,
             commands::get_settings,
             commands::update_settings,

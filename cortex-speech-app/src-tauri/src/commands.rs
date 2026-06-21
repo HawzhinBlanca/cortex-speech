@@ -1263,6 +1263,15 @@ pub fn get_dataset_stats(state: State<'_, AppState>) -> Result<stats::DatasetSta
     stats::compute_stats(&db).map_err(|e| e.to_string())
 }
 
+/// The complete speaker list (not the truncated top-10 dashboard summary) so the speaker-management
+/// panel can rename every speaker, including low-frequency ones.
+#[tauri::command]
+pub fn get_speakers(state: State<'_, AppState>) -> Result<Vec<stats::SpeakerStat>, String> {
+    RATE_LIMITER.check("get_speakers")?;
+    let db = state.lock_db();
+    stats::list_speakers(&db).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn get_dataset_quality(state: State<'_, AppState>) -> Result<quality::DatasetQuality, String> {
     RATE_LIMITER.check("get_dataset_quality")?;

@@ -17,8 +17,9 @@
   async function loadSpeakers() {
     loading = true;
     try {
-      const stats = await api.getDatasetStats();
-      speakers = stats?.topSpeakers ?? [];
+      // The COMPLETE speaker list — not stats.topSpeakers, which is truncated to 10, so speakers
+      // beyond the top ten were invisible here and could never be renamed.
+      speakers = (await api.getSpeakers()) ?? [];
     } catch (e) {
       notifications.error($t('speaker.loadFailed'), { detail: String(e) });
     } finally {
