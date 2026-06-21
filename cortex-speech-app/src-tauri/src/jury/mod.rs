@@ -89,7 +89,20 @@ pub fn t0_gate_segment(
     let poor_quality = if let Some(snr) = seg.snr_db { snr < 5.0 } else { false }
         || if let Some(clip) = seg.clipping_ratio { clip > 0.1 } else { false };
 
-    if nonconformity_score <= threshold && !poor_quality {
+    // Never auto-accept on a single recognizer: with <2 distinct voters the IRT "consensus" is a
+    // degenerate single-hypothesis prior, and a lone model's confidence is the most dangerous routing
+    // signal (it is confidently wrong exactly on the rare/OOD Sorani tail). Fail toward review.
+    // NOTE: 300M and 1B are architecturally KIN, so two-of-them agreement can still be a CORRELATED
+    // confident error — adding an architecturally INDEPENDENT recognizer's vote (e.g. ElevenLabs
+    // Scribe) at this gate is the follow-up that fully closes the confidently-wrong-correlated hole.
+    let distinct_voters = {
+        let mut ids: Vec<&str> = hyps.iter().map(|h| h.model_id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    };
+
+    if nonconformity_score <= threshold && !poor_quality && distinct_voters >= 2 {
         T0Decision::AutoAccept {
             segment_id: seg.id.clone(),
             consensus: consensus.to_string(),
@@ -492,6 +505,21 @@ mod tests {
         // Low confidence → escalate
         let decision = t0_gate_segment(&seg, &hyps, "کوردستان", 0.45, 0.60);
         assert!(matches!(decision, T0Decision::EscalateToT1 { .. }));
+    }
+
+    #[test]
+    fn t0_gate_escalates_a_single_recognizer_even_at_high_confidence() {
+        // Only one model produced a hypothesis: the IRT "consensus" is a degenerate single-hypothesis
+        // prior, and a lone model's confidence is the dangerous routing signal. Must escalate.
+        let seg = make_seg("s1", "کوردستان");
+        let one = vec![make_hyp("s1", "omniasr-ctc-300m", "کوردستان")];
+        assert!(
+            matches!(t0_gate_segment(&seg, &one, "کوردستان", 0.99, 0.60), T0Decision::EscalateToT1 { .. }),
+            "a single recognizer must escalate even at perfect confidence"
+        );
+        // Two distinct recognizers at the same confidence/threshold DO auto-accept.
+        let two = vec![make_hyp("s1", "omniasr-ctc-300m", "کوردستان"), make_hyp("s1", "omniasr-ctc-1b", "کوردستان")];
+        assert!(matches!(t0_gate_segment(&seg, &two, "کوردستان", 0.99, 0.60), T0Decision::AutoAccept { .. }));
     }
 
     #[test]
