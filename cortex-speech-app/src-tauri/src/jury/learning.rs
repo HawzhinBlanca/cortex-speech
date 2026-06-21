@@ -137,8 +137,9 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
 }
 
 /// The audio content hashes of the permanent holdout gold clips — the single source of truth for
-/// excluding held-out audio from any training/LM export. Shared by the DPO and LM-corpus exports.
-fn holdout_content_hashes(db: &Database) -> AppResult<std::collections::HashSet<String>> {
+/// excluding held-out audio from any training/LM export. Shared by the DPO, LM-corpus, and
+/// HuggingFace exports.
+pub(crate) fn holdout_content_hashes(db: &Database) -> AppResult<std::collections::HashSet<String>> {
     let mut stmt = db.connection().prepare("SELECT audio_path FROM gold_segments WHERE is_holdout = 1")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut hashes = std::collections::HashSet::new();

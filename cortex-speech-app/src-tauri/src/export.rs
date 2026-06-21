@@ -399,6 +399,25 @@ pub fn export_huggingface_dataset(
     std::fs::create_dir_all(&test_dir)?;
 
     let segments = db.get_segments(None)?;
+    // Exclude held-out gold audio from the TRAINING export — the same content-hash guard the DPO and
+    // LM-corpus exports already use. Without it, a clip registered as a holdout (for WER/CER eval)
+    // that ALSO exists as a normal training-ready segment leaks into data/train, contaminating the
+    // very eval set the promotion gate measures against.
+    let holdout = crate::jury::learning::holdout_content_hashes(db)?;
+    let segments: Vec<_> = segments
+        .into_iter()
+        .filter(|seg| {
+            let path = std::path::Path::new(&seg.audio_path);
+            let held_out = path.exists()
+                && crate::pipeline::source_audio_identity(path)
+                    .map(|id| holdout.contains(&id.content_hash))
+                    .unwrap_or(false);
+            if held_out {
+                tracing::warn!("Excluding segment {} from HF export: matches holdout gold audio", seg.id);
+            }
+            !held_out
+        })
+        .collect();
     if segments.is_empty() {
         return Ok(());
     }
@@ -1285,6 +1304,59 @@ mod tests {
             matches!(split.as_deref(), Some("train" | "validation" | "test")),
             "split persisted after a successful export, got {split:?}"
         );
+    }
+
+    #[test]
+    fn hf_export_excludes_holdout_gold_audio_from_training() {
+        // Round-3 audit HIGH: a clip registered as a holdout (for WER/CER eval) that also exists as a
+        // training-ready segment leaked into data/train, contaminating the eval set. It must be
+        // excluded, while a non-holdout segment is still exported.
+        let db_tmp = NamedTempFile::new().unwrap();
+        let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let write_wav = |name: &str, val: i16| {
+            let p = tmp_dir.path().join(name);
+            let mut w = hound::WavWriter::create(&p, spec).unwrap();
+            for _ in 0..16000 {
+                w.write_sample(val).unwrap();
+            }
+            w.finalize().unwrap();
+            p.to_string_lossy().to_string()
+        };
+        // Distinct audio content -> distinct content hashes.
+        let holdout_path = write_wav("holdout.wav", 0);
+        let keep_path = write_wav("keep.wav", 1000);
+
+        let mut hseg = sample_segment("hold-1");
+        hseg.audio_path = holdout_path.clone();
+        db.insert_segment(&hseg).unwrap();
+        let mut kseg = sample_segment("keep-1");
+        kseg.audio_path = keep_path;
+        db.insert_segment(&kseg).unwrap();
+
+        // Register the holdout clip's source as a holdout gold reference.
+        crate::eval::import_gold_segments(
+            &db,
+            vec![crate::eval::GoldSegmentInput { audio_path: holdout_path, reference: "ref".into(), is_holdout: true }],
+        )
+        .unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        export_huggingface_dataset(&db, out_dir.path(), &crate::settings::AppSettings::default()).unwrap();
+
+        let all_csv: String = ["train", "validation", "test"]
+            .iter()
+            .map(|s| std::fs::read_to_string(out_dir.path().join("data").join(s).join("metadata.csv")).unwrap_or_default())
+            .collect();
+        assert!(all_csv.contains("keep-1"), "the non-holdout segment must still be exported");
+        assert!(!all_csv.contains("hold-1"), "the holdout gold clip must NOT leak into any split");
     }
 
     #[test]
