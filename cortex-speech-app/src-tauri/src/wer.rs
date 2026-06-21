@@ -12,8 +12,14 @@ pub fn tokenize_words(text: &str) -> Vec<String> {
 }
 
 /// Unicode scalar characters for CER (important for Arabic/Kurdish script).
+///
+/// Interior whitespace is KEPT (counted as an ordinary character) so that word-segmentation
+/// errors — a real, common Sorani ASR error class (e.g. "هاوڕێ من" vs "هاوڕێمن") — are scored
+/// rather than silently collapsing to CER 0. This matches jiwer's default CER definition, which
+/// the project's acceptance criteria require us to track. `normalize_for_metrics` already collapses
+/// whitespace runs to a single space and trims, so only meaningful interior separators survive.
 pub fn tokenize_chars(text: &str) -> Vec<char> {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
+    text.chars().collect()
 }
 
 use crate::normalizer::{NormalizationConfig, SoraniNormalizer};
@@ -49,10 +55,10 @@ pub fn word_edit_distance(reference: &str, hypothesis: &str) -> EditDistanceResu
     let hyp_words = tokenize_words(&hypothesis);
 
     if ref_words.is_empty() {
-        return EditDistanceResult {
-            distance: if hyp_words.is_empty() { 0 } else { 1 },
-            ref_len: 0,
-        };
+        // Honest insertion count (one error per spurious hypothesis word) so corpus-level (micro)
+        // aggregation in eval.rs sums the true error. `compute_wer` separately clamps the
+        // per-utterance display rate to 1.0 for the empty-reference case.
+        return EditDistanceResult { distance: hyp_words.len(), ref_len: 0 };
     }
 
     let distance = levenshtein(&ref_words, &hyp_words);
@@ -66,10 +72,9 @@ pub fn char_edit_distance(reference: &str, hypothesis: &str) -> EditDistanceResu
     let hyp_chars = tokenize_chars(&hypothesis);
 
     if ref_chars.is_empty() {
-        return EditDistanceResult {
-            distance: if hyp_chars.is_empty() { 0 } else { 1 },
-            ref_len: 0,
-        };
+        // Honest insertion count for micro aggregation; `compute_cer` clamps the per-utterance
+        // display rate to 1.0 for the empty-reference case.
+        return EditDistanceResult { distance: hyp_chars.len(), ref_len: 0 };
     }
 
     let distance = levenshtein(&ref_chars, &hyp_chars);
@@ -81,7 +86,9 @@ pub fn char_edit_distance(reference: &str, hypothesis: &str) -> EditDistanceResu
 pub fn compute_wer(reference: &str, hypothesis: &str) -> f64 {
     let res = word_edit_distance(reference, hypothesis);
     if res.ref_len == 0 {
-        return res.distance as f64;
+        // Empty reference: 0.0 if the hypothesis is also empty, else a full-error 1.0. (The raw
+        // `res.distance` is the unclamped insertion count for aggregation, not a display rate.)
+        return if res.distance == 0 { 0.0 } else { 1.0 };
     }
     (res.distance as f64 / res.ref_len as f64).min(1.0)
 }
@@ -91,7 +98,7 @@ pub fn compute_wer(reference: &str, hypothesis: &str) -> f64 {
 pub fn compute_cer(reference: &str, hypothesis: &str) -> f64 {
     let res = char_edit_distance(reference, hypothesis);
     if res.ref_len == 0 {
-        return res.distance as f64;
+        return if res.distance == 0 { 0.0 } else { 1.0 };
     }
     (res.distance as f64 / res.ref_len as f64).min(1.0)
 }
@@ -260,9 +267,30 @@ mod tests {
     }
 
     #[test]
+    fn empty_reference_distance_is_honest_insertion_count() {
+        // The raw edit-distance reports the true insertion count (for micro aggregation in eval.rs),
+        // while compute_wer/compute_cer still clamp the per-utterance display rate to 1.0.
+        assert_eq!(word_edit_distance("", "one two three").distance, 3);
+        assert_eq!(word_edit_distance("", "").distance, 0);
+        assert_eq!(char_edit_distance("", "abc").distance, 3);
+        // Display rate stays clamped at 1.0 regardless of how many words were hallucinated.
+        assert_eq!(compute_wer("", "one two three"), 1.0);
+        assert_eq!(compute_cer("", "abc"), 1.0);
+        assert_eq!(compute_wer("", ""), 0.0);
+    }
+
+    #[test]
+    fn cer_counts_word_segmentation_errors() {
+        // A space-merge is a real Sorani ASR error and must NOT score CER 0 (the old whitespace-
+        // stripping tokenizer collapsed both sides to the same char stream). Matches jiwer, which
+        // counts the interior space as an ordinary character: "ab cd" -> "abcd" = 1 del / 5 = 0.2.
+        assert!((compute_cer("ab cd", "abcd") - 0.2).abs() < 1e-9, "got {}", compute_cer("ab cd", "abcd"));
+        assert!(compute_cer("هاوڕێ من", "هاوڕێمن") > 0.0, "word-merge in Sorani must register as CER > 0");
+    }
+
+    #[test]
     fn breakdown_reports_true_insertions_for_empty_reference() {
-        // word_edit_distance clamps empty-ref to distance 1; the breakdown is HONEST and
-        // reports the true insertion count instead.
+        // The breakdown is HONEST and reports the true insertion count.
         let bd = word_error_breakdown("", "one two");
         assert_eq!(bd.insertions, 2);
         assert_eq!(bd.deletions, 0);
