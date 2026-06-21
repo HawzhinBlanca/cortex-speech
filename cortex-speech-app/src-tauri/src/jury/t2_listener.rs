@@ -169,6 +169,23 @@ fn majority_vote(samples: &[GeminiSample]) -> Option<(String, usize)> {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
+/// Max CER a Gemini verdict may sit from its NEAREST local (audio-grounded) hypothesis before it is
+/// rejected as untrustworthy. Gemini is weak on Sorani and can fabricate a fluent-but-wrong
+/// transcript (or truncate long audio); a constrained post-editor must stay close to what the local
+/// ASR actually heard. A real correction is a small edit (low CER); only gross divergence is blocked.
+const GEMINI_MAX_EDIT_FROM_HYP: f64 = 0.6;
+
+/// Whether a Gemini verdict is a plausible audio-grounded post-edit rather than a hallucination: it
+/// must sit within [`GEMINI_MAX_EDIT_FROM_HYP`] CER of at least one local hypothesis. With no local
+/// hypotheses to ground against, it cannot be validated, so it is allowed (the gate is upstream).
+fn is_grounded_post_edit(winner: &str, hypotheses: &[SegmentHypothesis]) -> bool {
+    let min_cer = hypotheses
+        .iter()
+        .map(|h| crate::wer::compute_cer(&h.transcript, winner))
+        .fold(f64::INFINITY, f64::min);
+    !min_cer.is_finite() || min_cer <= GEMINI_MAX_EDIT_FROM_HYP
+}
+
 /// Run the T2 listening jury with N-sample self-consistency.
 ///
 /// - `audio_b64`: base-64 encoded WAV audio of the contested span.
@@ -218,6 +235,19 @@ pub fn listen_and_judge(
                     error: Some("T2 majority winner had no representative sample.".into()),
                 };
             };
+
+            // Anti-hallucination guard: a constrained post-editor must stay close to the
+            // audio-grounded local hypotheses. A wholesale rewrite (fabrication) or a truncated output
+            // is far from every local transcript — route it to human review instead of accepting.
+            if !is_grounded_post_edit(&winning_transcript, hypotheses) {
+                return T2Result {
+                    verdict: None,
+                    must_escalate: true,
+                    error: Some(
+                        "T2 verdict rejected as likely hallucination: too divergent from every local hypothesis".into(),
+                    ),
+                };
+            }
 
             T2Result {
                 verdict: Some(T2Verdict {
@@ -348,5 +378,23 @@ mod tests {
         let p1 = build_user_prompt(&hyps, &[], &[], 1);
         // Different rotation — at least the order should differ
         assert_ne!(p0, p1);
+    }
+
+    #[test]
+    fn t2_rejects_a_fabrication_far_from_every_local_hypothesis() {
+        use crate::db::SegmentHypothesis;
+        let h = |m: &str, t: &str| SegmentHypothesis {
+            segment_id: "s".into(),
+            model_id: m.into(),
+            transcript: t.into(),
+            confidence: Some(0.9),
+        };
+        let hyps = vec![h("omniasr-ctc-300m", "دەزگای ڕوانگە"), h("omniasr-ctc-1b", "دەستگای ڕوانگا")];
+        // A minor correction near a local hypothesis is a grounded post-edit.
+        assert!(is_grounded_post_edit("دەزگای ڕوانگە", &hyps));
+        // A fluent fabrication far from every local hypothesis is rejected (likely hallucination).
+        assert!(!is_grounded_post_edit("سپاس بۆ بینەران لە کۆتایی بەرنامەکەدا", &hyps));
+        // No local hypotheses to ground against → allowed (the gate is upstream).
+        assert!(is_grounded_post_edit("anything", &[]));
     }
 }
