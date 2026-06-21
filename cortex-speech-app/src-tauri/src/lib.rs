@@ -259,6 +259,8 @@ impl AppState {
 
     pub fn finish_import(&self) {
         *self.lock_import_state() = ImportState::Idle;
+        // Drop the (possibly-cancelled) token so the next import never inherits a stale one.
+        *self.lock_import_cancel_token() = None;
     }
 
     pub fn try_start_batch(&self) -> Result<(), String> {
@@ -272,6 +274,10 @@ impl AppState {
 
     pub fn finish_batch(&self) {
         *self.lock_batch_state() = BatchState::Idle;
+        // Drop the token here: ensure_cancel_token is reuse-or-create, so without clearing, a batch
+        // that was cancelled would leave a permanently-cancelled token in the slot and EVERY later
+        // batch would inherit it and no-op immediately.
+        *self.lock_batch_cancel_token() = None;
     }
 
     pub fn update_pipeline_settings(&self, settings: AppSettings) {
@@ -675,6 +681,25 @@ mod tests {
         assert!(state.cancel_current_operation());
         assert!(batch.is_cancelled(), "the batch is cancelled (its token was lost before the fix)");
         assert!(import.is_cancelled(), "the import is cancelled too");
+    }
+
+    #[test]
+    fn second_batch_gets_a_fresh_token_after_cancel() {
+        // Round-2 audit HIGH: ensure_cancel_token is reuse-or-create, so a cancelled batch left a
+        // permanently-cancelled token in the slot and every later batch inherited it and no-op'd.
+        // finish_batch now clears the slot so the next batch gets a live token.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+
+        state.try_start_batch().expect("start batch 1");
+        let t1 = state.ensure_cancel_token().expect("batch token 1");
+        assert!(state.cancel_current_operation());
+        assert!(t1.is_cancelled());
+        state.finish_batch(); // Drop-guard equivalent — must clear the cancelled token
+
+        state.try_start_batch().expect("start batch 2");
+        let t2 = state.ensure_cancel_token().expect("batch token 2");
+        assert!(!t2.is_cancelled(), "the second batch must NOT inherit the cancelled token");
     }
 
     #[test]
