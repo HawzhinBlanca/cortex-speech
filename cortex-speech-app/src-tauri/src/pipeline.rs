@@ -645,6 +645,16 @@ impl ProcessingPipeline {
         callback(PipelineEvent::Started { total });
         callback(PipelineEvent::Phase { phase: "importing".into() });
         self.set_import_status(0, total, "");
+        // RAII: clear import_status.running on EVERY exit path. The per-file `token.check()?` cancel
+        // below early-returns before the manual finish_import_status() calls, which used to leave
+        // get_import_status() reporting running:true forever after a cancelled directory import.
+        struct ImportStatusGuard<'a>(&'a ProcessingPipeline);
+        impl Drop for ImportStatusGuard<'_> {
+            fn drop(&mut self) {
+                self.0.finish_import_status();
+            }
+        }
+        let _status_guard = ImportStatusGuard(self);
         let mut succeeded = 0;
         let mut failed = 0;
         let mut imported_ids = Vec::new();
@@ -2367,6 +2377,24 @@ mod tests {
         let (pipeline, _dir) =
             test_pipeline_with_settings(AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() });
         assert!(pipeline.scribe_api_key_if_enabled().is_none(), "opted in but no key -> None");
+    }
+
+    #[test]
+    fn cancelled_directory_import_clears_running_status() {
+        // Round-2 audit MEDIUM: a cancel mid directory-import early-returned (token.check()?) before
+        // finish_import_status, so get_import_status().running stayed true forever. The RAII guard now
+        // clears it on every exit path.
+        let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+        let import_dir = dir.path().join("to_import");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        std::fs::write(import_dir.join("a.wav"), b"not-real-audio").unwrap();
+
+        let token = crate::cancel::CancellationToken::new();
+        token.cancel(); // pre-cancel so the loop's first token.check()? returns Err before any decode
+
+        let res = pipeline.import_directory_with_agent_run_id(&import_dir, Some(token), None, |_evt| {});
+        assert!(res.is_err(), "a cancelled import returns Err");
+        assert!(!pipeline.import_status().running, "running must be cleared after a cancelled import");
     }
 
     #[test]
