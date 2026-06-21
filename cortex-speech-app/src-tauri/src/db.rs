@@ -876,9 +876,11 @@ impl Database {
         Ok(list)
     }
 
-    pub fn update_segment_consensus_batch(&self, updates: &[(String, String, String, f64)]) -> AppResult<()> {
+    /// Returns the number of rows actually changed — human-reviewed rows are skipped by the guard,
+    /// so this can be less than `updates.len()`; callers must report THIS, not the attempted count.
+    pub fn update_segment_consensus_batch(&self, updates: &[(String, String, String, f64)]) -> AppResult<usize> {
         self.conn.execute("SAVEPOINT consensus_batch", [])?;
-        let result: AppResult<()> = (|| {
+        let result: AppResult<usize> = (|| {
             let mut stmt = self.conn.prepare(
                 // Guard: never overwrite a human-reviewed/edited segment with machine consensus —
                 // mirrors update_asr_transcript_if_unreviewed and merge_dataset_json. Without this,
@@ -892,16 +894,17 @@ impl Database {
                    AND (human_decision IS NULL OR human_decision = '')
                    AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
             )?;
+            let mut changed = 0usize;
             for (seg_id, cons, norm, conf) in updates {
-                stmt.execute(params![seg_id, cons, norm, conf])?;
+                changed += stmt.execute(params![seg_id, cons, norm, conf])?;
             }
-            Ok(())
+            Ok(changed)
         })();
         match result {
-            Ok(()) => {
+            Ok(changed) => {
                 self.conn.execute("RELEASE consensus_batch", [])?;
                 self.track_write()?;
-                Ok(())
+                Ok(changed)
             }
             Err(e) => {
                 self.cleanup_savepoint_after_error("consensus_batch");
@@ -1643,6 +1646,28 @@ mod tests {
             "original",
             "the locked row is genuinely unchanged"
         );
+    }
+
+    #[test]
+    fn consensus_batch_counts_only_rows_actually_changed() {
+        // Round-2 audit LOW: the refinery reported updates.len() (attempted), not rows changed, so a
+        // guard-skipped human-locked segment was over-counted. The method now returns rows-affected.
+        let db = make_db();
+        let mut locked = make_segment("c-lock", "/a.wav");
+        locked.raw_transcript = "orig".to_string();
+        db.insert_segment(&locked).expect("insert locked");
+        db.conn
+            .execute("UPDATE speech_segments SET verdict='human_accept' WHERE id='c-lock'", [])
+            .expect("lock");
+        db.insert_segment(&make_segment("c-fresh", "/b.wav")).expect("insert fresh");
+
+        let changed = db
+            .update_segment_consensus_batch(&[
+                ("c-lock".to_string(), "new".to_string(), "new".to_string(), 0.9),
+                ("c-fresh".to_string(), "new2".to_string(), "new2".to_string(), 0.9),
+            ])
+            .expect("batch");
+        assert_eq!(changed, 1, "only the unlocked row counts; the human-locked one is skipped");
     }
 
     #[test]

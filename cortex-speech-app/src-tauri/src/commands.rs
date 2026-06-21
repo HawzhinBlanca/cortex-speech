@@ -2108,14 +2108,14 @@ pub fn run_consensus_refinery(state: State<'_, AppState>) -> Result<serde_json::
         updates.push((segment_id.clone(), consensus_text.clone(), normalized_text, confidence));
     }
 
-    {
+    let segments_updated = {
         let db = state.lock_db();
-        db.update_segment_consensus_batch(&updates).map_err(|e| e.to_string())?;
-    }
+        db.update_segment_consensus_batch(&updates).map_err(|e| e.to_string())?
+    };
 
     Ok(serde_json::json!({
         "status": "success",
-        "segmentsUpdated": updates.len(),
+        "segmentsUpdated": segments_updated,
         "modelAbilities": results.model_abilities,
     }))
 }
