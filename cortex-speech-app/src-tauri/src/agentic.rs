@@ -395,7 +395,26 @@ fn write_reference_text_file(
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("Failed to create source transcript directory '{}': {e}", output_dir.display()))?;
     let stem = audio_path.file_stem().and_then(|name| name.to_str()).unwrap_or("audio");
-    let filename = format!("{}.{}.whole_file_reference.txt", sanitize_filename(stem), sanitize_filename(model));
+    // Disambiguate by the FULL path: two audio files with the same stem in different directories
+    // (e.g. seriesA/01.wav and seriesB/01.wav) must NOT share one reference-transcript file, or
+    // importing one silently overwrites the other's reference — and a later re-import then rewrites
+    // the first file's DB row to the second's text. A short hash of the full path keys them apart.
+    let path_key = {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(audio_path.to_string_lossy().as_bytes());
+        let mut s = String::with_capacity(12);
+        for b in digest.iter().take(6) {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+    let filename = format!(
+        "{}.{}.{}.whole_file_reference.txt",
+        sanitize_filename(stem),
+        sanitize_filename(model),
+        path_key
+    );
     let path = output_dir.join(filename);
     std::fs::write(&path, transcript.trim())
         .map_err(|e| format!("Failed to write source transcript '{}': {e}", path.display()))?;
@@ -641,11 +660,33 @@ mod tests {
 
         let path = write_reference_text_file(&audio, "gemini-2.5/pro", "hello", tmp.path()).expect("write ref");
 
-        assert_eq!(
-            path.file_name().unwrap().to_string_lossy(),
-            "My_Long_Audio.gemini-2.5_pro.whole_file_reference.txt"
-        );
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        // Stem + sanitized model preserved; a 12-hex path key now disambiguates same-stem files.
+        assert!(name.starts_with("My_Long_Audio.gemini-2.5_pro."), "{name}");
+        assert!(name.ends_with(".whole_file_reference.txt"), "{name}");
+        let key = name
+            .trim_start_matches("My_Long_Audio.gemini-2.5_pro.")
+            .trim_end_matches(".whole_file_reference.txt");
+        assert_eq!(key.len(), 12, "path key is 12 hex chars: {key}");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "{key}");
         assert_eq!(std::fs::read_to_string(path).expect("read ref"), "hello");
+    }
+
+    #[test]
+    fn reference_file_name_disambiguates_same_stem_different_dirs() {
+        // Round-2 audit HIGH (cross-file corruption): same-stem audio in different dirs must produce
+        // DISTINCT reference files (write_reference_text_file does not read the audio, only its path).
+        let tmp = TempDir::new().expect("tempdir");
+        let out = tmp.path();
+        let a = tmp.path().join("seriesA").join("interview.wav");
+        let b = tmp.path().join("seriesB").join("interview.wav");
+
+        let pa = write_reference_text_file(&a, "gemini-2.5-pro", "TEXT_A", out).expect("write a");
+        let pb = write_reference_text_file(&b, "gemini-2.5-pro", "TEXT_B", out).expect("write b");
+
+        assert_ne!(pa, pb, "same-stem files in different dirs must not collide");
+        assert_eq!(std::fs::read_to_string(&pa).unwrap(), "TEXT_A");
+        assert_eq!(std::fs::read_to_string(&pb).unwrap(), "TEXT_B", "b must not have overwritten a");
     }
 
     #[test]
