@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SpeechSegment, WordTimestamp, DatasetStats } from './types';
+import type { SpeechSegment, WordTimestamp, DatasetStats, SpeakerStat } from './types';
 import type { AppSettings } from './stores/settingsStore';
 import {
   mapBackendToFrontend,
@@ -350,6 +350,11 @@ export async function getWaveform(
 
 export async function getDatasetStats(): Promise<DatasetStats> {
   return invoke<DatasetStats>('get_dataset_stats');
+}
+
+/** Complete speaker list (not the truncated top-10 dashboard summary) for the speaker manager. */
+export async function getSpeakers(): Promise<SpeakerStat[]> {
+  return invoke<SpeakerStat[]>('get_speakers');
 }
 
 export interface ConfidenceInterval {
