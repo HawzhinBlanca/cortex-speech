@@ -525,10 +525,13 @@ pub fn run() {
         ])
         .setup(|app| {
             use tauri::Manager;
-            for (label, window) in app.webview_windows() {
+            for (label, _window) in app.webview_windows() {
                 tracing::info!("Found webview window: {label}");
+                // `open_devtools` only exists in debug builds, so in release the binding is
+                // otherwise unused — the underscore keeps the release build warning-clean
+                // while still allowing the debug-only devtools call below.
                 #[cfg(debug_assertions)]
-                window.open_devtools();
+                _window.open_devtools();
             }
 
             if std::env::var("CORTEX_INTEGRATION_TEST").ok().as_deref() == Some("1")
