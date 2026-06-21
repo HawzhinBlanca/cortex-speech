@@ -108,9 +108,13 @@
         {:else if loading}
           <div class="h-8 bg-cortex-800/30 rounded animate-pulse"></div>
         {:else if diff}
-          <div class="flex flex-wrap gap-x-1 gap-y-1 text-sm font-mono leading-relaxed" dir="auto">
+          <!-- dir="rtl": these are Kurdish (RTL) word chips in logical order; a flex row reverses
+               them unless the base direction is RTL (matching App.svelte's word-chip rows). <bdi>
+               isolates each chip so an embedded LTR token (or the Replace "raw → ann" arrow) can't
+               reorder the row or swap the two words within a chip. -->
+          <div class="flex flex-wrap gap-x-1 gap-y-1 text-sm font-mono leading-relaxed" dir="rtl" lang="ckb">
             {#each diff.changes as change}
-              <span class={opClass(change.op)}>{change.value}</span>
+              <span class={opClass(change.op)}><bdi>{change.value}</bdi></span>
             {/each}
           </div>
           <div class="flex flex-wrap gap-3 text-[10px] text-cortex-500 pt-1">

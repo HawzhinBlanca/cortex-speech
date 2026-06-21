@@ -401,8 +401,8 @@
                           <span class="badge-pending shrink-0">{$t('pending')}</span>
                         {/if}
                       </div>
-                      <p class="text-cortex-350 italic truncate mt-1">
-                        "{segment.annotatedTranscript || segment.rawTranscript || ''}"
+                      <p class="text-cortex-350 italic truncate mt-1" dir="rtl" lang="ckb">
+                        "<bdi>{segment.annotatedTranscript || segment.rawTranscript || ''}</bdi>"
                       </p>
                       <div
                         class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-cortex-400 pt-1"
@@ -491,8 +491,8 @@
                           >
                         {/if}
                       </div>
-                      <p class="opacity-80 italic truncate mt-1">
-                        "{segment.annotatedTranscript || segment.rawTranscript || ''}"
+                      <p class="opacity-80 italic truncate mt-1" dir="rtl" lang="ckb">
+                        "<bdi>{segment.annotatedTranscript || segment.rawTranscript || ''}</bdi>"
                       </p>
                       <div class="flex items-center gap-4 text-[10px] opacity-70 pt-1">
                         <span class="font-semibold text-amber-400"
