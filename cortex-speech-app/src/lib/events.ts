@@ -13,6 +13,7 @@ import {
   type PipelinePhase,
 } from './stores/uiStore';
 import { isTauriRuntime } from './runtime';
+import { segments } from './stores/segmentStore';
 
 export interface PipelineProgress {
   current: number;
@@ -233,6 +234,25 @@ export async function startEventListeners() {
     }
   });
   unlisteners.push(unlistenPhase);
+
+  // App-scoped so a finished WSL 7B refinement batch still notifies + refreshes the segment list even
+  // if the WSL console panel was closed mid-run. The panel keeps its own wsl-status listener purely
+  // for in-panel display (status pill / running flag) — the side effects live here, fired exactly once.
+  const unlistenWslStatus = await listen<{
+    status: 'completed' | 'failed' | 'cancelled';
+    exit_code: number;
+  }>('wsl-status', (event) => {
+    const { status, exit_code } = event.payload;
+    if (status === 'completed') {
+      notifications.success('WSL 7B refinement batch complete');
+      void segments.load();
+    } else if (status === 'cancelled') {
+      notifications.warning('WSL 7B refinement batch cancelled');
+    } else {
+      notifications.error(`WSL 7B refinement failed (exit code ${exit_code})`);
+    }
+  });
+  unlisteners.push(unlistenWslStatus);
 
   const unlistenBatch = await listen<BatchProgressEvent>('batch-progress', (event) => {
     const payload = event.payload;
