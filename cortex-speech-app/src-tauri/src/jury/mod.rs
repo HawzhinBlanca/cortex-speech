@@ -175,20 +175,30 @@ pub fn run_t0_gate(
     //    below. Previously the threshold was calibrated on seg.confidence-based nonconformity while
     //    the gate compared it against irt_confidence-based nonconformity — a different score
     //    distribution under the same cutoff, which silently VOIDED the coverage guarantee.
-    let cal_scored: Vec<(f64, f64)> = all_verified
-        .iter()
-        .filter_map(|s| {
-            let ref_text = s.annotated_transcript.as_deref()?.trim();
-            if ref_text.is_empty() {
-                return None;
-            }
-            let irt_conf = irt_results.segment_confidences.get(&s.id).copied().unwrap_or(0.5);
-            let score = conformal::nonconformity(irt_conf, s.ctc_score);
-            let cer = crate::wer::compute_cer(ref_text, &s.raw_transcript).min(1.0);
-            Some((score, cer))
-        })
-        .collect();
-    let (threshold, _bound, _is_calibrated) = conformal::calibrate_threshold(&cal_scored, 0.05, 0.90);
+    //    Calibrate PER SNR/condition bucket — a single global threshold is invalid across studio,
+    //    field and noisy recordings; a bucket with too little verified data falls back to the global
+    //    threshold so calibration degrades gracefully on small datasets.
+    let mut global_scored: Vec<(f64, f64)> = Vec::new();
+    let mut bucket_scored: [Vec<(f64, f64)>; conformal::N_SNR_BUCKETS] = std::array::from_fn(|_| Vec::new());
+    for s in &all_verified {
+        let Some(ref_text) = s.annotated_transcript.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        let irt_conf = irt_results.segment_confidences.get(&s.id).copied().unwrap_or(0.5);
+        let score = conformal::nonconformity(irt_conf, s.ctc_score);
+        let cer = crate::wer::compute_cer(ref_text, &s.raw_transcript).min(1.0);
+        global_scored.push((score, cer));
+        bucket_scored[conformal::snr_bucket(s.snr_db)].push((score, cer));
+    }
+    let (global_threshold, _gb, _gc) = conformal::calibrate_threshold(&global_scored, 0.05, 0.90);
+    let bucket_thresholds: [f64; conformal::N_SNR_BUCKETS] = std::array::from_fn(|b| {
+        let (t, _bb, is_cal) = conformal::calibrate_threshold(&bucket_scored[b], 0.05, 0.90);
+        if is_cal {
+            t
+        } else {
+            global_threshold
+        }
+    });
 
     // 4. Route and collect decisions
     let mut decisions = Vec::new();
@@ -208,7 +218,9 @@ pub fn run_t0_gate(
 
         let irt_confidence = irt_results.segment_confidences.get(&seg.id).copied().unwrap_or(0.0);
 
-        let base_decision = t0_gate_segment(seg, &seg_hyps, &consensus, irt_confidence, threshold);
+        // Gate this segment against its own acoustic-condition bucket's threshold.
+        let seg_threshold = bucket_thresholds[conformal::snr_bucket(seg.snr_db)];
+        let base_decision = t0_gate_segment(seg, &seg_hyps, &consensus, irt_confidence, seg_threshold);
         // The Autonomy Dial decides whether the gate may auto-commit.
         let decision = apply_autonomy(base_decision, autonomy, &consensus, &seg_hyps, irt_confidence);
 
