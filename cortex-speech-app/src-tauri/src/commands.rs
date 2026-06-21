@@ -467,8 +467,9 @@ pub fn import_audio_file(
 
     state.try_start_import()?;
 
-    emit_or_log(&app, "pipeline-started", serde_json::json!({ "total": 1 }));
-    emit_or_log(&app, "pipeline-phase", serde_json::json!({ "phase": "importing" }));
+    // NOTE: do NOT pre-emit pipeline-started/-phase here. The worker emits them via
+    // PipelineEvent::Started/Phase (import_single_file_with_events), exactly like the directory path.
+    // Pre-emitting fired pipeline-started twice -> two stacked "Pipeline started" toasts per open.
 
     let cancel = Some(state.start_cancel_token());
 
