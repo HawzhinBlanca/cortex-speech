@@ -1711,9 +1711,15 @@ pub fn batch_normalize(
             Vec::new()
         };
 
+        // Fold the result-affecting config flags into the cache key. NORMALIZER_CACHE is a
+        // never-cleared process-global static, so keying on raw text alone replayed the FIRST
+        // config's normalization for the same text after the user toggled auto_normalize /
+        // verbalize_numbers (digit handling differs), persisting the wrong normalized_transcript.
+        let (auto_norm, verbalize) = (settings.auto_normalize, settings.verbalize_numbers);
         let results = crate::perf::parallel_batch(&segments, |seg| {
+            let cache_key = format!("{}|{}|{}", auto_norm as u8, verbalize as u8, seg.raw_transcript);
             let normalized =
-                crate::perf::NORMALIZER_CACHE.memoize(&seg.raw_transcript, |text| normalizer.normalize(text));
+                crate::perf::NORMALIZER_CACHE.memoize(&cache_key, |_| normalizer.normalize(&seg.raw_transcript));
             (seg.id.clone(), normalized)
         });
 
