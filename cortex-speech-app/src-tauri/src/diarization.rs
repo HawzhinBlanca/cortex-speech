@@ -53,7 +53,7 @@ impl SpeakerEmbeddingService {
     }
 }
 
-/// Assign a speaker label per VAD chunk (`SPEAKER_00`, `SPEAKER_01`, …).
+/// Assign a speaker label per VAD chunk (`SPEAKER_00`, `SPEAKER_01`, …) for a single PCM buffer.
 pub fn label_chunk_speakers(
     pcm: &[i16],
     sample_rate: u32,
@@ -64,11 +64,22 @@ pub fn label_chunk_speakers(
     if chunk_ranges.is_empty() {
         return Vec::new();
     }
+    let embeddings = compute_chunk_embeddings(pcm, sample_rate, chunk_ranges, embedding_service);
+    cluster_embeddings(&embeddings, max_speakers)
+}
 
-    let max_speakers = max_speakers.clamp(1, 32) as usize;
+/// Compute one speaker embedding per chunk, WITHOUT clustering. Split out of `label_chunk_speakers`
+/// so the streaming import path can accumulate embeddings across decode windows and cluster the WHOLE
+/// file in a single pass — without this, each 90s window clusters from scratch and the same physical
+/// speaker gets a different `SPEAKER_xx` label in different windows.
+pub fn compute_chunk_embeddings(
+    pcm: &[i16],
+    sample_rate: u32,
+    chunk_ranges: &[(usize, usize)],
+    embedding_service: &SpeakerEmbeddingService,
+) -> Vec<Vec<f32>> {
     let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-
-    let embeddings: Vec<Vec<f32>> = chunk_ranges
+    chunk_ranges
         .iter()
         .map(|&(start, end)| {
             let start = start.min(f32_pcm.len());
@@ -88,9 +99,17 @@ pub fn label_chunk_speakers(
                 chunk_embedding(&fbank, chunk)
             }
         })
-        .collect();
+        .collect()
+}
 
-    online_cluster(&embeddings, max_speakers)
+/// Cluster a sequence of precomputed chunk embeddings into `SPEAKER_xx` labels. Clustering the whole
+/// file's embeddings in ONE call keeps each physical speaker on a single label across decode windows.
+pub fn cluster_embeddings(embeddings: &[Vec<f32>], max_speakers: u32) -> Vec<Option<String>> {
+    if embeddings.is_empty() {
+        return Vec::new();
+    }
+    let max_speakers = max_speakers.clamp(1, 32) as usize;
+    online_cluster(embeddings, max_speakers)
 }
 
 fn chunk_embedding(fbank: &FbankExtractor, pcm: &[f32]) -> Vec<f32> {
@@ -246,6 +265,29 @@ mod tests {
 
         let with_local = label_chunk_speakers(&pcm, sr, &local_ranges, 8, &svc);
         assert!(with_local.iter().any(Option::is_some), "local ranges produce real speaker labels");
+    }
+
+    #[test]
+    fn whole_file_clustering_keeps_one_label_per_speaker_across_windows() {
+        // Round-10 audit MEDIUM: the streaming import re-clustered diarization per 90s window, so the
+        // first speaker of EACH window became SPEAKER_00 and a physical speaker got different labels in
+        // different windows. Clustering the WHOLE file's embedding sequence in one pass must keep each
+        // speaker on a single label regardless of window boundaries.
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![0.0f32, 1.0, 0.0];
+        // Sequence spanning two "windows": window 1 = [A, A, B], window 2 = [B, B, A]. Per-window
+        // clustering would relabel window 2's leading B as SPEAKER_00, colliding with window 1's A.
+        let whole = vec![a.clone(), a.clone(), b.clone(), b.clone(), b.clone(), a.clone()];
+        let labels = cluster_embeddings(&whole, 2);
+
+        let la = labels[0].clone();
+        let lb = labels[2].clone();
+        assert!(la.is_some() && lb.is_some(), "both speakers labeled: {labels:?}");
+        assert_ne!(la, lb, "distinct speakers must get distinct labels");
+        assert_eq!(labels[1], la, "A stays A within the first window");
+        assert_eq!(labels[5], la, "A in the SECOND window keeps A's label (the fix)");
+        assert_eq!(labels[3], lb);
+        assert_eq!(labels[4], lb);
     }
 
     #[test]
