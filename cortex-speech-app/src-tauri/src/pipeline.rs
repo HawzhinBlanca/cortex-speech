@@ -1220,7 +1220,9 @@ impl ProcessingPipeline {
                 ctc_score: None,
                 clipping_ratio: Some(quality.clipping_ratio),
                 rms_db: Some(quality.rms_db),
-                snr_db: Some(quality.snr_db),
+                // Already Option: None (unmeasurable, e.g. a short clip) persists as NULL so the
+                // quality/jury gates skip the SNR check instead of reading 0.0 as the worst SNR.
+                snr_db: quality.snr_db,
                 split: None,
                 ood_score: None,
                 verdict: None,
