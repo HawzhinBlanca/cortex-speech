@@ -107,11 +107,16 @@
   // ── Actions ──────────────────────────────────────────────────────────────────
   async function accept() {
     if (!current || isSubmitting) return;
+    // Snapshot the target before the await — currentIndex/current can change mid-flight if the user
+    // clicks another rail item (the rail is not disabled during submit), which would otherwise stamp
+    // this decision onto the wrong segment's queue slot.
+    const cur = current;
+    const idx = currentIndex;
     isSubmitting = true;
     try {
-      history.push({ id: current.id, decision: 'accept', prev: { ...current } });
-      await api.recordHumanDecision(current.id, 'accept', null);
-      queue[currentIndex] = { ...current, humanDecision: 'accept' };
+      history.push({ id: cur.id, decision: 'accept', prev: { ...cur } });
+      await api.recordHumanDecision(cur.id, 'accept', null);
+      queue[idx] = { ...cur, humanDecision: 'accept' };
       statusMsg = '✅ Accepted';
       advance();
     } catch (e) {
@@ -135,14 +140,17 @@
 
   async function commitEdit() {
     if (!current || !editText.trim() || isSubmitting) return;
+    const cur = current;
+    const idx = currentIndex;
+    const text = editText.trim();
     isSubmitting = true;
     try {
-      history.push({ id: current.id, decision: 'edit', prev: { ...current } });
-      await api.recordHumanDecision(current.id, 'edit', editText.trim());
-      queue[currentIndex] = {
-        ...current,
+      history.push({ id: cur.id, decision: 'edit', prev: { ...cur } });
+      await api.recordHumanDecision(cur.id, 'edit', text);
+      queue[idx] = {
+        ...cur,
         humanDecision: 'edit',
-        verdictTranscript: editText.trim(),
+        verdictTranscript: text,
       };
       isEditing = false;
       statusMsg = '✏️ Edited';
@@ -157,11 +165,13 @@
 
   async function reject() {
     if (!current || isSubmitting) return;
+    const cur = current;
+    const idx = currentIndex;
     isSubmitting = true;
     try {
-      history.push({ id: current.id, decision: 'reject', prev: { ...current } });
-      await api.recordHumanDecision(current.id, 'reject', null);
-      queue[currentIndex] = { ...current, humanDecision: 'reject' };
+      history.push({ id: cur.id, decision: 'reject', prev: { ...cur } });
+      await api.recordHumanDecision(cur.id, 'reject', null);
+      queue[idx] = { ...cur, humanDecision: 'reject' };
       statusMsg = '❌ Rejected';
       advance();
     } catch (e) {
@@ -178,12 +188,25 @@
     advance();
   }
 
+  // Guard against a malformed evidence_json (truncated / legacy / externally-written row): a raw
+  // JSON.parse in the template throws synchronously during render and breaks the focus card so the
+  // segment can't be adjudicated. Fall back to showing the raw string.
+  function safeEvidence(j: string | null | undefined): string {
+    try {
+      return JSON.stringify(JSON.parse(j ?? '[]'), null, 2);
+    } catch {
+      return j ?? '';
+    }
+  }
+
   async function flag() {
     if (!current || isSubmitting) return;
+    const cur = current;
+    const idx = currentIndex;
     isSubmitting = true;
     try {
       await api.writeSegmentVerdict(
-        current.id,
+        cur.id,
         'escalated',
         null,
         'Flagged for second-pass adjudication',
@@ -191,7 +214,7 @@
         null,
         true,
       );
-      queue[currentIndex] = { ...current, escalated: true };
+      queue[idx] = { ...cur, escalated: true };
       statusMsg = '🚩 Flagged for second pass';
       advance();
     } catch (e) {
@@ -433,11 +456,7 @@
                   <p class="rationale-text">{current.rationale}</p>
                 {/if}
                 {#if current.evidenceJson}
-                  <pre class="evidence-pre">{JSON.stringify(
-                      JSON.parse(current.evidenceJson ?? '[]'),
-                      null,
-                      2,
-                    )}</pre>
+                  <pre class="evidence-pre">{safeEvidence(current.evidenceJson)}</pre>
                 {/if}
               </details>
             </section>

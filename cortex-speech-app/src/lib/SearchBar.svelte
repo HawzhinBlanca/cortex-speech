@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import {
@@ -15,6 +16,10 @@
   let debounceTimer: ReturnType<typeof setTimeout>;
   let searchGeneration = 0;
   const tauriAvailable = isTauriRuntime();
+
+  // Cancel any pending debounce on unmount so a stale keystroke can't write the global search stores
+  // after the component is gone (e.g. sidebar closed within the 250ms debounce).
+  onDestroy(() => clearTimeout(debounceTimer));
 
   async function fetchSearchResults(trimmed: string, gen: number) {
     if (!trimmed) {

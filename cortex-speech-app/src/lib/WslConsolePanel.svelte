@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import { focusTrap } from './actions/focusTrap';
-  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { listen } from '@tauri-apps/api/event';
   import * as api from './commands';
   import { showWslConsole } from './stores/uiStore';
   import { notifications } from './stores/notificationStore';
@@ -21,9 +21,6 @@
   // Console Logs
   let logs = $state<string[]>([]);
   let consoleContainer = $state<HTMLDivElement | null>(null);
-
-  let unlistenLog: UnlistenFn | null = null;
-  let unlistenStatus: UnlistenFn | null = null;
 
   function appendLog(line: string) {
     logs = appendBoundedLogLine(logs, line);
@@ -102,36 +99,28 @@
     if (e.key === 'Escape') close();
   }
 
-  onMount(async () => {
-    // Listen to log events from Rust subprocess
-    unlistenLog = await listen<string>('wsl-log', (event) => {
+  onMount(() => {
+    // Store the listen() PROMISES (not the resolved handles) and unsubscribe in the returned cleanup.
+    // onMount must be SYNCHRONOUS for the returned function to be treated as teardown — and because an
+    // async onMount does NOT block onDestroy, capturing the resolved handle in an awaited assignment
+    // could miss teardown (panel closed before listen() resolves) and leak the listener forever.
+    const logHandle = listen<string>('wsl-log', (event) => {
       appendLog(event.payload);
     });
-
-    // Listen to exit status from Rust subprocess
-    unlistenStatus = await listen<{
-      status: 'completed' | 'failed' | 'cancelled';
-      exit_code: number;
-    }>('wsl-status', (event) => {
-      // In-panel display only. The completion side effects (toast + segment refresh) are handled
-      // app-scoped in events.ts so they fire even when this panel is closed mid-run.
-      status = event.payload.status;
-      exitCode = event.payload.exit_code;
-      running = false;
-    });
-  });
-
-  onDestroy(() => {
-    try {
-      if (unlistenLog) unlistenLog();
-    } catch (e) {
-      // ignore
-    }
-    try {
-      if (unlistenStatus) unlistenStatus();
-    } catch (e) {
-      // ignore
-    }
+    const statusHandle = listen<{ status: 'completed' | 'failed' | 'cancelled'; exit_code: number }>(
+      'wsl-status',
+      (event) => {
+        // In-panel display only. The completion side effects (toast + segment refresh) are handled
+        // app-scoped in events.ts so they fire even when this panel is closed mid-run.
+        status = event.payload.status;
+        exitCode = event.payload.exit_code;
+        running = false;
+      },
+    );
+    return () => {
+      logHandle.then((u) => u()).catch(() => {});
+      statusHandle.then((u) => u()).catch(() => {});
+    };
   });
 </script>
 
