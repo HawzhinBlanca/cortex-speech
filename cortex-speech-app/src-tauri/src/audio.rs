@@ -14,8 +14,9 @@ pub const TARGET_SAMPLE_RATE: u32 = 16000;
 
 /// Returns true if the PCM array is completely silent or only contains micro-noise.
 pub fn is_silent(pcm: &[i16]) -> bool {
-    // 50 is a very low threshold for 16-bit PCM (max 32768)
-    pcm.iter().all(|&sample| sample.abs() < 50)
+    // 50 is a very low threshold for 16-bit PCM (max 32768). unsigned_abs (not abs) so a -32768
+    // sample can't overflow-panic (debug) / wrap (release) the silence check.
+    pcm.iter().all(|&sample| sample.unsigned_abs() < 50)
 }
 
 /// Normalize the gain of an f32 PCM buffer to `target_rms_db` (e.g. -20.0).
@@ -956,6 +957,14 @@ mod tests {
     #[test]
     fn test_compute_waveform_empty() {
         assert!(compute_waveform(&[], 100).is_empty());
+    }
+
+    #[test]
+    fn is_silent_handles_min_i16_without_overflow() {
+        // Hardening-audit HIGH (twin of the clipping bug): i16::abs() overflows at -32768. A loud
+        // negative-rail sample must register as NOT silent without panicking.
+        assert!(!is_silent(&[i16::MIN]), "a -32768 sample is loud, not silent");
+        assert!(is_silent(&[0, 10, -10, 49, -49]), "micro-noise is silent");
     }
 
     #[test]
