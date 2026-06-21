@@ -297,6 +297,32 @@ pub fn assign_splits(
     out
 }
 
+/// Decide the PCM slice for a segment's exported WAV from its alignment window.
+///
+/// Returns `None` when the segment must be SKIPPED: its alignment is present and parses but the
+/// window is out of range relative to the (possibly re-encoded/shortened) decoded buffer, or is
+/// degenerate (end <= start). In that case the OLD code substituted the WHOLE source file, pairing
+/// the entire recording with the segment's short transcript — silent training-data corruption. Only
+/// genuinely-absent or unparseable alignment falls back to the whole file (the intended behaviour).
+fn slice_for_export<'a>(
+    full_pcm: &'a [i16],
+    sample_rate: u32,
+    alignment_json: Option<&str>,
+) -> Option<std::borrow::Cow<'a, [i16]>> {
+    match alignment_json.and_then(chunking::SegmentSourceMeta::from_alignment_json) {
+        Some(meta) => {
+            let start = chunking::ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
+            let end = chunking::ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate).min(full_pcm.len());
+            if end > start && start < full_pcm.len() {
+                Some(std::borrow::Cow::Borrowed(&full_pcm[start..end]))
+            } else {
+                None // present-but-out-of-range window -> skip, never emit the whole file
+            }
+        }
+        None => Some(std::borrow::Cow::Borrowed(full_pcm)), // no/unparseable alignment -> whole file (intended)
+    }
+}
+
 /// Lowercase-hex SHA-256 of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -493,22 +519,18 @@ pub fn export_huggingface_dataset(
                             continue;
                         }
 
-                        // Slice from the already-decoded PCM buffer.
-                        let pcm_slice: std::borrow::Cow<[i16]> = if let Some(ref alignment) = seg.alignment_json {
-                            if let Some(meta) = chunking::SegmentSourceMeta::from_alignment_json(alignment) {
-                                let start = chunking::ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
-                                let end = chunking::ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate)
-                                    .min(full_pcm.len());
-                                if end > start {
-                                    std::borrow::Cow::Borrowed(&full_pcm[start..end])
-                                } else {
-                                    std::borrow::Cow::Borrowed(&full_pcm)
-                                }
-                            } else {
-                                std::borrow::Cow::Borrowed(&full_pcm)
+                        // Slice from the already-decoded PCM buffer. An out-of-range/degenerate
+                        // alignment window skips the row instead of emitting the whole source file.
+                        let pcm_slice = match slice_for_export(&full_pcm, sample_rate, seg.alignment_json.as_deref()) {
+                            Some(slice) => slice,
+                            None => {
+                                tracing::warn!(
+                                    "Skipping segment {} in HF export: alignment window out of range (pcm_len={})",
+                                    seg.id,
+                                    full_pcm.len()
+                                );
+                                continue;
                             }
-                        } else {
-                            std::borrow::Cow::Borrowed(&full_pcm)
                         };
 
                         let stem = source_path.file_stem().unwrap_or_default().to_string_lossy();
@@ -1193,6 +1215,30 @@ mod tests {
         assert_eq!(records.len(), 1, "the embedded comma/newline must not create extra rows");
         assert_eq!(&records[0][0], "adv-1");
         assert_eq!(&records[0][2], nasty, "the transcript round-trips intact through CSV escaping");
+    }
+
+    #[test]
+    fn slice_for_export_skips_out_of_range_and_degenerate_windows() {
+        // Round-2 audit: a present-but-out-of-range window must SKIP (None), not emit the whole file.
+        let full = vec![0i16; 1000]; // ~62ms at 16kHz
+        // start beyond the (shortened) buffer:
+        let beyond = crate::chunking::SegmentSourceMeta { source_start_ms: 5000, source_end_ms: 6000, chunk_index: 0, chunk_count: 1 };
+        assert!(slice_for_export(&full, 16000, Some(&beyond.to_alignment_json())).is_none(), "out-of-range -> skip");
+        // degenerate end <= start:
+        let degenerate = crate::chunking::SegmentSourceMeta { source_start_ms: 30, source_end_ms: 30, chunk_index: 0, chunk_count: 1 };
+        assert!(slice_for_export(&full, 16000, Some(&degenerate.to_alignment_json())).is_none(), "degenerate -> skip");
+    }
+
+    #[test]
+    fn slice_for_export_valid_window_and_whole_file_fallback() {
+        let full: Vec<i16> = (0..16000).collect::<Vec<i32>>().iter().map(|&i| i as i16).collect();
+        // Valid 0..500ms = 0..8000 samples.
+        let valid = crate::chunking::SegmentSourceMeta { source_start_ms: 0, source_end_ms: 500, chunk_index: 0, chunk_count: 1 };
+        let s = slice_for_export(&full, 16000, Some(&valid.to_alignment_json())).expect("valid window");
+        assert_eq!(s.len(), 8000, "valid window slices to exactly its sample span");
+        // No alignment -> whole file (intended fallback).
+        let whole = slice_for_export(&full, 16000, None).expect("whole file");
+        assert_eq!(whole.len(), full.len());
     }
 
     #[test]
