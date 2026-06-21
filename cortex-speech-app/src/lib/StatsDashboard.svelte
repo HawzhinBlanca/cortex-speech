@@ -123,6 +123,9 @@
       fetchStats();
       fetchInferenceStats();
     }, 500);
+    // Cancel the pending timer on teardown so it can't fire backend fetches / write $state after the
+    // panel unmounts (navigating away within the 500ms debounce).
+    return () => clearTimeout(fetchDebounceTimer);
   });
 
   function fmt(s: number) {
