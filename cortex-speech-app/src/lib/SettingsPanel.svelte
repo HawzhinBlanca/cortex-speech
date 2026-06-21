@@ -21,6 +21,10 @@
   let exportingAudio = $state(false);
   let sourceReferenceModelsInput = $state('');
   const tauriAvailable = isTauriRuntime();
+  // Set true only by the Cancel button so onDestroy discards unsaved edits instead of persisting
+  // them. (Theme/sliders have no per-field auto-save and rely on the close-to-save onDestroy path,
+  // so we must NOT gate it globally — only suppress it for an explicit Cancel.)
+  let cancelled = $state(false);
 
   $effect(() => {
     const nextSettings = $settings;
@@ -32,6 +36,8 @@
   });
 
   onDestroy(() => {
+    // Cancel must discard: don't persist unsaved edits when the user explicitly cancelled.
+    if (cancelled) return;
     applySourceReferenceModelsInput();
     const currentStore = get(settings);
     if (JSON.stringify(localSettings) !== JSON.stringify(currentStore)) {
@@ -794,8 +800,12 @@
     </div>
 
     <div class="flex justify-end gap-3 px-6 py-4 border-t border-cortex-800/50">
-      <button class="btn btn-secondary" onclick={() => showSettings.set(false)}
-        >{$t('cancel')}</button
+      <button
+        class="btn btn-secondary"
+        onclick={() => {
+          cancelled = true;
+          showSettings.set(false);
+        }}>{$t('cancel')}</button
       >
       <button class="btn btn-primary" onclick={save} disabled={saving}>
         {saving ? $t('saving') : $t('save')}
