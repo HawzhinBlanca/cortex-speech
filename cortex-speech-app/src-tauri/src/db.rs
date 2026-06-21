@@ -631,7 +631,7 @@ impl Database {
                     alignment_quality
              FROM speech_segments
              WHERE id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?1)
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC, id ASC",
         )?;
         let rows = stmt.query_map(params![match_query], Self::map_row)?;
         let mut segments = Vec::new();
@@ -657,7 +657,7 @@ impl Database {
         // Build a parameterised placeholder list: (?1,?2,...?N)
         let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
         let query = format!(
-            "SELECT {col_list} FROM speech_segments WHERE id IN ({}) ORDER BY created_at DESC",
+            "SELECT {col_list} FROM speech_segments WHERE id IN ({}) ORDER BY created_at DESC, id ASC",
             placeholders.join(",")
         );
         let mut stmt = self.conn.prepare(&query)?;
@@ -741,7 +741,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT segment_id, model_id, transcript, confidence
              FROM segment_hypotheses WHERE segment_id = ?1
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC, model_id ASC",
         )?;
         let rows = stmt.query_map(params![segment_id], |row| {
             Ok(SegmentHypothesis {
@@ -1326,6 +1326,29 @@ mod tests {
         let stored = db.get_segment_by_audio_path("/a.wav").unwrap().unwrap();
         assert_eq!(stored.raw_transcript, composed, "raw_transcript must be stored NFC-composed");
         assert_eq!(stored.annotated_transcript.as_deref(), Some(composed), "annotated must be NFC too");
+    }
+
+    #[test]
+    fn search_segments_tie_order_is_deterministic_by_id() {
+        let db = make_db();
+        // Insert in non-sorted id order; all share the search token and (in this fast test) the same
+        // 1s-resolution created_at, so the only stable order is the id tiebreaker.
+        for id in ["seg_m", "seg_a", "seg_z"] {
+            let mut s = make_segment(id, &format!("/{id}.wav"));
+            s.raw_transcript = "uniquesearchtoken body".to_string();
+            db.insert_segment(&s).unwrap();
+        }
+        let by_search: Vec<String> =
+            db.search_segments("uniquesearchtoken").unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(by_search, vec!["seg_a", "seg_m", "seg_z"], "tied search results must order by id");
+
+        let by_ids: Vec<String> = db
+            .get_segments_by_ids(&["seg_z".into(), "seg_a".into(), "seg_m".into()])
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(by_ids, vec!["seg_a", "seg_m", "seg_z"], "tied id-batch results must order by id");
     }
 
     #[test]
