@@ -61,6 +61,14 @@ pub struct BaselineComparison {
     pub paired_segments: usize,
     pub baseline_micro_wer: f64,
     pub system_micro_wer: f64,
+    /// PAIRED micro-CER over the same gold-id intersection as the WER figures above. The promotion
+    /// gate must compare CER on this paired basis — NOT the challenger's full-set micro_cer against the
+    /// champion's frozen stored gold_cer, which can be computed over a different (grown) gold set and
+    /// would let a CER-regressing model pass when evaluated on an easier/larger superset.
+    #[serde(default)]
+    pub baseline_micro_cer: f64,
+    #[serde(default)]
+    pub system_micro_cer: f64,
     pub mapsswe_p_value: f64,
     pub significant_at_05: bool,
     /// True only if the system's paired WER is lower AND the difference is significant.
@@ -196,6 +204,9 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
 
     let mut sys_errs = Vec::new();
     let mut base_errs = Vec::new();
+    // Paired CHAR errors over the same gold-id intersection, so the CER gate is paired like the WER gate.
+    let mut sys_cer_errs = Vec::new();
+    let mut base_cer_errs = Vec::new();
     // Per-condition slice accumulation (challenger vs baseline word errors, grouped by slice).
     let mut by_slice: std::collections::BTreeMap<&'static str, (Vec<SegmentError>, Vec<SegmentError>)> =
         std::collections::BTreeMap::new();
@@ -205,6 +216,8 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
             let be = word_error(&b.reference, &b.hypothesis);
             sys_errs.push(se);
             base_errs.push(be);
+            sys_cer_errs.push(char_error(&s.reference, &s.hypothesis));
+            base_cer_errs.push(char_error(&b.reference, &b.hypothesis));
             let slot = by_slice.entry(length_slice(&s.reference)).or_default();
             slot.0.push(se);
             slot.1.push(be);
@@ -213,6 +226,8 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
 
     let system_micro_wer = micro_rate(&sys_errs);
     let baseline_micro_wer = micro_rate(&base_errs);
+    let system_micro_cer = micro_rate(&sys_cer_errs);
+    let baseline_micro_cer = micro_rate(&base_cer_errs);
     let p = mapsswe(&sys_errs, &base_errs);
     let significant = p < 0.05;
 
@@ -239,6 +254,8 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
         paired_segments: sys_errs.len(),
         baseline_micro_wer,
         system_micro_wer,
+        baseline_micro_cer,
+        system_micro_cer,
         mapsswe_p_value: p,
         significant_at_05: significant,
         beats_baseline: significant && system_micro_wer < baseline_micro_wer,

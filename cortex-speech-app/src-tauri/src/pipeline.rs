@@ -118,7 +118,10 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
         if let Some(stripped) = line.strip_prefix("__RESULT__=") {
             if let Ok(res) = serde_json::from_str::<WslResult>(stripped) {
                 raw_transcript = res.raw_transcript;
-                confidence = res.confidence;
+                // Sanitize the external script's confidence to a valid posterior: drop non-finite and
+                // clamp into [0,1]. A homegrown script emitting a percentage (e.g. 92.0) must not flow
+                // unbounded into the conformal certificate, where it would read as MAXIMAL certainty.
+                confidence = res.confidence.filter(|c| c.is_finite()).map(|c| c.clamp(0.0, 1.0));
             }
         }
     }
@@ -927,7 +930,7 @@ impl ProcessingPipeline {
             &mut on_chunk,
         )?;
         let mut persisted = self.persist_segments(db, segments)?;
-        self.run_primary_wsl_pass_for_import(db, &mut persisted)?;
+        self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
         for (seg_id, f32_pcm) in pcm_cache {
             if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
                 log_hypothesis_population_failure(&seg_id, &error);
@@ -1046,7 +1049,7 @@ impl ProcessingPipeline {
         }
 
         let mut persisted = self.persist_segments(db, segments)?;
-        self.run_primary_wsl_pass_for_import(db, &mut persisted)?;
+        self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
         for (seg_id, f32_pcm) in all_pcm_cache {
             if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
                 log_hypothesis_population_failure(&seg_id, &error);
@@ -1251,13 +1254,23 @@ impl ProcessingPipeline {
         Ok(segments)
     }
 
-    fn run_primary_wsl_pass_for_import(&self, db: &Database, segments: &mut [SpeechSegment]) -> AppResult<usize> {
+    fn run_primary_wsl_pass_for_import(
+        &self,
+        db: &Database,
+        segments: &mut [SpeechSegment],
+        cancel: Option<&CancellationToken>,
+    ) -> AppResult<usize> {
         if !self.should_use_wsl_primary_asr() || segments.is_empty() {
             return Ok(0);
         }
 
         let mut updated = 0usize;
         for seg in segments {
+            // Honor cancellation between segments: each WSL transcription can ride a 300s timeout, so
+            // without this a cancelled import of an N-segment file would keep running for up to N*300s.
+            if let Some(token) = cancel {
+                token.check()?;
+            }
             match self.transcribe(Some(seg.id.as_str()), &seg.audio_path, seg.alignment_json.as_deref()) {
                 Ok((_raw_text, _corrected_text, _confidence)) => {
                     if self.refresh_segment_from_db(db, seg)? {
@@ -2703,7 +2716,7 @@ mod tests {
         db.insert_segment(&segment).unwrap();
 
         let mut segments = vec![segment];
-        let updated = pipeline.run_primary_wsl_pass_for_import(&db, &mut segments).unwrap();
+        let updated = pipeline.run_primary_wsl_pass_for_import(&db, &mut segments, None).unwrap();
 
         assert_eq!(updated, 0);
         assert_eq!(segments[0].raw_transcript, "local fallback transcript");

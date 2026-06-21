@@ -201,14 +201,64 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     }
 }
 
+/// Minimal union-find (disjoint-set) over string-keyed nodes, used to build leakage-safe split groups
+/// as connected components of the bipartite (recording, speaker) graph.
+struct UnionFind {
+    ids: std::collections::HashMap<String, usize>,
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+}
+
+impl UnionFind {
+    fn new() -> Self {
+        Self { ids: std::collections::HashMap::new(), parent: Vec::new(), rank: Vec::new() }
+    }
+
+    /// Get the id for `key`, creating a new singleton set if it is unseen.
+    fn node(&mut self, key: &str) -> usize {
+        if let Some(&id) = self.ids.get(key) {
+            return id;
+        }
+        let id = self.parent.len();
+        self.parent.push(id);
+        self.rank.push(0);
+        self.ids.insert(key.to_string(), id);
+        id
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]]; // path halving
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        match self.rank[ra].cmp(&self.rank[rb]) {
+            std::cmp::Ordering::Less => self.parent[ra] = rb,
+            std::cmp::Ordering::Greater => self.parent[rb] = ra,
+            std::cmp::Ordering::Equal => {
+                self.parent[rb] = ra;
+                self.rank[ra] += 1;
+            }
+        }
+    }
+}
+
 /// Deterministic, leakage-safe train/val/test assignment for the HuggingFace export.
 ///
 /// Two properties a training dataset must have, both of which the previous inline logic
 /// broke:
 /// 1. **No source-recording leakage** — every segment cut from the same source recording
 ///    lands in the same split; otherwise near-identical acoustic content leaks train→test.
-///    With `speaker_disjoint`, a *known* speaker is the grouping unit instead (so no speaker
-///    spans two splits); unknown-speaker segments fall back to their source recording.
+///    With `speaker_disjoint`, the grouping unit is a connected component of the bipartite
+///    (recording, speaker) graph, so a unit is BOTH speaker-disjoint AND keeps every recording
+///    intact — a multi-speaker recording can never straddle two splits.
 /// 2. **Seed reproducibility** — groups are visited in sorted-then-seed-shuffled order, so the
 ///    same segments + seed always yield the same split. (The old code shuffled `HashMap`
 ///    keys, whose iteration order is randomised per run, so the seed pinned nothing.)
@@ -239,17 +289,45 @@ pub fn assign_splits(
         path.rsplit(['/', '\\']).next().unwrap_or(path)
     }
 
-    // Group into leakage-safe units. BTreeMap keeps keys in a stable sorted order.
+    // Group into leakage-safe units. With speaker_disjoint, a unit is a connected component of the
+    // bipartite (recording, speaker) graph (built by union-find): each component keeps every source
+    // recording INTACT (no multi-speaker recording straddles two splits) AND is speaker-disjoint (no
+    // speaker spans two splits). Without speaker_disjoint, units are simply per-recording. BTreeMap
+    // keeps the canonical keys in a stable sorted order for seed-reproducible shuffling.
     let mut groups: std::collections::BTreeMap<String, Vec<&SpeechSegment>> =
         std::collections::BTreeMap::new();
-    for seg in segments {
-        let spk = seg.speaker_id.as_deref().unwrap_or("").trim();
-        let key = if speaker_disjoint && !spk.is_empty() {
-            format!("spk::{spk}")
-        } else {
-            format!("src::{}", source_name(&seg.audio_path))
-        };
-        groups.entry(key).or_default().push(seg);
+    if speaker_disjoint {
+        let mut uf = UnionFind::new();
+        for seg in segments {
+            let r = uf.node(&format!("r:{}", source_name(&seg.audio_path)));
+            let spk = seg.speaker_id.as_deref().unwrap_or("").trim();
+            if !spk.is_empty() {
+                let s = uf.node(&format!("s:{spk}"));
+                uf.union(r, s);
+            }
+        }
+        // Canonical key per component = the lexicographically smallest recording name in it
+        // (deterministic and unique — each recording belongs to exactly one component).
+        let mut root_key: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        for seg in segments {
+            let rec = source_name(&seg.audio_path).to_string();
+            let r = uf.node(&format!("r:{rec}"));
+            let root = uf.find(r);
+            root_key.entry(root).and_modify(|m| {
+                if rec < *m {
+                    *m = rec.clone();
+                }
+            }).or_insert(rec);
+        }
+        for seg in segments {
+            let r = uf.node(&format!("r:{}", source_name(&seg.audio_path)));
+            let root = uf.find(r);
+            groups.entry(root_key[&root].clone()).or_default().push(seg);
+        }
+    } else {
+        for seg in segments {
+            groups.entry(source_name(&seg.audio_path).to_string()).or_default().push(seg);
+        }
     }
 
     // Sorted keys, then a seeded Fisher–Yates shuffle → reproducible from `seed` alone.
@@ -462,16 +540,16 @@ pub fn export_huggingface_dataset(
     let process_split = |split_segs: &[SpeechSegment],
                          _split_name: &str,
                          dest_dir: &std::path::Path|
-     -> AppResult<(usize, f64, usize)> {
+     -> AppResult<(usize, f64, usize, Vec<String>)> {
         if split_segs.is_empty() {
-            return Ok((0, 0.0, 0));
+            return Ok((0, 0.0, 0, Vec::new()));
         }
 
         let csv_path = dest_dir.join("metadata.csv");
         let csv_tmp = csv_path.with_extension("csv.tmp");
         remove_file_on_error(
             &csv_tmp,
-            (|| -> AppResult<(usize, f64, usize)> {
+            (|| -> AppResult<(usize, f64, usize, Vec<String>)> {
                 let mut csv_wtr = csv::Writer::from_path(&csv_tmp)?;
                 csv_wtr.write_record([
                     "file_name",
@@ -490,6 +568,10 @@ pub fn export_huggingface_dataset(
                 // Segments dropped because their source audio is unavailable (missing or
                 // undecodable) — real, previously-silent data loss, surfaced after export.
                 let mut dropped_unavailable = 0usize;
+                // Ids of segments actually WRITTEN to disk, so the split column is later persisted ONLY
+                // for exported rows — never for ones dropped by the filters below (which would label a
+                // clip the dataset does not contain and disagree with dataset_infos.json counts).
+                let mut exported_ids: Vec<String> = Vec::new();
 
                 // Group segments by source audio_path so each source file is decoded only once.
                 // For a 2-hour podcast split into N segments, this avoids N full re-decodes.
@@ -587,20 +669,21 @@ pub fn export_huggingface_dataset(
 
                         total_exported_dur += seg.duration_ms as f64 / 1000.0;
                         count += 1;
+                        exported_ids.push(seg.id.clone());
                     }
                 }
 
                 csv_wtr.flush()?;
                 drop(csv_wtr);
                 replace_file(&csv_tmp, &csv_path)?;
-                Ok((count, total_exported_dur, dropped_unavailable))
+                Ok((count, total_exported_dur, dropped_unavailable, exported_ids))
             })(),
         )
     };
 
-    let (train_count, train_secs, train_dropped) = process_split(&train_segs, "train", &train_dir)?;
-    let (val_count, val_secs, val_dropped) = process_split(&val_segs, "validation", &val_dir)?;
-    let (test_count, test_secs, test_dropped) = process_split(&test_segs, "test", &test_dir)?;
+    let (train_count, train_secs, train_dropped, train_ids) = process_split(&train_segs, "train", &train_dir)?;
+    let (val_count, val_secs, val_dropped, val_ids) = process_split(&val_segs, "validation", &val_dir)?;
+    let (test_count, test_secs, test_dropped, test_ids) = process_split(&test_segs, "test", &test_dir)?;
 
     let total_count = train_count + val_count + test_count;
     let total_secs = train_secs + val_secs + test_secs;
@@ -695,7 +778,16 @@ This dataset was exported from Cortex Speech Processor.
 
     // Every on-disk artifact is now written — persist the split columns LAST so that any failure
     // above returned Err with the DB unchanged, never leaving splits that describe an unwritten set.
+    // Persist a split ONLY for segments that were actually exported: process_split drops rows whose
+    // source audio is missing/undecodable, that are not training-ready, that lack coverage, or whose
+    // alignment window is out of range. Recording a split for a dropped row would label a clip the
+    // dataset does not contain and disagree with dataset_infos.json's num_examples.
+    let exported_ids: std::collections::HashSet<&str> =
+        train_ids.iter().chain(val_ids.iter()).chain(test_ids.iter()).map(String::as_str).collect();
     for (id, split) in &pending_splits {
+        if !exported_ids.contains(id.as_str()) {
+            continue;
+        }
         db.update_segment_split(id, split)
             .map_err(|error| AppError::Other(format!("Failed to persist split {split} for {id}: {error}")))?;
     }
@@ -1149,6 +1241,57 @@ mod tests {
                 if let Some(prev) = spk_split.insert(spk, split) {
                     assert_eq!(prev, split, "speaker {spk} leaked across splits");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn multi_speaker_recording_stays_in_one_split_under_speaker_disjoint() {
+        use std::collections::{HashMap, HashSet};
+        // Round-10 audit HIGH: in speaker-disjoint mode the OLD grouping keyed purely on speaker, so a
+        // single recording diarized into two speakers could land its chunks in DIFFERENT splits — the
+        // same room/mic acoustic content leaking train<->test. The connected-components grouping must
+        // keep every recording intact AND stay speaker-disjoint.
+        let mk = |id: &str, src: &str, spk: &str, dur: i64| SpeechSegment {
+            id: id.to_string(),
+            audio_path: format!("/data/{src}"),
+            speaker_id: Some(spk.to_string()),
+            duration_ms: dur,
+            ..SpeechSegment::default()
+        };
+        let mut segs = Vec::new();
+        // One recording diarized into TWO speakers (an interview), plus two single-speaker recordings.
+        for i in 0..4 {
+            segs.push(mk(&format!("interview-A{i}"), "interview.wav", "SPEAKER_00", 5000));
+        }
+        for i in 0..4 {
+            segs.push(mk(&format!("interview-B{i}"), "interview.wav", "SPEAKER_01", 5000));
+        }
+        for i in 0..6 {
+            segs.push(mk(&format!("solo1-{i}"), "solo1.wav", "SPEAKER_02", 5000));
+        }
+        for i in 0..6 {
+            segs.push(mk(&format!("solo2-{i}"), "solo2.wav", "SPEAKER_03", 5000));
+        }
+
+        let a = assign_splits(&segs, 0.34, 0.33, 0.33, 11, true);
+        let split_of: HashMap<&str, &str> = a.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+
+        // The multi-speaker recording must be entirely within ONE split (no recording leakage).
+        let interview_splits: HashSet<&str> = segs
+            .iter()
+            .filter(|s| s.audio_path.ends_with("interview.wav"))
+            .map(|s| split_of[s.id.as_str()])
+            .collect();
+        assert_eq!(interview_splits.len(), 1, "a multi-speaker recording must not straddle splits: {interview_splits:?}");
+
+        // And speaker-disjointness still holds: no speaker spans two splits.
+        let mut spk_split: HashMap<&str, &str> = HashMap::new();
+        for s in &segs {
+            let spk = s.speaker_id.as_deref().unwrap();
+            let split = split_of[s.id.as_str()];
+            if let Some(prev) = spk_split.insert(spk, split) {
+                assert_eq!(prev, split, "speaker {spk} leaked across splits");
             }
         }
     }
