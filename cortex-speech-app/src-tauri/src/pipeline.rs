@@ -1278,7 +1278,7 @@ impl ProcessingPipeline {
 
     /// Import one audio file through the same VAD chunking + ASR path as directory import.
     pub fn import_single_file(&self, path: &Path) -> AppResult<Vec<SpeechSegment>> {
-        self.import_single_file_with_events(path, None, |_| {})
+        self.import_single_file_with_events(path, None, None, |_| {})
     }
 
     /// Import one file with optional cancellation and progress events (for Ctrl+O / long audiobooks).
@@ -1286,6 +1286,7 @@ impl ProcessingPipeline {
         &self,
         path: &Path,
         cancel: Option<CancellationToken>,
+        agent_run_id: Option<&str>,
         on_event: impl Fn(PipelineEvent),
     ) -> AppResult<Vec<SpeechSegment>> {
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
@@ -1408,7 +1409,11 @@ impl ProcessingPipeline {
                         imported_ids.len(),
                     ));
                     let source_path = path.to_string_lossy().to_string();
-                    let report_options = crate::runs::AgentImportReportOptions::from_settings(&self.settings);
+                    let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&self.settings);
+                    // Correlate the persisted report with the live agent-stage events, which carry
+                    // this run id — mirrors the directory path. Previously this report stored a null
+                    // run_id, so it could not be joined to the import's stage events.
+                    report_options.agent_run_id = agent_run_id.map(str::to_string);
                     match crate::commands::run_jury_pipeline_core(&db, &self.settings, imported_ids.clone()) {
                         Ok(jury_report) => {
                             on_event(agent_stage(
