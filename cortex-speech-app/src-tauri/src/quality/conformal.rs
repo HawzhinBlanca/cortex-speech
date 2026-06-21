@@ -14,13 +14,56 @@ pub struct ConformalCertificate {
     pub is_calibrated: bool,
 }
 
-/// Computes the nonconformity score for a segment.
-/// S = (1.0 - confidence) + 0.1 * (-ctc_score)
+/// The nonconformity score from a (confidence, ctc) pair: S = (1 - confidence) + 0.1·(-ctc).
+///
+/// This is the SINGLE source of truth for the score. The T0 gate MUST calibrate its threshold on
+/// the same score (and the same confidence source) it gates on, otherwise the conformal coverage
+/// guarantee is void. The gate routes on the IRT cross-model consensus confidence (the
+/// better-calibrated signal); calibrate_threshold is fed that same IRT-based score.
+pub fn nonconformity(confidence: f64, ctc_score: Option<f64>) -> f64 {
+    let ctc = ctc_score.unwrap_or(-5.0);
+    ((1.0 - confidence) + 0.1 * (-ctc)).max(0.0)
+}
+
+/// Nonconformity from a segment's OWN per-utterance confidence (used by the standalone dataset
+/// certificate, which is a seg.confidence-based artifact distinct from the IRT-based T0 gate).
 pub fn compute_nonconformity_score(seg: &SpeechSegment) -> f64 {
-    let conf = seg.confidence.unwrap_or(0.5);
-    let ctc = seg.ctc_score.unwrap_or(-5.0);
-    let score = (1.0 - conf) + 0.1 * (-ctc);
-    score.max(0.0)
+    nonconformity(seg.confidence.unwrap_or(0.5), seg.ctc_score)
+}
+
+/// Calibrate ONLY the conformal threshold from pre-scored calibration items `(nonconformity, cer)`.
+/// The caller supplies the exact score it will gate on, so the Hoeffding bound and the threshold are
+/// valid for that score. Returns `(threshold, expected_error_bound, is_calibrated)`.
+///
+/// Same statistics as calibrate_and_certify: tie-group-boundary cutoffs (so the certified prefix
+/// equals the bound's prefix) and a Bonferroni `ln(n/delta)` multiplicity correction.
+pub fn calibrate_threshold(scored: &[(f64, f64)], target_error: f64, confidence_level: f64) -> (f64, f64, bool) {
+    let delta = (1.0 - confidence_level).max(1e-5);
+    if scored.len() < 10 {
+        // Conservative cold-start: too little verified data for a guarantee.
+        return (0.35, target_error, false);
+    }
+    let mut sorted: Vec<(f64, f64)> = scored.to_vec();
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let (mut best_k, mut best_threshold, mut best_bound) = (0usize, 0.0, 1.0);
+    for k in 1..=n {
+        if k < n && sorted[k].0 == sorted[k - 1].0 {
+            continue; // only cut at a tie-group boundary
+        }
+        let empirical_risk = sorted.iter().take(k).map(|x| x.1).sum::<f64>() / k as f64;
+        let bound = empirical_risk + ((n as f64 / delta).ln() / (2.0 * k as f64)).sqrt();
+        if bound <= target_error {
+            best_k = k;
+            best_threshold = sorted[k - 1].0;
+            best_bound = bound;
+        }
+    }
+    if best_k == 0 {
+        // Nothing certifiable at target; fall back to the single best item, flagged uncalibrated.
+        return (sorted[0].0, 1.0, false);
+    }
+    (best_threshold, best_bound, true)
 }
 
 /// Calibrates the conformal threshold using verified segments as the calibration set.
@@ -30,11 +73,10 @@ pub fn calibrate_and_certify(
     target_error: f64,     // e.g., 0.05 for 5% CER
     confidence_level: f64, // e.g., 0.95 for 95% confidence
 ) -> ConformalCertificate {
-    let delta = 1.0 - confidence_level;
-    let delta = delta.max(1e-5); // safety guard
-
-    // Extract calibration set: verified segments with non-empty reference
-    let cal_set: Vec<(&SpeechSegment, f64, f64)> = all_segments
+    // Build the (nonconformity, cer) calibration set from verified segments with a non-empty
+    // reference, scored on the segment's own confidence (this is the seg.confidence-based DATASET
+    // certificate; the IRT-based T0 gate calibrates separately via calibrate_threshold).
+    let cal_scored: Vec<(f64, f64)> = all_segments
         .iter()
         .filter_map(|s| {
             if !s.verified {
@@ -44,110 +86,37 @@ pub fn calibrate_and_certify(
             if ref_text.is_empty() {
                 return None;
             }
-            let score = compute_nonconformity_score(s);
-            let hyp_text = &s.raw_transcript;
-            let cer = compute_cer(ref_text, hyp_text).min(1.0); // Bound error to [0, 1] for Hoeffding
-            Some((s, score, cer))
+            let cer = compute_cer(ref_text, &s.raw_transcript).min(1.0); // bound to [0,1] for Hoeffding
+            Some((compute_nonconformity_score(s), cer))
         })
         .collect();
 
-    // Check if we have enough calibration data
-    if cal_set.len() < 10 {
-        // Fallback to heuristic threshold
-        let heuristic_threshold = 0.35; // default conservative threshold
-        let mut certified_ids = Vec::new();
-        for seg in all_segments {
-            if compute_nonconformity_score(seg) <= heuristic_threshold {
-                certified_ids.push(seg.id.clone());
-            }
-        }
-        return ConformalCertificate {
-            target_error,
-            confidence_level,
-            threshold: heuristic_threshold,
-            total_certified: certified_ids.len(),
-            certified_segment_ids: certified_ids,
-            expected_error_bound: target_error, // nominal
-            is_calibrated: false,
-        };
-    }
+    let cal_n = cal_scored.len();
+    let (threshold, bound, is_calibrated) = calibrate_threshold(&cal_scored, target_error, confidence_level);
 
-    // Sort calibration set by nonconformity score ascending
-    let mut sorted_cal = cal_set;
-    sorted_cal.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Certify every segment whose nonconformity is at or below the calibrated threshold.
+    let certified_segment_ids: Vec<String> = all_segments
+        .iter()
+        .filter(|seg| compute_nonconformity_score(seg) <= threshold)
+        .map(|seg| seg.id.clone())
+        .collect();
 
-    let n = sorted_cal.len();
-    let mut best_k = 0;
-    let mut best_threshold = 0.0;
-    let mut best_bound = 1.0;
-
-    // We search for the largest k (selected subset size) such that the Hoeffding upper bound is
-    // <= target_error.
-    for k in 1..=n {
-        // Only evaluate at a TIE-GROUP BOUNDARY: the chosen threshold is sorted_cal[k-1].1, and the
-        // certification pass below admits every segment with `score <= threshold`. If the next
-        // calibration item shares this score, threshold would admit it too — yet its error was
-        // never summed into empirical_risk, so the reported bound would understate the certified
-        // population's true error. Skipping non-boundary k guarantees the certified calibration set
-        // equals exactly the first-k prefix the bound is computed over.
-        if k < n && sorted_cal[k].1 == sorted_cal[k - 1].1 {
-            continue;
-        }
-        let sum_error: f64 = sorted_cal.iter().take(k).map(|item| item.2).sum();
-        let empirical_risk = sum_error / k as f64;
-
-        // Hoeffding inequality upper bound with a Bonferroni multiplicity correction. The cutoff k
-        // (hence threshold and the certified subset) is chosen by searching the SAME calibration
-        // data over up to n candidate cutoffs, so a single-hypothesis ln(1/delta) bound would only
-        // hold per-cutoff and inflate true miscoverage by up to a factor n. Using ln(n/delta)
-        // (union bound over the n candidates) keeps the advertised (1 - delta) coverage honest:
-        //   R+(k) = R_emp + sqrt( ln(n/delta) / (2k) )
-        let bound = empirical_risk + ((n as f64 / delta).ln() / (2.0 * k as f64)).sqrt();
-
-        if bound <= target_error {
-            best_k = k;
-            best_threshold = sorted_cal[k - 1].1;
-            best_bound = bound;
-        }
-    }
-
-    // If no subset could be certified with mathematical certainty (best_k == 0),
-    // we use the single best element as a threshold, but warn/flag it as uncalibrated.
-    if best_k == 0 {
-        let fallback_threshold = sorted_cal[0].1;
-        let mut certified_ids = Vec::new();
-        for seg in all_segments {
-            if compute_nonconformity_score(seg) <= fallback_threshold {
-                certified_ids.push(seg.id.clone());
-            }
-        }
-        return ConformalCertificate {
-            target_error,
-            confidence_level,
-            threshold: fallback_threshold,
-            total_certified: certified_ids.len(),
-            certified_segment_ids: certified_ids,
-            expected_error_bound: 1.0,
-            is_calibrated: false,
-        };
-    }
-
-    // Certify all segments in the entire dataset that are below the calibrated threshold
-    let mut certified_ids = Vec::new();
-    for seg in all_segments {
-        if compute_nonconformity_score(seg) <= best_threshold {
-            certified_ids.push(seg.id.clone());
-        }
-    }
+    let expected_error_bound = if is_calibrated {
+        bound
+    } else if cal_n < 10 {
+        target_error // nominal under cold-start
+    } else {
+        1.0 // had enough data but nothing certifiable at target
+    };
 
     ConformalCertificate {
         target_error,
         confidence_level,
-        threshold: best_threshold,
-        total_certified: certified_ids.len(),
-        certified_segment_ids: certified_ids,
-        expected_error_bound: best_bound,
-        is_calibrated: true,
+        threshold,
+        total_certified: certified_segment_ids.len(),
+        certified_segment_ids,
+        expected_error_bound,
+        is_calibrated,
     }
 }
 
@@ -177,6 +146,28 @@ mod tests {
             ood_score: None,
             ..SpeechSegment::default()
         }
+    }
+
+    #[test]
+    fn nonconformity_is_the_shared_formula() {
+        // The gate and the calibration MUST use the identical formula, or the conformal guarantee is
+        // void. compute_nonconformity_score is just nonconformity() applied to the segment's own
+        // confidence; the gate feeds it the IRT confidence instead — same function, same shape.
+        let seg = mock_segment("x", 0.9, -1.0, true, "a", "a");
+        assert!((compute_nonconformity_score(&seg) - nonconformity(0.9, Some(-1.0))).abs() < 1e-12);
+        // Threshold calibration over the same scored items the dataset cert builds gives the same cut.
+        let scored: Vec<(f64, f64)> = (0..40)
+            .map(|i| {
+                let conf = if i % 4 == 0 { 0.4 } else { 0.95 };
+                let cer = if i % 4 == 0 { 1.0 } else { 0.0 };
+                (nonconformity(conf, Some(-1.0)), cer)
+            })
+            .collect();
+        // Target 0.4: 30 clean points give a Bonferroni-corrected bound ~0.316 (sqrt(ln(400)/60)),
+        // which certifies at 0.4 but not at a tighter 0.3 — the corrected math, same as the gate.
+        let (t, _b, cal) = calibrate_threshold(&scored, 0.4, 0.90);
+        assert!(cal, "30 clean spread points should calibrate at target 0.4");
+        assert!(t > 0.0);
     }
 
     #[test]
