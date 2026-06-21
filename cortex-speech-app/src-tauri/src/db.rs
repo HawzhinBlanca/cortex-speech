@@ -192,6 +192,12 @@ impl Database {
     }
 
     /// Open the database with a retry policy for corruption.
+    ///
+    /// Recovery is fail-CLOSED: `recover_database_at` is DESTRUCTIVE (it renames the live db away and
+    /// opens a fresh empty one), so it must fire ONLY on genuine corruption. A transient error — an
+    /// external process holding the file locked past busy_timeout, a disk I/O hiccup, OOM during the
+    /// integrity check — must NOT quarantine a healthy database (that would be silent data loss);
+    /// instead it aborts startup so the user can clear the locker / fix the disk and retry intact.
     pub fn open_with_retry(path: &str) -> AppResult<Self> {
         match Self::open(path) {
             Ok(db) => {
@@ -200,20 +206,32 @@ impl Database {
                         return Ok(db);
                     }
                     Ok(result) => {
+                        // A non-"ok" string is SQLite reporting genuine page corruption: quarantine.
                         tracing::error!("Database integrity check failed on open; quarantining database: {result}");
                     }
+                    Err(e) if is_corruption_error(&e) => {
+                        tracing::error!("Database integrity check returned a corruption code on open; quarantining database: {e}");
+                    }
                     Err(e) => {
-                        tracing::error!("Database integrity check errored on open; quarantining database: {e}");
+                        // Transient/non-corruption error — do NOT destroy a possibly-healthy database.
+                        tracing::error!("Database integrity check could not complete (transient, not corruption); aborting startup without quarantine: {e}");
+                        return Err(e);
                     }
                 }
                 drop(db);
                 recover_database_at(path)?;
                 Self::open(path)
             }
-            Err(e) => {
-                tracing::error!("Failed to open database: {e}. Attempting recovery...");
+            Err(e) if is_corruption_error(&e) => {
+                tracing::error!("Failed to open database with a corruption code: {e}. Attempting recovery...");
                 recover_database_at(path)?;
                 Self::open(path)
+            }
+            Err(e) => {
+                // A non-corruption open failure (lock contention, permissions, transient I/O) must not
+                // quarantine the database — surface it so the user can resolve and retry.
+                tracing::error!("Failed to open database (transient/non-corruption); aborting without quarantine: {e}");
+                Err(e)
             }
         }
     }
@@ -1325,6 +1343,18 @@ impl Database {
         let rows = stmt.query_map(params![limit as i64], Self::map_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+/// True only when an error indicates the database FILE itself is corrupt / not a database — the only
+/// conditions under which the destructive `recover_database_at` quarantine is warranted. Transient
+/// errors (SQLITE_BUSY/LOCKED, disk I/O, OOM) return false so a healthy db is never quarantined.
+fn is_corruption_error(err: &AppError) -> bool {
+    use rusqlite::ErrorCode;
+    matches!(
+        err,
+        AppError::Database(rusqlite::Error::SqliteFailure(f, _))
+            if matches!(f.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+    )
 }
 
 fn recover_database_at(path: &str) -> AppResult<()> {

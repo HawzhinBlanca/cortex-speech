@@ -2509,6 +2509,12 @@ pub fn get_configured_providers(state: State<'_, AppState>) -> Result<Vec<String
 #[tauri::command]
 pub fn transcribe_audio_with_scribe(audio_path: String, state: State<'_, AppState>) -> Result<String, String> {
     STRICT_RATE_LIMITER.check("transcribe_audio_with_scribe")?;
+    // Enforce the cloud-STT privacy gate at the IPC trust boundary: audio must never leave the device
+    // for ElevenLabs unless the user explicitly opted in — mirrors pipeline::scribe_api_key_if_enabled
+    // so every Scribe egress path honors the same toggle, not just the import path.
+    if !state.lock_settings().cloud_stt_opt_in {
+        return Err("Cloud STT (ElevenLabs Scribe) is disabled — enable it in Settings (cloud_stt_opt_in) before audio is sent to ElevenLabs.".to_string());
+    }
     let audio_path = validate::validate_file_path(&audio_path)?;
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
     let key = crate::api_keys::ApiKeys::load(&data_dir)
@@ -2533,6 +2539,11 @@ pub fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<
     STRICT_RATE_LIMITER.check("add_scribe_votes")?;
     for id in &ids {
         validate::validate_identifier(id)?;
+    }
+    // Same cloud-STT privacy gate as transcribe_audio_with_scribe: no segment audio is uploaded to
+    // ElevenLabs unless the user explicitly opted in, even if a key is present in secrets.env.
+    if !state.lock_settings().cloud_stt_opt_in {
+        return Err("Cloud STT (ElevenLabs Scribe) is disabled — enable it in Settings (cloud_stt_opt_in) before audio is sent to ElevenLabs.".to_string());
     }
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
     let key = crate::api_keys::ApiKeys::load(&data_dir)

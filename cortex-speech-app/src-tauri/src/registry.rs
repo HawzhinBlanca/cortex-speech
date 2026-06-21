@@ -322,18 +322,15 @@ pub struct PromotionDecision {
 }
 
 /// Decide whether a challenger may be promoted over the current champion. `challenger` is the
-/// challenger's gold scorecard whose `vs_baseline` compares it against the champion; `champion_cer`
-/// is the champion's own gold micro-CER (from `model_versions.gold_cer`). Pure and deterministic —
-/// the same inputs always yield the same verdict, so the gate is reproducible in CI.
+/// challenger's gold scorecard whose `vs_baseline` compares it against the champion — both the WER and
+/// CER gates use that PAIRED comparison (over the shared gold-id intersection), so no separate frozen
+/// champion CER is needed. Pure and deterministic — the same inputs always yield the same verdict, so
+/// the gate is reproducible in CI. A scorecard with no `vs_baseline` is blocked (fail-closed).
 ///
 /// Note: per-protected-slice regression (per-speaker / per-condition) is part of the doc's full
 /// gate but is not evaluated here yet — there is no slice breakdown in the scorecard at this layer.
 /// A caller that has slice data must AND it with this decision.
-pub fn decide_promotion(
-    challenger: &Scorecard,
-    champion_cer: f64,
-    policy: &PromotionPolicy,
-) -> PromotionDecision {
+pub fn decide_promotion(challenger: &Scorecard, policy: &PromotionPolicy) -> PromotionDecision {
     let mut reasons = Vec::new();
     let mut promote = true;
     let eps = 1e-9;
@@ -366,38 +363,51 @@ pub fn decide_promotion(
         }
     }
 
-    // --- CER gate: never ship a CER regression (the product north star). ---
-    let challenger_cer = challenger.system.micro_cer;
-    let allowed_cer = champion_cer * (1.0 + policy.max_cer_regression_frac);
-    if challenger_cer > allowed_cer + eps {
-        promote = false;
-        reasons.push(format!(
-            "CER gate FAILED: challenger CER {:.4} exceeds the allowed {:.4} (champion {:.4} + {:.0}% tolerance)",
-            challenger_cer, allowed_cer, champion_cer, policy.max_cer_regression_frac * 100.0
-        ));
-    } else {
-        reasons.push(format!(
-            "CER non-regression ok: challenger {challenger_cer:.4} <= allowed {allowed_cer:.4}"
-        ));
-    }
+    // --- CER gate: never ship a CER regression (the product north star). Gate on the PAIRED CER
+    // (challenger vs champion over the SAME gold-id intersection), exactly like the WER gate — NOT the
+    // challenger's unpaired full-set micro_cer vs the champion's frozen stored gold_cer, which can be
+    // computed over a different/grown gold set and would let a model regressing CER on the shared
+    // segments pass by being evaluated on an easier/larger superset. ---
+    match &challenger.vs_baseline {
+        Some(cmp) => {
+            let challenger_cer = cmp.system_micro_cer;
+            let baseline_cer = cmp.baseline_micro_cer;
+            let allowed_cer = baseline_cer * (1.0 + policy.max_cer_regression_frac);
+            if challenger_cer > allowed_cer + eps {
+                promote = false;
+                reasons.push(format!(
+                    "CER gate FAILED: challenger paired CER {:.4} exceeds the allowed {:.4} (champion {:.4} + {:.0}% tolerance)",
+                    challenger_cer, allowed_cer, baseline_cer, policy.max_cer_regression_frac * 100.0
+                ));
+            } else {
+                reasons.push(format!(
+                    "CER non-regression ok: challenger paired {challenger_cer:.4} <= allowed {allowed_cer:.4}"
+                ));
+            }
 
-    // --- Optional CER-reduction target (the charter's ">=N% reduction"). ---
-    if let Some(min_reduction) = policy.min_cer_reduction_frac {
-        let reduction =
-            if champion_cer > 0.0 { (champion_cer - challenger_cer) / champion_cer } else { 0.0 };
-        if reduction + eps < min_reduction {
+            // --- Optional CER-reduction target (the charter's ">=N% reduction"), also paired. ---
+            if let Some(min_reduction) = policy.min_cer_reduction_frac {
+                let reduction =
+                    if baseline_cer > 0.0 { (baseline_cer - challenger_cer) / baseline_cer } else { 0.0 };
+                if reduction + eps < min_reduction {
+                    promote = false;
+                    reasons.push(format!(
+                        "CER reduction gate FAILED: challenger reduces CER by {:.1}%, below the required {:.1}%",
+                        reduction * 100.0,
+                        min_reduction * 100.0
+                    ));
+                } else {
+                    reasons.push(format!(
+                        "CER reduction ok: {:.1}% >= required {:.1}%",
+                        reduction * 100.0,
+                        min_reduction * 100.0
+                    ));
+                }
+            }
+        }
+        None => {
             promote = false;
-            reasons.push(format!(
-                "CER reduction gate FAILED: challenger reduces CER by {:.1}%, below the required {:.1}%",
-                reduction * 100.0,
-                min_reduction * 100.0
-            ));
-        } else {
-            reasons.push(format!(
-                "CER reduction ok: {:.1}% >= required {:.1}%",
-                reduction * 100.0,
-                min_reduction * 100.0
-            ));
+            reasons.push("CER gate FAILED: no paired baseline comparison in the challenger scorecard".to_string());
         }
     }
 
@@ -442,7 +452,9 @@ pub fn gate_and_promote(
                 challenger.family
             )],
         },
-        Some(champion_cer) => decide_promotion(challenger_scorecard, champion_cer, policy),
+        // A champion exists — run the full gate. The CER baseline is the PAIRED champion CER carried
+        // in the challenger scorecard's vs_baseline, so the frozen gold_cer value is no longer needed.
+        Some(_) => decide_promotion(challenger_scorecard, policy),
     };
 
     if decision.promote {
@@ -657,8 +669,15 @@ mod tests {
         ConfidenceInterval { point: p, lower: p, upper: p, confidence: 0.95 }
     }
 
-    /// A challenger scorecard with a paired WER comparison against the champion.
-    fn challenger_card(system_wer: f64, system_cer: f64, champion_wer: f64, beats: bool, p: f64) -> Scorecard {
+    /// A challenger scorecard with a paired WER + CER comparison against the champion.
+    fn challenger_card(
+        system_wer: f64,
+        system_cer: f64,
+        champion_wer: f64,
+        champion_cer: f64,
+        beats: bool,
+        p: f64,
+    ) -> Scorecard {
         Scorecard {
             system: SystemScore {
                 model_id: "challenger".into(),
@@ -677,6 +696,8 @@ mod tests {
                 paired_segments: 50,
                 baseline_micro_wer: champion_wer,
                 system_micro_wer: system_wer,
+                baseline_micro_cer: champion_cer,
+                system_micro_cer: system_cer,
                 mapsswe_p_value: p,
                 significant_at_05: p < 0.05,
                 beats_baseline: beats,
@@ -691,29 +712,52 @@ mod tests {
     #[test]
     fn promotes_when_it_beats_wer_and_does_not_regress_cer() {
         // Significantly lower WER and lower CER than the champion -> promote.
-        let card = challenger_card(0.10, 0.05, 0.20, true, 0.01);
-        let decision = decide_promotion(&card, 0.08, &PromotionPolicy::default());
+        let card = challenger_card(0.10, 0.05, 0.20, 0.08, true, 0.01);
+        let decision = decide_promotion(&card, &PromotionPolicy::default());
         assert!(decision.promote, "a strict WER win with no CER regression must promote: {:?}", decision.reasons);
     }
 
     #[test]
     fn blocks_cer_regression_even_when_wer_wins() {
         // WER significantly better, but CER regressed (0.12 > champion 0.08) -> blocked.
-        let card = challenger_card(0.10, 0.12, 0.20, true, 0.01);
-        let decision = decide_promotion(&card, 0.08, &PromotionPolicy::default());
+        let card = challenger_card(0.10, 0.12, 0.20, 0.08, true, 0.01);
+        let decision = decide_promotion(&card, &PromotionPolicy::default());
         assert!(!decision.promote, "a CER regression must block promotion despite a WER win");
+        assert!(decision.reasons.iter().any(|r| r.contains("CER gate FAILED")), "{:?}", decision.reasons);
+    }
+
+    #[test]
+    fn cer_gate_uses_paired_not_unpaired_full_set_cer() {
+        // Round-10 audit HIGH: the CER gate compared the challenger's UNPAIRED full-set micro_cer
+        // against the champion's frozen stored gold_cer. A challenger evaluated on a larger/easier gold
+        // superset can show a LOWER full-set CER while REGRESSING CER on the shared (paired) segments.
+        // The gate must use the paired CER and BLOCK such a model.
+        let mut card = challenger_card(0.10, 0.05, 0.20, 0.10, true, 0.01);
+        // Full-set micro_cer looks great (0.05) — under the old gate this would clear champion 0.10...
+        card.system.micro_cer = 0.05;
+        // ...but on the SHARED segments the challenger regresses CER vs the champion (0.13 > 0.10).
+        if let Some(cmp) = card.vs_baseline.as_mut() {
+            cmp.system_micro_cer = 0.13;
+            cmp.baseline_micro_cer = 0.10;
+        }
+        let decision = decide_promotion(&card, &PromotionPolicy::default());
+        assert!(
+            !decision.promote,
+            "a paired CER regression must block even when full-set CER looks lower: {:?}",
+            decision.reasons
+        );
         assert!(decision.reasons.iter().any(|r| r.contains("CER gate FAILED")), "{:?}", decision.reasons);
     }
 
     #[test]
     fn blocks_slice_regression_even_when_aggregate_wins() {
         // Beats the champion on aggregate WER and CER, but regresses a per-condition slice -> blocked.
-        let mut card = challenger_card(0.10, 0.05, 0.20, true, 0.01);
+        let mut card = challenger_card(0.10, 0.05, 0.20, 0.08, true, 0.01);
         if let Some(cmp) = card.vs_baseline.as_mut() {
             cmp.slice_regressions
                 .push("short (≤4 words): challenger WER 0.4000 vs baseline 0.2000 over 12 segments".into());
         }
-        let decision = decide_promotion(&card, 0.08, &PromotionPolicy::default());
+        let decision = decide_promotion(&card, &PromotionPolicy::default());
         assert!(!decision.promote, "a slice regression must block promotion despite an aggregate win");
         assert!(decision.reasons.iter().any(|r| r.contains("Slice gate FAILED")), "{:?}", decision.reasons);
     }
@@ -721,8 +765,8 @@ mod tests {
     #[test]
     fn blocks_when_wer_not_significantly_better() {
         // Lower CER, but the WER improvement is not significant (beats_baseline=false) -> blocked.
-        let card = challenger_card(0.19, 0.05, 0.20, false, 0.40);
-        let decision = decide_promotion(&card, 0.08, &PromotionPolicy::default());
+        let card = challenger_card(0.19, 0.05, 0.20, 0.08, false, 0.40);
+        let decision = decide_promotion(&card, &PromotionPolicy::default());
         assert!(!decision.promote, "an insignificant WER change must block promotion");
         assert!(decision.reasons.iter().any(|r| r.contains("WER gate FAILED")), "{:?}", decision.reasons);
     }
@@ -731,20 +775,20 @@ mod tests {
     fn cer_reduction_target_blocks_small_gains_and_passes_large_ones() {
         let policy = PromotionPolicy { min_cer_reduction_frac: Some(0.30), ..PromotionPolicy::default() };
         // Champion CER 0.10; challenger 0.09 = only 10% reduction -> below the 30% target -> blocked.
-        let small = challenger_card(0.10, 0.09, 0.20, true, 0.01);
-        let d_small = decide_promotion(&small, 0.10, &policy);
+        let small = challenger_card(0.10, 0.09, 0.20, 0.10, true, 0.01);
+        let d_small = decide_promotion(&small, &policy);
         assert!(!d_small.promote, "10% CER reduction must miss the 30% target");
         assert!(d_small.reasons.iter().any(|r| r.contains("CER reduction gate FAILED")), "{:?}", d_small.reasons);
         // Challenger 0.06 = 40% reduction -> clears the target -> promote.
-        let big = challenger_card(0.10, 0.06, 0.20, true, 0.01);
-        assert!(decide_promotion(&big, 0.10, &policy).promote, "40% CER reduction must clear the 30% target");
+        let big = challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01);
+        assert!(decide_promotion(&big, &policy).promote, "40% CER reduction must clear the 30% target");
     }
 
     #[test]
     fn missing_baseline_comparison_blocks_by_default() {
-        let mut card = challenger_card(0.10, 0.05, 0.20, true, 0.01);
+        let mut card = challenger_card(0.10, 0.05, 0.20, 0.08, true, 0.01);
         card.vs_baseline = None;
-        let decision = decide_promotion(&card, 0.08, &PromotionPolicy::default());
+        let decision = decide_promotion(&card, &PromotionPolicy::default());
         assert!(!decision.promote, "no paired baseline comparison must block promotion by default");
     }
 
@@ -755,7 +799,7 @@ mod tests {
         let db = open();
         register_candidate(&db, &candidate("v1", "omniasr-7b", "user-finetuned", "sha")).unwrap();
         // Even a weak scorecard with no baseline promotes when there is no incumbent to beat.
-        let mut card = challenger_card(0.5, 0.5, 0.5, false, 0.9);
+        let mut card = challenger_card(0.5, 0.5, 0.5, 0.5, false, 0.9);
         card.vs_baseline = None;
         let decision = gate_and_promote(&db, "v1", &card, &PromotionPolicy::default()).unwrap();
         assert!(decision.promote, "the first model must become champion: {:?}", decision.reasons);
@@ -771,7 +815,7 @@ mod tests {
         promote_to_champion(&db, "champ").unwrap();
         // Challenger that significantly beats WER and lowers CER (0.06 < 0.10).
         register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
-        let card = challenger_card(0.10, 0.06, 0.20, true, 0.01);
+        let card = challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01);
         let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
         assert!(decision.promote, "a qualified challenger must promote: {:?}", decision.reasons);
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "chall");
@@ -786,7 +830,7 @@ mod tests {
         promote_to_champion(&db, "champ").unwrap();
         register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
         // Beats WER but regresses CER (0.15 > 0.10) -> blocked; the champion is untouched.
-        let card = challenger_card(0.10, 0.15, 0.20, true, 0.01);
+        let card = challenger_card(0.10, 0.15, 0.20, 0.10, true, 0.01);
         let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
         assert!(!decision.promote, "a CER-regressing challenger must be blocked");
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "champ", "champion is unchanged");
@@ -796,7 +840,7 @@ mod tests {
     #[test]
     fn gate_and_promote_errors_for_unknown_challenger() {
         let db = open();
-        let card = challenger_card(0.1, 0.05, 0.2, true, 0.01);
+        let card = challenger_card(0.1, 0.05, 0.2, 0.08, true, 0.01);
         assert!(gate_and_promote(&db, "ghost", &card, &PromotionPolicy::default()).is_err());
     }
 }
