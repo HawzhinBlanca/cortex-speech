@@ -19,6 +19,11 @@ static YEH_TWO_DOTS_BELOW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u06D
 static ALEF_MAKSURA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u0649").unwrap());
 static TATWEEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u0640").unwrap());
 static ZWNJ: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u200C").unwrap());
+/// Zero-width format characters that carry NO word boundary (unlike ZWNJ U+200C, handled as a
+/// space): ZWSP (U+200B), ZWJ (U+200D), and BOM/ZWNBSP (U+FEFF). Left in place they make two
+/// visually identical strings normalize differently, breaking dedup/exact-match and inflating
+/// WER/CER.
+static ZERO_WIDTH_FORMAT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u200B\u200D\uFEFF]").unwrap());
 static MULTI_SPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 static ARABIC_HAMZA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u0623\u0625]").unwrap());
 static ARABIC_DIACTIRICS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u064B-\u065F\u0670]").unwrap());
@@ -97,6 +102,11 @@ impl SoraniNormalizer {
         // Step 4: Replace ZWNJ with space
         result = ZWNJ.replace_all(&result, " ").to_string();
 
+        // Step 4b: Strip zero-width joiners/spaces (ZWJ, ZWSP, BOM) that carry no word boundary —
+        // unlike ZWNJ they must be deleted, not turned into a space, so the surrounding letters stay
+        // joined. Left in, they make two visually identical strings normalize differently.
+        result = ZERO_WIDTH_FORMAT.replace_all(&result, "").to_string();
+
         // Step 4.5: Contextual Word-Final Heh Translation (ه U+0647, ة U+0629)
         result = normalize_heh_contextual(&result);
 
@@ -123,18 +133,29 @@ impl SoraniNormalizer {
     }
 }
 
+/// Arabic combining marks (tashkeel/harakat U+064B–U+065F and superscript alef U+0670) that attach
+/// to a preceding base letter. They report `is_alphabetic() == true`, so they must be skipped when
+/// deciding whether a letter is word-final, otherwise a vocalized word-final heh (ه + harakat) is
+/// mis-judged non-final.
+fn is_arabic_combining_mark(c: char) -> bool {
+    matches!(c, '\u{064B}'..='\u{065F}' | '\u{0670}')
+}
+
+/// The next base (non-combining-mark) character at or after `from`, if any.
+fn next_base_char(chars: &[char], from: usize) -> Option<char> {
+    chars[from..].iter().copied().find(|&c| !is_arabic_combining_mark(c))
+}
+
 fn normalize_heh_contextual(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut result = String::with_capacity(text.len());
     for i in 0..chars.len() {
         let ch = chars[i];
         if ch == '\u{0647}' {
-            // Arabic Heh 'ه'
-            let is_final = if i + 1 == chars.len() {
-                true
-            } else {
-                let next_ch = chars[i + 1];
-                !next_ch.is_alphabetic()
+            // Arabic Heh 'ه'. Skip any harakat that attach to it before testing word-finality.
+            let is_final = match next_base_char(&chars, i + 1) {
+                None => true,
+                Some(next_ch) => !next_ch.is_alphabetic(),
             };
             if is_final {
                 result.push('\u{06D5}'); // Kurdish Ae 'ە'
@@ -165,8 +186,11 @@ fn protect_word_final_heh_tatweel(text: &str) -> String {
             }
             if j > i + 1 {
                 // Yes, followed by tatweel(s).
-                // Check if the character after the tatweel(s) is word-final (non-alphabetic or end of string)
-                let is_final = if j == chars.len() { true } else { !chars[j].is_alphabetic() };
+                // Check if the character after the tatweel(s) is word-final, skipping any harakat.
+                let is_final = match next_base_char(&chars, j) {
+                    None => true,
+                    Some(c) => !c.is_alphabetic(),
+                };
                 if is_final {
                     result.push('\u{06BE}'); // Map to Kurdish Heh 'ھ'
                     i = j; // skip the heh and the tatweels
@@ -197,18 +221,63 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
         return result;
     }
 
-    static DIGITS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").unwrap());
-
-    let expanded = DIGITS_RE.replace_all(&result, |caps: &regex::Captures| {
-        let num_str = &caps[0];
-        if let Ok(num) = num_str.parse::<u64>() {
-            num_to_kurdish(num)
-        } else {
-            num_str.to_string()
-        }
+    // Match a WHOLE number — a digit run optionally carrying thousands separators (the ASCII comma
+    // gets rewritten to the Arabic comma U+060C in Step 1) and/or a decimal part — rather than a
+    // bare `\d+`. Matching `\d+` split "3,000" (by then "3،000") into "3" and "000", verbalizing it
+    // as "three، zero" instead of "three thousand".
+    static DIGITS_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\d{1,3}(?:[،,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?").unwrap()
     });
 
+    let expanded = DIGITS_RE.replace_all(&result, |caps: &regex::Captures| verbalize_number_token(&caps[0]));
+
     expanded.into_owned()
+}
+
+/// Verbalize a matched numeric token that may carry thousands separators and a decimal part.
+/// Integer part is read as a magnitude; the fractional part is read digit-by-digit after خاڵ
+/// ("point"); a digit run with leading zeros (e.g. an ID like "007") is read digit-by-digit so the
+/// sequence is preserved instead of collapsing to a single value.
+fn verbalize_number_token(token: &str) -> String {
+    let (int_part_raw, frac_part) = match token.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (token, None),
+    };
+    // Strip thousands separators, leaving only the digits of the integer part.
+    let int_digits: String = int_part_raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if int_digits.is_empty() {
+        return token.to_string();
+    }
+
+    let leading_zero = int_digits.len() > 1 && int_digits.starts_with('0');
+    let mut out = if leading_zero {
+        digits_individually(&int_digits)
+    } else {
+        match int_digits.parse::<u64>() {
+            Ok(num) => num_to_kurdish(num),
+            // Larger than u64 — read digit-by-digit rather than corrupt the value.
+            Err(_) => digits_individually(&int_digits),
+        }
+    };
+
+    if let Some(frac) = frac_part {
+        let frac_digits: String = frac.chars().filter(|c| c.is_ascii_digit()).collect();
+        if !frac_digits.is_empty() {
+            out.push_str(" خاڵ ");
+            out.push_str(&digits_individually(&frac_digits));
+        }
+    }
+    out
+}
+
+/// Read a digit string one digit at a time (e.g. "14" -> "یەک چوار").
+fn digits_individually(digits: &str) -> String {
+    digits
+        .chars()
+        .filter_map(|c| c.to_digit(10))
+        .map(|d| num_to_kurdish(d as u64))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn num_to_kurdish(mut n: u64) -> String {
@@ -393,6 +462,42 @@ mod tests {
         let input = "ئەم ژمارانە: ١٢٣ و ۴۵۶";
         let expected = "ئەم ژمارانە: سەد و بیست و سێ و چوارسەد و پەنجا و شەش";
         assert_eq!(n.normalize(input), expected);
+    }
+
+    #[test]
+    fn grouped_and_decimal_numbers_verbalize_correctly() {
+        let n = SoraniNormalizer::new();
+        // Thousands-grouped integers must read as the full magnitude, not split per comma-group.
+        assert_eq!(n.normalize("3,000"), "سێ ھەزار");
+        assert_eq!(n.normalize("1,000,000"), "یەک ملیۆن");
+        // Decimals read the fractional part digit-by-digit after خاڵ ("point").
+        assert_eq!(n.normalize("3.14"), "سێ خاڵ یەک چوار");
+        // Leading-zero runs are read digit-by-digit so an ID is preserved, not parsed to 7.
+        assert_eq!(n.normalize("007"), "سفر سفر حەوت");
+        // Plain numbers still verbalize as before.
+        assert_eq!(n.normalize("123"), "سەد و بیست و سێ");
+    }
+
+    #[test]
+    fn word_final_heh_with_harakat_maps_to_ae_not_medial_heh() {
+        let n = SoraniNormalizer::new();
+        // A word-final Arabic heh carrying a fatha must still become final ە (U+06D5); the harakat
+        // must not fool the finality test into producing medial ھ (U+06BE).
+        let out = n.normalize("ماڵه\u{064E}");
+        assert!(out.contains('\u{06D5}'), "final heh+harakat must map to ە (U+06D5): {out:?}");
+        assert!(!out.contains('\u{06BE}'), "must NOT become medial ھ (U+06BE): {out:?}");
+    }
+
+    #[test]
+    fn zwj_and_zero_width_format_chars_removed() {
+        let n = SoraniNormalizer::new();
+        // ZWJ (U+200D), ZWSP (U+200B) and BOM (U+FEFF) must not survive into the canonical form,
+        // and (unlike ZWNJ) must NOT introduce a space — the letters stay joined.
+        let out = n.normalize("کورد\u{200D}ی\u{200B}\u{FEFF}");
+        assert!(!out.contains('\u{200D}'), "ZWJ must be stripped");
+        assert!(!out.contains('\u{200B}'), "ZWSP must be stripped");
+        assert!(!out.contains('\u{FEFF}'), "BOM must be stripped");
+        assert_eq!(out, "کوردی", "zero-width joiners must be deleted, not turned into spaces");
     }
 }
 
