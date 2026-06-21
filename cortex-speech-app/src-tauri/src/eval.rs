@@ -170,8 +170,8 @@ pub fn list_eval_runs(db: &Database) -> AppResult<Vec<EvalRun>> {
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-fn insert_eval_run(db: &Database, run: &EvalRun) -> AppResult<()> {
-    db.connection().execute(
+fn insert_eval_run(conn: &rusqlite::Connection, run: &EvalRun) -> AppResult<()> {
+    conn.execute(
         "INSERT INTO eval_runs (id, model_id, run_at, num_segs, wer, cer, meta_json)
          VALUES (?1, ?2, datetime('now'), ?3, ?4, ?5, ?6)",
         params![run.id, run.model_id, run.num_segs, run.wer, run.cer, run.meta_json],
@@ -283,29 +283,37 @@ pub fn run_gold_eval(
         meta_json: meta_str,
     };
 
-    insert_eval_run(db, &run)?;
-
+    // Persist the parent eval_runs row and all child eval_segment_results rows ATOMICALLY. The
+    // headline micro WER/CER on the run is computed over ALL N segments, so a partial write (e.g. a
+    // child insert hitting SQLITE_BUSY past the busy_timeout) must not leave a run whose stored
+    // metrics disagree with its surviving per-segment rows. The Transaction rolls back on any early
+    // `?` (Drop), and commits only after every row succeeds.
     let conn = db.connection();
-    let mut stmt = conn.prepare(
-        "INSERT INTO eval_segment_results (id, eval_run_id, gold_id, audio_path, reference, hypothesis, wer, cer, word_distance, word_ref_len, char_distance, char_ref_len)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
-    )?;
-    for (seg_res, w_dist, c_dist) in &seg_details {
-        stmt.execute(params![
-            Uuid::new_v4().to_string(),
-            run.id,
-            seg_res.gold_id,
-            seg_res.audio_path,
-            seg_res.reference,
-            seg_res.hypothesis,
-            seg_res.wer,
-            seg_res.cer,
-            w_dist.distance as i64,
-            w_dist.ref_len as i64,
-            c_dist.distance as i64,
-            c_dist.ref_len as i64,
-        ])?;
+    let tx = conn.unchecked_transaction()?;
+    insert_eval_run(&tx, &run)?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO eval_segment_results (id, eval_run_id, gold_id, audio_path, reference, hypothesis, wer, cer, word_distance, word_ref_len, char_distance, char_ref_len)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+        )?;
+        for (seg_res, w_dist, c_dist) in &seg_details {
+            stmt.execute(params![
+                Uuid::new_v4().to_string(),
+                run.id,
+                seg_res.gold_id,
+                seg_res.audio_path,
+                seg_res.reference,
+                seg_res.hypothesis,
+                seg_res.wer,
+                seg_res.cer,
+                w_dist.distance as i64,
+                w_dist.ref_len as i64,
+                c_dist.distance as i64,
+                c_dist.ref_len as i64,
+            ])?;
+        }
     }
+    tx.commit()?;
 
     // Re-query to get the DB-generated run_at timestamp
     let stored = list_eval_runs(db)?.into_iter().find(|r| r.id == run.id).unwrap_or(run);
