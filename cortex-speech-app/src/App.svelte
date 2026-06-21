@@ -769,11 +769,13 @@
     if (!requireDesktopRuntime()) return;
     try {
       const normalizedTranscript = await api.normalizeText(seg.rawTranscript);
+      const updatedSeg = { ...seg, normalizedTranscript };
+      await api.updateSegment(updatedSeg);
+      // Update the store only AFTER the persist succeeds. Mutating it first left unsaved state in the
+      // UI on a failed save — which a later unrelated auto-save would then silently persist.
       segments.update((arr) =>
         arr.map((s) => (s.id === seg.id ? { ...s, normalizedTranscript } : s)),
       );
-      const updatedSeg = { ...seg, normalizedTranscript };
-      await api.updateSegment(updatedSeg);
       notifications.success($t('notifications.textNormalized'));
     } catch (e) {
       notifications.error($t('notifications.normalizationFailed'), { detail: String(e) });
@@ -1227,11 +1229,13 @@
     statusMessage.set($t('pipeline.detecting'));
     try {
       const ts = await api.alignSegment(seg.audioPath, text, seg.alignmentJson);
-      wordTimestamps.set(ts);
       const alignmentJson = mergeWordTimestamps(seg.alignmentJson, ts);
-      segments.update((arr) => arr.map((s) => (s.id === seg.id ? { ...s, alignmentJson } : s)));
       const updatedSeg = { ...seg, alignmentJson };
       await api.updateSegment(updatedSeg);
+      // Update UI/store only AFTER the persist succeeds. Mutating first left an unsaved alignment in
+      // the UI on a failed save, which a later auto-save would then silently persist.
+      wordTimestamps.set(ts);
+      segments.update((arr) => arr.map((s) => (s.id === seg.id ? { ...s, alignmentJson } : s)));
       notifications.success($t('notifications.alignmentComplete'));
     } catch (e) {
       notifications.error($t('notifications.alignmentFailed'), { detail: String(e) });
