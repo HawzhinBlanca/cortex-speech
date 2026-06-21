@@ -5,7 +5,6 @@
   import * as api from './commands';
   import { showWslConsole } from './stores/uiStore';
   import { notifications } from './stores/notificationStore';
-  import { segments } from './stores/segmentStore';
   import { appendBoundedLogLine } from './logBuffer';
   import { t } from './i18n';
 
@@ -114,18 +113,11 @@
       status: 'completed' | 'failed' | 'cancelled';
       exit_code: number;
     }>('wsl-status', (event) => {
+      // In-panel display only. The completion side effects (toast + segment refresh) are handled
+      // app-scoped in events.ts so they fire even when this panel is closed mid-run.
       status = event.payload.status;
       exitCode = event.payload.exit_code;
       running = false;
-
-      if (status === 'completed') {
-        notifications.success($t('wsl.batchComplete'));
-        segments.load();
-      } else if (status === 'cancelled') {
-        notifications.warning($t('wsl.batchCancelled'));
-      } else {
-        notifications.error(`WSL Local 7B ASR transcription failed (Exit Code: ${exitCode}).`);
-      }
     });
   });
 
