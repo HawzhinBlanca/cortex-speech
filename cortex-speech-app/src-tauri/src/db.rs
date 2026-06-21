@@ -602,7 +602,10 @@ impl Database {
         if let Some(v) = verified {
             query.push_str(&format!(" WHERE verified = {}", if v { 1 } else { 0 }));
         }
-        query.push_str(" ORDER BY created_at DESC");
+        // `, id ASC` is a deterministic tiebreaker: created_at has 1s resolution, so a chunked file's
+        // batch-inserted segments tie, and without a unique secondary key SQLite's tie order is
+        // undefined — making JSON/JSONL/CSV/Parquet exports non-byte-reproducible across plan/VACUUM.
+        query.push_str(" ORDER BY created_at DESC, id ASC");
 
         let mut stmt = self.conn.prepare(&query)?;
         let rows = stmt.query_map([], Self::map_row)?;
@@ -1230,7 +1233,7 @@ impl Database {
              FROM speech_segments
              WHERE escalated = 1
                AND (human_decision IS NULL OR human_decision = '')
-             ORDER BY COALESCE(agent_confidence, 0.5) ASC
+             ORDER BY COALESCE(agent_confidence, 0.5) ASC, id ASC
              LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], Self::map_row)?;

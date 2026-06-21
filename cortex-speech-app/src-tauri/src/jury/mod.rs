@@ -332,7 +332,7 @@ pub fn get_escalation_queue(db: &Database, limit: usize) -> AppResult<Vec<Escala
                 confidence, agent_confidence, rationale, evidence_json
          FROM speech_segments
          WHERE escalated = 1 AND (human_decision IS NULL OR human_decision = '')
-         ORDER BY COALESCE(agent_confidence, 0.5) ASC
+         ORDER BY COALESCE(agent_confidence, 0.5) ASC, id ASC
          LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit as i64], |row| {

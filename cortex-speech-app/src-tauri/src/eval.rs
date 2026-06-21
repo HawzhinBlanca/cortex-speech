@@ -99,7 +99,10 @@ pub fn create_gold_from_verified_file(db: &Database, audio_path: &str) -> AppRes
         "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(normalized_transcript, ''), raw_transcript)
          FROM speech_segments
          WHERE audio_path = ?1 AND human_decision IS NOT NULL AND human_decision != ''
-         ORDER BY created_at ASC",
+         -- `, rowid ASC` tiebreaker: all of one file's chunks batch-insert in the same created_at
+         -- second (a tie), in chunk/chronological order — so rowid ASC keeps the concatenated gold
+         -- reference in true segment order rather than SQLite's undefined tie order.
+         ORDER BY created_at ASC, rowid ASC",
     )?;
     let rows = stmt.query_map(params![audio_path], |row| row.get::<_, Option<String>>(0))?;
 
@@ -502,6 +505,33 @@ mod tests {
 
         // A file with no reviewed segments errors (correct it in the app first).
         assert!(create_gold_from_verified_file(&db, "/clips/missing.wav").is_err());
+    }
+
+    #[test]
+    fn gold_reference_stays_in_segment_order_on_same_second_ties() {
+        // Round-3 audit: a chunked file's segments batch-insert with the SAME created_at second. The
+        // `, rowid ASC` tiebreaker must keep the concatenation in true (insertion = chunk) order
+        // instead of SQLite's undefined tie order.
+        let db = open_mem_db();
+        for (id, fix) in [("g1", "alpha"), ("g2", "beta"), ("g3", "gamma")] {
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: id.to_string(),
+                audio_path: "/clips/tie.wav".to_string(),
+                raw_transcript: "draft".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET human_decision='edit', verdict_transcript=?2, \
+                     created_at='2020-01-01 00:00:05' WHERE id=?1",
+                    params![id, fix],
+                )
+                .unwrap();
+        }
+        create_gold_from_verified_file(&db, "/clips/tie.wav").unwrap();
+        let gold = list_gold_segments(&db).unwrap();
+        assert_eq!(gold[0].reference, "alpha beta gamma", "concatenation stays in segment order on a tie");
     }
 
     #[test]
