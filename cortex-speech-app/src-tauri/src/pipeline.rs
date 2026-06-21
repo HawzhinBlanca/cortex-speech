@@ -1858,8 +1858,11 @@ impl ProcessingPipeline {
         }
     }
 
-    pub fn run_gold_eval_local(&self, db: &Database, model_id: &str) -> AppResult<crate::eval::EvalRunResult> {
-        let gold_segments = crate::eval::list_gold_segments(db)?;
+    pub fn run_gold_eval_local(&self, model_id: &str) -> AppResult<crate::eval::EvalRunResult> {
+        // Open our own DB connection so no AppState lock is held across the (slow) decode+ASR loop —
+        // mirrors run_gold_eval_asr. Holding the global db/pipeline mutexes here froze the whole UI.
+        let db = self.open_db()?;
+        let gold_segments = crate::eval::list_gold_segments(&db)?;
         let mut hypotheses = Vec::new();
 
         let model_dir = self.model_manager.resolved_dir();
@@ -1900,7 +1903,7 @@ impl ProcessingPipeline {
             }
         }
 
-        crate::eval::run_gold_eval(db, model_id, hypotheses)
+        crate::eval::run_gold_eval(&db, model_id, hypotheses)
     }
 
     pub fn populate_hypotheses(&self, db: &Database, segment_id: &str, f32_pcm: &[f32]) -> AppResult<()> {
@@ -2122,11 +2125,14 @@ impl ProcessingPipeline {
     }
 
     /// Re-run acoustic diarization on existing segments (grouped by source audio file).
-    pub fn rediarize_segments(&self, db: &Database, ids: &[String]) -> AppResult<usize> {
+    pub fn rediarize_segments(&self, ids: &[String]) -> AppResult<usize> {
         if !self.settings.enable_diarization {
             return Err(AppError::Validation("Speaker diarization is disabled in settings".into()));
         }
 
+        // Own DB connection so no AppState lock is held across the per-file decode + ONNX diarization
+        // loop (which previously froze every other db-touching command for the decode duration).
+        let db = self.open_db()?;
         let all = db.get_segments_by_ids(ids)?;
         let targets: Vec<_> = all.into_iter().collect();
         if targets.is_empty() {
