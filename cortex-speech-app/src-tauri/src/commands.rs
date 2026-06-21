@@ -701,7 +701,9 @@ pub fn transcribe_segment(
     if let Some(ref aj) = alignment_json {
         validate::validate_alignment_json(aj)?;
     }
-    let pipeline = state.lock_pipeline();
+    // Clone the pipeline (Arc-wrapped internals) so the global pipeline mutex is released before the
+    // possibly-long WSL/ONNX transcription — holding it would serialize every other pipeline command.
+    let pipeline = state.lock_pipeline().clone();
     let (raw_text, corrected_text, confidence) = pipeline
         .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref())
         .map_err(|e| e.to_string())?;
@@ -1238,9 +1240,11 @@ pub fn rediarize_segments(ids: Vec<String>, state: State<'_, AppState>) -> Resul
     for id in &ids {
         validate::validate_identifier(id)?;
     }
-    let pipeline = state.lock_pipeline();
-    let db = state.lock_db();
-    pipeline.rediarize_segments(&db, &ids).map_err(|e| e.to_string())
+    // Clone the pipeline and let it open its own DB connection, so neither the global pipeline nor
+    // db mutex is held across the per-file decode + diarization-inference loop (which would freeze
+    // every other db-touching command for the decode duration).
+    let pipeline = state.lock_pipeline().clone();
+    pipeline.rediarize_segments(&ids).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2123,7 +2127,11 @@ pub fn run_wsl_refinement(
 pub fn cancel_wsl_refinement() -> Result<(), String> {
     let mut guard = lock_wsl_child();
     if let Some(mut child) = guard.take() {
-        child.kill().map_err(|error| format!("Failed to cancel WSL refinement process: {error}"))?;
+        let kill_result = child.kill();
+        // Reap the child to match every other WSL kill site's kill+reap invariant — a killed child
+        // must be wait()ed so it does not linger as a defunct process on non-Windows hosts.
+        let _ = child.wait();
+        kill_result.map_err(|error| format!("Failed to cancel WSL refinement process: {error}"))?;
     }
     Ok(())
 }
@@ -2428,9 +2436,10 @@ pub fn run_gold_eval_local(
     model_id: String,
 ) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval_local")?;
-    let pipeline = state.lock_pipeline();
-    let db = state.lock_db();
-    pipeline.run_gold_eval_local(&db, &model_id).map_err(|e| e.to_string())
+    // Clone the pipeline and let it open its own DB connection, so neither global mutex is held
+    // across the multi-segment ASR eval loop (which would freeze the entire UI for minutes).
+    let pipeline = state.lock_pipeline().clone();
+    pipeline.run_gold_eval_local(&model_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
