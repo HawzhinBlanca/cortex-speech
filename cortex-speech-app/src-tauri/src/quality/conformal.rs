@@ -81,14 +81,28 @@ pub fn calibrate_and_certify(
     let mut best_threshold = 0.0;
     let mut best_bound = 1.0;
 
-    // We search for the largest k (selected subset size) such that the Hoeffding upper bound is <= target_error
+    // We search for the largest k (selected subset size) such that the Hoeffding upper bound is
+    // <= target_error.
     for k in 1..=n {
+        // Only evaluate at a TIE-GROUP BOUNDARY: the chosen threshold is sorted_cal[k-1].1, and the
+        // certification pass below admits every segment with `score <= threshold`. If the next
+        // calibration item shares this score, threshold would admit it too — yet its error was
+        // never summed into empirical_risk, so the reported bound would understate the certified
+        // population's true error. Skipping non-boundary k guarantees the certified calibration set
+        // equals exactly the first-k prefix the bound is computed over.
+        if k < n && sorted_cal[k].1 == sorted_cal[k - 1].1 {
+            continue;
+        }
         let sum_error: f64 = sorted_cal.iter().take(k).map(|item| item.2).sum();
         let empirical_risk = sum_error / k as f64;
 
-        // Hoeffding inequality upper bound:
-        // R+(k) = R_emp + sqrt( ln(1/delta) / (2 * k) )
-        let bound = empirical_risk + ((1.0 / delta).ln() / (2.0 * k as f64)).sqrt();
+        // Hoeffding inequality upper bound with a Bonferroni multiplicity correction. The cutoff k
+        // (hence threshold and the certified subset) is chosen by searching the SAME calibration
+        // data over up to n candidate cutoffs, so a single-hypothesis ln(1/delta) bound would only
+        // hold per-cutoff and inflate true miscoverage by up to a factor n. Using ln(n/delta)
+        // (union bound over the n candidates) keeps the advertised (1 - delta) coverage honest:
+        //   R+(k) = R_emp + sqrt( ln(n/delta) / (2k) )
+        let bound = empirical_risk + ((n as f64 / delta).ln() / (2.0 * k as f64)).sqrt();
 
         if bound <= target_error {
             best_k = k;
@@ -189,11 +203,59 @@ mod tests {
             segments.push(mock_segment(&format!("u{}", i), 0.95, -0.5, false, "کورد", ""));
         }
 
-        let cert = calibrate_and_certify(&segments, 0.2, 0.90);
+        // Target 0.3: with the Bonferroni-corrected slack the 50 clean calibration points give a
+        // bound of ~0.253 (sqrt(ln(600)/100)), so they certify at 0.3 but no longer at 0.2 — the
+        // corrected math correctly refuses the tighter target on this little data.
+        let cert = calibrate_and_certify(&segments, 0.3, 0.90);
         assert!(cert.is_calibrated);
         assert!(cert.threshold > 0.0);
         // The unverified segments have low score so they should be certified
         assert!(cert.certified_segment_ids.contains(&"u1".to_string()));
+    }
+
+    /// Bug #10: a calibration cutoff chosen INSIDE a tie group whose tail is fully wrong must not
+    /// yield a "calibrated" certificate whose bound never counted those admitted tied errors.
+    #[test]
+    fn tied_boundary_errors_cannot_escape_the_bound() {
+        // 30 clean items at score 0.10, then a tie group of 10 at score 0.20 whose first 5 are
+        // clean (cer 0) and last 5 are fully wrong (cer ~1.0). Rust's stable sort keeps the clean
+        // tie members first, so the OLD code could pick k=35 (bound over the clean prefix ~0.18)
+        // while certifying `score <= 0.20` — silently admitting the 5 wrong tied items. The fix
+        // forbids mid-tie cutoffs, so at a tight 0.2 target this data must report UNCALIBRATED.
+        let mut segs = Vec::new();
+        for i in 0..30 {
+            segs.push(mock_segment(&format!("a{i}"), 0.95, -0.5, true, "کورد", "کورد")); // 0.10, cer 0
+        }
+        for i in 0..5 {
+            segs.push(mock_segment(&format!("g{i}"), 0.90, -1.0, true, "کورد", "کورد")); // 0.20, cer 0
+        }
+        for i in 0..5 {
+            segs.push(mock_segment(&format!("b{i}"), 0.90, -1.0, true, "خراب", "جوان")); // 0.20, cer ~1
+        }
+        let cert = calibrate_and_certify(&segs, 0.2, 0.90);
+        assert!(
+            !cert.is_calibrated,
+            "a cutoff inside a fully-wrong tie-group tail must not produce a calibrated certificate"
+        );
+    }
+
+    /// Bug #11: the calibrated bound must use the union-bound ln(n/delta) slack (the cutoff is
+    /// selected over the same data across n candidates), not the single-hypothesis ln(1/delta).
+    #[test]
+    fn calibrated_bound_uses_bonferroni_multiplicity_correction() {
+        // 20 perfect items (cer 0), all tied → only cutoff k=20. For n=20, delta=0.1 the corrected
+        // bound is sqrt(ln(200)/40) ≈ 0.3640; the old uncorrected form would give ≈ 0.2397.
+        let segs: Vec<_> =
+            (0..20).map(|i| mock_segment(&format!("c{i}"), 0.9, -1.0, true, "کورد", "کورد")).collect();
+        let cert = calibrate_and_certify(&segs, 0.5, 0.90);
+        assert!(cert.is_calibrated);
+        let expected = ((20.0f64 / 0.1).ln() / (2.0 * 20.0)).sqrt();
+        assert!(
+            (cert.expected_error_bound - expected).abs() < 1e-9,
+            "bound {} must equal Bonferroni-corrected {expected}",
+            cert.expected_error_bound
+        );
+        assert!(cert.expected_error_bound > 0.30, "must be looser than the old uncorrected ~0.24 bound");
     }
 
     /// The whole point of the conformal certificate: when calibrated, the reported

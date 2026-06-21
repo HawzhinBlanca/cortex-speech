@@ -159,9 +159,16 @@ pub fn mapsswe(a: &[SegmentError], b: &[SegmentError]) -> f64 {
     let mean = diffs.iter().sum::<f64>() / n as f64;
     let var = diffs.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
     if var <= 0.0 {
-        // No variance: either a constant non-zero gap (perfectly significant) or
-        // identical systems (not significant at all).
-        return if mean == 0.0 { 1.0 } else { 0.0 };
+        // Degenerate sample variance (every paired difference is identical). If the constant gap
+        // is zero the systems are indistinguishable (p = 1.0). If it is a constant NON-zero value,
+        // the standardized statistic mean/(s/√n) is undefined (zero denominator) — NOT infinitely
+        // significant: a uniform gap over a handful of segments is weak evidence. Fall back to a
+        // two-sided sign test. All n differences share one sign, so p = 2·0.5ⁿ (n=2 → 0.5,
+        // n=3 → 0.25, …), which correctly refuses to declare significance off a tiny matched set.
+        if mean == 0.0 {
+            return 1.0;
+        }
+        return (2.0 * 0.5_f64.powi(n as i32)).min(1.0);
     }
     let se = (var / n as f64).sqrt();
     let z = mean / se;
@@ -246,6 +253,26 @@ mod tests {
         let a = segs(&[(5.0, 10.0)]);
         let b = segs(&[(0.0, 10.0)]);
         assert_eq!(mapsswe(&a, &b), 1.0, "n<2 cannot be significant");
+    }
+
+    #[test]
+    fn mapsswe_constant_nonzero_gap_is_not_falsely_significant() {
+        // A uniform +1-error gap over a tiny matched set has ZERO sample variance, so the
+        // parametric statistic mean/(s/√n) is undefined. The old code returned p=0.0 (maximally
+        // significant), which could auto-promote a challenger off 2-3 segments. The sign-test
+        // fallback returns 2·0.5ⁿ instead — weak evidence, correctly NOT significant at 0.05.
+        let a3 = segs(&[(5.0, 10.0), (6.0, 10.0), (4.0, 10.0)]);
+        let b3 = segs(&[(4.0, 10.0), (5.0, 10.0), (3.0, 10.0)]); // every diff = +1, var = 0
+        let p3 = mapsswe(&a3, &b3);
+        assert!((p3 - 0.25).abs() < 1e-9, "n=3 uniform gap => 2*0.5^3 = 0.25, got {p3}");
+        assert!(p3 >= 0.05, "a uniform gap over 3 segments must NOT be significant at 0.05");
+
+        let a2 = segs(&[(5.0, 10.0), (6.0, 10.0)]);
+        let b2 = segs(&[(4.0, 10.0), (5.0, 10.0)]);
+        assert!((mapsswe(&a2, &b2) - 0.5).abs() < 1e-9, "n=2 uniform gap => 2*0.5^2 = 0.5");
+
+        // A constant ZERO gap (identical systems) is still p=1.0, not the sign-test value.
+        assert_eq!(mapsswe(&a3, &a3), 1.0);
     }
 
     #[test]
