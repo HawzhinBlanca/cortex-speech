@@ -93,6 +93,20 @@ pub struct AudioInfo {
     pub format: String,
 }
 
+/// Duration in milliseconds from a per-channel frame count and sample rate.
+///
+/// Symphonia's `n_frames` is the per-channel frame count (one frame = one PCM sample across ALL
+/// channels), so duration is `n_frames / sample_rate` and NEVER depends on channel count. Dividing
+/// by channels (as an old `get_duration_ms` special case did for m4a/mp4/mov/3gp) halves a stereo
+/// clip's duration. Both [`check_audio_file`] and [`get_duration_ms`] route through here so they can
+/// never disagree on the same file.
+fn frames_to_duration_ms(n_frames: u64, sample_rate: f64) -> i64 {
+    if sample_rate <= 0.0 {
+        return 0;
+    }
+    (n_frames as f64 / sample_rate * 1000.0) as i64
+}
+
 /// Validate that a file is a readable audio file and return its basic info.
 pub fn check_audio_file<P: AsRef<Path>>(path: P) -> AppResult<AudioInfo> {
     let path = path.as_ref();
@@ -139,10 +153,14 @@ pub fn check_audio_file<P: AsRef<Path>>(path: P) -> AppResult<AudioInfo> {
         return Err(AppError::Audio(AudioError::Decode("Invalid sample rate in file".into())));
     }
 
-    let duration_secs = if sample_rate > 0.0 { n_frames as f64 / sample_rate } else { 0.0 };
     let format = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown").to_string();
 
-    Ok(AudioInfo { duration_ms: (duration_secs * 1000.0) as i64, sample_rate: sample_rate as u32, channels, format })
+    Ok(AudioInfo {
+        duration_ms: frames_to_duration_ms(n_frames, sample_rate),
+        sample_rate: sample_rate as u32,
+        channels,
+        format,
+    })
 }
 
 /// Decode any audio file to 16kHz mono 16-bit PCM using symphonia.
@@ -456,15 +474,7 @@ pub fn get_duration_ms<P: AsRef<Path>>(path: P) -> AppResult<i64> {
         return Err(AppError::Audio(AudioError::Decode("Invalid sample rate".into())));
     }
 
-    let format = path.as_ref().extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-
-    let duration_secs = if format == "m4a" || format == "mp4" || format == "mov" || format == "3gp" {
-        let channels = params.channels.map(|c| c.count()).unwrap_or(1) as f64;
-        n_frames as f64 / (sample_rate * channels)
-    } else {
-        n_frames as f64 / sample_rate
-    };
-    Ok((duration_secs * 1000.0) as i64)
+    Ok(frames_to_duration_ms(n_frames, sample_rate))
 }
 
 /// Clear the PCM decode cache.
@@ -1033,6 +1043,18 @@ mod tests {
         let samples: Vec<f32> = (0..1600).map(|i| i as f32 / 1600.0).collect();
         let pcm = interleaved_f32_to_pcm_i16(&samples, 1, 16000);
         assert_eq!(pcm.len(), 1600);
+    }
+
+    #[test]
+    fn duration_is_independent_of_channel_count() {
+        // n_frames is per-channel, so duration must NOT be divided by channels. A 60s stereo 44.1k
+        // clip has n_frames = 44100*60 (per channel) and must report 60000ms, not the old halved
+        // 30000ms. check_audio_file and get_duration_ms both route through frames_to_duration_ms,
+        // so they can never disagree on the same file.
+        assert_eq!(frames_to_duration_ms(16_000, 16_000.0), 1000);
+        assert_eq!(frames_to_duration_ms(44_100 * 60, 44_100.0), 60_000, "stereo 60s must not halve");
+        assert_eq!(frames_to_duration_ms(0, 16_000.0), 0);
+        assert_eq!(frames_to_duration_ms(16_000, 0.0), 0, "non-positive sample rate guarded");
     }
 
     #[test]
