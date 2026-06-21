@@ -178,13 +178,19 @@ pub fn run_t0_gate(
     //    Calibrate PER SNR/condition bucket — a single global threshold is invalid across studio,
     //    field and noisy recordings; a bucket with too little verified data falls back to the global
     //    threshold so calibration degrades gracefully on small datasets.
+    // The conformal guarantee requires the threshold to be calibrated on the SAME nonconformity score
+    // the gate compares against — including the SAME fallback when a segment has no IRT confidence (a
+    // no-hypothesis row). Calibration (here) and the gate (below) must use ONE shared default, or they
+    // place the same condition at two different points of the score distribution and void coverage.
+    // 0.0 (⇒ maximal nonconformity ⇒ escalate) is the safe default for a no-signal segment.
+    const MISSING_IRT_CONFIDENCE: f64 = 0.0;
     let mut global_scored: Vec<(f64, f64)> = Vec::new();
     let mut bucket_scored: [Vec<(f64, f64)>; conformal::N_SNR_BUCKETS] = std::array::from_fn(|_| Vec::new());
     for s in &all_verified {
         let Some(ref_text) = s.annotated_transcript.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
             continue;
         };
-        let irt_conf = irt_results.segment_confidences.get(&s.id).copied().unwrap_or(0.5);
+        let irt_conf = irt_results.segment_confidences.get(&s.id).copied().unwrap_or(MISSING_IRT_CONFIDENCE);
         let score = conformal::nonconformity(irt_conf, s.ctc_score);
         let cer = crate::wer::compute_cer(ref_text, &s.raw_transcript).min(1.0);
         global_scored.push((score, cer));
@@ -216,7 +222,7 @@ pub fn run_t0_gate(
         let consensus =
             irt_results.consensus_transcripts.get(&seg.id).cloned().unwrap_or_else(|| seg.raw_transcript.clone());
 
-        let irt_confidence = irt_results.segment_confidences.get(&seg.id).copied().unwrap_or(0.0);
+        let irt_confidence = irt_results.segment_confidences.get(&seg.id).copied().unwrap_or(MISSING_IRT_CONFIDENCE);
 
         // Gate this segment against its own acoustic-condition bucket's threshold.
         let seg_threshold = bucket_thresholds[conformal::snr_bucket(seg.snr_db)];

@@ -137,7 +137,17 @@ impl ForcedAligner {
         if num_frames == 0 || vocab_size == 0 {
             return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
         }
-        let blank_idx = self.tokens.iter().position(|t| t == "<pad>" || t == "_" || t == "<blank>").unwrap_or(0);
+        // `blank_idx` is a LINE position in the on-disk tokens file; it has no inherent relationship
+        // to the model's output vocab dimension. A mismatched/drifted tokens-vs-model pair could place
+        // the blank token at an index >= vocab_size, which would later index logits out of bounds and
+        // panic. Clamp it into range (falling back to the conventional CTC blank at 0) so the kernel
+        // stays panic-free on a corrupt-but-loadable pair — mirroring the zero-dim guards above.
+        let blank_idx = self
+            .tokens
+            .iter()
+            .position(|t| t == "<pad>" || t == "_" || t == "<blank>")
+            .filter(|&i| i < vocab_size)
+            .unwrap_or(0);
 
         // Tokenize text
         let words: Vec<&str> = text.split_whitespace().collect();
@@ -283,7 +293,17 @@ impl ForcedAligner {
         if vocab_size == 0 {
             return Ok(-5.0);
         }
-        let blank_idx = self.tokens.iter().position(|t| t == "<pad>" || t == "_" || t == "<blank>").unwrap_or(0);
+        // `blank_idx` is a LINE position in the on-disk tokens file; it has no inherent relationship
+        // to the model's output vocab dimension. A mismatched/drifted tokens-vs-model pair could place
+        // the blank token at an index >= vocab_size, which would later index logits out of bounds and
+        // panic. Clamp it into range (falling back to the conventional CTC blank at 0) so the kernel
+        // stays panic-free on a corrupt-but-loadable pair — mirroring the zero-dim guards above.
+        let blank_idx = self
+            .tokens
+            .iter()
+            .position(|t| t == "<pad>" || t == "_" || t == "<blank>")
+            .filter(|&i| i < vocab_size)
+            .unwrap_or(0);
 
         let words: Vec<&str> = text.split_whitespace().collect();
         let mut target_tokens = Vec::new();
@@ -309,6 +329,12 @@ impl ForcedAligner {
 }
 
 fn get_log_prob(logits: &[f32], vocab_size: usize, frame: usize, token: usize) -> f32 {
+    // Defense-in-depth: every caller now clamps its token columns into [0, vocab_size), but keep the
+    // kernel total so a future out-of-range token yields an impossible-path score instead of an
+    // out-of-bounds slice panic. (offset + token < offset + vocab_size <= logits.len() by construction.)
+    if vocab_size == 0 || token >= vocab_size {
+        return f32::NEG_INFINITY;
+    }
     let offset = frame * vocab_size;
     let mut max_val = f32::NEG_INFINITY;
     for i in 0..vocab_size {
@@ -534,6 +560,21 @@ mod tests {
         let score = forward_backward_ctc_score(&logits, 3, &target_tokens, 0);
         assert!(score > f64::MIN);
         assert!(score <= 0.0);
+    }
+
+    #[test]
+    fn get_log_prob_is_total_for_out_of_range_token() {
+        // Round-9 audit MEDIUM: a mismatched tokens/model pair could place the blank token at a column
+        // index >= vocab_size, which used to index `logits` out of bounds and PANIC the align thread.
+        // The kernel must instead return an impossible-path score for any out-of-range token column.
+        let logits = vec![0.0f32, 1.0, 2.0, 3.0]; // 2 frames × vocab 2
+        let vocab_size = 2;
+        assert!(get_log_prob(&logits, vocab_size, 0, 1).is_finite(), "in-range token is finite");
+        // token == vocab_size and token > vocab_size are both rejected (would have been OOB before).
+        assert_eq!(get_log_prob(&logits, vocab_size, 0, vocab_size), f32::NEG_INFINITY);
+        assert_eq!(get_log_prob(&logits, vocab_size, 0, 5), f32::NEG_INFINITY);
+        // Zero vocab is also total (no divide/loop into an empty row).
+        assert_eq!(get_log_prob(&logits, 0, 0, 0), f32::NEG_INFINITY);
     }
 
     #[test]

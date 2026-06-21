@@ -520,6 +520,46 @@ impl Database {
         Ok(rows_changed > 0)
     }
 
+    /// Persist a batch (re)transcription result WITHOUT clobbering concurrent human work.
+    ///
+    /// Batch transcription runs in a background thread off a snapshot taken at batch start; a human can
+    /// verify or edit a target segment while the batch is in flight. Writing the whole stale snapshot
+    /// back (the old `insert_segment` path) reverted the human's `verified` flag and overwrote their
+    /// edited annotation — a silent lost update. This targeted write instead:
+    ///   • updates ONLY the ASR-derived columns (raw / normalized / confidence),
+    ///   • seeds `annotated_transcript` solely when it is still empty, via COALESCE against the CURRENT
+    ///     row (never the stale snapshot), so an in-flight human annotation is preserved,
+    ///   • never touches `verified`, and
+    ///   • skips any row a human has verified or reviewed since the batch began.
+    /// Returns Ok(true) if the row was updated, Ok(false) if it was skipped as human-owned.
+    pub fn update_batch_transcription_if_unreviewed(
+        &self,
+        segment_id: &str,
+        raw_transcript: &str,
+        normalized_transcript: Option<&str>,
+        confidence: Option<f64>,
+        annotated_seed: &str,
+    ) -> AppResult<bool> {
+        let raw_nfc = to_nfc(raw_transcript);
+        let normalized_nfc = normalized_transcript.map(to_nfc);
+        let annotated_nfc = to_nfc(annotated_seed);
+        let rows_changed = self.conn.execute(
+            "UPDATE speech_segments
+             SET raw_transcript        = ?2,
+                 normalized_transcript = ?3,
+                 confidence            = ?4,
+                 annotated_transcript  = COALESCE(annotated_transcript, ?5),
+                 updated_at            = datetime('now')
+             WHERE id = ?1
+               AND verified = 0
+               AND (human_decision IS NULL OR human_decision = '')
+               AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
+            params![segment_id, raw_nfc, normalized_nfc, confidence, annotated_nfc],
+        )?;
+        self.track_write()?;
+        Ok(rows_changed > 0)
+    }
+
     pub fn delete_segment(&self, id: &str) -> AppResult<()> {
         self.conn.execute("DELETE FROM speech_segments WHERE id = ?1", params![id])?;
         self.track_write()?;
@@ -1192,13 +1232,20 @@ impl Database {
         if let (Some(content_hash), Some(fix), Some(wrong)) =
             (ledger_hash, corrected_transcript, wrong_side.as_deref())
         {
-            let correction_id = uuid::Uuid::new_v4().to_string();
-            tx.execute(
-                "INSERT INTO corrections
-                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, jury_verdict, model_version_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![correction_id, segment_id, content_hash, wrong, fix, prior_verdict, model_version_id],
-            )?;
+            // Only record a GENUINE correction. `wrong_side` falls back to raw_transcript when no
+            // candidate differed from the fix (the model was already right), which would otherwise
+            // append a row whose raw_hypothesis == human_fix (up to whitespace/case) and pollute the
+            // reconstructable training ledger with non-corrections. Gate on the same learning-key
+            // difference the agent_examples / LOOP-0 paths already use.
+            if learning_text_key(wrong) != learning_text_key(fix) {
+                let correction_id = uuid::Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO corrections
+                        (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, jury_verdict, model_version_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![correction_id, segment_id, content_hash, wrong, fix, prior_verdict, model_version_id],
+                )?;
+            }
         }
 
         // LOOP 0: distil the edit into per-slot error memories so the SAME confusion is corrected on
@@ -1682,6 +1729,94 @@ mod tests {
             "new consensus",
             "an unreviewed segment is still refined"
         );
+    }
+
+    #[test]
+    fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
+        // Round-9 audit HIGH (lost update): batch_transcribe wrote the whole STALE snapshot back via
+        // insert_segment, reverting a concurrent human verify/edit. The guarded targeted write must
+        // (a) refuse to touch a human-verified/reviewed row, (b) never revert `verified`, (c) seed the
+        // annotation only when still empty, and (d) preserve an existing human annotation (COALESCE).
+        let db = make_db();
+
+        // (a)+(b): a human verified + annotated this row AFTER the batch prefetched it.
+        let mut verified = make_segment("verified-1", "/a.wav");
+        verified.raw_transcript = "old asr".to_string();
+        db.insert_segment(&verified).expect("insert verified");
+        db.conn
+            .execute(
+                "UPDATE speech_segments SET verified=1, annotated_transcript='human gold' WHERE id='verified-1'",
+                [],
+            )
+            .expect("mark verified");
+        let updated = db
+            .update_batch_transcription_if_unreviewed("verified-1", "fresh asr", Some("fresh asr"), Some(0.9), "fresh asr")
+            .expect("update verified");
+        assert!(!updated, "a verified row must be skipped, not updated");
+        let after = db.get_segment_by_id("verified-1").unwrap().unwrap();
+        assert!(after.verified, "verified flag must NOT be reverted by the batch");
+        assert_eq!(after.annotated_transcript.as_deref(), Some("human gold"), "human annotation preserved");
+        assert_eq!(after.raw_transcript, "old asr", "human-owned row's raw must not be clobbered");
+
+        // (c): a fresh unreviewed row with no annotation IS updated and seeds the annotation.
+        let mut fresh = make_segment("fresh-1", "/b.wav");
+        fresh.raw_transcript = "old".to_string();
+        fresh.annotated_transcript = None;
+        db.insert_segment(&fresh).expect("insert fresh");
+        let updated = db
+            .update_batch_transcription_if_unreviewed("fresh-1", "new asr", Some("new asr"), Some(0.8), "new asr")
+            .expect("update fresh");
+        assert!(updated, "an unreviewed row is updated");
+        let after = db.get_segment_by_id("fresh-1").unwrap().unwrap();
+        assert_eq!(after.raw_transcript, "new asr");
+        assert_eq!(after.annotated_transcript.as_deref(), Some("new asr"), "annotation seeded when empty");
+
+        // (d): an unverified row the user annotated (without verifying) keeps that annotation; only
+        // the ASR fields refresh — the seed is ignored because COALESCE reads the CURRENT row.
+        let mut annotated = make_segment("annot-1", "/c.wav");
+        annotated.raw_transcript = "old".to_string();
+        annotated.annotated_transcript = Some("user typed".to_string());
+        db.insert_segment(&annotated).expect("insert annotated");
+        let updated = db
+            .update_batch_transcription_if_unreviewed("annot-1", "new asr", Some("new asr"), Some(0.7), "seed ignored")
+            .expect("update annotated");
+        assert!(updated, "an unverified annotated row still refreshes ASR");
+        let after = db.get_segment_by_id("annot-1").unwrap().unwrap();
+        assert_eq!(after.annotated_transcript.as_deref(), Some("user typed"), "existing annotation preserved (COALESCE)");
+        assert_eq!(after.raw_transcript, "new asr", "raw ASR refreshed on an unverified row");
+    }
+
+    #[test]
+    fn human_edit_does_not_write_no_op_correction_ledger_row() {
+        // Round-9 audit LOW: when the model was already right (no candidate differs from the fix),
+        // wrong_side falls back to raw_transcript, so the corrections ledger used to record a row whose
+        // raw_hypothesis == human_fix. A real (resolvable) audio file is required so the ledger hash
+        // resolves — otherwise the ledger insert is skipped for an unrelated reason and the bug hides.
+        let db = make_db();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let audio = tmp.path().join("clip.wav");
+        std::fs::write(&audio, b"RIFFxxxxWAVEfmt ").expect("write audio");
+        let audio_path = audio.to_string_lossy().to_string();
+
+        let mut seg = make_segment("noop-1", &audio_path);
+        seg.raw_transcript = "hello world".to_string();
+        db.insert_segment(&seg).expect("insert");
+
+        // A no-op edit: the corrected text equals the raw ASR (up to the learning key).
+        db.record_human_decision("noop-1", "edit", Some("hello world")).expect("record no-op edit");
+
+        let ledger_rows: i64 =
+            db.conn.query_row("SELECT COUNT(*) FROM corrections WHERE segment_id='noop-1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ledger_rows, 0, "a no-op edit must NOT append a corrections-ledger row");
+
+        // A genuine correction on the same kind of row DOES record a ledger entry.
+        let mut seg2 = make_segment("real-1", &audio_path);
+        seg2.raw_transcript = "helo wrld".to_string();
+        db.insert_segment(&seg2).expect("insert real");
+        db.record_human_decision("real-1", "edit", Some("hello world")).expect("record real edit");
+        let real_rows: i64 =
+            db.conn.query_row("SELECT COUNT(*) FROM corrections WHERE segment_id='real-1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(real_rows, 1, "a genuine correction still records a ledger row");
     }
 
     #[test]

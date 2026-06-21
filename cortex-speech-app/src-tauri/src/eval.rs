@@ -73,24 +73,36 @@ pub struct EvalRunResult {
 // Database helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Bulk-insert gold segments. Skips duplicates (ON CONFLICT IGNORE).
+/// Bulk-insert gold segments, IDEMPOTENT on the audio file identity.
+///
+/// Re-marking the same clip as gold must not create a second holdout row: the row id is a fresh UUID,
+/// so the previous `INSERT OR IGNORE` never actually dedup'd, and `run_gold_eval` would then transcribe
+/// the clip once but score it once PER duplicate row — double-counting it in the published WER/CER
+/// aggregates. We therefore replace any existing gold row(s) for the same `audio_path` inside one
+/// transaction, so a partial failure never drops the old row without writing the new one.
 pub fn import_gold_segments(db: &Database, inputs: Vec<GoldSegmentInput>) -> AppResult<usize> {
     let conn = db.connection();
-    let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO gold_segments (id, audio_path, reference, is_holdout, audio_content_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-    )?;
+    let tx = conn.unchecked_transaction()?;
     let mut count = 0usize;
-    for inp in &inputs {
-        let id = Uuid::new_v4().to_string();
-        // Persist the audio content hash NOW — the file is present when the user marks it gold — so
-        // holdout exclusion no longer depends on the file still existing at export time (fail-closed).
-        let content_hash = crate::pipeline::source_audio_identity(std::path::Path::new(&inp.audio_path))
-            .ok()
-            .map(|identity| identity.content_hash);
-        stmt.execute(params![id, inp.audio_path, inp.reference, inp.is_holdout as i32, content_hash])?;
-        count += 1;
+    {
+        let mut delete_stmt = tx.prepare("DELETE FROM gold_segments WHERE audio_path = ?1")?;
+        let mut insert_stmt = tx.prepare(
+            "INSERT INTO gold_segments (id, audio_path, reference, is_holdout, audio_content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for inp in &inputs {
+            delete_stmt.execute(params![inp.audio_path])?;
+            let id = Uuid::new_v4().to_string();
+            // Persist the audio content hash NOW — the file is present when the user marks it gold — so
+            // holdout exclusion no longer depends on the file still existing at export time (fail-closed).
+            let content_hash = crate::pipeline::source_audio_identity(std::path::Path::new(&inp.audio_path))
+                .ok()
+                .map(|identity| identity.content_hash);
+            insert_stmt.execute(params![id, inp.audio_path, inp.reference, inp.is_holdout as i32, content_hash])?;
+            count += 1;
+        }
     }
+    tx.commit()?;
     Ok(count)
 }
 
@@ -562,6 +574,29 @@ mod tests {
         assert_eq!(count, 2);
         let list = list_gold_segments(&db).unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn re_marking_same_audio_as_gold_is_idempotent() {
+        // Round-9 audit MEDIUM: re-marking the same clip as gold inserted a SECOND holdout row (the id
+        // is a fresh UUID, so INSERT OR IGNORE never dedup'd), which run_gold_eval then double-counts
+        // in the WER/CER aggregates. Re-import must REPLACE the prior row for the same audio_path.
+        let db = open_mem_db();
+        import_gold_segments(
+            &db,
+            vec![GoldSegmentInput { audio_path: "/tmp/dup.wav".into(), reference: "first reference".into(), is_holdout: true }],
+        )
+        .unwrap();
+        import_gold_segments(
+            &db,
+            vec![GoldSegmentInput { audio_path: "/tmp/dup.wav".into(), reference: "corrected reference".into(), is_holdout: true }],
+        )
+        .unwrap();
+
+        let list = list_gold_segments(&db).unwrap();
+        let for_clip: Vec<_> = list.iter().filter(|g| g.audio_path == "/tmp/dup.wav").collect();
+        assert_eq!(for_clip.len(), 1, "re-marking the same audio must keep exactly one gold row");
+        assert_eq!(for_clip[0].reference, "corrected reference", "the latest reference wins");
     }
 
     #[test]

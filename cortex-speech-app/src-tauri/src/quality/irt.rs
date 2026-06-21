@@ -62,12 +62,19 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
     let mut segment_slots_map = HashMap::new();
 
     // Step 1: Align all hypotheses for each segment to construct slots (confusion network)
-    for (segment_id, hyps) in &segment_hyps {
+    for (segment_id, hyps_all) in &segment_hyps {
+        // Ignore empty-transcript hypotheses ENTIRELY. A model that returned "" must not become the
+        // anchor (zero slots ⇒ a degenerate confidence) NOR vote — with its ability weight — for empty
+        // at every slot, which would blank out the consensus and let an empty transcript auto-accept.
+        // If every hypothesis is empty the segment has no signal: skip it (no confidence entry ⇒ it
+        // escalates downstream rather than being recorded as a confident empty).
+        let hyps: Vec<&SegmentHypothesis> =
+            hyps_all.iter().copied().filter(|h| !h.transcript.trim().is_empty()).collect();
         if hyps.is_empty() {
             continue;
         }
 
-        // Choose the anchor hypothesis (highest initial ability)
+        // Choose the anchor hypothesis (highest initial ability) among the surviving non-empty set.
         let Some(anchor_hyp) = hyps
             .iter()
             .max_by(|a, b| {
@@ -93,7 +100,7 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
             .collect();
 
         // Align other hypotheses to the anchor
-        for h in hyps {
+        for h in &hyps {
             if h.model_id == anchor_hyp.model_id {
                 continue;
             }
@@ -306,7 +313,10 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
         }
 
         let consensus_text = consensus_words.join(" ");
-        let confidence = if slot_count > 0 { total_posterior / slot_count as f64 } else { 1.0 };
+        // A degenerate (zero-slot / empty-anchor) segment carries NO consensus signal, so it must be
+        // the MINIMUM confidence to force escalation — not the maximum. A 1.0 here would zero out the
+        // disagreement term in the T0 gate's nonconformity and let an EMPTY transcript auto-accept.
+        let confidence = if slot_count > 0 { total_posterior / slot_count as f64 } else { 0.0 };
 
         consensus_transcripts.insert(segment_id.clone(), consensus_text);
         segment_confidences.insert(segment_id.clone(), confidence);
@@ -349,6 +359,31 @@ mod tests {
         let ability_gemini = res.model_abilities.get("gemini").unwrap();
         let ability_whisper = res.model_abilities.get("whisper-noisy").unwrap();
         assert!(ability_gemini > ability_whisper);
+    }
+
+    #[test]
+    fn empty_anchor_does_not_yield_false_max_confidence() {
+        // Round-9 audit MEDIUM: when the highest-ability model returned an empty transcript it became
+        // the anchor, yielding zero slots and a hard-coded confidence of 1.0 with an EMPTY consensus —
+        // which could auto-accept an empty transcript at the T0 gate. The anchor must skip empties, and
+        // a degenerate segment must never report maximal confidence.
+        let empty_strong = SegmentHypothesis {
+            segment_id: "seg1".to_string(),
+            model_id: "omniasr-ctc-1b".to_string(), // initial ability 0.5 — would be the anchor
+            transcript: "".to_string(),
+            confidence: Some(0.5),
+        };
+        let real_weak = SegmentHypothesis {
+            segment_id: "seg1".to_string(),
+            model_id: "omniasr-ctc-300m".to_string(), // initial ability -0.5
+            transcript: "ئەمە دەنگە".to_string(),
+            confidence: Some(0.4),
+        };
+        let res = fit_irt_consensus(&[empty_strong, real_weak]);
+        let consensus = res.consensus_transcripts.get("seg1").expect("segment present");
+        assert!(!consensus.is_empty(), "consensus must come from the non-empty hypothesis, not the empty anchor");
+        let conf = res.segment_confidences.get("seg1").copied().expect("confidence present");
+        assert!(conf < 1.0, "a segment with an empty strong model must not report maximal confidence; got {conf}");
     }
 
     #[test]
