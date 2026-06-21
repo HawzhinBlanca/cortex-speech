@@ -26,7 +26,16 @@
   let offsetY = $derived(startIndex * itemHeight);
 
   onMount(() => {
-    if (container) containerHeight = container.clientHeight;
+    if (!container) return;
+    containerHeight = container.clientHeight;
+    // Keep the virtualization window in sync with the real viewport: a one-shot mount read goes stale
+    // when the window/panel is later enlarged, leaving the bottom of the list rendered blank until the
+    // user scrolls. Observe the container so endIndex tracks the actual height.
+    const ro = new ResizeObserver(() => {
+      containerHeight = container.clientHeight;
+    });
+    ro.observe(container);
+    return () => ro.disconnect();
   });
 
   function handleScroll() {
