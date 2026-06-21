@@ -521,9 +521,10 @@ mod tests {
 
     #[test]
     fn beats_baseline_only_when_lower_and_significant() {
-        let pairs: Vec<(&str, &str)> = (0..12)
-            .map(|_| ("/x.wav", "one two three four five"))
-            .collect();
+        // Distinct audio paths per segment: gold rows are per-file and re-marking the same file is now
+        // idempotent, so identical paths would collapse into a single gold row.
+        let paths: Vec<String> = (0..12).map(|i| format!("/x{i}.wav")).collect();
+        let pairs: Vec<(&str, &str)> = paths.iter().map(|p| (p.as_str(), "one two three four five")).collect();
         // System: perfect on every segment. Baseline: one error on every segment.
         let sys_hyps: Vec<&str> = (0..12).map(|_| "one two three four five").collect();
         let base_hyps: Vec<&str> = (0..12).map(|_| "one two three four WRONG").collect();
@@ -540,7 +541,8 @@ mod tests {
 
     #[test]
     fn identical_system_does_not_beat_itself() {
-        let pairs: Vec<(&str, &str)> = (0..12).map(|_| ("/x.wav", "one two three")).collect();
+        let paths: Vec<String> = (0..12).map(|i| format!("/x{i}.wav")).collect();
+        let pairs: Vec<(&str, &str)> = paths.iter().map(|p| (p.as_str(), "one two three")).collect();
         let hyps: Vec<&str> = (0..12).map(|_| "one two WRONG").collect();
         let (a, b) = eval_pair(&pairs, &hyps, &hyps, "a", "b");
         let sc = build_scorecard(&a, Some(&b), ScorecardOptions::default());

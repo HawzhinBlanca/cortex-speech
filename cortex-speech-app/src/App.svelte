@@ -119,6 +119,10 @@
 
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle');
   let saveTimeout: ReturnType<typeof setTimeout> | null = null;
+  // Fields the user has edited since the last successful save, keyed to the target segment. These are
+  // re-applied onto the freshly re-read row at autosave fire time so the user's edit always wins even
+  // if a background reload (WSL/import/batch completion) replaces the store mid-debounce.
+  let pendingSave: { id: string; fields: Record<string, unknown> } | null = null;
   let tauriAvailable = $state(false);
   let datasetPromotionStage = $derived.by(
     () =>
@@ -154,28 +158,40 @@
     return stage.replaceAll('_', ' ');
   }
 
-  function scheduleAutoSave() {
+  function scheduleAutoSave(edits: Record<string, unknown> = {}) {
     saveState = 'saving';
     if (saveTimeout) clearTimeout(saveTimeout);
     // Capture only the target segment ID now (so selecting a different segment within 1s still saves
-    // the RIGHT one), then re-read the FRESH segment from the store at fire time. Persisting a
-    // whole-segment snapshot captured now would clobber any field — verified / speakerId /
-    // normalizedTranscript — that a concurrent verify/normalize/speaker action, or a background
-    // reload (WSL/import completion), changed during the 1s debounce, because update_segment writes
-    // the entire row.
+    // the RIGHT one), then re-read the FRESH segment from the store at fire time. Re-reading the fresh
+    // row preserves fields that a concurrent verify/normalize/speaker action changed during the 1s
+    // debounce. But the fresh row alone is NOT enough: a background reload (WSL/import/batch
+    // completion) can replace the entire store mid-debounce with server data that lacks the user's
+    // in-progress keystrokes — persisting that fresh-but-stale row would silently lose the edit and
+    // still flash "Saved". So we ALSO accumulate the user's edited fields here and re-apply them onto
+    // the fresh row at fire time: the user's edit always wins, other fields stay fresh.
     const id = $selectedSegment?.id;
     if (!id) {
       saveState = 'idle';
       return;
     }
+    if (!pendingSave || pendingSave.id !== id) {
+      pendingSave = { id, fields: {} };
+    }
+    Object.assign(pendingSave.fields, edits);
+    const pending = pendingSave;
     saveTimeout = setTimeout(async () => {
       const fresh = $segments.find((s) => s.id === id);
       if (!fresh) {
         saveState = 'idle';
+        if (pendingSave === pending) pendingSave = null;
         return;
       }
+      // Merge the user's pending edits onto the freshly re-read row so a concurrent change to OTHER
+      // fields is preserved while the user's in-flight edit is never overwritten by a stale store.
+      const merged = { ...fresh, ...pending.fields };
       try {
-        await api.updateSegment(fresh);
+        await api.updateSegment(merged);
+        if (pendingSave === pending) pendingSave = null;
         saveState = 'saved';
         setTimeout(() => {
           if (saveState === 'saved') saveState = 'idle';
@@ -212,7 +228,7 @@
             : s,
         ),
       );
-      scheduleAutoSave();
+      scheduleAutoSave({ alignmentJson, annotatedTranscript });
     }
     editingWordIndex = null;
   }
@@ -2142,14 +2158,11 @@
                 oninput={(e) => {
                   const seg = $selectedSegment;
                   if (seg) {
+                    const annotatedTranscript = (e.target as HTMLTextAreaElement).value;
                     segments.update((arr) =>
-                      arr.map((s) =>
-                        s.id === seg.id
-                          ? { ...s, annotatedTranscript: (e.target as HTMLTextAreaElement).value }
-                          : s,
-                      ),
+                      arr.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript } : s)),
                     );
-                    scheduleAutoSave();
+                    scheduleAutoSave({ annotatedTranscript });
                   }
                 }}
               ></textarea>
@@ -2172,7 +2185,7 @@
                       );
                       // Persist like the annotation field, so the speaker edit isn't left only in the
                       // store (lost on reload) or silently piggybacked onto an unrelated later save.
-                      scheduleAutoSave();
+                      scheduleAutoSave({ speakerId });
                     }
                   }}
                 />

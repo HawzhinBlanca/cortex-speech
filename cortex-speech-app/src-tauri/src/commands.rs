@@ -752,6 +752,7 @@ pub fn batch_transcribe(
 
         let mut succeeded = 0u32;
         let mut failed = 0u32;
+        let mut skipped = 0u32;
         let mut previous_segments: Vec<crate::db::SpeechSegment> = Vec::new();
         let mut transcribed_ids: Vec<String> = Vec::new();
         let mut cancelled = false;
@@ -794,27 +795,37 @@ pub fn batch_transcribe(
 
             let seg = seg_map.remove(id.as_str());
 
-            if let Some(mut seg) = seg {
+            if let Some(seg) = seg {
                 // Capture full snapshot BEFORE transcription for complete undo.
                 let pre_transcription_snapshot = seg.clone();
                 match pipeline.transcribe(Some(id), &seg.audio_path, seg.alignment_json.as_deref()) {
                     Ok((raw_text, corrected_text, confidence)) => {
-                        seg.raw_transcript = raw_text;
-                        // CRITICAL: Do not overwrite a human-corrected annotation.
-                        // Only set annotated_transcript if none exists yet.
-                        if seg.annotated_transcript.is_none() {
-                            seg.annotated_transcript = Some(corrected_text.clone());
-                        }
-                        seg.normalized_transcript = Some(normalizer.normalize(&corrected_text));
-                        seg.confidence = confidence;
-                        match app_state.lock_db().insert_segment(&seg) {
-                            Ok(()) => {
+                        let normalized = normalizer.normalize(&corrected_text);
+                        // Guarded targeted write (NOT a full insert_segment of the stale snapshot): a
+                        // human may have verified/edited this row since the batch prefetched it. This
+                        // writes only the ASR fields, seeds the annotation solely when still empty
+                        // (against the CURRENT row), never touches `verified`, and skips human-owned
+                        // rows — so a concurrent curator decision can never be silently lost.
+                        match app_state.lock_db().update_batch_transcription_if_unreviewed(
+                            id,
+                            &raw_text,
+                            Some(normalized.as_str()),
+                            confidence,
+                            &corrected_text,
+                        ) {
+                            Ok(true) => {
                                 previous_segments.push(pre_transcription_snapshot);
                                 transcribed_ids.push(id.clone());
                                 succeeded += 1;
                             }
+                            Ok(false) => {
+                                // Row became human-verified/reviewed after the batch began — skip
+                                // rather than overwrite the curator's confirmed label.
+                                tracing::info!("Batch transcribe skipped {id}: human-reviewed since batch start");
+                                skipped += 1;
+                            }
                             Err(error) => {
-                                tracing::error!("Batch transcribe DB insert failed for {id}: {error}");
+                                tracing::error!("Batch transcribe DB update failed for {id}: {error}");
                                 failed += 1;
                             }
                         }
@@ -859,7 +870,7 @@ pub fn batch_transcribe(
             "batch-progress",
             serde_json::json!({
                 "type": "completed", "total": total,
-                "succeeded": succeeded, "failed": failed,
+                "succeeded": succeeded, "failed": failed, "skipped": skipped,
                 "cancelled": cancelled, "operation": "transcribe"
             }),
         );
@@ -2164,7 +2175,9 @@ pub fn run_consensus_refinery(state: State<'_, AppState>) -> Result<serde_json::
 
     let mut updates = Vec::new();
     for (segment_id, consensus_text) in &results.consensus_transcripts {
-        let confidence = *results.segment_confidences.get(segment_id).unwrap_or(&1.0);
+        // Missing IRT confidence ⇒ MINIMUM, not maximum: a no-signal segment must not be recorded as
+        // maximally confident (which would suppress its escalation downstream).
+        let confidence = *results.segment_confidences.get(segment_id).unwrap_or(&0.0);
         let normalized_text = state.normalizer.normalize(consensus_text);
         updates.push((segment_id.clone(), consensus_text.clone(), normalized_text, confidence));
     }
