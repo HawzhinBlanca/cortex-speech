@@ -157,19 +157,25 @@
   function scheduleAutoSave() {
     saveState = 'saving';
     if (saveTimeout) clearTimeout(saveTimeout);
+    // Capture the target segment at SCHEDULE time, not inside the 1s timeout. Callers update the
+    // segments store before calling this, so $selectedSegment already reflects the edit. Reading it
+    // at fire time instead meant that selecting a different segment within 1s saved the WRONG segment
+    // and silently dropped the original edit.
+    const seg = $selectedSegment;
+    if (!seg) {
+      saveState = 'idle';
+      return;
+    }
     saveTimeout = setTimeout(async () => {
-      const seg = $selectedSegment;
-      if (seg) {
-        try {
-          await api.updateSegment(seg);
-          saveState = 'saved';
-          setTimeout(() => {
-            if (saveState === 'saved') saveState = 'idle';
-          }, 2000);
-        } catch (e) {
-          saveState = 'idle';
-          notifications.error($t('notifications.saveFailed'), { detail: String(e) });
-        }
+      try {
+        await api.updateSegment(seg);
+        saveState = 'saved';
+        setTimeout(() => {
+          if (saveState === 'saved') saveState = 'idle';
+        }, 2000);
+      } catch (e) {
+        saveState = 'idle';
+        notifications.error($t('notifications.saveFailed'), { detail: String(e) });
       }
     }, 1000);
   }
