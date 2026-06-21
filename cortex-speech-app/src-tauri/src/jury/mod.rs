@@ -83,8 +83,8 @@ pub fn t0_gate_segment(
     // Values closer to 1.0 = high disagreement.
     let disagreement_score = 1.0 - irt_confidence;
 
-    let ctc = seg.ctc_score.unwrap_or(-5.0);
-    let nonconformity_score = ((1.0 - irt_confidence) + 0.1 * (-ctc)).max(0.0);
+    // Same formula AND same confidence source the threshold was calibrated on (see run_t0_gate).
+    let nonconformity_score = conformal::nonconformity(irt_confidence, seg.ctc_score);
 
     let poor_quality = if let Some(snr) = seg.snr_db { snr < 5.0 } else { false }
         || if let Some(clip) = seg.clipping_ratio { clip > 0.1 } else { false };
@@ -158,9 +158,24 @@ pub fn run_t0_gate(
     // 2. Run IRT over all hypotheses
     let irt_results = irt::fit_irt_consensus(&all_hyps);
 
-    // 3. Determine conformal threshold (requires all verified segments for calibration)
-    let cert = conformal::calibrate_and_certify(&all_verified, 0.05, 0.90);
-    let threshold = cert.threshold;
+    // 3. Calibrate the conformal threshold on the SAME IRT-based nonconformity score the gate uses
+    //    below. Previously the threshold was calibrated on seg.confidence-based nonconformity while
+    //    the gate compared it against irt_confidence-based nonconformity — a different score
+    //    distribution under the same cutoff, which silently VOIDED the coverage guarantee.
+    let cal_scored: Vec<(f64, f64)> = all_verified
+        .iter()
+        .filter_map(|s| {
+            let ref_text = s.annotated_transcript.as_deref()?.trim();
+            if ref_text.is_empty() {
+                return None;
+            }
+            let irt_conf = irt_results.segment_confidences.get(&s.id).copied().unwrap_or(0.5);
+            let score = conformal::nonconformity(irt_conf, s.ctc_score);
+            let cer = crate::wer::compute_cer(ref_text, &s.raw_transcript).min(1.0);
+            Some((score, cer))
+        })
+        .collect();
+    let (threshold, _bound, _is_calibrated) = conformal::calibrate_threshold(&cal_scored, 0.05, 0.90);
 
     // 4. Route and collect decisions
     let mut decisions = Vec::new();
