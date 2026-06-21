@@ -223,16 +223,27 @@ pub enum Theme {
 }
 
 /// Autonomy level for the Listening Jury (the "Autonomy Dial").
+///
+/// Serialized as snake_case to match the frontend, which sends/expects
+/// `observe|propose|act_confirm|act_auto` (settingsStore.ts / SettingsPanel.svelte). Without this,
+/// an Autonomy Dial click sent e.g. `"act_confirm"`, which failed to deserialize the WHOLE
+/// `update_settings` payload (`unknown variant`), silently dropping every settings save in that
+/// session. PascalCase aliases keep any pre-existing settings.json files loadable.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AutonLevel {
     /// Agent only annotates cards without committing any verdict.
+    #[serde(alias = "Observe")]
     Observe,
     /// Agent stages verdicts; human confirms each one (default).
     #[default]
+    #[serde(alias = "Propose")]
     Propose,
     /// Agent auto-commits agreements; asks for human confirmation only on edits/rejects.
+    #[serde(alias = "ActConfirm")]
     ActConfirm,
     /// Fully unattended — agent commits all verdicts without pausing.
+    #[serde(alias = "ActAuto")]
     ActAuto,
 }
 
@@ -537,6 +548,34 @@ mod tests {
         for bad in ["", "   ", "http://attacker.example.com/collect", "ftp://x", "file:///etc/passwd"] {
             assert!(super::validate_outbound_endpoint(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn autonlevel_roundtrips_frontend_snake_case() {
+        // Round-2 audit HIGH: the Autonomy Dial sends snake_case; without rename_all it failed to
+        // deserialize and silently broke every settings save.
+        for (json, variant) in [
+            ("\"observe\"", AutonLevel::Observe),
+            ("\"propose\"", AutonLevel::Propose),
+            ("\"act_confirm\"", AutonLevel::ActConfirm),
+            ("\"act_auto\"", AutonLevel::ActAuto),
+        ] {
+            assert_eq!(serde_json::from_str::<AutonLevel>(json).unwrap(), variant, "{json} must parse");
+        }
+        // Serializes BACK as snake_case so the dropdown's `=== val` comparison matches.
+        assert_eq!(serde_json::to_string(&AutonLevel::ActConfirm).unwrap(), "\"act_confirm\"");
+        // Pre-existing PascalCase settings.json files still load via the aliases.
+        assert_eq!(serde_json::from_str::<AutonLevel>("\"ActConfirm\"").unwrap(), AutonLevel::ActConfirm);
+        assert_eq!(serde_json::from_str::<AutonLevel>("\"Propose\"").unwrap(), AutonLevel::Propose);
+    }
+
+    #[test]
+    fn update_settings_payload_with_snake_case_autonomy_deserializes() {
+        // Mirrors the real update_settings IPC arg the adapter produces.
+        let mut json = serde_json::to_value(AppSettings::default()).unwrap();
+        json["jury_autonomy_level"] = serde_json::json!("act_confirm");
+        let parsed: AppSettings = serde_json::from_value(json).expect("settings payload must deserialize");
+        assert_eq!(parsed.jury_autonomy_level, AutonLevel::ActConfirm);
     }
 
     #[test]
