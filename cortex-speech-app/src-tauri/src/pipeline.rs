@@ -1742,8 +1742,16 @@ impl ProcessingPipeline {
 
         let model_id = self.local_asr_model_id().to_string();
         if let Some(cached) = self.cache.get_chunk(path, &model_id, chunk_suffix.as_deref()) {
-            let fired = self.fire_loop0_if_enabled(&cached.raw_transcript);
-            return Ok((cached.raw_transcript.clone(), fired, None));
+            // The cache stores the RAW ASR text (the key omits the refiner config), so re-run LLM
+            // refinement + LOOP-0 with CURRENT settings — otherwise a refiner/settings change would be
+            // ignored and the raw element would be contaminated with refined text.
+            let raw = cached.raw_transcript.clone();
+            let refined = match self.build_refiner() {
+                Some(refiner) => refiner.refine_text(&raw).unwrap_or_else(|_| raw.clone()),
+                None => raw.clone(),
+            };
+            let fired = self.fire_loop0_if_enabled(&refined);
+            return Ok((raw, fired, None));
         }
 
         let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
@@ -1776,7 +1784,10 @@ impl ProcessingPipeline {
 
         let entry = crate::cache::CacheEntry {
             audio_hash: String::new(),
-            raw_transcript: final_text.clone(),
+            // Cache the RAW ASR text, NOT the refined output: the cache key omits the refiner config,
+            // so storing refined text would replay a stale refiner result (and contaminate the raw
+            // element) on a later hit. Refinement is re-run per call from the cached raw text.
+            raw_transcript: raw_text.clone(),
             normalized_transcript: None,
             created_at: chrono::Utc::now(),
             model_id: model_id.clone(),
