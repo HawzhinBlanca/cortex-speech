@@ -157,18 +157,25 @@
   function scheduleAutoSave() {
     saveState = 'saving';
     if (saveTimeout) clearTimeout(saveTimeout);
-    // Capture the target segment at SCHEDULE time, not inside the 1s timeout. Callers update the
-    // segments store before calling this, so $selectedSegment already reflects the edit. Reading it
-    // at fire time instead meant that selecting a different segment within 1s saved the WRONG segment
-    // and silently dropped the original edit.
-    const seg = $selectedSegment;
-    if (!seg) {
+    // Capture only the target segment ID now (so selecting a different segment within 1s still saves
+    // the RIGHT one), then re-read the FRESH segment from the store at fire time. Persisting a
+    // whole-segment snapshot captured now would clobber any field — verified / speakerId /
+    // normalizedTranscript — that a concurrent verify/normalize/speaker action, or a background
+    // reload (WSL/import completion), changed during the 1s debounce, because update_segment writes
+    // the entire row.
+    const id = $selectedSegment?.id;
+    if (!id) {
       saveState = 'idle';
       return;
     }
     saveTimeout = setTimeout(async () => {
+      const fresh = $segments.find((s) => s.id === id);
+      if (!fresh) {
+        saveState = 'idle';
+        return;
+      }
       try {
-        await api.updateSegment(seg);
+        await api.updateSegment(fresh);
         saveState = 'saved';
         setTimeout(() => {
           if (saveState === 'saved') saveState = 'idle';
@@ -329,9 +336,14 @@
           await loadSegments();
           statusMessage.set($t('ready'));
           endOperation('batch-verify');
-        } else if (payload.operation === 'assign_speaker' || payload.operation === 'normalize') {
+        } else if (payload.operation === 'assign_speaker') {
           await loadSegments();
           statusMessage.set($t('ready'));
+          endOperation('batch-assign-speaker');
+        } else if (payload.operation === 'normalize') {
+          await loadSegments();
+          statusMessage.set($t('ready'));
+          endOperation('batch-normalize');
         }
       } catch (e) {
         console.error('Batch complete handler error:', e);
@@ -585,11 +597,12 @@
   }
 
   async function loadSegments() {
+    // Route through the store's guarded load() (it owns a loadSeq counter + conformal refresh) so
+    // this refresh path can't interleave-overwrite a concurrent segments.load() — e.g. from a WSL
+    // refinement completing while a batch op finishes — with an older getSegments() result.
     segmentsLoading = true;
     try {
-      segments.set(await api.getSegments());
-    } catch (e) {
-      notifications.error($t('notifications.loadSegmentsFailed'), { detail: String(e) });
+      await segments.load();
     } finally {
       segmentsLoading = false;
     }
@@ -2079,6 +2092,10 @@
                           if (e.key === 'Enter' || e.key === ' ') {
                             currentTime = w.start;
                             e.preventDefault();
+                          } else if (e.key === 'F2') {
+                            // Keyboard path into inline word-edit (double-click is mouse-only).
+                            editingWordIndex = idx;
+                            e.preventDefault();
                           }
                         }}
                       >
@@ -2153,6 +2170,9 @@
                       segments.update((arr) =>
                         arr.map((s) => (s.id === seg.id ? { ...s, speakerId } : s)),
                       );
+                      // Persist like the annotation field, so the speaker edit isn't left only in the
+                      // store (lost on reload) or silently piggybacked onto an unrelated later save.
+                      scheduleAutoSave();
                     }
                   }}
                 />

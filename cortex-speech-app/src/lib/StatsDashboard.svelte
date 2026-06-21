@@ -252,9 +252,9 @@
         {#if quality.duplicateGroups.length > 0}
           <div class="text-[10px] text-cortex-500 space-y-1 max-h-20 overflow-y-auto">
             {#each quality.duplicateGroups.slice(0, 3) as group}
-              <div class="truncate">
-                "{group.normalizedPreview}" — {group.segmentIds.length}
-                {$t('stats.segShort')}
+              <div class="truncate" dir="rtl" lang="ckb">
+                "<bdi>{group.normalizedPreview}</bdi>" — <bdi>{group.segmentIds.length}
+                  {$t('stats.segShort')}</bdi>
               </div>
             {/each}
           </div>
