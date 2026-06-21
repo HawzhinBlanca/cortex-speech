@@ -421,11 +421,13 @@ pub fn export_huggingface_dataset(
     let mut train_segs = Vec::new();
     let mut val_segs = Vec::new();
     let mut test_segs = Vec::new();
+    // Collect the split assignments but DON'T persist them yet. The DB must be the LAST thing
+    // mutated — only after every file is written — or a mid-export file-write failure leaves split
+    // columns describing a dataset that was never fully written to disk.
+    let mut pending_splits: Vec<(String, &'static str)> = Vec::with_capacity(segments.len());
     for seg in &segments {
         let split = split_of.get(seg.id.as_str()).copied().unwrap_or("train");
-        db.update_segment_split(&seg.id, split).map_err(|error| {
-            AppError::Other(format!("Failed to persist split {split} for {}: {error}", seg.id))
-        })?;
+        pending_splits.push((seg.id.clone(), split));
         match split {
             "validation" => val_segs.push(seg.clone()),
             "test" => test_segs.push(seg.clone()),
@@ -667,6 +669,13 @@ This dataset was exported from Cortex Speech Processor.
     // Integrity manifest, written last so it covers every artifact: a consumer can run
     // `sha256sum -c SHA256SUMS` to detect any corrupted / truncated / partially-copied file.
     write_sha256sums(dir)?;
+
+    // Every on-disk artifact is now written — persist the split columns LAST so that any failure
+    // above returned Err with the DB unchanged, never leaving splits that describe an unwritten set.
+    for (id, split) in &pending_splits {
+        db.update_segment_split(id, split)
+            .map_err(|error| AppError::Other(format!("Failed to persist split {split} for {id}: {error}")))?;
+    }
 
     Ok(())
 }
@@ -1239,6 +1248,43 @@ mod tests {
         // No alignment -> whole file (intended fallback).
         let whole = slice_for_export(&full, 16000, None).expect("whole file");
         assert_eq!(whole.len(), full.len());
+    }
+
+    #[test]
+    fn hf_export_persists_splits_only_after_a_successful_write() {
+        // Round-2 audit MEDIUM: splits were committed to the DB BEFORE files were written. They must
+        // now be persisted last — present after a successful export, absent before.
+        let db_tmp = NamedTempFile::new().unwrap();
+        let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let wav_path = tmp_dir.path().join("hf-split.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for _ in 0..16000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut seg = sample_segment("hf-split-1");
+        seg.audio_path = wav_path.to_string_lossy().to_string();
+        db.insert_segment(&seg).unwrap();
+        assert!(db.get_segment_by_id("hf-split-1").unwrap().unwrap().split.is_none(), "split unset before export");
+
+        let out_dir = tempfile::tempdir().unwrap();
+        export_huggingface_dataset(&db, out_dir.path(), &crate::settings::AppSettings::default()).unwrap();
+
+        let split = db.get_segment_by_id("hf-split-1").unwrap().unwrap().split;
+        assert!(
+            matches!(split.as_deref(), Some("train" | "validation" | "test")),
+            "split persisted after a successful export, got {split:?}"
+        );
     }
 
     #[test]
