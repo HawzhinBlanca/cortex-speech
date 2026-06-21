@@ -42,13 +42,23 @@ fn is_known_vowel(c: char) -> bool {
     matches!(c, 'ا' | 'ە' | 'ۆ' | 'ێ')
 }
 
+/// A character that actually carries a phoneme: a known consonant, a known vowel, or one of the
+/// role-ambiguous letters 'و'/'ی'. Everything else (combining marks/harakat, ZWNJ/ZWJ and other
+/// format chars, control chars, digits, punctuation, non-Kurdish letters) is phonetically
+/// transparent — it produces no phoneme, so it must be dropped BEFORE role resolution. Leaving it
+/// in let a stray mark occupy a role slot and flip the classification of an adjacent 'و'/'ی' (e.g.
+/// splitting the long-vowel digraph 'وو' into two consonants).
+fn is_phonetic(c: char) -> bool {
+    is_known_consonant(c) || is_known_vowel(c) || c == 'و' || c == 'ی'
+}
+
 /// Converts a normalized Sorani Kurdish word to a phonetic (phoneme) string.
 fn word_to_g2p(word: &str) -> String {
     if word.is_empty() {
         return String::new();
     }
 
-    let chars: Vec<char> = word.chars().collect();
+    let chars: Vec<char> = word.chars().filter(|&c| is_phonetic(c)).collect();
     let n = chars.len();
     let mut roles = vec![SoundType::Undetermined; n];
 
@@ -262,5 +272,22 @@ mod tests {
         // A huge single token must also be handled without panic or pathological blowup.
         let huge = "و".repeat(5000);
         let _ = word_to_g2p(&huge);
+    }
+
+    #[test]
+    fn combining_marks_dont_split_the_waw_digraph() {
+        // A stray sukun (U+0652) between the two waws of the long-vowel digraph 'وو' must NOT break
+        // it into two consonants ("d w w"); transparent marks are filtered before role resolution.
+        assert_eq!(word_to_g2p("د\u{0648}\u{0652}\u{0648}"), "d U");
+        assert_eq!(word_to_g2p("دوو"), "d U", "baseline digraph unchanged");
+    }
+
+    #[test]
+    fn transparent_chars_dont_corrupt_neighbor_roles() {
+        // A non-phonetic char adjacent to an ambiguous 'و'/'ی' must not change the neighbor's
+        // phoneme. Old code left it as an Undetermined role slot that flipped the classification.
+        assert_eq!(word_to_g2p("دو"), "d u", "baseline");
+        assert_eq!(word_to_g2p("د\u{200C}و"), "d u", "ZWNJ must not flip و to consonant");
+        assert_eq!(word_to_g2p("د\u{064B}و"), "d u", "fathatan must not flip و to consonant");
     }
 }
