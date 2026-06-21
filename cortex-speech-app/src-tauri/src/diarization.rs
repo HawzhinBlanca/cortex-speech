@@ -227,6 +227,28 @@ mod tests {
     }
 
     #[test]
+    fn label_chunk_speakers_needs_local_ranges_not_global() {
+        // Round-4 audit: in the streaming path the pipeline passed GLOBAL sample ranges into the
+        // window-local PCM, so every chunk past the first 90s window indexed beyond the buffer and got
+        // NO speaker label. label_chunk_speakers slices `pcm` directly, so it must get LOCAL ranges.
+        let sr = 16000;
+        let mut pcm = tone_pcm(180.0, sr, 1000);
+        pcm.extend(tone_pcm(320.0, sr, 1000)); // 2s of two tones -> non-empty chunks -> embeddings
+        let svc = SpeakerEmbeddingService::new(std::path::Path::new("/nonexistent")); // fbank fallback
+
+        let local_ranges = vec![(0usize, 16_000usize), (16_000, 32_000)];
+        // Global ranges as the buggy streaming path produced them: offset past this window.
+        let base = pcm.len();
+        let global_ranges: Vec<(usize, usize)> = local_ranges.iter().map(|&(s, e)| (base + s, base + e)).collect();
+
+        let with_global = label_chunk_speakers(&pcm, sr, &global_ranges, 8, &svc);
+        assert!(with_global.iter().all(Option::is_none), "global ranges into local pcm drop every label");
+
+        let with_local = label_chunk_speakers(&pcm, sr, &local_ranges, 8, &svc);
+        assert!(with_local.iter().any(Option::is_some), "local ranges produce real speaker labels");
+    }
+
+    #[test]
     fn single_chunk_gets_speaker_label() {
         let pcm = tone_pcm(440.0, 16000, 500);
         let ranges = vec![(0, pcm.len())];

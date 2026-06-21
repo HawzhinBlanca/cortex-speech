@@ -1084,10 +1084,22 @@ impl ProcessingPipeline {
         };
 
         let diarization_labels = if self.settings.enable_diarization {
+            // chunk_ranges are in GLOBAL sample coordinates, but `pcm` is the window-local buffer in
+            // the streaming path (global_base_sample > 0). label_chunk_speakers slices `pcm` directly,
+            // so rebase the ranges to local coords first — exactly like the transcription slice below.
+            // Without this, every chunk past the first 90s window indexes beyond pcm.len(), clamps to
+            // an empty slice, and silently gets NO speaker label. No-op when global_base_sample == 0
+            // (the non-streaming path).
+            let local_ranges: Vec<(usize, usize)> = chunk_ranges
+                .iter()
+                .map(|&(gs, ge)| {
+                    (gs.saturating_sub(global_base_sample), ge.saturating_sub(global_base_sample).min(pcm.len()))
+                })
+                .collect();
             crate::diarization::label_chunk_speakers(
                 pcm,
                 sample_rate,
-                chunk_ranges,
+                &local_ranges,
                 self.settings.max_speakers,
                 embedding_service,
             )
