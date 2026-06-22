@@ -12,6 +12,7 @@
 
   import { onMount, onDestroy, tick } from 'svelte';
   import * as api from './commands';
+  import { t } from './i18n';
   import type { SpeechSegment } from './types';
 
   // ── Props ───────────────────────────────────────────────────────────────────
@@ -34,36 +35,21 @@
   $: pendingCount = queue.filter((s) => !s.humanDecision).length;
 
   // ── Confidence bands ─────────────────────────────────────────────────────────
-  function confidenceBand(conf: number | null | undefined): {
-    label: string;
-    icon: string;
-    color: string;
-  } {
-    if (conf == null)
-      return { label: 'Unknown confidence', icon: '❓', color: 'var(--text-subtle)' };
+  type Translate = (key: string, params?: Record<string, string>) => string;
+  // `tr` ($t) is passed in from the template so the band labels stay reactive to a locale change.
+  function confidenceBand(
+    conf: number | null | undefined,
+    tr: Translate,
+  ): { label: string; icon: string; color: string } {
+    const pct = (c: number) => ({ pct: String(Math.round(c * 100)) });
+    if (conf == null) return { label: tr('inbox.band.unknown'), icon: '❓', color: 'var(--text-subtle)' };
     if (conf >= 0.9)
-      return {
-        label: `AI is very confident (${Math.round(conf * 100)}%) — quick glance 👀`,
-        icon: '✅',
-        color: 'var(--success)',
-      };
+      return { label: tr('inbox.band.veryConfident', pct(conf)), icon: '✅', color: 'var(--success)' };
     if (conf >= 0.75)
-      return {
-        label: `AI is fairly sure (${Math.round(conf * 100)}%) — quick listen 👂`,
-        icon: '🟡',
-        color: 'var(--warning)',
-      };
+      return { label: tr('inbox.band.fairlySure', pct(conf)), icon: '🟡', color: 'var(--warning)' };
     if (conf >= 0.55)
-      return {
-        label: `AI is unsure (${Math.round(conf * 100)}%) — listen carefully ⚠`,
-        icon: '⚠️',
-        color: 'rgb(var(--orange-400-rgb))',
-      };
-    return {
-      label: `AI has low confidence (${Math.round(conf * 100)}%) — careful review needed 🔴`,
-      icon: '🔴',
-      color: 'var(--danger)',
-    };
+      return { label: tr('inbox.band.unsure', pct(conf)), icon: '⚠️', color: 'rgb(var(--orange-400-rgb))' };
+    return { label: tr('inbox.band.low', pct(conf)), icon: '🔴', color: 'var(--danger)' };
   }
 
   // ── Queue loading ─────────────────────────────────────────────────────────────
@@ -73,7 +59,7 @@
       queue = await api.getEscalationQueue(200);
       currentIndex = 0;
     } catch (e) {
-      statusMsg = `Failed to load queue: ${e}`;
+      statusMsg = $t('inbox.status.loadFailed', { err: String(e) });
     } finally {
       isLoading = false;
     }
@@ -84,21 +70,26 @@
   async function triggerJuryPipeline() {
     if (isRunningJury) return;
     isRunningJury = true;
-    statusMsg = '⏳ Running Jury Pipeline...';
+    statusMsg = $t('inbox.status.running');
     try {
       const allSegs = await api.getSegments();
       const targetIds = allSegs.filter((s) => !s.verified).map((s) => s.id);
       if (targetIds.length === 0) {
-        statusMsg = 'ℹ️ No unverified segments to run jury on.';
+        statusMsg = $t('inbox.status.noUnverified');
         isRunningJury = false;
         return;
       }
       const report = await api.runJuryPipeline(targetIds);
       if (!report) throw new Error('Jury pipeline returned no result');
-      statusMsg = `⚡ Jury finished! T0 accepted: ${report.t0AutoAccepted ?? 0}, T1 committed: ${report.t1Committed ?? 0}, T2 committed: ${report.t2Committed ?? 0}, Escalated: ${report.humanInbox ?? 0}`;
+      statusMsg = $t('inbox.status.juryFinished', {
+        t0: String(report.t0AutoAccepted ?? 0),
+        t1: String(report.t1Committed ?? 0),
+        t2: String(report.t2Committed ?? 0),
+        esc: String(report.humanInbox ?? 0),
+      });
       await loadQueue();
     } catch (e) {
-      statusMsg = `❌ Jury pipeline failed: ${e}`;
+      statusMsg = $t('inbox.status.juryFailed', { err: String(e) });
     } finally {
       isRunningJury = false;
     }
@@ -117,13 +108,13 @@
       history.push({ id: cur.id, decision: 'accept', prev: { ...cur } });
       await api.recordHumanDecision(cur.id, 'accept', null);
       queue[idx] = { ...cur, humanDecision: 'accept' };
-      statusMsg = '✅ Accepted';
+      statusMsg = $t('inbox.status.accepted');
       advance();
     } catch (e) {
       // The decision did not persist: drop the phantom undo entry pushed above and
       // tell the reviewer, rather than silently swallowing it (unhandled rejection).
       history.pop();
-      statusMsg = `Failed to accept: ${e}`;
+      statusMsg = $t('inbox.status.acceptFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
     }
@@ -153,11 +144,11 @@
         verdictTranscript: text,
       };
       isEditing = false;
-      statusMsg = '✏️ Edited';
+      statusMsg = $t('inbox.status.edited');
       advance();
     } catch (e) {
       history.pop();
-      statusMsg = `Failed to save edit: ${e}`;
+      statusMsg = $t('inbox.status.editFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
     }
@@ -172,11 +163,11 @@
       history.push({ id: cur.id, decision: 'reject', prev: { ...cur } });
       await api.recordHumanDecision(cur.id, 'reject', null);
       queue[idx] = { ...cur, humanDecision: 'reject' };
-      statusMsg = '❌ Rejected';
+      statusMsg = $t('inbox.status.rejected');
       advance();
     } catch (e) {
       history.pop();
-      statusMsg = `Failed to reject: ${e}`;
+      statusMsg = $t('inbox.status.rejectFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
     }
@@ -184,7 +175,7 @@
 
   function skip() {
     if (!current) return;
-    statusMsg = '⏭ Skipped';
+    statusMsg = $t('inbox.status.skipped');
     advance();
   }
 
@@ -215,11 +206,11 @@
         true,
       );
       queue[idx] = { ...cur, escalated: true };
-      statusMsg = '🚩 Flagged for second pass';
+      statusMsg = $t('inbox.status.flagged');
       advance();
     } catch (e) {
       // flag() records no undo history, so just surface the failure.
-      statusMsg = `Failed to flag: ${e}`;
+      statusMsg = $t('inbox.status.flagFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
     }
@@ -239,13 +230,13 @@
         // If the user accepted seg#5 then scrolled to seg#10, undo should show seg#5.
         currentIndex = idx;
       }
-      statusMsg = '↩ Undone';
+      statusMsg = $t('inbox.status.undone');
     } catch (e) {
       // The decision was NOT cleared — put the history entry back so the undo can be
       // retried, and tell the user instead of failing silently (which previously also
       // dropped the entry, making the undo permanently unretryable).
       history.push(last);
-      statusMsg = `Failed to undo: ${e}`;
+      statusMsg = $t('inbox.status.undoFailed', { err: String(e) });
     }
   }
 
@@ -318,12 +309,12 @@
 </script>
 
 <!-- ── Root container ──────────────────────────────────────────────────────── -->
-<div class="inbox-root" role="main" aria-label="Review Inbox">
+<div class="inbox-root" role="main" aria-label={$t('reviewInbox')}>
   <!-- Header -->
   <div class="inbox-header">
     <div class="inbox-title">
       <span class="inbox-icon">📬</span>
-      <h2>Review Inbox</h2>
+      <h2>{$t('reviewInbox')}</h2>
       {#if pendingCount > 0}
         <span class="inbox-badge">{pendingCount}</span>
       {/if}
@@ -334,54 +325,54 @@
       class="btn btn-primary btn-sm"
       onclick={triggerJuryPipeline}
       disabled={isRunningJury}
-      title="Run full T0->T1->T2 pipeline on all unverified segments"
+      title={$t('inbox.runJuryTitle')}
     >
       {#if isRunningJury}
-        <span class="spinner inline-block" style="width:10px;height:10px;"></span> Running Jury…
+        <span class="spinner inline-block" style="width:10px;height:10px;"></span> {$t('inbox.runningJury')}
       {:else}
-        ⚡ Run Jury
+        ⚡ {$t('inbox.runJury')}
       {/if}
     </button>
 
     <!-- Autonomy Dial -->
-    <div class="autonomy-dial" role="group" aria-label="Autonomy level">
-      {#each [['observe', '👁 Observe'], ['propose', '💡 Propose'], ['act_confirm', '✅ Act+Confirm'], ['act_auto', '🤖 Act Auto']] as [val, label]}
+    <div class="autonomy-dial" role="group" aria-label={$t('inbox.autonomyLevel')}>
+      {#each [['observe', '👁', 'inbox.autonomy.observe'], ['propose', '💡', 'inbox.autonomy.propose'], ['act_confirm', '✅', 'inbox.autonomy.actConfirm'], ['act_auto', '🤖', 'inbox.autonomy.actAuto']] as [val, emoji, key]}
         <button
           class="dial-btn"
           class:active={autonomyLevel === val}
           onclick={() => (autonomyLevel = val as typeof autonomyLevel)}
-          title={val}>{label}</button
+          title={val}>{emoji} {$t(key)}</button
         >
       {/each}
     </div>
 
-    <button class="close-btn" onclick={onClose} aria-label="Close inbox">✕</button>
+    <button class="close-btn" onclick={onClose} aria-label={$t('inbox.close')}>✕</button>
   </div>
 
   {#if isLoading}
     <div class="inbox-loading">
-      <span class="spinner"></span> Loading escalation queue…
+      <span class="spinner"></span> {$t('inbox.loadingQueue')}
     </div>
   {:else if queue.length === 0}
     <div class="inbox-empty">
       <div class="empty-icon">🎉</div>
-      <h3>Inbox zero!</h3>
-      <p>No segments need review right now.</p>
+      <h3>{$t('inbox.zero')}</h3>
+      <p>{$t('inbox.zeroHint')}</p>
       <div style="display: flex; gap: 10px; margin-top: 10px;">
         <button class="btn btn-primary" onclick={triggerJuryPipeline} disabled={isRunningJury}>
-          {isRunningJury ? 'Running Jury...' : '⚡ Run Jury Pipeline'}
+          {isRunningJury ? $t('inbox.runningJury') : '⚡ ' + $t('inbox.runJuryPipeline')}
         </button>
-        <button class="btn btn-secondary" onclick={loadQueue}>Refresh</button>
+        <button class="btn btn-secondary" onclick={loadQueue}>{$t('inbox.refresh')}</button>
       </div>
     </div>
   {:else}
     <div class="inbox-body">
       <!-- Queue Rail -->
-      <nav class="queue-rail" aria-label="Segment queue">
-        <div class="rail-header">Queue ({queue.length})</div>
+      <nav class="queue-rail" aria-label={$t('inbox.segmentQueue')}>
+        <div class="rail-header">{$t('inbox.queue', { n: String(queue.length) })}</div>
         <ul class="rail-list">
           {#each queue as seg, i}
-            {@const band = confidenceBand(seg.agentConfidence)}
+            {@const band = confidenceBand(seg.agentConfidence, $t)}
             <li class="rail-row">
               <button
                 type="button"
@@ -405,8 +396,8 @@
 
       <!-- Focus Card -->
       {#if current}
-        {@const band = confidenceBand(current.agentConfidence)}
-        <article class="focus-card" aria-label="Current segment">
+        {@const band = confidenceBand(current.agentConfidence, $t)}
+        <article class="focus-card" aria-label={$t('inbox.segmentQueue')}>
           <!-- Segment ID + meta -->
           <div class="card-meta">
             <span class="meta-id"><bdi>{current.id.slice(0, 16)}</bdi></span>
@@ -425,14 +416,14 @@
 
           <!-- Hypotheses section (RTL for Kurdish text) -->
           <section class="hyp-section">
-            <h3 class="section-label">Transcription hypotheses</h3>
+            <h3 class="section-label">{$t('inbox.hypotheses')}</h3>
             <div class="hyp-raw" dir="rtl" lang="ckb">
-              <span class="hyp-label-inline">Raw ASR:</span>
+              <span class="hyp-label-inline">{$t('rawAsr')}:</span>
               <span class="hyp-text">{current.rawTranscript}</span>
             </div>
             {#if current.normalizedTranscript && current.normalizedTranscript !== current.rawTranscript}
               <div class="hyp-norm" dir="rtl" lang="ckb">
-                <span class="hyp-label-inline">Normalized:</span>
+                <span class="hyp-label-inline">{$t('normalized')}:</span>
                 <span class="hyp-text">{current.normalizedTranscript}</span>
               </div>
             {/if}
@@ -441,7 +432,7 @@
           <!-- Jury verdict (RTL) -->
           {#if current.verdictTranscript}
             <section class="verdict-section">
-              <h3 class="section-label">🤖 Jury proposes</h3>
+              <h3 class="section-label">🤖 {$t('inbox.juryProposes')}</h3>
               <div class="verdict-text" dir="rtl" lang="ckb">{current.verdictTranscript}</div>
             </section>
           {/if}
@@ -449,9 +440,9 @@
           <!-- Evidence & reasoning -->
           {#if current.rationale || current.evidenceJson}
             <section class="rationale-section">
-              <h3 class="section-label">📋 Jury Rationale & Evidence</h3>
+              <h3 class="section-label">📋 {$t('inbox.rationale')}</h3>
               <details class="rationale-details" open>
-                <summary>Evidence & reasoning</summary>
+                <summary>{$t('inbox.evidenceReasoning')}</summary>
                 {#if current.rationale}
                   <p class="rationale-text">{current.rationale}</p>
                 {/if}
@@ -471,9 +462,7 @@
           <!-- Edit area (shown when e pressed) -->
           {#if isEditing}
             <div class="edit-area">
-              <label class="edit-label" for="edit-textarea"
-                >Edit transcript (Ctrl+Enter to save, Esc to cancel):</label
-              >
+              <label class="edit-label" for="edit-textarea">{$t('inbox.editLabel')}</label>
               <textarea
                 id="edit-textarea"
                 class="edit-textarea"
@@ -484,44 +473,44 @@
                 rows={3}
               ></textarea>
               <div class="edit-actions">
-                <button class="btn btn-primary" onclick={commitEdit}>Save edit (Ctrl+↵)</button>
+                <button class="btn btn-primary" onclick={commitEdit}>{$t('inbox.saveEdit')}</button>
                 <button class="btn btn-secondary" onclick={() => (isEditing = false)}
-                  >Cancel (Esc)</button
+                  >{$t('inbox.cancelEdit')}</button
                 >
               </div>
             </div>
           {/if}
 
           <!-- Verb bar (Prodigy-style) -->
-          <div class="verb-bar" role="group" aria-label="Review actions">
-            <button class="verb-btn accept" onclick={accept} title="Accept (a)" id="inbox-accept">
-              <span class="verb-key">A</span> Accept
+          <div class="verb-bar" role="group" aria-label={$t('inbox.reviewActions')}>
+            <button class="verb-btn accept" onclick={accept} title={$t('inbox.acceptTitle')} id="inbox-accept">
+              <span class="verb-key">A</span> {$t('inbox.accept')}
             </button>
-            <button class="verb-btn edit" onclick={startEdit} title="Edit (e)" id="inbox-edit">
-              <span class="verb-key">E</span> Edit
+            <button class="verb-btn edit" onclick={startEdit} title={$t('inbox.editTitle')} id="inbox-edit">
+              <span class="verb-key">E</span> {$t('inbox.edit')}
             </button>
-            <button class="verb-btn reject" onclick={reject} title="Reject (x)" id="inbox-reject">
-              <span class="verb-key">X</span> Reject
+            <button class="verb-btn reject" onclick={reject} title={$t('inbox.rejectTitle')} id="inbox-reject">
+              <span class="verb-key">X</span> {$t('inbox.reject')}
             </button>
-            <button class="verb-btn skip" onclick={skip} title="Skip (space)" id="inbox-skip">
-              <span class="verb-key">⎵</span> Skip
+            <button class="verb-btn skip" onclick={skip} title={$t('inbox.skipTitle')} id="inbox-skip">
+              <span class="verb-key">⎵</span> {$t('inbox.skip')}
             </button>
             <button
               class="verb-btn flag"
               onclick={flag}
-              title="Flag for second pass (f)"
+              title={$t('inbox.flagTitle')}
               id="inbox-flag"
             >
-              <span class="verb-key">F</span> Flag
+              <span class="verb-key">F</span> {$t('inbox.flag')}
             </button>
             <button
               class="verb-btn undo"
               onclick={undo}
-              title="Undo (⌫)"
+              title={$t('inbox.undoTitle')}
               id="inbox-undo"
               disabled={history.length === 0}
             >
-              <span class="verb-key">⌫</span> Undo
+              <span class="verb-key">⌫</span> {$t('undo')}
             </button>
           </div>
 
