@@ -59,7 +59,7 @@ impl ExportSegmentRecord {
 
 /// The published reference for an audio file: just its basename, never the curator's
 /// absolute path (which leaks the OS username and directory layout into a shared dataset).
-fn export_audio_ref(audio_path: &str) -> &str {
+pub(crate) fn export_audio_ref(audio_path: &str) -> &str {
     audio_path.rsplit(['/', '\\']).next().unwrap_or(audio_path)
 }
 
@@ -172,8 +172,41 @@ fn ready_agentic_huggingface_segment_ids(db: &Database) -> AppResult<BTreeSet<St
     Ok(report.segment_ids.into_iter().collect())
 }
 
+/// Remove any segment that matches a held-out gold clip (by audio_path OR content hash) from an
+/// export set. EVERY training-corpus export must run this — the plain JSON/JSONL/CSV/Parquet export
+/// and the production bundle that wraps it, not just the HuggingFace export — or a clip registered as
+/// a holdout (the WER/CER eval reference) that also exists as an ordinary training-ready segment
+/// leaks into the published training data and contaminates the very eval set the promotion gate
+/// measures against. Fail-closed: a path match excludes a held-out clip even when its file is missing
+/// (its content can no longer be re-hashed); a hash match also catches the same content at any path.
+pub(crate) fn exclude_holdout_segments(
+    db: &Database,
+    segments: Vec<crate::db::SpeechSegment>,
+) -> AppResult<Vec<crate::db::SpeechSegment>> {
+    let holdout = crate::jury::learning::holdout_content_hashes(db)?;
+    let holdout_paths = crate::jury::learning::holdout_audio_paths(db)?;
+    Ok(segments
+        .into_iter()
+        .filter(|seg| {
+            let path = std::path::Path::new(&seg.audio_path);
+            let held_out = holdout_paths.contains(&seg.audio_path)
+                || (path.exists()
+                    && crate::pipeline::source_audio_identity(path)
+                        .map(|id| holdout.contains(&id.content_hash))
+                        .unwrap_or(false));
+            if held_out {
+                tracing::warn!("Excluding segment {} from export: matches holdout gold audio", seg.id);
+            }
+            !held_out
+        })
+        .collect())
+}
+
 pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportFormat) -> AppResult<()> {
-    let segments = db.get_segments(None)?;
+    // Drop held-out gold segments BEFORE counting or writing any format (covers JSON/JSONL/CSV/Parquet
+    // and the production bundle that delegates here) — closes the eval-on-train leak the HF export
+    // already guards against.
+    let segments = exclude_holdout_segments(db, db.get_segments(None)?)?;
     let total_duration: i64 = segments.iter().map(|s| s.duration_ms).sum();
     let verified = segments.iter().filter(|s| s.verified).count();
 
@@ -463,30 +496,11 @@ pub fn export_huggingface_dataset(
     let val_dir = data_dir.join("validation");
     let test_dir = data_dir.join("test");
 
-    let segments = db.get_segments(None)?;
-    // Exclude held-out gold audio from the TRAINING export — the same content-hash guard the DPO and
-    // LM-corpus exports already use. Without it, a clip registered as a holdout (for WER/CER eval)
-    // that ALSO exists as a normal training-ready segment leaks into data/train, contaminating the
-    // very eval set the promotion gate measures against.
-    let holdout = crate::jury::learning::holdout_content_hashes(db)?;
-    let holdout_paths = crate::jury::learning::holdout_audio_paths(db)?;
-    let segments: Vec<_> = segments
-        .into_iter()
-        .filter(|seg| {
-            let path = std::path::Path::new(&seg.audio_path);
-            // Fail-closed: path match excludes a held-out clip even when its file is missing (so its
-            // content can no longer be re-hashed); hash match also catches the same content at any path.
-            let held_out = holdout_paths.contains(&seg.audio_path)
-                || (path.exists()
-                    && crate::pipeline::source_audio_identity(path)
-                        .map(|id| holdout.contains(&id.content_hash))
-                        .unwrap_or(false));
-            if held_out {
-                tracing::warn!("Excluding segment {} from HF export: matches holdout gold audio", seg.id);
-            }
-            !held_out
-        })
-        .collect();
+    // Exclude held-out gold audio from the TRAINING export — the same fail-closed content-hash guard
+    // the plain export, DPO, and LM-corpus exports use. Without it, a clip registered as a holdout
+    // (for WER/CER eval) that ALSO exists as a normal training-ready segment leaks into data/train,
+    // contaminating the very eval set the promotion gate measures against.
+    let segments = exclude_holdout_segments(db, db.get_segments(None)?)?;
     if segments.is_empty() {
         // Nothing to export — a true NO-OP that PRESERVES any prior export rather than wiping it
         // (re-exporting with zero training-ready segments must not destroy a previous good dataset).
@@ -1526,6 +1540,51 @@ mod tests {
             .collect();
         assert!(all_csv.contains("keep-1"), "the non-holdout segment must still be exported");
         assert!(!all_csv.contains("hold-1"), "the holdout gold clip must NOT leak into any split");
+    }
+
+    #[test]
+    fn plain_export_excludes_holdout_gold_audio() {
+        // Round-22 #1: the plain JSON/JSONL/CSV/Parquet export (and the production bundle that wraps
+        // it) must apply the SAME holdout exclusion as the HF export, or a clip registered as a
+        // holdout WER/CER reference leaks into the published training set and contaminates the gate.
+        let db_tmp = NamedTempFile::new().unwrap();
+        let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let write_wav = |name: &str, val: i16| {
+            let p = tmp_dir.path().join(name);
+            let mut w = hound::WavWriter::create(&p, spec).unwrap();
+            for _ in 0..16000 {
+                w.write_sample(val).unwrap();
+            }
+            w.finalize().unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let holdout_path = write_wav("holdout.wav", 0);
+        let keep_path = write_wav("keep.wav", 1000);
+        let mut hseg = sample_segment("hold-1");
+        hseg.audio_path = holdout_path.clone();
+        db.insert_segment(&hseg).unwrap();
+        let mut kseg = sample_segment("keep-1");
+        kseg.audio_path = keep_path;
+        db.insert_segment(&kseg).unwrap();
+        crate::eval::import_gold_segments(
+            &db,
+            vec![crate::eval::GoldSegmentInput { audio_path: holdout_path, reference: "ref".into(), is_holdout: true }],
+        )
+        .unwrap();
+
+        let out = tmp_dir.path().join("dataset.csv");
+        export_dataset(&db, &out, &ExportFormat::Csv).unwrap();
+        let body = std::fs::read_to_string(&out).unwrap();
+        assert!(body.contains("keep-1"), "the non-holdout segment must still be exported");
+        assert!(!body.contains("hold-1"), "the holdout gold clip must NOT leak into the plain export");
     }
 
     #[test]
