@@ -216,6 +216,11 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
         let arabic_char = char::from_u32(0x0660 + i as u32).unwrap();
         result = result.replace(arabic_char, &latin.to_string());
     }
+    // Native Sorani/Persian-script number separators: ARABIC DECIMAL SEPARATOR U+066B (٫) and ARABIC
+    // THOUSANDS SEPARATOR U+066C (٬). The digit-glyph folding above stops at U+0669, so these would
+    // survive and split a number mid-stream (e.g. ٣٫١٤ -> "3٫14" parses as two unrelated numbers with a
+    // stray separator token). Fold them to the ASCII forms DIGITS_RE already understands (round-22 #8).
+    result = result.replace('\u{066B}', ".").replace('\u{066C}', ",");
 
     if !verbalize {
         return result;
@@ -477,6 +482,21 @@ mod tests {
         assert_eq!(n.normalize("007"), "سفر سفر حەوت");
         // Plain numbers still verbalize as before.
         assert_eq!(n.normalize("123"), "سەد و بیست و سێ");
+    }
+
+    #[test]
+    fn native_arabic_number_separators_fold_like_ascii() {
+        // Round-22 #8: ARABIC DECIMAL SEPARATOR U+066B (٫) and ARABIC THOUSANDS SEPARATOR U+066C (٬) —
+        // the separators actually used inside native Sorani/Persian-script numbers — used to survive
+        // un-folded and split a number mid-stream. They must now normalize identically to the ASCII
+        // '.'/',' forms, with no stray separator token leaking into the verbalized output.
+        let n = SoraniNormalizer::new();
+        let dec = "\u{0663}\u{066B}\u{0661}\u{0664}"; // ٣٫١٤  (Arabic digits + U+066B decimal sep)
+        let grp = "\u{0663}\u{066C}\u{0660}\u{0660}\u{0660}"; // ٣٬٠٠٠ (Arabic digits + U+066C thousands sep)
+        assert_eq!(n.normalize(dec), n.normalize("3.14"), "native decimal separator must fold like ASCII '.'");
+        assert_eq!(n.normalize(grp), n.normalize("3,000"), "native thousands separator must fold like ASCII ','");
+        assert!(!n.normalize(dec).contains('\u{066B}'), "no stray U+066B leaks");
+        assert!(!n.normalize(grp).contains('\u{066C}'), "no stray U+066C leaks");
     }
 
     #[test]
