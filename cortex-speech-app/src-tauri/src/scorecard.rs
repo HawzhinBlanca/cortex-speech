@@ -76,9 +76,18 @@ pub struct BaselineComparison {
     /// Human-readable description of any per-condition SLICE on which the challenger REGRESSES vs the
     /// baseline (e.g. a length class), even though the aggregate improved. A non-empty list blocks
     /// promotion: shipping a model that is better on average but worse on a slice trades one
-    /// population's accuracy for another. Empty = no slice regressed (or too little data to slice).
+    /// population's accuracy for another. Empty means no slice regressed — but ONLY among the slices
+    /// that had enough data to be evaluated; see [`evaluated_slices`](Self::evaluated_slices).
     #[serde(default)]
     pub slice_regressions: Vec<String>,
+    /// How many length slices actually had enough paired data (>= `MIN_SLICE_SEGS`) to be EVALUATED
+    /// for regression. This disambiguates the two cases an empty `slice_regressions` used to conflate:
+    /// "all slices evaluated, none regressed" (`evaluated_slices > 0`) vs "no slice could be evaluated
+    /// at all" (`evaluated_slices == 0`). The promotion gate treats the latter as UNVERIFIED — not an
+    /// affirmative slice-gate pass — so a small gold set cannot launder unverified slice coverage into
+    /// a green promotion.
+    #[serde(default)]
+    pub evaluated_slices: usize,
 }
 
 /// A complete, reproducible scorecard.
@@ -245,10 +254,12 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
     const MIN_SLICE_SEGS: usize = 5;
     const SLICE_REGRESSION_TOL: f64 = 0.05; // absolute WER
     let mut slice_regressions = Vec::new();
+    let mut evaluated_slices = 0usize;
     for (name, (s_errs, b_errs)) in &by_slice {
         if s_errs.len() < MIN_SLICE_SEGS {
             continue; // too few to slice without noise
         }
+        evaluated_slices += 1;
         let s_wer = micro_rate(s_errs);
         let b_wer = micro_rate(b_errs);
         if s_wer > b_wer + SLICE_REGRESSION_TOL {
@@ -270,6 +281,7 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
         significant_at_05: significant,
         beats_baseline: significant && system_micro_wer < baseline_micro_wer,
         slice_regressions,
+        evaluated_slices,
     }
 }
 
