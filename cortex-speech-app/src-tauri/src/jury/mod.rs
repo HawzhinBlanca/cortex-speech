@@ -183,15 +183,28 @@ pub fn run_t0_gate(
     //    the gate compared it against irt_confidence-based nonconformity — a different score
     //    distribution under the same cutoff, which silently VOIDED the coverage guarantee.
     //    Calibrate PER SNR/condition bucket — a single global threshold is invalid across studio,
-    //    field and noisy recordings; a bucket with too little verified data falls back to the global
-    //    threshold so calibration degrades gracefully on small datasets.
+    //    field and noisy recordings.
+    //
+    //    Round-21 #2: a bucket with too little verified data to calibrate is NOT given the global
+    //    (clean-dominated) threshold as a fallback. Borrowing a cutoff calibrated on a DIFFERENT
+    //    condition advertises a per-condition coverage guarantee we cannot honor — a clean-calibrated
+    //    threshold is meaningless for noisy audio (the score↔CER relationship differs by condition).
+    //    Instead, an uncalibrated bucket is flagged, and every segment in it is fail-closed →
+    //    escalated to human review (see the routing loop). And because calibrating up to
+    //    N_SNR_BUCKETS separate thresholds inflates the family-wise miscoverage ~N×, each bucket's
+    //    confidence level is Bonferroni-tightened so the JOINT per-condition guarantee across all
+    //    conditions still holds at `T0_CONFIDENCE_LEVEL`.
+    //
     // The conformal guarantee requires the threshold to be calibrated on the SAME nonconformity score
     // the gate compares against — including the SAME fallback when a segment has no IRT confidence (a
     // no-hypothesis row). Calibration (here) and the gate (below) must use ONE shared default, or they
     // place the same condition at two different points of the score distribution and void coverage.
     // 0.0 (⇒ maximal nonconformity ⇒ escalate) is the safe default for a no-signal segment.
     const MISSING_IRT_CONFIDENCE: f64 = 0.0;
-    let mut global_scored: Vec<(f64, f64)> = Vec::new();
+    const T0_TARGET_ERROR: f64 = 0.05;
+    const T0_CONFIDENCE_LEVEL: f64 = 0.90;
+    // Bonferroni split of the miscoverage budget across the per-condition buckets.
+    let bucket_confidence = 1.0 - (1.0 - T0_CONFIDENCE_LEVEL) / conformal::N_SNR_BUCKETS as f64;
     let mut bucket_scored: [Vec<(f64, f64)>; conformal::N_SNR_BUCKETS] = std::array::from_fn(|_| Vec::new());
     for s in &all_verified {
         let Some(ref_text) = s.annotated_transcript.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
@@ -200,17 +213,13 @@ pub fn run_t0_gate(
         let irt_conf = irt_results.segment_confidences.get(&s.id).copied().unwrap_or(MISSING_IRT_CONFIDENCE);
         let score = conformal::nonconformity(irt_conf, s.ctc_score);
         let cer = crate::wer::compute_cer(ref_text, &s.raw_transcript).min(1.0);
-        global_scored.push((score, cer));
         bucket_scored[conformal::snr_bucket(s.snr_db)].push((score, cer));
     }
-    let (global_threshold, _gb, _gc) = conformal::calibrate_threshold(&global_scored, 0.05, 0.90);
+    let mut bucket_calibrated = [false; conformal::N_SNR_BUCKETS];
     let bucket_thresholds: [f64; conformal::N_SNR_BUCKETS] = std::array::from_fn(|b| {
-        let (t, _bb, is_cal) = conformal::calibrate_threshold(&bucket_scored[b], 0.05, 0.90);
-        if is_cal {
-            t
-        } else {
-            global_threshold
-        }
+        let (t, _bound, is_cal) = conformal::calibrate_threshold(&bucket_scored[b], T0_TARGET_ERROR, bucket_confidence);
+        bucket_calibrated[b] = is_cal;
+        t
     });
 
     // 4. Route and collect decisions
@@ -231,9 +240,21 @@ pub fn run_t0_gate(
 
         let irt_confidence = irt_results.segment_confidences.get(&seg.id).copied().unwrap_or(MISSING_IRT_CONFIDENCE);
 
-        // Gate this segment against its own acoustic-condition bucket's threshold.
-        let seg_threshold = bucket_thresholds[conformal::snr_bucket(seg.snr_db)];
-        let base_decision = t0_gate_segment(seg, &seg_hyps, &consensus, irt_confidence, seg_threshold);
+        // Gate this segment against its OWN acoustic-condition bucket — but only if that bucket is
+        // conformally calibrated. Round-21 #2: an uncalibrated bucket carries no coverage guarantee,
+        // so fail closed (escalate) rather than borrow a threshold from a different, clean-dominated
+        // condition. (Under ActAuto the gate is bypassed downstream anyway; this hardens the default
+        // ActConfirm path, where the threshold actually has teeth.)
+        let bucket = conformal::snr_bucket(seg.snr_db);
+        let base_decision = if bucket_calibrated[bucket] {
+            t0_gate_segment(seg, &seg_hyps, &consensus, irt_confidence, bucket_thresholds[bucket])
+        } else {
+            T0Decision::EscalateToT1 {
+                segment_id: seg.id.clone(),
+                hypotheses: seg_hyps.clone(),
+                disagreement_score: 1.0 - irt_confidence,
+            }
+        };
         // The Autonomy Dial decides whether the gate may auto-commit.
         let decision = apply_autonomy(base_decision, autonomy, &consensus, &seg_hyps, irt_confidence);
 
@@ -750,5 +771,30 @@ mod tests {
         let act = run_t0_gate(&db, &["s-dial".to_string()], &AutonLevel::ActConfirm).unwrap();
         assert_eq!(act.escalated, 1);
         assert_eq!(db.get_segment_by_id("s-dial").unwrap().unwrap().verdict.as_deref(), Some("escalated"));
+    }
+
+    #[test]
+    fn run_t0_gate_fails_closed_when_no_snr_bucket_is_calibrated() {
+        // Round-21 #2: a clean, high-confidence, TWO-recognizer segment (snr_db None ⇒ not poor-quality)
+        // that would auto-accept against a borrowed cold-start cutoff. With too little verified data to
+        // calibrate ANY SNR bucket, the gate must fail closed (escalate) rather than auto-accept against
+        // an uncalibrated/clean-dominated threshold borrowed from another condition.
+        use crate::settings::AutonLevel;
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&make_seg("s-uncal", "کوردستان")).unwrap(); // snr_db None → unknown bucket (4)
+        for (m, t) in [("omniasr-ctc-300m", "کوردستان"), ("omniasr-ctc-1b", "کوردستان")] {
+            db.insert_hypothesis(&SegmentHypothesis {
+                segment_id: "s-uncal".into(),
+                model_id: m.into(),
+                transcript: t.into(),
+                confidence: Some(0.95),
+            })
+            .unwrap();
+        }
+        let report = run_t0_gate(&db, &["s-uncal".to_string()], &AutonLevel::ActConfirm).unwrap();
+        assert_eq!(report.auto_accepted, 0, "no calibrated bucket → nothing may auto-accept");
+        assert_eq!(report.escalated, 1, "the segment fails closed to human review");
+        assert!(matches!(report.decisions[0], T0Decision::EscalateToT1 { .. }));
     }
 }
