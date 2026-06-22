@@ -870,10 +870,11 @@
     try {
       const updatedSeg = { ...seg, verified: nextVerified };
       await api.updateSegment(updatedSeg);
-      // Round-25 #9: re-apply the persisted value to the CURRENT row AFTER the await. A background
-      // segments.load() (wsl-status / batch / import completion) can resolve mid-flight with pre-write
-      // data and clobber the optimistic flip; without this re-sync the DB says verified while the UI
-      // shows pending, and re-clicking would flip the DB back — corrupting the human verification state.
+      // Invalidate any in-flight load so its stale pre-write data won't clobber the verified write.
+      // This closes the race window: a background load dispatched before this write will check its
+      // generation and return early rather than applying pre-write data.
+      segments.bumpLoadGeneration();
+      // Then re-apply verified state for consistency (in case a load started between optimize and bump).
       segments.update((list) =>
         list.map((s) => (s.id === seg.id ? { ...s, verified: nextVerified } : s)),
       );
