@@ -526,11 +526,14 @@ pub fn import_audio_file(
                 let adjudication_result = if let Some(app_state) = app_clone.try_state::<AppState>() {
                     let settings = app_state.lock_settings().clone();
                     let agentic_readiness = agentic_readiness_snapshot_for_state(&app_state, &settings);
-                    let db = app_state.lock_db();
                     let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&settings);
                     report_options.agent_run_id = Some(agent_run_id.clone());
                     report_options.agentic_readiness = Some(agentic_readiness);
-                    match run_jury_pipeline_core(&db, &settings, segment_ids.clone()) {
+                    // Dedicated connection across the jury + report write, so the global db Mutex is not
+                    // held across the jury's cloud T2 network calls (which would freeze every other DB
+                    // command during a single-file import). See with_jury_db.
+                    with_jury_db(&app_state, |db| {
+                    match run_jury_pipeline_core(db, &settings, segment_ids.clone()) {
                         Ok(jury_report) => {
                             let completion_detail = format!(
                                 "Reference commits: {}; review queue: {}",
@@ -551,7 +554,7 @@ pub fn import_audio_file(
                                 },
                             );
                             crate::runs::record_agent_import_report_with_options(
-                                &db,
+                                db,
                                 "file",
                                 &source_paths,
                                 &segment_ids,
@@ -582,7 +585,7 @@ pub fn import_audio_file(
                             let mut message =
                                 format!("Post-import jury adjudication failed after single-file import: {error}");
                             if let Err(report_error) = crate::runs::record_agent_import_report_with_options(
-                                &db,
+                                db,
                                 "file",
                                 &source_paths,
                                 &segment_ids,
@@ -610,6 +613,7 @@ pub fn import_audio_file(
                             Err(message)
                         }
                     }
+                    })
                 } else {
                     let message = "App state unavailable for post-import jury adjudication".to_string();
                     emit_agent_stage_event(
@@ -866,9 +870,11 @@ pub fn batch_transcribe(
 
         if !transcribed_ids.is_empty() {
             if let Some(app_state) = app_clone.try_state::<AppState>() {
-                let db = app_state.lock_db();
                 let settings = app_state.lock_settings().clone();
-                if let Err(error) = run_jury_pipeline_core(&db, &settings, transcribed_ids) {
+                // Dedicated connection: don't hold the global db Mutex across the jury network calls.
+                if let Err(error) =
+                    with_jury_db(&app_state, |db| run_jury_pipeline_core(db, &settings, transcribed_ids))
+                {
                     log_jury_pipeline_failure("batch transcription", &error);
                 }
             }
@@ -3067,6 +3073,32 @@ fn has_final_machine_verdict(seg: &crate::db::SpeechSegment) -> bool {
     seg.verdict.as_deref().map(|verdict| !verdict.trim().is_empty()).unwrap_or(false) && !seg.escalated
 }
 
+/// Run `f` with a database handle that does NOT keep the global `AppState` db Mutex locked for the
+/// duration of the call. `run_jury_pipeline_core` interleaves DB reads/writes with (potentially many)
+/// cloud T2 network round-trips in a per-segment loop; passing the shared, locked handle would hold
+/// the global Mutex across every `listen_and_judge`, freezing every other DB-touching command
+/// app-wide for the whole adjudication.
+///
+/// To avoid that, this opens a SECOND, dedicated connection to the same database file and runs `f`
+/// against it — SQLite WAL + `busy_timeout` let the two connections coexist, and all writes land in
+/// the same file, so verdicts persist exactly as before. It falls back to the shared, locked handle
+/// for an in-memory database (tests can't share `:memory:` across connections, and that path has cloud
+/// off so there is no network call to block on) or in the rare event the dedicated open fails.
+fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) -> R) -> R {
+    let db_path = { app_state.lock_db().path().to_string() };
+    if db_path != ":memory:" {
+        match crate::db::Database::open(&db_path) {
+            Ok(db) => return f(&db),
+            Err(e) => tracing::warn!(
+                "Jury dedicated db connection open failed ({e}); using the shared handle \
+                 (other DB commands may pause during adjudication)"
+            ),
+        }
+    }
+    let db = app_state.lock_db();
+    f(&db)
+}
+
 pub fn run_jury_pipeline_core(
     db: &crate::db::Database,
     settings: &crate::settings::AppSettings,
@@ -3339,9 +3371,10 @@ pub fn run_jury_pipeline_core(
 #[tauri::command]
 pub fn run_jury_pipeline(state: State<'_, AppState>, segment_ids: Vec<String>) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("run_jury_pipeline")?;
-    let db = state.lock_db();
     let settings = state.lock_settings().clone();
-    run_jury_pipeline_core(&db, &settings, segment_ids)
+    // Run on a dedicated connection so the global db Mutex is not held across the jury's cloud T2
+    // network calls (which would freeze the whole app). See with_jury_db.
+    with_jury_db(&state, |db| run_jury_pipeline_core(db, &settings, segment_ids))
 }
 
 /// `run_t2_for_segment` — run Gemini audio judge on a single segment directly.
@@ -3371,34 +3404,43 @@ pub fn run_t2_for_segment(
         return Err("Gemini API key is required for T2.".into());
     }
 
-    let db = state.lock_db();
-    let seg = db
-        .get_segment_by_id(&segment_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Segment not found: {segment_id}"))?;
+    // Gather every DB input under a BRIEF lock, then drop it before listen_and_judge. Holding the
+    // global AppState db Mutex across the cloud T2 round-trip (n_samples Gemini audio calls) would
+    // freeze every other DB-touching command app-wide for the whole network call. The lock is
+    // re-acquired only for the final verdict write below.
+    let (audio_b64, hyps, reference_report, t2_evidence, few_shots) = {
+        let db = state.lock_db();
+        let seg = db
+            .get_segment_by_id(&segment_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Segment not found: {segment_id}"))?;
 
-    // Base64-encode only the segment span for chunked long-form sources.
-    let audio_b64 = crate::agentic::segment_audio_as_wav_base64(&seg)
-        .map_err(|e| format!("Cannot prepare segment audio '{}': {e}", seg.audio_path))?;
+        // Base64-encode only the segment span for chunked long-form sources.
+        let audio_b64 = crate::agentic::segment_audio_as_wav_base64(&seg)
+            .map_err(|e| format!("Cannot prepare segment audio '{}': {e}", seg.audio_path))?;
 
-    // Build a single hypothesis from raw transcript (T2 will hear the audio and judge)
-    let mut hyps = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
-    if hyps.is_empty() {
-        hyps.push(crate::db::SegmentHypothesis {
-            segment_id: segment_id.clone(),
-            model_id: "asr".into(),
-            transcript: seg.raw_transcript.clone(),
-            confidence: seg.confidence,
-        });
-    }
+        // Build a single hypothesis from raw transcript (T2 will hear the audio and judge)
+        let mut hyps = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
+        if hyps.is_empty() {
+            hyps.push(crate::db::SegmentHypothesis {
+                segment_id: segment_id.clone(),
+                model_id: "asr".into(),
+                transcript: seg.raw_transcript.clone(),
+                confidence: seg.confidence,
+            });
+        }
 
-    let mut duration_cache = std::collections::HashMap::new();
-    let mut identity_cache = std::collections::HashMap::new();
-    let reference_report =
-        reference_selection_for_segment(&db, &settings, &seg, &hyps, &mut duration_cache, &mut identity_cache)?;
-    let t2_evidence = reference_report.as_ref().map(reference_selection_evidence).into_iter().collect::<Vec<_>>();
+        let mut duration_cache = std::collections::HashMap::new();
+        let mut identity_cache = std::collections::HashMap::new();
+        let reference_report =
+            reference_selection_for_segment(&db, &settings, &seg, &hyps, &mut duration_cache, &mut identity_cache)?;
+        let t2_evidence =
+            reference_report.as_ref().map(reference_selection_evidence).into_iter().collect::<Vec<_>>();
 
-    let few_shots = crate::jury::get_few_shot_examples(&db, &segment_id, 5).map_err(|e| e.to_string())?;
+        let few_shots = crate::jury::get_few_shot_examples(&db, &segment_id, 5).map_err(|e| e.to_string())?;
+        (audio_b64, hyps, reference_report, t2_evidence, few_shots)
+    };
+
     let result = crate::jury::t2_listener::listen_and_judge(
         &audio_b64,
         &hyps,
@@ -3409,7 +3451,7 @@ pub fn run_t2_for_segment(
         n_samples,
     );
 
-    // If T2 produced a verdict, write it to the DB automatically
+    // If T2 produced a verdict, write it to the DB automatically (re-acquire the lock briefly).
     if let Some(ref verdict) = result.verdict {
         let evidence_payload = match &reference_report {
             Some(report) => serde_json::json!({
@@ -3420,16 +3462,18 @@ pub fn run_t2_for_segment(
         };
         let ev_json = serde_json::to_string(&evidence_payload)
             .map_err(|e| format!("Failed to serialize T2 evidence for {segment_id}: {e}"))?;
-        db.write_segment_verdict(
-            &segment_id,
-            "jury_accept",
-            Some(&verdict.transcript),
-            Some(&verdict.reason),
-            Some(ev_json.as_str()),
-            Some(verdict.confidence),
-            false,
-        )
-        .map_err(|e| e.to_string())?;
+        state
+            .lock_db()
+            .write_segment_verdict(
+                &segment_id,
+                "jury_accept",
+                Some(&verdict.transcript),
+                Some(&verdict.reason),
+                Some(ev_json.as_str()),
+                Some(verdict.confidence),
+                false,
+            )
+            .map_err(|e| e.to_string())?;
     }
 
     Ok(result)
