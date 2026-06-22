@@ -672,9 +672,16 @@
     }
   }
 
+  // Round-25 #10: a synchronous re-entry guard that covers the window BEFORE isProcessing is set —
+  // i.e. while the native picker and the (awaited) agentic-readiness IPC are pending. Without it, the
+  // Ctrl+O/Ctrl+I shortcuts (not gated by DOM state) could fire a second import that the backend then
+  // rejects with a confusing "Import already in progress" toast.
+  let importStarting = false;
+
   async function handleOpenFile() {
-    if ($isProcessing) return;
+    if ($isProcessing || importStarting) return;
     if (!requireDesktopRuntime()) return;
+    importStarting = true;
     try {
       const path = await api.openAudioFile();
       if (!path) return;
@@ -694,12 +701,15 @@
       pipelinePhase.set('idle');
       statusMessage.set($t('ready'));
       endOperation('open-file');
+    } finally {
+      importStarting = false;
     }
   }
 
   async function handleImport() {
-    if ($isProcessing) return;
+    if ($isProcessing || importStarting) return;
     if (!requireDesktopRuntime()) return;
+    importStarting = true;
     startOperation('import');
     try {
       await warnAgenticReadinessBeforeImport();
@@ -721,6 +731,8 @@
       pipelineTotal.set(0);
       filesProcessed.set(0);
       endOperation('import');
+    } finally {
+      importStarting = false;
     }
   }
 
@@ -858,6 +870,13 @@
     try {
       const updatedSeg = { ...seg, verified: nextVerified };
       await api.updateSegment(updatedSeg);
+      // Round-25 #9: re-apply the persisted value to the CURRENT row AFTER the await. A background
+      // segments.load() (wsl-status / batch / import completion) can resolve mid-flight with pre-write
+      // data and clobber the optimistic flip; without this re-sync the DB says verified while the UI
+      // shows pending, and re-clicking would flip the DB back — corrupting the human verification state.
+      segments.update((list) =>
+        list.map((s) => (s.id === seg.id ? { ...s, verified: nextVerified } : s)),
+      );
       await historyStore.refresh();
     } catch (e) {
       // Revert Svelte store state on error
