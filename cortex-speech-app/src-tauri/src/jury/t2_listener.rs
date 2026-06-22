@@ -205,12 +205,41 @@ fn majority_vote(samples: &[GeminiSample]) -> Option<(String, usize)> {
 /// ASR actually heard. A real correction is a small edit (low CER); only gross divergence is blocked.
 const GEMINI_MAX_EDIT_FROM_HYP: f64 = 0.6;
 
-/// Whether a Gemini verdict is a plausible audio-grounded post-edit rather than a hallucination: it
-/// must sit within [`GEMINI_MAX_EDIT_FROM_HYP`] CER of at least one local hypothesis. With no local
-/// hypotheses to ground against, it cannot be validated, so it is allowed (the gate is upstream).
+/// A winner shorter than this fraction of the LONGEST local hypothesis is treated as a truncated /
+/// degenerate output, not a faithful post-edit. Without this floor, a truncated Gemini transcript can
+/// sneak past the CER gate by matching a SHORT partial hypothesis at ~0 CER (min-over-hypotheses).
+const GEMINI_MIN_LEN_FRACTION_OF_HYP: f64 = 0.5;
+
+/// Whether a Gemini verdict is a plausible audio-grounded post-edit rather than a hallucination.
+///
+/// Two defenses, because the naive "within CER of the NEAREST hypothesis" check is exploitable: a
+/// truncated output (e.g. a short prefix) matches any short/degenerate partial hypothesis at ~0 CER
+/// and is falsely accepted. So:
+///  1. Length floor — the winner must be at least [`GEMINI_MIN_LEN_FRACTION_OF_HYP`] of the LONGEST
+///     local hypothesis (the best estimate of true content length); a far-shorter winner is rejected
+///     outright as truncation.
+///  2. Substantive anchor — CER is measured only against hypotheses that are themselves at least half
+///     the longest, so a short degenerate partial cannot serve as the grounding anchor.
+///
+/// With no local hypotheses it cannot be validated, so it is allowed (the gate is upstream).
 fn is_grounded_post_edit(winner: &str, hypotheses: &[SegmentHypothesis]) -> bool {
-    let min_cer =
-        hypotheses.iter().map(|h| crate::wer::compute_cer(&h.transcript, winner)).fold(f64::INFINITY, f64::min);
+    let max_hyp_len = hypotheses.iter().map(|h| h.transcript.chars().count()).max().unwrap_or(0);
+    if max_hyp_len == 0 {
+        return true; // no local hypotheses to ground against; the gate is upstream
+    }
+    // Defense 1: truncation guard against the longest (most complete) local hypothesis.
+    let winner_len = winner.chars().count();
+    if (winner_len as f64) < GEMINI_MIN_LEN_FRACTION_OF_HYP * (max_hyp_len as f64) {
+        return false;
+    }
+    // Defense 2: ground only against SUBSTANTIVE hypotheses (>= half the longest). The longest
+    // hypothesis itself always qualifies, so the filtered set is never empty when `max_hyp_len > 0`.
+    let min_substantive_len = max_hyp_len.div_ceil(2);
+    let min_cer = hypotheses
+        .iter()
+        .filter(|h| h.transcript.chars().count() >= min_substantive_len)
+        .map(|h| crate::wer::compute_cer(&h.transcript, winner))
+        .fold(f64::INFINITY, f64::min);
     !min_cer.is_finite() || min_cer <= GEMINI_MAX_EDIT_FROM_HYP
 }
 
@@ -290,48 +319,84 @@ pub fn listen_and_judge(
                 error: None,
             }
         }
-        None => {
-            let judge_a_transcript = samples.first().map(|s| s.transcript.as_str()).unwrap_or("");
-            let judge_b_transcript = hypotheses
-                .iter()
-                .find(|h| h.model_id == "omniasr-ctc-1b")
-                .or_else(|| hypotheses.get(1))
-                .or_else(|| hypotheses.first())
-                .map(|h| h.transcript.as_str())
-                .unwrap_or("");
-            let judge_a_swapped = samples.get(1).map(|s| s.transcript.as_str()).unwrap_or(judge_a_transcript);
-            let judge_b_swapped = judge_b_transcript;
+        None => resolve_debate_fallback(&samples, hypotheses, t1_evidence),
+    }
+}
 
-            let debate_res = crate::jury::debate::adjudicate(
-                judge_a_transcript,
-                judge_b_transcript,
-                judge_a_swapped,
-                judge_b_swapped,
-            );
+/// Resolve the debate-tier fallback when self-consistency produced no majority. Pure and testable
+/// (no network): decides accept-vs-escalate from the surviving Gemini `samples` and the local
+/// `hypotheses`.
+///
+/// The debate tier's swap-stability guard is only meaningful with at least TWO independent Gemini
+/// samples: `judge_a_swapped` must be a genuinely DIFFERENT sample, not a self-referential fallback
+/// to `judge_a`. With a single surviving sample (the common case when 2-of-N cloud calls flake on
+/// 429 / timeout / empty-parts), `judge_a_swapped` collapses to `judge_a` and `judge_b_swapped` to
+/// `judge_b`, so `a_stable` and `b_stable` are both trivially true and the accept condition
+/// degenerates to "the lone sample equals a local hypothesis" — laundering one flaky cloud sample
+/// into a verified-looking auto-accept that no second opinion and no swap test actually backed.
+/// Require a real second sample; otherwise escalate to human review (the N-sample self-consistency
+/// contract is void for that segment).
+fn resolve_debate_fallback(
+    samples: &[GeminiSample],
+    hypotheses: &[SegmentHypothesis],
+    t1_evidence: &[Evidence],
+) -> T2Result {
+    if samples.len() < 2 {
+        return T2Result {
+            verdict: None,
+            must_escalate: true,
+            error: Some(
+                "T2 self-consistency failed: only one Gemini sample survived — cannot run a swap-stable debate; escalating to human.".into(),
+            ),
+        };
+    }
+    let judge_a_transcript = samples.first().map(|s| s.transcript.as_str()).unwrap_or("");
+    let judge_b_transcript = hypotheses
+        .iter()
+        .find(|h| h.model_id == "omniasr-ctc-1b")
+        .or_else(|| hypotheses.get(1))
+        .or_else(|| hypotheses.first())
+        .map(|h| h.transcript.as_str())
+        .unwrap_or("");
+    // A genuinely independent second Gemini sample drives the swap test (`a_stable` now compares two
+    // distinct samples). The shadow re-ASR judge is deterministic, so `judge_b_swapped` is itself.
+    let judge_a_swapped = samples.get(1).map(|s| s.transcript.as_str()).unwrap_or(judge_a_transcript);
+    let judge_b_swapped = judge_b_transcript;
 
-            if !debate_res.must_escalate {
-                T2Result {
-                    verdict: Some(T2Verdict {
-                        transcript: debate_res.winning_transcript,
-                        reason: debate_res.reason,
-                        confidence: 0.85,
-                        evidence: t1_evidence.to_vec(),
-                        self_consistency_agreement: false,
-                        votes: 1,
-                    }),
-                    must_escalate: false,
-                    error: None,
-                }
-            } else {
-                T2Result {
-                    verdict: None,
-                    must_escalate: true,
-                    error: Some(format!(
-                        "T2 self-consistency failed and debate could not resolve: {}",
-                        debate_res.reason
-                    )),
-                }
-            }
+    let debate_res =
+        crate::jury::debate::adjudicate(judge_a_transcript, judge_b_transcript, judge_a_swapped, judge_b_swapped);
+
+    if !debate_res.must_escalate {
+        // Even a swap-stable debate winner must stay grounded in the audio: a constrained post-editor
+        // cannot wander far from every local hypothesis. (When `ab_agree` holds the winner equals a
+        // local hypothesis and is grounded by construction; the check defends the path regardless.)
+        if !is_grounded_post_edit(&debate_res.winning_transcript, hypotheses) {
+            return T2Result {
+                verdict: None,
+                must_escalate: true,
+                error: Some(
+                    "T2 debate winner rejected as likely hallucination: too divergent from every local hypothesis"
+                        .into(),
+                ),
+            };
+        }
+        T2Result {
+            verdict: Some(T2Verdict {
+                transcript: debate_res.winning_transcript,
+                reason: debate_res.reason,
+                confidence: 0.85,
+                evidence: t1_evidence.to_vec(),
+                self_consistency_agreement: false,
+                votes: 1,
+            }),
+            must_escalate: false,
+            error: None,
+        }
+    } else {
+        T2Result {
+            verdict: None,
+            must_escalate: true,
+            error: Some(format!("T2 self-consistency failed and debate could not resolve: {}", debate_res.reason)),
         }
     }
 }
@@ -410,19 +475,77 @@ mod tests {
 
     #[test]
     fn t2_rejects_a_fabrication_far_from_every_local_hypothesis() {
-        use crate::db::SegmentHypothesis;
-        let h = |m: &str, t: &str| SegmentHypothesis {
-            segment_id: "s".into(),
-            model_id: m.into(),
-            transcript: t.into(),
-            confidence: Some(0.9),
-        };
-        let hyps = vec![h("omniasr-ctc-300m", "دەزگای ڕوانگە"), h("omniasr-ctc-1b", "دەستگای ڕوانگا")];
+        let hyps = vec![hyp("omniasr-ctc-300m", "دەزگای ڕوانگە"), hyp("omniasr-ctc-1b", "دەستگای ڕوانگا")];
         // A minor correction near a local hypothesis is a grounded post-edit.
         assert!(is_grounded_post_edit("دەزگای ڕوانگە", &hyps));
         // A fluent fabrication far from every local hypothesis is rejected (likely hallucination).
         assert!(!is_grounded_post_edit("سپاس بۆ بینەران لە کۆتایی بەرنامەکەدا", &hyps));
         // No local hypotheses to ground against → allowed (the gate is upstream).
         assert!(is_grounded_post_edit("anything", &[]));
+    }
+
+    fn gs(t: &str) -> GeminiSample {
+        GeminiSample { transcript: t.into(), reason: "r".into(), confidence: 0.9 }
+    }
+
+    fn hyp(model: &str, t: &str) -> SegmentHypothesis {
+        SegmentHypothesis {
+            segment_id: "s".into(),
+            model_id: model.into(),
+            transcript: t.into(),
+            confidence: Some(0.9),
+        }
+    }
+
+    #[test]
+    fn debate_fallback_escalates_a_lone_surviving_sample() {
+        // Round-21 #4: 2-of-N cloud calls flaked; one Gemini sample echoes the local ASR. A single
+        // sample cannot be swap-stable against itself, so this MUST escalate, never auto-accept.
+        let hyps = vec![hyp("omniasr-ctc-1b", "کوردستان")];
+        let r = resolve_debate_fallback(&[gs("کوردستان")], &hyps, &[]);
+        assert!(r.must_escalate, "a lone Gemini sample cannot be swap-stable against itself");
+        assert!(r.verdict.is_none());
+        assert!(r.error.unwrap().contains("only one Gemini sample survived"));
+    }
+
+    #[test]
+    fn debate_fallback_escalates_two_disagreeing_samples() {
+        let hyps = vec![hyp("omniasr-ctc-1b", "کوردستان")];
+        let r = resolve_debate_fallback(&[gs("کوردستان"), gs("ئێران")], &hyps, &[]);
+        assert!(r.must_escalate, "two non-agreeing samples are not swap-stable");
+        assert!(r.verdict.is_none());
+    }
+
+    #[test]
+    fn debate_fallback_accepts_two_agreeing_grounded_samples() {
+        // No strict majority overall (A,A,B,C), but the first two INDEPENDENT samples agree AND match
+        // the local hypothesis — a genuine swap-stable, grounded accept.
+        let hyps = vec![hyp("omniasr-ctc-1b", "کوردستان")];
+        let samples = [gs("کوردستان"), gs("کوردستان"), gs("ئێران"), gs("هەولێر")];
+        let r = resolve_debate_fallback(&samples, &hyps, &[]);
+        assert!(!r.must_escalate, "two agreeing samples matching the local hypothesis are accepted");
+        let v = r.verdict.expect("verdict");
+        assert_eq!(v.transcript, "کوردستان");
+        assert!(!v.self_consistency_agreement, "a debate accept is not a self-consistency majority");
+    }
+
+    #[test]
+    fn grounding_rejects_a_truncation_matching_a_short_partial() {
+        // Round-21 #3: a long real hypothesis plus a short degenerate partial. A truncated Gemini
+        // output matching ONLY the short partial (min-CER ~0) must NOT pass as grounded.
+        let hyps = vec![
+            hyp("omniasr-ctc-1b", "دەزگای ڕوانگە لە ڕەسمێکی شایستەدا ئەنجامەکان ڕادەگەیەنێت"),
+            hyp("omniasr-ctc-300m", "دەز"),
+        ];
+        assert!(!is_grounded_post_edit("دەز", &hyps), "a truncated prefix matching a short partial is not grounded");
+    }
+
+    #[test]
+    fn grounding_accepts_a_small_edit_of_the_long_hypothesis() {
+        let long = "دەزگای ڕوانگە لە ڕەسمێکی شایستەدا ئەنجامەکان ڕادەگەیەنێت";
+        let hyps = vec![hyp("omniasr-ctc-1b", long), hyp("omniasr-ctc-300m", "دەز")];
+        // A near-identical post-edit of the substantive hypothesis stays grounded.
+        let edited = "دەزگای ڕوانگە لە ڕەسمێکی شایستەدا ئەنجامەکان ڕادەگەیەنرێت";
+        assert!(is_grounded_post_edit(edited, &hyps), "a small edit of the substantive hypothesis is grounded");
     }
 }
