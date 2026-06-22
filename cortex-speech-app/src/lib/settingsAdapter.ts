@@ -19,6 +19,7 @@ export interface BackendSettings {
   assign_speaker_from_filename: boolean;
   enable_diarization: boolean;
   enable_denoising: boolean;
+  autoplay_segments?: boolean;
   max_speakers: number;
   max_wer_threshold: number;
   max_cer_threshold: number;
@@ -142,7 +143,7 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
     maxWerThreshold: raw.max_wer_threshold ?? 0.35,
     maxCerThreshold: raw.max_cer_threshold ?? 0.2,
     enforceQualityGates: raw.enforce_quality_gates ?? false,
-    autoplaySegments: false,
+    autoplaySegments: raw.autoplay_segments ?? false,
     hfTrainRatio: raw.hf_train_ratio ?? 0.8,
     hfValRatio: raw.hf_val_ratio ?? 0.1,
     hfTestRatio: raw.hf_test_ratio ?? 0.1,
@@ -188,6 +189,7 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
     assign_speaker_from_filename: ui.assignSpeakerFromFilename,
     enable_diarization: ui.enableDiarization,
     enable_denoising: ui.enableDenoising,
+    autoplay_segments: ui.autoplaySegments,
     max_speakers: ui.maxSpeakers,
     max_wer_threshold: ui.maxWerThreshold,
     max_cer_threshold: ui.maxCerThreshold,

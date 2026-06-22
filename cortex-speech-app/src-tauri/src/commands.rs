@@ -491,7 +491,16 @@ pub fn import_audio_file(
         let _guard = ImportGuard { app: app_clone.clone() };
 
         let result = pipeline.import_single_file_with_events(&file_path, cancel, Some(&agent_run_id), |event| {
-            emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "file");
+            // Drop the pipeline's terminal Completed event for the single-file path. emit_pipeline_event's
+            // Completed arm hard-codes source:"directory" and emits import-complete + pipeline-complete —
+            // forwarding it here would fire a SECOND, wrongly-sourced import-complete BEFORE the jury
+            // adjudication block below, producing a spurious "Successfully processed 1 file" toast, a
+            // premature idle/refresh, and an idle→adjudicating→complete flicker. The worker emits its own
+            // authoritative source:"file" import-complete + pipeline-complete after adjudication, so the
+            // frontend still gets exactly one of each. Forward every other event unchanged.
+            if !matches!(event, PipelineEvent::Completed { .. }) {
+                emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "file");
+            }
         });
         match result {
             Ok(segments) => {

@@ -598,7 +598,16 @@ pub fn transcript_hash(text: &str) -> String {
 }
 
 fn is_low_confidence(seg: &SpeechSegment) -> bool {
-    if is_placeholder_transcript(&seg.raw_transcript) {
+    // The placeholder shortcut flags a failed/pending raw ASR ("[Pending WSL 7B ASR]",
+    // "[ASR unavailable: …]") as low-confidence. But the grade is computed from the EFFECTIVE
+    // transcript, which for a human edit is verdict_transcript — the authoritative hand-typed text. If
+    // we keyed off raw_transcript here, a curator who manually re-transcribed a clip whose raw ASR
+    // failed would push "low_confidence_alignment", turning has_review_risk true and demoting an
+    // otherwise-GOLD human-verified clip to REVIEW — silently dropping it from HF export and the
+    // promotion-gate training_ready count. Keying off the effective transcript means the shortcut only
+    // fires when the text actually being graded is itself a placeholder (which the REJECT branch above
+    // already catches), so a hand-corrected segment over a failed raw ASR can still grade GOLD.
+    if is_placeholder_transcript(effective_transcript(seg)) {
         return true;
     }
 
@@ -910,6 +919,54 @@ mod tests {
         assert_eq!(report.transcript, "human corrected transcript");
         assert_eq!(report.transcript_source, "human_verified");
         assert_eq!(report.grade, TRAINING_GRADE_GOLD);
+        assert!(report.training_ready);
+    }
+
+    // A curator hand-transcribes a segment whose raw ASR was deferred/failed, so raw_transcript is a
+    // permanent "[Pending WSL 7B ASR]" placeholder (record_human_decision never overwrites it). The
+    // effective transcript is the correct human text and the segment is human-verified, so it must
+    // grade GOLD / training_ready — not be demoted to REVIEW because is_low_confidence keyed off the
+    // stale raw placeholder. Pins the fix that grades the EFFECTIVE transcript, not raw.
+    #[test]
+    fn training_grade_human_edit_over_failed_raw_asr_is_gold() {
+        let mut s = seg("human_over_pending", "[Pending WSL 7B ASR]", 5000);
+        s.verdict = Some("human_edit".to_string());
+        s.verdict_transcript = Some("ئەمڕۆ هەوا زۆر خۆشە".to_string());
+        s.human_decision = Some("edit".to_string());
+        s.clipping_ratio = Some(0.0);
+        s.rms_db = Some(-20.0);
+        s.snr_db = Some(25.0);
+
+        let report = training_grade_for_segment(&s);
+
+        assert_eq!(report.transcript, "ئەمڕۆ هەوا زۆر خۆشە");
+        assert_eq!(report.transcript_source, "human_verified");
+        assert_eq!(
+            report.grade, TRAINING_GRADE_GOLD,
+            "human edit over a failed raw ASR must grade GOLD, not REVIEW. reasons: {:?}",
+            report.reasons
+        );
+        assert!(report.training_ready, "hand-corrected clip must be training_ready");
+        assert!(
+            !report.reasons.iter().any(|r| r == "low_confidence_alignment"),
+            "stale raw placeholder must not trigger low_confidence_alignment"
+        );
+    }
+
+    // The same applies to an ASR error placeholder ("[ASR unavailable: …]") hand-corrected by a human.
+    #[test]
+    fn training_grade_human_edit_over_asr_error_is_gold() {
+        let mut s = seg("human_over_error", "[ASR unavailable: transcribe timed out]", 5000);
+        s.verdict = Some("human_edit".to_string());
+        s.verdict_transcript = Some("دیتنا ڕاست".to_string());
+        s.human_decision = Some("edit".to_string());
+        s.clipping_ratio = Some(0.0);
+        s.rms_db = Some(-20.0);
+        s.snr_db = Some(25.0);
+
+        let report = training_grade_for_segment(&s);
+
+        assert_eq!(report.grade, TRAINING_GRADE_GOLD, "reasons: {:?}", report.reasons);
         assert!(report.training_ready);
     }
 
