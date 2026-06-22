@@ -615,7 +615,12 @@ pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
 
     for i in 0..new_len {
         let src_idx = i as f64 / ratio;
-        let lo = src_idx.floor() as usize;
+        // Clamp BOTH lo and hi to the last valid index. `new_len = ceil(len * ratio)` can overshoot for
+        // some upsample ratios (e.g. 14700 or 7350 -> 16000 at certain lengths) so the final iteration's
+        // `src_idx.floor()` reaches `src.len()`; clamping only `hi` (as before) left `src[lo]` to panic
+        // with an out-of-bounds index. Edge-clamping `lo` makes the last sample a copy of the final
+        // source sample — consistent with the `hi` clamp — and is panic-free for every rate.
+        let lo = (src_idx.floor() as usize).min(src.len().saturating_sub(1));
         let hi = (lo + 1).min(src.len().saturating_sub(1));
         let frac = src_idx - lo as f64;
         let interpolated = src[lo] as f64 * (1.0 - frac) + src[hi] as f64 * frac;
@@ -1083,6 +1088,24 @@ mod tests {
         let input: Vec<f32> = (0..44100).map(|i| (i as f32 / 44100.0).sin()).collect();
         let output = resample(&input, 44100, 16000);
         assert_eq!(output.len(), 16000);
+    }
+
+    #[test]
+    fn resample_upsampling_does_not_panic_on_overshoot_ratios() {
+        // Round-16: new_len = ceil(len * to/from) can overshoot for certain upsample ratios so the final
+        // iteration's floor(src_idx) reaches src.len(); when only `hi` was clamped, src[lo] panicked with
+        // index-out-of-bounds. 7350 Hz (44100/6) and 14700 Hz (44100/3) are real HE-AAC/legacy rates, and
+        // length 147 is a confirmed trigger. Assert these return cleanly (and at the expected length).
+        for &(from, len) in &[(14700u32, 147usize), (7350, 147), (14700, 294), (7350, 2499)] {
+            let input = vec![0.25f32; len];
+            let out = resample(&input, from, 16000);
+            let expected = (len as f64 * (16000.0 / from as f64)).ceil() as usize;
+            assert_eq!(out.len(), expected, "resample({from}->16000, len={len}) length");
+        }
+        // Spot-check the previously-safe rates still work.
+        for &from in &[8000u32, 11025, 12000, 22050, 44100, 48000] {
+            let _ = resample(&vec![0.1f32; 147], from, 16000);
+        }
     }
 
     #[test]
