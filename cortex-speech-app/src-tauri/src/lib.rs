@@ -214,7 +214,14 @@ impl AppState {
     pub fn ensure_cancel_token(&self) -> Result<CancellationToken, String> {
         let mut guard = self.lock_batch_cancel_token();
         if let Some(token) = guard.as_ref() {
-            return Ok(token.clone());
+            // Reuse a LIVE token (so an in-flight cancel stays in effect), but NEVER hand back a
+            // cancelled one. finish_batch clears the slot under a separate lock AFTER it flips the
+            // state gate to Idle, so a re-clicked batch can start while a just-cancelled token still
+            // lingers here; returning it would make the new batch's first is_cancelled() check fire
+            // and silently no-op the whole run (round-15 TOCTOU). Replace a cancelled token instead.
+            if !token.is_cancelled() {
+                return Ok(token.clone());
+            }
         }
         let token = CancellationToken::new();
         *guard = Some(token.clone());
@@ -273,11 +280,13 @@ impl AppState {
     }
 
     pub fn finish_batch(&self) {
-        *self.lock_batch_state() = BatchState::Idle;
-        // Drop the token here: ensure_cancel_token is reuse-or-create, so without clearing, a batch
-        // that was cancelled would leave a permanently-cancelled token in the slot and EVERY later
-        // batch would inherit it and no-op immediately.
+        // Clear the (possibly-cancelled) token BEFORE opening the gate. A new batch can only start
+        // once batch_state is Idle, and the mutex release/acquire chain guarantees that any thread
+        // observing Idle also observes the token already cleared — so it can never inherit the stale
+        // token through the gap between these two statements (round-15 TOCTOU). ensure_cancel_token is
+        // additionally hardened to never return a cancelled token, as belt-and-suspenders.
         *self.lock_batch_cancel_token() = None;
+        *self.lock_batch_state() = BatchState::Idle;
     }
 
     pub fn update_pipeline_settings(&self, settings: AppSettings) {
@@ -675,7 +684,32 @@ mod tests {
         }));
 
         assert!(state.is_cancelled());
-        assert!(state.ensure_cancel_token().expect("recover cancel token").is_cancelled());
+        // ensure_cancel_token recovers the poisoned lock (does not panic) AND, per the round-15
+        // hardening, hands out a FRESH non-cancelled token rather than the lingering cancelled one.
+        assert!(!state.ensure_cancel_token().expect("recover cancel token").is_cancelled());
+    }
+
+    #[test]
+    fn batch_token_is_fresh_even_when_finish_batch_left_the_slot_torn() {
+        // Round-15 TOCTOU: finish_batch flips the gate to Idle and clears the cancel token under a
+        // SEPARATE lock, so a re-clicked batch can start (gate Idle) while a just-cancelled token still
+        // lingers in the slot. Reproduce that torn window directly: a cancelled token sits in the slot
+        // while the gate reads Idle. ensure_cancel_token must NOT hand that cancelled token to the new
+        // batch — doing so would trip its first is_cancelled() check and silently no-op the whole run.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+
+        // Batch 1 ran and was cancelled; its token is still in the slot.
+        let t1 = state.ensure_cancel_token().expect("batch token 1");
+        assert!(state.cancel_current_operation());
+        assert!(t1.is_cancelled());
+        // Simulate ONLY finish_batch's gate flip (the torn window before the token is cleared).
+        *state.lock_batch_state() = BatchState::Idle;
+
+        // Batch 2 starts in that window and requests its token.
+        state.try_start_batch().expect("start batch 2");
+        let t2 = state.ensure_cancel_token().expect("batch token 2");
+        assert!(!t2.is_cancelled(), "a new batch must never inherit a cancelled token from a torn slot");
     }
 
     #[test]
