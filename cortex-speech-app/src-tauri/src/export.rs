@@ -718,6 +718,15 @@ pub fn export_huggingface_dataset(
 
     // Write dataset card (README.md)
     let model_str = format!("{:?}", settings.asr_model_size);
+    // Round-24 #5: the HuggingFace size_categories tag must reflect the ACTUAL example count, not a
+    // hardcoded `n<1K` that contradicts the split-statistics table once the dataset exceeds 1000 rows.
+    let size_category = match total_count {
+        0..=999 => "n<1K",
+        1_000..=9_999 => "1K<n<10K",
+        10_000..=99_999 => "10K<n<100K",
+        100_000..=999_999 => "100K<n<1M",
+        _ => "n>1M",
+    };
     let readme = format!(
         r#"---
 language:
@@ -731,7 +740,7 @@ tags:
 license: {}
 pretty_name: Cortex Kurdish Speech Dataset
 size_categories:
-- n<1K
+- {size_category}
 ---
 
 # Cortex Kurdish (Sorani) Speech Dataset
@@ -776,9 +785,12 @@ This dataset was exported from Cortex Speech Processor.
                 "transcription": {"dtype": "string", "_type": "Value"},
                 "speaker_id": {"dtype": "string", "_type": "Value"},
                 "duration_ms": {"dtype": "int64", "_type": "Value"},
-                "verified": {"dtype": "bool", "_type": "Value"},
+                // Round-24 #4: the metadata.csv writes these as "1"/"0" strings. Declaring them `bool`
+                // made a consumer's bool-cast read "0" as truthy True (inverting unverified rows).
+                // Declare int64 to match the bytes — "1"/"0" parse cleanly to 1/0, like duration_ms.
+                "verified": {"dtype": "int64", "_type": "Value"},
                 "training_grade": {"dtype": "string", "_type": "Value"},
-                "training_ready": {"dtype": "bool", "_type": "Value"},
+                "training_ready": {"dtype": "int64", "_type": "Value"},
                 "transcript_source": {"dtype": "string", "_type": "Value"},
                 "training_reasons": {"dtype": "string", "_type": "Value"},
             },
