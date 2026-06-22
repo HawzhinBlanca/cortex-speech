@@ -431,7 +431,13 @@ fn write_reference_text_file(
     Ok(path)
 }
 
-pub fn segment_audio_as_wav_base64(segment: &SpeechSegment) -> AppResult<String> {
+/// Decode the source file, extract ONLY this segment's audio window (via its alignment), and return
+/// it as in-memory WAV bytes. This is the single source of truth for "the audio of one segment" —
+/// any cloud egress (Gemini T2, ElevenLabs Scribe vote) must send this slice, NEVER the whole source
+/// file, or it both leaks/processes unrelated audio and (for Scribe) stores a whole-file transcript
+/// against a single segment. `decode_to_pcm` caches by content, so slicing many segments from one
+/// source file decodes it once.
+pub fn segment_audio_as_wav_bytes(segment: &SpeechSegment) -> AppResult<Vec<u8>> {
     let path = Path::new(&segment.audio_path);
     let duration_ms = audio::get_duration_ms(path)?;
     if duration_ms == 0 {
@@ -444,8 +450,11 @@ pub fn segment_audio_as_wav_base64(segment: &SpeechSegment) -> AppResult<String>
         return Err(AppError::Audio(crate::error::AudioError::EmptyBuffer));
     }
     let (chunk_pcm, _) = chunking::slice_pcm_by_alignment(&pcm, sample_rate, segment.alignment_json.as_deref())?;
-    let wav_bytes = pcm_i16_to_wav_bytes(&chunk_pcm, audio::TARGET_SAMPLE_RATE)?;
-    Ok(base64_encode(&wav_bytes))
+    pcm_i16_to_wav_bytes(&chunk_pcm, audio::TARGET_SAMPLE_RATE)
+}
+
+pub fn segment_audio_as_wav_base64(segment: &SpeechSegment) -> AppResult<String> {
+    Ok(base64_encode(&segment_audio_as_wav_bytes(segment)?))
 }
 
 fn pcm_i16_to_wav_bytes(pcm: &[i16], sample_rate: u32) -> AppResult<Vec<u8>> {
@@ -738,6 +747,16 @@ mod tests {
         assert!(
             (32_000..=33_000).contains(&decoded_len_estimate),
             "one second 16-bit PCM WAV should be about 32 KB, got {decoded_len_estimate}"
+        );
+
+        // Round-21 #1: the Scribe vote path must send the sliced SEGMENT window (1 s ≈ 32 KB), never
+        // the whole 2 s source file (≈ 64 KB). Assert the raw WAV bytes are the slice, not the source.
+        let bytes = segment_audio_as_wav_bytes(&segment).expect("encode segment bytes");
+        assert!(bytes.starts_with(b"RIFF"), "raw WAV bytes start with the RIFF header");
+        assert!(
+            (32_000..=33_200).contains(&bytes.len()),
+            "sliced 1 s segment WAV should be ~32 KB (NOT the ~64 KB whole 2 s file), got {}",
+            bytes.len()
         );
     }
 
