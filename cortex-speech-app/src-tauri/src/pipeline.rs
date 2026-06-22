@@ -1149,9 +1149,12 @@ impl ProcessingPipeline {
             }
             let quality = crate::audio_quality::analyze_audio_quality(chunk_pcm);
             let chunk_duration_ms = chunking::samples_to_ms(local_end.saturating_sub(local_start), sample_rate);
-            let chunk_suffix = format!("chunk_{global_start}_{global_end}");
             let source_meta =
                 chunking::build_source_meta(global_start, global_end, sample_rate, chunk_index as u32, chunk_count);
+            // Round-22 #12: key the per-chunk cache on the SAME stored ms range the re-transcribe read
+            // path uses (slice_pcm_by_alignment), NOT raw sample indices. The read side round-trips
+            // sample -> ms -> sample, so a raw-sample key never matched and the cache missed every time.
+            let chunk_suffix = format!("chunk_{}_{}", source_meta.source_start_ms, source_meta.source_end_ms);
 
             let mut f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
 
@@ -1267,6 +1270,22 @@ impl ProcessingPipeline {
                 is_gold: false,
                 alignment_quality: None, // set to 'ctc_forced' or 'energy_heuristic' after align()
             });
+        }
+
+        // Round-22 #11: renumber the RETAINED segments to contiguous chunk_index / chunk_count. The loop
+        // `continue`s past empty/silent chunks, so chunk_index (the enumerate index over ALL chunk_ranges)
+        // has gaps and chunk_count over-counts the segments actually produced. The streaming caller
+        // re-applies a whole-file renumber across decode windows; doing it here makes the non-streaming
+        // whole-file path emit the same contiguous numbering instead of gappy provenance metadata.
+        let retained = segments.len() as u32;
+        for (idx, seg) in segments.iter_mut().enumerate() {
+            if let Some(meta) = seg.alignment_json.as_deref().and_then(chunking::SegmentSourceMeta::from_alignment_json)
+            {
+                let mut meta = meta;
+                meta.chunk_index = idx as u32;
+                meta.chunk_count = retained;
+                seg.alignment_json = Some(meta.to_alignment_json());
+            }
         }
 
         Ok((segments, pcm_cache))
@@ -1692,11 +1711,27 @@ impl ProcessingPipeline {
                     )
                     .ok()
             } else {
-                db.connection()
-                    .query_row("SELECT id FROM speech_segments WHERE audio_path = ?", [&audio_path_str], |row| {
-                        row.get(0)
-                    })
-                    .ok()
+                // Round-22 #10: with neither an explicit segment_id NOR an alignment_json to
+                // disambiguate, a bare `WHERE audio_path = ?` returns an ARBITRARY row when a file was
+                // chunked into multiple segments (every chunk shares the source audio_path) — writing
+                // the WSL ASR and its hypothesis to the WRONG segment. Only accept the bare lookup when
+                // EXACTLY ONE segment matches; otherwise refuse and require an explicit segment_id.
+                let conn = db.connection();
+                let mut stmt = conn
+                    .prepare("SELECT id FROM speech_segments WHERE audio_path = ?")
+                    .map_err(|e| AppError::Other(e.to_string()))?;
+                let ids: Vec<String> = stmt
+                    .query_map([&audio_path_str], |row| row.get::<_, String>(0))
+                    .map_err(|e| AppError::Other(e.to_string()))?
+                    .filter_map(Result::ok)
+                    .collect();
+                if ids.len() > 1 {
+                    return Err(AppError::Validation(format!(
+                        "transcribe: {} segments share this audio file; pass an explicit segment_id (or alignment_json) to choose which one to transcribe",
+                        ids.len()
+                    )));
+                }
+                ids.into_iter().next()
             };
 
             if let Some(id) = segment_id {
