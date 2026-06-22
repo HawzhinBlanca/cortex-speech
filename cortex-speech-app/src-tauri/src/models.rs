@@ -594,7 +594,12 @@ impl ModelManager {
     }
 
     pub fn denoiser_present(&self) -> bool {
-        model_file_meets_min_size(&self.models_dir, DENOISER_MODEL, 10_000_000)
+        // Round-23 #3 (review): check the RESOLVED dir — the directory inference actually loads from
+        // (resolve_models_dir falls back to the bundled dir when the user dir lacks OmniASR CTC). The
+        // pipeline constructs DenoiserService from resolved_dir(), so the denoising-provenance flag must
+        // be computed from the same place, or a denoiser present in the user dir but unreachable after
+        // the bundled-dir fallback would still record denoising=true while audio passed through.
+        model_file_meets_min_size(&self.resolved_dir(), DENOISER_MODEL, 10_000_000)
     }
 
     /// Download and extract the AI Denoiser archive.
