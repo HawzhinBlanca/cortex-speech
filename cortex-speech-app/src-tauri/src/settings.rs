@@ -342,6 +342,21 @@ pub fn validate_outbound_endpoint(endpoint: &str) -> Result<(), crate::error::Ap
 
 impl AppSettings {
     pub fn load(path: &std::path::Path) -> Self {
+        // If a previous save was interrupted (a hard crash between replace_file's two renames on
+        // Windows, or a rename+restore double-failure), the canonical file can be missing while a
+        // valid `.replace-bak-*` copy survives next to it. Promote it BEFORE reading so we never
+        // silently revert persisted state — output dir, the cloud consent opt-ins, the configured-key
+        // flag, jury settings — to defaults while the real values sit recoverable on disk. No-op when
+        // the file is present (the common case).
+        match crate::atomic_file::recover_interrupted_replace(path) {
+            Ok(true) => {
+                tracing::warn!("Recovered settings from an interrupted save at {}", path.display())
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("Could not check for an interrupted settings save at {}: {e}", path.display())
+            }
+        }
         match std::fs::read_to_string(path) {
             Ok(s) => match serde_json::from_str::<AppSettings>(&s) {
                 Ok(mut settings) => {
@@ -522,6 +537,26 @@ mod tests {
         let path = dir.path().join("settings.json");
         AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() }.save(&path).expect("save");
         assert!(AppSettings::load(&path).cloud_stt_opt_in, "the Scribe toggle must survive save -> load");
+    }
+
+    #[test]
+    fn load_recovers_settings_from_an_interrupted_save_backup() {
+        // Post-crash state the round-15 atomic_file fix addresses: the canonical settings.json is
+        // MISSING (the durable rename never completed), but a valid `.replace-bak-*` sibling still
+        // holds the user's real settings (cloud STT opted in). load() must promote that backup instead
+        // of silently returning defaults — which would flip the consent opt-in OFF and drop the
+        // configured key, with the recoverable data left orphaned on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let backup = dir.path().join("settings.json.replace-bak-9999");
+        let real = AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() };
+        std::fs::write(&backup, serde_json::to_string(&real).unwrap()).unwrap();
+        assert!(!path.exists(), "the canonical file is missing (interrupted save)");
+
+        let loaded = AppSettings::load(&path);
+
+        assert!(loaded.cloud_stt_opt_in, "consent opt-in must be recovered, not reverted to default OFF");
+        assert!(path.exists(), "the backup must have been promoted to the canonical path");
     }
 
     #[test]
