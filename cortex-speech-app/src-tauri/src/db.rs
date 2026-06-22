@@ -205,8 +205,22 @@ impl Database {
                     Ok(result) if result.trim() == "ok" => {
                         return Ok(db);
                     }
+                    Ok(result) if integrity_result_looks_transient(&result) => {
+                        // PRAGMA integrity_check reports a transient page-read failure (a momentary disk
+                        // error, or AV/backup/indexer holding a page locked mid-scan) as a text result
+                        // ROW, e.g. "unable to get the page 42. error code=8" — which arrives here as
+                        // Ok(non-"ok"). Quarantining (renaming the live db away and opening an empty one)
+                        // a HEALTHY db on that transient signal is silent total data loss. Mirror the
+                        // Err branch's discipline: abort startup WITHOUT quarantine so the user can retry
+                        // with their data intact.
+                        tracing::error!("Database integrity check returned a transient I/O message (not corruption); aborting startup without quarantine: {result}");
+                        return Err(AppError::Other(format!(
+                            "Database integrity check could not complete (transient, not corruption): {result}"
+                        )));
+                    }
                     Ok(result) => {
-                        // A non-"ok" string is SQLite reporting genuine page corruption: quarantine.
+                        // A non-"ok", non-transient string is SQLite reporting genuine structural page
+                        // corruption: quarantine.
                         tracing::error!("Database integrity check failed on open; quarantining database: {result}");
                     }
                     Err(e) if is_corruption_error(&e) => {
@@ -1449,6 +1463,22 @@ fn is_corruption_error(err: &AppError) -> bool {
     )
 }
 
+/// Whether a non-"ok" `PRAGMA integrity_check` result row is a TRANSIENT page-access / I/O message
+/// rather than genuine structural corruption. integrity_check is designed to keep walking the b-tree
+/// and report problems as up to 100 text result rows instead of failing the statement, so a momentary
+/// page-read failure (disk hiccup, or an AV/backup/indexer holding a page locked mid-scan) surfaces as
+/// `Ok("unable to get the page N. error code=...")`. Treating that as corruption and quarantining a
+/// HEALTHY database is silent total data loss, so these abort startup without quarantine instead.
+fn integrity_result_looks_transient(result: &str) -> bool {
+    let r = result.to_ascii_lowercase();
+    r.contains("unable to get the page")
+        || r.contains("error code=")
+        || r.contains("i/o error")
+        || r.contains("disk i/o")
+        || r.contains("is locked")
+        || r.contains("out of memory")
+}
+
 fn recover_database_at(path: &str) -> AppResult<()> {
     let path_buf = Path::new(path);
     if !path_buf.exists() {
@@ -1545,6 +1575,22 @@ mod tests {
             .unwrap();
         let seen = primary.get_segment_by_id("s1").unwrap().unwrap();
         assert_eq!(seen.verdict.as_deref(), Some("jury_accept"));
+    }
+
+    #[test]
+    fn transient_integrity_messages_are_not_classified_as_corruption() {
+        // Round-20: a transient page-read message from PRAGMA integrity_check must NOT be treated as
+        // corruption (which would quarantine a healthy db = silent data loss). It aborts startup instead.
+        assert!(integrity_result_looks_transient("unable to get the page 42. error code=8"));
+        assert!(integrity_result_looks_transient("disk I/O error"));
+        assert!(integrity_result_looks_transient("database is locked"));
+        assert!(integrity_result_looks_transient("out of memory"));
+        // Genuine structural-corruption findings are NOT transient -> they still quarantine.
+        assert!(!integrity_result_looks_transient("row 5 missing from index idx_foo"));
+        assert!(!integrity_result_looks_transient(
+            "*** in database main *** Page 9: btreeInitPage() returns error"
+        ));
+        assert!(!integrity_result_looks_transient("wrong # of entries in index"));
     }
 
     #[test]
