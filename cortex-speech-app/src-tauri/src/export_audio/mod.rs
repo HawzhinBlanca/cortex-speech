@@ -118,20 +118,27 @@ fn export_single_segment(
     let (sample_rate, pcm_samples) =
         audio::decode_to_pcm(&seg.audio_path).map_err(|e| AppError::Other(format!("Failed to decode audio: {e}")))?;
 
-    let pcm_samples = if let Some(ref alignment) = seg.alignment_json {
-        if let Some(meta) = SegmentSourceMeta::from_alignment_json(alignment) {
+    // Slice the clip from the segment's alignment window. Mirror export.rs::slice_for_export: when the
+    // alignment is present and parses but the window is OUT OF RANGE against the (possibly
+    // re-encoded/shortened) decoded buffer, or DEGENERATE (end <= start), SKIP the segment with a clear
+    // error — do NOT fall back to the whole source file. Pairing the entire recording with the
+    // segment's short transcript/duration in metadata.csv is silent training-data corruption (the
+    // round-2 bug, fixed for the HF/dataset path but never for this WAV/FLAC path). The whole-file
+    // fallback is reserved strictly for genuinely-absent/unparseable alignment.
+    let pcm_samples = match seg.alignment_json.as_deref().and_then(SegmentSourceMeta::from_alignment_json) {
+        Some(meta) => {
             let start = chunking::ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
             let end = chunking::ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate).min(pcm_samples.len());
-            if end > start {
+            if end > start && start < pcm_samples.len() {
                 pcm_samples[start..end].to_vec()
             } else {
-                pcm_samples
+                return Err(AppError::Validation(format!(
+                    "Segment {segment_id}: alignment window out of range (pcm_len={}); refusing to export the whole source file as this segment",
+                    pcm_samples.len()
+                )));
             }
-        } else {
-            pcm_samples
         }
-    } else {
-        pcm_samples
+        None => pcm_samples, // no/unparseable alignment -> whole file (intended)
     };
     let pcm_samples = resample_pcm_i16(&pcm_samples, sample_rate, options.sample_rate);
 
@@ -398,6 +405,54 @@ mod tests {
 
         assert_eq!(result.succeeded, 1);
         assert!(out_dir.join(&result.files[0]).exists());
+    }
+
+    #[test]
+    fn test_export_skips_out_of_range_alignment_instead_of_whole_file() {
+        // Round-16 (HIGH): a segment whose alignment window lies past the (re-encoded/shortened)
+        // decoded buffer must be SKIPPED, not exported as the WHOLE source recording paired with its
+        // short transcript/duration in metadata.csv — that is silent training-data corruption. The
+        // 1-second source with a 5000 ms window start is out of range, so the segment must fail with a
+        // clear error and produce NO clip and NO metadata.csv.
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("src.wav");
+        make_wav_file(&wav_path); // 1 second @ 16 kHz = 16000 samples
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let meta = SegmentSourceMeta { source_start_ms: 5000, source_end_ms: 5300, chunk_index: 0, chunk_count: 1 };
+        let seg = SpeechSegment {
+            id: "oob1".to_string(),
+            audio_path: wav_path.to_string_lossy().to_string(),
+            raw_transcript: "short utterance".to_string(),
+            duration_ms: 300,
+            alignment_json: Some(meta.to_alignment_json()),
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&seg).unwrap();
+
+        let out_dir = tmp.path().join("out");
+        let result = export_audio_segments(
+            &db,
+            &["oob1".to_string()],
+            &AudioExportOptions {
+                output_dir: out_dir.to_string_lossy().to_string(),
+                format: AudioExportFormat::Wav,
+                sample_rate: 16000,
+                include_metadata: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.succeeded, 0, "an out-of-range segment must not be exported");
+        assert_eq!(result.failed, 1);
+        assert!(result.errors[0].contains("out of range"), "error must explain the skip: {:?}", result.errors);
+        assert!(
+            !out_dir.join("src_oob1.wav").exists(),
+            "the whole source file must NOT be written as this segment's clip"
+        );
+        assert!(!out_dir.join("metadata.csv").exists(), "no metadata.csv when nothing was exported");
     }
 
     #[test]
