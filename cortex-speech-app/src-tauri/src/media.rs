@@ -72,10 +72,14 @@ impl MediaRegistry {
 
     pub fn resolve(&mut self, id: &str) -> Result<String, String> {
         self.prune_expired();
-        let record = self.grants.get(id).ok_or_else(|| "Media grant is missing or expired".to_string())?;
+        let record = self.grants.get_mut(id).ok_or_else(|| "Media grant is missing or expired".to_string())?;
         if !record.cached_path.exists() {
             return Err("Cached media file is missing".to_string());
         }
+        // Refresh the TTL on every resolve so a clip the user keeps interacting with (the AudioPlayer
+        // re-resolves on load/replay) is not pruned out from under it after MEDIA_TTL_MINUTES of idle
+        // time — which would make a later play/seek fail with "Cached media file is missing".
+        record.expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
         Ok(record.cached_path.to_string_lossy().to_string())
     }
 
@@ -118,16 +122,18 @@ impl MediaRegistry {
             }
         }
 
-        self.grants.iter().find_map(|(id, record)| {
-            if record.source_path == source_path && record.expires_at > now && record.cached_path.exists() {
-                Some(MediaGrant {
-                    id: id.clone(),
-                    path: record.cached_path.to_string_lossy().to_string(),
-                    expires_at: record.expires_at.to_rfc3339(),
-                })
-            } else {
-                None
-            }
+        // Find a live grant for this source and REFRESH its TTL on reuse — re-registering the same clip
+        // (e.g. re-selecting a segment) must keep it alive, not return a grant that is about to expire.
+        let live_id = self.grants.iter().find_map(|(id, record)| {
+            (record.source_path == source_path && record.expires_at > now && record.cached_path.exists())
+                .then(|| id.clone())
+        })?;
+        let record = self.grants.get_mut(&live_id)?;
+        record.expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
+        Some(MediaGrant {
+            id: live_id,
+            path: record.cached_path.to_string_lossy().to_string(),
+            expires_at: record.expires_at.to_rfc3339(),
         })
     }
 
@@ -268,6 +274,39 @@ mod tests {
         let cache_dir = tmp.path().join("media-cache");
         let cached_files = std::fs::read_dir(cache_dir).unwrap().count();
         assert_eq!(cached_files, 1, "same imported audio should only have one live cache copy");
+    }
+
+    #[test]
+    fn resolve_and_reuse_refresh_the_grant_ttl() {
+        // Round-18: the grant TTL was never refreshed by resolve/reuse, so prune_expired could delete a
+        // clip the user is still interacting with after MEDIA_TTL_MINUTES. resolving (and re-registering)
+        // must push the expiry back to a full TTL.
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("sample.wav");
+        std::fs::write(&audio, b"audio").unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&segment(&audio)).unwrap();
+
+        let mut registry = MediaRegistry::default();
+        let grant = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+
+        // Artificially age the grant to nearly-expired, then resolve.
+        registry.grants.get_mut(&grant.id).unwrap().expires_at = Utc::now() + Duration::seconds(2);
+        registry.resolve(&grant.id).unwrap();
+        assert!(
+            registry.grants.get(&grant.id).unwrap().expires_at > Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES - 1),
+            "resolve must refresh the grant TTL"
+        );
+
+        // The reuse path (re-registering the same source) also refreshes.
+        registry.grants.get_mut(&grant.id).unwrap().expires_at = Utc::now() + Duration::seconds(2);
+        let reused = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+        assert_eq!(reused.id, grant.id, "same source reuses the live grant");
+        assert!(
+            registry.grants.get(&grant.id).unwrap().expires_at > Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES - 1),
+            "reuse must refresh the grant TTL"
+        );
     }
 
     #[test]
