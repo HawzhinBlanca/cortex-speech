@@ -160,6 +160,8 @@ export const en: Record<string, string> = {
   'inbox.status.loadFailed': 'Failed to load queue: {err}',
   'inbox.status.accepted': '✅ Accepted',
   'inbox.status.acceptFailed': 'Failed to accept: {err}',
+  'inbox.status.autonomySet': 'Autonomy set to {level}',
+  'inbox.status.autonomyFailed': 'Failed to change autonomy: {err}',
   'inbox.status.edited': '✏️ Edited',
   'inbox.status.editFailed': 'Failed to save edit: {err}',
   'inbox.status.rejected': '❌ Rejected',

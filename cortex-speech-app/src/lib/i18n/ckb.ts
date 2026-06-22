@@ -160,6 +160,8 @@ export const ckb: Record<string, string> = {
   'inbox.status.loadFailed': 'بارکردنی ڕیز سەرکەوتوو نەبوو: {err}',
   'inbox.status.accepted': '✅ پەسەندکرا',
   'inbox.status.acceptFailed': 'پەسەندکردن سەرکەوتوو نەبوو: {err}',
+  'inbox.status.autonomySet': 'ئاستی خۆکاری کرا بە {level}',
+  'inbox.status.autonomyFailed': 'گۆڕینی ئاستی خۆکاری سەرکەوتوو نەبوو: {err}',
   'inbox.status.edited': '✏️ دەستکاریکرا',
   'inbox.status.editFailed': 'پاشەکەوتی دەستکاری سەرکەوتوو نەبوو: {err}',
   'inbox.status.rejected': '❌ ڕەتکرایەوە',

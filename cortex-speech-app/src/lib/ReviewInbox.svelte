@@ -14,6 +14,8 @@
   import * as api from './commands';
   import { t } from './i18n';
   import type { SpeechSegment } from './types';
+  import type { AppSettings } from './stores/settingsStore';
+  import AudioPlayer from './AudioPlayer.svelte';
 
   // ── Props ───────────────────────────────────────────────────────────────────
   export let onClose: () => void = () => {};
@@ -27,9 +29,36 @@
   let editTextarea: HTMLTextAreaElement | null = null;
   let statusMsg = '';
   let history: { id: string; decision: string; prev: SpeechSegment }[] = [];
+  // Round-23 #12: the autonomy dial reflects and WRITES the real backend `jury_autonomy_level` setting
+  // (read by the T0 gate's apply_autonomy), not a dead local variable. `settings` holds the loaded
+  // settings so a dial change can be persisted via update_settings.
   let autonomyLevel: 'observe' | 'propose' | 'act_confirm' | 'act_auto' = 'propose';
+  let settings: AppSettings | null = null;
   // Guard against double-submission from rapid key presses.
   let isSubmitting = false;
+
+  async function setAutonomy(val: 'observe' | 'propose' | 'act_confirm' | 'act_auto') {
+    const previous = autonomyLevel;
+    autonomyLevel = val; // optimistic
+    if (!settings) {
+      // Settings not loaded yet — keep the optimistic UI but don't claim it persisted.
+      return;
+    }
+    try {
+      const next = { ...settings, juryAutonomyLevel: val };
+      await api.updateSettings(next);
+      settings = next;
+      statusMsg = $t('inbox.status.autonomySet', { level: $t(`inbox.autonomy.${autonomyKey(val)}`) });
+    } catch (e) {
+      autonomyLevel = previous; // revert so the dial never lies about the persisted state
+      statusMsg = $t('inbox.status.autonomyFailed', { err: String(e) });
+    }
+  }
+
+  // Map a backend level to its i18n key suffix (observe/propose/actConfirm/actAuto).
+  function autonomyKey(val: string): string {
+    return val === 'act_confirm' ? 'actConfirm' : val === 'act_auto' ? 'actAuto' : val;
+  }
 
   $: current = queue[currentIndex] ?? null;
   $: pendingCount = queue.filter((s) => !s.humanDecision).length;
@@ -300,6 +329,16 @@
 
   onMount(() => {
     loadQueue();
+    // Round-23 #12: reflect the REAL backend autonomy level on the dial.
+    api
+      .getSettings()
+      .then((s) => {
+        settings = s;
+        autonomyLevel = s.juryAutonomyLevel ?? 'propose';
+      })
+      .catch(() => {
+        /* leave the optimistic default; the dial just won't persist until settings load */
+      });
     window.addEventListener('keydown', handleKey);
   });
 
@@ -340,7 +379,7 @@
         <button
           class="dial-btn"
           class:active={autonomyLevel === val}
-          onclick={() => (autonomyLevel = val as typeof autonomyLevel)}
+          onclick={() => setAutonomy(val as typeof autonomyLevel)}
           title={val}>{emoji} {$t(key)}</button
         >
       {/each}
@@ -407,8 +446,14 @@
             {/if}
           </div>
 
-          <!-- Waveform placeholder (LTR always) -->
-          <div class="waveform-zone" dir="ltr" aria-label="Audio waveform">
+          <!-- Audio playback (LTR always). Round-23 #13: a reviewer must be able to HEAR the clip before
+               adjudicating a biometric Kurdish transcript — the old static filename stub offered no way
+               to listen, yet Accept stamps a human-verified label. Keyed on the segment id so the player
+               re-resolves cleanly (no cross-segment audio bleed) as the queue is navigated. -->
+          <div class="waveform-zone" dir="ltr" aria-label="Audio playback">
+            {#key current.id}
+              <AudioPlayer audioPath={current.audioPath} autoplay={false} />
+            {/key}
             <div class="waveform-stub">
               🔊 <bdi>{current.audioPath?.split(/[\\/]/).pop() ?? 'audio'}</bdi>
             </div>
