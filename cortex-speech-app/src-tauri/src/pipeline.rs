@@ -1831,17 +1831,24 @@ impl ProcessingPipeline {
             raw_text.clone()
         };
 
-        let entry = crate::cache::CacheEntry {
-            audio_hash: String::new(),
-            // Cache the RAW ASR text, NOT the refined output: the cache key omits the refiner config,
-            // so storing refined text would replay a stale refiner result (and contaminate the raw
-            // element) on a later hit. Refinement is re-run per call from the cached raw text.
-            raw_transcript: raw_text.clone(),
-            normalized_transcript: None,
-            created_at: chrono::Utc::now(),
-            model_id: model_id.clone(),
-        };
-        self.cache.set_chunk(path, chunk_suffix.as_deref(), entry);
+        // Only cache a GENUINE transcription — never an empty or placeholder result. ASR can legitimately
+        // return Ok("") for a quiet-but-real chunk (and this path applies no RMS-normalize/denoise), so
+        // without this guard an empty result is baked into the in-memory chunk cache and every later
+        // "Re-run ASR" / batch_transcribe just replays the empty no-op instead of re-invoking the model.
+        // Mirrors the same guard in build_segments_from_pcm.
+        if !raw_text.trim().is_empty() && !crate::quality::is_placeholder_transcript(&raw_text) {
+            let entry = crate::cache::CacheEntry {
+                audio_hash: String::new(),
+                // Cache the RAW ASR text, NOT the refined output: the cache key omits the refiner config,
+                // so storing refined text would replay a stale refiner result (and contaminate the raw
+                // element) on a later hit. Refinement is re-run per call from the cached raw text.
+                raw_transcript: raw_text.clone(),
+                normalized_transcript: None,
+                created_at: chrono::Utc::now(),
+                model_id: model_id.clone(),
+            };
+            self.cache.set_chunk(path, chunk_suffix.as_deref(), entry);
+        }
 
         if let Some(id) = segment_id {
             if let Ok(db) = self.open_db() {

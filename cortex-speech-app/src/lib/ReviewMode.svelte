@@ -83,13 +83,33 @@
   }
 
   function advance() {
-    // After a save the just-verified clip drops to the done tail; jump to the next
-    // clip that still needs a human (the first remaining pending), else stay put.
+    // After a save the just-verified clip drops to the done tail; jump to the next clip that still
+    // needs a human (the first remaining pending). If NONE remain, set index = -1 so `current` resolves
+    // to null and the "all done" empty state renders — never clamp back onto an already-verified clip
+    // (which would silently re-open finished work for re-editing).
     const nextPending = queue.findIndex((s) => !s.verified);
-    index = nextPending >= 0 ? nextPending : Math.min(index, Math.max(0, queue.length - 1));
+    index = nextPending >= 0 ? nextPending : -1;
   }
-  function go(delta: number) {
-    index = Math.max(0, Math.min(queue.length - 1, index + delta));
+  async function go(delta: number) {
+    const target = Math.max(0, Math.min(queue.length - 1, index + delta));
+    if (target === index) return;
+    // Persist any unsaved edit as a DRAFT before navigating, so the load $effect can't silently discard
+    // the reviewer's typed corrections when `current` changes. Navigation is not a verify, so the
+    // segment's `verified` state is left untouched; the edit is recoverable and Reset still discards it.
+    if (dirty && current && !saving) {
+      const seg = current;
+      const draft: SpeechSegment = { ...seg, annotatedTranscript: editText.trim() };
+      saving = true;
+      try {
+        await api.updateSegment(draft);
+        segments.update((list) => list.map((s) => (s.id === seg.id ? draft : s)));
+      } catch (e) {
+        notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+      } finally {
+        saving = false;
+      }
+    }
+    index = target;
   }
   function resetToOriginal() {
     if (current) editText = originalText(current);

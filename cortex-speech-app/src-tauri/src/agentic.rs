@@ -374,11 +374,24 @@ fn delete_gemini_file(name: &str, api_key: &str) -> Result<(), String> {
 }
 
 fn extract_gemini_text(body: &Value) -> Result<String, String> {
-    body["candidates"][0]["content"]["parts"][0]["text"]
-        .as_str()
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| "Gemini response did not contain transcript text".to_string())
+    // Concatenate ALL text parts, not just parts[0]. Gemini can split one transcript across
+    // content.parts[0..N] (and a 2.5-class "thinking" model can emit a leading thought part), so
+    // reading parts[0] alone silently truncates the reference transcript — which then mis-scores every
+    // local candidate downstream. Join every part's text to reconstruct the full response.
+    let joined = body["candidates"][0]["content"]["parts"]
+        .as_array()
+        .map(|ps| {
+            ps.iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        return Err("Gemini response did not contain transcript text".to_string());
+    }
+    Ok(trimmed.to_string())
 }
 
 fn whole_file_reference_system_prompt() -> &'static str {

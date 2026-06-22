@@ -542,20 +542,83 @@ pub fn is_transient_decode_error(err: &AppError) -> bool {
     }
 }
 
+/// Windowed-sinc (Hamming) low-pass FIR, applied as a centered, same-length, edge-clamped convolution.
+/// Used as the anti-aliasing pre-filter before decimation. `cutoff_hz` is the -6 dB-ish passband edge.
+fn lowpass_fir(samples: &[f32], sample_rate: f64, cutoff_hz: f64) -> Vec<f32> {
+    const TAPS: usize = 63; // odd → symmetric, linear-phase kernel
+    let half = (TAPS / 2) as isize;
+    // Normalized cutoff in cycles/sample, kept strictly below Nyquist (0.5).
+    let fc = (cutoff_hz / sample_rate).clamp(1e-4, 0.499);
+
+    let mut kernel = [0.0f64; TAPS];
+    let mut sum = 0.0f64;
+    for (k, slot) in kernel.iter_mut().enumerate() {
+        let n = k as isize - half;
+        let sinc = if n == 0 {
+            2.0 * fc
+        } else {
+            let x = std::f64::consts::PI * n as f64;
+            (2.0 * fc * x).sin() / x
+        };
+        // Hamming window.
+        let w = 0.54 - 0.46 * (2.0 * std::f64::consts::PI * k as f64 / (TAPS as f64 - 1.0)).cos();
+        let v = sinc * w;
+        *slot = v;
+        sum += v;
+    }
+    // Normalize to unity DC gain so the filter neither amplifies nor attenuates the passband level.
+    for v in kernel.iter_mut() {
+        *v /= sum;
+    }
+
+    let len = samples.len();
+    let mut out = vec![0.0f32; len];
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut acc = 0.0f64;
+        for (k, &kv) in kernel.iter().enumerate() {
+            let idx = i as isize + (k as isize - half);
+            let s = if idx < 0 {
+                samples[0]
+            } else if idx as usize >= len {
+                samples[len - 1]
+            } else {
+                samples[idx as usize]
+            };
+            acc += kv * s as f64;
+        }
+        *o = acc as f32;
+    }
+    out
+}
+
 pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || samples.is_empty() {
         return samples.to_vec();
     }
+    // Anti-aliasing: when DOWNSAMPLING, low-pass below the NEW Nyquist before decimating. Real input is
+    // almost always 44.1k/48k, so every file is downsampled to 16k; linear interpolation alone is a poor
+    // anti-alias filter (~-6 dB/octave, no null at Nyquist), so source energy above 8 kHz would fold back
+    // into the speech band and corrupt the PCM fed to VAD/ASR, inflating WER/CER. Upsampling needs no
+    // pre-filter (no new aliases are created), so it keeps the plain interpolation path.
+    let prefiltered: Vec<f32>;
+    let src: &[f32] = if to_rate < from_rate {
+        let cutoff = 0.45 * to_rate as f64; // just under the new Nyquist (to_rate / 2)
+        prefiltered = lowpass_fir(samples, from_rate as f64, cutoff);
+        &prefiltered
+    } else {
+        samples
+    };
+
     let ratio = to_rate as f64 / from_rate as f64;
-    let new_len = (samples.len() as f64 * ratio).ceil() as usize;
+    let new_len = (src.len() as f64 * ratio).ceil() as usize;
     let mut out = Vec::with_capacity(new_len);
 
     for i in 0..new_len {
         let src_idx = i as f64 / ratio;
         let lo = src_idx.floor() as usize;
-        let hi = (lo + 1).min(samples.len().saturating_sub(1));
+        let hi = (lo + 1).min(src.len().saturating_sub(1));
         let frac = src_idx - lo as f64;
-        let interpolated = samples[lo] as f64 * (1.0 - frac) + samples[hi] as f64 * frac;
+        let interpolated = src[lo] as f64 * (1.0 - frac) + src[hi] as f64 * frac;
         out.push(interpolated as f32);
     }
     out
@@ -1020,6 +1083,29 @@ mod tests {
         let input: Vec<f32> = (0..44100).map(|i| (i as f32 / 44100.0).sin()).collect();
         let output = resample(&input, 44100, 16000);
         assert_eq!(output.len(), 16000);
+    }
+
+    #[test]
+    fn resample_attenuates_above_nyquist_tone() {
+        // Round-11 audit (aliasing): downsampling must low-pass BEFORE decimation. A tone above the new
+        // Nyquist (8 kHz for a 16 kHz target) must be attenuated, not folded into the passband. Compare
+        // a 9 kHz tone (above Nyquist) vs a 1 kHz tone (in band), both 48 kHz, after resampling to 16 kHz.
+        let sr = 48000.0f64;
+        let n = 48000usize; // 1 second
+        let tone = |hz: f64| -> Vec<f32> {
+            (0..n).map(|i| (2.0 * std::f64::consts::PI * hz * i as f64 / sr).sin() as f32).collect()
+        };
+        let energy = |s: &[f32]| -> f64 {
+            s.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / s.len().max(1) as f64
+        };
+
+        let e_in = energy(&resample(&tone(1000.0), 48000, 16000));
+        let e_above = energy(&resample(&tone(9000.0), 48000, 16000));
+
+        // The in-band tone passes through; the above-Nyquist tone is strongly attenuated. Before the
+        // anti-aliasing fix the 9 kHz tone aliased to 7 kHz and retained comparable (un-attenuated) energy.
+        assert!(e_in > 0.1, "in-band 1 kHz tone should pass: energy {e_in}");
+        assert!(e_above < e_in * 0.1, "above-Nyquist 9 kHz tone must be attenuated >10x vs in-band: {e_above} vs {e_in}");
     }
 
     #[test]

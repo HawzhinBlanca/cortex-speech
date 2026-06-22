@@ -148,10 +148,23 @@ impl LlmRefiner {
 
         let body: Value = resp.into_json().map_err(|e| format!("Failed to parse Gemini response: {}", e))?;
 
-        if let Some(content) = body["candidates"][0]["content"]["parts"][0]["text"].as_str() {
-            Ok(content.trim().to_string())
-        } else {
+        // Concatenate ALL text parts — Gemini can split a refined transcript across content.parts[0..N]
+        // (and a 2.5-class "thinking" model may emit a leading thought part); reading parts[0] alone
+        // would truncate the refinement or return the thought instead of the answer.
+        let joined = body["candidates"][0]["content"]["parts"]
+            .as_array()
+            .map(|ps| {
+                ps.iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
+        let trimmed = joined.trim();
+        if trimmed.is_empty() {
             Err("Invalid response format from Gemini".to_string())
+        } else {
+            Ok(trimmed.to_string())
         }
     }
 }
