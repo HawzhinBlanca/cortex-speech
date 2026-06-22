@@ -297,6 +297,21 @@ impl Database {
         }
     }
 
+    /// Release (commit) the named OUTERMOST savepoint. For the outermost savepoint, RELEASE *is* the
+    /// WAL commit and can fail (SQLITE_BUSY/IOERR at commit time); SQLite then leaves the savepoint
+    /// OPEN. If we returned that error without unwinding (the old `RELEASE ...?`), the dangling
+    /// savepoint would persist on the shared, poison-recovering (never-reopened) connection, so the
+    /// NEXT command would run inside the stale transaction and a later ROLLBACK TO could silently
+    /// discard writes already reported as committed. Roll it back + release on failure so a failed
+    /// commit cannot poison the connection.
+    fn release_savepoint(&self, savepoint: &str) -> AppResult<()> {
+        if let Err(error) = self.conn.execute(&format!("RELEASE {savepoint}"), []) {
+            self.cleanup_savepoint_after_error(savepoint);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     pub fn insert_segment(&self, seg: &SpeechSegment) -> AppResult<()> {
         validate_segment(seg)?;
         let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
@@ -480,7 +495,7 @@ impl Database {
         })();
         match result {
             Ok(()) => {
-                self.conn.execute("RELEASE batch_insert", [])?;
+                self.release_savepoint("batch_insert")?;
                 self.track_write()?;
                 Ok(())
             }
@@ -571,7 +586,7 @@ impl Database {
         })();
         match result {
             Ok(()) => {
-                self.conn.execute("RELEASE merge_json", [])?;
+                self.release_savepoint("merge_json")?;
                 self.track_write()?;
                 Ok((created, updated))
             }
@@ -664,7 +679,7 @@ impl Database {
         })();
         match result {
             Ok(()) => {
-                self.conn.execute("RELEASE batch_delete", [])?;
+                self.release_savepoint("batch_delete")?;
                 // Keep the FTS5 index clean after bulk deletions.
                 if let Err(error) = self.conn.execute("INSERT INTO segments_fts(segments_fts) VALUES('optimize')", []) {
                     tracing::warn!("Failed to optimize segments FTS index after batch delete: {error}");
@@ -1040,7 +1055,7 @@ impl Database {
         })();
         match result {
             Ok(changed) => {
-                self.conn.execute("RELEASE consensus_batch", [])?;
+                self.release_savepoint("consensus_batch")?;
                 self.track_write()?;
                 Ok(changed)
             }
@@ -1614,6 +1629,13 @@ mod tests {
             db.get_segment_by_audio_path("/b1.wav").unwrap().is_none(),
             "the whole batch must roll back, including the valid segment"
         );
+
+        // After a failed batch the connection must NOT hold an open savepoint/transaction — otherwise
+        // the next command would run inside a stale transaction and a later rollback could silently
+        // discard committed writes (round-17: release_savepoint cleans up even if the commit fails).
+        assert!(db.conn.is_autocommit(), "a failed batch must leave no open transaction on the connection");
+        db.insert_segment(&make_segment("after", "/after.wav")).expect("a write after a failed batch must commit");
+        assert!(db.get_segment_by_audio_path("/after.wav").unwrap().is_some());
     }
 
     #[test]
