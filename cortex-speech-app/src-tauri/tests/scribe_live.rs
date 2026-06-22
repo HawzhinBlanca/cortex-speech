@@ -41,8 +41,5 @@ fn scribe_transcribes_nawras_in_sorani() {
     .expect("scribe transcription should succeed");
     println!("SCRIBE_RUST_RESULT:: {text}");
     assert!(text.chars().count() > 20, "expected a real transcription, got: {text}");
-    assert!(
-        text.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)),
-        "expected Sorani (Arabic-script) characters"
-    );
+    assert!(text.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)), "expected Sorani (Arabic-script) characters");
 }

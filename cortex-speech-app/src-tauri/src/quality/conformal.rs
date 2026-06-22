@@ -241,13 +241,16 @@ mod tests {
         // forbids mid-tie cutoffs, so at a tight 0.2 target this data must report UNCALIBRATED.
         let mut segs = Vec::new();
         for i in 0..30 {
-            segs.push(mock_segment(&format!("a{i}"), 0.95, -0.5, true, "کورد", "کورد")); // 0.10, cer 0
+            segs.push(mock_segment(&format!("a{i}"), 0.95, -0.5, true, "کورد", "کورد"));
+            // 0.10, cer 0
         }
         for i in 0..5 {
-            segs.push(mock_segment(&format!("g{i}"), 0.90, -1.0, true, "کورد", "کورد")); // 0.20, cer 0
+            segs.push(mock_segment(&format!("g{i}"), 0.90, -1.0, true, "کورد", "کورد"));
+            // 0.20, cer 0
         }
         for i in 0..5 {
-            segs.push(mock_segment(&format!("b{i}"), 0.90, -1.0, true, "خراب", "جوان")); // 0.20, cer ~1
+            segs.push(mock_segment(&format!("b{i}"), 0.90, -1.0, true, "خراب", "جوان"));
+            // 0.20, cer ~1
         }
         let cert = calibrate_and_certify(&segs, 0.2, 0.90);
         assert!(
@@ -262,8 +265,7 @@ mod tests {
     fn calibrated_bound_uses_bonferroni_multiplicity_correction() {
         // 20 perfect items (cer 0), all tied → only cutoff k=20. For n=20, delta=0.1 the corrected
         // bound is sqrt(ln(200)/40) ≈ 0.3640; the old uncorrected form would give ≈ 0.2397.
-        let segs: Vec<_> =
-            (0..20).map(|i| mock_segment(&format!("c{i}"), 0.9, -1.0, true, "کورد", "کورد")).collect();
+        let segs: Vec<_> = (0..20).map(|i| mock_segment(&format!("c{i}"), 0.9, -1.0, true, "کورد", "کورد")).collect();
         let cert = calibrate_and_certify(&segs, 0.5, 0.90);
         assert!(cert.is_calibrated);
         let expected = ((20.0f64 / 0.1).ln() / (2.0 * 20.0)).sqrt();
@@ -320,8 +322,7 @@ mod tests {
     /// uncalibrated and fall back to the conservative heuristic threshold.
     #[test]
     fn too_few_verified_falls_back_to_uncalibrated() {
-        let segs: Vec<_> =
-            (0..5).map(|i| mock_segment(&format!("c{i}"), 0.9, -1.0, true, "کورد", "کورد")).collect();
+        let segs: Vec<_> = (0..5).map(|i| mock_segment(&format!("c{i}"), 0.9, -1.0, true, "کورد", "کورد")).collect();
         let cert = calibrate_and_certify(&segs, 0.2, 0.90);
         assert!(!cert.is_calibrated, "fewer than 10 verified segments must be uncalibrated");
         assert!((cert.threshold - 0.35).abs() < 1e-9, "fallback heuristic threshold is 0.35");

@@ -257,21 +257,42 @@ def test_app_entrypoint_reports_fatal_errors_without_panicking() -> None:
 
 def test_app_state_cancel_token_recovers_poisoned_lock() -> None:
     lib = (REPO_ROOT / "src-tauri/src/lib.rs").read_text(encoding="utf-8")
-    if "fn lock_cancel_token(&self) -> MutexGuard<'_, Option<CancellationToken>>" not in lib:
-        raise AssertionError("AppState must centralize cancellation token locking behind lock_cancel_token()")
-    if "Recovering poisoned cancellation token lock" not in lib:
-        raise AssertionError("AppState must warn when recovering a poisoned cancellation token lock")
+    required_locks = [
+        "fn lock_import_cancel_token(&self) -> MutexGuard<'_, Option<CancellationToken>>",
+        "fn lock_batch_cancel_token(&self) -> MutexGuard<'_, Option<CancellationToken>>",
+    ]
+    missing_locks = [lock for lock in required_locks if lock not in lib]
+    if missing_locks:
+        formatted = "\n".join(f"- {entry}" for entry in missing_locks)
+        raise AssertionError(f"AppState must centralize cancellation token locking per operation kind:\n{formatted}")
+    required_warnings = [
+        "Recovering poisoned import cancellation token lock",
+        "Recovering poisoned batch cancellation token lock",
+    ]
+    missing_warnings = [warning for warning in required_warnings if warning not in lib]
+    if missing_warnings:
+        formatted = "\n".join(f"- {entry}" for entry in missing_warnings)
+        raise AssertionError(f"AppState must warn when recovering poisoned cancellation token locks:\n{formatted}")
     if "poisoned.into_inner()" not in lib:
         raise AssertionError("AppState cancellation token locking must recover with poisoned.into_inner()")
-    direct_lock_count = lib.count("self.cancel_token.lock()")
-    if direct_lock_count != 1:
-        raise AssertionError(f"self.cancel_token.lock() must only appear inside lock_cancel_token(), found {direct_lock_count}")
+    import_lock_count = lib.count("self.import_cancel_token.lock()")
+    batch_lock_count = lib.count("self.batch_cancel_token.lock()")
+    if import_lock_count != 1:
+        raise AssertionError(f"self.import_cancel_token.lock() must only appear inside lock_import_cancel_token(), found {import_lock_count}")
+    if batch_lock_count != 1:
+        raise AssertionError(f"self.batch_cancel_token.lock() must only appear inside lock_batch_cancel_token(), found {batch_lock_count}")
     if "app_state_cancel_token_recovers_poisoned_lock" not in lib:
         raise AssertionError("lib.rs must keep a unit test for poisoned cancellation token recovery")
-    if "pub fn is_cancelled(&self) -> bool" not in lib or "self.lock_cancel_token()" not in lib:
-        raise AssertionError("AppState::is_cancelled() must read through lock_cancel_token()")
+    if (
+        "pub fn is_cancelled(&self) -> bool" not in lib
+        or "self.lock_import_cancel_token()" not in lib
+        or "self.lock_batch_cancel_token()" not in lib
+    ):
+        raise AssertionError("AppState::is_cancelled() must read through recovered per-operation token locks")
     if "pub fn start_cancel_token(&self) -> CancellationToken" not in lib:
         raise AssertionError("AppState must expose start_cancel_token() for command handlers")
+    if "pub fn ensure_cancel_token(&self) -> Result<CancellationToken, String>" not in lib:
+        raise AssertionError("AppState must expose ensure_cancel_token() for batch command handlers")
     if "pub fn cancel_current_operation(&self) -> bool" not in lib:
         raise AssertionError("AppState must expose cancel_current_operation() for command handlers")
     if "app_state_start_and_cancel_recover_poisoned_lock" not in lib:
@@ -679,8 +700,8 @@ def test_commands_alignment_quality_stamp_reports_failures() -> None:
         raise AssertionError(f"commands.rs silently discards alignment-quality stamp failures:\n{formatted}")
 
     required = [
-        'db.update_alignment_quality(id, "ctc_forced")',
-        'map_err(|error| format!("Failed to stamp CTC alignment quality for {id}: {error}"))?;',
+        "db.update_alignment_quality(id, quality.as_db_str())",
+        'map_err(|error| format!("Failed to stamp alignment quality for {id}: {error}"))?;',
     ]
     missing = [pattern for pattern in required if pattern not in commands]
     if missing:
@@ -717,13 +738,13 @@ def test_jury_db_and_export_paths_do_not_silently_drop_errors() -> None:
     export = (REPO_ROOT / "src-tauri/src/export.rs").read_text(encoding="utf-8")
     required_jury = [
         "db.record_human_decision(segment_id, decision, corrected_transcript)",
-        "Ok(rows.collect::<Result<Vec<_>, _>>()?)",
+        "rows.collect::<Result<Vec<_>, _>>()?",
     ]
     missing_jury = [pattern for pattern in required_jury if pattern not in jury]
     if missing_jury:
         formatted = "\n".join(f"- {entry}" for entry in missing_jury)
         raise AssertionError(f"jury/mod.rs is missing explicit DB error propagation:\n{formatted}")
-    if jury.count("Ok(rows.collect::<Result<Vec<_>, _>>()?)") != 3:
+    if jury.count("rows.collect::<Result<Vec<_>, _>>()?") != 3:
         raise AssertionError("jury/mod.rs must collect all three mapped row iterators with error propagation")
 
     required_learning = [
@@ -743,8 +764,8 @@ def test_jury_db_and_export_paths_do_not_silently_drop_errors() -> None:
         raise AssertionError(f"export.rs silently discards HuggingFace split persistence failures:\n{formatted}")
 
     required_export = [
-        "db.update_segment_split(&seg.id, assigned_split)",
-        'AppError::Other(format!("Failed to persist split {assigned_split} for {}: {error}", seg.id))',
+        "db.update_segment_split(id, split)",
+        'AppError::Other(format!("Failed to persist split {split} for {id}: {error}"))',
     ]
     missing_export = [pattern for pattern in required_export if pattern not in export]
     if missing_export:
@@ -760,7 +781,7 @@ def test_database_read_paths_do_not_silently_drop_rows() -> None:
         "Ok(rows.collect::<Result<Vec<_>, _>>()?)",
         "fn human_verdict_for_decision(decision: &str) -> AppResult<&'static str>",
         "fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String>]) -> Option<String>",
-        "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript, verdict_transcript",
+        "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript,\n                        verdict_transcript",
         "verdict_transcript.clone(),",
         "Some(raw_transcript.clone()),",
     ]
@@ -770,7 +791,7 @@ def test_database_read_paths_do_not_silently_drop_rows() -> None:
         raise AssertionError(f"db.rs is missing explicit DB read error propagation:\n{formatted}")
     if db.count("Ok(rows.collect::<Result<Vec<_>, _>>()?)") < 2:
         raise AssertionError("db.rs must propagate row-mapping errors from batch segment and escalation reads")
-    if "let (is_gold, raw_transcript, normalized_transcript, annotated_transcript, verdict_transcript):" not in db:
+    if "): HumanDecisionContext =" not in db:
         raise AssertionError("Database::record_human_decision must read a full segment snapshot before updating it")
     if "human_edit_learning_uses_agent_proposal_before_raw_asr" not in db:
         raise AssertionError("Database::record_human_decision needs a regression for agent proposal learning examples")
@@ -944,6 +965,10 @@ def test_pipeline_wsl_subprocess_send_failures_are_reported() -> None:
     pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
     forbidden = [
         "let _ = tx.send(cmd.output());",
+        "let _ = child.kill();",
+        "let _ = child.wait();",
+        "stdout_reader.join().unwrap_or_default()",
+        "stderr_reader.join().unwrap_or_default()",
     ]
     present = [pattern for pattern in forbidden if pattern in pipeline]
     if present:
@@ -951,9 +976,11 @@ def test_pipeline_wsl_subprocess_send_failures_are_reported() -> None:
         raise AssertionError(f"pipeline.rs silently discards WSL subprocess send failures:\n{formatted}")
 
     required = [
-        "fn send_wsl_subprocess_result(",
-        "send_wsl_subprocess_result(tx, cmd.output());",
-        'tracing::warn!("WSL subprocess worker could not send output; receiver was dropped or timed out");',
+        "fn kill_and_reap_wsl_child(child: &mut std::process::Child, context: &str)",
+        "kill_and_reap_wsl_child(&mut child, \"timed-out WSL subprocess\");",
+        "kill_and_reap_wsl_child(&mut child, \"failed WSL subprocess\");",
+        "fn join_wsl_pipe_reader(thread: std::thread::JoinHandle<Vec<u8>>, stream: &str) -> Vec<u8>",
+        'tracing::warn!("WSL subprocess {stream} reader panicked");',
     ]
     missing = [pattern for pattern in required if pattern not in pipeline]
     if missing:
@@ -983,7 +1010,7 @@ def test_pipeline_duration_probe_failures_are_not_silent() -> None:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"pipeline.rs must propagate or report duration probe failures:\n{formatted}")
 
-    if pipeline.count("let duration_ms = audio::get_duration_ms(path)?;") != 3:
+    if pipeline.count("let duration_ms = audio::get_duration_ms(path)?;") < 3:
         raise AssertionError("pipeline.rs must keep duration probe propagation on import, single-file import, and transcribe paths")
 
 
@@ -1029,7 +1056,8 @@ def test_eval_read_paths_do_not_silently_drop_rows() -> None:
 def test_pipeline_rediarize_reports_db_update_failures() -> None:
     pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
     required = [
-        "pub fn rediarize_segments(&self, db: &Database, ids: &[String]) -> AppResult<usize>",
+        "pub fn rediarize_segments(&self, ids: &[String]) -> AppResult<usize>",
+        "let db = self.open_db()?;",
         "match db.insert_segment(&seg)",
         'tracing::error!("Rediarize speaker update failed for {}: {error}", seg.id);',
     ]

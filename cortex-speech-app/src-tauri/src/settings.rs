@@ -580,7 +580,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_https_remote_endpoint_and_oversized_fields() {
-        let remote_http = AppSettings { llm_endpoint: "http://evil.example.com/exfil".to_string(), ..AppSettings::default() };
+        let remote_http =
+            AppSettings { llm_endpoint: "http://evil.example.com/exfil".to_string(), ..AppSettings::default() };
         assert!(
             matches!(remote_http.validate(), Err(crate::error::AppError::Validation(_))),
             "a non-https remote endpoint must be rejected (exfil risk)"
@@ -589,7 +590,8 @@ mod tests {
         let huge_prompt = AppSettings { llm_system_prompt: "x".repeat(20_000), ..AppSettings::default() };
         assert!(matches!(huge_prompt.validate(), Err(crate::error::AppError::Validation(_))));
 
-        let huge_endpoint = AppSettings { llm_endpoint: format!("https://{}", "a".repeat(3000)), ..AppSettings::default() };
+        let huge_endpoint =
+            AppSettings { llm_endpoint: format!("https://{}", "a".repeat(3000)), ..AppSettings::default() };
         assert!(matches!(huge_endpoint.validate(), Err(crate::error::AppError::Validation(_))));
     }
 

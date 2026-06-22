@@ -51,11 +51,9 @@ pub(crate) fn apply_loop0_firing(enabled: bool, db: &crate::db::Database, transc
         return transcript.to_string();
     }
     match db.load_correction_memories() {
-        Ok(memories) if !memories.is_empty() => crate::corrections::apply_memories(
-            transcript,
-            &memories,
-            &crate::corrections::FiringConfig::default(),
-        ),
+        Ok(memories) if !memories.is_empty() => {
+            crate::corrections::apply_memories(transcript, &memories, &crate::corrections::FiringConfig::default())
+        }
         Ok(_) => transcript.to_string(),
         Err(error) => {
             tracing::warn!("LOOP-0 firing skipped: failed to load correction memories: {error}");
@@ -76,6 +74,25 @@ fn subprocess_error_preview(output: &str) -> String {
         preview.push_str("\n[truncated subprocess stderr]");
     }
     preview
+}
+
+fn kill_and_reap_wsl_child(child: &mut std::process::Child, context: &str) {
+    if let Err(error) = child.kill() {
+        tracing::warn!("Failed to kill {context}: {error}");
+    }
+    if let Err(error) = child.wait() {
+        tracing::warn!("Failed to reap {context}: {error}");
+    }
+}
+
+fn join_wsl_pipe_reader(thread: std::thread::JoinHandle<Vec<u8>>, stream: &str) -> Vec<u8> {
+    match thread.join() {
+        Ok(buffer) => buffer,
+        Err(_) => {
+            tracing::warn!("WSL subprocess {stream} reader panicked");
+            Vec::new()
+        }
+    }
 }
 
 fn lock_decoded_windows(windows: &Mutex<Vec<audio::PcmWindow>>) -> MutexGuard<'_, Vec<audio::PcmWindow>> {
@@ -345,9 +362,7 @@ impl ProcessingPipeline {
     /// `AppState` lock is held across the (slow) ASR loop.
     pub fn run_gold_eval_asr(&self, model_id: Option<&str>) -> AppResult<crate::eval::EvalRunResult> {
         let db = self.open_db()?;
-        let model_id = model_id
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.local_asr_model_id().to_string());
+        let model_id = model_id.map(|s| s.to_string()).unwrap_or_else(|| self.local_asr_model_id().to_string());
         crate::eval::run_gold_eval_with_transcriber(&db, &model_id, |seg| {
             self.transcribe_audio_file_raw(&seg.audio_path)
         })
@@ -363,9 +378,7 @@ impl ProcessingPipeline {
             if !asr.is_available() {
                 return Err(AppError::Other("ASR model not loaded".into()));
             }
-            asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
-                .map(|(text, _confidence)| text)
-                .map_err(AppError::Other)
+            asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(text, _confidence)| text).map_err(AppError::Other)
         })
     }
 
@@ -1500,10 +1513,13 @@ impl ProcessingPipeline {
                 self.set_import_status(chunks_done, estimated_chunks, &fname);
             }
         }
-        on_event(PipelineEvent::Completed { total: 1, succeeded: if result.is_ok() { 1 } else { 0 }, failed: if result.is_err() { 1 } else { 0 } });
+        on_event(PipelineEvent::Completed {
+            total: 1,
+            succeeded: if result.is_ok() { 1 } else { 0 },
+            failed: if result.is_err() { 1 } else { 0 },
+        });
         self.finish_import_status();
         result
-
     }
 
     /// The ElevenLabs Scribe key to use for cloud STT, or `None` when cloud STT is not opted in or no
@@ -1824,12 +1840,27 @@ impl ProcessingPipeline {
         }
     }
 
+    /// Whether LLM refinement may run under the CURRENT consent-gated settings. Consults the
+    /// same `effective_llm_mode()` gate as `build_refiner` so every refinement decision point
+    /// enforces the cloud (Gemini) opt-in (defense in depth): if a future path attempts
+    /// refinement without going through `build_refiner`, this guard still blocks cloud use
+    /// when the user has not opted in.
+    fn llm_refinement_permitted(&self) -> bool {
+        self.settings.effective_llm_mode() != crate::settings::LlmMode::None
+    }
+
     /// Build the LLM refiner. When the configured mode is the cloud (Gemini) and an OPENROUTER_API_KEY
     /// is present in secrets.env, route through OpenRouter instead — it is verified working and
     /// reaches Gemini-class models, whereas direct Gemini is commonly 429 quota-blocked. Respects
     /// `None` (refinement disabled) and `Local` (the user's own endpoint).
     fn build_refiner(&self) -> Option<crate::llm_refiner::LlmRefiner> {
         use crate::settings::LlmMode;
+        // When the user has not opted into cloud LLM, `effective_llm_mode()` downgrades
+        // Gemini -> None, so no refiner (and therefore no outbound cloud call) is ever
+        // constructed. Mirrors the gate in `llm_refinement_permitted`.
+        if !self.llm_refinement_permitted() {
+            return None;
+        }
         let refiner_from_settings = |mode: &LlmMode| {
             crate::llm_refiner::LlmRefiner::new(
                 mode,
@@ -2013,8 +2044,7 @@ impl ProcessingPipeline {
             // for exit and, on timeout, kill + reap the child so nothing is left running.
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
-            let mut child =
-                cmd.spawn().map_err(|e| AppError::Other(format!("WSL subprocess launch failed: {e}")))?;
+            let mut child = cmd.spawn().map_err(|e| AppError::Other(format!("WSL subprocess launch failed: {e}")))?;
 
             // Drain both pipes on threads so a chatty child can't deadlock on a full pipe
             // buffer; the readers finish when the pipes close (child exit or kill).
@@ -2043,22 +2073,20 @@ impl ProcessingPipeline {
                     Ok(Some(status)) => break Some(status),
                     Ok(None) => {
                         if std::time::Instant::now() >= deadline {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            kill_and_reap_wsl_child(&mut child, "timed-out WSL subprocess");
                             break None;
                         }
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_and_reap_wsl_child(&mut child, "failed WSL subprocess");
                         return Err(AppError::Other(format!("WSL subprocess wait failed: {e}")));
                     }
                 }
             };
 
-            let stdout = stdout_reader.join().unwrap_or_default();
-            let stderr = stderr_reader.join().unwrap_or_default();
+            let stdout = join_wsl_pipe_reader(stdout_reader, "stdout");
+            let stderr = join_wsl_pipe_reader(stderr_reader, "stderr");
             match status {
                 Some(status) => std::process::Output { status, stdout, stderr },
                 None => {
@@ -2269,8 +2297,7 @@ mod tests {
     #[test]
     fn build_refiner_routes_gemini_through_openrouter_when_key_present() {
         use crate::settings::LlmMode;
-        let settings =
-            AppSettings { llm_mode: LlmMode::Gemini, cloud_llm_opt_in: true, ..AppSettings::default() };
+        let settings = AppSettings { llm_mode: LlmMode::Gemini, cloud_llm_opt_in: true, ..AppSettings::default() };
         let (pipeline, dir) = test_pipeline_with_settings(settings);
         std::fs::write(dir.path().join("secrets.env"), "OPENROUTER_API_KEY=test-or-key\n").unwrap();
         let refiner = pipeline.build_refiner().expect("a refiner should be built");
@@ -2366,7 +2393,8 @@ mod tests {
             ScribeSegment { text: "ئەمە یەکەمە".into(), source_start_ms: 0, source_end_ms: 1500 },
             ScribeSegment { text: "دووەمین پارچە".into(), source_start_ms: 2000, source_end_ms: 5000 },
         ];
-        let built = super::ProcessingPipeline::build_scribe_speech_segments(&scribe, "/audio/x.wav", 6000, false, false);
+        let built =
+            super::ProcessingPipeline::build_scribe_speech_segments(&scribe, "/audio/x.wav", 6000, false, false);
         db.insert_segments_batch(&built).expect("insert batch");
 
         let mut back = db.get_segments(None).expect("read back");
@@ -2379,15 +2407,15 @@ mod tests {
         assert_eq!(back[0].raw_transcript, "ئەمە یەکەمە", "text survives the round-trip");
         assert_eq!(back[0].audio_path, "/audio/x.wav");
         assert_eq!(back[0].duration_ms, 1500);
-        let m0 =
-            crate::chunking::SegmentSourceMeta::from_alignment_json(back[0].alignment_json.as_deref().unwrap()).unwrap();
+        let m0 = crate::chunking::SegmentSourceMeta::from_alignment_json(back[0].alignment_json.as_deref().unwrap())
+            .unwrap();
         assert_eq!(
             (m0.source_start_ms, m0.source_end_ms, m0.chunk_index, m0.chunk_count),
             (0, 1500, 0, 2),
             "alignment time-range + chunk indices survive persistence — playback hits the right slice"
         );
-        let m1 =
-            crate::chunking::SegmentSourceMeta::from_alignment_json(back[1].alignment_json.as_deref().unwrap()).unwrap();
+        let m1 = crate::chunking::SegmentSourceMeta::from_alignment_json(back[1].alignment_json.as_deref().unwrap())
+            .unwrap();
         assert_eq!((m1.source_start_ms, m1.source_end_ms), (2000, 5000));
     }
 

@@ -624,7 +624,7 @@ The 7B's `ckb` accuracy gains are **aspirational until measured** — `ckb`'s tr
 
 ### Appendix — verified file map (absolute paths, as found in the tree)
 
-Repo root: `C:\Users\hawzh\Desktop\CORTEX\.claude\worktrees\cortex-10x`. Note the **two distinct `scripts/` roots** — they are not the same directory:
+Repo root: `<repo-root>` (a local git worktree). Note the **two distinct `scripts/` roots** — they are not the same directory:
 
 - `…\scripts\sorani_ensemble_asr.py` — **(repo-root scripts/)** 3-engine ensemble; `agreement()`, `rover_fuse()`; the live call `ASRInferencePipeline(model_card="omniASR_LLM_7B_v2")` and import `omnilingual_asr.models.inference.pipeline`
 - `…\cortex-speech-app\scripts\test_model_provenance_policy.py` — **(app scripts/)** model-provenance policy gate

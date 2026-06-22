@@ -1,11 +1,11 @@
+import array
 import csv
 import json
 import math
+import sys
 import wave
 from collections import Counter
 from pathlib import Path
-
-import numpy as np
 
 from build_halwest_dataset import OUT_DIR
 from finalize_halwest_dataset import checked_manifest_audio_path
@@ -28,17 +28,42 @@ def wav_stats(path: Path) -> dict:
         raw = wav.readframes(frames)
     if sample_width != 2:
         raise ValueError(f"Expected 16-bit PCM WAV: {path}")
-    data = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
-    if channels > 1:
-        data = data.reshape(-1, channels).mean(axis=1)
-    if data.size == 0:
+
+    samples = array.array("h")
+    samples.frombytes(raw)
+    if sys.byteorder != "little":
+        samples.byteswap()
+
+    if not samples:
         peak = rms = 0.0
         clipped = 0
     else:
-        abs_data = np.abs(data)
-        peak = float(abs_data.max()) / 32768.0
-        rms = math.sqrt(float(np.mean(data * data))) / 32768.0
-        clipped = int(np.sum(abs_data >= 32760))
+        peak_abs = 0.0
+        sum_sq = 0.0
+        clipped = 0
+        measured_frames = 0
+
+        if channels > 1:
+            usable_samples = len(samples) - (len(samples) % channels)
+            for offset in range(0, usable_samples, channels):
+                value = sum(samples[offset : offset + channels]) / channels
+                abs_value = abs(value)
+                peak_abs = max(peak_abs, abs_value)
+                sum_sq += value * value
+                if any(abs(sample) >= 32760 for sample in samples[offset : offset + channels]):
+                    clipped += 1
+                measured_frames += 1
+        else:
+            for sample in samples:
+                abs_value = abs(sample)
+                peak_abs = max(peak_abs, abs_value)
+                sum_sq += float(sample) * float(sample)
+                if abs_value >= 32760:
+                    clipped += 1
+                measured_frames += 1
+
+        peak = peak_abs / 32768.0
+        rms = math.sqrt(sum_sq / measured_frames) / 32768.0 if measured_frames else 0.0
     duration = frames / sample_rate if sample_rate else 0.0
     peak_dbfs = 20 * math.log10(peak) if peak > 0 else -120.0
     rms_dbfs = 20 * math.log10(rms) if rms > 0 else -120.0

@@ -253,7 +253,7 @@ mod tests {
             "ووییوو",           // alternating ambiguous run
             "ـــ",              // tatweel only
             "\u{200C}\u{200C}", // ZWNJ run
-            "ًٌٍَُِّْ",          // Arabic diacritics only (combining marks)
+            "ًٌٍَُِّْ",                 // Arabic diacritics only (combining marks)
             "١٢٣٤٥",            // Arabic-Indic digits
             "abcdef",           // Latin (all-undetermined to the Kurdish classifier)
             "a و b ی c",        // mixed scripts with ambiguous letters
@@ -263,7 +263,7 @@ mod tests {
         ];
         for c in cases {
             let out = g2p(c); // must not panic
-            // Sanity: output is finite text; empty in → empty out.
+                              // Sanity: output is finite text; empty in → empty out.
             if c.trim().is_empty() {
                 assert!(out.is_empty(), "empty/whitespace input should yield empty: {c:?} -> {out:?}");
             }

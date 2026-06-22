@@ -65,10 +65,7 @@ pub fn locate_reference_span(reference: &str, hypothesis: &str) -> Option<SpanMa
 
     let mut ref_bigrams: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
     for i in 0..ref_tokens.len().saturating_sub(1) {
-        ref_bigrams
-            .entry((ref_tokens[i].as_str(), ref_tokens[i + 1].as_str()))
-            .or_default()
-            .push(i);
+        ref_bigrams.entry((ref_tokens[i].as_str(), ref_tokens[i + 1].as_str())).or_default().push(i);
     }
     for j in 0..hyp_tokens.len().saturating_sub(1) {
         let key = (hyp_tokens[j].as_str(), hyp_tokens[j + 1].as_str());

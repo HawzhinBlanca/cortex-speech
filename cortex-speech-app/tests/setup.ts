@@ -45,6 +45,19 @@ if (typeof Element !== 'undefined' && !Element.prototype.animate) {
   }
 }
 
+if (typeof globalThis.ResizeObserver === 'undefined') {
+  class MockResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  Object.defineProperty(globalThis, 'ResizeObserver', {
+    writable: true,
+    configurable: true,
+    value: MockResizeObserver,
+  });
+}
+
 // Mock Tauri invoke for tests
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),

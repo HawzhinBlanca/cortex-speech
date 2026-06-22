@@ -262,7 +262,11 @@ mod tests {
             ("a b c", ""),
         ] {
             let bd = word_error_breakdown(r, h);
-            assert_eq!(bd.total(), word_edit_distance(r, h).distance, "S+D+I must equal edit distance for ({r:?},{h:?})");
+            assert_eq!(
+                bd.total(),
+                word_edit_distance(r, h).distance,
+                "S+D+I must equal edit distance for ({r:?},{h:?})"
+            );
         }
     }
 
@@ -380,7 +384,7 @@ mod tests {
         // ZWNJ equivalence
         assert_eq!(compute_wer("ئەو\u{200C}کەسە", "ئەو کەسە"), 0.0);
         assert_eq!(compute_cer("ئەو\u{200C}کەسە", "ئەو کەسە"), 0.0);
-        
+
         // Diacritics equivalence
         assert_eq!(compute_wer("كُورْدِي", "کوردی"), 0.0);
         assert_eq!(compute_cer("كُورْدِي", "کوردی"), 0.0);

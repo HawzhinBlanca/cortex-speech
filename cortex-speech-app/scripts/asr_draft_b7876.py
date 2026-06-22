@@ -1,11 +1,11 @@
+from __future__ import annotations
+
 import csv
 import json
 import re
 import subprocess
 import wave
 from pathlib import Path
-
-import numpy as np
 
 from build_halwest_dataset import (
     MAX_SEG_DUR,
@@ -82,7 +82,12 @@ def convert_asr_input() -> None:
     )
 
 
-def load_audio(path: Path) -> tuple[np.ndarray, int]:
+def load_audio(path: Path):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("Missing dependency: install numpy before running B7876 ASR draft generation.") from exc
+
     with wave.open(str(path), "rb") as wav:
         sample_rate = wav.getframerate()
         audio = np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16)

@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 pub fn write_crash_report(data_dir: &Path, location: &str, message: &str, timestamp: &str) -> Option<PathBuf> {
     let dir = data_dir.join("crashes");
     std::fs::create_dir_all(&dir).ok()?;
-    let safe_ts: String =
-        timestamp.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let safe_ts: String = timestamp.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
     let path = dir.join(format!("crash-{safe_ts}.json"));
     let report = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
