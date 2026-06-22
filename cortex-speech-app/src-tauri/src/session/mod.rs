@@ -6,7 +6,16 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Session state — saved periodically for crash recovery.
+///
+/// NOTE (round-25 #4): only `segment_count` / `verified_count` currently round-trip. `from_db` is the
+/// sole writer and rebuilds the UI fields (`selected_segment_id`, `search_query`, filters, `view_mode`,
+/// panels) from `Self::new()` defaults, because the frontend does not yet pass live UI state into
+/// `save_session`. Those fields are RESERVED for that future wiring — do not rely on them being
+/// restored. Round-25 #5: `#[serde(default)]` lets an older/newer `session.json` deserialize by filling
+/// any missing field from `Self::default()` instead of quarantining a benign version-skewed file as
+/// corrupt (the `version` field is informational; there is no migration branch).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionState {
     pub version: String,
     pub last_saved: u64,
@@ -113,6 +122,8 @@ impl SessionManager {
 
     pub fn load(&self) -> Option<SessionState> {
         let path = self.save_path();
+        // Round-25 #3: promote an orphaned .replace-bak-* left by an interrupted atomic replace.
+        let _ = crate::atomic_file::recover_interrupted_replace(&path);
         if !path.exists() {
             return None;
         }
@@ -122,6 +133,14 @@ impl SessionManager {
 
     pub fn restore(&self) -> AppResult<Option<SessionState>> {
         let path = self.save_path();
+        // Round-25 #3: a hard crash between replace_file's two renames can leave session.json missing
+        // with the only good copy stranded at a .replace-bak-* sibling. Promote it back into place
+        // (mirrors AppSettings::load) BEFORE the path.exists() check, so a recoverable session is not
+        // silently lost. Round-25 #6: garbage-collect stale temp/backup/quarantine files while here.
+        if let Ok(true) = crate::atomic_file::recover_interrupted_replace(&path) {
+            tracing::warn!("Recovered an interrupted session.json replace from its backup copy");
+        }
+        self.prune_session_dir();
         if path.exists() {
             // Clean stale sessions older than 7 days
             if let Ok(metadata) = std::fs::metadata(&path) {
@@ -171,6 +190,34 @@ impl SessionManager {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => tracing::warn!("Failed to remove session file {}: {error}", path.display()),
+        }
+    }
+
+    /// Round-25 #6: best-effort garbage collection of the session directory — delete a leftover
+    /// `session.json.tmp` (failed write) and any `session.json.replace-bak-*` orphan (after recovery
+    /// has had its chance), and cap quarantined `session.corrupt.*.json` files to the most recent few
+    /// so repeated crash/upgrade cycles don't accumulate unbounded dead files. Never fails the load.
+    fn prune_session_dir(&self) {
+        const MAX_QUARANTINE: usize = 5;
+        let Ok(entries) = std::fs::read_dir(&self.save_dir) else {
+            return;
+        };
+        let mut corrupt: Vec<(SystemTime, PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if name == "session.json.tmp" || name.starts_with("session.json.replace-bak-") {
+                let _ = std::fs::remove_file(&path);
+            } else if name.starts_with("session.corrupt.") && name.ends_with(".json") {
+                let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
+                corrupt.push((mtime, path));
+            }
+        }
+        if corrupt.len() > MAX_QUARANTINE {
+            corrupt.sort_by_key(|(t, _)| *t); // oldest first
+            for (_, path) in corrupt.iter().take(corrupt.len() - MAX_QUARANTINE) {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 
