@@ -404,14 +404,27 @@ pub fn decide_promotion(challenger: &Scorecard, policy: &PromotionPolicy) -> Pro
 
     // --- Slice gate: never ship a model that improves the aggregate while REGRESSING a slice. ---
     if let Some(cmp) = &challenger.vs_baseline {
-        if cmp.slice_regressions.is_empty() {
-            reasons.push("Slice gate ok: no per-condition slice regressed beyond tolerance".to_string());
-        } else {
+        if !cmp.slice_regressions.is_empty() {
             promote = false;
             reasons.push(format!(
                 "Slice gate FAILED: challenger regresses {} slice(s) despite a better aggregate — {}",
                 cmp.slice_regressions.len(),
                 cmp.slice_regressions.join("; ")
+            ));
+        } else if cmp.evaluated_slices == 0 {
+            // Round-21 (promotion_slice_gate): NO length slice had enough paired data to evaluate, so
+            // "no slice regressed" would be unearned assurance — exactly the conflation the honesty law
+            // forbids. Fail closed: the slice gate is UNVERIFIED (not satisfied), which on the small
+            // gold sets this project actually ships on is the common case. Grow the gold set (so a
+            // length bucket reaches MIN_SLICE_SEGS) before a challenger can be crowned on slice grounds.
+            promote = false;
+            reasons.push(
+                "Slice gate UNVERIFIED: no length slice had enough paired data to test for regression — blocking under fail-closed policy (grow the gold set so a slice reaches the minimum)".to_string(),
+            );
+        } else {
+            reasons.push(format!(
+                "Slice gate ok: no per-condition slice regressed beyond tolerance ({} slice(s) evaluated)",
+                cmp.evaluated_slices
             ));
         }
     }
@@ -695,6 +708,7 @@ mod tests {
                 significant_at_05: p < 0.05,
                 beats_baseline: beats,
                 slice_regressions: Vec::new(),
+                evaluated_slices: 5, // slices were evaluated and clean (not "no data to evaluate")
             }),
             bootstrap_resamples: 1000,
             confidence: 0.95,
@@ -753,6 +767,25 @@ mod tests {
         let decision = decide_promotion(&card, &PromotionPolicy::default());
         assert!(!decision.promote, "a slice regression must block promotion despite an aggregate win");
         assert!(decision.reasons.iter().any(|r| r.contains("Slice gate FAILED")), "{:?}", decision.reasons);
+    }
+
+    #[test]
+    fn blocks_when_no_slice_could_be_evaluated() {
+        // Round-21 (promotion_slice_gate): a strict aggregate WER+CER win, but NO length slice had
+        // enough paired data to test for regression (evaluated_slices == 0, the small-gold-set regime).
+        // "No slice regressed" must NOT read as a green pass — fail closed as UNVERIFIED.
+        let mut card = challenger_card(0.10, 0.05, 0.20, 0.08, true, 0.01);
+        if let Some(cmp) = card.vs_baseline.as_mut() {
+            cmp.slice_regressions.clear();
+            cmp.evaluated_slices = 0;
+        }
+        let decision = decide_promotion(&card, &PromotionPolicy::default());
+        assert!(!decision.promote, "an unverifiable slice gate must block promotion: {:?}", decision.reasons);
+        assert!(
+            decision.reasons.iter().any(|r| r.contains("Slice gate UNVERIFIED")),
+            "must report the slice gate as UNVERIFIED, not an affirmative pass: {:?}",
+            decision.reasons
+        );
     }
 
     #[test]
