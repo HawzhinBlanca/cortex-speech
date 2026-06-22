@@ -140,9 +140,13 @@ fn file_meets_min_size(path: &Path, min_size_bytes: u64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfidenceSource {
-    /// Mean per-token posterior derived from the model's exposed `ys_probs`.
+    /// Mean per-token posterior, for a model that exposes per-token `ys_log_probs`. NOTE: the default
+    /// offline engine (OmniASR CTC via sherpa-onnx) does NOT expose these — its result JSON always
+    /// carries `ys_log_probs: []` — so this variant is unreachable on the shipped local path, which
+    /// uses `Heuristic`. It exists for a future/alternate engine that actually emits token log-probs.
     RealPosterior,
-    /// The 0.90 / 0.0 fallback, used when the model exposed no token probabilities.
+    /// The 0.90 / 0.0 fallback, used when the model exposed no token probabilities — which is EVERY
+    /// segment on the default offline OmniASR CTC engine.
     #[default]
     Heuristic,
 }
@@ -160,12 +164,17 @@ fn confidence_from_asr_result(text: &str, ys_log_probs: &[f64]) -> (Option<f64>,
 #[derive(serde::Deserialize)]
 struct RawAsrResult {
     text: String,
-    // sherpa-onnx's OfflineRecognizerResult JSON emits the per-token acoustic LOG-probs
-    // under the key "ys_probs". The original code only read "ys_log_probs" — a key sherpa
-    // never emits — so with serde(default) the array was ALWAYS empty and confidence fell
-    // back to the 0.90 heuristic on every segment. The alias accepts sherpa's real key
-    // (and the alias can only make more JSON parse, never less, so it cannot regress).
-    #[serde(default, alias = "ys_probs")]
+    // sherpa-onnx's OfflineRecognizerResult JSON emits per-token acoustic LOG-probs under the key
+    // "ys_log_probs" — which this field name matches directly. HONESTY NOTE: the omnilingual OmniASR
+    // CTC engine (the default and only local engine) NEVER populates it — its Convert() emits
+    // `ys_log_probs: []` for every chunk in sherpa-onnx 1.13.2 — so confidence_from_asr_result always
+    // takes the empty branch and returns the documented 0.90/0.0 HEURISTIC (correctly labelled
+    // ConfidenceSource::Heuristic). The RealPosterior branch is thus unreachable on the shipped local
+    // path; it would fire only for an engine that actually exposes these log-probs. A genuine per-token
+    // posterior for CTC would require capturing the greedy argmax log-prob in the sherpa bindings,
+    // which 1.13.2 discards. (The earlier `alias = "ys_probs"` aliased a key sherpa never emits — dead,
+    // so removed.)
+    #[serde(default)]
     ys_log_probs: Vec<f64>,
 }
 
@@ -556,14 +565,17 @@ mod tests {
     }
 
     #[test]
-    fn sherpa_ys_probs_field_drives_real_confidence_not_the_constant() {
-        // sherpa-onnx emits per-token acoustic LOG-probs under "ys_probs". With the alias,
-        // these now flow into a REAL mean-posterior confidence instead of the 0.90 constant.
+    fn real_token_log_probs_yield_a_mean_posterior_not_the_constant() {
+        // Exercises the RealPosterior branch's LOGIC using sherpa's REAL key "ys_log_probs", for a
+        // hypothetical engine that exposes per-token log-probs. Honesty: the default OmniASR CTC engine
+        // never emits these (it always sends `ys_log_probs: []` — see
+        // asr_result_without_token_probs_uses_honest_heuristic), so on the shipped local path confidence
+        // is ALWAYS the Heuristic; this test does NOT claim the default engine produces a real posterior.
         // mean(exp(-0.10536), exp(-0.22314)) = mean(0.900, 0.800) = 0.850.
-        let json = r#"{"text":"سڵاو","ys_probs":[-0.10536,-0.22314]}"#;
+        let json = r#"{"text":"سڵاو","ys_log_probs":[-0.10536,-0.22314]}"#;
         let (text, conf, source) = parse_asr_result_json(json).expect("parse");
         assert_eq!(text, "سڵاو");
-        assert_eq!(source, ConfidenceSource::RealPosterior, "real ys_probs ⇒ RealPosterior");
+        assert_eq!(source, ConfidenceSource::RealPosterior, "real per-token log-probs ⇒ RealPosterior");
         let c = conf.expect("confidence");
         assert!((c - 0.85).abs() < 0.01, "expected real ~0.85 mean posterior, got {c}");
         assert!((c - 0.90).abs() > 0.01, "must NOT be the 0.90 constant");
