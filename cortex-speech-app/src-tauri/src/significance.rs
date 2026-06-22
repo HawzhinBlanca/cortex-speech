@@ -79,6 +79,11 @@ pub fn micro_rate(segments: &[SegmentError]) -> f64 {
         .fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
     if len > 0.0 {
         (err / len).min(1.0)
+    } else if err > 0.0 {
+        // Zero reference length but non-zero errors (every reference empty, hypotheses non-empty) is
+        // FULL error, not a perfect 0.0. This matches run_gold_eval's headline branch (eval.rs), so the
+        // scorecard's micro_wer/cer can never contradict the persisted eval WER (1.0) for the same run.
+        1.0
     } else {
         0.0
     }
@@ -211,6 +216,17 @@ mod tests {
         // 1 error / 4 ref + 3 errors / 6 ref => 4/10 = 0.4 (NOT the mean of the two rates).
         let s = segs(&[(1.0, 4.0), (3.0, 6.0)]);
         assert!((micro_rate(&s) - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn micro_rate_is_full_error_for_zero_reference_with_errors() {
+        // Round-12 audit: an all-empty-reference corpus with counted errors (empty refs, non-empty
+        // hypotheses) is FULL error (1.0) — matching run_gold_eval's persisted headline — not a
+        // misleading 0.0 that would make the scorecard contradict the eval run for the same result.
+        assert_eq!(micro_rate(&segs(&[(3.0, 0.0)])), 1.0);
+        // Truly empty (no errors, no reference) stays 0.0, and so does an empty corpus.
+        assert_eq!(micro_rate(&segs(&[(0.0, 0.0)])), 0.0);
+        assert_eq!(micro_rate(&segs(&[])), 0.0);
     }
 
     #[test]

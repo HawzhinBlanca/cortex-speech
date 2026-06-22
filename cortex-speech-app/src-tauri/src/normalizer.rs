@@ -229,7 +229,12 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
         Regex::new(r"\d{1,3}(?:[،,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?").unwrap()
     });
 
-    let expanded = DIGITS_RE.replace_all(&result, |caps: &regex::Captures| verbalize_number_token(&caps[0]));
+    let expanded = DIGITS_RE.replace_all(&result, |caps: &regex::Captures| {
+        // Surround the multi-word expansion with spaces so a numeral glued to a word ("ساڵی٢٠٢٠") or a
+        // leftover digit after a thousands-group match cannot FUSE into a single non-word token. The
+        // subsequent MULTI_SPACE collapse + trim in `normalize` absorb the redundant spaces.
+        format!(" {} ", verbalize_number_token(&caps[0]))
+    });
 
     expanded.into_owned()
 }
@@ -362,7 +367,9 @@ mod tests {
             ("على", "علی"),
             ("ســـاڵ", "ساڵ"),
             ("ئەو\u{200C}کەسە", "ئەو کەسە"),
-            ("ئەو ڪەسە لە ســـاڵەکانی ١٩٥٠دا دەژیا", "ئەو کەسە لە ساڵەکانی ھەزار و نۆسەد و پەنجادا دەژیا"),
+            // The numeral ١٩٥٠ glued to the suffix دا must keep a word boundary after verbalization
+            // (round-12 fix): پەنجا (50) is no longer fused into پەنجادا, so FTS/dedup tokenizes it.
+            ("ئەو ڪەسە لە ســـاڵەکانی ١٩٥٠دا دەژیا", "ئەو کەسە لە ساڵەکانی ھەزار و نۆسەد و پەنجا دا دەژیا"),
             ("", ""),
         ];
         for (input, expected) in cases {
@@ -476,6 +483,25 @@ mod tests {
         assert_eq!(n.normalize("007"), "سفر سفر حەوت");
         // Plain numbers still verbalize as before.
         assert_eq!(n.normalize("123"), "سەد و بیست و سێ");
+    }
+
+    #[test]
+    fn verbalize_numbers_keeps_word_boundary_around_glued_digits() {
+        // Round-12 audit HIGH: a numeral glued to a word ("ساڵی٢٠٢٠", a common Sorani year pattern) used
+        // to FUSE the word with the first verbalized number-word ("ساڵیدوو …"), producing a non-word
+        // token that corrupts the FTS-indexed normalized_transcript. The expansion must be space-
+        // delimited from neighbours, with no leaked leading/trailing/double spaces.
+        let n = SoraniNormalizer::new();
+        let out = n.normalize("ساڵی٢٠٢٠");
+        assert!(out.starts_with("ساڵی "), "word must stay separated from the number: {out:?}");
+        assert!(!out.contains("ساڵیدوو"), "word must not fuse with the first number-word: {out:?}");
+        assert_eq!(out, out.trim(), "no leading/trailing space leak: {out:?}");
+        assert!(!out.contains("  "), "no double spaces leak: {out:?}");
+
+        // A leftover digit after a thousands-group match must also not fuse with the group's last word.
+        let grouped = n.normalize("100,0001");
+        assert!(!grouped.contains("  "), "no double spaces: {grouped:?}");
+        assert_eq!(grouped, grouped.trim());
     }
 
     #[test]

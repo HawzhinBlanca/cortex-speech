@@ -190,8 +190,13 @@ pub fn build_scorecard(
 /// both systems on the shared set, and run MAPSSWE. Only the intersection is used —
 /// the only statistically valid basis for a paired test.
 /// Utterance-length difficulty slice — a per-condition slice that needs no extra gold metadata.
+///
+/// Count over the SAME normalized token stream the WER uses (`normalize_for_metrics` splits ZWNJ into
+/// a space, so a raw `split_whitespace` count disagrees with the metric's effective word count on
+/// ZWNJ-joined Sorani words). Bucketing on the raw count would file a segment under the wrong slice and
+/// corrupt the promotion-blocking slice-regression gate.
 fn length_slice(reference: &str) -> &'static str {
-    match reference.split_whitespace().count() {
+    match wer::tokenize_words(&wer::normalize_for_metrics(reference)).len() {
         0..=4 => "short (≤4 words)",
         5..=15 => "medium (5–15 words)",
         _ => "long (>15 words)",
@@ -534,6 +539,17 @@ mod tests {
         let sc = build_scorecard(&result, None, ScorecardOptions::default());
         assert!(sc.system.wer_ci.lower <= sc.system.micro_wer + 1e-9);
         assert!(sc.system.micro_wer <= sc.system.wer_ci.upper + 1e-9);
+    }
+
+    #[test]
+    fn length_slice_counts_normalized_tokens_not_raw_zwnj() {
+        // Round-12 audit: bucket on the SAME normalized token stream the WER uses. ZWNJ (U+200C) is not
+        // whitespace, so normalize_for_metrics splits it into a space and yields one more word than a
+        // raw split_whitespace count. A 4-raw / 5-normalized-token reference must bucket as "medium",
+        // not "short", or the promotion-blocking slice gate is computed over a mis-bucketed population.
+        let r = "ئەو\u{200C}کەسە لە ماڵ بوو"; // first token joins ئەو + کەسە with a ZWNJ
+        assert_eq!(r.split_whitespace().count(), 4, "raw whitespace count is 4");
+        assert_eq!(length_slice(r), "medium (5–15 words)");
     }
 
     #[test]
