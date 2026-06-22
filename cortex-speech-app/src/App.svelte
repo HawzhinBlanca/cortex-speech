@@ -438,6 +438,7 @@
         description: 'Focus search',
         action: () => document.querySelector<HTMLInputElement>('[type=search]')?.focus(),
         category: 'navigation',
+        allowInEditable: true,
       },
       {
         key: ',',
@@ -540,6 +541,7 @@
         description: 'Command palette',
         action: () => (showCommandPalette = true),
         category: 'general',
+        allowInEditable: true,
       },
     ];
     km.registerAll(shortcuts);
