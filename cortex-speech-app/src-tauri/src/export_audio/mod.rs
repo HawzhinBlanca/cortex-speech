@@ -51,9 +51,13 @@ pub fn export_audio_segments(
     segment_ids: &[String],
     options: &AudioExportOptions,
 ) -> AppResult<AudioExportResult> {
-    if options.sample_rate < 8000 || options.sample_rate > 96000 {
+    // Round-24/25 #11: the working buffer is decoded+downmixed to 16 kHz (audio::decode_to_pcm), so a
+    // requested rate ABOVE 16000 would only UPSAMPLE a band-limited signal and write a WAV/FLAC header
+    // (and metadata.csv export_sample_rate) that overstates the true bandwidth of a shared dataset
+    // clip. Cap the accepted range at 16000 — only downsampling (e.g. 8000) is meaningful here.
+    if options.sample_rate < 8000 || options.sample_rate > 16000 {
         return Err(AppError::Validation(format!(
-            "Invalid sample rate: {} (must be between 8000 and 96000)",
+            "Invalid sample rate: {} (must be between 8000 and 16000; the source is 16 kHz, so higher rates would overstate fidelity)",
             options.sample_rate
         )));
     }
@@ -469,7 +473,7 @@ mod tests {
             &AudioExportOptions {
                 output_dir: out_dir.to_string_lossy().to_string(),
                 format: AudioExportFormat::Wav,
-                sample_rate: 24_000,
+                sample_rate: 16_000,
                 include_metadata: true,
             },
         )
@@ -493,7 +497,7 @@ mod tests {
         assert!(!src.contains('/') && !src.contains('\\'), "no directory separators may leak: {src}");
         assert_eq!(metadata_value(&headers, &row, "raw_transcript"), "hello");
         assert_eq!(metadata_value(&headers, &row, "verified"), "0");
-        assert_eq!(metadata_value(&headers, &row, "export_sample_rate"), "24000");
+        assert_eq!(metadata_value(&headers, &row, "export_sample_rate"), "16000");
         assert_eq!(metadata_value(&headers, &row, "export_format"), "wav");
         assert!(reader.records().next().is_none());
     }
@@ -599,34 +603,47 @@ mod tests {
     }
 
     #[test]
-    fn test_export_resamples_to_requested_sample_rate() {
+    fn test_export_rejects_upsampling_and_allows_downsampling() {
+        // Round-25 #11: the source is decoded to 16 kHz, so a requested rate ABOVE 16000 would only
+        // upsample a band-limited signal and write a header/metadata rate that overstates fidelity — it
+        // is rejected. Downsampling (8000) is still allowed and writes the true requested rate.
         let tmp = TempDir::new().unwrap();
         let wav_path = tmp.path().join("test.wav");
         make_wav_file(&wav_path);
-
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        insert_test_segment(&db, "exp24", &wav_path);
-
+        insert_test_segment(&db, "exp", &wav_path);
         let out_dir = tmp.path().join("out");
-        let result = export_audio_segments(
+
+        let upsample = export_audio_segments(
             &db,
-            &["exp24".to_string()],
+            &["exp".to_string()],
             &AudioExportOptions {
                 output_dir: out_dir.to_string_lossy().to_string(),
                 format: AudioExportFormat::Wav,
                 sample_rate: 24000,
                 include_metadata: true,
             },
+        );
+        assert!(upsample.is_err(), "a >16 kHz export rate must be rejected (it would overstate fidelity)");
+
+        let result = export_audio_segments(
+            &db,
+            &["exp".to_string()],
+            &AudioExportOptions {
+                output_dir: out_dir.to_string_lossy().to_string(),
+                format: AudioExportFormat::Wav,
+                sample_rate: 8000,
+                include_metadata: true,
+            },
         )
         .unwrap();
-
         assert_eq!(result.succeeded, 1);
         let (sample_rate, sample_count) = output_wav_info(&out_dir.join(&result.files[0]));
-        assert_eq!(sample_rate, 24000);
+        assert_eq!(sample_rate, 8000);
         assert!(
-            (23900..=24100).contains(&sample_count),
-            "resampled one-second clip should have about 24000 samples, got {sample_count}"
+            (7900..=8100).contains(&sample_count),
+            "downsampled one-second clip should have about 8000 samples, got {sample_count}"
         );
     }
 
