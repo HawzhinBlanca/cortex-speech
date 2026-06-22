@@ -370,10 +370,20 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
     let mut stmt = db.connection().prepare(
         // Only human-verified examples seed the LLM corrector's few-shot context; model pseudo-labels
         // (verified_by_human=0) are captured but never used as exemplars until a human signs off.
-        "SELECT id, segment_id, wrong_transcript, human_fix, created_at
-         FROM agent_examples
-         WHERE verified_by_human = 1
-         ORDER BY created_at DESC, id ASC
+        //
+        // HOLDOUT EXCLUSION: never inject a held-out gold clip's correction into the live judge — its
+        // human_fix IS the held-out reference text, so showing it to the T2 cloud judge contaminates the
+        // benchmark and inflates measured WER/CER. The DPO/LM exports already gate on this; the few-shot
+        // path must too. A clip promoted to holdout keeps its audio_path, so excluding examples whose
+        // segment audio_path is a holdout gold path (plus the defensive is_gold=0) closes the leak in
+        // SQL without re-hashing every candidate in the jury hot loop.
+        "SELECT ae.id, ae.segment_id, ae.wrong_transcript, ae.human_fix, ae.created_at
+         FROM agent_examples ae
+         JOIN speech_segments ss ON ae.segment_id = ss.id
+         WHERE ae.verified_by_human = 1
+           AND ss.is_gold = 0
+           AND ss.audio_path NOT IN (SELECT audio_path FROM gold_segments WHERE is_holdout = 1)
+         ORDER BY ae.created_at DESC, ae.id ASC
          LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![pool as i64], |row| {
@@ -633,6 +643,51 @@ mod tests {
         db.insert_segment(&make_seg("seg-empty", "")).unwrap();
         let recency = get_few_shot_examples(&db, "seg-empty", 1).unwrap();
         assert_eq!(recency[0].id, "a-new2", "no segment text -> recency fallback returns the newest");
+    }
+
+    #[test]
+    fn few_shot_excludes_holdout_gold_corrections() {
+        // Round-19 holdout-leak: a correction whose segment audio was promoted to a HOLDOUT gold clip
+        // must NOT be served as a few-shot exemplar — its human_fix IS the held-out reference text, so
+        // injecting it into the live T2 judge contaminates the benchmark and inflates measured WER/CER.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let mut held = make_seg("seg-held", "x");
+        held.audio_path = "/data/holdout.wav".to_string();
+        db.insert_segment(&held).unwrap();
+        let mut ok = make_seg("seg-ok", "x");
+        ok.audio_path = "/data/train.wav".to_string();
+        db.insert_segment(&ok).unwrap();
+        db.insert_segment(&make_seg("seg-q", "کوردی باشە")).unwrap();
+
+        let conn = db.connection();
+        conn.execute(
+            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
+             VALUES ('a-held', 'seg-held', 'کوردی', 'کوردی باشە', '2024-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
+             VALUES ('a-ok', 'seg-ok', 'کوردی', 'کوردی باشە', '2024-01-02')",
+            [],
+        )
+        .unwrap();
+        // Promote the first clip to a HOLDOUT gold reference (same audio_path).
+        conn.execute(
+            "INSERT INTO gold_segments (id, audio_path, reference, is_holdout)
+             VALUES ('g1', '/data/holdout.wav', 'کوردی باشە', 1)",
+            [],
+        )
+        .unwrap();
+
+        let ids: Vec<String> = get_few_shot_examples(&db, "seg-q", 10).unwrap().into_iter().map(|e| e.id).collect();
+        assert!(
+            !ids.iter().any(|id| id == "a-held"),
+            "a holdout gold clip's correction must NOT be served as a few-shot example: {ids:?}"
+        );
+        assert!(ids.iter().any(|id| id == "a-ok"), "a non-holdout correction is still available");
     }
 
     #[test]
