@@ -127,6 +127,18 @@ fn online_cluster(embeddings: &[Vec<f32>], max_speakers: usize) -> Vec<Option<St
             continue;
         }
 
+        // Round-23 #1: a non-empty but DEGENERATE embedding — all-zeros (a near-silent slice that
+        // still passed VAD) or containing NaN/Inf — must be treated like an empty one. cosine_similarity
+        // returns -1.0 for a zero vector and NaN for a non-finite one, so such a chunk never matches any
+        // centroid yet gets PUSHED as a brand-new permanent phantom centroid: it wastes a max_speakers
+        // slot and, once the budget is exhausted, later chunks fall through to SPEAKER_00, misattributing
+        // real speakers. Leave it unlabeled instead.
+        let norm_sq: f32 = emb.iter().map(|x| x * x).sum();
+        if emb.iter().any(|x| !x.is_finite()) || norm_sq <= 1e-12 {
+            labels.push(None);
+            continue;
+        }
+
         // Defense-in-depth: never cluster a mismatched-dimension embedding. cosine_similarity returns
         // -1.0 on a length mismatch, which would force a brand-new phantom speaker for every such chunk.
         // The per-file backend choice already keeps embeddings uniform; if one ever differs from the
@@ -234,6 +246,26 @@ mod tests {
         assert_eq!(labels[0].as_deref(), Some("SPEAKER_00"));
         assert_eq!(labels[1], None, "mismatched-dimension chunk must be unlabeled, not a new speaker");
         assert_eq!(labels[2].as_deref(), Some("SPEAKER_00"), "same-dim same-direction stays one speaker");
+    }
+
+    #[test]
+    fn cluster_embeddings_does_not_spawn_phantom_speaker_for_degenerate_embedding() {
+        // Round-23 #1: a zero-vector or non-finite embedding (a near-silent slice that passed VAD, or a
+        // NaN/Inf CAM++ output) must be left unlabeled — NOT pushed as a permanent phantom centroid that
+        // wastes a max_speakers slot and later misattributes real speakers to SPEAKER_00.
+        let a = vec![1.0_f32; 192];
+        let zero = vec![0.0_f32; 192];
+        let nan = {
+            let mut v = vec![1.0_f32; 192];
+            v[0] = f32::NAN;
+            v
+        };
+        let b = vec![1.0_f32; 192]; // same speaker as `a`
+        let labels = cluster_embeddings(&[a, zero, nan, b], 8);
+        assert_eq!(labels[0].as_deref(), Some("SPEAKER_00"));
+        assert_eq!(labels[1], None, "zero-norm embedding must be unlabeled, not a new speaker");
+        assert_eq!(labels[2], None, "non-finite embedding must be unlabeled, not a new speaker");
+        assert_eq!(labels[3].as_deref(), Some("SPEAKER_00"), "the real speaker still clusters to one label");
     }
 
     #[test]
