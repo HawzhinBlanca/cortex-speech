@@ -1988,6 +1988,21 @@ fn wsl_log_preview(line: &str) -> String {
     preview
 }
 
+/// Drain a subprocess log stream line-by-line, decoding each line LOSSILY. `BufRead::lines()` yields
+/// `io::Result<String>` and returns `Err(InvalidData)` for any non-UTF-8 line, so the previous
+/// `lines().map_while(Result::ok)` permanently terminated the reader on the first such line —
+/// silently freezing the live WSL progress feed for the rest of a (possibly hour-long) run on a
+/// distro with a non-UTF-8 locale. Reading raw bytes and decoding with `from_utf8_lossy` survives
+/// any input (invalid bytes become U+FFFD) so every subsequent line still reaches the feed. The
+/// trailing `\r` of a `\r\n` line is trimmed.
+fn drain_log_lines<R: std::io::BufRead>(reader: R, mut on_line: impl FnMut(&str)) {
+    for line in reader.split(b'\n') {
+        let Ok(bytes) = line else { break }; // genuine I/O error (not an encoding error): stop
+        let text = String::from_utf8_lossy(&bytes);
+        on_line(text.trim_end_matches('\r'));
+    }
+}
+
 fn join_wsl_log_reader(thread: std::thread::JoinHandle<()>, stream: &str) {
     if thread.join().is_err() {
         tracing::warn!("WSL {stream} log reader thread panicked");
@@ -2091,22 +2106,19 @@ pub fn run_wsl_refinement(
 
     // Spawn thread to read stdout/stderr and monitor exit
     std::thread::spawn(move || {
-        use std::io::BufRead;
         let stdout_reader = std::io::BufReader::new(stdout);
         let stderr_reader = std::io::BufReader::new(stderr);
 
         let app_stdout = app_clone.clone();
         let stdout_thread = std::thread::spawn(move || {
-            for l in stdout_reader.lines().map_while(Result::ok) {
-                emit_or_log(&app_stdout, "wsl-log", wsl_log_preview(&l));
-            }
+            drain_log_lines(stdout_reader, |l| emit_or_log(&app_stdout, "wsl-log", wsl_log_preview(l)));
         });
 
         let app_stderr = app_clone.clone();
         let stderr_thread = std::thread::spawn(move || {
-            for l in stderr_reader.lines().map_while(Result::ok) {
-                emit_or_log(&app_stderr, "wsl-log", format!("[ERROR] {}", wsl_log_preview(&l)));
-            }
+            drain_log_lines(stderr_reader, |l| {
+                emit_or_log(&app_stderr, "wsl-log", format!("[ERROR] {}", wsl_log_preview(l)))
+            });
         });
 
         // Wait for readers to finish
@@ -3691,6 +3703,27 @@ mod tests {
     #[test]
     fn wsl_log_preview_keeps_short_lines_unchanged() {
         assert_eq!(wsl_log_preview("ready"), "ready");
+    }
+
+    #[test]
+    fn drain_log_lines_survives_non_utf8_and_delivers_every_line() {
+        // A single non-UTF-8 byte mid-stream must NOT terminate the feed (the old
+        // lines().map_while(Result::ok) did, silently freezing the live WSL progress feed). Every
+        // later line must still arrive, with the bad byte replaced lossily and a trailing CR trimmed.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"line1\n");
+        data.extend_from_slice(&[b'b', b'a', b'd', 0xFF, b'\n']); // invalid UTF-8 line
+        data.extend_from_slice("کوردی\n".as_bytes()); // valid Sorani after the bad line
+        data.extend_from_slice(b"line4\r\n"); // CRLF — trailing CR must be trimmed
+
+        let mut got = Vec::new();
+        drain_log_lines(std::io::Cursor::new(data), |l| got.push(l.to_string()));
+
+        assert_eq!(got.len(), 4, "all four lines must be delivered despite the bad byte: {got:?}");
+        assert_eq!(got[0], "line1");
+        assert!(got[1].starts_with("bad"), "bad line still delivered lossily: {:?}", got[1]);
+        assert_eq!(got[2], "کوردی", "a valid line AFTER the bad one must still arrive");
+        assert_eq!(got[3], "line4", "trailing CR is trimmed");
     }
 
     #[test]
