@@ -1083,9 +1083,16 @@ pub fn register_media_asset(
 ) -> Result<crate::media::MediaGrant, String> {
     RATE_LIMITER.check("register_media_asset")?;
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    let db = state.lock_db();
     let mut registry = state.lock_media_registry();
-    registry.register(&db, &data_dir, &audio_path)
+    // Round-25 #7: validate the source under the global db lock (fast), then DROP that lock before the
+    // potentially multi-GB file copy in grant_source — otherwise the whole app's DB (every IPC command)
+    // froze for the length of the copy the first time a large clip was played. The media-registry lock
+    // is held throughout (only media commands take it), so this never deadlocks with the db lock.
+    let canonical = {
+        let db = state.lock_db();
+        registry.validate_source(&db, &audio_path)?
+    };
+    registry.grant_source(&data_dir, canonical)
 }
 
 #[tauri::command]
@@ -3019,10 +3026,14 @@ fn has_final_machine_verdict(seg: &crate::db::SpeechSegment) -> bool {
 fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) -> R) -> R {
     let db_path = { app_state.lock_db().path().to_string() };
     if db_path != ":memory:" {
-        match crate::db::Database::open(&db_path) {
+        // Round-25 #8: retry the dedicated open (busy_timeout) so a transient lock/contention doesn't
+        // drop us to the shared-handle fallback, which would hold the GLOBAL db Mutex across the jury's
+        // cloud T2 Gemini round-trips and freeze every other DB command for minutes. open_with_retry
+        // makes that fallback extremely rare (only a hard disk/handle failure reaches it).
+        match crate::db::Database::open_with_retry(&db_path) {
             Ok(db) => return f(&db),
             Err(e) => tracing::warn!(
-                "Jury dedicated db connection open failed ({e}); using the shared handle \
+                "Jury dedicated db connection open failed after retries ({e}); using the shared handle \
                  (other DB commands may pause during adjudication)"
             ),
         }

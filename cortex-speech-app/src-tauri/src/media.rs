@@ -42,17 +42,31 @@ pub fn media_cache_dir(data_dir: &Path) -> PathBuf {
 
 impl MediaRegistry {
     pub fn register(&mut self, db: &Database, data_dir: &Path, requested_path: &str) -> Result<MediaGrant, String> {
+        let canonical = self.validate_source(db, requested_path)?;
+        self.grant_source(data_dir, canonical)
+    }
+
+    /// db-locked, FAST: validate the path and confirm it is an imported media file, returning the
+    /// canonical source path. Round-25 #7: split out from [`grant_source`] so the caller can RELEASE
+    /// the global db Mutex before the (potentially multi-GB) file copy — holding the global db lock
+    /// across `std::fs::copy` froze every other DB command for the length of the copy.
+    pub fn validate_source(&mut self, db: &Database, requested_path: &str) -> Result<PathBuf, String> {
         self.prune_expired();
         let canonical = validate::validate_file_path(requested_path)?;
         self.ensure_imported_media_path(db, requested_path, &canonical)?;
-        let source_path = PathBuf::from(&canonical);
+        Ok(PathBuf::from(canonical))
+    }
 
+    /// NO db lock: copy the source into the media cache and grant a TTL token. The expensive
+    /// `std::fs::copy` runs here, so this MUST be called with the global db Mutex released (see
+    /// [`validate_source`]).
+    pub fn grant_source(&mut self, data_dir: &Path, source_path: PathBuf) -> Result<MediaGrant, String> {
         if let Some(grant) = self.existing_grant_for_source(&source_path) {
             return Ok(grant);
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let ext = Path::new(&canonical)
+        let ext = source_path
             .extension()
             .and_then(|e| e.to_str())
             .map(validate::sanitize_filename)
@@ -62,7 +76,7 @@ impl MediaRegistry {
         std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Create media cache: {e}"))?;
         self.prune_orphaned_cache_files(&cache_dir);
         let cached_path = cache_dir.join(format!("{id}.{ext}"));
-        std::fs::copy(&canonical, &cached_path).map_err(|e| format!("Copy media into app cache: {e}"))?;
+        std::fs::copy(&source_path, &cached_path).map_err(|e| format!("Copy media into app cache: {e}"))?;
 
         let expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
         self.grants.insert(id.clone(), GrantRecord { source_path, cached_path: cached_path.clone(), expires_at });
