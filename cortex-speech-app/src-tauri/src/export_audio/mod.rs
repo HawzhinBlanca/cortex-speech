@@ -270,7 +270,10 @@ fn write_metadata_csv(
                 wtr.write_record([
                     item.filename.as_str(),
                     seg.id.as_str(),
-                    seg.audio_path.as_str(),
+                    // Basename only — never the curator's absolute import path (it embeds the OS
+                    // username + drive layout, a PII leak into this deliberately-shared metadata.csv).
+                    // Matches the sanitization every export.rs exporter applies (round-22 #2).
+                    crate::export::export_audio_ref(&seg.audio_path),
                     seg.raw_transcript.as_str(),
                     seg.normalized_transcript.as_deref().unwrap_or(""),
                     seg.annotated_transcript.as_deref().unwrap_or(""),
@@ -483,6 +486,11 @@ mod tests {
         let row = reader.records().next().unwrap().unwrap();
         assert_eq!(metadata_value(&headers, &row, "file_name"), "test_exp1.wav");
         assert_eq!(metadata_value(&headers, &row, "segment_id"), "exp1");
+        // Round-22 #2: the published source reference is the BASENAME only — never the curator's
+        // absolute import path (which would leak the OS username + drive layout into a shared CSV).
+        let src = metadata_value(&headers, &row, "source_audio_path");
+        assert_eq!(src, "test.wav", "only the basename may be published");
+        assert!(!src.contains('/') && !src.contains('\\'), "no directory separators may leak: {src}");
         assert_eq!(metadata_value(&headers, &row, "raw_transcript"), "hello");
         assert_eq!(metadata_value(&headers, &row, "verified"), "0");
         assert_eq!(metadata_value(&headers, &row, "export_sample_rate"), "24000");
