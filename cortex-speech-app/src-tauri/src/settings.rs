@@ -318,6 +318,23 @@ impl Default for AppSettings {
 /// URL). Shared so every outbound channel — the LLM endpoint and the DPO export — enforces the same
 /// rule. The Rust IPC layer is the trust boundary, so a malicious/XSS-planted argument cannot repoint
 /// a request (and its payload) at an attacker-controlled host.
+/// Whether an endpoint targets the LOCAL device (loopback) and is therefore NOT off-device egress —
+/// so it needs no cloud-egress consent. Strict host match (not a loose `starts_with`): a hostname
+/// like `localhost.attacker.example` must NOT be treated as local. Covers http/https + an optional
+/// port and the IPv6 loopback `[::1]`.
+pub(crate) fn endpoint_is_localhost(endpoint: &str) -> bool {
+    let lower = endpoint.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://")) else {
+        return false;
+    };
+    let host_port = rest.split('/').next().unwrap_or("");
+    if host_port.starts_with("[::1]") {
+        return true; // IPv6 loopback, with or without a trailing :port
+    }
+    let host = host_port.split(':').next().unwrap_or("");
+    host == "localhost" || host == "127.0.0.1"
+}
+
 pub fn validate_outbound_endpoint(endpoint: &str) -> Result<(), crate::error::AppError> {
     use crate::error::AppError;
     const MAX_ENDPOINT_LEN: usize = 2048;
@@ -460,10 +477,15 @@ impl AppSettings {
     }
 
     pub fn effective_llm_mode(&self) -> LlmMode {
-        if self.llm_mode == LlmMode::Gemini && !self.cloud_llm_opt_in {
-            LlmMode::None
-        } else {
-            self.llm_mode.clone()
+        match self.llm_mode {
+            // Cloud Gemini requires explicit consent.
+            LlmMode::Gemini if !self.cloud_llm_opt_in => LlmMode::None,
+            // Round-22 #6: "Local" mode pointed at a NON-localhost endpoint is off-device egress of
+            // transcript text (and the API key) just like Gemini — it must require the same
+            // cloud_llm_opt_in consent. Without opt-in, downgrade to None so no transcript leaves the
+            // device. A genuine on-device endpoint (Ollama at localhost) needs no consent.
+            LlmMode::Local if !self.cloud_llm_opt_in && !endpoint_is_localhost(&self.llm_endpoint) => LlmMode::None,
+            _ => self.llm_mode.clone(),
         }
     }
 
@@ -583,6 +605,49 @@ mod tests {
         for bad in ["", "   ", "http://attacker.example.com/collect", "ftp://x", "file:///etc/passwd"] {
             assert!(super::validate_outbound_endpoint(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn endpoint_is_localhost_is_strict() {
+        for local in [
+            "http://localhost:11434/v1/chat/completions",
+            "http://127.0.0.1:8080/x",
+            "https://localhost/x",
+            "http://[::1]:9/z",
+        ] {
+            assert!(super::endpoint_is_localhost(local), "{local} is local");
+        }
+        for remote in [
+            "https://api.openai.com/v1/chat/completions",
+            "http://localhost.attacker.example/exfil", // must NOT be treated as local
+            "https://127.0.0.1.attacker.example/x",
+            "ftp://localhost",
+        ] {
+            assert!(!super::endpoint_is_localhost(remote), "{remote} is NOT local");
+        }
+    }
+
+    #[test]
+    fn local_mode_remote_endpoint_requires_cloud_consent() {
+        // Round-22 #6: Local mode pointed at a REMOTE endpoint is off-device egress and must be gated by
+        // cloud_llm_opt_in, exactly like Gemini — otherwise transcripts leak with no consent.
+        let remote = |opt_in: bool| AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "https://remote-llm.example/v1/chat/completions".to_string(),
+            cloud_llm_opt_in: opt_in,
+            ..AppSettings::default()
+        };
+        assert_eq!(remote(false).effective_llm_mode(), LlmMode::None, "remote Local without opt-in must downgrade");
+        assert_eq!(remote(true).effective_llm_mode(), LlmMode::Local, "remote Local WITH opt-in is allowed");
+
+        // A genuine on-device (localhost) endpoint needs no consent and is unaffected.
+        let local = AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "http://127.0.0.1:11434/v1/chat/completions".to_string(),
+            cloud_llm_opt_in: false,
+            ..AppSettings::default()
+        };
+        assert_eq!(local.effective_llm_mode(), LlmMode::Local, "localhost Local needs no consent");
     }
 
     #[test]
