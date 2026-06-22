@@ -582,8 +582,14 @@ pub fn export_huggingface_dataset(
 
                 // Group segments by source audio_path so each source file is decoded only once.
                 // For a 2-hour podcast split into N segments, this avoids N full re-decodes.
-                let mut segs_by_source: std::collections::HashMap<&str, Vec<&SpeechSegment>> =
-                    std::collections::HashMap::new();
+                // A BTreeMap (NOT HashMap) keeps the per-source iteration order DETERMINISTIC: std
+                // HashMap iterates in a per-process-random order, which permuted the metadata.csv row
+                // blocks across otherwise-identical exports, changing each split's recorded SHA256SUMS
+                // every run and breaking the byte-reproducibility the manifest is meant to guarantee.
+                // Sorting by source path makes metadata.csv (and its hash) stable; within each source
+                // the Vec keeps split_segs insertion order, which is already deterministic.
+                let mut segs_by_source: std::collections::BTreeMap<&str, Vec<&SpeechSegment>> =
+                    std::collections::BTreeMap::new();
                 for seg in split_segs {
                     segs_by_source.entry(seg.audio_path.as_str()).or_default().push(seg);
                 }
@@ -1743,6 +1749,52 @@ mod tests {
 
         assert!(all_metadata.contains("hf-ready"));
         assert!(!all_metadata.contains("hf-reject"));
+    }
+
+    #[test]
+    fn hf_metadata_rows_are_ordered_deterministically_by_source_path() {
+        // Round-15: metadata.csv rows were emitted in HashMap (per-process-random) iteration order, so
+        // two identical exports produced different bytes and different SHA256SUMS, breaking the
+        // byte-reproducibility the manifest promises. With a BTreeMap the per-source row blocks are
+        // written in sorted source-path order — deterministic. Insert the sources OUT of sorted order
+        // and assert the rows still come out sorted, proving the ordering is by source path (not
+        // insertion/segment order) and is therefore stable across runs.
+        let db_tmp = NamedTempFile::new().unwrap();
+        let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let wav_a = tmp_dir.path().join("a_source.wav");
+        let wav_z = tmp_dir.path().join("z_source.wav");
+        write_silent_wav(&wav_a);
+        write_silent_wav(&wav_z);
+
+        // Insert the z-source segment FIRST (non-sorted insertion order).
+        let mut sz = sample_segment("seg-from-z");
+        sz.audio_path = wav_z.to_string_lossy().to_string();
+        db.insert_segment(&sz).unwrap();
+        let mut sa = sample_segment("seg-from-a");
+        sa.audio_path = wav_a.to_string_lossy().to_string();
+        db.insert_segment(&sa).unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let settings = crate::settings::AppSettings {
+            hf_speaker_disjoint: false,
+            hf_train_ratio: 1.0,
+            hf_val_ratio: 0.0,
+            hf_test_ratio: 0.0,
+            ..crate::settings::AppSettings::default()
+        };
+        export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+
+        let meta = std::fs::read_to_string(out_dir.path().join("data/train/metadata.csv")).unwrap();
+        let a_idx = meta.find("a_source_seg-from-a.wav").expect("a_source row present");
+        let z_idx = meta.find("z_source_seg-from-z.wav").expect("z_source row present");
+        assert!(
+            a_idx < z_idx,
+            "metadata.csv rows must be sorted by source path (a_source before z_source) so the file \
+             is byte-reproducible:\n{meta}"
+        );
     }
 
     #[test]
