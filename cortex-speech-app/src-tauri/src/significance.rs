@@ -73,20 +73,27 @@ pub struct ConfidenceInterval {
 }
 
 /// Micro (corpus-level) error rate: `sum(errors) / sum(ref_len)`.
-pub fn micro_rate(segments: &[SegmentError]) -> f64 {
-    let (err, len) = segments
-        .iter()
-        .fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
+/// Error rate from total errors / total reference length, with the zero-reference convention that the
+/// point estimate AND every bootstrap replica MUST share: zero total reference length but non-zero
+/// errors (every reference empty, hypotheses non-empty) is FULL error (1.0), not a perfect 0.0. This
+/// matches run_gold_eval's headline branch (eval.rs). When the point estimate used 1.0 here but the
+/// bootstrap replicas used 0.0, an all-empty-reference corpus produced a 1.0 point with a [0,0] CI that
+/// did not bracket its own point estimate — a maximally-wrong system reported as zero-uncertainty.
+fn rate(err: f64, len: f64) -> f64 {
     if len > 0.0 {
         (err / len).min(1.0)
     } else if err > 0.0 {
-        // Zero reference length but non-zero errors (every reference empty, hypotheses non-empty) is
-        // FULL error, not a perfect 0.0. This matches run_gold_eval's headline branch (eval.rs), so the
-        // scorecard's micro_wer/cer can never contradict the persisted eval WER (1.0) for the same run.
         1.0
     } else {
         0.0
     }
+}
+
+pub fn micro_rate(segments: &[SegmentError]) -> f64 {
+    let (err, len) = segments
+        .iter()
+        .fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
+    rate(err, len)
 }
 
 /// Segment-level bootstrap confidence interval for the micro error rate.
@@ -116,7 +123,7 @@ pub fn bootstrap_ci(
             err += s.errors;
             len += s.ref_len;
         }
-        rates.push(if len > 0.0 { (err / len).min(1.0) } else { 0.0 });
+        rates.push(rate(err, len));
     }
     rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -247,6 +254,20 @@ mod tests {
         assert_eq!(ci.point, 0.0);
         assert_eq!(ci.lower, 0.0);
         assert_eq!(ci.upper, 0.0);
+    }
+
+    #[test]
+    fn bootstrap_ci_brackets_point_for_all_empty_reference_corpus() {
+        // Round-19: every reference empty + non-zero errors -> micro_rate (point) = 1.0, but the bootstrap
+        // replicas used a divergent zero-ref rule (=> 0.0), yielding a [0,0] CI that did NOT bracket the
+        // 1.0 point — a maximally-wrong system reported as zero-uncertainty. The replicas now share
+        // micro_rate's convention, so the CI degenerates to [1,1] and brackets the point.
+        let s = segs(&[(3.0, 0.0), (2.0, 0.0), (5.0, 0.0)]);
+        let ci = bootstrap_ci(&s, 500, 0.95, 0xC0FFEE);
+        assert_eq!(ci.point, 1.0);
+        assert_eq!(ci.lower, 1.0, "all-empty-ref replicas must be full-error, not 0");
+        assert_eq!(ci.upper, 1.0);
+        assert!(ci.lower <= ci.point && ci.point <= ci.upper, "CI must bracket its own point estimate");
     }
 
     #[test]
