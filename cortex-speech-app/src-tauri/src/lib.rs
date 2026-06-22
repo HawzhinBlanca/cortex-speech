@@ -525,6 +525,30 @@ pub fn run() {
         ])
         .setup(|app| {
             use tauri::Manager;
+
+            // Authorize the asset protocol to read the media-cache directory the registry actually
+            // writes into. The static `$APPDATA/media-cache/**` scope in tauri.conf.json resolves
+            // (Tauri v2) to the bundle-identifier-qualified app-data dir
+            // (%APPDATA%\com.cortex.kurdish-speech\media-cache), which is NOT where get_app_data_dir()
+            // writes (%APPDATA%\cortex-speech\media-cache). Without this runtime grant every
+            // convertFileSrc(asset://) playback URL is refused (403) and no imported clip can be
+            // played in the review UI — the core listen-and-approve step. Grant the REAL directory,
+            // derived from the same data_dir source of truth via media::media_cache_dir, so playback
+            // works regardless of how the static scope token would resolve.
+            if let Some(data_dir) = app.state::<AppState>().lock_data_dir().clone() {
+                let media_cache = crate::media::media_cache_dir(&data_dir);
+                if let Err(e) = std::fs::create_dir_all(&media_cache) {
+                    tracing::warn!("Could not create media cache dir {}: {e}", media_cache.display());
+                }
+                match app.asset_protocol_scope().allow_directory(&media_cache, true) {
+                    Ok(()) => tracing::info!(
+                        "Asset protocol scope authorized for media cache: {}",
+                        media_cache.display()
+                    ),
+                    Err(e) => tracing::warn!("Failed to authorize media cache dir in asset scope: {e}"),
+                }
+            }
+
             for (label, _window) in app.webview_windows() {
                 tracing::info!("Found webview window: {label}");
                 // `open_devtools` only exists in debug builds, so in release the binding is

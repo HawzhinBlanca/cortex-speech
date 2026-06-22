@@ -27,6 +27,19 @@ pub struct MediaRegistry {
     grants: HashMap<String, GrantRecord>,
 }
 
+/// The directory the registry copies playable clips into, relative to the app data dir.
+///
+/// This is the SINGLE source of truth shared by the writer (`register`, below) and the
+/// asset-protocol scope grant in `lib.rs` setup. The Tauri WebView can only load an `asset://`
+/// URL whose path is inside the asset-protocol scope, and the static `$APPDATA/media-cache/**`
+/// scope in `tauri.conf.json` resolves (Tauri v2) to the bundle-identifier-qualified app-data dir,
+/// NOT to `get_app_data_dir()`'s `%APPDATA%\cortex-speech`. So the scope is granted at runtime from
+/// THIS function; if the two ever computed different directories, in-app playback would silently
+/// break (every clip would 403). Keeping it in one place makes that drift impossible.
+pub fn media_cache_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("media-cache")
+}
+
 impl MediaRegistry {
     pub fn register(&mut self, db: &Database, data_dir: &Path, requested_path: &str) -> Result<MediaGrant, String> {
         self.prune_expired();
@@ -45,7 +58,7 @@ impl MediaRegistry {
             .map(validate::sanitize_filename)
             .filter(|e| !e.is_empty())
             .unwrap_or_else(|| "audio".to_string());
-        let cache_dir = data_dir.join("media-cache");
+        let cache_dir = media_cache_dir(data_dir);
         std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Create media cache: {e}"))?;
         self.prune_orphaned_cache_files(&cache_dir);
         let cached_path = cache_dir.join(format!("{id}.{ext}"));
@@ -186,6 +199,35 @@ mod tests {
             ood_score: None,
             ..SpeechSegment::default()
         }
+    }
+
+    // The asset-protocol scope grant in lib.rs setup and the registry writer MUST target the same
+    // directory, or the WebView refuses every cached clip's asset:// URL and no audio can play (the
+    // shipped bug: the static `$APPDATA/media-cache/**` scope resolved to the identifier-qualified
+    // app-data dir, a sibling of get_app_data_dir()'s %APPDATA%\cortex-speech). Both sides now derive
+    // the dir from media_cache_dir(); this pins that the registry's cache file really lands under it,
+    // so the runtime grant (which uses the same function) authorizes exactly what the registry wrote.
+    #[test]
+    fn registry_writes_into_media_cache_dir() {
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("sample.wav");
+        std::fs::write(&audio, b"audio").unwrap();
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&segment(&audio)).unwrap();
+
+        let mut registry = MediaRegistry::default();
+        let grant = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+
+        let expected_dir = media_cache_dir(tmp.path());
+        let cached = std::path::Path::new(&grant.path);
+        assert_eq!(
+            cached.parent(),
+            Some(expected_dir.as_path()),
+            "cached clip must live in media_cache_dir(data_dir) — the exact dir lib.rs grants to the asset scope"
+        );
+        assert!(cached.exists());
     }
 
     #[test]
