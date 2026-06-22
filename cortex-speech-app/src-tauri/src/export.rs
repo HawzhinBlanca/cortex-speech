@@ -1564,13 +1564,14 @@ mod tests {
 
     #[test]
     fn exports_never_leak_absolute_paths() {
-        // The curator's absolute path embeds their OS username + drive layout; publishing
-        // it into a shared CSV/JSONL/JSON/Parquet is a real PII leak. Every exporter must
-        // emit only the audio basename.
+        // A curator's absolute path embeds their OS username + drive layout; publishing it into a
+        // shared CSV/JSONL/JSON/Parquet is a real PII leak. Every exporter must emit only the audio
+        // basename. Fixture uses a SYNTHETIC absolute path (no real home dir — keeps the repo's
+        // private-path hygiene gate green) standing in for that username + drive layout.
         let tmp_dir = tempfile::tempdir().unwrap();
         let d = tmp_dir.path();
         let mut seg = sample_segment("p1");
-        seg.audio_path = "C:\\Users\\hawzhin\\private_recordings\\clip_001.wav".to_string();
+        seg.audio_path = "C:\\SynthHome\\synth_user\\private_recordings\\clip_001.wav".to_string();
         let segs = [seg];
 
         export_json(&d.join("o.json"), &sample_metadata(), &segs).unwrap();
@@ -1581,15 +1582,15 @@ mod tests {
         for name in ["o.json", "o.jsonl", "o.csv"] {
             let body = std::fs::read_to_string(d.join(name)).unwrap();
             assert!(body.contains("clip_001.wav"), "{name} should keep the basename");
-            assert!(!body.contains("hawzhin"), "{name} leaked the OS username: {body}");
-            assert!(!body.contains("Users"), "{name} leaked an absolute path");
+            assert!(!body.contains("synth_user"), "{name} leaked the OS username: {body}");
+            assert!(!body.contains("SynthHome"), "{name} leaked an absolute path");
             assert!(!body.contains("private_recordings"), "{name} leaked a directory");
         }
         // Parquet is binary — scan the raw bytes for the same leaked substrings.
         let pq = std::fs::read(d.join("o.parquet")).unwrap();
         let has = |needle: &str| pq.windows(needle.len()).any(|w| w == needle.as_bytes());
         assert!(has("clip_001.wav"), "parquet should keep the basename");
-        assert!(!has("hawzhin"), "parquet leaked the OS username");
+        assert!(!has("synth_user"), "parquet leaked the OS username");
         assert!(!has("private_recordings"), "parquet leaked a directory");
     }
 
