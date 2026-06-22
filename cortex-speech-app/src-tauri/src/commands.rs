@@ -2441,26 +2441,45 @@ pub fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<
         .ok_or_else(|| "No ElevenLabs API key configured — add ELEVENLABS_API_KEY to secrets.env".to_string())?;
 
     // Read which segments still need a Scribe vote, then RELEASE the db lock before any network call —
-    // never hold the global db mutex across a blocking cloud request (round-7 concurrency lesson).
-    let to_vote: Vec<(String, String)> = {
+    // never hold the global db mutex across a blocking cloud request (round-7 concurrency lesson). We
+    // keep the FULL segment (audio_path + alignment_json) so each vote can be sliced to that segment's
+    // own audio window rather than the whole source file.
+    let to_vote: Vec<crate::db::SpeechSegment> = {
         let db = state.lock_db();
         let segs = db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?;
         let mut out = Vec::new();
-        for seg in &segs {
+        for seg in segs {
             let existing = db.get_hypotheses_for_segment(&seg.id).map_err(|e| e.to_string())?;
             if !existing.iter().any(|h| h.model_id == SCRIBE_VOTE_MODEL_ID) {
-                out.push((seg.id.clone(), seg.audio_path.clone()));
+                out.push(seg);
             }
         }
         out
     };
 
     let mut added = 0usize;
-    for (segment_id, audio_path) in to_vote {
-        match crate::scribe_api::transcribe(&audio_path, &key, crate::scribe_api::DEFAULT_MODEL, "kur") {
+    for seg in to_vote {
+        // Send ONLY this segment's sliced audio window to Scribe — never the whole source file. The
+        // whole file would store a whole-recording transcript against one segment's `scribe-v2` vote
+        // (corrupting consensus) and cost ~N× more. `segment_audio_as_wav_bytes` decodes (cached) and
+        // slices by the segment alignment — the same window the T2 listener already sends.
+        let wav = match crate::agentic::segment_audio_as_wav_bytes(&seg) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("Scribe vote skipped: could not slice segment audio: {e}");
+                continue;
+            }
+        };
+        match crate::scribe_api::transcribe_wav_bytes(
+            &wav,
+            "segment.wav",
+            &key,
+            crate::scribe_api::DEFAULT_MODEL,
+            crate::scribe_api::SORANI_LANGUAGE_CODE,
+        ) {
             Ok(transcript) => {
                 let hyp = crate::db::SegmentHypothesis {
-                    segment_id,
+                    segment_id: seg.id.clone(),
                     model_id: SCRIBE_VOTE_MODEL_ID.to_string(),
                     transcript,
                     confidence: None,
