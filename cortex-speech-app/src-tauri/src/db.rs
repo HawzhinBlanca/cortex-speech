@@ -274,6 +274,12 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_segments_verified ON speech_segments(verified);
             CREATE INDEX IF NOT EXISTS idx_segments_speaker ON speech_segments(speaker_id);
             CREATE INDEX IF NOT EXISTS idx_segments_created ON speech_segments(created_at);
+            -- AUTHORITATIVE segments_fts schema. Round-23 #8: migrations/001_initial.sql contains a
+            -- second, DIFFERENT (4-column) CREATE for segments_fts, but this block runs first on a fresh
+            -- boot, so the migration's `IF NOT EXISTS` makes it a no-op — THIS definition is the one in
+            -- effect. Edit the FTS schema HERE (and the three triggers below), not in the migration copy.
+            -- `audio_path` stays indexed for trigger symmetry but is excluded from search by a column
+            -- filter in search_segments (#7), so it never produces false-positive transcript hits.
             CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
                 id UNINDEXED,
                 audio_path,
@@ -798,6 +804,11 @@ impl Database {
         if match_query.is_empty() {
             return Ok(Vec::new());
         }
+        // Round-23 #7: the segments_fts table also indexes `audio_path`, so a bare `MATCH ?` matches the
+        // query against the FILE PATH too — a token that appears only in a folder/file name returned
+        // false-positive segments whose transcript did not contain it. Restrict the match to the
+        // transcript columns with an FTS5 column filter so only transcript content is searched.
+        let scoped_query = format!("{{raw_transcript normalized_transcript annotated_transcript}} : ({match_query})");
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, audio_path, raw_transcript, normalized_transcript,
                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
@@ -809,7 +820,7 @@ impl Database {
              WHERE id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?1)
              ORDER BY created_at DESC, id ASC",
         )?;
-        let rows = stmt.query_map(params![match_query], Self::map_row)?;
+        let rows = stmt.query_map(params![scoped_query], Self::map_row)?;
         let mut segments = Vec::new();
         for row in rows {
             segments.push(row?);
@@ -1589,6 +1600,23 @@ mod tests {
         dedicated.write_segment_verdict("s1", "jury_accept", Some("hi"), None, None, Some(0.9), false).unwrap();
         let seen = primary.get_segment_by_id("s1").unwrap().unwrap();
         assert_eq!(seen.verdict.as_deref(), Some("jury_accept"));
+    }
+
+    #[test]
+    fn search_does_not_match_the_audio_path_column() {
+        // Round-23 #7: a token that appears ONLY in the file path must NOT return the segment — search
+        // is over transcript content, not folder/file names.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let mut path_only = make_segment("p1", "/recordings/kurdistan/interview.wav");
+        path_only.raw_transcript = "hello world".to_string(); // "kurdistan" is ONLY in the path
+        db.insert_segment(&path_only).unwrap();
+        let mut text_hit = make_segment("t1", "/recordings/a/b.wav");
+        text_hit.raw_transcript = "this is about kurdistan today".to_string();
+        db.insert_segment(&text_hit).unwrap();
+
+        let ids: Vec<String> = db.search_segments("kurdistan").unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["t1".to_string()], "only the transcript match may return, not the path match: {ids:?}");
     }
 
     #[test]
