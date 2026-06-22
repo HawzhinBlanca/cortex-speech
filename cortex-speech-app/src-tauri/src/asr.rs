@@ -402,7 +402,17 @@ impl KurdishAsrService {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("ASR Chunk {} transcription failed: {e}", chunk_idx);
+                    // Round-22 #9: a sub-chunk failure must NOT be swallowed. Silently dropping the
+                    // failed span and returning the surviving chunks stitched together would present a
+                    // PARTIAL transcript as a complete one at full ~0.90 heuristic confidence —
+                    // laundering a dropped audio span into the dataset as a confident transcription
+                    // (an honesty-law violation). The single-chunk path already returns Err (via `?`);
+                    // the multi-chunk path must be just as honest. Fail the whole segment so it is
+                    // escalated/retried, never persisted as a confident complete transcription.
+                    tracing::warn!("ASR Chunk {chunk_idx} transcription failed: {e}");
+                    return Err(format!(
+                        "ASR sub-chunk {chunk_idx} failed; refusing to return a partial transcript as complete: {e}"
+                    ));
                 }
             }
 
