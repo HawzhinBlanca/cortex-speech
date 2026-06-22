@@ -810,6 +810,14 @@ impl Database {
         &self.conn
     }
 
+    /// The on-disk path this connection was opened from (or `":memory:"`). Used by commands that need
+    /// to open a SECOND, dedicated connection so they can release the global AppState db Mutex before a
+    /// long network call (e.g. cloud jury T2) — holding it across the round-trip would freeze every
+    /// other DB-touching command app-wide.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
     pub fn info(&self) -> AppResult<serde_json::Value> {
         let size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         let journal_mode: String = self.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
@@ -1491,6 +1499,37 @@ mod tests {
             duration_ms: 1000,
             ..SpeechSegment::default()
         }
+    }
+
+    // The jury db-lock fix (with_jury_db) opens a SECOND, dedicated connection from Database::path so
+    // the global AppState db Mutex isn't held across cloud T2 network calls. This pins the assumption
+    // it relies on: path() round-trips, and a dedicated connection to the same file sees the primary's
+    // committed rows AND its own writes are visible back to the primary (SQLite WAL coexistence).
+    #[test]
+    fn dedicated_connection_via_path_shares_committed_data() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("jury.db");
+        let path_str = path.to_string_lossy().to_string();
+
+        let primary = Database::open(&path_str).unwrap();
+        primary.initialize().unwrap();
+        assert_eq!(primary.path(), path_str, "path() must return the opened path");
+        primary.insert_segment(&make_segment("s1", "/s1.wav")).unwrap();
+
+        // A dedicated connection opened from primary.path() (the with_jury_db pattern) sees the row.
+        let dedicated = Database::open(primary.path()).unwrap();
+        assert!(
+            dedicated.get_segment_by_id("s1").unwrap().is_some(),
+            "dedicated connection must see rows committed by the primary connection"
+        );
+
+        // A verdict written through the dedicated connection persists to the same file and is visible
+        // back to the primary — so the jury writing through it loses nothing.
+        dedicated
+            .write_segment_verdict("s1", "jury_accept", Some("hi"), None, None, Some(0.9), false)
+            .unwrap();
+        let seen = primary.get_segment_by_id("s1").unwrap().unwrap();
+        assert_eq!(seen.verdict.as_deref(), Some("jury_accept"));
     }
 
     #[test]
