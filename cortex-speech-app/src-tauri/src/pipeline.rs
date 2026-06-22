@@ -1475,6 +1475,16 @@ impl ProcessingPipeline {
                     // this run id — mirrors the directory path. Previously this report stored a null
                     // run_id, so it could not be joined to the import's stage events.
                     report_options.agent_run_id = agent_run_id.map(str::to_string);
+                    // Snapshot agentic readiness into the report (mirrors the directory path) so the
+                    // export-bundle promotion gate has it. This is the SINGLE adjudication for the
+                    // single-file path — the command worker no longer re-runs the jury.
+                    let model_status = self.model_manager.status();
+                    let external_provider = crate::commands::external_provider_status(&self.settings);
+                    report_options.agentic_readiness = Some(crate::commands::build_agentic_readiness_snapshot(
+                        &self.settings,
+                        &model_status,
+                        &external_provider,
+                    ));
                     match crate::commands::run_jury_pipeline_core(&db, &self.settings, imported_ids.clone()) {
                         Ok(jury_report) => {
                             on_event(agent_stage(

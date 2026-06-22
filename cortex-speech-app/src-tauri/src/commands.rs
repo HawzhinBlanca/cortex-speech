@@ -265,14 +265,6 @@ pub(crate) fn build_agentic_readiness_snapshot(
     }
 }
 
-fn agentic_readiness_snapshot_for_state(state: &AppState, settings: &AppSettings) -> serde_json::Value {
-    let model_status = {
-        let model_manager = state.lock_model_manager();
-        model_manager.status()
-    };
-    let external_provider = external_provider_status(settings);
-    build_agentic_readiness_snapshot(settings, &model_status, &external_provider)
-}
 
 #[tauri::command]
 pub fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
@@ -504,156 +496,16 @@ pub fn import_audio_file(
         });
         match result {
             Ok(segments) => {
+                // The pipeline already ran the post-import jury adjudication ONCE, internally —
+                // import_single_file_with_events emits the "adjudicating" phase + jury_adjudication
+                // stage events (forwarded by the callback above) and persists the agent import report
+                // (with agentic-readiness). Do NOT re-run it here: doing so emitted a duplicate
+                // adjudicating phase, a contradictory second jury count, a second agent_import_reports
+                // row, and doubled the jury work (and cloud T2 cost/latency under cloud opt-in). A jury
+                // failure is surfaced by the pipeline as a forwarded PipelineEvent::Error. Just emit the
+                // authoritative source:"file" import-complete (the pipeline's terminal Completed event is
+                // dropped in the callback above).
                 let segment_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
-                let source_paths = vec![file_path.to_string_lossy().to_string()];
-                let post_import_file =
-                    file_path.file_name().and_then(|n| n.to_str()).unwrap_or("post-import jury").to_string();
-                emit_or_log(&app_clone, "pipeline-phase", serde_json::json!({ "phase": "adjudicating" }));
-                let adjudication_detail = format!("Adjudicating {} imported segment(s)", segment_ids.len());
-                emit_agent_stage_event(
-                    &app_clone,
-                    Some(&agent_run_id),
-                    "file",
-                    AgentStageEmission {
-                        stage: "jury_adjudication",
-                        status: "running",
-                        file: &post_import_file,
-                        detail: &adjudication_detail,
-                        current: 0,
-                        total: segment_ids.len(),
-                    },
-                );
-                let adjudication_result = if let Some(app_state) = app_clone.try_state::<AppState>() {
-                    let settings = app_state.lock_settings().clone();
-                    let agentic_readiness = agentic_readiness_snapshot_for_state(&app_state, &settings);
-                    let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&settings);
-                    report_options.agent_run_id = Some(agent_run_id.clone());
-                    report_options.agentic_readiness = Some(agentic_readiness);
-                    // Dedicated connection across the jury + report write, so the global db Mutex is not
-                    // held across the jury's cloud T2 network calls (which would freeze every other DB
-                    // command during a single-file import). See with_jury_db.
-                    with_jury_db(&app_state, |db| {
-                    match run_jury_pipeline_core(db, &settings, segment_ids.clone()) {
-                        Ok(jury_report) => {
-                            let completion_detail = format!(
-                                "Reference commits: {}; review queue: {}",
-                                jury_report["referenceCommitted"].as_u64().unwrap_or(0),
-                                jury_report["humanInbox"].as_u64().unwrap_or(0)
-                            );
-                            emit_agent_stage_event(
-                                &app_clone,
-                                Some(&agent_run_id),
-                                "file",
-                                AgentStageEmission {
-                                    stage: "jury_adjudication",
-                                    status: "completed",
-                                    file: &post_import_file,
-                                    detail: &completion_detail,
-                                    current: segment_ids.len(),
-                                    total: segment_ids.len(),
-                                },
-                            );
-                            crate::runs::record_agent_import_report_with_options(
-                                db,
-                                "file",
-                                &source_paths,
-                                &segment_ids,
-                                Some(&jury_report),
-                                None,
-                                report_options,
-                            )
-                            .map(|_| {
-                                emit_agent_stage_event(
-                                    &app_clone,
-                                    Some(&agent_run_id),
-                                    "file",
-                                    AgentStageEmission {
-                                        stage: "agent_report",
-                                        status: "completed",
-                                        file: "agent import report",
-                                        detail: "Persisted auditable multi-agent import report",
-                                        current: segment_ids.len(),
-                                        total: segment_ids.len(),
-                                    },
-                                );
-                            })
-                            .map_err(|error| {
-                                format!("Agent import report persistence failed after single-file import: {error}")
-                            })
-                        }
-                        Err(error) => {
-                            let mut message =
-                                format!("Post-import jury adjudication failed after single-file import: {error}");
-                            if let Err(report_error) = crate::runs::record_agent_import_report_with_options(
-                                db,
-                                "file",
-                                &source_paths,
-                                &segment_ids,
-                                None,
-                                Some(&error),
-                                report_options,
-                            ) {
-                                message.push_str(&format!(
-                                    "; additionally failed to persist agent import report: {report_error}"
-                                ));
-                            }
-                            emit_agent_stage_event(
-                                &app_clone,
-                                Some(&agent_run_id),
-                                "file",
-                                AgentStageEmission {
-                                    stage: "jury_adjudication",
-                                    status: "blocked",
-                                    file: &post_import_file,
-                                    detail: &message,
-                                    current: 0,
-                                    total: segment_ids.len(),
-                                },
-                            );
-                            Err(message)
-                        }
-                    }
-                    })
-                } else {
-                    let message = "App state unavailable for post-import jury adjudication".to_string();
-                    emit_agent_stage_event(
-                        &app_clone,
-                        Some(&agent_run_id),
-                        "file",
-                        AgentStageEmission {
-                            stage: "jury_adjudication",
-                            status: "blocked",
-                            file: &post_import_file,
-                            detail: &message,
-                            current: 0,
-                            total: segment_ids.len(),
-                        },
-                    );
-                    Err(message)
-                };
-                if let Err(error) = adjudication_result {
-                    log_jury_pipeline_failure("single-file import", &error);
-                    let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("post-import jury");
-                    emit_or_log(
-                        &app_clone,
-                        "pipeline-error",
-                        serde_json::json!({
-                            "file": fname,
-                            "error": error,
-                        }),
-                    );
-                    let payload = serde_json::json!({
-                        "total": 1,
-                        "succeeded": 0,
-                        "failed": 1,
-                        "segmentCount": segments.len(),
-                        "segmentIds": segment_ids,
-                        "source": "file",
-                    });
-                    emit_or_log(&app_clone, "import-complete", payload.clone());
-                    emit_or_log(&app_clone, "pipeline-complete", payload);
-                    return;
-                }
                 let count = segments.len();
                 let payload = serde_json::json!({
                     "total": 1,
