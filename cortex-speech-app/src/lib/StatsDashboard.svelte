@@ -19,6 +19,22 @@
   let errorMessage = $state<string | null>(null);
   const tauriAvailable = isTauriRuntime();
 
+  // Round-24 #10: histogram bars are normalized to the LARGEST bucket, not the total segment count, so
+  // the chart actually uses its vertical range (a typical VAD dataset is mostly short clips, so no
+  // single bucket is a large share of the total and the old total-normalized bars looked flat).
+  const durationBuckets = $derived(
+    stats
+      ? [
+          { label: '<5s', value: stats.durationHistogram.under5s },
+          { label: '<10s', value: stats.durationHistogram.under10s },
+          { label: '<15s', value: stats.durationHistogram.under15s },
+          { label: '<30s', value: stats.durationHistogram.under30s },
+          { label: '30s+', value: stats.durationHistogram.over30s },
+        ]
+      : [],
+  );
+  const maxBucket = $derived(Math.max(1, ...durationBuckets.map((b) => b.value)));
+
   function buildLocalStats(items: SpeechSegment[]): DatasetStats {
     const durationSeconds = items.map((segment) => Math.max(0, segment.durationMs || 0) / 1000);
     const totalDurationSeconds = durationSeconds.reduce((sum, value) => sum + value, 0);
@@ -209,9 +225,13 @@
         </div>
         {#if quality.annotatedSegmentCount > 0}
           <div class="grid grid-cols-2 gap-2">
+            <!-- Round-24 #9: color each metric by ITS OWN real threshold-exceedance count, not the
+                 quality-gate flag. The gate flag is true whenever enforce_quality_gates is off (the
+                 DEFAULT), so it painted bad WER/CER green and used the SAME flag for both cells. Green
+                 here means "no annotated segment exceeds this metric's threshold" — an honest measure. -->
             <div class="bg-cortex-800/30 rounded-lg p-2">
               <div
-                class="text-sm font-bold {quality.qualityGatePassed
+                class="text-sm font-bold {quality.segmentsAboveWerThreshold === 0
                   ? 'text-emerald-300'
                   : 'text-red-300'}"
               >
@@ -224,7 +244,7 @@
             </div>
             <div class="bg-cortex-800/30 rounded-lg p-2">
               <div
-                class="text-sm font-bold {quality.qualityGatePassed
+                class="text-sm font-bold {quality.segmentsAboveCerThreshold === 0
                   ? 'text-emerald-300'
                   : 'text-red-300'}"
               >
@@ -265,12 +285,15 @@
     <div class="space-y-1">
       <span class="text-xs text-cortex-400">{$t('stats.durationDistribution')}</span>
       <div class="flex gap-1 h-16 items-end">
-        {#each [{ label: '<5s', value: stats.durationHistogram.under5s }, { label: '<10s', value: stats.durationHistogram.under10s }, { label: '<15s', value: stats.durationHistogram.under15s }, { label: '<30s', value: stats.durationHistogram.under30s }, { label: '30s+', value: stats.durationHistogram.over30s }] as bar}
+        {#each durationBuckets as bar}
           {#if stats.totalSegments > 0}
             <div class="flex-1 flex flex-col items-center gap-1">
               <div
                 class="w-full bg-cortex-600 rounded-t transition-all duration-500"
-                style="height: {(bar.value / stats.totalSegments) * 100}%"
+                style="height: {(bar.value / maxBucket) * 100}%"
+                title="{bar.value} ({stats.totalSegments > 0
+                  ? ((bar.value / stats.totalSegments) * 100).toFixed(0)
+                  : 0}%)"
               ></div>
               <span class="text-[10px] text-cortex-400">{bar.label}</span>
             </div>
