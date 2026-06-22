@@ -207,9 +207,9 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         for s in [
-            seg("s1", 3_000, true, Some("A"), "ab"),       // u5 bucket, 2 bytes
-            seg("s2", 8_000, true, Some("A"), "سڵاو"),     // u10 bucket, 8 UTF-8 bytes
-            seg("s3", 35_000, false, Some("B"), "x"),      // over_30s bucket, 1 byte
+            seg("s1", 3_000, true, Some("A"), "ab"),  // u5 bucket, 2 bytes
+            seg("s2", 8_000, true, Some("A"), "سڵاو"), // u10 bucket, 8 UTF-8 bytes
+            seg("s3", 35_000, false, Some("B"), "x"), // over_30s bucket, 1 byte
         ] {
             db.insert_segment(&s).unwrap();
         }

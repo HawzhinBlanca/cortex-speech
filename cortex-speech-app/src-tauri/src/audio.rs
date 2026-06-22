@@ -1118,9 +1118,8 @@ mod tests {
         let tone = |hz: f64| -> Vec<f32> {
             (0..n).map(|i| (2.0 * std::f64::consts::PI * hz * i as f64 / sr).sin() as f32).collect()
         };
-        let energy = |s: &[f32]| -> f64 {
-            s.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / s.len().max(1) as f64
-        };
+        let energy =
+            |s: &[f32]| -> f64 { s.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / s.len().max(1) as f64 };
 
         let e_in = energy(&resample(&tone(1000.0), 48000, 16000));
         let e_above = energy(&resample(&tone(9000.0), 48000, 16000));
@@ -1128,7 +1127,10 @@ mod tests {
         // The in-band tone passes through; the above-Nyquist tone is strongly attenuated. Before the
         // anti-aliasing fix the 9 kHz tone aliased to 7 kHz and retained comparable (un-attenuated) energy.
         assert!(e_in > 0.1, "in-band 1 kHz tone should pass: energy {e_in}");
-        assert!(e_above < e_in * 0.1, "above-Nyquist 9 kHz tone must be attenuated >10x vs in-band: {e_above} vs {e_in}");
+        assert!(
+            e_above < e_in * 0.1,
+            "above-Nyquist 9 kHz tone must be attenuated >10x vs in-band: {e_above} vs {e_in}"
+        );
     }
 
     #[test]

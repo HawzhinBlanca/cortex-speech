@@ -90,9 +90,7 @@ fn rate(err: f64, len: f64) -> f64 {
 }
 
 pub fn micro_rate(segments: &[SegmentError]) -> f64 {
-    let (err, len) = segments
-        .iter()
-        .fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
+    let (err, len) = segments.iter().fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
     rate(err, len)
 }
 
@@ -101,12 +99,7 @@ pub fn micro_rate(segments: &[SegmentError]) -> f64 {
 /// `n_resamples` bootstrap replicas, each resampling `segments.len()` segments with
 /// replacement; the interval is the percentile interval at two-sided `confidence`
 /// (e.g. `0.95`). Deterministic given `seed`.
-pub fn bootstrap_ci(
-    segments: &[SegmentError],
-    n_resamples: usize,
-    confidence: f64,
-    seed: u64,
-) -> ConfidenceInterval {
+pub fn bootstrap_ci(segments: &[SegmentError], n_resamples: usize, confidence: f64, seed: u64) -> ConfidenceInterval {
     let point = micro_rate(segments);
     let n = segments.len();
     if n == 0 || n_resamples == 0 {
@@ -202,9 +195,7 @@ fn erf(x: f64) -> f64 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
     let t = 1.0 / (1.0 + 0.3275911 * x);
-    let poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
-        + 0.254829592)
-        * t;
+    let poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
     let y = 1.0 - poly * (-x * x).exp();
     sign * y
 }

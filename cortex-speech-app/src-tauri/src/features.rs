@@ -333,9 +333,7 @@ mod tests {
         // (both paths). Mel extraction must be total: a well-shaped, finite matrix and
         // never a panic, for any config the public constructor accepts.
         for centered in [true, false] {
-            let ex = FbankExtractor::new_custom(
-                16000, 80, 64, 0.0, 0.0, 1e-10, centered, true, true, false, false,
-            );
+            let ex = FbankExtractor::new_custom(16000, 80, 64, 0.0, 0.0, 1e-10, centered, true, true, false, false);
             let audio = vec![0.1f32; 100];
             let feats = ex.compute(&audio);
             assert_eq!(feats.ncols(), 80, "centered={centered}");

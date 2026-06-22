@@ -438,7 +438,8 @@ pub static MIGRATIONS: &[Migration] = &[
         // future INSERT that omits the column still receives it, so the gate ("no row lacks
         // model_version_id") holds at the schema level. The registry (model_versions/adapters,
         // P1) will turn this free-text id into a foreign key once those tables land.
-        up_sql: "ALTER TABLE segment_hypotheses ADD COLUMN model_version_id TEXT NOT NULL DEFAULT 'unknown@pre-registry';
+        up_sql:
+            "ALTER TABLE segment_hypotheses ADD COLUMN model_version_id TEXT NOT NULL DEFAULT 'unknown@pre-registry';
                  ALTER TABLE speech_segments ADD COLUMN model_version_id TEXT NOT NULL DEFAULT 'unknown@pre-registry';",
         down_sql: Some(
             "ALTER TABLE speech_segments DROP COLUMN model_version_id;
@@ -620,10 +621,8 @@ mod tests {
 
         // Every migration was applied and the schema is at the latest version.
         assert_eq!(get_current_version(&db).unwrap(), max_version);
-        let recorded: i64 = db
-            .connection()
-            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
-            .unwrap();
+        let recorded: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0)).unwrap();
         assert_eq!(recorded as usize, MIGRATIONS.len(), "every migration must be recorded exactly once");
 
         // Re-running migrates nothing and leaves the version untouched.
@@ -655,11 +654,9 @@ mod tests {
 
         // The table and both lookup indexes exist after initialize().
         let table: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='correction_memory'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='correction_memory'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(table, 1, "correction_memory table must exist after initialize()");
         let indexes: i64 = conn
@@ -702,8 +699,7 @@ mod tests {
         // FK enforcement must be on for the SET NULL action to fire (it is, per Database::open).
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-        conn.execute("INSERT INTO speech_segments (id, audio_path) VALUES ('seg-x', '/tmp/a.wav')", [])
-            .unwrap();
+        conn.execute("INSERT INTO speech_segments (id, audio_path) VALUES ('seg-x', '/tmp/a.wav')", []).unwrap();
         conn.execute(
             "INSERT INTO correction_memory (id, wrong_token, human_token, slot_key, phonetic_key, source_segment)
              VALUES ('m1', 'wrong', 'right', 'L|R', 'phon', 'seg-x')",
@@ -715,11 +711,9 @@ mod tests {
         conn.execute("DELETE FROM speech_segments WHERE id='seg-x'", []).unwrap();
         // ...and the memory survives with its provenance nulled out.
         let (count, src_is_null): (i64, i64) = conn
-            .query_row(
-                "SELECT COUNT(*), MAX(source_segment IS NULL) FROM correction_memory WHERE id='m1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT COUNT(*), MAX(source_segment IS NULL) FROM correction_memory WHERE id='m1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(count, 1, "the learned correction must survive its source segment's deletion");
         assert_eq!(src_is_null, 1, "source_segment provenance must be SET NULL on delete");
@@ -732,11 +726,7 @@ mod tests {
         let conn = db.connection();
 
         let table: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='corrections'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='corrections'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(table, 1, "corrections ledger table must exist after initialize()");
         let indexes: i64 = conn
@@ -756,9 +746,8 @@ mod tests {
             [],
         )
         .unwrap();
-        let decided_set: i64 = conn
-            .query_row("SELECT decided_at IS NOT NULL FROM corrections WHERE id='c1'", [], |r| r.get(0))
-            .unwrap();
+        let decided_set: i64 =
+            conn.query_row("SELECT decided_at IS NOT NULL FROM corrections WHERE id='c1'", [], |r| r.get(0)).unwrap();
         assert_eq!(decided_set, 1, "decided_at must be populated by its default");
     }
 
@@ -773,8 +762,7 @@ mod tests {
         let conn = db.connection();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-        conn.execute("INSERT INTO speech_segments (id, audio_path) VALUES ('seg-y', '/tmp/b.wav')", [])
-            .unwrap();
+        conn.execute("INSERT INTO speech_segments (id, audio_path) VALUES ('seg-y', '/tmp/b.wav')", []).unwrap();
         conn.execute(
             "INSERT INTO corrections (id, segment_id, audio_content_hash, raw_hypothesis, human_fix)
              VALUES ('c1', 'seg-y', 'blake3hash', 'wrong', 'right')",
@@ -805,11 +793,9 @@ mod tests {
         // Both tables carry the column.
         for table in ["speech_segments", "segment_hypotheses"] {
             let has_col: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name='model_version_id'",
-                    [table],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name='model_version_id'", [table], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert_eq!(has_col, 1, "{table} must have a model_version_id column after v22");
         }
@@ -823,9 +809,8 @@ mod tests {
             [],
         )
         .unwrap();
-        let seg_mv: String = conn
-            .query_row("SELECT model_version_id FROM speech_segments WHERE id='s1'", [], |r| r.get(0))
-            .unwrap();
+        let seg_mv: String =
+            conn.query_row("SELECT model_version_id FROM speech_segments WHERE id='s1'", [], |r| r.get(0)).unwrap();
         let hyp_mv: String = conn
             .query_row("SELECT model_version_id FROM segment_hypotheses WHERE segment_id='s1'", [], |r| r.get(0))
             .unwrap();
@@ -851,11 +836,7 @@ mod tests {
         let conn = db.connection();
         for table in ["model_versions", "adapters"] {
             let exists: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [table], |r| r.get(0))
                 .unwrap();
             assert_eq!(exists, 1, "{table} table must exist after initialize()");
         }
@@ -941,8 +922,7 @@ mod tests {
 
         // Deleting the parent model version cascades to its adapter (a delta is meaningless alone).
         conn.execute("DELETE FROM model_versions WHERE id='mv1'", []).unwrap();
-        let remaining: i64 =
-            conn.query_row("SELECT COUNT(*) FROM adapters WHERE id='ad1'", [], |r| r.get(0)).unwrap();
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM adapters WHERE id='ad1'", [], |r| r.get(0)).unwrap();
         assert_eq!(remaining, 0, "an adapter must be cascade-deleted with its parent model version");
     }
 
@@ -971,11 +951,9 @@ mod tests {
         assert_eq!(version_rows, 0, "no version row may be left behind");
         let leaked_table: i64 = db
             .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='should_not_persist'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='should_not_persist'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(leaked_table, 0, "the partial table must have been rolled back");
     }

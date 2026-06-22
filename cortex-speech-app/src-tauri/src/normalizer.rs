@@ -225,9 +225,8 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
     // gets rewritten to the Arabic comma U+060C in Step 1) and/or a decimal part — rather than a
     // bare `\d+`. Matching `\d+` split "3,000" (by then "3،000") into "3" and "000", verbalizing it
     // as "three، zero" instead of "three thousand".
-    static DIGITS_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\d{1,3}(?:[،,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?").unwrap()
-    });
+    static DIGITS_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\d{1,3}(?:[،,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?").unwrap());
 
     let expanded = DIGITS_RE.replace_all(&result, |caps: &regex::Captures| {
         // Surround the multi-word expansion with spaces so a numeral glued to a word ("ساڵی٢٠٢٠") or a
@@ -277,12 +276,7 @@ fn verbalize_number_token(token: &str) -> String {
 
 /// Read a digit string one digit at a time (e.g. "14" -> "یەک چوار").
 fn digits_individually(digits: &str) -> String {
-    digits
-        .chars()
-        .filter_map(|c| c.to_digit(10))
-        .map(|d| num_to_kurdish(d as u64))
-        .collect::<Vec<_>>()
-        .join(" ")
+    digits.chars().filter_map(|c| c.to_digit(10)).map(|d| num_to_kurdish(d as u64)).collect::<Vec<_>>().join(" ")
 }
 
 fn num_to_kurdish(mut n: u64) -> String {

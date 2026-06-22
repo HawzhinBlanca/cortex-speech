@@ -170,7 +170,9 @@ fn export_single_segment(
                         .map_err(|e| AppError::Other(format!("Failed to create temporary WAV file: {e}")))?;
 
                     for &sample in &pcm_samples {
-                        writer.write_sample(sample).map_err(|e| AppError::Other(format!("Failed to write sample: {e}")))?;
+                        writer
+                            .write_sample(sample)
+                            .map_err(|e| AppError::Other(format!("Failed to write sample: {e}")))?;
                     }
 
                     writer.finalize().map_err(|e| AppError::Other(format!("Failed to finalize WAV: {e}")))?;
@@ -190,23 +192,15 @@ fn export_single_segment(
             let i32_samples: Vec<i32> = pcm_samples.iter().map(|&s| s as i32).collect();
 
             // MemSource::from_samples(samples, channels, bits_per_sample, sample_rate)
-            let source = flacenc::source::MemSource::from_samples(
-                &i32_samples,
-                1,
-                16,
-                options.sample_rate as usize,
-            );
+            let source = flacenc::source::MemSource::from_samples(&i32_samples, 1, 16, options.sample_rate as usize);
 
-            let flac_stream = flacenc::encode_with_fixed_block_size(
-                &config,
-                source,
-                config.block_size,
-            )
-            .map_err(|e| AppError::Other(format!("FLAC encoding failed: {:?}", e)))?;
+            let flac_stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+                .map_err(|e| AppError::Other(format!("FLAC encoding failed: {:?}", e)))?;
 
             use flacenc::component::BitRepr;
             let mut sink = flacenc::bitsink::ByteSink::new();
-            flac_stream.write(&mut sink)
+            flac_stream
+                .write(&mut sink)
                 .map_err(|e| AppError::Other(format!("Failed to write FLAC stream to sink: {:?}", e)))?;
 
             remove_file_on_error(

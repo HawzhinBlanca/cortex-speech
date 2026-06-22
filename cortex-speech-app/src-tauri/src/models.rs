@@ -402,7 +402,10 @@ impl ModelManager {
 
         tracing::info!("Downloading Meta OmniASR {:?} from {}", size, archive_url);
 
-        let response = crate::http::DOWNLOAD_AGENT.get(archive_url).call().map_err(|e| format!("OmniASR archive download failed: {e}"))?;
+        let response = crate::http::DOWNLOAD_AGENT
+            .get(archive_url)
+            .call()
+            .map_err(|e| format!("OmniASR archive download failed: {e}"))?;
 
         let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
 
@@ -559,7 +562,10 @@ impl ModelManager {
         let tmp_archive = self.models_dir.join("campp.downloading.tar.bz2");
         tracing::info!("Downloading CAM++ from {}", CAMPP_ARCHIVE_URL);
 
-        let response = crate::http::DOWNLOAD_AGENT.get(CAMPP_ARCHIVE_URL).call().map_err(|e| format!("CAM++ download failed: {e}"))?;
+        let response = crate::http::DOWNLOAD_AGENT
+            .get(CAMPP_ARCHIVE_URL)
+            .call()
+            .map_err(|e| format!("CAM++ download failed: {e}"))?;
 
         let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
 
@@ -607,7 +613,10 @@ impl ModelManager {
         let tmp_archive = self.models_dir.join("denoiser.downloading.tar.bz2");
         tracing::info!("Downloading AI Denoiser from {}", DENOISER_ARCHIVE_URL);
 
-        let response = crate::http::DOWNLOAD_AGENT.get(DENOISER_ARCHIVE_URL).call().map_err(|e| format!("Denoiser download failed: {e}"))?;
+        let response = crate::http::DOWNLOAD_AGENT
+            .get(DENOISER_ARCHIVE_URL)
+            .call()
+            .map_err(|e| format!("Denoiser download failed: {e}"))?;
 
         let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
 
@@ -660,7 +669,10 @@ impl ModelManager {
         let dest = self.model_path(model.filename);
         let tmp = dest.with_extension("downloading");
 
-        let response = crate::http::DOWNLOAD_AGENT.get(model.url).call().map_err(|e| format!("Download failed for {}: {}", model.name, e))?;
+        let response = crate::http::DOWNLOAD_AGENT
+            .get(model.url)
+            .call()
+            .map_err(|e| format!("Download failed for {}: {}", model.name, e))?;
 
         let total_size = response.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
 
@@ -965,7 +977,9 @@ pub fn init_ort_dylib_path() {
         tracing::info!("Setting ORT_DYLIB_PATH programmatically to {:?}", path);
         std::env::set_var("ORT_DYLIB_PATH", path);
     } else {
-        tracing::warn!("{dylib} not found next to exe, in models dir, or cwd; ORT will fall back to the system loader search");
+        tracing::warn!(
+            "{dylib} not found next to exe, in models dir, or cwd; ORT will fall back to the system loader search"
+        );
     }
 }
 
@@ -1031,12 +1045,7 @@ mod tests {
         // their extracted-file pins are computed directly from the on-disk models
         // and must stay populated — an empty pin would silently disable the
         // post-extract integrity check in `verify_extracted_against_pin`.
-        for filename in [
-            OMNIASR_CTC_300M_MODEL,
-            OMNIASR_CTC_300M_TOKENS,
-            OMNIASR_CTC_1B_MODEL,
-            OMNIASR_CTC_1B_TOKENS,
-        ] {
+        for filename in [OMNIASR_CTC_300M_MODEL, OMNIASR_CTC_300M_TOKENS, OMNIASR_CTC_1B_MODEL, OMNIASR_CTC_1B_TOKENS] {
             let model = MODELS.iter().find(|m| m.filename == filename).expect("model entry present");
             assert_eq!(model.sha256.len(), 64, "{filename} must carry a 64-hex-char SHA256 pin");
             assert!(model.sha256.chars().all(|c| c.is_ascii_hexdigit()), "{filename} pin must be hex");

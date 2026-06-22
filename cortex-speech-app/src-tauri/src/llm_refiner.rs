@@ -153,12 +153,7 @@ impl LlmRefiner {
         // would truncate the refinement or return the thought instead of the answer.
         let joined = body["candidates"][0]["content"]["parts"]
             .as_array()
-            .map(|ps| {
-                ps.iter()
-                    .filter_map(|p| p.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
+            .map(|ps| ps.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(""))
             .unwrap_or_default();
         let trimmed = joined.trim();
         if trimmed.is_empty() {

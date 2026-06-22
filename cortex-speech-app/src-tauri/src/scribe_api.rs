@@ -27,7 +27,8 @@ fn build_multipart(audio: &[u8], filename: &str, model_id: &str, language_code: 
     );
     body.extend_from_slice(audio);
     body.extend_from_slice(
-        format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model_id\"\r\n\r\n{model_id}\r\n").as_bytes(),
+        format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model_id\"\r\n\r\n{model_id}\r\n")
+            .as_bytes(),
     );
     body.extend_from_slice(
         format!("--{boundary}\r\nContent-Disposition: form-data; name=\"language_code\"\r\n\r\n{language_code}\r\n")
@@ -98,11 +99,13 @@ pub fn dedupe_repeated(text: &str) -> String {
 /// Send one Scribe request and return the parsed JSON response. Shared by [`transcribe`] (text only)
 /// and [`transcribe_segments`] (word timestamps). The key travels in a header; errors redact it.
 fn request_scribe_json(
-    audio_path: &str, api_key: &str, model_id: &str, language_code: &str,
+    audio_path: &str,
+    api_key: &str,
+    model_id: &str,
+    language_code: &str,
 ) -> AppResult<serde_json::Value> {
     let audio = std::fs::read(audio_path).map_err(|e| AppError::Other(format!("read audio {audio_path}: {e}")))?;
-    let filename =
-        std::path::Path::new(audio_path).file_name().and_then(|f| f.to_str()).unwrap_or("audio.wav");
+    let filename = std::path::Path::new(audio_path).file_name().and_then(|f| f.to_str()).unwrap_or("audio.wav");
     let (content_type, body) = build_multipart(&audio, filename, model_id, language_code);
 
     let redact = |s: String| s.replace(api_key, "<redacted>");
@@ -208,7 +211,10 @@ pub fn segment_words(words: &[ScribeWord], pause_gap_ms: i64, max_segment_ms: i6
 /// word-level timestamps — ONE Scribe API call per file (cost-efficient for long recordings). Falls
 /// back to a single whole-file segment (from the de-duplicated text) when no word timings are present.
 pub fn transcribe_segments(
-    audio_path: &str, api_key: &str, model_id: &str, language_code: &str,
+    audio_path: &str,
+    api_key: &str,
+    model_id: &str,
+    language_code: &str,
 ) -> AppResult<Vec<ScribeSegment>> {
     let json = request_scribe_json(audio_path, api_key, model_id, language_code)?;
     let words = parse_scribe_words(&json);
@@ -316,7 +322,9 @@ mod tests {
     #[test]
     fn parse_words_handles_non_array_words_field() {
         // `words` present but the wrong shape (object / string / number) -> empty, no panic.
-        for bad in [serde_json::json!({"words": {"a": 1}}), serde_json::json!({"words": "x"}), serde_json::json!({"words": 7})] {
+        for bad in
+            [serde_json::json!({"words": {"a": 1}}), serde_json::json!({"words": "x"}), serde_json::json!({"words": 7})]
+        {
             assert!(parse_scribe_words(&bad).is_empty(), "non-array words -> empty: {bad}");
         }
     }

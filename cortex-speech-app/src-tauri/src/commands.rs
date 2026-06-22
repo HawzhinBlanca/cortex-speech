@@ -265,7 +265,6 @@ pub(crate) fn build_agentic_readiness_snapshot(
     }
 }
 
-
 #[tauri::command]
 pub fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     RATE_LIMITER.check("open_audio_file")?;
@@ -2338,10 +2337,7 @@ pub fn compute_annotation_drift_scorecard(
 }
 
 #[tauri::command]
-pub fn run_gold_eval_local(
-    state: State<'_, AppState>,
-    model_id: String,
-) -> Result<crate::eval::EvalRunResult, String> {
+pub fn run_gold_eval_local(state: State<'_, AppState>, model_id: String) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval_local")?;
     // Clone the pipeline and let it open its own DB connection, so neither global mutex is held
     // across the multi-segment ASR eval loop (which would freeze the entire UI for minutes).
@@ -3311,8 +3307,7 @@ pub fn run_t2_for_segment(
         let mut identity_cache = std::collections::HashMap::new();
         let reference_report =
             reference_selection_for_segment(&db, &settings, &seg, &hyps, &mut duration_cache, &mut identity_cache)?;
-        let t2_evidence =
-            reference_report.as_ref().map(reference_selection_evidence).into_iter().collect::<Vec<_>>();
+        let t2_evidence = reference_report.as_ref().map(reference_selection_evidence).into_iter().collect::<Vec<_>>();
 
         let few_shots = crate::jury::get_few_shot_examples(&db, &segment_id, 5).map_err(|e| e.to_string())?;
         (audio_b64, hyps, reference_report, t2_evidence, few_shots)
