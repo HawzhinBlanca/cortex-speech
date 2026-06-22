@@ -141,7 +141,11 @@ impl HistoryManager {
             Command::DeleteSegments { segments } => {
                 for seg in segments {
                     if db.get_segment_by_id(&seg.id)?.is_none() {
-                        db.insert_segment(seg)?;
+                        // The row was HARD-deleted, so this is a fresh INSERT — use the full-column
+                        // restore so jury verdict / human decision / gold status / created_at survive.
+                        // insert_segment would drop them (it only writes 17 columns), silently wiping
+                        // curated provenance and re-stamping created_at to now.
+                        db.insert_segment_full(seg)?;
                     }
                 }
             }
@@ -292,6 +296,68 @@ mod tests {
         let restored = db.get_segment_by_id("del1").unwrap();
         assert!(restored.is_some());
         assert_eq!(restored.unwrap().raw_transcript, "to delete");
+    }
+
+    // Delete-then-undo must restore the FULL row, not just raw_transcript. A curator can run the jury
+    // and/or a human review (verdict, verdict_transcript, human_decision, corrected_at), mark the clip
+    // gold (is_gold), then delete and undo. Because delete is a hard DELETE, undo is a fresh INSERT —
+    // insert_segment would drop every jury/gold/created_at column to its default, silently wiping the
+    // curated decision and gold-anchor status. This pins insert_segment_full so the restore is lossless.
+    #[test]
+    fn test_undo_delete_preserves_jury_gold_and_created_at() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+
+        let seg = SpeechSegment {
+            id: "prov1".to_string(),
+            created_at: Some("2020-01-02 03:04:05".to_string()),
+            audio_path: "prov1.wav".to_string(),
+            raw_transcript: "[Pending WSL 7B ASR]".to_string(),
+            normalized_transcript: Some("dîtina rast".to_string()),
+            duration_ms: 1500,
+            verified: true,
+            verdict: Some("human_edit".to_string()),
+            verdict_transcript: Some("dîtina rast a mirov".to_string()),
+            rationale: Some("human corrected the failed ASR".to_string()),
+            evidence_json: Some("{\"src\":\"human\"}".to_string()),
+            agent_confidence: Some(0.91),
+            escalated: true,
+            human_decision: Some("edit".to_string()),
+            corrected_at: Some("2020-01-03 09:00:00".to_string()),
+            is_gold: true,
+            ..SpeechSegment::default()
+        };
+        // Persist the fully-provenanced row, then read it back as the snapshot the delete would capture.
+        db.insert_segment_full(&seg).unwrap();
+        let snapshot = db.get_segment_by_id("prov1").unwrap().unwrap();
+        assert_eq!(snapshot.verdict.as_deref(), Some("human_edit"));
+        assert_eq!(snapshot.created_at.as_deref(), Some("2020-01-02 03:04:05"));
+
+        // Hard-delete, then undo via the command holding the full snapshot.
+        db.delete_segment("prov1").unwrap();
+        assert!(db.get_segment_by_id("prov1").unwrap().is_none());
+        history.push(Command::DeleteSegments { segments: vec![snapshot] });
+        history.undo(&db).unwrap();
+
+        let restored = db.get_segment_by_id("prov1").unwrap().expect("row restored");
+        assert_eq!(restored.verdict.as_deref(), Some("human_edit"), "verdict must survive undo");
+        assert_eq!(
+            restored.verdict_transcript.as_deref(),
+            Some("dîtina rast a mirov"),
+            "human-corrected transcript must survive undo"
+        );
+        assert_eq!(restored.human_decision.as_deref(), Some("edit"), "human_decision must survive undo");
+        assert_eq!(restored.corrected_at.as_deref(), Some("2020-01-03 09:00:00"));
+        assert!(restored.is_gold, "gold-anchor status must survive undo");
+        assert!(restored.escalated, "escalated flag must survive undo");
+        assert_eq!(restored.agent_confidence, Some(0.91));
+        assert_eq!(restored.rationale.as_deref(), Some("human corrected the failed ASR"));
+        assert_eq!(restored.evidence_json.as_deref(), Some("{\"src\":\"human\"}"));
+        assert_eq!(
+            restored.created_at.as_deref(),
+            Some("2020-01-02 03:04:05"),
+            "created_at must be preserved, not re-stamped to now() (it orders every export)"
+        );
     }
 
     #[test]

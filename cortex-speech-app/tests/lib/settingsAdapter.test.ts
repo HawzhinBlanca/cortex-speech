@@ -87,4 +87,17 @@ describe('settingsAdapter', () => {
   it('normalizes unknown backend LLM modes to local-only mode', () => {
     expect(mapBackendToFrontend({ ...sampleBackend, llm_mode: 'UnexpectedMode' }).llmMode).toBe('Local');
   });
+
+  // The 'Autoplay Segments' toggle used to be silently dropped on save (mapFrontendToBackend never
+  // wrote it) and force-reset to false on load (mapBackendToFrontend hardcoded false), so it never
+  // survived a restart. Pin the full round-trip in both directions.
+  it('persists the autoplaySegments toggle across save and reload', () => {
+    const ui = { ...defaultSettings, autoplaySegments: true };
+    const backend = mapFrontendToBackend(ui, sampleBackend);
+    expect(backend.autoplay_segments).toBe(true);
+    expect(mapBackendToFrontend(backend).autoplaySegments).toBe(true);
+    // A stored value is honoured, not overridden.
+    expect(mapBackendToFrontend({ ...sampleBackend, autoplay_segments: true }).autoplaySegments).toBe(true);
+    expect(mapBackendToFrontend({ ...sampleBackend, autoplay_segments: false }).autoplaySegments).toBe(false);
+  });
 });

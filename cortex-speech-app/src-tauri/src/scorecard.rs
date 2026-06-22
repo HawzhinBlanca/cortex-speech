@@ -186,9 +186,10 @@ pub fn build_scorecard(
     }
 }
 
-/// Paired comparison: align segments by `gold_id`, compute per-segment word errors for
-/// both systems on the shared set, and run MAPSSWE. Only the intersection is used —
-/// the only statistically valid basis for a paired test.
+/// Paired comparison: align segments by the stable `audio_path` (NOT the volatile `gold_id` UUID,
+/// which a gold re-import re-mints), compute per-segment word errors for both systems on the shared
+/// set, and run MAPSSWE. Only the intersection is used — the only statistically valid basis for a
+/// paired test.
 /// Utterance-length difficulty slice — a per-condition slice that needs no extra gold metadata.
 ///
 /// Count over the SAME normalized token stream the WER uses (`normalize_for_metrics` splits ZWNJ into
@@ -204,8 +205,16 @@ fn length_slice(reference: &str) -> &'static str {
 }
 
 fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> BaselineComparison {
+    // Pair the two runs on the STABLE natural key audio_path, NOT gold_id. gold_id is a fresh UUID
+    // minted on every re-import (import_gold_segments DELETEs the old gold row for an audio_path and
+    // re-inserts with a new Uuid::new_v4), and persisted eval_segment_results keep the OLD id (there is
+    // no FK repointing them). So a baseline reconstructed from a run persisted BEFORE a gold re-mark
+    // carries different gold_ids than a fresh challenger, the intersection collapses to empty, and the
+    // whole MAPSSWE promotion test (and its slice-regression gate) silently no-ops on identical clips.
+    // audio_path is the logical identity of a gold clip (the column import_gold_segments itself dedups
+    // on) and is unique per run, so it survives re-import.
     let base_by_id: HashMap<&str, &crate::eval::EvalSegmentResult> =
-        baseline.segments.iter().map(|s| (s.gold_id.as_str(), s)).collect();
+        baseline.segments.iter().map(|s| (s.audio_path.as_str(), s)).collect();
 
     let mut sys_errs = Vec::new();
     let mut base_errs = Vec::new();
@@ -216,7 +225,7 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
     let mut by_slice: std::collections::BTreeMap<&'static str, (Vec<SegmentError>, Vec<SegmentError>)> =
         std::collections::BTreeMap::new();
     for s in &system.segments {
-        if let Some(b) = base_by_id.get(s.gold_id.as_str()) {
+        if let Some(b) = base_by_id.get(s.audio_path.as_str()) {
             let se = word_error(&s.reference, &s.hypothesis);
             let be = word_error(&b.reference, &b.hypothesis);
             sys_errs.push(se);
@@ -570,6 +579,76 @@ mod tests {
         assert!(cmp.system_micro_wer < cmp.baseline_micro_wer);
         assert!(cmp.significant_at_05, "a consistent per-segment win must be significant (p={})", cmp.mapsswe_p_value);
         assert!(cmp.beats_baseline);
+    }
+
+    // A gold re-import (re-mark a clip / re-import the holdout) DELETEs the gold row and re-inserts it
+    // with a fresh gold_id UUID, but the audio_path is stable. A baseline run persisted BEFORE the
+    // re-import keeps the OLD gold_id; a challenger run after it has the NEW gold_id. Pairing on gold_id
+    // would collapse the intersection to 0 and silently no-op the whole MAPSSWE promotion test on
+    // identical clips. Pairing on audio_path must survive the re-import. This reproduces the exact
+    // persist-baseline → re-import-gold → run-challenger → reconstruct-baseline sequence.
+    #[test]
+    fn paired_comparison_survives_gold_reimport_via_audio_path() {
+        use crate::eval::load_eval_run_and_recompute;
+
+        let db = open_mem_db();
+        let pairs = [
+            ("/g/1.wav", "ساڵی نوێ پیرۆز بێت"),
+            ("/g/2.wav", "ئەو لە کوردستان دەژی"),
+            ("/g/3.wav", "کتێبەکە زۆر باش بوو"),
+        ];
+        let inputs: Vec<GoldSegmentInput> = pairs
+            .iter()
+            .map(|(audio, reference)| GoldSegmentInput {
+                audio_path: (*audio).to_string(),
+                reference: (*reference).to_string(),
+                is_holdout: true,
+            })
+            .collect();
+
+        // 1. Import gold + run the baseline; eval_segment_results persist with the ORIGINAL gold_ids.
+        import_gold_segments(&db, inputs.clone()).unwrap();
+        let gold_old = list_gold_segments(&db).unwrap();
+        let base_hyps: Vec<(String, String)> =
+            gold_old.iter().map(|g| (g.id.clone(), "one two three four".to_string())).collect();
+        let baseline_persisted = run_gold_eval(&db, "champion", base_hyps).unwrap();
+        let baseline_run_id = baseline_persisted.run.id.clone();
+
+        // 2. Re-mark the SAME clips as gold → DELETE old rows + re-insert with FRESH gold_ids.
+        import_gold_segments(&db, inputs).unwrap();
+        let gold_new = list_gold_segments(&db).unwrap();
+        // Sanity: the re-import really did mint new ids (otherwise the test proves nothing).
+        let old_ids: std::collections::HashSet<&str> = gold_old.iter().map(|g| g.id.as_str()).collect();
+        assert!(
+            gold_new.iter().all(|g| !old_ids.contains(g.id.as_str())),
+            "re-import must mint fresh gold_ids for the test to be meaningful"
+        );
+
+        // 3. Run the challenger against the NEW gold_ids (perfect transcripts).
+        let chal_hyps: Vec<(String, String)> =
+            gold_new.iter().map(|g| (g.id.clone(), g.reference.clone())).collect();
+        let challenger = run_gold_eval(&db, "challenger", chal_hyps).unwrap();
+
+        // 4. Reconstruct the baseline from its persisted rows — it carries the OLD gold_ids.
+        let (run, segments) =
+            load_eval_run_and_recompute(&db, &baseline_run_id).unwrap().expect("baseline run reloads");
+        let baseline = EvalRunResult { run, segments };
+        // Confirm the gold_ids really diverged between the two runs (the root cause).
+        let chal_gold_ids: std::collections::HashSet<&str> =
+            challenger.segments.iter().map(|s| s.gold_id.as_str()).collect();
+        assert!(
+            baseline.segments.iter().all(|s| !chal_gold_ids.contains(s.gold_id.as_str())),
+            "baseline gold_ids must differ from challenger's (proving gold_id pairing would give 0)"
+        );
+
+        // 5. The paired comparison must still pair all 3 shared clips via audio_path.
+        let sc = build_scorecard(&challenger, Some(&baseline), ScorecardOptions::default());
+        let cmp = sc.vs_baseline.expect("baseline comparison present");
+        assert_eq!(
+            cmp.paired_segments, 3,
+            "paired comparison must survive a gold re-import by keying on audio_path, not gold_id"
+        );
+        assert!(cmp.system_micro_wer < cmp.baseline_micro_wer, "perfect challenger must beat the lossy baseline");
     }
 
     #[test]
