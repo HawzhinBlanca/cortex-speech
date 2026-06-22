@@ -67,7 +67,12 @@ pub fn analyze_audio_quality(pcm: &[i16]) -> AudioQualityMetrics {
         let signal_sum: f64 = frame_rms.iter().rev().take(signal_count).sum();
         let signal_rms = signal_sum / signal_count as f64;
 
-        if noise_rms > 1e-10 && signal_rms > 1e-10 {
+        // The signal floor (top 10%) is always >= the noise floor (bottom 10%); they coincide ONLY when
+        // every frame has the same level — a constant / DC-offset / steady-tone buffer. Round-23 #4:
+        // such an equal-level buffer used to yield ratio==1 -> 20*log10(1)==0 -> Some(0.0), which the
+        // quality/jury gates read as the WORST SNR class (severe_low_snr) and wrongly reject/escalate.
+        // Require the signal floor to be meaningfully above the noise floor; otherwise SNR is UNDEFINED.
+        if noise_rms > 1e-10 && signal_rms > noise_rms * (1.0 + 1e-6) {
             let ratio = signal_rms / noise_rms;
             Some((20.0 * ratio.log10()).clamp(0.0, 100.0))
         } else {
@@ -104,6 +109,17 @@ mod tests {
         // A long enough non-silent clip still produces a real measured SNR.
         let long_pcm: Vec<i16> = (0..32000).map(|i| (((i * 137) % 4000) as i16) - 2000).collect();
         assert!(analyze_audio_quality(&long_pcm).snr_db.is_some(), "long clip must yield a measured SNR");
+    }
+
+    #[test]
+    fn constant_dc_buffer_snr_is_none_not_worst_case_zero() {
+        // Round-23 #4: a constant non-zero (DC-offset) buffer has equal frame RMS, so the signal floor
+        // and the noise floor coincide: SNR is UNDEFINED. It must be None, not Some(0.0) — which the
+        // jury/quality gates read as the worst SNR class (severe_low_snr) and would wrongly escalate.
+        let pcm = vec![1000i16; 16000]; // constant DC: measurable RMS, equal frames
+        let metrics = analyze_audio_quality(&pcm);
+        assert!(metrics.rms_db > -90.0, "a non-zero DC buffer has measurable RMS");
+        assert_eq!(metrics.snr_db, None, "equal-level frames -> undefined SNR -> None, not Some(0.0)");
     }
 
     #[test]
