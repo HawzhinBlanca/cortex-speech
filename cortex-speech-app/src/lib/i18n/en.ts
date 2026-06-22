@@ -240,7 +240,7 @@ export const en: Record<string, string> = {
   'validation.activeLearning.noSegments': 'No segments found in the active learning queue.',
   'validation.ood.title': 'Out-of-Distribution Audio Detector',
   'validation.ood.description':
-    'Runs zero-crossing rate and short-time energy variance checks (or WavLM ONNX) to screen for silent audio, white noise, music, or distorted segments.',
+    'Runs zero-crossing rate and short-time energy variance checks to screen for silent audio, white noise, music, or distorted segments.',
   'validation.ood.run': 'Run OOD Detection',
   'validation.ood.running': 'Running OOD detection...',
   'validation.ood.success': 'Successfully computed OOD scores for {n} segments!',
