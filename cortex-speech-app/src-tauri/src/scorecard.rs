@@ -152,11 +152,7 @@ fn word_breakdown_aggregate(result: &EvalRunResult) -> (f64, usize, usize, usize
 }
 
 /// Build a scorecard from a gold-eval result (and an optional baseline run).
-pub fn build_scorecard(
-    result: &EvalRunResult,
-    baseline: Option<&EvalRunResult>,
-    opts: ScorecardOptions,
-) -> Scorecard {
+pub fn build_scorecard(result: &EvalRunResult, baseline: Option<&EvalRunResult>, opts: ScorecardOptions) -> Scorecard {
     let word_errs = word_errors(result);
     let char_errs = char_errors(result);
     let (macro_wer, substitutions, deletions, insertions) = word_breakdown_aggregate(result);
@@ -625,8 +621,7 @@ mod tests {
         );
 
         // 3. Run the challenger against the NEW gold_ids (perfect transcripts).
-        let chal_hyps: Vec<(String, String)> =
-            gold_new.iter().map(|g| (g.id.clone(), g.reference.clone())).collect();
+        let chal_hyps: Vec<(String, String)> = gold_new.iter().map(|g| (g.id.clone(), g.reference.clone())).collect();
         let challenger = run_gold_eval(&db, "challenger", chal_hyps).unwrap();
 
         // 4. Reconstruct the baseline from its persisted rows — it carries the OLD gold_ids.

@@ -258,8 +258,7 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
     // representative id, under-counting the failures. Attribute by segment id, and treat every segment
     // whose audio file is missing as failed.
     let failed_ids: HashSet<&str> = errors.iter().filter_map(|e| e.segment_id.as_deref()).collect();
-    let missing_paths: HashSet<&str> =
-        audio_paths.iter().copied().filter(|p| !Path::new(p).exists()).collect();
+    let missing_paths: HashSet<&str> = audio_paths.iter().copied().filter(|p| !Path::new(p).exists()).collect();
     let passed = segments
         .iter()
         .filter(|s| !failed_ids.contains(s.id.as_str()) && !missing_paths.contains(s.audio_path.as_str()))

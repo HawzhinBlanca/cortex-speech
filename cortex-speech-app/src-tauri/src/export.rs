@@ -294,8 +294,7 @@ pub fn assign_splits(
     // recording INTACT (no multi-speaker recording straddles two splits) AND is speaker-disjoint (no
     // speaker spans two splits). Without speaker_disjoint, units are simply per-recording. BTreeMap
     // keeps the canonical keys in a stable sorted order for seed-reproducible shuffling.
-    let mut groups: std::collections::BTreeMap<String, Vec<&SpeechSegment>> =
-        std::collections::BTreeMap::new();
+    let mut groups: std::collections::BTreeMap<String, Vec<&SpeechSegment>> = std::collections::BTreeMap::new();
     if speaker_disjoint {
         let mut uf = UnionFind::new();
         for seg in segments {
@@ -313,11 +312,14 @@ pub fn assign_splits(
             let rec = source_name(&seg.audio_path).to_string();
             let r = uf.node(&format!("r:{rec}"));
             let root = uf.find(r);
-            root_key.entry(root).and_modify(|m| {
-                if rec < *m {
-                    *m = rec.clone();
-                }
-            }).or_insert(rec);
+            root_key
+                .entry(root)
+                .and_modify(|m| {
+                    if rec < *m {
+                        *m = rec.clone();
+                    }
+                })
+                .or_insert(rec);
         }
         for seg in segments {
             let r = uf.node(&format!("r:{}", source_name(&seg.audio_path)));
@@ -356,8 +358,7 @@ pub fn assign_splits(
     for key in keys {
         let segs = &groups[key];
         let group_dur: i64 = segs.iter().map(|s| s.duration_ms).sum();
-        let (def_train, def_val, def_test) =
-            (target_train - d_train, target_val - d_val, target_test - d_test);
+        let (def_train, def_val, def_test) = (target_train - d_train, target_val - d_val, target_test - d_test);
         let split = if def_train >= def_val && def_train >= def_test {
             d_train += group_dur;
             "train"
@@ -419,11 +420,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// forward slashes, deterministic regardless of filesystem walk order. Excludes the
 /// `SHA256SUMS` file itself and any `.tmp` staging files.
 fn write_sha256sums(dir: &std::path::Path) -> AppResult<()> {
-    fn collect(
-        dir: &std::path::Path,
-        root: &std::path::Path,
-        out: &mut Vec<(String, String)>,
-    ) -> AppResult<()> {
+    fn collect(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) -> AppResult<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -435,11 +432,7 @@ fn write_sha256sums(dir: &std::path::Path) -> AppResult<()> {
                 if name == "SHA256SUMS" || name.ends_with(".tmp") {
                     continue;
                 }
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
                 out.push((rel, sha256_hex(&std::fs::read(&path)?)));
             }
         }
@@ -1291,12 +1284,13 @@ mod tests {
         let split_of: HashMap<&str, &str> = a.iter().map(|(id, s)| (id.as_str(), *s)).collect();
 
         // The multi-speaker recording must be entirely within ONE split (no recording leakage).
-        let interview_splits: HashSet<&str> = segs
-            .iter()
-            .filter(|s| s.audio_path.ends_with("interview.wav"))
-            .map(|s| split_of[s.id.as_str()])
-            .collect();
-        assert_eq!(interview_splits.len(), 1, "a multi-speaker recording must not straddle splits: {interview_splits:?}");
+        let interview_splits: HashSet<&str> =
+            segs.iter().filter(|s| s.audio_path.ends_with("interview.wav")).map(|s| split_of[s.id.as_str()]).collect();
+        assert_eq!(
+            interview_splits.len(),
+            1,
+            "a multi-speaker recording must not straddle splits: {interview_splits:?}"
+        );
 
         // And speaker-disjointness still holds: no speaker spans two splits.
         let mut spk_split: HashMap<&str, &str> = HashMap::new();
@@ -1321,9 +1315,7 @@ mod tests {
         let sums = std::fs::read_to_string(dir.path().join("SHA256SUMS")).unwrap();
 
         // Known vector for sha256("abc").
-        assert!(sums.contains(
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  a.txt"
-        ));
+        assert!(sums.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  a.txt"));
         // Nested file present with a forward-slash relative path.
         assert!(sums.lines().any(|l| l.ends_with("  data/train/clip.wav")));
         // .tmp staging files and the manifest itself are excluded.
@@ -1409,11 +1401,21 @@ mod tests {
     fn slice_for_export_skips_out_of_range_and_degenerate_windows() {
         // Round-2 audit: a present-but-out-of-range window must SKIP (None), not emit the whole file.
         let full = vec![0i16; 1000]; // ~62ms at 16kHz
-        // start beyond the (shortened) buffer:
-        let beyond = crate::chunking::SegmentSourceMeta { source_start_ms: 5000, source_end_ms: 6000, chunk_index: 0, chunk_count: 1 };
+                                     // start beyond the (shortened) buffer:
+        let beyond = crate::chunking::SegmentSourceMeta {
+            source_start_ms: 5000,
+            source_end_ms: 6000,
+            chunk_index: 0,
+            chunk_count: 1,
+        };
         assert!(slice_for_export(&full, 16000, Some(&beyond.to_alignment_json())).is_none(), "out-of-range -> skip");
         // degenerate end <= start:
-        let degenerate = crate::chunking::SegmentSourceMeta { source_start_ms: 30, source_end_ms: 30, chunk_index: 0, chunk_count: 1 };
+        let degenerate = crate::chunking::SegmentSourceMeta {
+            source_start_ms: 30,
+            source_end_ms: 30,
+            chunk_index: 0,
+            chunk_count: 1,
+        };
         assert!(slice_for_export(&full, 16000, Some(&degenerate.to_alignment_json())).is_none(), "degenerate -> skip");
     }
 
@@ -1421,7 +1423,12 @@ mod tests {
     fn slice_for_export_valid_window_and_whole_file_fallback() {
         let full: Vec<i16> = (0..16000).collect::<Vec<i32>>().iter().map(|&i| i as i16).collect();
         // Valid 0..500ms = 0..8000 samples.
-        let valid = crate::chunking::SegmentSourceMeta { source_start_ms: 0, source_end_ms: 500, chunk_index: 0, chunk_count: 1 };
+        let valid = crate::chunking::SegmentSourceMeta {
+            source_start_ms: 0,
+            source_end_ms: 500,
+            chunk_index: 0,
+            chunk_count: 1,
+        };
         let s = slice_for_export(&full, 16000, Some(&valid.to_alignment_json())).expect("valid window");
         assert_eq!(s.len(), 8000, "valid window slices to exactly its sample span");
         // No alignment -> whole file (intended fallback).
@@ -1513,7 +1520,9 @@ mod tests {
 
         let all_csv: String = ["train", "validation", "test"]
             .iter()
-            .map(|s| std::fs::read_to_string(out_dir.path().join("data").join(s).join("metadata.csv")).unwrap_or_default())
+            .map(|s| {
+                std::fs::read_to_string(out_dir.path().join("data").join(s).join("metadata.csv")).unwrap_or_default()
+            })
             .collect();
         assert!(all_csv.contains("keep-1"), "the non-holdout segment must still be exported");
         assert!(!all_csv.contains("hold-1"), "the holdout gold clip must NOT leak into any split");
@@ -1621,7 +1630,8 @@ mod tests {
         let empty: [SpeechSegment; 0] = [];
 
         export_json(&d.join("e.json"), &sample_metadata(), &empty).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("e.json")).unwrap()).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(d.join("e.json")).unwrap()).unwrap();
         assert!(parsed.get("segments").is_some_and(|s| s.as_array().is_some_and(|a| a.is_empty())));
 
         export_jsonl(&d.join("e.jsonl"), &empty).unwrap();

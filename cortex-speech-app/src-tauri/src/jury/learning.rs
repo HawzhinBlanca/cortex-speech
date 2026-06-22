@@ -118,10 +118,7 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
 
         // Gold-Holdout exclusion (fail-closed). Path match works even when the file is gone.
         if holdout_paths.contains(&row.audio_path) {
-            tracing::warn!(
-                "Excluding segment {} from DPO export: matches holdout gold audio path",
-                row.segment_id
-            );
+            tracing::warn!("Excluding segment {} from DPO export: matches holdout gold audio path", row.segment_id);
             continue;
         }
         let audio_path = Path::new(&row.audio_path);
@@ -515,7 +512,8 @@ pub fn run_dpo_update(db: &Database, endpoint: &str) -> AppResult<String> {
         return Ok("No preference pairs to export.".into());
     }
 
-    let resp = crate::http::API_AGENT.post(endpoint)
+    let resp = crate::http::API_AGENT
+        .post(endpoint)
         .set("Content-Type", "application/x-ndjson")
         .send_string(&export.jsonl)
         .map_err(|e| crate::error::AppError::Other(format!("DPO update POST failed: {e}")))?;
@@ -1004,10 +1002,7 @@ mod tests {
 
         // 4. Update to is_holdout = 0
         db.connection()
-            .execute(
-                "UPDATE gold_segments SET is_holdout = 0 WHERE id = 'gold-holdout'",
-                [],
-            )
+            .execute("UPDATE gold_segments SET is_holdout = 0 WHERE id = 'gold-holdout'", [])
             .expect("update gold");
 
         // 5. Verify it is now included

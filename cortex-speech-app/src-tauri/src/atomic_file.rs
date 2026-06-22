@@ -79,9 +79,7 @@ fn fsync_parent_dir(final_path: &Path) {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     if let Some(parent) = final_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Ok(dir) =
-            fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(parent)
-        {
+        if let Ok(dir) = fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(parent) {
             let _ = dir.sync_all();
         }
     }

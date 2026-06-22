@@ -468,11 +468,7 @@ pub enum ClipTier {
 /// `wer` module so reference and hypothesis are normalised + NFC-folded identically.
 pub fn clip_cer_tier(reference: &str, hypothesis: &str) -> (ClipTier, f64) {
     let d = crate::wer::char_edit_distance(reference, hypothesis);
-    let cer = if d.ref_len > 0 {
-        (d.distance as f64 / d.ref_len as f64).min(1.0)
-    } else {
-        0.0
-    };
+    let cer = if d.ref_len > 0 { (d.distance as f64 / d.ref_len as f64).min(1.0) } else { 0.0 };
     let tier = if cer <= 0.05 {
         ClipTier::Gold
     } else if cer <= 0.20 {
@@ -823,10 +819,7 @@ mod tests {
     #[test]
     fn clip_cer_tier_classifies_by_cer() {
         // Identical reference + hypothesis → gold (CER 0).
-        assert_eq!(
-            clip_cer_tier("ئەمڕۆ هەوا زۆر خۆشە", "ئەمڕۆ هەوا زۆر خۆشە").0,
-            ClipTier::Gold
-        );
+        assert_eq!(clip_cer_tier("ئەمڕۆ هەوا زۆر خۆشە", "ئەمڕۆ هەوا زۆر خۆشە").0, ClipTier::Gold);
         // Completely different content → reject (CER well above 0.20).
         let (tier, cer) = clip_cer_tier("ئەمڕۆ هەوا زۆر خۆشە", "پۆلیس و هێزی ئەمنی هاتن");
         assert_eq!(tier, ClipTier::Reject);

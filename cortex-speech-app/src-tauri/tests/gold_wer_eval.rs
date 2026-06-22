@@ -8,16 +8,16 @@
 //   cargo test --test gold_wer_eval -- --ignored --nocapture
 use cortex_speech_app_lib::asr::{AsrLoadConfig, KurdishAsrService};
 use cortex_speech_app_lib::audio;
-use cortex_speech_app_lib::settings::AsrModelSize;
+use cortex_speech_app_lib::cache::TranscriptCache;
 use cortex_speech_app_lib::db::Database;
 use cortex_speech_app_lib::error::AppError;
 use cortex_speech_app_lib::eval;
-use cortex_speech_app_lib::cache::TranscriptCache;
 use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use cortex_speech_app_lib::pipeline::ProcessingPipeline;
 use cortex_speech_app_lib::settings::AppSettings;
+use cortex_speech_app_lib::settings::AsrModelSize;
 use cortex_speech_app_lib::significance::{bootstrap_ci, mapsswe, SegmentError};
 use cortex_speech_app_lib::wer;
 use std::path::{Path, PathBuf};
@@ -44,19 +44,11 @@ fn gold_wer_real_omniasr() {
             return;
         }
     };
-    let model_dir = PathBuf::from(
-        std::env::var("CORTEX_MODELS_DIR").unwrap_or_else(|_| "models".to_string()),
-    );
-    let max: usize = std::env::var("CORTEX_GOLD_MAX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(usize::MAX);
+    let model_dir = PathBuf::from(std::env::var("CORTEX_MODELS_DIR").unwrap_or_else(|_| "models".to_string()));
+    let max: usize = std::env::var("CORTEX_GOLD_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
 
     if !model_dir.join("omniasr-ctc-300m/model.int8.onnx").exists() {
-        eprintln!(
-            "[gold-wer] skip: omniasr-ctc-300m model not found under {}",
-            model_dir.display()
-        );
+        eprintln!("[gold-wer] skip: omniasr-ctc-300m model not found under {}", model_dir.display());
         return;
     }
 
@@ -67,11 +59,7 @@ fn gold_wer_real_omniasr() {
         .map(|l| serde_json::from_str(l).expect("parse jsonl row"))
         .collect();
     rows.truncate(max);
-    eprintln!(
-        "[gold-wer] {} gold clips from manifest; model_dir={}",
-        rows.len(),
-        model_dir.display()
-    );
+    eprintln!("[gold-wer] {} gold clips from manifest; model_dir={}", rows.len(), model_dir.display());
 
     let db = Database::open(":memory:").expect("open db");
     db.initialize().expect("init db");
@@ -98,9 +86,7 @@ fn gold_wer_real_omniasr() {
         let (sr, pcm) = audio::decode_to_pcm(&seg.audio_path)?;
         let (_sr, pcm16) = audio::ensure_pcm_16khz(sr, pcm)?;
         let f32_pcm: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
-        asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
-            .map(|(text, _conf)| text)
-            .map_err(AppError::Other)
+        asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(text, _conf)| text).map_err(AppError::Other)
     })
     .expect("gold eval with real ASR");
     let elapsed = t0.elapsed().as_secs_f64();
@@ -108,10 +94,7 @@ fn gold_wer_real_omniasr() {
     let meta = result.run.meta_json.as_deref().unwrap_or("{}");
     eprintln!("\n========== GOLD WER/CER — real OmniASR-300M ==========");
     eprintln!("clips scored : {}", result.run.num_segs);
-    eprintln!(
-        "MICRO  WER   : {:.4}    CER : {:.4}    (corpus-level headline)",
-        result.run.wer, result.run.cer
-    );
+    eprintln!("MICRO  WER   : {:.4}    CER : {:.4}    (corpus-level headline)", result.run.wer, result.run.cer);
     eprintln!("micro/macro  : {meta}");
     eprintln!("elapsed      : {elapsed:.1}s for {} clips", result.run.num_segs);
 
@@ -128,14 +111,15 @@ fn gold_wer_real_omniasr() {
         }
         let inter = sa.intersection(&sb).count() as f64;
         let union = sa.union(&sb).count() as f64;
-        if union > 0.0 { inter / union } else { 0.0 }
+        if union > 0.0 {
+            inter / union
+        } else {
+            0.0
+        }
     };
 
-    let mut scored: Vec<(f64, &eval::EvalSegmentResult)> = result
-        .segments
-        .iter()
-        .map(|s| (jaccard(&s.reference, &s.hypothesis), s))
-        .collect();
+    let mut scored: Vec<(f64, &eval::EvalSegmentResult)> =
+        result.segments.iter().map(|s| (jaccard(&s.reference, &s.hypothesis), s)).collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     const ALIGN_THRESHOLD: f64 = 0.40;
@@ -148,11 +132,8 @@ fn gold_wer_real_omniasr() {
     }
 
     // Verified-aligned subset estimate (micro, char + word) over clips above threshold.
-    let aligned: Vec<&eval::EvalSegmentResult> = scored
-        .iter()
-        .filter(|(ov, _)| *ov >= ALIGN_THRESHOLD)
-        .map(|(_, s)| *s)
-        .collect();
+    let aligned: Vec<&eval::EvalSegmentResult> =
+        scored.iter().filter(|(ov, _)| *ov >= ALIGN_THRESHOLD).map(|(_, s)| *s).collect();
     let mut wd = 0usize;
     let mut wr = 0usize;
     let mut cd = 0usize;
@@ -213,13 +194,8 @@ fn compare_300m_vs_1b() {
             return;
         }
     };
-    let model_dir = PathBuf::from(
-        std::env::var("CORTEX_MODELS_DIR").unwrap_or_else(|_| "models".to_string()),
-    );
-    let max: usize = std::env::var("CORTEX_GOLD_MAX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(usize::MAX);
+    let model_dir = PathBuf::from(std::env::var("CORTEX_MODELS_DIR").unwrap_or_else(|_| "models".to_string()));
+    let max: usize = std::env::var("CORTEX_GOLD_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
     if !model_dir.join("omniasr-ctc-300m/model.int8.onnx").exists()
         || !model_dir.join("omniasr-ctc-1b/model.int8.onnx").exists()
     {
@@ -238,11 +214,7 @@ fn compare_300m_vs_1b() {
     let mut a300 = KurdishAsrService::new(&model_dir, false).expect("300M init");
     let mut a1b = KurdishAsrService::new_with_config(
         &model_dir,
-        &AsrLoadConfig {
-            model_size: AsrModelSize::CTC1B,
-            enable_gpu: false,
-            ..AsrLoadConfig::default()
-        },
+        &AsrLoadConfig { model_size: AsrModelSize::CTC1B, enable_gpu: false, ..AsrLoadConfig::default() },
     )
     .expect("1B init");
     assert!(a300.is_available() && a1b.is_available());
@@ -267,14 +239,8 @@ fn compare_300m_vs_1b() {
         };
         let (_sr, p16) = audio::ensure_pcm_16khz(sr, pcm).expect("16khz");
         let f32_pcm: Vec<f32> = p16.iter().map(|&s| s as f32 / 32768.0).collect();
-        let h3 = a300
-            .transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
-            .map(|(t, _)| t)
-            .unwrap_or_default();
-        let h1 = a1b
-            .transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
-            .map(|(t, _)| t)
-            .unwrap_or_default();
+        let h3 = a300.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(t, _)| t).unwrap_or_default();
+        let h1 = a1b.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(t, _)| t).unwrap_or_default();
         worksheet.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t\n",
             n + 1,
@@ -305,9 +271,7 @@ fn compare_300m_vs_1b() {
     eprintln!("\n========== 300M vs 1B — normalized CER on {n} gold clips ==========");
     eprintln!("300M  micro CER : {:.4}", micro(c3d, c3r));
     eprintln!("1B    micro CER : {:.4}", micro(c1d, c1r));
-    eprintln!(
-        "per-clip: 1B better {wins1b}  |  300M better {wins300}  |  ties {ties}  (of {n})"
-    );
+    eprintln!("per-clip: 1B better {wins1b}  |  300M better {wins300}  |  ties {ties}  (of {n})");
     eprintln!("elapsed: {elapsed:.1}s (both models)");
     if let Ok(out) = std::env::var("CORTEX_WORKSHEET_OUT") {
         std::fs::write(&out, &worksheet).expect("write worksheet");
@@ -331,9 +295,7 @@ fn whole_file_wer_real_omniasr() {
         }
     };
     let ref_path = std::env::var("CORTEX_WHOLE_REF").expect("set CORTEX_WHOLE_REF");
-    let model_dir = PathBuf::from(
-        std::env::var("CORTEX_MODELS_DIR").unwrap_or_else(|_| "models".to_string()),
-    );
+    let model_dir = PathBuf::from(std::env::var("CORTEX_MODELS_DIR").unwrap_or_else(|_| "models".to_string()));
     if !model_dir.join("omniasr-ctc-300m/model.int8.onnx").exists() {
         eprintln!("[whole-wer] skip: omniasr-ctc-300m model not found");
         return;
@@ -349,9 +311,7 @@ fn whole_file_wer_real_omniasr() {
     let f32_pcm: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
     let secs = f32_pcm.len() as f64 / 16000.0;
     eprintln!("[whole-wer] decoded {secs:.1}s audio; transcribing whole file…");
-    let (hyp, _conf) = asr
-        .transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
-        .expect("transcribe whole file");
+    let (hyp, _conf) = asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).expect("transcribe whole file");
     let elapsed = t0.elapsed().as_secs_f64();
 
     let norm = SoraniNormalizer::new();
@@ -371,23 +331,14 @@ fn whole_file_wer_real_omniasr() {
     let n_c = wer::char_edit_distance(&ref_n, &hyp_n);
 
     eprintln!("\n========== WHOLE-FILE WER — real OmniASR-300M ==========");
-    eprintln!(
-        "audio        : {:.1}s   decode+transcribe {:.1}s  ({:.2}x realtime)",
-        secs,
-        elapsed,
-        secs / elapsed
-    );
+    eprintln!("audio        : {:.1}s   decode+transcribe {:.1}s  ({:.2}x realtime)", secs, elapsed, secs / elapsed);
     eprintln!(
         "ref words    : {}    hyp words: {}",
         reference.split_whitespace().count(),
         hyp.split_whitespace().count()
     );
     eprintln!("RAW   WER {:.4}   CER {:.4}", pct(&raw_w), pct(&raw_c));
-    eprintln!(
-        "NORM  WER {:.4}   CER {:.4}   (SoraniNormalizer on both sides)",
-        pct(&n_w),
-        pct(&n_c)
-    );
+    eprintln!("NORM  WER {:.4}   CER {:.4}   (SoraniNormalizer on both sides)", pct(&n_w), pct(&n_c));
     eprintln!("\nref(norm) head: {}", head(&ref_n, 110));
     eprintln!("hyp(norm) head: {}", head(&hyp_n, 110));
 
@@ -427,17 +378,11 @@ fn pipeline_whole_file_wer() {
 
     let db = Database::open(&db_path_str).unwrap();
     let t0 = std::time::Instant::now();
-    pipeline
-        .process_single_file(Path::new(&audio_path), &db)
-        .expect("process_single_file should succeed");
+    pipeline.process_single_file(Path::new(&audio_path), &db).expect("process_single_file should succeed");
     let elapsed = t0.elapsed().as_secs_f64();
     let segments = db.get_segments(None).unwrap();
 
-    let hyp: String = segments
-        .iter()
-        .map(|s| s.raw_transcript.clone())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let hyp: String = segments.iter().map(|s| s.raw_transcript.clone()).collect::<Vec<_>>().join(" ");
 
     let norm = SoraniNormalizer::new();
     let ref_n = norm.normalize(&reference);
@@ -463,11 +408,7 @@ fn pipeline_whole_file_wer() {
         hyp.split_whitespace().count()
     );
     eprintln!("RAW   WER {:.4}   CER {:.4}", pct(&raw_w), pct(&raw_c));
-    eprintln!(
-        "NORM  WER {:.4}   CER {:.4}   (SoraniNormalizer on both sides)",
-        pct(&n_w),
-        pct(&n_c)
-    );
+    eprintln!("NORM  WER {:.4}   CER {:.4}   (SoraniNormalizer on both sides)", pct(&n_w), pct(&n_c));
     eprintln!("\nref(norm) head: {}", head(&ref_n, 130));
     eprintln!("hyp(norm) head: {}", head(&hyp_n, 130));
 
@@ -537,9 +478,7 @@ fn verbatim_wer_from_worksheet() {
         format!("{:.4} [{:.4}, {:.4}]", ci.point, ci.lower, ci.upper)
     };
 
-    eprintln!(
-        "\n===== VERBATIM WER/CER — hand-verified refs (n={n}, normalized, 95% bootstrap CI) ====="
-    );
+    eprintln!("\n===== VERBATIM WER/CER — hand-verified refs (n={n}, normalized, 95% bootstrap CI) =====");
     eprintln!("300M  WER {}", fmt(bootstrap_ci(&w300, RESAMPLES, CONF, SEED)));
     eprintln!("300M  CER {}", fmt(bootstrap_ci(&c300, RESAMPLES, CONF, SEED)));
     if has_1b && w1b.len() == n {
@@ -549,11 +488,7 @@ fn verbatim_wer_from_worksheet() {
         eprintln!(
             "MAPSSWE 300M vs 1B (word): p = {:.4}  ->  {}",
             p,
-            if p < 0.05 {
-                "significant difference"
-            } else {
-                "not statistically distinguishable"
-            }
+            if p < 0.05 { "significant difference" } else { "not statistically distinguishable" }
         );
     } else {
         eprintln!("(1B column absent — fill asr_1b to get the 300M-vs-1B significance test)");

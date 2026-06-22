@@ -54,8 +54,7 @@ fn requires_nonempty_pin(source: &str) -> bool {
     matches!(source, "user-finetuned" | "cortex-finetuned")
 }
 
-const SELECT_COLS: &str =
-    "id, family, model_card_name, checkpoint_sha256, checkpoint_path, source, license, status";
+const SELECT_COLS: &str = "id, family, model_card_name, checkpoint_sha256, checkpoint_path, source, license, status";
 
 fn map_version(row: &Row) -> rusqlite::Result<ModelVersion> {
     Ok(ModelVersion {
@@ -127,9 +126,8 @@ pub fn promote_to_champion(db: &Database, id: &str) -> AppResult<()> {
 /// The current champion for a family, if one is crowned.
 pub fn get_champion(db: &Database, family: &str) -> AppResult<Option<ModelVersion>> {
     let conn = db.connection();
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {SELECT_COLS} FROM model_versions WHERE family = ?1 AND status = 'champion'"
-    ))?;
+    let mut stmt =
+        conn.prepare(&format!("SELECT {SELECT_COLS} FROM model_versions WHERE family = ?1 AND status = 'champion'"))?;
     let mut rows = stmt.query(params![family])?;
     match rows.next()? {
         Some(row) => Ok(Some(map_version(row)?)),
@@ -141,9 +139,8 @@ pub fn get_champion(db: &Database, family: &str) -> AppResult<Option<ModelVersio
 /// lists.
 pub fn list_model_versions(db: &Database) -> AppResult<Vec<ModelVersion>> {
     let conn = db.connection();
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {SELECT_COLS} FROM model_versions ORDER BY family ASC, created_at DESC, id ASC"
-    ))?;
+    let mut stmt = conn
+        .prepare(&format!("SELECT {SELECT_COLS} FROM model_versions ORDER BY family ASC, created_at DESC, id ASC"))?;
     let rows = stmt.query_map([], map_version)?;
     let mut versions = Vec::new();
     for row in rows {
@@ -155,8 +152,7 @@ pub fn list_model_versions(db: &Database) -> AppResult<Vec<ModelVersion>> {
 /// Fetch a single model version by id.
 pub fn get_model_version(db: &Database, id: &str) -> AppResult<Option<ModelVersion>> {
     let conn = db.connection();
-    let mut stmt =
-        conn.prepare(&format!("SELECT {SELECT_COLS} FROM model_versions WHERE id = ?1"))?;
+    let mut stmt = conn.prepare(&format!("SELECT {SELECT_COLS} FROM model_versions WHERE id = ?1"))?;
     let mut rows = stmt.query(params![id])?;
     match rows.next()? {
         Some(row) => Ok(Some(map_version(row)?)),
@@ -240,9 +236,7 @@ pub fn import_checkpoint(
 ) -> AppResult<String> {
     let path = std::path::Path::new(checkpoint_path);
     if !path.is_file() {
-        return Err(AppError::Validation(format!(
-            "cannot import checkpoint: no file at '{checkpoint_path}'"
-        )));
+        return Err(AppError::Validation(format!("cannot import checkpoint: no file at '{checkpoint_path}'")));
     }
     let sha = crate::models::compute_file_sha256(path)
         .map_err(|e| AppError::Other(format!("hashing checkpoint '{checkpoint_path}': {e}")))?;
@@ -354,9 +348,7 @@ pub fn decide_promotion(challenger: &Scorecard, policy: &PromotionPolicy) -> Pro
         None => {
             if policy.require_wer_beats_baseline {
                 promote = false;
-                reasons.push(
-                    "WER gate FAILED: no paired baseline comparison in the challenger scorecard".to_string(),
-                );
+                reasons.push("WER gate FAILED: no paired baseline comparison in the challenger scorecard".to_string());
             } else {
                 reasons.push("WER gate skipped: not required by policy".to_string());
             }
@@ -387,8 +379,7 @@ pub fn decide_promotion(challenger: &Scorecard, policy: &PromotionPolicy) -> Pro
 
             // --- Optional CER-reduction target (the charter's ">=N% reduction"), also paired. ---
             if let Some(min_reduction) = policy.min_cer_reduction_frac {
-                let reduction =
-                    if baseline_cer > 0.0 { (baseline_cer - challenger_cer) / baseline_cer } else { 0.0 };
+                let reduction = if baseline_cer > 0.0 { (baseline_cer - challenger_cer) / baseline_cer } else { 0.0 };
                 if reduction + eps < min_reduction {
                     promote = false;
                     reasons.push(format!(
@@ -531,8 +522,11 @@ mod tests {
         promote_to_champion(&db, "v2").unwrap();
         let champ = get_champion(&db, "omniasr-7b").unwrap().unwrap();
         assert_eq!(champ.id, "v2", "the newly promoted version is champion");
-        assert_eq!(get_model_version(&db, "v1").unwrap().unwrap().status, "rolled_back",
-            "the prior champion is rolled back, not left as a second champion");
+        assert_eq!(
+            get_model_version(&db, "v1").unwrap().unwrap().status,
+            "rolled_back",
+            "the prior champion is rolled back, not left as a second champion"
+        );
     }
 
     #[test]
@@ -597,12 +591,9 @@ mod tests {
 
     #[test]
     fn asset_card_yaml_has_name_base_and_wsl_checkpoint() {
-        let yaml = build_fairseq2_asset_card(
-            "omniASR_ckb_v3@user",
-            "omniASR_LLM_7B",
-            "/mnt/c/models/abc/consolidated.pt",
-        )
-        .unwrap();
+        let yaml =
+            build_fairseq2_asset_card("omniASR_ckb_v3@user", "omniASR_LLM_7B", "/mnt/c/models/abc/consolidated.pt")
+                .unwrap();
         assert!(yaml.contains("name: omniASR_ckb_v3@user"), "{yaml}");
         assert!(yaml.contains("base: omniASR_LLM_7B"), "{yaml}");
         assert!(yaml.contains("checkpoint: \"/mnt/c/models/abc/consolidated.pt\""), "{yaml}");
@@ -642,11 +633,9 @@ mod tests {
 
         let (wer, cer, scj): (f64, f64, String) = db
             .connection()
-            .query_row(
-                "SELECT gold_wer, gold_cer, scorecard_json FROM model_versions WHERE id = 'v1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            .query_row("SELECT gold_wer, gold_cer, scorecard_json FROM model_versions WHERE id = 'v1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .unwrap();
         assert!((wer - 0.18).abs() < 1e-9);
         assert!((cer - 0.07).abs() < 1e-9);

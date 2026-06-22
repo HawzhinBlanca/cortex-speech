@@ -5,8 +5,8 @@
 
 pub mod agentic;
 pub mod align_text;
-pub mod api_keys;
 pub mod aligner;
+pub mod api_keys;
 pub mod asr;
 pub mod atomic_file;
 pub mod audio;
@@ -550,10 +550,9 @@ pub fn run() {
                     tracing::warn!("Could not create media cache dir {}: {e}", media_cache.display());
                 }
                 match app.asset_protocol_scope().allow_directory(&media_cache, true) {
-                    Ok(()) => tracing::info!(
-                        "Asset protocol scope authorized for media cache: {}",
-                        media_cache.display()
-                    ),
+                    Ok(()) => {
+                        tracing::info!("Asset protocol scope authorized for media cache: {}", media_cache.display())
+                    }
                     Err(e) => tracing::warn!("Failed to authorize media cache dir in asset scope: {e}"),
                 }
             }

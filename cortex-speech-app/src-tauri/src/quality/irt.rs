@@ -75,14 +75,11 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
         }
 
         // Choose the anchor hypothesis (highest initial ability) among the surviving non-empty set.
-        let Some(anchor_hyp) = hyps
-            .iter()
-            .max_by(|a, b| {
-                let ab_a = get_initial_ability(&a.model_id);
-                let ab_b = get_initial_ability(&b.model_id);
-                ab_a.partial_cmp(&ab_b).unwrap_or(std::cmp::Ordering::Equal)
-            })
-        else {
+        let Some(anchor_hyp) = hyps.iter().max_by(|a, b| {
+            let ab_a = get_initial_ability(&a.model_id);
+            let ab_b = get_initial_ability(&b.model_id);
+            ab_a.partial_cmp(&ab_b).unwrap_or(std::cmp::Ordering::Equal)
+        }) else {
             // `hyps` is non-empty (guarded above), so `max_by` is always `Some`;
             // handle the impossible `None` without panicking.
             continue;

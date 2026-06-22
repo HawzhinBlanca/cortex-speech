@@ -299,11 +299,9 @@ pub fn write_verdict(
         if let Some(corrected) = transcript {
             let raw: Option<String> = db
                 .connection()
-                .query_row(
-                    "SELECT raw_transcript FROM speech_segments WHERE id = ?1",
-                    params![segment_id],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT raw_transcript FROM speech_segments WHERE id = ?1", params![segment_id], |r| {
+                    r.get(0)
+                })
                 .ok();
             if let Some(raw) = raw {
                 if raw.trim() != corrected.trim() {
@@ -595,10 +593,7 @@ mod tests {
         // two-distinct-voters guard. Even at perfect confidence this must escalate, not auto-accept a
         // lone-model verdict.
         let seg = make_seg("s1", "کوردستان");
-        let hyps = vec![
-            make_hyp("s1", "omniasr-ctc-1b", "کوردستان"),
-            make_hyp("s1", "omniasr-ctc-300m", ""),
-        ];
+        let hyps = vec![make_hyp("s1", "omniasr-ctc-1b", "کوردستان"), make_hyp("s1", "omniasr-ctc-300m", "")];
         assert!(
             matches!(t0_gate_segment(&seg, &hyps, "کوردستان", 0.99, 0.60), T0Decision::EscalateToT1 { .. }),
             "an empty-transcript hypothesis must not count as a second voter"
@@ -610,7 +605,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         // Example-owning segments (FK) + the query segment whose text matches the relevant example.
-        for (id, text) in [("e-rel", "x"), ("e-old1", "x"), ("e-old2", "x"), ("seg-q", "ساڵی نوێ پیرۆز بێت")] {
+        for (id, text) in [("e-rel", "x"), ("e-old1", "x"), ("e-old2", "x"), ("seg-q", "ساڵی نوێ پیرۆز بێت")]
+        {
             db.insert_segment(&make_seg(id, text)).unwrap();
         }
         // The RELEVANT example is the OLDEST; two irrelevant examples are newer. Recency alone would
@@ -699,15 +695,30 @@ mod tests {
             || T0Decision::EscalateToT1 { segment_id: "s1".into(), hypotheses: hyps.clone(), disagreement_score: 0.4 };
 
         // ActConfirm (default): base decisions pass through unchanged.
-        assert!(matches!(apply_autonomy(accept(), &AutonLevel::ActConfirm, "x", &hyps, 0.9), T0Decision::AutoAccept { .. }));
-        assert!(matches!(apply_autonomy(escalate(), &AutonLevel::ActConfirm, "x", &hyps, 0.4), T0Decision::EscalateToT1 { .. }));
+        assert!(matches!(
+            apply_autonomy(accept(), &AutonLevel::ActConfirm, "x", &hyps, 0.9),
+            T0Decision::AutoAccept { .. }
+        ));
+        assert!(matches!(
+            apply_autonomy(escalate(), &AutonLevel::ActConfirm, "x", &hyps, 0.4),
+            T0Decision::EscalateToT1 { .. }
+        ));
 
         // Propose / Observe: a confident accept is STAGED for the human instead of auto-committed.
-        assert!(matches!(apply_autonomy(accept(), &AutonLevel::Propose, "x", &hyps, 0.9), T0Decision::EscalateToT1 { .. }));
-        assert!(matches!(apply_autonomy(accept(), &AutonLevel::Observe, "x", &hyps, 0.9), T0Decision::EscalateToT1 { .. }));
+        assert!(matches!(
+            apply_autonomy(accept(), &AutonLevel::Propose, "x", &hyps, 0.9),
+            T0Decision::EscalateToT1 { .. }
+        ));
+        assert!(matches!(
+            apply_autonomy(accept(), &AutonLevel::Observe, "x", &hyps, 0.9),
+            T0Decision::EscalateToT1 { .. }
+        ));
 
         // ActAuto: a low-confidence escalate is committed unattended.
-        assert!(matches!(apply_autonomy(escalate(), &AutonLevel::ActAuto, "x", &hyps, 0.4), T0Decision::AutoAccept { .. }));
+        assert!(matches!(
+            apply_autonomy(escalate(), &AutonLevel::ActAuto, "x", &hyps, 0.4),
+            T0Decision::AutoAccept { .. }
+        ));
     }
 
     #[test]

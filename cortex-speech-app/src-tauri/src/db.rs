@@ -224,7 +224,9 @@ impl Database {
                         tracing::error!("Database integrity check failed on open; quarantining database: {result}");
                     }
                     Err(e) if is_corruption_error(&e) => {
-                        tracing::error!("Database integrity check returned a corruption code on open; quarantining database: {e}");
+                        tracing::error!(
+                            "Database integrity check returned a corruption code on open; quarantining database: {e}"
+                        );
                     }
                     Err(e) => {
                         // Transient/non-corruption error — do NOT destroy a possibly-healthy database.
@@ -419,15 +421,33 @@ impl Database {
                 alignment_quality=excluded.alignment_quality,
                 updated_at=datetime('now')",
             params![
-                seg.id, seg.created_at, seg.audio_path, raw_nfc,
-                normalized_nfc, annotated_nfc,
-                seg.alignment_json, seg.duration_ms, seg.speaker_id,
-                seg.verified as i32, seg.confidence, seg.ctc_score,
-                seg.clipping_ratio, seg.rms_db, seg.snr_db, seg.split,
-                seg.ood_score, seg.verdict, verdict_transcript_nfc,
-                seg.rationale, seg.evidence_json, seg.agent_confidence,
-                seg.escalated as i32, seg.human_decision, seg.corrected_at,
-                seg.is_gold as i32, seg.alignment_quality,
+                seg.id,
+                seg.created_at,
+                seg.audio_path,
+                raw_nfc,
+                normalized_nfc,
+                annotated_nfc,
+                seg.alignment_json,
+                seg.duration_ms,
+                seg.speaker_id,
+                seg.verified as i32,
+                seg.confidence,
+                seg.ctc_score,
+                seg.clipping_ratio,
+                seg.rms_db,
+                seg.snr_db,
+                seg.split,
+                seg.ood_score,
+                seg.verdict,
+                verdict_transcript_nfc,
+                seg.rationale,
+                seg.evidence_json,
+                seg.agent_confidence,
+                seg.escalated as i32,
+                seg.human_decision,
+                seg.corrected_at,
+                seg.is_gold as i32,
+                seg.alignment_quality,
             ],
         )?;
         self.track_write()?;
@@ -1262,26 +1282,25 @@ impl Database {
             prior_verdict,
             audio_path,
             model_version_id,
-        ): HumanDecisionContext =
-            self.conn.query_row(
-                "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript,
+        ): HumanDecisionContext = self.conn.query_row(
+            "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript,
                         verdict_transcript, verdict, audio_path, model_version_id
                  FROM speech_segments
                  WHERE id = ?1",
-                params![segment_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )?;
+            params![segment_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )?;
 
         let rejected_learning_transcript = if decision == "edit" {
             corrected_transcript.and_then(|fix| {
@@ -1304,9 +1323,7 @@ impl Database {
         // unavailable, the verdict still records — we skip the audit row rather than fail the
         // human's correction over a missing file.
         let ledger_hash = if decision == "edit" {
-            crate::pipeline::source_audio_identity(Path::new(&audio_path))
-                .ok()
-                .map(|identity| identity.content_hash)
+            crate::pipeline::source_audio_identity(Path::new(&audio_path)).ok().map(|identity| identity.content_hash)
         } else {
             None
         };
@@ -1353,8 +1370,7 @@ impl Database {
         // the ledger records gold and non-gold alike — it is the full audit trail, keyed on the
         // durable audio_content_hash, that makes the training set reconstructable and every label
         // attributable to the model_version that produced it.
-        if let (Some(content_hash), Some(fix), Some(wrong)) =
-            (ledger_hash, corrected_transcript, wrong_side.as_deref())
+        if let (Some(content_hash), Some(fix), Some(wrong)) = (ledger_hash, corrected_transcript, wrong_side.as_deref())
         {
             // Only record a GENUINE correction. `wrong_side` falls back to raw_transcript when no
             // candidate differed from the fix (the model was already right), which would otherwise
@@ -1570,9 +1586,7 @@ mod tests {
 
         // A verdict written through the dedicated connection persists to the same file and is visible
         // back to the primary — so the jury writing through it loses nothing.
-        dedicated
-            .write_segment_verdict("s1", "jury_accept", Some("hi"), None, None, Some(0.9), false)
-            .unwrap();
+        dedicated.write_segment_verdict("s1", "jury_accept", Some("hi"), None, None, Some(0.9), false).unwrap();
         let seen = primary.get_segment_by_id("s1").unwrap().unwrap();
         assert_eq!(seen.verdict.as_deref(), Some("jury_accept"));
     }
@@ -1587,9 +1601,7 @@ mod tests {
         assert!(integrity_result_looks_transient("out of memory"));
         // Genuine structural-corruption findings are NOT transient -> they still quarantine.
         assert!(!integrity_result_looks_transient("row 5 missing from index idx_foo"));
-        assert!(!integrity_result_looks_transient(
-            "*** in database main *** Page 9: btreeInitPage() returns error"
-        ));
+        assert!(!integrity_result_looks_transient("*** in database main *** Page 9: btreeInitPage() returns error"));
         assert!(!integrity_result_looks_transient("wrong # of entries in index"));
     }
 
@@ -1627,9 +1639,7 @@ mod tests {
         // datetime('now') at 1s resolution, so if the three inserts straddle a one-second clock tick
         // they no longer tie, ORDER BY created_at DESC reorders them, and the id-tiebreaker assertions
         // below flake (~1-in-N runs, under load). Forcing equal timestamps isolates the id tiebreaker.
-        db.conn
-            .execute("UPDATE speech_segments SET created_at = '2026-01-01 00:00:00'", [])
-            .unwrap();
+        db.conn.execute("UPDATE speech_segments SET created_at = '2026-01-01 00:00:00'", []).unwrap();
         let by_search: Vec<String> =
             db.search_segments("uniquesearchtoken").unwrap().into_iter().map(|s| s.id).collect();
         assert_eq!(by_search, vec!["seg_a", "seg_m", "seg_z"], "tied search results must order by id");
@@ -1775,11 +1785,7 @@ mod tests {
         let conn = db.connection();
         for table in ["correction_memory", "corrections", "model_versions", "adapters"] {
             let exists: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [table], |r| r.get(0))
                 .expect("table query");
             assert_eq!(exists, 1, "{table} must exist after an on-disk restart");
         }
@@ -1907,10 +1913,7 @@ mod tests {
         locked.normalized_transcript = Some("human corrected text".to_string());
         db.insert_segment(&locked).expect("insert locked");
         db.conn
-            .execute(
-                "UPDATE speech_segments SET verdict='human_edit', human_decision='edit' WHERE id='locked-1'",
-                [],
-            )
+            .execute("UPDATE speech_segments SET verdict='human_edit', human_decision='edit' WHERE id='locked-1'", [])
             .expect("lock as human-reviewed");
 
         // The refinery's batch write tries to replace the locked segment with machine consensus.
@@ -1963,7 +1966,13 @@ mod tests {
             )
             .expect("mark verified");
         let updated = db
-            .update_batch_transcription_if_unreviewed("verified-1", "fresh asr", Some("fresh asr"), Some(0.9), "fresh asr")
+            .update_batch_transcription_if_unreviewed(
+                "verified-1",
+                "fresh asr",
+                Some("fresh asr"),
+                Some(0.9),
+                "fresh asr",
+            )
             .expect("update verified");
         assert!(!updated, "a verified row must be skipped, not updated");
         let after = db.get_segment_by_id("verified-1").unwrap().unwrap();
@@ -1995,7 +2004,11 @@ mod tests {
             .expect("update annotated");
         assert!(updated, "an unverified annotated row still refreshes ASR");
         let after = db.get_segment_by_id("annot-1").unwrap().unwrap();
-        assert_eq!(after.annotated_transcript.as_deref(), Some("user typed"), "existing annotation preserved (COALESCE)");
+        assert_eq!(
+            after.annotated_transcript.as_deref(),
+            Some("user typed"),
+            "existing annotation preserved (COALESCE)"
+        );
         assert_eq!(after.raw_transcript, "new asr", "raw ASR refreshed on an unverified row");
     }
 
@@ -2069,9 +2082,7 @@ mod tests {
         let mut locked = make_segment("c-lock", "/a.wav");
         locked.raw_transcript = "orig".to_string();
         db.insert_segment(&locked).expect("insert locked");
-        db.conn
-            .execute("UPDATE speech_segments SET verdict='human_accept' WHERE id='c-lock'", [])
-            .expect("lock");
+        db.conn.execute("UPDATE speech_segments SET verdict='human_accept' WHERE id='c-lock'", []).expect("lock");
         db.insert_segment(&make_segment("c-fresh", "/b.wav")).expect("insert fresh");
 
         let changed = db
@@ -2336,11 +2347,8 @@ mod tests {
         assert_eq!(mems.len(), 1, "the repeated correction upserts to a single memory");
         assert_eq!(mems[0].hit_count, 1, "confirmed twice -> hit_count 1, past the anti-one-off guard");
 
-        let out = crate::corrections::apply_memories(
-            "ئەو ساڵە باش بوو",
-            &mems,
-            &crate::corrections::FiringConfig::default(),
-        );
+        let out =
+            crate::corrections::apply_memories("ئەو ساڵە باش بوو", &mems, &crate::corrections::FiringConfig::default());
         assert_eq!(out, "ئەو ساڵە خراپ بوو", "capture x2 -> DB -> load -> fire reproduces the human fix");
     }
 
