@@ -1132,6 +1132,22 @@ impl ProcessingPipeline {
         let mut segments = Vec::with_capacity(chunk_ranges.len());
         let mut pcm_cache = Vec::new();
 
+        // Round-23 #3: if the user enabled denoising but the (optional) denoiser model is absent,
+        // process() is a silent pass-through — warn loudly so the un-denoised reality is visible. The
+        // run config separately records denoising=false (see runs::config_from_settings) so provenance
+        // is honest; this log surfaces it to the operator.
+        if self.settings.enable_denoising && !denoiser_service.is_active() {
+            tracing::warn!(
+                "Denoising is enabled in settings but the denoiser model is not loaded — audio is NOT being denoised (download the denoiser model to enable AI cleanup)"
+            );
+        }
+
+        // Round-23 #5: hash the audio file ONCE for the whole run (its content is invariant), then key
+        // every per-chunk cache get/set on that hash — instead of re-reading + re-hashing the entire
+        // file on each of the N chunks (O(N·filesize) of redundant I/O on long recordings). `None` when
+        // the file is unhashable, which simply means "no cache for this run" (same effect as before).
+        let file_hash = crate::cache::TranscriptCache::compute_hash(path).ok();
+
         for (chunk_index, &(global_start, global_end)) in chunk_ranges.iter().enumerate() {
             if let Some(token) = cancel {
                 token.check()?;
@@ -1171,7 +1187,9 @@ impl ProcessingPipeline {
 
             let (raw_transcript, confidence) = if self.should_use_wsl_primary_asr() {
                 ("[Pending WSL 7B ASR]".to_string(), None)
-            } else if let Some(cached) = self.cache.get_chunk(path, &model_id, Some(&chunk_suffix)) {
+            } else if let Some(cached) =
+                file_hash.as_deref().and_then(|h| self.cache.get_chunk_by_hash(h, &model_id, Some(&chunk_suffix)))
+            {
                 (cached.raw_transcript, None)
             } else {
                 let (text, conf) = self.with_asr(|asr| {
@@ -1200,14 +1218,16 @@ impl ProcessingPipeline {
                 // unavailable → empty, or a transcribe error → "[ASR unavailable: …]") into the
                 // cache, or every later retry would just replay the failure forever.
                 if !text.trim().is_empty() && !crate::quality::is_placeholder_transcript(&text) {
-                    let entry = crate::cache::CacheEntry {
-                        audio_hash: String::new(),
-                        raw_transcript: text.clone(),
-                        normalized_transcript: None,
-                        created_at: chrono::Utc::now(),
-                        model_id: model_id.clone(),
-                    };
-                    self.cache.set_chunk(path, Some(&chunk_suffix), entry);
+                    if let Some(h) = file_hash.as_deref() {
+                        let entry = crate::cache::CacheEntry {
+                            audio_hash: String::new(),
+                            raw_transcript: text.clone(),
+                            normalized_transcript: None,
+                            created_at: chrono::Utc::now(),
+                            model_id: model_id.clone(),
+                        };
+                        self.cache.set_chunk_by_hash(h, Some(&chunk_suffix), entry);
+                    }
                 }
                 (text, conf)
             };
