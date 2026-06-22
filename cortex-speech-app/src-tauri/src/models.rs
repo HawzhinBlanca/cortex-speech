@@ -129,10 +129,17 @@ pub struct ModelInfo {
 
 pub const MODELS: &[ModelInfo] = &[
     ModelInfo {
+        // Round-24 #8: the download URL must point at an IMMUTABLE ref whose bytes match the pin.
+        // The old `raw/master/...` URL was a moving target — upstream `master` has since advanced to the
+        // v6.x model (a different, v4-incompatible ONNX interface), so every VAD auto-download already
+        // failed the v4 SHA pin. Pin both the URL and the hash to the official, immutable Silero v4.0
+        // release (verified: 1,807,522 bytes, sha256 a35ebf52…). This is the canonical v4 model the app's
+        // VAD code targets; the bundled copy is not re-verified against this pin (the pin is used only on
+        // the download path), so existing installs are unaffected.
         name: "Silero VAD v4",
         filename: "silero_vad_v4.onnx",
-        url: "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx",
-        sha256: "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+        url: "https://github.com/snakers4/silero-vad/raw/v4.0/files/silero_vad.onnx",
+        sha256: "a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28",
         min_size_bytes: 1_000_000,
         version: "4.0",
     },
