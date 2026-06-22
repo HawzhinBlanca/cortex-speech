@@ -95,8 +95,15 @@ pub fn t0_gate_segment(
     // NOTE: 300M and 1B are architecturally KIN, so two-of-them agreement can still be a CORRELATED
     // confident error — adding an architecturally INDEPENDENT recognizer's vote (e.g. ElevenLabs
     // Scribe) at this gate is the follow-up that fully closes the confidently-wrong-correlated hole.
+    // Count only voters that actually CONTRIBUTED to the consensus. fit_irt_consensus drops
+    // empty-transcript hypotheses before building the consensus + irt_confidence, so an empty "" from
+    // one model (common when 300M and 1B disagree on whether a low-energy span contains speech) must
+    // NOT count toward the two-recognizer guard — otherwise the surviving lone recognizer satisfies
+    // distinct_voters >= 2 and the gate auto-accepts a single-model verdict, silently defeating the
+    // "never auto-accept on a single recognizer" invariant this block exists to enforce.
     let distinct_voters = {
-        let mut ids: Vec<&str> = hyps.iter().map(|h| h.model_id.as_str()).collect();
+        let mut ids: Vec<&str> =
+            hyps.iter().filter(|h| !h.transcript.trim().is_empty()).map(|h| h.model_id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
         ids.len()
@@ -568,6 +575,24 @@ mod tests {
         // Two distinct recognizers at the same confidence/threshold DO auto-accept.
         let two = vec![make_hyp("s1", "omniasr-ctc-300m", "کوردستان"), make_hyp("s1", "omniasr-ctc-1b", "کوردستان")];
         assert!(matches!(t0_gate_segment(&seg, &two, "کوردستان", 0.99, 0.60), T0Decision::AutoAccept { .. }));
+    }
+
+    #[test]
+    fn t0_gate_escalates_when_the_second_voter_returned_an_empty_transcript() {
+        // Two model_ids are present but ONE returned "" (no speech detected — common when 300M and 1B
+        // disagree on a low-energy span). IRT drops the empty hypothesis and derives its consensus +
+        // confidence from the single surviving recognizer, so the empty one must NOT count toward the
+        // two-distinct-voters guard. Even at perfect confidence this must escalate, not auto-accept a
+        // lone-model verdict.
+        let seg = make_seg("s1", "کوردستان");
+        let hyps = vec![
+            make_hyp("s1", "omniasr-ctc-1b", "کوردستان"),
+            make_hyp("s1", "omniasr-ctc-300m", ""),
+        ];
+        assert!(
+            matches!(t0_gate_segment(&seg, &hyps, "کوردستان", 0.99, 0.60), T0Decision::EscalateToT1 { .. }),
+            "an empty-transcript hypothesis must not count as a second voter"
+        );
     }
 
     #[test]
