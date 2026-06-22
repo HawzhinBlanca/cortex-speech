@@ -129,17 +129,19 @@ pub struct ModelInfo {
 
 pub const MODELS: &[ModelInfo] = &[
     ModelInfo {
-        // Round-24 #8: the download URL must point at an IMMUTABLE ref whose bytes match the pin.
-        // The old `raw/master/...` URL was a moving target — upstream `master` has since advanced to the
-        // v6.x model (a different, v4-incompatible ONNX interface), so every VAD auto-download already
-        // failed the v4 SHA pin. Pin both the URL and the hash to the official, immutable Silero v4.0
-        // release (verified: 1,807,522 bytes, sha256 a35ebf52…). This is the canonical v4 model the app's
-        // VAD code targets; the bundled copy is not re-verified against this pin (the pin is used only on
-        // the download path), so existing installs are unaffected.
+        // Round-24 #8: the download URL must point at an IMMUTABLE ref whose bytes BOTH match the pin
+        // AND expose the ONNX interface the app's VAD code requires — a unified `state`/`stateN` tensor
+        // (audio.rs `inputs!["input","sr","state"]`, `outputs["stateN"]`), NOT the separate-h/c LSTM
+        // interface. The old `raw/master/...` URL was a mutable branch ref (the original reliability
+        // bug). It currently still serves the correct model (sha 1a153a22…, 2.3 MB, unified-state), but
+        // a branch can change under us at any time. Pin to the immutable COMMIT that serves that exact
+        // file — same bytes as the pin and the bundled copy, so existing installs and the interface are
+        // unaffected. (The official v4.0-release file uses the incompatible h/c interface, so it must
+        // NOT be used here despite being labelled "v4".)
         name: "Silero VAD v4",
         filename: "silero_vad_v4.onnx",
-        url: "https://github.com/snakers4/silero-vad/raw/v4.0/files/silero_vad.onnx",
-        sha256: "a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28",
+        url: "https://github.com/snakers4/silero-vad/raw/bfdc0193023f121ea5b3cc7b176dbed570a68a59/src/silero_vad/data/silero_vad.onnx",
+        sha256: "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
         min_size_bytes: 1_000_000,
         version: "4.0",
     },
