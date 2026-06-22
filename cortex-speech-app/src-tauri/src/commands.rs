@@ -952,7 +952,11 @@ pub fn create_dataset_run(name: Option<String>, state: State<'_, AppState>) -> R
     RATE_LIMITER.check("create_dataset_run")?;
     let db = state.lock_db();
     let settings = state.lock_settings().clone();
-    crate::runs::create_dataset_run(&db, name, crate::runs::config_from_settings(&settings)).map_err(|e| e.to_string())
+    // Round-23 #3: record the ACTUAL denoising state. The denoiser silently passes audio through when
+    // its optional model is absent, so the run config must not claim denoising that did not run.
+    let denoising_active = state.lock_model_manager().denoiser_present();
+    crate::runs::create_dataset_run(&db, name, crate::runs::config_from_settings(&settings, denoising_active))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2430,7 +2434,12 @@ pub fn transcribe_audio_with_scribe(audio_path: String, state: State<'_, AppStat
 /// Model id for the independent ElevenLabs Scribe vote. Scribe is architecturally INDEPENDENT of the
 /// OmniASR-CTC family, so (unlike the kin 300M/1B) its vote genuinely corroborates or contradicts the
 /// local consensus — the highest-value escalation signal and training pair per the research.
-const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v2";
+///
+/// Round-23 #9: this label is stored as the hypothesis' provenance AND shown to the T2 judge, so it
+/// MUST name the model version ACTUALLY transmitted to ElevenLabs (`scribe_api::DEFAULT_MODEL`,
+/// currently `scribe_v1`) — never a version that was never invoked. The
+/// `scribe_vote_model_id_matches_the_model_actually_sent` test fails if the two ever drift.
+const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v1";
 
 /// Add an independent ElevenLabs Scribe hypothesis for the given segments (typically the escalated,
 /// hard ones), so the IRT jury sees an architecturally-INDEPENDENT vote rather than only kin OmniASR
@@ -2474,7 +2483,7 @@ pub fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<
     let mut added = 0usize;
     for seg in to_vote {
         // Send ONLY this segment's sliced audio window to Scribe — never the whole source file. The
-        // whole file would store a whole-recording transcript against one segment's `scribe-v2` vote
+        // whole file would store a whole-recording transcript against one segment's `scribe-v1` vote
         // (corrupting consensus) and cost ~N× more. `segment_audio_as_wav_bytes` decodes (cached) and
         // slices by the segment alignment — the same window the T2 listener already sends.
         let wav = match crate::agentic::segment_audio_as_wav_bytes(&seg) {
@@ -3469,6 +3478,19 @@ pub fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scribe_vote_model_id_matches_the_model_actually_sent() {
+        // Round-23 #9: the stored provenance label must name the model VERSION actually transmitted to
+        // ElevenLabs, never a version that was never invoked. If DEFAULT_MODEL ever changes (e.g. to a
+        // real scribe_v2), this fails until SCRIBE_VOTE_MODEL_ID is updated to match.
+        let sent = crate::scribe_api::DEFAULT_MODEL; // e.g. "scribe_v1"
+        let version = sent.rsplit('_').next().unwrap_or(sent); // "v1"
+        assert!(
+            SCRIBE_VOTE_MODEL_ID.contains(version),
+            "Scribe vote label '{SCRIBE_VOTE_MODEL_ID}' must reflect the sent model version '{version}' (from '{sent}')"
+        );
+    }
 
     fn test_segment(id: &str, audio_path: &str, raw_transcript: &str) -> crate::db::SpeechSegment {
         crate::db::SpeechSegment {

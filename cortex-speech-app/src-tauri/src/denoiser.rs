@@ -50,6 +50,13 @@ impl DenoiserService {
         }
     }
 
+    /// Whether a denoiser model is actually loaded. When false, `process` is a pass-through, so the
+    /// caller MUST NOT record the audio as denoised (round-23 #3: claiming denoising that did not run
+    /// is a provenance lie). The optional GTCRN model is a separate download, so this is commonly false.
+    pub fn is_active(&self) -> bool {
+        self.denoiser.is_some()
+    }
+
     pub fn process(&self, pcm: &[f32], sample_rate: u32) -> Vec<f32> {
         if let Some(ref denoiser) = self.denoiser {
             let res = denoiser.run(pcm, sample_rate as i32);

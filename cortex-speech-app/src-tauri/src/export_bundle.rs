@@ -376,7 +376,7 @@ pub fn export_dataset_bundle(
         "agentStageEventCount": agent_stage_event_count,
         "longFileDossierCount": long_file_dossier_count,
         "totalDurationMs": total_duration_ms,
-        "runConfig": crate::runs::config_from_settings(settings),
+        "runConfig": crate::runs::config_from_settings(settings, model_manager.denoiser_present()),
         "validation": {
             "blocked": validation_gate.blocked,
             "errors": validation_gate.error_count,

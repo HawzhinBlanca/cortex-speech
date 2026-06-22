@@ -186,13 +186,17 @@ impl AgentImportReportOptions {
     }
 }
 
-pub fn config_from_settings(settings: &crate::settings::AppSettings) -> DatasetRunConfig {
+/// Build the run's provenance config. `denoising_active` is whether the denoiser model is actually
+/// available — round-23 #3: the denoiser is a silent pass-through when its (optional) model is absent,
+/// so the run must record whether denoising was ACTUALLY applied, not merely requested in settings.
+/// Recording the requested flag while the audio passed through un-denoised is a provenance lie.
+pub fn config_from_settings(settings: &crate::settings::AppSettings, denoising_active: bool) -> DatasetRunConfig {
     DatasetRunConfig {
         model_version: format!("{:?}", settings.asr_model_size),
         vad_threshold: settings.vad_threshold,
         min_segment_duration_ms: settings.min_segment_duration_ms,
         max_segment_duration_ms: settings.max_segment_duration_ms,
-        denoising: settings.enable_denoising,
+        denoising: settings.enable_denoising && denoising_active,
         diarization: settings.enable_diarization,
         normalization: settings.auto_normalize,
     }
@@ -975,11 +979,22 @@ mod tests {
     use crate::db::{SegmentHypothesis, SourceTranscriptRecord, SpeechSegment};
 
     #[test]
+    fn run_config_records_denoising_only_when_actually_applied() {
+        // Round-23 #3: denoising requested but the model absent -> the run config must record
+        // denoising=false (the audio passed through un-denoised), never the requested flag.
+        let on = crate::settings::AppSettings { enable_denoising: true, ..Default::default() };
+        assert!(!config_from_settings(&on, false).denoising, "requested but inactive -> recorded false");
+        assert!(config_from_settings(&on, true).denoising, "requested and active -> recorded true");
+        let off = crate::settings::AppSettings { enable_denoising: false, ..Default::default() };
+        assert!(!config_from_settings(&off, true).denoising, "not requested -> false regardless of model");
+    }
+
+    #[test]
     fn persists_dataset_runs_and_jobs() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         let settings = crate::settings::AppSettings::default();
-        let run = create_dataset_run(&db, Some("test".into()), config_from_settings(&settings)).unwrap();
+        let run = create_dataset_run(&db, Some("test".into()), config_from_settings(&settings, true)).unwrap();
         assert_eq!(run.name, "test");
         assert_eq!(list_dataset_runs(&db).unwrap().len(), 1);
 
