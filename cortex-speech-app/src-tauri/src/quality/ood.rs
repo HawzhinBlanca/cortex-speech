@@ -1,107 +1,28 @@
-use ndarray::Array2;
-use ort::{session::Session, value::Tensor};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
 
 pub struct OodDetector {
-    session: Option<Mutex<Session>>,
-    centroid: Vec<f32>,
     threshold: f32,
 }
 
-fn lock_session<T>(session: &Mutex<T>) -> MutexGuard<'_, T> {
-    session.lock().unwrap_or_else(|poisoned| {
-        tracing::warn!("Recovering poisoned OOD session lock");
-        poisoned.into_inner()
-    })
-}
-
 impl OodDetector {
-    pub fn new(models_dir: &Path, threshold: f32) -> Result<Self, String> {
-        let model_path = models_dir.join("wavlm_ood.onnx");
-
-        // Default centroid vector for Kurdish target speech (pre-calculated or mock for initialization)
-        let mut centroid = vec![0.0f32; 256];
-        for (i, value) in centroid.iter_mut().enumerate().take(256) {
-            *value = (i as f32 / 256.0).sin();
-        }
-        let norm = centroid.iter().map(|&x| x * x).sum::<f32>().sqrt();
-        for x in &mut centroid {
-            *x /= norm;
-        }
-
-        if !model_path.exists() {
-            tracing::warn!("WavLM OOD model not found at {:?}; using signal processing fallback", model_path);
-            return Ok(Self { session: None, centroid, threshold });
-        }
-
-        crate::models::init_ort_dylib_path();
-        let session = Session::builder()
-            .map_err(|e| format!("OOD Session Builder: {e}"))?
-            .with_execution_providers([ort::ep::CPU::default().build()])
-            .map_err(|e| format!("OOD EP: {e}"))?
-            .commit_from_file(&model_path)
-            .map_err(|e| format!("Load OOD Model: {e}"))?;
-
-        Ok(Self { session: Some(Mutex::new(session)), centroid, threshold })
+    /// Round-24 #1/#2/#3: the previous WavLM-ONNX path scored OOD as the cosine distance to a
+    /// SYNTHETIC sine-wave centroid (`(i/256).sin()`) — a fabricated metric. No real learned
+    /// in-distribution Kurdish-speech centroid is computed or shipped anywhere in the tree, the
+    /// embedding was truncated to a hard-coded 256 dims (WavLM is 768/1024), and unchecked output
+    /// shapes could panic or silently produce a NaN score that read as "in-distribution". Presenting
+    /// distance-to-a-sine-wave as an OOD verdict in the UI and baking it into the exported dataset
+    /// violated the project's honesty law. That path is removed until a real learned centroid exists;
+    /// OOD scoring uses the honest signal-processing heuristic (ZCR + frame-energy variance) below.
+    pub fn new(_models_dir: &Path, threshold: f32) -> Result<Self, String> {
+        Ok(Self { threshold })
     }
 
-    /// Measures the out-of-distribution distance (0.0 to 1.0).
+    /// Measures the out-of-distribution distance (0.0 to 1.0) from a real signal-processing heuristic.
     pub fn compute_ood_score(&self, pcm: &[i16]) -> Result<f64, String> {
         if pcm.is_empty() {
             return Ok(1.0); // Empty audio is completely OOD
         }
-
-        if let Some(ref session_mutex) = self.session {
-            let mut session_guard = lock_session(session_mutex);
-
-            let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-            let input_nd =
-                Array2::from_shape_vec((1, f32_pcm.len()), f32_pcm).map_err(|e| format!("OOD Input shape: {e}"))?;
-            let input_tensor = Tensor::from_array(input_nd).map_err(|e| format!("OOD Tensor: {e}"))?;
-
-            let outputs = session_guard
-                .run(ort::inputs!["input_values" => input_tensor])
-                .map_err(|e| format!("OOD Inference: {e}"))?;
-
-            let output_tensor = outputs["last_hidden_state"]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| format!("Extract OOD output: {e}"))?;
-
-            let shape = output_tensor.0;
-            let data = output_tensor.1;
-            let t_dim = shape[1] as usize;
-            let d_dim = shape[2] as usize;
-
-            // Average pool over time dimension
-            let mut emb = vec![0.0f32; d_dim];
-            for t in 0..t_dim {
-                let offset = t * d_dim;
-                for (d, value) in emb.iter_mut().enumerate().take(d_dim.min(self.centroid.len())) {
-                    *value += data[offset + d];
-                }
-            }
-            for value in emb.iter_mut().take(self.centroid.len()) {
-                *value /= t_dim as f32;
-            }
-
-            // Normalize embedding
-            let mut norm = emb.iter().map(|&x| x * x).sum::<f32>().sqrt();
-            if norm < 1e-6 {
-                norm = 1.0;
-            }
-            for x in &mut emb {
-                *x /= norm;
-            }
-
-            // Cosine similarity
-            let dot: f32 = emb.iter().zip(self.centroid.iter()).map(|(a, b)| a * b).sum();
-            let distance = 1.0 - dot;
-            Ok(distance as f64)
-        } else {
-            // Signal processing heuristic fallback
-            Ok(self.fallback_heuristic(pcm))
-        }
+        Ok(self.heuristic_ood_score(pcm))
     }
 
     /// Returns true if the audio is out-of-distribution.
@@ -110,8 +31,11 @@ impl OodDetector {
         Ok(score > self.threshold as f64)
     }
 
-    /// Fallback signal processing heuristic: computes OOD distance based on ZCR and energy variance.
-    fn fallback_heuristic(&self, pcm: &[i16]) -> f64 {
+    /// Signal-processing OOD heuristic: an honest (if crude) distance in [0,1] derived from the
+    /// zero-crossing rate and frame-level energy variance. High ZCR (white noise / hiss) or very low
+    /// energy variance (music / hum / silence) push the score up; clean speech sits near a small
+    /// baseline. This is a measured signal property — not a learned model — and is labelled as such.
+    fn heuristic_ood_score(&self, pcm: &[i16]) -> f64 {
         let n = pcm.len();
         if n < 100 {
             return 1.0;
@@ -153,7 +77,7 @@ impl OodDetector {
 
         let var_factor = if var_energy < 1e-4 { (1.0 - (var_energy * 10000.0)).max(0.0) } else { 0.0 };
 
-        // Combine factors into a mock cosine distance score [0.0, 1.0]
+        // Combine factors into a [0.0, 1.0] distance on the same scale a cosine distance would use.
         let base_distance = 0.15; // clean speech nominal baseline distance
         let final_distance = base_distance + zcr_factor * 0.4 + var_factor * 0.4;
         final_distance.min(1.0)
@@ -165,7 +89,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fallback_heuristic_speech() {
+    fn test_heuristic_speech() {
         let detector = OodDetector::new(Path::new(""), 0.5).unwrap();
         // Generate a simulated speech signal (sine wave sweeps/modulated)
         let mut pcm = Vec::new();
@@ -180,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_heuristic_noise() {
+    fn test_heuristic_noise() {
         let detector = OodDetector::new(Path::new(""), 0.5).unwrap();
         // Generate white noise (random high ZCR)
         let mut pcm = Vec::new();
@@ -196,16 +120,13 @@ mod tests {
     }
 
     #[test]
-    fn ood_session_lock_recovers_poisoned_lock() {
-        let session = Mutex::new(41usize);
-
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = session.lock().expect("lock OOD session");
-            panic!("poison OOD session");
-        }));
-
-        *lock_session(&session) += 1;
-
-        assert_eq!(*lock_session(&session), 42);
+    fn ood_score_is_always_finite_and_in_range() {
+        // Round-24 #3: the OOD score must always be a finite value in [0,1] — never NaN (which the
+        // gate's `score > threshold` would silently treat as in-distribution).
+        let detector = OodDetector::new(Path::new(""), 0.5).unwrap();
+        for pcm in [vec![], vec![0i16; 50], vec![0i16; 16000], vec![32767i16; 16000]] {
+            let score = detector.compute_ood_score(&pcm).unwrap();
+            assert!(score.is_finite() && (0.0..=1.0).contains(&score), "score out of range: {score}");
+        }
     }
 }
