@@ -3064,7 +3064,10 @@ pub fn run_jury_pipeline_core(
     let t1_threshold = settings.jury_t1_threshold;
     let cloud_opt_in = settings.jury_cloud_opt_in;
     let jury_model = settings.jury_model.clone();
-    let n_samples = settings.jury_self_consistency_n as usize;
+    // Floor at 3: self-consistency is meaningless below 3 samples, and a misconfigured 1 would let a
+    // single Gemini sample masquerade as a "majority". majority_vote also requires >= 2 agreeing
+    // samples, so this is defense in depth at the config boundary.
+    let n_samples = (settings.jury_self_consistency_n as usize).max(3);
     let api_key = settings.llm_api_key.clone();
 
     let initial_seg_map: std::collections::HashMap<String, crate::db::SpeechSegment> = db
@@ -3344,7 +3347,10 @@ pub fn run_t2_for_segment(
 
     let settings = state.lock_settings().clone();
     let jury_model = settings.jury_model.clone();
-    let n_samples = settings.jury_self_consistency_n as usize;
+    // Floor at 3: self-consistency is meaningless below 3 samples, and a misconfigured 1 would let a
+    // single Gemini sample masquerade as a "majority". majority_vote also requires >= 2 agreeing
+    // samples, so this is defense in depth at the config boundary.
+    let n_samples = (settings.jury_self_consistency_n as usize).max(3);
     let cloud_opt_in = settings.jury_cloud_opt_in;
 
     if !cloud_opt_in {
