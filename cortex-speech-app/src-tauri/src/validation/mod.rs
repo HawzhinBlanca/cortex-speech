@@ -250,7 +250,20 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
 
     let errors: Vec<_> = issues.iter().filter(|i| i.severity == IssueSeverity::Error).cloned().collect();
     let warnings: Vec<_> = issues.iter().filter(|i| i.severity == IssueSeverity::Warning).cloned().collect();
-    let passed = segments.len().saturating_sub(errors.len());
+    // `passed` counts SEGMENTS with no failure attributable to them — NOT errors.len(). The old
+    // count was wrong three ways: (1) a dataset-level gate Error (segment_id None) is not a segment but
+    // was subtracted as one (phantom failing row with no "go to segment" target); (2) a segment that
+    // both raised a per-segment Error and tripped the aggregate gate was double-counted; (3) when
+    // several segments share one missing audio file the MissingAudio Error is deduped to a single
+    // representative id, under-counting the failures. Attribute by segment id, and treat every segment
+    // whose audio file is missing as failed.
+    let failed_ids: HashSet<&str> = errors.iter().filter_map(|e| e.segment_id.as_deref()).collect();
+    let missing_paths: HashSet<&str> =
+        audio_paths.iter().copied().filter(|p| !Path::new(p).exists()).collect();
+    let passed = segments
+        .iter()
+        .filter(|s| !failed_ids.contains(s.id.as_str()) && !missing_paths.contains(s.audio_path.as_str()))
+        .count();
 
     let summary = if errors.is_empty() && warnings.is_empty() {
         format!("All {} segments passed validation", segments.len())
@@ -311,6 +324,23 @@ mod tests {
         assert_eq!(report.total_segments, 0);
         assert!(report.errors.is_empty());
         assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn passed_counts_failing_segments_not_error_issue_count() {
+        // Round-18: `passed = total - errors.len()` under-counted failures when N segments share ONE
+        // missing audio file — the MissingAudio Error is deduped to a single representative id, so the
+        // old count reported passed = 2 - 1 = 1. Both rows referencing the missing file must count as
+        // failed, so passed must be 0.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&make_seg("a", "/does/not/exist.wav", "x")).unwrap();
+        db.insert_segment(&make_seg("b", "/does/not/exist.wav", "y")).unwrap();
+
+        let report = validate_dataset(&db).unwrap();
+
+        assert_eq!(report.total_segments, 2);
+        assert_eq!(report.passed, 0, "both segments sharing a missing audio file must be counted as failed");
     }
 
     #[test]
