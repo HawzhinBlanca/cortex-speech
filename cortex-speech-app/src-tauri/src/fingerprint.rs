@@ -86,6 +86,9 @@ impl AudioFingerprint {
     /// Returns true if this fingerprint matches audio already imported from a different file.
     pub fn check_duplicate(&self, pcm: &[i16], sample_rate: u32, source: Option<&Path>) -> bool {
         let fp = Self::fingerprint(pcm, sample_rate);
+        if fp == 0 {
+            return false; // degenerate fingerprint (empty/silent) — not a real content key, never a dup
+        }
         let source_key = Self::source_key(source);
         let map = self.lock_known();
         match map.get(&fp) {
@@ -106,6 +109,14 @@ impl AudioFingerprint {
         source: Option<&Path>,
     ) -> Result<u64, &'static str> {
         let fp = Self::fingerprint(pcm, sample_rate);
+        // A degenerate fingerprint (0 = empty OR a fully-silent window — every all-zero window hashes to
+        // 0) is NOT a real content key. Without this guard, the first file with a silent decode window
+        // registers 0, and the next DISTINCT file that also has any fully-silent window collides on 0
+        // and is rejected as "Duplicate audio content", silently dropping a legitimate clip. Skip dedup
+        // for a degenerate fingerprint and never store it.
+        if fp == 0 {
+            return Ok(fp);
+        }
         let source_key = Self::source_key(source);
 
         let mut map = self.lock_known();
@@ -133,7 +144,11 @@ impl AudioFingerprint {
     /// Register a fingerprint for a source file (re-registering the same path is allowed).
     pub fn register(&self, pcm: &[i16], sample_rate: u32, source: Option<&Path>) -> u64 {
         let fp = Self::fingerprint(pcm, sample_rate);
-        self.lock_known().insert(fp, Self::source_key(source));
+        // Never store a degenerate fingerprint (empty/silent window) as a content key — it would make
+        // every later silent window collide with it. See check_and_register.
+        if fp != 0 {
+            self.lock_known().insert(fp, Self::source_key(source));
+        }
         fp
     }
 
@@ -175,6 +190,34 @@ mod tests {
 
         fp.register(&pcm, 16000, Some(a));
         assert!(fp.check_duplicate(&pcm, 16000, Some(b)));
+    }
+
+    #[test]
+    fn silent_windows_do_not_collide_across_distinct_files() {
+        // Round-20: a fully-silent (all-zero) window hashes to fingerprint 0 — the same as empty input.
+        // Two DISTINCT files that each contain a silent decode window must NOT be rejected as duplicates
+        // just because they share silence.
+        let fp = AudioFingerprint::new();
+        let silent = vec![0i16; 16_000];
+        let a = Path::new(r"C:\audio\a.wav");
+        let b = Path::new(r"C:\audio\b.wav");
+
+        assert_eq!(fp.check_and_register(&silent, 16000, Some(a)).unwrap(), 0);
+        assert_eq!(
+            fp.check_and_register(&silent, 16000, Some(b)).unwrap(),
+            0,
+            "a distinct file's silent window must not be a 'Duplicate'"
+        );
+        assert!(!fp.check_duplicate(&silent, 16000, Some(b)), "silence is not a content duplicate");
+        assert_eq!(fp.count(), 0, "degenerate fingerprint 0 is never stored as a content key");
+
+        // Sanity: a REAL non-silent duplicate across distinct files is STILL rejected.
+        let real: Vec<i16> = (0..16_000).map(|i| ((i * 7) % 5000) as i16).collect();
+        assert!(fp.check_and_register(&real, 16000, Some(a)).is_ok());
+        assert!(
+            fp.check_and_register(&real, 16000, Some(b)).is_err(),
+            "real shared content across distinct files is still rejected"
+        );
     }
 
     #[test]
