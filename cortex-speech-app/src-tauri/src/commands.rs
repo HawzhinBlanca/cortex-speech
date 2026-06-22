@@ -1352,9 +1352,11 @@ pub fn update_settings(mut settings: AppSettings, state: State<'_, AppState>) ->
         state.lock_data_dir().clone().map(|d| d.join("settings.json"))
     };
     if let Some(path) = settings_path {
-        if let Err(e) = settings.save(&path) {
-            tracing::error!("Failed to save settings to {:?}: {e}", path);
-        }
+        // Propagate a persist failure (full/read-only/locked disk) to the caller. Swallowing it made
+        // the command return Ok while the UI showed "Settings saved" — yet the change silently reverted
+        // on the next launch (incl. security toggles like cloud opt-in). Returning Err lets the
+        // frontend surface settingsSaveFailed so the user can fix the disk and retry.
+        settings.save(&path).map_err(|e| format!("Failed to save settings to disk: {e}"))?;
     }
     state.update_pipeline_settings(settings);
     Ok(())
