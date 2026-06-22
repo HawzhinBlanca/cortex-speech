@@ -107,9 +107,19 @@ impl HistoryManager {
         match cmd {
             Some(cmd) => {
                 let description = cmd.description().to_string();
-                self.apply_undo(db, &cmd)?;
-                self.lock_redo_stack().push_back(cmd);
-                Ok(Some(description))
+                // Apply BEFORE mutating the other stack, and on failure put the command BACK on the
+                // stack it came from — never drop it. Popping first and pushing only on success means a
+                // failing apply (e.g. a DB error) would destroy the command and desync the stacks.
+                match self.apply_undo(db, &cmd) {
+                    Ok(()) => {
+                        self.lock_redo_stack().push_back(cmd);
+                        Ok(Some(description))
+                    }
+                    Err(e) => {
+                        self.lock_undo_stack().push_back(cmd);
+                        Err(e)
+                    }
+                }
             }
             None => Ok(None),
         }
@@ -123,9 +133,20 @@ impl HistoryManager {
         match cmd {
             Some(cmd) => {
                 let description = cmd.description().to_string();
-                self.apply_redo(db, &cmd)?;
-                self.lock_undo_stack().push_back(cmd);
-                Ok(Some(description))
+                // Keep the command on the redo stack if apply_redo fails — otherwise an unsupported
+                // redo (Command::BatchTranscribe returns Err) would DESTROY the popped command, leaving
+                // can_redo()=false and the DB stranded in the undone state with no recovery. Re-pushing
+                // preserves the entry so the user is never silently stranded.
+                match self.apply_redo(db, &cmd) {
+                    Ok(()) => {
+                        self.lock_undo_stack().push_back(cmd);
+                        Ok(Some(description))
+                    }
+                    Err(e) => {
+                        self.lock_redo_stack().push_back(cmd);
+                        Err(e)
+                    }
+                }
             }
             None => Ok(None),
         }
@@ -358,6 +379,26 @@ mod tests {
             Some("2020-01-02 03:04:05"),
             "created_at must be preserved, not re-stamped to now() (it orders every export)"
         );
+    }
+
+    #[test]
+    fn failed_redo_keeps_the_command_on_the_redo_stack() {
+        // Round-18: redo() popped the command BEFORE apply_redo, so an unsupported BatchTranscribe redo
+        // (apply_redo returns Err) DROPPED the command — leaving can_redo()=false and the DB stranded in
+        // the undone state with no recovery. A failed redo must keep the command so the user is never
+        // silently stranded.
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        let seg = make_segment("bt1", "before");
+        db.insert_segment(&seg).unwrap();
+
+        history.push(Command::BatchTranscribe { previous_segments: vec![seg.clone()] });
+        history.undo(&db).unwrap(); // moves the command onto the redo stack
+        assert!(history.can_redo(), "redo is available after undo");
+
+        // BatchTranscribe redo is unsupported -> Err, but the command must survive.
+        assert!(history.redo(&db).is_err(), "BatchTranscribe redo is unsupported and errors");
+        assert!(history.can_redo(), "a failed redo must NOT drop the command from the redo stack");
     }
 
     #[test]
