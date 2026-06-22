@@ -10,7 +10,6 @@
 
   let running = $state(false);
   let status = $state<'idle' | 'running' | 'completed' | 'failed' | 'cancelled'>('idle');
-  let exitCode = $state<number | null>(null);
 
   // Options
   let limitFiles = $state<number | undefined>(undefined);
@@ -39,7 +38,6 @@
 
     running = true;
     status = 'running';
-    exitCode = null;
     logs = [];
     appendLog('>>> Spawning configured external ASR provider via WSL...');
     appendLog(
@@ -113,7 +111,6 @@
         // In-panel display only. The completion side effects (toast + segment refresh) are handled
         // app-scoped in events.ts so they fire even when this panel is closed mid-run.
         status = event.payload.status;
-        exitCode = event.payload.exit_code;
         running = false;
       },
     );

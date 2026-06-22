@@ -282,15 +282,17 @@ fn upload_gemini_file(audio_path: &Path, api_key: &str, mime_type: &str) -> Resu
     let display_name = audio_path.file_name().and_then(|name| name.to_str()).unwrap_or("audio");
     let start_payload = json!({ "file": { "display_name": display_name } });
 
-    let start_response =
-        gemini_api::with_api_key(crate::http::API_AGENT.post("https://generativelanguage.googleapis.com/upload/v1beta/files"), api_key)
-            .set("X-Goog-Upload-Protocol", "resumable")
-            .set("X-Goog-Upload-Command", "start")
-            .set("X-Goog-Upload-Header-Content-Length", &size.to_string())
-            .set("X-Goog-Upload-Header-Content-Type", mime_type)
-            .set("Content-Type", "application/json")
-            .send_json(start_payload)
-            .map_err(|e| format!("Gemini file upload start failed: {}", redact_for_user(e, api_key)))?;
+    let start_response = gemini_api::with_api_key(
+        crate::http::API_AGENT.post("https://generativelanguage.googleapis.com/upload/v1beta/files"),
+        api_key,
+    )
+    .set("X-Goog-Upload-Protocol", "resumable")
+    .set("X-Goog-Upload-Command", "start")
+    .set("X-Goog-Upload-Header-Content-Length", &size.to_string())
+    .set("X-Goog-Upload-Header-Content-Type", mime_type)
+    .set("Content-Type", "application/json")
+    .send_json(start_payload)
+    .map_err(|e| format!("Gemini file upload start failed: {}", redact_for_user(e, api_key)))?;
 
     let upload_url = start_response
         .header("x-goog-upload-url")
@@ -300,7 +302,8 @@ fn upload_gemini_file(audio_path: &Path, api_key: &str, mime_type: &str) -> Resu
 
     let file = std::fs::File::open(audio_path)
         .map_err(|e| format!("Cannot open audio file '{}': {e}", audio_path.display()))?;
-    let upload_response = crate::http::API_AGENT.post(&upload_url)
+    let upload_response = crate::http::API_AGENT
+        .post(&upload_url)
         .set("Content-Length", &size.to_string())
         .set("X-Goog-Upload-Offset", "0")
         .set("X-Goog-Upload-Command", "upload, finalize")
@@ -409,12 +412,8 @@ fn write_reference_text_file(
         }
         s
     };
-    let filename = format!(
-        "{}.{}.{}.whole_file_reference.txt",
-        sanitize_filename(stem),
-        sanitize_filename(model),
-        path_key
-    );
+    let filename =
+        format!("{}.{}.{}.whole_file_reference.txt", sanitize_filename(stem), sanitize_filename(model), path_key);
     let path = output_dir.join(filename);
     std::fs::write(&path, transcript.trim())
         .map_err(|e| format!("Failed to write source transcript '{}': {e}", path.display()))?;
@@ -664,9 +663,8 @@ mod tests {
         // Stem + sanitized model preserved; a 12-hex path key now disambiguates same-stem files.
         assert!(name.starts_with("My_Long_Audio.gemini-2.5_pro."), "{name}");
         assert!(name.ends_with(".whole_file_reference.txt"), "{name}");
-        let key = name
-            .trim_start_matches("My_Long_Audio.gemini-2.5_pro.")
-            .trim_end_matches(".whole_file_reference.txt");
+        let key =
+            name.trim_start_matches("My_Long_Audio.gemini-2.5_pro.").trim_end_matches(".whole_file_reference.txt");
         assert_eq!(key.len(), 12, "path key is 12 hex chars: {key}");
         assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "{key}");
         assert_eq!(std::fs::read_to_string(path).expect("read ref"), "hello");

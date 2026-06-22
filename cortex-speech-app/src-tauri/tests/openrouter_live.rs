@@ -32,14 +32,10 @@ fn openrouter_refines_sorani() {
     let refiner = cortex_speech_app_lib::llm_refiner::LlmRefiner::for_openrouter(
         key,
         "openai/gpt-4o-mini".to_string(),
-        "You are a Central Kurdish (Sorani) proofreader. Output ONLY the corrected Sorani text."
-            .to_string(),
+        "You are a Central Kurdish (Sorani) proofreader. Output ONLY the corrected Sorani text.".to_string(),
     )
     .expect("refiner should construct with a key");
     let out = refiner.refine_text("ساڵی دووهەزار و بیستویەک ڕادەگەیەنرێت").expect("openrouter refine should succeed");
     println!("OPENROUTER_REFINE:: {out}");
-    assert!(
-        out.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)),
-        "expected Sorani output, got: {out}"
-    );
+    assert!(out.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)), "expected Sorani output, got: {out}");
 }

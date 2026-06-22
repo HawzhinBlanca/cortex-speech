@@ -67,6 +67,15 @@ fn model_downloaded(model_status: &[serde_json::Value], filename: &str) -> bool 
     })
 }
 
+fn kill_and_reap_child(child: &mut std::process::Child, context: &str) {
+    if let Err(error) = child.kill() {
+        tracing::warn!("Failed to kill {context}: {error}");
+    }
+    if let Err(error) = child.wait() {
+        tracing::warn!("Failed to reap {context}: {error}");
+    }
+}
+
 /// Probe `wsl --status` with a bounded timeout. `wsl --status` is known to hang indefinitely when
 /// the WSL/LxssManager subsystem is wedged; a bare `.output()` would then block the import/jury path
 /// (and the check_* command handlers) forever. This mirrors the kill+reap hardening already on the
@@ -89,15 +98,13 @@ fn wsl_status_available() -> bool {
             Ok(Some(status)) => return status.success(),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap_child(&mut child, "timed-out WSL status probe");
                     return false; // wedged WSL -> degrade, never hang
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap_child(&mut child, "failed WSL status probe");
                 return false;
             }
         }
@@ -2040,16 +2047,14 @@ pub fn run_wsl_refinement(
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap_child(&mut child, "WSL refinement after stdout capture failure");
             return Err("Failed to capture stdout".to_string());
         }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap_child(&mut child, "WSL refinement after stderr capture failure");
             return Err("Failed to capture stderr".to_string());
         }
     };
@@ -2127,11 +2132,12 @@ pub fn run_wsl_refinement(
 pub fn cancel_wsl_refinement() -> Result<(), String> {
     let mut guard = lock_wsl_child();
     if let Some(mut child) = guard.take() {
-        let kill_result = child.kill();
+        child.kill().map_err(|error| format!("Failed to cancel WSL refinement process: {error}"))?;
         // Reap the child to match every other WSL kill site's kill+reap invariant — a killed child
         // must be wait()ed so it does not linger as a defunct process on non-Windows hosts.
-        let _ = child.wait();
-        kill_result.map_err(|error| format!("Failed to cancel WSL refinement process: {error}"))?;
+        if let Err(error) = child.wait() {
+            tracing::warn!("Failed to reap cancelled WSL refinement process: {error}");
+        }
     }
     Ok(())
 }
@@ -2431,10 +2437,7 @@ pub fn compute_annotation_drift_scorecard(
 }
 
 #[tauri::command]
-pub fn run_gold_eval_local(
-    state: State<'_, AppState>,
-    model_id: String,
-) -> Result<crate::eval::EvalRunResult, String> {
+pub fn run_gold_eval_local(state: State<'_, AppState>, model_id: String) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval_local")?;
     // Clone the pipeline and let it open its own DB connection, so neither global mutex is held
     // across the multi-segment ASR eval loop (which would freeze the entire UI for minutes).

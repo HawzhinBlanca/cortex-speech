@@ -42,9 +42,14 @@ fn char_only_normalizer() -> SoraniNormalizer {
 #[derive(Clone, Copy)]
 enum AlignOp {
     /// A matched slot; carries only the `b`-side index used to look up the neighbor context.
-    Match { b: usize },
+    Match {
+        b: usize,
+    },
     /// A substituted slot: `a` is the wrong-side word index, `b` the human-side index.
-    Sub { a: usize, b: usize },
+    Sub {
+        a: usize,
+        b: usize,
+    },
     /// A deleted or inserted slot — a placeholder in the path; its indices are never read.
     Del,
     Ins,
@@ -74,11 +79,7 @@ fn align_words(na: &[String], nb: &[String]) -> Vec<AlignOp> {
         if i > 0 && j > 0 {
             let cost = usize::from(na[i - 1] != nb[j - 1]);
             if dp[i][j] == dp[i - 1][j - 1] + cost {
-                ops.push(if cost == 0 {
-                    AlignOp::Match { b: j - 1 }
-                } else {
-                    AlignOp::Sub { a: i - 1, b: j - 1 }
-                });
+                ops.push(if cost == 0 { AlignOp::Match { b: j - 1 } } else { AlignOp::Sub { a: i - 1, b: j - 1 } });
                 i -= 1;
                 j -= 1;
                 continue;

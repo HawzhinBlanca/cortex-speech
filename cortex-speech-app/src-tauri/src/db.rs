@@ -1098,26 +1098,25 @@ impl Database {
             prior_verdict,
             audio_path,
             model_version_id,
-        ): HumanDecisionContext =
-            self.conn.query_row(
-                "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript,
+        ): HumanDecisionContext = self.conn.query_row(
+            "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript,
                         verdict_transcript, verdict, audio_path, model_version_id
                  FROM speech_segments
                  WHERE id = ?1",
-                params![segment_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )?;
+            params![segment_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )?;
 
         let rejected_learning_transcript = if decision == "edit" {
             corrected_transcript.and_then(|fix| {
@@ -1140,9 +1139,7 @@ impl Database {
         // unavailable, the verdict still records — we skip the audit row rather than fail the
         // human's correction over a missing file.
         let ledger_hash = if decision == "edit" {
-            crate::pipeline::source_audio_identity(Path::new(&audio_path))
-                .ok()
-                .map(|identity| identity.content_hash)
+            crate::pipeline::source_audio_identity(Path::new(&audio_path)).ok().map(|identity| identity.content_hash)
         } else {
             None
         };
@@ -1189,8 +1186,7 @@ impl Database {
         // the ledger records gold and non-gold alike — it is the full audit trail, keyed on the
         // durable audio_content_hash, that makes the training set reconstructable and every label
         // attributable to the model_version that produced it.
-        if let (Some(content_hash), Some(fix), Some(wrong)) =
-            (ledger_hash, corrected_transcript, wrong_side.as_deref())
+        if let (Some(content_hash), Some(fix), Some(wrong)) = (ledger_hash, corrected_transcript, wrong_side.as_deref())
         {
             let correction_id = uuid::Uuid::new_v4().to_string();
             tx.execute(
@@ -1515,11 +1511,7 @@ mod tests {
         let conn = db.connection();
         for table in ["correction_memory", "corrections", "model_versions", "adapters"] {
             let exists: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [table], |r| r.get(0))
                 .expect("table query");
             assert_eq!(exists, 1, "{table} must exist after an on-disk restart");
         }
@@ -1647,10 +1639,7 @@ mod tests {
         locked.normalized_transcript = Some("human corrected text".to_string());
         db.insert_segment(&locked).expect("insert locked");
         db.conn
-            .execute(
-                "UPDATE speech_segments SET verdict='human_edit', human_decision='edit' WHERE id='locked-1'",
-                [],
-            )
+            .execute("UPDATE speech_segments SET verdict='human_edit', human_decision='edit' WHERE id='locked-1'", [])
             .expect("lock as human-reviewed");
 
         // The refinery's batch write tries to replace the locked segment with machine consensus.
@@ -1721,9 +1710,7 @@ mod tests {
         let mut locked = make_segment("c-lock", "/a.wav");
         locked.raw_transcript = "orig".to_string();
         db.insert_segment(&locked).expect("insert locked");
-        db.conn
-            .execute("UPDATE speech_segments SET verdict='human_accept' WHERE id='c-lock'", [])
-            .expect("lock");
+        db.conn.execute("UPDATE speech_segments SET verdict='human_accept' WHERE id='c-lock'", []).expect("lock");
         db.insert_segment(&make_segment("c-fresh", "/b.wav")).expect("insert fresh");
 
         let changed = db
@@ -1988,11 +1975,8 @@ mod tests {
         assert_eq!(mems.len(), 1, "the repeated correction upserts to a single memory");
         assert_eq!(mems[0].hit_count, 1, "confirmed twice -> hit_count 1, past the anti-one-off guard");
 
-        let out = crate::corrections::apply_memories(
-            "ئەو ساڵە باش بوو",
-            &mems,
-            &crate::corrections::FiringConfig::default(),
-        );
+        let out =
+            crate::corrections::apply_memories("ئەو ساڵە باش بوو", &mems, &crate::corrections::FiringConfig::default());
         assert_eq!(out, "ئەو ساڵە خراپ بوو", "capture x2 -> DB -> load -> fire reproduces the human fix");
     }
 

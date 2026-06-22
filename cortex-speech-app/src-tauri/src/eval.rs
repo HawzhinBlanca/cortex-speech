@@ -219,12 +219,20 @@ pub fn run_gold_eval(
         let c_dist = char_edit_distance(&gold.reference, hypothesis);
 
         let w = if w_dist.ref_len == 0 {
-            if w_dist.distance > 0 { 1.0 } else { 0.0 }
+            if w_dist.distance > 0 {
+                1.0
+            } else {
+                0.0
+            }
         } else {
             (w_dist.distance as f64 / w_dist.ref_len as f64).min(1.0)
         };
         let c = if c_dist.ref_len == 0 {
-            if c_dist.distance > 0 { 1.0 } else { 0.0 }
+            if c_dist.distance > 0 {
+                1.0
+            } else {
+                0.0
+            }
         } else {
             (c_dist.distance as f64 / c_dist.ref_len as f64).min(1.0)
         };
@@ -257,12 +265,20 @@ pub fn run_gold_eval(
     let micro_wer = if total_word_ref_len > 0 {
         (total_word_distance as f64 / total_word_ref_len as f64).min(1.0)
     } else {
-        if total_word_distance > 0 { 1.0 } else { 0.0 }
+        if total_word_distance > 0 {
+            1.0
+        } else {
+            0.0
+        }
     };
     let micro_cer = if total_char_ref_len > 0 {
         (total_char_distance as f64 / total_char_ref_len as f64).min(1.0)
     } else {
-        if total_char_distance > 0 { 1.0 } else { 0.0 }
+        if total_char_distance > 0 {
+            1.0
+        } else {
+            0.0
+        }
     };
 
     let meta = serde_json::json!({
@@ -374,20 +390,7 @@ pub fn load_eval_run_and_recompute(
         let c_dist: i64 = row.get(8)?;
         let c_ref: i64 = row.get(9)?;
 
-        Ok((
-            EvalSegmentResult {
-                gold_id,
-                audio_path,
-                reference,
-                hypothesis,
-                wer,
-                cer,
-            },
-            w_dist,
-            w_ref,
-            c_dist,
-            c_ref,
-        ))
+        Ok((EvalSegmentResult { gold_id, audio_path, reference, hypothesis, wer, cer }, w_dist, w_ref, c_dist, c_ref))
     })?;
 
     for row in rows {
@@ -403,13 +406,21 @@ pub fn load_eval_run_and_recompute(
     let micro_wer = if total_word_ref_len > 0 {
         (total_word_distance as f64 / total_word_ref_len as f64).min(1.0)
     } else {
-        if total_word_distance > 0 { 1.0 } else { 0.0 }
+        if total_word_distance > 0 {
+            1.0
+        } else {
+            0.0
+        }
     };
 
     let micro_cer = if total_char_ref_len > 0 {
         (total_char_distance as f64 / total_char_ref_len as f64).min(1.0)
     } else {
-        if total_char_distance > 0 { 1.0 } else { 0.0 }
+        if total_char_distance > 0 {
+            1.0
+        } else {
+            0.0
+        }
     };
 
     let mut recomputed_run = run;
@@ -428,11 +439,7 @@ pub fn load_eval_run_and_recompute(
 /// it is fully unit-testable without loading any model. Segments whose transcription
 /// fails are logged and skipped — never silently scored as an empty hypothesis, which
 /// would understate WER/CER.
-pub fn run_gold_eval_with_transcriber<F>(
-    db: &Database,
-    model_id: &str,
-    mut transcribe: F,
-) -> AppResult<EvalRunResult>
+pub fn run_gold_eval_with_transcriber<F>(db: &Database, model_id: &str, mut transcribe: F) -> AppResult<EvalRunResult>
 where
     F: FnMut(&GoldSegment) -> AppResult<String>,
 {
@@ -445,11 +452,7 @@ where
             Ok(hyp) => hypotheses.push((seg.id.clone(), hyp)),
             Err(e) => {
                 failed += 1;
-                tracing::warn!(
-                    "gold eval: transcription failed for {} ({}): {e}",
-                    seg.id,
-                    seg.audio_path
-                );
+                tracing::warn!("gold eval: transcription failed for {} ({}): {e}", seg.id, seg.audio_path);
             }
         }
     }
@@ -478,10 +481,9 @@ mod tests {
         let db = open_mem_db();
         // Two REVIEWED segments of the SAME source file, corrected (verdict_transcript), with explicit
         // ordered timestamps so concatenation order is deterministic.
-        for (id, fix, at) in [
-            ("c1", "ساڵی نوێ پیرۆز", "2020-01-01 00:00:01"),
-            ("c2", "بەخێربێیت بۆ کوردستان", "2020-01-01 00:00:02"),
-        ] {
+        for (id, fix, at) in
+            [("c1", "ساڵی نوێ پیرۆز", "2020-01-01 00:00:01"), ("c2", "بەخێربێیت بۆ کوردستان", "2020-01-01 00:00:02")]
+        {
             db.insert_segment(&crate::db::SpeechSegment {
                 id: id.to_string(),
                 audio_path: "/clips/nawras.wav".to_string(),
@@ -599,8 +601,12 @@ mod tests {
         import_gold_segments(
             &db,
             vec![
-                GoldSegmentInput { audio_path: "/tmp/a.wav".into(), reference: "کوردستان".into(), is_holdout: true },
-                GoldSegmentInput { audio_path: "/tmp/b.wav".into(), reference: "ئەمە دەنگە".into(), is_holdout: true },
+                GoldSegmentInput {
+                    audio_path: "/tmp/a.wav".into(), reference: "کوردستان".into(), is_holdout: true
+                },
+                GoldSegmentInput {
+                    audio_path: "/tmp/b.wav".into(), reference: "ئەمە دەنگە".into(), is_holdout: true
+                },
             ],
         )
         .unwrap();
@@ -609,7 +615,11 @@ mod tests {
         let mut calls = 0usize;
         let result = run_gold_eval_with_transcriber(&db, "fake-asr", |seg| {
             calls += 1;
-            Ok(if seg.reference == "کوردستان" { "کوردستان".to_string() } else { "خراب".to_string() })
+            Ok(if seg.reference == "کوردستان" {
+                "کوردستان".to_string()
+            } else {
+                "خراب".to_string()
+            })
         })
         .unwrap();
 
@@ -626,7 +636,9 @@ mod tests {
         import_gold_segments(
             &db,
             vec![
-                GoldSegmentInput { audio_path: "/tmp/ok.wav".into(), reference: "کوردستان".into(), is_holdout: true },
+                GoldSegmentInput {
+                    audio_path: "/tmp/ok.wav".into(), reference: "کوردستان".into(), is_holdout: true
+                },
                 GoldSegmentInput { audio_path: "/missing.wav".into(), reference: "ئەمە".into(), is_holdout: true },
             ],
         )
@@ -669,10 +681,7 @@ mod tests {
         import_gold_segments(&db, inputs).unwrap();
         let gold = list_gold_segments(&db).unwrap();
 
-        let hyps = vec![
-            (gold[0].id.clone(), "کوردستان".to_string()),
-            (gold[1].id.clone(), "ئەمە".to_string()),
-        ];
+        let hyps = vec![(gold[0].id.clone(), "کوردستان".to_string()), (gold[1].id.clone(), "ئەمە".to_string())];
 
         let result = run_gold_eval(&db, "test-model", hyps).unwrap();
         let recomputed = load_eval_run_and_recompute(&db, &result.run.id).unwrap().unwrap();

@@ -1,0 +1,85 @@
+name: CI
+
+# Pull-request and main-branch gate. Mirrors the "Clean release gate" in docs/RELEASE.md
+# so a green PR means the same checks a release tag must pass (minus the bundle build).
+# NOTE: action refs use version tags for readability; SHA-pinning every `uses:` is the
+# next hardening step tracked in docs/HARDENING_PLAN_10.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege by default: CI only needs to read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend-and-policies:
+    name: Frontend, policy gates, and E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: npm ci
+      # Playwright Chromium MUST be installed before the E2E step runs.
+      - name: Install Playwright system dependencies
+        run: npx playwright install-deps chromium
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests (vitest)
+        run: npm test
+      - name: Honesty and privacy policy gates
+        run: npm run test:python-policies
+      - name: Lint
+        run: npm run lint
+      - name: End-to-end tests (Playwright)
+        run: npm run test:e2e
+
+  rust:
+    name: Rust fmt, clippy, tests, and supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Install cargo-deny (pinned)
+        run: cargo install cargo-deny --version 0.19.8 --locked
+      - name: Supply-chain audit (cargo-deny)
+        run: cargo deny --manifest-path src-tauri/Cargo.toml check
+      - name: Production dependency audit (npm)
+        run: npm audit --omit=dev

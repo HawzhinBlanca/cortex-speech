@@ -39,6 +39,15 @@ def assert_contains(text: str, expected: str, context: str) -> None:
         raise AssertionError(f"{context} is missing: {expected}")
 
 
+def first_network_get_after(source: str, start: int) -> int:
+    candidates = [
+        match.start()
+        for pattern in (r"ureq::get", r"DOWNLOAD_AGENT\s*\.\s*get")
+        if (match := re.search(pattern, source[start:], flags=re.DOTALL))
+    ]
+    return start + min(candidates) if candidates else -1
+
+
 def test_non_empty_sha256_values_are_full_hex_digests() -> None:
     constants = rust_string_constants("SHA256")
     if not constants:
@@ -91,7 +100,7 @@ def test_archive_downloads_preflight_and_verify_sha256() -> None:
 
     for label, sha_expr in expected_pairs:
         ensure_index = source.find(f"ensure_pinned_sha256", source.find(sha_expr))
-        network_index = source.find("ureq::get", ensure_index)
+        network_index = first_network_get_after(source, ensure_index)
         verify_index = source.find("verify_sha256", network_index)
 
         if ensure_index < 0:

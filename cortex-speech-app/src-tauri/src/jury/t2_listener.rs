@@ -179,10 +179,8 @@ const GEMINI_MAX_EDIT_FROM_HYP: f64 = 0.6;
 /// must sit within [`GEMINI_MAX_EDIT_FROM_HYP`] CER of at least one local hypothesis. With no local
 /// hypotheses to ground against, it cannot be validated, so it is allowed (the gate is upstream).
 fn is_grounded_post_edit(winner: &str, hypotheses: &[SegmentHypothesis]) -> bool {
-    let min_cer = hypotheses
-        .iter()
-        .map(|h| crate::wer::compute_cer(&h.transcript, winner))
-        .fold(f64::INFINITY, f64::min);
+    let min_cer =
+        hypotheses.iter().map(|h| crate::wer::compute_cer(&h.transcript, winner)).fold(f64::INFINITY, f64::min);
     !min_cer.is_finite() || min_cer <= GEMINI_MAX_EDIT_FROM_HYP
 }
 

@@ -144,11 +144,7 @@ fn word_breakdown_aggregate(result: &EvalRunResult) -> (f64, usize, usize, usize
 }
 
 /// Build a scorecard from a gold-eval result (and an optional baseline run).
-pub fn build_scorecard(
-    result: &EvalRunResult,
-    baseline: Option<&EvalRunResult>,
-    opts: ScorecardOptions,
-) -> Scorecard {
+pub fn build_scorecard(result: &EvalRunResult, baseline: Option<&EvalRunResult>, opts: ScorecardOptions) -> Scorecard {
     let word_errs = word_errors(result);
     let char_errs = char_errors(result);
     let (macro_wer, substitutions, deletions, insertions) = word_breakdown_aggregate(result);
@@ -521,9 +517,7 @@ mod tests {
 
     #[test]
     fn beats_baseline_only_when_lower_and_significant() {
-        let pairs: Vec<(&str, &str)> = (0..12)
-            .map(|_| ("/x.wav", "one two three four five"))
-            .collect();
+        let pairs: Vec<(&str, &str)> = (0..12).map(|_| ("/x.wav", "one two three four five")).collect();
         // System: perfect on every segment. Baseline: one error on every segment.
         let sys_hyps: Vec<&str> = (0..12).map(|_| "one two three four five").collect();
         let base_hyps: Vec<&str> = (0..12).map(|_| "one two three four WRONG").collect();
