@@ -2259,8 +2259,21 @@ pub fn import_gold_segments(
     inputs: Vec<crate::eval::GoldSegmentInput>,
 ) -> Result<usize, String> {
     RATE_LIMITER.check("import_gold_segments")?;
+    // Validate every frontend-supplied input BEFORE any file is opened — the same guard every other
+    // file-opening command applies (import_audio_file, import_model_checkpoint, get_waveform, ...).
+    // Without it, a compromised/XSS'd renderer could pass an arbitrary, UNC, or traversal path that
+    // eval::import_gold_segments -> source_audio_identity opens and fully reads (info disclosure /
+    // outbound-SMB on Windows), plus persist it; the reference was likewise uncapped.
+    let validated: Vec<crate::eval::GoldSegmentInput> = inputs
+        .into_iter()
+        .map(|inp| {
+            let audio_path = validate::validate_file_path(&inp.audio_path)?;
+            validate::validate_text(&inp.reference, 100_000, "Gold reference")?;
+            Ok::<_, String>(crate::eval::GoldSegmentInput { audio_path, ..inp })
+        })
+        .collect::<Result<_, _>>()?;
     let db = state.lock_db();
-    crate::eval::import_gold_segments(&db, inputs).map_err(|e| e.to_string())
+    crate::eval::import_gold_segments(&db, validated).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
