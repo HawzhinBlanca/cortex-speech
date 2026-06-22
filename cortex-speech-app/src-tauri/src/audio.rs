@@ -668,7 +668,11 @@ impl SileroVad {
             sample_rate,
             frame_size: 512,
             threshold,
-            min_speech_frames: 15,
+            // Round-24 #6: ~96ms floor (3 frames). The old 480ms (15-frame) floor silently DROPPED any
+            // real short word (e.g. "بەڵێ"/yes) flanked by silence — its audio was never transcribed
+            // and vanished from the dataset. 3 frames still filters 1-2 frame spurious activations while
+            // preserving genuine short utterances; downstream chunking merges/absorbs as needed.
+            min_speech_frames: 3,
             min_silence_frames: 8,
         })
     }
@@ -703,7 +707,11 @@ impl SileroVad {
             sample_rate,
             frame_size: 512,
             threshold,
-            min_speech_frames: 15,
+            // Round-24 #6: ~96ms floor (3 frames). The old 480ms (15-frame) floor silently DROPPED any
+            // real short word (e.g. "بەڵێ"/yes) flanked by silence — its audio was never transcribed
+            // and vanished from the dataset. 3 frames still filters 1-2 frame spurious activations while
+            // preserving genuine short utterances; downstream chunking merges/absorbs as needed.
+            min_speech_frames: 3,
             min_silence_frames: 8,
         })
     }
@@ -727,7 +735,11 @@ impl SileroVad {
             sample_rate,
             frame_size: 512,
             threshold,
-            min_speech_frames: 15,
+            // Round-24 #6: ~96ms floor (3 frames). The old 480ms (15-frame) floor silently DROPPED any
+            // real short word (e.g. "بەڵێ"/yes) flanked by silence — its audio was never transcribed
+            // and vanished from the dataset. 3 frames still filters 1-2 frame spurious activations while
+            // preserving genuine short utterances; downstream chunking merges/absorbs as needed.
+            min_speech_frames: 3,
             min_silence_frames: 8,
         })
     }
@@ -980,20 +992,33 @@ fn vad_energy_fallback(pcm: &[i16], _sample_rate: u32, threshold: f32) -> AppRes
     }
 
     use rayon::prelude::*;
-    let speech_frames: Vec<bool> = (0..num_frames)
+    // Per-frame mean absolute amplitude (~0.02-0.2 for ordinary speech). Round-24 #7: the old code
+    // compared this against `threshold` — the Silero speech PROBABILITY (0..1, default 0.5), a totally
+    // different scale — so real speech (amplitude well below 0.5) was classified as silence on EVERY
+    // frame and the fallback returned the whole buffer as a single region (no VAD at all). Derive the
+    // speech/silence cutoff ADAPTIVELY from the signal's own energy distribution instead.
+    let energies: Vec<f32> = (0..num_frames)
         .into_par_iter()
         .map(|i| {
             let start = i * hop_size;
             let end = (start + frame_size).min(pcm.len());
             let frame = &pcm[start..end];
-
-            let energy: f32 =
-                frame.iter().map(|&s| (s as f32 / i16::MAX as f32).abs()).sum::<f32>() / frame.len() as f32;
-
-            // Use threshold directly instead of threshold * 0.1 for consistency with Silero VAD.
-            energy > threshold
+            frame.iter().map(|&s| (s as f32 / i16::MAX as f32).abs()).sum::<f32>() / frame.len().max(1) as f32
         })
         .collect();
+
+    // Noise floor = 10th percentile, peak = 95th percentile (robust to outliers). A frame is speech
+    // when its amplitude rises a sensitivity-scaled fraction of the way from the noise floor toward the
+    // peak. The user's `vad_threshold` (0..1) is honored as that SENSITIVITY (higher = stricter), NOT
+    // as a raw amplitude. A small absolute floor avoids a zero cutoff on near-silent input.
+    let mut sorted = energies.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pct = |p: f32| sorted[((sorted.len() as f32 * p) as usize).min(sorted.len().saturating_sub(1))];
+    let noise_floor = pct(0.10);
+    let peak = pct(0.95);
+    let frac = threshold.clamp(0.05, 0.95) * 0.5; // 0.5 -> 0.25 of the noise->peak span
+    let amp_threshold = (noise_floor + frac * (peak - noise_floor)).max(0.005);
+    let speech_frames: Vec<bool> = energies.iter().map(|&e| e > amp_threshold).collect();
 
     let mut segments = Vec::new();
     let mut in_speech = false;
