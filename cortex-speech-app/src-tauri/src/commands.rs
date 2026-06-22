@@ -1211,19 +1211,24 @@ pub fn update_settings(mut settings: AppSettings, state: State<'_, AppState>) ->
     // Server-side trust boundary: reject a malicious endpoint/oversized payload before it
     // can take effect and redirect LLM requests (+ the API key) to an attacker's server.
     settings.validate().map_err(|e| e.to_string())?;
+    // Round-22 #7: carry the in-session secret forward and capture the on-disk path WITHOUT yet
+    // overwriting the in-memory copy. Persisting BEFORE committing to memory/pipeline means a save
+    // failure (full/read-only/locked disk) leaves the in-memory settings, the running pipeline, AND
+    // disk all consistent at the OLD value — never a three-way divergence where get_settings() reports
+    // an unsaved change (including cloud-consent toggles) that the pipeline and the next launch ignore.
     let settings_path = {
-        let mut current = state.lock_settings();
+        let current = state.lock_settings();
         settings.merge_session_secret_from(&current);
-        *current = settings.clone();
         state.lock_data_dir().clone().map(|d| d.join("settings.json"))
     };
     if let Some(path) = settings_path {
-        // Propagate a persist failure (full/read-only/locked disk) to the caller. Swallowing it made
-        // the command return Ok while the UI showed "Settings saved" — yet the change silently reverted
-        // on the next launch (incl. security toggles like cloud opt-in). Returning Err lets the
-        // frontend surface settingsSaveFailed so the user can fix the disk and retry.
+        // Propagate a persist failure to the caller (the frontend surfaces settingsSaveFailed). On Err
+        // we return BEFORE the commit below, so nothing observable changed.
         settings.save(&path).map_err(|e| format!("Failed to save settings to disk: {e}"))?;
     }
+    // Disk now holds the new value (or there is no data dir to persist to): commit it to the in-memory
+    // store and the running pipeline together.
+    *state.lock_settings() = settings.clone();
     state.update_pipeline_settings(settings);
     Ok(())
 }
@@ -1332,6 +1337,9 @@ pub fn export_audio(
     options: crate::export_audio::AudioExportOptions,
     state: State<'_, AppState>,
 ) -> Result<crate::export_audio::AudioExportResult, String> {
+    // Decodes + re-encodes one clip per segment to disk — throttle it like every sibling export
+    // command (round-22 #5: it was the lone export missing a rate-limiter, a local DoS/disk-fill gap).
+    STRICT_RATE_LIMITER.check("export_audio")?;
     for id in &segment_ids {
         validate::validate_identifier(id)?;
     }
@@ -2030,6 +2038,12 @@ pub fn cancel_wsl_refinement() -> Result<(), String> {
 #[tauri::command]
 pub fn add_segment_hypothesis(state: State<'_, AppState>, hyp: crate::db::SegmentHypothesis) -> Result<(), String> {
     RATE_LIMITER.check("add_segment_hypothesis")?;
+    // This row feeds the IRT jury consensus, so apply the same validation discipline every other write
+    // command uses: shaped identifiers and a bounded transcript (round-22 #3) — never an unbounded blob
+    // or a malformed id straight from the renderer.
+    validate::validate_identifier(&hyp.segment_id)?;
+    validate::validate_identifier(&hyp.model_id)?;
+    validate::validate_text(&hyp.transcript, 100_000, "Hypothesis transcript")?;
     let db = state.lock_db();
     db.insert_hypothesis(&hyp).map_err(|e| e.to_string())?;
     Ok(())
@@ -2512,6 +2526,11 @@ pub fn record_human_decision(
     corrected_transcript: Option<String>,
 ) -> Result<(), String> {
     RATE_LIMITER.check("record_human_decision")?;
+    // Round-22 #4: validate the id and bound the free text, matching every other write command.
+    validate::validate_identifier(&segment_id)?;
+    if let Some(t) = corrected_transcript.as_deref() {
+        validate::validate_text(t, 100_000, "Corrected transcript")?;
+    }
     let db = state.lock_db();
     db.record_human_decision(&segment_id, &decision, corrected_transcript.as_deref()).map_err(|e| e.to_string())
 }
@@ -2521,6 +2540,7 @@ pub fn record_human_decision(
 #[tauri::command]
 pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> Result<(), String> {
     RATE_LIMITER.check("clear_human_decision")?;
+    validate::validate_identifier(&segment_id)?; // round-22 #4
     let db = state.lock_db();
     db.connection()
         .execute(
@@ -2548,6 +2568,17 @@ pub fn write_segment_verdict(
     escalated: bool,
 ) -> Result<(), String> {
     RATE_LIMITER.check("write_segment_verdict")?;
+    // Round-22 #4: validate the id and bound every free-text field, matching the other write commands.
+    validate::validate_identifier(&segment_id)?;
+    if let Some(t) = transcript.as_deref() {
+        validate::validate_text(t, 100_000, "Verdict transcript")?;
+    }
+    if let Some(r) = rationale.as_deref() {
+        validate::validate_text(r, 100_000, "Verdict rationale")?;
+    }
+    if let Some(e) = evidence_json.as_deref() {
+        validate::validate_text(e, 100_000, "Verdict evidence")?;
+    }
     let db = state.lock_db();
     db.write_segment_verdict(
         &segment_id,
