@@ -2,8 +2,6 @@
 //!
 //! Uses mel-filterbank embeddings per VAD chunk and online cosine clustering — no extra ONNX model.
 
-use crate::features::FbankExtractor;
-use ndarray::Array2;
 use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
 use std::path::Path;
 
@@ -84,14 +82,17 @@ pub fn compute_chunk_embeddings(
     chunk_ranges: &[(usize, usize)],
     embedding_service: &SpeakerEmbeddingService,
 ) -> Vec<Vec<f32>> {
+    // Speaker diarization requires the high-tier CAM++ embedding model. The previous fbank fallback
+    // (log-mel mean/std statistics) is NOT speaker-discriminative — its pairwise cosine for clearly
+    // distinct voices is ~0.97–0.999, far above the 0.85 clustering threshold — so EVERY chunk merged
+    // into SPEAKER_00 and a multi-speaker recording exported with one bogus, authoritative-looking
+    // speaker (worse than no diarization). When CAM++ is unavailable we therefore emit NO embeddings
+    // (each chunk → empty → None label) instead of confidently-wrong labels; the filename-based speaker
+    // hint (assign_speaker_from_filename) still applies, and a curator can assign speakers by hand.
+    if !embedding_service.is_available() {
+        return chunk_ranges.iter().map(|_| Vec::new()).collect();
+    }
     let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-    // Pick the embedding backend ONCE per file. CAM++ (fixed model dim, e.g. 192) and the fbank
-    // fallback (mean+log_energy+std = 161) emit DIFFERENT-LENGTH vectors; clustering a mix of both made
-    // cosine_similarity return -1.0 on the length mismatch, so every chunk that fell back to fbank was
-    // pushed as a brand-new phantom speaker. When CAM++ is available, use it for EVERY chunk and leave a
-    // chunk it cannot embed as an empty vec (clustering maps empty -> None label); only when CAM++ is
-    // entirely unavailable do we use the fbank backend for the whole file.
-    let fbank = (!embedding_service.is_available()).then(|| FbankExtractor::new(sample_rate));
     chunk_ranges
         .iter()
         .map(|&(start, end)| {
@@ -100,15 +101,8 @@ pub fn compute_chunk_embeddings(
             if end <= start {
                 return Vec::new();
             }
-            let chunk = &f32_pcm[start..end];
-
-            match &fbank {
-                // CAM++ unavailable for the whole file: uniform fbank backend.
-                Some(fbank) => chunk_embedding(fbank, chunk),
-                // CAM++ available: use it for every chunk; an empty result stays empty (None label),
-                // never substituted with a different-dimension fbank vector.
-                None => embedding_service.compute_embedding(chunk, sample_rate),
-            }
+            // An empty result stays empty (None label) — never a different-dimension substitute.
+            embedding_service.compute_embedding(&f32_pcm[start..end], sample_rate)
         })
         .collect()
 }
@@ -121,43 +115,6 @@ pub fn cluster_embeddings(embeddings: &[Vec<f32>], max_speakers: u32) -> Vec<Opt
     }
     let max_speakers = max_speakers.clamp(1, 32) as usize;
     online_cluster(embeddings, max_speakers)
-}
-
-fn chunk_embedding(fbank: &FbankExtractor, pcm: &[f32]) -> Vec<f32> {
-    if pcm.len() < 160 {
-        return Vec::new();
-    }
-    let features: Array2<f32> = fbank.compute(pcm);
-    if features.nrows() == 0 {
-        return Vec::new();
-    }
-    let bins = features.ncols();
-    let frames = features.nrows();
-    let mut mean = vec![0.0f32; bins];
-    for row in features.rows() {
-        for (i, &v) in row.iter().enumerate() {
-            mean[i] += v;
-        }
-    }
-    for v in &mut mean {
-        *v /= frames as f32;
-    }
-
-    let mut std = vec![0.0f32; bins];
-    if frames > 1 {
-        for b in 0..bins {
-            let m = mean[b];
-            let var: f32 = features.column(b).iter().map(|v| (v - m).powi(2)).sum::<f32>() / frames as f32;
-            std[b] = var.sqrt();
-        }
-    }
-
-    let energy: f32 = pcm.iter().map(|x| x * x).sum();
-    let log_energy = (energy / pcm.len().max(1) as f32 + 1e-8).ln();
-    mean.push(log_energy);
-    mean.extend(std);
-    l2_normalize(&mut mean);
-    mean
 }
 
 fn online_cluster(embeddings: &[Vec<f32>], max_speakers: usize) -> Vec<Option<String>> {
@@ -280,28 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn label_chunk_speakers_needs_local_ranges_not_global() {
-        // Round-4 audit: in the streaming path the pipeline passed GLOBAL sample ranges into the
-        // window-local PCM, so every chunk past the first 90s window indexed beyond the buffer and got
-        // NO speaker label. label_chunk_speakers slices `pcm` directly, so it must get LOCAL ranges.
-        let sr = 16000;
-        let mut pcm = tone_pcm(180.0, sr, 1000);
-        pcm.extend(tone_pcm(320.0, sr, 1000)); // 2s of two tones -> non-empty chunks -> embeddings
-        let svc = SpeakerEmbeddingService::new(std::path::Path::new("/nonexistent")); // fbank fallback
-
-        let local_ranges = vec![(0usize, 16_000usize), (16_000, 32_000)];
-        // Global ranges as the buggy streaming path produced them: offset past this window.
-        let base = pcm.len();
-        let global_ranges: Vec<(usize, usize)> = local_ranges.iter().map(|&(s, e)| (base + s, base + e)).collect();
-
-        let with_global = label_chunk_speakers(&pcm, sr, &global_ranges, 8, &svc);
-        assert!(with_global.iter().all(Option::is_none), "global ranges into local pcm drop every label");
-
-        let with_local = label_chunk_speakers(&pcm, sr, &local_ranges, 8, &svc);
-        assert!(with_local.iter().any(Option::is_some), "local ranges produce real speaker labels");
-    }
-
-    #[test]
     fn whole_file_clustering_keeps_one_label_per_speaker_across_windows() {
         // Round-10 audit MEDIUM: the streaming import re-clustered diarization per 90s window, so the
         // first speaker of EACH window became SPEAKER_00 and a physical speaker got different labels in
@@ -325,29 +260,31 @@ mod tests {
     }
 
     #[test]
-    fn single_chunk_gets_speaker_label() {
-        let pcm = tone_pcm(440.0, 16000, 500);
-        let ranges = vec![(0, pcm.len())];
-        let service = SpeakerEmbeddingService { manager: None };
-        let labels = label_chunk_speakers(&pcm, 16000, &ranges, 4, &service);
-        assert_eq!(labels.len(), 1);
-        assert!(labels[0].as_deref().unwrap().starts_with("SPEAKER_"));
-    }
-
-    #[test]
-    fn multi_chunk_assigns_speaker_labels() {
+    fn diarization_without_campp_produces_no_speaker_labels() {
+        // Round-17: without the high-tier CAM++ model (the default install state — CAM++ is not
+        // bundled), the only available backend was the fbank fallback, whose log-mel-statistic vectors
+        // are NOT speaker-discriminative (baseline pairwise cosine ~0.99). It collapsed every chunk into
+        // SPEAKER_00 — a confidently-wrong single speaker for ANY multi-speaker file, which looks
+        // authoritative and corrupts the exported dataset. The honest behavior is to emit NO speaker
+        // labels when CAM++ is unavailable, leaving assignment to the filename hint or a human.
         let pcm_a: Vec<i16> = (0..128_000).map(|i| (((i * 17) % 500) as i16).saturating_mul(60)).collect();
         let pcm_b: Vec<i16> = (0..128_000).map(|i| (((i * 43) % 900) as i16).saturating_mul(35)).collect();
         let split = pcm_a.len();
         let mut pcm = pcm_a;
         pcm.extend_from_slice(&pcm_b);
         let ranges = vec![(0, split), (split, pcm.len())];
-        let service = SpeakerEmbeddingService { manager: None };
+        let service = SpeakerEmbeddingService { manager: None }; // CAM++ unavailable
+
         let labels = label_chunk_speakers(&pcm, 16000, &ranges, 4, &service);
         assert_eq!(labels.len(), 2);
-        for label in &labels {
-            assert!(label.as_deref().unwrap_or("").starts_with("SPEAKER_"));
-        }
+        assert!(
+            labels.iter().all(Option::is_none),
+            "without CAM++, diarization must emit NO labels rather than collapse speakers: {labels:?}"
+        );
+
+        // The streaming path (compute_chunk_embeddings directly) is likewise unlabeled — no embeddings.
+        let embeddings = compute_chunk_embeddings(&pcm, 16000, &ranges, &service);
+        assert!(embeddings.iter().all(Vec::is_empty), "no embeddings without CAM++");
     }
 
     #[test]
