@@ -227,7 +227,12 @@ pub fn export_dataset_bundle(
         )));
     }
 
-    let segments = db.get_segments(None)?;
+    // Round-22 #1 (bundle completion): drop held-out gold segments at the SOURCE so EVERY bundle
+    // artifact derived from `segments` is holdout-free — not just the tabular dataset files (which
+    // export_dataset filters on its own). Without this, the holdout clip's HUMAN REFERENCE transcript
+    // (the WER/CER answer key) still leaks via source_transcripts/*.txt + source_reference_manifest.json,
+    // and training_grade_details.json / manifest counts still include it — re-contaminating the eval set.
+    let segments = export::exclude_holdout_segments(db, db.get_segments(None)?)?;
     let training_grade_summary = quality::training_grade_summary(&segments);
     let training_ready_machine_segment_ids = training_ready_machine_segment_ids(&segments);
     let source_reference_records = collect_source_reference_bundle_records(db, &segments)?;
@@ -1415,6 +1420,92 @@ mod tests {
             .unwrap()
             .iter()
             .all(|reference| reference["audioIdentityVerified"].as_bool() == Some(true)));
+    }
+
+    #[test]
+    fn bundle_excludes_holdout_gold_from_all_artifacts() {
+        // Round-22 #1 (bundle completion): the holdout gold clip's HUMAN REFERENCE transcript and its
+        // per-segment detail must NOT ship in the bundle SIDECARS (source_transcripts/*.txt,
+        // source_reference_manifest.json, training_grade_details.json, manifest counts) — not just the
+        // tabular dataset files. A non-production bundle exercises the sidecars without the agentic
+        // gates. The holdout is registered by PATH so no audio file needs to exist.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let tmp = TempDir::new().unwrap();
+
+        let mk = |id: &str, path: &str, transcript: &str| SpeechSegment {
+            id: id.into(),
+            created_at: None,
+            audio_path: path.into(),
+            raw_transcript: transcript.into(),
+            normalized_transcript: None,
+            annotated_transcript: None,
+            alignment_json: None,
+            duration_ms: 1200,
+            speaker_id: None,
+            verified: true,
+            confidence: Some(0.95),
+            ctc_score: None,
+            clipping_ratio: Some(0.0),
+            rms_db: Some(-20.0),
+            snr_db: Some(20.0),
+            split: Some("train".into()),
+            ood_score: None,
+            verdict: None,
+            verdict_transcript: None,
+            rationale: None,
+            evidence_json: None,
+            agent_confidence: None,
+            escalated: false,
+            human_decision: None,
+            corrected_at: None,
+            is_gold: false,
+            alignment_quality: None,
+        };
+        db.insert_segment(&mk("keep-seg", "/data/keep.wav", "KEEPMARKERTEXT")).unwrap();
+        db.insert_segment(&mk("hold-seg", "/data/holdout.wav", "HOLDOUTMARKERTEXT")).unwrap();
+        db.upsert_source_transcript(&SourceTranscriptRecord {
+            audio_path: "/data/holdout.wav".to_string(),
+            model_id: "gemini-2.5-pro".to_string(),
+            audio_content_hash: None,
+            audio_size_bytes: None,
+            transcript_path: "source_transcripts/holdout__gemini.txt".to_string(),
+            transcript_text: "HOLDOUTREFERENCETEXT".to_string(),
+            created_at: None,
+        })
+        .unwrap();
+        crate::eval::import_gold_segments(
+            &db,
+            vec![crate::eval::GoldSegmentInput {
+                audio_path: "/data/holdout.wav".into(),
+                reference: "HOLDOUTREFERENCETEXT".into(),
+                is_holdout: true,
+            }],
+        )
+        .unwrap();
+
+        let models = ModelManager::new(tmp.path().join("models"));
+        let out = tmp.path().join("bundle");
+        export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+
+        let mut blob = String::new();
+        for name in [
+            "training_grade_details.json",
+            "source_reference_manifest.json",
+            "manifest.json",
+            "dataset.csv",
+            "dataset.jsonl",
+        ] {
+            blob.push_str(&std::fs::read_to_string(out.join(name)).unwrap_or_default());
+        }
+        if let Ok(rd) = std::fs::read_dir(out.join("source_transcripts")) {
+            for entry in rd.flatten() {
+                blob.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+            }
+        }
+        assert!(blob.contains("KEEPMARKERTEXT"), "the non-holdout segment must still be in the bundle");
+        assert!(!blob.contains("HOLDOUTMARKERTEXT"), "holdout transcript must NOT leak into any bundle artifact");
+        assert!(!blob.contains("HOLDOUTREFERENCETEXT"), "holdout source-reference must NOT leak into the bundle");
     }
 
     #[test]
