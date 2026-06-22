@@ -203,46 +203,7 @@ impl ForcedAligner {
             }
         }
 
-        let mut word_timestamps = Vec::new();
-
-        for (word_idx, &word) in words.iter().enumerate() {
-            let char_indices = &word_char_to_token_idx[word_idx];
-            let mut word_start_frame = usize::MAX;
-            let mut word_end_frame = 0;
-
-            for &opt_idx in char_indices {
-                if let Some(token_idx) = opt_idx {
-                    if token_idx < char_alignments.len() {
-                        let (s, e) = char_alignments[token_idx];
-                        if s < e {
-                            if s < word_start_frame {
-                                word_start_frame = s;
-                            }
-                            if e > word_end_frame {
-                                word_end_frame = e;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let start_time = if word_start_frame != usize::MAX {
-                word_start_frame as f64 * 0.02
-            } else {
-                word_timestamps.last().map(|w: &WordTimestamp| w.end).unwrap_or(0.0)
-            };
-
-            let end_time = if word_end_frame > 0 { word_end_frame as f64 * 0.02 } else { start_time + 0.25 };
-
-            word_timestamps.push(WordTimestamp {
-                word: word.to_string(),
-                start: start_time,
-                end: end_time,
-                confidence: 0.95,
-            });
-        }
-
-        Ok((word_timestamps, AlignmentQuality::CtcForced))
+        Ok(assemble_word_timestamps(&words, &word_char_to_token_idx, &char_alignments, num_frames))
     }
 
     pub fn score_consistency(&self, pcm: &[i16], _sample_rate: u32, text: &str) -> Result<f64, String> {
@@ -420,6 +381,84 @@ fn ctc_align(logits: &[f32], vocab_size: usize, target_tokens: &[usize], blank_i
     }
 
     (path, best_val)
+}
+
+/// Seconds per CTC frame (20 ms stride).
+const FRAME_SEC: f64 = 0.02;
+/// Confidence stamped on a word whose timing was FABRICATED (gap-filled) because it had no in-vocab
+/// characters. Kept STRICTLY below `quality::is_low_confidence`'s per-word cutoff
+/// (`LOW_CONFIDENCE_THRESHOLD * 0.5` = 0.3) so a single fabricated word always trips the flag — never
+/// the 0.95 of a genuinely measured word.
+const FABRICATED_WORD_CONFIDENCE: f64 = 0.25;
+
+/// Assemble per-word timestamps from CTC character alignments, with HONEST clamping and provenance.
+///
+/// `char_alignments[i] = (start_frame, end_frame)` for the i-th target token; each word maps to a
+/// (possibly empty) set of token indices via `word_char_to_token_idx`. A word whose characters are
+/// ALL out-of-vocab (e.g. a Sorani numeral or Latin loanword absent from the MMS token set) contributes
+/// no token, so its timing is GAP-FILLED rather than measured. Round-21 #5: such fabricated timing
+/// used to be stamped past the clip end, non-monotonic, at confidence 0.95, and the whole segment was
+/// returned as `CtcForced`. Here instead:
+///   * every timestamp is clamped to `[prev_end, clip_end]` with `start <= end`, so a fabricated word
+///     can never sit past the clip, invert, or push a later real frame backwards (the word list stays
+///     in-bounds and monotonic);
+///   * a fabricated word is stamped [`FABRICATED_WORD_CONFIDENCE`] so the low-confidence gate flags it;
+///   * if ANY word was fabricated the segment is downgraded to `EnergyHeuristic` — it is not true
+///     forced alignment, and the energy_heuristic-vs-ctc_forced provenance gate must stay honest.
+fn assemble_word_timestamps(
+    words: &[&str],
+    word_char_to_token_idx: &[Vec<Option<usize>>],
+    char_alignments: &[(usize, usize)],
+    num_frames: usize,
+) -> (Vec<WordTimestamp>, AlignmentQuality) {
+    let clip_end = num_frames as f64 * FRAME_SEC;
+    let mut word_timestamps: Vec<WordTimestamp> = Vec::with_capacity(words.len());
+    let mut aligned_words = 0usize;
+
+    for (word_idx, &word) in words.iter().enumerate() {
+        let char_indices = &word_char_to_token_idx[word_idx];
+        let mut word_start_frame = usize::MAX;
+        let mut word_end_frame = 0usize;
+        for &opt_idx in char_indices {
+            if let Some(token_idx) = opt_idx {
+                if token_idx < char_alignments.len() {
+                    let (s, e) = char_alignments[token_idx];
+                    if s < e {
+                        word_start_frame = word_start_frame.min(s);
+                        word_end_frame = word_end_frame.max(e);
+                    }
+                }
+            }
+        }
+
+        let aligned = word_start_frame != usize::MAX && word_end_frame > 0;
+        if aligned {
+            aligned_words += 1;
+        }
+
+        let prev_end = word_timestamps.last().map(|w: &WordTimestamp| w.end).unwrap_or(0.0);
+        let raw_start = if word_start_frame != usize::MAX { word_start_frame as f64 * FRAME_SEC } else { prev_end };
+        let raw_end = if word_end_frame > 0 { word_end_frame as f64 * FRAME_SEC } else { raw_start + 0.25 };
+
+        // Clamp into the clip and keep the interval well-formed. `clip_end.max(prev_end)` only guards
+        // against a degenerate clip (num_frames smaller than an earlier end); normally prev_end<=clip_end.
+        let start_time = raw_start.clamp(prev_end, clip_end.max(prev_end));
+        let end_time = raw_end.clamp(start_time, clip_end.max(start_time));
+
+        word_timestamps.push(WordTimestamp {
+            word: word.to_string(),
+            start: start_time,
+            end: end_time,
+            confidence: if aligned { 0.95 } else { FABRICATED_WORD_CONFIDENCE },
+        });
+    }
+
+    let quality = if !words.is_empty() && aligned_words == words.len() {
+        AlignmentQuality::CtcForced
+    } else {
+        AlignmentQuality::EnergyHeuristic
+    };
+    (word_timestamps, quality)
 }
 
 fn fallback_align(pcm: &[i16], sample_rate: u32, text: &str) -> Vec<WordTimestamp> {
@@ -601,6 +640,47 @@ mod tests {
         let logits = vec![0.1f32, 0.2, 0.3];
         assert_eq!(ctc_align(&logits, 0, &[1], 0), (Vec::new(), f32::NEG_INFINITY));
         assert_eq!(forward_backward_ctc_score(&logits, 0, &[1], 0), -20.0);
+    }
+
+    #[test]
+    fn assemble_timestamps_all_aligned_is_ctc_forced_and_monotonic() {
+        // Two fully in-vocab words → genuine forced alignment: 0.95 confidence, CtcForced, in-bounds.
+        let words = ["aa", "bb"];
+        let map = vec![vec![Some(0usize), Some(1)], vec![Some(2), Some(3)]];
+        let char_alignments = [(0usize, 10usize), (10, 20), (20, 30), (30, 40)];
+        let (ts, quality) = assemble_word_timestamps(&words, &map, &char_alignments, 100);
+        assert_eq!(quality, AlignmentQuality::CtcForced);
+        assert!(ts.iter().all(|w| (w.confidence - 0.95).abs() < 1e-9));
+        assert!(ts.windows(2).all(|p| p[0].end <= p[1].start + 1e-9), "monotonic");
+        assert!(ts.iter().all(|w| w.start <= w.end + 1e-9 && w.end <= 2.0 + 1e-9));
+    }
+
+    #[test]
+    fn assemble_timestamps_oov_word_is_fabricated_low_conf_and_downgrades_quality() {
+        // Round-21 #5: a middle out-of-vocab word (no in-vocab chars) has its timing GAP-FILLED. It must
+        // be stamped low-confidence (< 0.3 so is_low_confidence flags it), stay in-bounds + monotonic,
+        // and the WHOLE segment must downgrade to EnergyHeuristic — not be published as ctc_forced.
+        let words = ["aa", "xx", "bb"];
+        let map = vec![vec![Some(0usize), Some(1)], vec![None, None], vec![Some(2), Some(3)]];
+        let char_alignments = [(0usize, 10usize), (10, 20), (20, 30), (30, 40)];
+        let (ts, quality) = assemble_word_timestamps(&words, &map, &char_alignments, 100);
+        assert_eq!(quality, AlignmentQuality::EnergyHeuristic, "a fabricated word voids true forced alignment");
+        assert!(ts[1].confidence < 0.3, "fabricated word must be flaggable as low-confidence");
+        assert!((ts[0].confidence - 0.95).abs() < 1e-9 && (ts[2].confidence - 0.95).abs() < 1e-9);
+        assert!(ts.windows(2).all(|p| p[0].end <= p[1].start + 1e-9), "monotonic across the fabricated word");
+        assert!(ts.iter().all(|w| w.start <= w.end + 1e-9 && w.end <= 2.0 + 1e-9), "in-bounds");
+    }
+
+    #[test]
+    fn assemble_timestamps_trailing_oov_is_clamped_to_clip_end() {
+        // A trailing OOV word must NOT push its fabricated end (prev_end + 0.25) past the clip end.
+        let words = ["aa", "zz"];
+        let map = vec![vec![Some(0usize), Some(1)], vec![None]];
+        let char_alignments = [(95usize, 98usize), (98, 100)]; // aa ends exactly at the 2.0 s clip end
+        let (ts, quality) = assemble_word_timestamps(&words, &map, &char_alignments, 100);
+        assert_eq!(quality, AlignmentQuality::EnergyHeuristic);
+        assert!(ts[1].end <= 2.0 + 1e-9, "fabricated trailing word clamped to clip end, got {}", ts[1].end);
+        assert!(ts[1].start <= ts[1].end + 1e-9, "interval not inverted");
     }
 
     #[test]
