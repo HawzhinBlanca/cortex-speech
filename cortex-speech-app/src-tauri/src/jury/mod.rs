@@ -422,15 +422,21 @@ pub fn get_escalation_queue(db: &Database, limit: usize) -> AppResult<Vec<Escala
 
 /// Return a time-series of (date, escalation_rate) for the dashboard.
 pub fn get_escalation_rate_trend(db: &Database) -> AppResult<Vec<EscalationTrendPoint>> {
+    // Select the 30 MOST-RECENT activity days (inner DESC + LIMIT), then present them oldest→newest
+    // (outer ASC) for the chart. A plain `ORDER BY day ASC LIMIT 30` keeps the EARLIEST 30 days, so the
+    // trend would freeze on the first month of history once a project runs the jury on >30 days.
     let mut stmt = db.connection().prepare(
-        "SELECT date(updated_at) as day,
-                COUNT(*) as total,
-                SUM(escalated) as esc
-         FROM speech_segments
-         WHERE updated_at IS NOT NULL AND verdict IS NOT NULL
-         GROUP BY day
-         ORDER BY day ASC
-         LIMIT 30",
+        "SELECT day, total, esc FROM (
+             SELECT date(updated_at) as day,
+                    COUNT(*) as total,
+                    SUM(escalated) as esc
+             FROM speech_segments
+             WHERE updated_at IS NOT NULL AND verdict IS NOT NULL
+             GROUP BY day
+             ORDER BY day DESC
+             LIMIT 30
+         )
+         ORDER BY day ASC",
     )?;
     let rows = stmt.query_map([], |row| {
         let total: i64 = row.get(1)?;

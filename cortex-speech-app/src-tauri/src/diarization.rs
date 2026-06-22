@@ -39,6 +39,12 @@ impl SpeakerEmbeddingService {
         }
     }
 
+    /// Whether the high-tier CAM++ embedding model is loaded. Used to pick ONE embedding backend per
+    /// file so 192-dim CAM++ and 161-dim fbank vectors are never mixed within a single clustering pass.
+    pub fn is_available(&self) -> bool {
+        self.manager.is_some()
+    }
+
     pub fn compute_embedding(&self, samples: &[f32], sample_rate: u32) -> Vec<f32> {
         if let Some(ref manager) = self.manager {
             if let Some(stream) = manager.create_stream() {
@@ -79,6 +85,13 @@ pub fn compute_chunk_embeddings(
     embedding_service: &SpeakerEmbeddingService,
 ) -> Vec<Vec<f32>> {
     let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+    // Pick the embedding backend ONCE per file. CAM++ (fixed model dim, e.g. 192) and the fbank
+    // fallback (mean+log_energy+std = 161) emit DIFFERENT-LENGTH vectors; clustering a mix of both made
+    // cosine_similarity return -1.0 on the length mismatch, so every chunk that fell back to fbank was
+    // pushed as a brand-new phantom speaker. When CAM++ is available, use it for EVERY chunk and leave a
+    // chunk it cannot embed as an empty vec (clustering maps empty -> None label); only when CAM++ is
+    // entirely unavailable do we use the fbank backend for the whole file.
+    let fbank = (!embedding_service.is_available()).then(|| FbankExtractor::new(sample_rate));
     chunk_ranges
         .iter()
         .map(|&(start, end)| {
@@ -89,14 +102,12 @@ pub fn compute_chunk_embeddings(
             }
             let chunk = &f32_pcm[start..end];
 
-            // Try high-tier embedding first
-            let emb = embedding_service.compute_embedding(chunk, sample_rate);
-            if !emb.is_empty() {
-                emb
-            } else {
-                // Fallback to acoustic clustering if service is unavailable
-                let fbank = FbankExtractor::new(sample_rate);
-                chunk_embedding(&fbank, chunk)
+            match &fbank {
+                // CAM++ unavailable for the whole file: uniform fbank backend.
+                Some(fbank) => chunk_embedding(fbank, chunk),
+                // CAM++ available: use it for every chunk; an empty result stays empty (None label),
+                // never substituted with a different-dimension fbank vector.
+                None => embedding_service.compute_embedding(chunk, sample_rate),
             }
         })
         .collect()
@@ -155,6 +166,15 @@ fn online_cluster(embeddings: &[Vec<f32>], max_speakers: usize) -> Vec<Option<St
 
     for emb in embeddings {
         if emb.is_empty() {
+            labels.push(None);
+            continue;
+        }
+
+        // Defense-in-depth: never cluster a mismatched-dimension embedding. cosine_similarity returns
+        // -1.0 on a length mismatch, which would force a brand-new phantom speaker for every such chunk.
+        // The per-file backend choice already keeps embeddings uniform; if one ever differs from the
+        // established centroid dimension, leave it unlabeled rather than manufacture a bogus speaker.
+        if centroids.first().is_some_and(|c| c.len() != emb.len()) {
             labels.push(None);
             continue;
         }
@@ -243,6 +263,20 @@ mod tests {
                 (f32::sin(2.0 * std::f32::consts::PI * freq * t) * 16000.0) as i16
             })
             .collect()
+    }
+
+    #[test]
+    fn cluster_embeddings_does_not_spawn_phantom_speaker_for_mismatched_dim() {
+        // Round-13 audit: a mismatched-dimension embedding (a 161-dim fbank chunk mixed in with 192-dim
+        // CAM++ centroids) must NOT manufacture a new speaker — cosine_similarity returns -1.0 on a
+        // length mismatch, which previously forced a phantom SPEAKER_xx per such chunk. It is left None.
+        let a = vec![1.0_f32; 192];
+        let b = vec![1.0_f32; 192]; // same speaker as `a`
+        let odd = vec![1.0_f32; 161]; // a backend-mismatched chunk
+        let labels = cluster_embeddings(&[a, odd, b], 8);
+        assert_eq!(labels[0].as_deref(), Some("SPEAKER_00"));
+        assert_eq!(labels[1], None, "mismatched-dimension chunk must be unlabeled, not a new speaker");
+        assert_eq!(labels[2].as_deref(), Some("SPEAKER_00"), "same-dim same-direction stays one speaker");
     }
 
     #[test]
