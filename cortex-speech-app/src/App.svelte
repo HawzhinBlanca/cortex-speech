@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { get } from 'svelte/store';
   import * as api from './lib/commands';
+  import { createAutosaveController } from './lib/autosave';
   import type {
     AgenticReadiness,
     AgentImportReport,
@@ -118,11 +120,25 @@
   let latestAgentStageEvents = $state<AgentStageEvent[]>([]);
 
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle');
-  let saveTimeout: ReturnType<typeof setTimeout> | null = null;
-  // Fields the user has edited since the last successful save, keyed to the target segment. These are
-  // re-applied onto the freshly re-read row at autosave fire time so the user's edit always wins even
-  // if a background reload (WSL/import/batch completion) replaces the store mid-debounce.
-  let pendingSave: { id: string; fields: Record<string, unknown> } | null = null;
+  // Debounced auto-save lives in a standalone, unit-tested controller (lib/autosave.ts). It keys the
+  // debounce per target segment and FLUSHES a queued edit before re-keying to a different segment, so
+  // switching segments mid-debounce can never silently drop the prior segment's edit. The controller
+  // re-reads the fresh row at fire time and re-applies the user's edited fields, so a concurrent
+  // background reload (WSL/import/batch completion) can't clobber an in-progress keystroke.
+  const autosave = createAutosaveController<SpeechSegment>({
+    targetId: () => get(selectedSegment)?.id ?? null,
+    getRow: (id) => get(segments).find((s) => s.id === id) ?? null,
+    save: (row) => api.updateSegment(row),
+    onState: (s) => {
+      saveState = s;
+      if (s === 'saved') {
+        setTimeout(() => {
+          if (saveState === 'saved') saveState = 'idle';
+        }, 2000);
+      }
+    },
+    onError: (e) => notifications.error($t('notifications.saveFailed'), { detail: String(e) }),
+  });
   let tauriAvailable = $state(false);
   let datasetPromotionStage = $derived.by(
     () =>
@@ -159,48 +175,7 @@
   }
 
   function scheduleAutoSave(edits: Record<string, unknown> = {}) {
-    saveState = 'saving';
-    if (saveTimeout) clearTimeout(saveTimeout);
-    // Capture only the target segment ID now (so selecting a different segment within 1s still saves
-    // the RIGHT one), then re-read the FRESH segment from the store at fire time. Re-reading the fresh
-    // row preserves fields that a concurrent verify/normalize/speaker action changed during the 1s
-    // debounce. But the fresh row alone is NOT enough: a background reload (WSL/import/batch
-    // completion) can replace the entire store mid-debounce with server data that lacks the user's
-    // in-progress keystrokes — persisting that fresh-but-stale row would silently lose the edit and
-    // still flash "Saved". So we ALSO accumulate the user's edited fields here and re-apply them onto
-    // the fresh row at fire time: the user's edit always wins, other fields stay fresh.
-    const id = $selectedSegment?.id;
-    if (!id) {
-      saveState = 'idle';
-      return;
-    }
-    if (!pendingSave || pendingSave.id !== id) {
-      pendingSave = { id, fields: {} };
-    }
-    Object.assign(pendingSave.fields, edits);
-    const pending = pendingSave;
-    saveTimeout = setTimeout(async () => {
-      const fresh = $segments.find((s) => s.id === id);
-      if (!fresh) {
-        saveState = 'idle';
-        if (pendingSave === pending) pendingSave = null;
-        return;
-      }
-      // Merge the user's pending edits onto the freshly re-read row so a concurrent change to OTHER
-      // fields is preserved while the user's in-flight edit is never overwritten by a stale store.
-      const merged = { ...fresh, ...pending.fields };
-      try {
-        await api.updateSegment(merged);
-        if (pendingSave === pending) pendingSave = null;
-        saveState = 'saved';
-        setTimeout(() => {
-          if (saveState === 'saved') saveState = 'idle';
-        }, 2000);
-      } catch (e) {
-        saveState = 'idle';
-        notifications.error($t('notifications.saveFailed'), { detail: String(e) });
-      }
-    }, 1000);
+    autosave.schedule(edits);
   }
 
   function finishEditingWord(index: number, newValue: string) {
@@ -388,7 +363,7 @@
   onDestroy(() => {
     stopEventListeners();
     globalKeyboardManager?.destroy();
-    if (saveTimeout) clearTimeout(saveTimeout);
+    autosave.flush();
   });
 
   function navigateSegment(direction: 'up' | 'down') {
@@ -1289,6 +1264,9 @@
   }
 
   function selectSegment(seg: SpeechSegment) {
+    // Persist any edit queued for the segment we're LEAVING before switching, so its debounced save
+    // is never dropped by the switch (round-16 data-loss fix).
+    autosave.flush();
     selectedSegmentId.set(seg.id);
     wordTimestamps.set(parseWordTimestamps(seg.alignmentJson));
     currentTime = chunkPlaybackRange(parseSourceMeta(seg.alignmentJson)).startTime;
@@ -2030,7 +2008,7 @@
                   id="raw-ts"
                   dir="rtl"
                   lang="ckb"
-                  class="input h-28 resize-none font-mono text-xs text-right"
+                  class="input h-28 resize-none font-mono text-xs text-end"
                   value={$selectedSegment.rawTranscript}
                   readonly
                 ></textarea>
@@ -2041,7 +2019,7 @@
                   id="norm-ts"
                   dir="rtl"
                   lang="ckb"
-                  class="input h-28 resize-none font-mono text-xs text-right"
+                  class="input h-28 resize-none font-mono text-xs text-end"
                   value={$selectedSegment.normalizedTranscript ?? ''}
                   readonly
                 ></textarea>
@@ -2120,7 +2098,7 @@
                             type="text"
                             dir="rtl"
                             lang="ckb"
-                            class="bg-cortex-800 text-white text-xs px-1 border border-cortex-500 rounded outline-none focus:ring-1 focus:ring-cortex-400 w-16 text-right"
+                            class="bg-cortex-800 text-white text-xs px-1 border border-cortex-500 rounded outline-none focus:ring-1 focus:ring-cortex-400 w-16 text-end"
                             value={w.word}
                             onblur={(e) =>
                               finishEditingWord(idx, (e.target as HTMLInputElement).value)}
@@ -2152,7 +2130,7 @@
               <textarea
                 dir="rtl"
                 lang="ckb"
-                class="input h-32 resize-none font-mono text-sm text-right"
+                class="input h-32 resize-none font-mono text-sm text-end"
                 value={$selectedSegment.annotatedTranscript ?? ''}
                 placeholder={$t('editTranscript')}
                 oninput={(e) => {
