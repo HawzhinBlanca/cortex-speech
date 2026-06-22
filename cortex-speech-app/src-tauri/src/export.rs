@@ -466,15 +466,9 @@ pub fn export_huggingface_dataset(
 ) -> AppResult<()> {
     std::fs::create_dir_all(dir)?;
     let data_dir = dir.join("data");
-    std::fs::create_dir_all(&data_dir)?;
-
     let train_dir = data_dir.join("train");
     let val_dir = data_dir.join("validation");
     let test_dir = data_dir.join("test");
-
-    std::fs::create_dir_all(&train_dir)?;
-    std::fs::create_dir_all(&val_dir)?;
-    std::fs::create_dir_all(&test_dir)?;
 
     let segments = db.get_segments(None)?;
     // Exclude held-out gold audio from the TRAINING export — the same content-hash guard the DPO and
@@ -501,8 +495,22 @@ pub fn export_huggingface_dataset(
         })
         .collect();
     if segments.is_empty() {
+        // Nothing to export — a true NO-OP that PRESERVES any prior export rather than wiping it
+        // (re-exporting with zero training-ready segments must not destroy a previous good dataset).
         return Ok(());
     }
+
+    // There IS something to export: clear any prior export's split artifacts before re-writing, so a
+    // re-export into the same directory never leaves orphan WAVs (a segment that no longer exports) or a
+    // stale metadata.csv for a now-empty split — both would be hashed into SHA256SUMS and disagree with
+    // the freshly written metadata.csv / dataset_infos.json (round-12 audit).
+    if data_dir.exists() {
+        std::fs::remove_dir_all(&data_dir)?;
+    }
+    std::fs::create_dir_all(&train_dir)?;
+    std::fs::create_dir_all(&val_dir)?;
+    std::fs::create_dir_all(&test_dir)?;
+
     let ready_agentic_segment_ids = ready_agentic_huggingface_segment_ids(db)?;
     let required_source_reference_models = settings.source_reference_models();
 
@@ -541,10 +549,9 @@ pub fn export_huggingface_dataset(
                          _split_name: &str,
                          dest_dir: &std::path::Path|
      -> AppResult<(usize, f64, usize, Vec<String>)> {
-        if split_segs.is_empty() {
-            return Ok((0, 0.0, 0, Vec::new()));
-        }
-
+        // NOTE: do NOT early-return when split_segs is empty. We still write a HEADER-ONLY metadata.csv
+        // (the per-source loop below simply runs zero times) so an empty split's on-disk metadata agrees
+        // with dataset_infos.json's num_examples=0 — never a stale or missing file after a re-export.
         let csv_path = dest_dir.join("metadata.csv");
         let csv_tmp = csv_path.with_extension("csv.tmp");
         remove_file_on_error(
@@ -2027,6 +2034,71 @@ mod tests {
         assert!(!out_dir.path().join("dataset_infos.json.tmp").exists());
         assert!(!train_dir.join("metadata.csv.tmp").exists());
         assert_no_tmp_exports(&train_dir);
+    }
+
+    #[test]
+    fn hf_reexport_removes_orphan_wav_for_a_dropped_segment() {
+        // Round-12 audit (#5/#6): a re-export must remove the WAV of a segment that no longer exports
+        // (so it isn't left orphaned and hashed into SHA256SUMS with no metadata row), while keeping the
+        // still-exporting segments and a metadata.csv for every split. An EMPTY re-export is a separate
+        // no-op that preserves the prior export, so this scenario keeps one segment exporting.
+        let db_tmp = NamedTempFile::new().unwrap();
+        let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let wav_path = tmp_dir.path().join("clip.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for _ in 0..16000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        for id in ["orphan-seg", "keep-seg"] {
+            let mut seg = sample_segment(id);
+            seg.audio_path = wav_path.to_string_lossy().to_string();
+            db.insert_segment(&seg).unwrap();
+        }
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let settings = crate::settings::AppSettings::default();
+        let data_dir = out_dir.path().join("data");
+
+        let find_wavs = |root: &std::path::Path| -> Vec<std::path::PathBuf> {
+            ["train", "validation", "test"]
+                .iter()
+                .flat_map(|s| std::fs::read_dir(root.join("data").join(s)).ok().into_iter().flatten().flatten())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
+                .collect()
+        };
+
+        // Run 1: both segments export.
+        export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+        assert_eq!(find_wavs(out_dir.path()).len(), 2, "run 1 exports two wavs");
+
+        // One segment no longer exports; re-export into the SAME directory.
+        db.delete_segment("orphan-seg").unwrap();
+        export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+
+        let after = find_wavs(out_dir.path());
+        assert_eq!(after.len(), 1, "only the kept segment's wav remains, got {after:?}");
+        assert!(after[0].to_string_lossy().contains("keep-seg"), "kept wav is keep-seg: {after:?}");
+
+        let sums = std::fs::read_to_string(out_dir.path().join("SHA256SUMS")).unwrap();
+        assert!(!sums.contains("orphan-seg"), "SHA256SUMS must not list the orphan WAV:\n{sums}");
+        assert!(sums.contains("keep-seg"), "SHA256SUMS must list the kept WAV:\n{sums}");
+
+        // Every declared split still has a metadata.csv (header-only for the empty ones).
+        for s in ["train", "validation", "test"] {
+            assert!(data_dir.join(s).join("metadata.csv").exists(), "split {s} must have a metadata.csv");
+        }
     }
 
     fn assert_no_tmp_exports(dir: &std::path::Path) {
