@@ -599,3 +599,46 @@ fn test_gold_eval_real_asr_closes_the_loop() {
     assert!(!hyp.trim().is_empty(), "real OmniASR must produce a non-blank transcript");
     assert!((0.0..=1.0).contains(&result.run.cer), "CER must be a valid rate in [0,1]");
 }
+
+/// M1.2 / M2b A/B spike — does the OmniASR-CTC `language="ckb"` hint change the transcript vs no
+/// hint? Pure self-comparison on real Kurdish audio (NO human reference needed). Resolves the
+/// long-standing `[unverified]` tag on whether the wired hint is actually effective. Gated by env
+/// `CORTEX_CKB_AB_CLIP` pointing at a wav:
+///   CORTEX_CKB_AB_CLIP=<clip.wav> cargo test --test real_audio ckb_language_hint_ab -- --ignored --nocapture
+#[test]
+#[ignore]
+fn ckb_language_hint_ab() {
+    use cortex_speech_app_lib::asr::{AsrLoadConfig, KurdishAsrService};
+    use cortex_speech_app_lib::audio;
+
+    let clip = match std::env::var("CORTEX_CKB_AB_CLIP") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("CORTEX_CKB_AB_CLIP not set; skipping ckb A/B spike");
+            return;
+        }
+    };
+    let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+    let (sr, pcm) = audio::decode_to_pcm(std::path::Path::new(&clip)).expect("decode A/B clip");
+    let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+
+    let transcribe_with = |lang: &str| -> String {
+        let cfg = AsrLoadConfig { language: lang.to_string(), enable_gpu: false, ..Default::default() };
+        let mut asr = KurdishAsrService::new_with_config(&model_dir, &cfg).expect("asr init");
+        assert!(asr.is_available(), "ASR must be available (real model present)");
+        asr.transcribe(&f32_pcm, sr).expect("transcribe").0
+    };
+
+    let t_ckb = transcribe_with("ckb");
+    let t_none = transcribe_with("");
+
+    eprintln!("[ckb-ab] hint='ckb' -> {t_ckb}");
+    eprintln!("[ckb-ab] hint=''    -> {t_none}");
+    if t_ckb == t_none {
+        eprintln!(
+            "[ckb-ab] FINDING: the ckb language hint is a NO-OP for OmniASR-CTC on this clip (identical output)."
+        );
+    } else {
+        eprintln!("[ckb-ab] FINDING: the ckb language hint CHANGES output (effective on this clip).");
+    }
+}
