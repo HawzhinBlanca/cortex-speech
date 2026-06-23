@@ -463,12 +463,157 @@ where
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Label-quality lift (M3.1)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Measured raw-ASR vs post-jury label-quality lift (blueprint M3.1). Over segments that carry a
+/// ground-truth reference, a raw ASR hypothesis, and a post-jury verdict, this reports the micro
+/// CER of each and the CER reduction (`cer_lift = raw - jury`; positive means the jury improved
+/// labels), with a seeded paired bootstrap 95% CI on the per-replicate micro-CER lift.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelQualityLift {
+    pub n: usize,
+    pub raw_micro_cer: f64,
+    pub jury_micro_cer: f64,
+    pub cer_lift: f64,
+    pub lift_ci_low: f64,
+    pub lift_ci_high: f64,
+}
+
+/// Compute the label-quality lift over `(reference, raw_hyp, jury_hyp)` triples. CER flows through
+/// the same normalized char-edit-distance path as the scorecard. The paired bootstrap resamples
+/// whole segments (seeded xorshift64, deterministic) so the CI reflects sampling variability and
+/// the raw/jury micro-CERs are resampled together (paired).
+pub fn compute_label_quality_lift(
+    triples: &[(String, String, String)],
+    bootstrap_samples: usize,
+    seed: u64,
+) -> LabelQualityLift {
+    let n = triples.len();
+    // (ref_char_len, raw_char_dist, jury_char_dist) per segment — ref_len is shared (same reference).
+    let per: Vec<(usize, usize, usize)> = triples
+        .iter()
+        .map(|(reference, raw, jury)| {
+            let dr = char_edit_distance(reference, raw);
+            let dj = char_edit_distance(reference, jury);
+            (dr.ref_len, dr.distance, dj.distance)
+        })
+        .collect();
+
+    let micro = |indices: &[usize]| -> (f64, f64) {
+        let mut ref_chars = 0usize;
+        let mut raw_d = 0usize;
+        let mut jury_d = 0usize;
+        for &i in indices {
+            let (rl, rd, jd) = per[i];
+            ref_chars += rl;
+            raw_d += rd;
+            jury_d += jd;
+        }
+        if ref_chars == 0 {
+            (0.0, 0.0)
+        } else {
+            (raw_d as f64 / ref_chars as f64, jury_d as f64 / ref_chars as f64)
+        }
+    };
+
+    let all: Vec<usize> = (0..n).collect();
+    let (raw_micro_cer, jury_micro_cer) = micro(&all);
+    let cer_lift = raw_micro_cer - jury_micro_cer;
+
+    let mut lifts: Vec<f64> = Vec::with_capacity(bootstrap_samples);
+    if n > 0 && bootstrap_samples > 0 {
+        let mut state = seed | 1; // xorshift64 state must be non-zero
+        for _ in 0..bootstrap_samples {
+            let sample: Vec<usize> = (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state % n as u64) as usize
+                })
+                .collect();
+            let (rc, jc) = micro(&sample);
+            lifts.push(rc - jc);
+        }
+        lifts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    let percentile = |p: f64| -> f64 {
+        if lifts.is_empty() {
+            return cer_lift;
+        }
+        let idx = ((p * (lifts.len() as f64 - 1.0)).round() as usize).min(lifts.len() - 1);
+        lifts[idx]
+    };
+
+    LabelQualityLift {
+        n,
+        raw_micro_cer,
+        jury_micro_cer,
+        cer_lift,
+        lift_ci_low: percentile(0.025),
+        lift_ci_high: percentile(0.975),
+    }
+}
+
+/// Load `(reference, raw, jury)` triples for the label-quality lift from human-verified segments:
+/// the human's correction (`annotated_transcript`) is the ground-truth reference, `raw_transcript`
+/// is the raw ASR hypothesis, and `verdict_transcript` is the post-jury label. Only segments that
+/// carry all three (non-empty) are included — a real measured lift needs ground truth + both hyps.
+pub fn load_lift_triples(db: &Database) -> AppResult<Vec<(String, String, String)>> {
+    let conn = db.connection();
+    let mut stmt = conn.prepare(
+        // Require human_decision so the reference is HUMAN-confirmed ground truth, not just an
+        // LLM-refined annotated_transcript (commands.rs notes annotated can be human OR LLM).
+        "SELECT annotated_transcript, raw_transcript, verdict_transcript \
+         FROM speech_segments \
+         WHERE human_decision IS NOT NULL AND TRIM(human_decision) <> '' \
+           AND annotated_transcript IS NOT NULL AND TRIM(annotated_transcript) <> '' \
+           AND verdict_transcript IS NOT NULL AND TRIM(verdict_transcript) <> '' \
+           AND raw_transcript IS NOT NULL AND TRIM(raw_transcript) <> ''",
+    )?;
+    let rows =
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_quality_lift_rewards_jury_corrections() {
+        // Raw ASR is wrong; the jury restores the reference -> positive lift, jury CER 0.
+        let triples = vec![
+            ("hello world".to_string(), "hello word".to_string(), "hello world".to_string()),
+            ("good morning".to_string(), "good mrning".to_string(), "good morning".to_string()),
+        ];
+        let lift = compute_label_quality_lift(&triples, 200, 42);
+        assert_eq!(lift.n, 2);
+        assert!(lift.raw_micro_cer > 0.0, "raw should have errors: {}", lift.raw_micro_cer);
+        assert!(lift.jury_micro_cer.abs() < 1e-9, "jury matches reference: {}", lift.jury_micro_cer);
+        assert!(lift.cer_lift > 0.0, "jury improved labels: lift={}", lift.cer_lift);
+        assert!(lift.lift_ci_low <= lift.lift_ci_high, "CI bounds ordered");
+    }
+
+    #[test]
+    fn label_quality_lift_zero_when_jury_no_better() {
+        let triples = vec![("hello world".to_string(), "hello word".to_string(), "hello word".to_string())];
+        let lift = compute_label_quality_lift(&triples, 50, 1);
+        assert!(lift.cer_lift.abs() < 1e-9, "no improvement -> ~0 lift: {}", lift.cer_lift);
+    }
+
+    #[test]
+    fn label_quality_lift_empty_is_zero() {
+        let lift = compute_label_quality_lift(&[], 100, 7);
+        assert_eq!(lift.n, 0);
+        assert_eq!(lift.cer_lift, 0.0);
+    }
 
     fn open_mem_db() -> Database {
         let db = Database::open(":memory:").unwrap();

@@ -7,10 +7,11 @@
    */
   import { onMount } from 'svelte';
   import * as api from './commands';
-  import type { EvalRun, EscalationTrendPoint } from './types';
+  import type { EvalRun, EscalationTrendPoint, LabelQualityLift } from './types';
 
   let evalRuns: EvalRun[] = [];
   let trend: EscalationTrendPoint[] = [];
+  let lift: LabelQualityLift | null = null;
   let loading = true;
   let error = '';
 
@@ -18,7 +19,11 @@
 
   onMount(async () => {
     try {
-      [evalRuns, trend] = await Promise.all([api.listEvalRuns(), api.getEscalationRateTrend()]);
+      [evalRuns, trend, lift] = await Promise.all([
+        api.listEvalRuns(),
+        api.getEscalationRateTrend(),
+        api.getLabelQualityLift(),
+      ]);
     } catch (e) {
       error = `Failed to load refinery data: ${e}`;
     } finally {
@@ -38,9 +43,31 @@
     <!-- Label-quality lift (pending M3.1 backend) -->
     <div class="card" data-testid="refinery-lift">
       <h3 class="card-title">Label-quality lift (raw ASR → post-jury)</h3>
-      <p class="muted">
-        Pending M3.1: a measured raw-vs-jury CER delta with a bootstrap CI on the difference.
-      </p>
+      {#if lift && lift.n > 0}
+        <div class="lift-grid">
+          <div class="lift-cell">
+            <span class="lift-label">Raw ASR CER</span>
+            <span class="lift-val">{pct(lift.rawMicroCer)}</span>
+          </div>
+          <div class="lift-cell">
+            <span class="lift-label">Post-jury CER</span>
+            <span class="lift-val">{pct(lift.juryMicroCer)}</span>
+          </div>
+          <div class="lift-cell">
+            <span class="lift-label">CER lift</span>
+            <span class="lift-val" class:lift-pos={lift.cerLift > 0} class:lift-neg={lift.cerLift < 0}>
+              {pct(lift.cerLift)}
+            </span>
+          </div>
+        </div>
+        <p class="muted">
+          n={lift.n} verified segments · 95% CI [{pct(lift.liftCiLow)}, {pct(lift.liftCiHigh)}]
+        </p>
+      {:else}
+        <p class="muted">
+          No measured lift yet — needs human-verified segments that also carry a jury verdict.
+        </p>
+      {/if}
     </div>
 
     <!-- Eval-run history -->
@@ -119,6 +146,29 @@
   .error {
     color: var(--error, #c0392b);
     font-size: 0.85rem;
+  }
+  .lift-grid {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 6px;
+  }
+  .lift-cell {
+    display: flex;
+    flex-direction: column;
+  }
+  .lift-label {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+  }
+  .lift-val {
+    font-size: 1rem;
+    font-weight: 600;
+  }
+  .lift-pos {
+    color: var(--success, #2e7d32);
+  }
+  .lift-neg {
+    color: var(--error, #c0392b);
   }
   .metrics-table {
     width: 100%;

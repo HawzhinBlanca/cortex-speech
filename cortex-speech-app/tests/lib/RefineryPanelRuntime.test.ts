@@ -24,6 +24,9 @@ describe('RefineryPanel browser runtime', () => {
       if (cmd === 'get_escalation_rate_trend') {
         return [{ date: '2026-06-23', escalationRate: 0.25, total: 8, escalated: 2 }];
       }
+      if (cmd === 'get_label_quality_lift') {
+        return { n: 5, rawMicroCer: 0.2, juryMicroCer: 0.08, cerLift: 0.12, liftCiLow: 0.09, liftCiHigh: 0.15 };
+      }
       return [];
     });
 
@@ -38,6 +41,12 @@ describe('RefineryPanel browser runtime', () => {
     expect(screen.getByText('10.0%')).toBeInTheDocument(); // WER
     expect(screen.getByText('5.0%')).toBeInTheDocument(); // CER
     expect(screen.getByText('25.0% (2/8)')).toBeInTheDocument(); // escalation rate
+
+    // measured label-quality lift (M3.1)
+    expect(screen.getByTestId('refinery-lift')).toBeInTheDocument();
+    expect(screen.getByText('20.0%')).toBeInTheDocument(); // raw ASR CER
+    expect(screen.getByText('8.0%')).toBeInTheDocument(); // post-jury CER
+    expect(screen.getByText('12.0%')).toBeInTheDocument(); // CER lift
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('list_eval_runs');

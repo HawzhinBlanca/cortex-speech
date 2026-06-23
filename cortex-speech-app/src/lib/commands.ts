@@ -750,6 +750,7 @@ import type {
   EvalRun,
   EvalRunResult,
   EscalationTrendPoint,
+  LabelQualityLift,
   FewShotExample,
   T0GateReport,
 } from './types';
@@ -769,6 +770,10 @@ export async function runGoldEval(
 
 export async function listEvalRuns(): Promise<EvalRun[]> {
   return invoke<EvalRun[]>('list_eval_runs');
+}
+
+export async function getLabelQualityLift(): Promise<LabelQualityLift> {
+  return invoke<LabelQualityLift>('get_label_quality_lift');
 }
 
 export async function listGoldSegments(): Promise<GoldSegment[]> {
