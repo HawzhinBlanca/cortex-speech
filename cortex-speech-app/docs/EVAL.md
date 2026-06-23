@@ -29,6 +29,26 @@
 This is, as far as we know, the **first per-gender / per-age Sorani CER breakdown**. Read the
 small-N cells (female, teens, forties) as directional, not conclusive.
 
+## ⭐ Key finding: most of the error is *script*, not recognition (N=200)
+
+Splitting a separate N=200 run by the **script the model actually emitted**:
+
+| Output script | Share of clips | micro CER |
+|---|:--:|:--:|
+| **Kurdish (Arabic block)** | **78%** | **19.71%** |
+| Latin (romanized) | 21% | 94.50% |
+| empty | <1% | 100% |
+
+When the model writes Kurdish script — the large majority of clips — CER is **~20%**, far better than
+the ~30% aggregate. Nearly all of the remaining error comes from the **21% of clips it romanizes to
+Latin**, which score ~94% against Arabic-script references *even though the romanization is usually the
+correct content* (`axékihalkesa` ≈ `ئاخێکی هەڵکێشا`).
+
+**Implication — this reframes the roadmap:** the headline accuracy gap is mostly a **script-locking
+problem, not a recognition problem.** Forcing Kurdish-script output (or transliterating the romanized
+minority back to Arabic) should pull aggregate CER from ~30% toward the ~20% floor — a cheap fix
+relative to a full fine-tune. **Script-locking first, fine-tune second.**
+
 ## Dataset
 
 - **Source:** "A Comprehensive Central Kurdish Sound Dataset for Robust Speech-to-Text Transformation"
@@ -70,10 +90,11 @@ python scripts/scorecard_stats.py <results.tsv> 3000
 
 ## What this tells us about the roadmap
 
-Data is no longer the blocker — the corpus exists and works. The two real levers now: (1) **language/
-script locking** (make `ckb` conditioning effective, or fine-tune — this alone should collapse the WER
-gap), and (2) **scale to ≥900 + IAA + a SeamlessM4T-v2 baseline** for a publishable, significance-tested
-leaderboard entry. 29.4% CER is the honest starting line.
+Data is no longer the blocker — the corpus exists and works. The script split above quantifies the #1
+lever: **script-locking takes aggregate CER from ~30% toward the ~20% Kurdish-script floor** with no
+re-training (force Arabic-script output, or transliterate the romanized 21%). After that: (2) scale to
+≥900 + IAA + a SeamlessM4T-v2 baseline for a publishable, significance-tested leaderboard entry, and
+(3) fine-tune to close the remaining ~20% → ~8% gap to SOTA. 29.4% CER is the honest starting line.
 
 ## Example transcriptions (ref → hyp)
 
