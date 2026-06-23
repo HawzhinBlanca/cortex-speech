@@ -240,7 +240,6 @@
             <span class="text-sm text-muted w-32">{$t('language')}</span>
             <select class="input flex-1" bind:value={localSettings.language}>
               <option value="ckb">{$t('kurdish')}</option>
-              <option value="kmr">Kurmanji</option>
             </select>
           </label>
           <label class="flex items-center gap-3 cursor-pointer">
