@@ -672,7 +672,7 @@ fn ckb_scorecard_on_gold() {
 
     let text = std::fs::read_to_string(&manifest).expect("read gold manifest");
     let (mut t_cd, mut t_crl, mut t_wd, mut t_wrl, mut n) = (0usize, 0usize, 0usize, 0usize, 0usize);
-    let mut rows = String::from("gender\tage\tchar_dist\tchar_ref_len\tword_dist\tword_ref_len\n");
+    let mut rows = String::from("gender\tage\tscript\tchar_dist\tchar_ref_len\tword_dist\tword_ref_len\n");
     for (i, line) in text.lines().enumerate() {
         // manifest: <wav_path>\t<reference>[\t<gender>[\t<age>]]
         let cols: Vec<&str> = line.split('\t').collect();
@@ -691,6 +691,17 @@ fn ckb_scorecard_on_gold() {
         };
         let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
         let hyp = asr.transcribe(&f32_pcm, sr).map(|t| t.0).unwrap_or_default();
+        // Classify the hypothesis's dominant script: does the model output Kurdish (Arabic block) or
+        // romanize to Latin? This isolates "recognition quality" from "wrong script" in the CER.
+        let arab = hyp.chars().filter(|c| ('\u{0600}'..='\u{06FF}').contains(c)).count();
+        let latin = hyp.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        let script = if hyp.trim().is_empty() {
+            "empty"
+        } else if arab >= latin {
+            "arab"
+        } else {
+            "latin"
+        };
         let cd = wer::char_edit_distance(reference, &hyp);
         let wd = wer::word_edit_distance(reference, &hyp);
         t_cd += cd.distance;
@@ -698,7 +709,10 @@ fn ckb_scorecard_on_gold() {
         t_wd += wd.distance;
         t_wrl += wd.ref_len;
         n += 1;
-        rows.push_str(&format!("{gender}\t{age}\t{}\t{}\t{}\t{}\n", cd.distance, cd.ref_len, wd.distance, wd.ref_len));
+        rows.push_str(&format!(
+            "{gender}\t{age}\t{script}\t{}\t{}\t{}\t{}\n",
+            cd.distance, cd.ref_len, wd.distance, wd.ref_len
+        ));
         if i < 5 {
             eprintln!("[gold] ref={reference} | hyp={hyp}");
         }
