@@ -15,7 +15,8 @@ import random
 import sys
 from collections import defaultdict
 
-CHAR_DIST, CHAR_REF, WORD_DIST, WORD_REF = 2, 3, 4, 5
+# results columns: gender, age, script, char_dist, char_ref_len, word_dist, word_ref_len
+CHAR_DIST, CHAR_REF, WORD_DIST, WORD_REF = 3, 4, 5, 6
 
 
 def micro(rows, dist_idx, ref_idx):
@@ -47,9 +48,9 @@ def main():
         reader = csv.reader(f, delimiter="\t")
         next(reader, None)  # header
         for row in reader:
-            if len(row) < 6:
+            if len(row) < 7:
                 continue
-            rows.append((row[0], row[1], int(row[2]), int(row[3]), int(row[4]), int(row[5])))
+            rows.append((row[0], row[1], row[2], int(row[3]), int(row[4]), int(row[5]), int(row[6])))
 
     n = len(rows)
     cer = micro(rows, CHAR_DIST, CHAR_REF)
@@ -72,6 +73,14 @@ def main():
     if len(cers) >= 2:
         disparity = max(cers.values()) - min(cers.values())
         print(f"  -> max-min gender CER disparity: {disparity * 100:.2f} pts")
+
+    by_s = defaultdict(list)
+    for r in rows:
+        by_s[r[2] or "(unknown)"].append(r)
+    print("\nOutput-script split (does the model emit Kurdish vs romanize to Latin?):")
+    for s, rs in sorted(by_s.items(), key=lambda x: -len(x[1])):
+        frac = 100.0 * len(rs) / n
+        print(f"  {s:<8} N={len(rs):<5} ({frac:.0f}% of clips)  CER={micro(rs, CHAR_DIST, CHAR_REF) * 100:.2f}%")
 
     by_a = defaultdict(list)
     for r in rows:
