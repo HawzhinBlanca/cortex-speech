@@ -51,8 +51,9 @@
 | 2026-06-23 | jiwer fixture (self-referential, not external jiwer) | PASS | workspace HEAD | `cargo test --lib jiwer_fixture_matches_reference_values` |
 | 2026-06-23 | FTS determinism | PASS | workspace HEAD | `cargo test --lib search_segments_tie_order_is_deterministic_by_id` |
 | 2026-06-23 | eval runtime round-trip | PASS | workspace HEAD | `cargo test --lib run_gold_eval` |
-| **2026-06-24** | **ckb micro CER (primary)** | **34.5%** | OmniASR-CTC-300M stock / "Comprehensive Central Kurdish Sound Dataset" N=40 | `CORTEX_GOLD_MANIFEST=<m> cargo test --test real_audio ckb_scorecard_on_gold -- --ignored` |
-| **2026-06-24** | **ckb micro WER (secondary)** | **79.4%** | same (N=40) | same — see `cortex-speech-app/docs/EVAL.md` |
+| **2026-06-24** | **ckb micro CER (primary)** | **29.40% (95% CI 26.3–32.5)** | OmniASR-CTC-300M stock / "Comprehensive Central Kurdish Sound Dataset", N=400 (seed=42) | `cargo test --test real_audio ckb_scorecard_on_gold` → `python scripts/scorecard_stats.py results.tsv 3000` |
+| **2026-06-24** | **ckb micro WER (secondary)** | **67.62%** | same (N=400) | see `cortex-speech-app/docs/EVAL.md` |
+| **2026-06-24** | **fairness: gender CER disparity** | **4.29 pts** (M 29.66% / F 25.37%) | same, N=375/25 | first per-gender Sorani CER slice; `docs/EVAL.md` |
 
 ---
 
