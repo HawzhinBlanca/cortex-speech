@@ -245,6 +245,27 @@ fn verify_extracted_against_pin(filename: &str, computed: &str, pinned: &str) ->
     Ok(())
 }
 
+/// Runtime integrity check for a model file already on disk. Unlike `verify_sha256` (the
+/// download path, which DELETES a mismatched file), this is NON-destructive: a tampered or
+/// wrong-version model at load time must be refused, not silently removed. The expected digest
+/// is the pinned `MODELS[].sha256` for `pin_filename`; an empty pin means "not pinned" and is a
+/// no-op (campp/denoiser/wavlm_ood are unpinned today). Returns Err with both digests on
+/// mismatch so a swapped/corrupted `.onnx` is rejected at load (charter M2.3: "a tampered ONNX
+/// fails the runtime manifest check").
+pub fn verify_model_path_runtime(path: &Path, pin_filename: &str) -> Result<(), String> {
+    let pinned = MODELS.iter().find(|m| m.filename == pin_filename).map(|m| m.sha256).unwrap_or("");
+    if pinned.is_empty() {
+        return Ok(()); // not pinned -> cannot verify, do not block load
+    }
+    let actual = compute_file_sha256(path)?;
+    if actual != pinned {
+        return Err(format!(
+            "Model integrity check FAILED for {pin_filename}: expected SHA256 {pinned}, got {actual} (tampered or wrong version) - refusing to load"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ModelMeta {
     pub filename: String,
@@ -989,6 +1010,40 @@ mod tests {
     use std::cell::Cell;
     use std::fs::File;
     use std::io;
+
+    #[test]
+    fn runtime_integrity_rejects_tampered_model() {
+        // A file under a PINNED model filename whose content does not match the pin is rejected
+        // at runtime (charter M2.3: a tampered ONNX fails the runtime manifest check).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("tampered.onnx");
+        std::fs::write(&path, b"this is not the real model").unwrap();
+        let result = verify_model_path_runtime(&path, OMNIASR_CTC_300M_MODEL);
+        assert!(result.is_err(), "a tampered model must be rejected, got {result:?}");
+        assert!(result.unwrap_err().contains("integrity check FAILED"));
+    }
+
+    #[test]
+    fn runtime_integrity_noop_for_unpinned_model() {
+        // CAM++ has an empty pin today -> verification is a documented no-op (cannot verify).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("whatever.onnx");
+        std::fs::write(&path, b"unpinned content").unwrap();
+        assert!(verify_model_path_runtime(&path, CAMPP_MODEL).is_ok());
+    }
+
+    #[test]
+    fn runtime_integrity_accepts_real_300m_model_when_present() {
+        // Positive proof on a machine where the real model is downloaded; skipped in CI.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("models").join(OMNIASR_CTC_300M_MODEL);
+        if !path.exists() {
+            return;
+        }
+        assert!(
+            verify_model_path_runtime(&path, OMNIASR_CTC_300M_MODEL).is_ok(),
+            "the real on-disk 300M model must pass its pinned integrity check"
+        );
+    }
 
     #[test]
     fn omniasr_download_refuses_unpinned_archive_before_side_effects() {
