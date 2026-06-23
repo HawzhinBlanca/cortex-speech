@@ -4,7 +4,7 @@
 
 > **Reading guide — the body below is a historical snapshot.** Everything from "Executive summary" onward is the **original migration design & investigation (2026-05-30)**, kept for history. Where it says "what runs today is Whisper Sorani," "OmniASR is not wired," or "`sherpa-onnx` is not in `Cargo.toml`," that describes the **pre-migration** state and is **no longer true** — the five-step plan has since been carried out.
 
-> **Remaining gap (roadmap M2b).** `settings.language = "ckb"` is still **not passed** into the sherpa OmniASR config — `asr.rs` sets no language/locale field. Wiring the Central Kurdish hint (and confirming whether it changes output) is the only unfinished part of this migration.
+> **Remaining gap (roadmap M2b) — UPDATED 2026-06-23.** `settings.language = "ckb"` **IS** now passed into the sherpa OmniASR stream — see `asr.rs:425-427` (`stream.set_option("language", &self.language)`). The earlier "not passed" claim is **stale/false**. What remains unfinished: `set_option` is a generic FFI passthrough, so **whether OmniASR-CTC actually consumes the hint is [unverified]** — it needs an A/B spike (≥10 ckb clips, with vs without the hint, measured CER delta). See `docs/BLUEPRINT_9_5.md` M1.2.
 
 ---
 
