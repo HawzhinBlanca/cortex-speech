@@ -666,11 +666,22 @@ fn ckb_scorecard_on_gold() {
     let mut asr = KurdishAsrService::new_with_config(&model_dir, &cfg).expect("asr init");
     assert!(asr.is_available(), "ASR must be available (real model present)");
 
+    // Optional per-clip results file (gender, age, edit-distance counts) for post-hoc bootstrap CI
+    // and per-group fairness — computed without re-running the (slow) ASR.
+    let results_path = std::env::var("CORTEX_GOLD_RESULTS").ok();
+
     let text = std::fs::read_to_string(&manifest).expect("read gold manifest");
     let (mut t_cd, mut t_crl, mut t_wd, mut t_wrl, mut n) = (0usize, 0usize, 0usize, 0usize, 0usize);
-    for line in text.lines() {
-        let mut parts = line.splitn(2, '\t');
-        let (Some(path), Some(reference)) = (parts.next(), parts.next()) else { continue };
+    let mut rows = String::from("gender\tage\tchar_dist\tchar_ref_len\tword_dist\tword_ref_len\n");
+    for (i, line) in text.lines().enumerate() {
+        // manifest: <wav_path>\t<reference>[\t<gender>[\t<age>]]
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 {
+            continue;
+        }
+        let (path, reference) = (cols[0], cols[1]);
+        let gender = cols.get(2).copied().unwrap_or("");
+        let age = cols.get(3).copied().unwrap_or("");
         let (sr, pcm) = match audio::decode_to_pcm(std::path::Path::new(path)) {
             Ok(x) => x,
             Err(e) => {
@@ -687,9 +698,16 @@ fn ckb_scorecard_on_gold() {
         t_wd += wd.distance;
         t_wrl += wd.ref_len;
         n += 1;
-        eprintln!("[gold] ref={reference} | hyp={hyp}");
+        rows.push_str(&format!("{gender}\t{age}\t{}\t{}\t{}\t{}\n", cd.distance, cd.ref_len, wd.distance, wd.ref_len));
+        if i < 5 {
+            eprintln!("[gold] ref={reference} | hyp={hyp}");
+        }
     }
     let micro_cer = t_cd as f64 / t_crl.max(1) as f64;
     let micro_wer = t_wd as f64 / t_wrl.max(1) as f64;
+    if let Some(rp) = results_path {
+        std::fs::write(&rp, rows).expect("write per-clip results");
+        eprintln!("[gold] per-clip results -> {rp}");
+    }
     eprintln!("[scorecard] N={n} micro_CER={micro_cer:.4} micro_WER={micro_wer:.4} (ckb, OmniASR-CTC-300M)");
 }
