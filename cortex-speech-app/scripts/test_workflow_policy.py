@@ -2,7 +2,10 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
+# GitHub Actions runs the workflows at the GIT ROOT (one level above cortex-speech-app/), not the
+# app subdir. The cortex-speech-app/.github duplicate was removed as dead config, so this policy
+# validates the live root workflows that CI actually executes.
+WORKFLOWS_DIR = REPO_ROOT.parent / ".github" / "workflows"
 CARGO_DENY_VERSION = "0.19.8"
 CLEAN_RELEASE_GATE_COMMANDS = [
     "npm ci",
@@ -38,7 +41,7 @@ def test_workflow_yaml_is_ascii() -> None:
     for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
         for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if any(ord(char) > 127 for char in line):
-                offenders.append(f"{path.relative_to(REPO_ROOT)}:{line_no}:{ascii(line)}")
+                offenders.append(f"{path.name}:{line_no}:{ascii(line)}")
     if offenders:
         raise AssertionError("Workflow YAML must stay ASCII-clean:\n" + "\n".join(offenders))
 
