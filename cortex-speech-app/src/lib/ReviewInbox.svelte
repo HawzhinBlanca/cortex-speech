@@ -12,6 +12,7 @@
 
   import { onMount, onDestroy, tick } from 'svelte';
   import * as api from './commands';
+  import AudioPlayer from './AudioPlayer.svelte';
   import type { SpeechSegment } from './types';
 
   // ── Props ───────────────────────────────────────────────────────────────────
@@ -27,6 +28,8 @@
   let statusMsg = '';
   let history: { id: string; decision: string; prev: SpeechSegment }[] = [];
   let autonomyLevel: 'observe' | 'propose' | 'act_confirm' | 'act_auto' = 'propose';
+  // Persisted jury autonomy (mirrors Settings). Seeded on mount, written on dial change.
+  let appSettings: Awaited<ReturnType<typeof api.getSettings>> | null = null;
   // Guard against double-submission from rapid key presses.
   let isSubmitting = false;
 
@@ -76,6 +79,27 @@
       statusMsg = `Failed to load queue: ${e}`;
     } finally {
       isLoading = false;
+    }
+  }
+
+  // ── Autonomy dial: real settings round-trip (not a cosmetic local toggle) ──────
+  async function loadAutonomy() {
+    try {
+      appSettings = await api.getSettings();
+      autonomyLevel = appSettings.juryAutonomyLevel;
+    } catch (e) {
+      statusMsg = `Failed to load settings: ${e}`;
+    }
+  }
+
+  async function setAutonomy(val: typeof autonomyLevel) {
+    autonomyLevel = val;
+    if (!appSettings) return;
+    appSettings = { ...appSettings, juryAutonomyLevel: val };
+    try {
+      await api.updateSettings(appSettings);
+    } catch (e) {
+      statusMsg = `Failed to save autonomy level: ${e}`;
     }
   }
 
@@ -309,6 +333,7 @@
 
   onMount(() => {
     loadQueue();
+    loadAutonomy();
     window.addEventListener('keydown', handleKey);
   });
 
@@ -349,7 +374,7 @@
         <button
           class="dial-btn"
           class:active={autonomyLevel === val}
-          onclick={() => (autonomyLevel = val as typeof autonomyLevel)}
+          onclick={() => setAutonomy(val as typeof autonomyLevel)}
           title={val}>{label}</button
         >
       {/each}
@@ -416,11 +441,15 @@
             {/if}
           </div>
 
-          <!-- Waveform placeholder (LTR always) -->
-          <div class="waveform-zone" dir="ltr" aria-label="Audio waveform">
-            <div class="waveform-stub">
-              🔊 <bdi>{current.audioPath?.split(/[\\/]/).pop() ?? 'audio'}</bdi>
-            </div>
+          <!-- Bounded clip playback so the reviewer can HEAR the segment before deciding -->
+          <div class="audio-zone" dir="ltr" aria-label="Segment audio player">
+            {#if current.audioPath}
+              {#key current.id}
+                <AudioPlayer audioPath={current.audioPath} autoplay={false} />
+              {/key}
+            {:else}
+              <div class="waveform-stub">🔊 <bdi>no audio</bdi></div>
+            {/if}
           </div>
 
           <!-- Hypotheses section (RTL for Kurdish text) -->
@@ -767,7 +796,7 @@
   }
 
   /* ── Waveform zone ───────────────────────────────────────────────────────────── */
-  .waveform-zone {
+  .audio-zone {
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: 8px;
