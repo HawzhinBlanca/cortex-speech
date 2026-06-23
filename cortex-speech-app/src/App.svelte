@@ -59,6 +59,7 @@
   import Toast from './lib/Toast.svelte';
   import SettingsPanel from './lib/SettingsPanel.svelte';
   import StatsDashboard from './lib/StatsDashboard.svelte';
+  import RefineryPanel from './lib/RefineryPanel.svelte';
   import AgentReportPanel from './lib/AgentReportPanel.svelte';
   import SearchBar from './lib/SearchBar.svelte';
   import VirtualList from './lib/VirtualList.svelte';
@@ -1929,6 +1930,7 @@
       >
         {#if viewMode === 'insights'}
           <StatsDashboard />
+          <RefineryPanel />
         {:else if viewMode === 'review'}
           <ReviewMode />
         {:else if $selectedSegment}
