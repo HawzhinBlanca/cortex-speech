@@ -43,7 +43,7 @@
   }
 </script>
 
-<div bind:this={container} class="overflow-y-auto h-full" onscroll={handleScroll} role="list">
+<div bind:this={container} class="overflow-y-auto h-full" onscroll={handleScroll} role="group">
   <div style="height: {totalHeight}px; position: relative;">
     <div style="position: absolute; top: 0; left: 0; right: 0; transform: translateY({offsetY}px);">
       {#each visibleItems as item (item.id)}

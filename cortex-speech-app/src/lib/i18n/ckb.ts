@@ -151,6 +151,7 @@ export const ckb: Record<string, string> = {
   searchFailed: 'گەڕان سەرکەوتوو نەبوو',
   filterVerified: '✓ پشتڕاستکراو',
   filterPending: '○ چاوەڕوان',
+  sortBy: 'ڕیزکردن بەپێی',
   sortNewest: 'نوێترین',
   sortOldest: 'کۆنترین',
   sortDuration: 'ماوە',

@@ -147,6 +147,7 @@
     <div class="ms-auto">
       <select
         class="text-xs bg-cortex-800 border border-cortex-700 rounded px-2 py-1 text-cortex-300"
+        aria-label={$t('sortBy')}
         value={$sortOrder}
         oninput={(e) =>
           sortOrder.set(

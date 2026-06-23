@@ -151,6 +151,7 @@ export const en: Record<string, string> = {
   searchFailed: 'Search failed',
   filterVerified: '✓ Verified',
   filterPending: '○ Pending',
+  sortBy: 'Sort by',
   sortNewest: 'Newest',
   sortOldest: 'Oldest',
   sortDuration: 'Duration',

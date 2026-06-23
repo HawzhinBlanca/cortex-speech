@@ -11,18 +11,11 @@ async function violations(page: Page) {
   return results.violations.map((v) => `${v.id} x${v.nodes.length}`);
 }
 
-// M3.6 — the WCAG 2.2 AA gate is REAL and wired, but the app currently has genuine a11y debt,
-// so the suite is marked `.fixme` (skipped, not failing CI) until the violations are fixed.
-// Flip `.fixme` -> `()` once `npx playwright test e2e/axe.spec.ts` is green.
-//
-// Violations as of 2026-06-23 (axe-core, chromium), consistent across surfaces:
-//   App root (en):   aria-required-children x1, color-contrast x5, scrollable-region-focusable x1, select-name x1
-//   App root (ckb):  aria-required-children x1, color-contrast x3, scrollable-region-focusable x1, select-name x1
-//   Settings dialog: aria-required-children x1, color-contrast x5, scrollable-region-focusable x1, select-name x1
-// Quick wins (1-line ARIA): select-name (add aria-label to the unnamed <select>),
-// scrollable-region-focusable (tabindex=0 on the scroll container), aria-required-children.
-// color-contrast needs a design-token review (subjective — owner sign-off) before changing colors.
-test.describe.fixme('axe-core WCAG 2.2 AA gate (M3.6)', () => {
+// M3.6 — ENFORCED WCAG 2.2 AA gate (axe-core) over the App root (en + ckb/RTL) and the settings
+// dialog. The four violation classes originally surfaced (aria-required-children, color-contrast,
+// scrollable-region-focusable, select-name) were fixed; this gate now asserts ZERO violations and
+// fails the e2e suite on any regression.
+test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
   test('App root has zero a11y violations (en)', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByLabel('Open settings')).toBeVisible();

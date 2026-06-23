@@ -2192,7 +2192,7 @@
             {#if $wordTimestamps.length > 0}
               <div class="space-y-1">
                 <span class="text-[11px] text-cortex-400">{$t('wordTimestamps')}</span>
-                <div class="flex flex-wrap gap-1 max-h-20 overflow-y-auto" role="list" dir="rtl" lang="ckb">
+                <div class="flex flex-wrap gap-1 max-h-20 overflow-y-auto" role="group" aria-label={$t('wordTimestamps')} dir="rtl" lang="ckb">
                   {#each $wordTimestamps as w}
                     <button
                       type="button"
@@ -2307,8 +2307,13 @@
           style="width: {statsWidth}px;"
         >
           {#if statsOpen}
+            <!-- A scrollable region must be keyboard-focusable (WCAG 2.1.1 / axe scrollable-region-focusable); role=region + aria-label give it a name. -->
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
             <div
               class="p-2 flex flex-col gap-3 h-full overflow-y-auto"
+              role="region"
+              aria-label={$t('stats.title')}
+              tabindex="0"
               style="scrollbar-width: thin; scrollbar-color: #475569 transparent;"
             >
               <AgentReportPanel report={latestAgentReport} stageEvents={latestAgentStageEvents} />
@@ -2507,11 +2512,11 @@
         </div>
       {/if}
     </div>
-    <div class="flex items-center gap-3 text-[10px] text-cortex-600">
+    <div class="flex items-center gap-3 text-[10px] text-cortex-500">
       <span>{$segmentStats.total} {$t('segments')}</span>
       <span>{fmtDuration($segmentStats.totalDurationMs)} {$t('total')}</span>
       <span>{$segmentStats.verified}/{$segmentStats.total} {$t('verifiedCount')}</span>
-      <span class="text-[10px] text-cortex-600">{$t('pressForShortcuts')}</span>
+      <span class="text-[10px] text-cortex-500">{$t('pressForShortcuts')}</span>
       <button
         class="hover:text-cortex-400 transition-colors"
         onclick={() => showKeyboardHelp.set(true)}
