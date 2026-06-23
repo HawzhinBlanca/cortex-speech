@@ -73,6 +73,15 @@ export interface EscalationTrendPoint {
   escalated: number;
 }
 
+export interface LabelQualityLift {
+  n: number;
+  rawMicroCer: number;
+  juryMicroCer: number;
+  cerLift: number;
+  liftCiLow: number;
+  liftCiHigh: number;
+}
+
 export interface FewShotExample {
   id: string;
   segmentId: string;

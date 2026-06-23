@@ -508,6 +508,7 @@ pub fn run() {
             commands::build_scorecard,
             commands::compute_annotation_drift_scorecard,
             commands::list_eval_runs,
+            commands::get_label_quality_lift,
             commands::list_gold_segments,
             // Phase 2 — T0 Gate + Jury
             commands::run_t0_gate,

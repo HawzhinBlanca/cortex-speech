@@ -2452,6 +2452,15 @@ pub fn list_eval_runs(state: State<'_, AppState>) -> Result<Vec<crate::eval::Eva
     crate::eval::list_eval_runs(&db).map_err(|e| e.to_string())
 }
 
+/// Measured raw-ASR vs post-jury label-quality lift (M3.1) over human-verified segments.
+#[tauri::command]
+pub fn get_label_quality_lift(state: State<'_, AppState>) -> Result<crate::eval::LabelQualityLift, String> {
+    RATE_LIMITER.check("get_label_quality_lift")?;
+    let db = state.lock_db();
+    let triples = crate::eval::load_lift_triples(&db).map_err(|e| e.to_string())?;
+    Ok(crate::eval::compute_label_quality_lift(&triples, 2000, 1234))
+}
+
 #[tauri::command]
 pub fn list_gold_segments(state: State<'_, AppState>) -> Result<Vec<crate::eval::GoldSegment>, String> {
     RATE_LIMITER.check("list_gold_segments")?;
