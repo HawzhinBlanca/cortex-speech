@@ -376,12 +376,15 @@ mod tests {
         assert_eq!(compute_cer("كُورْدِي", "کوردی"), 0.0);
     }
 
-    /// FIXTURE-BASED jiwer COMPATIBILITY CHECK
+    /// REGRESSION FIXTURE — externally cross-validated against jiwer 4.0.0.
     ///
-    /// These values are taken from the ACTUAL produced by `compute_wer`/`compute_cer` in
-    /// this repo's current normalization path and form the regression fixture. If any
-    /// future change to `normalize_for_metrics`/`compute_wer`/`compute_cer` changes any
-    /// line below, that is a behavior regression and must be investigated before merging.
+    /// These are this repo's `compute_wer`/`compute_cer` outputs AND they are confirmed to match
+    /// the independent `jiwer` library within 1e-6 on identical (Rust-normalized) input by
+    /// `scripts/crossval_jiwer.py` (blueprint M1.1) — so this is no longer self-referential.
+    /// (The two empty-reference cases are a documented convention divergence: Rust clamps WER/CER
+    /// to 1.0, jiwer returns the raw insertion count.) Regenerate the cross-val vectors with the
+    /// `emit_crossval_vectors` test. Any change to `normalize_for_metrics`/`compute_wer`/`compute_cer`
+    /// that moves a line below is a regression to investigate before merging.
     #[test]
     fn jiwer_fixture_matches_reference_values() {
         let mut failures = Vec::new();
@@ -418,5 +421,73 @@ mod tests {
         if !failures.is_empty() {
             panic!("jiwer fixture regression:\n{}", failures.join("\n"));
         }
+    }
+
+    /// Minimal JSON string escaper (avoids a serde dependency in this emit-only test).
+    fn json_str(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                _ => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// Emit cross-validation vectors for the EXTERNAL jiwer check (`scripts/crossval_jiwer.py`).
+    /// Writes this repo's ACTUAL normalized strings + WER/CER so the Python side runs jiwer on
+    /// IDENTICAL (Rust-normalized) input — isolating the metric math from normalization. This is
+    /// what makes the cross-check real rather than self-referential (blueprint M1.1).
+    ///
+    /// Run explicitly:
+    ///   CORTEX_EMIT_CROSSVAL=1 cargo test --manifest-path src-tauri/Cargo.toml --lib \
+    ///       emit_crossval_vectors -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn emit_crossval_vectors() {
+        if std::env::var("CORTEX_EMIT_CROSSVAL").is_err() {
+            return;
+        }
+        let pairs = [
+            ("hello world", "hello world"),
+            ("hello world", "hello earth"),
+            ("hello world", "hello"),
+            ("", "hello world"),
+            ("", ""),
+            ("a b c", "a b d"),
+            ("کوردی", "کوردی"),
+            ("کوردی", "کوردێ"),
+            ("hello   world", "hello world"),
+            ("Hello World", "hello world"),
+            ("ab cd", "abcd"),
+            // orthographic-equivalence cases (Rust normalization should drive these to 0):
+            ("كوردستان", "کوردستان"),
+            ("ئەو\u{200C}کەسە", "ئەو کەسە"),
+            ("كُورْدِي", "کوردی"),
+        ];
+        let mut rows = Vec::new();
+        for (r, h) in pairs {
+            let nr = super::normalize_for_metrics(r);
+            let nh = super::normalize_for_metrics(h);
+            let wer = compute_wer(r, h);
+            let cer = compute_cer(r, h);
+            rows.push(format!(
+                "  {{\"reference\": {}, \"hypothesis\": {}, \"norm_reference\": {}, \"norm_hypothesis\": {}, \"rust_wer\": {:.10}, \"rust_cer\": {:.10}}}",
+                json_str(r),
+                json_str(h),
+                json_str(&nr),
+                json_str(&nh),
+                wer,
+                cer
+            ));
+        }
+        let out = format!("[\n{}\n]\n", rows.join(",\n"));
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/crossval_vectors.json");
+        std::fs::write(path, out).expect("write crossval vectors");
+        eprintln!("wrote crossval vectors -> {path}");
     }
 }

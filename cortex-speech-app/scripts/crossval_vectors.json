@@ -1,0 +1,16 @@
+[
+  {"reference": "hello world", "hypothesis": "hello world", "norm_reference": "hello world", "norm_hypothesis": "hello world", "rust_wer": 0.0000000000, "rust_cer": 0.0000000000},
+  {"reference": "hello world", "hypothesis": "hello earth", "norm_reference": "hello world", "norm_hypothesis": "hello earth", "rust_wer": 0.5000000000, "rust_cer": 0.3636363636},
+  {"reference": "hello world", "hypothesis": "hello", "norm_reference": "hello world", "norm_hypothesis": "hello", "rust_wer": 0.5000000000, "rust_cer": 0.5454545455},
+  {"reference": "", "hypothesis": "hello world", "norm_reference": "", "norm_hypothesis": "hello world", "rust_wer": 1.0000000000, "rust_cer": 1.0000000000},
+  {"reference": "", "hypothesis": "", "norm_reference": "", "norm_hypothesis": "", "rust_wer": 0.0000000000, "rust_cer": 0.0000000000},
+  {"reference": "a b c", "hypothesis": "a b d", "norm_reference": "a b c", "norm_hypothesis": "a b d", "rust_wer": 0.3333333333, "rust_cer": 0.2000000000},
+  {"reference": "کوردی", "hypothesis": "کوردی", "norm_reference": "کوردی", "norm_hypothesis": "کوردی", "rust_wer": 0.0000000000, "rust_cer": 0.0000000000},
+  {"reference": "کوردی", "hypothesis": "کوردێ", "norm_reference": "کوردی", "norm_hypothesis": "کوردێ", "rust_wer": 1.0000000000, "rust_cer": 0.2000000000},
+  {"reference": "hello   world", "hypothesis": "hello world", "norm_reference": "hello world", "norm_hypothesis": "hello world", "rust_wer": 0.0000000000, "rust_cer": 0.0000000000},
+  {"reference": "Hello World", "hypothesis": "hello world", "norm_reference": "hello world", "norm_hypothesis": "hello world", "rust_wer": 0.0000000000, "rust_cer": 0.0000000000},
+  {"reference": "ab cd", "hypothesis": "abcd", "norm_reference": "ab cd", "norm_hypothesis": "abcd", "rust_wer": 1.0000000000, "rust_cer": 0.2000000000},
+  {"reference": "كوردستان", "hypothesis": "کوردستان", "norm_reference": "کوردستان", "norm_hypothesis": "کوردستان", "rust_wer": 0.0000000000, "rust_cer": 0.0000000000},
+  {"reference": "ئەو‌کەسە", "hypothesis": "ئەو کەسە", "norm_reference": "ئەو کەسە", "norm_hypothesis": "ئەو کەسە", "rust_wer": 0.0000000000, "rust_cer": 0.0000000000},
+  {"reference": "كُورْدِي", "hypothesis": "کوردی", "norm_reference": "کوردی", "norm_hypothesis": "کوردی", "rust_wer": 0.0000000000, "rust_cer": 0.0000000000}
+]
