@@ -52,10 +52,27 @@ etc. characters — e.g. `چەند کەس شەهید بوون` → `tsany kazy s
 by a Latin→Sorani transliterator.
 
 **Implication — the real lever:** the model's honest Kurdish-script CER is **~20%**, and the headline
-gap is dominated by **losing language lock on ~21% of clips**. There is **no cheap post-processing
-fix** (a transliterator would have nothing clean to transliterate on most of these). The path is
-**model-level language conditioning / fine-tuning** so the decoder stays in Kurdish — then scale to
-≥900 + IAA + a SeamlessM4T-v2 baseline.
+gap is dominated by **losing language lock on ~21% of clips**. The path is **model-level language
+conditioning / fine-tuning** so the decoder stays in Kurdish — then scale to ≥900 + IAA + a
+SeamlessM4T-v2 baseline.
+
+## Tried in-sandbox (no retrain): constraining the decoder to Kurdish tokens
+
+The model takes raw audio and emits CTC logits over a **9812-token, 1600-language vocabulary with only
+155 Arabic-script tokens** — so per frame it can pick a non-Kurdish token. Running the ONNX directly
+(`scripts/constrained_decode_probe.py`), finding the CTC blank empirically, and greedy-decoding
+**unconstrained** vs **masked to {blank, space, the 155 Arabic-script tokens}**:
+
+| Decode | micro CER (N=30 probe) |
+|---|:--:|
+| Unconstrained (matches the sherpa path) | 22.71% |
+| **Constrained to Kurdish tokens** | **21.22%** |
+
+Constraining **guarantees Kurdish-script output** (no more `t不` / `ite bent` in transcripts — a real
+UX win) for **~+1.5 CER pts** with **no retraining**. But it is a **mitigation, not a cure**: on the
+hard clips the model genuinely *mishears* (its Kurdish-token logits are weak there), so masking only
+changes the script of an already-wrong output. **Validated and recommended for production** (port the
+masked greedy decode into the `ort` inference path); the real accuracy lever remains fine-tuning.
 
 ## Dataset
 
