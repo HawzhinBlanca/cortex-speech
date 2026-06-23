@@ -642,3 +642,54 @@ fn ckb_language_hint_ab() {
         eprintln!("[ckb-ab] FINDING: the ckb language hint CHANGES output (effective on this clip).");
     }
 }
+
+/// M1.3 — first real Central Kurdish CER/WER scorecard: runs the live OmniASR-CTC engine on a gold
+/// set of human-transcribed clips and scores it against the verified Sorani references. Gated by
+/// env `CORTEX_GOLD_MANIFEST` = a TSV of `<audio_path>\t<reference_sentence>` per line.
+///   CORTEX_GOLD_MANIFEST=<manifest.tsv> cargo test --manifest-path src-tauri/Cargo.toml \
+///       --test real_audio ckb_scorecard_on_gold -- --ignored --nocapture
+#[test]
+#[ignore]
+fn ckb_scorecard_on_gold() {
+    use cortex_speech_app_lib::asr::{AsrLoadConfig, KurdishAsrService};
+    use cortex_speech_app_lib::{audio, wer};
+
+    let manifest = match std::env::var("CORTEX_GOLD_MANIFEST") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("CORTEX_GOLD_MANIFEST not set; skipping scorecard");
+            return;
+        }
+    };
+    let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+    let cfg = AsrLoadConfig { language: "ckb".into(), enable_gpu: false, ..Default::default() };
+    let mut asr = KurdishAsrService::new_with_config(&model_dir, &cfg).expect("asr init");
+    assert!(asr.is_available(), "ASR must be available (real model present)");
+
+    let text = std::fs::read_to_string(&manifest).expect("read gold manifest");
+    let (mut t_cd, mut t_crl, mut t_wd, mut t_wrl, mut n) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for line in text.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let (Some(path), Some(reference)) = (parts.next(), parts.next()) else { continue };
+        let (sr, pcm) = match audio::decode_to_pcm(std::path::Path::new(path)) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("[gold] decode failed {path}: {e}");
+                continue;
+            }
+        };
+        let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+        let hyp = asr.transcribe(&f32_pcm, sr).map(|t| t.0).unwrap_or_default();
+        let cd = wer::char_edit_distance(reference, &hyp);
+        let wd = wer::word_edit_distance(reference, &hyp);
+        t_cd += cd.distance;
+        t_crl += cd.ref_len;
+        t_wd += wd.distance;
+        t_wrl += wd.ref_len;
+        n += 1;
+        eprintln!("[gold] ref={reference} | hyp={hyp}");
+    }
+    let micro_cer = t_cd as f64 / t_crl.max(1) as f64;
+    let micro_wer = t_wd as f64 / t_wrl.max(1) as f64;
+    eprintln!("[scorecard] N={n} micro_CER={micro_cer:.4} micro_WER={micro_wer:.4} (ckb, OmniASR-CTC-300M)");
+}
