@@ -40,14 +40,22 @@ Splitting a separate N=200 run by the **script the model actually emitted**:
 | empty | <1% | 100% |
 
 When the model writes Kurdish script — the large majority of clips — CER is **~20%**, far better than
-the ~30% aggregate. Nearly all of the remaining error comes from the **21% of clips it romanizes to
-Latin**, which score ~94% against Arabic-script references *even though the romanization is usually the
-correct content* (`axékihalkesa` ≈ `ئاخێکی هەڵکێشا`).
+the ~30% aggregate. Nearly all of the remaining error comes from the **21% of clips where it does NOT
+stay in Kurdish.**
 
-**Implication — this reframes the roadmap:** the headline accuracy gap is mostly a **script-locking
-problem, not a recognition problem.** Forcing Kurdish-script output (or transliterating the romanized
-minority back to Arabic) should pull aggregate CER from ~30% toward the ~20% floor — a cheap fix
-relative to a full fine-tune. **Script-locking first, fine-tune second.**
+**What those clips actually are (checked by inspecting the hypotheses — correcting an earlier guess):**
+a *few* are clean romanizations of the correct content (`axékihalkesa` ≈ `ئاخێکی هەڵکێشا`,
+`sêrî minîandekişt` ≈ correct), but **most are garbled multilingual noise.** When the model loses
+Kurdish lock it draws tokens from its 1600-language vocabulary and emits stray Chinese / Vietnamese /
+etc. characters — e.g. `چەند کەس شەهید بوون` → `tsany kazy sahily kono`, `خوات لەگەڵ بێت` →
+`qan la gần biệt`, `کەی بوو` → `t不`. These are genuine **language-lock failures**, *not* recoverable
+by a Latin→Sorani transliterator.
+
+**Implication — the real lever:** the model's honest Kurdish-script CER is **~20%**, and the headline
+gap is dominated by **losing language lock on ~21% of clips**. There is **no cheap post-processing
+fix** (a transliterator would have nothing clean to transliterate on most of these). The path is
+**model-level language conditioning / fine-tuning** so the decoder stays in Kurdish — then scale to
+≥900 + IAA + a SeamlessM4T-v2 baseline.
 
 ## Dataset
 
@@ -90,11 +98,14 @@ python scripts/scorecard_stats.py <results.tsv> 3000
 
 ## What this tells us about the roadmap
 
-Data is no longer the blocker — the corpus exists and works. The script split above quantifies the #1
-lever: **script-locking takes aggregate CER from ~30% toward the ~20% Kurdish-script floor** with no
-re-training (force Arabic-script output, or transliterate the romanized 21%). After that: (2) scale to
-≥900 + IAA + a SeamlessM4T-v2 baseline for a publishable, significance-tested leaderboard entry, and
-(3) fine-tune to close the remaining ~20% → ~8% gap to SOTA. 29.4% CER is the honest starting line.
+Data is no longer the blocker — the corpus exists and works. The script split quantifies the picture:
+the model's real Kurdish-script CER is ~20%, and the aggregate is dragged to ~30% by **losing language
+lock on ~21% of clips** (multilingual garbage, not recoverable in post-processing). The levers, in order:
+(1) **model-level language conditioning / fine-tuning** so the decoder stays in Kurdish (collapses the
+language-lock losses — the biggest single win, and it needs training compute, not sandbox work);
+(2) scale to ≥900 + IAA + a SeamlessM4T-v2 baseline for a publishable, significance-tested leaderboard
+entry; (3) fine-tune further to close the remaining ~20% → ~8% gap to SOTA. 29.4% CER is the honest
+starting line.
 
 ## Example transcriptions (ref → hyp)
 
