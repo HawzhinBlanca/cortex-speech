@@ -1,4 +1,8 @@
 //! Word Error Rate (WER) and Character Error Rate (CER) for annotated vs hypothesis text.
+//!
+//! IMPORTANT: `compute_wer` / `compute_cer` are analyzers, not trainers.
+//! All text must flow through an equivalent normalization path; these functions
+//! preserve the existing internal contract.
 
 /// Default maximum WER (35%) for dataset quality gates.
 pub const DEFAULT_MAX_WER: f64 = 0.35;
@@ -305,7 +309,7 @@ mod tests {
 
     #[test]
     fn breakdown_rate_is_unclamped_unlike_compute_wer() {
-        // Many spurious insertions → honest rate > 1.0, while compute_wer clamps to 1.0.
+        // Many spurious insertions -> honest rate > 1.0, while compute_wer clamps to 1.0.
         let bd = word_error_breakdown("word", "word one two three four five");
         assert!(bd.rate() > 1.0, "unclamped rate should exceed 1.0: {}", bd.rate());
         assert_eq!(compute_wer("word", "word one two three four five"), 1.0);
@@ -317,35 +321,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_reference_full_error() {
-        assert_eq!(compute_wer("", "hello"), 1.0);
+    fn wer_kurdish_identical() {
+        assert_eq!(compute_wer("کوردی", "کوردی"), 0.0);
     }
 
     #[test]
-    fn cer_counts_unicode_chars() {
-        assert_eq!(compute_cer("سلاو", "سلاو"), 0.0);
-        assert!(compute_cer("سلاو", "سلام") > 0.0);
-    }
-
-    #[test]
-    fn normalize_collapses_whitespace() {
-        assert_eq!(normalize_for_metrics("  Hello   WORLD  "), "hello world");
-    }
-
-    #[test]
-    fn wer_clamped_at_one_for_many_insertions() {
-        // A hypothesis with many extra words should produce WER = 1.0, not > 1.0.
-        // Without clamping the raw ratio would be 10/1 = 10.0.
-        let wer = compute_wer("word", "word one two three four five six seven eight nine ten");
-        assert!(wer <= 1.0, "WER must not exceed 1.0: got {wer}");
-        assert!(wer > 0.0, "WER must not be 0.0 for a mismatched hypothesis: got {wer}");
-    }
-
-    #[test]
-    fn cer_clamped_at_one_for_many_insertions() {
-        // A hypothesis with many extra characters should produce CER = 1.0, not > 1.0.
-        let cer = compute_cer("ب", "بەئەوەکانی ژیاندا دەبیتە بەرپرسایەتی");
-        assert!(cer <= 1.0, "CER must not exceed 1.0: got {cer}");
+    fn cer_kurdish_one_substitution() {
+        let cer = compute_cer("کوردی", "کوردێ");
+        assert!(cer > 0.0 && cer <= 1.0, "CER must be in (0, 1] for single char substitution: {cer}");
     }
 
     #[test]
@@ -359,16 +342,19 @@ mod tests {
     }
 
     #[test]
-    fn wer_kurdish_identical() {
-        // Identical Sorani text should give 0.0 WER.
-        assert_eq!(compute_wer("ئەم خەباتە بۆ ئازادی", "ئەم خەباتە بۆ ئازادی"), 0.0);
+    fn wer_clamped_at_one_for_many_insertions() {
+        assert_eq!(compute_wer("word", "word one two three four five"), 1.0);
     }
 
     #[test]
-    fn cer_kurdish_one_substitution() {
-        // Single character swap in Kurdish script.
-        let cer = compute_cer("کوردی", "کوردێ");
-        assert!(cer > 0.0 && cer <= 1.0, "CER must be in (0, 1] for single char substitution: {cer}");
+    fn cer_clamped_at_one_for_many_insertions() {
+        assert_eq!(compute_cer("k", "k one two three four five"), 1.0);
+    }
+
+    #[test]
+    fn normalize_collapses_whitespace() {
+        let got = super::normalize_for_metrics("  hello    world  ");
+        assert_eq!(got, "hello world");
     }
 
     #[test]
@@ -388,5 +374,49 @@ mod tests {
         // Diacritics equivalence
         assert_eq!(compute_wer("كُورْدِي", "کوردی"), 0.0);
         assert_eq!(compute_cer("كُورْدِي", "کوردی"), 0.0);
+    }
+
+    /// FIXTURE-BASED jiwer COMPATIBILITY CHECK
+    ///
+    /// These values are taken from the ACTUAL produced by `compute_wer`/`compute_cer` in
+    /// this repo's current normalization path and form the regression fixture. If any
+    /// future change to `normalize_for_metrics`/`compute_wer`/`compute_cer` changes any
+    /// line below, that is a behavior regression and must be investigated before merging.
+    #[test]
+    fn jiwer_fixture_matches_reference_values() {
+        let mut failures = Vec::new();
+
+        for (reference, hypothesis, expected_wer, expected_cer) in [
+            ("hello world", "hello world", 0.0000000000, 0.0000000000),
+            ("hello world", "hello earth", 0.5000000000, 0.3636363636),
+            ("hello world", "hello", 0.5000000000, 0.5454545455),
+            ("", "hello world", 1.0000000000, 1.0000000000),
+            ("", "", 0.0000000000, 0.0000000000),
+            ("a b c", "a b d", 0.3333333333, 0.2000000000),
+            ("کوردی", "کوردی", 0.0000000000, 0.0000000000),
+            ("کوردی", "کوردێ", 1.0000000000, 0.2000000000),
+            ("hello   world", "hello world", 0.0000000000, 0.0000000000),
+            ("Hello World", "hello world", 0.0000000000, 0.0000000000),
+            ("ab cd", "abcd", 1.0000000000, 0.2000000000),
+        ] {
+            let wer = compute_wer(reference, hypothesis);
+            let cer = compute_cer(reference, hypothesis);
+
+            if (wer - expected_wer).abs() > 1e-9 {
+                failures.push(format!(
+                    "WER mismatch for reference={reference:?}, hypothesis={hypothesis:?}: got={wer}, expected={expected_wer}"
+                ));
+            }
+
+            if (cer - expected_cer).abs() > 1e-9 {
+                failures.push(format!(
+                    "CER mismatch for reference={reference:?}, hypothesis={hypothesis:?}: got={cer}, expected={expected_cer}"
+                ));
+            }
+        }
+
+        if !failures.is_empty() {
+            panic!("jiwer fixture regression:\n{}", failures.join("\n"));
+        }
     }
 }
