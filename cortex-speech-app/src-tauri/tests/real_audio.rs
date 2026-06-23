@@ -673,6 +673,7 @@ fn ckb_scorecard_on_gold() {
     let text = std::fs::read_to_string(&manifest).expect("read gold manifest");
     let (mut t_cd, mut t_crl, mut t_wd, mut t_wrl, mut n) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut rows = String::from("gender\tage\tscript\tchar_dist\tchar_ref_len\tword_dist\tword_ref_len\n");
+    let mut hyp_rows = String::new();
     for (i, line) in text.lines().enumerate() {
         // manifest: <wav_path>\t<reference>[\t<gender>[\t<age>]]
         let cols: Vec<&str> = line.split('\t').collect();
@@ -713,6 +714,7 @@ fn ckb_scorecard_on_gold() {
             "{gender}\t{age}\t{script}\t{}\t{}\t{}\t{}\n",
             cd.distance, cd.ref_len, wd.distance, wd.ref_len
         ));
+        hyp_rows.push_str(&format!("{script}\t{reference}\t{hyp}\n"));
         if i < 5 {
             eprintln!("[gold] ref={reference} | hyp={hyp}");
         }
@@ -722,6 +724,10 @@ fn ckb_scorecard_on_gold() {
     if let Some(rp) = results_path {
         std::fs::write(&rp, rows).expect("write per-clip results");
         eprintln!("[gold] per-clip results -> {rp}");
+    }
+    if let Ok(hp) = std::env::var("CORTEX_GOLD_HYPS") {
+        std::fs::write(&hp, hyp_rows).ok();
+        eprintln!("[gold] ref/hyp pairs -> {hp}");
     }
     eprintln!("[scorecard] N={n} micro_CER={micro_cer:.4} micro_WER={micro_wer:.4} (ckb, OmniASR-CTC-300M)");
 }
