@@ -6,7 +6,7 @@ default-run = "cortex-speech-app"
 description = "Production-grade Kurdish (Sorani) speech transcription, processing, and dataset curation app"
 authors = ["Cortex Team"]
 license = "Apache-2.0"
-repository = "https://github.com/hawzh/cortex-speech"
+repository = "https://github.com/HawzhinBlanca/cortex-speech"
 
 [lib]
 name = "cortex_speech_app_lib"
