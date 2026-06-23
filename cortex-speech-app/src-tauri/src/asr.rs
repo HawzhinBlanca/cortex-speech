@@ -261,6 +261,21 @@ impl KurdishAsrService {
             return Ok(Self::new_unavailable());
         }
 
+        // Runtime integrity gate (M2.3): recompute the on-disk model SHA-256 and refuse to build
+        // a recognizer if it does not match the pinned digest. A missing model degrades gracefully
+        // (handled above); a TAMPERED/wrong model is a hard error, not silent acceptance.
+        let model_pin = match config.model_size {
+            AsrModelSize::CTC300M => Some(crate::models::OMNIASR_CTC_300M_MODEL),
+            AsrModelSize::CTC1B => Some(crate::models::OMNIASR_CTC_1B_MODEL),
+            AsrModelSize::WSL7B => None, // no pinned digest for this size -> cannot verify
+        };
+        if let Some(pin) = model_pin {
+            if let Err(e) = crate::models::verify_model_path_runtime(&model_path, pin) {
+                tracing::error!("ASR model integrity check failed: {e}");
+                return Err(e);
+            }
+        }
+
         let mut provider = detect_optimal_provider(config.enable_gpu).to_string();
         let mut rec_config =
             OfflineRecognizerConfig { decoding_method: Some("greedy_search".into()), ..Default::default() };
