@@ -71,8 +71,14 @@ The model takes raw audio and emits CTC logits over a **9812-token, 1600-languag
 Constraining **guarantees Kurdish-script output** (no more `t不` / `ite bent` in transcripts — a real
 UX win) for **~+1.5 CER pts** with **no retraining**. But it is a **mitigation, not a cure**: on the
 hard clips the model genuinely *mishears* (its Kurdish-token logits are weak there), so masking only
-changes the script of an already-wrong output. **Validated and recommended for production** (port the
-masked greedy decode into the `ort` inference path); the real accuracy lever remains fine-tuning.
+changes the script of an already-wrong output. The real accuracy lever remains fine-tuning.
+
+**Ported to Rust (tested):** the masked greedy decode + an `ort` inference entry point now live in
+`src-tauri/src/constrained_decode.rs` — 5 unit tests (keep-set, masking remap, repeat/blank collapse,
+token parsing) plus a Windows parity test (`constrained_decode_real_clip_is_kurdish_script`,
+`CORTEX_CONSTRAINED_WAV=…`) that loads `model.int8.onnx` via `ort` and asserts Kurdish-script output.
+It is **not yet wired into the default sherpa-onnx path** — production use is an opt-in settings flag +
+a cached `ort` session (small, low-risk follow-up).
 
 ## Dataset
 
