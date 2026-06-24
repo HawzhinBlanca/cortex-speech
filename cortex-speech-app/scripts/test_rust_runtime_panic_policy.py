@@ -1049,8 +1049,27 @@ def test_eval_read_paths_do_not_silently_drop_rows() -> None:
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"eval.rs is missing explicit row error propagation:\n{formatted}")
-    if eval_rs.count("Ok(rows.collect::<Result<Vec<_>, _>>()?)") != 2:
-        raise AssertionError("eval.rs must propagate row-mapping errors from gold and eval-run listings")
+    # Verify each listing propagates row-mapping errors WITHIN ITS OWN BODY. (A global
+    # occurrence count is brittle: it false-fails the moment any other query fn correctly
+    # adopts the same safe collect pattern — e.g. the IAA-triples listing — so check the two
+    # required functions individually, which is strictly stronger.)
+    collect_pattern = "Ok(rows.collect::<Result<Vec<_>, _>>()?)"
+    for sig in (
+        "pub fn list_gold_segments(db: &Database) -> AppResult<Vec<GoldSegment>>",
+        "pub fn list_eval_runs(db: &Database) -> AppResult<Vec<EvalRun>>",
+    ):
+        start = eval_rs.index(sig)
+        rest = eval_rs[start + len(sig):]
+        end = len(rest)
+        for marker in ("\npub fn ", "\nfn "):
+            idx = rest.find(marker)
+            if idx != -1:
+                end = min(end, idx)
+        if collect_pattern not in rest[:end]:
+            fn_name = sig.split("(")[0].replace("pub fn ", "")
+            raise AssertionError(
+                f"eval.rs: {fn_name} must propagate row-mapping errors ({collect_pattern})"
+            )
 
 
 def test_pipeline_rediarize_reports_db_update_failures() -> None:
