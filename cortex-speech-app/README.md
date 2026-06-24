@@ -95,6 +95,27 @@ DLLs from their pinned upstreams, verifies each against a pinned SHA-256 (a mism
 unverifiable artifact is placed), and writes them to `src-tauri/models/`. Re-run anytime; it skips
 files already present + verified. `npm run verify-models` does the offline integrity check only.
 
+### Fine-tuned Kurdish model (optional, embedded) — the **Fine-tuned** button
+
+Cortex can run a **fine-tuned MMS-CTC-1B** Sorani model that roughly **halves CER** vs the stock
+OmniASR (~19% vs ~42% on a matched sample — see [docs/EVAL.md](docs/EVAL.md)) and always emits Kurdish
+script. It is an opt-in engine (the per-segment **Fine-tuned** button / `transcribe_segment_finetuned`
+IPC command); the default Transcribe path is unchanged.
+
+To enable it, place the int8 ONNX export + vocab at **`src-tauri/models/finetuned-mms-ckb/`**:
+
+```
+models/finetuned-mms-ckb/
+|-- model.onnx     # int8 Wav2Vec2-CTC export (~925 MB)
+`-- vocab.json     # the MMS nested vocab (uses the "ckb" sub-map)
+```
+
+Export from a fine-tuned HF `Wav2Vec2ForCTC` with `CORTEX_FINETUNED_MODEL=<hf-dir>
+CORTEX_FINETUNED_ONNX=<out.onnx> python scripts/export_finetuned_onnx.py`, then int8-quantize
+(`onnxruntime.quantization.quantize_dynamic`). It is gitignored and, when present, bundled into the
+installer. Without it, the **Fine-tuned** button reports the model is not installed and the stock
+engines keep working.
+
 ### Bundled (release installer)
 
 The packaged Windows installer ships the OmniASR weights, Silero VAD, and the ONNX Runtime
