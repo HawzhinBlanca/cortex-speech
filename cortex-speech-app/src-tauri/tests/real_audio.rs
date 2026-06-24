@@ -548,6 +548,44 @@ fn test_omniasr_on_real_audio() {
     assert!(conf > 0.0 && conf <= 1.0, "ASR confidence score {} should be in (0.0, 1.0]", conf);
 }
 
+/// Default real-ASR gate on a COMMITTED, CC-BY-licensed fixture (Google FLEURS `ckb_iq`, see
+/// tests/fixtures/ATTRIBUTION.md). Unlike the `#[ignore]`d tests above, this needs no external
+/// CORTEX_REAL_AUDIO_DIR — the audio is in-repo — so it runs from a fresh clone once the OmniASR
+/// model is present (`npm run fetch-models`). It skips cleanly when the model isn't fetched, and
+/// asserts the real OmniASR produces a non-blank Kurdish (Arabic-script) transcript (no-fabrication).
+#[test]
+fn omniasr_on_committed_fleurs_ckb_fixture() {
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
+    if !fixture.exists() {
+        eprintln!("[fleurs-gate] committed fixture missing; skipping");
+        return;
+    }
+    let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+    if !model_dir.join("omniasr-ctc-300m/model.int8.onnx").exists() {
+        eprintln!("[fleurs-gate] OmniASR model not present (run `npm run fetch-models`); skipping");
+        return;
+    }
+
+    let (sr, pcm) = audio::decode_to_pcm_with_timeout(&fixture, std::time::Duration::from_secs(120))
+        .expect("decode committed fixture");
+    assert_eq!(sr, 16000);
+    let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+
+    let mut asr = KurdishAsrService::new(&model_dir, false).expect("ASR init with real models");
+    assert!(asr.is_available(), "ASR should be available");
+    let (text, _conf) = asr.transcribe(&f32_pcm, 16000).expect("OmniASR transcription should succeed");
+    let trimmed = text.trim();
+    eprintln!("[fleurs-gate] transcript ({} chars): {trimmed}", trimmed.len());
+
+    assert!(!trimmed.is_empty(), "real ASR must not return a blank transcript (no-fabrication guard)");
+    let arabic = trimmed
+        .chars()
+        .filter(|c| ('\u{0600}'..='\u{06FF}').contains(c) || ('\u{0750}'..='\u{077F}').contains(c))
+        .count();
+    assert!(arabic > 0, "expected Kurdish (Arabic-script) output, got: {trimmed}");
+}
+
 // ── M3: closed-loop gold eval against the REAL OmniASR engine ───────────
 
 #[test]
