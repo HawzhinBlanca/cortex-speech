@@ -12,7 +12,14 @@
 //! decode functions are unit-tested; `run_constrained` is covered by a Windows-only `#[ignore]`d
 //! parity test that runs the real model.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+
+/// Cached `ort` session for the constrained decode path, keyed by model path. The 300M model load
+/// (~hundreds of ms) is amortized across repeated opt-in calls; the Mutex serializes constrained
+/// inferences (acceptable — this is a user-initiated, off-the-default-path action).
+static SESSION_CACHE: LazyLock<Mutex<Option<(PathBuf, ort::session::Session)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// A token is treated as Kurdish (Arabic-script) if any of its chars fall in the Arabic block
 /// (U+0600..U+06FF) or the Arabic Supplement block (U+0750..U+077F) — the ranges Central Kurdish
@@ -135,10 +142,18 @@ pub fn run_constrained(
     constrained: bool,
 ) -> Result<String, String> {
     crate::models::init_ort_dylib_path();
-    let mut session = ort::session::Session::builder()
-        .map_err(|e| format!("ort builder: {e}"))?
-        .commit_from_file(model_path)
-        .map_err(|e| format!("ort load {}: {e}", model_path.display()))?;
+    let mut guard = SESSION_CACHE.lock().map_err(|_| "constrained session cache poisoned".to_string())?;
+    if guard.as_ref().map(|(p, _)| p.as_path() != model_path).unwrap_or(true) {
+        let session = ort::session::Session::builder()
+            .map_err(|e| format!("ort builder: {e}"))?
+            .commit_from_file(model_path)
+            .map_err(|e| format!("ort load {}: {e}", model_path.display()))?;
+        *guard = Some((model_path.to_path_buf(), session));
+    }
+    let session = match guard.as_mut() {
+        Some((_, s)) => s,
+        None => return Err("constrained session unexpectedly missing after init".to_string()),
+    };
 
     let n = audio.len();
     let input = ort::value::Tensor::from_array(([1usize, n], audio.to_vec()))
