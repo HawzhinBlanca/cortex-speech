@@ -575,7 +575,33 @@ pub fn import_audio_file(
                 let adjudication_result = if let Some(app_state) = app_clone.try_state::<AppState>() {
                     let settings = app_state.lock_settings().clone();
                     let agentic_readiness = agentic_readiness_snapshot_for_state(&app_state, &settings);
-                    let db = app_state.lock_db();
+                    // Adjudication uses its OWN database connection (WAL mode) rather than the
+                    // shared Mutex<Database> guard, so the heavy ASR-bearing jury never starves the
+                    // UI's get_segments (which locks the shared connection) while it runs. WAL lets
+                    // the UI read concurrently while the jury writes verdicts on its own connection.
+                    let jury_conn = app_state
+                        .data_dir
+                        .lock()
+                        .ok()
+                        .and_then(|g| (*g).clone())
+                        .map(|dir| dir.join("cortex-speech.db"))
+                        .and_then(|p| crate::db::Database::open(p.to_string_lossy().as_ref()).ok());
+                    let Some(db) = jury_conn else {
+                        emit_agent_stage_event(
+                            &app_clone,
+                            Some(&agent_run_id),
+                            "file",
+                            AgentStageEmission {
+                                stage: "jury_adjudication",
+                                status: "blocked",
+                                file: &post_import_file,
+                                detail: "could not open a private DB connection for adjudication",
+                                current: 0,
+                                total: segment_ids.len(),
+                            },
+                        );
+                        return;
+                    };
                     let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&settings);
                     report_options.agent_run_id = Some(agent_run_id.clone());
                     report_options.agentic_readiness = Some(agentic_readiness);
