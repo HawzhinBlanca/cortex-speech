@@ -105,7 +105,13 @@ jobs:
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: E2E tests
+      # This is a UI smoke test against a MOCKED Tauri backend (e2e/helpers/tauri-mock.ts): it
+      # exercises Svelte wiring against canned IPC data and does NOT run the real Rust pipeline
+      # (no decode / VAD / OmniASR / SQLite / export). The real-app end-to-end gate is
+      # `npm run test:e2e:real` (e2e_real_app.cjs), which drives the built .exe over CDP and asserts
+      # a non-blank transcript — it needs the ONNX models + a real audio fixture, so it runs on a
+      # machine that has them (locally / a self-hosted Windows runner), not on this hosted runner.
+      - name: E2E UI smoke (mocked backend)
         run: npm run test:e2e
 
       - name: npm audit
