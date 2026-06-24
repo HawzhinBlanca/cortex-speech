@@ -106,16 +106,46 @@ async function run() {
   console.log('==> Importing real audio:', AUDIO);
   await page.evaluate((p) => window.__TAURI_INTERNALS__.invoke('import_audio_file', { path: p }), AUDIO);
 
-  console.log('==> Waiting for Silero VAD segmentation (up to 12 min for long media)...');
-  await page.locator('[data-testid="segment-card"]').first().waitFor({ state: 'visible', timeout: 720000 });
+  // Poll the BACKEND for segments (ground truth) rather than relying on the UI auto-refreshing
+  // via the Tauri event channel, which can be delivered unreliably under remote-debugging. Once
+  // the backend has the segment, reload so the UI renders it from the DB in a clean (settled) state.
+  console.log('==> Waiting for Silero VAD segmentation (polling backend get_segments, up to 12 min)...');
+  let backendSegs = [];
+  for (let i = 0; i < 360; i++) {
+    backendSegs = await page
+      .evaluate(() => window.__TAURI_INTERNALS__.invoke('get_segments', { verified: null }).catch(() => []))
+      .catch(() => []);
+    if (Array.isArray(backendSegs) && backendSegs.length >= 1) break;
+    if (i % 15 === 0) console.log(`   still segmenting... ${i * 2}s`);
+    await sleep(2000);
+  }
+  if (!Array.isArray(backendSegs) || backendSegs.length === 0) {
+    throw new Error('VAD produced 0 segments for the provided audio (backend get_segments empty).');
+  }
+  console.log(`==> VAD produced ${backendSegs.length} segment(s) (backend). Reloading UI to render from DB...`);
+  await page.reload();
+  await page.waitForSelector('[data-testid="app-root"]', { timeout: 30000 });
+  await page.locator('[data-testid="segment-card"]').first().waitFor({ state: 'visible', timeout: 60000 });
   const segCount = await page.locator('[data-testid="segment-card"]').count();
-  console.log(`==> VAD produced ${segCount} segment(s).`);
-  if (segCount === 0) throw new Error('VAD produced 0 segments for the provided audio.');
+  console.log(`==> UI rendered ${segCount} segment-card(s).`);
 
   console.log('==> Selecting first segment and running local ASR (OmniASR CTC)...');
   await page.locator('[data-testid="segment-card"]').first().click();
   await page.waitForTimeout(800);
-  await page.locator('button:has-text("Transcribe"), button:has-text("نووسینەوە")').first().click();
+
+  // The per-segment Transcribe button is disabled while the import/jury pipeline is still
+  // processing ($isProcessing). Wait for it to settle before clicking, and target the precise
+  // segment button (data-testid) rather than a substring match that also hits "Transcribe Empty".
+  const transcribeBtn = page.locator('[data-testid="transcribe-btn"]');
+  await transcribeBtn.waitFor({ state: 'visible', timeout: 60000 });
+  let settled = false;
+  for (let i = 0; i < 150; i++) { // up to 5 min for post-import adjudication to finish
+    if (await transcribeBtn.isEnabled().catch(() => false)) { settled = true; break; }
+    if (i % 10 === 0) console.log(`   waiting for pipeline to settle (transcribe enabled)... ${i * 2}s`);
+    await sleep(2000);
+  }
+  if (!settled) throw new Error('Transcribe button never became enabled (import/jury pipeline did not settle).');
+  await transcribeBtn.click();
   await page.waitForTimeout(3000);
 
   let rawText = '';
