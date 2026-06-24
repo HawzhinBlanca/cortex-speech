@@ -13,6 +13,7 @@ pub mod audio;
 pub mod audio_quality;
 pub mod cache;
 pub mod cancel;
+pub mod constrained_decode;
 pub mod chunking;
 pub mod commands;
 pub mod corrections;
