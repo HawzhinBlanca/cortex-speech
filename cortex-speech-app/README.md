@@ -52,9 +52,16 @@ All audio is resampled to 16 kHz mono PCM for ASR and VAD.
 # Install frontend dependencies
 npm install
 
-# Place ONNX models (see below), then run in dev mode
+# Fetch + SHA-256-verify the ONNX models into src-tauri/models/ (required to build from source,
+# since the models are gitignored). Skips files already present + verified. See Model Placement.
+npm run fetch-models
+
+# Run in dev mode
 npm run tauri dev
 ```
+
+Verify models are present and unmodified at any time with `npm run verify-models` (offline SHA-256
+check). The release installer already bundles the models, so end users do not run this.
 
 Other useful scripts:
 
@@ -78,7 +85,15 @@ The user-podcast guard requires `-UserPodcastFile` or `CORTEX_USER_PODCAST_FILE`
 
 ## Model Placement
 
-Meta OmniASR CTC 300M weights can be installed automatically or manually.
+Building from source? The simplest path is **`npm run fetch-models`** (downloads + SHA-256-verifies
+every model into `src-tauri/models/`). The options below cover the bundled, in-app, and manual paths.
+
+### From source (recommended) — `npm run fetch-models`
+
+Runs `scripts/fetch_models.py`: downloads the OmniASR archive, Silero VAD, and the ONNX Runtime
+DLLs from their pinned upstreams, verifies each against a pinned SHA-256 (a mismatch is rejected — no
+unverifiable artifact is placed), and writes them to `src-tauri/models/`. Re-run anytime; it skips
+files already present + verified. `npm run verify-models` does the offline integrity check only.
 
 ### Bundled (release installer)
 

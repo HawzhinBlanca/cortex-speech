@@ -15,6 +15,8 @@
     "test:python-policies": "python scripts/run_python_policies.py",
     "test:e2e": "playwright test",
     "test:e2e:real": "node e2e_real_app.cjs",
+    "fetch-models": "python scripts/fetch_models.py",
+    "verify-models": "python scripts/fetch_models.py --check",
     "tauri:build:smoke": "npm run build && cargo build --release --manifest-path src-tauri/Cargo.toml --bin cortex-speech-app",
     "test:integration": "cargo test --manifest-path src-tauri/Cargo.toml --test tauri_integration -- --nocapture",
     "test:soak": "cargo test --manifest-path src-tauri/Cargo.toml --test soak -- --nocapture",
