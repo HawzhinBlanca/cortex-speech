@@ -808,6 +808,36 @@
     }
   }
 
+  // Opt-in: transcribe the selected segment with the embedded fine-tuned Kurdish model (~19% CER)
+  // via `transcribe_segment_finetuned`. The default `handleTranscribe` (sherpa) path is unchanged.
+  async function handleTranscribeFinetuned() {
+    const seg = $selectedSegment;
+    if (!seg || $isProcessing) return;
+    if (!requireDesktopRuntime()) return;
+    startOperation('transcribe');
+    isProcessing.set(true);
+    pipelinePhase.set('transcribing');
+    statusMessage.set($t('transcribing'));
+    try {
+      const result = await api.transcribeSegmentFinetuned(seg.audioPath);
+      const updatedSeg = {
+        ...seg,
+        rawTranscript: result.rawTranscript,
+        annotatedTranscript: result.text,
+      };
+      await api.updateSegment(updatedSeg);
+      await loadSegments();
+      notifications.success($t('notifications.transcriptionComplete'));
+    } catch (e) {
+      notifyActionableError(e, $t('errors.transcriptionFailed'));
+    } finally {
+      isProcessing.set(false);
+      pipelinePhase.set('idle');
+      statusMessage.set($t('ready'));
+      endOperation('transcribe');
+    }
+  }
+
   async function handleNormalize() {
     const seg = $selectedSegment;
     if (!seg?.rawTranscript) return;
@@ -2043,6 +2073,15 @@
                   title={$t('transcribeConstrainedTitle')}
                 >
                   {$t('transcribeConstrained')}
+                </button>
+                <button
+                  data-testid="transcribe-finetuned-btn"
+                  class="btn btn-secondary !text-xs"
+                  onclick={handleTranscribeFinetuned}
+                  disabled={$isProcessing}
+                  title={$t('transcribeFinetunedTitle')}
+                >
+                  {$t('transcribeFinetuned')}
                 </button>
                 <button class="btn btn-secondary !text-xs" onclick={handleNormalize}
                   >{$t('normalize')}</button

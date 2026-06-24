@@ -56,6 +56,16 @@ export async function transcribeSegmentConstrained(
   return invoke('transcribe_segment_constrained', { audioPath });
 }
 
+/**
+ * Opt-in: transcribe with the embedded fine-tuned Kurdish Wav2Vec2-CTC model (~19% CER, roughly
+ * half the stock OmniASR error). Falls back with an error if the model is not installed.
+ */
+export async function transcribeSegmentFinetuned(
+  audioPath: string,
+): Promise<{ text: string; rawTranscript: string }> {
+  return invoke('transcribe_segment_finetuned', { audioPath });
+}
+
 export async function batchTranscribe(ids: string[]): Promise<{ status: string }> {
   return invoke('batch_transcribe', { ids });
 }
