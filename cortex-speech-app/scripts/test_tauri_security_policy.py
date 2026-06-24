@@ -90,7 +90,11 @@ def test_csp_blocks_browser_escape_hatches() -> None:
         if forbidden in directives["script-src"]:
             raise AssertionError(f"CSP script-src must not allow {forbidden}")
 
-    if directives.get("connect-src") != ["'self'", "ipc:", "https://ipc.localhost"]:
+    # http://ipc.localhost is the Windows WebView2 origin for Tauri's IPC/event channel; without
+    # it the event-listen connect is CSP-blocked and import/refresh events can be dropped. This
+    # mirrors the existing http://asset.localhost entry already approved in media-src below — a
+    # specific localhost origin, NOT a broad http: wildcard (script-src still forbids http:).
+    if directives.get("connect-src") != ["'self'", "ipc:", "https://ipc.localhost", "http://ipc.localhost"]:
         raise AssertionError(f"CSP connect-src changed: {directives.get('connect-src')}")
     if directives.get("img-src") != ["'self'", "asset:", "https://asset.localhost"]:
         raise AssertionError(f"CSP img-src changed: {directives.get('img-src')}")
