@@ -526,10 +526,10 @@ pub fn run() {
         ])
         .setup(|app| {
             use tauri::Manager;
-            for (label, window) in app.webview_windows() {
+            for (label, _window) in app.webview_windows() {
                 tracing::info!("Found webview window: {label}");
                 #[cfg(debug_assertions)]
-                window.open_devtools();
+                _window.open_devtools();
             }
 
             if std::env::var("CORTEX_INTEGRATION_TEST").ok().as_deref() == Some("1")

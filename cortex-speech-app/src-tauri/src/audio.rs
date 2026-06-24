@@ -467,14 +467,29 @@ pub fn get_duration_ms<P: AsRef<Path>>(path: P) -> AppResult<i64> {
         .ok_or_else(|| AppError::Audio(AudioError::NoTracks(path.as_ref().to_path_buf())))?;
 
     let params = &track.codec_params;
-    let n_frames = params.n_frames.unwrap_or(0);
     let sample_rate = params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE) as f64;
 
     if sample_rate <= 0.0 {
         return Err(AppError::Audio(AudioError::Decode("Invalid sample rate".into())));
     }
 
-    Ok(frames_to_duration_ms(n_frames, sample_rate))
+    match params.n_frames {
+        // Container reported a real frame count (the common path): cheap, metadata-only.
+        Some(n) if n > 0 => Ok(frames_to_duration_ms(n, sample_rate)),
+        // No usable frame count (VBR MP3 without a Xing/Info header, streamed OGG/WebM, some
+        // live recordings). Reporting 0 here makes every import entry point reject the file as
+        // "Empty audio file" even though it decodes fine. Fall back to an actual decode to get
+        // the true duration; decode_to_pcm caches, so the subsequent pipeline decode reuses it.
+        // A genuinely empty/0-sample file still yields 0 and is still rejected.
+        _ => {
+            let (decoded_rate, samples) = decode_to_pcm(path.as_ref())?;
+            if samples.is_empty() || decoded_rate == 0 {
+                Ok(0)
+            } else {
+                Ok(((samples.len() as f64 / decoded_rate as f64) * 1000.0) as i64)
+            }
+        }
+    }
 }
 
 /// Clear the PCM decode cache.
@@ -1055,6 +1070,27 @@ mod tests {
         assert_eq!(frames_to_duration_ms(44_100 * 60, 44_100.0), 60_000, "stereo 60s must not halve");
         assert_eq!(frames_to_duration_ms(0, 16_000.0), 0);
         assert_eq!(frames_to_duration_ms(16_000, 0.0), 0, "non-positive sample rate guarded");
+    }
+
+    #[test]
+    fn get_duration_ms_reports_real_duration_for_wav() {
+        use hound::{WavSpec, WavWriter};
+        use tempfile::TempDir;
+
+        // Common metadata path: a WAV always carries n_frames, so this must stay byte-identical
+        // to the old behavior (a regression guard for the unknown-frame fallback added to
+        // get_duration_ms). Exactly 1 second of 16 kHz mono audio => 1000 ms.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("one_sec.wav");
+        let spec =
+            WavSpec { channels: 1, sample_rate: 16000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut writer = WavWriter::create(&path, spec).unwrap();
+        for _ in 0..16_000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        assert_eq!(get_duration_ms(&path).unwrap(), 1000);
     }
 
     #[test]

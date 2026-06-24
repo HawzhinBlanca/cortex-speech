@@ -436,9 +436,19 @@ pub fn import_directory(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
         }
         let _guard = ImportGuard { app: app_clone.clone() };
 
-        let result = pipeline.import_directory_with_agent_run_id(&dir_path, cancel, Some(&agent_run_id), |event| {
-            emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "directory");
-        });
+        // Panic-guard the directory worker (same rationale as the single-file path): an unwound
+        // panic must not leave the import UI stuck "processing".
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pipeline.import_directory_with_agent_run_id(&dir_path, cancel, Some(&agent_run_id), |event| {
+                emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "directory");
+            })
+        }));
+        let result = match caught {
+            Ok(r) => r,
+            Err(_) => {
+                Err(crate::error::AppError::Other("Import failed unexpectedly (internal error); see logs.".to_string()))
+            }
+        };
 
         if let Err(e) = result {
             let error = e.to_string();
@@ -497,9 +507,32 @@ pub fn import_audio_file(
         }
         let _guard = ImportGuard { app: app_clone.clone() };
 
-        let result = pipeline.import_single_file_with_events(&file_path, cancel, Some(&agent_run_id), |event| {
-            emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "file");
-        });
+        // Guard the decode/VAD/ASR worker against panics (e.g. a pathological tensor inside
+        // onnxruntime/sherpa-onnx). Without this, an unwound panic skips every terminal event
+        // below and leaves the import progress UI stuck "processing" forever.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pipeline.import_single_file_with_events(&file_path, cancel, Some(&agent_run_id), |event| {
+                emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "file");
+            })
+        }));
+        let result = match caught {
+            Ok(r) => r,
+            Err(_) => {
+                let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+                emit_or_log(
+                    &app_clone,
+                    "pipeline-error",
+                    serde_json::json!({
+                        "file": fname,
+                        "error": "Import failed unexpectedly (internal error); see logs.",
+                    }),
+                );
+                let payload = serde_json::json!({ "total": 1, "succeeded": 0, "failed": 1, "source": "file" });
+                emit_or_log(&app_clone, "import-complete", payload.clone());
+                emit_or_log(&app_clone, "pipeline-complete", payload);
+                return;
+            }
+        };
         match result {
             Ok(segments) => {
                 let segment_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
