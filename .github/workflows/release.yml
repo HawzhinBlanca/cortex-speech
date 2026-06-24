@@ -57,6 +57,10 @@ jobs:
       - run: npm run test:e2e
       - run: npm audit --omit=dev
       - run: cargo deny --manifest-path src-tauri/Cargo.toml check
+      # Fetch + SHA-256-verify the gitignored model files into src-tauri/models/ so the bundle
+      # step finds the declared bundle.resources on a fresh checkout (blocker #1, from-source).
+      - name: Fetch + verify models
+        run: npm run fetch-models
       - name: Build Tauri app
         run: npm run tauri build
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
