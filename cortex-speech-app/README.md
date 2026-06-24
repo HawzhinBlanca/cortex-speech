@@ -80,9 +80,19 @@ The user-podcast guard requires `-UserPodcastFile` or `CORTEX_USER_PODCAST_FILE`
 
 Meta OmniASR CTC 300M weights can be installed automatically or manually.
 
-### Automatic (recommended)
+### Bundled (release installer)
 
-In the app, open **Settings -> AI Models** and click **Download All**. This fetches Silero VAD and the official sherpa-onnx OmniASR archive (~235 MB int8) into your app-data `models/` directory.
+The packaged Windows installer ships the OmniASR weights, Silero VAD, and the ONNX Runtime
+DLLs inside the app — a user who installs the release does **not** need to download anything.
+
+### Automatic (in-app, partial)
+
+In the app, open **Settings -> AI Models** and click **Download All**. This fetches **Silero VAD**
+(and other optional models with pinned hashes) into your app-data `models/` directory. The core
+**OmniASR CTC 300M** archive is **not** auto-downloaded yet — its release archive SHA-256 is not
+pinned, and the app refuses to fetch an unverifiable artifact — so install it via **Manual install**
+below or use the bundled release. (Pinning the archive hash to re-enable OmniASR auto-download is
+tracked as a release item.)
 
 ### Manual install
 
@@ -93,12 +103,23 @@ Download the archive from the [sherpa-onnx releases](https://github.com/k2-fsa/s
 | `model.int8.onnx` | Yes |
 | `tokens.txt` | Yes |
 | `silero_vad_v4.onnx` | Yes (VAD; sibling of `omniasr-ctc-300m/`) |
+| `onnxruntime.dll/onnxruntime.dll` | Yes on Windows (ONNX Runtime for `ort` load-dynamic VAD) |
+| `onnxruntime.dll/onnxruntime_providers_shared.dll` | Yes on Windows |
 
-Expected layout:
+On Windows the ONNX Runtime shared library is resolved next to the executable, or under the active
+`models/` directory in a folder literally named `onnxruntime.dll/` (see `models::init_ort_dylib_path`).
+Download the matching ONNX Runtime build from the
+[onnxruntime releases](https://github.com/microsoft/onnxruntime/releases) (the version `ort` 2.0 rc
+links against) and place both DLLs as shown below. The release installer bundles these for you.
+
+Expected layout (Windows dev tree):
 
 ```
 models/
 |-- silero_vad_v4.onnx
+|-- onnxruntime.dll/
+|   |-- onnxruntime.dll
+|   `-- onnxruntime_providers_shared.dll
 `-- omniasr-ctc-300m/
     |-- model.int8.onnx
     `-- tokens.txt
