@@ -70,3 +70,4 @@ cortex-speech-app/src-tauri/sherpa-onnx-v1.13.2-win-x64-shared-MD-Release/
 !docs/*.txt
 screenshot_now.png
 db_rs_original.rs
+Kurdish_ASR_Model_Export/

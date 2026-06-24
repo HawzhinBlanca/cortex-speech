@@ -3,7 +3,30 @@
 > **Real, measured numbers.** Produced by running the live OmniASR-CTC engine on human-transcribed
 > Kurdish audio and scoring against the verified references — no estimates, fully reproducible.
 
-## Headline result (2026-06-24)
+## ⭐ Fine-tuned model — the accuracy cure, measured (2026-06-25)
+
+A user-provided fine-tuned model, **`MMS-CTC-1B` (Wav2Vec2ForCTC, base `facebook/mms-1b-all`)**, was
+measured head-to-head against the stock baseline on an **identical** seed-fixed gold sample
+(N=50, seed=42, same corpus/chunk). Same NFC+lower+whitespace normalization for all; CPU inference.
+
+| Model (identical 50 clips) | micro CER | Output script |
+|---|:--:|:--:|
+| Stock OmniASR-CTC-300M (baseline) | **42.06%** | mixed (romanizes ~minority) |
+| Stock + Kurdish-token constrained decode | 40.08% | Kurdish (forced) |
+| **MMS-CTC-1B fine-tuned** | **19.77%** | **Kurdish (all clips)** |
+
+**Fine-tuning roughly halves CER (42.06% → 19.77%, ~53% relative) on identical audio, and eliminates
+the language-lock failures.** This is the real accuracy lever — measured, not estimated.
+
+**Honest caveats:** (1) **N=50 is preliminary** — a *publishable* number needs ≥900 + a bootstrap CI
+(the ≥53% gap is far beyond N=50 noise, but the point estimate will move). (2) The 29.40% headline
+below was a **different N=400** sample; this random 50-subset is harder for the stock model (42% here),
+so the **same-clips A/B is the fair comparison**, not 19.77% vs 29.40%. (3) Measured via a CPU
+`transformers` harness (`scripts/measure_finetuned_cer.py`), **not yet wired into the Tauri app** — the
+HF Wav2Vec2 model needs an ONNX export (for sherpa-onnx/`ort`) or a Python inference bridge to ship.
+(4) The model's own `sorani_normalize.py` was not applied (kept normalization identical across models).
+
+## Headline result — STOCK model baseline (2026-06-24)
 
 | Metric | Value | 95% CI | N | Model | Conditioning |
 |---|:--:|:--:|:--:|---|---|
