@@ -6,6 +6,8 @@ export const en: Record<string, string> = {
   open: 'Open',
   openFile: 'Open File',
   transcribe: 'Transcribe',
+  transcribeConstrained: 'Kurdish-only',
+  transcribeConstrainedTitle: 'Transcribe with constrained Kurdish-script decode (guarantees Kurdish output)',
   transcribing: 'Transcribing...',
   verify: 'Verify',
   unverify: 'Unverify',

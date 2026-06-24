@@ -6,6 +6,8 @@ export const ckb: Record<string, string> = {
   open: 'کردنەوە',
   openFile: 'کردنەوەی فایل',
   transcribe: 'نووسینەوە',
+  transcribeConstrained: 'تەنها کوردی',
+  transcribeConstrainedTitle: 'نووسینەوە بە دیکۆدی بەربەستکراوی پیتی کوردی (دەرئەنجامی کوردی دەستەبەر دەکات)',
   transcribing: 'نووسینەوە...',
   verify: 'پشتڕاستکردن',
   unverify: 'لابردنی پشتڕاستکردن',
