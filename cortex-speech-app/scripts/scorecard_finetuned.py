@@ -82,6 +82,21 @@ def main() -> int:
     print(f"  (stock OmniASR-CTC-300M baseline: 29.40%, N=400)")
     print(f"  per-clip -> {out_tsv}")
     print(f"=================================================")
+
+    # Optional regression gate: fail if micro CER exceeds the baseline CI upper bound by more than a
+    # noise margin (default 1.5 absolute pts). Set CORTEX_SCORECARD_BASELINE to docs/finetuned_scorecard_baseline.json.
+    baseline_path = os.environ.get("CORTEX_SCORECARD_BASELINE", "")
+    if baseline_path:
+        import json
+
+        with open(baseline_path, encoding="utf-8") as bf:
+            b = json.load(bf)
+        margin = float(os.environ.get("CORTEX_SCORECARD_MARGIN_PTS", "1.5"))
+        ceiling = float(b["ci_hi"]) + margin
+        if micro * 100 > ceiling:
+            print(f"REGRESSION: micro CER {micro*100:.2f}% > baseline ci_hi {b['ci_hi']}% + {margin}pt = {ceiling:.2f}%")
+            return 1
+        print(f"OK vs baseline: {micro*100:.2f}% <= {ceiling:.2f}%")
     return 0
 
 

@@ -71,3 +71,20 @@ jobs:
       - name: Soak import stability
         run: cargo test --test soak -- --nocapture
         working-directory: cortex-speech-app/src-tauri
+
+      - name: Fine-tuned accuracy regression gate (when gold + model provided)
+        working-directory: cortex-speech-app
+        env:
+          CORTEX_FINETUNED_GOLD: ${{ vars.CORTEX_FINETUNED_GOLD || '' }}
+          CORTEX_FINETUNED_MODEL: ${{ vars.CORTEX_FINETUNED_MODEL || '' }}
+          CORTEX_FINETUNED_ONNX: ${{ vars.CORTEX_FINETUNED_ONNX || '' }}
+          CORTEX_SCORECARD_BASELINE: docs/finetuned_scorecard_baseline.json
+        run: |
+          if [ -z "$CORTEX_FINETUNED_GOLD" ] || [ ! -f "$CORTEX_FINETUNED_GOLD" ] || [ -z "$CORTEX_FINETUNED_ONNX" ]; then
+            echo "::warning title=Fine-tuned accuracy gate skipped::No CORTEX_FINETUNED_GOLD/ONNX provided - the fine-tuned CER regression gate did NOT run. A green run here does NOT mean accuracy held. Provide the gold manifest + model.onnx to enforce 21.00% +/- band (docs/finetuned_scorecard_baseline.json)."
+            exit 0
+          fi
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --quiet transformers soundfile jiwer onnxruntime numpy
+          # Exits non-zero if micro CER exceeds the committed baseline ci_hi by > the noise margin.
+          python scripts/scorecard_finetuned.py "$CORTEX_FINETUNED_GOLD" 3000
