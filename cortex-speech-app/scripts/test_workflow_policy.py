@@ -108,7 +108,9 @@ def test_nightly_real_audio_fails_on_real_regressions_but_skips_missing_fixtures
     nightly = workflow("nightly-real-audio.yml")
     if "continue-on-error" in nightly:
         raise AssertionError("nightly real-audio must fail when configured tests fail")
-    assert_contains(nightly, 'echo "No CORTEX_REAL_AUDIO_DIR - skipping real-audio suite"', "nightly-real-audio.yml")
+    # Missing-fixture branch must SKIP (exit 0) but make the skip VISIBLE via a warning annotation,
+    # so a green nightly is never mistaken for "real audio passed" (a skip is not a pass).
+    assert_contains(nightly, "::warning title=Real-audio suite skipped", "nightly-real-audio.yml")
     assert_contains(nightly, "exit 0", "nightly-real-audio.yml")
     assert_contains(nightly, "cargo test --test real_audio -- --ignored --nocapture", "nightly-real-audio.yml")
     assert_contains(nightly, "cargo test --test soak -- --nocapture", "nightly-real-audio.yml")
