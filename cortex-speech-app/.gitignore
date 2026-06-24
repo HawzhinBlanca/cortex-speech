@@ -24,6 +24,9 @@ coverage/
 *.wav
 *.mp3
 *.flac
+# Committable CC-BY test fixture (Google FLEURS ckb_iq) for the real-ASR gate — exempt from *.wav/*.txt.
+!src-tauri/tests/fixtures/fleurs_ckb_sample.wav
+!src-tauri/tests/fixtures/fleurs_ckb_sample.txt
 *.m4a
 *.ogg
 *.aac
