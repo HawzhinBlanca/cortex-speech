@@ -5,9 +5,25 @@
 
 ## ⭐ Fine-tuned model — the accuracy cure, measured (2026-06-25)
 
-A user-provided fine-tuned model, **`MMS-CTC-1B` (Wav2Vec2ForCTC, base `facebook/mms-1b-all`)**, was
-measured head-to-head against the stock baseline on an **identical** seed-fixed gold sample
-(N=50, seed=42, same corpus/chunk). Same NFC+lower+whitespace normalization for all; CPU inference.
+A user-provided fine-tuned model, **`MMS-CTC-1B` (Wav2Vec2ForCTC, base `facebook/mms-1b-all`)**, is
+now the app's opt-in engine. Two measurements: a **publishable N=900 scorecard** of the fine-tuned
+model, and an **identical-clips A/B (N=50)** isolating the per-clip improvement vs the stock model.
+
+### Publishable scorecard — the shipped (int8 ONNX) fine-tuned engine
+
+| Metric | Value | 95% CI | N | Engine | Command |
+|---|:--:|:--:|:--:|---|---|
+| **micro CER** | **21.00%** | **[19.93%, 22.04%]** | 900 | MMS-CTC-1B int8 ONNX via onnxruntime | `scripts/scorecard_finetuned.py <manifest> 3000` |
+
+- 3000-sample utterance bootstrap (Bisani & Ney ratio-of-sums; seed-fixed). Same NFC+lower+whitespace
+  normalization as the stock baseline below. This is the number the **embedded engine** produces.
+- vs stock OmniASR-CTC-300M **29.40%** (N=400): the fine-tune cuts CER by ~8.4 pts absolute / ~29%
+  relative on the corpus, and always emits Kurdish script (no romanization/language-lock failures).
+
+### Identical-clips A/B (N=50) — per-clip improvement
+
+Measured head-to-head against the stock baseline on an **identical** seed-fixed gold sample
+(N=50, seed=42, same corpus/chunk). Same normalization; CPU inference.
 
 | Model (identical 50 clips) | micro CER | Output script |
 |---|:--:|:--:|
@@ -18,10 +34,10 @@ measured head-to-head against the stock baseline on an **identical** seed-fixed 
 **Fine-tuning roughly halves CER (42.06% → 19.77%, ~53% relative) on identical audio, and eliminates
 the language-lock failures.** This is the real accuracy lever — measured, not estimated.
 
-**Honest caveats:** (1) **N=50 is preliminary** — a *publishable* number needs ≥900 + a bootstrap CI
-(the ≥53% gap is far beyond N=50 noise, but the point estimate will move). (2) The 29.40% headline
-below was a **different N=400** sample; this random 50-subset is harder for the stock model (42% here),
-so the **same-clips A/B is the fair comparison**, not 19.77% vs 29.40%. (3) Measured via a CPU
+**Honest caveats:** (1) The publishable point estimate is the **N=900 21.00% [19.93, 22.04]** above;
+this N=50 A/B is for the *per-clip* comparison only (its 19.77% is on an easier subset than the N=900
+mean). (2) The 29.40% headline below was a **different N=400** sample; this random 50-subset is harder
+for the stock model (42% here), so the **same-clips A/B is the fair per-clip comparison**. (3) Measured via a CPU
 `transformers` harness (`scripts/measure_finetuned_cer.py`). The model is now **ONNX-exported**
 (`scripts/export_finetuned_onnx.py`, external-data) and the export is **verified** — run via
 onnxruntime it scores **18.57% CER** on the same 50 clips (`scripts/verify_onnx_export.py`), matching
