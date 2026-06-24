@@ -8,6 +8,8 @@ export const en: Record<string, string> = {
   transcribe: 'Transcribe',
   transcribeConstrained: 'Kurdish-only',
   transcribeConstrainedTitle: 'Transcribe with constrained Kurdish-script decode (guarantees Kurdish output)',
+  transcribeFinetuned: 'Fine-tuned',
+  transcribeFinetunedTitle: 'Transcribe with the fine-tuned Kurdish model (~19% CER, roughly half the stock error)',
   transcribing: 'Transcribing...',
   verify: 'Verify',
   unverify: 'Unverify',

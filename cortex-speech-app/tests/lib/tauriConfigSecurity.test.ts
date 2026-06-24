@@ -50,8 +50,12 @@ describe('Tauri config security boundaries', () => {
       { path: 'models/onnxruntime.dll/onnxruntime.dll', minBytes: 10_000_000 },
       { path: 'models/onnxruntime.dll/onnxruntime_providers_shared.dll', minBytes: 1_000 },
     ];
+    // The embedded fine-tuned Kurdish model is USER-PROVIDED (not fetched from a public upstream
+    // like the base models), so it must be DECLARED in the bundle but its (large, gitignored) file
+    // is only size-checked when present.
+    const finetunedPaths = ['models/finetuned-mms-ckb/model.onnx', 'models/finetuned-mms-ckb/vocab.json'];
     const resources = config.bundle?.resources ?? [];
-    const requiredPaths = requiredResources.map((resource) => resource.path);
+    const requiredPaths = [...requiredResources.map((resource) => resource.path), ...finetunedPaths];
 
     expect(resources).toEqual(requiredPaths);
     expect(resources).not.toContain('models/*');
@@ -71,6 +75,14 @@ describe('Tauri config security boundaries', () => {
 
       expect(existsSync(resourcePath)).toBe(true);
       expect(statSync(resourcePath).size).toBeGreaterThanOrEqual(resource.minBytes);
+    }
+
+    for (const p of finetunedPaths) {
+      expect(resources).toContain(p);
+      const fp = resolve(process.cwd(), 'src-tauri', p);
+      if (existsSync(fp)) {
+        expect(statSync(fp).size).toBeGreaterThan(0);
+      }
     }
   });
 });
