@@ -781,6 +781,48 @@ pub fn transcribe_segment_constrained(audio_path: String) -> Result<serde_json::
     Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
 }
 
+/// Opt-in: transcribe a segment with the fine-tuned Kurdish Wav2Vec2-CTC model (ONNX via `ort`),
+/// which roughly halves CER vs the stock OmniASR path (see docs/EVAL.md). Additive — the default
+/// `transcribe_segment` path is unchanged. Resolves the model from `CORTEX_FINETUNED_ONNX` +
+/// `CORTEX_FINETUNED_VOCAB` (dev/testing) or `<models>/finetuned-mms-ckb/{model.onnx,vocab.json}`.
+#[tauri::command]
+pub fn transcribe_segment_finetuned(audio_path: String) -> Result<serde_json::Value, String> {
+    RATE_LIMITER.check("transcribe_segment_finetuned")?;
+    validate::validate_file_path(&audio_path)?;
+    let (onnx, vocab) = if let (Ok(o), Ok(v)) = (
+        std::env::var("CORTEX_FINETUNED_ONNX"),
+        std::env::var("CORTEX_FINETUNED_VOCAB"),
+    ) {
+        (std::path::PathBuf::from(o), std::path::PathBuf::from(v))
+    } else {
+        // Resolve finetuned-mms-ckb/{model.onnx,vocab.json} from the active (user/APPDATA) models
+        // dir, then the bundled models dir (installer resources / dev tree).
+        let mut found = None;
+        for base in [crate::models::active_models_dir(), crate::models::bundled_models_dir()] {
+            let dir = base.join("finetuned-mms-ckb");
+            let onnx = dir.join("model.onnx");
+            let vocab = dir.join("vocab.json");
+            if onnx.exists() && vocab.exists() {
+                found = Some((onnx, vocab));
+                break;
+            }
+        }
+        match found {
+            Some(p) => p,
+            None => {
+                return Err(
+                    "fine-tuned model not found (models/finetuned-mms-ckb/{model.onnx,vocab.json})"
+                        .to_string(),
+                )
+            }
+        }
+    };
+    let (_rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
+    let audio: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+    let text = crate::wav2vec2_asr::run_wav2vec2(&onnx, &vocab, "ckb", &audio)?;
+    Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
+}
+
 #[tauri::command]
 pub fn transcribe_segment(
     segment_id: Option<String>,
