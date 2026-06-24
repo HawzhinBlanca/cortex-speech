@@ -46,6 +46,16 @@ export async function transcribeSegment(
   });
 }
 
+/**
+ * Opt-in: transcribe with the CONSTRAINED Kurdish-token CTC decode (guaranteed Kurdish-script
+ * output) via the ort raw-logits path, instead of the default sherpa-onnx decode.
+ */
+export async function transcribeSegmentConstrained(
+  audioPath: string,
+): Promise<{ text: string; rawTranscript: string }> {
+  return invoke('transcribe_segment_constrained', { audioPath });
+}
+
 export async function batchTranscribe(ids: string[]): Promise<{ status: string }> {
   return invoke('batch_transcribe', { ids });
 }

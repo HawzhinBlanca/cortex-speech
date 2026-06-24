@@ -423,6 +423,7 @@ pub fn run() {
             commands::import_directory,
             commands::import_audio_file,
             commands::transcribe_segment,
+            commands::transcribe_segment_constrained,
             commands::batch_transcribe,
             commands::normalize_text,
             commands::align_segment,
