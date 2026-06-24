@@ -58,6 +58,7 @@ pub mod stats;
 pub mod telemetry;
 pub mod throttle;
 pub mod validation;
+pub mod wav2vec2_asr;
 pub mod wer;
 
 use cache::TranscriptCache;
@@ -424,6 +425,7 @@ pub fn run() {
             commands::import_audio_file,
             commands::transcribe_segment,
             commands::transcribe_segment_constrained,
+            commands::transcribe_segment_finetuned,
             commands::batch_transcribe,
             commands::normalize_text,
             commands::align_segment,

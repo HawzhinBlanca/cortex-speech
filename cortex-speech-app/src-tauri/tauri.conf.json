@@ -38,7 +38,9 @@
       "models/omniasr-ctc-300m/model.int8.onnx",
       "models/omniasr-ctc-300m/tokens.txt",
       "models/onnxruntime.dll/onnxruntime.dll",
-      "models/onnxruntime.dll/onnxruntime_providers_shared.dll"
+      "models/onnxruntime.dll/onnxruntime_providers_shared.dll",
+      "models/finetuned-mms-ckb/model.onnx",
+      "models/finetuned-mms-ckb/vocab.json"
     ],
     "windows": {
       "wix": {
