@@ -54,6 +54,19 @@
 | **2026-06-24** | **ckb micro CER (primary)** | **29.40% (95% CI 26.3–32.5)** | OmniASR-CTC-300M stock / "Comprehensive Central Kurdish Sound Dataset", N=400 (seed=42) | `cargo test --test real_audio ckb_scorecard_on_gold` → `python scripts/scorecard_stats.py results.tsv 3000` |
 | **2026-06-24** | **ckb micro WER (secondary)** | **67.62%** | same (N=400) | see `cortex-speech-app/docs/EVAL.md` |
 | **2026-06-24** | **fairness: gender CER disparity** | **4.29 pts** (M 29.66% / F 25.37%) | same, N=375/25 | first per-gender Sorani CER slice; `docs/EVAL.md` |
+| **2026-06-24** | **real-exe pipeline e2e (import→VAD→OmniASR)** | **PASS** — non-blank `"بروايت مفهومي حديث"` (ref `بە ڕیوایەتی مەفهوومی حەدیس`) | release build 2.1.0 / real ckb clip | `node e2e_pipeline_ipc.cjs` against `target/release/cortex-speech-app.exe` (no-fabrication guard) |
+| **2026-06-24** | **Windows installer bundle** | **PASS** — MSI 310 MB + NSIS 291 MB produced | release 2.1.0 (models bundled) | `npm run tauri build` → `target/release/bundle/{msi,nsis}/` |
+| **2026-06-24** | **Rust gates after reliability/CSP fixes** | **GREEN** | branch `m02-sorani-metrics` | `cargo clippy -D warnings` + `cargo test` + `npm run test:python-policies` |
+
+> **2026-06-24 hardening pass** (branch `m02-sorani-metrics`): drove the real `.exe` end-to-end and
+> fixed real defects found — import-worker panic-guard, unknown-frame audio recovery, CSP block of
+> the Windows event IPC (`http://ipc.localhost`), an un-broke of the eval row-propagation policy gate,
+> `ship-check` made a superset of CI, honest model-download docs + root README, and a real-app e2e
+> harness (`test:e2e:real` + `e2e_pipeline_ipc.cjs`). **Open finding:** the full UI click-through
+> e2e does not yet pass because the post-import jury adjudication holds the global DB lock across
+> heavy ASR (commands.rs:560-564), starving the UI's `get_segments` so the segment list does not
+> render promptly during import — flagged for a focused fix (segment is created and transcribes
+> fine; this is a UI-responsiveness defect, not an ASR defect).
 
 ---
 
