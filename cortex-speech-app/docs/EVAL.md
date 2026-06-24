@@ -22,8 +22,13 @@ the language-lock failures.** This is the real accuracy lever — measured, not 
 (the ≥53% gap is far beyond N=50 noise, but the point estimate will move). (2) The 29.40% headline
 below was a **different N=400** sample; this random 50-subset is harder for the stock model (42% here),
 so the **same-clips A/B is the fair comparison**, not 19.77% vs 29.40%. (3) Measured via a CPU
-`transformers` harness (`scripts/measure_finetuned_cer.py`), **not yet wired into the Tauri app** — the
-HF Wav2Vec2 model needs an ONNX export (for sherpa-onnx/`ort`) or a Python inference bridge to ship.
+`transformers` harness (`scripts/measure_finetuned_cer.py`). The model is now **ONNX-exported**
+(`scripts/export_finetuned_onnx.py`, external-data) and the export is **verified** — run via
+onnxruntime it scores **18.57% CER** on the same 50 clips (`scripts/verify_onnx_export.py`), matching
+the transformers 19.77% within export-fidelity noise. So it is loadable by the app's `ort` path; what
+remains to ship it in-app is the **Rust ASR-engine wiring** (Wav2Vec2 zero-mean/unit-variance feature
+normalization → ort inference → CTC decode against the model's `vocab.json`) and int8 quantization to
+shrink the ~3.7 GB fp32 ONNX.
 (4) The model's own `sorani_normalize.py` was not applied (kept normalization identical across models).
 
 ## Headline result — STOCK model baseline (2026-06-24)
