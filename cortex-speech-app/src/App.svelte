@@ -777,6 +777,37 @@
     }
   }
 
+  // Opt-in: transcribe the selected segment with the constrained Kurdish-token decode (guarantees
+  // Kurdish-script output) via the additive `transcribe_segment_constrained` backend command. The
+  // default `handleTranscribe` (sherpa path) is unchanged.
+  async function handleTranscribeConstrained() {
+    const seg = $selectedSegment;
+    if (!seg || $isProcessing) return;
+    if (!requireDesktopRuntime()) return;
+    startOperation('transcribe');
+    isProcessing.set(true);
+    pipelinePhase.set('transcribing');
+    statusMessage.set($t('transcribing'));
+    try {
+      const result = await api.transcribeSegmentConstrained(seg.audioPath);
+      const updatedSeg = {
+        ...seg,
+        rawTranscript: result.rawTranscript,
+        annotatedTranscript: result.text,
+      };
+      await api.updateSegment(updatedSeg);
+      await loadSegments();
+      notifications.success($t('notifications.transcriptionComplete'));
+    } catch (e) {
+      notifyActionableError(e, $t('errors.transcriptionFailed'));
+    } finally {
+      isProcessing.set(false);
+      pipelinePhase.set('idle');
+      statusMessage.set($t('ready'));
+      endOperation('transcribe');
+    }
+  }
+
   async function handleNormalize() {
     const seg = $selectedSegment;
     if (!seg?.rawTranscript) return;
@@ -2003,6 +2034,15 @@
                       >^T</span
                     >
                   {/if}
+                </button>
+                <button
+                  data-testid="transcribe-constrained-btn"
+                  class="btn btn-secondary !text-xs"
+                  onclick={handleTranscribeConstrained}
+                  disabled={$isProcessing}
+                  title={$t('transcribeConstrainedTitle')}
+                >
+                  {$t('transcribeConstrained')}
                 </button>
                 <button class="btn btn-secondary !text-xs" onclick={handleNormalize}
                   >{$t('normalize')}</button
