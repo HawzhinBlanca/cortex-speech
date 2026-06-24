@@ -559,6 +559,36 @@ impl AsrPool {
 mod tests {
     use super::*;
 
+    /// Feasibility gate for the constrained-decode port: can we load the OmniASR ONNX via `ort`
+    /// (dynamic onnxruntime) and run one inference to get the [1, T, 9812] CTC logits? Gated on the
+    /// model being present; sets ORT_DYLIB_PATH to the bundled onnxruntime.dll.
+    #[test]
+    #[ignore]
+    fn ort_omniasr_smoke() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let model = root.join("models/omniasr-ctc-300m/model.int8.onnx");
+        if !model.exists() {
+            eprintln!("model not present; skipping ort smoke");
+            return;
+        }
+        // Resolve the real nested onnxruntime.dll (models/onnxruntime.dll/onnxruntime.dll on
+        // Windows) via the production helper rather than hardcoding a path.
+        crate::models::init_ort_dylib_path();
+
+        let mut session = ort::session::Session::builder()
+            .expect("builder")
+            .commit_from_file(&model)
+            .expect("load model.int8.onnx via ort");
+
+        let n = 16000usize; // 1s of silence
+        let audio = vec![0.0f32; n];
+        let input = ort::value::Tensor::from_array(([1usize, n], audio)).expect("tensor");
+        let outputs = session.run(ort::inputs!["x" => input]).expect("run");
+        let (shape, _data) = outputs["logits"].try_extract_tensor::<f32>().expect("extract logits");
+        eprintln!("[ort-smoke] logits shape = {shape:?}");
+        assert_eq!(shape[2], 9812, "vocab dim must be 9812");
+    }
+
     #[test]
     fn empty_asr_text_has_zero_confidence_without_token_probs() {
         assert_eq!(confidence_from_asr_result("", &[]), (Some(0.0), ConfidenceSource::Heuristic));

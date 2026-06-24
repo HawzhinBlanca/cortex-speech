@@ -1971,6 +1971,7 @@
               </h2>
               <div class="flex gap-2">
                 <button
+                  data-testid="transcribe-btn"
                   class="btn btn-secondary !text-xs relative"
                   onclick={handleTranscribe}
                   disabled={$isProcessing}
