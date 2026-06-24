@@ -1,0 +1,12 @@
+{
+  "model": "MMS-CTC-1B int8 ONNX (fine-tuned ckb)",
+  "metric": "micro_cer",
+  "cer": 21.00,
+  "ci_lo": 19.93,
+  "ci_hi": 22.04,
+  "n": 900,
+  "seed": 42,
+  "normalization": "NFC+lower+whitespace",
+  "date": "2026-06-25",
+  "note": "Baseline for the gold-regression gate (scripts/scorecard_finetuned.py --baseline). A fresh run whose micro CER exceeds ci_hi by more than the noise margin fails. Stock OmniASR-CTC-300M baseline is 29.40% (N=400)."
+}
