@@ -60,7 +60,9 @@ jobs:
           CORTEX_REAL_AUDIO_DIR: ${{ github.event.inputs.real_audio_dir || vars.CORTEX_REAL_AUDIO_DIR || '' }}
         run: |
           if [ -z "$CORTEX_REAL_AUDIO_DIR" ] || [ ! -d "$CORTEX_REAL_AUDIO_DIR" ]; then
-            echo "No CORTEX_REAL_AUDIO_DIR - skipping real-audio suite"
+            # Honest signal: a SKIP is not a PASS. Emit a visible warning annotation so a green
+            # nightly is never mistaken for "the real OmniASR pipeline was exercised".
+            echo "::warning title=Real-audio suite skipped::No CORTEX_REAL_AUDIO_DIR fixture provided - the real OmniASR pipeline was NOT exercised. A green run here does NOT mean real-audio passed. Run npm run test:e2e:real or set CORTEX_REAL_AUDIO_DIR on a runner with the ONNX models."
             exit 0
           fi
           cd src-tauri
