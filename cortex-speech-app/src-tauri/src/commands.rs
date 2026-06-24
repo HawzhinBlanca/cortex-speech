@@ -539,6 +539,24 @@ pub fn import_audio_file(
                 let source_paths = vec![file_path.to_string_lossy().to_string()];
                 let post_import_file =
                     file_path.file_name().and_then(|n| n.to_str()).unwrap_or("post-import jury").to_string();
+                let seg_count = segments.len();
+
+                // Import is complete once VAD has produced segments — signal it NOW so the UI
+                // renders the segment list immediately, then run the heavy, ASR-bearing jury
+                // adjudication on a background thread. (Previously adjudication ran inline holding
+                // the global DB lock across ASR, starving the UI's get_segments so the list never
+                // rendered during import.) Adjudication enriches the segments and emits a refresh.
+                let ready_payload = serde_json::json!({
+                    "total": 1, "succeeded": 1, "failed": 0,
+                    "segmentCount": seg_count, "segmentIds": segment_ids.clone(), "source": "file",
+                });
+                emit_or_log(&app_clone, "import-complete", ready_payload.clone());
+                emit_or_log(&app_clone, "pipeline-complete", ready_payload);
+
+                let app_clone = app_clone.clone();
+                let agent_run_id = agent_run_id.clone();
+                let segment_ids = segment_ids.clone();
+                std::thread::spawn(move || {
                 emit_or_log(&app_clone, "pipeline-phase", serde_json::json!({ "phase": "adjudicating" }));
                 let adjudication_detail = format!("Adjudicating {} imported segment(s)", segment_ids.len());
                 emit_agent_stage_event(
@@ -659,39 +677,29 @@ pub fn import_audio_file(
                     Err(message)
                 };
                 if let Err(error) = adjudication_result {
+                    // Adjudication is best-effort enrichment; the import already succeeded and the
+                    // UI already rendered the segments, so a failure here is a non-fatal notice
+                    // (the jury_adjudication stage event already carries the detail) — NOT an
+                    // import failure.
                     log_jury_pipeline_failure("single-file import", &error);
-                    let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("post-import jury");
                     emit_or_log(
                         &app_clone,
                         "pipeline-error",
-                        serde_json::json!({
-                            "file": fname,
-                            "error": error,
-                        }),
+                        serde_json::json!({ "file": &post_import_file, "error": error }),
                     );
-                    let payload = serde_json::json!({
-                        "total": 1,
-                        "succeeded": 0,
-                        "failed": 1,
-                        "segmentCount": segments.len(),
-                        "segmentIds": segment_ids,
-                        "source": "file",
-                    });
-                    emit_or_log(&app_clone, "import-complete", payload.clone());
-                    emit_or_log(&app_clone, "pipeline-complete", payload);
-                    return;
                 }
-                let count = segments.len();
-                let payload = serde_json::json!({
+                // Refresh the UI so any references/verdicts produced by adjudication appear.
+                let done_payload = serde_json::json!({
                     "total": 1,
                     "succeeded": 1,
                     "failed": 0,
-                    "segmentCount": count,
+                    "segmentCount": seg_count,
                     "segmentIds": segment_ids,
                     "source": "file",
                 });
-                emit_or_log(&app_clone, "import-complete", payload.clone());
-                emit_or_log(&app_clone, "pipeline-complete", payload);
+                emit_or_log(&app_clone, "import-complete", done_payload.clone());
+                emit_or_log(&app_clone, "pipeline-complete", done_payload);
+                });
             }
             Err(e) => {
                 let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
