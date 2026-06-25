@@ -17,6 +17,7 @@
   } | null>(null);
   let loading = $state(true);
   let errorMessage = $state<string | null>(null);
+  let fingerprintCount = $state<number | null>(null);
   const tauriAvailable = isTauriRuntime();
 
   function buildLocalStats(items: SpeechSegment[]): DatasetStats {
@@ -83,6 +84,11 @@
     errorMessage = null;
     try {
       [stats, quality] = await Promise.all([api.getDatasetStats(), api.getDatasetQuality()]);
+      try {
+        fingerprintCount = await api.getFingerprintCount();
+      } catch {
+        // Non-essential stat — leave it hidden if the backend call fails.
+      }
       try {
         cert = await api.getDatasetCertificate(0.05, 0.95);
       } catch (err) {
@@ -179,6 +185,12 @@
         <div class="text-2xl font-bold text-cortex-300">{stats.uniqueSpeakers}</div>
         <div class="text-xs text-cortex-400">{$t('stats.uniqueSpeakers')}</div>
       </div>
+      {#if fingerprintCount !== null}
+        <div class="bg-cortex-800/30 rounded-lg p-3" data-testid="stat-fingerprints">
+          <div class="text-2xl font-bold text-cortex-300">{fingerprintCount}</div>
+          <div class="text-xs text-cortex-400">{$t('stats.fingerprints')}</div>
+        </div>
+      {/if}
     </div>
 
     {#if quality && quality.totalSegments > 0}

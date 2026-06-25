@@ -115,6 +115,8 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'get_configured_providers':
             // Names only, never key values — matches the real configured_providers() contract.
             return ['elevenlabs'];
+          case 'get_fingerprint_count':
+            return 1;
           case 'save_session': {
             // Persist view-state in localStorage so a reload restores it (the real backend persists
             // to session.json). Per-context, so it never leaks across tests.
