@@ -34,19 +34,13 @@ pub fn normalize_audio(audio: &[f32]) -> Vec<f32> {
 pub fn load_lang_vocab(vocab_path: &Path, lang: &str) -> Result<Vec<String>, String> {
     let text = std::fs::read_to_string(vocab_path).map_err(|e| format!("read vocab: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parse vocab: {e}"))?;
-    let sub = v
-        .get(lang)
-        .and_then(|s| s.as_object())
-        .ok_or_else(|| format!("vocab.json has no object for lang {lang:?}"))?;
+    let sub =
+        v.get(lang).and_then(|s| s.as_object()).ok_or_else(|| format!("vocab.json has no object for lang {lang:?}"))?;
     vocab_from_map(sub)
 }
 
 fn vocab_from_map(sub: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<String>, String> {
-    let max_id = sub
-        .values()
-        .filter_map(|x| x.as_u64())
-        .max()
-        .ok_or_else(|| "empty vocab".to_string())? as usize;
+    let max_id = sub.values().filter_map(|x| x.as_u64()).max().ok_or_else(|| "empty vocab".to_string())? as usize;
     let mut toks = vec![String::new(); max_id + 1];
     for (tok, id) in sub {
         if let Some(i) = id.as_u64() {
@@ -108,14 +102,10 @@ pub fn run_wav2vec2(onnx_path: &Path, vocab_path: &Path, lang: &str, audio: &[f3
         None => return Err("wav2vec2 session unexpectedly missing after init".to_string()),
     };
 
-    let input = ort::value::Tensor::from_array(([1usize, n], normed))
-        .map_err(|e| format!("ort input tensor: {e}"))?;
-    let outputs = session
-        .run(ort::inputs!["input_values" => input])
-        .map_err(|e| format!("ort run: {e}"))?;
-    let (shape, data) = outputs["logits"]
-        .try_extract_tensor::<f32>()
-        .map_err(|e| format!("ort extract logits: {e}"))?;
+    let input = ort::value::Tensor::from_array(([1usize, n], normed)).map_err(|e| format!("ort input tensor: {e}"))?;
+    let outputs = session.run(ort::inputs!["input_values" => input]).map_err(|e| format!("ort run: {e}"))?;
+    let (shape, data) =
+        outputs["logits"].try_extract_tensor::<f32>().map_err(|e| format!("ort extract logits: {e}"))?;
     if shape.len() != 3 {
         return Err(format!("unexpected logits rank {shape:?}"));
     }
@@ -124,9 +114,7 @@ pub fn run_wav2vec2(onnx_path: &Path, vocab_path: &Path, lang: &str, audio: &[f3
     if data.len() < frames_n * vocab {
         return Err("logits buffer smaller than shape".to_string());
     }
-    let frames: Vec<Vec<f32>> = (0..frames_n)
-        .map(|i| data[i * vocab..(i + 1) * vocab].to_vec())
-        .collect();
+    let frames: Vec<Vec<f32>> = (0..frames_n).map(|i| data[i * vocab..(i + 1) * vocab].to_vec()).collect();
     let tokens = load_lang_vocab(vocab_path, lang)?;
     Ok(ctc_decode(&frames, &tokens))
 }
@@ -163,13 +151,7 @@ mod tests {
     #[test]
     fn ctc_decode_collapses_drops_pad_and_maps_delimiter() {
         // tokens: 0=<pad>(blank), 1="|"(space), 2="ا", 3="ب", 4="<unk>"
-        let tokens = vec![
-            "<pad>".to_string(),
-            "|".to_string(),
-            "ا".to_string(),
-            "ب".to_string(),
-            "<unk>".to_string(),
-        ];
+        let tokens = vec!["<pad>".to_string(), "|".to_string(), "ا".to_string(), "ب".to_string(), "<unk>".to_string()];
         let hot = |id: usize| {
             let mut f = vec![0.0f32; 5];
             f[id] = 9.0;

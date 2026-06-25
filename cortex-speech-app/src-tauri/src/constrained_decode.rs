@@ -18,15 +18,13 @@ use std::sync::{LazyLock, Mutex};
 /// Cached `ort` session for the constrained decode path, keyed by model path. The 300M model load
 /// (~hundreds of ms) is amortized across repeated opt-in calls; the Mutex serializes constrained
 /// inferences (acceptable — this is a user-initiated, off-the-default-path action).
-static SESSION_CACHE: LazyLock<Mutex<Option<(PathBuf, ort::session::Session)>>> =
-    LazyLock::new(|| Mutex::new(None));
+static SESSION_CACHE: LazyLock<Mutex<Option<(PathBuf, ort::session::Session)>>> = LazyLock::new(|| Mutex::new(None));
 
 /// A token is treated as Kurdish (Arabic-script) if any of its chars fall in the Arabic block
 /// (U+0600..U+06FF) or the Arabic Supplement block (U+0750..U+077F) — the ranges Central Kurdish
 /// (Sorani) draws from. Mirrors `is_arabic` in the Python probe.
 pub fn is_arabic(tok: &str) -> bool {
-    tok.chars()
-        .any(|c| ('\u{0600}'..='\u{06FF}').contains(&c) || ('\u{0750}'..='\u{077F}').contains(&c))
+    tok.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c) || ('\u{0750}'..='\u{077F}').contains(&c))
 }
 
 /// Parse an OmniASR `tokens.txt`: every non-empty line is `<token> <id>`, where the id is the last
@@ -80,10 +78,7 @@ pub fn empirical_blank(logits: &[Vec<f32>]) -> usize {
     use std::collections::HashMap;
     let mut counts: HashMap<usize, usize> = HashMap::new();
     for frame in logits {
-        counts
-            .entry(argmax(frame, None))
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
+        counts.entry(argmax(frame, None)).and_modify(|c| *c += 1).or_insert(1);
     }
     counts.into_iter().max_by_key(|&(_, c)| c).map(|(id, _)| id).unwrap_or(0)
 }
@@ -156,14 +151,11 @@ pub fn run_constrained(
     };
 
     let n = audio.len();
-    let input = ort::value::Tensor::from_array(([1usize, n], audio.to_vec()))
-        .map_err(|e| format!("ort input tensor: {e}"))?;
-    let outputs = session
-        .run(ort::inputs!["x" => input])
-        .map_err(|e| format!("ort run: {e}"))?;
-    let (shape, data) = outputs["logits"]
-        .try_extract_tensor::<f32>()
-        .map_err(|e| format!("ort extract logits: {e}"))?;
+    let input =
+        ort::value::Tensor::from_array(([1usize, n], audio.to_vec())).map_err(|e| format!("ort input tensor: {e}"))?;
+    let outputs = session.run(ort::inputs!["x" => input]).map_err(|e| format!("ort run: {e}"))?;
+    let (shape, data) =
+        outputs["logits"].try_extract_tensor::<f32>().map_err(|e| format!("ort extract logits: {e}"))?;
     if shape.len() != 3 {
         return Err(format!("unexpected logits rank {:?}", shape));
     }
@@ -172,17 +164,11 @@ pub fn run_constrained(
     if data.len() < frames_n * vocab {
         return Err("logits buffer smaller than shape".to_string());
     }
-    let frames: Vec<Vec<f32>> = (0..frames_n)
-        .map(|i| data[i * vocab..(i + 1) * vocab].to_vec())
-        .collect();
+    let frames: Vec<Vec<f32>> = (0..frames_n).map(|i| data[i * vocab..(i + 1) * vocab].to_vec()).collect();
 
     let tokens = load_tokens(tokens_path).map_err(|e| format!("tokens {}: {e}", tokens_path.display()))?;
     let blank = empirical_blank(&frames);
-    let keep = if constrained {
-        Some(kurdish_keep_set(&tokens, blank))
-    } else {
-        None
-    };
+    let keep = if constrained { Some(kurdish_keep_set(&tokens, blank)) } else { None };
     Ok(greedy_ctc(&frames, blank, &tokens, keep.as_deref()))
 }
 

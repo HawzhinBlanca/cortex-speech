@@ -557,118 +557,36 @@ pub fn import_audio_file(
                 let agent_run_id = agent_run_id.clone();
                 let segment_ids = segment_ids.clone();
                 std::thread::spawn(move || {
-                emit_or_log(&app_clone, "pipeline-phase", serde_json::json!({ "phase": "adjudicating" }));
-                let adjudication_detail = format!("Adjudicating {} imported segment(s)", segment_ids.len());
-                emit_agent_stage_event(
-                    &app_clone,
-                    Some(&agent_run_id),
-                    "file",
-                    AgentStageEmission {
-                        stage: "jury_adjudication",
-                        status: "running",
-                        file: &post_import_file,
-                        detail: &adjudication_detail,
-                        current: 0,
-                        total: segment_ids.len(),
-                    },
-                );
-                let adjudication_result = if let Some(app_state) = app_clone.try_state::<AppState>() {
-                    let settings = app_state.lock_settings().clone();
-                    let agentic_readiness = agentic_readiness_snapshot_for_state(&app_state, &settings);
-                    // Adjudication uses its OWN database connection (WAL mode) rather than the
-                    // shared Mutex<Database> guard, so the heavy ASR-bearing jury never starves the
-                    // UI's get_segments (which locks the shared connection) while it runs. WAL lets
-                    // the UI read concurrently while the jury writes verdicts on its own connection.
-                    let jury_conn = app_state
-                        .data_dir
-                        .lock()
-                        .ok()
-                        .and_then(|g| (*g).clone())
-                        .map(|dir| dir.join("cortex-speech.db"))
-                        .and_then(|p| crate::db::Database::open(p.to_string_lossy().as_ref()).ok());
-                    let Some(db) = jury_conn else {
-                        emit_agent_stage_event(
-                            &app_clone,
-                            Some(&agent_run_id),
-                            "file",
-                            AgentStageEmission {
-                                stage: "jury_adjudication",
-                                status: "blocked",
-                                file: &post_import_file,
-                                detail: "could not open a private DB connection for adjudication",
-                                current: 0,
-                                total: segment_ids.len(),
-                            },
-                        );
-                        return;
-                    };
-                    let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&settings);
-                    report_options.agent_run_id = Some(agent_run_id.clone());
-                    report_options.agentic_readiness = Some(agentic_readiness);
-                    match run_jury_pipeline_core(&db, &settings, segment_ids.clone()) {
-                        Ok(jury_report) => {
-                            let completion_detail = format!(
-                                "Reference commits: {}; review queue: {}",
-                                jury_report["referenceCommitted"].as_u64().unwrap_or(0),
-                                jury_report["humanInbox"].as_u64().unwrap_or(0)
-                            );
-                            emit_agent_stage_event(
-                                &app_clone,
-                                Some(&agent_run_id),
-                                "file",
-                                AgentStageEmission {
-                                    stage: "jury_adjudication",
-                                    status: "completed",
-                                    file: &post_import_file,
-                                    detail: &completion_detail,
-                                    current: segment_ids.len(),
-                                    total: segment_ids.len(),
-                                },
-                            );
-                            crate::runs::record_agent_import_report_with_options(
-                                &db,
-                                "file",
-                                &source_paths,
-                                &segment_ids,
-                                Some(&jury_report),
-                                None,
-                                report_options,
-                            )
-                            .map(|_| {
-                                emit_agent_stage_event(
-                                    &app_clone,
-                                    Some(&agent_run_id),
-                                    "file",
-                                    AgentStageEmission {
-                                        stage: "agent_report",
-                                        status: "completed",
-                                        file: "agent import report",
-                                        detail: "Persisted auditable multi-agent import report",
-                                        current: segment_ids.len(),
-                                        total: segment_ids.len(),
-                                    },
-                                );
-                            })
-                            .map_err(|error| {
-                                format!("Agent import report persistence failed after single-file import: {error}")
-                            })
-                        }
-                        Err(error) => {
-                            let mut message =
-                                format!("Post-import jury adjudication failed after single-file import: {error}");
-                            if let Err(report_error) = crate::runs::record_agent_import_report_with_options(
-                                &db,
-                                "file",
-                                &source_paths,
-                                &segment_ids,
-                                None,
-                                Some(&error),
-                                report_options,
-                            ) {
-                                message.push_str(&format!(
-                                    "; additionally failed to persist agent import report: {report_error}"
-                                ));
-                            }
+                    emit_or_log(&app_clone, "pipeline-phase", serde_json::json!({ "phase": "adjudicating" }));
+                    let adjudication_detail = format!("Adjudicating {} imported segment(s)", segment_ids.len());
+                    emit_agent_stage_event(
+                        &app_clone,
+                        Some(&agent_run_id),
+                        "file",
+                        AgentStageEmission {
+                            stage: "jury_adjudication",
+                            status: "running",
+                            file: &post_import_file,
+                            detail: &adjudication_detail,
+                            current: 0,
+                            total: segment_ids.len(),
+                        },
+                    );
+                    let adjudication_result = if let Some(app_state) = app_clone.try_state::<AppState>() {
+                        let settings = app_state.lock_settings().clone();
+                        let agentic_readiness = agentic_readiness_snapshot_for_state(&app_state, &settings);
+                        // Adjudication uses its OWN database connection (WAL mode) rather than the
+                        // shared Mutex<Database> guard, so the heavy ASR-bearing jury never starves the
+                        // UI's get_segments (which locks the shared connection) while it runs. WAL lets
+                        // the UI read concurrently while the jury writes verdicts on its own connection.
+                        let jury_conn = app_state
+                            .data_dir
+                            .lock()
+                            .ok()
+                            .and_then(|g| (*g).clone())
+                            .map(|dir| dir.join("cortex-speech.db"))
+                            .and_then(|p| crate::db::Database::open(p.to_string_lossy().as_ref()).ok());
+                        let Some(db) = jury_conn else {
                             emit_agent_stage_event(
                                 &app_clone,
                                 Some(&agent_run_id),
@@ -677,54 +595,136 @@ pub fn import_audio_file(
                                     stage: "jury_adjudication",
                                     status: "blocked",
                                     file: &post_import_file,
-                                    detail: &message,
+                                    detail: "could not open a private DB connection for adjudication",
                                     current: 0,
                                     total: segment_ids.len(),
                                 },
                             );
-                            Err(message)
+                            return;
+                        };
+                        let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&settings);
+                        report_options.agent_run_id = Some(agent_run_id.clone());
+                        report_options.agentic_readiness = Some(agentic_readiness);
+                        match run_jury_pipeline_core(&db, &settings, segment_ids.clone()) {
+                            Ok(jury_report) => {
+                                let completion_detail = format!(
+                                    "Reference commits: {}; review queue: {}",
+                                    jury_report["referenceCommitted"].as_u64().unwrap_or(0),
+                                    jury_report["humanInbox"].as_u64().unwrap_or(0)
+                                );
+                                emit_agent_stage_event(
+                                    &app_clone,
+                                    Some(&agent_run_id),
+                                    "file",
+                                    AgentStageEmission {
+                                        stage: "jury_adjudication",
+                                        status: "completed",
+                                        file: &post_import_file,
+                                        detail: &completion_detail,
+                                        current: segment_ids.len(),
+                                        total: segment_ids.len(),
+                                    },
+                                );
+                                crate::runs::record_agent_import_report_with_options(
+                                    &db,
+                                    "file",
+                                    &source_paths,
+                                    &segment_ids,
+                                    Some(&jury_report),
+                                    None,
+                                    report_options,
+                                )
+                                .map(|_| {
+                                    emit_agent_stage_event(
+                                        &app_clone,
+                                        Some(&agent_run_id),
+                                        "file",
+                                        AgentStageEmission {
+                                            stage: "agent_report",
+                                            status: "completed",
+                                            file: "agent import report",
+                                            detail: "Persisted auditable multi-agent import report",
+                                            current: segment_ids.len(),
+                                            total: segment_ids.len(),
+                                        },
+                                    );
+                                })
+                                .map_err(|error| {
+                                    format!("Agent import report persistence failed after single-file import: {error}")
+                                })
+                            }
+                            Err(error) => {
+                                let mut message =
+                                    format!("Post-import jury adjudication failed after single-file import: {error}");
+                                if let Err(report_error) = crate::runs::record_agent_import_report_with_options(
+                                    &db,
+                                    "file",
+                                    &source_paths,
+                                    &segment_ids,
+                                    None,
+                                    Some(&error),
+                                    report_options,
+                                ) {
+                                    message.push_str(&format!(
+                                        "; additionally failed to persist agent import report: {report_error}"
+                                    ));
+                                }
+                                emit_agent_stage_event(
+                                    &app_clone,
+                                    Some(&agent_run_id),
+                                    "file",
+                                    AgentStageEmission {
+                                        stage: "jury_adjudication",
+                                        status: "blocked",
+                                        file: &post_import_file,
+                                        detail: &message,
+                                        current: 0,
+                                        total: segment_ids.len(),
+                                    },
+                                );
+                                Err(message)
+                            }
                         }
+                    } else {
+                        let message = "App state unavailable for post-import jury adjudication".to_string();
+                        emit_agent_stage_event(
+                            &app_clone,
+                            Some(&agent_run_id),
+                            "file",
+                            AgentStageEmission {
+                                stage: "jury_adjudication",
+                                status: "blocked",
+                                file: &post_import_file,
+                                detail: &message,
+                                current: 0,
+                                total: segment_ids.len(),
+                            },
+                        );
+                        Err(message)
+                    };
+                    if let Err(error) = adjudication_result {
+                        // Adjudication is best-effort enrichment; the import already succeeded and the
+                        // UI already rendered the segments, so a failure here is a non-fatal notice
+                        // (the jury_adjudication stage event already carries the detail) — NOT an
+                        // import failure.
+                        log_jury_pipeline_failure("single-file import", &error);
+                        emit_or_log(
+                            &app_clone,
+                            "pipeline-error",
+                            serde_json::json!({ "file": &post_import_file, "error": error }),
+                        );
                     }
-                } else {
-                    let message = "App state unavailable for post-import jury adjudication".to_string();
-                    emit_agent_stage_event(
-                        &app_clone,
-                        Some(&agent_run_id),
-                        "file",
-                        AgentStageEmission {
-                            stage: "jury_adjudication",
-                            status: "blocked",
-                            file: &post_import_file,
-                            detail: &message,
-                            current: 0,
-                            total: segment_ids.len(),
-                        },
-                    );
-                    Err(message)
-                };
-                if let Err(error) = adjudication_result {
-                    // Adjudication is best-effort enrichment; the import already succeeded and the
-                    // UI already rendered the segments, so a failure here is a non-fatal notice
-                    // (the jury_adjudication stage event already carries the detail) — NOT an
-                    // import failure.
-                    log_jury_pipeline_failure("single-file import", &error);
-                    emit_or_log(
-                        &app_clone,
-                        "pipeline-error",
-                        serde_json::json!({ "file": &post_import_file, "error": error }),
-                    );
-                }
-                // Refresh the UI so any references/verdicts produced by adjudication appear.
-                let done_payload = serde_json::json!({
-                    "total": 1,
-                    "succeeded": 1,
-                    "failed": 0,
-                    "segmentCount": seg_count,
-                    "segmentIds": segment_ids,
-                    "source": "file",
-                });
-                emit_or_log(&app_clone, "import-complete", done_payload.clone());
-                emit_or_log(&app_clone, "pipeline-complete", done_payload);
+                    // Refresh the UI so any references/verdicts produced by adjudication appear.
+                    let done_payload = serde_json::json!({
+                        "total": 1,
+                        "succeeded": 1,
+                        "failed": 0,
+                        "segmentCount": seg_count,
+                        "segmentIds": segment_ids,
+                        "source": "file",
+                    });
+                    emit_or_log(&app_clone, "import-complete", done_payload.clone());
+                    emit_or_log(&app_clone, "pipeline-complete", done_payload);
                 });
             }
             Err(e) => {
@@ -789,10 +789,9 @@ pub fn transcribe_segment_constrained(audio_path: String) -> Result<serde_json::
 pub fn transcribe_segment_finetuned(audio_path: String) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("transcribe_segment_finetuned")?;
     validate::validate_file_path(&audio_path)?;
-    let (onnx, vocab) = if let (Ok(o), Ok(v)) = (
-        std::env::var("CORTEX_FINETUNED_ONNX"),
-        std::env::var("CORTEX_FINETUNED_VOCAB"),
-    ) {
+    let (onnx, vocab) = if let (Ok(o), Ok(v)) =
+        (std::env::var("CORTEX_FINETUNED_ONNX"), std::env::var("CORTEX_FINETUNED_VOCAB"))
+    {
         (std::path::PathBuf::from(o), std::path::PathBuf::from(v))
     } else {
         // Resolve finetuned-mms-ckb/{model.onnx,vocab.json} from the active (user/APPDATA) models
@@ -810,10 +809,7 @@ pub fn transcribe_segment_finetuned(audio_path: String) -> Result<serde_json::Va
         match found {
             Some(p) => p,
             None => {
-                return Err(
-                    "fine-tuned model not found (models/finetuned-mms-ckb/{model.onnx,vocab.json})"
-                        .to_string(),
-                )
+                return Err("fine-tuned model not found (models/finetuned-mms-ckb/{model.onnx,vocab.json})".to_string())
             }
         }
     };

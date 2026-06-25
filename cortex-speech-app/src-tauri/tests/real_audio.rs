@@ -555,8 +555,7 @@ fn test_omniasr_on_real_audio() {
 /// asserts the real OmniASR produces a non-blank Kurdish (Arabic-script) transcript (no-fabrication).
 #[test]
 fn omniasr_on_committed_fleurs_ckb_fixture() {
-    let fixture =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
     if !fixture.exists() {
         eprintln!("[fleurs-gate] committed fixture missing; skipping");
         return;
