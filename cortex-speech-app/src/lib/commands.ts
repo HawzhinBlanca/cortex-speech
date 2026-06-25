@@ -397,6 +397,11 @@ export async function saveSession(searchQuery: string, sortOrder: string): Promi
   return invoke('save_session', { searchQuery, sortOrder });
 }
 
+/** Number of audio fingerprints stored for duplicate-import detection. */
+export async function getFingerprintCount(): Promise<number> {
+  return invoke<number>('get_fingerprint_count');
+}
+
 export async function getAudioDuration(path: string): Promise<number> {
   return invoke<number>('get_audio_duration', { path });
 }

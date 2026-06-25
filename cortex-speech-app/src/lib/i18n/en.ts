@@ -284,6 +284,7 @@ export const en: Record<string, string> = {
   'stats.totalDuration': 'Total Duration',
   'stats.verified': 'Verified',
   'stats.uniqueSpeakers': 'Unique Speakers',
+  'stats.fingerprints': 'Audio fingerprints',
   'stats.qualityTitle': 'Dataset Quality',
   'stats.emptyTranscripts': 'Empty transcripts',
   'stats.lowConfidence': 'Low confidence',

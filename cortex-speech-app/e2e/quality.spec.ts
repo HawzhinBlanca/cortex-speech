@@ -12,6 +12,11 @@ test.describe('Dataset quality UI', () => {
     await expect(page.getByText('Dataset Statistics')).toBeVisible();
     await expect(page.getByTestId('right-panel').getByText(/Mean WER/)).toBeVisible();
     await expect(page.getByTestId('right-panel').getByText('0.0%').first()).toBeVisible();
+
+    // Audio-fingerprint count (dedup) is surfaced as a stat card.
+    const fp = page.getByTestId('stat-fingerprints');
+    await expect(fp).toBeVisible();
+    await expect(fp).toContainText('Audio fingerprints');
   });
 
   test('validation panel opens and shows summary', async ({ page }) => {
