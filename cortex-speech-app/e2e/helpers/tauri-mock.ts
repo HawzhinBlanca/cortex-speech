@@ -141,6 +141,29 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'plugin:dialog|open':
             // Simulate the native file picker returning a chosen path.
             return '/fake/path/to/checkpoint.onnx';
+          case 'list_eval_runs':
+            return [];
+          case 'get_escalation_rate_trend':
+            return [];
+          case 'get_label_quality_lift':
+            return null;
+          case 'run_gold_eval_asr':
+          case 'run_gold_eval_local':
+            return {
+              run: {
+                id: 'eval-run-1',
+                modelId: 'omniasr-ctc-300m',
+                runAt: '2026-06-25T00:00:00Z',
+                numSegs: 40,
+                wer: 0.6,
+                cer: 0.29,
+              },
+              segments: [],
+            };
+          case 'build_scorecard':
+            return { scorecard: {}, markdown: '# Scorecard\n\nmicro CER: 29.0%\n' };
+          case 'create_gold_from_file':
+            return 5;
           case 'save_session': {
             // Persist view-state in localStorage so a reload restores it (the real backend persists
             // to session.json). Per-context, so it never leaks across tests.

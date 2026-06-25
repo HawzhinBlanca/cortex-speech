@@ -115,6 +115,28 @@ test.describe('App smoke tests', () => {
     await expect(page.getByRole('alert').filter({ hasText: 'Imported checkpoint' })).toBeVisible();
   });
 
+  test('refinery eval actions run an eval and build a scorecard', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.getByTestId('segments-empty-state')).not.toBeVisible({ timeout: 15_000 });
+
+    // Switch to the Insights view, where the RefineryPanel (with eval actions) renders.
+    await page.getByRole('button', { name: 'Insights' }).click();
+    const actions = page.getByTestId('refinery-eval-actions');
+    await expect(actions).toBeVisible();
+
+    // Run the honest-CER eval (run_gold_eval_asr) and show the result.
+    await page.getByTestId('eval-honest-cer').click();
+    const result = page.getByTestId('eval-result');
+    await expect(result).toBeVisible();
+    await expect(result).toContainText('CER 29.0%');
+
+    // Build a scorecard from that result (build_scorecard).
+    await page.getByTestId('eval-build-scorecard').click();
+    const scorecard = page.getByTestId('eval-scorecard');
+    await expect(scorecard).toBeVisible();
+    await expect(scorecard).toContainText('Scorecard');
+  });
+
   test('diagnostics panel shows tracing stats and recent spans', async ({ page }) => {
     await page.goto('/');
 
