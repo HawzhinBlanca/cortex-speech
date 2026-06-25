@@ -36,8 +36,14 @@
   }
 </script>
 
-<Modal open={$showKeyboardHelp} title={$t('keyboardShortcuts')} size="lg" onClose={close}>
-  <div class="space-y-5 px-5 py-4" data-testid="shortcuts-modal">
+<Modal
+  open={$showKeyboardHelp}
+  title={$t('keyboardShortcuts')}
+  size="lg"
+  testid="shortcuts-modal"
+  onClose={close}
+>
+  <div class="space-y-5 px-5 py-4">
     {#if shortcuts}
       {#each categories as cat (cat.id)}
         {#if shortcuts.filter((s) => s.category === cat.id).length > 0}

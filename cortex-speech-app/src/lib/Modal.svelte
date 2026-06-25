@@ -9,6 +9,7 @@
     title = '',
     description = '',
     size = 'md',
+    testid = '',
     onClose = () => {},
     children,
     footer,
@@ -17,6 +18,7 @@
     title?: string;
     description?: string;
     size?: Size;
+    testid?: string;
     onClose?: () => void;
     children?: import('svelte').Snippet;
     footer?: import('svelte').Snippet;
@@ -56,6 +58,7 @@
       ]}"
       role="dialog"
       aria-modal="true"
+      data-testid={testid || undefined}
       aria-label={title || undefined}
       aria-describedby={description ? 'modal-desc' : undefined}
       tabindex="-1"
