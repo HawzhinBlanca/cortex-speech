@@ -979,10 +979,19 @@ pub fn batch_transcribe(
 
         if !transcribed_ids.is_empty() {
             if let Some(app_state) = app_clone.try_state::<AppState>() {
-                let db = app_state.lock_db();
                 let settings = app_state.lock_settings().clone();
-                if let Err(error) = run_jury_pipeline_core(&db, &settings, transcribed_ids) {
-                    log_jury_pipeline_failure("batch transcription", &error);
+                // Separate WAL connection (not the shared lock_db guard) so the post-batch jury's
+                // possible T2 cloud calls don't starve the UI's get_segments while it runs.
+                match open_jury_db_connection(&app_state) {
+                    Some(db) => {
+                        if let Err(error) = run_jury_pipeline_core(&db, &settings, transcribed_ids) {
+                            log_jury_pipeline_failure("batch transcription", &error);
+                        }
+                    }
+                    None => log_jury_pipeline_failure(
+                        "batch transcription",
+                        "app data directory unavailable; could not open jury DB connection",
+                    ),
                 }
             }
         }
@@ -3464,11 +3473,28 @@ pub fn run_jury_pipeline_core(
     }))
 }
 
+/// Open a SEPARATE connection (WAL mode) to the app's SQLite DB for jury/adjudication batches. The
+/// jury may make N blocking T2 cloud calls; running it on its own connection — rather than the shared
+/// `lock_db()` guard — keeps the global lock free so the UI's `get_segments` is never starved for the
+/// duration of the run. Returns None when the app data dir isn't available yet.
+pub(crate) fn open_jury_db_connection(app_state: &AppState) -> Option<crate::db::Database> {
+    app_state
+        .data_dir
+        .lock()
+        .ok()
+        .and_then(|g| (*g).clone())
+        .map(|dir| dir.join("cortex-speech.db"))
+        .and_then(|p| crate::db::Database::open(p.to_string_lossy().as_ref()).ok())
+}
+
 #[tauri::command]
 pub fn run_jury_pipeline(state: State<'_, AppState>, segment_ids: Vec<String>) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("run_jury_pipeline")?;
-    let db = state.lock_db();
     let settings = state.lock_settings().clone();
+    // Run on a separate WAL connection (see open_jury_db_connection) so the batch jury's blocking T2
+    // cloud calls never hold the global lock and freeze the UI's get_segments for the whole run.
+    let db = open_jury_db_connection(&state)
+        .ok_or_else(|| "App data directory is unavailable for the jury run.".to_string())?;
     run_jury_pipeline_core(&db, &settings, segment_ids)
 }
 
@@ -3524,6 +3550,13 @@ pub fn run_t2_for_segment(
     let t2_evidence = reference_report.as_ref().map(reference_selection_evidence).into_iter().collect::<Vec<_>>();
 
     let few_shots = crate::jury::get_few_shot_examples(&db, &segment_id, 5).map_err(|e| e.to_string())?;
+
+    // Release the global DB lock BEFORE the blocking T2 cloud call (Gemini, n_samples retries —
+    // multiple seconds): holding it across the network request would starve every other DB user
+    // (e.g. the UI's get_segments) for the whole call — the same lock-across-blocking-work class as
+    // the jury-adjudication fix. All reads above are done; the verdict write below re-acquires.
+    drop(db);
+
     let result = crate::jury::t2_listener::listen_and_judge(
         &audio_b64,
         &hyps,
@@ -3545,6 +3578,7 @@ pub fn run_t2_for_segment(
         };
         let ev_json = serde_json::to_string(&evidence_payload)
             .map_err(|e| format!("Failed to serialize T2 evidence for {segment_id}: {e}"))?;
+        let db = state.lock_db(); // re-acquire the lock only to persist the verdict
         db.write_segment_verdict(
             &segment_id,
             "jury_accept",
