@@ -371,6 +371,17 @@ fn write_sha256sums(dir: &std::path::Path) -> AppResult<()> {
 }
 
 /// Export a HuggingFace Datasets–compatible directory (split folders + metadata + dataset card).
+/// Build the per-clip output filename for the HF export. Both the source stem and the segment id
+/// are caller/import-controlled (`validate_segment` only checks non-empty), so each is reduced to
+/// `[A-Za-z0-9_-]` — guaranteeing the result is a single path component that cannot escape the
+/// destination directory via separators or `..` when `join`ed (path traversal, CWE-22).
+fn sanitized_clip_filename(stem: &str, id: &str) -> String {
+    let clean = |s: &str| {
+        s.chars().map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect::<String>()
+    };
+    format!("{}_{}.wav", clean(stem), clean(id))
+}
+
 pub fn export_huggingface_dataset(
     db: &Database,
     dir: &std::path::Path,
@@ -549,11 +560,7 @@ pub fn export_huggingface_dataset(
                         };
 
                         let stem = source_path.file_stem().unwrap_or_default().to_string_lossy();
-                        let clean_stem = stem
-                            .chars()
-                            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-                            .collect::<String>();
-                        let filename = format!("{}_{}.wav", clean_stem, seg.id);
+                        let filename = sanitized_clip_filename(&stem, &seg.id);
                         let out_audio_path = dest_dir.join(&filename);
 
                         write_wav_atomic(&out_audio_path, 16000, pcm_slice.as_ref())?;
@@ -909,6 +916,26 @@ mod tests {
     use super::*;
     use crate::db::{Database, SegmentHypothesis, SourceTranscriptRecord};
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn sanitized_clip_filename_blocks_path_traversal() {
+        // A crafted stem/id from an imported dataset must never produce a separator or `..` escape:
+        // the result is always a single, join-safe component (CWE-22 regression).
+        for (stem, id) in [
+            ("../../etc/pass", "../../../root/id"),
+            ("a/b\\c", ".."),
+            ("normal", "..\\..\\win"),
+            ("clip\0", "seg/../../x"),
+        ] {
+            let f = sanitized_clip_filename(stem, id);
+            assert!(!f.contains('/') && !f.contains('\\'), "no separators: {f:?}");
+            assert!(!f.contains(".."), "no parent-dir tokens: {f:?}");
+            assert_eq!(std::path::Path::new(&f).components().count(), 1, "must be a single path component: {f:?}");
+            assert!(std::path::Path::new("/export/dir").join(&f).starts_with("/export/dir"), "stays under dir: {f:?}");
+        }
+        // Normal stems/ids pass through unchanged.
+        assert_eq!(sanitized_clip_filename("clip01", "seg_42"), "clip01_seg_42.wav");
+    }
 
     fn insert_machine_silver_segment_with_hf_coverage(
         db: &Database,
