@@ -2640,6 +2640,17 @@ pub(crate) fn require_cloud_stt_consent(state: &AppState) -> Result<(), String> 
     }
 }
 
+/// Consent gate for outbound cloud-LLM channels that POST private, transcript-derived data (e.g. the
+/// DPO preference-pair export). Same explicit opt-in the LLM-refine path requires — never ship the
+/// user's data to a cloud endpoint without it, even though the endpoint is also allow-list-validated.
+pub(crate) fn require_cloud_llm_consent(state: &AppState) -> Result<(), String> {
+    if state.lock_settings().cloud_llm_opt_in {
+        Ok(())
+    } else {
+        Err("Cloud LLM opt-in is required for this cloud upload. Enable it in Settings.".into())
+    }
+}
+
 /// Transcribe an audio file with ElevenLabs Scribe (verified working for Sorani). Uses the locally
 /// configured ELEVENLABS_API_KEY; errors clearly if it is absent. Returns the transcription text.
 #[tauri::command]
@@ -2800,6 +2811,10 @@ pub fn get_escalation_rate_trend(state: State<'_, AppState>) -> Result<Vec<crate
 #[tauri::command]
 pub fn run_dpo_update(state: State<'_, AppState>, endpoint: String) -> Result<String, String> {
     RATE_LIMITER.check("run_dpo_update")?;
+    // DPO POSTs private, transcript-derived preference pairs outbound — a parallel cloud-LLM channel,
+    // so it requires the same explicit cloud-LLM opt-in (the endpoint allow-list is a separate,
+    // non-consent control). Gate before building/serializing any of that private data.
+    require_cloud_llm_consent(&state)?;
     let db = state.lock_db();
     crate::jury::learning::run_dpo_update(&db, &endpoint).map_err(|e| e.to_string())
 }

@@ -657,6 +657,20 @@ mod tests {
     }
 
     #[test]
+    fn cloud_llm_channels_require_opt_in() {
+        // Regression: run_dpo_update POSTs private transcript-derived preference pairs outbound, so it
+        // must refuse without explicit cloud-LLM opt-in (the endpoint allow-list is not consent).
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        assert!(
+            commands::require_cloud_llm_consent(&state).is_err(),
+            "cloud-LLM data egress must be refused without opt-in"
+        );
+        state.settings.lock().unwrap().cloud_llm_opt_in = true;
+        assert!(commands::require_cloud_llm_consent(&state).is_ok(), "opt-in permits cloud-LLM egress");
+    }
+
+    #[test]
     fn app_state_cancel_token_recovers_poisoned_lock() {
         let dir = tempfile::TempDir::new().unwrap();
         let state = test_app_state(dir.path().to_path_buf());
