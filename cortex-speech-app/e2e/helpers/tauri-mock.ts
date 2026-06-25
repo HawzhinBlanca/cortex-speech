@@ -59,6 +59,19 @@ export async function installTauriMock(page: Page): Promise<void> {
       werOutliers: [],
     };
 
+    // Matches the real get_dataset_certificate contract (Result<ConformalCertificate, String>,
+    // always Ok — sparse data yields a heuristic, not-calibrated cert). Without this the harness's
+    // default null tripped `cert.threshold` and logged a misleading console.error every run.
+    const mockCertificate = {
+      targetError: 0.05,
+      confidenceLevel: 0.95,
+      threshold: 0.35,
+      totalCertified: 0,
+      certifiedSegmentIds: [],
+      expectedErrorBound: 0.05,
+      isCalibrated: false,
+    };
+
     let eventId = 1;
     const eventHandlers = new Map<number, (payload: unknown) => void>();
     const eventListenerIds = new Map<string, number[]>();
@@ -94,6 +107,8 @@ export async function installTauriMock(page: Page): Promise<void> {
             return mockSettings;
           case 'get_dataset_quality':
             return mockQuality;
+          case 'get_dataset_certificate':
+            return mockCertificate;
           case 'get_inference_stats':
             return {
               vad: { calls: 0, failures: 0, p50_ms: 0, p99_ms: 0 },
