@@ -89,6 +89,24 @@ test.describe('App smoke tests', () => {
     await expect(rows.first()).toContainText('CC-BY-NC-4.0');
   });
 
+  test('diagnostics panel shows tracing stats and recent spans', async ({ page }) => {
+    await page.goto('/');
+
+    await page.getByTestId('settings-btn').click();
+    const settings = page.getByTestId('settings-panel');
+    await expect(settings).toBeVisible();
+
+    await settings.getByRole('button', { name: 'Diagnostics', exact: true }).click();
+
+    const panel = settings.getByTestId('diagnostics-panel');
+    await expect(panel).toBeVisible();
+    await expect(panel.getByTestId('diagnostics-stats')).toBeVisible();
+
+    const spans = panel.getByTestId('diagnostics-spans').locator('li');
+    await expect(spans).toHaveCount(2);
+    await expect(spans.first()).toContainText('diff.compute');
+  });
+
   test('settings panel opens via Ctrl+, shortcut', async ({ page }) => {
     await page.goto('/');
     await page.getByTestId('app-root').click();

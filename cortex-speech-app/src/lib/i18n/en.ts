@@ -62,6 +62,7 @@ export const en: Record<string, string> = {
   general: 'General',
   asr: 'ASR',
   audio: 'Audio',
+  diagnostics: 'Diagnostics',
   theme: 'Theme',
   language: 'Language',
   dark: 'Dark',

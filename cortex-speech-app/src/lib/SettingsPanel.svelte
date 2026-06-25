@@ -9,15 +9,16 @@
   import { PARQUET_EXPORT_SUPPORTED } from './appFeatures';
   import ModelDownload from './ModelDownload.svelte';
   import ModelRegistry from './ModelRegistry.svelte';
+  import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import { t } from './i18n';
   import { get } from 'svelte/store';
   import { onDestroy, onMount } from 'svelte';
   import { isTauriRuntime } from './runtime';
 
   let localSettings: AppSettings = $state({ ...$settings });
-  let activeTab = $state<'general' | 'asr' | 'audio' | 'export' | 'models' | 'ai' | 'jury'>(
-    $settingsTab,
-  );
+  let activeTab = $state<
+    'general' | 'asr' | 'audio' | 'export' | 'models' | 'ai' | 'jury' | 'diagnostics'
+  >($settingsTab);
   let saving = $state(false);
   let exportingAudio = $state(false);
   let sourceReferenceModelsInput = $state('');
@@ -112,6 +113,7 @@
     { id: 'models', labelKey: 'models' },
     { id: 'ai', labelKey: 'AI Post-Processing' },
     { id: 'jury', labelKey: '📬 Listening Jury' },
+    { id: 'diagnostics', labelKey: 'diagnostics' },
   ] as const;
 
   async function save() {
@@ -822,6 +824,16 @@
               </label>
             {/if}
           </div>
+        {:else if activeTab === 'diagnostics'}
+          {#if tauriAvailable}
+            <DiagnosticsPanel />
+          {:else}
+            <div
+              class="rounded-md border border-cortex-700/40 bg-cortex-900/30 p-3 text-xs text-muted"
+            >
+              {$t('desktopRuntimeRequired')}
+            </div>
+          {/if}
         {/if}
       </div>
     </div>
