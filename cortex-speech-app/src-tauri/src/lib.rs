@@ -493,7 +493,6 @@ pub fn run() {
             commands::models_status,
             commands::models_download,
             commands::models_download_all,
-            commands::start_operation,
             commands::cancel_operation,
             commands::get_inference_stats,
             commands::run_wsl_refinement,
