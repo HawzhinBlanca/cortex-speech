@@ -1,6 +1,5 @@
 use crate::atomic_file::{remove_file_on_error, replace_file};
 use crate::audio;
-use crate::chunking::{self, SegmentSourceMeta};
 use crate::db::{Database, SpeechSegment};
 use crate::error::{AppError, AppResult};
 use crate::validation::input as validate;
@@ -118,22 +117,18 @@ fn export_single_segment(
     let (sample_rate, pcm_samples) =
         audio::decode_to_pcm(&seg.audio_path).map_err(|e| AppError::Other(format!("Failed to decode audio: {e}")))?;
 
-    let pcm_samples = if let Some(ref alignment) = seg.alignment_json {
-        if let Some(meta) = SegmentSourceMeta::from_alignment_json(alignment) {
-            let start = chunking::ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
-            let end = chunking::ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate).min(pcm_samples.len());
-            if end > start {
-                pcm_samples[start..end].to_vec()
-            } else {
-                pcm_samples
-            }
-        } else {
-            pcm_samples
-        }
-    } else {
-        pcm_samples
-    };
-    let pcm_samples = resample_pcm_i16(&pcm_samples, sample_rate, options.sample_rate);
+    // Slice to the segment's alignment window. A present-but-out-of-range window must SKIP
+    // (return Err, which the caller counts as a failed segment) — never fall back to the whole
+    // recording, which would pair a multi-minute file with one segment's short transcript (silent
+    // training-data corruption). Shares the exact guard the HF exporter uses (export::slice_for_export).
+    let pcm_window = crate::export::slice_for_export(&pcm_samples, sample_rate, seg.alignment_json.as_deref())
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "Segment {segment_id}: alignment window out of range for the decoded audio; skipping \
+                 to avoid exporting the whole recording under one segment's transcript"
+            ))
+        })?;
+    let pcm_samples = resample_pcm_i16(pcm_window.as_ref(), sample_rate, options.sample_rate);
 
     // Determine output filename
     let stem = source_path.file_stem().unwrap_or_default().to_string_lossy();
