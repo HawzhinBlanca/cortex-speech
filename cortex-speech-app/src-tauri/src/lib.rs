@@ -372,7 +372,7 @@ pub fn run() {
     );
 
     let history = HistoryManager::new(500);
-    let session = SessionManager::new(data_dir.join("session"));
+    let mut session = SessionManager::new(data_dir.join("session"));
 
     let model_manager = ModelManager::new(data_dir.join("models"));
     if let Err(e) = model_manager.ensure_dir() {

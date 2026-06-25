@@ -99,7 +99,10 @@ export async function installTauriMock(page: Page): Promise<void> {
         eventHandlers.delete(id);
       },
       convertFileSrc: (path: string) => path,
-      invoke: async (cmd: string, args?: { ids?: string[]; speakerId?: string }) => {
+      invoke: async (
+        cmd: string,
+        args?: { ids?: string[]; speakerId?: string; searchQuery?: string; sortOrder?: string },
+      ) => {
         switch (cmd) {
           case 'get_segments':
             return [mockSegment];
@@ -112,6 +115,37 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'get_configured_providers':
             // Names only, never key values — matches the real configured_providers() contract.
             return ['elevenlabs'];
+          case 'save_session': {
+            // Persist view-state in localStorage so a reload restores it (the real backend persists
+            // to session.json). Per-context, so it never leaks across tests.
+            try {
+              window.localStorage.setItem(
+                '__cortex_session__',
+                JSON.stringify({
+                  search_query: args?.searchQuery ?? '',
+                  sort_order: args?.sortOrder ?? 'newest',
+                }),
+              );
+            } catch {
+              /* ignore storage failures in tests */
+            }
+            return null;
+          }
+          case 'restore_session': {
+            try {
+              const raw = window.localStorage.getItem('__cortex_session__');
+              if (!raw) return null;
+              const parsed = JSON.parse(raw) as { search_query?: string; sort_order?: string };
+              return {
+                search_query: parsed.search_query ?? '',
+                sort_order: parsed.sort_order ?? 'newest',
+                segment_count: 1,
+                verified_count: 0,
+              };
+            } catch {
+              return null;
+            }
+          }
           case 'list_model_versions':
             return [
               {

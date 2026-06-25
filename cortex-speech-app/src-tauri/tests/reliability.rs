@@ -89,7 +89,7 @@ fn test_session_survives_crash() {
 
     let fresh_db = Database::open(":memory:").unwrap();
     fresh_db.initialize().unwrap();
-    let recovered = SessionManager::new(tmp.path().to_path_buf());
+    let mut recovered = SessionManager::new(tmp.path().to_path_buf());
     let restored = recovered.restore().unwrap();
 
     assert!(restored.is_some(), "Session should be restored");

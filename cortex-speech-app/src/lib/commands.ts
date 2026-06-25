@@ -379,6 +379,24 @@ export async function listModelVersions(): Promise<ModelVersion[]> {
   return invoke<ModelVersion[]>('list_model_versions');
 }
 
+/** Persisted session view-state (snake_case, as serialized by the backend). */
+export interface SessionState {
+  search_query: string;
+  sort_order: string;
+  segment_count: number;
+  verified_count: number;
+}
+
+/** Restore the last session's view-state, or null if there is no recent session. */
+export async function restoreSession(): Promise<SessionState | null> {
+  return invoke<SessionState | null>('restore_session');
+}
+
+/** Persist the current search query + sort order so they survive a restart. */
+export async function saveSession(searchQuery: string, sortOrder: string): Promise<void> {
+  return invoke('save_session', { searchQuery, sortOrder });
+}
+
 export async function getAudioDuration(path: string): Promise<number> {
   return invoke<number>('get_audio_duration', { path });
 }

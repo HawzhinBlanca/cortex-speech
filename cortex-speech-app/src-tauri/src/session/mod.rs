@@ -67,6 +67,11 @@ pub struct SessionManager {
     save_dir: PathBuf,
     save_interval_secs: u64,
     last_save: u64,
+    // Last-known UI view-state, held in memory so EVERY save persists it — otherwise the periodic
+    // counts-only auto_save (which derives state via `from_db`) would reset it to defaults and the
+    // explicit frontend save would be clobbered seconds later. Seeded from disk on `restore`.
+    search_query: String,
+    sort_order: String,
 }
 
 impl SessionManager {
@@ -78,7 +83,17 @@ impl SessionManager {
             save_dir,
             save_interval_secs: 60, // auto-save every 60 seconds
             last_save: 0,
+            search_query: String::new(),
+            sort_order: "newest".to_string(),
         }
+    }
+
+    /// Update the in-memory view-state that every subsequent save persists. Called from the frontend
+    /// whenever the user's search query or sort order changes, so a later counts-only auto_save keeps
+    /// it instead of resetting it.
+    pub fn set_view_state(&mut self, search_query: String, sort_order: String) {
+        self.search_query = search_query;
+        self.sort_order = sort_order;
     }
 
     pub fn save_path(&self) -> PathBuf {
@@ -96,7 +111,11 @@ impl SessionManager {
     }
 
     pub fn save(&self, db: &Database) -> AppResult<()> {
-        let state = SessionState::from_db(db)?;
+        // Counts come from the DB; the view-state fields come from the held in-memory state so a
+        // periodic auto_save preserves the user's last search/sort rather than resetting them.
+        let mut state = SessionState::from_db(db)?;
+        state.search_query = self.search_query.clone();
+        state.sort_order = self.sort_order.clone();
         let json = serde_json::to_string_pretty(&state)
             .map_err(|e| crate::error::AppError::Other(format!("Session serialize: {e}")))?;
         let tmp_path = self.save_dir.join("session.json.tmp");
@@ -120,7 +139,7 @@ impl SessionManager {
         serde_json::from_str(&json).ok()
     }
 
-    pub fn restore(&self) -> AppResult<Option<SessionState>> {
+    pub fn restore(&mut self) -> AppResult<Option<SessionState>> {
         let path = self.save_path();
         if path.exists() {
             // Clean stale sessions older than 7 days
@@ -152,6 +171,10 @@ impl SessionManager {
         match serde_json::from_str::<SessionState>(&json) {
             Ok(state) => {
                 tracing::info!("Restored session: {} segments, {} verified", state.segment_count, state.verified_count);
+                // Seed the in-memory view-state so the next counts-only auto_save preserves the
+                // restored search/sort instead of overwriting them with defaults.
+                self.search_query = state.search_query.clone();
+                self.sort_order = state.sort_order.clone();
                 Ok(Some(state))
             }
             Err(e) => {
@@ -234,7 +257,7 @@ mod tests {
     #[test]
     fn test_session_restore_empty() {
         let tmp = TempDir::new().unwrap();
-        let manager = SessionManager::new(tmp.path().to_path_buf());
+        let mut manager = SessionManager::new(tmp.path().to_path_buf());
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
 
@@ -245,7 +268,7 @@ mod tests {
     #[test]
     fn test_session_restore_quarantines_corrupt_file() {
         let tmp = TempDir::new().unwrap();
-        let manager = SessionManager::new(tmp.path().to_path_buf());
+        let mut manager = SessionManager::new(tmp.path().to_path_buf());
         std::fs::write(manager.save_path(), "{not valid json").unwrap();
 
         let restored = manager.restore().unwrap();
@@ -288,6 +311,44 @@ mod tests {
         assert!(manager.save_path().exists());
         manager.clear();
         assert!(!manager.save_path().exists());
+    }
+
+    #[test]
+    fn test_session_persists_and_restores_view_state() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        // Session 1: the user sets a search + sort, which is saved.
+        let mut first = SessionManager::new(tmp.path().to_path_buf());
+        first.set_view_state("بەڕێوە".to_string(), "duration".to_string());
+        first.save(&db).unwrap();
+
+        // Session 2 ("restart"): a fresh manager over the same dir restores the view-state.
+        let mut second = SessionManager::new(tmp.path().to_path_buf());
+        let restored = second.restore().unwrap().expect("a saved session is restored");
+        assert_eq!(restored.search_query, "بەڕێوە");
+        assert_eq!(restored.sort_order, "duration");
+    }
+
+    #[test]
+    fn test_counts_autosave_preserves_view_state() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let mut manager = SessionManager::new(tmp.path().to_path_buf());
+        manager.set_view_state("query".to_string(), "confidence".to_string());
+        manager.save(&db).unwrap();
+
+        // A later counts-only auto_save (the periodic mutation-triggered path) must NOT reset the
+        // view-state to defaults.
+        manager.last_save = 0; // force the interval check to fire
+        manager.auto_save(&db).unwrap();
+
+        let json = std::fs::read_to_string(manager.save_path()).unwrap();
+        assert!(json.contains("\"search_query\": \"query\""), "view-state survived auto_save: {json}");
+        assert!(json.contains("\"sort_order\": \"confidence\""));
     }
 
     #[test]
