@@ -1639,6 +1639,43 @@ impl ProcessingPipeline {
 
         let (chunk_pcm, chunk_suffix) = chunking::slice_pcm_by_alignment(&pcm, sample_rate, alignment_json)?;
 
+        // Primary-engine override: when use_finetuned_asr is set, transcribe with the embedded
+        // fine-tuned MMS-CTC engine (best local Sorani quality) regardless of asr_model_size. Any
+        // failure (model absent / inference error / empty output) falls through to the configured
+        // engine below, so transcription never breaks.
+        if self.settings.use_finetuned_asr {
+            if let Some((onnx, vocab)) = Self::finetuned_model_paths() {
+                match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_pcm) {
+                    Ok(raw_text) if !raw_text.trim().is_empty() => {
+                        let final_text = match self.build_refiner() {
+                            Some(refiner) => refiner.refine_text(&raw_text).unwrap_or_else(|_| raw_text.clone()),
+                            None => raw_text.clone(),
+                        };
+                        let final_text = self.fire_loop0_if_enabled(&final_text);
+                        if let Some(id) = segment_id {
+                            if let Ok(db) = self.open_db() {
+                                let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+                                if let Err(error) = self.populate_hypotheses(&db, id, &f32_pcm) {
+                                    log_hypothesis_population_failure(id, &error);
+                                }
+                            }
+                        }
+                        return Ok((raw_text, final_text, None));
+                    }
+                    Ok(_) => {
+                        tracing::warn!("fine-tuned ASR returned empty output; falling back to the configured engine")
+                    }
+                    Err(e) => {
+                        tracing::warn!("fine-tuned ASR failed ({e}); falling back to the configured engine")
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "use_finetuned_asr is set but the fine-tuned model is absent; using the configured engine"
+                );
+            }
+        }
+
         if self.should_use_wsl_primary_asr() {
             let db = crate::db::Database::open_with_retry(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
             let audio_path_str = path.to_string_lossy().to_string();
@@ -1838,6 +1875,48 @@ impl ProcessingPipeline {
                 transcript.to_string()
             }
         }
+    }
+
+    /// Resolve the embedded fine-tuned MMS-CTC model (`finetuned-mms-ckb/{model.onnx,vocab.json}`)
+    /// from the active (user) models dir, then the bundled one. `None` if it is not present.
+    fn finetuned_model_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        for base in [crate::models::active_models_dir(), crate::models::bundled_models_dir()] {
+            let dir = base.join("finetuned-mms-ckb");
+            let (onnx, vocab) = (dir.join("model.onnx"), dir.join("vocab.json"));
+            if onnx.exists() && vocab.exists() {
+                return Some((onnx, vocab));
+            }
+        }
+        None
+    }
+
+    /// Transcribe one decoded chunk (16 kHz mono i16) with the fine-tuned engine. The fine-tuned
+    /// model is trained on short utterances, so a single >~15 s pass can duplicate text — sub-split a
+    /// long chunk into balanced ~15 s windows and join the per-window transcripts.
+    fn transcribe_chunk_finetuned(onnx: &Path, vocab: &Path, chunk_pcm: &[i16]) -> Result<String, String> {
+        const MAX_WIN: usize = 15 * 16000;
+        let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+        let n = f32_pcm.len();
+        if n == 0 {
+            return Ok(String::new());
+        }
+        let n_win = n.div_ceil(MAX_WIN);
+        let step = n.div_ceil(n_win);
+        let mut out = String::new();
+        let mut a = 0;
+        while a < n {
+            let b = (a + step).min(n);
+            let part = crate::wav2vec2_asr::run_wav2vec2(onnx, vocab, "ckb", &f32_pcm[a..b])?;
+            let part = part.trim();
+            if !part.is_empty() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(part);
+            }
+            a = b;
+        }
+        Ok(out)
     }
 
     /// Whether LLM refinement may run under the CURRENT consent-gated settings. Consults the

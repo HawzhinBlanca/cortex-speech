@@ -831,3 +831,123 @@ fn ckb_scorecard_on_gold() {
     }
     eprintln!("[scorecard] N={n} micro_CER={micro_cer:.4} micro_WER={micro_wer:.4} (ckb, OmniASR-CTC-300M)");
 }
+
+/// Transcribe an arbitrary file with the EMBEDDED fine-tuned MMS-CTC engine (max local quality — the
+/// same engine the app's "Fine-tuned" button uses): decode -> 16 kHz mono, Silero VAD-chunk like the
+/// app, run the fine-tuned model per speech segment, Sorani-normalize, and print each segment + the
+/// full transcript. Reusable tool, gated by env so it never runs in the default suite:
+///   CORTEX_TRANSCRIBE_FILE="C:\path\clip.wav" cargo test --manifest-path src-tauri/Cargo.toml \
+///       --test real_audio transcribe_file_with_finetuned -- --ignored --nocapture
+#[test]
+#[ignore]
+fn transcribe_file_with_finetuned() {
+    let Ok(clip) = std::env::var("CORTEX_TRANSCRIBE_FILE") else {
+        eprintln!("CORTEX_TRANSCRIBE_FILE not set; skipping");
+        return;
+    };
+    let model_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/finetuned-mms-ckb");
+    let onnx = model_dir.join("model.onnx");
+    let vocab = model_dir.join("vocab.json");
+    if !onnx.exists() || !vocab.exists() {
+        eprintln!("[finetuned] embedded fine-tuned model absent under {}; skipping", model_dir.display());
+        return;
+    }
+
+    let (sr, pcm) = audio::decode_to_pcm_with_timeout(Path::new(&clip), std::time::Duration::from_secs(180))
+        .expect("decode input audio");
+    assert_eq!(sr, 16000, "decoder should resample to 16 kHz");
+    let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+    eprintln!("[finetuned] file: {clip}");
+    eprintln!("[finetuned] {:.1}s @ 16 kHz mono (decoded)", f32_pcm.len() as f64 / 16000.0);
+
+    let normalizer = SoraniNormalizer::new();
+    let vad = voice_activity_detection(&pcm, 16000, 0.5).unwrap_or_default();
+    let raw_segments: Vec<(usize, usize)> = if vad.is_empty() { vec![(0, f32_pcm.len())] } else { vad };
+
+    // The fine-tuned MMS-CTC model is trained on short utterances; a single >~15 s pass can duplicate
+    // text. Sub-split any long VAD segment into balanced ~15 s windows (what the app does per segment).
+    const MAX_CHUNK_SAMPLES: usize = 15 * 16000;
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in &raw_segments {
+        let s = (*start).min(f32_pcm.len());
+        let e = (*end).min(f32_pcm.len());
+        if e <= s {
+            continue;
+        }
+        let len = e - s;
+        if len <= MAX_CHUNK_SAMPLES {
+            windows.push((s, e));
+        } else {
+            let n = len.div_ceil(MAX_CHUNK_SAMPLES);
+            let step = len.div_ceil(n);
+            let mut a = s;
+            while a < e {
+                let b = (a + step).min(e);
+                windows.push((a, b));
+                a = b;
+            }
+        }
+    }
+    eprintln!("[finetuned] {} VAD segment(s) -> {} window(s)\n", raw_segments.len(), windows.len());
+
+    let mut full = String::new();
+    for (i, (s, e)) in windows.iter().enumerate() {
+        let hyp = cortex_speech_app_lib::wav2vec2_asr::run_wav2vec2(&onnx, &vocab, "ckb", &f32_pcm[*s..*e])
+            .expect("fine-tuned ASR");
+        let norm = normalizer.normalize(hyp.trim());
+        eprintln!("[finetuned] win {i} [{:.1}-{:.1}s]: {norm}", *s as f64 / 16000.0, *e as f64 / 16000.0);
+        if !norm.trim().is_empty() {
+            full.push_str(norm.trim());
+            full.push(' ');
+        }
+    }
+
+    let full = full.trim().to_string();
+    eprintln!("\n================ FULL TRANSCRIPT (fine-tuned, max quality) ================");
+    eprintln!("{full}");
+    eprintln!("==========================================================================");
+    assert!(!full.is_empty(), "fine-tuned engine produced an empty transcript (no-fabrication guard)");
+    assert!(full.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)), "expected Kurdish (Arabic-script) output");
+}
+
+/// Verify the PIPELINE routing (not just the raw engine): with `use_finetuned_asr` enabled, the
+/// standard `transcribe` path uses the embedded fine-tuned engine and returns Kurdish text with NO
+/// confidence — the fine-tuned engine yields none, which fingerprints that the fine-tuned branch
+/// ran rather than OmniASR (which returns Some). Runs on the committed CC-BY FLEURS fixture; skips
+/// cleanly if the fine-tuned model is absent.
+#[test]
+#[ignore]
+fn pipeline_routes_to_finetuned_when_enabled() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
+    let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/finetuned-mms-ckb/model.onnx");
+    if !fixture.exists() || !model.exists() {
+        eprintln!("[pipeline-finetuned] fixture or fine-tuned model absent; skipping");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ft.db").to_string_lossy().to_string();
+    let db = Database::open(&db_path).unwrap();
+    db.initialize().unwrap();
+    drop(db);
+
+    let settings = AppSettings { use_finetuned_asr: true, ..AppSettings::default() };
+    let pipeline = ProcessingPipeline::new(
+        db_path,
+        Arc::new(SoraniNormalizer::new()),
+        Arc::new(TranscriptCache::new(10)),
+        Arc::new(AudioFingerprint::new()),
+        Arc::new(settings),
+        Arc::new(ModelManager::new(tmp.path().to_path_buf())),
+    );
+
+    let (raw, _final_text, conf) =
+        pipeline.transcribe(None, fixture.to_str().unwrap(), None).expect("fine-tuned pipeline transcribe");
+    eprintln!("[pipeline-finetuned] raw: {raw}  conf={conf:?}");
+    assert!(conf.is_none(), "the fine-tuned engine returns no confidence (proves it was the engine used)");
+    assert!(!raw.trim().is_empty(), "fine-tuned pipeline must not return a blank transcript");
+    assert!(
+        raw.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)),
+        "expected Kurdish (Arabic-script) output from the fine-tuned pipeline, got: {raw}"
+    );
+}

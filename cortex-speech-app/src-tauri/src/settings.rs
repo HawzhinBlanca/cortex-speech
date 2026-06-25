@@ -104,6 +104,13 @@ pub struct AppSettings {
     #[serde(default)]
     pub loop0_firing_enabled: bool,
 
+    /// Use the embedded fine-tuned MMS-CTC engine (best local Sorani quality — roughly half the CER
+    /// of stock OmniASR; see docs/EVAL.md) as the PRIMARY transcription engine, overriding
+    /// `asr_model_size`. Falls back to the configured engine if the fine-tuned model is absent or
+    /// errors, so transcription never breaks. Default OFF (the model is large; opt in per machine).
+    #[serde(default)]
+    pub use_finetuned_asr: bool,
+
     /// Opt-in: prime LLM refinement with the diverse N-best hypotheses + relevant past corrections
     /// (generative error correction) instead of plain single-string refinement. Default OFF — it
     /// changes the refinement prompt, so it is a deliberate, validate-on-your-data choice.
@@ -308,6 +315,7 @@ impl Default for AppSettings {
             jury_autonomy_level: AutonLevel::default(),
             jury_t1_threshold: default_jury_t1_threshold(),
             loop0_firing_enabled: false,
+            use_finetuned_asr: false,
             ger_refinement_enabled: false,
         }
     }
