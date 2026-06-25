@@ -367,7 +367,11 @@ fn generate_from_uploaded_file(
 fn delete_gemini_file(name: &str, api_key: &str) -> Result<(), String> {
     let path = if name.starts_with("files/") { name.to_string() } else { format!("files/{name}") };
     let url = format!("https://generativelanguage.googleapis.com/v1beta/{path}");
-    gemini_api::with_api_key(ureq::delete(&url), api_key)
+    // Route through the bounded shared agent (connect/read/write timeouts). A bare
+    // `ureq::delete` uses the timeout-less global agent and would block this worker thread
+    // forever if Gemini accepts the connection then stalls (see http.rs) — this was the only
+    // remaining bare `ureq::` call site in the tree.
+    gemini_api::with_api_key(crate::http::API_AGENT.delete(&url), api_key)
         .call()
         .map_err(|e| format!("Gemini file delete failed: {}", redact_for_user(e, api_key)))?;
     Ok(())
