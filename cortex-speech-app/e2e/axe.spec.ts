@@ -19,6 +19,9 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
   test('App root has zero a11y violations (en)', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByLabel('Open settings')).toBeVisible();
+    // The conformal panel loads async; wait for it so axe analyzes the settled view
+    // (and actually covers that panel) instead of racing its mid-render state.
+    await expect(page.getByTestId('conformal-cert')).toBeVisible();
     expect(await violations(page)).toEqual([]);
   });
 
@@ -26,6 +29,7 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
     await page.goto('/');
     await page.getByLabel('Switch language').click();
     await expect(page.locator('html')).toHaveAttribute('lang', 'ckb');
+    await expect(page.getByTestId('conformal-cert')).toBeVisible();
     expect(await violations(page)).toEqual([]);
   });
 

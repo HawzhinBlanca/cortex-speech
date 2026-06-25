@@ -296,7 +296,7 @@
     {/if}
 
     {#if cert}
-      <div class="space-y-2 pt-2 border-t border-cortex-800/50">
+      <div class="space-y-2 pt-2 border-t border-cortex-800/50" data-testid="conformal-cert">
         <h3
           class="text-xs font-semibold text-cortex-300 uppercase tracking-wider flex items-center justify-between"
         >
