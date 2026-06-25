@@ -444,10 +444,24 @@ impl KurdishAsrService {
         stream.accept_waveform(sample_rate as i32, audio);
         recognizer.decode(&stream);
 
+        // We need the per-token acoustic confidences sherpa-onnx emits in its result JSON. The safe
+        // `OfflineStream::get_result()` parses the JSON into `OfflineRecognizerResult`, which keeps
+        // only text/tokens/timestamps/durations and DISCARDS those confidences (they feed
+        // conformal/IRT/autonomy downstream). So we reach the stream's raw C pointer — which
+        // sherpa-onnx keeps `pub(crate)` — and call the JSON API directly. In sherpa-onnx 1.13.2,
+        // `OfflineStream` is a single-field wrapper `{ pub(crate) ptr: *const sys::OfflineStream }`,
+        // so transmuting `&OfflineStream` to a `#[repr(transparent)]` pointer mirror reads exactly it.
         #[repr(transparent)]
         struct OfflineStreamMirror {
             ptr: *const std::ffi::c_void,
         }
+        // Turn any future layout drift (e.g. a sherpa-onnx bump that adds a field to OfflineStream)
+        // into a COMPILE error instead of silent UB: a single-pointer wrapper must stay pointer-sized.
+        const _: () = assert!(
+            std::mem::size_of::<sherpa_onnx::OfflineStream>() == std::mem::size_of::<*const std::ffi::c_void>(),
+            "sherpa-onnx OfflineStream is no longer a single-pointer wrapper; the transmute in \
+             transcribe_chunk would be unsound — re-verify its layout before bumping the dep.",
+        );
 
         let stream_ptr = unsafe {
             let mirror: &OfflineStreamMirror = std::mem::transmute(&stream);
