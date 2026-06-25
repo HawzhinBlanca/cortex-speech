@@ -883,6 +883,53 @@
     }
   }
 
+  // Opt-in cloud STT: re-transcribe the selected segment with ElevenLabs Scribe. Consent is enforced
+  // server-side; the button is only shown when cloud-STT opt-in is on, so this never surprises a
+  // fully-offline user.
+  async function handleTranscribeScribe() {
+    const seg = $selectedSegment;
+    if (!seg || $isProcessing) return;
+    if (!requireDesktopRuntime()) return;
+    startOperation('transcribe');
+    isProcessing.set(true);
+    pipelinePhase.set('transcribing');
+    statusMessage.set($t('transcribing'));
+    try {
+      const text = await api.transcribeWithScribe(seg.audioPath);
+      await api.updateSegment({ ...seg, rawTranscript: text, annotatedTranscript: text });
+      await loadSegments();
+      notifications.success($t('notifications.transcriptionComplete'));
+    } catch (e) {
+      notifyActionableError(e, $t('errors.transcriptionFailed'));
+    } finally {
+      isProcessing.set(false);
+      pipelinePhase.set('idle');
+      statusMessage.set($t('ready'));
+      endOperation('transcribe');
+    }
+  }
+
+  // Opt-in cloud STT: add an independent Scribe jury vote for the selected segment. The jury pipeline
+  // folds Scribe votes into consensus on its next run.
+  async function handleAddScribeVote() {
+    const seg = $selectedSegment;
+    if (!seg || $isProcessing) return;
+    if (!requireDesktopRuntime()) return;
+    isProcessing.set(true);
+    try {
+      const count = await api.addScribeVotes([seg.id]);
+      if (count > 0) {
+        notifications.success($t('scribe.voteAdded'));
+      } else {
+        notifications.info($t('scribe.voteExists'));
+      }
+    } catch (e) {
+      notifyActionableError(e, $t('scribe.voteFailed'));
+    } finally {
+      isProcessing.set(false);
+    }
+  }
+
   async function handleNormalize() {
     const seg = $selectedSegment;
     if (!seg?.rawTranscript) return;
@@ -2128,6 +2175,26 @@
                 >
                   {$t('transcribeFinetuned')}
                 </button>
+                {#if $settings.cloudSttOptIn}
+                  <button
+                    data-testid="transcribe-scribe-btn"
+                    class="btn btn-secondary !text-xs"
+                    onclick={handleTranscribeScribe}
+                    disabled={$isProcessing}
+                    title={$t('scribe.transcribeTitle')}
+                  >
+                    {$t('scribe.transcribe')}
+                  </button>
+                  <button
+                    data-testid="add-scribe-vote-btn"
+                    class="btn btn-secondary !text-xs"
+                    onclick={handleAddScribeVote}
+                    disabled={$isProcessing}
+                    title={$t('scribe.voteTitle')}
+                  >
+                    {$t('scribe.vote')}
+                  </button>
+                {/if}
                 <button class="btn btn-secondary !text-xs" onclick={handleNormalize}
                   >{$t('normalize')}</button
                 >

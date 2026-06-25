@@ -379,6 +379,28 @@ export async function listModelVersions(): Promise<ModelVersion[]> {
   return invoke<ModelVersion[]>('list_model_versions');
 }
 
+/**
+ * Register an externally fine-tuned checkpoint as a gated candidate. The SHA-256 is computed
+ * server-side from the file; promotion to champion is a separate gated step. Returns the new id.
+ */
+export async function importModelCheckpoint(args: {
+  id: string;
+  family: string;
+  checkpointPath: string;
+  source: string;
+  license: string;
+  modelCardName?: string | null;
+}): Promise<string> {
+  return invoke<string>('import_model_checkpoint', {
+    id: args.id,
+    family: args.family,
+    checkpointPath: args.checkpointPath,
+    source: args.source,
+    license: args.license,
+    modelCardName: args.modelCardName ?? null,
+  });
+}
+
 /** Persisted session view-state (snake_case, as serialized by the backend). */
 export interface SessionState {
   search_query: string;
@@ -430,6 +452,22 @@ export async function getRecentSpans(count?: number): Promise<TracingSpan[]> {
 
 export async function clearTracingSpans(): Promise<void> {
   return invoke('clear_tracing_spans');
+}
+
+/**
+ * Transcribe one audio clip with ElevenLabs Scribe (cloud STT). Consent-gated server-side: errors
+ * unless cloud-STT opt-in is enabled. Returns the transcription text.
+ */
+export async function transcribeWithScribe(audioPath: string): Promise<string> {
+  return invoke<string>('transcribe_audio_with_scribe', { audioPath });
+}
+
+/**
+ * Add an independent ElevenLabs Scribe hypothesis (jury vote) for the given segments. Consent-gated
+ * server-side. Skips segments that already have a Scribe vote; returns the number of votes added.
+ */
+export async function addScribeVotes(ids: string[]): Promise<number> {
+  return invoke<number>('add_scribe_votes', { ids });
 }
 
 export async function getAudioDuration(path: string): Promise<number> {
