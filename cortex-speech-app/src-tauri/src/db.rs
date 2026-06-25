@@ -1366,13 +1366,19 @@ mod tests {
     #[test]
     fn search_segments_tie_order_is_deterministic_by_id() {
         let db = make_db();
-        // Insert in non-sorted id order; all share the search token and (in this fast test) the same
-        // 1s-resolution created_at, so the only stable order is the id tiebreaker.
+        // Insert in non-sorted id order; all share the search token.
         for id in ["seg_m", "seg_a", "seg_z"] {
             let mut s = make_segment(id, &format!("/{id}.wav"));
             s.raw_transcript = "uniquesearchtoken body".to_string();
             db.insert_segment(&s).unwrap();
         }
+        // created_at is stamped by the column default at 1-second resolution. If these
+        // near-instant inserts straddle a second boundary, created_at (the primary sort key) —
+        // not id — would decide the order and the test would flake. Pin all rows to one
+        // timestamp so the `id ASC` tiebreaker is what's actually under test.
+        db.conn
+            .execute("UPDATE speech_segments SET created_at = '2024-01-01 00:00:00'", [])
+            .unwrap();
         let by_search: Vec<String> =
             db.search_segments("uniquesearchtoken").unwrap().into_iter().map(|s| s.id).collect();
         assert_eq!(by_search, vec!["seg_a", "seg_m", "seg_z"], "tied search results must order by id");
