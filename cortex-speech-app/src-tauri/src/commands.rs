@@ -2629,11 +2629,23 @@ pub fn get_configured_providers(state: State<'_, AppState>) -> Result<Vec<String
     Ok(keys.configured_providers().into_iter().map(String::from).collect())
 }
 
+/// Consent gate for any ElevenLabs Scribe upload. Voice is biometric data (GDPR Art. 9), so audio
+/// must NEVER be sent to a provider without the user's explicit cloud-STT opt-in. The pipeline path
+/// enforces this; the direct Scribe IPC commands must too, or they silently bypass consent.
+pub(crate) fn require_cloud_stt_consent(state: &AppState) -> Result<(), String> {
+    if state.lock_settings().cloud_stt_opt_in {
+        Ok(())
+    } else {
+        Err("Cloud STT opt-in is required to use ElevenLabs Scribe. Enable it in Settings.".into())
+    }
+}
+
 /// Transcribe an audio file with ElevenLabs Scribe (verified working for Sorani). Uses the locally
 /// configured ELEVENLABS_API_KEY; errors clearly if it is absent. Returns the transcription text.
 #[tauri::command]
 pub fn transcribe_audio_with_scribe(audio_path: String, state: State<'_, AppState>) -> Result<String, String> {
     STRICT_RATE_LIMITER.check("transcribe_audio_with_scribe")?;
+    require_cloud_stt_consent(&state)?;
     let audio_path = validate::validate_file_path(&audio_path)?;
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
     let key = crate::api_keys::ApiKeys::load(&data_dir)
@@ -2656,6 +2668,7 @@ const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v2";
 #[tauri::command]
 pub fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("add_scribe_votes")?;
+    require_cloud_stt_consent(&state)?;
     for id in &ids {
         validate::validate_identifier(id)?;
     }
