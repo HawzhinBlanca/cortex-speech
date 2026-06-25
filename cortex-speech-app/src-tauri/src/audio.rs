@@ -552,7 +552,12 @@ pub fn is_transient_decode_error(err: &AppError) -> bool {
                 || lower.contains("worker thread")
                 || lower.contains("temporarily")
         }
-        AppError::Io(_) => true,
+        // Only genuinely transient I/O kinds are worth retrying; permanent ones (NotFound,
+        // PermissionDenied, ...) just double the latency and fail again.
+        AppError::Io(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
         _ => false,
     }
 }
@@ -1153,6 +1158,17 @@ mod tests {
         assert!(is_transient_decode_error(&timeout));
         let validation = AppError::Validation("bad".into());
         assert!(!is_transient_decode_error(&validation));
+
+        // I/O kind matters: transient kinds retry, permanent ones must not.
+        use std::io::{Error as IoError, ErrorKind};
+        let interrupted = AppError::Io(IoError::from(ErrorKind::Interrupted));
+        assert!(is_transient_decode_error(&interrupted), "Interrupted I/O should retry");
+        let timed_out = AppError::Io(IoError::from(ErrorKind::TimedOut));
+        assert!(is_transient_decode_error(&timed_out), "TimedOut I/O should retry");
+        let not_found = AppError::Io(IoError::from(ErrorKind::NotFound));
+        assert!(!is_transient_decode_error(&not_found), "NotFound I/O must NOT retry");
+        let denied = AppError::Io(IoError::from(ErrorKind::PermissionDenied));
+        assert!(!is_transient_decode_error(&denied), "PermissionDenied I/O must NOT retry");
     }
 
     #[test]
