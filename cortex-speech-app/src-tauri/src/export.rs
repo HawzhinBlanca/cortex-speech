@@ -303,7 +303,7 @@ pub fn assign_splits(
 /// degenerate (end <= start). In that case the OLD code substituted the WHOLE source file, pairing
 /// the entire recording with the segment's short transcript — silent training-data corruption. Only
 /// genuinely-absent or unparseable alignment falls back to the whole file (the intended behaviour).
-fn slice_for_export<'a>(
+pub(crate) fn slice_for_export<'a>(
     full_pcm: &'a [i16],
     sample_rate: u32,
     alignment_json: Option<&str>,
@@ -489,6 +489,8 @@ pub fn export_huggingface_dataset(
 
                 let mut total_exported_dur = 0.0;
                 let mut count = 0;
+                // Filenames written this run; used to prune orphaned clips left by a prior, larger export.
+                let mut written_clips: std::collections::HashSet<String> = std::collections::HashSet::new();
                 // Segments dropped because their source audio is unavailable (missing or
                 // undecodable) — real, previously-silent data loss, surfaced after export.
                 let mut dropped_unavailable = 0usize;
@@ -565,6 +567,7 @@ pub fn export_huggingface_dataset(
                         let out_audio_path = dest_dir.join(&filename);
 
                         write_wav_atomic(&out_audio_path, 16000, pcm_slice.as_ref())?;
+                        written_clips.insert(filename.clone());
 
                         let dur_str = seg.duration_ms.to_string();
                         let verified_str = if seg.verified { "1" } else { "0" };
@@ -589,6 +592,22 @@ pub fn export_huggingface_dataset(
 
                         total_exported_dur += seg.duration_ms as f64 / 1000.0;
                         count += 1;
+                    }
+                }
+
+                // Prune orphaned clips from a previous, larger export so the on-disk *.wav set
+                // matches the freshly-written metadata.csv exactly (stale clips otherwise disagree
+                // with the manifest and get cemented into SHA256SUMS). Runs only after every current
+                // clip wrote successfully, so a mid-export failure never half-empties the directory.
+                if let Ok(entries) = std::fs::read_dir(dest_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let is_wav =
+                            path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+                        let keep = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| written_clips.contains(n));
+                        if is_wav && !keep {
+                            let _ = std::fs::remove_file(&path);
+                        }
                     }
                 }
 
@@ -1964,6 +1983,9 @@ mod tests {
         std::fs::write(train_dir.join("metadata.csv"), "__stale_split_metadata__").unwrap();
         let stale_wav_path = train_dir.join("hf-atomic_hf-atomic.wav");
         std::fs::write(&stale_wav_path, "__stale_wav_payload__").unwrap();
+        // Orphan from a prior, larger export: a clip whose name this export does NOT produce.
+        let orphan_wav_path = train_dir.join("old-recording_orphan-seg.wav");
+        std::fs::write(&orphan_wav_path, "__orphan_wav_payload__").unwrap();
         std::fs::write(out_dir.path().join("README.md"), "__stale_readme__").unwrap();
         std::fs::write(out_dir.path().join("dataset_infos.json"), "__stale_info__").unwrap();
         let settings = crate::settings::AppSettings::default();
