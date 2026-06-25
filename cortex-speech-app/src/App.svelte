@@ -915,6 +915,7 @@
     const seg = $selectedSegment;
     if (!seg || $isProcessing) return;
     if (!requireDesktopRuntime()) return;
+    startOperation('scribe-vote');
     isProcessing.set(true);
     try {
       const count = await api.addScribeVotes([seg.id]);
@@ -927,6 +928,7 @@
       notifyActionableError(e, $t('scribe.voteFailed'));
     } finally {
       isProcessing.set(false);
+      endOperation('scribe-vote');
     }
   }
 
