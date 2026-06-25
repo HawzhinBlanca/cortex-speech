@@ -147,6 +147,25 @@ CORTEX_GOLD_MANIFEST=<manifest.tsv> CORTEX_GOLD_RESULTS=<results.tsv> \
 python scripts/scorecard_stats.py <results.tsv> 3000
 ```
 
+## Performance — real-time factor (RTF), first measurement (2026-06-25)
+
+| Engine | Audio | Per-inference | **RTF** | Conditions |
+|---|---|---|---|---|
+| OmniASR-CTC-300M (int8) | 8.22 s (FLEURS `ckb_iq` fixture) | 785.8 ms | **0.0956** | CPU, single-stream, 5 iters after warmup |
+
+RTF = inference wall-clock ÷ audio duration; **0.0956 means ~10× faster than real-time** (model load
+excluded via a warmup pass). This is a real measurement from the committed CC-BY fixture, reproducible:
+
+```
+cargo test --manifest-path src-tauri/Cargo.toml --test real_audio -- \
+  --ignored omniasr_rtf_on_committed_fleurs_ckb_fixture --nocapture
+```
+
+**Caveat:** measured on a developer Windows machine, *not* a named reference machine — so it is a data
+point, not a published cross-machine benchmark (charter M4.1 wants a pinned reference rig + audio set).
+The test asserts only that RTF is a finite positive measurement; it prints the number for comparison
+against a latency target rather than failing on a machine-dependent threshold.
+
 ## Honest caveats (do not over-read this)
 
 - **N=400 from one archive chunk, one corpus.** A solid first scorecard, but not multi-source; the
