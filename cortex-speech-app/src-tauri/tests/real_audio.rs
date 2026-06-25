@@ -583,6 +583,24 @@ fn omniasr_on_committed_fleurs_ckb_fixture() {
         .filter(|c| ('\u{0600}'..='\u{06FF}').contains(c) || ('\u{0750}'..='\u{077F}').contains(c))
         .count();
     assert!(arabic > 0, "expected Kurdish (Arabic-script) output, got: {trimmed}");
+
+    // Enforced accuracy ceiling against the committed verified reference (CC-BY FLEURS). CTC greedy
+    // decode is deterministic, so this CER is reproducible run-to-run for a fixed model pin — it is a
+    // single-clip REGRESSION guard, not a published scorecard (those numbers are in docs/EVAL.md).
+    // Measured stock OmniASR-CTC-300M on this clip = 0.244 CER (2026-06-25); the loose 0.40 ceiling
+    // catches gross regressions (romanization, word-salad, near-blank) while tolerating a legitimate
+    // model-pin change. It TIGHTENS the prior non-blank/script-only guard into a real accuracy gate.
+    let reference = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.txt"),
+    )
+    .expect("read committed reference transcript");
+    let cd = cortex_speech_app_lib::wer::char_edit_distance(reference.trim(), trimmed);
+    let cer = cd.distance as f64 / cd.ref_len.max(1) as f64;
+    eprintln!("[fleurs-gate] CER vs committed reference = {cer:.4} (dist={}, ref_len={})", cd.distance, cd.ref_len);
+    assert!(
+        cer < 0.40,
+        "OmniASR CER on the committed FLEURS clip regressed past the 0.40 ceiling: {cer:.4} (hyp: {trimmed})"
+    );
 }
 
 /// RTF (real-time-factor) MEASUREMENT harness on the committed FLEURS fixture.

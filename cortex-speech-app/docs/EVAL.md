@@ -166,6 +166,24 @@ point, not a published cross-machine benchmark (charter M4.1 wants a pinned refe
 The test asserts only that RTF is a finite positive measurement; it prints the number for comparison
 against a latency target rather than failing on a machine-dependent threshold.
 
+## Enforced accuracy regression gate — committed CC-BY fixture (2026-06-25)
+
+The in-repo gate `omniasr_on_committed_fleurs_ckb_fixture` (runs in the **default** `cargo test`
+whenever the OmniASR model is present; skips cleanly otherwise) now enforces a real **CER ceiling** —
+not just "non-blank + Kurdish-script". On the one committed FLEURS `ckb_iq` clip (CC-BY-4.0, verified
+reference in `tests/fixtures/fleurs_ckb_sample.txt`):
+
+| Engine | Clip | Measured CER | Enforced ceiling |
+|---|---|---|---|
+| OmniASR-CTC-300M (int8) | committed FLEURS `ckb_iq` (N=1) | **0.244** | **< 0.40** |
+
+CTC greedy decode is deterministic, so this CER is reproducible run-to-run for a fixed model pin; the
+loose 0.40 ceiling catches gross regressions (romanization, word-salad, near-blank) while tolerating a
+legitimate model-pin change. **This is a single-clip regression guard, not a published scorecard** — the
+publishable numbers (N=400 stock / N=900 fine-tuned, with bootstrap CIs) are above. It converts the
+prior presence/script-only check into a real, committed, in-repo accuracy gate (the charter's "CI
+regression gate" item), reproducible from a fresh clone after `npm run fetch-models`.
+
 ## Honest caveats (do not over-read this)
 
 - **N=400 from one archive chunk, one corpus.** A solid first scorecard, but not multi-source; the
