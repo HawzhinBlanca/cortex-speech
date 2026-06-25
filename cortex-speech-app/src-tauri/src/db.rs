@@ -1376,9 +1376,7 @@ mod tests {
         // near-instant inserts straddle a second boundary, created_at (the primary sort key) —
         // not id — would decide the order and the test would flake. Pin all rows to one
         // timestamp so the `id ASC` tiebreaker is what's actually under test.
-        db.conn
-            .execute("UPDATE speech_segments SET created_at = '2024-01-01 00:00:00'", [])
-            .unwrap();
+        db.conn.execute("UPDATE speech_segments SET created_at = '2024-01-01 00:00:00'", []).unwrap();
         let by_search: Vec<String> =
             db.search_segments("uniquesearchtoken").unwrap().into_iter().map(|s| s.id).collect();
         assert_eq!(by_search, vec!["seg_a", "seg_m", "seg_z"], "tied search results must order by id");
