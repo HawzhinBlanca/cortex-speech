@@ -1157,6 +1157,10 @@ pub fn delete_segments_batch(ids: Vec<String>, state: State<'_, AppState>) -> Re
 #[tauri::command]
 pub fn merge_dataset_json(json_content: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("merge_dataset_json")?;
+    // Sanity-bound the pasted payload (generous enough for a real multi-segment dataset) so a
+    // pathological blob can't drive an unbounded parse — matching the size guard every other
+    // JSON-accepting command applies.
+    validate::validate_text(&json_content, 50_000_000, "Dataset JSON")?;
     let db = state.lock_db();
     let (created, updated) = db.merge_dataset_json(&json_content).map_err(|e| e.to_string())?;
     Ok(serde_json::json!({
@@ -2757,6 +2761,10 @@ pub fn record_human_decision(
     corrected_transcript: Option<String>,
 ) -> Result<(), String> {
     RATE_LIMITER.check("record_human_decision")?;
+    validate::validate_identifier(&segment_id)?;
+    if let Some(ref t) = corrected_transcript {
+        validate::validate_text(t, 100000, "Corrected transcript")?;
+    }
     let db = state.lock_db();
     db.record_human_decision(&segment_id, &decision, corrected_transcript.as_deref()).map_err(|e| e.to_string())
 }
@@ -2793,6 +2801,16 @@ pub fn write_segment_verdict(
     escalated: bool,
 ) -> Result<(), String> {
     RATE_LIMITER.check("write_segment_verdict")?;
+    validate::validate_identifier(&segment_id)?;
+    if let Some(ref t) = transcript {
+        validate::validate_text(t, 100000, "Verdict transcript")?;
+    }
+    if let Some(ref r) = rationale {
+        validate::validate_text(r, 100000, "Verdict rationale")?;
+    }
+    if let Some(ref ej) = evidence_json {
+        validate::validate_alignment_json(ej)?;
+    }
     let db = state.lock_db();
     db.write_segment_verdict(
         &segment_id,
@@ -2813,6 +2831,7 @@ pub fn get_few_shot_examples(
     k: usize,
 ) -> Result<Vec<crate::jury::FewShotExample>, String> {
     RATE_LIMITER.check("get_few_shot_examples")?;
+    validate::validate_identifier(&segment_id)?;
     let db = state.lock_db();
     crate::jury::get_few_shot_examples(&db, &segment_id, k).map_err(|e| e.to_string())
 }
@@ -3516,6 +3535,7 @@ pub fn run_t2_for_segment(
     api_key: String,
 ) -> Result<crate::jury::t2_listener::T2Result, String> {
     STRICT_RATE_LIMITER.check("run_t2_for_segment")?;
+    validate::validate_identifier(&segment_id)?;
 
     let settings = state.lock_settings().clone();
     let jury_model = settings.jury_model.clone();
