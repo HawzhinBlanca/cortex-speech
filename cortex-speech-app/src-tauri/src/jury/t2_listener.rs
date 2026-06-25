@@ -280,11 +280,22 @@ pub fn listen_and_judge(
             );
 
             if !debate_res.must_escalate {
+                // Honesty: no separate "debate confidence" is ever measured — the debate yields
+                // only swap-stability + agreement booleans. The accepted winner IS judge A's
+                // transcript (the first Gemini self-consistency sample), so report THAT sample's
+                // real model-assigned confidence instead of a fabricated constant. `votes: 1` and
+                // `self_consistency_agreement: false` already record that this did not win by vote.
+                let debate_confidence = samples
+                    .iter()
+                    .find(|s| s.transcript.trim() == debate_res.winning_transcript.trim())
+                    .or_else(|| samples.first())
+                    .map(|s| s.confidence)
+                    .unwrap_or(0.0);
                 T2Result {
                     verdict: Some(T2Verdict {
                         transcript: debate_res.winning_transcript,
                         reason: debate_res.reason,
-                        confidence: 0.85,
+                        confidence: debate_confidence,
                         evidence: t1_evidence.to_vec(),
                         self_consistency_agreement: false,
                         votes: 1,
