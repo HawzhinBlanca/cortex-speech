@@ -126,6 +126,10 @@ export async function installTauriMock(page: Page): Promise<void> {
             ];
           case 'clear_tracing_spans':
             return null;
+          case 'transcribe_audio_with_scribe':
+            return 'سکرایب کوردی';
+          case 'add_scribe_votes':
+            return 1;
           case 'save_session': {
             // Persist view-state in localStorage so a reload restores it (the real backend persists
             // to session.json). Per-context, so it never leaks across tests.

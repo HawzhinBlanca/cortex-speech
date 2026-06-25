@@ -107,6 +107,39 @@ test.describe('App smoke tests', () => {
     await expect(spans.first()).toContainText('diff.compute');
   });
 
+  test('Scribe actions are consent-gated and invoke the cloud STT commands', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.getByTestId('segments-empty-state')).not.toBeVisible({ timeout: 15_000 });
+
+    // Select the (mock) segment so the per-segment action buttons render. The filename title is on
+    // the span inside the list-item button; clicking it bubbles to the button's select handler.
+    await page.locator('[title="sample.wav"]').first().click();
+
+    // Scribe buttons are hidden until cloud-STT opt-in is enabled.
+    await expect(page.getByTestId('transcribe-scribe-btn')).toHaveCount(0);
+
+    // Enable cloud STT via Settings → Audio.
+    await page.getByTestId('settings-btn').click();
+    const settings = page.getByTestId('settings-panel');
+    await expect(settings).toBeVisible();
+    await settings.getByRole('button', { name: 'Audio', exact: true }).click();
+    await settings
+      .locator('label', { hasText: 'Cloud transcription (ElevenLabs Scribe)' })
+      .getByRole('checkbox')
+      .check();
+    await settings.getByTestId('settings-close-btn').click();
+    await expect(settings).not.toBeVisible();
+
+    // Now the consent-gated Scribe actions appear; clicking each runs its command's happy path.
+    const scribe = page.getByTestId('transcribe-scribe-btn');
+    await expect(scribe).toBeVisible();
+    await scribe.click();
+    await expect(page.getByRole('alert').filter({ hasText: 'Transcription complete' })).toBeVisible();
+
+    await page.getByTestId('add-scribe-vote-btn').click();
+    await expect(page.getByRole('alert').filter({ hasText: 'Scribe vote added' })).toBeVisible();
+  });
+
   test('settings panel opens via Ctrl+, shortcut', async ({ page }) => {
     await page.goto('/');
     await page.getByTestId('app-root').click();
