@@ -10,6 +10,7 @@ use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::Arc;
@@ -569,17 +570,21 @@ pub fn export_huggingface_dataset(
                         let verified_str = if seg.verified { "1" } else { "0" };
                         let training_ready_str = if grade.training_ready { "1" } else { "0" };
                         let reasons = grade.reasons.join("; ");
+                        // Formula-injection guard on the free-text columns only.
+                        let hf_transcript = csv_safe_cell(grade.transcript.as_str());
+                        let hf_speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
+                        let hf_reasons = csv_safe_cell(reasons.as_str());
 
                         csv_wtr.write_record([
                             filename.as_str(),
-                            grade.transcript.as_str(),
-                            seg.speaker_id.as_deref().unwrap_or(""),
+                            hf_transcript.as_ref(),
+                            hf_speaker.as_ref(),
                             dur_str.as_str(),
                             verified_str,
                             grade.grade.as_str(),
                             training_ready_str,
                             grade.transcript_source.as_str(),
-                            reasons.as_str(),
+                            hf_reasons.as_ref(),
                         ])?;
 
                         total_exported_dur += seg.duration_ms as f64 / 1000.0;
@@ -737,6 +742,26 @@ fn export_jsonl(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult
     )
 }
 
+/// CWE-1236 mitigation — neutralize CSV / spreadsheet formula injection.
+///
+/// A CSV cell whose first byte is one of `= + - @` (or a leading TAB/CR, which some
+/// spreadsheet apps treat as a formula lead-in) is executed as a live formula when the
+/// exported dataset CSV is opened in Excel / LibreOffice Calc / Google Sheets — enabling
+/// exfiltration or command execution on the reviewer's machine. Transcript, speaker, and
+/// verdict text is human/cloud/third-party-controlled (imported datasets are not
+/// content-validated), so prefix any such cell with a single quote: the value is then shown
+/// literally and can never execute. Non-triggering cells (the vast majority) are returned
+/// borrowed, so there is no allocation on the common path.
+///
+/// Only free-text columns are routed through this — structural columns (filenames, audio
+/// paths, numeric and enum/boolean literals) are left untouched so the dataset stays valid.
+pub(crate) fn csv_safe_cell(value: &str) -> Cow<'_, str> {
+    match value.as_bytes().first() {
+        Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r') => Cow::Owned(format!("'{value}")),
+        _ => Cow::Borrowed(value),
+    }
+}
+
 fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<()> {
     // Atomic write: write CSV to .tmp then rename.
     let tmp = path.with_extension("csv.tmp");
@@ -763,20 +788,27 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
             for seg in segments {
                 let grade = quality::training_grade_for_segment(seg);
                 let reasons = grade.reasons.join("; ");
+                // Formula-injection guard on the free-text columns only.
+                let raw = csv_safe_cell(seg.raw_transcript.as_str());
+                let normalized = csv_safe_cell(seg.normalized_transcript.as_deref().unwrap_or(""));
+                let annotated = csv_safe_cell(seg.annotated_transcript.as_deref().unwrap_or(""));
+                let training = csv_safe_cell(grade.transcript.as_str());
+                let speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
+                let reasons_cell = csv_safe_cell(reasons.as_str());
                 wtr.write_record([
                     seg.id.as_str(),
                     export_audio_ref(&seg.audio_path),
-                    seg.raw_transcript.as_str(),
-                    seg.normalized_transcript.as_deref().unwrap_or(""),
-                    seg.annotated_transcript.as_deref().unwrap_or(""),
+                    raw.as_ref(),
+                    normalized.as_ref(),
+                    annotated.as_ref(),
                     &seg.duration_ms.to_string(),
-                    seg.speaker_id.as_deref().unwrap_or(""),
+                    speaker.as_ref(),
                     if seg.verified { "1" } else { "0" },
-                    grade.transcript.as_str(),
+                    training.as_ref(),
                     grade.transcript_source.as_str(),
                     grade.grade.as_str(),
                     if grade.training_ready { "1" } else { "0" },
-                    reasons.as_str(),
+                    reasons_cell.as_ref(),
                 ])?;
             }
             wtr.flush()?;
@@ -1262,6 +1294,40 @@ mod tests {
         assert_eq!(records.len(), 1, "the embedded comma/newline must not create extra rows");
         assert_eq!(&records[0][0], "adv-1");
         assert_eq!(&records[0][2], nasty, "the transcript round-trips intact through CSV escaping");
+    }
+
+    #[test]
+    fn csv_safe_cell_quotes_only_formula_leads() {
+        // Contract: a leading formula trigger is single-quote-prefixed; everything else is
+        // returned untouched (and borrowed, no allocation).
+        assert_eq!(csv_safe_cell("=1+1").as_ref(), "'=1+1");
+        assert_eq!(csv_safe_cell("+1").as_ref(), "'+1");
+        assert_eq!(csv_safe_cell("-1").as_ref(), "'-1");
+        assert_eq!(csv_safe_cell("@SUM(A1)").as_ref(), "'@SUM(A1)");
+        assert_eq!(csv_safe_cell("\tx").as_ref(), "'\tx");
+        assert_eq!(csv_safe_cell("\rx").as_ref(), "'\rx");
+        // Normal Sorani text and an embedded (non-leading) '=' are left exactly as-is.
+        assert_eq!(csv_safe_cell("کوردی").as_ref(), "کوردی");
+        assert_eq!(csv_safe_cell("a=b").as_ref(), "a=b");
+        assert_eq!(csv_safe_cell("").as_ref(), "");
+    }
+
+    #[test]
+    fn export_csv_neutralizes_spreadsheet_formula_injection() {
+        // CWE-1236: a transcript/speaker that begins with a formula trigger must be neutralized
+        // so it can never execute when the exported dataset CSV is opened in a spreadsheet app.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("inject.csv");
+        let mut seg = sample_segment("inj-1");
+        seg.raw_transcript = "=HYPERLINK(\"http://evil/\",\"x\")".to_string();
+        seg.speaker_id = Some("@SUM(1+1)".to_string());
+        export_csv(&path, &[seg]).unwrap();
+
+        let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_path(&path).unwrap();
+        let rec = rdr.records().next().unwrap().unwrap();
+        // Header order: 0 id, 2 raw_transcript, 6 speaker_id.
+        assert!(rec[2].starts_with("'="), "leading = must be quote-prefixed, got {:?}", &rec[2]);
+        assert!(rec[6].starts_with("'@"), "leading @ must be quote-prefixed, got {:?}", &rec[6]);
     }
 
     #[test]
