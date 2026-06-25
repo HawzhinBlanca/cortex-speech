@@ -367,6 +367,17 @@
         ⚡ Run Jury
       {/if}
     </button>
+    {#if appSettings && !appSettings.juryCloudOptIn}
+      <!-- Consent affordance: the jury's T2 tier can send audio to Gemini, but cloud T2 is opt-in.
+           The backend hard-refuses T2 egress when the opt-in is off (the run stays local) — surface
+           that state here so it's not silent, mirroring the gated Scribe buttons. -->
+      <span
+        data-testid="jury-local-only"
+        style="font-size: 0.68rem; opacity: 0.75; margin-left: 6px; white-space: nowrap;"
+        title="Cloud T2 (Gemini) escalation is OFF in Settings — this run stays fully local (T0/T1); contested segments go to your inbox and no audio leaves your machine."
+        >🔒 Local only</span
+      >
+    {/if}
 
     <!-- Autonomy Dial -->
     <div class="autonomy-dial" role="group" aria-label="Autonomy level">
