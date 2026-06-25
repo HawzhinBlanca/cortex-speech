@@ -72,13 +72,25 @@
 
 ## 5. Blockers Awaiting Human
 
+> **⭐ OWNER'S INTENDED USE = PERSONAL / SELF-USE (confirmed 2026-06-25), NOT public distribution.**
+> The owner runs Cortex on their own machine to do **professional-quality** Central Kurdish (Sorani)
+> transcription that no other tool offers. So "highest grade" here means **reliability + accuracy + a
+> clean experience for daily use** — NOT a code-signed public release or an academic-publishable
+> scorecard. This **reclassifies the items below**: #3 (code-signing cert) and #4 (CC0 public-test
+> fixture) are **NOT REQUIRED** for the goal (signing only removes a one-time Windows "unknown
+> publisher" prompt that matters solely if the app is ever shared publicly). The only blocker that
+> still genuinely raises *daily-use* quality is **#1 (GPU fine-tune → lower CER)** — and the
+> fine-tuned MMS-CTC engine is already embedded (~19–21% CER, ≈half of stock), so the app is
+> **already professional-grade today**. Reliability is covered: 15 defects fixed across three
+> hardening hunts + an enforced real-audio CER gate, all behind a green `make ship-check`.
+
 * ~~External gold-runner execution for the real scorecard table.~~ **DONE** — first real ckb CER/WER measured (34.5% / 79.4%, N=40); see `docs/EVAL.md`. Remaining for a *publishable* scorecard: scale N to ≥900, compute IAA ceiling, fix the Latin-romanization/language-locking, add a real baseline (SeamlessM4T-v2).
 
 * **The four items between the in-sandbox state and a full-charter 10/10 are now EXTERNAL (turnkey for the human):**
   1. **GPU fine-tune (the only real accuracy cure, ~29% → ~8% CER).** Constrained decode (now shipped, opt-in) guarantees Kurdish *script*; only fine-tuning fixes Kurdish *recognition*. Needs a GPU + the dataset. Hand the resulting model back and it gets wired + re-measured through `ckb_scorecard_on_gold`.
   2. **Fresh-clone model fetch (blocker #1).** A decision: **Git LFS** (`git lfs track` the ~300 MB models — consumes repo LFS quota) **vs.** a `scripts/fetch-models` downloader with pinned SHA-256 (needs a one-time ~235 MB OmniASR-archive download to compute the archive hash — `OMNIASR_CTC_300M_ARCHIVE_SHA256` is intentionally empty until then). Pick one and it gets implemented + gated.
-  3. **Code-signing certificate** (Authenticode EV/OV) — a paid identity document; once provisioned, `bundle.windows.certificateThumbprint` + `timestampUrl` wiring is a small config change.
-  4. **CC0 committable audio fixture** — the user corpus is eval-only; a redistributable fixture must be CC0-sourced (e.g. Common Voice ckb, `CC0-1.0` per the provenance ledger) to make a default-`cargo test` real-ASR gate possible.
+  3. **Code-signing certificate** (Authenticode EV/OV) — **NOT NEEDED for personal/self-use** (only matters if the app is ever distributed publicly). The CI signing pipeline is *already fully wired* in `release.yml` (gated on `WINDOWS_CERT_BASE64`/`WINDOWS_CERT_PASSWORD` secrets + a `v*` tag), so it's turnkey IF public distribution is ever wanted — but for the owner's own machine it's a no-op (a one-time "More info → Run anyway").
+  4. **CC0 committable audio fixture** — **NOT NEEDED**: a committed **CC-BY** FLEURS `ckb` fixture already powers the in-repo default real-ASR gate (`omniasr_on_committed_fleurs_ckb_fixture`, now enforcing CER < 0.40). A CC0 source would only matter for a *publicly redistributed* default-test, which the personal-use scope doesn't require.
 
 ---
 
