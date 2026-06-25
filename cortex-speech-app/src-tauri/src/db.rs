@@ -126,7 +126,11 @@ fn normalize_search_query(text: &str) -> String {
 /// AND-ed (matching the previous behaviour for multi-word queries). Returns `""` for whitespace-only
 /// input so the caller can short-circuit to an empty result.
 fn to_fts5_match(query: &str) -> String {
-    query
+    // Control characters (NUL and other C0/C1) are never meaningful search terms and an embedded
+    // NUL makes SQLite/FTS5 raise a hard error (interior NUL in a bound string), so map every
+    // control char to a separator before tokenizing — they can't survive into the MATCH string.
+    let cleaned: String = query.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    cleaned
         .split_whitespace()
         .filter(|t| !t.is_empty())
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
@@ -1622,7 +1626,12 @@ mod tests {
         db.insert_segment(&seg).expect("insert");
 
         // Each of these errored BEFORE the fix; all must now be Ok (results or empty), never Err.
-        for q in ["\"hello", "foo:bar", "*", "(", "NEAR(a b", "a AND", "OR", "^", "-foo", ")"] {
+        // The control-char cases (NUL etc.) are the regression a proptest later surfaced: an interior
+        // NUL survived split_whitespace and made SQLite/FTS5 raise a hard error.
+        for q in [
+            "\"hello", "foo:bar", "*", "(", "NEAR(a b", "a AND", "OR", "^", "-foo", ")", "\0", "a\0b", "\u{1b}",
+            "\u{7f}",
+        ] {
             assert!(db.search_segments(q).is_ok(), "query {q:?} must not error");
         }
         // A real token still finds the segment, and a quote next to it doesn't break matching.
@@ -1630,6 +1639,22 @@ mod tests {
         assert_eq!(db.search_segments("\"hello\"").unwrap().len(), 1, "quoted token matches too");
         // Whitespace-only input is an empty result, not an error.
         assert!(db.search_segments("   ").unwrap().is_empty(), "blank query -> empty, not error");
+    }
+
+    #[test]
+    fn search_segments_never_errors_on_arbitrary_input() {
+        use proptest::prelude::*;
+        // Property generalization of the metacharacter regression above: for ANY user input the
+        // search box must return Ok (results or empty), never an FTS5 syntax Err or a panic. The
+        // example test samples known-bad punctuation; this covers the infinite input space.
+        let db = make_db();
+        let mut seg = make_segment("prop-1", "/a.wav");
+        seg.raw_transcript = "hello world foo bar".to_string();
+        db.insert_segment(&seg).expect("insert");
+
+        proptest!(|(q in ".*")| {
+            prop_assert!(db.search_segments(&q).is_ok(), "search must not error on input {q:?}");
+        });
     }
 
     #[test]
