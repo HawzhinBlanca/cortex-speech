@@ -641,6 +641,22 @@ mod tests {
     }
 
     #[test]
+    fn scribe_commands_require_cloud_stt_consent() {
+        // Regression: the Scribe IPC commands (transcribe_audio_with_scribe, add_scribe_votes) upload
+        // raw audio (biometric) to ElevenLabs. They MUST refuse without explicit cloud-STT opt-in —
+        // this guards the shared gate both call before any key load or network request.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = test_app_state(dir.path().to_path_buf());
+        // Default settings: cloud_stt_opt_in = false → consent gate refuses.
+        let denied = commands::require_cloud_stt_consent(&state);
+        assert!(denied.is_err(), "biometric audio egress must be refused without opt-in");
+        assert!(denied.unwrap_err().contains("opt-in"), "error should name the missing consent");
+        // After explicit opt-in, the gate allows it.
+        state.settings.lock().unwrap().cloud_stt_opt_in = true;
+        assert!(commands::require_cloud_stt_consent(&state).is_ok(), "opt-in permits Scribe egress");
+    }
+
+    #[test]
     fn app_state_cancel_token_recovers_poisoned_lock() {
         let dir = tempfile::TempDir::new().unwrap();
         let state = test_app_state(dir.path().to_path_buf());
