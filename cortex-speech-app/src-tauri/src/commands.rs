@@ -2067,12 +2067,6 @@ pub fn models_download_all(app: tauri::AppHandle, state: State<'_, AppState>) ->
 }
 
 #[tauri::command]
-pub fn start_operation(state: State<'_, AppState>) -> Result<(), String> {
-    state.start_cancel_token();
-    Ok(())
-}
-
-#[tauri::command]
 pub fn cancel_operation(state: State<'_, AppState>) -> Result<(), String> {
     state.cancel_current_operation();
     Ok(())
