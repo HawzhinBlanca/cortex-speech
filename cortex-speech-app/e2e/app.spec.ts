@@ -46,6 +46,30 @@ test.describe('App smoke tests', () => {
     await expect(settings).not.toBeVisible();
   });
 
+  test('cloud STT opt-in surfaces ElevenLabs key status', async ({ page }) => {
+    await page.goto('/');
+
+    await page.getByTestId('settings-btn').click();
+    const settings = page.getByTestId('settings-panel');
+    await expect(settings).toBeVisible();
+
+    // The cloud-transcription opt-in lives on the Audio tab.
+    await settings.getByRole('button', { name: 'Audio', exact: true }).click();
+
+    // No status until the opt-in is on (it only matters when cloud STT is enabled).
+    await expect(settings.getByTestId('elevenlabs-key-status')).toHaveCount(0);
+
+    // Enable the ElevenLabs Scribe opt-in; the mock reports its key as present.
+    await settings
+      .locator('label', { hasText: 'Cloud transcription (ElevenLabs Scribe)' })
+      .getByRole('checkbox')
+      .check();
+
+    const status = settings.getByTestId('elevenlabs-key-status');
+    await expect(status).toBeVisible();
+    await expect(status).toContainText('ElevenLabs key detected');
+  });
+
   test('settings panel opens via Ctrl+, shortcut', async ({ page }) => {
     await page.goto('/');
     await page.getByTestId('app-root').click();

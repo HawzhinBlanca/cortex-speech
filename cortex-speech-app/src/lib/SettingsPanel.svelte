@@ -10,7 +10,7 @@
   import ModelDownload from './ModelDownload.svelte';
   import { t } from './i18n';
   import { get } from 'svelte/store';
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { isTauriRuntime } from './runtime';
 
   let localSettings: AppSettings = $state({ ...$settings });
@@ -20,6 +20,9 @@
   let saving = $state(false);
   let exportingAudio = $state(false);
   let sourceReferenceModelsInput = $state('');
+  // Lowercase provider names whose key is present in secrets.env (e.g. "elevenlabs").
+  // Read-only signal so cloud opt-ins can warn when their key is missing; never holds key values.
+  let configuredProviders = $state<string[]>([]);
   const tauriAvailable = isTauriRuntime();
   // Set true only by the Cancel button so onDestroy discards unsaved edits instead of persisting
   // them. (Theme/sliders have no per-field auto-save and rely on the close-to-save onDestroy path,
@@ -33,6 +36,17 @@
   });
   $effect(() => {
     activeTab = $settingsTab;
+  });
+
+  onMount(async () => {
+    // Surface which cloud keys are present so an opt-in can warn before a use-time failure.
+    // Best-effort + read-only: a failure must never break the settings panel.
+    if (!tauriAvailable) return;
+    try {
+      configuredProviders = await api.getConfiguredProviders();
+    } catch (e) {
+      console.error('Failed to load configured cloud providers:', e);
+    }
   });
 
   onDestroy(() => {
@@ -359,6 +373,18 @@
               work.
             </span>
           </label>
+          {#if tauriAvailable && localSettings.cloudSttOptIn}
+            {#if configuredProviders.includes('elevenlabs')}
+              <p class="text-[10px] text-emerald-300 -mt-1" data-testid="elevenlabs-key-status">
+                ✓ ElevenLabs key detected in secrets.env.
+              </p>
+            {:else}
+              <p class="text-[10px] text-amber-300 -mt-1" data-testid="elevenlabs-key-status">
+                ⚠ No ElevenLabs key found in secrets.env — cloud transcription will fail until you add
+                one.
+              </p>
+            {/if}
+          {/if}
           <label class="flex items-center gap-3 cursor-pointer">
             <input
               type="checkbox"

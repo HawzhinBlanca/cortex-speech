@@ -352,6 +352,15 @@ export async function checkExternalProvider(): Promise<{
   return invoke('check_external_provider');
 }
 
+/**
+ * Lowercase names of cloud providers whose API key is present in `secrets.env`
+ * (e.g. "elevenlabs", "gemini", "openrouter"). Returns names only — never key
+ * values — so it is safe to surface in the UI.
+ */
+export async function getConfiguredProviders(): Promise<string[]> {
+  return invoke<string[]>('get_configured_providers');
+}
+
 export async function getAudioDuration(path: string): Promise<number> {
   return invoke<number>('get_audio_duration', { path });
 }
