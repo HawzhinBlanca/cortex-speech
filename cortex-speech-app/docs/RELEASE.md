@@ -32,6 +32,21 @@ Use this before tagging a production release (`v*`). Windows Pro is the primary 
 - [ ] Every installed/downloaded model has filename, size, SHA256, version, source, and install time recorded.
 - [ ] Downloaded model archives have pinned SHA256 values before release. Empty hash constants are release blockers.
 
+## Code signing (Windows Authenticode)
+
+The release workflow (`.github/workflows/release.yml`) signs + timestamps the MSI and NSIS
+installers when a certificate is provided, and skips with a loud `::warning::` (unsigned, SmartScreen
+will warn "unknown publisher") when it is not. To enable signed releases:
+
+1. Obtain an **Authenticode (EV or OV) code-signing certificate** as a password-protected `.pfx`.
+2. Add two repository secrets: **`WINDOWS_CERT_BASE64`** (`base64 -w0 cert.pfx`) and
+   **`WINDOWS_CERT_PASSWORD`**.
+3. Tag a `v*` release. The workflow imports the cert and runs (verified locally with a self-signed cert):
+   `signtool sign /f cert.pfx /p <pw> /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 <installer>`
+   then `signtool verify /pa <installer>` on each artifact.
+
+- [ ] Release installers are Authenticode-signed + timestamped (or the unsigned warning is a conscious choice).
+
 ## Security gate
 
 - [ ] Tauri asset protocol remains scoped to app data only.
