@@ -124,20 +124,25 @@ fn test_corrupt_database_detection_corrupted() {
     }
 
     let mut content = std::fs::read(&path).unwrap();
-    if content.len() > 100 {
-        for i in 0..content.len().min(100) {
-            content[i] = 0xFF;
-        }
-        std::fs::write(&path, &content).unwrap();
+    // The checkpointed DB is at least one 4096-byte page; clobber the SQLite header magic.
+    assert!(content.len() > 100, "checkpointed DB must be large enough to corrupt its header");
+    for byte in content.iter_mut().take(100) {
+        *byte = 0xFF;
     }
+    std::fs::write(&path, &content).unwrap();
 
-    let result = Database::open(&path);
-    if let Ok(corrupted_db) = result {
-        let check: std::result::Result<String, _> =
-            corrupted_db.connection().query_row("PRAGMA integrity_check", [], |r| r.get(0));
-
-        if let Ok(msg) = check {
-            assert_ne!(msg, "ok", "Corrupted DB should not pass integrity_check, got: {msg}");
+    // Detection contract: opening a header-corrupted DB must EITHER be rejected outright, OR open
+    // but fail PRAGMA integrity_check (never silently report "ok"). Assert in BOTH branches so the
+    // test fails if corruption detection regresses. (The previous version nested its only assertion
+    // inside two `if let Ok` guards that the injected corruption itself defeats — it asserted nothing.)
+    match Database::open(&path) {
+        Err(_) => { /* open rejected the clobbered header — corruption detected */ }
+        Ok(corrupted_db) => {
+            let msg: String = corrupted_db
+                .connection()
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .expect("integrity_check query must run on an opened DB");
+            assert_ne!(msg, "ok", "corrupted DB must not report integrity 'ok', got: {msg}");
         }
     }
 }
