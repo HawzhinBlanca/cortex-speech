@@ -1430,7 +1430,10 @@ pub fn get_waveform(
     if let Some(ref aj) = alignment_json {
         validate::validate_alignment_json(aj)?;
     }
-    let pipeline = state.lock_pipeline();
+    // Clone the pipeline out of the global lock before the (up to 30 s) decode so a waveform
+    // render never starves other pipeline-lock users (matches import_audio_file / rediarize /
+    // run_gold_eval_asr, which all clone for the same reason).
+    let pipeline = state.lock_pipeline().clone();
     pipeline.get_waveform(&validated, num_points, alignment_json.as_deref()).map_err(|e| e.to_string())
 }
 
