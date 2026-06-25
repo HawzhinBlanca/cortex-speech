@@ -89,6 +89,32 @@ test.describe('App smoke tests', () => {
     await expect(rows.first()).toContainText('CC-BY-NC-4.0');
   });
 
+  test('model registry can import a checkpoint as a candidate', async ({ page }) => {
+    await page.goto('/');
+
+    await page.getByTestId('settings-btn').click();
+    const settings = page.getByTestId('settings-panel');
+    await expect(settings).toBeVisible();
+    await settings.getByRole('button', { name: 'AI Models', exact: true }).click();
+
+    await settings.getByTestId('model-import-toggle').click();
+    const form = settings.getByTestId('model-import-form');
+    await expect(form).toBeVisible();
+
+    await form.getByPlaceholder('id (e.g. mms-ckb-v2)').fill('test-candidate');
+    await form.getByPlaceholder('family (e.g. mms-ckb)').fill('mms-ckb');
+    await form.getByPlaceholder('source (e.g. fine-tune)').fill('fine-tune');
+    await form.getByPlaceholder('license (e.g. CC-BY-NC-4.0)').fill('CC-BY-NC-4.0');
+
+    // Submit is disabled until a checkpoint file is chosen.
+    await expect(settings.getByTestId('model-import-submit')).toBeDisabled();
+    await settings.getByTestId('model-import-pick').click();
+    await expect(settings.getByTestId('model-import-submit')).toBeEnabled();
+
+    await settings.getByTestId('model-import-submit').click();
+    await expect(page.getByRole('alert').filter({ hasText: 'Imported checkpoint' })).toBeVisible();
+  });
+
   test('diagnostics panel shows tracing stats and recent spans', async ({ page }) => {
     await page.goto('/');
 

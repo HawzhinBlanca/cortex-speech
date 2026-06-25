@@ -40,9 +40,11 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
     await expect(dialog).toBeVisible();
     expect(await violations(page)).toEqual([]);
 
-    // Also cover the AI Models tab, where the read-only model-registry panel renders.
+    // Also cover the AI Models tab, where the model-registry panel + import form render.
     await dialog.getByRole('button', { name: 'AI Models', exact: true }).click();
     await expect(page.getByTestId('model-registry')).toBeVisible();
+    await dialog.getByTestId('model-import-toggle').click();
+    await expect(page.getByTestId('model-import-form')).toBeVisible();
     expect(await violations(page)).toEqual([]);
 
     // And the Diagnostics tab (tracing panel).

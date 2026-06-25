@@ -101,7 +101,13 @@ export async function installTauriMock(page: Page): Promise<void> {
       convertFileSrc: (path: string) => path,
       invoke: async (
         cmd: string,
-        args?: { ids?: string[]; speakerId?: string; searchQuery?: string; sortOrder?: string },
+        args?: {
+          ids?: string[];
+          speakerId?: string;
+          searchQuery?: string;
+          sortOrder?: string;
+          id?: string;
+        },
       ) => {
         switch (cmd) {
           case 'get_segments':
@@ -130,6 +136,11 @@ export async function installTauriMock(page: Page): Promise<void> {
             return 'سکرایب کوردی';
           case 'add_scribe_votes':
             return 1;
+          case 'import_model_checkpoint':
+            return args?.id ?? 'imported-candidate';
+          case 'plugin:dialog|open':
+            // Simulate the native file picker returning a chosen path.
+            return '/fake/path/to/checkpoint.onnx';
           case 'save_session': {
             // Persist view-state in localStorage so a reload restores it (the real backend persists
             // to session.json). Per-context, so it never leaks across tests.
