@@ -1,4 +1,3 @@
-import { invoke } from '@tauri-apps/api/core';
 import { writable } from 'svelte/store';
 
 export const activeOperations = writable<Set<string>>(new Set());
@@ -17,17 +16,4 @@ export function endOperation(opName: string): void {
     next.delete(opName);
     return next;
   });
-}
-
-export async function trackedInvoke<T>(
-  opName: string,
-  cmd: string,
-  args?: Record<string, unknown>,
-): Promise<T> {
-  startOperation(opName);
-  try {
-    return await invoke<T>(cmd, args);
-  } finally {
-    endOperation(opName);
-  }
 }
