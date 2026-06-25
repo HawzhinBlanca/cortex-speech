@@ -23,7 +23,9 @@ const translations = { en, ckb };
 export const t = derived(locale, ($locale) => {
   const dict = translations[$locale];
   return (key: string, params?: Record<string, string>) => {
-    let text = dict[key] || key;
+    // Fall back to English before showing the raw key, so a label that only exists in `en`
+    // (e.g. an advanced/dev feature not yet translated) degrades to English rather than a key string.
+    let text = dict[key] || en[key] || key;
     if (params) {
       for (const [k, v] of Object.entries(params)) {
         text = text.replace(`{${k}}`, v);
