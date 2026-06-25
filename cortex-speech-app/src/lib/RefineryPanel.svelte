@@ -7,7 +7,9 @@
    */
   import { onMount } from 'svelte';
   import * as api from './commands';
-  import type { EvalRun, EscalationTrendPoint, LabelQualityLift } from './types';
+  import type { EvalRun, EscalationTrendPoint, LabelQualityLift, EvalRunResult } from './types';
+  import { notifications } from './stores/notificationStore';
+  import { isTauriRuntime } from './runtime';
 
   let evalRuns: EvalRun[] = [];
   let trend: EscalationTrendPoint[] = [];
@@ -15,7 +17,85 @@
   let loading = true;
   let error = '';
 
+  // Eval-action state (legacy reactivity — this component is not in runes mode).
+  const tauriAvailable = isTauriRuntime();
+  let evalModelId = '';
+  let evalResult: EvalRunResult | null = null;
+  let scorecardMd = '';
+  let evalBusy = false;
+
   const pct = (x: number): string => `${(x * 100).toFixed(1)}%`;
+
+  async function refreshRuns() {
+    try {
+      evalRuns = await api.listEvalRuns();
+    } catch {
+      // keep the previous list on a transient refresh failure
+    }
+  }
+
+  async function runHonestCer() {
+    if (evalBusy || !tauriAvailable) return;
+    evalBusy = true;
+    scorecardMd = '';
+    try {
+      evalResult = await api.runGoldEvalAsr(evalModelId.trim() || null);
+      await refreshRuns();
+      notifications.success(
+        `Honest-CER eval done: CER ${pct(evalResult.run.cer)} (N=${evalResult.run.numSegs}).`,
+      );
+    } catch (e) {
+      notifications.error('Honest-CER eval failed', { detail: String(e) });
+    } finally {
+      evalBusy = false;
+    }
+  }
+
+  async function runLocalEval() {
+    if (evalBusy || !tauriAvailable || !evalModelId.trim()) return;
+    evalBusy = true;
+    scorecardMd = '';
+    try {
+      evalResult = await api.runGoldEvalLocal(evalModelId.trim());
+      await refreshRuns();
+      notifications.success(
+        `Local eval done: CER ${pct(evalResult.run.cer)} (N=${evalResult.run.numSegs}).`,
+      );
+    } catch (e) {
+      notifications.error('Local eval failed', { detail: String(e) });
+    } finally {
+      evalBusy = false;
+    }
+  }
+
+  async function buildScorecardFromResult() {
+    if (!evalResult || evalBusy) return;
+    evalBusy = true;
+    try {
+      const res = await api.buildScorecard(evalResult);
+      scorecardMd = res.markdown;
+    } catch (e) {
+      notifications.error('Build scorecard failed', { detail: String(e) });
+    } finally {
+      evalBusy = false;
+    }
+  }
+
+  async function importGoldFromFile() {
+    if (evalBusy || !tauriAvailable) return;
+    const { open } = await import('@tauri-apps/plugin-dialog');
+    const picked = await open({ multiple: false, title: 'Select a verified audio file' });
+    if (typeof picked !== 'string') return;
+    evalBusy = true;
+    try {
+      const n = await api.createGoldFromFile(picked);
+      notifications.success(`Created ${n} gold segment(s) from the file.`);
+    } catch (e) {
+      notifications.error('Create gold from file failed', { detail: String(e) });
+    } finally {
+      evalBusy = false;
+    }
+  }
 
   onMount(async () => {
     try {
@@ -69,6 +149,62 @@
         </p>
       {/if}
     </div>
+
+    <!-- Eval actions (honest-CER / local eval, scorecard, gold-from-file) -->
+    {#if tauriAvailable}
+      <div class="card" data-testid="refinery-eval-actions">
+        <h3 class="card-title">Run evaluation</h3>
+        <input
+          class="input eval-input"
+          placeholder="model id (optional for honest-CER)"
+          aria-label="Eval model id"
+          bind:value={evalModelId}
+        />
+        <div class="action-row">
+          <button
+            class="btn btn-secondary"
+            onclick={runHonestCer}
+            disabled={evalBusy}
+            data-testid="eval-honest-cer"
+          >
+            {evalBusy ? 'Running…' : 'Run honest-CER eval'}
+          </button>
+          <button
+            class="btn btn-secondary"
+            onclick={runLocalEval}
+            disabled={evalBusy || !evalModelId.trim()}
+            data-testid="eval-local"
+          >
+            Run local-pipeline eval
+          </button>
+          <button
+            class="btn btn-secondary"
+            onclick={importGoldFromFile}
+            disabled={evalBusy}
+            data-testid="eval-import-gold"
+          >
+            Import gold from file…
+          </button>
+        </div>
+        {#if evalResult}
+          <p class="muted" data-testid="eval-result">
+            Last eval: CER {pct(evalResult.run.cer)} · WER {pct(evalResult.run.wer)} · N={evalResult
+              .run.numSegs}
+            <button
+              class="btn btn-ghost"
+              onclick={buildScorecardFromResult}
+              disabled={evalBusy}
+              data-testid="eval-build-scorecard"
+            >
+              Build scorecard
+            </button>
+          </p>
+        {/if}
+        {#if scorecardMd}
+          <pre class="scorecard" data-testid="eval-scorecard">{scorecardMd}</pre>
+        {/if}
+      </div>
+    {/if}
 
     <!-- Eval-run history -->
     <div class="card" data-testid="refinery-eval-runs">
@@ -212,5 +348,26 @@
   .trend-val {
     width: 120px;
     text-align: right;
+  }
+  .eval-input {
+    width: 100%;
+    margin-bottom: 8px;
+  }
+  .action-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .scorecard {
+    margin-top: 8px;
+    max-height: 240px;
+    overflow: auto;
+    font-size: 0.72rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--surface-1, var(--surface-2));
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
   }
 </style>

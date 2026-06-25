@@ -906,6 +906,35 @@ export async function runGoldEval(
   return invoke<EvalRunResult>('run_gold_eval', { modelId, hypotheses });
 }
 
+/** The honest-CER entrypoint: runs the real ASR over the gold set (no caller-supplied hypotheses). */
+export async function runGoldEvalAsr(modelId?: string | null): Promise<EvalRunResult> {
+  return invoke<EvalRunResult>('run_gold_eval_asr', { modelId: modelId ?? null });
+}
+
+/** Run the gold eval against the local pipeline for a specific model id. */
+export async function runGoldEvalLocal(modelId: string): Promise<EvalRunResult> {
+  return invoke<EvalRunResult>('run_gold_eval_local', { modelId });
+}
+
+/** Create gold-eval segments from a verified file. Returns the number created. */
+export async function createGoldFromFile(audioPath: string): Promise<number> {
+  return invoke<number>('create_gold_from_file', { audioPath });
+}
+
+/** A reproducible scorecard built from already-computed gold-eval results. */
+export interface ScorecardResponse {
+  scorecard: unknown;
+  markdown: string;
+}
+
+/** Build a scorecard (system vs optional baseline) from gold-eval results. */
+export async function buildScorecard(
+  system: EvalRunResult,
+  baseline?: EvalRunResult | null,
+): Promise<ScorecardResponse> {
+  return invoke<ScorecardResponse>('build_scorecard', { system, baseline: baseline ?? null });
+}
+
 export async function listEvalRuns(): Promise<EvalRun[]> {
   return invoke<EvalRun[]>('list_eval_runs');
 }
