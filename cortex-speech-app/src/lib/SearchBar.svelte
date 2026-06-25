@@ -16,6 +16,17 @@
   let debounceTimer: ReturnType<typeof setTimeout>;
   let searchGeneration = 0;
   const tauriAvailable = isTauriRuntime();
+  // Mirror EXTERNAL changes to the shared search store (session restore on launch, or a programmatic
+  // clear) into the local input. `lastPushed` tracks what this component itself wrote, so the user's
+  // own debounced input is never echoed back and cannot fight their typing.
+  let lastPushed = '';
+  $effect(() => {
+    const external = $searchQuery;
+    if (external !== lastPushed) {
+      query = external;
+      lastPushed = external;
+    }
+  });
 
   // Cancel any pending debounce on unmount so a stale keystroke can't write the global search stores
   // after the component is gone (e.g. sidebar closed within the 250ms debounce).
@@ -53,6 +64,7 @@
     debounceTimer = setTimeout(() => {
       const trimmed = query.trim();
       searchQuery.set(trimmed);
+      lastPushed = trimmed;
       const gen = ++searchGeneration;
       if (!trimmed) {
         searchResults.set(null);
@@ -68,6 +80,7 @@
     searchGeneration++;
     query = '';
     searchQuery.set('');
+    lastPushed = '';
     searchResults.set(null);
     searchLoading.set(false);
   }

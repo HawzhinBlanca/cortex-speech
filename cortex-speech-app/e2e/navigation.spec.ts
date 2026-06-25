@@ -45,6 +45,24 @@ test.describe('Navigation and panel interaction', () => {
     await expect(searchInput).toHaveValue('');
   });
 
+  test('search query persists across a restart (session restore)', async ({ page }) => {
+    await page.goto('/');
+
+    const placeholder = 'Search transcripts, files, speakers...';
+    const searchInput = page.getByPlaceholder(placeholder);
+    await expect(searchInput).toBeVisible();
+    await searchInput.fill('بەڕێوە');
+
+    // Wait until the debounced save_session has persisted the view-state.
+    await expect
+      .poll(async () => page.evaluate(() => localStorage.getItem('__cortex_session__')))
+      .toContain('بەڕێوە');
+
+    // Reload the app — restore_session repopulates the prior search query on launch.
+    await page.goto('/');
+    await expect(page.getByPlaceholder(placeholder)).toHaveValue('بەڕێوە');
+  });
+
   test('search verification filter buttons exist', async ({ page }) => {
     await page.goto('/');
 

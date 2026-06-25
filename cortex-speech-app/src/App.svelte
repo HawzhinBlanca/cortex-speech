@@ -13,6 +13,8 @@
     selectedSegmentId,
     wordTimestamps,
     searchQuery,
+    sortOrder,
+    type SortOrder,
     selectedSegment,
     filteredSegments,
     segmentStats,
@@ -121,6 +123,47 @@
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle');
   let saveTimeout: ReturnType<typeof setTimeout> | null = null;
   let tauriAvailable = $state(false);
+  // Session view-state persistence: only start saving once the prior session has been restored, so
+  // the initial restore->apply does not race a default-valued save over it.
+  let sessionRestored = false;
+  let sessionSaveTimeout: ReturnType<typeof setTimeout> | null = null;
+  const VALID_SORT_ORDERS: SortOrder[] = [
+    'newest',
+    'oldest',
+    'duration',
+    'verified',
+    'confidence',
+    'activeLearning',
+  ];
+
+  async function restoreAndApplySession() {
+    if (!tauriAvailable) return;
+    try {
+      const restored = await api.restoreSession();
+      if (restored) {
+        if (restored.search_query) searchQuery.set(restored.search_query);
+        if (restored.sort_order && VALID_SORT_ORDERS.includes(restored.sort_order as SortOrder)) {
+          sortOrder.set(restored.sort_order as SortOrder);
+        }
+      }
+    } catch (e) {
+      console.error('Session restore failed:', e);
+    } finally {
+      sessionRestored = true;
+    }
+  }
+
+  // Debounced persistence of the user's search query + sort order (survives a restart). Gated on
+  // sessionRestored so applying the restored values on launch does not immediately re-save defaults.
+  $effect(() => {
+    const q = $searchQuery;
+    const s = $sortOrder;
+    if (!sessionRestored || !tauriAvailable) return;
+    if (sessionSaveTimeout) clearTimeout(sessionSaveTimeout);
+    sessionSaveTimeout = setTimeout(() => {
+      void api.saveSession(q, s).catch((e) => console.error('Session save failed:', e));
+    }, 800);
+  });
   let datasetPromotionStage = $derived.by(
     () =>
       latestAgentReport?.summary.orchestrationStages?.find(
@@ -363,6 +406,7 @@
       await loadLatestAgentReport();
       await loadLatestAgentStageEvents();
       await loadSettings();
+      await restoreAndApplySession();
     } else {
       segments.set([]);
       segmentsLoading = false;
@@ -374,6 +418,7 @@
     stopEventListeners();
     globalKeyboardManager?.destroy();
     if (saveTimeout) clearTimeout(saveTimeout);
+    if (sessionSaveTimeout) clearTimeout(sessionSaveTimeout);
   });
 
   function navigateSegment(direction: 'up' | 'down') {
