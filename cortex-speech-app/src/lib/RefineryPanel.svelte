@@ -175,7 +175,7 @@
             disabled={evalBusy || !evalModelId.trim()}
             data-testid="eval-local"
           >
-            Run local-pipeline eval
+            {evalBusy ? 'Running…' : 'Run local-pipeline eval'}
           </button>
           <button
             class="btn btn-secondary"
@@ -183,7 +183,7 @@
             disabled={evalBusy}
             data-testid="eval-import-gold"
           >
-            Import gold from file…
+            {evalBusy ? 'Importing…' : 'Import gold from file…'}
           </button>
         </div>
         {#if evalResult}
