@@ -63,6 +63,29 @@ jobs:
         run: npm run fetch-models
       - name: Build Tauri app
         run: npm run tauri build
+      - name: Code-sign installers (Authenticode) when a cert is provided
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERT_BASE64) {
+            Write-Output "::warning title=Installers UNSIGNED::No WINDOWS_CERT_BASE64 secret - the MSI/NSIS are NOT code-signed and Windows SmartScreen will warn 'unknown publisher'. Add an Authenticode (EV/OV) cert as a base64 secret (+ WINDOWS_CERT_PASSWORD) to sign + timestamp."
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP cert.pfx
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
+          $st = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1).FullName
+          $installers = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -Include *.msi,*-setup.exe
+          foreach ($f in $installers) {
+            & $st sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signing failed for $($f.Name)" }
+            & $st verify /pa $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "verify failed for $($f.Name)" }
+            Write-Output "signed + verified: $($f.Name)"
+          }
+          Remove-Item $pfx -Force
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cortex-speech-${{ matrix.os }}
