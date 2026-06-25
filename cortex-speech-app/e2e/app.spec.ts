@@ -70,6 +70,25 @@ test.describe('App smoke tests', () => {
     await expect(status).toContainText('ElevenLabs key detected');
   });
 
+  test('model registry lists registered models with a champion badge', async ({ page }) => {
+    await page.goto('/');
+
+    await page.getByTestId('settings-btn').click();
+    const settings = page.getByTestId('settings-panel');
+    await expect(settings).toBeVisible();
+
+    await settings.getByRole('button', { name: 'AI Models', exact: true }).click();
+
+    const registry = settings.getByTestId('model-registry');
+    await expect(registry).toBeVisible();
+
+    const rows = settings.getByTestId('model-registry-row');
+    await expect(rows).toHaveCount(2);
+    await expect(rows.first()).toContainText('finetuned-mms-ckb');
+    await expect(rows.first()).toContainText('champion');
+    await expect(rows.first()).toContainText('CC-BY-NC-4.0');
+  });
+
   test('settings panel opens via Ctrl+, shortcut', async ({ page }) => {
     await page.goto('/');
     await page.getByTestId('app-root').click();

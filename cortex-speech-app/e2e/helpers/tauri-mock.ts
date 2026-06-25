@@ -112,6 +112,29 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'get_configured_providers':
             // Names only, never key values — matches the real configured_providers() contract.
             return ['elevenlabs'];
+          case 'list_model_versions':
+            return [
+              {
+                id: 'finetuned-mms-ckb',
+                family: 'mms-ckb',
+                model_card_name: 'MMS-CTC-1B (ckb)',
+                checkpoint_sha256: 'a1b2c3d4e5f600112233445566778899aabbccddeeff00112233445566778899',
+                checkpoint_path: '',
+                source: 'fine-tune',
+                license: 'CC-BY-NC-4.0',
+                status: 'champion',
+              },
+              {
+                id: 'omniasr-ctc-300m',
+                family: 'omniasr',
+                model_card_name: null,
+                checkpoint_sha256: '00112233445566778899aabbccddeeffa1b2c3d4e5f6000000000000deadbeef',
+                checkpoint_path: '',
+                source: 'bundled',
+                license: 'CC-BY-4.0',
+                status: 'candidate',
+              },
+            ];
           case 'get_inference_stats':
             return {
               vad: { calls: 0, failures: 0, p50_ms: 0, p99_ms: 0 },

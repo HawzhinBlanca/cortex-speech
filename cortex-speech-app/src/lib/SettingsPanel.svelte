@@ -8,6 +8,7 @@
   import { startOperation, endOperation } from './invoke';
   import { PARQUET_EXPORT_SUPPORTED } from './appFeatures';
   import ModelDownload from './ModelDownload.svelte';
+  import ModelRegistry from './ModelRegistry.svelte';
   import { t } from './i18n';
   import { get } from 'svelte/store';
   import { onDestroy, onMount } from 'svelte';
@@ -486,6 +487,7 @@
         {:else if activeTab === 'models'}
           {#if tauriAvailable}
             <ModelDownload />
+            <ModelRegistry />
           {:else}
             <div
               class="rounded-md border border-cortex-700/40 bg-cortex-900/30 p-3 text-xs text-muted"

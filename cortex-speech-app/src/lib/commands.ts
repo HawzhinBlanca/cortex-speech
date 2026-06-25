@@ -361,6 +361,24 @@ export async function getConfiguredProviders(): Promise<string[]> {
   return invoke<string[]>('get_configured_providers');
 }
 
+/** A row of the model-version registry (snake_case, as serialized by the backend). */
+export interface ModelVersion {
+  id: string;
+  family: string;
+  model_card_name: string | null;
+  checkpoint_sha256: string;
+  checkpoint_path: string;
+  source: string;
+  license: string;
+  /** "candidate" or "champion". */
+  status: string;
+}
+
+/** The registered model versions, newest-first within each family. */
+export async function listModelVersions(): Promise<ModelVersion[]> {
+  return invoke<ModelVersion[]>('list_model_versions');
+}
+
 export async function getAudioDuration(path: string): Promise<number> {
   return invoke<number>('get_audio_duration', { path });
 }
