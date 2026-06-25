@@ -36,7 +36,13 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
   test('Settings dialog has zero a11y violations', async ({ page }) => {
     await page.goto('/');
     await page.getByLabel('Open settings').click();
-    await expect(page.locator('role=dialog')).toBeVisible();
+    const dialog = page.locator('role=dialog');
+    await expect(dialog).toBeVisible();
+    expect(await violations(page)).toEqual([]);
+
+    // Also cover the AI Models tab, where the read-only model-registry panel renders.
+    await dialog.getByRole('button', { name: 'AI Models', exact: true }).click();
+    await expect(page.getByTestId('model-registry')).toBeVisible();
     expect(await violations(page)).toEqual([]);
   });
 });
