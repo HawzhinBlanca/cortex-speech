@@ -509,7 +509,14 @@ fn add_audio_quality_reasons(seg: &SpeechSegment, reasons: &mut Vec<String>) -> 
 }
 
 fn hypothesis_transcript(seg: &SpeechSegment) -> &str {
-    seg.normalized_transcript.as_deref().unwrap_or(&seg.raw_transcript)
+    // Score the RAW ASR output, NOT normalized_transcript. wer::compute_wer/compute_cer apply
+    // normalize_for_metrics (verbalize_numbers:false) to BOTH the reference and the hypothesis, so
+    // both must enter in the same surface form. The stored normalized_transcript may have been
+    // number-verbalized one-way (e.g. "١٤" -> "چواردە") per the user's verbalize_numbers setting —
+    // a transform normalize_for_metrics cannot reverse — which would inflate WER/CER against the
+    // digit-form human reference even on a perfect transcript. The raw transcript keeps digits,
+    // matching the reference, so both sides canonicalize symmetrically.
+    &seg.raw_transcript
 }
 
 fn compute_wer_cer_metrics(
@@ -768,6 +775,25 @@ mod tests {
             ood_score: None,
             ..SpeechSegment::default()
         }
+    }
+
+    #[test]
+    fn metrics_score_raw_hypothesis_so_verbalized_numbers_dont_inflate_wer() {
+        // Regression: a segment whose stored normalized_transcript was number-verbalized must still
+        // score WER/CER 0 against a digit-form human reference — the dashboard/manifest metrics
+        // score the RAW hypothesis and canonicalize both sides identically (verbalize_numbers:false),
+        // so a perfect transcript reads as 0, not an inflated rate.
+        let mut s = seg("num-1", "تەمەنی ١٤ ساڵ", 1500);
+        s.annotated_transcript = Some("تەمەنی ١٤ ساڵ".to_string());
+        // The one-way verbalized form must NOT be what gets scored.
+        s.normalized_transcript = Some("تەمەنی یەک چوار ساڵ".to_string());
+        let settings = AppSettings::default();
+        let (n, wer, cer, above_wer, _above_cer, _outliers) =
+            compute_wer_cer_metrics(std::slice::from_ref(&s), &settings);
+        assert_eq!(n, 1, "the annotated segment is counted");
+        assert_eq!(wer, Some(0.0), "verbalized normalized_transcript must not inflate WER");
+        assert_eq!(cer, Some(0.0), "verbalized normalized_transcript must not inflate CER");
+        assert_eq!(above_wer, 0, "a perfect transcript must not trip the WER threshold");
     }
 
     #[test]
