@@ -1286,7 +1286,9 @@ pub fn list_model_versions(state: State<'_, AppState>) -> Result<Vec<crate::regi
     crate::registry::list_model_versions(&db).map_err(|e| e.to_string())
 }
 
-/// The current champion for a family, if one is crowned.
+/// The current champion for a family, if one is crowned. Reserved programmatic accessor: the
+/// model-registry UI surfaces the champion via each row's `status` field, so this is intentionally
+/// not invoked from the frontend — it stays for CLI/scripted callers. (IPC-surface audit 2026-06-25.)
 #[tauri::command]
 pub fn get_champion_model(
     family: String,
@@ -2276,6 +2278,9 @@ pub fn cancel_wsl_refinement() -> Result<(), String> {
     Ok(())
 }
 
+/// Insert a single segment hypothesis. Reserved programmatic API: the jury/consensus pipeline
+/// produces hypotheses internally (ASR votes, Scribe votes), so there is no manual single-insert UI
+/// — this stays for CLI/scripted jury orchestration. (IPC-surface audit 2026-06-25.)
 #[tauri::command]
 pub fn add_segment_hypothesis(state: State<'_, AppState>, hyp: crate::db::SegmentHypothesis) -> Result<(), String> {
     RATE_LIMITER.check("add_segment_hypothesis")?;
