@@ -43,6 +43,9 @@
       "models/finetuned-mms-ckb/vocab.json"
     ],
     "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller"
+      },
       "wix": {
         "language": "en-US"
       },
