@@ -109,6 +109,9 @@ export async function installTauriMock(page: Page): Promise<void> {
             return mockQuality;
           case 'get_dataset_certificate':
             return mockCertificate;
+          case 'get_configured_providers':
+            // Names only, never key values — matches the real configured_providers() contract.
+            return ['elevenlabs'];
           case 'get_inference_stats':
             return {
               vad: { calls: 0, failures: 0, p50_ms: 0, p99_ms: 0 },
