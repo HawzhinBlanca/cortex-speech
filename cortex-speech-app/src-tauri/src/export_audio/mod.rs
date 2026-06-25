@@ -260,15 +260,23 @@ fn write_metadata_csv(
                     AudioExportFormat::Wav => "wav",
                     AudioExportFormat::Flac => "flac",
                 };
+                // CWE-1236: neutralize spreadsheet formula injection on the free-text columns
+                // (transcripts / speaker / verdict). Structural columns (filename, audio_path,
+                // numeric, enum) are left untouched so the metadata stays valid.
+                let raw_t = crate::export::csv_safe_cell(seg.raw_transcript.as_str());
+                let norm_t = crate::export::csv_safe_cell(seg.normalized_transcript.as_deref().unwrap_or(""));
+                let annot_t = crate::export::csv_safe_cell(seg.annotated_transcript.as_deref().unwrap_or(""));
+                let speaker_t = crate::export::csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
+                let verdict_t = crate::export::csv_safe_cell(seg.verdict.as_deref().unwrap_or(""));
                 wtr.write_record([
                     item.filename.as_str(),
                     seg.id.as_str(),
                     seg.audio_path.as_str(),
-                    seg.raw_transcript.as_str(),
-                    seg.normalized_transcript.as_deref().unwrap_or(""),
-                    seg.annotated_transcript.as_deref().unwrap_or(""),
+                    raw_t.as_ref(),
+                    norm_t.as_ref(),
+                    annot_t.as_ref(),
                     duration_ms.as_str(),
-                    seg.speaker_id.as_deref().unwrap_or(""),
+                    speaker_t.as_ref(),
                     if seg.verified { "1" } else { "0" },
                     confidence.as_str(),
                     ctc_score.as_str(),
@@ -277,7 +285,7 @@ fn write_metadata_csv(
                     snr_db.as_str(),
                     seg.split.as_deref().unwrap_or(""),
                     ood_score.as_str(),
-                    seg.verdict.as_deref().unwrap_or(""),
+                    verdict_t.as_ref(),
                     seg.alignment_quality.as_deref().unwrap_or(""),
                     export_sample_rate.as_str(),
                     export_format,
