@@ -1658,6 +1658,21 @@ mod tests {
     }
 
     #[test]
+    fn insert_segment_accepts_arbitrary_transcript_text_and_keeps_search_queryable() {
+        use proptest::prelude::*;
+        // Write-path sibling of the search robustness property: user annotations/corrections are
+        // free text, so persisting ANY transcript body must not error and must not corrupt the FTS
+        // index it feeds (a later search must still return Ok, never an indexing-time syntax error).
+        proptest!(|(body in ".*")| {
+            let db = make_db();
+            let mut seg = make_segment("prop-w", "/w.wav");
+            seg.raw_transcript = body.clone();
+            prop_assert!(db.insert_segment(&seg).is_ok(), "insert must not error on body {body:?}");
+            prop_assert!(db.search_segments("hello").is_ok(), "search must stay Ok after body {body:?}");
+        });
+    }
+
+    #[test]
     fn consensus_batch_preserves_human_reviewed_transcripts() {
         // Hardening-audit MEDIUM (silent data loss): the consensus refinery overwrote human-corrected
         // transcripts because update_segment_consensus_batch lacked the human-review guard that every
