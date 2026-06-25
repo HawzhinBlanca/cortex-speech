@@ -117,6 +117,15 @@ export async function installTauriMock(page: Page): Promise<void> {
             return ['elevenlabs'];
           case 'get_fingerprint_count':
             return 1;
+          case 'get_tracing_stats':
+            return { total_spans: 2, failures: 0, total_duration_ms: 12.5, avg_duration_ms: 6.25 };
+          case 'get_recent_spans':
+            return [
+              { operation: 'diff.compute', start: '0', duration_ms: 5.0, metadata: {}, success: true, error: null },
+              { operation: 'asr.transcribe', start: '0', duration_ms: 7.5, metadata: {}, success: true, error: null },
+            ];
+          case 'clear_tracing_spans':
+            return null;
           case 'save_session': {
             // Persist view-state in localStorage so a reload restores it (the real backend persists
             // to session.json). Per-context, so it never leaks across tests.

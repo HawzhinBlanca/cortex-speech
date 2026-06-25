@@ -402,6 +402,36 @@ export async function getFingerprintCount(): Promise<number> {
   return invoke<number>('get_fingerprint_count');
 }
 
+/** Aggregate telemetry stats (snake_case, as serialized by the backend Tracer). */
+export interface TracingStats {
+  total_spans: number;
+  failures: number;
+  total_duration_ms: number;
+  avg_duration_ms: number;
+}
+
+/** A single recorded operation span. */
+export interface TracingSpan {
+  operation: string;
+  start: string;
+  duration_ms: number;
+  metadata: Record<string, string>;
+  success: boolean;
+  error: string | null;
+}
+
+export async function getTracingStats(): Promise<TracingStats> {
+  return invoke<TracingStats>('get_tracing_stats');
+}
+
+export async function getRecentSpans(count?: number): Promise<TracingSpan[]> {
+  return invoke<TracingSpan[]>('get_recent_spans', { count: count ?? null });
+}
+
+export async function clearTracingSpans(): Promise<void> {
+  return invoke('clear_tracing_spans');
+}
+
 export async function getAudioDuration(path: string): Promise<number> {
   return invoke<number>('get_audio_duration', { path });
 }

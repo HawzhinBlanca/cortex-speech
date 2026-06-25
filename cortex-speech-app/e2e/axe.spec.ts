@@ -44,5 +44,10 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
     await dialog.getByRole('button', { name: 'AI Models', exact: true }).click();
     await expect(page.getByTestId('model-registry')).toBeVisible();
     expect(await violations(page)).toEqual([]);
+
+    // And the Diagnostics tab (tracing panel).
+    await dialog.getByRole('button', { name: 'Diagnostics', exact: true }).click();
+    await expect(page.getByTestId('diagnostics-panel')).toBeVisible();
+    expect(await violations(page)).toEqual([]);
   });
 });
