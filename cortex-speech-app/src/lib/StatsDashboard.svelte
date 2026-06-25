@@ -353,9 +353,19 @@
             </div>
             <div class="flex justify-between">
               <span>Expected Error Bound:</span>
-              <span class="font-semibold text-emerald-400"
-                >{(cert.expectedErrorBound * 100).toFixed(1)}%</span
-              >
+              {#if cert.isCalibrated}
+                <span class="font-semibold text-emerald-400"
+                  >{(cert.expectedErrorBound * 100).toFixed(1)}%</span
+                >
+              {:else}
+                <!-- Uncalibrated: expectedErrorBound is just the requested target echoed back,
+                     not a measured/achieved bound — never show it in success-green. -->
+                <span
+                  class="font-semibold text-amber-400/90"
+                  title="Uncalibrated — this is the requested target, not a measured bound"
+                  >n/a (uncalibrated)</span
+                >
+              {/if}
             </div>
           </div>
 
