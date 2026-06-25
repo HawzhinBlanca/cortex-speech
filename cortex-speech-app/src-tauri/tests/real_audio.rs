@@ -585,6 +585,51 @@ fn omniasr_on_committed_fleurs_ckb_fixture() {
     assert!(arabic > 0, "expected Kurdish (Arabic-script) output, got: {trimmed}");
 }
 
+/// RTF (real-time-factor) MEASUREMENT harness on the committed FLEURS fixture.
+/// RTF = inference wall-clock / audio duration; < 1.0 is faster-than-real-time. Opt-in
+/// (`#[ignore]`) because absolute timing is machine-dependent — a hard threshold belongs on a
+/// NAMED reference machine (charter M4.1), not the default suite, so this asserts only that the
+/// RTF is a finite positive measurement and PRINTS the real number to compare against a target.
+/// Run with:
+///   cargo test --test real_audio -- --ignored omniasr_rtf_on_committed_fleurs_ckb_fixture --nocapture
+/// Skips cleanly when the fixture or model is absent.
+#[test]
+#[ignore]
+fn omniasr_rtf_on_committed_fleurs_ckb_fixture() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
+    let model_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+    if !fixture.exists() || !model_dir.join("omniasr-ctc-300m/model.int8.onnx").exists() {
+        eprintln!("[rtf] fixture or OmniASR model absent; skipping");
+        return;
+    }
+
+    let (sr, pcm) = audio::decode_to_pcm_with_timeout(&fixture, std::time::Duration::from_secs(120))
+        .expect("decode committed fixture");
+    assert_eq!(sr, 16000);
+    let audio_secs = pcm.len() as f64 / sr as f64;
+    let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+
+    let mut asr = KurdishAsrService::new(&model_dir, false).expect("ASR init with real models");
+    assert!(asr.is_available(), "ASR should be available");
+
+    // Warm up so model load / first-call JIT is excluded from the RTF.
+    let _ = asr.transcribe(&f32_pcm, 16000).expect("warmup transcription");
+
+    const ITERS: u32 = 5;
+    let start = Instant::now();
+    for _ in 0..ITERS {
+        let _ = asr.transcribe(&f32_pcm, 16000).expect("timed transcription");
+    }
+    let per_iter = start.elapsed().as_secs_f64() / ITERS as f64;
+    let rtf = per_iter / audio_secs;
+
+    eprintln!(
+        "[rtf] audio={audio_secs:.2}s  per-inference={:.1}ms  RTF={rtf:.4}  ({ITERS} iters, CPU int8)",
+        per_iter * 1000.0,
+    );
+    assert!(rtf.is_finite() && rtf > 0.0, "RTF must be a finite positive measurement, got {rtf}");
+}
+
 // ── M3: closed-loop gold eval against the REAL OmniASR engine ───────────
 
 #[test]
