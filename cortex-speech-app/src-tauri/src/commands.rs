@@ -1350,9 +1350,15 @@ pub fn register_media_asset(
 ) -> Result<crate::media::MediaGrant, String> {
     RATE_LIMITER.check("register_media_asset")?;
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    let db = state.lock_db();
+    // Membership check under a SHORT-LIVED db lock, then release it before the (potentially
+    // gigabyte) cache copy — holding the global db mutex across std::fs::copy stalled get_segments
+    // and every other DB-touching IPC for the copy duration.
+    let canonical = {
+        let db = state.lock_db();
+        crate::media::MediaRegistry::ensure_imported(&db, &audio_path)?
+    };
     let mut registry = state.lock_media_registry();
-    registry.register(&db, &data_dir, &audio_path)
+    registry.register_cached(&data_dir, &canonical)
 }
 
 #[tauri::command]
@@ -1491,12 +1497,19 @@ pub fn update_settings(mut settings: AppSettings, state: State<'_, AppState>) ->
         *current = settings.clone();
         state.lock_data_dir().clone().map(|d| d.join("settings.json"))
     };
+    // Apply to the running pipeline immediately so the session reflects the change.
+    state.update_pipeline_settings(settings.clone());
+    // Persist. A save failure (e.g. a consent toggle that never reached disk) must be SURFACED, not
+    // swallowed — otherwise the user believes the change stuck while it silently reverts on the next
+    // launch (a privacy hazard for the cloud opt-in toggles).
     if let Some(path) = settings_path {
-        if let Err(e) = settings.save(&path) {
-            tracing::error!("Failed to save settings to {:?}: {e}", path);
-        }
+        settings.save(&path).map_err(|e| {
+            tracing::error!("Failed to save settings to {path:?}: {e}");
+            format!(
+                "Settings applied for this session but could not be saved to disk (they will revert on restart): {e}"
+            )
+        })?;
     }
-    state.update_pipeline_settings(settings);
     Ok(())
 }
 
@@ -2677,7 +2690,13 @@ pub(crate) fn require_cloud_llm_consent(state: &AppState) -> Result<(), String> 
 pub fn transcribe_audio_with_scribe(audio_path: String, state: State<'_, AppState>) -> Result<String, String> {
     STRICT_RATE_LIMITER.check("transcribe_audio_with_scribe")?;
     require_cloud_stt_consent(&state)?;
-    let audio_path = validate::validate_file_path(&audio_path)?;
+    // Only audio already imported into THIS dataset may be uploaded to the cloud — never an
+    // arbitrary local file path handed in by the (untrusted) webview. ensure_imported both
+    // validates the path and confirms DB membership.
+    let audio_path = {
+        let db = state.lock_db();
+        crate::media::MediaRegistry::ensure_imported(&db, &audio_path)?
+    };
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
     let key = crate::api_keys::ApiKeys::load(&data_dir)
         .elevenlabs
@@ -2774,6 +2793,7 @@ pub fn record_human_decision(
 #[tauri::command]
 pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> Result<(), String> {
     RATE_LIMITER.check("clear_human_decision")?;
+    validate::validate_identifier(&segment_id)?;
     let db = state.lock_db();
     db.connection()
         .execute(
