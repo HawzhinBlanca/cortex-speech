@@ -981,27 +981,66 @@ impl ProcessingPipeline {
 
         let mut segments = Vec::new();
         let mut all_pcm_cache = Vec::new();
-        for window in windows {
+        let num_windows = windows.len();
+        // Carry the final chunk of each 90 s decode window into the next one. That chunk touches the
+        // hard window edge, so re-chunking it together with the following audio lets the silence-aware
+        // splitter cut on a pause instead of guillotining a word across the boundary (which made the 7B
+        // re-emit the straddling word — e.g. "پێداویستە سەرەتایەکانی" was duplicated across a 180 s seam).
+        let mut carry_pcm: Vec<i16> = Vec::new();
+        let mut carry_base: usize = 0;
+        let mut sample_rate_seen: u32 = 16_000;
+        for (w_idx, window) in windows.into_iter().enumerate() {
             if let Some(token) = cancel {
                 token.check()?;
             }
-            if window.pcm.is_empty() {
+            let is_last = w_idx + 1 == num_windows;
+
+            let (sample_rate, win_pcm) = if window.pcm.is_empty() {
+                (sample_rate_seen, Vec::new())
+            } else {
+                let (sr, p) = audio::ensure_pcm_16khz(window.sample_rate, window.pcm)?;
+                sample_rate_seen = sr;
+                // Fingerprint only freshly-decoded audio, never the carried-over tail.
+                self.fingerprint.check_and_register(&p, sr, Some(path)).map_err(|e| AppError::Validation(e.into()))?;
+                (sr, p)
+            };
+
+            // Prepend the previous window's carried-over tail (contiguous audio) before chunking.
+            let (effective_pcm, base_sample) = if carry_pcm.is_empty() {
+                let base = chunking::ms_to_samples(window.offset_ms.max(0) as u32, sample_rate);
+                (win_pcm, base)
+            } else {
+                let mut v = std::mem::take(&mut carry_pcm);
+                let base = carry_base;
+                v.extend_from_slice(&win_pcm);
+                (v, base)
+            };
+            if effective_pcm.is_empty() {
                 continue;
             }
-            let (sample_rate, pcm) = audio::ensure_pcm_16khz(window.sample_rate, window.pcm)?;
-            let _fp = self
-                .fingerprint
-                .check_and_register(&pcm, sample_rate, Some(path))
-                .map_err(|e| AppError::Validation(e.into()))?;
+            let pcm = effective_pcm;
 
-            let base_sample = chunking::ms_to_samples(window.offset_ms.max(0) as u32, sample_rate);
-            let chunk_ranges = chunking::plan_speech_chunks(
+            let mut chunk_ranges = chunking::plan_speech_chunks(
                 &pcm,
                 sample_rate,
                 self.settings.vad_threshold,
                 self.settings.min_segment_duration_ms,
                 self.settings.max_segment_duration_ms,
             )?;
+
+            // Hold back the boundary-touching tail of every non-final window for the next round so the
+            // splitter can later cut it on a pause. The final window emits everything (nothing dropped).
+            if !is_last {
+                if let Some(&(ls, le)) = chunk_ranges.last() {
+                    carry_pcm = pcm[ls..le].to_vec();
+                    carry_base = base_sample + ls;
+                    chunk_ranges.pop();
+                }
+            }
+            if chunk_ranges.is_empty() {
+                continue;
+            }
+
             let global_ranges: Vec<(usize, usize)> =
                 chunk_ranges.iter().map(|&(s, e)| (base_sample + s, base_sample + e.min(pcm.len()))).collect();
 
