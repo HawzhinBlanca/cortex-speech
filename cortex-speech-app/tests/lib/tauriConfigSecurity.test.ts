@@ -11,8 +11,17 @@ describe('Tauri config security boundaries', () => {
     const assetProtocol = config.app?.security?.assetProtocol;
 
     expect(assetProtocol?.enable).toBe(true);
-    expect(assetProtocol?.scope).toEqual(['$APPDATA/media-cache/**']);
-    expect(assetProtocol?.scope).not.toContain('$APPDATA/**');
+    // Scope must point at the app's REAL data dir ($DATA/cortex-speech, per lib.rs get_app_data_dir)
+    // and stay confined to media-cache. The old '$APPDATA/media-cache/**' resolved to
+    // $APPDATA=app_data_dir (Roaming/<bundle-identifier>), a different folder, so every clip was
+    // blocked ("Failed to load audio file", media errCode 4).
+    expect(assetProtocol?.scope).toEqual(['$DATA/cortex-speech/media-cache/**']);
+    // Still locked down: never a broad data-dir grant.
+    for (const s of assetProtocol?.scope ?? []) {
+      expect(s).toContain('media-cache');
+      expect(s).not.toBe('$DATA/**');
+      expect(s).not.toBe('$APPDATA/**');
+    }
   });
 
   it('does not retain stale filesystem plugin configuration', () => {
