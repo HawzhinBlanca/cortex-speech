@@ -1329,7 +1329,17 @@ impl ProcessingPipeline {
                         }
                         last_problem = Some("7B returned an empty transcript".to_string());
                     }
-                    Err(error) => last_problem = Some(error.to_string()),
+                    Err(error) => {
+                        let msg = error.to_string();
+                        // A 5-minute per-attempt timeout means the server is HUNG, not transiently
+                        // flaky — another full-timeout attempt only triples the stall. Stop and
+                        // escalate fast. Quick failures (connection refused, empty) still retry.
+                        let hung = msg.contains("timed out");
+                        last_problem = Some(msg);
+                        if hung {
+                            break;
+                        }
+                    }
                 }
                 if attempt < MAX_ATTEMPTS {
                     std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -2185,13 +2195,17 @@ impl ProcessingPipeline {
 
             // Drain both pipes on threads so a chatty child can't deadlock on a full pipe
             // buffer; the readers finish when the pipes close (child exit or kill).
+            // Bound how much we read from the child so a buggy/hostile script that streams unbounded
+            // output can't OOM the host. The real protocol is one small `__RESULT__=` line; 8 MiB is
+            // far more than enough headroom while capping a runaway.
+            const MAX_WSL_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
             let mut child_stdout = child.stdout.take();
             let mut child_stderr = child.stderr.take();
             let stdout_reader = std::thread::spawn(move || {
                 let mut buf = Vec::new();
                 if let Some(ref mut s) = child_stdout {
                     use std::io::Read;
-                    let _ = s.read_to_end(&mut buf);
+                    let _ = s.take(MAX_WSL_OUTPUT_BYTES).read_to_end(&mut buf);
                 }
                 buf
             });
@@ -2199,7 +2213,7 @@ impl ProcessingPipeline {
                 let mut buf = Vec::new();
                 if let Some(ref mut s) = child_stderr {
                     use std::io::Read;
-                    let _ = s.read_to_end(&mut buf);
+                    let _ = s.take(MAX_WSL_OUTPUT_BYTES).read_to_end(&mut buf);
                 }
                 buf
             });
