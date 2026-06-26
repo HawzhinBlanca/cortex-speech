@@ -73,12 +73,18 @@
     }
   }
 
-  // Handle Playback Centering
+  // Keep the playhead visible during playback — but only nudge when it actually LEAVES the viewport.
+  // Forcing scrollLeft to re-centre every animation frame fought the user's manual horizontal scroll
+  // (it snapped straight back), making the waveform un-scrollable while playing.
   $effect(() => {
     if (scrollContainer && duration > 0 && playing && !isDragging) {
       const w = containerWidth * zoom;
       const playheadX = (currentTime / duration) * w;
-      scrollContainer.scrollLeft = playheadX - scrollContainer.clientWidth / 2;
+      const viewLeft = scrollContainer.scrollLeft;
+      const viewRight = viewLeft + scrollContainer.clientWidth;
+      if (playheadX < viewLeft || playheadX > viewRight) {
+        scrollContainer.scrollLeft = playheadX - scrollContainer.clientWidth / 2;
+      }
     }
   });
 

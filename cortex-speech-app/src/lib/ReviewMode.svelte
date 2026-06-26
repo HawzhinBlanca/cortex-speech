@@ -58,12 +58,23 @@
     return seg.annotatedTranscript ?? seg.normalizedTranscript ?? seg.rawTranscript ?? '';
   }
 
+  // Plain (non-reactive) cache of in-progress edits keyed by segment id, so switching clips — via
+  // prev/next OR a queue reorder from a concurrent store reload — never silently discards an unsaved
+  // correction. Cleared per id on a successful save.
+  const editCache = new Map<string, string>();
+  let lastLoadedOriginal = '';
+
   // Load the editable text + waveform whenever the current clip changes.
   $effect(() => {
     const seg = current;
     if (!seg || seg.id === lastLoadedId) return;
+    // Stash the OUTGOING clip's unsaved edit before we switch away from it.
+    if (lastLoadedId && editText.trim() !== lastLoadedOriginal.trim()) {
+      editCache.set(lastLoadedId, editText);
+    }
     lastLoadedId = seg.id;
-    editText = originalText(seg);
+    lastLoadedOriginal = originalText(seg);
+    editText = editCache.get(seg.id) ?? lastLoadedOriginal;
     currentTime = 0;
     playing = false;
     loadWaveform(seg);
@@ -89,6 +100,8 @@
     try {
       await api.updateSegment(updated);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
+      editCache.delete(seg.id); // persisted — drop the in-progress copy
+      lastLoadedOriginal = text; // the saved text is now the baseline for dirty-tracking
       notifications.success($t('saved'));
       advance();
     } catch (e) {
