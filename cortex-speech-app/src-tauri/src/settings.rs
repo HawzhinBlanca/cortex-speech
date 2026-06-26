@@ -452,12 +452,33 @@ impl AppSettings {
         }
     }
 
-    pub fn effective_llm_mode(&self) -> LlmMode {
-        if self.llm_mode == LlmMode::Gemini && !self.cloud_llm_opt_in {
-            LlmMode::None
-        } else {
-            self.llm_mode.clone()
+    /// True when the configured LLM endpoint targets the local machine (loopback) — a transcript
+    /// sent there never leaves the device. An empty endpoint is treated as local (no outbound).
+    pub fn llm_endpoint_is_local(&self) -> bool {
+        let e = self.llm_endpoint.trim().to_ascii_lowercase();
+        if e.is_empty() {
+            return true;
         }
+        let host = e.strip_prefix("https://").or_else(|| e.strip_prefix("http://")).unwrap_or(e.as_str());
+        host.starts_with("localhost")
+            || host.starts_with("127.0.0.1")
+            || host.starts_with("[::1]")
+            || host.starts_with("::1")
+    }
+
+    pub fn effective_llm_mode(&self) -> LlmMode {
+        // Cloud (Gemini) requires the explicit cloud-LLM opt-in.
+        if self.llm_mode == LlmMode::Gemini && !self.cloud_llm_opt_in {
+            return LlmMode::None;
+        }
+        // "Local" mode pointed at a REMOTE (non-loopback) endpoint sends the transcript off the
+        // device, so it is effectively cloud and likewise requires the cloud-LLM opt-in. A loopback
+        // endpoint stays on the machine and is always allowed. Without this, Local + an https remote
+        // would POST every transcript with no consent gate.
+        if self.llm_mode == LlmMode::Local && !self.cloud_llm_opt_in && !self.llm_endpoint_is_local() {
+            return LlmMode::None;
+        }
+        self.llm_mode.clone()
     }
 
     pub fn external_asr_script_path(&self) -> Option<String> {
@@ -556,6 +577,37 @@ mod tests {
         for bad in ["", "   ", "http://attacker.example.com/collect", "ftp://x", "file:///etc/passwd"] {
             assert!(super::validate_outbound_endpoint(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn local_mode_to_remote_endpoint_requires_cloud_opt_in() {
+        // Loopback "Local" never leaves the device — always allowed.
+        let local = AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "http://localhost:11434/v1".into(),
+            cloud_llm_opt_in: false,
+            ..AppSettings::default()
+        };
+        assert_eq!(local.effective_llm_mode(), LlmMode::Local);
+
+        // "Local" pointed at a REMOTE https host sends the transcript off-device: without the
+        // cloud-LLM opt-in it must downgrade to None (no outbound call constructed).
+        let remote_no_optin = AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "https://gateway.example.com/v1/chat/completions".into(),
+            cloud_llm_opt_in: false,
+            ..AppSettings::default()
+        };
+        assert_eq!(remote_no_optin.effective_llm_mode(), LlmMode::None);
+
+        // With the opt-in, the same remote Local endpoint is permitted.
+        let remote_opted = AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "https://gateway.example.com/v1/chat/completions".into(),
+            cloud_llm_opt_in: true,
+            ..AppSettings::default()
+        };
+        assert_eq!(remote_opted.effective_llm_mode(), LlmMode::Local);
     }
 
     #[test]
