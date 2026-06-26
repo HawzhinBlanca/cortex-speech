@@ -123,6 +123,23 @@ describe('AudioPlayer', () => {
     expect(playMock).toHaveBeenCalled();
   });
 
+  it('shows a clip-relative scrubber (0 → clip length), not the whole-file duration', async () => {
+    mockMediaResolution('C:\\media\\clip.wav');
+    render(AudioPlayer, {
+      props: { audioPath: 'C:\\input\\clip.wav', startTime: 10, endTime: 20 },
+    });
+    const audio = document.querySelector('audio') as HTMLAudioElement;
+    await waitFor(() => expect(audio.src).toContain('asset://localhost/C:/media/clip.wav'));
+    Object.defineProperty(audio, 'duration', { configurable: true, value: 30 });
+    await fireEvent.loadedMetadata(audio);
+    // The slider spans the 10s clip window, never the 30s source file.
+    const slider = document.querySelector('input[type="range"]') as HTMLInputElement;
+    expect(slider.max).toBe('10');
+    // Total-time read-out shows the clip length (0:10), not the file length (0:30).
+    expect(screen.getByText('0:10')).toBeInTheDocument();
+    expect(screen.queryByText('0:30')).not.toBeInTheDocument();
+  });
+
   it('reports loop replay failures instead of silently swallowing them', async () => {
     mockMediaResolution('C:\\media\\clip.wav');
     playMock.mockRejectedValueOnce(new Error('autoplay denied'));

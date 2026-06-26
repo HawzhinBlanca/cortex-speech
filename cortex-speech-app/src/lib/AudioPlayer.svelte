@@ -30,6 +30,16 @@
   let loop = $state(false);
   const RATES = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
+  // Clip-relative scrubber: when bounded to a segment ([startTime, endTime]) show the CLIP
+  // timeline (0:00 → clip length) instead of the whole source file, so a short sentence
+  // doesn't render as a multi-minute bar you can't navigate. Internal playback still uses
+  // absolute (whole-file) time; only the read-out + slider are clip-relative.
+  const clipMode = $derived(endTime > startTime);
+  const clipLength = $derived(clipMode ? endTime - startTime : duration);
+  const clipPosition = $derived(
+    clipMode ? Math.max(0, Math.min(currentTime - startTime, clipLength)) : currentTime,
+  );
+
   function toggleRate() {
     const idx = RATES.indexOf(playbackRate);
     playbackRate = RATES[(idx + 1) % RATES.length];
@@ -183,10 +193,11 @@
 
   function seek(e: Event) {
     const target = e.currentTarget as HTMLInputElement;
-    const time = parseFloat(target.value);
+    // Slider value is clip-relative when bounded; map back to absolute file time.
+    const abs = clipMode ? startTime + parseFloat(target.value) : parseFloat(target.value);
     if (audioEl) {
-      audioEl.currentTime = time;
-      currentTime = time;
+      audioEl.currentTime = abs;
+      currentTime = abs;
     }
   }
 
@@ -246,11 +257,11 @@
       {/if}
     </button>
 
-    <span class="text-xs font-mono text-cortex-300 min-w-12">{fmt(currentTime)}</span>
+    <span class="text-xs font-mono text-cortex-300 min-w-12">{fmt(clipPosition)}</span>
 
-    <input type="range" min="0" max={duration} value={currentTime} oninput={seek} class="flex-1" />
+    <input type="range" min="0" max={clipLength || 0} value={clipPosition} oninput={seek} class="flex-1" />
 
-    <span class="text-xs font-mono text-cortex-300 min-w-12">{fmt(duration)}</span>
+    <span class="text-xs font-mono text-cortex-300 min-w-12">{fmt(clipLength)}</span>
     <button
       type="button"
       class="btn btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono min-w-10 rounded-lg hover:bg-cortex-700/50 hover:text-default transition-colors border border-cortex-700/50 shadow-sm ms-1"
