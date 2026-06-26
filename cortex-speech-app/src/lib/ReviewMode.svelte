@@ -34,14 +34,17 @@
   // powers the listen-strip: tap a word to hear it, colour the low-confidence ones so
   // the reviewer's eye lands on likely errors, and karaoke-highlight the active word.
   const words = $derived<WordTimestamp[]>(parseWordTimestamps(current?.alignmentJson));
-  const activeWordIndex = $derived(
-    words.findIndex((w) => currentTime >= w.start && currentTime < w.end),
-  );
 
   // The clip's window within its source file. Without this the player plays the WHOLE file
   // and the waveform playhead is whole-file-relative — so you don't hear/see the one sentence
   // you're correcting. Bound the player to [start,end] and show the waveform clip-relative.
   const range = $derived(chunkPlaybackRange(parseSourceMeta(current?.alignmentJson)));
+  // Word timestamps from the aligner are CLIP-relative (0-based within the chunk), so compare
+  // against currentTime minus the clip's start offset; otherwise an offset chunk never highlights.
+  const activeWordIndex = $derived.by(() => {
+    const clipT = currentTime - range.startTime;
+    return words.findIndex((w) => clipT >= w.start && clipT < w.end);
+  });
   const clipLength = $derived(
     range.endTime > range.startTime ? range.endTime - range.startTime : playerDuration,
   );
@@ -108,13 +111,14 @@
     if (current) editText = originalText(current);
   }
 
-  // Tap a word → seek there and play, so a reviewer can verify it by ear instantly.
+  // Tap a word → seek there and play, so a reviewer can verify it by ear instantly. Word times are
+  // clip-relative; add the clip's start offset to land at the right place in the source file.
   function playFromWord(w: WordTimestamp) {
-    currentTime = w.start;
+    currentTime = range.startTime + w.start;
     playing = true;
   }
   function replay() {
-    currentTime = 0;
+    currentTime = range.startTime;
     playing = true;
   }
 

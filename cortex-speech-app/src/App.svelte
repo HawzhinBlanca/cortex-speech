@@ -2352,20 +2352,23 @@
                        words read reversed. -->
                   <div class="flex flex-wrap gap-x-1.5 gap-y-2" dir="rtl" lang="ckb">
                     {#each $wordTimestamps as w, idx}
-                      {@const isActive = currentTime >= w.start && currentTime <= w.end}
+                      <!-- Word times are CLIP-relative; compare/seek against the clip offset so an
+                           offset chunk highlights + seeks correctly (not at the whole-file position). -->
+                      {@const isActive =
+                        currentTime - chunkStartTime >= w.start && currentTime - chunkStartTime <= w.end}
                       <span
                         class="relative inline-block px-1.5 py-0.5 rounded cursor-pointer transition-all duration-150 group
                         {isActive
                           ? 'bg-cortex-700 text-default font-bold border-b border-yellow-400'
                           : 'text-cortex-200 hover:bg-cortex-800 hover:text-white'}"
-                        onclick={() => (currentTime = w.start)}
+                        onclick={() => (currentTime = chunkStartTime + w.start)}
                         ondblclick={() => (editingWordIndex = idx)}
                         title="{w.word} ({w.start.toFixed(2)}s - {w.end.toFixed(2)}s)"
                         role="button"
                         tabindex="0"
                         onkeydown={(e) => {
                           if (e.key === 'Enter' || e.key === ' ') {
-                            currentTime = w.start;
+                            currentTime = chunkStartTime + w.start;
                             e.preventDefault();
                           } else if (e.key === 'F2') {
                             // Keyboard path into inline word-edit (double-click is mouse-only).
