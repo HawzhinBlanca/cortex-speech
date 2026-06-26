@@ -29,17 +29,46 @@ pub struct MediaRegistry {
 
 impl MediaRegistry {
     pub fn register(&mut self, db: &Database, data_dir: &Path, requested_path: &str) -> Result<MediaGrant, String> {
-        self.prune_expired();
+        let canonical = Self::ensure_imported(db, requested_path)?;
+        self.register_cached(data_dir, &canonical)
+    }
+
+    /// DB-only membership check (no file I/O). Returns the canonicalized source path so the caller
+    /// can RELEASE the db lock before the (potentially gigabyte) cache copy in `register_cached` —
+    /// otherwise the global db mutex is held across `std::fs::copy` and every other DB-touching IPC
+    /// (notably the UI's get_segments) stalls for the copy duration.
+    pub fn ensure_imported(db: &Database, requested_path: &str) -> Result<String, String> {
+        // Use the audio_path index (migration v13) for a single O(log N) lookup. Try the canonical
+        // and original forms: Windows `canonicalize()` adds a \\?\ prefix while the DB may hold the
+        // original non-canonical path.
         let canonical = validate::validate_file_path(requested_path)?;
-        self.ensure_imported_media_path(db, requested_path, &canonical)?;
-        let source_path = PathBuf::from(&canonical);
+        if db.get_segment_by_audio_path(&canonical).map_err(|e| format!("Media path check failed: {e}"))?.is_some() {
+            return Ok(canonical);
+        }
+        if requested_path != canonical
+            && db
+                .get_segment_by_audio_path(requested_path)
+                .map_err(|e| format!("Media path check (original) failed: {e}"))?
+                .is_some()
+        {
+            return Ok(canonical);
+        }
+        Err("Media playback is limited to files already imported into this dataset".to_string())
+    }
+
+    /// Grant + cache an ALREADY-validated source path. Touches NO database, so the full-file copy is
+    /// safe to run without the db lock held. Only the media-registry mutex serializes concurrent
+    /// callers, which does not contend with get_segments.
+    pub fn register_cached(&mut self, data_dir: &Path, canonical: &str) -> Result<MediaGrant, String> {
+        self.prune_expired();
+        let source_path = PathBuf::from(canonical);
 
         if let Some(grant) = self.existing_grant_for_source(&source_path) {
             return Ok(grant);
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let ext = Path::new(&canonical)
+        let ext = Path::new(canonical)
             .extension()
             .and_then(|e| e.to_str())
             .map(validate::sanitize_filename)
@@ -49,7 +78,7 @@ impl MediaRegistry {
         std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Create media cache: {e}"))?;
         self.prune_orphaned_cache_files(&cache_dir);
         let cached_path = cache_dir.join(format!("{id}.{ext}"));
-        std::fs::copy(&canonical, &cached_path).map_err(|e| format!("Copy media into app cache: {e}"))?;
+        std::fs::copy(canonical, &cached_path).map_err(|e| format!("Copy media into app cache: {e}"))?;
 
         let expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
         self.grants.insert(id.clone(), GrantRecord { source_path, cached_path: cached_path.clone(), expires_at });
@@ -64,26 +93,6 @@ impl MediaRegistry {
             return Err("Cached media file is missing".to_string());
         }
         Ok(record.cached_path.to_string_lossy().to_string())
-    }
-
-    fn ensure_imported_media_path(&self, db: &Database, original: &str, canonical: &str) -> Result<(), String> {
-        // Use the audio_path index (migration v13) for a single O(log N) lookup.
-        // Try both the canonical and original forms: on Windows, `canonicalize()` adds
-        // a \\?\ prefix, while the DB may store the path in its original non-canonical form.
-        let found = db.get_segment_by_audio_path(canonical).map_err(|e| format!("Media path check failed: {e}"))?;
-        if found.is_some() {
-            return Ok(());
-        }
-        // Second try: match using the original (pre-canonicalize) path.
-        if original != canonical {
-            let found2 = db
-                .get_segment_by_audio_path(original)
-                .map_err(|e| format!("Media path check (original) failed: {e}"))?;
-            if found2.is_some() {
-                return Ok(());
-            }
-        }
-        Err("Media playback is limited to files already imported into this dataset".to_string())
     }
 
     fn existing_grant_for_source(&mut self, source_path: &Path) -> Option<MediaGrant> {
