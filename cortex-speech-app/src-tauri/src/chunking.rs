@@ -106,24 +106,26 @@ pub fn plan_speech_chunks(
     }
 
     regions = merge_adjacent_regions(regions, max_samples);
-    regions = split_oversized_regions(regions, max_samples, pcm.len());
+    regions = split_oversized_regions(pcm, sample_rate, regions, max_samples, min_samples, pcm.len());
     regions = absorb_short_regions(regions, min_samples, max_samples, pcm.len());
 
-    if regions.len() == 1 && regions[0].1.saturating_sub(regions[0].0) > max_samples {
-        regions = fixed_window_split(regions[0].0, regions[0].1, max_samples);
-    } else if regions.is_empty() {
-        regions = fixed_window_split(0, pcm.len(), max_samples);
+    if regions.is_empty() {
+        regions = silence_aware_split(pcm, sample_rate, 0, pcm.len(), max_samples, min_samples);
     }
 
-    // Safety: enforce max sample cap per chunk
+    // Safety: enforce the max-duration cap. A last-resort split still cuts on the quietest
+    // point so it never slices through a word (the bug that split "کەسایەتی" across chunks).
     let mut final_regions = Vec::new();
     for (start, end) in regions {
-        let mut s = start.min(pcm.len());
+        let s = start.min(pcm.len());
         let e = end.min(pcm.len());
-        while e > s {
-            let chunk_end = (s + max_samples).min(e);
-            final_regions.push((s, chunk_end));
-            s = chunk_end;
+        if e <= s {
+            continue;
+        }
+        if e - s <= max_samples {
+            final_regions.push((s, e));
+        } else {
+            final_regions.extend(silence_aware_split(pcm, sample_rate, s, e, max_samples, min_samples));
         }
     }
 
@@ -161,8 +163,16 @@ fn merge_adjacent_regions(regions: Vec<(usize, usize)>, max_samples: usize) -> V
     merged
 }
 
-/// Split any region longer than `max_samples` into sub-ranges.
-fn split_oversized_regions(regions: Vec<(usize, usize)>, max_samples: usize, total_len: usize) -> Vec<(usize, usize)> {
+/// Split any region longer than `max_samples` into sub-ranges, cutting on the quietest
+/// point near each boundary so chunk edges fall in pauses rather than mid-word.
+fn split_oversized_regions(
+    pcm: &[i16],
+    sample_rate: u32,
+    regions: Vec<(usize, usize)>,
+    max_samples: usize,
+    min_samples: usize,
+    total_len: usize,
+) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for (start, end) in regions {
         let s = start.min(total_len);
@@ -173,23 +183,75 @@ fn split_oversized_regions(regions: Vec<(usize, usize)>, max_samples: usize, tot
         if e - s <= max_samples {
             out.push((s, e));
         } else {
-            out.extend(fixed_window_split(s, e, max_samples));
+            out.extend(silence_aware_split(pcm, sample_rate, s, e, max_samples, min_samples));
         }
     }
     out
 }
 
-fn fixed_window_split(start: usize, end: usize, window: usize) -> Vec<(usize, usize)> {
-    let mut chunks = Vec::new();
+/// Split [start, end) into pieces of at most `max_samples`, choosing each cut at the
+/// lowest-energy (most pause-like) sample in a window just before the max boundary. This
+/// keeps word and sentence boundaries intact instead of guillotining at a fixed offset.
+fn silence_aware_split(
+    pcm: &[i16],
+    sample_rate: u32,
+    start: usize,
+    end: usize,
+    max_samples: usize,
+    min_samples: usize,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
     let mut s = start;
-    while s < end {
-        let e = (s + window).min(end);
-        if e > s {
-            chunks.push((s, e));
+    while end - s > max_samples {
+        // Prefer cutting in the last ~30% of the window, but never sooner than min_samples in.
+        let lo = (s + max_samples * 7 / 10).max(s + min_samples).min(end.saturating_sub(1));
+        // Keep at least min_samples after the cut so we never leave a tiny trailing fragment.
+        let mut hi = s + max_samples;
+        if end.saturating_sub(hi) < min_samples {
+            hi = end.saturating_sub(min_samples);
         }
-        s = e;
+        let hi = hi.clamp(lo + 1, end);
+        let cut = find_quietest_cut(pcm, lo, hi, sample_rate).clamp(s + 1, end);
+        out.push((s, cut));
+        s = cut;
     }
-    chunks
+    if end > s {
+        out.push((s, end));
+    }
+    out
+}
+
+/// Return the sample index within [lo, hi) at the centre of the lowest-energy short frame —
+/// the most silence-like place to cut. Returns `lo` when the range is flat or degenerate.
+fn find_quietest_cut(pcm: &[i16], lo: usize, hi: usize, sample_rate: u32) -> usize {
+    if hi <= lo {
+        return lo;
+    }
+    let half = (ms_to_samples(15, sample_rate) / 2).max(1); // ~15 ms analysis frame
+    let step = half.max(1);
+    let mut best_idx = lo;
+    let mut best_energy = u64::MAX;
+    let mut c = lo;
+    while c < hi {
+        let f_start = c.saturating_sub(half);
+        let f_end = (c + half).min(pcm.len());
+        let mut energy = 0u64;
+        let mut n = 0u64;
+        let mut i = f_start;
+        while i < f_end {
+            let v = pcm[i] as i64;
+            energy += (v * v) as u64;
+            n += 1;
+            i += 1;
+        }
+        let mean = energy.checked_div(n).unwrap_or(u64::MAX);
+        if mean < best_energy {
+            best_energy = mean;
+            best_idx = c;
+        }
+        c += step;
+    }
+    best_idx
 }
 
 /// Merge regions shorter than `min_samples` into neighbors when possible.
@@ -309,13 +371,39 @@ mod tests {
     }
 
     #[test]
-    fn fixed_window_split_covers_range() {
-        let chunks = fixed_window_split(0, 50_000, 10_000);
-        assert_eq!(chunks.first().map(|c| c.0), Some(0));
-        assert_eq!(chunks.last().map(|c| c.1), Some(50_000));
-        assert!(chunks.iter().all(|(s, e)| e > s && e - s <= 10_000));
-        let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
-        assert_eq!(total, 50_000);
+    fn silence_aware_split_covers_range_and_bounds() {
+        let sr = 16000;
+        let max_samples = ms_to_samples(10_000, sr);
+        let min_samples = ms_to_samples(2_000, sr);
+        let pcm = vec![4000i16; sr as usize * 50]; // 50 s flat tone
+        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples);
+        assert_eq!(parts.first().map(|c| c.0), Some(0));
+        assert_eq!(parts.last().map(|c| c.1), Some(pcm.len()));
+        for w in parts.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "chunks must be contiguous (no gaps/overlaps)");
+        }
+        assert!(parts.iter().all(|(s, e)| e > s && e - s <= max_samples), "every chunk within max");
+        let total: usize = parts.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, pcm.len(), "chunks must cover the whole range");
+    }
+
+    #[test]
+    fn silence_aware_split_cuts_on_the_pause_not_mid_word() {
+        // Regression for the Nawras bug: a continuous-speech region must be cut at the
+        // silent gap, not blindly at the 15 s boundary (which sliced "کەسایەتی" in two).
+        let sr = 16000;
+        let max_samples = ms_to_samples(15_000, sr);
+        let min_samples = ms_to_samples(3_000, sr);
+        let mut pcm = vec![6000i16; sr as usize * 20]; // 20 s loud tone
+        let gap = ms_to_samples(13_000, sr);
+        let gap_half = ms_to_samples(120, sr); // 240 ms silent gap at 13 s
+        for s in pcm.iter_mut().take(gap + gap_half).skip(gap - gap_half) {
+            *s = 0;
+        }
+        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples);
+        assert!(parts.len() >= 2);
+        let cut_ms = samples_to_ms(parts[0].1, sr);
+        assert!((cut_ms - 13_000).abs() < 300, "expected the cut at the ~13 s pause, got {cut_ms}ms");
     }
 
     #[test]
