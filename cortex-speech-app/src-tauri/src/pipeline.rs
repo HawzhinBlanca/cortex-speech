@@ -1308,17 +1308,36 @@ impl ProcessingPipeline {
             return Ok(0);
         }
 
+        // The warm 7B server can transiently fail or return an empty result for a clip (e.g. while
+        // still under load right after launch), which would otherwise leave that segment stuck at its
+        // "[Pending WSL 7B ASR]" placeholder for good (observed in stress testing: 1 of 3 segments).
+        // Retry a few times before giving up so an import reliably transcribes every segment; only
+        // escalate after the retries are exhausted, rather than silently shipping a pending segment.
+        const MAX_ATTEMPTS: usize = 3;
         let mut updated = 0usize;
         for seg in segments {
-            match self.transcribe(Some(seg.id.as_str()), &seg.audio_path, seg.alignment_json.as_deref()) {
-                Ok((_raw_text, _corrected_text, _confidence)) => {
-                    if self.refresh_segment_from_db(db, seg)? {
-                        updated += 1;
+            let mut last_problem: Option<String> = None;
+            for attempt in 1..=MAX_ATTEMPTS {
+                match self.transcribe(Some(seg.id.as_str()), &seg.audio_path, seg.alignment_json.as_deref()) {
+                    Ok((_raw_text, _corrected_text, _confidence)) => {
+                        self.refresh_segment_from_db(db, seg)?;
+                        let usable = !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
+                        if usable {
+                            updated += 1;
+                            last_problem = None;
+                            break;
+                        }
+                        last_problem = Some("7B returned an empty transcript".to_string());
                     }
+                    Err(error) => last_problem = Some(error.to_string()),
                 }
-                Err(error) => {
-                    self.mark_wsl_primary_unavailable(db, seg, &error.to_string())?;
+                if attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
                 }
+            }
+            if let Some(reason) = last_problem {
+                tracing::warn!("WSL 7B import: segment {} failed after {MAX_ATTEMPTS} attempts: {reason}", seg.id);
+                self.mark_wsl_primary_unavailable(db, seg, &reason)?;
             }
         }
         Ok(updated)
