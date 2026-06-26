@@ -13,6 +13,7 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import * as api from './commands';
   import AudioPlayer from './AudioPlayer.svelte';
+  import { parseSourceMeta, chunkPlaybackRange } from './alignment';
   import type { SpeechSegment } from './types';
 
   // ── Props ───────────────────────────────────────────────────────────────────
@@ -35,6 +36,10 @@
 
   $: current = queue[currentIndex] ?? null;
   $: pendingCount = queue.filter((s) => !s.humanDecision).length;
+  // Bound the player to this segment's window so Play hears only this clip, not the whole file.
+  $: inboxRange = current
+    ? chunkPlaybackRange(parseSourceMeta(current.alignmentJson))
+    : { startTime: 0, endTime: 0 };
 
   // ── Confidence bands ─────────────────────────────────────────────────────────
   function confidenceBand(conf: number | null | undefined): {
@@ -456,7 +461,12 @@
           <div class="audio-zone" dir="ltr" aria-label="Segment audio player">
             {#if current.audioPath}
               {#key current.id}
-                <AudioPlayer audioPath={current.audioPath} autoplay={false} />
+                <AudioPlayer
+                  audioPath={current.audioPath}
+                  startTime={inboxRange.startTime}
+                  endTime={inboxRange.endTime}
+                  autoplay={false}
+                />
               {/key}
             {:else}
               <div class="waveform-stub">🔊 <bdi>no audio</bdi></div>

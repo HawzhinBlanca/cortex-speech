@@ -6,7 +6,7 @@
   import Waveform from './Waveform.svelte';
   import AudioPlayer from './AudioPlayer.svelte';
   import EmptyState from './EmptyState.svelte';
-  import { parseWordTimestamps } from './alignment';
+  import { parseWordTimestamps, parseSourceMeta, chunkPlaybackRange } from './alignment';
   import type { SpeechSegment, WordTimestamp } from './types';
 
   // Simple, focused review queue: one clip at a time. Pending (unverified) first,
@@ -36,6 +36,19 @@
   const words = $derived<WordTimestamp[]>(parseWordTimestamps(current?.alignmentJson));
   const activeWordIndex = $derived(
     words.findIndex((w) => currentTime >= w.start && currentTime < w.end),
+  );
+
+  // The clip's window within its source file. Without this the player plays the WHOLE file
+  // and the waveform playhead is whole-file-relative — so you don't hear/see the one sentence
+  // you're correcting. Bound the player to [start,end] and show the waveform clip-relative.
+  const range = $derived(chunkPlaybackRange(parseSourceMeta(current?.alignmentJson)));
+  const clipLength = $derived(
+    range.endTime > range.startTime ? range.endTime - range.startTime : playerDuration,
+  );
+  const clipPosition = $derived(
+    range.endTime > range.startTime
+      ? Math.max(0, Math.min(currentTime - range.startTime, clipLength))
+      : currentTime,
   );
 
   function originalText(seg: SpeechSegment): string {
@@ -157,17 +170,19 @@
       <div class="card overflow-hidden">
         <Waveform
           waveform={waveformData}
-          {currentTime}
-          duration={playerDuration}
+          currentTime={clipPosition}
+          duration={clipLength}
           {playing}
           wordTimestamps={words}
-          onSeek={(time) => (currentTime = time)}
+          onSeek={(time) => (currentTime = range.startTime + time)}
         />
       </div>
 
-      <!-- Audio player -->
+      <!-- Audio player — bounded to this clip so Play hears only this sentence. -->
       <AudioPlayer
         audioPath={current.audioPath}
+        startTime={range.startTime}
+        endTime={range.endTime}
         bind:currentTime
         bind:duration={playerDuration}
         bind:playing

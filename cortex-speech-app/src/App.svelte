@@ -271,6 +271,17 @@
     return chunkPlaybackRange(meta).endTime;
   });
 
+  // Clip-relative time for the waveform playhead: the waveform bars are the selected chunk's
+  // window, so the playhead must run 0 → chunk-length, not against the whole source file.
+  let chunkClipLength = $derived(
+    chunkEndTime > chunkStartTime ? chunkEndTime - chunkStartTime : playerDuration,
+  );
+  let chunkClipPosition = $derived(
+    chunkEndTime > chunkStartTime
+      ? Math.max(0, Math.min(currentTime - chunkStartTime, chunkClipLength))
+      : currentTime,
+  );
+
   let chunkLabel = $derived.by(() => {
     const meta = parseSourceMeta($selectedSegment?.alignmentJson);
     if (!meta || meta.chunkCount <= 1) return null;
@@ -1448,7 +1459,8 @@
   }
 
   function onSeek(time: number) {
-    currentTime = time;
+    // The waveform emits clip-relative time (its bars are the chunk window); map back to file time.
+    currentTime = chunkEndTime > chunkStartTime ? chunkStartTime + time : time;
   }
 
   function fmtDuration(ms: number) {
@@ -2159,8 +2171,8 @@
           <div class="card overflow-hidden">
             <Waveform
               waveform={waveformData}
-              {currentTime}
-              duration={playerDuration}
+              currentTime={chunkClipPosition}
+              duration={chunkClipLength}
               wordTimestamps={$wordTimestamps}
               {onSeek}
             />
