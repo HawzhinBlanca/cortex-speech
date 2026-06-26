@@ -25,7 +25,7 @@
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost; connect-src 'self' ipc: https://ipc.localhost http://ipc.localhost; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; media-src 'self' blob: mediastream: asset: https://asset.localhost http://asset.localhost; worker-src 'self' blob:",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/media-cache/**"]
+        "scope": ["$DATA/cortex-speech/media-cache/**"]
       }
     }
   },
