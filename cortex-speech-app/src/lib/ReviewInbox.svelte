@@ -80,6 +80,9 @@
     try {
       queue = await api.getEscalationQueue(200);
       currentIndex = 0;
+      // Drop the undo stack: it references the PREVIOUS queue's segments. A stale undo after a
+      // reload would fire a backend clear against a segment no longer in view.
+      history = [];
     } catch (e) {
       statusMsg = `Failed to load queue: ${e}`;
     } finally {
