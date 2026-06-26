@@ -433,6 +433,8 @@
   }
 
   let viewMode = $state<'curate' | 'insights' | 'review'>('curate');
+  // One-time dismiss for the "N clips ready to review" nudge banner (resets each app launch).
+  let reviewNudgeDismissed = $state(false);
   let showCommandPalette = $state(false);
 
   function registerShortcuts(km: ReturnType<typeof initKeyboardManager>) {
@@ -617,6 +619,16 @@
   function openReviewInbox() {
     if (!requireDesktopRuntime()) return;
     showReviewInbox.set(true);
+  }
+
+  // Enter the focused, one-clip-at-a-time Review & Correct workspace (the fast lane for
+  // fixing transcripts). Mirrors the ActivityRail 'review' behaviour: collapse the side
+  // panels so the reviewer sees only the clip + the edit box.
+  function enterReviewMode() {
+    if (!requireDesktopRuntime()) return;
+    viewMode = 'review';
+    sidebarOpen = false;
+    statsOpen = false;
   }
 
   function openWslConsole() {
@@ -1664,6 +1676,31 @@
         Local 7B ASR (WSL)
       </button>
       <button
+        data-testid="review-correct-btn"
+        class="btn !text-xs relative {$segmentStats.pending > 0 ? 'btn-primary' : 'btn-secondary'}"
+        onclick={enterReviewMode}
+        disabled={!tauriAvailable || $segmentStats.total === 0}
+        title={tauriAvailable ? $t('reviewCorrect.tooltip') : $t('desktopRuntimeRequired')}
+        aria-label={$t('reviewCorrect.label')}
+      >
+        <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+          ><path
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+          /></svg
+        >
+        {$t('reviewCorrect.label')}
+        {#if $segmentStats.pending > 0}
+          <span
+            data-testid="review-pending-badge"
+            class="absolute -top-2 -right-2 min-w-[18px] h-[18px] flex items-center justify-center bg-amber-400 text-black text-[10px] font-bold px-1 rounded-full shadow border border-amber-500 select-none z-50 pointer-events-none"
+            >{$segmentStats.pending}</span
+          >
+        {/if}
+      </button>
+      <button
         data-testid="validate-btn"
         class="btn btn-secondary !text-xs relative"
         onclick={openValidationPanel}
@@ -2083,6 +2120,36 @@
         data-testid="center-panel"
         class="flex-1 flex flex-col gap-3 p-4 overflow-y-auto min-w-0"
       >
+        {#if viewMode === 'curate' && $segmentStats.pending > 0 && !reviewNudgeDismissed}
+          <!-- Friendly nudge: surface the fast Review & Correct flow so it's never hidden. -->
+          <div
+            data-testid="review-nudge"
+            class="shrink-0 flex items-center justify-between gap-3 rounded-lg border border-amber-400/40 bg-amber-400/10 px-4 py-3"
+          >
+            <div class="flex items-center gap-2.5 text-sm text-amber-100">
+              <svg class="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                ><path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                /></svg
+              >
+              <span>{$t($segmentStats.pending === 1 ? 'reviewCorrect.ctaOne' : 'reviewCorrect.cta', { n: String($segmentStats.pending) })}</span>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+              <button data-testid="review-nudge-start" class="btn btn-primary !text-xs" onclick={enterReviewMode}>
+                {$t('reviewCorrect.start')} →
+              </button>
+              <button
+                class="text-cortex-400 hover:text-cortex-200 text-sm leading-none px-1"
+                aria-label={$t('reviewCorrect.dismiss')}
+                title={$t('reviewCorrect.dismiss')}
+                onclick={() => (reviewNudgeDismissed = true)}>✕</button
+              >
+            </div>
+          </div>
+        {/if}
         {#if viewMode === 'insights'}
           <StatsDashboard />
           <RefineryPanel />
