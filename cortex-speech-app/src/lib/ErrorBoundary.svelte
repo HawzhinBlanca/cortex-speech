@@ -15,12 +15,21 @@
   let actionableError = $state<ActionableError>({ message: 'Unknown error' });
 
   function handleError(e: ErrorEvent) {
+    // Resource-load failures (an <img>/<audio>/<link>/<script> that 404s or is CSP-blocked) also
+    // surface as window 'error' events in the capture phase, but they are NOT app crashes: their
+    // target is the failing DOM element and they carry no Error object. Treating them as fatal
+    // blanked every panel at once — e.g. the CSP-blocked Google-Fonts <link> took the whole UI
+    // down. A genuine uncaught script error targets the window (never an Element), so ignore any
+    // 'error' whose target is a DOM element.
+    if (e.target instanceof Element) {
+      return;
+    }
     const message = e.message || '';
     if (message.includes('ResizeObserver') || message.includes('Resize observer')) {
       return;
     }
     e.preventDefault();
-    actionableError = parseActionableError(e.error ?? e.message);
+    actionableError = parseActionableError(e.error ?? e.message ?? 'Unknown error');
     hasError = true;
   }
 

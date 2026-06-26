@@ -31,7 +31,14 @@ export function openModelsSettings(): void {
 }
 
 export function parseActionableError(error: unknown): ActionableError {
-  const raw = error instanceof Error ? error.message : String(error);
+  // Never surface the literal string "undefined"/"null" to the user: a nullish error (e.g. a
+  // resource event with no message) must degrade to a readable fallback, not String(undefined).
+  const raw =
+    error instanceof Error
+      ? error.message
+      : error === undefined || error === null || error === ''
+        ? 'Unknown error'
+        : String(error);
 
   if (isModelError(raw)) {
     return {

@@ -8,24 +8,13 @@
     <meta name="theme-color" content="#0a0e15" />
     <title>Cortex — Kurdish Speech Studio</title>
 
-    <!-- Typography: Inter (UI, LTR) · Vazirmatn (Kurdish/RTL) · JetBrains Mono (code).
-         Loaded NON-render-blocking: the app paints instantly on a quality system
-         stack and swaps to the web fonts once they arrive (and stays usable fully
-         offline). -->
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      rel="preload"
-      as="style"
-      href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&family=JetBrains+Mono:wght@400;500;600&family=Vazirmatn:wght@300;400;500;600;700&display=swap"
-      onload="this.onload=null;this.rel='stylesheet'"
-    />
-    <noscript>
-      <link
-        rel="stylesheet"
-        href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&family=JetBrains+Mono:wght@400;500;600&family=Vazirmatn:wght@300;400;500;600;700&display=swap"
-      />
-    </noscript>
+    <!-- Typography: this is an OFFLINE-FIRST app with a strict CSP (style-src/font-src 'self').
+         External font CDNs (fonts.googleapis.com / fonts.gstatic.com) are therefore blocked, and
+         a blocked <link> fires a resource 'error' that used to blank the whole UI. We render on the
+         system stack declared in app.css (--font-sans/-kurdish/-mono: Segoe UI / system-ui etc.,
+         which display Kurdish/Arabic correctly). To restore the designed faces, self-host their
+         woff2 under /public and add @font-face rules served from 'self'. -->
+    <meta name="referrer" content="no-referrer" />
   </head>
   <body class="bg-app text-default">
     <div id="app"></div>
