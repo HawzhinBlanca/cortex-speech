@@ -465,10 +465,10 @@ pub fn export_huggingface_dataset(
                          _split_name: &str,
                          dest_dir: &std::path::Path|
      -> AppResult<(usize, f64, usize)> {
-        if split_segs.is_empty() {
-            return Ok((0, 0.0, 0));
-        }
-
+        // NOTE: do NOT early-return when this split is empty on a re-export. Falling through writes a
+        // header-only metadata.csv and runs the orphan-prune below, which clears clips a prior, larger
+        // export left in this split dir. Returning early left that stale metadata.csv + orphaned clips
+        // on disk (and cemented into SHA256SUMS), disagreeing with the actual (now-empty) split.
         let csv_path = dest_dir.join("metadata.csv");
         let csv_tmp = csv_path.with_extension("csv.tmp");
         remove_file_on_error(
