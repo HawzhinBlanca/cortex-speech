@@ -515,6 +515,15 @@ pub fn import_audio_file(
         // below and leaves the import progress UI stuck "processing" forever.
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pipeline.import_single_file_with_events(&file_path, cancel, Some(&agent_run_id), |event| {
+                // This command OWNS the terminal import-complete/pipeline-complete events: it emits
+                // ready_payload right after segments exist (so the list renders immediately) and
+                // done_payload after the background jury finishes. Drop the pipeline's own Completed so
+                // it can't fire a PREMATURE terminal event that tears down the pipeline UI (clears the
+                // agent stages, flips to idle) before adjudication even starts. The directory import
+                // path uses a different code path and keeps its Completed.
+                if matches!(event, PipelineEvent::Completed { .. }) {
+                    return;
+                }
                 emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "file");
             })
         }));
@@ -1099,7 +1108,11 @@ pub fn align_segment(
     }
     validate::validate_text(&text, 100000, "Alignment text")?;
     let (timestamps, quality) = {
-        let pipeline = state.lock_pipeline();
+        // Clone the pipeline OUT of the lock so the global mutex is released before the slow decode +
+        // ONNX forced alignment runs — holding it serializes every other pipeline command (the UI's
+        // get_import_status polling, transcribe, get_waveform) for the whole alignment. Matches the
+        // get_waveform / rediarize_segments pattern; ProcessingPipeline is Clone and align takes &self.
+        let pipeline = state.lock_pipeline().clone();
         pipeline.align(&audio_path, &text, alignment_json.as_deref()).map_err(|e| e.to_string())?
     };
     // Write the HONEST alignment_quality back to the segment so validation/provenance can
