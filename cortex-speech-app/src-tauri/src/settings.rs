@@ -339,7 +339,17 @@ pub fn endpoint_host_is_loopback(endpoint: &str) -> bool {
     let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     let hostport = authority.rsplit('@').next().unwrap_or(authority); // drop any userinfo
     let host = if let Some(rest) = hostport.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest) // [::1]:port -> ::1
+        // Bracketed IPv6: the ']' must be followed by nothing or ':port'. Reject junk after it (e.g.
+        // `[::1].evil.com`) — otherwise the bracket trick smuggles an attacker host past the loopback
+        // check. `rest` is "::1].evil.com" / "::1]:8080" / "::1]".
+        let Some(close) = rest.find(']') else {
+            return false; // no closing bracket -> malformed, fail closed
+        };
+        let after = &rest[close + 1..];
+        if !after.is_empty() && !after.starts_with(':') {
+            return false;
+        }
+        &rest[..close] // inner host, e.g. ::1
     } else {
         hostport.split(':').next().unwrap_or(hostport) // host:port -> host
     };
@@ -414,9 +424,11 @@ impl AppSettings {
         if !endpoint.is_empty() {
             let lower = endpoint.to_ascii_lowercase();
             let is_https = lower.starts_with("https://");
-            let is_localhost = lower.starts_with("http://localhost")
-                || lower.starts_with("http://127.0.0.1")
-                || lower.starts_with("http://[::1]");
+            // Match the host EXACTLY, not by string prefix — `starts_with("http://localhost")` let
+            // `http://localhost.evil.com` / `http://127.0.0.1.evil.com` pass this entry-point validator
+            // (update_settings is the webview trust boundary) and exfiltrate transcripts in cleartext.
+            // Use the same authority-parsing helper the egress validator uses so both stay identical.
+            let is_localhost = lower.starts_with("http://") && endpoint_host_is_loopback(endpoint);
             if !is_https && !is_localhost {
                 return Err(AppError::Validation(
                     "LLM endpoint must be an https:// URL or a localhost http:// address".into(),
@@ -579,6 +591,22 @@ mod tests {
         ] {
             let s = AppSettings { llm_endpoint: ep.to_string(), ..AppSettings::default() };
             assert!(s.validate().is_ok(), "endpoint should be accepted: {ep:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_loopback_prefix_trick_over_plaintext_http() {
+        // The entry-point validator (update_settings trust boundary) must match the host EXACTLY, not by
+        // string prefix — otherwise http://localhost.evil.com / http://127.0.0.1.evil.com pass as
+        // "localhost" over cleartext HTTP and exfiltrate transcripts. Mirrors validate_outbound_endpoint.
+        for bad in [
+            "http://localhost.evil.com/collect",
+            "http://127.0.0.1.evil.com/collect",
+            "http://localhost@evil.com/collect",
+            "http://[::1].evil.com/x",
+        ] {
+            let s = AppSettings { llm_endpoint: bad.to_string(), ..AppSettings::default() };
+            assert!(s.validate().is_err(), "loopback-prefix trick must be rejected by validate(): {bad:?}");
         }
     }
 
