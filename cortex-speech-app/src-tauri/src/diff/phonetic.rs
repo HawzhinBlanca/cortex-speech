@@ -62,15 +62,17 @@ pub fn phonetic_word_distance(w1: &str, w2: &str) -> f64 {
 
 /// Compute the normalized phonetic edit distance between two words (0.0 to 1.0).
 pub fn normalized_phonetic_word_distance(w1: &str, w2: &str) -> f64 {
-    let dist = phonetic_word_distance(w1, w2);
     let len1 = crate::normalizer::g2p::g2p(w1).replace(" ", "").chars().count();
     let len2 = crate::normalizer::g2p::g2p(w2).replace(" ", "").chars().count();
     let max_len = len1.max(len2);
     if max_len == 0 {
-        0.0
-    } else {
-        dist / max_len as f64
+        // Neither word carries phonetic content (digits / Latin / symbols g2p to nothing). Two DIFFERENT
+        // surface tokens then have NO phonetic evidence of a match — returning 0.0 here let a LOOP-0
+        // correction memory keyed on one numeric/Latin token fire on a DIFFERENT one (e.g. rewrite a
+        // correct "٢٠٢٥" to the "٢٠٢٣" a past edit happened to learn). Only an exact surface match counts.
+        return if w1 == w2 { 0.0 } else { 1.0 };
     }
+    phonetic_word_distance(w1, w2) / max_len as f64
 }
 
 /// Aligns two word sequences using normalized phonetic word distance as substitution cost.
@@ -193,6 +195,18 @@ mod tests {
         // They should align via Replace because of phonetic closeness
         assert_eq!(diff2.changes.len(), 1);
         assert!(matches!(diff2.changes[0].op, DiffOp::Replace));
+    }
+
+    #[test]
+    fn distinct_non_phonetic_tokens_are_max_distance_not_a_match() {
+        // Two DIFFERENT tokens that both g2p to nothing (digits / Latin / symbols) must NOT score as a
+        // phonetic match — otherwise a LOOP-0 correction memory keyed on one number rewrites a different
+        // one. Only an exact surface match is distance 0.
+        assert_eq!(normalized_phonetic_word_distance("٢٠٢٥", "٢٠٢٤"), 1.0);
+        assert_eq!(normalized_phonetic_word_distance("abc", "xyz"), 1.0);
+        assert_eq!(normalized_phonetic_word_distance("٢٠٢٤", "٢٠٢٤"), 0.0); // identical surface = real match
+                                                                            // A real Kurdish word pair still aligns on phonetic closeness (regression guard).
+        assert!(normalized_phonetic_word_distance("کوردستان", "کوردستان") < 0.01);
     }
 
     #[test]
