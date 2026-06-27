@@ -901,6 +901,10 @@
       };
       await api.updateSegment(updatedSeg);
       await loadSegments();
+      // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
+      // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
+      // no pending debounce macrotask can interleave between the await resolving and this line.)
+      if (pendingSaveId === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
       notifyActionableError(e, $t('errors.transcriptionFailed'));
@@ -936,6 +940,10 @@
       };
       await api.updateSegment(updatedSeg);
       await loadSegments();
+      // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
+      // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
+      // no pending debounce macrotask can interleave between the await resolving and this line.)
+      if (pendingSaveId === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
       notifyActionableError(e, $t('errors.transcriptionFailed'));
@@ -970,6 +978,10 @@
       };
       await api.updateSegment(updatedSeg);
       await loadSegments();
+      // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
+      // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
+      // no pending debounce macrotask can interleave between the await resolving and this line.)
+      if (pendingSaveId === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
       notifyActionableError(e, $t('errors.transcriptionFailed'));
@@ -1000,6 +1012,10 @@
       // human-verified (the honesty guardrail), and so the human re-reviews the replaced transcript.
       await api.updateSegment({ ...seg, rawTranscript: text, annotatedTranscript: text, verified: false });
       await loadSegments();
+      // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
+      // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
+      // no pending debounce macrotask can interleave between the await resolving and this line.)
+      if (pendingSaveId === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
       notifyActionableError(e, $t('errors.transcriptionFailed'));
