@@ -1171,7 +1171,14 @@ impl Database {
         corrected_transcript: Option<&str>,
     ) -> AppResult<()> {
         let human_verdict = human_verdict_for_decision(decision)?;
-        let corrected_transcript = corrected_transcript.map(str::trim).filter(|value| !value.is_empty());
+        // NFC-canonicalize the human correction like EVERY other transcript write path (insert/restore/
+        // update_*). Without it a decomposed (NFD) paste / IME input becomes the lone non-NFC label in an
+        // otherwise-NFC corpus (verdict_transcript is the COALESCE-preferred gold source) and defeats the
+        // no-op-edit dedup guard — which compares via learning_text_key WITHOUT NFC — so an edit that is
+        // byte-different-but-NFC-identical to the wrong text emits a degenerate DPO pair.
+        let corrected_owned: Option<String> =
+            corrected_transcript.map(|t| to_nfc(t.trim())).filter(|value| !value.is_empty());
+        let corrected_transcript = corrected_owned.as_deref();
         if decision == "edit" && corrected_transcript.is_none() {
             return Err(AppError::Validation("Human edit decisions require a corrected transcript".into()));
         }
