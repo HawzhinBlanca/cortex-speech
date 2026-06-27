@@ -60,8 +60,9 @@ pub fn ngram_perplexity(text: &str) -> f64 {
     if text.is_empty() {
         return f64::INFINITY;
     }
-    // Character-level trigram entropy from the text itself (bootstrap estimator).
-    // Low entropy ≈ more fluent / repetitive → lower perplexity.
+    // Character-level trigram entropy from the text itself (bootstrap estimator), with an explicit
+    // repetition penalty (below). Raw self-entropy alone is misleading: a looping ASR output collapses
+    // onto a few trigrams and so has LOW self-entropy, which would otherwise be rewarded as "fluent".
     let chars: Vec<char> = text.chars().collect();
     if chars.len() < 3 {
         return 50.0; // penalize very short texts
@@ -71,6 +72,7 @@ pub fn ngram_perplexity(text: &str) -> f64 {
         *trigrams.entry(w.to_vec()).or_insert(0u32) += 1;
     }
     let n = trigrams.values().sum::<u32>() as f64;
+    let unique = trigrams.len() as f64;
     let entropy: f64 = trigrams
         .values()
         .map(|&c| {
@@ -78,8 +80,13 @@ pub fn ngram_perplexity(text: &str) -> f64 {
             -p * p.log2()
         })
         .sum();
+    // Repetition penalty: the average number of times each distinct trigram recurs (1.0 for all-distinct
+    // text, growing as the same trigrams loop), squared. This makes repetition RAISE perplexity — and so
+    // lower the fluency score — instead of lowering it via the entropy drop. Squared so heavy looping is
+    // strongly penalized while ordinary letter reuse in real prose barely moves the number.
+    let repetition_penalty = (n / unique).powi(2);
     // Scale to a pseudo-perplexity in [1, 200]
-    2.0f64.powf(entropy).clamp(1.0, 200.0)
+    (2.0f64.powf(entropy) * repetition_penalty).clamp(1.0, 200.0)
 }
 
 // ─── Core T1 judge ───────────────────────────────────────────────────────────
@@ -183,6 +190,19 @@ mod tests {
         let ppl = ngram_perplexity("کوردستان ئازاد");
         assert!(ppl.is_finite());
         assert!(ppl > 1.0);
+    }
+
+    #[test]
+    fn test_perplexity_penalizes_repetition() {
+        // A looping ASR output (the same word repeated) must score WORSE (higher perplexity) than a
+        // diverse, genuine transcript of comparable length — not better, as raw self-entropy would have
+        // it. Otherwise the T1 judge commits hallucinated loops as "fluent".
+        let diverse = ngram_perplexity("کوردستان ئازاد و سەربەخۆ");
+        let looping = ngram_perplexity("کوردکوردکوردکوردکوردکورد");
+        assert!(
+            looping > diverse,
+            "repetitive text must have higher perplexity (looping={looping:.2}, diverse={diverse:.2})"
+        );
     }
 
     #[test]
