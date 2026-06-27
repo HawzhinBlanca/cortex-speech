@@ -326,6 +326,26 @@ impl Default for AppSettings {
 /// URL). Shared so every outbound channel — the LLM endpoint and the DPO export — enforces the same
 /// rule. The Rust IPC layer is the trust boundary, so a malicious/XSS-planted argument cannot repoint
 /// a request (and its payload) at an attacker-controlled host.
+/// Whether an http(s) endpoint's HOST is a loopback address. Parses the host EXACTLY (authority,
+/// minus any userinfo / port / IPv6 brackets) rather than a string prefix, so an attacker-controlled
+/// name like `localhost.evil.com`, `127.0.0.1.evil.com`, or the `http://localhost@evil.com` userinfo
+/// trick is NOT mistaken for the local machine (which would bypass the cloud consent gate / SSRF
+/// allow-list). Returns false for a non-http(s) or unparseable endpoint (fail closed).
+pub fn endpoint_host_is_loopback(endpoint: &str) -> bool {
+    let lower = endpoint.trim().to_ascii_lowercase();
+    let Some(after_scheme) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) else {
+        return false;
+    };
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or(authority); // drop any userinfo
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest) // [::1]:port -> ::1
+    } else {
+        hostport.split(':').next().unwrap_or(hostport) // host:port -> host
+    };
+    host == "localhost" || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
 pub fn validate_outbound_endpoint(endpoint: &str) -> Result<(), crate::error::AppError> {
     use crate::error::AppError;
     const MAX_ENDPOINT_LEN: usize = 2048;
@@ -338,9 +358,8 @@ pub fn validate_outbound_endpoint(endpoint: &str) -> Result<(), crate::error::Ap
     }
     let lower = trimmed.to_ascii_lowercase();
     let is_https = lower.starts_with("https://");
-    let is_localhost = lower.starts_with("http://localhost")
-        || lower.starts_with("http://127.0.0.1")
-        || lower.starts_with("http://[::1]");
+    // A plain-http endpoint is only allowed if its host is genuinely loopback (exact parse).
+    let is_localhost = lower.starts_with("http://") && endpoint_host_is_loopback(trimmed);
     if is_https || is_localhost {
         Ok(())
     } else {
@@ -455,15 +474,10 @@ impl AppSettings {
     /// True when the configured LLM endpoint targets the local machine (loopback) — a transcript
     /// sent there never leaves the device. An empty endpoint is treated as local (no outbound).
     pub fn llm_endpoint_is_local(&self) -> bool {
-        let e = self.llm_endpoint.trim().to_ascii_lowercase();
-        if e.is_empty() {
-            return true;
-        }
-        let host = e.strip_prefix("https://").or_else(|| e.strip_prefix("http://")).unwrap_or(e.as_str());
-        host.starts_with("localhost")
-            || host.starts_with("127.0.0.1")
-            || host.starts_with("[::1]")
-            || host.starts_with("::1")
+        let e = self.llm_endpoint.trim();
+        // Empty = no outbound. Otherwise require the host to be EXACTLY loopback (parsed, not a string
+        // prefix) so localhost.evil.com / 127.0.0.1.evil.com / localhost@evil.com can't bypass consent.
+        e.is_empty() || endpoint_host_is_loopback(e)
     }
 
     pub fn effective_llm_mode(&self) -> LlmMode {
@@ -573,9 +587,42 @@ mod tests {
         for ok in ["https://example.com/x", "http://localhost:8080", "http://127.0.0.1/y", "http://[::1]:9/z"] {
             assert!(super::validate_outbound_endpoint(ok).is_ok(), "{ok} should pass");
         }
-        // Empty, non-https remote, and non-http schemes are all rejected (exfil / SSRF surface).
-        for bad in ["", "   ", "http://attacker.example.com/collect", "ftp://x", "file:///etc/passwd"] {
+        // Empty, non-https remote, non-http schemes, AND loopback-prefix/userinfo tricks are rejected.
+        for bad in [
+            "",
+            "   ",
+            "http://attacker.example.com/collect",
+            "ftp://x",
+            "file:///etc/passwd",
+            "http://localhost.evil.com/collect",
+            "http://127.0.0.1.evil.com/collect",
+            "http://localhost@evil.com/collect",
+        ] {
             assert!(super::validate_outbound_endpoint(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn endpoint_host_is_loopback_uses_exact_host_not_prefix() {
+        for local in [
+            "http://localhost:11434/v1",
+            "https://localhost",
+            "http://127.0.0.1/x",
+            "http://[::1]:9/z",
+            "https://127.0.0.5",
+        ] {
+            assert!(super::endpoint_host_is_loopback(local), "{local} should be loopback");
+        }
+        for remote in [
+            "https://localhost.evil.com/v1",
+            "http://localhost.evil.com/v1",
+            "http://127.0.0.1.evil.com/v1",
+            "http://localhost@evil.com/v1",
+            "https://evil.com/localhost",
+            "ftp://localhost",
+            "",
+        ] {
+            assert!(!super::endpoint_host_is_loopback(remote), "{remote} must NOT be loopback");
         }
     }
 
@@ -599,6 +646,15 @@ mod tests {
             ..AppSettings::default()
         };
         assert_eq!(remote_no_optin.effective_llm_mode(), LlmMode::None);
+
+        // A loopback-PREFIX attacker host must NOT be mistaken for local (the consent-gate bypass).
+        let prefix_trick = AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "https://localhost.evil.com/v1/chat/completions".into(),
+            cloud_llm_opt_in: false,
+            ..AppSettings::default()
+        };
+        assert_eq!(prefix_trick.effective_llm_mode(), LlmMode::None);
 
         // With the opt-in, the same remote Local endpoint is permitted.
         let remote_opted = AppSettings {
