@@ -217,6 +217,19 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
         result = result.replace(arabic_char, &latin.to_string());
     }
 
+    // Strip thousands separators inside grouped numbers ("1،000" / "1,000" -> "1000") so a formatted
+    // number compares equal to its bare form. This runs BEFORE the verbalize early-return below, so it
+    // also fixes the metric path (verbalize=false): without it the separator — an Arabic comma by this
+    // stage, since step 84 of normalize() rewrites ASCII ',' to '،' — survives into the WER/CER string
+    // and counts a correct "1,000" as wrong against a reference "1000". The 3-digit grouping requirement
+    // means ordinary prose commas are left untouched.
+    static THOUSANDS_SEP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{1,3}(?:[،,]\d{3})+").unwrap());
+    let result = THOUSANDS_SEP_RE
+        .replace_all(&result, |caps: &regex::Captures| {
+            caps[0].chars().filter(|c| *c != '،' && *c != ',').collect::<String>()
+        })
+        .into_owned();
+
     if !verbalize {
         return result;
     }
@@ -492,6 +505,34 @@ mod tests {
         assert!(!out.contains('\u{200B}'), "ZWSP must be stripped");
         assert!(!out.contains('\u{FEFF}'), "BOM must be stripped");
         assert_eq!(out, "کوردی", "zero-width joiners must be deleted, not turned into spaces");
+    }
+
+    #[test]
+    fn metric_normalizer_collapses_thousands_separator_to_match_bare_number() {
+        // The WER/CER path runs with verbalize_numbers=false (keep digits as digits). A correctly
+        // transcribed "1,000" must normalize to the SAME string as a reference "1000" — otherwise the
+        // surviving separator counts a right answer as wrong and inflates the error rate.
+        let metric = SoraniNormalizer::with_config(NormalizationConfig {
+            normalize_numbers: true,
+            verbalize_numbers: false,
+            normalize_hamza: true,
+            remove_diacritics: false,
+        });
+        assert_eq!(metric.normalize("1,000"), metric.normalize("1000"));
+        assert_eq!(metric.normalize("1,000,000"), metric.normalize("1000000"));
+        // Already-Arabic-comma grouping (or mixed digits) collapses too.
+        assert_eq!(metric.normalize("١٢٣,٤٥٦"), metric.normalize("123456"));
+        // A genuine prose comma (not a 3-digit grouping) must survive as the Arabic comma, untouched.
+        let prose = metric.normalize("سڵاو, دونیا");
+        assert!(prose.contains('،'), "prose comma must remain (as ، ): {prose:?}");
+    }
+
+    #[test]
+    fn verbalize_path_still_reads_grouped_number_as_one_magnitude() {
+        // Stripping the separator before the verbalize early-return must not change verbalization:
+        // "1,000" and "1000" must verbalize identically (one thousand), not digit-by-digit.
+        let n = SoraniNormalizer::new(); // verbalize_numbers = true
+        assert_eq!(n.normalize("1,000"), n.normalize("1000"));
     }
 }
 
