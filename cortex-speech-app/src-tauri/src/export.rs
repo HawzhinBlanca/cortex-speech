@@ -179,15 +179,27 @@ fn ready_agentic_huggingface_segment_ids(db: &Database) -> AppResult<BTreeSet<St
 pub(crate) fn exclude_holdout_segments(db: &Database, segments: Vec<SpeechSegment>) -> AppResult<Vec<SpeechSegment>> {
     let holdout = crate::jury::learning::holdout_content_hashes(db)?;
     let holdout_paths = crate::jury::learning::holdout_audio_paths(db)?;
+    // All VAD chunks of one recording share a single audio_path. Memoize path -> held_out so a source
+    // split into N segments is content-hashed at most ONCE, not N times; and when there are no holdout
+    // content hashes (the common no-gold case) skip the whole-file hash entirely — the path check alone
+    // decides. Without this, exporting a long recording re-hashed the same multi-MB file once per segment.
+    let mut path_cache: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     Ok(segments
         .into_iter()
         .filter(|seg| {
-            let path = std::path::Path::new(&seg.audio_path);
-            let held_out = holdout_paths.contains(&seg.audio_path)
-                || (path.exists()
-                    && crate::pipeline::source_audio_identity(path)
-                        .map(|id| holdout.contains(&id.content_hash))
-                        .unwrap_or(false));
+            let held_out = if holdout_paths.contains(&seg.audio_path) {
+                true
+            } else if holdout.is_empty() {
+                false
+            } else {
+                *path_cache.entry(seg.audio_path.clone()).or_insert_with(|| {
+                    let path = std::path::Path::new(&seg.audio_path);
+                    path.exists()
+                        && crate::pipeline::source_audio_identity(path)
+                            .map(|id| holdout.contains(&id.content_hash))
+                            .unwrap_or(false)
+                })
+            };
             if held_out {
                 tracing::warn!("Excluding segment {} from dataset export: matches holdout gold audio", seg.id);
             }
@@ -522,9 +534,17 @@ pub fn export_huggingface_dataset(
 
                 for (source_path_str, segs) in segs_by_source {
                     let source_path = std::path::Path::new(source_path_str);
+                    // Preserve any clips a PRIOR successful export wrote for a source that is only
+                    // TRANSIENTLY unavailable this run (unmounted/network drive, momentary decode
+                    // error). Their expected filenames go into the keep-set so the orphan-prune
+                    // below does NOT delete them — pruning them would be permanent training-data
+                    // loss from a recoverable error. They stay on disk but are (correctly) absent
+                    // from this run's metadata.csv until a later run can re-read the source.
+                    let source_stem = source_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
                     if !source_path.exists() {
                         for seg in &segs {
                             tracing::warn!("Skipping segment {} in HF export: audio not found", seg.id);
+                            written_clips.insert(sanitized_clip_filename(&source_stem, &seg.id));
                         }
                         dropped_unavailable += segs.len();
                         continue;
@@ -535,6 +555,9 @@ pub fn export_huggingface_dataset(
                         Ok(res) => res,
                         Err(e) => {
                             tracing::error!("Failed to decode {source_path_str} in HF export: {e}");
+                            for seg in &segs {
+                                written_clips.insert(sanitized_clip_filename(&source_stem, &seg.id));
+                            }
                             dropped_unavailable += segs.len();
                             continue;
                         }
