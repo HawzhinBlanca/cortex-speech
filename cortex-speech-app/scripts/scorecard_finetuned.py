@@ -41,17 +41,26 @@ def main() -> int:
 
     rows = [l.rstrip("\n").split("\t") for l in open(manifest, encoding="utf-8") if "\t" in l]
     per_clip = []  # (char_dist, char_ref_len)
-    for i, (wav, ref) in enumerate(rows):
+    for i, row in enumerate(rows):
+        # Accept the 4-field gold manifest (wav/ref/gender/age) as well as a 2-field one.
+        wav, ref = row[0], row[1]
         audio, sr = sf.read(wav)
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         inputs = processor(audio, sampling_rate=16000, return_tensors="np")
         iv = inputs["input_values"].astype(np.float32)
         logits = sess.run(None, {iname: iv})[0]
-        hyp = processor.batch_decode(logits.argmax(axis=-1))[0]
+        # skip_special_tokens=True to match measure_finetuned_cer.py and the model's integration_guide.md,
+        # so <unk>/<s>/</s> argmax frames are dropped (not emitted as literal token strings). Without it
+        # this scorecard decoded differently than the 19.77% reference it is published as comparable to.
+        hyp = processor.batch_decode(logits.argmax(axis=-1), skip_special_tokens=True)[0]
         r, h = norm(ref), norm(hyp)
-        o = jiwer.process_characters(r if r else " ", h if h else "")
-        per_clip.append((o.substitutions + o.deletions + o.insertions, len(r) if r else 1))
+        if not r:
+            # Zero-reference clip drops out of the ratio-of-sums (numerator AND denominator), matching
+            # eval.rs — the old `" "` + ref_len=1 hack inflated micro CER and the bootstrap CI.
+            continue
+        o = jiwer.process_characters(r, h if h else "")
+        per_clip.append((o.substitutions + o.deletions + o.insertions, len(r)))
         if (i + 1) % 50 == 0:
             print(f"  ...{i+1}/{len(rows)}")
 
