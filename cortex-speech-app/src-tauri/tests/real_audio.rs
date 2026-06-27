@@ -805,6 +805,15 @@ fn ckb_scorecard_on_gold() {
         };
         let cd = wer::char_edit_distance(reference, &hyp);
         let wd = wer::word_edit_distance(reference, &hyp);
+        // Zero-reference clip (reference normalizes to empty): CER/WER are undefined per reference
+        // unit, so it contributes to NEITHER numerator nor denominator — and must NOT be written to
+        // the per-clip TSV, or scorecard_stats.py's ratio-of-sums would fold its full insertion
+        // distance against a 0-length reference and inflate the published micro CER. Matches the
+        // empty-ref skip in eval.rs and measure_finetuned_cer.py / scorecard_finetuned.py.
+        if cd.ref_len == 0 {
+            eprintln!("[gold] skipping empty-reference clip {path}");
+            continue;
+        }
         t_cd += cd.distance;
         t_crl += cd.ref_len;
         t_wd += wd.distance;
