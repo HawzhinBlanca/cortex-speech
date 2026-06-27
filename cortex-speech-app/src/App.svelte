@@ -920,11 +920,13 @@
     pipelinePhase.set('transcribing');
     statusMessage.set($t('transcribing'));
     try {
-      const result = await api.transcribeSegmentConstrained(seg.audioPath);
+      const result = await api.transcribeSegmentConstrained(seg.audioPath, seg.alignmentJson);
       const updatedSeg = {
         ...seg,
         rawTranscript: result.rawTranscript,
         annotatedTranscript: result.text,
+        // A re-transcription is machine output — reset verified so it isn't kept as human-verified.
+        verified: false,
       };
       await api.updateSegment(updatedSeg);
       await loadSegments();

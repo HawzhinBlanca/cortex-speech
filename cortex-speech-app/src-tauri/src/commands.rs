@@ -827,9 +827,15 @@ pub fn app_health(state: State<'_, AppState>) -> Result<serde_json::Value, Strin
 /// decode. Additive — it does NOT touch the default `transcribe_segment` path. Loads a fresh ort
 /// session per call (fine for a user-initiated action; session caching is a perf follow-up).
 #[tauri::command]
-pub fn transcribe_segment_constrained(audio_path: String) -> Result<serde_json::Value, String> {
+pub fn transcribe_segment_constrained(
+    audio_path: String,
+    alignment_json: Option<String>,
+) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("transcribe_segment_constrained")?;
     validate::validate_file_path(&audio_path)?;
+    if let Some(ref aj) = alignment_json {
+        validate::validate_alignment_json(aj)?;
+    }
     let models = crate::models::active_models_dir();
     let model = models.join(crate::models::OMNIASR_CTC_300M_MODEL);
     let tokens = models.join(crate::models::OMNIASR_CTC_300M_TOKENS);
@@ -837,8 +843,13 @@ pub fn transcribe_segment_constrained(audio_path: String) -> Result<serde_json::
         return Err("OmniASR model/tokens not found for constrained decode".to_string());
     }
     // decode_to_pcm returns 16 kHz mono PCM (the model's expected input rate).
-    let (_rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
-    let audio: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+    let (rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
+    // Slice only THIS segment's clip — every VAD chunk shares the whole-source audio_path (the range is
+    // in alignment_json), so decoding `pcm` directly would re-transcribe the ENTIRE recording into one
+    // segment. None alignment (single-segment file) = whole file. Mirrors the finetuned/Scribe paths.
+    let (clip, _suffix) =
+        crate::chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref()).map_err(|e| e.to_string())?;
+    let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
     let text = crate::constrained_decode::run_constrained(&model, &tokens, &audio, true)?;
     Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
 }

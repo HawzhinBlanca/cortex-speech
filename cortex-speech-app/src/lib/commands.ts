@@ -52,8 +52,10 @@ export async function transcribeSegment(
  */
 export async function transcribeSegmentConstrained(
   audioPath: string,
+  alignmentJson?: string | null,
 ): Promise<{ text: string; rawTranscript: string }> {
-  return invoke('transcribe_segment_constrained', { audioPath });
+  // Pass alignmentJson so constrained decode transcribes only THIS segment's clip, not the whole file.
+  return invoke('transcribe_segment_constrained', { audioPath, alignmentJson: alignmentJson ?? null });
 }
 
 /**
