@@ -258,6 +258,16 @@ pub fn render_markdown(sc: &Scorecard) -> String {
         sc.bootstrap_resamples,
         sc.seed
     ));
+    // No segments were scored → WER/CER are UNDEFINED, not 0%. Rendering a 0.00% here would read as a
+    // flawless model produced from nothing — exactly the fabricated metric the honesty bar forbids.
+    // Say so plainly and stop before the table.
+    if s.num_segments == 0 {
+        out.push_str(
+            "> ⚠️ **No segments were scored — WER/CER are undefined (not 0%).** \
+             Add held-out gold segments and re-run to get a real measurement.\n",
+        );
+        return out;
+    }
     out.push_str("| Metric | Value | 95% CI |\n|---|---|---|\n");
     out.push_str(&format!(
         "| **WER** (micro) | {} | [{}, {}] |\n",
@@ -620,5 +630,17 @@ mod tests {
         let json = serde_json::to_string(&card).unwrap();
         let back: AnnotationDriftScorecard = serde_json::from_str(&json).unwrap();
         assert_eq!(back.num_segments, 0);
+    }
+
+    #[test]
+    fn render_markdown_on_zero_segments_says_undefined_not_zero_percent() {
+        // A scorecard built from no scored segments must NOT render a 0.00% WER (which reads as a
+        // perfect model produced from nothing). It must say the metric is undefined.
+        let empty = build_scorecard(&eval_with(&[], &[], "no-data-model"), None, ScorecardOptions::default());
+        assert_eq!(empty.system.num_segments, 0);
+        let md = render_markdown(&empty);
+        assert!(md.contains("undefined"), "must call the metric undefined: {md}");
+        assert!(!md.contains("0.00%"), "must NOT render a 0.00% rate from zero data: {md}");
+        assert!(!md.contains("| **WER** (micro) |"), "must not print the metric table: {md}");
     }
 }
