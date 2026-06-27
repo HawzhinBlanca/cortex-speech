@@ -2487,6 +2487,21 @@ pub fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize, Stri
                 continue;
             }
         };
+        // Score only THIS segment's clip, not the whole source file. Segments share the source
+        // audio_path (the per-segment range lives in alignment_json), so without slicing the acoustic
+        // ctc_score — which feeds the conformal jury gate — would be computed over the ENTIRE recording
+        // for every segment, a systematically wrong quality signal on any multi-segment import.
+        let pcm_16k = match crate::chunking::slice_pcm_by_alignment(
+            &pcm_16k,
+            audio::TARGET_SAMPLE_RATE,
+            seg.alignment_json.as_deref(),
+        ) {
+            Ok((clip, _)) => clip,
+            Err(error) => {
+                tracing::warn!("Skipping acoustic score for {}: clip slice failed: {error}", seg.id);
+                continue;
+            }
+        };
         let score = match aligner.score_consistency(&pcm_16k, audio::TARGET_SAMPLE_RATE, &text) {
             Ok(score) => score,
             Err(error) => {
@@ -2555,6 +2570,19 @@ pub fn compute_ood_scores(state: State<'_, AppState>) -> Result<usize, String> {
             Ok(resampled) => resampled,
             Err(error) => {
                 tracing::warn!("Skipping OOD score for {}: 16 kHz conversion failed: {error}", seg.id);
+                continue;
+            }
+        };
+        // Score only THIS segment's clip, not the whole source file (same whole-file-vs-clip hazard as
+        // the acoustic-score loop): segments share the source audio_path, with the range in alignment_json.
+        let pcm_16k = match crate::chunking::slice_pcm_by_alignment(
+            &pcm_16k,
+            audio::TARGET_SAMPLE_RATE,
+            seg.alignment_json.as_deref(),
+        ) {
+            Ok((clip, _)) => clip,
+            Err(error) => {
+                tracing::warn!("Skipping OOD score for {}: clip slice failed: {error}", seg.id);
                 continue;
             }
         };
