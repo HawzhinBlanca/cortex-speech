@@ -303,7 +303,16 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
         }
 
         let consensus_text = consensus_words.join(" ");
-        let confidence = if slot_count > 0 { total_posterior / slot_count as f64 } else { 1.0 };
+        // No scorable slots (e.g. the highest-ability anchor hypothesis was blank/whitespace, so there
+        // were no words to align against) means ZERO posterior evidence. Emitting confidence 1.0 here
+        // fabricated a perfect score from nothing and let the T0 gate AUTO-ACCEPT an empty transcript at
+        // maximal confidence — both a fabricated metric and silent data loss. Skip the segment entirely:
+        // the gate then has no IRT confidence for it (unwrap_or(0.0) -> escalates) and falls back to the
+        // raw transcript instead of an empty consensus. Same for a degenerate all-empty consensus.
+        if slot_count == 0 || consensus_text.trim().is_empty() {
+            continue;
+        }
+        let confidence = total_posterior / slot_count as f64;
 
         consensus_transcripts.insert(segment_id.clone(), consensus_text);
         segment_confidences.insert(segment_id.clone(), confidence);
@@ -346,6 +355,36 @@ mod tests {
         let ability_gemini = res.model_abilities.get("gemini").unwrap();
         let ability_whisper = res.model_abilities.get("whisper-noisy").unwrap();
         assert!(ability_gemini > ability_whisper);
+    }
+
+    #[test]
+    fn blank_anchor_segment_is_omitted_not_given_perfect_confidence() {
+        // The highest-ability model (the anchor) returns a blank/whitespace transcript while a lower
+        // model emits text. The anchor has no words to align against, so there are zero scorable slots.
+        // The segment MUST NOT be emitted with a fabricated confidence 1.0 (which let the T0 gate
+        // auto-accept an EMPTY transcript at perfect confidence) — it is omitted entirely so the gate
+        // has no IRT confidence (escalates) and falls back to the raw transcript.
+        let anchor_blank = SegmentHypothesis {
+            segment_id: "segX".to_string(),
+            model_id: "omniasr-7b".to_string(), // ability 1.5 -> chosen as anchor
+            transcript: "   ".to_string(),      // whitespace-only
+            confidence: Some(0.9),
+        };
+        let other = SegmentHypothesis {
+            segment_id: "segX".to_string(),
+            model_id: "omniasr-300m".to_string(), // ability -0.5
+            transcript: "هەڵە".to_string(),
+            confidence: Some(0.5),
+        };
+        let res = fit_irt_consensus(&[anchor_blank, other]);
+        assert!(
+            !res.segment_confidences.contains_key("segX"),
+            "blank-anchor segment must be omitted, never given a fabricated confidence"
+        );
+        assert!(
+            !res.consensus_transcripts.contains_key("segX"),
+            "no empty consensus transcript should be emitted for a blank-anchor segment"
+        );
     }
 
     #[test]
