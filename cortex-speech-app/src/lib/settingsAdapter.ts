@@ -23,6 +23,7 @@ export interface BackendSettings {
   max_wer_threshold: number;
   max_cer_threshold: number;
   enforce_quality_gates: boolean;
+  autoplay_segments?: boolean;
   theme: string;
   llm_mode: string;
   llm_endpoint: string;
@@ -142,7 +143,7 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
     maxWerThreshold: raw.max_wer_threshold ?? 0.35,
     maxCerThreshold: raw.max_cer_threshold ?? 0.2,
     enforceQualityGates: raw.enforce_quality_gates ?? false,
-    autoplaySegments: false,
+    autoplaySegments: raw.autoplay_segments ?? false,
     hfTrainRatio: raw.hf_train_ratio ?? 0.8,
     hfValRatio: raw.hf_val_ratio ?? 0.1,
     hfTestRatio: raw.hf_test_ratio ?? 0.1,
@@ -192,6 +193,7 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
     max_wer_threshold: ui.maxWerThreshold,
     max_cer_threshold: ui.maxCerThreshold,
     enforce_quality_gates: ui.enforceQualityGates,
+    autoplay_segments: ui.autoplaySegments,
     llm_mode: ui.llmMode,
     llm_endpoint: ui.llmEndpoint,
     llm_api_key: ui.llmApiKey,
