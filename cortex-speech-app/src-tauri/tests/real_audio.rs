@@ -951,3 +951,128 @@ fn pipeline_routes_to_finetuned_when_enabled() {
         "expected Kurdish (Arabic-script) output from the fine-tuned pipeline, got: {raw}"
     );
 }
+
+/// Minimal JSON-string escaper (no serde_json in the integration-test crate).
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// Write a 16 kHz mono 16-bit PCM WAV (minimal RIFF; avoids a hound dev-dep in this crate).
+fn write_wav_16k_mono(path: &Path, pcm: &[i16]) -> std::io::Result<()> {
+    use std::io::Write;
+    let sr = 16_000u32;
+    let data_len = (pcm.len() * 2) as u32;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_len).to_le_bytes())?;
+    f.write_all(b"WAVE")?;
+    f.write_all(b"fmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?; // PCM
+    f.write_all(&1u16.to_le_bytes())?; // mono
+    f.write_all(&sr.to_le_bytes())?;
+    f.write_all(&(sr * 2).to_le_bytes())?; // byte rate
+    f.write_all(&2u16.to_le_bytes())?; // block align
+    f.write_all(&16u16.to_le_bytes())?; // bits/sample
+    f.write_all(b"data")?;
+    f.write_all(&data_len.to_le_bytes())?;
+    for &s in pcm {
+        f.write_all(&s.to_le_bytes())?;
+    }
+    f.flush()
+}
+
+/// End-to-end "what the end user gets" run: decode -> Silero VAD -> ≤15 s app-style segments ->
+/// fine-tuned MMS-CTC transcription -> Sorani normalization -> per-segment audio clips + a review
+/// manifest (run.jsonl) that `scripts/build_review_page.py` turns into the self-contained review page.
+///   CORTEX_TRANSCRIBE_FILE="C:\clip.wav" CORTEX_OUT="C:\out" cargo test --manifest-path src-tauri/Cargo.toml \
+///       --test real_audio end_to_end_review_run -- --ignored --nocapture
+#[test]
+#[ignore]
+fn end_to_end_review_run() {
+    let Ok(clip_path) = std::env::var("CORTEX_TRANSCRIBE_FILE") else {
+        eprintln!("CORTEX_TRANSCRIBE_FILE not set; skipping");
+        return;
+    };
+    let out_dir = std::env::var("CORTEX_OUT")
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/e2e_run").to_string_lossy().to_string());
+    let out = Path::new(&out_dir);
+    let clips_dir = out.join("clips");
+    std::fs::create_dir_all(&clips_dir).expect("create clips dir");
+
+    let model_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/finetuned-mms-ckb");
+    let onnx = model_dir.join("model.onnx");
+    let vocab = model_dir.join("vocab.json");
+    if !onnx.exists() || !vocab.exists() {
+        eprintln!("[e2e] fine-tuned model absent; skipping");
+        return;
+    }
+
+    let (sr, pcm) = audio::decode_to_pcm_with_timeout(Path::new(&clip_path), std::time::Duration::from_secs(180))
+        .expect("decode input");
+    assert_eq!(sr, 16000);
+    let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+
+    // App-faithful segmentation: VAD, then split anything over ~15 s (max_segment_duration_ms).
+    let vad = voice_activity_detection(&pcm, 16000, 0.5).unwrap_or_default();
+    let raw_segs: Vec<(usize, usize)> = if vad.is_empty() { vec![(0, pcm.len())] } else { vad };
+    const MAX: usize = 15 * 16000;
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    for (s0, e0) in &raw_segs {
+        let s = (*s0).min(pcm.len());
+        let e = (*e0).min(pcm.len());
+        if e <= s {
+            continue;
+        }
+        let len = e - s;
+        if len <= MAX {
+            windows.push((s, e));
+        } else {
+            let n = len.div_ceil(MAX);
+            let step = len.div_ceil(n);
+            let mut a = s;
+            while a < e {
+                let b = (a + step).min(e);
+                windows.push((a, b));
+                a = b;
+            }
+        }
+    }
+
+    let normalizer = SoraniNormalizer::new();
+    let mut manifest = String::new();
+    for (i, (s, e)) in windows.iter().enumerate() {
+        let id = format!("nawras-seg-{i:03}");
+        let clip = clips_dir.join(format!("{id}.wav"));
+        write_wav_16k_mono(&clip, &pcm[*s..*e]).expect("write clip wav");
+        let hyp = cortex_speech_app_lib::wav2vec2_asr::run_wav2vec2(&onnx, &vocab, "ckb", &f32_pcm[*s..*e])
+            .expect("fine-tuned ASR");
+        let text = normalizer.normalize(hyp.trim());
+        let dur_ms = (*e - *s) as i64 / 16; // 16 kHz -> samples/16 = ms
+        manifest.push_str(&format!(
+            "{{\"id\":\"{id}\",\"audio_path\":\"{}\",\"raw_transcript\":\"{}\",\"model_id\":\"finetuned-mms-ckb\",\"duration_ms\":{dur_ms},\"speaker_id\":\"\"}}\n",
+            json_escape(&clip.to_string_lossy()),
+            json_escape(&text),
+        ));
+        eprintln!("[e2e] {id} [{:.1}-{:.1}s]: {text}", *s as f64 / 16000.0, *e as f64 / 16000.0);
+    }
+
+    let run_jsonl = out.join("run.jsonl");
+    std::fs::write(&run_jsonl, &manifest).expect("write run.jsonl");
+    eprintln!("\n[e2e] segments: {}", windows.len());
+    eprintln!("[e2e] manifest: {}", run_jsonl.display());
+    eprintln!("[e2e] clips:    {}", clips_dir.display());
+    assert!(!windows.is_empty(), "VAD produced no segments");
+}
