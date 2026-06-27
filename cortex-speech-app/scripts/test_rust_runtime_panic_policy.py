@@ -427,7 +427,14 @@ def test_app_state_pipeline_settings_update_recovers_poisoned_lock() -> None:
         raise AssertionError("lib.rs must keep a unit test for poisoned pipeline settings updates")
     if "pub fn settings_snapshot(&self) -> AppSettings" not in pipeline:
         raise AssertionError("ProcessingPipeline must expose settings_snapshot() for regression verification")
-    if "state.update_pipeline_settings(settings);" not in commands:
+    # Accept either a by-value move or a `.clone()` — update_settings legitimately clones because it
+    # still needs `settings` for the disk save AFTER applying to the pipeline (apply-before-save, so the
+    # session reflects the change even if the save fails). The gate's intent is that the refresh goes
+    # through AppState::update_pipeline_settings, which both forms satisfy.
+    if (
+        "state.update_pipeline_settings(settings);" not in commands
+        and "state.update_pipeline_settings(settings.clone());" not in commands
+    ):
         raise AssertionError("commands.rs update_settings must refresh the live pipeline through AppState")
     if "state.pipeline.lock()" in commands:
         raise AssertionError("commands.rs must not lock the processing pipeline directly")
