@@ -35,11 +35,18 @@ fn is_known_consonant(c: char) -> bool {
             | 'ھ'
             | 'ه'
             | 'ئ'
+            // Hamza carriers that survive normalization (only أ/إ fold to ا): glottal-stop consonants.
+            // Without a phoneme they drop, collapsing distinct words like سر vs سؤر to identical phonemes.
+            | 'ء'
+            | 'ؤ'
     )
 }
 
 fn is_known_vowel(c: char) -> bool {
-    matches!(c, 'ا' | 'ە' | 'ۆ' | 'ێ')
+    // 'آ' (U+0622, alef-madda) is a long-a vowel that survives normalization (only أ/إ fold to ا), so
+    // it must carry a phoneme here or distinct words like بر vs بآر g2p to the SAME phonemes and a
+    // correction memory keyed on one silently rewrites the other.
+    matches!(c, 'ا' | 'ە' | 'ۆ' | 'ێ' | 'آ')
 }
 
 /// A character that actually carries a phoneme: a known consonant, a known vowel, or one of the
@@ -181,8 +188,8 @@ fn word_to_g2p(word: &str) -> String {
             'م' => "m",
             'ن' => "n",
             'ھ' | 'ه' => "h",
-            'ئ' => "Y",
-            'ا' => "A",
+            'ئ' | 'ء' | 'ؤ' => "Y", // hamza glottal stop (and hamza-on-waw)
+            'ا' | 'آ' => "A",       // alef and alef-madda: long a
             'ە' => "a",
             'ێ' => "e",
             'ۆ' => "o",
@@ -233,6 +240,17 @@ mod tests {
         assert_eq!(g2p("پێنج"), "p e n j");
         assert_eq!(g2p("چوار"), "c w A r");
         assert_eq!(g2p("دوو"), "d U");
+    }
+
+    #[test]
+    fn hamza_carriers_carry_phonemes_so_distinct_words_dont_collapse() {
+        // آ (alef-madda), ء (hamza), ؤ (waw-with-hamza) survive normalization, so they MUST produce a
+        // phoneme — otherwise distinct words collapse to identical phonemes and a correction memory keyed
+        // on one silently rewrites the other.
+        assert!(g2p("آب").contains('A'), "alef-madda must produce the long-a phoneme, not be dropped");
+        assert_ne!(g2p("بآر"), g2p("بر"), "بآر and بر must NOT g2p to the same phonemes");
+        assert_ne!(g2p("سؤر"), g2p("سر"), "سؤر and سر must NOT g2p to the same phonemes");
+        assert_ne!(g2p("ئاو"), g2p("او"), "hamza ئ vs none must differ");
     }
 
     // The 4-pass role resolver does heavy roles[i-1]/roles[i+1]/roles[i+2] indexing.
