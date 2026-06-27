@@ -276,6 +276,9 @@
     if (isDragging && onSeek && !e.shiftKey) {
       onSeek(Math.max(0, Math.min(t, duration)));
     }
+    // hoverTime/selectionEnd are read imperatively inside draw(), not via a reactive $effect, and while
+    // PAUSED no redraw loop is running — so repaint here or the hover scrub guide never follows the cursor.
+    draw();
   }
 
   function handlePointerUp(_e: PointerEvent) {
