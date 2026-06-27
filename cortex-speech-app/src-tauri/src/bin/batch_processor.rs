@@ -24,7 +24,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = app_data_dir.join("cortex-speech.db");
     info!("Using Database at: {}", db_path.display());
 
-    let db = Database::open(&db_path.to_string_lossy())?;
+    // Use open_with_retry + initialize like batch_importer and the app: open() only sets PRAGMAs and
+    // creates NO tables/FTS triggers/migrations, so reading or writing against a fresh or stale-schema
+    // data dir would fail ("no such table: speech_segments") or silently skip FTS indexing.
+    let db = Database::open_with_retry(&db_path.to_string_lossy())?;
+    db.initialize()?;
 
     // 2. Fetch unverified segments
     let unverified = db.get_segments(Some(false))?;
