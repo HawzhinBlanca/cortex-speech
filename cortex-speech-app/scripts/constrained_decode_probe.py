@@ -56,7 +56,7 @@ def greedy_ctc(logits, blank, toks, keep=None):
 
 
 def norm(s):
-    return " ".join(unicodedata.normalize("NFC", s).lower().split())
+    return " ".join(unicodedata.normalize("NFC", s).strip().lower().split())
 
 
 def cer(ref, hyp):
@@ -96,17 +96,23 @@ def main():
 
     # micro CER both ways
     def micro(constrained):
+        import jiwer as J
+
         td = tr = 0
         examples = []
         for lg, ref in zip(all_logits, refs):
             hyp = greedy_ctc(lg, blank, toks, keep if constrained else None)
-            r, h = norm(ref), norm(hyp)
-            # char edit distance via jiwer process_characters counts
-            import jiwer as J
-            o = J.process_characters(r if r else " ", h if h else "")
-            td += o.substitutions + o.deletions + o.insertions
-            tr += len(r) if r else 1
             examples.append((ref, hyp))
+            r, h = norm(ref), norm(hyp)
+            if not r:
+                # Zero-reference clip drops out of the ratio-of-sums (numerator AND denominator), matching
+                # eval.rs and measure_finetuned_cer.py / scorecard_finetuned.py so this probe's CER stays
+                # comparable to the published 19.77% scorecard. The old `r if r else " "` + `tr += 1` hack
+                # injected the full hypothesis insertion distance against a phantom 1-char denominator.
+                continue
+            o = J.process_characters(r, h if h else "")
+            td += o.substitutions + o.deletions + o.insertions
+            tr += len(r)
         return td / max(tr, 1), examples
 
     cer_u, ex_u = micro(False)
