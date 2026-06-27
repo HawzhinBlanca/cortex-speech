@@ -241,7 +241,7 @@ document.querySelectorAll('button.play').forEach(function (btn) {
   const end = parseFloat(audio.dataset.end || '') || 0;
   btn.addEventListener('click', function () {
     if (audio.paused) {
-      if (start > 0 && (audio.currentTime < start || (end > 0 && audio.currentTime >= end))) { audio.currentTime = start; }
+      if (audio.currentTime < start || (end > 0 && audio.currentTime >= end)) { audio.currentTime = start; }
       audio.play().then(function () { btn.innerHTML = '&#10073;&#10073; Pause'; }).catch(function () { btn.innerHTML = 'play blocked'; });
     } else { audio.pause(); }
   });
@@ -280,7 +280,14 @@ document.getElementById('export-json').addEventListener('click', function () {
 document.getElementById('export-csv').addEventListener('click', function () {
   const rows = approvedRows();
   if (!rows.length) { alert('No segments approved yet.'); return; }
-  const esc = function (v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; };
+  const esc = function (v) {
+    var s = String(v == null ? '' : v);
+    // Neutralize spreadsheet formula injection: a cell beginning with = + - @ (or a tab/CR) is
+    // executed as a formula by Excel/LibreOffice. Prefix it with a single quote, matching the Rust
+    // csv_safe_cell guard used by every other CSV writer in this project.
+    if (/^[=+\\-@\\t\\r]/.test(s)) { s = "'" + s; }
+    return '"' + s.replace(/"/g, '""') + '"';
+  };
   const head = ['id', 'engine', 'duration_sec', 'audio', 'draft', 'corrected'];
   const lines = [head.join(',')].concat(rows.map(function (r) { return head.map(function (k) { return esc(r[k]); }).join(','); }));
   download('approved_corrections.csv', '\\ufeff' + lines.join('\\r\\n'), 'text/csv');
