@@ -252,10 +252,19 @@ pub fn run_gold_eval(
 
         total_wer += w;
         total_cer += c;
-        total_word_distance += w_dist.distance;
-        total_word_ref_len += w_dist.ref_len;
-        total_char_distance += c_dist.distance;
-        total_char_ref_len += c_dist.ref_len;
+        // Micro (corpus) rate is errors-per-REFERENCE-token, so a zero-reference segment (a gold ref
+        // that normalizes to empty) must contribute to NEITHER accumulator. The old code added its
+        // insertions to the numerator but 0 to the denominator, so a single empty-ref hallucination
+        // pegged the whole corpus micro-WER/CER to its 1.0 clamp even when every other clip was perfect.
+        // The hallucination is still reflected in the macro average (its per-segment rate is 1.0 above).
+        if w_dist.ref_len > 0 {
+            total_word_distance += w_dist.distance;
+            total_word_ref_len += w_dist.ref_len;
+        }
+        if c_dist.ref_len > 0 {
+            total_char_distance += c_dist.distance;
+            total_char_ref_len += c_dist.ref_len;
+        }
         n += 1;
     }
 
@@ -738,6 +747,44 @@ mod tests {
         // Wrong hypothesis → WER > 0
         let result2 = run_gold_eval(&db, "bad-model", vec![(gold_id, "خراب".into())]).unwrap();
         assert!(result2.run.wer > 0.0, "Wrong hypothesis should have WER > 0");
+    }
+
+    #[test]
+    fn empty_reference_segment_does_not_peg_micro_rate_to_one() {
+        let db = open_mem_db();
+        // One real gold (will match perfectly) + one whose reference is tatweel-only, so it normalizes to
+        // EMPTY for metrics, paired with a non-empty (hallucinated) hypothesis. The corpus micro WER/CER
+        // must reflect only the reference-bearing clip (~0%), NOT be pegged to its 1.0 clamp by the
+        // zero-reference insertions.
+        import_gold_segments(
+            &db,
+            vec![
+                GoldSegmentInput {
+                    audio_path: "/a.wav".into(), reference: "کوردستان".into(), is_holdout: true
+                },
+                GoldSegmentInput {
+                    audio_path: "/b.wav".into(),
+                    reference: "\u{0640}\u{0640}\u{0640}".into(), // tatweel-only -> normalizes to ""
+                    is_holdout: true,
+                },
+            ],
+        )
+        .unwrap();
+        let gold = list_gold_segments(&db).unwrap();
+        let hyps: Vec<(String, String)> = gold
+            .iter()
+            .map(|g| {
+                let hyp = if g.audio_path == "/a.wav" { "کوردستان" } else { "one two three" };
+                (g.id.clone(), hyp.to_string())
+            })
+            .collect();
+        let result = run_gold_eval(&db, "m", hyps).unwrap();
+        assert!(
+            result.run.wer < 0.01 && result.run.cer < 0.01,
+            "an empty-reference hallucination must not peg micro WER/CER to 1.0 (wer={}, cer={})",
+            result.run.wer,
+            result.run.cer
+        );
     }
 
     #[test]
