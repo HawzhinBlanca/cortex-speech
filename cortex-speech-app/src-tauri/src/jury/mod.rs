@@ -71,6 +71,26 @@ pub struct T0GateReport {
     pub decisions: Vec<T0Decision>,
 }
 
+/// Hard distrust vetoes that block an auto-accept no matter how high the IRT agreement is: poor audio
+/// quality (low SNR / clipping) or a single distinct recognizer. With <2 distinct voters the IRT
+/// "consensus" is a degenerate single-hypothesis prior, and a lone model's confidence is the most
+/// dangerous routing signal (confidently wrong exactly on the rare/OOD Sorani tail). These are kept hard
+/// even under ActAuto — committing such a segment at the agreement confidence would stamp a high
+/// confidence on audio/consensus the gate explicitly distrusted. (NOTE: 300M and 1B are architecturally
+/// KIN, so two-of-them agreement can still be a correlated confident error — adding an architecturally
+/// INDEPENDENT recognizer's vote is the follow-up that fully closes that hole.)
+fn has_hard_distrust_veto(seg: &SpeechSegment, hyps: &[SegmentHypothesis]) -> bool {
+    let poor_quality =
+        seg.snr_db.map(|snr| snr < 5.0).unwrap_or(false) || seg.clipping_ratio.map(|clip| clip > 0.1).unwrap_or(false);
+    let distinct_voters = {
+        let mut ids: Vec<&str> = hyps.iter().map(|h| h.model_id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    };
+    poor_quality || distinct_voters < 2
+}
+
 /// Evaluate a single segment against the IRT consensus and conformal threshold.
 pub fn t0_gate_segment(
     seg: &SpeechSegment,
@@ -86,23 +106,7 @@ pub fn t0_gate_segment(
     // Same formula AND same confidence source the threshold was calibrated on (see run_t0_gate).
     let nonconformity_score = conformal::nonconformity(irt_confidence, seg.ctc_score);
 
-    let poor_quality = if let Some(snr) = seg.snr_db { snr < 5.0 } else { false }
-        || if let Some(clip) = seg.clipping_ratio { clip > 0.1 } else { false };
-
-    // Never auto-accept on a single recognizer: with <2 distinct voters the IRT "consensus" is a
-    // degenerate single-hypothesis prior, and a lone model's confidence is the most dangerous routing
-    // signal (it is confidently wrong exactly on the rare/OOD Sorani tail). Fail toward review.
-    // NOTE: 300M and 1B are architecturally KIN, so two-of-them agreement can still be a CORRELATED
-    // confident error — adding an architecturally INDEPENDENT recognizer's vote (e.g. ElevenLabs
-    // Scribe) at this gate is the follow-up that fully closes the confidently-wrong-correlated hole.
-    let distinct_voters = {
-        let mut ids: Vec<&str> = hyps.iter().map(|h| h.model_id.as_str()).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids.len()
-    };
-
-    if nonconformity_score <= threshold && !poor_quality && distinct_voters >= 2 {
+    if nonconformity_score <= threshold && !has_hard_distrust_veto(seg, hyps) {
         T0Decision::AutoAccept {
             segment_id: seg.id.clone(),
             consensus: consensus.to_string(),
@@ -122,6 +126,7 @@ pub fn t0_gate_segment(
 pub fn apply_autonomy(
     decision: T0Decision,
     autonomy: &crate::settings::AutonLevel,
+    seg: &SpeechSegment,
     consensus: &str,
     hypotheses: &[SegmentHypothesis],
     confidence: f64,
@@ -138,8 +143,17 @@ pub fn apply_autonomy(
         },
         AutonLevel::ActConfirm => decision,
         AutonLevel::ActAuto => match decision {
-            T0Decision::EscalateToT1 { segment_id, .. } => {
-                T0Decision::AutoAccept { segment_id, consensus: consensus.to_string(), confidence }
+            // ActAuto force-commits unattended — but the HARD distrust vetoes (poor audio quality, single
+            // recognizer) keep escalating even here. Promoting such a segment would write Verdict::
+            // AutoAccept with the IRT AGREEMENT confidence, which carries no information about the acoustic
+            // veto that caused the escalation — stamping a high confidence on a segment the gate explicitly
+            // distrusted. Only a borderline conformal-threshold escalation (no hard veto) is promoted.
+            T0Decision::EscalateToT1 { segment_id, hypotheses: esc_hyps, disagreement_score } => {
+                if has_hard_distrust_veto(seg, hypotheses) {
+                    T0Decision::EscalateToT1 { segment_id, hypotheses: esc_hyps, disagreement_score }
+                } else {
+                    T0Decision::AutoAccept { segment_id, consensus: consensus.to_string(), confidence }
+                }
             }
             accept => accept,
         },
@@ -192,7 +206,14 @@ pub fn run_t0_gate(
         };
         let irt_conf = irt_results.segment_confidences.get(&s.id).copied().unwrap_or(MISSING_IRT_CONFIDENCE);
         let score = conformal::nonconformity(irt_conf, s.ctc_score);
-        let cer = crate::wer::compute_cer(ref_text, &s.raw_transcript).min(1.0);
+        // Calibrate against the text the gate actually COMMITS on auto-accept — the IRT consensus
+        // (falling back to raw_transcript when there's no consensus) — exactly as t0_gate_segment /
+        // run_t0_gate select it. Certifying raw_transcript's CER while committing the consensus would
+        // make the conformal coverage guarantee cover a DIFFERENT quantity than the one published, void
+        // on every segment where consensus != raw (the disagreement case the jury exists to resolve).
+        let committed =
+            irt_results.consensus_transcripts.get(&s.id).map(String::as_str).unwrap_or(s.raw_transcript.as_str());
+        let cer = crate::wer::compute_cer(ref_text, committed).min(1.0);
         global_scored.push((score, cer));
         bucket_scored[conformal::snr_bucket(s.snr_db)].push((score, cer));
     }
@@ -228,7 +249,7 @@ pub fn run_t0_gate(
         let seg_threshold = bucket_thresholds[conformal::snr_bucket(seg.snr_db)];
         let base_decision = t0_gate_segment(seg, &seg_hyps, &consensus, irt_confidence, seg_threshold);
         // The Autonomy Dial decides whether the gate may auto-commit.
-        let decision = apply_autonomy(base_decision, autonomy, &consensus, &seg_hyps, irt_confidence);
+        let decision = apply_autonomy(base_decision, autonomy, seg, &consensus, &seg_hyps, irt_confidence);
 
         // 5. Write verdict to DB
         match &decision {
@@ -606,36 +627,58 @@ mod tests {
     #[test]
     fn apply_autonomy_changes_routing_per_dial() {
         use crate::settings::AutonLevel;
-        let hyps = vec![make_hyp("s1", "m", "x")];
+        // Good-quality segment (snr/clipping None -> not poor) with TWO distinct recognizers -> no hard veto.
+        let seg = make_seg("s1", "x");
+        let hyps = vec![make_hyp("s1", "m1", "x"), make_hyp("s1", "m2", "x")];
         let accept = || T0Decision::AutoAccept { segment_id: "s1".into(), consensus: "x".into(), confidence: 0.9 };
         let escalate =
             || T0Decision::EscalateToT1 { segment_id: "s1".into(), hypotheses: hyps.clone(), disagreement_score: 0.4 };
 
         // ActConfirm (default): base decisions pass through unchanged.
         assert!(matches!(
-            apply_autonomy(accept(), &AutonLevel::ActConfirm, "x", &hyps, 0.9),
+            apply_autonomy(accept(), &AutonLevel::ActConfirm, &seg, "x", &hyps, 0.9),
             T0Decision::AutoAccept { .. }
         ));
         assert!(matches!(
-            apply_autonomy(escalate(), &AutonLevel::ActConfirm, "x", &hyps, 0.4),
+            apply_autonomy(escalate(), &AutonLevel::ActConfirm, &seg, "x", &hyps, 0.4),
             T0Decision::EscalateToT1 { .. }
         ));
 
         // Propose / Observe: a confident accept is STAGED for the human instead of auto-committed.
         assert!(matches!(
-            apply_autonomy(accept(), &AutonLevel::Propose, "x", &hyps, 0.9),
+            apply_autonomy(accept(), &AutonLevel::Propose, &seg, "x", &hyps, 0.9),
             T0Decision::EscalateToT1 { .. }
         ));
         assert!(matches!(
-            apply_autonomy(accept(), &AutonLevel::Observe, "x", &hyps, 0.9),
+            apply_autonomy(accept(), &AutonLevel::Observe, &seg, "x", &hyps, 0.9),
             T0Decision::EscalateToT1 { .. }
         ));
 
-        // ActAuto: a low-confidence escalate is committed unattended.
+        // ActAuto: a borderline conformal escalate WITHOUT a hard veto is committed unattended.
         assert!(matches!(
-            apply_autonomy(escalate(), &AutonLevel::ActAuto, "x", &hyps, 0.4),
+            apply_autonomy(escalate(), &AutonLevel::ActAuto, &seg, "x", &hyps, 0.4),
             T0Decision::AutoAccept { .. }
         ));
+
+        // ActAuto must NOT override the hard distrust vetoes: a single recognizer stays escalated...
+        let one_hyp = vec![make_hyp("s1", "only", "x")];
+        assert!(
+            matches!(
+                apply_autonomy(escalate(), &AutonLevel::ActAuto, &seg, "x", &one_hyp, 0.4),
+                T0Decision::EscalateToT1 { .. }
+            ),
+            "single-voter segment must stay escalated even under ActAuto"
+        );
+        // ...and so does poor audio quality.
+        let mut noisy = make_seg("s1", "x");
+        noisy.snr_db = Some(2.0);
+        assert!(
+            matches!(
+                apply_autonomy(escalate(), &AutonLevel::ActAuto, &noisy, "x", &hyps, 0.4),
+                T0Decision::EscalateToT1 { .. }
+            ),
+            "poor-audio segment must stay escalated even under ActAuto"
+        );
     }
 
     #[test]
