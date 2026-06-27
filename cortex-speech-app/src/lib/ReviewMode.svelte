@@ -68,9 +68,14 @@
   $effect(() => {
     const seg = current;
     if (!seg || seg.id === lastLoadedId) return;
-    // Stash the OUTGOING clip's unsaved edit before we switch away from it.
-    if (lastLoadedId && editText.trim() !== lastLoadedOriginal.trim()) {
-      editCache.set(lastLoadedId, editText);
+    // Stash the OUTGOING clip's unsaved edit before we switch away — but if the user reverted it back
+    // to the original, DROP any previously-cached edit so a discarded correction can't resurrect.
+    if (lastLoadedId) {
+      if (editText.trim() !== lastLoadedOriginal.trim()) {
+        editCache.set(lastLoadedId, editText);
+      } else {
+        editCache.delete(lastLoadedId);
+      }
     }
     lastLoadedId = seg.id;
     lastLoadedOriginal = originalText(seg);

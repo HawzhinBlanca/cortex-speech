@@ -137,10 +137,10 @@
 
   function play() {
     if (!audioEl) return;
-    if (
-      startTime > 0 &&
-      (audioEl.currentTime < startTime || (endTime > 0 && audioEl.currentTime >= endTime))
-    ) {
+    // Re-seek to the clip start when the playhead is outside the clip window. Guard on the clip being
+    // bounded (endTime > startTime) rather than startTime > 0 — otherwise the FIRST chunk (startTime 0)
+    // is never rewound and can't be replayed once it reaches its end.
+    if (endTime > startTime && (audioEl.currentTime < startTime || audioEl.currentTime >= endTime)) {
       audioEl.currentTime = startTime;
     }
     attemptPlay('Playback blocked or file not found');
