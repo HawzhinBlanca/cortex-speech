@@ -7,6 +7,8 @@ import sys
 # Reconfigure stdout for proper UTF-8 output
 sys.stdout.reconfigure(encoding='utf-8')
 
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
 def create_corrupted_wav(path):
     with open(path, 'wb') as f:
         f.write(b'RIFF')
@@ -28,11 +30,15 @@ def create_silent_wav(path, duration_seconds=5, sample_rate=16000):
             f.writeframes(struct.pack('<h', 0))
 
 def run_ai_engine(audio_path):
+    models_dir = os.path.join(_HERE, "cortex-speech-app", "src-tauri", "models")
+    vad_model = os.path.join(models_dir, "silero_vad_v4.onnx")
+    tokens = os.path.join(models_dir, "omniasr-ctc-300m", "tokens.txt")
+    asr_model = os.path.join(models_dir, "omniasr-ctc-300m", "model.int8.onnx")
     cmd = [
         r".\sherpa-onnx-v1.13.2-win-x64-shared-MD-Release\bin\sherpa-onnx-vad-with-offline-asr.exe",
-        "--silero-vad-model=C:\\Users\\hawzh\\Desktop\\CORTEX\\cortex-speech-app\\src-tauri\\models\\silero_vad_v4.onnx",
-        "--tokens=C:\\Users\\hawzh\\Desktop\\CORTEX\\cortex-speech-app\\src-tauri\\models\\omniasr-ctc-300m\\tokens.txt",
-        "--omnilingual-asr-model=C:\\Users\\hawzh\\Desktop\\CORTEX\\cortex-speech-app\\src-tauri\\models\\omniasr-ctc-300m\\model.int8.onnx",
+        f"--silero-vad-model={vad_model}",
+        f"--tokens={tokens}",
+        f"--omnilingual-asr-model={asr_model}",
         "--num-threads=4",
         audio_path
     ]

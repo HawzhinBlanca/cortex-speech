@@ -7,7 +7,9 @@ import shutil
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-DATASETS_DIR = r"C:\Users\hawzh\Desktop\CORTEX\kurdish_datasets"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
+DATASETS_DIR = os.path.join(_HERE, "kurdish_datasets")
 MANIFEST_PATH = os.path.join(DATASETS_DIR, "manifest.json")
 GOLD_DIR = os.path.join(DATASETS_DIR, "gold_dataset")
 QUARANTINE_DIR = os.path.join(DATASETS_DIR, "quarantine_dataset")

@@ -5,11 +5,13 @@ import sqlite3
 import subprocess
 import re
 
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
 # Reconfigure stdout for proper UTF-8 output
 sys.stdout.reconfigure(encoding='utf-8')
 
-DB_PATH = os.path.join(os.environ['APPDATA'], "cortex-speech", "cortex-speech.db")
-OUTPUT_BASE_DIR = r"C:\Users\hawzh\Desktop\CORTEX\kurdish_datasets"
+DB_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~/AppData/Roaming"), "cortex-speech", "cortex-speech.db")
+OUTPUT_BASE_DIR = os.path.join(_HERE, "kurdish_datasets")
 
 def clean_filename(name):
     # Remove extension

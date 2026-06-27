@@ -10,7 +10,9 @@ import csv
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-DATASETS_DIR = r"C:\Users\hawzh\Desktop\CORTEX\kurdish_datasets"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
+DATASETS_DIR = os.path.join(_HERE, "kurdish_datasets")
 MANIFEST_PATH = os.path.join(DATASETS_DIR, "manifest.json")
 REPORT_PATH = os.path.join(DATASETS_DIR, "brutal_reality_report.csv")
 
@@ -19,7 +21,7 @@ SAMPLE_SIZE = 100
 CONCURRENCY = 10
 
 def load_env():
-    env_path = r"C:\Users\hawzh\Desktop\CORTEX\.env"
+    env_path = os.path.join(_HERE, ".env")
     if os.path.exists(env_path):
         with open(env_path, "r", encoding="utf-8") as f:
             for line in f:

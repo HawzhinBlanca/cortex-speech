@@ -2,6 +2,10 @@ import subprocess
 import re
 import json
 import uuid
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
 
 def normalize_ckb(text):
     # Arabic Kaf -> Kurdish Kaf
@@ -18,13 +22,22 @@ def normalize_ckb(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+_models_dir = os.path.join(_HERE, "cortex-speech-app", "src-tauri", "models")
+_vad_model = os.path.join(_models_dir, "silero_vad_v4.onnx")
+_tokens = os.path.join(_models_dir, "omniasr-ctc-300m", "tokens.txt")
+_asr_model = os.path.join(_models_dir, "omniasr-ctc-300m", "model.int8.onnx")
+
+audio_path = os.environ.get("CORTEX_AUDIO", "")
+if not audio_path:
+    sys.exit("set CORTEX_AUDIO to the path of the input .wav file")
+
 cmd = [
     r".\sherpa-onnx-v1.13.2-win-x64-shared-MD-Release\bin\sherpa-onnx-vad-with-offline-asr.exe",
-    "--silero-vad-model=C:\\Users\\hawzh\\Desktop\\CORTEX\\cortex-speech-app\\src-tauri\\models\\silero_vad_v4.onnx",
-    "--tokens=C:\\Users\\hawzh\\Desktop\\CORTEX\\cortex-speech-app\\src-tauri\\models\\omniasr-ctc-300m\\tokens.txt",
-    "--omnilingual-asr-model=C:\\Users\\hawzh\\Desktop\\CORTEX\\cortex-speech-app\\src-tauri\\models\\omniasr-ctc-300m\\model.int8.onnx",
+    f"--silero-vad-model={_vad_model}",
+    f"--tokens={_tokens}",
+    f"--omnilingual-asr-model={_asr_model}",
     "--num-threads=4",
-    "C:\\Users\\hawzh\\Desktop\\Lamo Voice Samples\\290426_ZP_EP017_Technoshan_P01-esv2-speech-50p.wav"
+    audio_path
 ]
 
 print(f"Running command: {' '.join(cmd)}")
@@ -32,7 +45,6 @@ result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
 
 lines = result.stdout.splitlines()
 segments = []
-audio_path = r"C:\Users\hawzh\Desktop\Lamo Voice Samples\290426_ZP_EP017_Technoshan_P01-esv2-speech-50p.wav"
 
 pattern = re.compile(r'(\d+\.\d+) -- (\d+\.\d+): (.*)')
 

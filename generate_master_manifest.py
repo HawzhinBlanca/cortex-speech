@@ -4,7 +4,9 @@ import json
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-DATASETS_DIR = r"C:\Users\hawzh\Desktop\CORTEX\kurdish_datasets"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
+DATASETS_DIR = os.path.join(_HERE, "kurdish_datasets")
 MASTER_CSV = os.path.join(DATASETS_DIR, "metadata.csv")
 MASTER_JSON = os.path.join(DATASETS_DIR, "manifest.json")
 

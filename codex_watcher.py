@@ -14,17 +14,19 @@ import tempfile
 # Reconfigure stdout for proper UTF-8 output
 sys.stdout.reconfigure(encoding='utf-8')
 
-WATCH_DIR = r"C:\Users\hawzh\Desktop\Lamo Voice Samples"
-CORTEX_DIR = r"C:\Users\hawzh\Desktop\CORTEX"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
+WATCH_DIR = os.environ.get("CORTEX_AUDIO_DIR", "")
+CORTEX_DIR = _HERE
 LOG_FILE = os.path.join(CORTEX_DIR, "codex_watcher.log")
 
-SHERPA_EXE = os.path.join(CORTEX_DIR, r"sherpa-onnx-v1.13.2-win-x64-shared-MD-Release\bin\sherpa-onnx-vad-with-offline-asr.exe")
-VAD_MODEL = os.path.join(CORTEX_DIR, r"cortex-speech-app\src-tauri\models\silero_vad_v4.onnx")
-TOKENS = os.path.join(CORTEX_DIR, r"cortex-speech-app\src-tauri\models\omniasr-ctc-300m\tokens.txt")
-ASR_MODEL = os.path.join(CORTEX_DIR, r"cortex-speech-app\src-tauri\models\omniasr-ctc-300m\model.int8.onnx")
+SHERPA_EXE = os.path.join(CORTEX_DIR, "sherpa-onnx-v1.13.2-win-x64-shared-MD-Release", "bin", "sherpa-onnx-vad-with-offline-asr.exe")
+VAD_MODEL = os.path.join(CORTEX_DIR, "cortex-speech-app", "src-tauri", "models", "silero_vad_v4.onnx")
+TOKENS = os.path.join(CORTEX_DIR, "cortex-speech-app", "src-tauri", "models", "omniasr-ctc-300m", "tokens.txt")
+ASR_MODEL = os.path.join(CORTEX_DIR, "cortex-speech-app", "src-tauri", "models", "omniasr-ctc-300m", "model.int8.onnx")
 
 appdata = os.environ.get("APPDATA")
-DB_PATH = os.path.join(appdata, "cortex-speech", "cortex-speech.db") if appdata else os.path.join(CORTEX_DIR, "cortex-speech.db")
+DB_PATH = os.path.join(appdata, "cortex-speech", "cortex-speech.db") if appdata else os.path.expanduser("~/AppData/Roaming/cortex-speech/cortex-speech.db")
 
 CHUNK_DURATION_SEC = 180 # Split large audio files into 3-minute chunks for fast, memory-safe processing
 
@@ -300,6 +302,8 @@ def process_audio(audio_path):
         log(f"Database injection error: {e}")
 
 def main():
+    if not WATCH_DIR:
+        sys.exit("set CORTEX_AUDIO_DIR to the folder of audio files to watch")
     if not os.path.exists(WATCH_DIR):
         log(f"Creating watch directory: {WATCH_DIR}")
         os.makedirs(WATCH_DIR, exist_ok=True)

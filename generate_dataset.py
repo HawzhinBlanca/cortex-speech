@@ -1,6 +1,9 @@
 import re
 import json
 import uuid
+import os
+
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
 
 def normalize_ckb(text):
     # Arabic Kaf -> Kurdish Kaf
@@ -18,7 +21,7 @@ def normalize_ckb(text):
     return text
 
 segments = []
-audio_path = r"C:\Users\hawzh\Desktop\Lamo Voice Samples\PODCAST-002.WAV"
+audio_path = os.environ.get("CORTEX_AUDIO", "")
 
 try:
     with open('podcast_transcription.txt', 'r', encoding='utf-8') as f:

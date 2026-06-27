@@ -7,7 +7,9 @@ from openai import AsyncOpenAI
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-DATASETS_DIR = r"C:\Users\hawzh\Desktop\CORTEX\kurdish_datasets"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
+DATASETS_DIR = os.path.join(_HERE, "kurdish_datasets")
 MANIFEST_PATH = os.path.join(DATASETS_DIR, "manifest.json")
 VERIFIED_MANIFEST_PATH = os.path.join(DATASETS_DIR, "manifest_verified.json")
 VERIFIED_CSV_PATH = os.path.join(DATASETS_DIR, "metadata_verified.csv")
@@ -16,7 +18,7 @@ VERIFIED_CSV_PATH = os.path.join(DATASETS_DIR, "metadata_verified.csv")
 CONCURRENCY = 15
 
 def load_env():
-    env_path = r"C:\Users\hawzh\Desktop\CORTEX\.env"
+    env_path = os.path.join(_HERE, ".env")
     if os.path.exists(env_path):
         with open(env_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -117,7 +119,7 @@ async def main():
     load_env()
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        print("ERROR: OPENROUTER_API_KEY is not set in environment or C:\\Users\\hawzh\\Desktop\\CORTEX\\.env")
+        print(f"ERROR: OPENROUTER_API_KEY is not set in environment or {os.path.join(_HERE, '.env')}")
         sys.exit(1)
 
     if not os.path.exists(MANIFEST_PATH):

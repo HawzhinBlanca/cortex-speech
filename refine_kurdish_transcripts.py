@@ -6,7 +6,7 @@ import re
 sys.stdout.reconfigure(encoding='utf-8')
 
 appdata = os.environ.get("APPDATA")
-DB_PATH = os.path.join(appdata, "cortex-speech", "cortex-speech.db") if appdata else r"C:\Users\hawzh\AppData\Roaming\cortex-speech\cortex-speech.db"
+DB_PATH = os.path.join(appdata, "cortex-speech", "cortex-speech.db") if appdata else os.path.expanduser("~/AppData/Roaming/cortex-speech/cortex-speech.db")
 
 # Dictionary of common phonetic and split-word errors in Meta OmniASR Sorani Kurdish outputs
 CORRECTION_MAP = {
