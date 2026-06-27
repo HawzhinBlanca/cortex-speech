@@ -39,7 +39,9 @@ def main() -> int:
     rows = [l.rstrip("\n").split("\t") for l in open(manifest, encoding="utf-8") if "\t" in l]
     total_dist = 0
     total_ref = 0
-    for i, (wav, ref) in enumerate(rows):
+    for i, row in enumerate(rows):
+        # Accept the 4-field gold manifest (wav/ref/gender/age) as well as a 2-field one.
+        wav, ref = row[0], row[1]
         audio, sr = sf.read(wav)
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
@@ -47,11 +49,18 @@ def main() -> int:
         iv = inputs["input_values"].astype(np.float32)
         logits = sess.run(None, {iname: iv})[0]
         pred_ids = logits.argmax(axis=-1)
-        hyp = processor.batch_decode(pred_ids)[0]
+        # skip_special_tokens=True to match measure_finetuned_cer.py (the 19.77% reference) and the
+        # model's integration_guide.md — otherwise <unk>/<s>/</s> argmax frames decode as literal token
+        # strings and the ONNX CER is computed by a different decode path than the number it confirms.
+        hyp = processor.batch_decode(pred_ids, skip_special_tokens=True)[0]
         r, h = norm(ref), norm(hyp)
-        o = jiwer.process_characters(r if r else " ", h if h else "")
+        if not r:
+            # Zero-reference clip drops out of the ratio-of-sums (numerator AND denominator), matching
+            # eval.rs and the fixed measure_finetuned_cer.py.
+            continue
+        o = jiwer.process_characters(r, h if h else "")
         total_dist += o.substitutions + o.deletions + o.insertions
-        total_ref += len(r) if r else 1
+        total_ref += len(r)
         if (i + 1) % 10 == 0:
             print(f"  ...{i+1}/{len(rows)}")
     cer = total_dist / max(total_ref, 1)

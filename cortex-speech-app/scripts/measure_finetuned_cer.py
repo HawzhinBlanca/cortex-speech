@@ -43,7 +43,11 @@ def main() -> int:
     total_dist = 0
     total_ref = 0
     examples = []
-    for i, (wav, ref) in enumerate(rows):
+    for i, row in enumerate(rows):
+        # Accept the documented 4-field gold manifest (wav<TAB>ref<TAB>gender<TAB>age) as well as a bare
+        # 2-field one — only the first two columns are used. A rigid 2-tuple unpack crashed on the
+        # 4-field manifest the docs/EVAL.md recipe and scorecard_stats.py produce.
+        wav, ref = row[0], row[1]
         audio, sr = sf.read(wav)
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
@@ -54,9 +58,15 @@ def main() -> int:
         pred_ids = torch.argmax(logits, dim=-1)
         hyp = processor.batch_decode(pred_ids, skip_special_tokens=True)[0]
         r, h = norm(ref), norm(hyp)
-        o = jiwer.process_characters(r if r else " ", h if h else "")
+        if not r:
+            # Zero-reference clip (ref normalizes to empty): CER is undefined per reference character, so
+            # contribute to NEITHER the numerator nor the denominator (ratio-of-sums) — matching
+            # src-tauri/src/eval.rs. The old `r if r else " "` + ref_len=1 hack injected the full
+            # hypothesis insertion distance against a phantom 1-char denominator, inflating micro CER.
+            continue
+        o = jiwer.process_characters(r, h if h else "")
         total_dist += o.substitutions + o.deletions + o.insertions
-        total_ref += len(r) if r else 1
+        total_ref += len(r)
         if i < 10:
             examples.append((ref, hyp))
         if (i + 1) % 10 == 0:
