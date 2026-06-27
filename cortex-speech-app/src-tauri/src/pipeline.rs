@@ -1029,10 +1029,15 @@ impl ProcessingPipeline {
             )?;
 
             // Hold back the boundary-touching tail of every non-final window for the next round so the
-            // splitter can later cut it on a pause. The final window emits everything (nothing dropped).
+            // splitter can later cut it on a pause. Carry from the last chunk's START all the way to the
+            // window END (`pcm[ls..]`), NOT just to its VAD end `le`: the samples after `le` (trailing
+            // silence up to the true window boundary) are real audio, and dropping them shifted the next
+            // window's base earlier by `pcm.len() - le`, drifting every later segment's source_start_ms/
+            // _end_ms cumulatively (offset_ms is only consulted while the carry is empty). Carrying the
+            // whole tail keeps the concatenated timeline globally contiguous. Final window emits all.
             if !is_last {
-                if let Some(&(ls, le)) = chunk_ranges.last() {
-                    carry_pcm = pcm[ls..le].to_vec();
+                if let Some(&(ls, _le)) = chunk_ranges.last() {
+                    carry_pcm = pcm[ls..].to_vec();
                     carry_base = base_sample + ls;
                     chunk_ranges.pop();
                 }
