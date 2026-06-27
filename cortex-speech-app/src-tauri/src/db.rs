@@ -322,6 +322,70 @@ impl Database {
         Ok(())
     }
 
+    /// Re-insert a FULL segment row, INCLUDING the jury/review columns (verdict, verdict_transcript,
+    /// rationale, evidence_json, agent_confidence, escalated, human_decision, corrected_at, is_gold) and
+    /// the original created_at. `insert_segment` deliberately omits those so a normal edit can't clobber
+    /// them via its ON CONFLICT branch — but undoing a DELETE resurrects into an EMPTY row, where that
+    /// omission would silently reset the human-verified verdict / gold flag / review state to their
+    /// schema defaults (NULL/0). This writes every column so an undo truly restores the segment.
+    pub fn restore_segment(&self, seg: &SpeechSegment) -> AppResult<()> {
+        validate_segment(seg)?;
+        let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
+        self.conn.execute(
+            "INSERT INTO speech_segments
+                (id, created_at, audio_path, raw_transcript, normalized_transcript, annotated_transcript,
+                 alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio,
+                 rms_db, snr_db, split, ood_score, verdict, verdict_transcript, rationale, evidence_json,
+                 agent_confidence, escalated, human_decision, corrected_at, is_gold, alignment_quality)
+             VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+             ON CONFLICT(id) DO UPDATE SET
+                created_at=excluded.created_at, audio_path=excluded.audio_path,
+                raw_transcript=excluded.raw_transcript, normalized_transcript=excluded.normalized_transcript,
+                annotated_transcript=excluded.annotated_transcript, alignment_json=excluded.alignment_json,
+                duration_ms=excluded.duration_ms, speaker_id=excluded.speaker_id, verified=excluded.verified,
+                confidence=excluded.confidence, ctc_score=excluded.ctc_score,
+                clipping_ratio=excluded.clipping_ratio, rms_db=excluded.rms_db, snr_db=excluded.snr_db,
+                split=excluded.split, ood_score=excluded.ood_score, verdict=excluded.verdict,
+                verdict_transcript=excluded.verdict_transcript, rationale=excluded.rationale,
+                evidence_json=excluded.evidence_json, agent_confidence=excluded.agent_confidence,
+                escalated=excluded.escalated, human_decision=excluded.human_decision,
+                corrected_at=excluded.corrected_at, is_gold=excluded.is_gold,
+                alignment_quality=excluded.alignment_quality, updated_at=datetime('now')",
+            params![
+                seg.id,
+                seg.created_at,
+                seg.audio_path,
+                raw_nfc,
+                normalized_nfc,
+                annotated_nfc,
+                seg.alignment_json,
+                seg.duration_ms,
+                seg.speaker_id,
+                seg.verified as i32,
+                seg.confidence,
+                seg.ctc_score,
+                seg.clipping_ratio,
+                seg.rms_db,
+                seg.snr_db,
+                seg.split,
+                seg.ood_score,
+                seg.verdict,
+                seg.verdict_transcript,
+                seg.rationale,
+                seg.evidence_json,
+                seg.agent_confidence,
+                seg.escalated as i32,
+                seg.human_decision,
+                seg.corrected_at,
+                seg.is_gold as i32,
+                seg.alignment_quality,
+            ],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
     /// Targeted single-column update: sets `verified` without touching any other field.
     /// Returns true if the row was found and updated.
     pub fn update_verified(&self, id: &str, verified: bool) -> AppResult<bool> {
