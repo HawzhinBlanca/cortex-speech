@@ -457,6 +457,8 @@ This dataset was generated from the WAV files in:
 
 The transcript-backed sets preserve the provided transcript order and split it across silence-detected audio chunks. This is suitable for a first professional dataset pass, but every row marked `review` in `review/segment_review.csv` should be listened to before final model training. Forced alignment or manual listening is still required for true "perfect" clip-level text timing.
 
+**This applies to `train`-status rows too.** Their clip-level transcript is allocated to each chunk by proportional char-count (in document order), NOT by forced alignment — see each row's `alignment_method` field (e.g. `silence_split_transcript_order`). So a `train` clip whose silence boundary falls mid-sentence can carry text shifted from what is actually spoken, even though it passed the duration/char-rate quality check. Before high-stakes training, run a forced aligner over the `train` split (or spot-listen) and drop/refit any row whose `alignment_method` is not a verified alignment.
+
 Only exact same-basename transcript pairs are trusted for TTS/voice-cloning training. Inferred transcript candidates are disabled by default and, even when explicitly enabled with `CORTEX_ALLOW_HALWEST_INFERRED_PAIRS=1`, are exported as review-only material until a human confirms the pairing and timing.
 
 ## Summary
