@@ -117,6 +117,16 @@
     }
   });
 
+  // While PAUSED no animation loop runs, so a seek that changes currentTime (the AudioPlayer scrubber,
+  // a word-chip seek, a programmatic jump) would leave the playhead frozen at the old position. Redraw
+  // on currentTime change when not playing; during playback the rAF loop above already repaints, so the
+  // `!playing` guard skips the redundant draw. (currentTime was previously tracked by the data-change
+  // effect; splitting out the animation loop dropped it — this restores the paused-seek repaint.)
+  $effect(() => {
+    track(currentTime);
+    if (!playing) draw();
+  });
+
   onDestroy(() => cancelAnimationFrame(animationId));
 
   function draw() {
