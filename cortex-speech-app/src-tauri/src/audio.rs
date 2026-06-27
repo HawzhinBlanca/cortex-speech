@@ -216,6 +216,10 @@ pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
         .map_err(|e| AppError::Audio(AudioError::Decode(e.to_string())))?;
 
     let track_id = track.id;
+    // Bound how much we decode into RAM in one pass so a pathologically large (or hostile) file can't
+    // OOM the host. ~256M interleaved f32 ≈ 1 GiB — far beyond any realistic clip/source; genuinely
+    // long audio is decoded incrementally via decode_pcm_windows instead.
+    const MAX_DECODE_SAMPLES: usize = 256 * 1024 * 1024;
     let mut all_samples: Vec<f32> = Vec::new();
     let mut actual_channels = 0u32;
     let mut actual_sample_rate = 0u32;
@@ -247,6 +251,11 @@ pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
         sample_buf.copy_interleaved_ref(decoded);
         let samples = sample_buf.samples();
         all_samples.extend_from_slice(samples);
+        if all_samples.len() > MAX_DECODE_SAMPLES {
+            return Err(AppError::Audio(AudioError::Decode(format!(
+                "audio too large to decode in one pass (> {MAX_DECODE_SAMPLES} samples)"
+            ))));
+        }
     }
 
     if all_samples.is_empty() {
