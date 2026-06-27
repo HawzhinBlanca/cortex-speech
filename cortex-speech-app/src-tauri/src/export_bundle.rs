@@ -227,7 +227,12 @@ pub fn export_dataset_bundle(
         )));
     }
 
-    let segments = db.get_segments(None)?;
+    // Exclude held-out gold eval audio from EVERY artifact in the bundle — not just the tabular data
+    // files (which route through export::export_dataset and were already filtered). The training-grade
+    // summary/details and the source-reference text artifacts below iterate this same list, so without
+    // filtering here a holdout clip's reference transcript leaks verbatim into training_grade_details.json
+    // and source_transcripts/*.txt, contaminating the eval set the promotion gate measures against.
+    let segments = crate::export::exclude_holdout_segments(db, db.get_segments(None)?)?;
     let training_grade_summary = quality::training_grade_summary(&segments);
     let training_ready_machine_segment_ids = training_ready_machine_segment_ids(&segments);
     let source_reference_records = collect_source_reference_bundle_records(db, &segments)?;
