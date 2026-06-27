@@ -12,7 +12,11 @@ EXPECTED_CAPABILITY_PERMISSIONS = [
     "dialog:allow-open",
     "dialog:allow-save",
 ]
-EXPECTED_ASSET_SCOPE = ["$APPDATA/media-cache/**"]
+# The media cache lives under the app DATA dir (`$DATA/cortex-speech/media-cache`), NOT `$APPDATA` —
+# the audio-playback fix corrected the asset scope to match where register_media_asset actually writes
+# clips, so clip-bounded playback resolves. Still tightly scoped to the media-cache subtree (the
+# forbidden-prefix check below rejects any broadening to `$APPDATA/**`, `$HOME`, etc.).
+EXPECTED_ASSET_SCOPE = ["$DATA/cortex-speech/media-cache/**"]
 
 
 def read_json(path: Path) -> dict:
