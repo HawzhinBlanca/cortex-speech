@@ -80,7 +80,11 @@ pub fn empirical_blank(logits: &[Vec<f32>]) -> usize {
     for frame in logits {
         counts.entry(argmax(frame, None)).and_modify(|c| *c += 1).or_insert(1);
     }
-    counts.into_iter().max_by_key(|&(_, c)| c).map(|(id, _)| id).unwrap_or(0)
+    // Deterministic tie-break: HashMap iteration order is per-process-randomized and max_by_key keeps the
+    // LAST max seen, so on a count tie the chosen blank — and thus the decoded string — could differ
+    // between runs of the SAME input (and diverge from the Python probe this mirrors). Break ties by the
+    // smallest token id so the result is reproducible.
+    counts.into_iter().max_by_key(|&(id, c)| (c, std::cmp::Reverse(id))).map(|(id, _)| id).unwrap_or(0)
 }
 
 fn argmax(frame: &[f32], keep_mask: Option<&[bool]>) -> usize {
@@ -175,6 +179,22 @@ pub fn run_constrained(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empirical_blank_tie_break_is_deterministic_smallest_id() {
+        // Frames where token 0 and token 2 each win 2 argmaxes (a tie). The blank must deterministically
+        // be the smallest id (0), not a HashMap-iteration-order coin flip. Build many frames and assert
+        // the result is stable and == 0.
+        let frame_for = |winner: usize| {
+            let mut f = vec![0.0f32; 4];
+            f[winner] = 1.0;
+            f
+        };
+        let logits = vec![frame_for(2), frame_for(0), frame_for(2), frame_for(0)];
+        for _ in 0..50 {
+            assert_eq!(empirical_blank(&logits), 0, "tie must resolve to the smallest token id, every run");
+        }
+    }
 
     #[test]
     fn is_arabic_detects_kurdish_script() {
