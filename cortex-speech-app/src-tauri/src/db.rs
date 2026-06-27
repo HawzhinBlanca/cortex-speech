@@ -658,15 +658,26 @@ impl Database {
                         verdict, verdict_transcript, rationale, evidence_json,
                         agent_confidence, escalated, human_decision, corrected_at, is_gold,
                         alignment_quality";
-        // Build a parameterised placeholder list: (?1,?2,...?N)
-        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
-        let query = format!(
-            "SELECT {col_list} FROM speech_segments WHERE id IN ({}) ORDER BY created_at DESC, id ASC",
-            placeholders.join(",")
-        );
-        let mut stmt = self.conn.prepare(&query)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), Self::map_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        // SQLite caps bound parameters per statement (SQLITE_MAX_VARIABLE_NUMBER — only 999 on older
+        // builds). A large selection (delete/undo of thousands of segments) would overflow a single
+        // IN(?,?,…) and fail with "too many SQL variables", so fetch in bounded chunks and re-impose
+        // the global ordering afterwards (per-chunk ORDER BY doesn't compose across chunks).
+        const CHUNK: usize = 500;
+        let mut segments: Vec<SpeechSegment> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            // Build a parameterised placeholder list: (?1,?2,...?N)
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let query = format!("SELECT {col_list} FROM speech_segments WHERE id IN ({})", placeholders.join(","));
+            let mut stmt = self.conn.prepare(&query)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), Self::map_row)?;
+            for row in rows {
+                segments.push(row?);
+            }
+        }
+        // Match the single-query contract: created_at DESC (newest first), then id ASC. None sorts
+        // last under DESC, mirroring SQLite ordering NULLs after non-NULLs in a descending sort.
+        segments.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+        Ok(segments)
     }
 
     pub fn rename_speaker(&self, old_id: &str, new_id: &str) -> AppResult<usize> {
@@ -1392,6 +1403,28 @@ mod tests {
             .map(|s| s.id)
             .collect();
         assert_eq!(by_ids, vec!["seg_a", "seg_m", "seg_z"], "tied id-batch results must order by id");
+    }
+
+    #[test]
+    fn get_segments_by_ids_handles_more_than_one_sqlite_param_chunk() {
+        // 1200 ids spans >2 of the 500-id chunks. A single IN(?,?,…) of this size would overflow the
+        // SQLite bound-parameter cap on older builds; the chunked fetch must return every row, with the
+        // global (created_at DESC, id ASC) order preserved across chunk boundaries.
+        let db = make_db();
+        let n = 1200usize;
+        for i in 0..n {
+            let id = format!("seg_{i:05}");
+            db.insert_segment(&make_segment(&id, &format!("/{id}.wav"))).unwrap();
+        }
+        // Pin created_at so the id ASC tiebreaker is what orders the result deterministically.
+        db.conn.execute("UPDATE speech_segments SET created_at = '2024-01-01 00:00:00'", []).unwrap();
+        let ids: Vec<String> = (0..n).map(|i| format!("seg_{i:05}")).collect();
+        let got = db.get_segments_by_ids(&ids).unwrap();
+        assert_eq!(got.len(), n, "every requested id must come back across all chunks");
+        let got_ids: Vec<String> = got.into_iter().map(|s| s.id).collect();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(got_ids, expected, "rows must be globally ordered by id ASC across chunk boundaries");
     }
 
     #[test]
