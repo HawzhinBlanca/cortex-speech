@@ -62,8 +62,10 @@ export async function transcribeSegmentConstrained(
  */
 export async function transcribeSegmentFinetuned(
   audioPath: string,
+  alignmentJson?: string | null,
 ): Promise<{ text: string; rawTranscript: string }> {
-  return invoke('transcribe_segment_finetuned', { audioPath });
+  // Pass alignmentJson so the fine-tuned model transcribes only THIS segment's clip, not the whole file.
+  return invoke('transcribe_segment_finetuned', { audioPath, alignmentJson: alignmentJson ?? null });
 }
 
 export async function batchTranscribe(ids: string[]): Promise<{ status: string }> {
@@ -458,8 +460,12 @@ export async function clearTracingSpans(): Promise<void> {
  * Transcribe one audio clip with ElevenLabs Scribe (cloud STT). Consent-gated server-side: errors
  * unless cloud-STT opt-in is enabled. Returns the transcription text.
  */
-export async function transcribeWithScribe(audioPath: string): Promise<string> {
-  return invoke<string>('transcribe_audio_with_scribe', { audioPath });
+export async function transcribeWithScribe(
+  audioPath: string,
+  alignmentJson?: string | null,
+): Promise<string> {
+  // Pass alignmentJson so Scribe transcribes only THIS segment's clip, not the whole source file.
+  return invoke<string>('transcribe_audio_with_scribe', { audioPath, alignmentJson: alignmentJson ?? null });
 }
 
 /**

@@ -877,7 +877,7 @@ fn write_text_atomic(path: &std::path::Path, text: &str) -> AppResult<()> {
     )
 }
 
-fn write_wav_atomic(path: &std::path::Path, sample_rate: u32, samples: &[i16]) -> AppResult<()> {
+pub(crate) fn write_wav_atomic(path: &std::path::Path, sample_rate: u32, samples: &[i16]) -> AppResult<()> {
     let tmp = unique_tmp_path(path);
     remove_file_on_error(
         &tmp,
