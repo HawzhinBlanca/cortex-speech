@@ -380,7 +380,18 @@ fn sanitized_clip_filename(stem: &str, id: &str) -> String {
     let clean = |s: &str| {
         s.chars().map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect::<String>()
     };
-    format!("{}_{}.wav", clean(stem), clean(id))
+    let clean_id = clean(id);
+    // The segment id is the unique key, so the filename only stays unique if distinct ids map to
+    // distinct cleaned ids. For the universal case (a v4 UUID, all `[A-Za-z0-9-]`) cleaning is a no-op
+    // and the id alone guarantees uniqueness. But the id is import-controlled and only checked
+    // non-empty, so two ids that differ ONLY in stripped characters (`a/b` and `a.b` both -> `a_b`)
+    // would otherwise collide and silently overwrite each other's clip + metadata row. When cleaning
+    // actually altered the id, append a short hash of the RAW id to restore one-to-one uniqueness.
+    if clean_id == id {
+        format!("{}_{}.wav", clean(stem), clean_id)
+    } else {
+        format!("{}_{}_{}.wav", clean(stem), clean_id, &sha256_hex(id.as_bytes())[..8])
+    }
 }
 
 pub fn export_huggingface_dataset(
@@ -569,7 +580,13 @@ pub fn export_huggingface_dataset(
                         write_wav_atomic(&out_audio_path, 16000, pcm_slice.as_ref())?;
                         written_clips.insert(filename.clone());
 
-                        let dur_str = seg.duration_ms.to_string();
+                        // Report the duration of the clip ACTUALLY written, not the segment's stored
+                        // duration_ms. The two drift when slice_for_export clamps an over-long window to
+                        // the decoded length, or falls back to the whole file for a segment with no
+                        // alignment — and the metadata must describe the bytes on disk, never a value the
+                        // WAV doesn't back up. The clip is mono 16 kHz (see write_wav_atomic below).
+                        let clip_dur_ms = (pcm_slice.len() as i64 * 1000) / audio::TARGET_SAMPLE_RATE as i64;
+                        let dur_str = clip_dur_ms.to_string();
                         let verified_str = if seg.verified { "1" } else { "0" };
                         let training_ready_str = if grade.training_ready { "1" } else { "0" };
                         let reasons = grade.reasons.join("; ");
@@ -590,7 +607,7 @@ pub fn export_huggingface_dataset(
                             hf_reasons.as_ref(),
                         ])?;
 
-                        total_exported_dur += seg.duration_ms as f64 / 1000.0;
+                        total_exported_dur += clip_dur_ms as f64 / 1000.0;
                         count += 1;
                     }
                 }
@@ -984,8 +1001,18 @@ mod tests {
             assert_eq!(std::path::Path::new(&f).components().count(), 1, "must be a single path component: {f:?}");
             assert!(std::path::Path::new("/export/dir").join(&f).starts_with("/export/dir"), "stays under dir: {f:?}");
         }
-        // Normal stems/ids pass through unchanged.
+        // Normal stems/ids pass through unchanged (already filename-safe -> no disambiguating hash).
         assert_eq!(sanitized_clip_filename("clip01", "seg_42"), "clip01_seg_42.wav");
+        // A v4-UUID id is filename-safe, so it passes through verbatim (no hash suffix, no collision).
+        assert_eq!(
+            sanitized_clip_filename("rec", "550e8400-e29b-41d4-a716-446655440000"),
+            "rec_550e8400-e29b-41d4-a716-446655440000.wav"
+        );
+        // Two ids that collapse to the same cleaned form must NOT collide: the raw-id hash disambiguates.
+        let a = sanitized_clip_filename("rec", "a/b");
+        let b = sanitized_clip_filename("rec", "a.b");
+        assert_ne!(a, b, "distinct ids that clean to the same value must not share a filename");
+        assert!(a.starts_with("rec_a_b_") && b.starts_with("rec_a_b_"), "{a:?} {b:?}");
     }
 
     fn insert_machine_silver_segment_with_hf_coverage(
