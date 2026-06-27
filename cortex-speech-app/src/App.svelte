@@ -208,15 +208,13 @@
   // and silently lose the correction. We instead merge this captured patch over the freshest row, so the
   // user's edit always wins while any field a concurrent op changed (raw/normalized/verdict) is kept.
   let pendingEdit: Partial<SpeechSegment> = {};
-  // Full snapshot of the segment at schedule time — the fallback base if the row is gone from the store
-  // (e.g. a reload dropped it) so we can still persist the edit.
-  let pendingSnapshot: SpeechSegment | null = null;
 
-  async function persistSegment(id: string, edit: Partial<SpeechSegment>, snapshot: SpeechSegment | null) {
-    // Prefer the freshest store row as the base (it carries any concurrent background updates), but fall
-    // back to the schedule-time snapshot if the row was reloaded out of the store. Overlay the captured
-    // user edit last so it can never be clobbered.
-    const base = $segments.find((s) => s.id === id) ?? snapshot;
+  async function persistSegment(id: string, edit: Partial<SpeechSegment>) {
+    // Use the freshest store row as the base (it carries any concurrent background update) and overlay
+    // the captured user edit last so it can never be clobbered. If the row is GONE from the store, the
+    // segment was DELETED (segments.load does an atomic set(), so there is no transient-missing window) —
+    // do NOT persist, or update_segment's INSERT-ON-CONFLICT would resurrect the just-deleted row.
+    const base = $segments.find((s) => s.id === id);
     if (!base) {
       saveState = 'idle';
       return;
@@ -245,11 +243,21 @@
     }
     const id = pendingSaveId;
     const edit = pendingEdit;
-    const snap = pendingSnapshot;
     pendingSaveId = null;
     pendingEdit = {};
-    pendingSnapshot = null;
-    if (id) void persistSegment(id, edit, snap);
+    if (id) void persistSegment(id, edit);
+  }
+
+  // Cancel a pending save WITHOUT persisting — used when the pending segment is deleted, so its
+  // debounced edit can't fire after the row is gone and resurrect it via INSERT-ON-CONFLICT.
+  function cancelPendingSave() {
+    if (saveTimeout) {
+      clearTimeout(saveTimeout);
+      saveTimeout = null;
+    }
+    pendingSaveId = null;
+    pendingEdit = {};
+    if (saveState === 'saving') saveState = 'idle';
   }
 
   function scheduleAutoSave(patch: Partial<SpeechSegment>) {
@@ -268,7 +276,6 @@
     saveState = 'saving';
     if (saveTimeout) clearTimeout(saveTimeout);
     pendingSaveId = id;
-    pendingSnapshot = seg;
     // Accumulate the edited fields for THIS segment so multi-field edits (text + speaker) within one
     // window all persist; keep only this segment's edits (flush above reset pendingEdit on a switch).
     pendingEdit = { ...pendingEdit, ...patch };
@@ -276,11 +283,9 @@
       saveTimeout = null;
       const eid = pendingSaveId;
       const edit = pendingEdit;
-      const snap = pendingSnapshot;
       pendingSaveId = null;
       pendingEdit = {};
-      pendingSnapshot = null;
-      if (eid) void persistSegment(eid, edit, snap);
+      if (eid) void persistSegment(eid, edit);
     }, 1000);
   }
 
@@ -482,7 +487,9 @@
   onDestroy(() => {
     stopEventListeners();
     globalKeyboardManager?.destroy();
-    if (saveTimeout) clearTimeout(saveTimeout);
+    // Flush (not just cancel) a pending edit on teardown so a correction typed in the last debounce
+    // window before exit is still persisted, rather than silently dropped by a bare clearTimeout.
+    flushPendingSave();
     if (sessionSaveTimeout) clearTimeout(sessionSaveTimeout);
   });
 
@@ -1416,6 +1423,8 @@
   async function handleDeleteFiltered(ids: string[]) {
     if ($isProcessing) return;
     if (!requireDesktopRuntime()) return;
+    // Cancel a pending autosave for any segment in this batch, so its flush can't resurrect a deleted row.
+    if (pendingSaveId && ids.includes(pendingSaveId)) cancelPendingSave();
     startOperation('batch-delete');
     isProcessing.set(true);
     statusMessage.set($t('batchDelete.progress', { n: String(ids.length) }));
@@ -1440,6 +1449,10 @@
     const seg = $selectedSegment;
     if (!seg) return;
     if (!requireDesktopRuntime()) return;
+
+    // Cancel any pending autosave for THIS segment before deleting, so its debounced flush can't fire
+    // after the row is gone and resurrect it via update_segment's INSERT-ON-CONFLICT.
+    if (pendingSaveId === seg.id) cancelPendingSave();
 
     // Optimistic Update
     const originalSegments = $segments;
