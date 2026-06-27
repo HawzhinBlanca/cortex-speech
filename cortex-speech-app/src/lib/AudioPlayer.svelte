@@ -50,7 +50,10 @@
   let resolveController: AbortController | null = null;
 
   async function resolveAudioUrl(path: string) {
-    // 1. Stop any existing playback immediately so there's no ghost audio.
+    // 1. Stop any existing playback immediately so there's no ghost audio. Cancel the clip-stop timer
+    //    too — otherwise a pending timer from the PREVIOUS clip could fire after the source switched and
+    //    (with Loop on) auto-play the newly-selected clip the user never pressed Play on.
+    clearClipStop();
     if (audioEl && !audioEl.paused) {
       audioEl.pause();
       playing = false;
@@ -146,7 +149,9 @@
     clipStopTimer = setTimeout(
       () => {
         clipStopTimer = null;
-        if (!audioEl) return;
+        // Only act if still actively playing — a timer that survived a pause or a source switch must
+        // not resurrect playback (e.g. loop-restart the newly-selected clip).
+        if (!audioEl || !playing) return;
         if (loop) {
           audioEl.currentTime = startTime;
           attemptPlay('Loop playback failed');
