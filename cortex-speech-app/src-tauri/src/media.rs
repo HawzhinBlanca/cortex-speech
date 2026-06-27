@@ -88,10 +88,14 @@ impl MediaRegistry {
 
     pub fn resolve(&mut self, id: &str) -> Result<String, String> {
         self.prune_expired();
-        let record = self.grants.get(id).ok_or_else(|| "Media grant is missing or expired".to_string())?;
+        let record = self.grants.get_mut(id).ok_or_else(|| "Media grant is missing or expired".to_string())?;
         if !record.cached_path.exists() {
             return Err("Cached media file is missing".to_string());
         }
+        // Sliding TTL: resolving means the frontend is (re)loading this clip, so keep it alive. Without
+        // this a clip the user is still working with expires after 30 min and the next prune (triggered
+        // by granting any other clip) deletes the file out from under the playing <audio> element.
+        record.expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
         Ok(record.cached_path.to_string_lossy().to_string())
     }
 
@@ -114,8 +118,10 @@ impl MediaRegistry {
             }
         }
 
-        self.grants.iter().find_map(|(id, record)| {
+        self.grants.iter_mut().find_map(|(id, record)| {
             if record.source_path == source_path && record.expires_at > now && record.cached_path.exists() {
+                // Sliding TTL: reusing the grant for a fresh play means it's still in use — refresh it.
+                record.expires_at = now + Duration::minutes(MEDIA_TTL_MINUTES);
                 Some(MediaGrant {
                     id: id.clone(),
                     path: record.cached_path.to_string_lossy().to_string(),
