@@ -865,6 +865,10 @@
     const seg = $selectedSegment;
     if (!seg || $isProcessing) return;
     if (!requireDesktopRuntime()) return;
+    // Re-transcription replaces this segment's text with fresh MACHINE output, so drop any pending
+    // autosave for it first — otherwise the debounced pre-edit annotation fires AFTER this write and
+    // clobbers the new transcript (the same clobber the delete paths already cancel against).
+    if (pendingSaveId === seg.id) cancelPendingSave();
     startOperation('transcribe');
     isProcessing.set(true);
     pipelinePhase.set('transcribing');
@@ -915,6 +919,8 @@
     const seg = $selectedSegment;
     if (!seg || $isProcessing) return;
     if (!requireDesktopRuntime()) return;
+    // Drop any pending autosave for this segment so it can't clobber the fresh machine transcript.
+    if (pendingSaveId === seg.id) cancelPendingSave();
     startOperation('transcribe');
     isProcessing.set(true);
     pipelinePhase.set('transcribing');
@@ -947,6 +953,8 @@
     const seg = $selectedSegment;
     if (!seg || $isProcessing) return;
     if (!requireDesktopRuntime()) return;
+    // Drop any pending autosave for this segment so it can't clobber the fresh machine transcript.
+    if (pendingSaveId === seg.id) cancelPendingSave();
     startOperation('transcribe');
     isProcessing.set(true);
     pipelinePhase.set('transcribing');
@@ -980,6 +988,8 @@
     const seg = $selectedSegment;
     if (!seg || $isProcessing) return;
     if (!requireDesktopRuntime()) return;
+    // Drop any pending autosave for this segment so it can't clobber the fresh machine transcript.
+    if (pendingSaveId === seg.id) cancelPendingSave();
     startOperation('transcribe');
     isProcessing.set(true);
     pipelinePhase.set('transcribing');
