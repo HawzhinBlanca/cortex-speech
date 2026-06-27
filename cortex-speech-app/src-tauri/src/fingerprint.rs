@@ -106,6 +106,13 @@ impl AudioFingerprint {
         source: Option<&Path>,
     ) -> Result<u64, &'static str> {
         let fp = Self::fingerprint(pcm, sample_rate);
+        // A fingerprint of 0 is the degenerate "no usable energy bands" case — digital silence, or a clip
+        // shorter than 8 frames (<16 ms) — NOT a real content signature. Two distinct such files would
+        // otherwise collide on 0 and the second gets wrongly rejected as a duplicate. Never dedup on it
+        // (such audio yields no speech segments anyway), so skip both the conflict check and registration.
+        if fp == 0 {
+            return Ok(fp);
+        }
         let source_key = Self::source_key(source);
 
         let mut map = self.lock_known();
