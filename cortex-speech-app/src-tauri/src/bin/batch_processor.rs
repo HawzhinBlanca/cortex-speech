@@ -144,10 +144,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
+            // This is a MACHINE ASR draft, not a human approval. Populate only the raw + normalized
+            // transcript and leave annotated_transcript empty and verified=false. Setting
+            // annotated_transcript (the human-correction field) and verified=true here made
+            // training_grade_for_segment grade pure ASR output as human_verified GOLD — fabricating
+            // human-verified training data, which the honesty law forbids. The segment now flows through
+            // the normal review/agentic gates like any other unreviewed draft.
             seg.raw_transcript = text;
-            seg.normalized_transcript = Some(norm.clone());
-            seg.annotated_transcript = Some(norm);
-            seg.verified = true;
+            seg.normalized_transcript = Some(norm);
             seg.confidence = confidence;
 
             to_update.push(seg);
