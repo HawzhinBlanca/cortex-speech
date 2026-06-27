@@ -15,16 +15,33 @@ human review.
 
 Usage:
   python3 sorani_ensemble_asr.py <audio.wav> [start_ms-end_ms ...]
-Defaults to Nawras with the 0-15s / 15-30s / 30-36s VAD slices.
+The audio path is required; bounds default to the 0-15s / 15-30s / 30-36s VAD slices.
+Set HF_HOME in the environment if your model cache is not at the platform default.
 """
 import os, sys, re, json, tempfile, subprocess
 
-os.environ.setdefault("HF_HOME", "/mnt/c/Users/hawzh/.cache/huggingface")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")  # use only the local cache; never call the network
+# Use only the local HF cache; never call the network. HF_HOME is intentionally NOT hardcoded here —
+# it defaults to the platform standard (~/.cache/huggingface) and is overridable via the environment,
+# so this tracked script never bakes in a private profile path (repo hygiene policy).
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-AUDIO = sys.argv[1] if len(sys.argv) > 1 else "/mnt/c/Users/hawzh/Desktop/Nawras - KU.wav"
+if len(sys.argv) < 2:
+    sys.exit("usage: python3 sorani_ensemble_asr.py <audio.wav> [start_ms-end_ms ...]")
+AUDIO = sys.argv[1]
+
+
+def _parse_bound(a):
+    parts = a.split("-")
+    if len(parts) != 2:
+        sys.exit(f"bad bound '{a}': expected <start_ms>-<end_ms>")
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except ValueError:
+        sys.exit(f"bad bound '{a}': start and end must be integers (milliseconds)")
+
+
 if len(sys.argv) > 2:
-    BOUNDS = [tuple(int(x) for x in a.split("-")) for a in sys.argv[2:]]
+    BOUNDS = [_parse_bound(a) for a in sys.argv[2:]]
 else:
     BOUNDS = [(0, 15000), (15000, 30000), (30000, 36000)]
 

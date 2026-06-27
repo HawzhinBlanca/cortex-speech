@@ -48,3 +48,6 @@ src-tauri/icons/*.ico
 # Local API keys — never commit
 secrets.env
 **/secrets.env
+
+# Per-machine Claude Code settings — holds absolute local paths, must not be tracked in a public repo
+.claude/settings.local.json
