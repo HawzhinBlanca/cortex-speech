@@ -509,6 +509,11 @@ impl Database {
         normalized_transcript: Option<&str>,
         confidence: Option<f64>,
     ) -> AppResult<bool> {
+        // NFC-canonicalize before writing the FTS-indexed columns, exactly like insert_segment /
+        // update_segment. The WSL 7B branch feeds raw ASR output here, which can arrive decomposed;
+        // storing a non-NFC form fragments the search index so the text can't be found.
+        let raw_nfc = to_nfc(raw_transcript);
+        let normalized_nfc = normalized_transcript.map(to_nfc);
         let rows_changed = self.conn.execute(
             "UPDATE speech_segments
              SET raw_transcript        = ?2,
@@ -518,7 +523,7 @@ impl Database {
              WHERE id = ?1
                AND (human_decision IS NULL OR human_decision = '')
                AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
-            params![segment_id, raw_transcript, normalized_transcript, confidence],
+            params![segment_id, raw_nfc, normalized_nfc, confidence],
         )?;
         self.track_write()?;
         Ok(rows_changed > 0)
@@ -914,7 +919,10 @@ impl Database {
             )?;
             let mut changed = 0usize;
             for (seg_id, cons, norm, conf) in updates {
-                changed += stmt.execute(params![seg_id, cons, norm, conf])?;
+                // NFC-canonicalize the consensus transcript + its normalization before they hit the
+                // FTS-indexed columns — same guard as the other write paths, so machine consensus
+                // doesn't store a decomposed form that search can't match.
+                changed += stmt.execute(params![seg_id, to_nfc(cons), to_nfc(norm), conf])?;
             }
             Ok(changed)
         })();
@@ -1376,6 +1384,31 @@ mod tests {
         let stored = db.get_segment_by_audio_path("/a.wav").unwrap().unwrap();
         assert_eq!(stored.raw_transcript, composed, "raw_transcript must be stored NFC-composed");
         assert_eq!(stored.annotated_transcript.as_deref(), Some(composed), "annotated must be NFC too");
+    }
+
+    #[test]
+    fn asr_and_consensus_updates_store_nfc_so_search_still_matches() {
+        // The two UPDATE paths that feed the FTS-indexed raw_transcript (the WSL 7B refinement and the
+        // machine-consensus batch) must NFC-canonicalize like the insert path, or a decomposed update
+        // silently drops the segment out of search.
+        let db = make_db();
+        let decomposed = "\u{0627}\u{0653}\u{0628}"; // NFD of "آب"
+        let composed = "\u{0622}\u{0628}"; // NFC
+
+        // update_asr_transcript_if_unreviewed
+        db.insert_segment(&make_segment("u1", "/u1.wav")).unwrap();
+        assert!(db.update_asr_transcript_if_unreviewed("u1", decomposed, Some(decomposed), Some(0.9)).unwrap());
+        let s1 = db.get_segment_by_audio_path("/u1.wav").unwrap().unwrap();
+        assert_eq!(s1.raw_transcript, composed, "ASR-update raw_transcript must be stored NFC");
+        assert!(db.search_segments(composed).unwrap().iter().any(|s| s.id == "u1"), "NFC query must find it");
+
+        // update_segment_consensus_batch
+        db.insert_segment(&make_segment("u2", "/u2.wav")).unwrap();
+        let updates = vec![("u2".to_string(), decomposed.to_string(), decomposed.to_string(), 0.8)];
+        assert_eq!(db.update_segment_consensus_batch(&updates).unwrap(), 1);
+        let s2 = db.get_segment_by_audio_path("/u2.wav").unwrap().unwrap();
+        assert_eq!(s2.raw_transcript, composed, "consensus-batch raw_transcript must be stored NFC");
+        assert!(db.search_segments(composed).unwrap().iter().any(|s| s.id == "u2"), "NFC query must find it");
     }
 
     #[test]
