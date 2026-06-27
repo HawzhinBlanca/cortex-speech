@@ -65,13 +65,30 @@ pub fn export_audio_segments(
             .map_err(|e| AppError::Other(format!("Failed to create output dir: {e}")))?;
     }
 
+    // Fail-closed: never export held-out gold eval audio, exactly like export_dataset / HF / bundle.
+    // Resolve the requested ids to segments, run the shared holdout filter, and skip any requested id
+    // that loaded but is held out. Ids that don't load are NOT excluded here, so export_single_segment
+    // still runs and reports their not-found error (preserving the original failure accounting).
+    let requested: Vec<SpeechSegment> =
+        segment_ids.iter().filter_map(|id| db.get_segment_by_id(id).ok().flatten()).collect();
+    let loaded_ids: std::collections::HashSet<String> = requested.iter().map(|s| s.id.clone()).collect();
+    let allowed_ids: std::collections::HashSet<String> =
+        crate::export::exclude_holdout_segments(db, requested)?.into_iter().map(|s| s.id).collect();
+    let holdout_excluded: std::collections::HashSet<String> = loaded_ids.difference(&allowed_ids).cloned().collect();
+
     let mut succeeded = 0usize;
     let mut failed = 0usize;
+    let mut skipped_holdout = 0usize;
     let mut files = Vec::new();
     let mut errors = Vec::new();
     let mut exported = Vec::new();
 
     for id in segment_ids {
+        if holdout_excluded.contains(id) {
+            // Intentional fail-closed exclusion; exclude_holdout_segments already logged the reason.
+            skipped_holdout += 1;
+            continue;
+        }
         match export_single_segment(db, id, &options) {
             Ok(exported_file) => {
                 succeeded += 1;
@@ -83,6 +100,10 @@ pub fn export_audio_segments(
                 errors.push(format!("{id}: {e}"));
             }
         }
+    }
+
+    if skipped_holdout > 0 {
+        tracing::warn!("Audio export: skipped {skipped_holdout} held-out gold segment(s) — not exported (fail-closed)");
     }
 
     if options.include_metadata && !exported.is_empty() {
