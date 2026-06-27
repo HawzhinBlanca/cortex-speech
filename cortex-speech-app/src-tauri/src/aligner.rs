@@ -216,13 +216,15 @@ impl ForcedAligner {
                 }
             }
 
-            let start_time = if word_start_frame != usize::MAX {
-                word_start_frame as f64 * 0.02
-            } else {
-                word_timestamps.last().map(|w: &WordTimestamp| w.end).unwrap_or(0.0)
-            };
-
-            let end_time = if word_end_frame > 0 { word_end_frame as f64 * 0.02 } else { start_time + 0.25 };
+            let prev_end = word_timestamps.last().map(|w: &WordTimestamp| w.end).unwrap_or(0.0);
+            let raw_start = if word_start_frame != usize::MAX { word_start_frame as f64 * 0.02 } else { prev_end };
+            // Enforce monotonicity: a word never starts before the previous one ended. CTC per-word
+            // frame ranges can be out of order / overlap for characters that mis-aligned (or never
+            // aligned), which otherwise yields word timestamps that jump backwards — breaking the
+            // karaoke highlight and word-tap seeks.
+            let start_time = raw_start.max(prev_end);
+            let raw_end = if word_end_frame > 0 { word_end_frame as f64 * 0.02 } else { start_time + 0.25 };
+            let end_time = raw_end.max(start_time + 0.02);
 
             word_timestamps.push(WordTimestamp {
                 word: word.to_string(),
