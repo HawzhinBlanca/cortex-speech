@@ -19,7 +19,7 @@
     ],
     "component": {
       "type": "application",
-      "bom-ref": "path+file:///C:/Users/hawzh/Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0",
+      "bom-ref": "path+file:///Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0",
       "author": "Cortex Team",
       "name": "cortex-speech-app",
       "version": "2.1.0",
@@ -40,42 +40,42 @@
       "components": [
         {
           "type": "library",
-          "bom-ref": "path+file:///C:/Users/hawzh/Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-0",
+          "bom-ref": "path+file:///Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-0",
           "name": "cortex_speech_app_lib",
           "version": "2.1.0",
           "purl": "pkg:cargo/cortex-speech-app@2.1.0?download_url=file://.#src/lib.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file:///C:/Users/hawzh/Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-1",
+          "bom-ref": "path+file:///Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-1",
           "name": "batch_importer",
           "version": "2.1.0",
           "purl": "pkg:cargo/cortex-speech-app@2.1.0?download_url=file://.#src/bin/batch_importer.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file:///C:/Users/hawzh/Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-2",
+          "bom-ref": "path+file:///Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-2",
           "name": "batch_processor",
           "version": "2.1.0",
           "purl": "pkg:cargo/cortex-speech-app@2.1.0?download_url=file://.#src/bin/batch_processor.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file:///C:/Users/hawzh/Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-3",
+          "bom-ref": "path+file:///Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-3",
           "name": "cortex-speech-app",
           "version": "2.1.0",
           "purl": "pkg:cargo/cortex-speech-app@2.1.0?download_url=file://.#src/main.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file:///C:/Users/hawzh/Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-4",
+          "bom-ref": "path+file:///Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-4",
           "name": "download_model",
           "version": "2.1.0",
           "purl": "pkg:cargo/cortex-speech-app@2.1.0?download_url=file://.#src/bin/download_model.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file:///C:/Users/hawzh/Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-5",
+          "bom-ref": "path+file:///Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0 bin-target-5",
           "name": "test_file",
           "version": "2.1.0",
           "purl": "pkg:cargo/cortex-speech-app@2.1.0?download_url=file://.#src/bin/test_file.rs"
@@ -12023,7 +12023,7 @@
   ],
   "dependencies": [
     {
-      "ref": "path+file:///C:/Users/hawzh/Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0",
+      "ref": "path+file:///Desktop/CORTEX/cortex-speech-app/src-tauri#cortex-speech-app@2.1.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#arrow-array@58.3.0",
         "registry+https://github.com/rust-lang/crates.io-index#arrow-schema@58.3.0",
