@@ -577,15 +577,39 @@ pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
     }
     let ratio = to_rate as f64 / from_rate as f64;
     let new_len = (samples.len() as f64 * ratio).ceil() as usize;
-    let mut out = Vec::with_capacity(new_len);
 
+    // Anti-aliased windowed-sinc resampling. Each output sample is a Hamming-windowed-sinc-weighted sum
+    // of the nearby SOURCE samples, with the sinc cutoff at the lower of the two Nyquist limits. When
+    // DOWNsampling (the common 44.1/48 kHz -> 16 kHz import case) that cutoff is the TARGET Nyquist, so
+    // source energy above it is removed before decimation instead of folding back as aliasing into the
+    // speech band that OmniASR/VAD consume. Plain linear interpolation (the previous implementation) is
+    // NOT an anti-alias filter and aliased every non-16 kHz import. Cost is O(new_len * 2*RADIUS).
+    use std::f64::consts::PI;
+    // Cutoff as a fraction of the SOURCE sample rate (cycles per source sample), in (0, 0.5].
+    let cutoff = if to_rate < from_rate { (to_rate as f64 / 2.0) / from_rate as f64 } else { 0.5 };
+    const RADIUS: i64 = 16; // sinc window half-width, in source samples
+    let n = samples.len() as i64;
+    let mut out = Vec::with_capacity(new_len);
     for i in 0..new_len {
-        let src_idx = i as f64 / ratio;
-        let lo = src_idx.floor() as usize;
-        let hi = (lo + 1).min(samples.len().saturating_sub(1));
-        let frac = src_idx - lo as f64;
-        let interpolated = samples[lo] as f64 * (1.0 - frac) + samples[hi] as f64 * frac;
-        out.push(interpolated as f32);
+        let center = i as f64 / ratio; // output position expressed in source samples
+        let c0 = center.floor() as i64;
+        let mut acc = 0.0f64;
+        let mut wsum = 0.0f64;
+        for j in (c0 - RADIUS)..=(c0 + RADIUS + 1) {
+            let dist = center - j as f64;
+            if dist.abs() > RADIUS as f64 {
+                continue;
+            }
+            let x = 2.0 * cutoff * dist;
+            let sinc = if x.abs() < 1e-9 { 1.0 } else { (PI * x).sin() / (PI * x) };
+            let window = 0.54 + 0.46 * (PI * dist / RADIUS as f64).cos(); // Hamming, centered
+            let weight = sinc * window;
+            let idx = j.clamp(0, n - 1) as usize; // edge clamp
+            acc += weight * samples[idx] as f64;
+            wsum += weight;
+        }
+        // Normalize by the weight sum so DC gain is exactly 1 even with edge clamping.
+        out.push(if wsum.abs() > 1e-12 { (acc / wsum) as f32 } else { 0.0 });
     }
     out
 }
@@ -1049,6 +1073,22 @@ mod tests {
         let input: Vec<f32> = (0..44100).map(|i| (i as f32 / 44100.0).sin()).collect();
         let output = resample(&input, 44100, 16000);
         assert_eq!(output.len(), 16000);
+    }
+
+    #[test]
+    fn resample_anti_aliases_above_target_nyquist_but_passes_speech_band() {
+        use std::f64::consts::PI;
+        let rms = |v: &[f32]| (v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / v.len() as f64).sqrt();
+        let tone =
+            |hz: f64| -> Vec<f32> { (0..22050).map(|i| (2.0 * PI * hz * i as f64 / 44100.0).sin() as f32).collect() };
+        // A 14 kHz tone sits ABOVE the 16 kHz target's 8 kHz Nyquist. Without an anti-alias filter it
+        // folds back into the speech band (~2 kHz) at near-full amplitude; with the windowed-sinc
+        // low-pass it is removed. Input RMS is ~0.707, so a strong attenuation proves the filter works.
+        let high = resample(&tone(14_000.0), 44100, 16000);
+        assert!(rms(&high) < 0.30, "14 kHz tone must be attenuated below target Nyquist, got rms {}", rms(&high));
+        // A 1 kHz tone is well inside the speech band and must pass through essentially intact.
+        let low = resample(&tone(1_000.0), 44100, 16000);
+        assert!(rms(&low) > 0.55, "1 kHz speech-band tone must be preserved, got rms {}", rms(&low));
     }
 
     #[test]
