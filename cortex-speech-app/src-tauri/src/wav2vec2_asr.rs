@@ -116,6 +116,19 @@ pub fn run_wav2vec2(onnx_path: &Path, vocab_path: &Path, lang: &str, audio: &[f3
     }
     let frames: Vec<Vec<f32>> = (0..frames_n).map(|i| data[i * vocab..(i + 1) * vocab].to_vec()).collect();
     let tokens = load_lang_vocab(vocab_path, lang)?;
+    // The CTC head width MUST equal the vocab token count — otherwise argmax indices map to the WRONG
+    // token (head narrower than vocab → fluent-but-wrong Kurdish) or fall off the end (head wider →
+    // dropped tokens), all SILENTLY. A mismatched/swapped model.onnx + vocab.json pair (user-supplied or
+    // env-overridden) would otherwise produce confidently-wrong output; fail hard and observably instead.
+    if vocab != tokens.len() {
+        return Err(format!(
+            "fine-tuned model/vocab mismatch: logits head width {} != vocab.json '{}' token count {} \
+             — the model.onnx and vocab.json do not correspond",
+            vocab,
+            lang,
+            tokens.len()
+        ));
+    }
     Ok(ctc_decode(&frames, &tokens))
 }
 
