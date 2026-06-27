@@ -600,6 +600,19 @@ pub fn import_audio_file(
                                     total: segment_ids.len(),
                                 },
                             );
+                            // Still emit the terminal refresh — adjudication is best-effort and the
+                            // import itself already succeeded, so the UI must not hang waiting for a
+                            // completion event that would otherwise never fire on this early return.
+                            let done_payload = serde_json::json!({
+                                "total": 1,
+                                "succeeded": 1,
+                                "failed": 0,
+                                "segmentCount": seg_count,
+                                "segmentIds": segment_ids,
+                                "source": "file",
+                            });
+                            emit_or_log(&app_clone, "import-complete", done_payload.clone());
+                            emit_or_log(&app_clone, "pipeline-complete", done_payload);
                             return;
                         };
                         let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&settings);
