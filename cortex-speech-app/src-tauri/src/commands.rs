@@ -848,9 +848,15 @@ pub fn transcribe_segment_constrained(audio_path: String) -> Result<serde_json::
 /// `transcribe_segment` path is unchanged. Resolves the model from `CORTEX_FINETUNED_ONNX` +
 /// `CORTEX_FINETUNED_VOCAB` (dev/testing) or `<models>/finetuned-mms-ckb/{model.onnx,vocab.json}`.
 #[tauri::command]
-pub fn transcribe_segment_finetuned(audio_path: String) -> Result<serde_json::Value, String> {
+pub fn transcribe_segment_finetuned(
+    audio_path: String,
+    alignment_json: Option<String>,
+) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("transcribe_segment_finetuned")?;
     validate::validate_file_path(&audio_path)?;
+    if let Some(ref aj) = alignment_json {
+        validate::validate_alignment_json(aj)?;
+    }
     let (onnx, vocab) = if let (Ok(o), Ok(v)) =
         (std::env::var("CORTEX_FINETUNED_ONNX"), std::env::var("CORTEX_FINETUNED_VOCAB"))
     {
@@ -875,8 +881,13 @@ pub fn transcribe_segment_finetuned(audio_path: String) -> Result<serde_json::Va
             }
         }
     };
-    let (_rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
-    let audio: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+    let (rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
+    // Slice out only THIS segment's clip — every VAD chunk shares the whole-source audio_path (the range
+    // lives in alignment_json), so transcribing `pcm` directly would re-transcribe the ENTIRE recording
+    // and write the whole-file text into one segment. None alignment (single-segment file) = whole file.
+    let (clip, _suffix) =
+        crate::chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref()).map_err(|e| e.to_string())?;
+    let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
     let text = crate::wav2vec2_asr::run_wav2vec2(&onnx, &vocab, "ckb", &audio)?;
     Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
 }
@@ -2750,10 +2761,31 @@ pub(crate) fn require_cloud_llm_consent(state: &AppState) -> Result<(), String> 
     }
 }
 
-/// Transcribe an audio file with ElevenLabs Scribe (verified working for Sorani). Uses the locally
-/// configured ELEVENLABS_API_KEY; errors clearly if it is absent. Returns the transcription text.
+/// Scribe-transcribe ONLY this segment's clip. Every VAD chunk shares the WHOLE-source audio_path (the
+/// per-segment range lives in alignment_json), so uploading `audio_path` directly would send the entire
+/// recording to ElevenLabs — billing for the whole file and returning the whole-recording transcript for
+/// one short segment. Decode, slice the clip by alignment, write a temp 16 kHz WAV, transcribe that, and
+/// delete the temp. `alignment_json` None (a single-segment file) sends the whole file, which is correct.
+fn scribe_transcribe_clip(audio_path: &str, alignment_json: Option<&str>, key: &str) -> Result<String, String> {
+    let (sr, pcm) = crate::audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
+    let (clip, _suffix) =
+        crate::chunking::slice_pcm_by_alignment(&pcm, sr, alignment_json).map_err(|e| e.to_string())?;
+    let tmp = std::env::temp_dir().join(format!("cortex-scribe-{}.wav", uuid::Uuid::new_v4()));
+    crate::export::write_wav_atomic(&tmp, sr, &clip).map_err(|e| e.to_string())?;
+    let result =
+        crate::scribe_api::transcribe(tmp.to_string_lossy().as_ref(), key, crate::scribe_api::DEFAULT_MODEL, "kur");
+    let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+    result.map_err(|e| e.to_string())
+}
+
+/// Transcribe ONE imported segment's clip with ElevenLabs Scribe (verified working for Sorani). Uses the
+/// locally configured ELEVENLABS_API_KEY; errors clearly if it is absent. Returns the transcription text.
 #[tauri::command]
-pub fn transcribe_audio_with_scribe(audio_path: String, state: State<'_, AppState>) -> Result<String, String> {
+pub fn transcribe_audio_with_scribe(
+    audio_path: String,
+    alignment_json: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     STRICT_RATE_LIMITER.check("transcribe_audio_with_scribe")?;
     require_cloud_stt_consent(&state)?;
     // Only audio already imported into THIS dataset may be uploaded to the cloud — never an
@@ -2767,7 +2799,7 @@ pub fn transcribe_audio_with_scribe(audio_path: String, state: State<'_, AppStat
     let key = crate::api_keys::ApiKeys::load(&data_dir)
         .elevenlabs
         .ok_or_else(|| "No ElevenLabs API key configured — add ELEVENLABS_API_KEY to secrets.env".to_string())?;
-    crate::scribe_api::transcribe(&audio_path, &key, crate::scribe_api::DEFAULT_MODEL, "kur").map_err(|e| e.to_string())
+    scribe_transcribe_clip(&audio_path, alignment_json.as_deref(), &key)
 }
 
 /// Model id for the independent ElevenLabs Scribe vote. Scribe is architecturally INDEPENDENT of the
@@ -2795,22 +2827,25 @@ pub fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<
 
     // Read which segments still need a Scribe vote, then RELEASE the db lock before any network call —
     // never hold the global db mutex across a blocking cloud request (round-7 concurrency lesson).
-    let to_vote: Vec<(String, String)> = {
+    let to_vote: Vec<(String, String, Option<String>)> = {
         let db = state.lock_db();
         let segs = db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for seg in &segs {
             let existing = db.get_hypotheses_for_segment(&seg.id).map_err(|e| e.to_string())?;
             if !existing.iter().any(|h| h.model_id == SCRIBE_VOTE_MODEL_ID) {
-                out.push((seg.id.clone(), seg.audio_path.clone()));
+                // Capture alignment_json so the Scribe vote covers the SAME audio span as the local
+                // hypotheses. Without it the vote would be the whole-recording transcript (segments share
+                // the source path), which can never align with the short local hyps and poisons consensus.
+                out.push((seg.id.clone(), seg.audio_path.clone(), seg.alignment_json.clone()));
             }
         }
         out
     };
 
     let mut added = 0usize;
-    for (segment_id, audio_path) in to_vote {
-        match crate::scribe_api::transcribe(&audio_path, &key, crate::scribe_api::DEFAULT_MODEL, "kur") {
+    for (segment_id, audio_path, alignment_json) in to_vote {
+        match scribe_transcribe_clip(&audio_path, alignment_json.as_deref(), &key) {
             Ok(transcript) => {
                 let hyp = crate::db::SegmentHypothesis {
                     segment_id,
@@ -2936,7 +2971,12 @@ pub fn run_dpo_update(state: State<'_, AppState>, endpoint: String) -> Result<St
     // so it requires the same explicit cloud-LLM opt-in (the endpoint allow-list is a separate,
     // non-consent control). Gate before building/serializing any of that private data.
     require_cloud_llm_consent(&state)?;
-    let db = state.lock_db();
+    // Build + POST on a SEPARATE WAL connection (see open_jury_db_connection), never the global lock —
+    // run_dpo_update performs a blocking outbound HTTP POST (up to ~120s on a stalled endpoint), and
+    // holding lock_db() across it would freeze every other DB-touching IPC (get_segments, search, ...)
+    // and the whole UI. Mirrors run_jury_pipeline / run_t2_for_segment.
+    let db = open_jury_db_connection(&state)
+        .ok_or_else(|| "App data directory is unavailable for the DPO update.".to_string())?;
     crate::jury::learning::run_dpo_update(&db, &endpoint).map_err(|e| e.to_string())
 }
 
