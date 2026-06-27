@@ -44,6 +44,7 @@
     const idx = RATES.indexOf(playbackRate);
     playbackRate = RATES[(idx + 1) % RATES.length];
     if (audioEl) audioEl.playbackRate = playbackRate;
+    if (playing) scheduleClipStop(); // remaining clip time changed with the rate
   }
 
   let resolveController: AbortController | null = null;
@@ -91,6 +92,7 @@
 
   // Abort any pending resolution when the component is torn down.
   onDestroy(() => {
+    clearClipStop();
     resolveController?.abort();
     audioEl?.pause();
   });
@@ -125,11 +127,46 @@
     notifications.error(message, { detail: String(cause) });
   }
 
+  // Precise clip-boundary stop. The HTMLAudioElement `timeupdate` event only fires ~every 250ms, so
+  // relying on it to stop at endTime overruns the clip by up to a quarter second — audibly bleeding the
+  // first word of the NEXT segment into every clip. Schedule a setTimeout for the exact remaining clip
+  // time so playback pauses (or loops) right at endTime; handleTimeUpdate stays as a coarse backstop.
+  let clipStopTimer: ReturnType<typeof setTimeout> | null = null;
+  function clearClipStop() {
+    if (clipStopTimer) {
+      clearTimeout(clipStopTimer);
+      clipStopTimer = null;
+    }
+  }
+  function scheduleClipStop() {
+    clearClipStop();
+    if (!audioEl || endTime <= startTime) return; // not a bounded clip
+    const remainingSec = (endTime - audioEl.currentTime) / (playbackRate || 1);
+    if (remainingSec <= 0) return;
+    clipStopTimer = setTimeout(
+      () => {
+        clipStopTimer = null;
+        if (!audioEl) return;
+        if (loop) {
+          audioEl.currentTime = startTime;
+          attemptPlay('Loop playback failed');
+        } else {
+          audioEl.pause();
+          playing = false;
+        }
+      },
+      Math.max(0, remainingSec * 1000),
+    );
+  }
+
   function attemptPlay(failureMessage: string) {
     if (!audioEl) return;
     audioEl
       .play()
-      .then(() => (playing = true))
+      .then(() => {
+        playing = true;
+        scheduleClipStop();
+      })
       .catch((e: unknown) => {
         reportPlaybackFailure(failureMessage, e);
       });
@@ -147,6 +184,7 @@
   }
 
   function pause() {
+    clearClipStop();
     audioEl?.pause();
     playing = false;
   }
@@ -198,6 +236,7 @@
     if (audioEl) {
       audioEl.currentTime = abs;
       currentTime = abs;
+      if (playing) scheduleClipStop(); // remaining clip time changed with the seek
     }
   }
 
