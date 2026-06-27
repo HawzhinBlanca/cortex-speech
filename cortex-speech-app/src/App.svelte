@@ -202,17 +202,30 @@
     return stage.replaceAll('_', ' ');
   }
 
-  // Persist the FRESH store copy of a segment (re-read by id, never a stale snapshot) so a concurrent
-  // verify/normalize/speaker action or a background reload during the debounce isn't clobbered —
-  // update_segment writes the whole row.
-  async function persistSegmentById(id: string) {
-    const fresh = $segments.find((s) => s.id === id);
-    if (!fresh) {
+  // The user-edited fields awaiting persistence, captured at edit time (NOT re-read from the store at
+  // flush time). A background segments.load() can replace the whole store array mid-debounce with fresh
+  // DB rows that DON'T contain the unsaved edit; re-reading the store then would persist the stale row
+  // and silently lose the correction. We instead merge this captured patch over the freshest row, so the
+  // user's edit always wins while any field a concurrent op changed (raw/normalized/verdict) is kept.
+  let pendingEdit: Partial<SpeechSegment> = {};
+  // Full snapshot of the segment at schedule time — the fallback base if the row is gone from the store
+  // (e.g. a reload dropped it) so we can still persist the edit.
+  let pendingSnapshot: SpeechSegment | null = null;
+
+  async function persistSegment(id: string, edit: Partial<SpeechSegment>, snapshot: SpeechSegment | null) {
+    // Prefer the freshest store row as the base (it carries any concurrent background updates), but fall
+    // back to the schedule-time snapshot if the row was reloaded out of the store. Overlay the captured
+    // user edit last so it can never be clobbered.
+    const base = $segments.find((s) => s.id === id) ?? snapshot;
+    if (!base) {
       saveState = 'idle';
       return;
     }
+    const merged: SpeechSegment = { ...base, ...edit };
     try {
-      await api.updateSegment(fresh);
+      await api.updateSegment(merged);
+      // Reflect the persisted edit back into the store so a subsequent reload doesn't revert it visually.
+      segments.update((arr) => arr.map((s) => (s.id === id ? { ...s, ...edit } : s)));
       saveState = 'saved';
       setTimeout(() => {
         if (saveState === 'saved') saveState = 'idle';
@@ -224,37 +237,50 @@
   }
 
   // Immediately fire the pending debounced save (if any), cancelling its timer. Used to drain the
-  // queue before it would otherwise be discarded.
+  // queue before it would otherwise be discarded (segment switch, component teardown).
   function flushPendingSave() {
     if (saveTimeout) {
       clearTimeout(saveTimeout);
       saveTimeout = null;
     }
     const id = pendingSaveId;
+    const edit = pendingEdit;
+    const snap = pendingSnapshot;
     pendingSaveId = null;
-    if (id) void persistSegmentById(id);
+    pendingEdit = {};
+    pendingSnapshot = null;
+    if (id) void persistSegment(id, edit, snap);
   }
 
-  function scheduleAutoSave() {
-    const id = $selectedSegment?.id;
-    if (!id) {
+  function scheduleAutoSave(patch: Partial<SpeechSegment>) {
+    const seg = $selectedSegment;
+    if (!seg) {
       saveState = 'idle';
       return;
     }
+    const id = seg.id;
     // If a save is already pending for a DIFFERENT segment, flush it NOW before we reschedule —
-    // otherwise the clearTimeout below cancels it and that segment's edit (already applied to the
-    // store) is never written. This is the exact loss when a user edits segment A then switches to and
-    // edits segment B within the 1s window.
+    // otherwise the clearTimeout below cancels it and that segment's edit is never written (the loss
+    // when a user edits segment A then switches to and edits segment B within the 1s window).
     if (pendingSaveId && pendingSaveId !== id) {
       flushPendingSave();
     }
     saveState = 'saving';
     if (saveTimeout) clearTimeout(saveTimeout);
     pendingSaveId = id;
+    pendingSnapshot = seg;
+    // Accumulate the edited fields for THIS segment so multi-field edits (text + speaker) within one
+    // window all persist; keep only this segment's edits (flush above reset pendingEdit on a switch).
+    pendingEdit = { ...pendingEdit, ...patch };
     saveTimeout = setTimeout(() => {
       saveTimeout = null;
+      const eid = pendingSaveId;
+      const edit = pendingEdit;
+      const snap = pendingSnapshot;
       pendingSaveId = null;
-      void persistSegmentById(id);
+      pendingEdit = {};
+      pendingSnapshot = null;
+      if (eid) void persistSegment(eid, edit, snap);
     }, 1000);
   }
 
@@ -271,7 +297,7 @@
     if (seg) {
       const alignmentJson = mergeWordTimestamps(seg.alignmentJson, updatedWords);
       const annotatedTranscript = updatedWords.map((w) => w.word).join(' ');
-      // Update store so auto-save picks it up
+      // Update store so the UI reflects the edit immediately...
       segments.update((arr) =>
         arr.map((s) =>
           s.id === seg.id
@@ -283,7 +309,8 @@
             : s,
         ),
       );
-      scheduleAutoSave();
+      // ...and persist exactly the fields we changed (merged over the freshest row at flush time).
+      scheduleAutoSave({ alignmentJson, annotatedTranscript });
     }
     editingWordIndex = null;
   }
@@ -2447,14 +2474,11 @@
                 oninput={(e) => {
                   const seg = $selectedSegment;
                   if (seg) {
+                    const annotatedTranscript = (e.target as HTMLTextAreaElement).value;
                     segments.update((arr) =>
-                      arr.map((s) =>
-                        s.id === seg.id
-                          ? { ...s, annotatedTranscript: (e.target as HTMLTextAreaElement).value }
-                          : s,
-                      ),
+                      arr.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript } : s)),
                     );
-                    scheduleAutoSave();
+                    scheduleAutoSave({ annotatedTranscript });
                   }
                 }}
               ></textarea>
@@ -2477,7 +2501,7 @@
                       );
                       // Persist like the annotation field, so the speaker edit isn't left only in the
                       // store (lost on reload) or silently piggybacked onto an unrelated later save.
-                      scheduleAutoSave();
+                      scheduleAutoSave({ speakerId });
                     }
                   }}
                 />
@@ -2501,10 +2525,10 @@
                       type="button"
                       class="px-1.5 py-0.5 text-[10px] rounded bg-cortex-800 text-cortex-300 font-mono cursor-pointer hover:bg-cortex-700 transition-colors border-0"
                       title="{w.word}: {w.start.toFixed(2)}s - {w.end.toFixed(2)}s"
-                      onclick={() => (currentTime = w.start)}
+                      onclick={() => (currentTime = chunkStartTime + w.start)}
                       onkeydown={(e) => {
                         if (e.key === 'Enter' || e.key === ' ') {
-                          currentTime = w.start;
+                          currentTime = chunkStartTime + w.start;
                           e.preventDefault();
                         }
                       }}
