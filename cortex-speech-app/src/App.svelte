@@ -892,6 +892,8 @@
         annotatedTranscript,
         normalizedTranscript,
         alignmentJson,
+        // A re-transcription is machine output — reset verified so it isn't kept as human-verified.
+        verified: false,
       };
       await api.updateSegment(updatedSeg);
       await loadSegments();
@@ -948,11 +950,13 @@
     pipelinePhase.set('transcribing');
     statusMessage.set($t('transcribing'));
     try {
-      const result = await api.transcribeSegmentFinetuned(seg.audioPath);
+      const result = await api.transcribeSegmentFinetuned(seg.audioPath, seg.alignmentJson);
       const updatedSeg = {
         ...seg,
         rawTranscript: result.rawTranscript,
         annotatedTranscript: result.text,
+        // A re-transcription is machine output — reset verified so it isn't kept as human-verified.
+        verified: false,
       };
       await api.updateSegment(updatedSeg);
       await loadSegments();
@@ -979,8 +983,10 @@
     pipelinePhase.set('transcribing');
     statusMessage.set($t('transcribing'));
     try {
-      const text = await api.transcribeWithScribe(seg.audioPath);
-      await api.updateSegment({ ...seg, rawTranscript: text, annotatedTranscript: text });
+      const text = await api.transcribeWithScribe(seg.audioPath, seg.alignmentJson);
+      // A fresh MACHINE re-transcription: reset verified=false so the new text is never presented as
+      // human-verified (the honesty guardrail), and so the human re-reviews the replaced transcript.
+      await api.updateSegment({ ...seg, rawTranscript: text, annotatedTranscript: text, verified: false });
       await loadSegments();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
@@ -1854,7 +1860,7 @@
         title={$t('localeToggle')}
         aria-label={$t('localeToggle')}
       >
-        {$locale === 'ckb' ? 'EN' : 'ckb'}
+        {$locale === 'ckb' ? $t('english') : $t('kurdish')}
       </button>
     </div>
   </header>
