@@ -138,6 +138,14 @@ impl ForcedAligner {
             return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
         }
         let blank_idx = self.tokens.iter().position(|t| t == "<pad>" || t == "_" || t == "<blank>").unwrap_or(0);
+        // The blank token's line index in tokens.txt must address a real column of the CTC logits. A
+        // mismatched model/tokens pair (more token lines than the model's emitted vocab dim) with the
+        // blank past vocab_size would index logits out of bounds and PANIC the alignment worker. Degrade
+        // to the energy heuristic like the other corrupt-model guards above. (Char tokens are already
+        // filtered `idx < vocab_size`, so blank_idx is the only token that can exceed the vocab.)
+        if blank_idx >= vocab_size {
+            return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
+        }
 
         // Tokenize text
         let words: Vec<&str> = text.split_whitespace().collect();
@@ -286,6 +294,12 @@ impl ForcedAligner {
             return Ok(-5.0);
         }
         let blank_idx = self.tokens.iter().position(|t| t == "<pad>" || t == "_" || t == "<blank>").unwrap_or(0);
+        // Same bound as align(): a blank token past the model's vocab dim would index logits OOB in
+        // forward_backward_ctc_score and panic. Return the neutral low score used for other degenerate
+        // models instead.
+        if blank_idx >= vocab_size {
+            return Ok(-5.0);
+        }
 
         let words: Vec<&str> = text.split_whitespace().collect();
         let mut target_tokens = Vec::new();
@@ -311,6 +325,12 @@ impl ForcedAligner {
 }
 
 fn get_log_prob(logits: &[f32], vocab_size: usize, frame: usize, token: usize) -> f32 {
+    // Defense in depth: a token index past the vocab can't be a valid logit column. Callers guard
+    // blank_idx before reaching here, but never index out of bounds on a bad model — treat it as
+    // impossible (NEG_INFINITY) rather than panicking the alignment worker.
+    if token >= vocab_size {
+        return f32::NEG_INFINITY;
+    }
     let offset = frame * vocab_size;
     let mut max_val = f32::NEG_INFINITY;
     for i in 0..vocab_size {
