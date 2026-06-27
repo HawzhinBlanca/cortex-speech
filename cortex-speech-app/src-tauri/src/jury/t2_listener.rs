@@ -164,7 +164,13 @@ fn majority_vote(samples: &[GeminiSample]) -> Option<(String, usize)> {
         }
         *counts.entry(transcript.to_string()).or_default() += 1;
     }
-    counts.into_iter().max_by_key(|(_, c)| *c).filter(|(_, c)| *c > samples.len() / 2)
+    // A self-consistency majority needs BOTH a strict majority of the surviving samples AND at least
+    // two samples that actually agree. The `>= 2` floor is load-bearing: Gemini calls that error out
+    // are dropped before this point, so without it a single surviving sample (e.g. 2 of 3 calls
+    // failed) clears `1 > 1/2 == 0` and gets reported with self_consistency_agreement: true — claiming
+    // an N-sample agreement that never occurred. One sample is no consensus; it falls to the debate
+    // path, which records the lone verdict honestly (votes: 1, agreement: false).
+    counts.into_iter().max_by_key(|(_, c)| *c).filter(|(_, c)| *c > samples.len() / 2 && *c >= 2)
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -344,6 +350,18 @@ mod tests {
         // 1/2 each — no strict majority
         let result = majority_vote(&samples);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_majority_vote_single_survivor_is_not_a_majority() {
+        // Simulates 2 of 3 Gemini calls having failed (only their successes reach majority_vote): a
+        // lone sample must NOT be reported as a self-consistency majority. It falls through to the
+        // debate/escalation path instead, which records the single verdict honestly.
+        let samples =
+            vec![GeminiSample {
+                transcript: "کوردستان".into(), reason: "only survivor".into(), confidence: 0.9
+            }];
+        assert!(majority_vote(&samples).is_none(), "one surviving sample is not a self-consistency majority");
     }
 
     #[test]
