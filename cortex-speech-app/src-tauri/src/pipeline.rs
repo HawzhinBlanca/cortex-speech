@@ -1381,7 +1381,9 @@ impl ProcessingPipeline {
         &self,
         path: &Path,
         cancel: Option<CancellationToken>,
-        agent_run_id: Option<&str>,
+        // Retained for call-site symmetry with the directory path; the jury (which consumed this for
+        // report correlation) now runs in the import command's background thread, not inline here.
+        _agent_run_id: Option<&str>,
         on_event: impl Fn(PipelineEvent),
     ) -> AppResult<Vec<SpeechSegment>> {
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
@@ -1491,91 +1493,13 @@ impl ProcessingPipeline {
                 ));
                 on_event(multi_model_hypothesis_stage(&db, fname.clone(), segments));
 
-                // ── Post-import jury adjudication (mirrors directory import) ────
-                let imported_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
-                if !imported_ids.is_empty() {
-                    on_event(PipelineEvent::Phase { phase: "adjudicating".into() });
-                    on_event(agent_stage(
-                        "jury_adjudication",
-                        "running",
-                        fname.clone(),
-                        format!("Adjudicating {} imported segment(s)", imported_ids.len()),
-                        0,
-                        imported_ids.len(),
-                    ));
-                    let source_path = path.to_string_lossy().to_string();
-                    let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&self.settings);
-                    // Correlate the persisted report with the live agent-stage events, which carry
-                    // this run id — mirrors the directory path. Previously this report stored a null
-                    // run_id, so it could not be joined to the import's stage events.
-                    report_options.agent_run_id = agent_run_id.map(str::to_string);
-                    match crate::commands::run_jury_pipeline_core(&db, &self.settings, imported_ids.clone()) {
-                        Ok(jury_report) => {
-                            on_event(agent_stage(
-                                "jury_adjudication",
-                                "completed",
-                                fname.clone(),
-                                format!(
-                                    "Reference commits: {}; review queue: {}",
-                                    jury_report["referenceCommitted"].as_u64().unwrap_or(0),
-                                    jury_report["humanInbox"].as_u64().unwrap_or(0)
-                                ),
-                                imported_ids.len(),
-                                imported_ids.len(),
-                            ));
-                            if let Err(error) = crate::runs::record_agent_import_report_with_options(
-                                &db,
-                                "file",
-                                &[source_path],
-                                &imported_ids,
-                                Some(&jury_report),
-                                None,
-                                report_options,
-                            ) {
-                                tracing::error!("Agent import report failed after single-file import: {error}");
-                                on_event(PipelineEvent::Error {
-                                    file: "agent import report".into(),
-                                    error: error.to_string(),
-                                });
-                            } else {
-                                on_event(agent_stage(
-                                    "agent_report",
-                                    "completed",
-                                    fname.clone(),
-                                    "Persisted auditable multi-agent import report",
-                                    imported_ids.len(),
-                                    imported_ids.len(),
-                                ));
-                            }
-                        }
-                        Err(error) => {
-                            let message =
-                                format!("Post-import jury adjudication failed after single-file import: {error}");
-                            tracing::error!("{message}");
-                            on_event(agent_stage(
-                                "jury_adjudication",
-                                "blocked",
-                                fname.clone(),
-                                message.clone(),
-                                0,
-                                imported_ids.len(),
-                            ));
-                            // Still persist the report with error context
-                            if let Err(report_error) = crate::runs::record_agent_import_report_with_options(
-                                &db,
-                                "file",
-                                &[source_path],
-                                &imported_ids,
-                                None,
-                                Some(error.as_str()),
-                                report_options,
-                            ) {
-                                tracing::error!("Failed to persist error agent report: {report_error}");
-                            }
-                            on_event(PipelineEvent::Error { file: fname.clone(), error: message });
-                        }
-                    }
-                }
+                // Post-import jury adjudication is intentionally NOT run here. The import COMMAND
+                // (commands.rs `import_audio_file`) runs it on a background thread with its OWN WAL
+                // database connection, so the heavy ASR-bearing jury never holds the shared DB lock
+                // and starves the UI's get_segments. Running it here too made single-file import
+                // adjudicate — and make any opted-in cloud LLM calls — TWICE and persist two agent
+                // import reports for one import. The directory path keeps its own inline jury because
+                // it batches every file's segments into a single adjudication.
             }
             Err(_) => {
                 self.set_import_status(chunks_done, estimated_chunks, &fname);
