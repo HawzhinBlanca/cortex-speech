@@ -107,9 +107,19 @@ impl HistoryManager {
         match cmd {
             Some(cmd) => {
                 let description = cmd.description().to_string();
-                self.apply_undo(db, &cmd)?;
-                self.lock_redo_stack().push_back(cmd);
-                Ok(Some(description))
+                // Apply BEFORE moving the command to the redo stack. If apply fails, push the command
+                // BACK onto the undo stack so it isn't lost from BOTH stacks (which would corrupt the
+                // history and mis-order future undo/redo).
+                match self.apply_undo(db, &cmd) {
+                    Ok(()) => {
+                        self.lock_redo_stack().push_back(cmd);
+                        Ok(Some(description))
+                    }
+                    Err(e) => {
+                        self.lock_undo_stack().push_back(cmd);
+                        Err(e)
+                    }
+                }
             }
             None => Ok(None),
         }
@@ -123,9 +133,20 @@ impl HistoryManager {
         match cmd {
             Some(cmd) => {
                 let description = cmd.description().to_string();
-                self.apply_redo(db, &cmd)?;
-                self.lock_undo_stack().push_back(cmd);
-                Ok(Some(description))
+                // Same invariant as undo: only move the command to the undo stack if the redo actually
+                // applied. BatchTranscribe redo returns Err (unsupported) — without this, the command was
+                // popped off the redo stack and never re-pushed, vanishing from history and corrupting
+                // the stacks. On failure, return it to the redo stack.
+                match self.apply_redo(db, &cmd) {
+                    Ok(()) => {
+                        self.lock_undo_stack().push_back(cmd);
+                        Ok(Some(description))
+                    }
+                    Err(e) => {
+                        self.lock_redo_stack().push_back(cmd);
+                        Err(e)
+                    }
+                }
             }
             None => Ok(None),
         }
@@ -141,7 +162,11 @@ impl HistoryManager {
             Command::DeleteSegments { segments } => {
                 for seg in segments {
                     if db.get_segment_by_id(&seg.id)?.is_none() {
-                        db.insert_segment(seg)?;
+                        // restore_segment (NOT insert_segment) — the row is gone, so we must rewrite the
+                        // jury/review columns (verdict, human_decision, is_gold, ...) too. insert_segment
+                        // omits them, which on a from-nothing resurrect would silently wipe the human's
+                        // verdict and gold flag and make undo destructive.
+                        db.restore_segment(seg)?;
                     }
                 }
             }
@@ -270,6 +295,50 @@ mod tests {
         assert!(desc.is_some());
         let redone = db.get_segment_by_id("test1").unwrap().unwrap();
         assert_eq!(redone.raw_transcript, "hello universe");
+    }
+
+    #[test]
+    fn undo_delete_restores_full_jury_and_gold_state() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        // A reviewed, gold segment carrying jury/human state.
+        let mut seg = make_segment("g1", "کوردستان");
+        seg.verified = true;
+        seg.verdict = Some("human_accept".to_string());
+        seg.human_decision = Some("human_edit".to_string());
+        seg.is_gold = true;
+        seg.agent_confidence = Some(0.9);
+        seg.rationale = Some("reviewed".to_string());
+        db.restore_segment(&seg).unwrap();
+
+        // Snapshot exactly what the delete command captures, delete, then undo.
+        let snapshot = db.get_segment_by_id("g1").unwrap().unwrap();
+        assert_eq!(snapshot.verdict.as_deref(), Some("human_accept"));
+        db.delete_segment("g1").unwrap();
+        history.push(Command::DeleteSegments { segments: vec![snapshot] });
+        assert!(db.get_segment_by_id("g1").unwrap().is_none());
+
+        history.undo(&db).unwrap();
+        let restored = db.get_segment_by_id("g1").unwrap().unwrap();
+        assert_eq!(restored.verdict.as_deref(), Some("human_accept"), "verdict must survive undo of delete");
+        assert_eq!(restored.human_decision.as_deref(), Some("human_edit"), "human_decision must survive");
+        assert!(restored.is_gold, "is_gold must survive undo of delete");
+        assert_eq!(restored.agent_confidence, Some(0.9), "agent_confidence must survive");
+    }
+
+    #[test]
+    fn redo_of_unsupported_batch_transcribe_keeps_the_command() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        let prev = make_segment("b1", "old");
+        db.insert_segment(&prev).unwrap();
+        history.push(Command::BatchTranscribe { previous_segments: vec![prev] });
+        history.undo(&db).unwrap(); // moves it to the redo stack
+        assert!(history.can_redo());
+        // BatchTranscribe redo is unsupported (returns Err) — but the command must NOT vanish from the
+        // stacks, or future undo/redo would mis-order.
+        assert!(history.redo(&db).is_err());
+        assert!(history.can_redo(), "the unredoable command must remain on the redo stack, not be lost");
     }
 
     #[test]
