@@ -809,6 +809,12 @@ impl Database {
     }
 
     pub fn insert_hypothesis(&self, hyp: &SegmentHypothesis) -> AppResult<()> {
+        // NFC-canonicalize the vote at this single chokepoint so EVERY engine's hypothesis (local
+        // 300M/1B/WSL-7B and cloud Scribe) is stored in the same normalization form. The jury scores
+        // agreement by exact surface word-equality (diff/phonetic.rs); without this, two engines that
+        // emit the same Sorani text in different forms (NFD vs NFC) would be scored as disagreeing and
+        // a real consensus would be spuriously escalated. Matches the NFC enforced on speech_segments.
+        let transcript = to_nfc(&hyp.transcript);
         self.conn.execute(
             "INSERT INTO segment_hypotheses (segment_id, model_id, transcript, confidence)
              VALUES (?1, ?2, ?3, ?4)
@@ -816,7 +822,7 @@ impl Database {
                 transcript=excluded.transcript,
                 confidence=excluded.confidence,
                 created_at=datetime('now')",
-            params![hyp.segment_id, hyp.model_id, hyp.transcript, hyp.confidence],
+            params![hyp.segment_id, hyp.model_id, transcript, hyp.confidence],
         )?;
         Ok(())
     }
@@ -1480,6 +1486,30 @@ mod tests {
         let s2 = db.get_segment_by_audio_path("/u2.wav").unwrap().unwrap();
         assert_eq!(s2.raw_transcript, composed, "consensus-batch raw_transcript must be stored NFC");
         assert!(db.search_segments(composed).unwrap().iter().any(|s| s.id == "u2"), "NFC query must find it");
+    }
+
+    #[test]
+    fn insert_hypothesis_stores_nfc_so_jury_agreement_is_not_normalization_fragile() {
+        // The jury scores inter-engine agreement by exact surface word-equality. If two engines emit the
+        // same Sorani word in different normalization forms (NFD vs NFC), a real consensus would be
+        // mis-scored as a disagreement and spuriously escalated. insert_hypothesis must NFC-canonicalize
+        // every vote (local 300M/1B/WSL-7B and cloud Scribe), exactly like the segment write paths.
+        let db = make_db();
+        let decomposed = "\u{0627}\u{0653}\u{0628}"; // ا + ◌ٓ + ب  (NFD of "آب")
+        let composed = "\u{0622}\u{0628}"; // آب (NFC)
+        assert_ne!(decomposed, composed, "fixture must actually differ before NFC");
+
+        db.insert_segment(&make_segment("h1", "/h1.wav")).unwrap();
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: "h1".to_string(),
+            model_id: "engine-nfd".to_string(),
+            transcript: decomposed.to_string(),
+            confidence: Some(0.9),
+        })
+        .unwrap();
+        let hyps = db.get_hypotheses_for_segment("h1").unwrap();
+        assert_eq!(hyps.len(), 1, "exactly one hypothesis stored");
+        assert_eq!(hyps[0].transcript, composed, "hypothesis vote must be stored NFC-composed, not NFD");
     }
 
     #[test]
