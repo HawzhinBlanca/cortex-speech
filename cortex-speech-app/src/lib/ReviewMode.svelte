@@ -107,6 +107,10 @@
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       editCache.delete(seg.id); // persisted — drop the in-progress copy
       lastLoadedOriginal = text; // the saved text is now the baseline for dirty-tracking
+      // Align editText with the saved baseline BEFORE advance() triggers the clip-switch effect.
+      // Otherwise, on "Accept as-is" (text = original, but editText still holds a typed-then-discarded
+      // edit) the stash branch would re-cache that discarded edit for this id and resurrect it on return.
+      editText = text;
       notifications.success($t('saved'));
       advance();
     } catch (e) {
