@@ -20,6 +20,14 @@ import html
 import json
 import sys
 from pathlib import Path
+from urllib.parse import quote
+
+
+def file_url(p: Path) -> str:
+    """A percent-encoded file:// URL. Without encoding, a path with a space (the project's own default
+    Halwest dirs contain one), '#', '?', '%', or a non-ASCII Kurdish filename produces an invalid URL,
+    so the WebView2/Chromium <audio> fails to load and the play button is silently dead."""
+    return "file:///" + quote(p.as_posix().lstrip("/"), safe="/:")
 
 AUDIO_KEYS = ["audio", "audio_filepath", "audio_file", "audio_path", "review_audio_file"]
 TEXT_KEYS = ["text", "draft_text", "raw_transcript", "transcript", "normalized_transcript"]
@@ -91,12 +99,12 @@ def audio_src(p, embed: bool, per_clip_limit: int, budget: list):
     if not p.is_file():
         return "", "audio not found"
     if not embed:
-        return "file:///" + p.as_posix().lstrip("/"), ""
+        return file_url(p), ""
     size = p.stat().st_size
     if size > per_clip_limit:
-        return "file:///" + p.as_posix().lstrip("/"), f"clip too large to embed ({size // 1024} KB); linked by file path"
+        return file_url(p), f"clip too large to embed ({size // 1024} KB); linked by file path"
     if budget[0] - size < 0:
-        return "file:///" + p.as_posix().lstrip("/"), "embed budget exhausted; linked by file path"
+        return file_url(p), "embed budget exhausted; linked by file path"
     budget[0] -= size
     mime = MIME.get(p.suffix.lower(), "application/octet-stream")
     b64 = base64.b64encode(p.read_bytes()).decode("ascii")
