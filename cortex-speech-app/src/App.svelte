@@ -122,6 +122,10 @@
 
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle');
   let saveTimeout: ReturnType<typeof setTimeout> | null = null;
+  // The segment id the currently-pending debounced save is for. Tracked so that switching to and
+  // editing a DIFFERENT segment within the debounce window flushes the first segment's save instead
+  // of silently cancelling it (see scheduleAutoSave).
+  let pendingSaveId: string | null = null;
   let tauriAvailable = $state(false);
   // Session view-state persistence: only start saving once the prior session has been restored, so
   // the initial restore->apply does not race a default-valued save over it.
@@ -198,36 +202,59 @@
     return stage.replaceAll('_', ' ');
   }
 
+  // Persist the FRESH store copy of a segment (re-read by id, never a stale snapshot) so a concurrent
+  // verify/normalize/speaker action or a background reload during the debounce isn't clobbered —
+  // update_segment writes the whole row.
+  async function persistSegmentById(id: string) {
+    const fresh = $segments.find((s) => s.id === id);
+    if (!fresh) {
+      saveState = 'idle';
+      return;
+    }
+    try {
+      await api.updateSegment(fresh);
+      saveState = 'saved';
+      setTimeout(() => {
+        if (saveState === 'saved') saveState = 'idle';
+      }, 2000);
+    } catch (e) {
+      saveState = 'idle';
+      notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+    }
+  }
+
+  // Immediately fire the pending debounced save (if any), cancelling its timer. Used to drain the
+  // queue before it would otherwise be discarded.
+  function flushPendingSave() {
+    if (saveTimeout) {
+      clearTimeout(saveTimeout);
+      saveTimeout = null;
+    }
+    const id = pendingSaveId;
+    pendingSaveId = null;
+    if (id) void persistSegmentById(id);
+  }
+
   function scheduleAutoSave() {
-    saveState = 'saving';
-    if (saveTimeout) clearTimeout(saveTimeout);
-    // Capture only the target segment ID now (so selecting a different segment within 1s still saves
-    // the RIGHT one), then re-read the FRESH segment from the store at fire time. Persisting a
-    // whole-segment snapshot captured now would clobber any field — verified / speakerId /
-    // normalizedTranscript — that a concurrent verify/normalize/speaker action, or a background
-    // reload (WSL/import completion), changed during the 1s debounce, because update_segment writes
-    // the entire row.
     const id = $selectedSegment?.id;
     if (!id) {
       saveState = 'idle';
       return;
     }
-    saveTimeout = setTimeout(async () => {
-      const fresh = $segments.find((s) => s.id === id);
-      if (!fresh) {
-        saveState = 'idle';
-        return;
-      }
-      try {
-        await api.updateSegment(fresh);
-        saveState = 'saved';
-        setTimeout(() => {
-          if (saveState === 'saved') saveState = 'idle';
-        }, 2000);
-      } catch (e) {
-        saveState = 'idle';
-        notifications.error($t('notifications.saveFailed'), { detail: String(e) });
-      }
+    // If a save is already pending for a DIFFERENT segment, flush it NOW before we reschedule —
+    // otherwise the clearTimeout below cancels it and that segment's edit (already applied to the
+    // store) is never written. This is the exact loss when a user edits segment A then switches to and
+    // edits segment B within the 1s window.
+    if (pendingSaveId && pendingSaveId !== id) {
+      flushPendingSave();
+    }
+    saveState = 'saving';
+    if (saveTimeout) clearTimeout(saveTimeout);
+    pendingSaveId = id;
+    saveTimeout = setTimeout(() => {
+      saveTimeout = null;
+      pendingSaveId = null;
+      void persistSegmentById(id);
     }, 1000);
   }
 
