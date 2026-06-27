@@ -7,9 +7,11 @@ import subprocess
 # Reconfigure stdout for proper UTF-8 output
 sys.stdout.reconfigure(encoding='utf-8')
 
-DB_PATH = os.path.join(os.environ['APPDATA'], "cortex-speech", "cortex-speech.db")
-INPUT_AUDIO = r"C:\Users\CortexUser\Desktop\CortexAudio\كوردي\1Cheshti Mjewr⧸Hajar MukryaniBashi1.mp3"
-OUTPUT_DIR = r"C:\Users\CortexUser\Desktop\CORTEX\kurdish_datasets\1Cheshti_Mjewr"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
+DB_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~/AppData/Roaming"), "cortex-speech", "cortex-speech.db")
+INPUT_AUDIO = os.environ.get("CORTEX_AUDIO", "")
+OUTPUT_DIR = os.path.join(_HERE, "kurdish_datasets", "1Cheshti_Mjewr")
 WAVS_DIR = os.path.join(OUTPUT_DIR, "wavs")
 
 def main():
@@ -18,6 +20,9 @@ def main():
     print(f"File: {INPUT_AUDIO}")
     print(f"Output Directory: {OUTPUT_DIR}")
     print("====================================================")
+
+    if not INPUT_AUDIO:
+        sys.exit("set CORTEX_AUDIO to the path of the input audio file")
 
     if not os.path.exists(INPUT_AUDIO):
         print(f"Error: Input audio file does not exist at: {INPUT_AUDIO}")

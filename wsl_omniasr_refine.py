@@ -9,8 +9,15 @@ import re
 import shutil
 
 # Paths inside WSL
-DB_PATH = "/mnt/c/Users/hawzh/AppData/Roaming/cortex-speech/cortex-speech.db"
-CORTEX_DIR = "/mnt/c/Users/hawzh/Desktop/CORTEX"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+CORTEX_DIR = _HERE
+# Derive the AppData DB from _HERE (.../Users/<user>/Desktop/CORTEX) with no hardcoded
+# username; allow CORTEX_DB to override (APPDATA is typically unset under WSL).
+_DEFAULT_DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(_HERE)),
+    "AppData", "Roaming", "cortex-speech", "cortex-speech.db",
+)
+DB_PATH = os.environ.get("CORTEX_DB", _DEFAULT_DB_PATH)
 
 def normalize_ckb(text):
     if not text:
@@ -40,11 +47,15 @@ def to_wsl_path(win_path):
     # Replace drive letter (e.g. C:) with mount point (e.g. /mnt/c)
     if p.startswith('C:/') or p.startswith('c:/'):
         p = '/mnt/c/' + p[3:]
-    
-    # Correct path redirection for Lamo Voice Samples if it contains the old Desktop path
-    if "Desktop/Lamo Voice Samples" in p:
-        p = p.replace("Desktop/Lamo Voice Samples", "Desktop/CortexAudio/Lamo Voice Samples")
-        
+
+    # Optional path redirection: set CORTEX_AUDIO_REDIRECT="from=>to" to rewrite a
+    # stored audio prefix to its current on-disk location (no hardcoded private path).
+    _redirect = os.environ.get("CORTEX_AUDIO_REDIRECT", "")
+    if "=>" in _redirect:
+        _from, _to = (part.strip() for part in _redirect.split("=>", 1))
+        if _from and _from in p:
+            p = p.replace(_from, _to)
+
     return p
 
 def get_db_connection(db_path):

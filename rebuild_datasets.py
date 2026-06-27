@@ -5,7 +5,9 @@ import subprocess
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-DATASETS_DIR = r"C:\Users\CortexUser\Desktop\CORTEX\kurdish_datasets"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
+DATASETS_DIR = os.path.join(_HERE, "kurdish_datasets")
 
 def clean_dir(path):
     if os.path.exists(path):

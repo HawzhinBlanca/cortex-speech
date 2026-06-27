@@ -6,8 +6,10 @@ import sys
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-MANIFEST_PATH = r"C:\Users\CortexUser\Desktop\CORTEX\kurdish_datasets\manifest_verified.json"
-DB_PATH = r"C:\Users\CortexUser\AppData\Roaming\cortex-speech\cortex-speech.db"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
+MANIFEST_PATH = os.path.join(_HERE, "kurdish_datasets", "manifest_verified.json")
+DB_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~/AppData/Roaming"), "cortex-speech", "cortex-speech.db")
 
 # Kurdish Number Spelling Converter
 def num_to_kurdish(n):

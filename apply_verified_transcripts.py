@@ -5,7 +5,9 @@ import sys
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-MANIFEST_VERIFIED_PATH = r"C:\Users\CortexUser\Desktop\CORTEX\kurdish_datasets\manifest_verified.json"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
+MANIFEST_VERIFIED_PATH = os.path.join(_HERE, "kurdish_datasets", "manifest_verified.json")
 DB_PATH = os.path.join(os.environ['APPDATA'], 'cortex-speech', 'cortex-speech.db')
 
 def apply_verified_transcripts():

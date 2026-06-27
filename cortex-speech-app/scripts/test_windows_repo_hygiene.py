@@ -1,8 +1,17 @@
 import re
+import subprocess
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# The actual git root / PUBLIC remote is the PARENT of cortex-speech-app/ (which is a plain subdirectory,
+# not a submodule). The private-path gate must scan that whole public surface, or root-level dev scripts
+# leak the owner's profile path with the gate still green.
+GIT_ROOT = REPO_ROOT.parent
+# Pure DATA files whose tracked content embeds the owner's local audio paths. Exempt from this
+# source-hygiene gate by explicit decision (sanitizing data paths could change how the owner re-uses the
+# dataset); the leak is tracked separately, not silently cleared. Suffix-matched so a script can't hide here.
+DATASET_EXEMPT_SUFFIXES = ("_perfect_dataset.json",)
 SKIP_DIRS = {
     ".claude",  # per-machine editor/tool config (settings.local.json), not shipped app source
     ".git",
@@ -64,6 +73,24 @@ def test_no_windows_reserved_repo_entries() -> None:
         raise AssertionError(f"Windows-reserved repo entries break tooling:\n{formatted}")
 
 
+def _git_tracked_text_files(root: Path) -> list[tuple[str, Path]]:
+    """The PUBLIC surface = git-tracked text files at the git root (what actually ships). Scanning
+    tracked files, not a filesystem walk, avoids false positives from untracked local scratch and
+    correctly covers the whole repo, not just the cortex-speech-app/ subtree."""
+    out = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z"], capture_output=True, text=True, check=True
+    )
+    files: list[tuple[str, Path]] = []
+    for rel in out.stdout.split("\0"):
+        rel = rel.strip()
+        if not rel:
+            continue
+        path = root / rel
+        if path.suffix.lower() in TEXT_EXTENSIONS and path.is_file():
+            files.append((rel.replace("\\", "/"), path))
+    return files
+
+
 def test_no_hardcoded_local_windows_profile_paths() -> None:
     offenders: list[str] = []
     # Catch a private profile path in EVERY form a leak realistically takes, not just native
@@ -79,11 +106,22 @@ def test_no_hardcoded_local_windows_profile_paths() -> None:
     ]
     # This file defines the forbidden patterns as string literals and documents them in comments, so it
     # would match itself — a pattern-detector cannot scan its own pattern definitions. Exempt it.
-    self_path = Path(__file__).resolve()
-    for path in iter_repo_paths(REPO_ROOT):
-        if not path.is_file() or path.suffix.lower() not in TEXT_EXTENSIONS:
+    self_rel = str(Path(__file__).resolve().relative_to(GIT_ROOT.resolve())).replace("\\", "/")
+    try:
+        tracked = _git_tracked_text_files(GIT_ROOT)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # No git available: fall back to the cortex-speech-app/ filesystem walk (original, narrower scope).
+        tracked = [
+            (str(p.relative_to(GIT_ROOT)).replace("\\", "/"), p)
+            for p in iter_repo_paths(REPO_ROOT)
+            if p.is_file() and p.suffix.lower() in TEXT_EXTENSIONS
+        ]
+    exempt_datasets: list[str] = []
+    for rel, path in tracked:
+        if rel == self_rel:
             continue
-        if path.resolve() == self_path:
+        if rel.endswith(DATASET_EXEMPT_SUFFIXES):
+            exempt_datasets.append(rel)
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         for line_no, line in enumerate(text.splitlines(), start=1):
@@ -91,10 +129,15 @@ def test_no_hardcoded_local_windows_profile_paths() -> None:
             # normalizes to C:\Users\ and is caught like the plain native form.
             normalized = re.sub(r"\\+", "\\\\", line)
             if any(forbidden in normalized for forbidden in forbidden_paths):
-                offenders.append(f"{path.relative_to(REPO_ROOT)}:{line_no}:{line.strip()}")
+                offenders.append(f"{rel}:{line_no}:{line.strip()}")
+    if exempt_datasets:
+        print(
+            f"  NOTE: {len(exempt_datasets)} dataset data file(s) exempt from path-hygiene "
+            f"(leak tracked separately): {', '.join(sorted(exempt_datasets))}"
+        )
     if offenders:
         formatted = "\n".join(f"- {entry}" for entry in offenders)
-        raise AssertionError(f"Source files must not hardcode private local Windows paths:\n{formatted}")
+        raise AssertionError(f"Tracked files must not hardcode a private local profile path (public repo):\n{formatted}")
 
 
 def main() -> None:

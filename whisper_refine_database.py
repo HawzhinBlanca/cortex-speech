@@ -11,9 +11,11 @@ import re
 
 sys.stdout.reconfigure(encoding='utf-8')
 
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+
 appdata = os.environ.get("APPDATA")
-DB_PATH = os.path.join(appdata, "cortex-speech", "cortex-speech.db") if appdata else r"C:\Users\CortexUser\AppData\Roaming\cortex-speech\cortex-speech.db"
-CORTEX_DIR = r"C:\Users\CortexUser\Desktop\CORTEX"
+DB_PATH = os.path.join(appdata, "cortex-speech", "cortex-speech.db") if appdata else os.path.expanduser("~/AppData/Roaming/cortex-speech/cortex-speech.db")
+CORTEX_DIR = _HERE
 
 # Fine-tuned Kurdish Whisper model on Hugging Face
 MODEL_NAME = "razhan/whisper-base-ckb"

@@ -13,17 +13,18 @@ import tempfile
 # Reconfigure stdout for proper UTF-8 output
 sys.stdout.reconfigure(encoding='utf-8')
 
-TARGET_DIR = r"C:\Users\CortexUser\Desktop\CortexAudio\كوردي"
-CORTEX_DIR = r"C:\Users\CortexUser\Desktop\CORTEX"
+_HERE = os.path.dirname(os.path.abspath(__file__))   # == the CORTEX repo root
+CORTEX_DIR = _HERE
+TARGET_DIR = os.environ.get("CORTEX_AUDIO_DIR", "")
 LOG_FILE = os.path.join(CORTEX_DIR, "ingest_folder.log")
 
-SHERPA_EXE = os.path.join(CORTEX_DIR, r"sherpa-onnx-v1.13.2-win-x64-shared-MD-Release\bin\sherpa-onnx-vad-with-offline-asr.exe")
-VAD_MODEL = os.path.join(CORTEX_DIR, r"cortex-speech-app\src-tauri\models\silero_vad_v4.onnx")
-TOKENS = os.path.join(CORTEX_DIR, r"cortex-speech-app\src-tauri\models\omniasr-ctc-300m\tokens.txt")
-ASR_MODEL = os.path.join(CORTEX_DIR, r"cortex-speech-app\src-tauri\models\omniasr-ctc-300m\model.int8.onnx")
+SHERPA_EXE = os.path.join(CORTEX_DIR, "sherpa-onnx-v1.13.2-win-x64-shared-MD-Release", "bin", "sherpa-onnx-vad-with-offline-asr.exe")
+VAD_MODEL = os.path.join(CORTEX_DIR, "cortex-speech-app", "src-tauri", "models", "silero_vad_v4.onnx")
+TOKENS = os.path.join(CORTEX_DIR, "cortex-speech-app", "src-tauri", "models", "omniasr-ctc-300m", "tokens.txt")
+ASR_MODEL = os.path.join(CORTEX_DIR, "cortex-speech-app", "src-tauri", "models", "omniasr-ctc-300m", "model.int8.onnx")
 
 appdata = os.environ.get("APPDATA")
-DB_PATH = os.path.join(appdata, "cortex-speech", "cortex-speech.db") if appdata else os.path.join(CORTEX_DIR, "cortex-speech.db")
+DB_PATH = os.path.join(appdata, "cortex-speech", "cortex-speech.db") if appdata else os.path.expanduser("~/AppData/Roaming/cortex-speech/cortex-speech.db")
 
 CHUNK_DURATION_SEC = 180 # Split large audio files into 3-minute chunks for fast, memory-safe processing
 
@@ -258,6 +259,8 @@ def main():
     log(f"Target Database: {DB_PATH}")
     log("====================================================")
     
+    if not TARGET_DIR:
+        sys.exit("set CORTEX_AUDIO_DIR to the folder of audio files to ingest")
     if not os.path.exists(TARGET_DIR):
         log(f"Error: Target directory does not exist: {TARGET_DIR}")
         return
