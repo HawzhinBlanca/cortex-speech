@@ -85,11 +85,18 @@
     loadWaveform(seg);
   });
 
+  // Drop a stale getWaveform response: switching clips A -> B while A's decode (up to ~30 s for a large
+  // source) is still in flight must NOT let A's later-resolving waveform overwrite B's. Last-call-wins via
+  // a monotonic sequence, mirroring segmentStore.load()'s loadSeq guard.
+  let waveformLoadSeq = 0;
   async function loadWaveform(seg: SpeechSegment) {
+    const seq = ++waveformLoadSeq;
     try {
-      waveformData = await api.getWaveform(seg.audioPath, 240, seg.alignmentJson);
+      const data = await api.getWaveform(seg.audioPath, 240, seg.alignmentJson);
+      if (seq !== waveformLoadSeq) return; // a newer clip started loading; this response is stale
+      waveformData = data;
     } catch {
-      waveformData = [];
+      if (seq === waveformLoadSeq) waveformData = [];
     }
   }
 
