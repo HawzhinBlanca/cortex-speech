@@ -240,14 +240,24 @@ export async function startEventListeners() {
   // for in-panel display (status pill / running flag) — the side effects live here, fired exactly once.
   const unlistenWslStatus = await listen<{
     status: 'completed' | 'failed' | 'cancelled';
+    transcribed?: number;
+    failed?: number;
     exit_code: number;
   }>('wsl-status', (event) => {
-    const { status, exit_code } = event.payload;
+    const { status, transcribed = 0, failed = 0, exit_code } = event.payload;
     if (status === 'completed') {
-      notifications.success('WSL 7B refinement batch complete');
+      // Honest completion: never a plain green "success" when segments failed or nothing was written.
       void segments.load();
+      if (failed > 0) {
+        notifications.warning(`WSL 7B batch: ${transcribed} transcribed, ${failed} failed`);
+      } else if (transcribed > 0) {
+        notifications.success(`WSL 7B batch complete: ${transcribed} transcribed`);
+      } else {
+        notifications.info('WSL 7B batch: no segments needed transcription');
+      }
     } else if (status === 'cancelled') {
-      notifications.warning('WSL 7B refinement batch cancelled');
+      void segments.load();
+      notifications.warning(`WSL 7B batch cancelled (${transcribed} transcribed before stopping)`);
     } else {
       notifications.error(`WSL 7B refinement failed (exit code ${exit_code})`);
     }

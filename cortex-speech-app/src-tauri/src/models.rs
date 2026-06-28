@@ -275,6 +275,7 @@ pub struct ModelMeta {
     pub version: String,
 }
 
+#[derive(Clone)]
 pub struct ModelManager {
     pub models_dir: PathBuf,
 }
