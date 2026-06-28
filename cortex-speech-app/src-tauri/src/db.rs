@@ -1100,7 +1100,16 @@ impl Database {
 
     // ── Jury DB helpers ───────────────────────────────────────────────────────
 
-    /// Write a jury verdict to a segment (used by T0, T1, T2 and human review).
+    /// Write a MACHINE jury verdict to a segment (T0/T1/T2 and the agentic/escalation paths).
+    ///
+    /// The human-review path is `record_human_decision`, NOT this function. A machine verdict must never
+    /// overwrite a human decision: the jury runs on a SEPARATE WAL connection from the human path, reads
+    /// its segment snapshot once at the start of a run, then may block for seconds on a T2 cloud call —
+    /// so a curator can accept/edit the same segment mid-run. Without this guard the late machine write
+    /// would silently revert the human's `verdict` (the COALESCE-preferred gold transcript source) and
+    /// flip `escalated` back, mis-routing the segment. The predicate mirrors the consensus/ASR write
+    /// paths (the `human_decision`/`verdict NOT IN (human_*)` guards elsewhere in this file): a verdict
+    /// for an already-human-decided segment matches 0 rows and is a no-op, leaving the human authoritative.
     #[allow(clippy::too_many_arguments)]
     pub fn write_segment_verdict(
         &self,
@@ -1112,7 +1121,7 @@ impl Database {
         agent_confidence: Option<f64>,
         escalated: bool,
     ) -> AppResult<()> {
-        self.conn.execute(
+        let affected = self.conn.execute(
             "UPDATE speech_segments
              SET verdict            = ?2,
                  verdict_transcript = ?3,
@@ -1121,9 +1130,18 @@ impl Database {
                  agent_confidence   = ?6,
                  escalated          = ?7,
                  updated_at         = datetime('now')
-             WHERE id = ?1",
+             WHERE id = ?1
+               AND (human_decision IS NULL OR human_decision = '')
+               AND (verdict IS NULL OR verdict NOT IN ('human_accept', 'human_edit', 'human_reject'))",
             params![segment_id, verdict, transcript, rationale, evidence_json, agent_confidence, escalated as i32],
         )?;
+        if affected == 0 {
+            // Either the row is gone or a human already decided it — in both cases the machine verdict
+            // correctly does not apply. Logged (not an error) so the no-op is visible without masking it.
+            tracing::debug!(
+                "write_segment_verdict({segment_id}, {verdict}): no-op — segment is human-decided or missing"
+            );
+        }
         self.track_write()?;
         Ok(())
     }
@@ -1510,6 +1528,30 @@ mod tests {
         let hyps = db.get_hypotheses_for_segment("h1").unwrap();
         assert_eq!(hyps.len(), 1, "exactly one hypothesis stored");
         assert_eq!(hyps[0].transcript, composed, "hypothesis vote must be stored NFC-composed, not NFD");
+    }
+
+    #[test]
+    fn machine_verdict_never_overwrites_a_human_decision() {
+        // The jury (machine) write runs on a separate connection and may land AFTER a curator decided the
+        // same segment mid-run. The human is authoritative: a late write_segment_verdict must be a no-op,
+        // never reverting the human verdict/transcript or re-escalating an accepted segment.
+        let db = make_db();
+        db.insert_segment(&make_segment("hv1", "/hv1.wav")).unwrap();
+        db.record_human_decision("hv1", "accept", None).unwrap();
+
+        db.write_segment_verdict("hv1", "jury_accept", Some("machine consensus"), Some("r"), None, Some(0.9), true)
+            .unwrap();
+
+        let seg = db.get_segment_by_id("hv1").unwrap().unwrap();
+        assert_eq!(seg.verdict.as_deref(), Some("human_accept"), "machine verdict clobbered the human decision");
+        assert_eq!(seg.human_decision.as_deref(), Some("accept"), "human_decision must be preserved");
+        assert!(!seg.escalated, "a human-accepted segment must not be re-escalated by a late machine write");
+
+        // Sanity: the SAME machine write DOES apply to a fresh (non-human) segment — the guard is targeted.
+        db.insert_segment(&make_segment("hv2", "/hv2.wav")).unwrap();
+        db.write_segment_verdict("hv2", "jury_accept", Some("machine"), None, None, Some(0.8), false).unwrap();
+        let seg2 = db.get_segment_by_id("hv2").unwrap().unwrap();
+        assert_eq!(seg2.verdict.as_deref(), Some("jury_accept"), "a machine verdict must apply to a non-human segment");
     }
 
     #[test]
