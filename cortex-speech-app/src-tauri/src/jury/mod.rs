@@ -285,7 +285,13 @@ pub fn write_verdict(
     evidence_json: Option<&str>,
     agent_confidence: Option<f64>,
 ) -> AppResult<()> {
-    db.connection().execute(
+    // Never let this MACHINE verdict overwrite a HUMAN decision. The T0/T1/T2 jury runs on a SEPARATE
+    // WAL connection from the human path (record_human_decision), snapshots its segments once, then can
+    // lag a multi-second T2 cloud call — so a curator may accept/edit the same segment mid-run, and the
+    // in-memory "already has a verdict" skip reads the STALE snapshot. The same guard as db::
+    // write_segment_verdict and the consensus/ASR write paths makes a verdict for an already-human-decided
+    // segment a 0-row no-op, keeping the human's verdict/gold transcript authoritative.
+    let affected = db.connection().execute(
         "UPDATE speech_segments
          SET verdict           = ?2,
              verdict_transcript = ?3,
@@ -294,7 +300,9 @@ pub fn write_verdict(
              agent_confidence  = ?6,
              escalated         = ?7,
              updated_at        = datetime('now')
-         WHERE id = ?1",
+         WHERE id = ?1
+           AND (human_decision IS NULL OR human_decision = '')
+           AND (verdict IS NULL OR verdict NOT IN ('human_accept', 'human_edit', 'human_reject'))",
         params![
             segment_id,
             verdict.to_string(),
@@ -308,8 +316,10 @@ pub fn write_verdict(
 
     // Flywheel capture: when the jury ACCEPTS a transcript that differs from the raw ASR, the model
     // corrected OmniASR — record it as a provenance-tagged PSEUDO example (never auto-trained; gated
-    // behind human review). Best-effort: a capture failure must not fail the verdict write.
-    if matches!(verdict, Verdict::AutoAccept | Verdict::JuryAccept) {
+    // behind human review). Best-effort: a capture failure must not fail the verdict write. Gated on
+    // `affected > 0` so we never capture a "model correction" for a verdict the guard above did NOT
+    // write (the segment was human-decided) — that would tag the human's row with a phantom pseudo-label.
+    if affected > 0 && matches!(verdict, Verdict::AutoAccept | Verdict::JuryAccept) {
         if let Some(corrected) = transcript {
             let raw: Option<String> = db
                 .connection()
@@ -710,5 +720,29 @@ mod tests {
         let act = run_t0_gate(&db, &["s-dial".to_string()], &AutonLevel::ActConfirm).unwrap();
         assert_eq!(act.escalated, 1);
         assert_eq!(db.get_segment_by_id("s-dial").unwrap().unwrap().verdict.as_deref(), Some("escalated"));
+    }
+
+    #[test]
+    fn write_verdict_never_overwrites_a_human_decision() {
+        // The T0/T1/T2 jury (write_verdict, on a separate connection) can land AFTER a curator decided the
+        // same segment mid-run. The human is authoritative: the machine write must be a no-op — and the
+        // flywheel must NOT capture a model pseudo-correction for a verdict it did not actually write.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&make_seg("s-hv", "raw text")).unwrap();
+        db.record_human_decision("s-hv", "accept", None).unwrap();
+
+        write_verdict(&db, "s-hv", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).unwrap();
+
+        let seg = db.get_segment_by_id("s-hv").unwrap().unwrap();
+        assert_eq!(seg.verdict.as_deref(), Some("human_accept"), "T0 write_verdict clobbered the human decision");
+        assert_eq!(seg.human_decision.as_deref(), Some("accept"), "human_decision must be preserved");
+        assert!(!seg.escalated, "a human-accepted segment must not be re-escalated by a late machine write");
+
+        let captured: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 's-hv'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(captured, 0, "no model-correction example may be captured when the verdict write no-ops");
     }
 }
