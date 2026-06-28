@@ -217,6 +217,14 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
         result = result.replace(arabic_char, &latin.to_string());
     }
 
+    // Normalize the native Arabic number separators the digit fold above leaves behind: the THOUSANDS
+    // separator U+066C and the DECIMAL separator U+066B sit just past the digit block (U+0660-0669) so
+    // they survive folding, and neither regex below recognizes them. Map them to the forms those regexes
+    // already handle — U+066C -> the Arabic comma the pipeline uses, U+066B -> '.'. Without this, the
+    // metric path scores "1٬000" as wrong vs "1000" (CER inflation) and the verbalizer reads "٣٫١٤" as
+    // "three ٫ fourteen" instead of "three point one four".
+    result = result.replace('\u{066C}', "،").replace('\u{066B}', ".");
+
     // Strip thousands separators inside grouped numbers ("1،000" / "1,000" -> "1000") so a formatted
     // number compares equal to its bare form. This runs BEFORE the verbalize early-return below, so it
     // also fixes the metric path (verbalize=false): without it the separator — an Arabic comma by this
@@ -533,6 +541,27 @@ mod tests {
         // "1,000" and "1000" must verbalize identically (one thousand), not digit-by-digit.
         let n = SoraniNormalizer::new(); // verbalize_numbers = true
         assert_eq!(n.normalize("1,000"), n.normalize("1000"));
+    }
+
+    #[test]
+    fn native_arabic_number_separators_are_handled() {
+        // U+066C (Arabic THOUSANDS separator) and U+066B (Arabic DECIMAL separator) survive the digit
+        // fold (they sit just past U+0660-0669) and were previously left in the string — inflating CER
+        // and breaking verbalization. Both must now behave like their ASCII counterparts.
+        let metric = SoraniNormalizer::with_config(NormalizationConfig {
+            normalize_numbers: true,
+            verbalize_numbers: false,
+            normalize_hamza: true,
+            remove_diacritics: false,
+        });
+        // Metric path: "1٬000" collapses to the bare number; "3٫14" becomes "3.14".
+        assert_eq!(metric.normalize("1\u{066C}000"), metric.normalize("1000"));
+        assert_eq!(metric.normalize("3\u{066B}14"), metric.normalize("3.14"));
+
+        // Verbalize path: grouped U+066C reads as one magnitude; U+066B decimal reads digit-by-digit.
+        let n = SoraniNormalizer::new();
+        assert_eq!(n.normalize("1\u{066C}000"), n.normalize("1000"), "U+066C groups one magnitude");
+        assert_eq!(n.normalize("3\u{066B}14"), "سێ خاڵ یەک چوار", "U+066B decimal -> three point one four");
     }
 }
 
