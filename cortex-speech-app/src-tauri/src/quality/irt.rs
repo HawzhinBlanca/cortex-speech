@@ -278,52 +278,92 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
     let mut segment_confidences = HashMap::new();
 
     for (segment_id, seg_slots) in &segment_slots_map {
-        let mut consensus_words = Vec::new();
-        let mut total_posterior = 0.0f64;
-        let mut slot_count = 0usize;
-
-        for slot in &seg_slots.slots {
-            // Find candidate index with max posterior
-            let max_idx = slot
-                .posteriors
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-
-            let best_token = &slot.candidates[max_idx];
-            let posterior = slot.posteriors[max_idx];
-
-            if !best_token.is_empty() {
-                consensus_words.push(best_token.clone());
-            }
-            total_posterior += posterior;
-            slot_count += 1;
+        if let Some((consensus_text, confidence)) = consensus_from_slots(&seg_slots.slots) {
+            consensus_transcripts.insert(segment_id.clone(), consensus_text);
+            segment_confidences.insert(segment_id.clone(), confidence);
         }
-
-        let consensus_text = consensus_words.join(" ");
-        // No scorable slots (e.g. the highest-ability anchor hypothesis was blank/whitespace, so there
-        // were no words to align against) means ZERO posterior evidence. Emitting confidence 1.0 here
-        // fabricated a perfect score from nothing and let the T0 gate AUTO-ACCEPT an empty transcript at
-        // maximal confidence — both a fabricated metric and silent data loss. Skip the segment entirely:
-        // the gate then has no IRT confidence for it (unwrap_or(0.0) -> escalates) and falls back to the
-        // raw transcript instead of an empty consensus. Same for a degenerate all-empty consensus.
-        if slot_count == 0 || consensus_text.trim().is_empty() {
-            continue;
-        }
-        let confidence = total_posterior / slot_count as f64;
-
-        consensus_transcripts.insert(segment_id.clone(), consensus_text);
-        segment_confidences.insert(segment_id.clone(), confidence);
     }
 
     IrtResults { consensus_transcripts, segment_confidences, model_abilities, segment_difficulties }
 }
 
+/// Reduce one segment's aligned slots to `(consensus_text, confidence)`, or `None` for a degenerate
+/// segment that must be OMITTED rather than scored.
+///
+/// Per slot the winner is the max-posterior candidate. An EMITTED word (non-empty winner) contributes
+/// its posterior to the confidence numerator and its token to the text; a DELETION slot (winner = "")
+/// contributes nothing to the numerator but still counts toward the denominator (`slot_count`). So a
+/// truncated consensus — many high-posterior deletions, few retained words — is penalized rather than
+/// flattered, and confidence reflects the fraction of anchor slots that produced a confident word, never
+/// the model's confidence in DELETING them. (Each posterior is in [0,1] and at most one per slot enters
+/// the numerator, so confidence stays in [0,1] without a clamp.)
+///
+/// Returns `None` when there are no slots, or the consensus is all-deletion (empty) — the caller then
+/// omits the segment so the T0 gate gets no IRT confidence (escalates) instead of a fabricated perfect
+/// score for an empty transcript.
+fn consensus_from_slots(slots: &[Slot]) -> Option<(String, f64)> {
+    let mut consensus_words = Vec::new();
+    let mut total_posterior = 0.0f64;
+    let mut slot_count = 0usize;
+    for slot in slots {
+        let max_idx = slot
+            .posteriors
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let best_token = &slot.candidates[max_idx];
+        if !best_token.is_empty() {
+            consensus_words.push(best_token.clone());
+            total_posterior += slot.posteriors[max_idx];
+        }
+        slot_count += 1;
+    }
+    let consensus_text = consensus_words.join(" ");
+    if slot_count == 0 || consensus_text.trim().is_empty() {
+        return None;
+    }
+    Some((consensus_text, total_posterior / slot_count as f64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slot(candidates: &[&str], posteriors: &[f64]) -> Slot {
+        Slot {
+            candidates: candidates.iter().map(|s| s.to_string()).collect(),
+            observations: Vec::new(),
+            posteriors: posteriors.to_vec(),
+        }
+    }
+
+    #[test]
+    fn deletion_slots_penalize_confidence_instead_of_inflating_it() {
+        // A full 2-word consensus: both slots emit, confidence = mean posterior.
+        let full = consensus_from_slots(&[slot(&["ئەمە", ""], &[0.9, 0.1]), slot(&["دەنگە", ""], &[0.8, 0.2])]);
+        let (full_text, full_conf) = full.expect("full consensus must be scored");
+        assert_eq!(full_text, "ئەمە دەنگە");
+        assert!((full_conf - 0.85).abs() < 1e-9, "full confidence = (0.9+0.8)/2: {full_conf}");
+
+        // A TRUNCATED consensus: slot 1 emits (0.9) but slot 2 is won by a HIGH-posterior deletion (0.95).
+        // The deletion must NOT inflate confidence — it counts only in the denominator. So confidence is
+        // 0.9/2 = 0.45, NOT (0.9+0.95)/2 = 0.925. This is the exact bug: a cut-off transcript scoring near
+        // the same as a full one, which let the T0 gate auto-accept it.
+        let trunc = consensus_from_slots(&[slot(&["ئەمە", ""], &[0.9, 0.1]), slot(&["دەنگە", ""], &[0.05, 0.95])]);
+        let (trunc_text, trunc_conf) = trunc.expect("truncated consensus must still be scored");
+        assert_eq!(trunc_text, "ئەمە", "the high-posterior deletion truncates the trailing word");
+        assert!((trunc_conf - 0.45).abs() < 1e-9, "deletion posterior must not inflate confidence: {trunc_conf}");
+        assert!(trunc_conf < full_conf, "a truncated consensus must score lower than the full one");
+    }
+
+    #[test]
+    fn all_deletion_consensus_is_omitted() {
+        // Every slot won by "" -> empty consensus -> None (omitted, not a fabricated score).
+        assert!(consensus_from_slots(&[slot(&["x", ""], &[0.1, 0.9]), slot(&["y", ""], &[0.2, 0.8])]).is_none());
+        assert!(consensus_from_slots(&[]).is_none());
+    }
 
     #[test]
     fn test_irt_consensus() {
