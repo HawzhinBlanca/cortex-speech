@@ -197,22 +197,36 @@ def test_known_runtime_panic_patterns_do_not_return() -> None:
         raise AssertionError(f"Known runtime panic-prone patterns returned:\n{formatted}")
 
 
-def test_wsl_child_locking_is_centralized_and_poison_recovering() -> None:
+def test_wsl_refinement_batch_is_panic_safe_and_cancellable() -> None:
     commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
-    if "fn lock_wsl_child() -> std::sync::MutexGuard<'static, Option<std::process::Child>>" not in commands:
-        raise AssertionError("commands.rs must keep WSL child locking behind lock_wsl_child()")
-    if "poisoned.into_inner()" not in commands:
-        raise AssertionError("lock_wsl_child() must recover a poisoned WSL child mutex")
-    direct_lock_count = commands.count("WSL_CHILD.lock()")
-    if direct_lock_count != 1:
-        raise AssertionError(f"WSL_CHILD.lock() must only appear inside lock_wsl_child(), found {direct_lock_count}")
+    # The batch 7B refinement no longer spawns the configured script once with batch flags the
+    # per-segment warm client cannot parse; it drives the shared per-segment helper in a loop. These
+    # invariants keep that loop process-safe, cancellable, and non-destructive.
+    required = [
+        # Single-run guard: a second batch cannot run concurrently over the same segments.
+        "static WSL_REFINE_RUNNING: std::sync::atomic::AtomicBool",
+        "WSL_REFINE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst)",
+        # Cancellation flag, set by the cancel command and polled between segments + in-flight.
+        "static WSL_REFINE_CANCEL: std::sync::atomic::AtomicBool",
+        "WSL_REFINE_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst)",
+        # The running flag clears even if the worker thread panics mid-batch (RAII guard on Drop).
+        "impl Drop for WslRefineRunningGuard",
+        "WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst)",
+        # Drive the shared per-segment warm client (not a one-shot batch spawn), passing the cancel
+        # flag so a long clip is interrupted promptly instead of blocking the whole batch.
+        "crate::pipeline::run_wsl_segment_transcript_with_script(external_script, id, Some(&WSL_REFINE_CANCEL))",
+        # Writes go through the human-decision-safe update so a batch never clobbers reviewed text.
+        "db.update_asr_transcript_if_unreviewed(id, &raw_transcript, normalized.as_deref(), confidence)",
+    ]
+    missing = [pattern for pattern in required if pattern not in commands]
+    if missing:
+        formatted = "\n".join(f"- {entry}" for entry in missing)
+        raise AssertionError(f"commands.rs WSL batch refinement lost a safety invariant:\n{formatted}")
 
 
 def test_wsl_refinement_lifecycle_failures_are_reported() -> None:
     commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
     forbidden = [
-        "let _ = stdout_thread.join();",
-        "let _ = stderr_thread.join();",
         "child.wait().ok()",
         "let _ = child.kill();",
     ]
@@ -222,11 +236,12 @@ def test_wsl_refinement_lifecycle_failures_are_reported() -> None:
         raise AssertionError(f"commands.rs silently discards WSL refinement lifecycle failures:\n{formatted}")
 
     required = [
-        "fn join_wsl_log_reader(thread: std::thread::JoinHandle<()>, stream: &str)",
-        'tracing::warn!("WSL {stream} log reader thread panicked");',
-        "fn wait_for_wsl_child(child: &mut std::process::Child) -> Option<std::process::ExitStatus>",
-        'tracing::error!("Failed to wait for WSL refinement process: {error}");',
-        'child.kill().map_err(|error| format!("Failed to cancel WSL refinement process: {error}"))?;',
+        # The detached batch worker reports a terminal failure as an event instead of swallowing it.
+        'emit_or_log(&app, "wsl-log", format!("[ERROR] {}", wsl_log_preview(&message)));',
+        'emit_or_log(&app, "wsl-status", serde_json::json!({ "status": status, "exit_code": exit_code }));',
+        # Per-segment failures and human-reviewed skips are surfaced, not hidden.
+        "failed += 1;",
+        "skipped (human-reviewed; transcript not overwritten)",
     ]
     missing = [pattern for pattern in required if pattern not in commands]
     if missing:
@@ -1362,7 +1377,7 @@ def test_telemetry_tracer_recovers_poisoned_span_buffer() -> None:
 
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
-    test_wsl_child_locking_is_centralized_and_poison_recovering()
+    test_wsl_refinement_batch_is_panic_safe_and_cancellable()
     test_wsl_refinement_lifecycle_failures_are_reported()
     test_app_entrypoint_reports_fatal_errors_without_panicking()
     test_app_state_cancel_token_recovers_poisoned_lock()
