@@ -1137,12 +1137,17 @@ pub fn align_segment(
         let pipeline = state.lock_pipeline().clone();
         pipeline.align(&audio_path, &text, alignment_json.as_deref()).map_err(|e| e.to_string())?
     };
-    // Write the HONEST alignment_quality back to the segment so validation/provenance can
-    // distinguish real CTC forced alignment from the linear/energy heuristic fallback —
-    // never label heuristic output as 'ctc_forced'.
+    // Persist the word timings INTO alignment_json (merged with the existing chunk metadata) AND
+    // stamp the honest alignment_quality, so the per-word review features (spoken-span playback,
+    // tap-a-word, karaoke highlight) survive a reload instead of vanishing every time. The quality
+    // distinguishes real CTC forced alignment from the linear/energy heuristic fallback — heuristic
+    // output is never labelled 'ctc_forced'.
     if let Some(ref id) = segment_id {
         if !timestamps.is_empty() {
+            let merged = crate::chunking::merge_word_timestamps(alignment_json.as_deref(), &timestamps);
             let db = state.lock_db();
+            db.update_segment_alignment_json(id, &merged)
+                .map_err(|error| format!("Failed to persist word timings for {id}: {error}"))?;
             db.update_alignment_quality(id, quality.as_db_str())
                 .map_err(|error| format!("Failed to stamp alignment quality for {id}: {error}"))?;
         }
