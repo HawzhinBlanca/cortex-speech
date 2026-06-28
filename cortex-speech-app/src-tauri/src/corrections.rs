@@ -41,10 +41,9 @@ fn char_only_normalizer() -> SoraniNormalizer {
 
 #[derive(Clone, Copy)]
 enum AlignOp {
-    /// A matched slot; carries only the `b`-side index used to look up the neighbor context.
-    Match {
-        b: usize,
-    },
+    /// A matched slot. Neighbor context is now read from the wrong-side immediate neighbors at the
+    /// substitution site (so it matches the firing rule), so the match index is no longer needed here.
+    Match,
     /// A substituted slot: `a` is the wrong-side word index, `b` the human-side index.
     Sub {
         a: usize,
@@ -79,7 +78,7 @@ fn align_words(na: &[String], nb: &[String]) -> Vec<AlignOp> {
         if i > 0 && j > 0 {
             let cost = usize::from(na[i - 1] != nb[j - 1]);
             if dp[i][j] == dp[i - 1][j - 1] + cost {
-                ops.push(if cost == 0 { AlignOp::Match { b: j - 1 } } else { AlignOp::Sub { a: i - 1, b: j - 1 } });
+                ops.push(if cost == 0 { AlignOp::Match } else { AlignOp::Sub { a: i - 1, b: j - 1 } });
                 i -= 1;
                 j -= 1;
                 continue;
@@ -112,18 +111,18 @@ pub fn extract_substitution_memories(wrong: &str, right: &str) -> Vec<Substituti
     let ops = align_words(&na, &nb);
 
     let mut out = Vec::new();
-    for (idx, op) in ops.iter().enumerate() {
+    for op in &ops {
         let AlignOp::Sub { a: ai, b: bj } = *op else { continue };
-        // The nearest matched word on each side is the canonical +/-1 neighbor context.
-        let left = ops[..idx]
-            .iter()
-            .rev()
-            .find_map(|o| if let AlignOp::Match { b } = o { Some(nb[*b].clone()) } else { None })
-            .unwrap_or_default();
-        let right_ctx = ops[idx + 1..]
-            .iter()
-            .find_map(|o| if let AlignOp::Match { b } = o { Some(nb[*b].clone()) } else { None })
-            .unwrap_or_default();
+        // The +/-1 neighbor context MUST be the IMMEDIATE neighbors in the (normalized) WRONG sequence —
+        // the exact key the firing rule (apply_memories) reconstructs from the raw input's adjacent tokens
+        // (norm[i-1] / norm[i+1]). The previous code used the nearest *matched* word, which is not
+        // computable at firing time (there is no alignment there): for an ADJACENT substitution the
+        // immediate neighbor is itself a Sub (no Match), so capture stored key "left|" while firing built
+        // "left|right" — they never matched and the memory silently never fired, even on an exact repeat
+        // of the same ASR error. For a lone substitution flanked by matches the two definitions coincide,
+        // so existing single-sub behavior (and its tests) is unchanged.
+        let left = if ai > 0 { na[ai - 1].clone() } else { String::new() };
+        let right_ctx = na.get(ai + 1).cloned().unwrap_or_default();
         out.push(SubstitutionMemory {
             slot_key: format!("{left}|{right_ctx}"),
             phonetic_key: na[ai].clone(),
@@ -205,7 +204,7 @@ fn word_error_count(a: &str, b: &str) -> usize {
     let normalizer = char_only_normalizer();
     let na: Vec<String> = a.split_whitespace().map(|w| normalizer.normalize(w)).collect();
     let nb: Vec<String> = b.split_whitespace().map(|w| normalizer.normalize(w)).collect();
-    align_words(&na, &nb).iter().filter(|op| !matches!(op, AlignOp::Match { .. })).count()
+    align_words(&na, &nb).iter().filter(|op| !matches!(op, AlignOp::Match)).count()
 }
 
 /// The net effect of LOOP-0 firing on a gold set: the change in total word-error count from applying
@@ -308,6 +307,29 @@ mod tests {
         let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
         let out = apply_memories("ئەو ساڵە باش بوو", &[entry], &FiringConfig::default());
         assert_eq!(out, "ئەو ساڵە خراپ بوو", "the remembered fix must fire on the same confusion");
+    }
+
+    #[test]
+    fn adjacent_substitutions_round_trip_and_fire() {
+        // Two ADJACENT substitutions (پێنج->شەش then بووم->هاتم, with no matched word between them). Before
+        // the neighbor-key fix, capture stored a nearest-Match key ("ساڵی|") that firing's immediate-
+        // neighbor key ("ساڵی|بووم") never matched, so NEITHER memory fired — even on an exact repeat of
+        // the same ASR output. Both must now fire and reproduce the human correction in full.
+        let mems = extract_substitution_memories("من ساڵی پێنج بووم", "من ساڵی شەش هاتم");
+        assert_eq!(mems.len(), 2);
+        let entries: Vec<MemoryEntry> = mems
+            .into_iter()
+            .map(|m| MemoryEntry {
+                wrong_token: m.wrong_token,
+                human_token: m.human_token,
+                slot_key: m.slot_key,
+                phonetic_key: m.phonetic_key,
+                confidence: 1.0,
+                hit_count: 1,
+            })
+            .collect();
+        let out = apply_memories("من ساڵی پێنج بووم", &entries, &FiringConfig::default());
+        assert_eq!(out, "من ساڵی شەش هاتم", "both adjacent substitutions must fire on the same input");
     }
 
     #[test]
