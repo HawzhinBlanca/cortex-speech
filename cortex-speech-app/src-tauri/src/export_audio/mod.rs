@@ -401,7 +401,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let seg = SpeechSegment {
             id: "s1".to_string(),
-            audio_path: "C:\\Users\\studio_user\\private_clips\\clip_001.wav".to_string(),
+            // A fake absolute path with a username + dir layout. Deliberately NOT a Windows per-user
+            // profile path: that form is itself a repo-hygiene-gate violation (the gate can't tell a fake
+            // fixture username from a real one), so this uses the C:\Recordings\ convention that
+            // export.rs::exports_never_leak_absolute_paths already uses.
+            audio_path: "C:\\Recordings\\studio_user\\private_clips\\clip_001.wav".to_string(),
             raw_transcript: "hello".to_string(),
             ..SpeechSegment::default()
         };
