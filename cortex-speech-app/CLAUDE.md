@@ -78,3 +78,8 @@ Run the relevant gates and paste the real output. A fix without a regression gat
 Per `AGENT_CHARTER.md`: on a clean checkout, a single `make verify-10` exits 0 and prints
 `CORTEX 10/10: ALL GATES GREEN`. Until that command exists and passes, you are not done —
 partial completion means keep going, and nothing is called "10/10" on tests alone.
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan
+<!-- SPECKIT END -->
