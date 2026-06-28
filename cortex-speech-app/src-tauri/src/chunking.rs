@@ -313,8 +313,15 @@ pub fn slice_pcm_by_alignment(
     alignment_json: Option<&str>,
 ) -> AppResult<(Vec<i16>, Option<String>)> {
     if let Some(meta) = alignment_json.and_then(SegmentSourceMeta::from_alignment_json) {
-        let start = ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
-        let end = ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate).min(pcm.len());
+        let (start_ms, end_ms) = (meta.source_start_ms.max(0), meta.source_end_ms.max(0));
+        // Reject an absurd offset rather than truncating via `as u32` (i64 -> u32 wraps mod 2^32, which
+        // would silently slice an UNRELATED in-bounds window with no error). The app never emits an
+        // offset > u32::MAX ms (~49.7 days); a value this large is a malformed or crafted alignment blob.
+        if start_ms > u32::MAX as i64 || end_ms > u32::MAX as i64 {
+            return Err(AppError::Validation("Chunk time range out of bounds".into()));
+        }
+        let start = ms_to_samples(start_ms as u32, sample_rate);
+        let end = ms_to_samples(end_ms as u32, sample_rate).min(pcm.len());
         if end <= start {
             return Err(AppError::Validation("Invalid chunk time range".into()));
         }
@@ -436,6 +443,21 @@ mod tests {
         let (slice, suffix) = slice_pcm_by_alignment(&pcm, 16000, Some(&meta.to_alignment_json())).unwrap();
         assert_eq!(slice.len(), 16000);
         assert!(suffix.as_deref().unwrap().starts_with("chunk_"));
+    }
+
+    #[test]
+    fn slice_pcm_by_alignment_rejects_out_of_range_offset_instead_of_truncating() {
+        // A source_*_ms beyond u32::MAX must error, NOT be truncated by `as u32` (which wraps mod 2^32 and
+        // would silently slice an unrelated in-bounds window). The app never emits such an offset; this
+        // guards a malformed/crafted alignment blob arriving via an IPC command.
+        let pcm: Vec<i16> = (0..32000).map(|i| i as i16).collect();
+        let bad = SegmentSourceMeta {
+            source_start_ms: u32::MAX as i64 + 1, // ~49.7 days; would truncate to a small in-bounds value
+            source_end_ms: u32::MAX as i64 + 2000,
+            chunk_index: 0,
+            chunk_count: 1,
+        };
+        assert!(slice_pcm_by_alignment(&pcm, 16000, Some(&bad.to_alignment_json())).is_err());
     }
 
     #[test]

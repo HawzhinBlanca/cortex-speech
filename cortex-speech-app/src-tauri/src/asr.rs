@@ -148,9 +148,15 @@ pub enum ConfidenceSource {
 }
 
 fn confidence_from_asr_result(text: &str, ys_log_probs: &[f64]) -> (Option<f64>, ConfidenceSource) {
+    // Empty/whitespace output is never high-confidence, even if the model exposed per-token probs for the
+    // blank-collapsed result. A confident-empty would persist a high confidence on a BLANK transcript,
+    // which then feeds the jury/conformal gate as if it were trustworthy. Guard BOTH branches, not just
+    // the no-probs heuristic (the original guarded only the empty `ys_log_probs` case).
+    if text.trim().is_empty() {
+        return (Some(0.0), ConfidenceSource::Heuristic);
+    }
     if ys_log_probs.is_empty() {
-        let conf = if text.trim().is_empty() { Some(0.0) } else { Some(0.90) };
-        (conf, ConfidenceSource::Heuristic)
+        (Some(0.90), ConfidenceSource::Heuristic)
     } else {
         let sum_prob: f64 = ys_log_probs.iter().map(|&lp| lp.exp()).sum();
         (Some(sum_prob / ys_log_probs.len() as f64), ConfidenceSource::RealPosterior)
@@ -607,6 +613,15 @@ mod tests {
     fn empty_asr_text_has_zero_confidence_without_token_probs() {
         assert_eq!(confidence_from_asr_result("", &[]), (Some(0.0), ConfidenceSource::Heuristic));
         assert_eq!(confidence_from_asr_result("   ", &[]), (Some(0.0), ConfidenceSource::Heuristic));
+    }
+
+    #[test]
+    fn empty_asr_text_has_zero_confidence_even_with_token_probs() {
+        // A blank/whitespace transcript must never carry a high confidence, even when the model exposed
+        // per-token probs for the blank-collapsed result — a confident-empty would persist into the jury
+        // gate as if trustworthy. The RealPosterior branch is now guarded too.
+        assert_eq!(confidence_from_asr_result("", &[-0.1, -0.1]), (Some(0.0), ConfidenceSource::Heuristic));
+        assert_eq!(confidence_from_asr_result("  ", &[-0.05]), (Some(0.0), ConfidenceSource::Heuristic));
     }
 
     #[test]

@@ -157,6 +157,15 @@ impl HistoryManager {
             Command::UpdateSegment { previous, .. } => {
                 if db.get_segment_by_id(&previous.id)?.is_some() {
                     db.insert_segment(previous)?;
+                } else {
+                    // The segment was deleted (by a divergent/external path) after this edit, so there is
+                    // nothing to revert to its previous state. FAIL the undo instead of silently reporting
+                    // success and pushing a no-op onto the redo stack — undo()/redo() keep the command on
+                    // the undo stack on Err, so the user sees an honest failure, not a phantom "undone".
+                    return Err(crate::error::AppError::Validation(format!(
+                        "Cannot undo the edit of segment {}: it no longer exists",
+                        previous.id
+                    )));
                 }
             }
             Command::DeleteSegments { segments } => {
@@ -295,6 +304,30 @@ mod tests {
         assert!(desc.is_some());
         let redone = db.get_segment_by_id("test1").unwrap().unwrap();
         assert_eq!(redone.raw_transcript, "hello universe");
+    }
+
+    #[test]
+    fn undo_of_an_update_fails_when_the_segment_was_deleted_rather_than_silently_succeeding() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        let original = make_segment("gone1", "hello world");
+        db.insert_segment(&original).unwrap();
+        let updated = SpeechSegment { raw_transcript: "hello universe".to_string(), ..original.clone() };
+        db.insert_segment(&updated).unwrap();
+        history.push(Command::UpdateSegment {
+            segment_id: updated.id.clone(),
+            previous: Box::new(original.clone()),
+            current: Box::new(updated.clone()),
+        });
+
+        // A divergent/external path deletes the segment after the edit was recorded.
+        db.delete_segment("gone1").unwrap();
+
+        // Undo must FAIL honestly (not silently report success and push a no-op onto the redo stack), and
+        // the failed command must stay on the undo stack so the user can retry — and must not resurrect.
+        assert!(history.undo(&db).is_err(), "undo of an edit on a deleted segment must fail, not no-op-succeed");
+        assert!(history.can_undo(), "a failed undo must leave the command on the undo stack");
+        assert!(db.get_segment_by_id("gone1").unwrap().is_none(), "the failed undo must not resurrect the segment");
     }
 
     #[test]

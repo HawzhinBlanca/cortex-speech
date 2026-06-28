@@ -1192,11 +1192,20 @@ impl Database {
         if fix.is_empty() || wrong == fix {
             return Ok(()); // not a correction
         }
-        // Quarantine gold at capture time (holdout exclusion is also applied at every export).
-        let is_gold: i64 = self
-            .conn
-            .query_row("SELECT is_gold FROM speech_segments WHERE id = ?1", params![segment_id], |r| r.get(0))
-            .unwrap_or(0);
+        // Quarantine gold at capture time (holdout exclusion is also applied at every export). Distinguish
+        // "no such segment" (genuinely not gold -> 0) from a TRANSIENT read error (e.g. SQLITE_BUSY after
+        // the busy_timeout, under a long adjudication on the other connection): the latter must NOT
+        // fail-OPEN the quarantine by defaulting to 0 and writing a model pseudo-label onto a gold row —
+        // propagate it so the best-effort caller simply skips this capture.
+        let is_gold: i64 =
+            match self
+                .conn
+                .query_row("SELECT is_gold FROM speech_segments WHERE id = ?1", params![segment_id], |r| r.get(0))
+            {
+                Ok(v) => v,
+                Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+                Err(e) => return Err(e.into()),
+            };
         if is_gold != 0 {
             return Ok(());
         }
