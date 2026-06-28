@@ -131,15 +131,23 @@ fn char_errors(result: &EvalRunResult) -> Vec<SegmentError> {
 /// Aggregate the per-segment word-error decomposition: the macro (per-segment-mean)
 /// UNCLAMPED WER plus total substitutions/deletions/insertions across all segments.
 fn word_breakdown_aggregate(result: &EvalRunResult) -> (f64, usize, usize, usize) {
-    let (mut subs, mut dels, mut ins, mut rate_sum) = (0usize, 0usize, 0usize, 0.0f64);
+    let (mut subs, mut dels, mut ins, mut rate_sum, mut scored) = (0usize, 0usize, 0usize, 0.0f64, 0usize);
     for s in &result.segments {
         let bd = wer::word_error_breakdown(&s.reference, &s.hypothesis);
+        // An empty-reference segment (ref normalizes to zero words) has no reference to score against;
+        // `bd.rate()` returns 1.0 for it (a hallucination on silence), which would inflate the macro
+        // mean and the error totals. Exclude it everywhere, exactly as the micro path does — so the
+        // scorecard treats empty-ref uniformly and never reports phantom errors against a phantom ref.
+        if bd.ref_len == 0 {
+            continue;
+        }
         subs += bd.substitutions;
         dels += bd.deletions;
         ins += bd.insertions;
         rate_sum += bd.rate();
+        scored += 1;
     }
-    let macro_wer = if result.segments.is_empty() { 0.0 } else { rate_sum / result.segments.len() as f64 };
+    let macro_wer = if scored == 0 { 0.0 } else { rate_sum / scored as f64 };
     (macro_wer, subs, dels, ins)
 }
 
@@ -496,6 +504,44 @@ mod tests {
         let sys = run_gold_eval(&db, sys_id, sys_h).unwrap();
         let base = run_gold_eval(&db, base_id, base_h).unwrap();
         (sys, base)
+    }
+
+    #[test]
+    fn empty_reference_does_not_peg_scorecard_micro_to_one() {
+        // The scorecard shares the eval table's data but lacked its empty-reference guard: one tatweel-only
+        // reference (-> normalizes to "") paired with a hallucinated hypothesis used to peg micro WER/CER,
+        // the bootstrap CI point, AND the macro mean to the 1.0 clamp while the eval table read ~0% for the
+        // identical data. All four must now reflect only the reference-bearing clip.
+        let db = open_mem_db();
+        import_gold_segments(
+            &db,
+            vec![
+                GoldSegmentInput {
+                    audio_path: "/a.wav".into(), reference: "کوردستان".into(), is_holdout: true
+                },
+                GoldSegmentInput {
+                    audio_path: "/b.wav".into(),
+                    reference: "\u{0640}\u{0640}\u{0640}".into(), // tatweel-only -> normalizes to ""
+                    is_holdout: true,
+                },
+            ],
+        )
+        .unwrap();
+        let gold = list_gold_segments(&db).unwrap();
+        let hyps: Vec<(String, String)> = gold
+            .iter()
+            .map(|g| {
+                let hyp = if g.audio_path == "/a.wav" { "کوردستان" } else { "one two three" };
+                (g.id.clone(), hyp.to_string())
+            })
+            .collect();
+        let result = run_gold_eval(&db, "m", hyps).unwrap();
+        let sc = build_scorecard(&result, None, ScorecardOptions::default());
+        assert!(sc.system.micro_wer < 0.01, "micro_wer pegged by empty-ref: {}", sc.system.micro_wer);
+        assert!(sc.system.micro_cer < 0.01, "micro_cer pegged by empty-ref: {}", sc.system.micro_cer);
+        assert!(sc.system.wer_ci.point < 0.01, "wer CI point pegged by empty-ref: {}", sc.system.wer_ci.point);
+        assert!(sc.system.cer_ci.point < 0.01, "cer CI point pegged by empty-ref: {}", sc.system.cer_ci.point);
+        assert!(sc.system.macro_wer < 0.01, "macro_wer pegged by empty-ref: {}", sc.system.macro_wer);
     }
 
     #[test]
