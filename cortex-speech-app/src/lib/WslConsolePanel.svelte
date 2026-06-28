@@ -39,14 +39,14 @@
     running = true;
     status = 'running';
     logs = [];
-    appendLog('>>> Spawning configured external ASR provider via WSL...');
-    appendLog(
-      `>>> Command: wsl /root/cortex_env/bin/python3 <configured-provider-script>` +
-        (limitFiles ? ` --limit-files ${limitFiles}` : '') +
-        (limitSegments ? ` --limit-segments ${limitSegments}` : '') +
-        (dryRun ? ' --dry-run' : '') +
-        (testOne ? ' --test-one' : ''),
-    );
+    appendLog('>>> Starting Meta OmniASR 7B batch transcription of pending segments...');
+    const opts = [
+      limitFiles ? `files ≤ ${limitFiles}` : '',
+      limitSegments ? `segments ≤ ${limitSegments}` : '',
+      dryRun ? 'dry-run (no writes)' : '',
+      testOne ? 'test-one (single segment)' : '',
+    ].filter(Boolean);
+    appendLog(`>>> Options: ${opts.length ? opts.join(', ') : 'all pending segments'}`);
 
     try {
       await api.runWslRefinement({

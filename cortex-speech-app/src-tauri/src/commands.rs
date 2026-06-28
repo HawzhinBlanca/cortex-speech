@@ -2192,14 +2192,23 @@ pub fn get_inference_stats() -> Result<serde_json::Value, String> {
     Ok(crate::inference::get_inference_stats())
 }
 
-static WSL_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
 const WSL_LOG_LINE_PREVIEW_CHARS: usize = 4096;
 
-fn lock_wsl_child() -> std::sync::MutexGuard<'static, Option<std::process::Child>> {
-    WSL_CHILD.lock().unwrap_or_else(|poisoned| {
-        tracing::warn!("WSL child process lock was poisoned; recovering inner state");
-        poisoned.into_inner()
-    })
+/// True while a batch 7B refinement run is in flight. A plain flag (not a child handle) because the
+/// batch drives the per-segment warm client in a loop — there is no single long-lived child to hold.
+/// Guards against a second concurrent batch starting on top of the first.
+static WSL_REFINE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set by `cancel_wsl_refinement`; polled between segments by the batch loop AND in-flight by the
+/// per-segment spawn so a cancel stops the run within ~50 ms. Reset to false when a new batch starts.
+static WSL_REFINE_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Resets `WSL_REFINE_RUNNING` on drop so the running flag clears even if the worker thread panics
+/// mid-batch — otherwise a panic would wedge the single-run guard until the app restarts.
+struct WslRefineRunningGuard;
+impl Drop for WslRefineRunningGuard {
+    fn drop(&mut self) {
+        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 fn wsl_log_preview(line: &str) -> String {
@@ -2211,20 +2220,55 @@ fn wsl_log_preview(line: &str) -> String {
     preview
 }
 
-fn join_wsl_log_reader(thread: std::thread::JoinHandle<()>, stream: &str) {
-    if thread.join().is_err() {
-        tracing::warn!("WSL {stream} log reader thread panicked");
-    }
+/// A segment needs (re)transcription by the 7B batch when it has no usable transcript yet — either
+/// empty or still showing the "[Pending …]" placeholder the import path leaves on a transient
+/// warm-server miss. We never target segments that already have a real transcript, so the batch
+/// can't clobber good CTC output (and `update_asr_transcript_if_unreviewed` additionally refuses to
+/// overwrite a human decision).
+fn segment_awaits_wsl7b(raw_transcript: &str) -> bool {
+    let trimmed = raw_transcript.trim();
+    trimmed.is_empty() || trimmed.contains("[Pending")
 }
 
-fn wait_for_wsl_child(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
-    match child.wait() {
-        Ok(status) => Some(status),
-        Err(error) => {
-            tracing::error!("Failed to wait for WSL refinement process: {error}");
-            None
-        }
+/// Select which segments the batch 7B refinement should transcribe, oldest-first, honoring the
+/// panel's limits. Pure (no I/O) so it is unit-testable. `limit_files` caps the number of distinct
+/// source audio files touched; `limit_segments` caps total segments; `test_one` overrides to a
+/// single segment. Returns `(segment_id, audio_path)` pairs.
+fn select_wsl_refinement_targets(
+    segments: &[crate::db::SpeechSegment],
+    limit_files: Option<u32>,
+    limit_segments: Option<u32>,
+    test_one: bool,
+) -> Vec<(String, String)> {
+    // get_segments returns newest-first; drain the backlog oldest-first so a capped run is deterministic.
+    let mut targets: Vec<(String, String)> = segments
+        .iter()
+        .rev()
+        .filter(|s| segment_awaits_wsl7b(&s.raw_transcript))
+        .map(|s| (s.id.clone(), s.audio_path.clone()))
+        .collect();
+
+    if let Some(max_files) = limit_files.map(|n| n as usize) {
+        let mut kept_files: Vec<String> = Vec::new();
+        targets.retain(|(_, path)| {
+            if let Some(_existing) = kept_files.iter().find(|p| *p == path) {
+                true
+            } else if kept_files.len() < max_files {
+                kept_files.push(path.clone());
+                true
+            } else {
+                false
+            }
+        });
     }
+
+    if test_one {
+        targets.truncate(1);
+    } else if let Some(max_segments) = limit_segments.map(|n| n as usize) {
+        targets.truncate(max_segments);
+    }
+
+    targets
 }
 
 #[tauri::command]
@@ -2238,151 +2282,204 @@ pub fn run_wsl_refinement(
 ) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("run_wsl_refinement")?;
 
-    // Hold the WSL_CHILD lock across BOTH the "already running" check AND the store below, so a
-    // second concurrent invocation cannot pass this check during the spawn window and orphan the
-    // first child (Child::drop does NOT kill the OS process, and the exit-monitors would cross-wire).
-    // The lock spans only the bounded settings read + spawn + pipe setup; early returns drop it,
-    // leaving the slot None.
-    let mut wsl_slot = lock_wsl_child();
-    if wsl_slot.is_some() {
+    // Single-run guard: claim the running flag atomically. If it was already true, a batch is in
+    // flight — refuse rather than starting a second concurrent loop over the same segments.
+    if WSL_REFINE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Err("WSL 7B refinement batch transcription is already running.".into());
     }
+    // The running flag is now OURS; every early return below MUST clear it or the guard would wedge.
+    WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
 
-    let external_script = state
-        .settings
-        .lock()
-        .map_err(|e| e.to_string())?
-        .external_asr_script_path()
-        .ok_or_else(|| "External ASR provider script is not configured in Settings.".to_string())?;
-
-    // Build the command
-    let mut cmd = std::process::Command::new("wsl");
-    cmd.arg("/root/cortex_env/bin/python3").arg(external_script);
-
-    if let Some(limit) = limit_files {
-        cmd.arg("--limit-files").arg(limit.to_string());
-    }
-    if let Some(limit) = limit_segments {
-        cmd.arg("--limit-segments").arg(limit.to_string());
-    }
-    if dry_run {
-        cmd.arg("--dry-run");
-    }
-    if test_one {
-        cmd.arg("--test-one");
-    }
-
-    // Piped stdout and stderr so we can read them
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    // Hide console window on Windows (prevent popping up CMD window)
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn WSL process: {}", e))?;
-
-    // If we can't capture the pipes, kill + reap the child before bailing — otherwise the
-    // spawned `wsl` process is orphaned, since Child::drop does NOT terminate it.
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
+    // Read everything the worker needs under the locks NOW, then release them so the long per-segment
+    // loop holds no AppState lock. A 7B call can take seconds; holding a lock across the loop would
+    // freeze the UI's get_segments exactly like the jury-starvation bug we already fixed. The
+    // poison-recovering lock_* accessors never panic.
+    let setup = {
+        let settings = state.lock_settings();
+        let external_script = settings.external_asr_script_path();
+        let auto_normalize = settings.auto_normalize;
+        let verbalize_numbers = settings.verbalize_numbers;
+        drop(settings);
+        external_script.map(|script| (script, auto_normalize, verbalize_numbers))
+    };
+    let (external_script, auto_normalize, verbalize_numbers) = match setup {
+        Some(values) => values,
         None => {
-            kill_and_reap_child(&mut child, "WSL refinement after stdout capture failure");
-            return Err("Failed to capture stdout".to_string());
+            WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err("External ASR provider script is not configured in Settings.".into());
         }
     };
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            kill_and_reap_child(&mut child, "WSL refinement after stderr capture failure");
-            return Err("Failed to capture stderr".to_string());
-        }
-    };
+    let db_path = state.lock_pipeline().db_path().to_string();
 
-    // Save the child handle under the SAME guard acquired at the check above (closing the TOCTOU),
-    // then release it before the monitor thread (which re-locks to take() the child on exit).
-    *wsl_slot = Some(child);
-    drop(wsl_slot);
-
-    let app_clone = app.clone();
-
-    // Spawn thread to read stdout/stderr and monitor exit
     std::thread::spawn(move || {
-        use std::io::BufRead;
-        let stdout_reader = std::io::BufReader::new(stdout);
-        let stderr_reader = std::io::BufReader::new(stderr);
-
-        let app_stdout = app_clone.clone();
-        let stdout_thread = std::thread::spawn(move || {
-            for l in stdout_reader.lines().map_while(Result::ok) {
-                emit_or_log(&app_stdout, "wsl-log", wsl_log_preview(&l));
-            }
-        });
-
-        let app_stderr = app_clone.clone();
-        let stderr_thread = std::thread::spawn(move || {
-            for l in stderr_reader.lines().map_while(Result::ok) {
-                emit_or_log(&app_stderr, "wsl-log", format!("[ERROR] {}", wsl_log_preview(&l)));
-            }
-        });
-
-        // Wait for readers to finish
-        join_wsl_log_reader(stdout_thread, "stdout");
-        join_wsl_log_reader(stderr_thread, "stderr");
-
-        // Wait for child to exit
-        let exit_status = {
-            let mut guard = lock_wsl_child();
-            if let Some(mut child) = guard.take() {
-                wait_for_wsl_child(&mut child)
-            } else {
-                None
+        // Clears WSL_REFINE_RUNNING on every exit path, including a panic inside the loop.
+        let _running = WslRefineRunningGuard;
+        let outcome = run_wsl_refinement_loop(
+            &app,
+            &db_path,
+            &external_script,
+            auto_normalize,
+            verbalize_numbers,
+            limit_files,
+            limit_segments,
+            dry_run,
+            test_one,
+        );
+        let (status, exit_code) = match outcome {
+            Ok(summary) if summary.cancelled => ("cancelled", summary.transcribed as i64),
+            Ok(summary) if summary.transcribed == 0 && summary.failed > 0 => ("failed", summary.failed as i64),
+            Ok(summary) => ("completed", summary.transcribed as i64),
+            Err(message) => {
+                emit_or_log(&app, "wsl-log", format!("[ERROR] {}", wsl_log_preview(&message)));
+                ("failed", -1)
             }
         };
-
-        match exit_status {
-            Some(status) => {
-                let code = status.code().unwrap_or(0);
-                emit_or_log(
-                    &app_clone,
-                    "wsl-status",
-                    serde_json::json!({
-                        "status": if status.success() { "completed" } else { "failed" },
-                        "exit_code": code
-                    }),
-                );
-            }
-            None => {
-                emit_or_log(
-                    &app_clone,
-                    "wsl-status",
-                    serde_json::json!({
-                        "status": "cancelled",
-                        "exit_code": -1
-                    }),
-                );
-            }
-        }
+        emit_or_log(&app, "wsl-status", serde_json::json!({ "status": status, "exit_code": exit_code }));
     });
 
     Ok(serde_json::json!({ "status": "started" }))
 }
 
-#[tauri::command]
-pub fn cancel_wsl_refinement() -> Result<(), String> {
-    let mut guard = lock_wsl_child();
-    if let Some(mut child) = guard.take() {
-        child.kill().map_err(|error| format!("Failed to cancel WSL refinement process: {error}"))?;
-        // Reap the child to match every other WSL kill site's kill+reap invariant — a killed child
-        // must be wait()ed so it does not linger as a defunct process on non-Windows hosts.
-        if let Err(error) = child.wait() {
-            tracing::warn!("Failed to reap cancelled WSL refinement process: {error}");
+struct WslRefinementSummary {
+    transcribed: usize,
+    failed: usize,
+    cancelled: bool,
+}
+
+/// The detached batch worker: drive the per-segment warm 7B client over every pending segment, write
+/// each result through the human-decision-safe update, and stream progress as `wsl-log` events. No
+/// AppState lock is held here — it owns its own DB connection opened from `db_path`.
+#[allow(clippy::too_many_arguments)]
+fn run_wsl_refinement_loop(
+    app: &tauri::AppHandle,
+    db_path: &str,
+    external_script: &str,
+    auto_normalize: bool,
+    verbalize_numbers: bool,
+    limit_files: Option<u32>,
+    limit_segments: Option<u32>,
+    dry_run: bool,
+    test_one: bool,
+) -> Result<WslRefinementSummary, String> {
+    emit_or_log(
+        app,
+        "wsl-log",
+        ">>> Driving the Meta OmniASR 7B warm client over pending segments (one --segment-id call each)...".to_string(),
+    );
+
+    let db = crate::db::Database::open_with_retry(db_path).map_err(|e| e.to_string())?;
+    let segments = db.get_segments(None).map_err(|e| e.to_string())?;
+    let targets = select_wsl_refinement_targets(&segments, limit_files, limit_segments, test_one);
+
+    if targets.is_empty() {
+        emit_or_log(
+            app,
+            "wsl-log",
+            ">>> No segments are awaiting 7B transcription (every segment already has a transcript). Nothing to do."
+                .to_string(),
+        );
+        return Ok(WslRefinementSummary { transcribed: 0, failed: 0, cancelled: false });
+    }
+
+    let total = targets.len();
+    emit_or_log(app, "wsl-log", format!(">>> {total} segment(s) awaiting 7B transcription."));
+
+    if dry_run {
+        for (idx, (id, path)) in targets.iter().enumerate() {
+            let file = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path.as_str());
+            emit_or_log(
+                app,
+                "wsl-log",
+                format!("[dry-run] [{}/{}] would transcribe {} ({})", idx + 1, total, id, wsl_log_preview(file)),
+            );
+        }
+        emit_or_log(app, "wsl-log", ">>> Dry run complete — no transcripts were written.".to_string());
+        return Ok(WslRefinementSummary { transcribed: 0, failed: 0, cancelled: false });
+    }
+
+    let normalizer = crate::normalizer::SoraniNormalizer::with_config(crate::normalizer::NormalizationConfig {
+        normalize_numbers: auto_normalize,
+        verbalize_numbers,
+        normalize_hamza: true,
+        remove_diacritics: false,
+    });
+
+    let mut transcribed = 0usize;
+    let mut failed = 0usize;
+    for (idx, (id, _path)) in targets.iter().enumerate() {
+        if WSL_REFINE_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_or_log(app, "wsl-log", format!(">>> Cancelled by user after {idx}/{total} segment(s)."));
+            return Ok(WslRefinementSummary { transcribed, failed, cancelled: true });
+        }
+        emit_or_log(app, "wsl-log", format!("[{}/{}] transcribing {}...", idx + 1, total, id));
+        match crate::pipeline::run_wsl_segment_transcript_with_script(external_script, id, Some(&WSL_REFINE_CANCEL)) {
+            Ok((raw_transcript, confidence)) => {
+                let normalized = if auto_normalize && !raw_transcript.is_empty() {
+                    Some(normalizer.normalize(&raw_transcript))
+                } else {
+                    None
+                };
+                match db.update_asr_transcript_if_unreviewed(id, &raw_transcript, normalized.as_deref(), confidence) {
+                    Ok(true) => {
+                        transcribed += 1;
+                        emit_or_log(
+                            app,
+                            "wsl-log",
+                            format!("[{}/{}] {} -> {}", idx + 1, total, id, wsl_log_preview(raw_transcript.trim())),
+                        );
+                    }
+                    Ok(false) => emit_or_log(
+                        app,
+                        "wsl-log",
+                        format!("[{}/{}] {} skipped (human-reviewed; transcript not overwritten)", idx + 1, total, id),
+                    ),
+                    Err(error) => {
+                        failed += 1;
+                        emit_or_log(
+                            app,
+                            "wsl-log",
+                            format!(
+                                "[ERROR] [{}/{}] {} db write failed: {}",
+                                idx + 1,
+                                total,
+                                id,
+                                wsl_log_preview(&error.to_string())
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                // A cancel mid-clip surfaces here as an error from the spawn; attribute it to the
+                // cancel, not to a failure, and stop the run.
+                if WSL_REFINE_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+                    emit_or_log(app, "wsl-log", format!(">>> Cancelled by user during segment {}/{}.", idx + 1, total));
+                    return Ok(WslRefinementSummary { transcribed, failed, cancelled: true });
+                }
+                failed += 1;
+                emit_or_log(
+                    app,
+                    "wsl-log",
+                    format!("[ERROR] [{}/{}] {}: {}", idx + 1, total, id, wsl_log_preview(&error.to_string())),
+                );
+            }
         }
     }
+
+    emit_or_log(
+        app,
+        "wsl-log",
+        format!(">>> Complete! {transcribed} transcribed, {failed} failed of {total} pending."),
+    );
+    Ok(WslRefinementSummary { transcribed, failed, cancelled: false })
+}
+
+#[tauri::command]
+pub fn cancel_wsl_refinement() -> Result<(), String> {
+    // Signal the batch loop (checked between segments) and the in-flight per-segment spawn (which
+    // polls this same flag and kills its child) to stop. There is no single child handle to kill
+    // here — each per-segment child is owned and reaped inside the spawn helper.
+    WSL_REFINE_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
@@ -3913,6 +4010,49 @@ mod tests {
             source_reference_models: models.iter().map(|model| (*model).to_string()).collect(),
             ..crate::settings::AppSettings::default()
         }
+    }
+
+    #[test]
+    fn segment_awaits_wsl7b_flags_only_empty_or_placeholder_transcripts() {
+        assert!(segment_awaits_wsl7b(""));
+        assert!(segment_awaits_wsl7b("   "));
+        assert!(segment_awaits_wsl7b("[Pending WSL 7B ASR]"));
+        // A real transcript (CTC or human) must NOT be flagged — the batch never clobbers good text.
+        assert!(!segment_awaits_wsl7b("سڵاو ئەمە دەقێکی ڕاستەقینەیە"));
+        assert!(!segment_awaits_wsl7b("a real ctc transcript"));
+    }
+
+    #[test]
+    fn select_wsl_refinement_targets_takes_only_pending_oldest_first() {
+        // get_segments returns newest-first; the batch must drain oldest-first and skip non-pending.
+        let segments = vec![
+            test_segment("s4", "b.wav", "real transcript"), // newest, has text -> excluded
+            test_segment("s3", "b.wav", "[Pending WSL 7B ASR]"), // pending
+            test_segment("s2", "a.wav", ""),                // pending
+            test_segment("s1", "a.wav", "already done"),    // oldest, has text -> excluded
+        ];
+        let targets = select_wsl_refinement_targets(&segments, None, None, false);
+        assert_eq!(targets, vec![("s2".to_string(), "a.wav".to_string()), ("s3".to_string(), "b.wav".to_string())]);
+    }
+
+    #[test]
+    fn select_wsl_refinement_targets_honors_file_segment_and_test_one_limits() {
+        // newest-first input; oldest-first pending order is s1(a) s2(a) s3(b) s4(b) s5(c).
+        let segments = vec![
+            test_segment("s5", "c.wav", ""),
+            test_segment("s4", "b.wav", ""),
+            test_segment("s3", "b.wav", ""),
+            test_segment("s2", "a.wav", ""),
+            test_segment("s1", "a.wav", ""),
+        ];
+        let ids = |targets: Vec<(String, String)>| targets.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+
+        // limit_files = 2 keeps only the first two distinct files (a, b), not c.
+        assert_eq!(ids(select_wsl_refinement_targets(&segments, Some(2), None, false)), vec!["s1", "s2", "s3", "s4"]);
+        // limit_segments = 3 caps to the three oldest pending.
+        assert_eq!(ids(select_wsl_refinement_targets(&segments, None, Some(3), false)), vec!["s1", "s2", "s3"]);
+        // test_one overrides limit_segments down to a single oldest segment.
+        assert_eq!(ids(select_wsl_refinement_targets(&segments, None, Some(3), true)), vec!["s1"]);
     }
 
     fn downloaded_model_status(filename: &str) -> serde_json::Value {

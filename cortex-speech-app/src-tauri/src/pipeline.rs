@@ -147,6 +147,114 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
     Ok((raw_transcript, confidence))
 }
 
+/// Spawn the configured external WSL ASR client for ONE segment and return its parsed transcript.
+///
+/// Shared by the per-segment pipeline path (`cancel = None`) and the batch refinement command. The
+/// configured script is the per-segment warm-server client (`--segment-id <id> --stdout-only`); the
+/// batch command drives THIS function in a loop rather than spawning the script once with batch
+/// flags (`--limit-files`/`--dry-run`/…) the per-segment client does not understand. `cancel`, when
+/// supplied, is polled while waiting for the child so a long-running clip is killed promptly (within
+/// ~50 ms) instead of blocking the whole batch for the full 5-minute timeout.
+pub(crate) fn run_wsl_segment_transcript_with_script(
+    external_script: &str,
+    segment_id: &str,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> AppResult<(String, Option<f64>)> {
+    let mut cmd = std::process::Command::new("wsl");
+    cmd.arg("/root/cortex_env/bin/python3")
+        .arg(external_script)
+        .arg("--segment-id")
+        .arg(segment_id)
+        .arg("--stdout-only");
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    // Spawn with explicit pipes so we keep a KILLABLE Child handle. The previous
+    // cmd.output()-on-a-thread approach gave no handle: on timeout the reader thread stayed blocked
+    // in output() and the wsl subprocess kept running, leaking one thread + one zombie process per
+    // timed-out segment. Now we poll for exit and, on timeout OR cancel, kill + reap the child.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| AppError::Other(format!("WSL subprocess launch failed: {e}")))?;
+
+    // Drain both pipes on threads so a chatty child can't deadlock on a full pipe buffer; the
+    // readers finish when the pipes close (child exit or kill). Bound how much we read so a
+    // buggy/hostile script that streams unbounded output can't OOM the host. The real protocol is
+    // one small `__RESULT__=` line; 8 MiB is far more than enough headroom while capping a runaway.
+    const MAX_WSL_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut s) = child_stdout {
+            use std::io::Read;
+            let _ = s.take(MAX_WSL_OUTPUT_BYTES).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut s) = child_stderr {
+            use std::io::Read;
+            let _ = s.take(MAX_WSL_OUTPUT_BYTES).read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let mut was_cancelled = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                    kill_and_reap_wsl_child(&mut child, "cancelled WSL subprocess");
+                    was_cancelled = true;
+                    break None;
+                }
+                if std::time::Instant::now() >= deadline {
+                    kill_and_reap_wsl_child(&mut child, "timed-out WSL subprocess");
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                kill_and_reap_wsl_child(&mut child, "failed WSL subprocess");
+                return Err(AppError::Other(format!("WSL subprocess wait failed: {e}")));
+            }
+        }
+    };
+
+    let stdout = join_wsl_pipe_reader(stdout_reader, "stdout");
+    let stderr = join_wsl_pipe_reader(stderr_reader, "stderr");
+    let output = match status {
+        Some(status) => std::process::Output { status, stdout, stderr },
+        None if was_cancelled => return Err(AppError::Other("WSL 7B ASR was cancelled.".into())),
+        None => return Err(AppError::Other("WSL 7B ASR process timed out after 5 minutes. Check WSL health.".into())),
+    };
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if !stdout_str.is_empty() {
+        tracing::debug!("WSL 7B ASR stdout captured ({} bytes).", output.stdout.len());
+    }
+    if !stderr_str.is_empty() {
+        tracing::debug!("WSL 7B ASR stderr captured ({} bytes).", output.stderr.len());
+    }
+
+    if !output.status.success() {
+        let err_msg = subprocess_error_preview(&stderr_str);
+        return Err(AppError::Other(format!("WSL 7B ASR process failed: {}", err_msg)));
+    }
+
+    parse_wsl_segment_result(&stdout_str)
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ImportStatus {
     pub running: bool,
@@ -293,6 +401,13 @@ impl ProcessingPipeline {
 
     pub fn update_settings(&mut self, settings: AppSettings) {
         self.settings = Arc::new(settings);
+    }
+
+    /// Path to the SQLite database this pipeline writes to. The batch 7B refinement command reads it
+    /// (briefly, under the pipeline lock) so its detached worker thread can open its OWN connection
+    /// instead of holding an AppState lock across a long per-segment transcription loop.
+    pub(crate) fn db_path(&self) -> &str {
+        &self.db_path
     }
 
     pub fn settings_snapshot(&self) -> AppSettings {
@@ -2097,100 +2212,7 @@ impl ProcessingPipeline {
                 "External ASR provider is not configured. Set the WSL script path in Settings before using the 7B provider.".into(),
             ));
         };
-
-        let mut cmd = std::process::Command::new("wsl");
-        cmd.arg("/root/cortex_env/bin/python3")
-            .arg(external_script)
-            .arg("--segment-id")
-            .arg(segment_id)
-            .arg("--stdout-only");
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let output = {
-            // Spawn with explicit pipes so we keep a KILLABLE Child handle. The previous
-            // cmd.output()-on-a-thread approach gave no handle: on timeout the reader
-            // thread stayed blocked in output() and the wsl subprocess kept running,
-            // leaking one thread + one zombie process per timed-out segment. Now we poll
-            // for exit and, on timeout, kill + reap the child so nothing is left running.
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
-            let mut child = cmd.spawn().map_err(|e| AppError::Other(format!("WSL subprocess launch failed: {e}")))?;
-
-            // Drain both pipes on threads so a chatty child can't deadlock on a full pipe
-            // buffer; the readers finish when the pipes close (child exit or kill).
-            // Bound how much we read from the child so a buggy/hostile script that streams unbounded
-            // output can't OOM the host. The real protocol is one small `__RESULT__=` line; 8 MiB is
-            // far more than enough headroom while capping a runaway.
-            const MAX_WSL_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-            let mut child_stdout = child.stdout.take();
-            let mut child_stderr = child.stderr.take();
-            let stdout_reader = std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(ref mut s) = child_stdout {
-                    use std::io::Read;
-                    let _ = s.take(MAX_WSL_OUTPUT_BYTES).read_to_end(&mut buf);
-                }
-                buf
-            });
-            let stderr_reader = std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(ref mut s) = child_stderr {
-                    use std::io::Read;
-                    let _ = s.take(MAX_WSL_OUTPUT_BYTES).read_to_end(&mut buf);
-                }
-                buf
-            });
-
-            let deadline = std::time::Instant::now() + Duration::from_secs(300);
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break Some(status),
-                    Ok(None) => {
-                        if std::time::Instant::now() >= deadline {
-                            kill_and_reap_wsl_child(&mut child, "timed-out WSL subprocess");
-                            break None;
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(e) => {
-                        kill_and_reap_wsl_child(&mut child, "failed WSL subprocess");
-                        return Err(AppError::Other(format!("WSL subprocess wait failed: {e}")));
-                    }
-                }
-            };
-
-            let stdout = join_wsl_pipe_reader(stdout_reader, "stdout");
-            let stderr = join_wsl_pipe_reader(stderr_reader, "stderr");
-            match status {
-                Some(status) => std::process::Output { status, stdout, stderr },
-                None => {
-                    return Err(AppError::Other(
-                        "WSL 7B ASR process timed out after 5 minutes. Check WSL health.".into(),
-                    ))
-                }
-            }
-        };
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        if !stdout_str.is_empty() {
-            tracing::debug!("WSL 7B ASR stdout captured ({} bytes).", output.stdout.len());
-        }
-        if !stderr_str.is_empty() {
-            tracing::debug!("WSL 7B ASR stderr captured ({} bytes).", output.stderr.len());
-        }
-
-        if !output.status.success() {
-            let err_msg = subprocess_error_preview(&stderr_str);
-            return Err(AppError::Other(format!("WSL 7B ASR process failed: {}", err_msg)));
-        }
-
-        parse_wsl_segment_result(&stdout_str)
+        run_wsl_segment_transcript_with_script(&external_script, segment_id, None)
     }
 
     pub fn align(
