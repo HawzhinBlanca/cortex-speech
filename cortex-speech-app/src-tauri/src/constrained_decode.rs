@@ -72,9 +72,13 @@ pub fn kurdish_keep_set(tokens: &[String], blank: usize) -> Vec<usize> {
     keep
 }
 
-/// Determine the CTC blank id empirically as the most-frequent argmax across all frames (OmniASR
-/// emits blank on the large majority of frames). Mirrors the probe's empirical-blank selection.
-pub fn empirical_blank(logits: &[Vec<f32>]) -> usize {
+/// Determine the CTC blank id empirically as the most-frequent argmax across frames (OmniASR emits blank
+/// on the large majority of frames). The blank is a fixed SPECIAL token (`<s>`/`<pad>`/…), never a real
+/// script token — so the vote is restricted to special `<...>` tokens. On a LONG clip the blank wins the
+/// global plurality anyway, but on a SHORT clip a single sustained Arabic token can out-count it; choosing
+/// that token as "blank" would make greedy_ctc silently DELETE the one word from the transcript.
+/// Restricting to special tokens makes the choice correct regardless of clip length.
+pub fn empirical_blank(logits: &[Vec<f32>], tokens: &[String]) -> usize {
     use std::collections::HashMap;
     let mut counts: HashMap<usize, usize> = HashMap::new();
     for frame in logits {
@@ -82,8 +86,15 @@ pub fn empirical_blank(logits: &[Vec<f32>]) -> usize {
     }
     // Deterministic tie-break: HashMap iteration order is per-process-randomized and max_by_key keeps the
     // LAST max seen, so on a count tie the chosen blank — and thus the decoded string — could differ
-    // between runs of the SAME input (and diverge from the Python probe this mirrors). Break ties by the
-    // smallest token id so the result is reproducible.
+    // between runs of the SAME input. Break ties by the smallest token id so the result is reproducible.
+    let is_special = |id: usize| tokens.get(id).map(|t| t.starts_with('<') && t.ends_with('>')).unwrap_or(false);
+    if let Some((&id, _)) =
+        counts.iter().filter(|&(&id, _)| is_special(id)).max_by_key(|&(&id, &c)| (c, std::cmp::Reverse(id)))
+    {
+        return id;
+    }
+    // No special token ever won a frame (a degenerate single-token clip, or a vocab with no `<...>`
+    // specials): fall back to the unrestricted plurality with the same smallest-id tie-break.
     counts.into_iter().max_by_key(|&(id, c)| (c, std::cmp::Reverse(id))).map(|(id, _)| id).unwrap_or(0)
 }
 
@@ -171,7 +182,7 @@ pub fn run_constrained(
     let frames: Vec<Vec<f32>> = (0..frames_n).map(|i| data[i * vocab..(i + 1) * vocab].to_vec()).collect();
 
     let tokens = load_tokens(tokens_path).map_err(|e| format!("tokens {}: {e}", tokens_path.display()))?;
-    let blank = empirical_blank(&frames);
+    let blank = empirical_blank(&frames, &tokens);
     let keep = if constrained { Some(kurdish_keep_set(&tokens, blank)) } else { None };
     Ok(greedy_ctc(&frames, blank, &tokens, keep.as_deref()))
 }
@@ -182,18 +193,33 @@ mod tests {
 
     #[test]
     fn empirical_blank_tie_break_is_deterministic_smallest_id() {
-        // Frames where token 0 and token 2 each win 2 argmaxes (a tie). The blank must deterministically
-        // be the smallest id (0), not a HashMap-iteration-order coin flip. Build many frames and assert
-        // the result is stable and == 0.
+        // Special tokens 0 (<s>) and 2 (</s>) each win 2 argmaxes (a tie). The blank must deterministically
+        // be the smallest id (0), not a HashMap-iteration-order coin flip.
         let frame_for = |winner: usize| {
             let mut f = vec![0.0f32; 4];
             f[winner] = 1.0;
             f
         };
+        let tokens = vec!["<s>".to_string(), "<pad>".to_string(), "</s>".to_string(), "ئ".to_string()];
         let logits = vec![frame_for(2), frame_for(0), frame_for(2), frame_for(0)];
         for _ in 0..50 {
-            assert_eq!(empirical_blank(&logits), 0, "tie must resolve to the smallest token id, every run");
+            assert_eq!(empirical_blank(&logits, &tokens), 0, "tie must resolve to the smallest token id, every run");
         }
+    }
+
+    #[test]
+    fn empirical_blank_ignores_a_real_token_that_out_counts_blank_on_a_short_clip() {
+        // A short clip where a sustained Arabic token (id 3) wins MORE frames than the real blank
+        // (<pad>, id 1). The blank must still be the special token, never the Arabic one — otherwise
+        // greedy_ctc would treat the word as blank and DELETE it from the transcript.
+        let frame_for = |winner: usize| {
+            let mut f = vec![0.0f32; 4];
+            f[winner] = 1.0;
+            f
+        };
+        let tokens = vec!["<s>".to_string(), "<pad>".to_string(), "</s>".to_string(), "ئ".to_string()];
+        let logits = vec![frame_for(3), frame_for(3), frame_for(3), frame_for(1)];
+        assert_eq!(empirical_blank(&logits, &tokens), 1, "a real script token must never be chosen as the blank");
     }
 
     #[test]
