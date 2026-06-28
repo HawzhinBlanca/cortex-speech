@@ -218,14 +218,8 @@ pub fn run_t0_gate(
         bucket_scored[conformal::snr_bucket(s.snr_db)].push((score, cer));
     }
     let (global_threshold, _gb, _gc) = conformal::calibrate_threshold(&global_scored, 0.05, 0.90);
-    let bucket_thresholds: [f64; conformal::N_SNR_BUCKETS] = std::array::from_fn(|b| {
-        let (t, _bb, is_cal) = conformal::calibrate_threshold(&bucket_scored[b], 0.05, 0.90);
-        if is_cal {
-            t
-        } else {
-            global_threshold
-        }
-    });
+    let bucket_thresholds: [f64; conformal::N_SNR_BUCKETS] =
+        std::array::from_fn(|b| bucket_threshold(&bucket_scored[b], global_threshold));
 
     // 4. Route and collect decisions
     let mut decisions = Vec::new();
@@ -270,6 +264,24 @@ pub fn run_t0_gate(
     }
 
     Ok(T0GateReport { total: target_segs.len(), auto_accepted, escalated, decisions })
+}
+
+/// Pick the conformal threshold for one acoustic-condition bucket. `calibrate_threshold` reports
+/// `is_calibrated = false` for TWO different reasons, which the gate must NOT conflate:
+///   * SPARSE (`< 10` verified items): too little data for the bucket's OWN guarantee — borrow the
+///     global threshold so calibration degrades gracefully on small datasets.
+///   * POPULATED but UNCERTIFIABLE (`>= 10` items, yet nothing certifies at the target error): the
+///     bucket has enough data, it is just too noisy. Keep its OWN strict cut (its minimum nonconformity,
+///     what `calibrate_threshold` returns here) — borrowing the lenient global, which is calibrated over
+///     the easier all-bucket mix, would let a worst-condition bucket auto-accept MORE of its segments,
+///     the opposite of the per-condition guarantee the bucketing exists to provide.
+fn bucket_threshold(bucket_scored: &[(f64, f64)], global_threshold: f64) -> f64 {
+    let (t, _bound, is_calibrated) = conformal::calibrate_threshold(bucket_scored, 0.05, 0.90);
+    if is_calibrated || bucket_scored.len() >= 10 {
+        t // calibrated -> its certified threshold; populated-uncertifiable -> its strict cut
+    } else {
+        global_threshold // sparse cold-start: degrade to the global threshold
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -744,5 +756,22 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 's-hv'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(captured, 0, "no model-correction example may be captured when the verdict write no-ops");
+    }
+
+    #[test]
+    fn uncertifiable_bucket_keeps_its_strict_cut_while_sparse_borrows_global() {
+        let global = 0.9; // a deliberately lenient global threshold
+                          // POPULATED (>=10) but too noisy to certify at 5% (every cer = 0.5): must keep its OWN strict cut
+                          // (the minimum nonconformity), NOT borrow the lenient global — else a worst-condition bucket
+                          // auto-accepts MORE of its segments. calibrate_threshold returns sorted[0].0 (the min) here.
+        let noisy: Vec<(f64, f64)> = (0..15).map(|i| (0.1 + i as f64 * 0.05, 0.5)).collect();
+        assert!(
+            (bucket_threshold(&noisy, global) - noisy[0].0).abs() < 1e-9,
+            "an uncertifiable bucket must use its own strict cut ({}), not the lenient global ({global})",
+            noisy[0].0
+        );
+        // SPARSE (<10) has too little data for its own guarantee -> borrow the global.
+        let sparse: Vec<(f64, f64)> = (0..5).map(|i| (0.1 * i as f64, 0.0)).collect();
+        assert_eq!(bucket_threshold(&sparse, global), global, "a sparse bucket borrows the global threshold");
     }
 }
