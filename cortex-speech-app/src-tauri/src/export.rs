@@ -60,7 +60,9 @@ impl ExportSegmentRecord {
 
 /// The published reference for an audio file: just its basename, never the curator's
 /// absolute path (which leaks the OS username and directory layout into a shared dataset).
-fn export_audio_ref(audio_path: &str) -> &str {
+/// `pub(crate)` so the audio-clip exporter (export_audio) reduces its metadata.csv source column
+/// the same way the JSON/JSONL/CSV/Parquet/HF exporters here do.
+pub(crate) fn export_audio_ref(audio_path: &str) -> &str {
     audio_path.rsplit(['/', '\\']).next().unwrap_or(audio_path)
 }
 

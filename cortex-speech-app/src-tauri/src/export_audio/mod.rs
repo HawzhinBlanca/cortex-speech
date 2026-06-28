@@ -277,8 +277,11 @@ fn write_metadata_csv(
                     AudioExportFormat::Flac => "flac",
                 };
                 // CWE-1236: neutralize spreadsheet formula injection on the free-text columns
-                // (transcripts / speaker / verdict). Structural columns (filename, audio_path,
-                // numeric, enum) are left untouched so the metadata stays valid.
+                // (transcripts / speaker / verdict). Numeric/enum structural columns are left untouched.
+                // The source path is reduced to its BASENAME (via export_audio_ref) so this shared
+                // metadata.csv never leaks the curator's absolute path — the OS username + directory
+                // layout — exactly as the JSON/JSONL/CSV/Parquet/HF exporters do.
+                let source_ref = crate::export::export_audio_ref(&seg.audio_path);
                 let raw_t = crate::export::csv_safe_cell(seg.raw_transcript.as_str());
                 let norm_t = crate::export::csv_safe_cell(seg.normalized_transcript.as_deref().unwrap_or(""));
                 let annot_t = crate::export::csv_safe_cell(seg.annotated_transcript.as_deref().unwrap_or(""));
@@ -287,7 +290,7 @@ fn write_metadata_csv(
                 wtr.write_record([
                     item.filename.as_str(),
                     seg.id.as_str(),
-                    seg.audio_path.as_str(),
+                    source_ref,
                     raw_t.as_ref(),
                     norm_t.as_ref(),
                     annot_t.as_ref(),
@@ -388,6 +391,26 @@ mod tests {
         let reader = hound::WavReader::open(path).unwrap();
         let spec = reader.spec();
         (spec.sample_rate, reader.duration())
+    }
+
+    #[test]
+    fn metadata_csv_reduces_source_path_to_basename_never_leaking_absolute_path() {
+        // The shared metadata.csv must publish only the source BASENAME, never the curator's absolute
+        // path (which leaks the OS username + directory layout), exactly like the JSON/JSONL/CSV/Parquet/HF
+        // exporters. Test write_metadata_csv directly so no fixture audio is needed.
+        let tmp = TempDir::new().unwrap();
+        let seg = SpeechSegment {
+            id: "s1".to_string(),
+            audio_path: "C:\\Users\\studio_user\\private_clips\\clip_001.wav".to_string(),
+            raw_transcript: "hello".to_string(),
+            ..SpeechSegment::default()
+        };
+        let exported = vec![ExportedAudioFile { filename: "ep_s1.wav".to_string(), segment: seg }];
+        write_metadata_csv(tmp.path(), &exported, &AudioExportOptions::default()).unwrap();
+        let csv = fs::read_to_string(tmp.path().join("metadata.csv")).unwrap();
+        assert!(!csv.contains("studio_user"), "absolute path leaked the OS username:\n{csv}");
+        assert!(!csv.contains("private_clips"), "absolute path leaked the directory layout:\n{csv}");
+        assert!(csv.contains("clip_001.wav"), "the source basename must be published as provenance:\n{csv}");
     }
 
     #[test]
