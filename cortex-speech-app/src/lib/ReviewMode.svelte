@@ -54,6 +54,42 @@
       : currentTime,
   );
 
+  // "Play exact words": when word timings exist, bound playback to the spoken span (first word →
+  // last word, small pad) so Play hears the words, not the silence/music the VAD chunk padded around
+  // them. Falls back to the whole clip when there are no word timings yet.
+  const SPOKEN_PAD = 0.12;
+  const hasWords = $derived(words.length > 0 && range.endTime > range.startTime);
+  const playStart = $derived(
+    hasWords ? range.startTime + Math.max(0, words[0].start - SPOKEN_PAD) : range.startTime,
+  );
+  const playEnd = $derived(
+    hasWords
+      ? range.startTime + Math.min(clipLength, words[words.length - 1].end + SPOKEN_PAD)
+      : range.endTime,
+  );
+
+  // Lazily compute + PERSIST forced-alignment word timings the first time a clip is opened without
+  // them, so the spoken-span playback + tap-a-word strip light up for the whole existing backlog
+  // (alignment reuses the saved transcript + audio; it does NOT re-run ASR). Best-effort: review still
+  // works with whole-clip playback if alignment is unavailable.
+  let aligning = $state(false);
+  const alignAttempted = new Set<string>();
+  async function ensureWordTimings(seg: SpeechSegment) {
+    if (parseWordTimestamps(seg.alignmentJson).length > 0 || alignAttempted.has(seg.id)) return;
+    const text = originalText(seg);
+    if (!text.trim() || text.includes('[Pending') || text.includes('[ASR unavailable')) return;
+    alignAttempted.add(seg.id);
+    aligning = true;
+    try {
+      await api.alignSegment(seg.audioPath, text, seg.alignmentJson ?? null, seg.id);
+      await segments.load(); // align_segment persisted the timings; reload so `words` derives them
+    } catch {
+      // best-effort — leave whole-clip playback in place
+    } finally {
+      aligning = false;
+    }
+  }
+
   function originalText(seg: SpeechSegment): string {
     return seg.annotatedTranscript ?? seg.normalizedTranscript ?? seg.rawTranscript ?? '';
   }
@@ -83,6 +119,7 @@
     currentTime = 0;
     playing = false;
     loadWaveform(seg);
+    void ensureWordTimings(seg);
   });
 
   // Drop a stale getWaveform response: switching clips A -> B while A's decode (up to ~30 s for a large
@@ -147,7 +184,7 @@
     playing = true;
   }
   function replay() {
-    currentTime = range.startTime;
+    currentTime = playStart;
     playing = true;
   }
 
@@ -211,11 +248,27 @@
         />
       </div>
 
-      <!-- Audio player — bounded to this clip so Play hears only this sentence. -->
+      <!-- Honest playback-scope hint: are we playing just the words, or the whole clip? -->
+      <div class="flex items-center gap-2 px-1 text-xs text-subtle" aria-live="polite">
+        {#if aligning}
+          <span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-t-transparent"
+          ></span>
+          <span>{$t('review.aligningWords')}</span>
+        {:else if hasWords}
+          <span class="text-accent">●</span>
+          <span>{$t('review.playingWordsOnly').replace('{sec}', (playEnd - playStart).toFixed(1))}</span>
+        {:else}
+          <span>{$t('review.playingWholeClip').replace('{sec}', clipLength.toFixed(1))}</span>
+        {/if}
+      </div>
+
+      <!-- Audio player — bounded to the SPOKEN SPAN (first→last word) when word timings exist, so Play
+           hears the exact words and not the silence/music the VAD chunk padded around them; otherwise
+           the whole clip. -->
       <AudioPlayer
         audioPath={current.audioPath}
-        startTime={range.startTime}
-        endTime={range.endTime}
+        startTime={playStart}
+        endTime={playEnd}
         bind:currentTime
         bind:duration={playerDuration}
         bind:playing

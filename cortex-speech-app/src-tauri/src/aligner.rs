@@ -418,17 +418,49 @@ fn ctc_align(logits: &[f32], vocab_size: usize, target_tokens: &[usize], blank_i
     (path, best_val)
 }
 
+/// Find the speech region [start_sec, end_sec] inside a clip by trimming leading/trailing low-energy
+/// (silence/music-pad) frames, so the fallback aligner places words on the actual speech instead of
+/// smearing them across the whole VAD-padded chunk. Returns None when the clip is empty or all silence.
+fn speech_bounds_sec(pcm: &[i16], sample_rate: u32) -> Option<(f64, f64)> {
+    if pcm.is_empty() || sample_rate == 0 {
+        return None;
+    }
+    let frame = (sample_rate as usize / 50).max(1); // ~20 ms frames
+    let rms: Vec<f64> = pcm
+        .chunks(frame)
+        .map(|c| (c.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / c.len() as f64).sqrt())
+        .collect();
+    let peak = rms.iter().cloned().fold(0.0_f64, f64::max);
+    if peak <= 0.0 {
+        return None;
+    }
+    // 8% of the clip's peak RMS separates speech from the noise/silence floor robustly across clips.
+    let threshold = peak * 0.08;
+    let first = rms.iter().position(|&e| e >= threshold)?;
+    let last = rms.iter().rposition(|&e| e >= threshold)?;
+    let start = (first * frame) as f64 / sample_rate as f64;
+    let end = (((last + 1) * frame).min(pcm.len()) as f64) / sample_rate as f64;
+    Some((start, end))
+}
+
 fn fallback_align(pcm: &[i16], sample_rate: u32, text: &str) -> Vec<WordTimestamp> {
-    let duration = pcm.len() as f64 / sample_rate as f64;
     let words: Vec<&str> = text.split_whitespace().collect();
-    let per_word = duration / words.len().max(1) as f64;
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let duration = pcm.len() as f64 / sample_rate.max(1) as f64;
+    // Distribute words across the detected SPEECH span (not the whole clip), so the spoken-span
+    // playback in review can actually trim the silence/music padding around a few words.
+    let (span_start, span_end) = speech_bounds_sec(pcm, sample_rate).unwrap_or((0.0, duration));
+    let span = (span_end - span_start).max(1e-3);
+    let per_word = span / words.len() as f64;
     words
         .iter()
         .enumerate()
         .map(|(i, w)| WordTimestamp {
             word: w.to_string(),
-            start: i as f64 * per_word,
-            end: (i + 1) as f64 * per_word,
+            start: span_start + i as f64 * per_word,
+            end: span_start + (i + 1) as f64 * per_word,
             confidence: 0.5,
         })
         .collect()
@@ -572,6 +604,31 @@ mod tests {
         assert_eq!(quality, AlignmentQuality::EnergyHeuristic);
         assert_eq!(quality.as_db_str(), "energy_heuristic");
         assert!(!timestamps.is_empty(), "fallback still yields per-word timestamps");
+    }
+
+    #[test]
+    fn fallback_align_places_words_on_speech_not_surrounding_silence() {
+        // A 4s clip with 1.5s leading silence, ~1s of speech, 1.5s trailing silence — the exact
+        // "few words inside a long padded chunk" case. The fallback must put the words on the speech
+        // span (so review's spoken-span playback can trim the silence), NOT smear them across 0–4s.
+        let sr = 16_000usize;
+        let mut pcm = vec![0i16; sr * 4];
+        for (i, s) in pcm.iter_mut().enumerate() {
+            if i >= sr * 3 / 2 && i < sr * 5 / 2 {
+                *s = if i % 2 == 0 { 9000 } else { -9000 }; // loud speech in [1.5s, 2.5s)
+            }
+        }
+        let words = fallback_align(&pcm, sr as u32, "یەک دوو سێ");
+        assert_eq!(words.len(), 3);
+        assert!(words[0].start >= 1.2 && words[0].start <= 1.8, "first word starts on speech, got {}", words[0].start);
+        assert!(
+            words[2].end >= 2.2 && words[2].end <= 2.8,
+            "last word ends on speech (not at clip end 4.0), got {}",
+            words[2].end
+        );
+        // All-silence clip degrades to spanning the whole duration rather than collapsing to zero.
+        let silent = fallback_align(&vec![0i16; sr * 2], sr as u32, "یەک دوو");
+        assert!((silent[1].end - 2.0).abs() < 0.05, "silent clip spans full duration, got {}", silent[1].end);
     }
 
     #[test]

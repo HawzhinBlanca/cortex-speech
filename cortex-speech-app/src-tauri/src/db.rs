@@ -1064,6 +1064,21 @@ impl Database {
         Ok(())
     }
 
+    /// Persist the chunk metadata + word timestamps JSON for a segment. `alignment_json` is metadata
+    /// (chunk window + per-word timings), NOT FTS-indexed transcript text, so no NFC canonicalization
+    /// is needed. Used by `align_segment` so forced-alignment word timings survive a reload instead of
+    /// being recomputed every time the clip is opened in review.
+    pub fn update_segment_alignment_json(&self, segment_id: &str, alignment_json: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE speech_segments
+             SET alignment_json = ?2, updated_at = datetime('now')
+             WHERE id = ?1",
+            params![segment_id, alignment_json],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
     fn map_row(row: &rusqlite::Row) -> rusqlite::Result<SpeechSegment> {
         Ok(SpeechSegment {
             id: row.get(0)?,
