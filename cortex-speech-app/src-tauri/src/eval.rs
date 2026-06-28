@@ -404,10 +404,19 @@ pub fn load_eval_run_and_recompute(
 
     for row in rows {
         let (seg, w_dist, w_ref, c_dist, c_ref) = row?;
-        total_word_distance += w_dist as usize;
-        total_word_ref_len += w_ref as usize;
-        total_char_distance += c_dist as usize;
-        total_char_ref_len += c_ref as usize;
+        // Skip empty-reference rows (ref_len == 0) from the micro accumulators, EXACTLY as the write
+        // path (run_gold_eval, lines ~260-267) does. Otherwise the recompute counts an empty-ref row's
+        // insertions over a zero denominator and pegs the reloaded micro WER/CER to its 1.0 clamp, while
+        // the stored run reads ~0% for the identical rows — breaking the documented "reload by id ==
+        // stored micro" invariant. The all-empty-corpus case still yields 0.0 below (distance is 0 too).
+        if w_ref > 0 {
+            total_word_distance += w_dist as usize;
+            total_word_ref_len += w_ref as usize;
+        }
+        if c_ref > 0 {
+            total_char_distance += c_dist as usize;
+            total_char_ref_len += c_ref as usize;
+        }
         seg_results.push(seg);
     }
 
@@ -869,19 +878,49 @@ mod tests {
             GoldSegmentInput {
                 audio_path: "/tmp/b.wav".into(), reference: "ئەمە دەنگە".into(), is_holdout: true
             },
+            // Empty-reference clip (tatweel-only ref -> normalizes to "") paired with a hallucinated
+            // hypothesis. Its persisted row carries word/char_distance > 0 with ref_len == 0; the reload
+            // path must skip it from the micro accumulators just like the write path, or recompute pegs
+            // to 1.0 while the stored run reads ~0% — exactly the divergence the reload invariant exists
+            // to catch. Without an empty-ref row in the fixture, this assertion never exercised it.
+            GoldSegmentInput {
+                audio_path: "/tmp/c.wav".into(),
+                reference: "\u{0640}\u{0640}\u{0640}".into(),
+                is_holdout: true,
+            },
         ];
         import_gold_segments(&db, inputs).unwrap();
         let gold = list_gold_segments(&db).unwrap();
 
-        let hyps = vec![(gold[0].id.clone(), "کوردستان".to_string()), (gold[1].id.clone(), "ئەمە".to_string())];
+        let hyps: Vec<(String, String)> = gold
+            .iter()
+            .map(|g| {
+                let hyp = match g.audio_path.as_str() {
+                    "/tmp/a.wav" => "کوردستان",
+                    "/tmp/b.wav" => "ئەمە",
+                    _ => "one two three", // hallucination on the empty-reference clip
+                };
+                (g.id.clone(), hyp.to_string())
+            })
+            .collect();
 
         let result = run_gold_eval(&db, "test-model", hyps).unwrap();
         let recomputed = load_eval_run_and_recompute(&db, &result.run.id).unwrap().unwrap();
 
         assert_eq!(result.run.id, recomputed.0.id);
         assert_eq!(result.run.num_segs, recomputed.0.num_segs);
-        assert_eq!(result.run.wer, recomputed.0.wer);
-        assert_eq!(result.run.cer, recomputed.0.cer);
+        assert_eq!(
+            result.run.wer, recomputed.0.wer,
+            "reloaded micro WER must equal the stored value (empty-ref guard)"
+        );
+        assert_eq!(
+            result.run.cer, recomputed.0.cer,
+            "reloaded micro CER must equal the stored value (empty-ref guard)"
+        );
+        // The reloaded micro rate must reflect only the reference-bearing clips (~0.33 from b's one
+        // deletion), NOT be pegged to 1.0 by the empty-ref hallucination's insertions over a 0 denominator.
+        assert!(recomputed.0.wer < 1.0, "empty-ref hallucination must not peg the RELOADED micro WER to 1.0");
+        assert!(recomputed.0.cer < 1.0, "empty-ref hallucination must not peg the RELOADED micro CER to 1.0");
         assert_eq!(result.segments.len(), recomputed.1.len());
     }
 }

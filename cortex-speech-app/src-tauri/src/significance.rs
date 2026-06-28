@@ -73,8 +73,16 @@ pub struct ConfidenceInterval {
 }
 
 /// Micro (corpus-level) error rate: `sum(errors) / sum(ref_len)`.
+///
+/// Empty-reference segments (`ref_len == 0`) are excluded from BOTH the numerator and the denominator.
+/// Such a segment has no reference unit to score against — its "errors" are pure insertions over a zero
+/// denominator, and counting them pegs the whole corpus rate to its 1.0 clamp from a single hallucination
+/// on silence. This is the ratio-of-sums convention (Bisani & Ney 2004) and matches the guard in
+/// `eval.rs::run_gold_eval`; centralizing it here keeps every caller (scorecard, annotation-drift,
+/// bootstrap) honest without each one having to remember.
 pub fn micro_rate(segments: &[SegmentError]) -> f64 {
-    let (err, len) = segments.iter().fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
+    let (err, len) =
+        segments.iter().filter(|s| s.ref_len > 0.0).fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
     if len > 0.0 {
         (err / len).min(1.0)
     } else {
@@ -88,8 +96,12 @@ pub fn micro_rate(segments: &[SegmentError]) -> f64 {
 /// replacement; the interval is the percentile interval at two-sided `confidence`
 /// (e.g. `0.95`). Deterministic given `seed`.
 pub fn bootstrap_ci(segments: &[SegmentError], n_resamples: usize, confidence: f64, seed: u64) -> ConfidenceInterval {
-    let point = micro_rate(segments);
-    let n = segments.len();
+    // Resample only scoreable (non-empty-reference) segments, consistent with `micro_rate`. An empty-ref
+    // row carries zero reference units, so keeping it in the pool would just inject 0/0 noise rows that
+    // distort the interval (and let one hallucination drag the whole CI toward 1.0).
+    let pool: Vec<SegmentError> = segments.iter().copied().filter(|s| s.ref_len > 0.0).collect();
+    let point = micro_rate(&pool);
+    let n = pool.len();
     if n == 0 || n_resamples == 0 {
         return ConfidenceInterval { point, lower: point, upper: point, confidence };
     }
@@ -100,7 +112,7 @@ pub fn bootstrap_ci(segments: &[SegmentError], n_resamples: usize, confidence: f
         let mut err = 0.0f64;
         let mut len = 0.0f64;
         for _ in 0..n {
-            let s = segments[rng.index(n)];
+            let s = pool[rng.index(n)];
             err += s.errors;
             len += s.ref_len;
         }
@@ -202,6 +214,17 @@ mod tests {
         // 1 error / 4 ref + 3 errors / 6 ref => 4/10 = 0.4 (NOT the mean of the two rates).
         let s = segs(&[(1.0, 4.0), (3.0, 6.0)]);
         assert!((micro_rate(&s) - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn micro_rate_and_bootstrap_exclude_empty_reference_segments() {
+        // A perfect referenced clip (0/8) + an empty-reference hallucination (errors=3, ref_len=0). The
+        // empty-ref row must contribute to NEITHER accumulator, so micro stays 0.0 — not pegged to 1.0 —
+        // and the bootstrap (which resamples only the scoreable pool) must not inflate its interval.
+        let s = segs(&[(0.0, 8.0), (3.0, 0.0)]);
+        assert_eq!(micro_rate(&s), 0.0, "empty-ref insertions must not peg micro_rate to 1.0");
+        let ci = bootstrap_ci(&s, 500, 0.95, 9);
+        assert!(ci.point < 1e-12 && ci.upper < 1e-12, "empty-ref must not inflate the bootstrap CI: {ci:?}");
     }
 
     #[test]
