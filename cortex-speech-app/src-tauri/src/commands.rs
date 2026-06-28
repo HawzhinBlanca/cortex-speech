@@ -2935,17 +2935,7 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
     RATE_LIMITER.check("clear_human_decision")?;
     validate::validate_identifier(&segment_id)?;
     let db = state.lock_db();
-    db.connection()
-        .execute(
-            "UPDATE speech_segments
-             SET human_decision = NULL,
-                 corrected_at   = NULL,
-                 updated_at     = datetime('now')
-             WHERE id = ?1",
-            rusqlite::params![segment_id],
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    db.clear_human_decision(&segment_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

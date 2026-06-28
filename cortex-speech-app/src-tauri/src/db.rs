@@ -1146,6 +1146,31 @@ impl Database {
         Ok(())
     }
 
+    /// Fully RE-OPEN a segment whose human decision is being undone. record_human_decision OVERWRITES
+    /// the prior machine verdict with the human one, so the pre-decision verdict is gone — the honest
+    /// reset is "un-adjudicated": clear the human decision AND the verdict it set, and return the segment
+    /// to the review queue (escalated = 1). Clearing only human_decision (the old behavior) left a stale
+    /// verdict = 'human_*' so the "undone" segment still looked decided on reload AND the machine
+    /// verdict-write guard (write_segment_verdict / jury::write_verdict) would refuse to re-adjudicate it.
+    pub fn clear_human_decision(&self, segment_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE speech_segments
+             SET human_decision     = NULL,
+                 corrected_at       = NULL,
+                 verdict            = NULL,
+                 verdict_transcript = NULL,
+                 rationale          = NULL,
+                 evidence_json      = NULL,
+                 agent_confidence   = NULL,
+                 escalated          = 1,
+                 updated_at         = datetime('now')
+             WHERE id = ?1",
+            params![segment_id],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
     /// Capture a MODEL correction (the jury auto-correcting OmniASR) as a provenance-tagged PSEUDO
     /// example: `source='model'`, `verified_by_human=0`. Unlike a human edit, this is NOT trusted
     /// training data — it is a candidate for human review / a future gated pseudo-label pass, and is
@@ -1552,6 +1577,28 @@ mod tests {
         db.write_segment_verdict("hv2", "jury_accept", Some("machine"), None, None, Some(0.8), false).unwrap();
         let seg2 = db.get_segment_by_id("hv2").unwrap().unwrap();
         assert_eq!(seg2.verdict.as_deref(), Some("jury_accept"), "a machine verdict must apply to a non-human segment");
+    }
+
+    #[test]
+    fn clear_human_decision_reopens_the_segment_for_re_adjudication() {
+        // Undo of a human decision must FULLY re-open the segment: clear the human decision AND the
+        // verdict it set (the pre-decision machine verdict is gone), returning it to the review queue.
+        // Otherwise the stale verdict='human_*' both shows as decided on reload and blocks re-jury.
+        let db = make_db();
+        db.insert_segment(&make_segment("cl1", "/cl1.wav")).unwrap();
+        db.record_human_decision("cl1", "edit", Some("human gold")).unwrap();
+        assert_eq!(db.get_segment_by_id("cl1").unwrap().unwrap().verdict.as_deref(), Some("human_edit"));
+
+        db.clear_human_decision("cl1").unwrap();
+        let cleared = db.get_segment_by_id("cl1").unwrap().unwrap();
+        assert_eq!(cleared.human_decision, None, "human_decision must be cleared");
+        assert_eq!(cleared.verdict, None, "the stale human verdict must be cleared, not left as 'human_edit'");
+        assert_eq!(cleared.verdict_transcript, None, "the human gold transcript is part of the undone decision");
+        assert!(cleared.escalated, "a re-opened segment returns to the review queue");
+
+        // A fresh machine verdict now applies (the human-decision guard no longer blocks it).
+        db.write_segment_verdict("cl1", "jury_accept", Some("machine"), None, None, Some(0.8), false).unwrap();
+        assert_eq!(db.get_segment_by_id("cl1").unwrap().unwrap().verdict.as_deref(), Some("jury_accept"));
     }
 
     #[test]
