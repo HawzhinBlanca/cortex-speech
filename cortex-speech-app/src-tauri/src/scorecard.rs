@@ -38,6 +38,14 @@ impl Default for ScorecardOptions {
 pub struct SystemScore {
     pub model_id: String,
     pub num_segments: usize,
+    /// Segments that actually contributed to the metrics: those whose reference normalizes to a non-empty
+    /// string. Empty-reference segments are excluded from WER/CER/CI/macro (a CER is undefined with no
+    /// reference unit), so when `scored_segments == 0` the metrics are UNDEFINED, not a real 0% — even
+    /// though `num_segments` may be > 0. render_markdown gates on this, never on the raw segment count.
+    /// `serde(default)` for forward-compat: a scorecard JSON persisted before this field existed still
+    /// deserializes (to 0) instead of failing — matching `slice_regressions`.
+    #[serde(default)]
+    pub scored_segments: usize,
     pub micro_wer: f64,
     pub micro_cer: f64,
     /// Macro (per-segment-mean) WER over UNCLAMPED per-segment rates — short clips with
@@ -156,10 +164,14 @@ pub fn build_scorecard(result: &EvalRunResult, baseline: Option<&EvalRunResult>,
     let word_errs = word_errors(result);
     let char_errs = char_errors(result);
     let (macro_wer, substitutions, deletions, insertions) = word_breakdown_aggregate(result);
+    // Count the segments that actually contribute a reference unit. The metrics already exclude empty-ref
+    // segments, so this can be < num_segments; when it is 0 the metrics are UNDEFINED (not a real 0%).
+    let scored_segments = word_errs.iter().filter(|e| e.ref_len > 0.0).count();
 
     let system = SystemScore {
         model_id: result.run.model_id.clone(),
         num_segments: result.segments.len(),
+        scored_segments,
         micro_wer: micro_rate(&word_errs),
         micro_cer: micro_rate(&char_errs),
         macro_wer,
@@ -260,19 +272,22 @@ pub fn render_markdown(sc: &Scorecard) -> String {
     let mut out = String::new();
     out.push_str(&format!("## ASR Scorecard — `{}`\n\n", s.model_id));
     out.push_str(&format!(
-        "Held-out gold segments: **{}** · {:.0}% bootstrap CIs ({} resamples, seed `{}`)\n\n",
+        "Held-out gold segments: **{}** ({} scored) · {:.0}% bootstrap CIs ({} resamples, seed `{}`)\n\n",
         s.num_segments,
+        s.scored_segments,
         sc.confidence * 100.0,
         sc.bootstrap_resamples,
         sc.seed
     ));
-    // No segments were scored → WER/CER are UNDEFINED, not 0%. Rendering a 0.00% here would read as a
-    // flawless model produced from nothing — exactly the fabricated metric the honesty bar forbids.
-    // Say so plainly and stop before the table.
-    if s.num_segments == 0 {
+    // No segments were SCORED → WER/CER are UNDEFINED, not 0%. Rendering a 0.00% here would read as a
+    // flawless model produced from nothing — exactly the fabricated metric the honesty bar forbids. Gate
+    // on the SCOREABLE count, not the raw segment count: a corpus of segments whose references all
+    // normalize to empty has num_segments > 0 yet every metric legitimately collapses to 0.0 (empty-ref
+    // segments are excluded), which would otherwise print a fabricated flawless table. Say so and stop.
+    if s.scored_segments == 0 {
         out.push_str(
             "> ⚠️ **No segments were scored — WER/CER are undefined (not 0%).** \
-             Add held-out gold segments and re-run to get a real measurement.\n",
+             Add held-out gold segments with non-empty references and re-run to get a real measurement.\n",
         );
         return out;
     }
@@ -687,6 +702,26 @@ mod tests {
         let md = render_markdown(&empty);
         assert!(md.contains("undefined"), "must call the metric undefined: {md}");
         assert!(!md.contains("0.00%"), "must NOT render a 0.00% rate from zero data: {md}");
+        assert!(!md.contains("| **WER** (micro) |"), "must not print the metric table: {md}");
+    }
+
+    #[test]
+    fn render_markdown_on_all_empty_references_says_undefined_not_fabricated_zero() {
+        // A corpus whose references ALL normalize to empty (tatweel-only) has num_segments > 0, yet every
+        // metric legitimately collapses to 0.0 (empty-ref segments are excluded from micro/macro/CI).
+        // render_markdown must gate on the SCOREABLE count and say "undefined" — NOT print a fabricated
+        // flawless 0.00% table (the honesty-law violation the empty-ref micro fix would otherwise expose).
+        let result = eval_with(
+            &[("/a.wav", "\u{0640}\u{0640}\u{0640}"), ("/b.wav", "\u{0640}\u{0640}")],
+            &["one two three", "four five"],
+            "all-empty-ref",
+        );
+        let sc = build_scorecard(&result, None, ScorecardOptions::default());
+        assert!(sc.system.num_segments > 0, "the segments exist (num_segments non-zero)");
+        assert_eq!(sc.system.scored_segments, 0, "none are scoreable (all references normalize to empty)");
+        let md = render_markdown(&sc);
+        assert!(md.contains("undefined"), "must call the metric undefined: {md}");
+        assert!(!md.contains("0.00%"), "must NOT render a fabricated flawless 0.00% from empty references: {md}");
         assert!(!md.contains("| **WER** (micro) |"), "must not print the metric table: {md}");
     }
 }

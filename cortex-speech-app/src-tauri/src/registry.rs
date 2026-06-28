@@ -649,6 +649,7 @@ mod tests {
             system: SystemScore {
                 model_id: "challenger".into(),
                 num_segments: 50,
+                scored_segments: 50,
                 micro_wer: system_wer,
                 micro_cer: system_cer,
                 macro_wer: system_wer,
