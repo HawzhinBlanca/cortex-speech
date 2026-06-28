@@ -118,6 +118,12 @@
     if (audioEl && Math.abs(audioEl.currentTime - currentTime) > 0.05) {
       try {
         audioEl.currentTime = currentTime;
+        // A programmatic seek WHILE PLAYING (tapping a word, a parent scrubber, a loop/replay jump)
+        // invalidates the clip-stop timer, which was scheduled for the OLD position's remaining time —
+        // leaving the clip to stop early (seek backward) or bleed past endTime (seek forward). Reschedule
+        // it from the new position so the clip still stops/loops exactly at endTime. The `> 0.05` guard
+        // above means normal playback progression (the prop tracking the element) never triggers this.
+        if (playing) scheduleClipStop();
       } catch {
         // Ignore potential errors if the audio element is not ready to seek yet
       }
