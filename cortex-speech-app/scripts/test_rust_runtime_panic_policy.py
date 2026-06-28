@@ -209,9 +209,16 @@ def test_wsl_refinement_batch_is_panic_safe_and_cancellable() -> None:
         # Cancellation flag, set by the cancel command and polled between segments + in-flight.
         "static WSL_REFINE_CANCEL: std::sync::atomic::AtomicBool",
         "WSL_REFINE_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst)",
-        # The running flag clears even if the worker thread panics mid-batch (RAII guard on Drop).
+        # The running flag clears even if the worker thread panics mid-batch (RAII guard on Drop),
+        # and the guard ALSO clears CANCEL at run end (so no start-of-run reset clobbers a racing cancel).
         "impl Drop for WslRefineRunningGuard",
         "WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst)",
+        "WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst)",
+        # Builder::spawn returns Err instead of panicking on OS thread-creation failure, so a failed
+        # spawn cannot wedge WSL_REFINE_RUNNING true (the RAII guard lives inside the closure).
+        'std::thread::Builder::new().name("wsl-7b-batch".into()).spawn(',
+        # A panic in the loop still emits a terminal wsl-status so the panel never wedges at "running".
+        "std::panic::catch_unwind(std::panic::AssertUnwindSafe(",
         # Drive the shared per-segment warm client (not a one-shot batch spawn), passing the cancel
         # flag so a long clip is interrupted promptly instead of blocking the whole batch.
         "crate::pipeline::run_wsl_segment_transcript_with_script(external_script, id, Some(&WSL_REFINE_CANCEL))",
@@ -238,7 +245,9 @@ def test_wsl_refinement_lifecycle_failures_are_reported() -> None:
     required = [
         # The detached batch worker reports a terminal failure as an event instead of swallowing it.
         'emit_or_log(&app, "wsl-log", format!("[ERROR] {}", wsl_log_preview(&message)));',
-        'emit_or_log(&app, "wsl-status", serde_json::json!({ "status": status, "exit_code": exit_code }));',
+        # The terminal status carries transcribed AND failed so the UI is honest about partial failure
+        # (a run with failures is never a plain green success).
+        'serde_json::json!({ "status": status, "transcribed": transcribed, "failed": failed, "exit_code": exit_code })',
         # Per-segment failures and human-reviewed skips are surfaced, not hidden.
         "failed += 1;",
         "skipped (human-reviewed; transcript not overwritten)",

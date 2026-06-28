@@ -1415,8 +1415,11 @@ pub fn import_model_checkpoint(
         validate::validate_text(card, 256, "model_card_name")?;
     }
     let checkpoint_path = validate::validate_file_path(&checkpoint_path)?;
+    // Hash the (potentially multi-GB) checkpoint BEFORE taking the DB lock — holding the global db
+    // mutex across the full-file SHA-256 would starve every UI DB poll (get_segments, search, …).
+    let sha = crate::registry::hash_checkpoint(&checkpoint_path).map_err(|e| e.to_string())?;
     let db = state.lock_db();
-    crate::registry::import_checkpoint(&db, &id, &family, &checkpoint_path, &source, &license, model_card_name)
+    crate::registry::register_checkpoint(&db, &id, &family, &checkpoint_path, &source, &license, model_card_name, sha)
         .map_err(|e| e.to_string())
 }
 
@@ -2117,7 +2120,10 @@ pub fn models_download(filename: String, state: State<'_, AppState>) -> Result<(
         .iter()
         .find(|m| m.filename == filename)
         .ok_or_else(|| format!("Unknown model filename: {filename}"))?;
-    let mm = state.lock_model_manager();
+    // Clone the manager (just a models_dir PathBuf) and DROP the AppState lock before the
+    // multi-hundred-MB blocking download, so the model panel's status poll and the readiness /
+    // acoustic-score checks aren't starved on lock_model_manager() for the whole download.
+    let mm = state.lock_model_manager().clone();
     mm.download_model(model, |progress| {
         tracing::debug!("Download {} progress: {:.0}%", model.name, progress * 100.0);
     })
@@ -2126,7 +2132,10 @@ pub fn models_download(filename: String, state: State<'_, AppState>) -> Result<(
 #[tauri::command]
 pub fn models_download_all(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("models_download_all")?;
-    let mm = state.lock_model_manager();
+    // Clone the manager and DROP the AppState lock before the long download loop — otherwise every
+    // missing model is fetched (hundreds of MB each) with lock_model_manager() held the whole time,
+    // starving the model panel's own progress poll and the readiness/score checks.
+    let mm = state.lock_model_manager().clone();
     let all_missing_count = mm.missing_models().len();
     let missing = mm.downloadable_missing_models();
     let total = missing.len();
@@ -2202,11 +2211,14 @@ static WSL_REFINE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// per-segment spawn so a cancel stops the run within ~50 ms. Reset to false when a new batch starts.
 static WSL_REFINE_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Resets `WSL_REFINE_RUNNING` on drop so the running flag clears even if the worker thread panics
-/// mid-batch — otherwise a panic would wedge the single-run guard until the app restarts.
+/// Clears the batch flags on drop so they reset even if the worker thread panics mid-batch.
+/// Resetting CANCEL here (at run END) — rather than at run start — means a new run never needs a
+/// start-of-run reset that could clobber a cancel racing the claim, and a late cancel can't leak
+/// into the next run.
 struct WslRefineRunningGuard;
 impl Drop for WslRefineRunningGuard {
     fn drop(&mut self) {
+        WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
         WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -2220,38 +2232,62 @@ fn wsl_log_preview(line: &str) -> String {
     preview
 }
 
-/// A segment needs (re)transcription by the 7B batch when it has no usable transcript yet — either
-/// empty or still showing the "[Pending …]" placeholder the import path leaves on a transient
-/// warm-server miss. We never target segments that already have a real transcript, so the batch
-/// can't clobber good CTC output (and `update_asr_transcript_if_unreviewed` additionally refuses to
-/// overwrite a human decision).
+/// A segment needs (re)transcription by the 7B batch when it has no usable transcript yet — empty or
+/// any placeholder (`[Pending …]`, `[ASR unavailable …]`, `n/a`, `null`). Uses the same predicate as
+/// the rest of the app (`quality::is_placeholder_transcript`) so the batch recovers an import that
+/// failed under the local CTC engine too, not just the 7B-primary "[Pending]" case. We never target
+/// a segment that already has a real transcript, so the batch can't clobber good CTC output (and
+/// `update_asr_transcript_if_unreviewed` additionally refuses to overwrite a human decision).
 fn segment_awaits_wsl7b(raw_transcript: &str) -> bool {
     let trimmed = raw_transcript.trim();
-    trimmed.is_empty() || trimmed.contains("[Pending")
+    trimmed.is_empty() || crate::quality::is_placeholder_transcript(trimmed)
 }
 
-/// Select which segments the batch 7B refinement should transcribe, oldest-first, honoring the
-/// panel's limits. Pure (no I/O) so it is unit-testable. `limit_files` caps the number of distinct
-/// source audio files touched; `limit_segments` caps total segments; `test_one` overrides to a
-/// single segment. Returns `(segment_id, audio_path)` pairs.
+/// Within-file ordering key: the chunk's source start offset (ms) parsed from `alignment_json`, or 0
+/// when absent. Segments from one import share a 1-second `created_at` and are tie-broken only by a
+/// random UUID, so without this the batch would process an arbitrary chunk first.
+fn segment_chunk_offset_ms(segment: &crate::db::SpeechSegment) -> i64 {
+    segment
+        .alignment_json
+        .as_deref()
+        .and_then(crate::chunking::SegmentSourceMeta::from_alignment_json)
+        .map(|meta| meta.source_start_ms)
+        .unwrap_or(0)
+}
+
+/// Select which segments the batch 7B refinement should transcribe, honoring the panel's limits.
+/// Pure (no I/O) so it is unit-testable. Drains the backlog deterministically oldest-first and, WITHIN
+/// one import (segments sharing a `created_at`), in chunk order (source start offset) so `test_one`
+/// and capped runs process the FIRST chunk rather than an arbitrary UUID-ordered one. `limit_files`
+/// caps distinct source files; `limit_segments` caps total segments; `test_one` overrides to a single
+/// segment. Returns `(segment_id, audio_path)` pairs.
 fn select_wsl_refinement_targets(
     segments: &[crate::db::SpeechSegment],
     limit_files: Option<u32>,
     limit_segments: Option<u32>,
     test_one: bool,
 ) -> Vec<(String, String)> {
-    // get_segments returns newest-first; drain the backlog oldest-first so a capped run is deterministic.
-    let mut targets: Vec<(String, String)> = segments
+    // Pair each pending segment with its (parsed-once) chunk offset, then sort: oldest import first,
+    // same file grouped, earliest chunk first, UUID only as a final stable tiebreak.
+    let mut pending: Vec<(&crate::db::SpeechSegment, i64)> = segments
         .iter()
-        .rev()
         .filter(|s| segment_awaits_wsl7b(&s.raw_transcript))
-        .map(|s| (s.id.clone(), s.audio_path.clone()))
+        .map(|s| (s, segment_chunk_offset_ms(s)))
         .collect();
+    pending.sort_by(|(a, a_offset), (b, b_offset)| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.audio_path.cmp(&b.audio_path))
+            .then_with(|| a_offset.cmp(b_offset))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut targets: Vec<(String, String)> =
+        pending.iter().map(|(s, _)| (s.id.clone(), s.audio_path.clone())).collect();
 
     if let Some(max_files) = limit_files.map(|n| n as usize) {
         let mut kept_files: Vec<String> = Vec::new();
         targets.retain(|(_, path)| {
-            if let Some(_existing) = kept_files.iter().find(|p| *p == path) {
+            if kept_files.iter().any(|p| p == path) {
                 true
             } else if kept_files.len() < max_files {
                 kept_files.push(path.clone());
@@ -2288,7 +2324,8 @@ pub fn run_wsl_refinement(
         return Err("WSL 7B refinement batch transcription is already running.".into());
     }
     // The running flag is now OURS; every early return below MUST clear it or the guard would wedge.
-    WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+    // CANCEL is NOT reset here: the WslRefineRunningGuard cleared it when the previous run ended, so it
+    // is already false, and resetting it here could clobber a cancel that races this claim.
 
     // Read everything the worker needs under the locks NOW, then release them so the long per-segment
     // loop holds no AppState lock. A 7B call can take seconds; holding a lock across the loop would
@@ -2311,31 +2348,56 @@ pub fn run_wsl_refinement(
     };
     let db_path = state.lock_pipeline().db_path().to_string();
 
-    std::thread::spawn(move || {
-        // Clears WSL_REFINE_RUNNING on every exit path, including a panic inside the loop.
+    // Builder::spawn returns Err on OS thread-creation failure instead of PANICKING like thread::spawn,
+    // so a failed spawn can't leave WSL_REFINE_RUNNING wedged true (the RAII guard lives inside the
+    // closure and would never run on a spawn panic).
+    let spawned = std::thread::Builder::new().name("wsl-7b-batch".into()).spawn(move || {
+        // Clears WSL_REFINE_RUNNING + WSL_REFINE_CANCEL on every exit path, including a panic.
         let _running = WslRefineRunningGuard;
-        let outcome = run_wsl_refinement_loop(
-            &app,
-            &db_path,
-            &external_script,
-            auto_normalize,
-            verbalize_numbers,
-            limit_files,
-            limit_segments,
-            dry_run,
-            test_one,
-        );
-        let (status, exit_code) = match outcome {
-            Ok(summary) if summary.cancelled => ("cancelled", summary.transcribed as i64),
-            Ok(summary) if summary.transcribed == 0 && summary.failed > 0 => ("failed", summary.failed as i64),
-            Ok(summary) => ("completed", summary.transcribed as i64),
-            Err(message) => {
+        // catch_unwind so a panic in the loop still emits a terminal wsl-status — otherwise the panel
+        // would stay wedged at "Processing…" forever (it only clears `running` on a wsl-status event).
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_wsl_refinement_loop(
+                &app,
+                &db_path,
+                &external_script,
+                auto_normalize,
+                verbalize_numbers,
+                limit_files,
+                limit_segments,
+                dry_run,
+                test_one,
+            )
+        }));
+        // Carry transcribed AND failed so the UI can be honest: a run with any failures is reported
+        // "completed" with failed>0 (not a clean green success), and an all-failed run is "failed".
+        let (status, transcribed, failed, exit_code) = match outcome {
+            Ok(Ok(summary)) if summary.cancelled => {
+                ("cancelled", summary.transcribed as i64, summary.failed as i64, summary.transcribed as i64)
+            }
+            Ok(Ok(summary)) if summary.transcribed == 0 && summary.failed > 0 => {
+                ("failed", 0, summary.failed as i64, -1)
+            }
+            Ok(Ok(summary)) => ("completed", summary.transcribed as i64, summary.failed as i64, summary.transcribed as i64),
+            Ok(Err(message)) => {
                 emit_or_log(&app, "wsl-log", format!("[ERROR] {}", wsl_log_preview(&message)));
-                ("failed", -1)
+                ("failed", 0, 0, -1)
+            }
+            Err(_panic) => {
+                emit_or_log(&app, "wsl-log", "[ERROR] WSL 7B batch worker panicked; the run was aborted.".to_string());
+                ("failed", 0, 0, -1)
             }
         };
-        emit_or_log(&app, "wsl-status", serde_json::json!({ "status": status, "exit_code": exit_code }));
+        emit_or_log(
+            &app,
+            "wsl-status",
+            serde_json::json!({ "status": status, "transcribed": transcribed, "failed": failed, "exit_code": exit_code }),
+        );
     });
+    if let Err(error) = spawned {
+        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err(format!("Failed to start the WSL 7B batch worker thread: {error}"));
+    }
 
     Ok(serde_json::json!({ "status": "started" }))
 }
@@ -2466,6 +2528,13 @@ fn run_wsl_refinement_loop(
         }
     }
 
+    // A cancel that arrives during the FINAL segment passes every in-loop check (there is no next
+    // iteration); re-check once here so it is honestly reported as cancelled, not completed.
+    if WSL_REFINE_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+        emit_or_log(app, "wsl-log", format!(">>> Cancelled by user; {transcribed} transcribed before stopping."));
+        return Ok(WslRefinementSummary { transcribed, failed, cancelled: true });
+    }
+
     emit_or_log(
         app,
         "wsl-log",
@@ -2476,10 +2545,13 @@ fn run_wsl_refinement_loop(
 
 #[tauri::command]
 pub fn cancel_wsl_refinement() -> Result<(), String> {
-    // Signal the batch loop (checked between segments) and the in-flight per-segment spawn (which
-    // polls this same flag and kills its child) to stop. There is no single child handle to kill
-    // here — each per-segment child is owned and reaped inside the spawn helper.
-    WSL_REFINE_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Only arm the cancel while a batch is actually running, so an idle cancel can't leak into and
+    // immediately abort the NEXT run. Signals the batch loop (checked between segments) and the
+    // in-flight per-segment spawn (which polls this same flag and kills its child) to stop; there is
+    // no single child handle to kill here — each per-segment child is owned and reaped in the helper.
+    if WSL_REFINE_RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+        WSL_REFINE_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     Ok(())
 }
 
@@ -4017,9 +4089,42 @@ mod tests {
         assert!(segment_awaits_wsl7b(""));
         assert!(segment_awaits_wsl7b("   "));
         assert!(segment_awaits_wsl7b("[Pending WSL 7B ASR]"));
+        // Also the placeholders the LOCAL CTC import path can leave, so the batch can recover them too.
+        assert!(segment_awaits_wsl7b("[ASR unavailable: model load failed]"));
+        assert!(segment_awaits_wsl7b("n/a"));
         // A real transcript (CTC or human) must NOT be flagged — the batch never clobbers good text.
         assert!(!segment_awaits_wsl7b("سڵاو ئەمە دەقێکی ڕاستەقینەیە"));
         assert!(!segment_awaits_wsl7b("a real ctc transcript"));
+    }
+
+    #[test]
+    fn select_wsl_refinement_targets_orders_by_chunk_offset_within_a_file_not_by_uuid() {
+        // Two chunks of ONE file sharing a created_at. The LATER chunk has the lexically-SMALLER id,
+        // so a naive id/UUID order (the old `.rev()` of `id ASC`) would pick it first; the chunk's
+        // source offset must win so test_one transcribes chunk 0.
+        let meta = |start: i64, idx: u32| {
+            crate::chunking::SegmentSourceMeta {
+                source_start_ms: start,
+                source_end_ms: start + 1000,
+                chunk_index: idx,
+                chunk_count: 2,
+            }
+            .to_alignment_json()
+        };
+        let mut early = test_segment("zzz-chunk0", "file.wav", "[Pending WSL 7B ASR]");
+        early.created_at = Some("2026-01-01T00:00:00Z".to_string());
+        early.alignment_json = Some(meta(0, 0));
+        let mut late = test_segment("aaa-chunk1", "file.wav", "[Pending WSL 7B ASR]");
+        late.created_at = Some("2026-01-01T00:00:00Z".to_string());
+        late.alignment_json = Some(meta(5000, 1));
+        // get_segments returns newest-first; pass the later-position chunk first.
+        let segments = vec![late, early];
+        let targets = select_wsl_refinement_targets(&segments, None, None, true);
+        assert_eq!(
+            targets,
+            vec![("zzz-chunk0".to_string(), "file.wav".to_string())],
+            "test_one must pick chunk 0 (earliest source offset), not the lexically-smaller UUID"
+        );
     }
 
     #[test]

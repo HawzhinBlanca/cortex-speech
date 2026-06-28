@@ -224,8 +224,22 @@ pub fn record_eval_result(
 /// This is the safe half of ingesting a fine-tuned model. Writing the fairseq2 asset-card and
 /// resolving the real base-card name (which must fail loudly rather than hardcode `…_v2`) are a
 /// follow-up that needs the WSL fairseq2 registry.
+/// Hash the checkpoint file (the slow, multi-hundred-MB-to-GB streaming SHA-256). Split out from
+/// `import_checkpoint` so a caller can run it BEFORE taking the DB lock — holding the global db mutex
+/// across a full-file read starves every UI DB poll (same lock-across-heavy-op class as the rest).
+pub fn hash_checkpoint(checkpoint_path: &str) -> AppResult<String> {
+    let path = std::path::Path::new(checkpoint_path);
+    if !path.is_file() {
+        return Err(AppError::Validation(format!("cannot import checkpoint: no file at '{checkpoint_path}'")));
+    }
+    crate::models::compute_file_sha256(path)
+        .map_err(|e| AppError::Other(format!("hashing checkpoint '{checkpoint_path}': {e}")))
+}
+
+/// Register a (pre-hashed) checkpoint as an unpinned candidate. This is the brief DB-only half; pass
+/// the `sha` from `hash_checkpoint` so the DB lock is held only for the insert, not the file read.
 #[allow(clippy::too_many_arguments)]
-pub fn import_checkpoint(
+pub fn register_checkpoint(
     db: &Database,
     id: &str,
     family: &str,
@@ -233,13 +247,8 @@ pub fn import_checkpoint(
     source: &str,
     license: &str,
     model_card_name: Option<String>,
+    sha: String,
 ) -> AppResult<String> {
-    let path = std::path::Path::new(checkpoint_path);
-    if !path.is_file() {
-        return Err(AppError::Validation(format!("cannot import checkpoint: no file at '{checkpoint_path}'")));
-    }
-    let sha = crate::models::compute_file_sha256(path)
-        .map_err(|e| AppError::Other(format!("hashing checkpoint '{checkpoint_path}': {e}")))?;
     register_candidate(
         db,
         &NewModelVersion {
@@ -253,6 +262,20 @@ pub fn import_checkpoint(
         },
     )?;
     Ok(sha)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn import_checkpoint(
+    db: &Database,
+    id: &str,
+    family: &str,
+    checkpoint_path: &str,
+    source: &str,
+    license: &str,
+    model_card_name: Option<String>,
+) -> AppResult<String> {
+    let sha = hash_checkpoint(checkpoint_path)?;
+    register_checkpoint(db, id, family, checkpoint_path, source, license, model_card_name, sha)
 }
 
 /// Build the fairseq2 asset-card YAML that drops an imported checkpoint into the WSL inference path

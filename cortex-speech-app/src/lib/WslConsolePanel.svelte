@@ -10,6 +10,8 @@
 
   let running = $state(false);
   let status = $state<'idle' | 'running' | 'completed' | 'failed' | 'cancelled'>('idle');
+  let lastTranscribed = $state(0);
+  let lastFailed = $state(0);
 
   // Options
   let limitFiles = $state<number | undefined>(undefined);
@@ -105,15 +107,19 @@
     const logHandle = listen<string>('wsl-log', (event) => {
       appendLog(event.payload);
     });
-    const statusHandle = listen<{ status: 'completed' | 'failed' | 'cancelled'; exit_code: number }>(
-      'wsl-status',
-      (event) => {
-        // In-panel display only. The completion side effects (toast + segment refresh) are handled
-        // app-scoped in events.ts so they fire even when this panel is closed mid-run.
-        status = event.payload.status;
-        running = false;
-      },
-    );
+    const statusHandle = listen<{
+      status: 'completed' | 'failed' | 'cancelled';
+      transcribed?: number;
+      failed?: number;
+      exit_code: number;
+    }>('wsl-status', (event) => {
+      // In-panel display only. The completion side effects (toast + segment refresh) are handled
+      // app-scoped in events.ts so they fire even when this panel is closed mid-run.
+      status = event.payload.status;
+      lastTranscribed = event.payload.transcribed ?? 0;
+      lastFailed = event.payload.failed ?? 0;
+      running = false;
+    });
     return () => {
       logHandle.then((u) => u()).catch(() => {});
       statusHandle.then((u) => u()).catch(() => {});
@@ -244,7 +250,11 @@
                 {$t('wsl.processing')}
               </span>
             {:else if status === 'completed'}
-              <span class="text-emerald-400 font-semibold">● {$t('wsl.completed')}</span>
+              {#if lastFailed > 0}
+                <span class="text-amber-400 font-semibold">● {lastTranscribed} ✓ · {lastFailed} ✗</span>
+              {:else}
+                <span class="text-emerald-400 font-semibold">● {$t('wsl.completed')}</span>
+              {/if}
             {:else if status === 'failed'}
               <span class="text-red-400 font-semibold">● {$t('wsl.failed')}</span>
             {:else if status === 'cancelled'}
