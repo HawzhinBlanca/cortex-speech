@@ -1515,14 +1515,22 @@ impl ProcessingPipeline {
         // Retry a few times before giving up so an import reliably transcribes every segment; only
         // escalate after the retries are exhausted, rather than silently shipping a pending segment.
         const MAX_ATTEMPTS: usize = 3;
+        // FORCE-USE the Champion (fail-hard): if the 7B server is unreachable/hung/errored — an
+        // INFRASTRUCTURE failure, i.e. the client process exits non-zero (its honest failure contract),
+        // as opposed to a REACHABLE server legitimately returning an empty transcript for a silent clip —
+        // this import is CANCELLED and every segment it just created is rolled back. The user then starts
+        // the 7B server and re-imports cleanly, instead of being left with a library of
+        // "[Pending WSL 7B ASR]" placeholders or silently-downgraded output the owner never asked for.
+        let import_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
         let mut updated = 0usize;
-        for seg in segments {
+        for seg in segments.iter_mut() {
             // Honor cancellation between segments: each WSL transcription can ride a 300s timeout, so
             // without this a cancelled import of an N-segment file would keep running for up to N*300s.
             if let Some(token) = cancel {
                 token.check()?;
             }
             let mut last_problem: Option<String> = None;
+            let mut infra_failure = false;
             for attempt in 1..=MAX_ATTEMPTS {
                 match self.transcribe(Some(seg.id.as_str()), &seg.audio_path, seg.alignment_json.as_deref()) {
                     Ok((_raw_text, _corrected_text, _confidence)) => {
@@ -1531,17 +1539,24 @@ impl ProcessingPipeline {
                         if usable {
                             updated += 1;
                             last_problem = None;
+                            infra_failure = false;
                             break;
                         }
+                        // Reachable server but no words back — could be a genuinely silent clip. NOT an
+                        // infrastructure failure: escalate only this segment after retries, never cancel.
                         last_problem = Some("7B returned an empty transcript".to_string());
+                        infra_failure = false;
                     }
                     Err(error) => {
+                        // The client exited non-zero: server not running / unreachable / hung / errored.
+                        // Fatal for a force-7B import. A 5-minute per-attempt timeout means the server is
+                        // HUNG, not transiently flaky — another full-timeout attempt only triples the
+                        // stall, so stop fast. Quick failures (connection refused) still retry briefly in
+                        // case the server is mid-launch.
                         let msg = error.to_string();
-                        // A 5-minute per-attempt timeout means the server is HUNG, not transiently
-                        // flaky — another full-timeout attempt only triples the stall. Stop and
-                        // escalate fast. Quick failures (connection refused, empty) still retry.
                         let hung = msg.contains("timed out");
                         last_problem = Some(msg);
+                        infra_failure = true;
                         if hung {
                             break;
                         }
@@ -1550,6 +1565,24 @@ impl ProcessingPipeline {
                 if attempt < MAX_ATTEMPTS {
                     std::thread::sleep(std::time::Duration::from_millis(1000));
                 }
+            }
+            if infra_failure {
+                let reason = last_problem.unwrap_or_else(|| "7B server unreachable".to_string());
+                tracing::error!(
+                    "WSL 7B import cancelled (server unavailable: {reason}); rolling back {} segment(s)",
+                    import_ids.len()
+                );
+                if let Err(e) = db.delete_segments_batch(&import_ids) {
+                    tracing::error!(
+                        "failed to roll back {} placeholder segment(s) after 7B cancel: {e}",
+                        import_ids.len()
+                    );
+                }
+                return Err(AppError::Validation(format!(
+                    "OmniASR 7B server is not running — start it (e.g. \"Start 7B server.bat\") and re-import. \
+                     The import was cancelled and its {} segment(s) were rolled back. ({reason})",
+                    import_ids.len()
+                )));
             }
             if let Some(reason) = last_problem {
                 tracing::warn!("WSL 7B import: segment {} failed after {MAX_ATTEMPTS} attempts: {reason}", seg.id);
