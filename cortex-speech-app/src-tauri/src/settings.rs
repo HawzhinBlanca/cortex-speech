@@ -273,7 +273,12 @@ impl Default for AppSettings {
             model_dir: PathBuf::from("models"),
             output_dir: PathBuf::from("exports"),
             asr_provider: AsrProvider::default(),
-            asr_model_size: AsrModelSize::CTC300M,
+            // The fine-tuned OmniASR-7B Champion (run via the WSL GPU path) is the owner's main model,
+            // so it is the built-in default — a lost/reset settings.json still selects the 7B rather than
+            // silently reverting to the weaker base CTC-300M. The 7B client script is resolved from
+            // external_asr_script_path (or the bundled client when that is empty); when neither the script
+            // nor a reachable server is available the import fails hard rather than downgrading.
+            asr_model_size: AsrModelSize::WSL7B,
             vad_threshold: 0.5,
             min_segment_duration_ms: 3000,
             max_segment_duration_ms: 15000,
@@ -558,8 +563,10 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn default_asr_model_matches_bundled_runtime_model() {
-        assert_eq!(AppSettings::default().asr_model_size, AsrModelSize::CTC300M);
+    fn default_asr_model_is_the_forced_7b_champion() {
+        // The owner's main model is the fine-tuned OmniASR-7B Champion (WSL GPU path), so it is the
+        // built-in default — a reset/lost settings.json must not silently revert to the weaker base CTC.
+        assert_eq!(AppSettings::default().asr_model_size, AsrModelSize::WSL7B);
     }
 
     #[test]
@@ -830,7 +837,7 @@ mod tests {
 
         let loaded = AppSettings::load(&path);
         assert_eq!(loaded.language, "ckb");
-        assert_eq!(loaded.asr_model_size, AsrModelSize::CTC300M);
+        assert_eq!(loaded.asr_model_size, AsrModelSize::WSL7B);
         assert!(!path.with_extension("json.tmp").exists());
         assert!(!backup_files_left(tmp.path()));
     }
