@@ -82,9 +82,16 @@ pub fn ctc_decode(frames: &[Vec<f32>], tokens: &[String]) -> String {
     out.trim().to_string()
 }
 
-/// Run the fine-tuned Wav2Vec2-CTC model on raw 16 kHz mono audio via `ort` and decode to text.
-/// The session is cached (keyed by ONNX path) across calls.
-pub fn run_wav2vec2(onnx_path: &Path, vocab_path: &Path, lang: &str, audio: &[f32]) -> Result<String, String> {
+/// Run the fine-tuned Wav2Vec2-CTC model and return the raw CTC emission logits (flat row-major
+/// `[frames * vocab]`), the frame count, the vocab width, and the char token table. Shared by
+/// transcription (greedy decode) and forced alignment (Viterbi against a known transcript). The
+/// session is cached (keyed by ONNX path) across calls.
+pub fn wav2vec2_logits(
+    onnx_path: &Path,
+    vocab_path: &Path,
+    lang: &str,
+    audio: &[f32],
+) -> Result<(Vec<f32>, usize, usize, Vec<String>), String> {
     crate::models::init_ort_dylib_path();
     let normed = normalize_audio(audio);
     let n = normed.len();
@@ -114,7 +121,6 @@ pub fn run_wav2vec2(onnx_path: &Path, vocab_path: &Path, lang: &str, audio: &[f3
     if data.len() < frames_n * vocab {
         return Err("logits buffer smaller than shape".to_string());
     }
-    let frames: Vec<Vec<f32>> = (0..frames_n).map(|i| data[i * vocab..(i + 1) * vocab].to_vec()).collect();
     let tokens = load_lang_vocab(vocab_path, lang)?;
     // The CTC head width MUST equal the vocab token count — otherwise argmax indices map to the WRONG
     // token (head narrower than vocab → fluent-but-wrong Kurdish) or fall off the end (head wider →
@@ -129,6 +135,13 @@ pub fn run_wav2vec2(onnx_path: &Path, vocab_path: &Path, lang: &str, audio: &[f3
             tokens.len()
         ));
     }
+    Ok((data[..frames_n * vocab].to_vec(), frames_n, vocab, tokens))
+}
+
+/// Run the fine-tuned Wav2Vec2-CTC model on raw 16 kHz mono audio via `ort` and decode to text.
+pub fn run_wav2vec2(onnx_path: &Path, vocab_path: &Path, lang: &str, audio: &[f32]) -> Result<String, String> {
+    let (data, frames_n, vocab, tokens) = wav2vec2_logits(onnx_path, vocab_path, lang, audio)?;
+    let frames: Vec<Vec<f32>> = (0..frames_n).map(|i| data[i * vocab..(i + 1) * vocab].to_vec()).collect();
     Ok(ctc_decode(&frames, &tokens))
 }
 
