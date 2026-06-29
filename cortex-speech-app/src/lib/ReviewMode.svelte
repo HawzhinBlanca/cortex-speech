@@ -172,21 +172,26 @@
   async function submit(acceptAsIs: boolean) {
     const seg = current;
     if (!seg || saving) return;
-    saving = true;
     const original = originalText(seg).trim();
     const text = acceptAsIs ? original : editText.trim();
+    // Never save an empty edit (mirrors the Save button's disabled guard — the Ctrl+Enter shortcut
+    // would otherwise bypass it, blank the transcript, and split the segment's state).
+    if (!acceptAsIs && !text) return;
+    saving = true;
     // Map to a real human decision: an actual change is an "edit" (the typed text becomes gold), a
     // no-change save is an "accept".
     const isEdit = !acceptAsIs && text !== original;
     const updated: SpeechSegment = { ...seg, annotatedTranscript: text, verified: true };
     try {
-      // BOTH calls are required. updateSegment marks `verified` (so the queue/progress/completion
-      // advance) and writes the text to annotated_transcript where the editor + FTS search read it.
-      // recordHumanDecision records the human_decision (so the jury never re-adjudicates this clip)
-      // and feeds the learning flywheel. recordHumanDecision ALONE left `verified` false (queue stuck)
-      // and wrote only verdict_transcript (the editor showed stale text on revisit).
-      await api.updateSegment(updated);
+      // BOTH calls are required, recordHumanDecision FIRST: it validates the decision (an empty edit
+      // throws here) so a failure aborts BEFORE updateSegment commits — no split state where the clip
+      // is `verified` with no human_decision (or a blanked transcript). recordHumanDecision records the
+      // human_decision (so the jury never re-adjudicates) + feeds the learning flywheel; updateSegment
+      // marks `verified` (queue/progress advance) and writes annotated_transcript where the editor +
+      // FTS search read it. If updateSegment fails after recordHumanDecision, the clip stays unverified
+      // (in the queue) and re-review self-heals it.
       await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', isEdit ? text : null);
+      await api.updateSegment(updated);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       editCache.delete(seg.id); // persisted — drop the in-progress copy
       lastLoadedOriginal = text; // the saved text is now the baseline for dirty-tracking
