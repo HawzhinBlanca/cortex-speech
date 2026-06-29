@@ -92,6 +92,27 @@ export async function alignSegment(
   });
 }
 
+export interface ConsensusWord {
+  text: string;
+  agreement: number;
+  modelsAgreeing: number;
+  totalModels: number;
+  alternatives: string[];
+}
+
+export interface SegmentConsensus {
+  draft: string;
+  words: ConsensusWord[];
+  modelCount: number;
+  minAgreement: number;
+  meanAgreement: number;
+}
+
+/** Offline best-of-N consensus draft for a segment (ability-weighted vote over its ASR hypotheses). */
+export async function getSegmentConsensus(segmentId: string): Promise<SegmentConsensus> {
+  return invoke<SegmentConsensus>('get_segment_consensus', { segmentId });
+}
+
 export async function getSegments(verified?: boolean): Promise<SpeechSegment[]> {
   const data = await invoke<SpeechSegment[]>('get_segments', { verified });
   if (!Array.isArray(data)) {

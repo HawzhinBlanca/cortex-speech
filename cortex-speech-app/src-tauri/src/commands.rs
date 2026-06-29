@@ -139,11 +139,14 @@ fn build_agentic_readiness(
     let mut checks = Vec::new();
     let source_reference_models = settings.source_reference_models();
     if !settings.jury_cloud_opt_in {
+        // Cloud whole-file references are an OPTIONAL enhancement, not a hard requirement — the jury
+        // still runs local multi-model consensus offline (escalating disagreements for review). Report
+        // "degraded", not "blocked", so the offline path isn't mis-presented as unavailable.
         checks.push(readiness_check(
             "source_reference",
             "Whole-file source references",
-            "blocked",
-            "Enable jury cloud opt-in to create Gemini whole-file reference transcripts before chunking.",
+            "degraded",
+            "Offline mode: the jury runs local multi-model consensus and escalates disagreements for review. Enable jury cloud opt-in to also cross-check against Gemini whole-file references.",
         ));
     } else if settings.llm_api_key.trim().is_empty() {
         checks.push(readiness_check(
@@ -1153,6 +1156,43 @@ pub fn align_segment(
         }
     }
     Ok(timestamps)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentConsensus {
+    /// Best-of-N draft transcript (ability-weighted vote across the segment's ASR hypotheses).
+    pub draft: String,
+    /// Per-word breakdown with the agreement signal + what the other models said.
+    pub words: Vec<crate::quality::irt::ConsensusWord>,
+    pub model_count: usize,
+    /// Lowest per-word agreement (0..1) — a quick "how contested is this clip" signal.
+    pub min_agreement: f64,
+    pub mean_agreement: f64,
+}
+
+/// Offline best-of-N consensus DRAFT for a segment: an ability-weighted vote over its ASR hypotheses
+/// (no cloud) so review can start from a transcript better than any single model and highlight exactly
+/// where the models disagreed. Empty when the segment has no hypotheses to vote over.
+#[tauri::command]
+pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> Result<SegmentConsensus, String> {
+    RATE_LIMITER.check("get_segment_consensus")?;
+    validate::validate_identifier(&segment_id)?;
+    let hyps = {
+        let db = state.lock_db();
+        db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?
+    };
+    let words = crate::quality::irt::segment_consensus_words(&hyps);
+    let draft = words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+    let model_count = words.first().map(|w| w.total_models).unwrap_or(0);
+    let (min_agreement, mean_agreement) = if words.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let min = words.iter().map(|w| w.agreement).fold(f64::INFINITY, f64::min);
+        let mean = words.iter().map(|w| w.agreement).sum::<f64>() / words.len() as f64;
+        (min, mean)
+    };
+    Ok(SegmentConsensus { draft, words, model_count, min_agreement, mean_agreement })
 }
 
 #[tauri::command]
@@ -4173,9 +4213,9 @@ mod tests {
     }
 
     #[test]
-    fn agentic_readiness_blocks_when_source_reference_and_hypothesis_coverage_are_missing() {
+    fn agentic_readiness_offline_source_reference_is_degraded_not_blocked() {
         let readiness = build_agentic_readiness(
-            &crate::settings::AppSettings::default(),
+            &crate::settings::AppSettings::default(), // cloud off, no models
             &[],
             &serde_json::json!({
                 "available": false,
@@ -4183,9 +4223,12 @@ mod tests {
             }),
         );
 
+        // Overall is still blocked — but because hypothesis coverage is missing, NOT because the OFFLINE
+        // source-reference is unavailable. Cloud whole-file references are an optional enhancement, so
+        // with cloud off the source-reference check is DEGRADED (local consensus still runs), not blocked.
         assert_eq!(readiness.status, "blocked");
         assert!(!readiness.ready);
-        assert!(readiness.checks.iter().any(|check| check.id == "source_reference" && check.status == "blocked"));
+        assert!(readiness.checks.iter().any(|check| check.id == "source_reference" && check.status == "degraded"));
         assert!(readiness.checks.iter().any(|check| check.id == "hypothesis_coverage" && check.status == "blocked"));
         assert!(readiness.available_hypothesis_models.is_empty());
         assert_eq!(readiness.required_hypothesis_models, quality::MIN_HYPOTHESIS_MODELS_FOR_TRAINING_READY_MACHINE);

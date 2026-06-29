@@ -8,6 +8,7 @@
   import EmptyState from './EmptyState.svelte';
   import { parseWordTimestamps, parseSourceMeta, chunkPlaybackRange } from './alignment';
   import type { SpeechSegment, WordTimestamp } from './types';
+  import type { SegmentConsensus } from './commands';
 
   // Simple, focused review queue: one clip at a time. Pending (unverified) first,
   // then the rest — so a reviewer always lands on work that needs doing.
@@ -29,6 +30,24 @@
   let playing = $state(false);
   let saving = $state(false);
   let lastLoadedId = $state<string | null>(null);
+
+  // Offline best-of-N consensus draft (ability-weighted vote across this clip's ASR hypotheses) + the
+  // per-word agreement that drives the disagreement highlight. Only shown when 2+ models voted.
+  let consensus = $state<SegmentConsensus | null>(null);
+  let consensusSeq = 0;
+  async function loadConsensus(seg: SpeechSegment) {
+    const seq = ++consensusSeq;
+    consensus = null;
+    try {
+      const c = await api.getSegmentConsensus(seg.id);
+      if (seq !== consensusSeq) return;
+      consensus = c.words.length > 0 && c.modelCount >= 2 ? c : null;
+    } catch {
+      if (seq === consensusSeq) consensus = null;
+    }
+  }
+  // A word is "contested" (worth a second look) when under two-thirds weighted agreement.
+  const CONTESTED = 0.67;
 
   // Word-level alignment for the current clip (forced or heuristic). When present it
   // powers the listen-strip: tap a word to hear it, colour the low-confidence ones so
@@ -120,6 +139,7 @@
     playing = false;
     loadWaveform(seg);
     void ensureWordTimings(seg);
+    void loadConsensus(seg);
   });
 
   // Drop a stale getWaveform response: switching clips A -> B while A's decode (up to ~30 s for a large
@@ -310,6 +330,46 @@
               </button>
             {/each}
           </div>
+        </div>
+      {/if}
+
+      <!-- Consensus draft: an offline best-of-N vote across this clip's ASR models. Contested words
+           (the models disagreed) are highlighted so the eye lands on likely errors first; "Use draft"
+           starts the edit from a transcript better than any single model. -->
+      {#if consensus && consensus.words.length > 0}
+        <div class="card space-y-2 p-4">
+          <div class="flex items-center justify-between gap-3">
+            <div class="text-xs font-semibold uppercase tracking-wider text-muted">
+              {$t('review.consensusDraft')}
+              <span class="ms-1 font-normal normal-case text-subtle">
+                {$t('review.consensusAgree')
+                  .replace('{n}', String(consensus.modelCount))
+                  .replace('{pct}', String(Math.round(consensus.meanAgreement * 100)))}
+              </span>
+            </div>
+            <button
+              type="button"
+              class="btn btn-secondary shrink-0 !text-xs"
+              onclick={() => {
+                if (consensus) editText = consensus.draft;
+              }}
+            >
+              {$t('review.useDraft')}
+            </button>
+          </div>
+          <div class="font-kurdish flex flex-wrap gap-1 text-lg leading-loose" dir="rtl">
+            {#each consensus.words as w, i (i)}
+              <span
+                class="rounded-token px-1.5 {w.agreement < CONTESTED
+                  ? 'bg-amber-500/20 text-amber-200'
+                  : 'text-default'}"
+                title={w.alternatives.length
+                  ? $t('review.modelsAlsoSaid').replace('{alts}', w.alternatives.join('  /  '))
+                  : ''}>{w.text}</span
+              >
+            {/each}
+          </div>
+          <p class="text-[11px] text-subtle">{$t('review.consensusHint')}</p>
         </div>
       {/if}
 

@@ -429,6 +429,7 @@ pub fn run() {
             commands::batch_transcribe,
             commands::normalize_text,
             commands::align_segment,
+            commands::get_segment_consensus,
             commands::get_segments,
             commands::search_segments,
             commands::update_segment,

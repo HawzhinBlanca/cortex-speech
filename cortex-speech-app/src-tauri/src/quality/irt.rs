@@ -49,6 +49,95 @@ fn get_initial_ability(model_id: &str) -> f64 {
     }
 }
 
+/// Build a confusion network for ONE segment: per-anchor-word slots, each holding every model's
+/// observed token and the deduped candidate set, by aligning each hypothesis to the highest-ability
+/// anchor. Shared by the IRT EM fit and the offline consensus-draft builder so both align identically.
+/// Returns `(slots, anchor_model_id)`, or None when there is no usable hypothesis.
+fn build_confusion_slots(hyps: &[&SegmentHypothesis]) -> Option<(Vec<Slot>, String)> {
+    if hyps.is_empty() {
+        return None;
+    }
+    // Choose the anchor hypothesis (highest initial ability).
+    let anchor_hyp = hyps.iter().max_by(|a, b| {
+        get_initial_ability(&a.model_id)
+            .partial_cmp(&get_initial_ability(&b.model_id))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+
+    let anchor_words: Vec<String> = anchor_hyp.transcript.split_whitespace().map(|s| s.to_string()).collect();
+    let mut slots: Vec<Slot> = anchor_words
+        .iter()
+        .map(|w| Slot {
+            candidates: vec![w.clone(), "".to_string()],
+            observations: vec![HypothesisObs { model_id: anchor_hyp.model_id.clone(), observed_token: w.clone() }],
+            posteriors: vec![0.0; 2],
+        })
+        .collect();
+
+    // Align other hypotheses to the anchor.
+    for h in hyps {
+        if h.model_id == anchor_hyp.model_id {
+            continue;
+        }
+        let diff = compute_phonetic_diff(&anchor_hyp.transcript, &h.transcript);
+        let mut anchor_word_idx = 0;
+        for change in &diff.changes {
+            match change.op {
+                DiffOp::Equal => {
+                    if anchor_word_idx < slots.len() {
+                        slots[anchor_word_idx]
+                            .observations
+                            .push(HypothesisObs { model_id: h.model_id.clone(), observed_token: change.value.clone() });
+                        if !slots[anchor_word_idx].candidates.contains(&change.value) {
+                            slots[anchor_word_idx].candidates.push(change.value.clone());
+                        }
+                        anchor_word_idx += 1;
+                    }
+                }
+                DiffOp::Replace => {
+                    let parts: Vec<&str> = change.value.split(" → ").collect();
+                    if parts.len() == 2 && anchor_word_idx < slots.len() {
+                        let other_word = parts[1].to_string();
+                        slots[anchor_word_idx]
+                            .observations
+                            .push(HypothesisObs { model_id: h.model_id.clone(), observed_token: other_word.clone() });
+                        if !slots[anchor_word_idx].candidates.contains(&other_word) {
+                            slots[anchor_word_idx].candidates.push(other_word);
+                        }
+                        anchor_word_idx += 1;
+                    }
+                }
+                DiffOp::Delete => {
+                    if anchor_word_idx < slots.len() {
+                        slots[anchor_word_idx]
+                            .observations
+                            .push(HypothesisObs { model_id: h.model_id.clone(), observed_token: "".to_string() });
+                        anchor_word_idx += 1;
+                    }
+                }
+                DiffOp::Insert => {}
+            }
+        }
+    }
+
+    // Deduplicate candidates and ensure the empty (deletion) candidate exists; reset posteriors.
+    for slot in &mut slots {
+        let mut unique = Vec::new();
+        for c in &slot.candidates {
+            if !unique.contains(c) {
+                unique.push(c.clone());
+            }
+        }
+        if !unique.contains(&"".to_string()) {
+            unique.push("".to_string());
+        }
+        slot.candidates = unique;
+        slot.posteriors = vec![0.0; slot.candidates.len()];
+    }
+
+    Some((slots, anchor_hyp.model_id.clone()))
+}
+
 /// Fits a 1PL Item Response Theory (IRT) model using the Expectation-Maximization (EM) algorithm
 /// over multiple transcript hypotheses to compute a phonetic consensus transcript and posterior confidence.
 pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
@@ -61,111 +150,18 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
     let mut segment_difficulties = HashMap::new();
     let mut segment_slots_map = HashMap::new();
 
-    // Step 1: Align all hypotheses for each segment to construct slots (confusion network)
+    // Step 1: Align all hypotheses for each segment into a confusion network (shared builder).
     for (segment_id, hyps) in &segment_hyps {
-        if hyps.is_empty() {
-            continue;
-        }
-
-        // Choose the anchor hypothesis (highest initial ability)
-        let Some(anchor_hyp) = hyps.iter().max_by(|a, b| {
-            let ab_a = get_initial_ability(&a.model_id);
-            let ab_b = get_initial_ability(&b.model_id);
-            ab_a.partial_cmp(&ab_b).unwrap_or(std::cmp::Ordering::Equal)
-        }) else {
-            // `hyps` is non-empty (guarded above), so `max_by` is always `Some`;
-            // handle the impossible `None` without panicking.
+        let Some((slots, anchor_model)) = build_confusion_slots(hyps) else {
             continue;
         };
-
-        let anchor_words: Vec<String> = anchor_hyp.transcript.split_whitespace().map(|s| s.to_string()).collect();
-
-        let mut slots: Vec<Slot> = anchor_words
-            .iter()
-            .map(|w| Slot {
-                candidates: vec![w.clone(), "".to_string()],
-                observations: vec![HypothesisObs { model_id: anchor_hyp.model_id.clone(), observed_token: w.clone() }],
-                posteriors: vec![0.0; 2],
-            })
-            .collect();
-
-        // Align other hypotheses to the anchor
-        for h in hyps {
-            if h.model_id == anchor_hyp.model_id {
-                continue;
-            }
-
-            let diff = compute_phonetic_diff(&anchor_hyp.transcript, &h.transcript);
-            let mut anchor_word_idx = 0;
-
-            for change in &diff.changes {
-                match change.op {
-                    DiffOp::Equal => {
-                        if anchor_word_idx < slots.len() {
-                            slots[anchor_word_idx].observations.push(HypothesisObs {
-                                model_id: h.model_id.clone(),
-                                observed_token: change.value.clone(),
-                            });
-                            if !slots[anchor_word_idx].candidates.contains(&change.value) {
-                                slots[anchor_word_idx].candidates.push(change.value.clone());
-                            }
-                            anchor_word_idx += 1;
-                        }
-                    }
-                    DiffOp::Replace => {
-                        // "anchor_word → other_word"
-                        let parts: Vec<&str> = change.value.split(" → ").collect();
-                        if parts.len() == 2 && anchor_word_idx < slots.len() {
-                            let other_word = parts[1].to_string();
-                            slots[anchor_word_idx].observations.push(HypothesisObs {
-                                model_id: h.model_id.clone(),
-                                observed_token: other_word.clone(),
-                            });
-                            if !slots[anchor_word_idx].candidates.contains(&other_word) {
-                                slots[anchor_word_idx].candidates.push(other_word);
-                            }
-                            anchor_word_idx += 1;
-                        }
-                    }
-                    DiffOp::Delete => {
-                        // Deleted from other, meaning other outputted empty string in this anchor slot
-                        if anchor_word_idx < slots.len() {
-                            slots[anchor_word_idx]
-                                .observations
-                                .push(HypothesisObs { model_id: h.model_id.clone(), observed_token: "".to_string() });
-                            anchor_word_idx += 1;
-                        }
-                    }
-                    DiffOp::Insert => {
-                        // Insertions in other are ignored to keep the anchor slots consistent
-                    }
-                }
-            }
-        }
-
-        // Initialize candidate posteriors and ensure model_abilities keys exist
-        for slot in &mut slots {
-            // Deduplicate candidates
-            let mut unique = Vec::new();
-            for c in &slot.candidates {
-                if !unique.contains(c) {
-                    unique.push(c.clone());
-                }
-            }
-            if !unique.contains(&"".to_string()) {
-                unique.push("".to_string());
-            }
-            slot.candidates = unique;
-            slot.posteriors = vec![0.0; slot.candidates.len()];
-
+        for slot in &slots {
             for obs in &slot.observations {
                 model_abilities.entry(obs.model_id.clone()).or_insert_with(|| get_initial_ability(&obs.model_id));
             }
         }
-
         segment_difficulties.insert(segment_id.clone(), 0.0);
-        segment_slots_map
-            .insert(segment_id.clone(), SegmentSlots { slots, _anchor_model: anchor_hyp.model_id.clone() });
+        segment_slots_map.insert(segment_id.clone(), SegmentSlots { slots, _anchor_model: anchor_model });
     }
 
     let beta = 0.5f64;
@@ -327,6 +323,83 @@ fn consensus_from_slots(slots: &[Slot]) -> Option<(String, f64)> {
     Some((consensus_text, total_posterior / slot_count as f64))
 }
 
+/// One word of the offline consensus DRAFT, with how strongly the models agreed on it.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsensusWord {
+    /// The winning token (ability-weighted vote across the aligned hypotheses).
+    pub text: String,
+    /// 0..1 weighted share of model "mass" on the winner — 1.0 = unanimous; low = the models disagreed
+    /// here (the review UI highlights low-agreement words so the eye lands on likely errors first).
+    pub agreement: f64,
+    /// How many distinct models produced the winning token (for a plain "2/3"-style readout).
+    pub models_agreeing: usize,
+    /// Total distinct models that voted on this slot.
+    pub total_models: usize,
+    /// The other tokens the remaining models produced here (what each alternative said).
+    pub alternatives: Vec<String>,
+}
+
+/// Ability-weighted vote weight for a model. `exp2(ability)` makes the strongest model (OmniASR 7B,
+/// ability 1.5 → 2.83) outweigh the two architecturally-KIN CTC models combined (0.5 → 1.41 and
+/// −0.5 → 0.71, summing 2.12) so a correlated CTC-pair error can't override the 7B; yet two
+/// independent agreements still beat a lone outlier.
+fn model_vote_weight(model_id: &str) -> f64 {
+    get_initial_ability(model_id).exp2()
+}
+
+/// Build an offline best-of-N consensus DRAFT for ONE segment's hypotheses, word by word, with a
+/// per-word agreement signal. No cloud, no EM — an ability-weighted vote over the same confusion
+/// network the IRT gate uses. Empty (deletion-consensus) slots are dropped from the draft.
+pub fn segment_consensus_words(hypotheses: &[SegmentHypothesis]) -> Vec<ConsensusWord> {
+    let refs: Vec<&SegmentHypothesis> = hypotheses.iter().collect();
+    let Some((slots, _anchor)) = build_confusion_slots(&refs) else {
+        return Vec::new();
+    };
+    let total_models = {
+        let mut ids = std::collections::HashSet::new();
+        for slot in &slots {
+            for obs in &slot.observations {
+                ids.insert(obs.model_id.as_str());
+            }
+        }
+        ids.len().max(1)
+    };
+
+    let mut out = Vec::new();
+    for slot in &slots {
+        let mut weight: HashMap<&str, f64> = HashMap::new();
+        let mut count: HashMap<&str, usize> = HashMap::new();
+        for obs in &slot.observations {
+            *weight.entry(obs.observed_token.as_str()).or_insert(0.0) += model_vote_weight(&obs.model_id);
+            *count.entry(obs.observed_token.as_str()).or_insert(0) += 1;
+        }
+        let Some(winner) = weight
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(token, _)| *token)
+        else {
+            continue;
+        };
+        if winner.is_empty() {
+            continue; // the models' consensus here is a deletion — omit the word from the draft
+        }
+        let total_weight: f64 = weight.values().sum();
+        let agreement = if total_weight > 0.0 { weight[winner] / total_weight } else { 0.0 };
+        let mut alternatives: Vec<String> =
+            count.keys().filter(|t| **t != winner && !t.is_empty()).map(|t| t.to_string()).collect();
+        alternatives.sort();
+        out.push(ConsensusWord {
+            text: winner.to_string(),
+            agreement,
+            models_agreeing: *count.get(winner).unwrap_or(&0),
+            total_models,
+            alternatives,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +468,31 @@ mod tests {
         let ability_gemini = res.model_abilities.get("gemini").unwrap();
         let ability_whisper = res.model_abilities.get("whisper-noisy").unwrap();
         assert!(ability_gemini > ability_whisper);
+    }
+
+    #[test]
+    fn segment_consensus_draft_votes_by_ability_and_flags_disagreement() {
+        // Anchor = the 7B (ability 1.5). On word 2 it says "دەنگە" while the two architecturally-KIN
+        // CTC models both say "ڕەنگە". The 7B must still win the draft (exp2-weighted 2.83 > 1.41+0.71),
+        // and that word must be flagged lower-agreement so review highlights it first.
+        let h = |m: &str, t: &str| SegmentHypothesis {
+            segment_id: "s".to_string(),
+            model_id: m.to_string(),
+            transcript: t.to_string(),
+            confidence: None,
+        };
+        let hyps = vec![
+            h("omniasr-wsl-7b", "ئەمە دەنگە"),
+            h("omniasr-ctc-1b", "ئەمە ڕەنگە"),
+            h("omniasr-ctc-300m", "ئەمە ڕەنگە"),
+        ];
+        let words = segment_consensus_words(&hyps);
+        let draft: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(draft, vec!["ئەمە", "دەنگە"], "7B wins the kin-pair slot");
+        assert!((words[0].agreement - 1.0).abs() < 1e-9, "unanimous first word is full agreement");
+        assert!(words[1].agreement < 0.7, "contested word is lower-agreement: {}", words[1].agreement);
+        assert_eq!(words[1].models_agreeing, 1, "only the 7B produced the winning token");
+        assert!(words[1].alternatives.contains(&"ڕەنگە".to_string()), "alternative shows what the CTC pair said");
     }
 
     #[test]
