@@ -123,6 +123,23 @@ export const en: Record<string, string> = {
   'review.useDraft': 'Use draft',
   'review.modelsAlsoSaid': 'Other models: {alts}',
   'review.consensusHint': 'Voted across all ASR models — amber words are where they disagreed; check those first.',
+  'review.draftBy': 'Draft by',
+  'review.notHumanVerified': '— machine draft, not human-verified.',
+  'review.retranscribe': 'Re-transcribe:',
+  'review.retranscribeChampion': 'OmniASR-7B',
+  'review.retranscribeChampionTitle':
+    'Re-transcribe this clip with the OmniASR-7B Champion (needs the 7B server running).',
+  'review.retranscribeFinetuned': 'Fine-tuned MMS-1B',
+  'review.retranscribeFinetunedTitle':
+    'Re-transcribe this clip with the embedded fine-tuned MMS-1B (CPU, always available).',
+  'review.retranscribing': 'Re-transcribing…',
+  'review.retranscribed': 'Re-transcribed.',
+  'review.retranscribeFailed': 'Re-transcription failed',
+  'review.markBad': 'Mark bad',
+  'review.markBadTitle': 'Flag this clip as bad — excluded from export, kept so you can re-transcribe later.',
+  'review.markBadConfirm':
+    'Mark this clip as bad and exclude it from export? It is kept — you can re-review or re-transcribe it later.',
+  'review.markedBad': 'Marked bad — excluded from export.',
   'review.replay': 'Replay',
   'review.acceptAsIs': 'Looks good',
   'review.saveNext': 'Save & next',

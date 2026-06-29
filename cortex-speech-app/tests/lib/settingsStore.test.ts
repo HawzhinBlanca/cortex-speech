@@ -12,7 +12,7 @@ describe('settingsStore', () => {
     expect(state.theme).toBe('dark');
     expect(state.numThreads).toBe(4);
     expect(state.enableGpu).toBe(true);
-    expect(state.asrModel).toBe('ctc-300m');
+    expect(state.asrModel).toBe('wsl-7b');
     expect(state.language).toBe('ckb');
     expect(state.sourceReferenceModels).toEqual(['gemini-2.5-pro', 'gemini-2.5-flash']);
   });

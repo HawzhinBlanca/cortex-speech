@@ -55,7 +55,9 @@ export const defaultSettings: AppSettings = {
   verbalizeNumbers: true,
   autoAlign: false,
   exportFormat: 'json',
-  asrModel: 'ctc-300m',
+  // The fine-tuned OmniASR-7B Champion (WSL GPU path) is the owner's main model and the app default,
+  // matching the Rust AppSettings default — a reset never silently reverts to the weaker base CTC.
+  asrModel: 'wsl-7b',
   vadThreshold: 0.5,
   minSegmentSec: 3,
   maxSegmentSec: 15,

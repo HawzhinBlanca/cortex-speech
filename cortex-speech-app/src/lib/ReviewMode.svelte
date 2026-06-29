@@ -43,16 +43,91 @@
   // Offline best-of-N consensus draft (ability-weighted vote across this clip's ASR hypotheses) + the
   // per-word agreement that drives the disagreement highlight. Only shown when 2+ models voted.
   let consensus = $state<SegmentConsensus | null>(null);
+  // Engines that actually produced this clip's draft, recorded (never inferred). Shown as an honest
+  // provenance badge even for a single-engine clip (e.g. only the OmniASR-7B Champion ran), where the
+  // multi-model consensus card below is intentionally hidden.
+  let draftModels = $state<string[]>([]);
   let consensusSeq = 0;
   async function loadConsensus(seg: SpeechSegment) {
     const seq = ++consensusSeq;
     consensus = null;
+    draftModels = [];
     try {
       const c = await api.getSegmentConsensus(seg.id);
       if (seq !== consensusSeq) return;
+      draftModels = c.models ?? [];
       consensus = c.words.length > 0 && c.modelCount >= 2 ? c : null;
     } catch {
-      if (seq === consensusSeq) consensus = null;
+      if (seq === consensusSeq) {
+        consensus = null;
+        draftModels = [];
+      }
+    }
+  }
+
+  // Re-transcribe THIS clip with a chosen engine when the current draft is wrong. 'champion' routes
+  // through the configured primary engine (the OmniASR-7B Champion by default — needs its server up);
+  // 'finetuned' runs the embedded fine-tuned MMS-1B (CPU/ONNX, always available). A re-transcription is
+  // machine output, so verified is reset (it must never be kept as if a human confirmed it).
+  let retranscribing = $state(false);
+  async function retranscribe(engine: 'champion' | 'finetuned') {
+    const seg = current;
+    if (!seg || retranscribing || saving) return;
+    retranscribing = true;
+    try {
+      const result =
+        engine === 'finetuned'
+          ? await api.transcribeSegmentFinetuned(seg.audioPath, seg.alignmentJson)
+          : await api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id);
+      const text = result.text;
+      const updated: SpeechSegment = {
+        ...seg,
+        rawTranscript: result.rawTranscript,
+        annotatedTranscript: text,
+        verified: false,
+      };
+      await api.updateSegment(updated);
+      segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
+      editText = text;
+      // The re-transcribed draft is the new baseline (not a "dirty" edit). Do NOT reset lastLoadedId —
+      // the clip id is unchanged, so the load effect must stay a no-op; resetting it would re-run
+      // loadConsensus and wipe the provenance badge we set just below.
+      lastLoadedOriginal = text;
+      notifications.success($t('review.retranscribed'));
+      // The owner just produced this draft with the chosen engine, so name it on the provenance badge
+      // immediately (honest — it's exactly what was used). A single-engine re-transcribe has no
+      // multi-model consensus, so hide that card.
+      draftModels = [engine === 'finetuned' ? 'finetuned-mms-ckb' : 'omniasr-wsl-7b'];
+      consensus = null;
+      await ensureWordTimings(updated);
+    } catch (e) {
+      notifications.error($t('review.retranscribeFailed'), { detail: String(e) });
+    } finally {
+      retranscribing = false;
+    }
+  }
+
+  // "This draft is wrong" — mark the clip bad so it leaves the review queue and is excluded from
+  // dataset export, but the audio + draft are KEPT (reversible: re-review to accept, or re-transcribe).
+  // Records a human 'reject' decision (verdict = human_reject) which the export path already honors.
+  async function markBad() {
+    const seg = current;
+    if (!seg || saving || retranscribing) return;
+    if (!window.confirm($t('review.markBadConfirm'))) return;
+    saving = true;
+    try {
+      // recordHumanDecision FIRST so a validation failure aborts before updateSegment commits (same
+      // ordering rationale as submit()).
+      await api.recordHumanDecision(seg.id, 'reject', null);
+      const updated: SpeechSegment = { ...seg, verified: true };
+      await api.updateSegment(updated);
+      segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
+      notifications.success($t('review.markedBad'));
+      advance();
+    } catch (e) {
+      notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+    } finally {
+      saving = false;
     }
   }
   // A word is "contested" (worth a second look) when under two-thirds weighted agreement.
@@ -448,6 +523,13 @@
               {$t('transcript')}
             </div>
             <p class="mt-0.5 text-xs text-subtle">{$t('review.editHint')}</p>
+            {#if draftModels.length > 0}
+              <p class="mt-1 text-[11px] text-subtle" dir="ltr">
+                {$t('review.draftBy')}
+                <span class="font-medium text-muted">{draftModels.map((m) => api.engineLabel(m)).join(', ')}</span>
+                {$t('review.notHumanVerified')}
+              </p>
+            {/if}
           </div>
           {#if dirty}
             <button
@@ -466,6 +548,39 @@
           class="input font-kurdish mt-3 min-h-[150px] w-full resize-none text-2xl leading-loose"
           placeholder={$t('editTranscript')}
         ></textarea>
+      </div>
+
+      <!-- Fix-the-draft tools: the current transcript is wrong -> re-transcribe with a better engine,
+           or flag the clip bad (excluded from export, kept + reversible). -->
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="text-[11px] uppercase tracking-wider text-subtle">{$t('review.retranscribe')}</span>
+        <button
+          type="button"
+          class="btn btn-secondary !text-xs"
+          onclick={() => retranscribe('champion')}
+          disabled={retranscribing || saving}
+          title={$t('review.retranscribeChampionTitle')}
+        >
+          {retranscribing ? $t('review.retranscribing') : $t('review.retranscribeChampion')}
+        </button>
+        <button
+          type="button"
+          class="btn btn-secondary !text-xs"
+          onclick={() => retranscribe('finetuned')}
+          disabled={retranscribing || saving}
+          title={$t('review.retranscribeFinetunedTitle')}
+        >
+          {$t('review.retranscribeFinetuned')}
+        </button>
+        <button
+          type="button"
+          class="btn btn-secondary ms-auto !text-xs !text-rose-300 hover:!text-rose-200"
+          onclick={markBad}
+          disabled={saving || retranscribing}
+          title={$t('review.markBadTitle')}
+        >
+          {$t('review.markBad')}
+        </button>
       </div>
 
       <!-- Actions -->

@@ -1537,6 +1537,15 @@ impl ProcessingPipeline {
                         self.refresh_segment_from_db(db, seg)?;
                         let usable = !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
                         if usable {
+                            // Record the Champion's output as its hypothesis so the review provenance badge
+                            // can honestly name "OmniASR-7B Champion" as the producing engine — the primary
+                            // raw_transcript otherwise carries no model id. Best-effort: a provenance-write
+                            // failure must not fail the (successful) transcription.
+                            if let Err(e) =
+                                insert_hypothesis_checked(db, &seg.id, "omniasr-wsl-7b", seg.raw_transcript.clone(), None)
+                            {
+                                tracing::warn!("could not record omniasr-wsl-7b provenance for {}: {e}", seg.id);
+                            }
                             updated += 1;
                             last_problem = None;
                             infra_failure = false;

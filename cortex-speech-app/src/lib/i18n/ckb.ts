@@ -124,6 +124,23 @@ export const ckb: Record<string, string> = {
   'review.useDraft': 'بەکارهێنانی ڕەشنووس',
   'review.modelsAlsoSaid': 'مۆدێلەکانی تر: {alts}',
   'review.consensusHint': 'لە هەموو مۆدێلەکانی ASR دەنگدراوە — وشە کارەباییەکان ئەوێن کە مۆدێلەکان ناکۆکن؛ یەکەم جار ئەوانە بپشکنە.',
+  'review.draftBy': 'ڕەشنووس لەلایەن',
+  'review.notHumanVerified': '— ڕەشنووسی ئامێر، لەلایەن مرۆڤەوە پشتڕاست نەکراوەتەوە.',
+  'review.retranscribe': 'دووبارە نووسینەوە:',
+  'review.retranscribeChampion': 'OmniASR-7B',
+  'review.retranscribeChampionTitle':
+    'دووبارە نووسینەوەی ئەم پارچەیە بە OmniASR-7B Champion (پێویستی بە سێرڤەری ٧B هەیە کارا بێت).',
+  'review.retranscribeFinetuned': 'MMS-1B ڕاهێنراو',
+  'review.retranscribeFinetunedTitle':
+    'دووبارە نووسینەوەی ئەم پارچەیە بە MMS-1B ڕاهێنراوی ناوەکی (CPU، هەمیشە بەردەستە).',
+  'review.retranscribing': 'دووبارە نووسینەوە...',
+  'review.retranscribed': 'دووبارە نووسرایەوە.',
+  'review.retranscribeFailed': 'دووبارە نووسینەوە سەرکەوتوو نەبوو',
+  'review.markBad': 'نیشانکردن وەک خراپ',
+  'review.markBadTitle': 'ئەم پارچەیە وەک خراپ نیشان بکە — لە هەناردە دەردەکرێت، دەمێنێتەوە بۆ دووبارە نووسینەوەی دواتر.',
+  'review.markBadConfirm':
+    'ئەم پارچەیە وەک خراپ نیشان بکرێت و لە هەناردە دەربکرێت؟ دەمێنێتەوە — دەتوانیت دواتر دووبارە پێداچوونەوەی بکەیت یان دووبارە بینووسیتەوە.',
+  'review.markedBad': 'وەک خراپ نیشانکرا — لە هەناردە دەرکرا.',
   'review.replay': 'دووبارە لێدان',
   'review.acceptAsIs': 'دروستە',
   'review.saveNext': 'پاشەکەوت و دواتر',

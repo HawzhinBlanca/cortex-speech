@@ -871,6 +871,52 @@ pub fn transcribe_segment_constrained(
     Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
 }
 
+/// Decode ONLY a segment's clip window to 16 kHz mono PCM without loading the whole (possibly
+/// multi-hour) source file. Reads just the [source_start_ms, source_end_ms] span via the incremental
+/// window decoder, early-stopping once past the window. Falls back to a whole-file decode when there is
+/// no window (a single-segment file, which is small). Fixes the per-clip fine-tuned re-transcribe
+/// failing with "audio too large to decode in one pass" on long recordings.
+fn decode_finetuned_clip_16k(audio_path: &str, alignment_json: Option<&str>) -> Result<Vec<i16>, String> {
+    let meta = alignment_json.and_then(crate::chunking::SegmentSourceMeta::from_alignment_json);
+    let Some(meta) = meta else {
+        let (rate, pcm) = crate::audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
+        let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, pcm).map_err(|e| e.to_string())?;
+        return Ok(pcm16);
+    };
+    let start_ms = meta.source_start_ms.max(0);
+    let end_ms = meta.source_end_ms.max(start_ms);
+    let mut native: Vec<i16> = Vec::new();
+    let mut rate = crate::audio::TARGET_SAMPLE_RATE;
+    const CLIP_DONE: &str = "__clip_window_done__";
+    let res = crate::audio::decode_pcm_windows(audio_path, 30_000, |win| {
+        rate = win.sample_rate.max(1);
+        let win_start = win.offset_ms;
+        let dur_ms = (win.pcm.len() as i64 * 1000) / rate as i64;
+        let win_end = win_start + dur_ms;
+        if win_end > start_ms && win_start < end_ms {
+            let a_ms = (start_ms.max(win_start) - win_start).max(0);
+            let b_ms = (end_ms.min(win_end) - win_start).max(0);
+            let a = ((a_ms * rate as i64) / 1000) as usize;
+            let b = (((b_ms * rate as i64) / 1000) as usize).min(win.pcm.len());
+            if b > a {
+                native.extend_from_slice(&win.pcm[a..b]);
+            }
+        }
+        // Past the clip window — stop early rather than decode the rest of a long file (sentinel Err).
+        if win_start >= end_ms {
+            return Err(crate::error::AppError::Other(CLIP_DONE.to_string()));
+        }
+        Ok(())
+    });
+    match res {
+        Ok(()) => {}
+        Err(crate::error::AppError::Other(m)) if m == CLIP_DONE => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, native).map_err(|e| e.to_string())?;
+    Ok(pcm16)
+}
+
 /// Opt-in: transcribe a segment with the fine-tuned Kurdish Wav2Vec2-CTC model (ONNX via `ort`),
 /// which roughly halves CER vs the stock OmniASR path (see docs/EVAL.md). Additive — the default
 /// `transcribe_segment` path is unchanged. Resolves the model from `CORTEX_FINETUNED_ONNX` +
@@ -909,12 +955,11 @@ pub fn transcribe_segment_finetuned(
             }
         }
     };
-    let (rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
-    // Slice out only THIS segment's clip — every VAD chunk shares the whole-source audio_path (the range
-    // lives in alignment_json), so transcribing `pcm` directly would re-transcribe the ENTIRE recording
-    // and write the whole-file text into one segment. None alignment (single-segment file) = whole file.
-    let (clip, _suffix) =
-        crate::chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref()).map_err(|e| e.to_string())?;
+    // Decode ONLY this segment's clip window (16 kHz). Every VAD chunk shares the whole-source
+    // audio_path with its range in alignment_json; decoding the WHOLE source first (the old path) failed
+    // on long recordings ("audio too large to decode in one pass") even though the clip is a few
+    // seconds. The windowed decode reads just the clip, so re-transcribe works on any source length.
+    let clip = decode_finetuned_clip_16k(&audio_path, alignment_json.as_deref())?;
     let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
     let text = crate::wav2vec2_asr::run_wav2vec2(&onnx, &vocab, "ckb", &audio)?;
     Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
@@ -1191,6 +1236,11 @@ pub struct SegmentConsensus {
     /// Lowest per-word agreement (0..1) — a quick "how contested is this clip" signal.
     pub min_agreement: f64,
     pub mean_agreement: f64,
+    /// Distinct engine ids that produced this segment's hypotheses (e.g. "omniasr-wsl-7b",
+    /// "finetuned-mms-ckb", "omniasr-ctc-300m", "scribe-v1"), in first-seen order. Drawn from the
+    /// recorded hypotheses — NEVER inferred — so the review UI can honestly name which model(s)
+    /// produced the draft. Empty when the segment has no recorded hypotheses (pre-provenance imports).
+    pub models: Vec<String>,
 }
 
 /// Offline best-of-N consensus DRAFT for a segment: an ability-weighted vote over its ASR hypotheses
@@ -1204,6 +1254,15 @@ pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> 
         let db = state.lock_db();
         db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?
     };
+    // Distinct producing engines, in first-seen order, straight from the recorded hypotheses (never
+    // inferred) so the review badge can honestly say which model(s) made the draft.
+    let mut models: Vec<String> = Vec::new();
+    for h in &hyps {
+        let id = h.model_id.trim();
+        if !id.is_empty() && !models.iter().any(|m| m == id) {
+            models.push(id.to_string());
+        }
+    }
     let words = crate::quality::irt::segment_consensus_words(&hyps);
     let draft = words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
     let model_count = words.first().map(|w| w.total_models).unwrap_or(0);
@@ -1214,7 +1273,7 @@ pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> 
         let mean = words.iter().map(|w| w.agreement).sum::<f64>() / words.len() as f64;
         (min, mean)
     };
-    Ok(SegmentConsensus { draft, words, model_count, min_agreement, mean_agreement })
+    Ok(SegmentConsensus { draft, words, model_count, min_agreement, mean_agreement, models })
 }
 
 #[tauri::command]

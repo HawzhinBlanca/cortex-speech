@@ -106,6 +106,21 @@ export interface SegmentConsensus {
   modelCount: number;
   minAgreement: number;
   meanAgreement: number;
+  /** Distinct engine ids that produced this segment's hypotheses, recorded (never inferred). */
+  models: string[];
+}
+
+/** Map a recorded ASR engine id to a short, honest human label. Unknown ids show verbatim (never
+ * invented) so the review badge always names exactly what produced the draft. */
+export function engineLabel(modelId: string): string {
+  const id = (modelId || '').toLowerCase();
+  if (id.includes('wsl-7b') || id.includes('omniasr-7b') || id === 'omniasr-llm-7b') return 'OmniASR-7B Champion';
+  if (id.includes('finetuned') || id.includes('mms-ckb') || id.includes('mms_ctc')) return 'Fine-tuned MMS-1B';
+  if (id.includes('ctc-1b') || id.includes('ctc_1b')) return 'OmniASR-CTC 1B (base)';
+  if (id.includes('ctc-300m') || id.includes('ctc_300m')) return 'OmniASR-CTC 300M (base)';
+  if (id.includes('scribe')) return 'ElevenLabs Scribe (cloud)';
+  if (id.startsWith('unknown@') || id === 'unknown') return 'unknown (pre-registry)';
+  return modelId;
 }
 
 /** Offline best-of-N consensus draft for a segment (ability-weighted vote over its ASR hypotheses). */
