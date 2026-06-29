@@ -105,7 +105,11 @@ pub fn plan_speech_chunks(
         regions.push((0, pcm.len()));
     }
 
-    regions = merge_adjacent_regions(regions, max_samples);
+    // Don't merge VAD regions across a silence longer than this — keeps clips tight around speech
+    // (intra-sentence pauses are shorter; a 2s+ gap is a real break worth a chunk boundary).
+    const MAX_MERGE_GAP_MS: u32 = 2000;
+    let max_gap_samples = ms_to_samples(MAX_MERGE_GAP_MS, sample_rate);
+    regions = merge_adjacent_regions(regions, max_samples, max_gap_samples);
     regions = split_oversized_regions(pcm, sample_rate, regions, max_samples, min_samples, pcm.len());
     regions = absorb_short_regions(regions, min_samples, max_samples, pcm.len());
 
@@ -136,8 +140,16 @@ pub fn plan_speech_chunks(
     Ok(final_regions)
 }
 
-/// Merge consecutive VAD regions if the combined span fits within `max_samples`.
-fn merge_adjacent_regions(regions: Vec<(usize, usize)>, max_samples: usize) -> Vec<(usize, usize)> {
+/// Merge consecutive VAD regions when the combined span fits within `max_samples` AND the silence gap
+/// between them is no longer than `max_gap_samples`. Without the gap limit, two short utterances with a
+/// long pause between them (e.g. 2s speech + 8s silence + 3s speech) merged into one ~13s clip that is
+/// mostly silence — the "clip far longer than the words" complaint. Splitting on a long pause keeps each
+/// clip tight around contiguous speech while still merging across natural intra-sentence pauses.
+fn merge_adjacent_regions(
+    regions: Vec<(usize, usize)>,
+    max_samples: usize,
+    max_gap_samples: usize,
+) -> Vec<(usize, usize)> {
     if regions.is_empty() {
         return regions;
     }
@@ -147,7 +159,8 @@ fn merge_adjacent_regions(regions: Vec<(usize, usize)>, max_samples: usize) -> V
 
     for &(start, end) in regions.iter().skip(1) {
         let combined_len = end.saturating_sub(cur_start);
-        if combined_len <= max_samples {
+        let gap = start.saturating_sub(cur_end);
+        if combined_len <= max_samples && gap <= max_gap_samples {
             cur_end = end;
         } else {
             if cur_end > cur_start {
@@ -470,12 +483,31 @@ mod tests {
 
     #[test]
     fn merge_adjacent_respects_max() {
+        // Contiguous regions (no gap) still merge up to max_samples.
         let regions = vec![(0, 5000), (5000, 10_000), (10_000, 15_000)];
-        let merged = merge_adjacent_regions(regions, 20_000);
+        let merged = merge_adjacent_regions(regions, 20_000, usize::MAX);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0], (0, 15_000));
 
-        let merged2 = merge_adjacent_regions(vec![(0, 12_000), (12_000, 25_000)], 20_000);
+        let merged2 = merge_adjacent_regions(vec![(0, 12_000), (12_000, 25_000)], 20_000, usize::MAX);
         assert_eq!(merged2.len(), 2);
+    }
+
+    #[test]
+    fn merge_adjacent_splits_across_a_long_silence_gap() {
+        // 2s speech, then an 8s silence, then 3s speech: combined span (13s) fits under max, but the
+        // long gap must force a chunk boundary so neither clip is mostly silence.
+        let sr = 16_000usize;
+        let speech_a = (0, 2 * sr);
+        let speech_b = (10 * sr, 13 * sr); // 8s gap before it
+        let max_gap = ms_to_samples(2000, sr as u32); // 2s
+        let merged = merge_adjacent_regions(vec![speech_a, speech_b], 20 * sr, max_gap);
+        assert_eq!(merged.len(), 2, "a long silence gap must split, not merge into one mostly-silent clip");
+        assert_eq!(merged[0], speech_a);
+        assert_eq!(merged[1], speech_b);
+        // A short (sub-gap) pause still merges into one clip.
+        let close_b = (2 * sr + sr / 2, 5 * sr); // 0.5s gap
+        let merged_close = merge_adjacent_regions(vec![speech_a, close_b], 20 * sr, max_gap);
+        assert_eq!(merged_close.len(), 1, "a short intra-sentence pause stays merged");
     }
 }
