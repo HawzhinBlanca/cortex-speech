@@ -368,31 +368,45 @@ pub fn segment_consensus_words(hypotheses: &[SegmentHypothesis]) -> Vec<Consensu
 
     let mut out = Vec::new();
     for slot in &slots {
-        let mut weight: HashMap<&str, f64> = HashMap::new();
-        let mut count: HashMap<&str, usize> = HashMap::new();
+        let mut tally: HashMap<&str, (f64, usize)> = HashMap::new();
         for obs in &slot.observations {
-            *weight.entry(obs.observed_token.as_str()).or_insert(0.0) += model_vote_weight(&obs.model_id);
-            *count.entry(obs.observed_token.as_str()).or_insert(0) += 1;
+            let entry = tally.entry(obs.observed_token.as_str()).or_insert((0.0, 0));
+            entry.0 += model_vote_weight(&obs.model_id);
+            entry.1 += 1;
         }
-        let Some(winner) = weight
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(token, _)| *token)
-        else {
+        if tally.is_empty() {
             continue;
-        };
-        if winner.is_empty() {
-            continue; // the models' consensus here is a deletion — omit the word from the draft
         }
-        let total_weight: f64 = weight.values().sum();
-        let agreement = if total_weight > 0.0 { weight[winner] / total_weight } else { 0.0 };
-        let mut alternatives: Vec<String> =
-            count.keys().filter(|t| **t != winner && !t.is_empty()).map(|t| t.to_string()).collect();
-        alternatives.sort();
+        let total_weight: f64 = tally.values().map(|(w, _)| *w).sum();
+        // Pick the winner DETERMINISTICALLY (sorting, not HashMap::max_by which is randomized per
+        // process and last-wins on ties — that flipped the draft between runs). The empty (deletion)
+        // token is pushed LAST when any real word exists, so a word that ties a peer's deletion is
+        // KEPT (and flagged contested), never silently dropped.
+        let any_non_empty = tally.keys().any(|t| !t.is_empty());
+        let mut candidates: Vec<(&str, f64, usize)> = tally.iter().map(|(t, (w, c))| (*t, *w, *c)).collect();
+        candidates.sort_by(|a, b| {
+            let a_demoted = a.0.is_empty() && any_non_empty;
+            let b_demoted = b.0.is_empty() && any_non_empty;
+            a_demoted
+                .cmp(&b_demoted)
+                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)) // higher weight first
+                .then(b.2.cmp(&a.2)) // then more models
+                .then(a.0.cmp(b.0)) // then token, for a fully stable order
+        });
+        let (winner, winner_weight, winner_count) = candidates[0];
+        if winner.is_empty() {
+            continue; // every model deleted here — omit the word from the draft
+        }
+        let agreement = if total_weight > 0.0 { winner_weight / total_weight } else { 0.0 };
+        let alternatives: Vec<String> = candidates
+            .iter()
+            .filter(|(t, _, _)| *t != winner && !t.is_empty())
+            .map(|(t, _, _)| t.to_string())
+            .collect();
         out.push(ConsensusWord {
             text: winner.to_string(),
             agreement,
-            models_agreeing: *count.get(winner).unwrap_or(&0),
+            models_agreeing: winner_count,
             total_models,
             alternatives,
         });
@@ -493,6 +507,31 @@ mod tests {
         assert!(words[1].agreement < 0.7, "contested word is lower-agreement: {}", words[1].agreement);
         assert_eq!(words[1].models_agreeing, 1, "only the 7B produced the winning token");
         assert!(words[1].alternatives.contains(&"ڕەنگە".to_string()), "alternative shows what the CTC pair said");
+    }
+
+    #[test]
+    fn segment_consensus_is_deterministic_and_keeps_a_word_over_a_tied_deletion() {
+        let h = |m: &str, t: &str| SegmentHypothesis {
+            segment_id: "s".to_string(),
+            model_id: m.to_string(),
+            transcript: t.to_string(),
+            confidence: None,
+        };
+        // Both models are ability 0.0 (weight exp2(0)=1.0). The anchor (whisper-x, last in the ability
+        // tie) keeps "alpha"; scribe-v2 deletes it -> a 1.0-vs-1.0 tie on that slot. The word must be
+        // KEPT (an empty deletion token never wins over a real word), and the draft must be IDENTICAL
+        // across many runs (the old HashMap::max_by was randomized per process and flipped the result).
+        let hyps = vec![h("scribe-v2", "shared"), h("whisper-x", "shared alpha")];
+        let first: Vec<String> = segment_consensus_words(&hyps).into_iter().map(|w| w.text).collect();
+        assert_eq!(
+            first,
+            vec!["shared".to_string(), "alpha".to_string()],
+            "a real word ties a deletion -> keep the word"
+        );
+        for _ in 0..50 {
+            let again: Vec<String> = segment_consensus_words(&hyps).into_iter().map(|w| w.text).collect();
+            assert_eq!(again, first, "consensus draft must be deterministic across runs");
+        }
     }
 
     #[test]

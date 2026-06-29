@@ -178,16 +178,20 @@
     // Map to a real human decision: an actual change is an "edit" (the typed text becomes gold), a
     // no-change save is an "accept".
     const isEdit = !acceptAsIs && text !== original;
+    const updated: SpeechSegment = { ...seg, annotatedTranscript: text, verified: true };
     try {
-      // Use the canonical human-decision path (not a bare updateSegment): it records a human_decision
-      // — so the jury never re-adjudicates this clip — AND feeds the learning flywheel from review
-      // edits. (updateSegment set `verified` WITHOUT a human_decision, an inconsistent state.)
+      // BOTH calls are required. updateSegment marks `verified` (so the queue/progress/completion
+      // advance) and writes the text to annotated_transcript where the editor + FTS search read it.
+      // recordHumanDecision records the human_decision (so the jury never re-adjudicates this clip)
+      // and feeds the learning flywheel. recordHumanDecision ALONE left `verified` false (queue stuck)
+      // and wrote only verdict_transcript (the editor showed stale text on revisit).
+      await api.updateSegment(updated);
       await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', isEdit ? text : null);
+      segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       editCache.delete(seg.id); // persisted — drop the in-progress copy
       lastLoadedOriginal = text; // the saved text is now the baseline for dirty-tracking
       editText = text;
       notifications.success($t('saved'));
-      await segments.load(); // reflect the verdict + human_decision the backend wrote
       advance();
     } catch (e) {
       notifications.error($t('notifications.saveFailed'), { detail: String(e) });

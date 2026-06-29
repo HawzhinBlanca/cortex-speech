@@ -111,7 +111,7 @@ pub fn plan_speech_chunks(
     let max_gap_samples = ms_to_samples(MAX_MERGE_GAP_MS, sample_rate);
     regions = merge_adjacent_regions(regions, max_samples, max_gap_samples);
     regions = split_oversized_regions(pcm, sample_rate, regions, max_samples, min_samples, pcm.len());
-    regions = absorb_short_regions(regions, min_samples, max_samples, pcm.len());
+    regions = absorb_short_regions(regions, min_samples, max_samples, max_gap_samples, pcm.len());
 
     if regions.is_empty() {
         regions = silence_aware_split(pcm, sample_rate, 0, pcm.len(), max_samples, min_samples);
@@ -267,11 +267,14 @@ fn find_quietest_cut(pcm: &[i16], lo: usize, hi: usize, sample_rate: u32) -> usi
     best_idx
 }
 
-/// Merge regions shorter than `min_samples` into neighbors when possible.
+/// Merge regions shorter than `min_samples` into a neighbor when possible — but NOT across a silence
+/// longer than `max_gap_samples`, otherwise this would undo the gap-aware split in
+/// `merge_adjacent_regions` and re-create a clip that is mostly silence.
 fn absorb_short_regions(
     regions: Vec<(usize, usize)>,
     min_samples: usize,
     max_samples: usize,
+    max_gap_samples: usize,
     total_len: usize,
 ) -> Vec<(usize, usize)> {
     if regions.is_empty() {
@@ -291,8 +294,8 @@ fn absorb_short_regions(
             let len = e - s;
             if len < min_samples {
                 if i + 1 < working.len() {
-                    let (_ns, ne) = working[i + 1];
-                    if ne.saturating_sub(s) <= max_samples {
+                    let (ns, ne) = working[i + 1];
+                    if ns.saturating_sub(e) <= max_gap_samples && ne.saturating_sub(s) <= max_samples {
                         working[i + 1] = (s, ne);
                         changed = true;
                         i += 1;
@@ -300,8 +303,8 @@ fn absorb_short_regions(
                     }
                 }
                 if let Some(last) = next.last_mut() {
-                    let (ps, _pe) = *last;
-                    if e.saturating_sub(ps) <= max_samples {
+                    let (ps, pe) = *last;
+                    if s.saturating_sub(pe) <= max_gap_samples && e.saturating_sub(ps) <= max_samples {
                         *last = (ps, e);
                         changed = true;
                         i += 1;
@@ -509,5 +512,18 @@ mod tests {
         let close_b = (2 * sr + sr / 2, 5 * sr); // 0.5s gap
         let merged_close = merge_adjacent_regions(vec![speech_a, close_b], 20 * sr, max_gap);
         assert_eq!(merged_close.len(), 1, "a short intra-sentence pause stays merged");
+    }
+
+    #[test]
+    fn absorb_short_regions_does_not_merge_across_a_long_silence_gap() {
+        // The "2s speech / 8s silence / 3s speech" case where the FIRST region is shorter than min.
+        // Without the gap guard, absorb_short_regions re-merged across the 8s silence (undoing the
+        // merge_adjacent_regions split) and recreated a mostly-silent 13s clip. It must stay split.
+        let (min, max, max_gap) = (48_000usize, 240_000usize, 32_000usize); // 3s / 15s / 2s
+        let split = absorb_short_regions(vec![(0, 32_000), (160_000, 208_000)], min, max, max_gap, 208_000);
+        assert_eq!(split.len(), 2, "must NOT absorb a short region across an 8s silence");
+        // A short region with only a short (sub-gap) pause to its neighbor is still absorbed.
+        let absorbed = absorb_short_regions(vec![(0, 32_000), (40_000, 88_000)], min, max, max_gap, 88_000);
+        assert_eq!(absorbed.len(), 1, "a short region with a sub-gap neighbor is still absorbed");
     }
 }

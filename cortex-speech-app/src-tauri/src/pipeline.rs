@@ -2251,6 +2251,13 @@ impl ProcessingPipeline {
         if text.trim().is_empty() || pcm.is_empty() {
             return None;
         }
+        // The fine-tuned model is trained on short utterances; a single >~15 s forward pass degrades
+        // (the same reason transcribe_chunk_finetuned windows at 15 s) and the Viterbi DP grows with
+        // frames×chars. Bound the forced-alignment clip; longer clips fall back to the bundled aligner.
+        const MAX_ALIGN_SAMPLES: usize = 15 * 16_000;
+        if pcm.len() > MAX_ALIGN_SAMPLES {
+            return None;
+        }
         let (onnx, vocab) = Self::finetuned_model_paths()?;
         let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
         let (logits, frames, vocab_size, tokens) =

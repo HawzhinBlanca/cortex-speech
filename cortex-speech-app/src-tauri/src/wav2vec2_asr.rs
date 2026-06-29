@@ -96,7 +96,9 @@ pub fn wav2vec2_logits(
     let normed = normalize_audio(audio);
     let n = normed.len();
 
-    let mut guard = SESSION_CACHE.lock().map_err(|_| "wav2vec2 session cache poisoned".to_string())?;
+    // Recover a poisoned cache lock (into_inner) instead of hard-failing — a panic in one inference
+    // path must not permanently break BOTH fine-tuned transcription and alignment until app restart.
+    let mut guard = SESSION_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if guard.as_ref().map(|(p, _)| p.as_path() != onnx_path).unwrap_or(true) {
         let session = ort::session::Session::builder()
             .map_err(|e| format!("ort builder: {e}"))?
