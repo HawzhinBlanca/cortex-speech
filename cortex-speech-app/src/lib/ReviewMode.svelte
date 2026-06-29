@@ -10,6 +10,13 @@
   import type { SpeechSegment, WordTimestamp } from './types';
   import type { SegmentConsensus } from './commands';
 
+  interface Props {
+    // Pro next-steps surfaced when the whole queue is reviewed (wired by App to its export / exit).
+    onExport?: () => void;
+    onDone?: () => void;
+  }
+  let { onExport, onDone }: Props = $props();
+
   // Simple, focused review queue: one clip at a time. Pending (unverified) first,
   // then the rest — so a reviewer always lands on work that needs doing.
   const queue = $derived.by<SpeechSegment[]>(() => {
@@ -22,6 +29,8 @@
   let index = $state(0);
   const current = $derived(queue[index] ?? null);
   const reviewedCount = $derived($segments.filter((s) => s.verified).length);
+  // Every clip verified — surface the "you're done, here's what's next" completion banner.
+  const allReviewed = $derived($segments.length > 0 && reviewedCount === $segments.length);
 
   let editText = $state('');
   let waveformData = $state<number[]>([]);
@@ -164,18 +173,21 @@
     const seg = current;
     if (!seg || saving) return;
     saving = true;
-    const text = acceptAsIs ? originalText(seg) : editText.trim();
-    const updated: SpeechSegment = { ...seg, annotatedTranscript: text, verified: true };
+    const original = originalText(seg).trim();
+    const text = acceptAsIs ? original : editText.trim();
+    // Map to a real human decision: an actual change is an "edit" (the typed text becomes gold), a
+    // no-change save is an "accept".
+    const isEdit = !acceptAsIs && text !== original;
     try {
-      await api.updateSegment(updated);
-      segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
+      // Use the canonical human-decision path (not a bare updateSegment): it records a human_decision
+      // — so the jury never re-adjudicates this clip — AND feeds the learning flywheel from review
+      // edits. (updateSegment set `verified` WITHOUT a human_decision, an inconsistent state.)
+      await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', isEdit ? text : null);
       editCache.delete(seg.id); // persisted — drop the in-progress copy
       lastLoadedOriginal = text; // the saved text is now the baseline for dirty-tracking
-      // Align editText with the saved baseline BEFORE advance() triggers the clip-switch effect.
-      // Otherwise, on "Accept as-is" (text = original, but editText still holds a typed-then-discarded
-      // edit) the stash branch would re-cache that discarded edit for this id and resurrect it on return.
       editText = text;
       notifications.success($t('saved'));
+      await segments.load(); // reflect the verdict + human_decision the backend wrote
       advance();
     } catch (e) {
       notifications.error($t('notifications.saveFailed'), { detail: String(e) });
@@ -234,6 +246,32 @@
   {@const isVerified = current.verified}
   <div class="h-full overflow-y-auto">
     <div class="mx-auto flex max-w-3xl flex-col gap-5 px-4 py-6">
+      <!-- Completion banner: every clip verified → surface the next steps (export / done). The clips
+           stay below so the reviewer can still scrub back and re-check any of them. -->
+      {#if allReviewed}
+        <div class="card border border-emerald-700/40 bg-emerald-950/20 p-5 text-center" data-testid="review-complete">
+          <div class="text-lg font-semibold text-emerald-300">
+            {$t('review.completeTitle').replace('{n}', String($segments.length))}
+          </div>
+          <p class="mt-1 text-sm text-subtle">{$t('review.completeHint')}</p>
+          <div class="mt-4 flex flex-wrap justify-center gap-2">
+            {#if onExport}
+              <button type="button" class="btn btn-primary !text-sm" data-testid="review-complete-export" onclick={onExport}>
+                {$t('review.exportDataset')}
+              </button>
+            {/if}
+            <button type="button" class="btn btn-secondary !text-sm" onclick={() => (index = 0)}>
+              {$t('review.reviewAgain')}
+            </button>
+            {#if onDone}
+              <button type="button" class="btn btn-secondary !text-sm" onclick={onDone}>
+                {$t('review.backToLibrary')}
+              </button>
+            {/if}
+          </div>
+        </div>
+      {/if}
+
       <!-- Progress -->
       <div>
         <div class="flex items-center justify-between gap-3">

@@ -159,7 +159,7 @@ def main() -> None:
         "hypothesis_coverage",
         "available_hypothesis_models",
         "required_hypothesis_models",
-        "agentic_readiness_offline_source_reference_is_degraded_not_blocked",
+        "agentic_readiness_offline_source_reference_is_ready_not_blocked",
         "agentic_readiness_is_ready_with_gemini_wsl_and_local_hypothesis_model",
     ]:
         assert needle in commands, f"agentic readiness preflight must cover {needle}"
