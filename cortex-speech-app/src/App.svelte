@@ -795,12 +795,15 @@
     if (!tauriAvailable) return;
     try {
       const readiness = await api.checkAgenticReadiness();
+      // WARN only when the pipeline genuinely CAN'T run (blocked). "degraded" still works (e.g. a
+      // partial config) so surface it as a gentle INFO, not an alarming warning on every import. The
+      // common offline case now reports "ready" (cloud cross-check is opt-in, not a degradation).
       if (readiness.status === 'blocked') {
         notifications.warning($t('agenticReadiness.blocked'), {
           detail: agenticReadinessDetail(readiness),
         });
       } else if (readiness.status === 'degraded') {
-        notifications.warning($t('agenticReadiness.degraded'), {
+        notifications.info($t('agenticReadiness.degraded'), {
           detail: agenticReadinessDetail(readiness),
         });
       }
@@ -2267,7 +2270,7 @@
           <StatsDashboard />
           <RefineryPanel />
         {:else if viewMode === 'review'}
-          <ReviewMode />
+          <ReviewMode onExport={handleExport} onDone={() => (viewMode = 'curate')} />
         {:else if $selectedSegment}
           <div class="card overflow-hidden">
             <Waveform
