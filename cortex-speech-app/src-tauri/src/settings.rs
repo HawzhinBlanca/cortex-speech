@@ -379,6 +379,21 @@ pub fn validate_outbound_endpoint(endpoint: &str) -> Result<(), crate::error::Ap
 
 impl AppSettings {
     pub fn load(path: &std::path::Path) -> Self {
+        // If a previous save was interrupted (a hard crash between replace_file's two renames on
+        // Windows, or a rename+restore double-failure), the canonical file can be missing while a
+        // valid `.replace-bak-*` copy survives next to it. Promote it BEFORE reading so we never
+        // silently revert persisted state — output dir, the cloud consent opt-ins, the configured-key
+        // flag, jury settings — to defaults while the real values sit recoverable on disk. No-op when
+        // the file is present (the common case).
+        match crate::atomic_file::recover_interrupted_replace(path) {
+            Ok(true) => {
+                tracing::warn!("Recovered settings from an interrupted save at {}", path.display())
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("Could not check for an interrupted settings save at {}: {e}", path.display())
+            }
+        }
         match std::fs::read_to_string(path) {
             Ok(s) => match serde_json::from_str::<AppSettings>(&s) {
                 Ok(mut settings) => {
@@ -497,10 +512,11 @@ impl AppSettings {
         if self.llm_mode == LlmMode::Gemini && !self.cloud_llm_opt_in {
             return LlmMode::None;
         }
-        // "Local" mode pointed at a REMOTE (non-loopback) endpoint sends the transcript off the
-        // device, so it is effectively cloud and likewise requires the cloud-LLM opt-in. A loopback
-        // endpoint stays on the machine and is always allowed. Without this, Local + an https remote
-        // would POST every transcript with no consent gate.
+        // Round-22 #6: "Local" mode pointed at a REMOTE (non-loopback) endpoint sends the transcript
+        // text (and the bearer API key) off the device, so it is effectively cloud and likewise
+        // requires the cloud-LLM opt-in. A genuine on-device endpoint (e.g. Ollama at localhost) stays
+        // on the machine and is always allowed. Without this, Local + an https remote would POST every
+        // transcript with no consent gate.
         if self.llm_mode == LlmMode::Local && !self.cloud_llm_opt_in && !self.llm_endpoint_is_local() {
             return LlmMode::None;
         }
@@ -577,6 +593,26 @@ mod tests {
         let path = dir.path().join("settings.json");
         AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() }.save(&path).expect("save");
         assert!(AppSettings::load(&path).cloud_stt_opt_in, "the Scribe toggle must survive save -> load");
+    }
+
+    #[test]
+    fn load_recovers_settings_from_an_interrupted_save_backup() {
+        // Post-crash state the round-15 atomic_file fix addresses: the canonical settings.json is
+        // MISSING (the durable rename never completed), but a valid `.replace-bak-*` sibling still
+        // holds the user's real settings (cloud STT opted in). load() must promote that backup instead
+        // of silently returning defaults — which would flip the consent opt-in OFF and drop the
+        // configured key, with the recoverable data left orphaned on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let backup = dir.path().join("settings.json.replace-bak-9999");
+        let real = AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() };
+        std::fs::write(&backup, serde_json::to_string(&real).unwrap()).unwrap();
+        assert!(!path.exists(), "the canonical file is missing (interrupted save)");
+
+        let loaded = AppSettings::load(&path);
+
+        assert!(loaded.cloud_stt_opt_in, "consent opt-in must be recovered, not reverted to default OFF");
+        assert!(path.exists(), "the backup must have been promoted to the canonical path");
     }
 
     #[test]
@@ -692,6 +728,49 @@ mod tests {
             ..AppSettings::default()
         };
         assert_eq!(remote_opted.effective_llm_mode(), LlmMode::Local);
+    }
+
+    #[test]
+    fn endpoint_host_is_loopback_is_strict_about_egress() {
+        for local in [
+            "http://localhost:11434/v1/chat/completions",
+            "http://127.0.0.1:8080/x",
+            "https://localhost/x",
+            "http://[::1]:9/z",
+        ] {
+            assert!(super::endpoint_host_is_loopback(local), "{local} is local");
+        }
+        for remote in [
+            "https://api.openai.com/v1/chat/completions",
+            "http://localhost.attacker.example/exfil", // must NOT be treated as local
+            "https://127.0.0.1.attacker.example/x",
+            "ftp://localhost",
+        ] {
+            assert!(!super::endpoint_host_is_loopback(remote), "{remote} is NOT local");
+        }
+    }
+
+    #[test]
+    fn local_mode_remote_endpoint_requires_cloud_consent() {
+        // Round-22 #6: Local mode pointed at a REMOTE endpoint is off-device egress and must be gated by
+        // cloud_llm_opt_in, exactly like Gemini — otherwise transcripts leak with no consent.
+        let remote = |opt_in: bool| AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "https://remote-llm.example/v1/chat/completions".to_string(),
+            cloud_llm_opt_in: opt_in,
+            ..AppSettings::default()
+        };
+        assert_eq!(remote(false).effective_llm_mode(), LlmMode::None, "remote Local without opt-in must downgrade");
+        assert_eq!(remote(true).effective_llm_mode(), LlmMode::Local, "remote Local WITH opt-in is allowed");
+
+        // A genuine on-device (localhost) endpoint needs no consent and is unaffected.
+        let local = AppSettings {
+            llm_mode: LlmMode::Local,
+            llm_endpoint: "http://127.0.0.1:11434/v1/chat/completions".to_string(),
+            cloud_llm_opt_in: false,
+            ..AppSettings::default()
+        };
+        assert_eq!(local.effective_llm_mode(), LlmMode::Local, "localhost Local needs no consent");
     }
 
     #[test]

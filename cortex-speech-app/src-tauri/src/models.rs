@@ -129,9 +129,18 @@ pub struct ModelInfo {
 
 pub const MODELS: &[ModelInfo] = &[
     ModelInfo {
+        // Round-24 #8: the download URL must point at an IMMUTABLE ref whose bytes BOTH match the pin
+        // AND expose the ONNX interface the app's VAD code requires — a unified `state`/`stateN` tensor
+        // (audio.rs `inputs!["input","sr","state"]`, `outputs["stateN"]`), NOT the separate-h/c LSTM
+        // interface. The old `raw/master/...` URL was a mutable branch ref (the original reliability
+        // bug). It currently still serves the correct model (sha 1a153a22…, 2.3 MB, unified-state), but
+        // a branch can change under us at any time. Pin to the immutable COMMIT that serves that exact
+        // file — same bytes as the pin and the bundled copy, so existing installs and the interface are
+        // unaffected. (The official v4.0-release file uses the incompatible h/c interface, so it must
+        // NOT be used here despite being labelled "v4".)
         name: "Silero VAD v4",
         filename: "silero_vad_v4.onnx",
-        url: "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx",
+        url: "https://github.com/snakers4/silero-vad/raw/bfdc0193023f121ea5b3cc7b176dbed570a68a59/src/silero_vad/data/silero_vad.onnx",
         sha256: "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
         min_size_bytes: 1_000_000,
         version: "4.0",
@@ -616,7 +625,12 @@ impl ModelManager {
     }
 
     pub fn denoiser_present(&self) -> bool {
-        model_file_meets_min_size(&self.models_dir, DENOISER_MODEL, 10_000_000)
+        // Round-23 #3 (review): check the RESOLVED dir — the directory inference actually loads from
+        // (resolve_models_dir falls back to the bundled dir when the user dir lacks OmniASR CTC). The
+        // pipeline constructs DenoiserService from resolved_dir(), so the denoising-provenance flag must
+        // be computed from the same place, or a denoiser present in the user dir but unreachable after
+        // the bundled-dir fallback would still record denoising=true while audio passed through.
+        model_file_meets_min_size(&self.resolved_dir(), DENOISER_MODEL, 10_000_000)
     }
 
     /// Download and extract the AI Denoiser archive.

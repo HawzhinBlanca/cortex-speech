@@ -50,9 +50,13 @@ pub fn export_audio_segments(
     segment_ids: &[String],
     options: &AudioExportOptions,
 ) -> AppResult<AudioExportResult> {
-    if options.sample_rate < 8000 || options.sample_rate > 96000 {
+    // Round-24/25 #11: the working buffer is decoded+downmixed to 16 kHz (audio::decode_to_pcm), so a
+    // requested rate ABOVE 16000 would only UPSAMPLE a band-limited signal and write a WAV/FLAC header
+    // (and metadata.csv export_sample_rate) that overstates the true bandwidth of a shared dataset
+    // clip. Cap the accepted range at 16000 — only downsampling (e.g. 8000) is meaningful here.
+    if options.sample_rate < 8000 || options.sample_rate > 16000 {
         return Err(AppError::Validation(format!(
-            "Invalid sample rate: {} (must be between 8000 and 96000)",
+            "Invalid sample rate: {} (must be between 8000 and 16000; the source is 16 kHz, so higher rates would overstate fidelity)",
             options.sample_rate
         )));
     }
@@ -138,15 +142,20 @@ fn export_single_segment(
     let (sample_rate, pcm_samples) =
         audio::decode_to_pcm(&seg.audio_path).map_err(|e| AppError::Other(format!("Failed to decode audio: {e}")))?;
 
-    // Slice to the segment's alignment window. A present-but-out-of-range window must SKIP
-    // (return Err, which the caller counts as a failed segment) — never fall back to the whole
-    // recording, which would pair a multi-minute file with one segment's short transcript (silent
-    // training-data corruption). Shares the exact guard the HF exporter uses (export::slice_for_export).
+    // Slice the clip from the segment's alignment window, sharing the exact guard the HF exporter uses
+    // (export::slice_for_export). When the alignment is present and parses but the window is OUT OF RANGE
+    // against the (possibly re-encoded/shortened) decoded buffer, or DEGENERATE (end <= start), SKIP the
+    // segment with a clear error (the caller counts it as a failed segment) — do NOT fall back to the
+    // whole source file. Pairing the entire multi-minute recording with one segment's short
+    // transcript/duration in metadata.csv is silent training-data corruption (the round-2 bug, fixed for
+    // the HF/dataset path but never for this WAV/FLAC path). The whole-file fallback is reserved strictly
+    // for genuinely-absent/unparseable alignment (handled inside slice_for_export).
     let pcm_window = crate::export::slice_for_export(&pcm_samples, sample_rate, seg.alignment_json.as_deref())
         .ok_or_else(|| {
-            AppError::Other(format!(
-                "Segment {segment_id}: alignment window out of range for the decoded audio; skipping \
-                 to avoid exporting the whole recording under one segment's transcript"
+            AppError::Validation(format!(
+                "Segment {segment_id}: alignment window out of range (pcm_len={}); refusing to export the \
+                 whole source file as this segment",
+                pcm_samples.len()
             ))
         })?;
     let pcm_samples = resample_pcm_i16(pcm_window.as_ref(), sample_rate, options.sample_rate);
@@ -290,6 +299,11 @@ fn write_metadata_csv(
                 wtr.write_record([
                     item.filename.as_str(),
                     seg.id.as_str(),
+                    // Basename only (source_ref = export_audio_ref) — never the curator's absolute import
+                    // path, which embeds the OS username + drive layout, a PII leak into this
+                    // deliberately-shared metadata.csv. Matches the sanitization every export.rs exporter
+                    // applies (round-22 #2). The transcript cells are additionally csv_safe_cell-escaped
+                    // above to prevent CSV/formula injection.
                     source_ref,
                     raw_t.as_ref(),
                     norm_t.as_ref(),
@@ -344,6 +358,7 @@ fn temporary_output_path(output_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunking::SegmentSourceMeta;
     use crate::db::{Database, SpeechSegment};
     use std::fs;
     use tempfile::TempDir;
@@ -446,6 +461,54 @@ mod tests {
     }
 
     #[test]
+    fn test_export_skips_out_of_range_alignment_instead_of_whole_file() {
+        // Round-16 (HIGH): a segment whose alignment window lies past the (re-encoded/shortened)
+        // decoded buffer must be SKIPPED, not exported as the WHOLE source recording paired with its
+        // short transcript/duration in metadata.csv — that is silent training-data corruption. The
+        // 1-second source with a 5000 ms window start is out of range, so the segment must fail with a
+        // clear error and produce NO clip and NO metadata.csv.
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("src.wav");
+        make_wav_file(&wav_path); // 1 second @ 16 kHz = 16000 samples
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let meta = SegmentSourceMeta { source_start_ms: 5000, source_end_ms: 5300, chunk_index: 0, chunk_count: 1 };
+        let seg = SpeechSegment {
+            id: "oob1".to_string(),
+            audio_path: wav_path.to_string_lossy().to_string(),
+            raw_transcript: "short utterance".to_string(),
+            duration_ms: 300,
+            alignment_json: Some(meta.to_alignment_json()),
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&seg).unwrap();
+
+        let out_dir = tmp.path().join("out");
+        let result = export_audio_segments(
+            &db,
+            &["oob1".to_string()],
+            &AudioExportOptions {
+                output_dir: out_dir.to_string_lossy().to_string(),
+                format: AudioExportFormat::Wav,
+                sample_rate: 16000,
+                include_metadata: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.succeeded, 0, "an out-of-range segment must not be exported");
+        assert_eq!(result.failed, 1);
+        assert!(result.errors[0].contains("out of range"), "error must explain the skip: {:?}", result.errors);
+        assert!(
+            !out_dir.join("src_oob1.wav").exists(),
+            "the whole source file must NOT be written as this segment's clip"
+        );
+        assert!(!out_dir.join("metadata.csv").exists(), "no metadata.csv when nothing was exported");
+    }
+
+    #[test]
     fn test_export_writes_metadata_when_requested() {
         let tmp = TempDir::new().unwrap();
         let wav_path = tmp.path().join("test.wav");
@@ -462,7 +525,7 @@ mod tests {
             &AudioExportOptions {
                 output_dir: out_dir.to_string_lossy().to_string(),
                 format: AudioExportFormat::Wav,
-                sample_rate: 24_000,
+                sample_rate: 16_000,
                 include_metadata: true,
             },
         )
@@ -479,9 +542,14 @@ mod tests {
         let row = reader.records().next().unwrap().unwrap();
         assert_eq!(metadata_value(&headers, &row, "file_name"), "test_exp1.wav");
         assert_eq!(metadata_value(&headers, &row, "segment_id"), "exp1");
+        // Round-22 #2: the published source reference is the BASENAME only — never the curator's
+        // absolute import path (which would leak the OS username + drive layout into a shared CSV).
+        let src = metadata_value(&headers, &row, "source_audio_path");
+        assert_eq!(src, "test.wav", "only the basename may be published");
+        assert!(!src.contains('/') && !src.contains('\\'), "no directory separators may leak: {src}");
         assert_eq!(metadata_value(&headers, &row, "raw_transcript"), "hello");
         assert_eq!(metadata_value(&headers, &row, "verified"), "0");
-        assert_eq!(metadata_value(&headers, &row, "export_sample_rate"), "24000");
+        assert_eq!(metadata_value(&headers, &row, "export_sample_rate"), "16000");
         assert_eq!(metadata_value(&headers, &row, "export_format"), "wav");
         assert!(reader.records().next().is_none());
     }
@@ -587,34 +655,47 @@ mod tests {
     }
 
     #[test]
-    fn test_export_resamples_to_requested_sample_rate() {
+    fn test_export_rejects_upsampling_and_allows_downsampling() {
+        // Round-25 #11: the source is decoded to 16 kHz, so a requested rate ABOVE 16000 would only
+        // upsample a band-limited signal and write a header/metadata rate that overstates fidelity — it
+        // is rejected. Downsampling (8000) is still allowed and writes the true requested rate.
         let tmp = TempDir::new().unwrap();
         let wav_path = tmp.path().join("test.wav");
         make_wav_file(&wav_path);
-
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        insert_test_segment(&db, "exp24", &wav_path);
-
+        insert_test_segment(&db, "exp", &wav_path);
         let out_dir = tmp.path().join("out");
-        let result = export_audio_segments(
+
+        let upsample = export_audio_segments(
             &db,
-            &["exp24".to_string()],
+            &["exp".to_string()],
             &AudioExportOptions {
                 output_dir: out_dir.to_string_lossy().to_string(),
                 format: AudioExportFormat::Wav,
                 sample_rate: 24000,
                 include_metadata: true,
             },
+        );
+        assert!(upsample.is_err(), "a >16 kHz export rate must be rejected (it would overstate fidelity)");
+
+        let result = export_audio_segments(
+            &db,
+            &["exp".to_string()],
+            &AudioExportOptions {
+                output_dir: out_dir.to_string_lossy().to_string(),
+                format: AudioExportFormat::Wav,
+                sample_rate: 8000,
+                include_metadata: true,
+            },
         )
         .unwrap();
-
         assert_eq!(result.succeeded, 1);
         let (sample_rate, sample_count) = output_wav_info(&out_dir.join(&result.files[0]));
-        assert_eq!(sample_rate, 24000);
+        assert_eq!(sample_rate, 8000);
         assert!(
-            (23900..=24100).contains(&sample_count),
-            "resampled one-second clip should have about 24000 samples, got {sample_count}"
+            (7900..=8100).contains(&sample_count),
+            "downsampled one-second clip should have about 8000 samples, got {sample_count}"
         );
     }
 

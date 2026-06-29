@@ -9,11 +9,14 @@ function createSegmentsStore() {
     subscribe,
     set,
     update,
+    bumpLoadGeneration() {
+      loadSeq++;
+    },
     async load() {
       const seq = ++loadSeq;
       try {
         const data = await api.getSegments();
-        if (seq !== loadSeq) return; // stale load — a newer one is in flight
+        if (seq !== loadSeq) return; // stale load — a newer one is in flight or a write invalidated it
         set(data);
         // Refresh threshold after loading segments
         await refreshConformalThreshold();

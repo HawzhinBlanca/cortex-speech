@@ -6,6 +6,14 @@ export interface Shortcut {
   description: string;
   action: () => void;
   category: string;
+  /**
+   * Allow this shortcut to fire while focus is in a text field / contentEditable (or during IME
+   * composition). Default false: in an editable, ALL other shortcuts — bare keys AND modifier combos
+   * like Ctrl+Z / Ctrl+Shift+Z / Ctrl+D — are suppressed so the field keeps native text editing
+   * (undo/redo, etc.) and a reflexive Ctrl+Z can't hijack it or revert an unrelated app action. Mark
+   * only genuinely editor-safe globals (command palette, focus-search) true.
+   */
+  allowInEditable?: boolean;
 }
 
 export class KeyboardManager {
@@ -39,13 +47,17 @@ export class KeyboardManager {
 
   private handleKeydown(e: KeyboardEvent) {
     const mod = e.metaKey || e.ctrlKey;
-
-    // Don't let bare shortcuts (Delete, j/k, '/', '?', Space…) fire while the user is
-    // typing in a field or composing Kurdish/Arabic text — only modifier shortcuts
-    // (Ctrl/Cmd + …) pass through. Prevents editing from silently mutating data.
-    if (!mod && this.isFromEditable(e)) return;
+    const inEditable = this.isFromEditable(e);
 
     for (const s of this.shortcuts) {
+      // While typing in a field or composing Kurdish/Arabic text, suppress EVERY shortcut that is not
+      // explicitly editor-safe — bare keys (Delete, j/k, '/', Space…) AND modifier combos (Ctrl+Z,
+      // Ctrl+Shift+Z, Ctrl+D…). This keeps native text editing intact: a reflexive Ctrl+Z performs the
+      // field's own undo instead of being hijacked into a backend `undo` that reverts an unrelated
+      // action and wipes the in-progress edit. Only allow-listed globals (command palette, focus
+      // search) fire while editing.
+      if (inEditable && !s.allowInEditable) continue;
+
       const keyMatch = e.key.toLowerCase() === s.key.toLowerCase();
       const ctrlMatch = !!s.ctrl === mod;
       const shiftMatch = !!s.shift === e.shiftKey;

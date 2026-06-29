@@ -21,6 +21,11 @@ pub struct ConformalCertificate {
 /// guarantee is void. The gate routes on the IRT cross-model consensus confidence (the
 /// better-calibrated signal); calibrate_threshold is fed that same IRT-based score.
 pub fn nonconformity(confidence: f64, ctc_score: Option<f64>) -> f64 {
+    // Clamp confidence into the valid posterior range [0,1]. The local ASR path is always in range,
+    // but an external (WSL) script can emit an out-of-range or non-finite confidence; left unclamped,
+    // e.g. confidence=92.0 yields a negative term that .max(0.0) floors to 0.0 — a falsely MAXIMAL
+    // certainty that silently corrupts the conformal coverage guarantee. NaN ⇒ 0.0 (least certain).
+    let confidence = if confidence.is_finite() { confidence.clamp(0.0, 1.0) } else { 0.0 };
     let ctc = ctc_score.unwrap_or(-5.0);
     ((1.0 - confidence) + 0.1 * (-ctc)).max(0.0)
 }
@@ -163,6 +168,26 @@ mod tests {
             ood_score: None,
             ..SpeechSegment::default()
         }
+    }
+
+    #[test]
+    fn nonconformity_clamps_out_of_range_confidence() {
+        // Round-10 audit MEDIUM: an external (WSL) script could emit confidence as a percentage (92.0),
+        // which UNCLAMPED yields ((1-92)+0.5).max(0)=0.0 — the SMALLEST (most-certain) nonconformity,
+        // silently certifying a possibly-wrong segment. Out-of-range confidence must NOT read as maximal
+        // certainty: clamp to [0,1] so 92.0 behaves like 1.0, and NaN like 0.0 (least certain).
+        let one = nonconformity(1.0, None);
+        let pct = nonconformity(92.0, None);
+        assert!((one - pct).abs() < 1e-9, "92.0 must clamp to 1.0: {one} vs {pct}");
+
+        let zero_conf = nonconformity(0.0, None);
+        let nan = nonconformity(f64::NAN, None);
+        assert!((nan - zero_conf).abs() < 1e-9, "NaN confidence must be treated as 0.0 (least certain)");
+
+        // The clamped high-confidence score is genuinely SMALLER than the low-confidence score —
+        // i.e. 92.0 no longer masquerades as the most-certain (0.0) score.
+        assert!(pct < zero_conf, "higher confidence must yield a lower nonconformity");
+        assert!(pct > 0.0, "a clamped 1.0 confidence still carries the ctc term, not a falsely-zero score");
     }
 
     #[test]

@@ -100,7 +100,7 @@ def main() -> None:
         "configured source-reference failures must not be logged and ignored"
     )
     assert "run_primary_wsl_pass_for_import" in pipeline, "WSL 7B imports must attempt the primary ASR pass before jury"
-    assert "self.run_primary_wsl_pass_for_import(db, &mut persisted)?" in pipeline, (
+    assert "self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?" in pipeline, (
         "import must run the WSL 7B primary pass immediately after segment persistence"
     )
     assert "if !self.should_use_wsl_primary_asr() || segments.is_empty()" in pipeline, (

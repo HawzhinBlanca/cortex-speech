@@ -196,6 +196,12 @@ impl Database {
     }
 
     /// Open the database with a retry policy for corruption.
+    ///
+    /// Recovery is fail-CLOSED: `recover_database_at` is DESTRUCTIVE (it renames the live db away and
+    /// opens a fresh empty one), so it must fire ONLY on genuine corruption. A transient error — an
+    /// external process holding the file locked past busy_timeout, a disk I/O hiccup, OOM during the
+    /// integrity check — must NOT quarantine a healthy database (that would be silent data loss);
+    /// instead it aborts startup so the user can clear the locker / fix the disk and retry intact.
     pub fn open_with_retry(path: &str) -> AppResult<Self> {
         match Self::open(path) {
             Ok(db) => {
@@ -203,21 +209,49 @@ impl Database {
                     Ok(result) if result.trim() == "ok" => {
                         return Ok(db);
                     }
+                    Ok(result) if integrity_result_looks_transient(&result) => {
+                        // PRAGMA integrity_check reports a transient page-read failure (a momentary disk
+                        // error, or AV/backup/indexer holding a page locked mid-scan) as a text result
+                        // ROW, e.g. "unable to get the page 42. error code=8" — which arrives here as
+                        // Ok(non-"ok"). Quarantining (renaming the live db away and opening an empty one)
+                        // a HEALTHY db on that transient signal is silent total data loss. Mirror the
+                        // Err branch's discipline: abort startup WITHOUT quarantine so the user can retry
+                        // with their data intact.
+                        tracing::error!("Database integrity check returned a transient I/O message (not corruption); aborting startup without quarantine: {result}");
+                        return Err(AppError::Other(format!(
+                            "Database integrity check could not complete (transient, not corruption): {result}"
+                        )));
+                    }
                     Ok(result) => {
+                        // A non-"ok", non-transient string is SQLite reporting genuine structural page
+                        // corruption: quarantine.
                         tracing::error!("Database integrity check failed on open; quarantining database: {result}");
                     }
+                    Err(e) if is_corruption_error(&e) => {
+                        tracing::error!(
+                            "Database integrity check returned a corruption code on open; quarantining database: {e}"
+                        );
+                    }
                     Err(e) => {
-                        tracing::error!("Database integrity check errored on open; quarantining database: {e}");
+                        // Transient/non-corruption error — do NOT destroy a possibly-healthy database.
+                        tracing::error!("Database integrity check could not complete (transient, not corruption); aborting startup without quarantine: {e}");
+                        return Err(e);
                     }
                 }
                 drop(db);
                 recover_database_at(path)?;
                 Self::open(path)
             }
-            Err(e) => {
-                tracing::error!("Failed to open database: {e}. Attempting recovery...");
+            Err(e) if is_corruption_error(&e) => {
+                tracing::error!("Failed to open database with a corruption code: {e}. Attempting recovery...");
                 recover_database_at(path)?;
                 Self::open(path)
+            }
+            Err(e) => {
+                // A non-corruption open failure (lock contention, permissions, transient I/O) must not
+                // quarantine the database — surface it so the user can resolve and retry.
+                tracing::error!("Failed to open database (transient/non-corruption); aborting without quarantine: {e}");
+                Err(e)
             }
         }
     }
@@ -244,6 +278,12 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_segments_verified ON speech_segments(verified);
             CREATE INDEX IF NOT EXISTS idx_segments_speaker ON speech_segments(speaker_id);
             CREATE INDEX IF NOT EXISTS idx_segments_created ON speech_segments(created_at);
+            -- AUTHORITATIVE segments_fts schema. Round-23 #8: migrations/001_initial.sql contains a
+            -- second, DIFFERENT (4-column) CREATE for segments_fts, but this block runs first on a fresh
+            -- boot, so the migration's `IF NOT EXISTS` makes it a no-op — THIS definition is the one in
+            -- effect. Edit the FTS schema HERE (and the three triggers below), not in the migration copy.
+            -- `audio_path` stays indexed for trigger symmetry but is excluded from search by a column
+            -- filter in search_segments (#7), so it never produces false-positive transcript hits.
             CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
                 id UNINDEXED,
                 audio_path,
@@ -281,6 +321,21 @@ impl Database {
         if let Err(error) = self.conn.execute(&format!("RELEASE {savepoint}"), []) {
             tracing::warn!("Failed to release savepoint {savepoint}: {error}");
         }
+    }
+
+    /// Release (commit) the named OUTERMOST savepoint. For the outermost savepoint, RELEASE *is* the
+    /// WAL commit and can fail (SQLITE_BUSY/IOERR at commit time); SQLite then leaves the savepoint
+    /// OPEN. If we returned that error without unwinding (the old `RELEASE ...?`), the dangling
+    /// savepoint would persist on the shared, poison-recovering (never-reopened) connection, so the
+    /// NEXT command would run inside the stale transaction and a later ROLLBACK TO could silently
+    /// discard writes already reported as committed. Roll it back + release on failure so a failed
+    /// commit cannot poison the connection.
+    fn release_savepoint(&self, savepoint: &str) -> AppResult<()> {
+        if let Err(error) = self.conn.execute(&format!("RELEASE {savepoint}"), []) {
+            self.cleanup_savepoint_after_error(savepoint);
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     pub fn insert_segment(&self, seg: &SpeechSegment) -> AppResult<()> {
@@ -322,36 +377,62 @@ impl Database {
         Ok(())
     }
 
-    /// Re-insert a FULL segment row, INCLUDING the jury/review columns (verdict, verdict_transcript,
-    /// rationale, evidence_json, agent_confidence, escalated, human_decision, corrected_at, is_gold) and
-    /// the original created_at. `insert_segment` deliberately omits those so a normal edit can't clobber
-    /// them via its ON CONFLICT branch — but undoing a DELETE resurrects into an EMPTY row, where that
-    /// omission would silently reset the human-verified verdict / gold flag / review state to their
-    /// schema defaults (NULL/0). This writes every column so an undo truly restores the segment.
-    pub fn restore_segment(&self, seg: &SpeechSegment) -> AppResult<()> {
+    /// Resurrect a HARD-DELETED segment from a full in-memory snapshot, persisting EVERY column the
+    /// snapshot carries — including the jury / human-review / gold-provenance fields (verdict,
+    /// verdict_transcript, rationale, evidence_json, agent_confidence, escalated, human_decision,
+    /// corrected_at, is_gold) and `created_at` that [`insert_segment`] deliberately omits.
+    ///
+    /// [`insert_segment`]'s 17-column subset is correct for the normal edit path, where the row still
+    /// exists and its `ON CONFLICT DO UPDATE` branch leaves the untouched columns intact. But undoing a
+    /// deletion runs as a *fresh* INSERT (the row was physically removed by `delete_segment` /
+    /// `delete_segments_batch`), so anything `insert_segment` skips would silently revert to its schema
+    /// default: verdict/human_decision/is_gold/corrected_at → NULL/0 and `created_at` → datetime('now'),
+    /// reordering the row in every `ORDER BY created_at` query and export. This method writes the whole
+    /// row so a restore is lossless. `created_at` falls back to `datetime('now')` only when the snapshot
+    /// genuinely lacks one (the column is NOT NULL).
+    pub fn insert_segment_full(&self, seg: &SpeechSegment) -> AppResult<()> {
         validate_segment(seg)?;
         let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
+        // NFC-normalize the jury verdict transcript too, so a restored row stays byte-consistent with
+        // the rest of the (already NFC) transcript columns.
+        let verdict_transcript_nfc = seg.verdict_transcript.as_deref().map(to_nfc);
         self.conn.execute(
             "INSERT INTO speech_segments
-                (id, created_at, audio_path, raw_transcript, normalized_transcript, annotated_transcript,
-                 alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio,
-                 rms_db, snr_db, split, ood_score, verdict, verdict_transcript, rationale, evidence_json,
-                 agent_confidence, escalated, human_decision, corrected_at, is_gold, alignment_quality)
+                (id, created_at, audio_path, raw_transcript, normalized_transcript,
+                 annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence,
+                 ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
+                 verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
+                 human_decision, corrected_at, is_gold, alignment_quality, updated_at)
              VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, datetime('now'))
              ON CONFLICT(id) DO UPDATE SET
-                created_at=excluded.created_at, audio_path=excluded.audio_path,
-                raw_transcript=excluded.raw_transcript, normalized_transcript=excluded.normalized_transcript,
-                annotated_transcript=excluded.annotated_transcript, alignment_json=excluded.alignment_json,
-                duration_ms=excluded.duration_ms, speaker_id=excluded.speaker_id, verified=excluded.verified,
-                confidence=excluded.confidence, ctc_score=excluded.ctc_score,
-                clipping_ratio=excluded.clipping_ratio, rms_db=excluded.rms_db, snr_db=excluded.snr_db,
-                split=excluded.split, ood_score=excluded.ood_score, verdict=excluded.verdict,
-                verdict_transcript=excluded.verdict_transcript, rationale=excluded.rationale,
-                evidence_json=excluded.evidence_json, agent_confidence=excluded.agent_confidence,
-                escalated=excluded.escalated, human_decision=excluded.human_decision,
-                corrected_at=excluded.corrected_at, is_gold=excluded.is_gold,
-                alignment_quality=excluded.alignment_quality, updated_at=datetime('now')",
+                created_at=excluded.created_at,
+                audio_path=excluded.audio_path,
+                raw_transcript=excluded.raw_transcript,
+                normalized_transcript=excluded.normalized_transcript,
+                annotated_transcript=excluded.annotated_transcript,
+                alignment_json=excluded.alignment_json,
+                duration_ms=excluded.duration_ms,
+                speaker_id=excluded.speaker_id,
+                verified=excluded.verified,
+                confidence=excluded.confidence,
+                ctc_score=excluded.ctc_score,
+                clipping_ratio=excluded.clipping_ratio,
+                rms_db=excluded.rms_db,
+                snr_db=excluded.snr_db,
+                split=excluded.split,
+                ood_score=excluded.ood_score,
+                verdict=excluded.verdict,
+                verdict_transcript=excluded.verdict_transcript,
+                rationale=excluded.rationale,
+                evidence_json=excluded.evidence_json,
+                agent_confidence=excluded.agent_confidence,
+                escalated=excluded.escalated,
+                human_decision=excluded.human_decision,
+                corrected_at=excluded.corrected_at,
+                is_gold=excluded.is_gold,
+                alignment_quality=excluded.alignment_quality,
+                updated_at=datetime('now')",
             params![
                 seg.id,
                 seg.created_at,
@@ -371,7 +452,7 @@ impl Database {
                 seg.split,
                 seg.ood_score,
                 seg.verdict,
-                seg.verdict_transcript,
+                verdict_transcript_nfc,
                 seg.rationale,
                 seg.evidence_json,
                 seg.agent_confidence,
@@ -385,6 +466,13 @@ impl Database {
         self.track_write()?;
         Ok(())
     }
+
+    /// Alias for [`insert_segment_full`], kept so the undo path can read as "restore". Both names
+    /// write the FULL row (jury/review/gold columns + created_at) so an undone delete is lossless.
+    pub fn restore_segment(&self, seg: &SpeechSegment) -> AppResult<()> {
+        self.insert_segment_full(seg)
+    }
+
 
     /// Targeted single-column update: sets `verified` without touching any other field.
     /// Returns true if the row was found and updated.
@@ -461,7 +549,7 @@ impl Database {
         })();
         match result {
             Ok(()) => {
-                self.conn.execute("RELEASE batch_insert", [])?;
+                self.release_savepoint("batch_insert")?;
                 self.track_write()?;
                 Ok(())
             }
@@ -552,7 +640,7 @@ impl Database {
         })();
         match result {
             Ok(()) => {
-                self.conn.execute("RELEASE merge_json", [])?;
+                self.release_savepoint("merge_json")?;
                 self.track_write()?;
                 Ok((created, updated))
             }
@@ -593,6 +681,46 @@ impl Database {
         Ok(rows_changed > 0)
     }
 
+    /// Persist a batch (re)transcription result WITHOUT clobbering concurrent human work.
+    ///
+    /// Batch transcription runs in a background thread off a snapshot taken at batch start; a human can
+    /// verify or edit a target segment while the batch is in flight. Writing the whole stale snapshot
+    /// back (the old `insert_segment` path) reverted the human's `verified` flag and overwrote their
+    /// edited annotation — a silent lost update. This targeted write instead:
+    ///   • updates ONLY the ASR-derived columns (raw / normalized / confidence),
+    ///   • seeds `annotated_transcript` solely when it is still empty, via COALESCE against the CURRENT
+    ///     row (never the stale snapshot), so an in-flight human annotation is preserved,
+    ///   • never touches `verified`, and
+    ///   • skips any row a human has verified or reviewed since the batch began.
+    /// Returns Ok(true) if the row was updated, Ok(false) if it was skipped as human-owned.
+    pub fn update_batch_transcription_if_unreviewed(
+        &self,
+        segment_id: &str,
+        raw_transcript: &str,
+        normalized_transcript: Option<&str>,
+        confidence: Option<f64>,
+        annotated_seed: &str,
+    ) -> AppResult<bool> {
+        let raw_nfc = to_nfc(raw_transcript);
+        let normalized_nfc = normalized_transcript.map(to_nfc);
+        let annotated_nfc = to_nfc(annotated_seed);
+        let rows_changed = self.conn.execute(
+            "UPDATE speech_segments
+             SET raw_transcript        = ?2,
+                 normalized_transcript = ?3,
+                 confidence            = ?4,
+                 annotated_transcript  = COALESCE(annotated_transcript, ?5),
+                 updated_at            = datetime('now')
+             WHERE id = ?1
+               AND verified = 0
+               AND (human_decision IS NULL OR human_decision = '')
+               AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
+            params![segment_id, raw_nfc, normalized_nfc, confidence, annotated_nfc],
+        )?;
+        self.track_write()?;
+        Ok(rows_changed > 0)
+    }
+
     pub fn delete_segment(&self, id: &str) -> AppResult<()> {
         self.conn.execute("DELETE FROM speech_segments WHERE id = ?1", params![id])?;
         self.track_write()?;
@@ -610,7 +738,7 @@ impl Database {
         })();
         match result {
             Ok(()) => {
-                self.conn.execute("RELEASE batch_delete", [])?;
+                self.release_savepoint("batch_delete")?;
                 // Keep the FTS5 index clean after bulk deletions.
                 if let Err(error) = self.conn.execute("INSERT INTO segments_fts(segments_fts) VALUES('optimize')", []) {
                     tracing::warn!("Failed to optimize segments FTS index after batch delete: {error}");
@@ -695,6 +823,11 @@ impl Database {
         if match_query.is_empty() {
             return Ok(Vec::new());
         }
+        // Round-23 #7: the segments_fts table also indexes `audio_path`, so a bare `MATCH ?` matches the
+        // query against the FILE PATH too — a token that appears only in a folder/file name returned
+        // false-positive segments whose transcript did not contain it. Restrict the match to the
+        // transcript columns with an FTS5 column filter so only transcript content is searched.
+        let scoped_query = format!("{{raw_transcript normalized_transcript annotated_transcript}} : ({match_query})");
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, audio_path, raw_transcript, normalized_transcript,
                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
@@ -706,7 +839,7 @@ impl Database {
              WHERE id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?1)
              ORDER BY created_at DESC, id ASC",
         )?;
-        let rows = stmt.query_map(params![match_query], Self::map_row)?;
+        let rows = stmt.query_map(params![scoped_query], Self::map_row)?;
         let mut segments = Vec::new();
         for row in rows {
             segments.push(row?);
@@ -765,6 +898,14 @@ impl Database {
 
     pub fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// The on-disk path this connection was opened from (or `":memory:"`). Used by commands that need
+    /// to open a SECOND, dedicated connection so they can release the global AppState db Mutex before a
+    /// long network call (e.g. cloud jury T2) — holding it across the round-trip would freeze every
+    /// other DB-touching command app-wide.
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     pub fn info(&self) -> AppResult<serde_json::Value> {
@@ -998,7 +1139,7 @@ impl Database {
         })();
         match result {
             Ok(changed) => {
-                self.conn.execute("RELEASE consensus_batch", [])?;
+                self.release_savepoint("consensus_batch")?;
                 self.track_write()?;
                 Ok(changed)
             }
@@ -1355,13 +1496,20 @@ impl Database {
         // attributable to the model_version that produced it.
         if let (Some(content_hash), Some(fix), Some(wrong)) = (ledger_hash, corrected_transcript, wrong_side.as_deref())
         {
-            let correction_id = uuid::Uuid::new_v4().to_string();
-            tx.execute(
-                "INSERT INTO corrections
-                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, jury_verdict, model_version_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![correction_id, segment_id, content_hash, wrong, fix, prior_verdict, model_version_id],
-            )?;
+            // Only record a GENUINE correction. `wrong_side` falls back to raw_transcript when no
+            // candidate differed from the fix (the model was already right), which would otherwise
+            // append a row whose raw_hypothesis == human_fix (up to whitespace/case) and pollute the
+            // reconstructable training ledger with non-corrections. Gate on the same learning-key
+            // difference the agent_examples / LOOP-0 paths already use.
+            if learning_text_key(wrong) != learning_text_key(fix) {
+                let correction_id = uuid::Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO corrections
+                        (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, jury_verdict, model_version_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![correction_id, segment_id, content_hash, wrong, fix, prior_verdict, model_version_id],
+                )?;
+            }
         }
 
         // LOOP 0: distil the edit into per-slot error memories so the SAME confusion is corrected on
@@ -1443,6 +1591,34 @@ impl Database {
     }
 }
 
+/// True only when an error indicates the database FILE itself is corrupt / not a database — the only
+/// conditions under which the destructive `recover_database_at` quarantine is warranted. Transient
+/// errors (SQLITE_BUSY/LOCKED, disk I/O, OOM) return false so a healthy db is never quarantined.
+fn is_corruption_error(err: &AppError) -> bool {
+    use rusqlite::ErrorCode;
+    matches!(
+        err,
+        AppError::Database(rusqlite::Error::SqliteFailure(f, _))
+            if matches!(f.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+    )
+}
+
+/// Whether a non-"ok" `PRAGMA integrity_check` result row is a TRANSIENT page-access / I/O message
+/// rather than genuine structural corruption. integrity_check is designed to keep walking the b-tree
+/// and report problems as up to 100 text result rows instead of failing the statement, so a momentary
+/// page-read failure (disk hiccup, or an AV/backup/indexer holding a page locked mid-scan) surfaces as
+/// `Ok("unable to get the page N. error code=...")`. Treating that as corruption and quarantining a
+/// HEALTHY database is silent total data loss, so these abort startup without quarantine instead.
+fn integrity_result_looks_transient(result: &str) -> bool {
+    let r = result.to_ascii_lowercase();
+    r.contains("unable to get the page")
+        || r.contains("error code=")
+        || r.contains("i/o error")
+        || r.contains("disk i/o")
+        || r.contains("is locked")
+        || r.contains("out of memory")
+}
+
 fn recover_database_at(path: &str) -> AppResult<()> {
     let path_buf = Path::new(path);
     if !path_buf.exists() {
@@ -1508,6 +1684,66 @@ mod tests {
             duration_ms: 1000,
             ..SpeechSegment::default()
         }
+    }
+
+    // The jury db-lock fix (with_jury_db) opens a SECOND, dedicated connection from Database::path so
+    // the global AppState db Mutex isn't held across cloud T2 network calls. This pins the assumption
+    // it relies on: path() round-trips, and a dedicated connection to the same file sees the primary's
+    // committed rows AND its own writes are visible back to the primary (SQLite WAL coexistence).
+    #[test]
+    fn dedicated_connection_via_path_shares_committed_data() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("jury.db");
+        let path_str = path.to_string_lossy().to_string();
+
+        let primary = Database::open(&path_str).unwrap();
+        primary.initialize().unwrap();
+        assert_eq!(primary.path(), path_str, "path() must return the opened path");
+        primary.insert_segment(&make_segment("s1", "/s1.wav")).unwrap();
+
+        // A dedicated connection opened from primary.path() (the with_jury_db pattern) sees the row.
+        let dedicated = Database::open(primary.path()).unwrap();
+        assert!(
+            dedicated.get_segment_by_id("s1").unwrap().is_some(),
+            "dedicated connection must see rows committed by the primary connection"
+        );
+
+        // A verdict written through the dedicated connection persists to the same file and is visible
+        // back to the primary — so the jury writing through it loses nothing.
+        dedicated.write_segment_verdict("s1", "jury_accept", Some("hi"), None, None, Some(0.9), false).unwrap();
+        let seen = primary.get_segment_by_id("s1").unwrap().unwrap();
+        assert_eq!(seen.verdict.as_deref(), Some("jury_accept"));
+    }
+
+    #[test]
+    fn search_does_not_match_the_audio_path_column() {
+        // Round-23 #7: a token that appears ONLY in the file path must NOT return the segment — search
+        // is over transcript content, not folder/file names.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let mut path_only = make_segment("p1", "/recordings/kurdistan/interview.wav");
+        path_only.raw_transcript = "hello world".to_string(); // "kurdistan" is ONLY in the path
+        db.insert_segment(&path_only).unwrap();
+        let mut text_hit = make_segment("t1", "/recordings/a/b.wav");
+        text_hit.raw_transcript = "this is about kurdistan today".to_string();
+        db.insert_segment(&text_hit).unwrap();
+
+        let ids: Vec<String> = db.search_segments("kurdistan").unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["t1".to_string()], "only the transcript match may return, not the path match: {ids:?}");
+    }
+
+    #[test]
+    fn transient_integrity_messages_are_not_classified_as_corruption() {
+        // Round-20: a transient page-read message from PRAGMA integrity_check must NOT be treated as
+        // corruption (which would quarantine a healthy db = silent data loss). It aborts startup instead.
+        assert!(integrity_result_looks_transient("unable to get the page 42. error code=8"));
+        assert!(integrity_result_looks_transient("disk I/O error"));
+        assert!(integrity_result_looks_transient("database is locked"));
+        assert!(integrity_result_looks_transient("out of memory"));
+        // Genuine structural-corruption findings are NOT transient -> they still quarantine.
+        assert!(!integrity_result_looks_transient("row 5 missing from index idx_foo"));
+        assert!(!integrity_result_looks_transient("*** in database main *** Page 9: btreeInitPage() returns error"));
+        assert!(!integrity_result_looks_transient("wrong # of entries in index"));
     }
 
     #[test]
@@ -1634,11 +1870,12 @@ mod tests {
             s.raw_transcript = "uniquesearchtoken body".to_string();
             db.insert_segment(&s).unwrap();
         }
-        // created_at is stamped by the column default at 1-second resolution. If these
-        // near-instant inserts straddle a second boundary, created_at (the primary sort key) —
-        // not id — would decide the order and the test would flake. Pin all rows to one
-        // timestamp so the `id ASC` tiebreaker is what's actually under test.
-        db.conn.execute("UPDATE speech_segments SET created_at = '2024-01-01 00:00:00'", []).unwrap();
+        // Pin all rows' created_at to ONE value so the tie is GUARANTEED. created_at is stamped by
+        // the column default datetime('now') at 1-second resolution, so if these near-instant inserts
+        // straddle a one-second clock tick they no longer tie: ORDER BY created_at DESC (the primary
+        // sort key) reorders them and the id-tiebreaker assertions below flake (~1-in-N runs, under
+        // load). Forcing equal timestamps isolates the `id ASC` tiebreaker that is actually under test.
+        db.conn.execute("UPDATE speech_segments SET created_at = '2026-01-01 00:00:00'", []).unwrap();
         let by_search: Vec<String> =
             db.search_segments("uniquesearchtoken").unwrap().into_iter().map(|s| s.id).collect();
         assert_eq!(by_search, vec!["seg_a", "seg_m", "seg_z"], "tied search results must order by id");
@@ -1706,6 +1943,13 @@ mod tests {
             db.get_segment_by_audio_path("/b1.wav").unwrap().is_none(),
             "the whole batch must roll back, including the valid segment"
         );
+
+        // After a failed batch the connection must NOT hold an open savepoint/transaction — otherwise
+        // the next command would run inside a stale transaction and a later rollback could silently
+        // discard committed writes (round-17: release_savepoint cleans up even if the commit fails).
+        assert!(db.conn.is_autocommit(), "a failed batch must leave no open transaction on the connection");
+        db.insert_segment(&make_segment("after", "/after.wav")).expect("a write after a failed batch must commit");
+        assert!(db.get_segment_by_audio_path("/after.wav").unwrap().is_some());
     }
 
     #[test]
@@ -1995,6 +2239,104 @@ mod tests {
             "new consensus",
             "an unreviewed segment is still refined"
         );
+    }
+
+    #[test]
+    fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
+        // Round-9 audit HIGH (lost update): batch_transcribe wrote the whole STALE snapshot back via
+        // insert_segment, reverting a concurrent human verify/edit. The guarded targeted write must
+        // (a) refuse to touch a human-verified/reviewed row, (b) never revert `verified`, (c) seed the
+        // annotation only when still empty, and (d) preserve an existing human annotation (COALESCE).
+        let db = make_db();
+
+        // (a)+(b): a human verified + annotated this row AFTER the batch prefetched it.
+        let mut verified = make_segment("verified-1", "/a.wav");
+        verified.raw_transcript = "old asr".to_string();
+        db.insert_segment(&verified).expect("insert verified");
+        db.conn
+            .execute(
+                "UPDATE speech_segments SET verified=1, annotated_transcript='human gold' WHERE id='verified-1'",
+                [],
+            )
+            .expect("mark verified");
+        let updated = db
+            .update_batch_transcription_if_unreviewed(
+                "verified-1",
+                "fresh asr",
+                Some("fresh asr"),
+                Some(0.9),
+                "fresh asr",
+            )
+            .expect("update verified");
+        assert!(!updated, "a verified row must be skipped, not updated");
+        let after = db.get_segment_by_id("verified-1").unwrap().unwrap();
+        assert!(after.verified, "verified flag must NOT be reverted by the batch");
+        assert_eq!(after.annotated_transcript.as_deref(), Some("human gold"), "human annotation preserved");
+        assert_eq!(after.raw_transcript, "old asr", "human-owned row's raw must not be clobbered");
+
+        // (c): a fresh unreviewed row with no annotation IS updated and seeds the annotation.
+        let mut fresh = make_segment("fresh-1", "/b.wav");
+        fresh.raw_transcript = "old".to_string();
+        fresh.annotated_transcript = None;
+        db.insert_segment(&fresh).expect("insert fresh");
+        let updated = db
+            .update_batch_transcription_if_unreviewed("fresh-1", "new asr", Some("new asr"), Some(0.8), "new asr")
+            .expect("update fresh");
+        assert!(updated, "an unreviewed row is updated");
+        let after = db.get_segment_by_id("fresh-1").unwrap().unwrap();
+        assert_eq!(after.raw_transcript, "new asr");
+        assert_eq!(after.annotated_transcript.as_deref(), Some("new asr"), "annotation seeded when empty");
+
+        // (d): an unverified row the user annotated (without verifying) keeps that annotation; only
+        // the ASR fields refresh — the seed is ignored because COALESCE reads the CURRENT row.
+        let mut annotated = make_segment("annot-1", "/c.wav");
+        annotated.raw_transcript = "old".to_string();
+        annotated.annotated_transcript = Some("user typed".to_string());
+        db.insert_segment(&annotated).expect("insert annotated");
+        let updated = db
+            .update_batch_transcription_if_unreviewed("annot-1", "new asr", Some("new asr"), Some(0.7), "seed ignored")
+            .expect("update annotated");
+        assert!(updated, "an unverified annotated row still refreshes ASR");
+        let after = db.get_segment_by_id("annot-1").unwrap().unwrap();
+        assert_eq!(
+            after.annotated_transcript.as_deref(),
+            Some("user typed"),
+            "existing annotation preserved (COALESCE)"
+        );
+        assert_eq!(after.raw_transcript, "new asr", "raw ASR refreshed on an unverified row");
+    }
+
+    #[test]
+    fn human_edit_does_not_write_no_op_correction_ledger_row() {
+        // Round-9 audit LOW: when the model was already right (no candidate differs from the fix),
+        // wrong_side falls back to raw_transcript, so the corrections ledger used to record a row whose
+        // raw_hypothesis == human_fix. A real (resolvable) audio file is required so the ledger hash
+        // resolves — otherwise the ledger insert is skipped for an unrelated reason and the bug hides.
+        let db = make_db();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let audio = tmp.path().join("clip.wav");
+        std::fs::write(&audio, b"RIFFxxxxWAVEfmt ").expect("write audio");
+        let audio_path = audio.to_string_lossy().to_string();
+
+        let mut seg = make_segment("noop-1", &audio_path);
+        seg.raw_transcript = "hello world".to_string();
+        db.insert_segment(&seg).expect("insert");
+
+        // A no-op edit: the corrected text equals the raw ASR (up to the learning key).
+        db.record_human_decision("noop-1", "edit", Some("hello world")).expect("record no-op edit");
+
+        let ledger_rows: i64 =
+            db.conn.query_row("SELECT COUNT(*) FROM corrections WHERE segment_id='noop-1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ledger_rows, 0, "a no-op edit must NOT append a corrections-ledger row");
+
+        // A genuine correction on the same kind of row DOES record a ledger entry.
+        let mut seg2 = make_segment("real-1", &audio_path);
+        seg2.raw_transcript = "helo wrld".to_string();
+        db.insert_segment(&seg2).expect("insert real");
+        db.record_human_decision("real-1", "edit", Some("hello world")).expect("record real edit");
+        let real_rows: i64 =
+            db.conn.query_row("SELECT COUNT(*) FROM corrections WHERE segment_id='real-1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(real_rows, 1, "a genuine correction still records a ledger row");
     }
 
     #[test]

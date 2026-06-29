@@ -175,9 +175,15 @@ fn ready_agentic_huggingface_segment_ids(db: &Database) -> AppResult<BTreeSet<St
     Ok(report.segment_ids.into_iter().collect())
 }
 
-/// Drop any segment whose audio is registered as held-out gold eval audio, so a TRAINING export can't
-/// leak the eval set's reference transcripts. Fail-closed, identical to the HF/DPO guard: exclude by
-/// holdout audio path (even when the file is gone and can't be re-hashed) OR by source content hash.
+/// Remove any segment that matches a held-out gold clip (by audio_path OR content hash) from an
+/// export set, so a TRAINING export can't leak the eval set's reference transcripts. EVERY
+/// training-corpus export must run this — the plain JSON/JSONL/CSV/Parquet export and the production
+/// bundle that wraps it, not just the HuggingFace export — or a clip registered as a holdout (the
+/// WER/CER eval reference) that also exists as an ordinary training-ready segment leaks into the
+/// published training data and contaminates the very eval set the promotion gate measures against.
+/// Fail-closed, identical to the HF/DPO guard: a path match excludes a held-out clip even when its
+/// file is missing (its content can no longer be re-hashed); a hash match also catches the same
+/// content at any path.
 pub(crate) fn exclude_holdout_segments(db: &Database, segments: Vec<SpeechSegment>) -> AppResult<Vec<SpeechSegment>> {
     let holdout = crate::jury::learning::holdout_content_hashes(db)?;
     let holdout_paths = crate::jury::learning::holdout_audio_paths(db)?;
@@ -210,9 +216,12 @@ pub(crate) fn exclude_holdout_segments(db: &Database, segments: Vec<SpeechSegmen
         .collect())
 }
 
+
 pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportFormat) -> AppResult<()> {
-    // Exclude held-out gold audio so the training tables (JSON/JSONL/CSV/Parquet) — including the
-    // production bundle that loops through here — never publish the eval set's reference transcripts.
+    // Drop held-out gold segments BEFORE counting or writing any format, so the training tables
+    // (JSON/JSONL/CSV/Parquet) — including the production bundle that delegates through here — never
+    // publish the eval set's reference transcripts; closes the eval-on-train leak the HF export
+    // already guards against.
     let segments = exclude_holdout_segments(db, db.get_segments(None)?)?;
     let total_duration: i64 = segments.iter().map(|s| s.duration_ms).sum();
     let verified = segments.iter().filter(|s| s.verified).count();
@@ -241,14 +250,64 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     }
 }
 
+/// Minimal union-find (disjoint-set) over string-keyed nodes, used to build leakage-safe split groups
+/// as connected components of the bipartite (recording, speaker) graph.
+struct UnionFind {
+    ids: std::collections::HashMap<String, usize>,
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+}
+
+impl UnionFind {
+    fn new() -> Self {
+        Self { ids: std::collections::HashMap::new(), parent: Vec::new(), rank: Vec::new() }
+    }
+
+    /// Get the id for `key`, creating a new singleton set if it is unseen.
+    fn node(&mut self, key: &str) -> usize {
+        if let Some(&id) = self.ids.get(key) {
+            return id;
+        }
+        let id = self.parent.len();
+        self.parent.push(id);
+        self.rank.push(0);
+        self.ids.insert(key.to_string(), id);
+        id
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]]; // path halving
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        match self.rank[ra].cmp(&self.rank[rb]) {
+            std::cmp::Ordering::Less => self.parent[ra] = rb,
+            std::cmp::Ordering::Greater => self.parent[rb] = ra,
+            std::cmp::Ordering::Equal => {
+                self.parent[rb] = ra;
+                self.rank[ra] += 1;
+            }
+        }
+    }
+}
+
 /// Deterministic, leakage-safe train/val/test assignment for the HuggingFace export.
 ///
 /// Two properties a training dataset must have, both of which the previous inline logic
 /// broke:
 /// 1. **No source-recording leakage** — every segment cut from the same source recording
 ///    lands in the same split; otherwise near-identical acoustic content leaks train→test.
-///    With `speaker_disjoint`, a *known* speaker is the grouping unit instead (so no speaker
-///    spans two splits); unknown-speaker segments fall back to their source recording.
+///    With `speaker_disjoint`, the grouping unit is a connected component of the bipartite
+///    (recording, speaker) graph, so a unit is BOTH speaker-disjoint AND keeps every recording
+///    intact — a multi-speaker recording can never straddle two splits.
 /// 2. **Seed reproducibility** — groups are visited in sorted-then-seed-shuffled order, so the
 ///    same segments + seed always yield the same split. (The old code shuffled `HashMap`
 ///    keys, whose iteration order is randomised per run, so the seed pinned nothing.)
@@ -279,16 +338,47 @@ pub fn assign_splits(
         path.rsplit(['/', '\\']).next().unwrap_or(path)
     }
 
-    // Group into leakage-safe units. BTreeMap keeps keys in a stable sorted order.
+    // Group into leakage-safe units. With speaker_disjoint, a unit is a connected component of the
+    // bipartite (recording, speaker) graph (built by union-find): each component keeps every source
+    // recording INTACT (no multi-speaker recording straddles two splits) AND is speaker-disjoint (no
+    // speaker spans two splits). Without speaker_disjoint, units are simply per-recording. BTreeMap
+    // keeps the canonical keys in a stable sorted order for seed-reproducible shuffling.
     let mut groups: std::collections::BTreeMap<String, Vec<&SpeechSegment>> = std::collections::BTreeMap::new();
-    for seg in segments {
-        let spk = seg.speaker_id.as_deref().unwrap_or("").trim();
-        let key = if speaker_disjoint && !spk.is_empty() {
-            format!("spk::{spk}")
-        } else {
-            format!("src::{}", source_name(&seg.audio_path))
-        };
-        groups.entry(key).or_default().push(seg);
+    if speaker_disjoint {
+        let mut uf = UnionFind::new();
+        for seg in segments {
+            let r = uf.node(&format!("r:{}", source_name(&seg.audio_path)));
+            let spk = seg.speaker_id.as_deref().unwrap_or("").trim();
+            if !spk.is_empty() {
+                let s = uf.node(&format!("s:{spk}"));
+                uf.union(r, s);
+            }
+        }
+        // Canonical key per component = the lexicographically smallest recording name in it
+        // (deterministic and unique — each recording belongs to exactly one component).
+        let mut root_key: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        for seg in segments {
+            let rec = source_name(&seg.audio_path).to_string();
+            let r = uf.node(&format!("r:{rec}"));
+            let root = uf.find(r);
+            root_key
+                .entry(root)
+                .and_modify(|m| {
+                    if rec < *m {
+                        *m = rec.clone();
+                    }
+                })
+                .or_insert(rec);
+        }
+        for seg in segments {
+            let r = uf.node(&format!("r:{}", source_name(&seg.audio_path)));
+            let root = uf.find(r);
+            groups.entry(root_key[&root].clone()).or_default().push(seg);
+        }
+    } else {
+        for seg in segments {
+            groups.entry(source_name(&seg.audio_path).to_string()).or_default().push(seg);
+        }
     }
 
     // Sorted keys, then a seeded Fisher–Yates shuffle → reproducible from `seed` alone.
@@ -440,24 +530,32 @@ pub fn export_huggingface_dataset(
 ) -> AppResult<()> {
     std::fs::create_dir_all(dir)?;
     let data_dir = dir.join("data");
-    std::fs::create_dir_all(&data_dir)?;
-
     let train_dir = data_dir.join("train");
     let val_dir = data_dir.join("validation");
     let test_dir = data_dir.join("test");
 
+    // Exclude held-out gold audio from the TRAINING export — the same fail-closed content-hash guard
+    // the plain export, DPO, and LM-corpus exports use. Without it, a clip registered as a holdout
+    // (for WER/CER eval) that ALSO exists as a normal training-ready segment leaks into data/train,
+    // contaminating the very eval set the promotion gate measures against.
+    let segments = exclude_holdout_segments(db, db.get_segments(None)?)?;
+    if segments.is_empty() {
+        // Nothing to export — a true NO-OP that PRESERVES any prior export rather than wiping it
+        // (re-exporting with zero training-ready segments must not destroy a previous good dataset).
+        return Ok(());
+    }
+
+    // There IS something to export: clear any prior export's split artifacts before re-writing, so a
+    // re-export into the same directory never leaves orphan WAVs (a segment that no longer exports) or a
+    // stale metadata.csv for a now-empty split — both would be hashed into SHA256SUMS and disagree with
+    // the freshly written metadata.csv / dataset_infos.json (round-12 audit).
+    if data_dir.exists() {
+        std::fs::remove_dir_all(&data_dir)?;
+    }
     std::fs::create_dir_all(&train_dir)?;
     std::fs::create_dir_all(&val_dir)?;
     std::fs::create_dir_all(&test_dir)?;
 
-    // Exclude held-out gold audio from the TRAINING export — the same fail-closed guard the DPO and
-    // LM-corpus exports use (shared helper). Without it, a clip registered as a holdout (for WER/CER
-    // eval) that ALSO exists as a normal training-ready segment leaks into data/train, contaminating
-    // the very eval set the promotion gate measures against.
-    let segments = exclude_holdout_segments(db, db.get_segments(None)?)?;
-    if segments.is_empty() {
-        return Ok(());
-    }
     let ready_agentic_segment_ids = ready_agentic_huggingface_segment_ids(db)?;
     let required_source_reference_models = settings.source_reference_models();
 
@@ -495,16 +593,18 @@ pub fn export_huggingface_dataset(
     let process_split = |split_segs: &[SpeechSegment],
                          _split_name: &str,
                          dest_dir: &std::path::Path|
-     -> AppResult<(usize, f64, usize)> {
+     -> AppResult<(usize, f64, usize, Vec<String>)> {
         // NOTE: do NOT early-return when this split is empty on a re-export. Falling through writes a
-        // header-only metadata.csv and runs the orphan-prune below, which clears clips a prior, larger
-        // export left in this split dir. Returning early left that stale metadata.csv + orphaned clips
-        // on disk (and cemented into SHA256SUMS), disagreeing with the actual (now-empty) split.
+        // HEADER-ONLY metadata.csv (the per-source loop below simply runs zero times) and runs the
+        // orphan-prune below, which clears clips a prior, larger export left in this split dir. So an
+        // empty split's on-disk metadata agrees with dataset_infos.json's num_examples=0 — never a
+        // stale or missing file. Returning early left that stale metadata.csv + orphaned clips on disk
+        // (and cemented into SHA256SUMS), disagreeing with the actual (now-empty) split.
         let csv_path = dest_dir.join("metadata.csv");
         let csv_tmp = csv_path.with_extension("csv.tmp");
         remove_file_on_error(
             &csv_tmp,
-            (|| -> AppResult<(usize, f64, usize)> {
+            (|| -> AppResult<(usize, f64, usize, Vec<String>)> {
                 let mut csv_wtr = csv::Writer::from_path(&csv_tmp)?;
                 csv_wtr.write_record([
                     "file_name",
@@ -525,11 +625,21 @@ pub fn export_huggingface_dataset(
                 // Segments dropped because their source audio is unavailable (missing or
                 // undecodable) — real, previously-silent data loss, surfaced after export.
                 let mut dropped_unavailable = 0usize;
+                // Ids of segments actually WRITTEN to disk, so the split column is later persisted ONLY
+                // for exported rows — never for ones dropped by the filters below (which would label a
+                // clip the dataset does not contain and disagree with dataset_infos.json counts).
+                let mut exported_ids: Vec<String> = Vec::new();
 
                 // Group segments by source audio_path so each source file is decoded only once.
                 // For a 2-hour podcast split into N segments, this avoids N full re-decodes.
-                let mut segs_by_source: std::collections::HashMap<&str, Vec<&SpeechSegment>> =
-                    std::collections::HashMap::new();
+                // A BTreeMap (NOT HashMap) keeps the per-source iteration order DETERMINISTIC: std
+                // HashMap iterates in a per-process-random order, which permuted the metadata.csv row
+                // blocks across otherwise-identical exports, changing each split's recorded SHA256SUMS
+                // every run and breaking the byte-reproducibility the manifest is meant to guarantee.
+                // Sorting by source path makes metadata.csv (and its hash) stable; within each source
+                // the Vec keeps split_segs insertion order, which is already deterministic.
+                let mut segs_by_source: std::collections::BTreeMap<&str, Vec<&SpeechSegment>> =
+                    std::collections::BTreeMap::new();
                 for seg in split_segs {
                     segs_by_source.entry(seg.audio_path.as_str()).or_default().push(seg);
                 }
@@ -640,6 +750,7 @@ pub fn export_huggingface_dataset(
 
                         total_exported_dur += clip_dur_ms as f64 / 1000.0;
                         count += 1;
+                        exported_ids.push(seg.id.clone());
                     }
                 }
 
@@ -662,14 +773,14 @@ pub fn export_huggingface_dataset(
                 csv_wtr.flush()?;
                 drop(csv_wtr);
                 replace_file(&csv_tmp, &csv_path)?;
-                Ok((count, total_exported_dur, dropped_unavailable))
+                Ok((count, total_exported_dur, dropped_unavailable, exported_ids))
             })(),
         )
     };
 
-    let (train_count, train_secs, train_dropped) = process_split(&train_segs, "train", &train_dir)?;
-    let (val_count, val_secs, val_dropped) = process_split(&val_segs, "validation", &val_dir)?;
-    let (test_count, test_secs, test_dropped) = process_split(&test_segs, "test", &test_dir)?;
+    let (train_count, train_secs, train_dropped, train_ids) = process_split(&train_segs, "train", &train_dir)?;
+    let (val_count, val_secs, val_dropped, val_ids) = process_split(&val_segs, "validation", &val_dir)?;
+    let (test_count, test_secs, test_dropped, test_ids) = process_split(&test_segs, "test", &test_dir)?;
 
     let total_count = train_count + val_count + test_count;
     let total_secs = train_secs + val_secs + test_secs;
@@ -684,6 +795,15 @@ pub fn export_huggingface_dataset(
 
     // Write dataset card (README.md)
     let model_str = format!("{:?}", settings.asr_model_size);
+    // Round-24 #5: the HuggingFace size_categories tag must reflect the ACTUAL example count, not a
+    // hardcoded `n<1K` that contradicts the split-statistics table once the dataset exceeds 1000 rows.
+    let size_category = match total_count {
+        0..=999 => "n<1K",
+        1_000..=9_999 => "1K<n<10K",
+        10_000..=99_999 => "10K<n<100K",
+        100_000..=999_999 => "100K<n<1M",
+        _ => "n>1M",
+    };
     let readme = format!(
         r#"---
 language:
@@ -697,7 +817,7 @@ tags:
 license: {}
 pretty_name: Cortex Kurdish Speech Dataset
 size_categories:
-- n<1K
+- {size_category}
 ---
 
 # Cortex Kurdish (Sorani) Speech Dataset
@@ -742,9 +862,12 @@ This dataset was exported from Cortex Speech Processor.
                 "transcription": {"dtype": "string", "_type": "Value"},
                 "speaker_id": {"dtype": "string", "_type": "Value"},
                 "duration_ms": {"dtype": "int64", "_type": "Value"},
-                "verified": {"dtype": "bool", "_type": "Value"},
+                // Round-24 #4: the metadata.csv writes these as "1"/"0" strings. Declaring them `bool`
+                // made a consumer's bool-cast read "0" as truthy True (inverting unverified rows).
+                // Declare int64 to match the bytes — "1"/"0" parse cleanly to 1/0, like duration_ms.
+                "verified": {"dtype": "int64", "_type": "Value"},
                 "training_grade": {"dtype": "string", "_type": "Value"},
-                "training_ready": {"dtype": "bool", "_type": "Value"},
+                "training_ready": {"dtype": "int64", "_type": "Value"},
                 "transcript_source": {"dtype": "string", "_type": "Value"},
                 "training_reasons": {"dtype": "string", "_type": "Value"},
             },
@@ -764,7 +887,16 @@ This dataset was exported from Cortex Speech Processor.
 
     // Every on-disk artifact is now written — persist the split columns LAST so that any failure
     // above returned Err with the DB unchanged, never leaving splits that describe an unwritten set.
+    // Persist a split ONLY for segments that were actually exported: process_split drops rows whose
+    // source audio is missing/undecodable, that are not training-ready, that lack coverage, or whose
+    // alignment window is out of range. Recording a split for a dropped row would label a clip the
+    // dataset does not contain and disagree with dataset_infos.json's num_examples.
+    let exported_ids: std::collections::HashSet<&str> =
+        train_ids.iter().chain(val_ids.iter()).chain(test_ids.iter()).map(String::as_str).collect();
     for (id, split) in &pending_splits {
+        if !exported_ids.contains(id.as_str()) {
+            continue;
+        }
         db.update_segment_split(id, split)
             .map_err(|error| AppError::Other(format!("Failed to persist split {split} for {id}: {error}")))?;
     }
@@ -1280,6 +1412,58 @@ mod tests {
     }
 
     #[test]
+    fn multi_speaker_recording_stays_in_one_split_under_speaker_disjoint() {
+        use std::collections::{HashMap, HashSet};
+        // Round-10 audit HIGH: in speaker-disjoint mode the OLD grouping keyed purely on speaker, so a
+        // single recording diarized into two speakers could land its chunks in DIFFERENT splits — the
+        // same room/mic acoustic content leaking train<->test. The connected-components grouping must
+        // keep every recording intact AND stay speaker-disjoint.
+        let mk = |id: &str, src: &str, spk: &str, dur: i64| SpeechSegment {
+            id: id.to_string(),
+            audio_path: format!("/data/{src}"),
+            speaker_id: Some(spk.to_string()),
+            duration_ms: dur,
+            ..SpeechSegment::default()
+        };
+        let mut segs = Vec::new();
+        // One recording diarized into TWO speakers (an interview), plus two single-speaker recordings.
+        for i in 0..4 {
+            segs.push(mk(&format!("interview-A{i}"), "interview.wav", "SPEAKER_00", 5000));
+        }
+        for i in 0..4 {
+            segs.push(mk(&format!("interview-B{i}"), "interview.wav", "SPEAKER_01", 5000));
+        }
+        for i in 0..6 {
+            segs.push(mk(&format!("solo1-{i}"), "solo1.wav", "SPEAKER_02", 5000));
+        }
+        for i in 0..6 {
+            segs.push(mk(&format!("solo2-{i}"), "solo2.wav", "SPEAKER_03", 5000));
+        }
+
+        let a = assign_splits(&segs, 0.34, 0.33, 0.33, 11, true);
+        let split_of: HashMap<&str, &str> = a.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+
+        // The multi-speaker recording must be entirely within ONE split (no recording leakage).
+        let interview_splits: HashSet<&str> =
+            segs.iter().filter(|s| s.audio_path.ends_with("interview.wav")).map(|s| split_of[s.id.as_str()]).collect();
+        assert_eq!(
+            interview_splits.len(),
+            1,
+            "a multi-speaker recording must not straddle splits: {interview_splits:?}"
+        );
+
+        // And speaker-disjointness still holds: no speaker spans two splits.
+        let mut spk_split: HashMap<&str, &str> = HashMap::new();
+        for s in &segs {
+            let spk = s.speaker_id.as_deref().unwrap();
+            let split = split_of[s.id.as_str()];
+            if let Some(prev) = spk_split.insert(spk, split) {
+                assert_eq!(prev, split, "speaker {spk} leaked across splits");
+            }
+        }
+    }
+
+    #[test]
     fn sha256sums_manifest_covers_files_and_verifies() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"abc").unwrap();
@@ -1590,6 +1774,51 @@ mod tests {
     }
 
     #[test]
+    fn plain_export_excludes_holdout_gold_audio() {
+        // Round-22 #1: the plain JSON/JSONL/CSV/Parquet export (and the production bundle that wraps
+        // it) must apply the SAME holdout exclusion as the HF export, or a clip registered as a
+        // holdout WER/CER reference leaks into the published training set and contaminates the gate.
+        let db_tmp = NamedTempFile::new().unwrap();
+        let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let write_wav = |name: &str, val: i16| {
+            let p = tmp_dir.path().join(name);
+            let mut w = hound::WavWriter::create(&p, spec).unwrap();
+            for _ in 0..16000 {
+                w.write_sample(val).unwrap();
+            }
+            w.finalize().unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let holdout_path = write_wav("holdout.wav", 0);
+        let keep_path = write_wav("keep.wav", 1000);
+        let mut hseg = sample_segment("hold-1");
+        hseg.audio_path = holdout_path.clone();
+        db.insert_segment(&hseg).unwrap();
+        let mut kseg = sample_segment("keep-1");
+        kseg.audio_path = keep_path;
+        db.insert_segment(&kseg).unwrap();
+        crate::eval::import_gold_segments(
+            &db,
+            vec![crate::eval::GoldSegmentInput { audio_path: holdout_path, reference: "ref".into(), is_holdout: true }],
+        )
+        .unwrap();
+
+        let out = tmp_dir.path().join("dataset.csv");
+        export_dataset(&db, &out, &ExportFormat::Csv).unwrap();
+        let body = std::fs::read_to_string(&out).unwrap();
+        assert!(body.contains("keep-1"), "the non-holdout segment must still be exported");
+        assert!(!body.contains("hold-1"), "the holdout gold clip must NOT leak into the plain export");
+    }
+
+    #[test]
     fn export_parquet_writes_valid_file() {
         let db_tmp = NamedTempFile::new().unwrap();
         let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
@@ -1634,13 +1863,14 @@ mod tests {
 
     #[test]
     fn exports_never_leak_absolute_paths() {
-        // The curator's absolute path embeds their OS username + drive layout; publishing
-        // it into a shared CSV/JSONL/JSON/Parquet is a real PII leak. Every exporter must
-        // emit only the audio basename.
+        // A curator's absolute path embeds their OS username + drive layout; publishing it into a
+        // shared CSV/JSONL/JSON/Parquet is a real PII leak. Every exporter must emit only the audio
+        // basename. Fixture uses a SYNTHETIC absolute path (no real home dir — keeps the repo's
+        // private-path hygiene gate green) standing in for that username + drive layout.
         let tmp_dir = tempfile::tempdir().unwrap();
         let d = tmp_dir.path();
         let mut seg = sample_segment("p1");
-        seg.audio_path = "C:\\Recordings\\studio_user\\private_clips\\clip_001.wav".to_string();
+        seg.audio_path = "C:\\SynthHome\\synth_user\\private_recordings\\clip_001.wav".to_string();
         let segs = [seg];
 
         export_json(&d.join("o.json"), &sample_metadata(), &segs).unwrap();
@@ -1651,16 +1881,16 @@ mod tests {
         for name in ["o.json", "o.jsonl", "o.csv"] {
             let body = std::fs::read_to_string(d.join(name)).unwrap();
             assert!(body.contains("clip_001.wav"), "{name} should keep the basename");
-            assert!(!body.contains("studio_user"), "{name} leaked the OS username: {body}");
-            assert!(!body.contains("Recordings"), "{name} leaked an absolute path");
-            assert!(!body.contains("private_clips"), "{name} leaked a directory");
+            assert!(!body.contains("synth_user"), "{name} leaked the OS username: {body}");
+            assert!(!body.contains("SynthHome"), "{name} leaked an absolute path");
+            assert!(!body.contains("private_recordings"), "{name} leaked a directory");
         }
         // Parquet is binary — scan the raw bytes for the same leaked substrings.
         let pq = std::fs::read(d.join("o.parquet")).unwrap();
         let has = |needle: &str| pq.windows(needle.len()).any(|w| w == needle.as_bytes());
         assert!(has("clip_001.wav"), "parquet should keep the basename");
-        assert!(!has("studio_user"), "parquet leaked the OS username");
-        assert!(!has("private_clips"), "parquet leaked a directory");
+        assert!(!has("synth_user"), "parquet leaked the OS username");
+        assert!(!has("private_recordings"), "parquet leaked a directory");
     }
 
     #[test]
@@ -1820,6 +2050,52 @@ mod tests {
 
         assert!(all_metadata.contains("hf-ready"));
         assert!(!all_metadata.contains("hf-reject"));
+    }
+
+    #[test]
+    fn hf_metadata_rows_are_ordered_deterministically_by_source_path() {
+        // Round-15: metadata.csv rows were emitted in HashMap (per-process-random) iteration order, so
+        // two identical exports produced different bytes and different SHA256SUMS, breaking the
+        // byte-reproducibility the manifest promises. With a BTreeMap the per-source row blocks are
+        // written in sorted source-path order — deterministic. Insert the sources OUT of sorted order
+        // and assert the rows still come out sorted, proving the ordering is by source path (not
+        // insertion/segment order) and is therefore stable across runs.
+        let db_tmp = NamedTempFile::new().unwrap();
+        let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let wav_a = tmp_dir.path().join("a_source.wav");
+        let wav_z = tmp_dir.path().join("z_source.wav");
+        write_silent_wav(&wav_a);
+        write_silent_wav(&wav_z);
+
+        // Insert the z-source segment FIRST (non-sorted insertion order).
+        let mut sz = sample_segment("seg-from-z");
+        sz.audio_path = wav_z.to_string_lossy().to_string();
+        db.insert_segment(&sz).unwrap();
+        let mut sa = sample_segment("seg-from-a");
+        sa.audio_path = wav_a.to_string_lossy().to_string();
+        db.insert_segment(&sa).unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let settings = crate::settings::AppSettings {
+            hf_speaker_disjoint: false,
+            hf_train_ratio: 1.0,
+            hf_val_ratio: 0.0,
+            hf_test_ratio: 0.0,
+            ..crate::settings::AppSettings::default()
+        };
+        export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+
+        let meta = std::fs::read_to_string(out_dir.path().join("data/train/metadata.csv")).unwrap();
+        let a_idx = meta.find("a_source_seg-from-a.wav").expect("a_source row present");
+        let z_idx = meta.find("z_source_seg-from-z.wav").expect("z_source row present");
+        assert!(
+            a_idx < z_idx,
+            "metadata.csv rows must be sorted by source path (a_source before z_source) so the file \
+             is byte-reproducible:\n{meta}"
+        );
     }
 
     #[test]
@@ -2114,6 +2390,71 @@ mod tests {
         assert!(!out_dir.path().join("dataset_infos.json.tmp").exists());
         assert!(!train_dir.join("metadata.csv.tmp").exists());
         assert_no_tmp_exports(&train_dir);
+    }
+
+    #[test]
+    fn hf_reexport_removes_orphan_wav_for_a_dropped_segment() {
+        // Round-12 audit (#5/#6): a re-export must remove the WAV of a segment that no longer exports
+        // (so it isn't left orphaned and hashed into SHA256SUMS with no metadata row), while keeping the
+        // still-exporting segments and a metadata.csv for every split. An EMPTY re-export is a separate
+        // no-op that preserves the prior export, so this scenario keeps one segment exporting.
+        let db_tmp = NamedTempFile::new().unwrap();
+        let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let wav_path = tmp_dir.path().join("clip.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for _ in 0..16000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        for id in ["orphan-seg", "keep-seg"] {
+            let mut seg = sample_segment(id);
+            seg.audio_path = wav_path.to_string_lossy().to_string();
+            db.insert_segment(&seg).unwrap();
+        }
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let settings = crate::settings::AppSettings::default();
+        let data_dir = out_dir.path().join("data");
+
+        let find_wavs = |root: &std::path::Path| -> Vec<std::path::PathBuf> {
+            ["train", "validation", "test"]
+                .iter()
+                .flat_map(|s| std::fs::read_dir(root.join("data").join(s)).ok().into_iter().flatten().flatten())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
+                .collect()
+        };
+
+        // Run 1: both segments export.
+        export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+        assert_eq!(find_wavs(out_dir.path()).len(), 2, "run 1 exports two wavs");
+
+        // One segment no longer exports; re-export into the SAME directory.
+        db.delete_segment("orphan-seg").unwrap();
+        export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+
+        let after = find_wavs(out_dir.path());
+        assert_eq!(after.len(), 1, "only the kept segment's wav remains, got {after:?}");
+        assert!(after[0].to_string_lossy().contains("keep-seg"), "kept wav is keep-seg: {after:?}");
+
+        let sums = std::fs::read_to_string(out_dir.path().join("SHA256SUMS")).unwrap();
+        assert!(!sums.contains("orphan-seg"), "SHA256SUMS must not list the orphan WAV:\n{sums}");
+        assert!(sums.contains("keep-seg"), "SHA256SUMS must list the kept WAV:\n{sums}");
+
+        // Every declared split still has a metadata.csv (header-only for the empty ones).
+        for s in ["train", "validation", "test"] {
+            assert!(data_dir.join(s).join("metadata.csv").exists(), "split {s} must have a metadata.csv");
+        }
     }
 
     fn assert_no_tmp_exports(dir: &std::path::Path) {

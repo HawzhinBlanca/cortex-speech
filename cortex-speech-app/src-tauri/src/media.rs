@@ -27,6 +27,19 @@ pub struct MediaRegistry {
     grants: HashMap<String, GrantRecord>,
 }
 
+/// The directory the registry copies playable clips into, relative to the app data dir.
+///
+/// This is the SINGLE source of truth shared by the writer (`register`, below) and the
+/// asset-protocol scope grant in `lib.rs` setup. The Tauri WebView can only load an `asset://`
+/// URL whose path is inside the asset-protocol scope, and the static `$APPDATA/media-cache/**`
+/// scope in `tauri.conf.json` resolves (Tauri v2) to the bundle-identifier-qualified app-data dir,
+/// NOT to `get_app_data_dir()`'s `%APPDATA%\cortex-speech`. So the scope is granted at runtime from
+/// THIS function; if the two ever computed different directories, in-app playback would silently
+/// break (every clip would 403). Keeping it in one place makes that drift impossible.
+pub fn media_cache_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("media-cache")
+}
+
 impl MediaRegistry {
     pub fn register(&mut self, db: &Database, data_dir: &Path, requested_path: &str) -> Result<MediaGrant, String> {
         let canonical = Self::ensure_imported(db, requested_path)?;
@@ -56,34 +69,70 @@ impl MediaRegistry {
         Err("Media playback is limited to files already imported into this dataset".to_string())
     }
 
+    /// db-locked, FAST: validate the path and confirm it is an imported media file, returning the
+    /// canonical source path. Round-25 #7: split out so the caller can RELEASE the global db Mutex
+    /// before the (potentially multi-GB) file copy in [`grant_source`] — holding the global db lock
+    /// across `std::fs::copy` froze every other DB command for the length of the copy. This is the
+    /// `PathBuf`-returning sibling of [`ensure_imported`]; both share the same DB-only membership
+    /// check via [`ensure_imported_media_path`].
+    pub fn validate_source(&mut self, db: &Database, requested_path: &str) -> Result<PathBuf, String> {
+        self.prune_expired();
+        let canonical = validate::validate_file_path(requested_path)?;
+        self.ensure_imported_media_path(db, requested_path, &canonical)?;
+        Ok(PathBuf::from(canonical))
+    }
+
     /// Grant + cache an ALREADY-validated source path. Touches NO database, so the full-file copy is
     /// safe to run without the db lock held. Only the media-registry mutex serializes concurrent
     /// callers, which does not contend with get_segments.
     pub fn register_cached(&mut self, data_dir: &Path, canonical: &str) -> Result<MediaGrant, String> {
-        self.prune_expired();
-        let source_path = PathBuf::from(canonical);
+        self.grant_source(data_dir, PathBuf::from(canonical))
+    }
 
+    /// NO db lock: copy the source into the media cache and grant a TTL token. The expensive
+    /// `std::fs::copy` runs here, so this MUST be called with the global db Mutex released (see
+    /// [`validate_source`] / [`ensure_imported`]).
+    pub fn grant_source(&mut self, data_dir: &Path, source_path: PathBuf) -> Result<MediaGrant, String> {
+        self.prune_expired();
         if let Some(grant) = self.existing_grant_for_source(&source_path) {
             return Ok(grant);
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let ext = Path::new(canonical)
+        let ext = source_path
             .extension()
             .and_then(|e| e.to_str())
             .map(validate::sanitize_filename)
             .filter(|e| !e.is_empty())
             .unwrap_or_else(|| "audio".to_string());
-        let cache_dir = data_dir.join("media-cache");
+        let cache_dir = media_cache_dir(data_dir);
         std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Create media cache: {e}"))?;
         self.prune_orphaned_cache_files(&cache_dir);
         let cached_path = cache_dir.join(format!("{id}.{ext}"));
-        std::fs::copy(canonical, &cached_path).map_err(|e| format!("Copy media into app cache: {e}"))?;
+        std::fs::copy(&source_path, &cached_path).map_err(|e| format!("Copy media into app cache: {e}"))?;
 
         let expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
         self.grants.insert(id.clone(), GrantRecord { source_path, cached_path: cached_path.clone(), expires_at });
 
         Ok(MediaGrant { id, path: cached_path.to_string_lossy().to_string(), expires_at: expires_at.to_rfc3339() })
+    }
+
+    /// DB-only membership check using the audio_path index (migration v13): a single O(log N) lookup,
+    /// trying both the canonical and original (pre-canonicalize) forms because Windows
+    /// `canonicalize()` adds a `\\?\` prefix while the DB may store the original non-canonical path.
+    fn ensure_imported_media_path(&self, db: &Database, original: &str, canonical: &str) -> Result<(), String> {
+        if db.get_segment_by_audio_path(canonical).map_err(|e| format!("Media path check failed: {e}"))?.is_some() {
+            return Ok(());
+        }
+        if original != canonical
+            && db
+                .get_segment_by_audio_path(original)
+                .map_err(|e| format!("Media path check (original) failed: {e}"))?
+                .is_some()
+        {
+            return Ok(());
+        }
+        Err("Media playback is limited to files already imported into this dataset".to_string())
     }
 
     pub fn resolve(&mut self, id: &str) -> Result<String, String> {
@@ -92,9 +141,11 @@ impl MediaRegistry {
         if !record.cached_path.exists() {
             return Err("Cached media file is missing".to_string());
         }
-        // Sliding TTL: resolving means the frontend is (re)loading this clip, so keep it alive. Without
-        // this a clip the user is still working with expires after 30 min and the next prune (triggered
-        // by granting any other clip) deletes the file out from under the playing <audio> element.
+        // Sliding TTL: resolving means the frontend is (re)loading this clip (the AudioPlayer
+        // re-resolves on load/replay), so keep it alive. Without this, a clip the user is still
+        // working with expires after MEDIA_TTL_MINUTES and the next prune (triggered by granting any
+        // other clip, or idle time) deletes the file out from under the playing <audio> element,
+        // making a later play/seek fail with "Cached media file is missing".
         record.expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
         Ok(record.cached_path.to_string_lossy().to_string())
     }
@@ -118,9 +169,11 @@ impl MediaRegistry {
             }
         }
 
+        // Find a live grant for this source and REFRESH its TTL on reuse — re-registering the same
+        // clip (e.g. re-selecting a segment) means it's still in use, so it must keep the clip alive,
+        // not return a grant that is about to expire.
         self.grants.iter_mut().find_map(|(id, record)| {
             if record.source_path == source_path && record.expires_at > now && record.cached_path.exists() {
-                // Sliding TTL: reusing the grant for a fresh play means it's still in use — refresh it.
                 record.expires_at = now + Duration::minutes(MEDIA_TTL_MINUTES);
                 Some(MediaGrant {
                     id: id.clone(),
@@ -203,6 +256,35 @@ mod tests {
         }
     }
 
+    // The asset-protocol scope grant in lib.rs setup and the registry writer MUST target the same
+    // directory, or the WebView refuses every cached clip's asset:// URL and no audio can play (the
+    // shipped bug: the static `$APPDATA/media-cache/**` scope resolved to the identifier-qualified
+    // app-data dir, a sibling of get_app_data_dir()'s %APPDATA%\cortex-speech). Both sides now derive
+    // the dir from media_cache_dir(); this pins that the registry's cache file really lands under it,
+    // so the runtime grant (which uses the same function) authorizes exactly what the registry wrote.
+    #[test]
+    fn registry_writes_into_media_cache_dir() {
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("sample.wav");
+        std::fs::write(&audio, b"audio").unwrap();
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&segment(&audio)).unwrap();
+
+        let mut registry = MediaRegistry::default();
+        let grant = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+
+        let expected_dir = media_cache_dir(tmp.path());
+        let cached = std::path::Path::new(&grant.path);
+        assert_eq!(
+            cached.parent(),
+            Some(expected_dir.as_path()),
+            "cached clip must live in media_cache_dir(data_dir) — the exact dir lib.rs grants to the asset scope"
+        );
+        assert!(cached.exists());
+    }
+
     #[test]
     fn grants_imported_media_and_rejects_arbitrary_files() {
         let tmp = TempDir::new().unwrap();
@@ -241,6 +323,39 @@ mod tests {
         let cache_dir = tmp.path().join("media-cache");
         let cached_files = std::fs::read_dir(cache_dir).unwrap().count();
         assert_eq!(cached_files, 1, "same imported audio should only have one live cache copy");
+    }
+
+    #[test]
+    fn resolve_and_reuse_refresh_the_grant_ttl() {
+        // Round-18: the grant TTL was never refreshed by resolve/reuse, so prune_expired could delete a
+        // clip the user is still interacting with after MEDIA_TTL_MINUTES. resolving (and re-registering)
+        // must push the expiry back to a full TTL.
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("sample.wav");
+        std::fs::write(&audio, b"audio").unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&segment(&audio)).unwrap();
+
+        let mut registry = MediaRegistry::default();
+        let grant = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+
+        // Artificially age the grant to nearly-expired, then resolve.
+        registry.grants.get_mut(&grant.id).unwrap().expires_at = Utc::now() + Duration::seconds(2);
+        registry.resolve(&grant.id).unwrap();
+        assert!(
+            registry.grants.get(&grant.id).unwrap().expires_at > Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES - 1),
+            "resolve must refresh the grant TTL"
+        );
+
+        // The reuse path (re-registering the same source) also refreshes.
+        registry.grants.get_mut(&grant.id).unwrap().expires_at = Utc::now() + Duration::seconds(2);
+        let reused = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+        assert_eq!(reused.id, grant.id, "same source reuses the live grant");
+        assert!(
+            registry.grants.get(&grant.id).unwrap().expires_at > Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES - 1),
+            "reuse must refresh the grant TTL"
+        );
     }
 
     #[test]

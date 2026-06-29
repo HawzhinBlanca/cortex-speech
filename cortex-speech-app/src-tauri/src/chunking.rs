@@ -341,7 +341,11 @@ pub fn slice_pcm_by_alignment(
         if end <= start {
             return Err(AppError::Validation("Invalid chunk time range".into()));
         }
-        let suffix = format!("chunk_{start}_{end}");
+        // Round-22 #12: key the per-chunk cache on the STORED ms range, not the sample indices. The
+        // import write-side derives its key from the same source_start_ms/source_end_ms, so the keys
+        // match exactly; a sample-index key never matched here because `start`/`end` round-trip
+        // sample -> ms -> sample, so the cache missed on every re-transcribe.
+        let suffix = format!("chunk_{}_{}", meta.source_start_ms, meta.source_end_ms);
         Ok((pcm[start..end].to_vec(), Some(suffix)))
     } else {
         Ok((pcm.to_vec(), None))

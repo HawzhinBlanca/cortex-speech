@@ -106,7 +106,19 @@ fn request_scribe_json(
 ) -> AppResult<serde_json::Value> {
     let audio = std::fs::read(audio_path).map_err(|e| AppError::Other(format!("read audio {audio_path}: {e}")))?;
     let filename = std::path::Path::new(audio_path).file_name().and_then(|f| f.to_str()).unwrap_or("audio.wav");
-    let (content_type, body) = build_multipart(&audio, filename, model_id, language_code);
+    request_scribe_json_from_bytes(&audio, filename, api_key, model_id, language_code)
+}
+
+/// Send already-in-memory audio bytes to Scribe. Lets callers transcribe a sliced segment window
+/// without first materializing a temp WAV file on disk.
+fn request_scribe_json_from_bytes(
+    audio: &[u8],
+    filename: &str,
+    api_key: &str,
+    model_id: &str,
+    language_code: &str,
+) -> AppResult<serde_json::Value> {
+    let (content_type, body) = build_multipart(audio, filename, model_id, language_code);
 
     let redact = |s: String| s.replace(api_key, "<redacted>");
     let resp = crate::http::API_AGENT
@@ -122,6 +134,22 @@ fn request_scribe_json(
 /// key redacted (defense in depth, though the key is only ever sent as a header).
 pub fn transcribe(audio_path: &str, api_key: &str, model_id: &str, language_code: &str) -> AppResult<String> {
     let json = request_scribe_json(audio_path, api_key, model_id, language_code)?;
+    parse_scribe_text(&json)
+        .map(|text| dedupe_repeated(&text))
+        .ok_or_else(|| AppError::Other("Scribe returned no transcription text".into()))
+}
+
+/// Transcribe in-memory WAV bytes (typically ONE sliced segment window) with Scribe. Same contract as
+/// [`transcribe`] but avoids a temp file — used for per-segment votes, where sending the whole source
+/// file would be wrong (whole-file transcript attributed to one segment) and ~N× the cost.
+pub fn transcribe_wav_bytes(
+    wav: &[u8],
+    filename: &str,
+    api_key: &str,
+    model_id: &str,
+    language_code: &str,
+) -> AppResult<String> {
+    let json = request_scribe_json_from_bytes(wav, filename, api_key, model_id, language_code)?;
     parse_scribe_text(&json)
         .map(|text| dedupe_repeated(&text))
         .ok_or_else(|| AppError::Other("Scribe returned no transcription text".into()))

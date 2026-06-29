@@ -275,15 +275,6 @@ pub(crate) fn build_agentic_readiness_snapshot(
     }
 }
 
-fn agentic_readiness_snapshot_for_state(state: &AppState, settings: &AppSettings) -> serde_json::Value {
-    let model_status = {
-        let model_manager = state.lock_model_manager();
-        model_manager.status()
-    };
-    let external_provider = external_provider_status(settings);
-    build_agentic_readiness_snapshot(settings, &model_status, &external_provider)
-}
-
 #[tauri::command]
 pub fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     RATE_LIMITER.check("open_audio_file")?;
@@ -520,10 +511,17 @@ pub fn import_audio_file(
             pipeline.import_single_file_with_events(&file_path, cancel, Some(&agent_run_id), |event| {
                 // This command OWNS the terminal import-complete/pipeline-complete events: it emits
                 // ready_payload right after segments exist (so the list renders immediately) and
-                // done_payload after the background jury finishes. Drop the pipeline's own Completed so
-                // it can't fire a PREMATURE terminal event that tears down the pipeline UI (clears the
-                // agent stages, flips to idle) before adjudication even starts. The directory import
-                // path uses a different code path and keeps its Completed.
+                // done_payload after the background jury finishes. Drop the pipeline's own terminal
+                // Completed event for the single-file path: emit_pipeline_event's Completed arm
+                // hard-codes source:"directory" and emits import-complete + pipeline-complete —
+                // forwarding it here would fire a SECOND, wrongly-sourced import-complete BEFORE the
+                // jury adjudication block below, producing a spurious "Successfully processed 1 file"
+                // toast, a premature idle/refresh, and an idle→adjudicating→complete flicker that tears
+                // down the pipeline UI (clears the agent stages, flips to idle) before adjudication even
+                // starts. The worker emits its own authoritative source:"file" import-complete +
+                // pipeline-complete after adjudication, so the frontend still gets exactly one of each.
+                // (The directory import path uses a different code path and keeps its Completed.)
+                // Forward every other event unchanged.
                 if matches!(event, PipelineEvent::Completed { .. }) {
                     return;
                 }
@@ -550,6 +548,15 @@ pub fn import_audio_file(
         };
         match result {
             Ok(segments) => {
+                // This command — NOT the pipeline — runs the single-file post-import jury adjudication,
+                // exactly ONCE, on the background thread below. The pipeline's single-file path
+                // intentionally skips inline adjudication (see pipeline.rs import_single_file_with_events)
+                // so the jury runs here on its OWN WAL connection and never holds the shared DB lock
+                // across ASR — running it in both places would emit a duplicate adjudicating phase, a
+                // contradictory second jury count, a second agent_import_reports row, and double the jury
+                // work (and cloud T2 cost/latency under cloud opt-in). We emit the authoritative
+                // source:"file" import-complete here (the pipeline's terminal Completed event is dropped
+                // in the callback above).
                 let segment_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
                 let source_paths = vec![file_path.to_string_lossy().to_string()];
                 let post_import_file =
@@ -598,7 +605,14 @@ pub fn import_audio_file(
                         );
                         let adjudication_result = if let Some(app_state) = app_clone.try_state::<AppState>() {
                             let settings = app_state.lock_settings().clone();
-                            let agentic_readiness = agentic_readiness_snapshot_for_state(&app_state, &settings);
+                            // Snapshot agentic readiness the same way pipeline.rs and check_agentic_readiness do
+                            // (model status + external-provider status -> build_agentic_readiness_snapshot), so the
+                            // background-thread jury report carries an honest readiness state.
+                            let agentic_readiness = {
+                                let model_status = app_state.lock_model_manager().status();
+                                let external_provider = external_provider_status(&settings);
+                                build_agentic_readiness_snapshot(&settings, &model_status, &external_provider)
+                            };
                             // Adjudication uses its OWN database connection (WAL mode) rather than the
                             // shared Mutex<Database> guard, so the heavy ASR-bearing jury never starves the
                             // UI's get_segments (which locks the shared connection) while it runs. WAL lets
@@ -972,6 +986,7 @@ pub fn batch_transcribe(
 
         let mut succeeded = 0u32;
         let mut failed = 0u32;
+        let mut skipped = 0u32;
         let mut previous_segments: Vec<crate::db::SpeechSegment> = Vec::new();
         let mut transcribed_ids: Vec<String> = Vec::new();
         let mut cancelled = false;
@@ -1014,27 +1029,37 @@ pub fn batch_transcribe(
 
             let seg = seg_map.remove(id.as_str());
 
-            if let Some(mut seg) = seg {
+            if let Some(seg) = seg {
                 // Capture full snapshot BEFORE transcription for complete undo.
                 let pre_transcription_snapshot = seg.clone();
                 match pipeline.transcribe(Some(id), &seg.audio_path, seg.alignment_json.as_deref()) {
                     Ok((raw_text, corrected_text, confidence)) => {
-                        seg.raw_transcript = raw_text;
-                        // CRITICAL: Do not overwrite a human-corrected annotation.
-                        // Only set annotated_transcript if none exists yet.
-                        if seg.annotated_transcript.is_none() {
-                            seg.annotated_transcript = Some(corrected_text.clone());
-                        }
-                        seg.normalized_transcript = Some(normalizer.normalize(&corrected_text));
-                        seg.confidence = confidence;
-                        match app_state.lock_db().insert_segment(&seg) {
-                            Ok(()) => {
+                        let normalized = normalizer.normalize(&corrected_text);
+                        // Guarded targeted write (NOT a full insert_segment of the stale snapshot): a
+                        // human may have verified/edited this row since the batch prefetched it. This
+                        // writes only the ASR fields, seeds the annotation solely when still empty
+                        // (against the CURRENT row), never touches `verified`, and skips human-owned
+                        // rows — so a concurrent curator decision can never be silently lost.
+                        match app_state.lock_db().update_batch_transcription_if_unreviewed(
+                            id,
+                            &raw_text,
+                            Some(normalized.as_str()),
+                            confidence,
+                            &corrected_text,
+                        ) {
+                            Ok(true) => {
                                 previous_segments.push(pre_transcription_snapshot);
                                 transcribed_ids.push(id.clone());
                                 succeeded += 1;
                             }
+                            Ok(false) => {
+                                // Row became human-verified/reviewed after the batch began — skip
+                                // rather than overwrite the curator's confirmed label.
+                                tracing::info!("Batch transcribe skipped {id}: human-reviewed since batch start");
+                                skipped += 1;
+                            }
                             Err(error) => {
-                                tracing::error!("Batch transcribe DB insert failed for {id}: {error}");
+                                tracing::error!("Batch transcribe DB update failed for {id}: {error}");
                                 failed += 1;
                             }
                         }
@@ -1067,18 +1092,15 @@ pub fn batch_transcribe(
         if !transcribed_ids.is_empty() {
             if let Some(app_state) = app_clone.try_state::<AppState>() {
                 let settings = app_state.lock_settings().clone();
-                // Separate WAL connection (not the shared lock_db guard) so the post-batch jury's
-                // possible T2 cloud calls don't starve the UI's get_segments while it runs.
-                match open_jury_db_connection(&app_state) {
-                    Some(db) => {
-                        if let Err(error) = run_jury_pipeline_core(&db, &settings, transcribed_ids) {
-                            log_jury_pipeline_failure("batch transcription", &error);
-                        }
-                    }
-                    None => log_jury_pipeline_failure(
-                        "batch transcription",
-                        "app data directory unavailable; could not open jury DB connection",
-                    ),
+                // Dedicated connection (not the shared lock_db guard) so the post-batch jury's
+                // possible T2 cloud calls don't hold the global db Mutex and starve the UI's
+                // get_segments while it runs. with_jury_db retries the dedicated open and only falls
+                // back to the shared handle on a hard failure (so a transient lock doesn't skip the
+                // jury entirely).
+                if let Err(error) =
+                    with_jury_db(&app_state, |db| run_jury_pipeline_core(db, &settings, transcribed_ids))
+                {
+                    log_jury_pipeline_failure("batch transcription", &error);
                 }
             }
         }
@@ -1088,7 +1110,7 @@ pub fn batch_transcribe(
             "batch-progress",
             serde_json::json!({
                 "type": "completed", "total": total,
-                "succeeded": succeeded, "failed": failed,
+                "succeeded": succeeded, "failed": failed, "skipped": skipped,
                 "cancelled": cancelled, "operation": "transcribe"
             }),
         );
@@ -1354,7 +1376,11 @@ pub fn create_dataset_run(name: Option<String>, state: State<'_, AppState>) -> R
     RATE_LIMITER.check("create_dataset_run")?;
     let db = state.lock_db();
     let settings = state.lock_settings().clone();
-    crate::runs::create_dataset_run(&db, name, crate::runs::config_from_settings(&settings)).map_err(|e| e.to_string())
+    // Round-23 #3: record the ACTUAL denoising state. The denoiser silently passes audio through when
+    // its optional model is absent, so the run config must not claim denoising that did not run.
+    let denoising_active = state.lock_model_manager().denoiser_present();
+    crate::runs::create_dataset_run(&db, name, crate::runs::config_from_settings(&settings, denoising_active))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1486,15 +1512,18 @@ pub fn register_media_asset(
 ) -> Result<crate::media::MediaGrant, String> {
     RATE_LIMITER.check("register_media_asset")?;
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    // Membership check under a SHORT-LIVED db lock, then release it before the (potentially
-    // gigabyte) cache copy — holding the global db mutex across std::fs::copy stalled get_segments
-    // and every other DB-touching IPC for the copy duration.
+    let mut registry = state.lock_media_registry();
+    // Round-25 #7: validate the source (membership check) under a SHORT-LIVED global db lock (fast),
+    // then DROP that lock before the potentially multi-GB cache copy in grant_source — holding the
+    // global db mutex across std::fs::copy froze every other DB-touching IPC (notably the UI's
+    // get_segments) for the length of the copy the first time a large clip was played. The
+    // media-registry lock is held throughout (only media commands take it), so this never deadlocks
+    // with the db lock.
     let canonical = {
         let db = state.lock_db();
-        crate::media::MediaRegistry::ensure_imported(&db, &audio_path)?
+        registry.validate_source(&db, &audio_path)?
     };
-    let mut registry = state.lock_media_registry();
-    registry.register_cached(&data_dir, &canonical)
+    registry.grant_source(&data_dir, canonical)
 }
 
 #[tauri::command]
@@ -1627,25 +1656,34 @@ pub fn update_settings(mut settings: AppSettings, state: State<'_, AppState>) ->
     // Server-side trust boundary: reject a malicious endpoint/oversized payload before it
     // can take effect and redirect LLM requests (+ the API key) to an attacker's server.
     settings.validate().map_err(|e| e.to_string())?;
+    // Round-22 #7: carry the in-session secret forward and capture the on-disk path WITHOUT yet
+    // overwriting the in-memory copy. Persisting BEFORE committing to memory/pipeline means a save
+    // failure (full/read-only/locked disk) leaves the in-memory settings, the running pipeline, AND
+    // disk all consistent at the OLD value — never a three-way divergence where get_settings() reports
+    // an unsaved change (including cloud-consent toggles) that the pipeline and the next launch ignore.
     let settings_path = {
-        let mut current = state.lock_settings();
+        let current = state.lock_settings();
         settings.merge_session_secret_from(&current);
-        *current = settings.clone();
         state.lock_data_dir().clone().map(|d| d.join("settings.json"))
     };
-    // Apply to the running pipeline immediately so the session reflects the change.
-    state.update_pipeline_settings(settings.clone());
-    // Persist. A save failure (e.g. a consent toggle that never reached disk) must be SURFACED, not
-    // swallowed — otherwise the user believes the change stuck while it silently reverts on the next
-    // launch (a privacy hazard for the cloud opt-in toggles).
+    // Persist FIRST, before committing to memory/pipeline. A save failure (e.g. a cloud-consent
+    // toggle that never reached disk) must be SURFACED, not swallowed — otherwise the user believes
+    // the change stuck while it silently reverts on the next launch (a privacy hazard for the cloud
+    // opt-in toggles).
     if let Some(path) = settings_path {
+        // Propagate a persist failure to the caller (the frontend surfaces settingsSaveFailed). On Err
+        // we return BEFORE the commit below, so nothing observable changed: in-memory settings, the
+        // running pipeline, AND disk all stay consistent at the OLD value — never a divergence where
+        // get_settings() reports an unsaved change the pipeline and next launch ignore.
         settings.save(&path).map_err(|e| {
             tracing::error!("Failed to save settings to {path:?}: {e}");
-            format!(
-                "Settings applied for this session but could not be saved to disk (they will revert on restart): {e}"
-            )
+            format!("Failed to save settings to disk: {e}")
         })?;
     }
+    // Disk now holds the new value (or there is no data dir to persist to): commit it to the in-memory
+    // store and the running pipeline together.
+    *state.lock_settings() = settings.clone();
+    state.update_pipeline_settings(settings);
     Ok(())
 }
 
@@ -1758,6 +1796,9 @@ pub fn export_audio(
     options: crate::export_audio::AudioExportOptions,
     state: State<'_, AppState>,
 ) -> Result<crate::export_audio::AudioExportResult, String> {
+    // Decodes + re-encodes one clip per segment to disk — throttle it like every sibling export
+    // command (round-22 #5: it was the lone export missing a rate-limiter, a local DoS/disk-fill gap).
+    STRICT_RATE_LIMITER.check("export_audio")?;
     for id in &segment_ids {
         validate::validate_identifier(id)?;
     }
@@ -2352,6 +2393,36 @@ fn select_wsl_refinement_targets(
     targets
 }
 
+/// Drain a subprocess log stream line-by-line, decoding each line LOSSILY. `BufRead::lines()` yields
+/// `io::Result<String>` and returns `Err(InvalidData)` for any non-UTF-8 line, so the previous
+/// `lines().map_while(Result::ok)` permanently terminated the reader on the first such line —
+/// silently freezing the live WSL progress feed for the rest of a (possibly hour-long) run on a
+/// distro with a non-UTF-8 locale. Reading raw bytes and decoding with `from_utf8_lossy` survives
+/// any input (invalid bytes become U+FFFD) so every subsequent line still reaches the feed. The
+/// trailing `\r` of a `\r\n` line is trimmed. Retained (with its regression test) as the canonical
+/// subprocess-log drainer; the current per-segment warm-client batch streams progress directly, so
+/// it has no caller today — kept (allow(dead_code), paired with `join_wsl_log_reader`) so the
+/// subprocess log path can be restored without re-deriving the non-UTF-8 contract.
+#[allow(dead_code)]
+fn drain_log_lines<R: std::io::BufRead>(reader: R, mut on_line: impl FnMut(&str)) {
+    for line in reader.split(b'\n') {
+        let Ok(bytes) = line else { break }; // genuine I/O error (not an encoding error): stop
+        let text = String::from_utf8_lossy(&bytes);
+        on_line(text.trim_end_matches('\r'));
+    }
+}
+
+// Join a WSL subprocess log-reader thread, warning (never panicking) if it unwound. Paired with
+// drain_log_lines for the subprocess-spawning log path; the per-segment warm-client batch supersedes
+// the in-commands subprocess driver, so this currently has no caller here — kept (allow(dead_code))
+// so the subprocess path can be restored without re-deriving it.
+#[allow(dead_code)]
+fn join_wsl_log_reader(thread: std::thread::JoinHandle<()>, stream: &str) {
+    if thread.join().is_err() {
+        tracing::warn!("WSL {stream} log reader thread panicked");
+    }
+}
+
 #[tauri::command]
 pub fn run_wsl_refinement(
     app: tauri::AppHandle,
@@ -2606,6 +2677,12 @@ pub fn cancel_wsl_refinement() -> Result<(), String> {
 #[tauri::command]
 pub fn add_segment_hypothesis(state: State<'_, AppState>, hyp: crate::db::SegmentHypothesis) -> Result<(), String> {
     RATE_LIMITER.check("add_segment_hypothesis")?;
+    // This row feeds the IRT jury consensus, so apply the same validation discipline every other write
+    // command uses: shaped identifiers and a bounded transcript (round-22 #3) — never an unbounded blob
+    // or a malformed id straight from the renderer.
+    validate::validate_identifier(&hyp.segment_id)?;
+    validate::validate_identifier(&hyp.model_id)?;
+    validate::validate_text(&hyp.transcript, 100_000, "Hypothesis transcript")?;
     let db = state.lock_db();
     db.insert_hypothesis(&hyp).map_err(|e| e.to_string())?;
     Ok(())
@@ -2631,7 +2708,9 @@ pub fn run_consensus_refinery(state: State<'_, AppState>) -> Result<serde_json::
 
     let mut updates = Vec::new();
     for (segment_id, consensus_text) in &results.consensus_transcripts {
-        let confidence = *results.segment_confidences.get(segment_id).unwrap_or(&1.0);
+        // Missing IRT confidence ⇒ MINIMUM, not maximum: a no-signal segment must not be recorded as
+        // maximally confident (which would suppress its escalation downstream).
+        let confidence = *results.segment_confidences.get(segment_id).unwrap_or(&0.0);
         let normalized_text = state.normalizer.normalize(consensus_text);
         updates.push((segment_id.clone(), consensus_text.clone(), normalized_text, confidence));
     }
@@ -2860,8 +2939,21 @@ pub fn import_gold_segments(
     inputs: Vec<crate::eval::GoldSegmentInput>,
 ) -> Result<usize, String> {
     RATE_LIMITER.check("import_gold_segments")?;
+    // Validate every frontend-supplied input BEFORE any file is opened — the same guard every other
+    // file-opening command applies (import_audio_file, import_model_checkpoint, get_waveform, ...).
+    // Without it, a compromised/XSS'd renderer could pass an arbitrary, UNC, or traversal path that
+    // eval::import_gold_segments -> source_audio_identity opens and fully reads (info disclosure /
+    // outbound-SMB on Windows), plus persist it; the reference was likewise uncapped.
+    let validated: Vec<crate::eval::GoldSegmentInput> = inputs
+        .into_iter()
+        .map(|inp| {
+            let audio_path = validate::validate_file_path(&inp.audio_path)?;
+            validate::validate_text(&inp.reference, 100_000, "Gold reference")?;
+            Ok::<_, String>(crate::eval::GoldSegmentInput { audio_path, ..inp })
+        })
+        .collect::<Result<_, _>>()?;
     let db = state.lock_db();
-    crate::eval::import_gold_segments(&db, inputs).map_err(|e| e.to_string())
+    crate::eval::import_gold_segments(&db, validated).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3040,6 +3132,10 @@ pub fn transcribe_audio_with_scribe(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     STRICT_RATE_LIMITER.check("transcribe_audio_with_scribe")?;
+    // Enforce the cloud-STT privacy gate at the IPC trust boundary: audio must never leave the device
+    // for ElevenLabs unless the user explicitly opted in — require_cloud_stt_consent mirrors
+    // pipeline::scribe_api_key_if_enabled so every Scribe egress path honors the same toggle, not just
+    // the import path.
     require_cloud_stt_consent(&state)?;
     // Only audio already imported into THIS dataset may be uploaded to the cloud — never an
     // arbitrary local file path handed in by the (untrusted) webview. ensure_imported both
@@ -3058,7 +3154,12 @@ pub fn transcribe_audio_with_scribe(
 /// Model id for the independent ElevenLabs Scribe vote. Scribe is architecturally INDEPENDENT of the
 /// OmniASR-CTC family, so (unlike the kin 300M/1B) its vote genuinely corroborates or contradicts the
 /// local consensus — the highest-value escalation signal and training pair per the research.
-const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v2";
+///
+/// Round-23 #9: this label is stored as the hypothesis' provenance AND shown to the T2 judge, so it
+/// MUST name the model version ACTUALLY transmitted to ElevenLabs (`scribe_api::DEFAULT_MODEL`,
+/// currently `scribe_v1`) — never a version that was never invoked. The
+/// `scribe_vote_model_id_matches_the_model_actually_sent` test fails if the two ever drift.
+const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v1";
 
 /// Add an independent ElevenLabs Scribe hypothesis for the given segments (typically the escalated,
 /// hard ones), so the IRT jury sees an architecturally-INDEPENDENT vote rather than only kin OmniASR
@@ -3069,6 +3170,8 @@ const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v2";
 #[tauri::command]
 pub fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("add_scribe_votes")?;
+    // Same cloud-STT privacy gate as transcribe_audio_with_scribe: no segment audio is uploaded to
+    // ElevenLabs unless the user explicitly opted in, even if a key is present in secrets.env.
     require_cloud_stt_consent(&state)?;
     for id in &ids {
         validate::validate_identifier(id)?;
@@ -3079,29 +3182,49 @@ pub fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<
         .ok_or_else(|| "No ElevenLabs API key configured — add ELEVENLABS_API_KEY to secrets.env".to_string())?;
 
     // Read which segments still need a Scribe vote, then RELEASE the db lock before any network call —
-    // never hold the global db mutex across a blocking cloud request (round-7 concurrency lesson).
-    let to_vote: Vec<(String, String, Option<String>)> = {
+    // never hold the global db mutex across a blocking cloud request (round-7 concurrency lesson). We
+    // keep the FULL segment (audio_path + alignment_json) so each vote can be sliced to that segment's
+    // own audio window rather than the whole source file.
+    let to_vote: Vec<crate::db::SpeechSegment> = {
         let db = state.lock_db();
         let segs = db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?;
         let mut out = Vec::new();
-        for seg in &segs {
+        for seg in segs {
             let existing = db.get_hypotheses_for_segment(&seg.id).map_err(|e| e.to_string())?;
             if !existing.iter().any(|h| h.model_id == SCRIBE_VOTE_MODEL_ID) {
-                // Capture alignment_json so the Scribe vote covers the SAME audio span as the local
-                // hypotheses. Without it the vote would be the whole-recording transcript (segments share
-                // the source path), which can never align with the short local hyps and poisons consensus.
-                out.push((seg.id.clone(), seg.audio_path.clone(), seg.alignment_json.clone()));
+                // Keep the full segment (audio_path + alignment_json) so the Scribe vote covers the SAME
+                // audio span as the local hypotheses. Without that window the vote would be the
+                // whole-recording transcript (segments share the source path), which can never align with
+                // the short local hyps and poisons consensus.
+                out.push(seg);
             }
         }
         out
     };
 
     let mut added = 0usize;
-    for (segment_id, audio_path, alignment_json) in to_vote {
-        match scribe_transcribe_clip(&audio_path, alignment_json.as_deref(), &key) {
+    for seg in to_vote {
+        // Send ONLY this segment's sliced audio window to Scribe — never the whole source file. The
+        // whole file would store a whole-recording transcript against one segment's `scribe-v1` vote
+        // (corrupting consensus) and cost ~N× more. `segment_audio_as_wav_bytes` decodes (cached) and
+        // slices by the segment alignment — the same window the T2 listener already sends.
+        let wav = match crate::agentic::segment_audio_as_wav_bytes(&seg) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("Scribe vote skipped: could not slice segment audio: {e}");
+                continue;
+            }
+        };
+        match crate::scribe_api::transcribe_wav_bytes(
+            &wav,
+            "segment.wav",
+            &key,
+            crate::scribe_api::DEFAULT_MODEL,
+            crate::scribe_api::SORANI_LANGUAGE_CODE,
+        ) {
             Ok(transcript) => {
                 let hyp = crate::db::SegmentHypothesis {
-                    segment_id,
+                    segment_id: seg.id.clone(),
                     model_id: SCRIBE_VOTE_MODEL_ID.to_string(),
                     transcript,
                     confidence: None,
@@ -3134,9 +3257,10 @@ pub fn record_human_decision(
     corrected_transcript: Option<String>,
 ) -> Result<(), String> {
     RATE_LIMITER.check("record_human_decision")?;
+    // Round-22 #4: validate the id and bound the free text, matching every other write command.
     validate::validate_identifier(&segment_id)?;
-    if let Some(ref t) = corrected_transcript {
-        validate::validate_text(t, 100000, "Corrected transcript")?;
+    if let Some(t) = corrected_transcript.as_deref() {
+        validate::validate_text(t, 100_000, "Corrected transcript")?;
     }
     let db = state.lock_db();
     db.record_human_decision(&segment_id, &decision, corrected_transcript.as_deref()).map_err(|e| e.to_string())
@@ -3147,7 +3271,7 @@ pub fn record_human_decision(
 #[tauri::command]
 pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> Result<(), String> {
     RATE_LIMITER.check("clear_human_decision")?;
-    validate::validate_identifier(&segment_id)?;
+    validate::validate_identifier(&segment_id)?; // round-22 #4
     let db = state.lock_db();
     db.clear_human_decision(&segment_id).map_err(|e| e.to_string())
 }
@@ -3165,14 +3289,17 @@ pub fn write_segment_verdict(
     escalated: bool,
 ) -> Result<(), String> {
     RATE_LIMITER.check("write_segment_verdict")?;
+    // Round-22 #4: validate the id and bound every free-text field, matching the other write commands.
     validate::validate_identifier(&segment_id)?;
-    if let Some(ref t) = transcript {
-        validate::validate_text(t, 100000, "Verdict transcript")?;
+    if let Some(t) = transcript.as_deref() {
+        validate::validate_text(t, 100_000, "Verdict transcript")?;
     }
-    if let Some(ref r) = rationale {
-        validate::validate_text(r, 100000, "Verdict rationale")?;
+    if let Some(r) = rationale.as_deref() {
+        validate::validate_text(r, 100_000, "Verdict rationale")?;
     }
-    if let Some(ref ej) = evidence_json {
+    // evidence_json is always serialized JSON; validate_alignment_json both confirms it parses as JSON
+    // and bounds it (max 500KB), which is stricter and more apt than a plain length cap.
+    if let Some(ej) = evidence_json.as_deref() {
         validate::validate_alignment_json(ej)?;
     }
     let db = state.lock_db();
@@ -3602,6 +3729,36 @@ fn has_final_machine_verdict(seg: &crate::db::SpeechSegment) -> bool {
     seg.verdict.as_deref().map(|verdict| !verdict.trim().is_empty()).unwrap_or(false) && !seg.escalated
 }
 
+/// Run `f` with a database handle that does NOT keep the global `AppState` db Mutex locked for the
+/// duration of the call. `run_jury_pipeline_core` interleaves DB reads/writes with (potentially many)
+/// cloud T2 network round-trips in a per-segment loop; passing the shared, locked handle would hold
+/// the global Mutex across every `listen_and_judge`, freezing every other DB-touching command
+/// app-wide for the whole adjudication.
+///
+/// To avoid that, this opens a SECOND, dedicated connection to the same database file and runs `f`
+/// against it — SQLite WAL + `busy_timeout` let the two connections coexist, and all writes land in
+/// the same file, so verdicts persist exactly as before. It falls back to the shared, locked handle
+/// for an in-memory database (tests can't share `:memory:` across connections, and that path has cloud
+/// off so there is no network call to block on) or in the rare event the dedicated open fails.
+fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) -> R) -> R {
+    let db_path = { app_state.lock_db().path().to_string() };
+    if db_path != ":memory:" {
+        // Round-25 #8: retry the dedicated open (busy_timeout) so a transient lock/contention doesn't
+        // drop us to the shared-handle fallback, which would hold the GLOBAL db Mutex across the jury's
+        // cloud T2 Gemini round-trips and freeze every other DB command for minutes. open_with_retry
+        // makes that fallback extremely rare (only a hard disk/handle failure reaches it).
+        match crate::db::Database::open_with_retry(&db_path) {
+            Ok(db) => return f(&db),
+            Err(e) => tracing::warn!(
+                "Jury dedicated db connection open failed after retries ({e}); using the shared handle \
+                 (other DB commands may pause during adjudication)"
+            ),
+        }
+    }
+    let db = app_state.lock_db();
+    f(&db)
+}
+
 pub fn run_jury_pipeline_core(
     db: &crate::db::Database,
     settings: &crate::settings::AppSettings,
@@ -3610,7 +3767,10 @@ pub fn run_jury_pipeline_core(
     let t1_threshold = settings.jury_t1_threshold;
     let cloud_opt_in = settings.jury_cloud_opt_in;
     let jury_model = settings.jury_model.clone();
-    let n_samples = settings.jury_self_consistency_n as usize;
+    // Floor at 3: self-consistency is meaningless below 3 samples, and a misconfigured 1 would let a
+    // single Gemini sample masquerade as a "majority". majority_vote also requires >= 2 agreeing
+    // samples, so this is defense in depth at the config boundary.
+    let n_samples = (settings.jury_self_consistency_n as usize).max(3);
     let api_key = settings.llm_api_key.clone();
 
     let initial_seg_map: std::collections::HashMap<String, crate::db::SpeechSegment> = db
@@ -3886,11 +4046,10 @@ pub(crate) fn open_jury_db_connection(app_state: &AppState) -> Option<crate::db:
 pub fn run_jury_pipeline(state: State<'_, AppState>, segment_ids: Vec<String>) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("run_jury_pipeline")?;
     let settings = state.lock_settings().clone();
-    // Run on a separate WAL connection (see open_jury_db_connection) so the batch jury's blocking T2
-    // cloud calls never hold the global lock and freeze the UI's get_segments for the whole run.
-    let db = open_jury_db_connection(&state)
-        .ok_or_else(|| "App data directory is unavailable for the jury run.".to_string())?;
-    run_jury_pipeline_core(&db, &settings, segment_ids)
+    // Run on a dedicated connection so the global db Mutex is not held across the jury's blocking T2
+    // cloud calls — holding it would freeze the UI's get_segments for the whole run. with_jury_db
+    // retries the dedicated open and only falls back to the shared handle on a hard failure.
+    with_jury_db(&state, |db| run_jury_pipeline_core(db, &settings, segment_ids))
 }
 
 /// `run_t2_for_segment` — run Gemini audio judge on a single segment directly.
@@ -3908,7 +4067,10 @@ pub fn run_t2_for_segment(
 
     let settings = state.lock_settings().clone();
     let jury_model = settings.jury_model.clone();
-    let n_samples = settings.jury_self_consistency_n as usize;
+    // Floor at 3: self-consistency is meaningless below 3 samples, and a misconfigured 1 would let a
+    // single Gemini sample masquerade as a "majority". majority_vote also requires >= 2 agreeing
+    // samples, so this is defense in depth at the config boundary.
+    let n_samples = (settings.jury_self_consistency_n as usize).max(3);
     let cloud_opt_in = settings.jury_cloud_opt_in;
 
     if !cloud_opt_in {
@@ -3918,41 +4080,45 @@ pub fn run_t2_for_segment(
         return Err("Gemini API key is required for T2.".into());
     }
 
-    let db = state.lock_db();
-    let seg = db
-        .get_segment_by_id(&segment_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Segment not found: {segment_id}"))?;
+    // Gather every DB input under a BRIEF lock, then drop it before listen_and_judge. Holding the
+    // global AppState db Mutex across the cloud T2 round-trip (n_samples Gemini audio calls) would
+    // freeze every other DB-touching command app-wide for the whole network call. The lock is
+    // re-acquired only for the final verdict write below.
+    let (audio_b64, hyps, reference_report, t2_evidence, few_shots) = {
+        let db = state.lock_db();
+        let seg = db
+            .get_segment_by_id(&segment_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Segment not found: {segment_id}"))?;
 
-    // Base64-encode only the segment span for chunked long-form sources.
-    let audio_b64 = crate::agentic::segment_audio_as_wav_base64(&seg)
-        .map_err(|e| format!("Cannot prepare segment audio '{}': {e}", seg.audio_path))?;
+        // Base64-encode only the segment span for chunked long-form sources.
+        let audio_b64 = crate::agentic::segment_audio_as_wav_base64(&seg)
+            .map_err(|e| format!("Cannot prepare segment audio '{}': {e}", seg.audio_path))?;
 
-    // Build a single hypothesis from raw transcript (T2 will hear the audio and judge)
-    let mut hyps = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
-    if hyps.is_empty() {
-        hyps.push(crate::db::SegmentHypothesis {
-            segment_id: segment_id.clone(),
-            model_id: "asr".into(),
-            transcript: seg.raw_transcript.clone(),
-            confidence: seg.confidence,
-        });
-    }
+        // Build a single hypothesis from raw transcript (T2 will hear the audio and judge)
+        let mut hyps = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
+        if hyps.is_empty() {
+            hyps.push(crate::db::SegmentHypothesis {
+                segment_id: segment_id.clone(),
+                model_id: "asr".into(),
+                transcript: seg.raw_transcript.clone(),
+                confidence: seg.confidence,
+            });
+        }
 
-    let mut duration_cache = std::collections::HashMap::new();
-    let mut identity_cache = std::collections::HashMap::new();
-    let reference_report =
-        reference_selection_for_segment(&db, &settings, &seg, &hyps, &mut duration_cache, &mut identity_cache)?;
-    let t2_evidence = reference_report.as_ref().map(reference_selection_evidence).into_iter().collect::<Vec<_>>();
+        let mut duration_cache = std::collections::HashMap::new();
+        let mut identity_cache = std::collections::HashMap::new();
+        let reference_report =
+            reference_selection_for_segment(&db, &settings, &seg, &hyps, &mut duration_cache, &mut identity_cache)?;
+        let t2_evidence = reference_report.as_ref().map(reference_selection_evidence).into_iter().collect::<Vec<_>>();
 
-    let few_shots = crate::jury::get_few_shot_examples(&db, &segment_id, 5).map_err(|e| e.to_string())?;
+        let few_shots = crate::jury::get_few_shot_examples(&db, &segment_id, 5).map_err(|e| e.to_string())?;
+        (audio_b64, hyps, reference_report, t2_evidence, few_shots)
+    };
 
-    // Release the global DB lock BEFORE the blocking T2 cloud call (Gemini, n_samples retries —
-    // multiple seconds): holding it across the network request would starve every other DB user
-    // (e.g. the UI's get_segments) for the whole call — the same lock-across-blocking-work class as
-    // the jury-adjudication fix. All reads above are done; the verdict write below re-acquires.
-    drop(db);
-
+    // The gather block above released the global DB lock when it ended (all reads are done, few_shots
+    // included), so the blocking T2 cloud call below (Gemini, n_samples retries — multiple seconds)
+    // never starves other DB users like the UI's get_segments. The verdict write re-acquires briefly.
     let result = crate::jury::t2_listener::listen_and_judge(
         &audio_b64,
         &hyps,
@@ -3963,7 +4129,7 @@ pub fn run_t2_for_segment(
         n_samples,
     );
 
-    // If T2 produced a verdict, write it to the DB automatically
+    // If T2 produced a verdict, write it to the DB automatically (re-acquire the lock briefly).
     if let Some(ref verdict) = result.verdict {
         let evidence_payload = match &reference_report {
             Some(report) => serde_json::json!({
@@ -3974,17 +4140,19 @@ pub fn run_t2_for_segment(
         };
         let ev_json = serde_json::to_string(&evidence_payload)
             .map_err(|e| format!("Failed to serialize T2 evidence for {segment_id}: {e}"))?;
-        let db = state.lock_db(); // re-acquire the lock only to persist the verdict
-        db.write_segment_verdict(
-            &segment_id,
-            "jury_accept",
-            Some(&verdict.transcript),
-            Some(&verdict.reason),
-            Some(ev_json.as_str()),
-            Some(verdict.confidence),
-            false,
-        )
-        .map_err(|e| e.to_string())?;
+        // Re-acquire the lock only to persist the verdict.
+        state
+            .lock_db()
+            .write_segment_verdict(
+                &segment_id,
+                "jury_accept",
+                Some(&verdict.transcript),
+                Some(&verdict.reason),
+                Some(ev_json.as_str()),
+                Some(verdict.confidence),
+                false,
+            )
+            .map_err(|e| e.to_string())?;
     }
 
     Ok(result)
@@ -4058,6 +4226,19 @@ pub fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scribe_vote_model_id_matches_the_model_actually_sent() {
+        // Round-23 #9: the stored provenance label must name the model VERSION actually transmitted to
+        // ElevenLabs, never a version that was never invoked. If DEFAULT_MODEL ever changes (e.g. to a
+        // real scribe_v2), this fails until SCRIBE_VOTE_MODEL_ID is updated to match.
+        let sent = crate::scribe_api::DEFAULT_MODEL; // e.g. "scribe_v1"
+        let version = sent.rsplit('_').next().unwrap_or(sent); // "v1"
+        assert!(
+            SCRIBE_VOTE_MODEL_ID.contains(version),
+            "Scribe vote label '{SCRIBE_VOTE_MODEL_ID}' must reflect the sent model version '{version}' (from '{sent}')"
+        );
+    }
 
     fn test_segment(id: &str, audio_path: &str, raw_transcript: &str) -> crate::db::SpeechSegment {
         crate::db::SpeechSegment {
@@ -4281,6 +4462,27 @@ mod tests {
     #[test]
     fn wsl_log_preview_keeps_short_lines_unchanged() {
         assert_eq!(wsl_log_preview("ready"), "ready");
+    }
+
+    #[test]
+    fn drain_log_lines_survives_non_utf8_and_delivers_every_line() {
+        // A single non-UTF-8 byte mid-stream must NOT terminate the feed (the old
+        // lines().map_while(Result::ok) did, silently freezing the live WSL progress feed). Every
+        // later line must still arrive, with the bad byte replaced lossily and a trailing CR trimmed.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"line1\n");
+        data.extend_from_slice(&[b'b', b'a', b'd', 0xFF, b'\n']); // invalid UTF-8 line
+        data.extend_from_slice("کوردی\n".as_bytes()); // valid Sorani after the bad line
+        data.extend_from_slice(b"line4\r\n"); // CRLF — trailing CR must be trimmed
+
+        let mut got = Vec::new();
+        drain_log_lines(std::io::Cursor::new(data), |l| got.push(l.to_string()));
+
+        assert_eq!(got.len(), 4, "all four lines must be delivered despite the bad byte: {got:?}");
+        assert_eq!(got[0], "line1");
+        assert!(got[1].starts_with("bad"), "bad line still delivered lossily: {:?}", got[1]);
+        assert_eq!(got[2], "کوردی", "a valid line AFTER the bad one must still arrive");
+        assert_eq!(got[3], "line4", "trailing CR is trimmed");
     }
 
     #[test]

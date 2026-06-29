@@ -135,7 +135,10 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
         if let Some(stripped) = line.strip_prefix("__RESULT__=") {
             if let Ok(res) = serde_json::from_str::<WslResult>(stripped) {
                 raw_transcript = res.raw_transcript;
-                confidence = res.confidence;
+                // Sanitize the external script's confidence to a valid posterior: drop non-finite and
+                // clamp into [0,1]. A homegrown script emitting a percentage (e.g. 92.0) must not flow
+                // unbounded into the conformal certificate, where it would read as MAXIMAL certainty.
+                confidence = res.confidence.filter(|c| c.is_finite()).map(|c| c.clamp(0.0, 1.0));
             }
         }
     }
@@ -1053,9 +1056,10 @@ impl ProcessingPipeline {
             embedding_service,
             denoiser_service,
             &mut on_chunk,
+            None, // non-streaming: the whole file is one call, so diarization clusters in-place
         )?;
         let mut persisted = self.persist_segments(db, segments)?;
-        self.run_primary_wsl_pass_for_import(db, &mut persisted)?;
+        self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
         for (seg_id, f32_pcm) in pcm_cache {
             if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
                 log_hypothesis_population_failure(&seg_id, &error);
@@ -1104,6 +1108,9 @@ impl ProcessingPipeline {
         let mut carry_pcm: Vec<i16> = Vec::new();
         let mut carry_base: usize = 0;
         let mut sample_rate_seen: u32 = 16_000;
+        // Accumulate one speaker embedding per retained segment across ALL decode windows, so speakers
+        // are clustered over the WHOLE file once (below) rather than re-clustered per 90s window.
+        let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
         for (w_idx, window) in windows.into_iter().enumerate() {
             if let Some(token) = cancel {
                 token.check()?;
@@ -1197,6 +1204,7 @@ impl ProcessingPipeline {
                 embedding_service,
                 denoiser_service,
                 &mut window_progress,
+                Some(&mut all_embeddings), // streaming: defer clustering to the whole-file pass below
             )?;
             segments.extend(window_segs);
             all_pcm_cache.extend(window_pcm_cache);
@@ -1217,8 +1225,22 @@ impl ProcessingPipeline {
             }
         }
 
+        // Whole-file speaker clustering: cluster every retained segment's embedding TOGETHER so a
+        // physical speaker keeps ONE SPEAKER_xx label across decode-window boundaries (per-window
+        // clustering relabels the first speaker of each window as SPEAKER_00). all_embeddings is in
+        // lockstep with `segments`, so labels back-fill by index; a None label keeps any
+        // filename-derived speaker hint, and it is a no-op when diarization is off.
+        if self.settings.enable_diarization && all_embeddings.len() == segments.len() {
+            let labels = crate::diarization::cluster_embeddings(&all_embeddings, self.settings.max_speakers);
+            for (seg, label) in segments.iter_mut().zip(labels) {
+                if let Some(spk) = label {
+                    seg.speaker_id = Some(spk);
+                }
+            }
+        }
+
         let mut persisted = self.persist_segments(db, segments)?;
-        self.run_primary_wsl_pass_for_import(db, &mut persisted)?;
+        self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
         for (seg_id, f32_pcm) in all_pcm_cache {
             if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
                 log_hypothesis_population_failure(&seg_id, &error);
@@ -1239,6 +1261,10 @@ impl ProcessingPipeline {
         embedding_service: &crate::diarization::SpeakerEmbeddingService,
         denoiser_service: &crate::denoiser::DenoiserService,
         on_chunk: &mut impl FnMut(usize, usize),
+        // When `Some`, this is the STREAMING path: diarization clustering is DEFERRED — one embedding
+        // per retained segment is appended here (in segment order) so the caller can cluster the WHOLE
+        // file once. When `None`, clustering happens per-call (the non-streaming whole-file path).
+        mut embedding_sink: Option<&mut Vec<Vec<f32>>>,
     ) -> AppResult<(Vec<SpeechSegment>, Vec<(String, Vec<f32>)>)> {
         let chunk_count = chunk_ranges.len() as u32;
         let chunk_total = chunk_ranges.len().max(1);
@@ -1255,32 +1281,50 @@ impl ProcessingPipeline {
             None
         };
 
-        let diarization_labels = if self.settings.enable_diarization {
+        let (diarization_labels, chunk_embeddings) = if self.settings.enable_diarization {
             // chunk_ranges are in GLOBAL sample coordinates, but `pcm` is the window-local buffer in
-            // the streaming path (global_base_sample > 0). label_chunk_speakers slices `pcm` directly,
-            // so rebase the ranges to local coords first — exactly like the transcription slice below.
-            // Without this, every chunk past the first 90s window indexes beyond pcm.len(), clamps to
-            // an empty slice, and silently gets NO speaker label. No-op when global_base_sample == 0
-            // (the non-streaming path).
+            // the streaming path (global_base_sample > 0). Embeddings slice `pcm` directly, so rebase
+            // the ranges to local coords first — exactly like the transcription slice below. Without
+            // this, every chunk past the first 90s window indexes beyond pcm.len(), clamps to an empty
+            // slice, and silently gets NO speaker label. No-op when global_base_sample == 0.
             let local_ranges: Vec<(usize, usize)> = chunk_ranges
                 .iter()
                 .map(|&(gs, ge)| {
                     (gs.saturating_sub(global_base_sample), ge.saturating_sub(global_base_sample).min(pcm.len()))
                 })
                 .collect();
-            crate::diarization::label_chunk_speakers(
-                pcm,
-                sample_rate,
-                &local_ranges,
-                self.settings.max_speakers,
-                embedding_service,
-            )
+            let embeddings =
+                crate::diarization::compute_chunk_embeddings(pcm, sample_rate, &local_ranges, embedding_service);
+            if embedding_sink.is_some() {
+                // Streaming: defer clustering to the caller's whole-file pass; no per-window labels.
+                (vec![None; chunk_ranges.len()], Some(embeddings))
+            } else {
+                // Non-streaming: the whole file is this one call, so cluster in place and drop the
+                // embeddings (the deferred sink is unused here).
+                (crate::diarization::cluster_embeddings(&embeddings, self.settings.max_speakers), None)
+            }
         } else {
-            vec![None; chunk_ranges.len()]
+            (vec![None; chunk_ranges.len()], None)
         };
 
         let mut segments = Vec::with_capacity(chunk_ranges.len());
         let mut pcm_cache = Vec::new();
+
+        // Round-23 #3: if the user enabled denoising but the (optional) denoiser model is absent,
+        // process() is a silent pass-through — warn loudly so the un-denoised reality is visible. The
+        // run config separately records denoising=false (see runs::config_from_settings) so provenance
+        // is honest; this log surfaces it to the operator.
+        if self.settings.enable_denoising && !denoiser_service.is_active() {
+            tracing::warn!(
+                "Denoising is enabled in settings but the denoiser model is not loaded — audio is NOT being denoised (download the denoiser model to enable AI cleanup)"
+            );
+        }
+
+        // Round-23 #5: hash the audio file ONCE for the whole run (its content is invariant), then key
+        // every per-chunk cache get/set on that hash — instead of re-reading + re-hashing the entire
+        // file on each of the N chunks (O(N·filesize) of redundant I/O on long recordings). `None` when
+        // the file is unhashable, which simply means "no cache for this run" (same effect as before).
+        let file_hash = crate::cache::TranscriptCache::compute_hash(path).ok();
 
         for (chunk_index, &(global_start, global_end)) in chunk_ranges.iter().enumerate() {
             if let Some(token) = cancel {
@@ -1299,9 +1343,12 @@ impl ProcessingPipeline {
             }
             let quality = crate::audio_quality::analyze_audio_quality(chunk_pcm);
             let chunk_duration_ms = chunking::samples_to_ms(local_end.saturating_sub(local_start), sample_rate);
-            let chunk_suffix = format!("chunk_{global_start}_{global_end}");
             let source_meta =
                 chunking::build_source_meta(global_start, global_end, sample_rate, chunk_index as u32, chunk_count);
+            // Round-22 #12: key the per-chunk cache on the SAME stored ms range the re-transcribe read
+            // path uses (slice_pcm_by_alignment), NOT raw sample indices. The read side round-trips
+            // sample -> ms -> sample, so a raw-sample key never matched and the cache missed every time.
+            let chunk_suffix = format!("chunk_{}_{}", source_meta.source_start_ms, source_meta.source_end_ms);
 
             let mut f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
 
@@ -1318,7 +1365,9 @@ impl ProcessingPipeline {
 
             let (raw_transcript, confidence) = if self.should_use_wsl_primary_asr() {
                 ("[Pending WSL 7B ASR]".to_string(), None)
-            } else if let Some(cached) = self.cache.get_chunk(path, &model_id, Some(&chunk_suffix)) {
+            } else if let Some(cached) =
+                file_hash.as_deref().and_then(|h| self.cache.get_chunk_by_hash(h, &model_id, Some(&chunk_suffix)))
+            {
                 (cached.raw_transcript, None)
             } else {
                 let (text, conf) = self.with_asr(|asr| {
@@ -1347,14 +1396,16 @@ impl ProcessingPipeline {
                 // unavailable → empty, or a transcribe error → "[ASR unavailable: …]") into the
                 // cache, or every later retry would just replay the failure forever.
                 if !text.trim().is_empty() && !crate::quality::is_placeholder_transcript(&text) {
-                    let entry = crate::cache::CacheEntry {
-                        audio_hash: String::new(),
-                        raw_transcript: text.clone(),
-                        normalized_transcript: None,
-                        created_at: chrono::Utc::now(),
-                        model_id: model_id.clone(),
-                    };
-                    self.cache.set_chunk(path, Some(&chunk_suffix), entry);
+                    if let Some(h) = file_hash.as_deref() {
+                        let entry = crate::cache::CacheEntry {
+                            audio_hash: String::new(),
+                            raw_transcript: text.clone(),
+                            normalized_transcript: None,
+                            created_at: chrono::Utc::now(),
+                            model_id: model_id.clone(),
+                        };
+                        self.cache.set_chunk_by_hash(h, Some(&chunk_suffix), entry);
+                    }
                 }
                 (text, conf)
             };
@@ -1376,6 +1427,15 @@ impl ProcessingPipeline {
 
             let seg_id = Uuid::new_v4().to_string();
             pcm_cache.push((seg_id.clone(), f32_pcm));
+
+            // Streaming defer: accumulate this segment's embedding (in segment order) so the caller can
+            // cluster the whole file once. The push stays in lockstep with `segments` — both happen only
+            // for a RETAINED chunk — so the back-filled labels align by index.
+            if let Some(sink) = embedding_sink.as_mut() {
+                if let Some(embs) = chunk_embeddings.as_ref() {
+                    sink.push(embs.get(chunk_index).cloned().unwrap_or_default());
+                }
+            }
 
             segments.push(SpeechSegment {
                 id: seg_id,
@@ -1410,6 +1470,22 @@ impl ProcessingPipeline {
             });
         }
 
+        // Round-22 #11: renumber the RETAINED segments to contiguous chunk_index / chunk_count. The loop
+        // `continue`s past empty/silent chunks, so chunk_index (the enumerate index over ALL chunk_ranges)
+        // has gaps and chunk_count over-counts the segments actually produced. The streaming caller
+        // re-applies a whole-file renumber across decode windows; doing it here makes the non-streaming
+        // whole-file path emit the same contiguous numbering instead of gappy provenance metadata.
+        let retained = segments.len() as u32;
+        for (idx, seg) in segments.iter_mut().enumerate() {
+            if let Some(meta) = seg.alignment_json.as_deref().and_then(chunking::SegmentSourceMeta::from_alignment_json)
+            {
+                let mut meta = meta;
+                meta.chunk_index = idx as u32;
+                meta.chunk_count = retained;
+                seg.alignment_json = Some(meta.to_alignment_json());
+            }
+        }
+
         Ok((segments, pcm_cache))
     }
 
@@ -1423,7 +1499,12 @@ impl ProcessingPipeline {
         Ok(segments)
     }
 
-    fn run_primary_wsl_pass_for_import(&self, db: &Database, segments: &mut [SpeechSegment]) -> AppResult<usize> {
+    fn run_primary_wsl_pass_for_import(
+        &self,
+        db: &Database,
+        segments: &mut [SpeechSegment],
+        cancel: Option<&CancellationToken>,
+    ) -> AppResult<usize> {
         if !self.should_use_wsl_primary_asr() || segments.is_empty() {
             return Ok(0);
         }
@@ -1436,6 +1517,11 @@ impl ProcessingPipeline {
         const MAX_ATTEMPTS: usize = 3;
         let mut updated = 0usize;
         for seg in segments {
+            // Honor cancellation between segments: each WSL transcription can ride a 300s timeout, so
+            // without this a cancelled import of an N-segment file would keep running for up to N*300s.
+            if let Some(token) = cancel {
+                token.check()?;
+            }
             let mut last_problem: Option<String> = None;
             for attempt in 1..=MAX_ATTEMPTS {
                 match self.transcribe(Some(seg.id.as_str()), &seg.audio_path, seg.alignment_json.as_deref()) {
@@ -1803,11 +1889,27 @@ impl ProcessingPipeline {
                     )
                     .ok()
             } else {
-                db.connection()
-                    .query_row("SELECT id FROM speech_segments WHERE audio_path = ?", [&audio_path_str], |row| {
-                        row.get(0)
-                    })
-                    .ok()
+                // Round-22 #10: with neither an explicit segment_id NOR an alignment_json to
+                // disambiguate, a bare `WHERE audio_path = ?` returns an ARBITRARY row when a file was
+                // chunked into multiple segments (every chunk shares the source audio_path) — writing
+                // the WSL ASR and its hypothesis to the WRONG segment. Only accept the bare lookup when
+                // EXACTLY ONE segment matches; otherwise refuse and require an explicit segment_id.
+                let conn = db.connection();
+                let mut stmt = conn
+                    .prepare("SELECT id FROM speech_segments WHERE audio_path = ?")
+                    .map_err(|e| AppError::Other(e.to_string()))?;
+                let ids: Vec<String> = stmt
+                    .query_map([&audio_path_str], |row| row.get::<_, String>(0))
+                    .map_err(|e| AppError::Other(e.to_string()))?
+                    .filter_map(Result::ok)
+                    .collect();
+                if ids.len() > 1 {
+                    return Err(AppError::Validation(format!(
+                        "transcribe: {} segments share this audio file; pass an explicit segment_id (or alignment_json) to choose which one to transcribe",
+                        ids.len()
+                    )));
+                }
+                ids.into_iter().next()
             };
 
             if let Some(id) = segment_id {
@@ -1949,17 +2051,24 @@ impl ProcessingPipeline {
             raw_text.clone()
         };
 
-        let entry = crate::cache::CacheEntry {
-            audio_hash: String::new(),
-            // Cache the RAW ASR text, NOT the refined output: the cache key omits the refiner config,
-            // so storing refined text would replay a stale refiner result (and contaminate the raw
-            // element) on a later hit. Refinement is re-run per call from the cached raw text.
-            raw_transcript: raw_text.clone(),
-            normalized_transcript: None,
-            created_at: chrono::Utc::now(),
-            model_id: model_id.clone(),
-        };
-        self.cache.set_chunk(path, chunk_suffix.as_deref(), entry);
+        // Only cache a GENUINE transcription — never an empty or placeholder result. ASR can legitimately
+        // return Ok("") for a quiet-but-real chunk (and this path applies no RMS-normalize/denoise), so
+        // without this guard an empty result is baked into the in-memory chunk cache and every later
+        // "Re-run ASR" / batch_transcribe just replays the empty no-op instead of re-invoking the model.
+        // Mirrors the same guard in build_segments_from_pcm.
+        if !raw_text.trim().is_empty() && !crate::quality::is_placeholder_transcript(&raw_text) {
+            let entry = crate::cache::CacheEntry {
+                audio_hash: String::new(),
+                // Cache the RAW ASR text, NOT the refined output: the cache key omits the refiner config,
+                // so storing refined text would replay a stale refiner result (and contaminate the raw
+                // element) on a later hit. Refinement is re-run per call from the cached raw text.
+                raw_transcript: raw_text.clone(),
+                normalized_transcript: None,
+                created_at: chrono::Utc::now(),
+                model_id: model_id.clone(),
+            };
+            self.cache.set_chunk(path, chunk_suffix.as_deref(), entry);
+        }
 
         if let Some(id) = segment_id {
             if let Ok(db) = self.open_db() {
@@ -2868,7 +2977,7 @@ mod tests {
         db.insert_segment(&segment).unwrap();
 
         let mut segments = vec![segment];
-        let updated = pipeline.run_primary_wsl_pass_for_import(&db, &mut segments).unwrap();
+        let updated = pipeline.run_primary_wsl_pass_for_import(&db, &mut segments, None).unwrap();
 
         assert_eq!(updated, 0);
         assert_eq!(segments[0].raw_transcript, "local fallback transcript");

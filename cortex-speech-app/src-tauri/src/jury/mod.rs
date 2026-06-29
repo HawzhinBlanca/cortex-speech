@@ -82,8 +82,15 @@ pub struct T0GateReport {
 fn has_hard_distrust_veto(seg: &SpeechSegment, hyps: &[SegmentHypothesis]) -> bool {
     let poor_quality =
         seg.snr_db.map(|snr| snr < 5.0).unwrap_or(false) || seg.clipping_ratio.map(|clip| clip > 0.1).unwrap_or(false);
+    // Count only voters that actually CONTRIBUTED to the consensus. fit_irt_consensus drops
+    // empty-transcript hypotheses before building the consensus + irt_confidence, so an empty "" from
+    // one model (common when 300M and 1B disagree on whether a low-energy span contains speech) must
+    // NOT count toward the two-recognizer guard — otherwise the surviving lone recognizer satisfies
+    // distinct_voters >= 2 and the gate auto-accepts a single-model verdict, silently defeating the
+    // "never auto-accept on a single recognizer" invariant this veto exists to enforce.
     let distinct_voters = {
-        let mut ids: Vec<&str> = hyps.iter().map(|h| h.model_id.as_str()).collect();
+        let mut ids: Vec<&str> =
+            hyps.iter().filter(|h| !h.transcript.trim().is_empty()).map(|h| h.model_id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
         ids.len()
@@ -106,6 +113,10 @@ pub fn t0_gate_segment(
     // Same formula AND same confidence source the threshold was calibrated on (see run_t0_gate).
     let nonconformity_score = conformal::nonconformity(irt_confidence, seg.ctc_score);
 
+    // The hard distrust vetoes (poor audio quality, single distinct recognizer) live in
+    // has_hard_distrust_veto so the SAME guards are shared with apply_autonomy's ActAuto path. The
+    // helper's distinct-voter count filters out empty-transcript hypotheses, matching fit_irt_consensus
+    // (theirs' fix), so a lone recognizer can never satisfy the two-voter guard.
     if nonconformity_score <= threshold && !has_hard_distrust_veto(seg, hyps) {
         T0Decision::AutoAccept {
             segment_id: seg.id.clone(),
@@ -190,15 +201,30 @@ pub fn run_t0_gate(
     //    the gate compared it against irt_confidence-based nonconformity — a different score
     //    distribution under the same cutoff, which silently VOIDED the coverage guarantee.
     //    Calibrate PER SNR/condition bucket — a single global threshold is invalid across studio,
-    //    field and noisy recordings; a bucket with too little verified data falls back to the global
-    //    threshold so calibration degrades gracefully on small datasets.
-    // Default IRT confidence for a segment absent from segment_confidences (no multi-model consensus
-    // evidence — e.g. no hypotheses recorded, or a blank-anchor segment skipped by fit_irt_consensus).
-    // Calibration and the gate MUST score this identical condition with the SAME value or the conformal
-    // coverage guarantee is void; previously calibration used 0.5 while the gate used 0.0, scoring the
-    // same input 0.5 apart. Use the conservative gate value in both.
+    //    field and noisy recordings.
+    //
+    //    Round-21 #2: a bucket with too little verified data to calibrate is NOT given the global
+    //    (clean-dominated) threshold as a fallback. Borrowing a cutoff calibrated on a DIFFERENT
+    //    condition advertises a per-condition coverage guarantee we cannot honor — a clean-calibrated
+    //    threshold is meaningless for noisy audio (the score↔CER relationship differs by condition).
+    //    Instead, an uncalibrated bucket is flagged, and every segment in it is fail-closed →
+    //    escalated to human review (see the routing loop). And because calibrating up to
+    //    N_SNR_BUCKETS separate thresholds inflates the family-wise miscoverage ~N×, each bucket's
+    //    confidence level is Bonferroni-tightened so the JOINT per-condition guarantee across all
+    //    conditions still holds at `T0_CONFIDENCE_LEVEL`.
+    //
+    // The conformal guarantee requires the threshold to be calibrated on the SAME nonconformity score
+    // the gate compares against — including the SAME fallback when a segment has no IRT confidence (a
+    // no-hypothesis row, or a blank-anchor segment skipped by fit_irt_consensus). Calibration (here) and
+    // the gate (below) must use ONE shared default, or they place the same condition at two different
+    // points of the score distribution and void coverage; previously calibration used 0.5 while the gate
+    // used 0.0, scoring the same input 0.5 apart. 0.0 (⇒ maximal nonconformity ⇒ escalate) is the safe,
+    // conservative default for a no-signal segment, used in both places.
     const MISSING_IRT_CONFIDENCE: f64 = 0.0;
-    let mut global_scored: Vec<(f64, f64)> = Vec::new();
+    const T0_TARGET_ERROR: f64 = 0.05;
+    const T0_CONFIDENCE_LEVEL: f64 = 0.90;
+    // Bonferroni split of the miscoverage budget across the per-condition buckets.
+    let bucket_confidence = 1.0 - (1.0 - T0_CONFIDENCE_LEVEL) / conformal::N_SNR_BUCKETS as f64;
     let mut bucket_scored: [Vec<(f64, f64)>; conformal::N_SNR_BUCKETS] = std::array::from_fn(|_| Vec::new());
     for s in &all_verified {
         let Some(ref_text) = s.annotated_transcript.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
@@ -214,12 +240,14 @@ pub fn run_t0_gate(
         let committed =
             irt_results.consensus_transcripts.get(&s.id).map(String::as_str).unwrap_or(s.raw_transcript.as_str());
         let cer = crate::wer::compute_cer(ref_text, committed).min(1.0);
-        global_scored.push((score, cer));
         bucket_scored[conformal::snr_bucket(s.snr_db)].push((score, cer));
     }
-    let (global_threshold, _gb, _gc) = conformal::calibrate_threshold(&global_scored, 0.05, 0.90);
-    let bucket_thresholds: [f64; conformal::N_SNR_BUCKETS] =
-        std::array::from_fn(|b| bucket_threshold(&bucket_scored[b], global_threshold));
+    let mut bucket_calibrated = [false; conformal::N_SNR_BUCKETS];
+    let bucket_thresholds: [f64; conformal::N_SNR_BUCKETS] = std::array::from_fn(|b| {
+        let (t, _bound, is_cal) = conformal::calibrate_threshold(&bucket_scored[b], T0_TARGET_ERROR, bucket_confidence);
+        bucket_calibrated[b] = is_cal;
+        t
+    });
 
     // 4. Route and collect decisions
     let mut decisions = Vec::new();
@@ -239,9 +267,21 @@ pub fn run_t0_gate(
 
         let irt_confidence = irt_results.segment_confidences.get(&seg.id).copied().unwrap_or(MISSING_IRT_CONFIDENCE);
 
-        // Gate this segment against its own acoustic-condition bucket's threshold.
-        let seg_threshold = bucket_thresholds[conformal::snr_bucket(seg.snr_db)];
-        let base_decision = t0_gate_segment(seg, &seg_hyps, &consensus, irt_confidence, seg_threshold);
+        // Gate this segment against its OWN acoustic-condition bucket — but only if that bucket is
+        // conformally calibrated. Round-21 #2: an uncalibrated bucket carries no coverage guarantee,
+        // so fail closed (escalate) rather than borrow a threshold from a different, clean-dominated
+        // condition. (Under ActAuto the gate is bypassed downstream anyway; this hardens the default
+        // ActConfirm path, where the threshold actually has teeth.)
+        let bucket = conformal::snr_bucket(seg.snr_db);
+        let base_decision = if bucket_calibrated[bucket] {
+            t0_gate_segment(seg, &seg_hyps, &consensus, irt_confidence, bucket_thresholds[bucket])
+        } else {
+            T0Decision::EscalateToT1 {
+                segment_id: seg.id.clone(),
+                hypotheses: seg_hyps.clone(),
+                disagreement_score: 1.0 - irt_confidence,
+            }
+        };
         // The Autonomy Dial decides whether the gate may auto-commit.
         let decision = apply_autonomy(base_decision, autonomy, seg, &consensus, &seg_hyps, irt_confidence);
 
@@ -264,24 +304,6 @@ pub fn run_t0_gate(
     }
 
     Ok(T0GateReport { total: target_segs.len(), auto_accepted, escalated, decisions })
-}
-
-/// Pick the conformal threshold for one acoustic-condition bucket. `calibrate_threshold` reports
-/// `is_calibrated = false` for TWO different reasons, which the gate must NOT conflate:
-///   * SPARSE (`< 10` verified items): too little data for the bucket's OWN guarantee — borrow the
-///     global threshold so calibration degrades gracefully on small datasets.
-///   * POPULATED but UNCERTIFIABLE (`>= 10` items, yet nothing certifies at the target error): the
-///     bucket has enough data, it is just too noisy. Keep its OWN strict cut (its minimum nonconformity,
-///     what `calibrate_threshold` returns here) — borrowing the lenient global, which is calibrated over
-///     the easier all-bucket mix, would let a worst-condition bucket auto-accept MORE of its segments,
-///     the opposite of the per-condition guarantee the bucketing exists to provide.
-fn bucket_threshold(bucket_scored: &[(f64, f64)], global_threshold: f64) -> f64 {
-    let (t, _bound, is_calibrated) = conformal::calibrate_threshold(bucket_scored, 0.05, 0.90);
-    if is_calibrated || bucket_scored.len() >= 10 {
-        t // calibrated -> its certified threshold; populated-uncertifiable -> its strict cut
-    } else {
-        global_threshold // sparse cold-start: degrade to the global threshold
-    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -404,10 +426,20 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
     let mut stmt = db.connection().prepare(
         // Only human-verified examples seed the LLM corrector's few-shot context; model pseudo-labels
         // (verified_by_human=0) are captured but never used as exemplars until a human signs off.
-        "SELECT id, segment_id, wrong_transcript, human_fix, created_at
-         FROM agent_examples
-         WHERE verified_by_human = 1
-         ORDER BY created_at DESC, id ASC
+        //
+        // HOLDOUT EXCLUSION: never inject a held-out gold clip's correction into the live judge — its
+        // human_fix IS the held-out reference text, so showing it to the T2 cloud judge contaminates the
+        // benchmark and inflates measured WER/CER. The DPO/LM exports already gate on this; the few-shot
+        // path must too. A clip promoted to holdout keeps its audio_path, so excluding examples whose
+        // segment audio_path is a holdout gold path (plus the defensive is_gold=0) closes the leak in
+        // SQL without re-hashing every candidate in the jury hot loop.
+        "SELECT ae.id, ae.segment_id, ae.wrong_transcript, ae.human_fix, ae.created_at
+         FROM agent_examples ae
+         JOIN speech_segments ss ON ae.segment_id = ss.id
+         WHERE ae.verified_by_human = 1
+           AND ss.is_gold = 0
+           AND ss.audio_path NOT IN (SELECT audio_path FROM gold_segments WHERE is_holdout = 1)
+         ORDER BY ae.created_at DESC, ae.id ASC
          LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![pool as i64], |row| {
@@ -463,15 +495,21 @@ pub fn get_escalation_queue(db: &Database, limit: usize) -> AppResult<Vec<Escala
 
 /// Return a time-series of (date, escalation_rate) for the dashboard.
 pub fn get_escalation_rate_trend(db: &Database) -> AppResult<Vec<EscalationTrendPoint>> {
+    // Select the 30 MOST-RECENT activity days (inner DESC + LIMIT), then present them oldest→newest
+    // (outer ASC) for the chart. A plain `ORDER BY day ASC LIMIT 30` keeps the EARLIEST 30 days, so the
+    // trend would freeze on the first month of history once a project runs the jury on >30 days.
     let mut stmt = db.connection().prepare(
-        "SELECT date(updated_at) as day,
-                COUNT(*) as total,
-                SUM(escalated) as esc
-         FROM speech_segments
-         WHERE updated_at IS NOT NULL AND verdict IS NOT NULL
-         GROUP BY day
-         ORDER BY day ASC
-         LIMIT 30",
+        "SELECT day, total, esc FROM (
+             SELECT date(updated_at) as day,
+                    COUNT(*) as total,
+                    SUM(escalated) as esc
+             FROM speech_segments
+             WHERE updated_at IS NOT NULL AND verdict IS NOT NULL
+             GROUP BY day
+             ORDER BY day DESC
+             LIMIT 30
+         )
+         ORDER BY day ASC",
     )?;
     let rows = stmt.query_map([], |row| {
         let total: i64 = row.get(1)?;
@@ -606,6 +644,21 @@ mod tests {
     }
 
     #[test]
+    fn t0_gate_escalates_when_the_second_voter_returned_an_empty_transcript() {
+        // Two model_ids are present but ONE returned "" (no speech detected — common when 300M and 1B
+        // disagree on a low-energy span). IRT drops the empty hypothesis and derives its consensus +
+        // confidence from the single surviving recognizer, so the empty one must NOT count toward the
+        // two-distinct-voters guard. Even at perfect confidence this must escalate, not auto-accept a
+        // lone-model verdict.
+        let seg = make_seg("s1", "کوردستان");
+        let hyps = vec![make_hyp("s1", "omniasr-ctc-1b", "کوردستان"), make_hyp("s1", "omniasr-ctc-300m", "")];
+        assert!(
+            matches!(t0_gate_segment(&seg, &hyps, "کوردستان", 0.99, 0.60), T0Decision::EscalateToT1 { .. }),
+            "an empty-transcript hypothesis must not count as a second voter"
+        );
+    }
+
+    #[test]
     fn few_shot_examples_rank_by_relevance_not_just_recency() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
@@ -644,6 +697,51 @@ mod tests {
         db.insert_segment(&make_seg("seg-empty", "")).unwrap();
         let recency = get_few_shot_examples(&db, "seg-empty", 1).unwrap();
         assert_eq!(recency[0].id, "a-new2", "no segment text -> recency fallback returns the newest");
+    }
+
+    #[test]
+    fn few_shot_excludes_holdout_gold_corrections() {
+        // Round-19 holdout-leak: a correction whose segment audio was promoted to a HOLDOUT gold clip
+        // must NOT be served as a few-shot exemplar — its human_fix IS the held-out reference text, so
+        // injecting it into the live T2 judge contaminates the benchmark and inflates measured WER/CER.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let mut held = make_seg("seg-held", "x");
+        held.audio_path = "/data/holdout.wav".to_string();
+        db.insert_segment(&held).unwrap();
+        let mut ok = make_seg("seg-ok", "x");
+        ok.audio_path = "/data/train.wav".to_string();
+        db.insert_segment(&ok).unwrap();
+        db.insert_segment(&make_seg("seg-q", "کوردی باشە")).unwrap();
+
+        let conn = db.connection();
+        conn.execute(
+            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
+             VALUES ('a-held', 'seg-held', 'کوردی', 'کوردی باشە', '2024-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
+             VALUES ('a-ok', 'seg-ok', 'کوردی', 'کوردی باشە', '2024-01-02')",
+            [],
+        )
+        .unwrap();
+        // Promote the first clip to a HOLDOUT gold reference (same audio_path).
+        conn.execute(
+            "INSERT INTO gold_segments (id, audio_path, reference, is_holdout)
+             VALUES ('g1', '/data/holdout.wav', 'کوردی باشە', 1)",
+            [],
+        )
+        .unwrap();
+
+        let ids: Vec<String> = get_few_shot_examples(&db, "seg-q", 10).unwrap().into_iter().map(|e| e.id).collect();
+        assert!(
+            !ids.iter().any(|id| id == "a-held"),
+            "a holdout gold clip's correction must NOT be served as a few-shot example: {ids:?}"
+        );
+        assert!(ids.iter().any(|id| id == "a-ok"), "a non-holdout correction is still available");
     }
 
     #[test]
@@ -759,19 +857,27 @@ mod tests {
     }
 
     #[test]
-    fn uncertifiable_bucket_keeps_its_strict_cut_while_sparse_borrows_global() {
-        let global = 0.9; // a deliberately lenient global threshold
-                          // POPULATED (>=10) but too noisy to certify at 5% (every cer = 0.5): must keep its OWN strict cut
-                          // (the minimum nonconformity), NOT borrow the lenient global — else a worst-condition bucket
-                          // auto-accepts MORE of its segments. calibrate_threshold returns sorted[0].0 (the min) here.
-        let noisy: Vec<(f64, f64)> = (0..15).map(|i| (0.1 + i as f64 * 0.05, 0.5)).collect();
-        assert!(
-            (bucket_threshold(&noisy, global) - noisy[0].0).abs() < 1e-9,
-            "an uncertifiable bucket must use its own strict cut ({}), not the lenient global ({global})",
-            noisy[0].0
-        );
-        // SPARSE (<10) has too little data for its own guarantee -> borrow the global.
-        let sparse: Vec<(f64, f64)> = (0..5).map(|i| (0.1 * i as f64, 0.0)).collect();
-        assert_eq!(bucket_threshold(&sparse, global), global, "a sparse bucket borrows the global threshold");
+    fn run_t0_gate_fails_closed_when_no_snr_bucket_is_calibrated() {
+        // Round-21 #2: a clean, high-confidence, TWO-recognizer segment (snr_db None ⇒ not poor-quality)
+        // that would auto-accept against a borrowed cold-start cutoff. With too little verified data to
+        // calibrate ANY SNR bucket, the gate must fail closed (escalate) rather than auto-accept against
+        // an uncalibrated/clean-dominated threshold borrowed from another condition.
+        use crate::settings::AutonLevel;
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&make_seg("s-uncal", "کوردستان")).unwrap(); // snr_db None → unknown bucket (4)
+        for (m, t) in [("omniasr-ctc-300m", "کوردستان"), ("omniasr-ctc-1b", "کوردستان")] {
+            db.insert_hypothesis(&SegmentHypothesis {
+                segment_id: "s-uncal".into(),
+                model_id: m.into(),
+                transcript: t.into(),
+                confidence: Some(0.95),
+            })
+            .unwrap();
+        }
+        let report = run_t0_gate(&db, &["s-uncal".to_string()], &AutonLevel::ActConfirm).unwrap();
+        assert_eq!(report.auto_accepted, 0, "no calibrated bucket → nothing may auto-accept");
+        assert_eq!(report.escalated, 1, "the segment fails closed to human review");
+        assert!(matches!(report.decisions[0], T0Decision::EscalateToT1 { .. }));
     }
 }

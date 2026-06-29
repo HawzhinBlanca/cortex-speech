@@ -57,6 +57,19 @@ fn build_confusion_slots(hyps: &[&SegmentHypothesis]) -> Option<(Vec<Slot>, Stri
     if hyps.is_empty() {
         return None;
     }
+    // Ignore empty-transcript hypotheses ENTIRELY. A model that returned "" must not become the anchor
+    // (zero slots ⇒ a degenerate confidence) NOR vote — with its ability weight — for empty at every
+    // slot, which would blank the consensus and let an empty transcript auto-accept. If every hypothesis
+    // is empty the segment has no signal: return None so the caller omits it (escalates downstream rather
+    // than recording a confident empty). Shared by the EM gate and the offline consensus draft, so this
+    // input guard protects both. A segment with at least one real hypothesis still yields a draft from the
+    // surviving models instead of being dropped.
+    let filtered: Vec<&SegmentHypothesis> =
+        hyps.iter().copied().filter(|h| !h.transcript.trim().is_empty()).collect();
+    if filtered.is_empty() {
+        return None;
+    }
+    let hyps: &[&SegmentHypothesis] = &filtered;
     // Choose the anchor hypothesis (highest initial ability).
     let anchor_hyp = hyps.iter().max_by(|a, b| {
         get_initial_ability(&a.model_id)
@@ -535,33 +548,59 @@ mod tests {
     }
 
     #[test]
-    fn blank_anchor_segment_is_omitted_not_given_perfect_confidence() {
-        // The highest-ability model (the anchor) returns a blank/whitespace transcript while a lower
-        // model emits text. The anchor has no words to align against, so there are zero scorable slots.
-        // The segment MUST NOT be emitted with a fabricated confidence 1.0 (which let the T0 gate
-        // auto-accept an EMPTY transcript at perfect confidence) — it is omitted entirely so the gate
-        // has no IRT confidence (escalates) and falls back to the raw transcript.
-        let anchor_blank = SegmentHypothesis {
+    fn all_empty_segment_is_omitted_not_given_perfect_confidence() {
+        // When EVERY model returns a blank/whitespace transcript the segment has no signal. The empty-
+        // hypothesis filter drops them all, build_confusion_slots returns None, and the segment is omitted
+        // entirely — never emitted with a fabricated confidence 1.0 (which let the T0 gate auto-accept an
+        // EMPTY transcript at perfect confidence). With no IRT confidence the gate escalates and falls
+        // back to the raw transcript.
+        let blank_strong = SegmentHypothesis {
             segment_id: "segX".to_string(),
-            model_id: "omniasr-7b".to_string(), // ability 1.5 -> chosen as anchor
-            transcript: "   ".to_string(),      // whitespace-only
+            model_id: "omniasr-7b".to_string(), // ability 1.5 -> would be the anchor
+            transcript: "   ".to_string(),       // whitespace-only
             confidence: Some(0.9),
         };
-        let other = SegmentHypothesis {
+        let blank_weak = SegmentHypothesis {
             segment_id: "segX".to_string(),
             model_id: "omniasr-300m".to_string(), // ability -0.5
-            transcript: "هەڵە".to_string(),
+            transcript: "".to_string(),
             confidence: Some(0.5),
         };
-        let res = fit_irt_consensus(&[anchor_blank, other]);
+        let res = fit_irt_consensus(&[blank_strong, blank_weak]);
         assert!(
             !res.segment_confidences.contains_key("segX"),
-            "blank-anchor segment must be omitted, never given a fabricated confidence"
+            "all-empty segment must be omitted, never given a fabricated confidence"
         );
         assert!(
             !res.consensus_transcripts.contains_key("segX"),
-            "no empty consensus transcript should be emitted for a blank-anchor segment"
+            "no empty consensus transcript should be emitted for an all-empty segment"
         );
+    }
+
+    #[test]
+    fn empty_anchor_recovers_consensus_from_the_surviving_model_at_sub_max_confidence() {
+        // The highest-ability model returns an empty transcript: without the input filter it became the
+        // anchor, yielding zero slots and a hard-coded confidence of 1.0 with an EMPTY consensus — which
+        // could auto-accept an empty transcript at the T0 gate. The filter drops the empty model, so the
+        // anchor is the surviving real model: the segment is RECOVERED (a real consensus the human can
+        // check) rather than omitted, and a degenerate segment never reports maximal confidence.
+        let empty_strong = SegmentHypothesis {
+            segment_id: "seg1".to_string(),
+            model_id: "omniasr-ctc-1b".to_string(), // initial ability 0.5 — would be the anchor
+            transcript: "".to_string(),
+            confidence: Some(0.5),
+        };
+        let real_weak = SegmentHypothesis {
+            segment_id: "seg1".to_string(),
+            model_id: "omniasr-ctc-300m".to_string(), // initial ability -0.5
+            transcript: "ئەمە دەنگە".to_string(),
+            confidence: Some(0.4),
+        };
+        let res = fit_irt_consensus(&[empty_strong, real_weak]);
+        let consensus = res.consensus_transcripts.get("seg1").expect("segment present");
+        assert!(!consensus.is_empty(), "consensus must come from the non-empty hypothesis, not the empty anchor");
+        let conf = res.segment_confidences.get("seg1").copied().expect("confidence present");
+        assert!(conf < 1.0, "a segment with an empty strong model must not report maximal confidence; got {conf}");
     }
 
     #[test]

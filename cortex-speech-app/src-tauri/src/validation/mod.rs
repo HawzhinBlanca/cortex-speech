@@ -79,15 +79,22 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
         }
     }
 
-    // 2. Check empty transcripts
+    // 2. Check empty transcripts. Round-25 #2: flag only when the EFFECTIVE transcript is empty
+    // (mirroring quality.rs::effective_transcript) — a clip whose raw ASR produced nothing but which a
+    // curator then hand-annotated (or the jury committed a verdict for) is valid and training-ready.
+    // Flagging it spuriously raised an EmptyTranscript warning that blocks a production bundle export
+    // under the default warning_threshold=0.
     for seg in &segments {
-        if seg.raw_transcript.trim().is_empty() {
+        let has_content = !seg.raw_transcript.trim().is_empty()
+            || seg.annotated_transcript.as_deref().is_some_and(|a| !a.trim().is_empty())
+            || seg.verdict_transcript.as_deref().is_some_and(|v| !v.trim().is_empty());
+        if !has_content {
             issues.push(ValidationIssue {
                 severity: IssueSeverity::Warning,
                 category: IssueCategory::EmptyTranscript,
                 segment_id: Some(seg.id.clone()),
                 field: "raw_transcript".to_string(),
-                message: "Raw transcript is empty".to_string(),
+                message: "Segment has no transcript (raw, annotation, and verdict are all empty)".to_string(),
                 details: Some(format!("Path: {}", seg.audio_path)),
             });
         }
@@ -250,7 +257,19 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
 
     let errors: Vec<_> = issues.iter().filter(|i| i.severity == IssueSeverity::Error).cloned().collect();
     let warnings: Vec<_> = issues.iter().filter(|i| i.severity == IssueSeverity::Warning).cloned().collect();
-    let passed = segments.len().saturating_sub(errors.len());
+    // `passed` counts SEGMENTS with no failure attributable to them — NOT errors.len(). The old
+    // count was wrong three ways: (1) a dataset-level gate Error (segment_id None) is not a segment but
+    // was subtracted as one (phantom failing row with no "go to segment" target); (2) a segment that
+    // both raised a per-segment Error and tripped the aggregate gate was double-counted; (3) when
+    // several segments share one missing audio file the MissingAudio Error is deduped to a single
+    // representative id, under-counting the failures. Attribute by segment id, and treat every segment
+    // whose audio file is missing as failed.
+    let failed_ids: HashSet<&str> = errors.iter().filter_map(|e| e.segment_id.as_deref()).collect();
+    let missing_paths: HashSet<&str> = audio_paths.iter().copied().filter(|p| !Path::new(p).exists()).collect();
+    let passed = segments
+        .iter()
+        .filter(|s| !failed_ids.contains(s.id.as_str()) && !missing_paths.contains(s.audio_path.as_str()))
+        .count();
 
     let summary = if errors.is_empty() && warnings.is_empty() {
         format!("All {} segments passed validation", segments.len())
@@ -314,12 +333,45 @@ mod tests {
     }
 
     #[test]
+    fn passed_counts_failing_segments_not_error_issue_count() {
+        // Round-18: `passed = total - errors.len()` under-counted failures when N segments share ONE
+        // missing audio file — the MissingAudio Error is deduped to a single representative id, so the
+        // old count reported passed = 2 - 1 = 1. Both rows referencing the missing file must count as
+        // failed, so passed must be 0.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&make_seg("a", "/does/not/exist.wav", "x")).unwrap();
+        db.insert_segment(&make_seg("b", "/does/not/exist.wav", "y")).unwrap();
+
+        let report = validate_dataset(&db).unwrap();
+
+        assert_eq!(report.total_segments, 2);
+        assert_eq!(report.passed, 0, "both segments sharing a missing audio file must be counted as failed");
+    }
+
+    #[test]
     fn test_validate_empty_transcript() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         db.insert_segment(&make_seg("test1", "/fake/path.wav", "")).unwrap();
         let report = validate_dataset(&db).unwrap();
         assert!(report.warnings.iter().any(|i| i.category == IssueCategory::EmptyTranscript));
+    }
+
+    #[test]
+    fn empty_raw_with_human_annotation_is_not_flagged_empty() {
+        // Round-25 #2: a clip whose raw ASR was empty but which a curator hand-annotated is valid and
+        // must NOT raise an EmptyTranscript warning (which would block a production bundle export).
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let mut seg = make_seg("annotated", "/fake/path.wav", "");
+        seg.annotated_transcript = Some("دەقی دەستکارد".to_string());
+        db.insert_segment(&seg).unwrap();
+        let report = validate_dataset(&db).unwrap();
+        assert!(
+            !report.warnings.iter().any(|i| i.category == IssueCategory::EmptyTranscript),
+            "a hand-annotated segment with empty raw ASR must not be flagged empty"
+        );
     }
 
     #[test]
