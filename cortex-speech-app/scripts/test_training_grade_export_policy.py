@@ -24,7 +24,7 @@ def main() -> None:
         "training_grade_summary",
         "human_rejected",
         "placeholder_transcript",
-        "is_placeholder_transcript(&seg.raw_transcript)",
+        "is_placeholder_transcript(effective_transcript(seg))",
         '"[Pending WSL 7B ASR]"',
         "severe_clipping",
         "high_confidence_jury_accept",

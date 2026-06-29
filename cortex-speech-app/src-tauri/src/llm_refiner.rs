@@ -119,7 +119,10 @@ impl LlmRefiner {
             return Err("Gemini API Key is missing. Please configure it in settings.".to_string());
         }
 
-        let model_name = if self.model.trim().is_empty() { "gemini-3.1-pro-latest" } else { &self.model };
+        // Round-23 #10: default to a model id that actually exists on the v1beta REST surface. The
+        // previous "gemini-3.1-pro-latest" is not a published model, so an unconfigured direct-Gemini
+        // refiner 404'd on every call. Match the jury/source-reference default.
+        let model_name = if self.model.trim().is_empty() { "gemini-2.5-pro" } else { &self.model };
 
         let url = gemini_api::generate_content_url(model_name);
 
@@ -148,10 +151,18 @@ impl LlmRefiner {
 
         let body: Value = resp.into_json().map_err(|e| format!("Failed to parse Gemini response: {}", e))?;
 
-        if let Some(content) = body["candidates"][0]["content"]["parts"][0]["text"].as_str() {
-            Ok(content.trim().to_string())
-        } else {
+        // Concatenate ALL text parts — Gemini can split a refined transcript across content.parts[0..N]
+        // (and a 2.5-class "thinking" model may emit a leading thought part); reading parts[0] alone
+        // would truncate the refinement or return the thought instead of the answer.
+        let joined = body["candidates"][0]["content"]["parts"]
+            .as_array()
+            .map(|ps| ps.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(""))
+            .unwrap_or_default();
+        let trimmed = joined.trim();
+        if trimmed.is_empty() {
             Err("Invalid response format from Gemini".to_string())
+        } else {
+            Ok(trimmed.to_string())
         }
     }
 }

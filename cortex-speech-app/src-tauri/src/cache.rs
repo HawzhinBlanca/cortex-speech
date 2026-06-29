@@ -59,8 +59,15 @@ impl TranscriptCache {
 
     pub fn get_chunk(&self, audio_path: &Path, model_id: &str, chunk_suffix: Option<&str>) -> Option<CacheEntry> {
         let hash = Self::compute_hash(audio_path).ok()?;
+        self.get_chunk_by_hash(&hash, model_id, chunk_suffix)
+    }
+
+    /// Lookup using a PRECOMPUTED whole-file content hash. Round-23 #5: the per-chunk transcription
+    /// loop must hash the audio file ONCE per run (the content is invariant for the run) and reuse the
+    /// hash here, instead of re-reading + re-hashing the entire file on every chunk get/set.
+    pub fn get_chunk_by_hash(&self, hash: &str, model_id: &str, chunk_suffix: Option<&str>) -> Option<CacheEntry> {
         let store = self.lock_store();
-        store.get(&Self::cache_key(&hash, model_id, chunk_suffix)).cloned()
+        store.get(&Self::cache_key(hash, model_id, chunk_suffix)).cloned()
     }
 
     pub fn set(&self, audio_path: &Path, entry: CacheEntry) {
@@ -69,17 +76,31 @@ impl TranscriptCache {
 
     pub fn set_chunk(&self, audio_path: &Path, chunk_suffix: Option<&str>, entry: CacheEntry) {
         if let Ok(hash) = Self::compute_hash(audio_path) {
-            let mut store = self.lock_store();
-            let key = Self::cache_key(&hash, &entry.model_id, chunk_suffix);
+            self.set_chunk_by_hash(&hash, chunk_suffix, entry);
+        }
+    }
+
+    /// Insert using a PRECOMPUTED whole-file content hash (see [`get_chunk_by_hash`]).
+    pub fn set_chunk_by_hash(&self, hash: &str, chunk_suffix: Option<&str>, entry: CacheEntry) {
+        let mut store = self.lock_store();
+        let key = Self::cache_key(hash, &entry.model_id, chunk_suffix);
+        // Round-23 #6: only evict when inserting a genuinely NEW key — an overwrite of an existing key
+        // is net-zero in size, so evicting an unrelated entry for it needlessly drops a good transcript
+        // and shrinks the cache below max_entries. And when we DO evict, drop the OLDEST entry (by
+        // created_at) deterministically, not `keys().next()` (random HashMap order, which can evict a
+        // hot entry while keeping cold ones).
+        if !store.contains_key(&key) {
             while store.len() >= self.max_entries {
-                if let Some(key) = store.keys().next().cloned() {
-                    store.remove(&key);
-                } else {
-                    break;
+                let oldest = store.iter().min_by_key(|(_, e)| e.created_at).map(|(k, _)| k.clone());
+                match oldest {
+                    Some(k) => {
+                        store.remove(&k);
+                    }
+                    None => break,
                 }
             }
-            store.insert(key, entry);
         }
+        store.insert(key, entry);
     }
 
     pub fn invalidate(&self, audio_path: &Path) {
@@ -133,6 +154,50 @@ mod tests {
 
         assert_eq!(cached.raw_transcript, "text");
         assert_eq!(cache.size(), 1);
+    }
+
+    #[test]
+    fn overwrite_does_not_evict_an_unrelated_entry() {
+        // Round-23 #6: re-caching an EXISTING key (an overwrite) must not evict a different valid entry
+        // or shrink the cache below capacity.
+        let cache = TranscriptCache::new(2);
+        let a = audio_file(b"aaa");
+        let b = audio_file(b"bbb");
+        cache.set(a.path(), cache_entry("m", "a-text"));
+        cache.set(b.path(), cache_entry("m", "b-text")); // cache now full at 2
+        cache.set(a.path(), cache_entry("m", "a-text-2")); // overwrite a's key
+        assert_eq!(cache.size(), 2, "overwrite must not shrink the cache");
+        assert!(cache.get(b.path(), "m").is_some(), "the unrelated entry must survive an overwrite");
+        assert_eq!(cache.get(a.path(), "m").expect("a present").raw_transcript, "a-text-2");
+    }
+
+    #[test]
+    fn eviction_drops_the_oldest_entry_deterministically() {
+        // Round-23 #6: when full, eviction drops the OLDEST entry (by created_at), not a random one.
+        let cache = TranscriptCache::new(2);
+        let mk = |path: &Path, text: &str, secs: i64| {
+            cache.set_chunk(
+                path,
+                None,
+                CacheEntry {
+                    audio_hash: "x".into(),
+                    raw_transcript: text.into(),
+                    normalized_transcript: None,
+                    created_at: chrono::DateTime::from_timestamp(secs, 0).expect("valid ts"),
+                    model_id: "m".into(),
+                },
+            );
+        };
+        let a = audio_file(b"a1");
+        let b = audio_file(b"b1");
+        let c = audio_file(b"c1");
+        mk(a.path(), "a", 100); // oldest
+        mk(b.path(), "b", 200);
+        mk(c.path(), "c", 300); // full -> evict the oldest (a)
+        assert_eq!(cache.size(), 2);
+        assert!(cache.get(a.path(), "m").is_none(), "the oldest entry (by created_at) is evicted");
+        assert!(cache.get(b.path(), "m").is_some());
+        assert!(cache.get(c.path(), "m").is_some());
     }
 
     #[test]

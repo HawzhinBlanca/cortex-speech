@@ -123,10 +123,23 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
         }
         let audio_path = Path::new(&row.audio_path);
         if audio_path.exists() {
-            if let Ok(identity) = crate::pipeline::source_audio_identity(audio_path) {
-                if holdout_hashes.contains(&identity.content_hash) {
+            match crate::pipeline::source_audio_identity(audio_path) {
+                Ok(identity) if holdout_hashes.contains(&identity.content_hash) => {
                     tracing::warn!(
                         "Excluding segment {} from DPO export: matches holdout gold audio hash",
+                        row.segment_id
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // Fail CLOSED: a present-but-unhashable clip (transient lock/permission/flaky disk)
+                    // could be the SAME CONTENT as a holdout gold clip at a different path — the path
+                    // guard above only catches identical path strings. Including it risks leaking
+                    // held-out audio into the training corpus and silently inflating eval, so exclude
+                    // an unverifiable clip rather than contaminate.
+                    tracing::warn!(
+                        "Excluding segment {} from DPO export: could not hash audio to clear holdout ({e})",
                         row.segment_id
                     );
                     continue;
@@ -222,10 +235,13 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
         }
         let path = Path::new(&audio_path);
         if path.exists() {
-            if let Ok(identity) = crate::pipeline::source_audio_identity(path) {
-                if holdout.contains(&identity.content_hash) {
-                    continue;
-                }
+            match crate::pipeline::source_audio_identity(path) {
+                Ok(identity) if holdout.contains(&identity.content_hash) => continue,
+                Ok(_) => {}
+                // Fail CLOSED: an unhashable-but-present clip could be the same content as a holdout
+                // clip at a different path; exclude it rather than risk leaking held-out text into the LM
+                // corpus and inflating eval.
+                Err(_) => continue,
             }
         }
 
@@ -1033,6 +1049,53 @@ mod tests {
 
         let result = build_dpo_dataset(&db).expect("build DPO");
         assert_eq!(result.pair_count, 0, "missing file must not leak held-out content into DPO");
+    }
+
+    #[test]
+    fn build_dpo_excludes_present_but_unhashable_segment_fail_closed() {
+        // Round-17: the holdout content-hash guard re-reads each training clip's audio. A clip that
+        // EXISTS but cannot be hashed (transient lock / permission / flaky disk) used to fall through
+        // and be INCLUDED (fail-open) — and since the path guard only matches identical path strings,
+        // a same-content-at-a-different-path holdout clip would then leak into training. Verify it now
+        // fails CLOSED: a present-but-unhashable clip is excluded. (A directory path is present but
+        // unhashable on every platform.)
+        let db = open_mem_db();
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        // Control: a readable audio file yields a valid DPO pair.
+        let readable = temp.path().join("readable.wav");
+        std::fs::write(&readable, b"some audio bytes").expect("write audio");
+        let seg = SpeechSegment {
+            id: "seg-x".to_string(),
+            audio_path: readable.to_string_lossy().to_string(),
+            raw_transcript: "wrong text".to_string(),
+            duration_ms: 1000,
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&seg).expect("insert segment");
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix) VALUES (?1, ?2, ?3, ?4)",
+                params!["ex-x", "seg-x", "wrong text", "corrected text"],
+            )
+            .expect("insert example");
+        assert_eq!(build_dpo_dataset(&db).expect("build").pair_count, 1, "readable clip is a valid pair");
+
+        // Repoint the segment at a present-but-unhashable path (a directory): exists() is true but
+        // source_audio_identity errors, so the holdout hash cannot be cleared -> fail closed -> excluded.
+        let unhashable = temp.path().join("a_dir");
+        std::fs::create_dir(&unhashable).expect("mkdir");
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_path = ?1 WHERE id = 'seg-x'",
+                params![unhashable.to_string_lossy().to_string()],
+            )
+            .expect("update path");
+        assert_eq!(
+            build_dpo_dataset(&db).expect("build").pair_count,
+            0,
+            "a present-but-unhashable clip must be excluded (fail-closed), not leaked into training"
+        );
     }
 
     #[test]

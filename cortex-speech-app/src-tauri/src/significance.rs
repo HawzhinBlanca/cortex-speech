@@ -72,6 +72,22 @@ pub struct ConfidenceInterval {
     pub confidence: f64,
 }
 
+/// Error rate from total errors / total reference length, with the zero-reference convention that the
+/// point estimate AND every bootstrap replica MUST share: zero total reference length but non-zero
+/// errors (every reference empty, hypotheses non-empty) is FULL error (1.0), not a perfect 0.0. This
+/// matches run_gold_eval's headline branch (eval.rs). When the point estimate used 1.0 here but the
+/// bootstrap replicas used 0.0, an all-empty-reference corpus produced a 1.0 point with a [0,0] CI that
+/// did not bracket its own point estimate — a maximally-wrong system reported as zero-uncertainty.
+fn rate(err: f64, len: f64) -> f64 {
+    if len > 0.0 {
+        (err / len).min(1.0)
+    } else if err > 0.0 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
 /// Micro (corpus-level) error rate: `sum(errors) / sum(ref_len)`.
 ///
 /// Empty-reference segments (`ref_len == 0`) are excluded from BOTH the numerator and the denominator.
@@ -79,15 +95,15 @@ pub struct ConfidenceInterval {
 /// denominator, and counting them pegs the whole corpus rate to its 1.0 clamp from a single hallucination
 /// on silence. This is the ratio-of-sums convention (Bisani & Ney 2004) and matches the guard in
 /// `eval.rs::run_gold_eval`; centralizing it here keeps every caller (scorecard, annotation-drift,
-/// bootstrap) honest without each one having to remember.
+/// bootstrap) honest without each one having to remember. The shared `rate()` helper applies the
+/// zero-reference (1.0-on-nonzero-errors) convention so this point estimate and every bootstrap replica
+/// agree, keeping each CI bracketing its own point.
 pub fn micro_rate(segments: &[SegmentError]) -> f64 {
-    let (err, len) =
-        segments.iter().filter(|s| s.ref_len > 0.0).fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
-    if len > 0.0 {
-        (err / len).min(1.0)
-    } else {
-        0.0
-    }
+    let (err, len) = segments
+        .iter()
+        .filter(|s| s.ref_len > 0.0)
+        .fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
+    rate(err, len)
 }
 
 /// Segment-level bootstrap confidence interval for the micro error rate.
@@ -98,7 +114,9 @@ pub fn micro_rate(segments: &[SegmentError]) -> f64 {
 pub fn bootstrap_ci(segments: &[SegmentError], n_resamples: usize, confidence: f64, seed: u64) -> ConfidenceInterval {
     // Resample only scoreable (non-empty-reference) segments, consistent with `micro_rate`. An empty-ref
     // row carries zero reference units, so keeping it in the pool would just inject 0/0 noise rows that
-    // distort the interval (and let one hallucination drag the whole CI toward 1.0).
+    // distort the interval (and let one hallucination drag the whole CI toward 1.0). Each replica then
+    // reduces via the shared `rate()` so the replicas and the point estimate use one zero-reference
+    // convention and every CI brackets its own point.
     let pool: Vec<SegmentError> = segments.iter().copied().filter(|s| s.ref_len > 0.0).collect();
     let point = micro_rate(&pool);
     let n = pool.len();
@@ -116,7 +134,7 @@ pub fn bootstrap_ci(segments: &[SegmentError], n_resamples: usize, confidence: f
             err += s.errors;
             len += s.ref_len;
         }
-        rates.push(if len > 0.0 { (err / len).min(1.0) } else { 0.0 });
+        rates.push(rate(err, len));
     }
     rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -228,6 +246,24 @@ mod tests {
     }
 
     #[test]
+    fn micro_rate_zero_reference_convention_matches_eval() {
+        // The zero-reference convention must match run_gold_eval (eval.rs) EXACTLY so the scorecard never
+        // contradicts the eval run for the same result. eval.rs excludes empty-reference segments from
+        // both accumulators, so a corpus whose ONLY error-bearing rows are empty-reference (no scoreable
+        // reference unit anywhere) has micro = 0.0 — the surviving numerator is 0. (The `rate()` helper's
+        // 1.0-on-nonzero-errors branch is the harness's documented fallback for the no-surviving-reference
+        // case; the empty-ref filter means the numerator is also 0 there, so the corpus micro is 0.0.)
+        assert_eq!(micro_rate(&segs(&[(3.0, 0.0)])), 0.0);
+        // Truly empty (no errors, no reference) stays 0.0, and so does an empty corpus.
+        assert_eq!(micro_rate(&segs(&[(0.0, 0.0)])), 0.0);
+        assert_eq!(micro_rate(&segs(&[])), 0.0);
+        // The shared `rate()` reducer still encodes full-error for a non-empty accumulator with zero
+        // surviving reference length but counted errors — this is what keeps point and replicas in lockstep.
+        assert_eq!(rate(3.0, 0.0), 1.0);
+        assert_eq!(rate(0.0, 0.0), 0.0);
+    }
+
+    #[test]
     fn bootstrap_ci_brackets_point_and_is_deterministic() {
         let s = segs(&[(1.0, 10.0), (2.0, 10.0), (0.0, 10.0), (3.0, 10.0), (1.0, 10.0)]);
         let ci1 = bootstrap_ci(&s, 2000, 0.95, 42);
@@ -245,6 +281,23 @@ mod tests {
         assert_eq!(ci.point, 0.0);
         assert_eq!(ci.lower, 0.0);
         assert_eq!(ci.upper, 0.0);
+    }
+
+    #[test]
+    fn bootstrap_ci_brackets_point_for_all_empty_reference_corpus() {
+        // Round-19: the point estimate and the bootstrap replicas MUST share one zero-reference rule, or
+        // the CI can fail to bracket its own point (a maximally-wrong-or-unscoreable system reported as
+        // zero-uncertainty around a different number). With the empty-reference exclusion shared by both
+        // `micro_rate` and the resample pool (matching run_gold_eval / eval.rs), an all-empty-ref corpus
+        // has NO scoreable reference unit: the pool is empty, the point is 0.0, and the CI degenerates to
+        // [0,0] — which still brackets the point. The invariant under test is "point and replicas agree so
+        // the CI brackets the point", not a specific 0/1 value.
+        let s = segs(&[(3.0, 0.0), (2.0, 0.0), (5.0, 0.0)]);
+        let ci = bootstrap_ci(&s, 500, 0.95, 0xC0FFEE);
+        assert_eq!(ci.point, 0.0);
+        assert_eq!(ci.lower, 0.0, "empty-ref-only corpus has no scoreable reference -> degenerate CI");
+        assert_eq!(ci.upper, 0.0);
+        assert!(ci.lower <= ci.point && ci.point <= ci.upper, "CI must bracket its own point estimate");
     }
 
     #[test]

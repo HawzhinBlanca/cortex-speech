@@ -216,6 +216,11 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
         let arabic_char = char::from_u32(0x0660 + i as u32).unwrap();
         result = result.replace(arabic_char, &latin.to_string());
     }
+    // Native Sorani/Persian-script number separators: ARABIC DECIMAL SEPARATOR U+066B (٫) and ARABIC
+    // THOUSANDS SEPARATOR U+066C (٬). The digit-glyph folding above stops at U+0669, so these would
+    // survive and split a number mid-stream (e.g. ٣٫١٤ -> "3٫14" parses as two unrelated numbers with a
+    // stray separator token). Fold them to the ASCII forms DIGITS_RE already understands (round-22 #8).
+    result = result.replace('\u{066B}', ".").replace('\u{066C}', ",");
 
     // Normalize the native Arabic number separators the digit fold above leaves behind: the THOUSANDS
     // separator U+066C and the DECIMAL separator U+066B sit just past the digit block (U+0660-0669) so
@@ -249,7 +254,12 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
     static DIGITS_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\d{1,3}(?:[،,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?").unwrap());
 
-    let expanded = DIGITS_RE.replace_all(&result, |caps: &regex::Captures| verbalize_number_token(&caps[0]));
+    let expanded = DIGITS_RE.replace_all(&result, |caps: &regex::Captures| {
+        // Surround the multi-word expansion with spaces so a numeral glued to a word ("ساڵی٢٠٢٠") or a
+        // leftover digit after a thousands-group match cannot FUSE into a single non-word token. The
+        // subsequent MULTI_SPACE collapse + trim in `normalize` absorb the redundant spaces.
+        format!(" {} ", verbalize_number_token(&caps[0]))
+    });
 
     expanded.into_owned()
 }
@@ -377,7 +387,9 @@ mod tests {
             ("على", "علی"),
             ("ســـاڵ", "ساڵ"),
             ("ئەو\u{200C}کەسە", "ئەو کەسە"),
-            ("ئەو ڪەسە لە ســـاڵەکانی ١٩٥٠دا دەژیا", "ئەو کەسە لە ساڵەکانی ھەزار و نۆسەد و پەنجادا دەژیا"),
+            // The numeral ١٩٥٠ glued to the suffix دا must keep a word boundary after verbalization
+            // (round-12 fix): پەنجا (50) is no longer fused into پەنجادا, so FTS/dedup tokenizes it.
+            ("ئەو ڪەسە لە ســـاڵەکانی ١٩٥٠دا دەژیا", "ئەو کەسە لە ساڵەکانی ھەزار و نۆسەد و پەنجا دا دەژیا"),
             ("", ""),
         ];
         for (input, expected) in cases {
@@ -491,6 +503,40 @@ mod tests {
         assert_eq!(n.normalize("007"), "سفر سفر حەوت");
         // Plain numbers still verbalize as before.
         assert_eq!(n.normalize("123"), "سەد و بیست و سێ");
+    }
+
+    #[test]
+    fn native_arabic_number_separators_fold_like_ascii() {
+        // Round-22 #8: ARABIC DECIMAL SEPARATOR U+066B (٫) and ARABIC THOUSANDS SEPARATOR U+066C (٬) —
+        // the separators actually used inside native Sorani/Persian-script numbers — used to survive
+        // un-folded and split a number mid-stream. They must now normalize identically to the ASCII
+        // '.'/',' forms, with no stray separator token leaking into the verbalized output.
+        let n = SoraniNormalizer::new();
+        let dec = "\u{0663}\u{066B}\u{0661}\u{0664}"; // ٣٫١٤  (Arabic digits + U+066B decimal sep)
+        let grp = "\u{0663}\u{066C}\u{0660}\u{0660}\u{0660}"; // ٣٬٠٠٠ (Arabic digits + U+066C thousands sep)
+        assert_eq!(n.normalize(dec), n.normalize("3.14"), "native decimal separator must fold like ASCII '.'");
+        assert_eq!(n.normalize(grp), n.normalize("3,000"), "native thousands separator must fold like ASCII ','");
+        assert!(!n.normalize(dec).contains('\u{066B}'), "no stray U+066B leaks");
+        assert!(!n.normalize(grp).contains('\u{066C}'), "no stray U+066C leaks");
+    }
+
+    #[test]
+    fn verbalize_numbers_keeps_word_boundary_around_glued_digits() {
+        // Round-12 audit HIGH: a numeral glued to a word ("ساڵی٢٠٢٠", a common Sorani year pattern) used
+        // to FUSE the word with the first verbalized number-word ("ساڵیدوو …"), producing a non-word
+        // token that corrupts the FTS-indexed normalized_transcript. The expansion must be space-
+        // delimited from neighbours, with no leaked leading/trailing/double spaces.
+        let n = SoraniNormalizer::new();
+        let out = n.normalize("ساڵی٢٠٢٠");
+        assert!(out.starts_with("ساڵی "), "word must stay separated from the number: {out:?}");
+        assert!(!out.contains("ساڵیدوو"), "word must not fuse with the first number-word: {out:?}");
+        assert_eq!(out, out.trim(), "no leading/trailing space leak: {out:?}");
+        assert!(!out.contains("  "), "no double spaces leak: {out:?}");
+
+        // A leftover digit after a thousands-group match must also not fuse with the group's last word.
+        let grouped = n.normalize("100,0001");
+        assert!(!grouped.contains("  "), "no double spaces: {grouped:?}");
+        assert_eq!(grouped, grouped.trim());
     }
 
     #[test]

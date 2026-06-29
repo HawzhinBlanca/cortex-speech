@@ -571,12 +571,77 @@ pub fn is_transient_decode_error(err: &AppError) -> bool {
     }
 }
 
+/// Windowed-sinc (Hamming) low-pass FIR, applied as a centered, same-length, edge-clamped convolution.
+/// Used as the anti-aliasing pre-filter before decimation. `cutoff_hz` is the -6 dB-ish passband edge.
+fn lowpass_fir(samples: &[f32], sample_rate: f64, cutoff_hz: f64) -> Vec<f32> {
+    const TAPS: usize = 63; // odd → symmetric, linear-phase kernel
+    let half = (TAPS / 2) as isize;
+    // Normalized cutoff in cycles/sample, kept strictly below Nyquist (0.5).
+    let fc = (cutoff_hz / sample_rate).clamp(1e-4, 0.499);
+
+    let mut kernel = [0.0f64; TAPS];
+    let mut sum = 0.0f64;
+    for (k, slot) in kernel.iter_mut().enumerate() {
+        let n = k as isize - half;
+        let sinc = if n == 0 {
+            2.0 * fc
+        } else {
+            let x = std::f64::consts::PI * n as f64;
+            (2.0 * fc * x).sin() / x
+        };
+        // Hamming window.
+        let w = 0.54 - 0.46 * (2.0 * std::f64::consts::PI * k as f64 / (TAPS as f64 - 1.0)).cos();
+        let v = sinc * w;
+        *slot = v;
+        sum += v;
+    }
+    // Normalize to unity DC gain so the filter neither amplifies nor attenuates the passband level.
+    for v in kernel.iter_mut() {
+        *v /= sum;
+    }
+
+    let len = samples.len();
+    let mut out = vec![0.0f32; len];
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut acc = 0.0f64;
+        for (k, &kv) in kernel.iter().enumerate() {
+            let idx = i as isize + (k as isize - half);
+            let s = if idx < 0 {
+                samples[0]
+            } else if idx as usize >= len {
+                samples[len - 1]
+            } else {
+                samples[idx as usize]
+            };
+            acc += kv * s as f64;
+        }
+        *o = acc as f32;
+    }
+    out
+}
+
 pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || samples.is_empty() {
         return samples.to_vec();
     }
+    // Anti-aliasing: when DOWNSAMPLING, low-pass below the NEW Nyquist before decimating. Real input is
+    // almost always 44.1k/48k, so every file is downsampled to 16k; linear interpolation alone is a poor
+    // anti-alias filter (~-6 dB/octave, no null at Nyquist), so source energy above 8 kHz would fold back
+    // into the speech band and corrupt the PCM fed to VAD/ASR, inflating WER/CER. Upsampling needs no
+    // pre-filter (no new aliases are created), so it keeps the plain interpolation path.
+    let prefiltered: Vec<f32>;
+    let src: &[f32] = if to_rate < from_rate {
+        let cutoff = 0.45 * to_rate as f64; // just under the new Nyquist (to_rate / 2)
+        prefiltered = lowpass_fir(samples, from_rate as f64, cutoff);
+        &prefiltered
+    } else {
+        samples
+    };
+
     let ratio = to_rate as f64 / from_rate as f64;
-    let new_len = (samples.len() as f64 * ratio).ceil() as usize;
+    // Length is derived from `src` (the prefiltered signal), not the raw `samples`, so the
+    // downsample pre-filter above is not silently dropped. `src == samples` on the upsample path.
+    let new_len = (src.len() as f64 * ratio).ceil() as usize;
 
     // Anti-aliased windowed-sinc resampling. Each output sample is a Hamming-windowed-sinc-weighted sum
     // of the nearby SOURCE samples, with the sinc cutoff at the lower of the two Nyquist limits. When
@@ -588,7 +653,10 @@ pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
     // Cutoff as a fraction of the SOURCE sample rate (cycles per source sample), in (0, 0.5].
     let cutoff = if to_rate < from_rate { (to_rate as f64 / 2.0) / from_rate as f64 } else { 0.5 };
     const RADIUS: i64 = 16; // sinc window half-width, in source samples
-    let n = samples.len() as i64;
+    // Read from `src` (prefiltered on downsample, == samples on upsample), per theirs/base. Every
+    // index below is edge-clamped to [0, n-1], so this is panic-free for every rate — covering the
+    // out-of-bounds case theirs fixed (new_len = ceil(len*ratio) can overshoot the last index).
+    let n = src.len() as i64;
     let mut out = Vec::with_capacity(new_len);
     for i in 0..new_len {
         let center = i as f64 / ratio; // output position expressed in source samples
@@ -605,7 +673,7 @@ pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
             let window = 0.54 + 0.46 * (PI * dist / RADIUS as f64).cos(); // Hamming, centered
             let weight = sinc * window;
             let idx = j.clamp(0, n - 1) as usize; // edge clamp
-            acc += weight * samples[idx] as f64;
+            acc += weight * src[idx] as f64;
             wsum += weight;
         }
         // Normalize by the weight sum so DC gain is exactly 1 even with edge clamping.
@@ -653,7 +721,11 @@ impl SileroVad {
             sample_rate,
             frame_size: 512,
             threshold,
-            min_speech_frames: 15,
+            // Round-24 #6: ~96ms floor (3 frames). The old 480ms (15-frame) floor silently DROPPED any
+            // real short word (e.g. "بەڵێ"/yes) flanked by silence — its audio was never transcribed
+            // and vanished from the dataset. 3 frames still filters 1-2 frame spurious activations while
+            // preserving genuine short utterances; downstream chunking merges/absorbs as needed.
+            min_speech_frames: 3,
             min_silence_frames: 8,
         })
     }
@@ -688,7 +760,11 @@ impl SileroVad {
             sample_rate,
             frame_size: 512,
             threshold,
-            min_speech_frames: 15,
+            // Round-24 #6: ~96ms floor (3 frames). The old 480ms (15-frame) floor silently DROPPED any
+            // real short word (e.g. "بەڵێ"/yes) flanked by silence — its audio was never transcribed
+            // and vanished from the dataset. 3 frames still filters 1-2 frame spurious activations while
+            // preserving genuine short utterances; downstream chunking merges/absorbs as needed.
+            min_speech_frames: 3,
             min_silence_frames: 8,
         })
     }
@@ -712,7 +788,11 @@ impl SileroVad {
             sample_rate,
             frame_size: 512,
             threshold,
-            min_speech_frames: 15,
+            // Round-24 #6: ~96ms floor (3 frames). The old 480ms (15-frame) floor silently DROPPED any
+            // real short word (e.g. "بەڵێ"/yes) flanked by silence — its audio was never transcribed
+            // and vanished from the dataset. 3 frames still filters 1-2 frame spurious activations while
+            // preserving genuine short utterances; downstream chunking merges/absorbs as needed.
+            min_speech_frames: 3,
             min_silence_frames: 8,
         })
     }
@@ -965,20 +1045,33 @@ fn vad_energy_fallback(pcm: &[i16], _sample_rate: u32, threshold: f32) -> AppRes
     }
 
     use rayon::prelude::*;
-    let speech_frames: Vec<bool> = (0..num_frames)
+    // Per-frame mean absolute amplitude (~0.02-0.2 for ordinary speech). Round-24 #7: the old code
+    // compared this against `threshold` — the Silero speech PROBABILITY (0..1, default 0.5), a totally
+    // different scale — so real speech (amplitude well below 0.5) was classified as silence on EVERY
+    // frame and the fallback returned the whole buffer as a single region (no VAD at all). Derive the
+    // speech/silence cutoff ADAPTIVELY from the signal's own energy distribution instead.
+    let energies: Vec<f32> = (0..num_frames)
         .into_par_iter()
         .map(|i| {
             let start = i * hop_size;
             let end = (start + frame_size).min(pcm.len());
             let frame = &pcm[start..end];
-
-            let energy: f32 =
-                frame.iter().map(|&s| (s as f32 / i16::MAX as f32).abs()).sum::<f32>() / frame.len() as f32;
-
-            // Use threshold directly instead of threshold * 0.1 for consistency with Silero VAD.
-            energy > threshold
+            frame.iter().map(|&s| (s as f32 / i16::MAX as f32).abs()).sum::<f32>() / frame.len().max(1) as f32
         })
         .collect();
+
+    // Noise floor = 10th percentile, peak = 95th percentile (robust to outliers). A frame is speech
+    // when its amplitude rises a sensitivity-scaled fraction of the way from the noise floor toward the
+    // peak. The user's `vad_threshold` (0..1) is honored as that SENSITIVITY (higher = stricter), NOT
+    // as a raw amplitude. A small absolute floor avoids a zero cutoff on near-silent input.
+    let mut sorted = energies.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pct = |p: f32| sorted[((sorted.len() as f32 * p) as usize).min(sorted.len().saturating_sub(1))];
+    let noise_floor = pct(0.10);
+    let peak = pct(0.95);
+    let frac = threshold.clamp(0.05, 0.95) * 0.5; // 0.5 -> 0.25 of the noise->peak span
+    let amp_threshold = (noise_floor + frac * (peak - noise_floor)).max(0.005);
+    let speech_frames: Vec<bool> = energies.iter().map(|&e| e > amp_threshold).collect();
 
     let mut segments = Vec::new();
     let mut in_speech = false;
@@ -1089,6 +1182,49 @@ mod tests {
         // A 1 kHz tone is well inside the speech band and must pass through essentially intact.
         let low = resample(&tone(1_000.0), 44100, 16000);
         assert!(rms(&low) > 0.55, "1 kHz speech-band tone must be preserved, got rms {}", rms(&low));
+    }
+
+    #[test]
+    fn resample_upsampling_does_not_panic_on_overshoot_ratios() {
+        // Round-16: new_len = ceil(len * to/from) can overshoot for certain upsample ratios so the final
+        // iteration's floor(src_idx) reaches src.len(); when only `hi` was clamped, src[lo] panicked with
+        // index-out-of-bounds. 7350 Hz (44100/6) and 14700 Hz (44100/3) are real HE-AAC/legacy rates, and
+        // length 147 is a confirmed trigger. Assert these return cleanly (and at the expected length).
+        for &(from, len) in &[(14700u32, 147usize), (7350, 147), (14700, 294), (7350, 2499)] {
+            let input = vec![0.25f32; len];
+            let out = resample(&input, from, 16000);
+            let expected = (len as f64 * (16000.0 / from as f64)).ceil() as usize;
+            assert_eq!(out.len(), expected, "resample({from}->16000, len={len}) length");
+        }
+        // Spot-check the previously-safe rates still work.
+        for &from in &[8000u32, 11025, 12000, 22050, 44100, 48000] {
+            let _ = resample(&vec![0.1f32; 147], from, 16000);
+        }
+    }
+
+    #[test]
+    fn resample_attenuates_above_nyquist_tone() {
+        // Round-11 audit (aliasing): downsampling must low-pass BEFORE decimation. A tone above the new
+        // Nyquist (8 kHz for a 16 kHz target) must be attenuated, not folded into the passband. Compare
+        // a 9 kHz tone (above Nyquist) vs a 1 kHz tone (in band), both 48 kHz, after resampling to 16 kHz.
+        let sr = 48000.0f64;
+        let n = 48000usize; // 1 second
+        let tone = |hz: f64| -> Vec<f32> {
+            (0..n).map(|i| (2.0 * std::f64::consts::PI * hz * i as f64 / sr).sin() as f32).collect()
+        };
+        let energy =
+            |s: &[f32]| -> f64 { s.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / s.len().max(1) as f64 };
+
+        let e_in = energy(&resample(&tone(1000.0), 48000, 16000));
+        let e_above = energy(&resample(&tone(9000.0), 48000, 16000));
+
+        // The in-band tone passes through; the above-Nyquist tone is strongly attenuated. Before the
+        // anti-aliasing fix the 9 kHz tone aliased to 7 kHz and retained comparable (un-attenuated) energy.
+        assert!(e_in > 0.1, "in-band 1 kHz tone should pass: energy {e_in}");
+        assert!(
+            e_above < e_in * 0.1,
+            "above-Nyquist 9 kHz tone must be attenuated >10x vs in-band: {e_above} vs {e_in}"
+        );
     }
 
     #[test]

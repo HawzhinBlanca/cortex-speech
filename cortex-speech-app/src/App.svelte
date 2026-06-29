@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { get } from 'svelte/store';
   import * as api from './lib/commands';
+  import { createAutosaveController } from './lib/autosave';
   import type {
     AgenticReadiness,
     AgentImportReport,
@@ -121,11 +123,28 @@
   let latestAgentStageEvents = $state<AgentStageEvent[]>([]);
 
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle');
-  let saveTimeout: ReturnType<typeof setTimeout> | null = null;
-  // The segment id the currently-pending debounced save is for. Tracked so that switching to and
-  // editing a DIFFERENT segment within the debounce window flushes the first segment's save instead
-  // of silently cancelling it (see scheduleAutoSave).
-  let pendingSaveId: string | null = null;
+  // Debounced auto-save lives in a standalone, unit-tested controller (lib/autosave.ts). It keys the
+  // debounce per target segment and FLUSHES a queued edit before re-keying to a different segment, so
+  // switching segments mid-debounce can never silently drop the prior segment's edit (the round-16
+  // data-loss fix). The controller re-reads the fresh row at fire time and re-applies only the user's
+  // edited fields, so a concurrent background reload (WSL/import/batch completion) or a verify/normalize
+  // can't clobber an in-progress keystroke, and a row that has since been DELETED is never resurrected
+  // (getRow returns null -> no save). `pendingId()` lets delete/re-transcribe paths drop the queued
+  // edit for one specific segment without touching an unrelated segment's pending save.
+  const autosave = createAutosaveController<SpeechSegment>({
+    targetId: () => get(selectedSegment)?.id ?? null,
+    getRow: (id) => get(segments).find((s) => s.id === id) ?? null,
+    save: (row) => api.updateSegment(row),
+    onState: (s) => {
+      saveState = s;
+      if (s === 'saved') {
+        setTimeout(() => {
+          if (saveState === 'saved') saveState = 'idle';
+        }, 2000);
+      }
+    },
+    onError: (e) => notifications.error($t('notifications.saveFailed'), { detail: String(e) }),
+  });
   let tauriAvailable = $state(false);
   // Session view-state persistence: only start saving once the prior session has been restored, so
   // the initial restore->apply does not race a default-valued save over it.
@@ -202,91 +221,21 @@
     return stage.replaceAll('_', ' ');
   }
 
-  // The user-edited fields awaiting persistence, captured at edit time (NOT re-read from the store at
-  // flush time). A background segments.load() can replace the whole store array mid-debounce with fresh
-  // DB rows that DON'T contain the unsaved edit; re-reading the store then would persist the stale row
-  // and silently lose the correction. We instead merge this captured patch over the freshest row, so the
-  // user's edit always wins while any field a concurrent op changed (raw/normalized/verdict) is kept.
-  let pendingEdit: Partial<SpeechSegment> = {};
-
-  async function persistSegment(id: string, edit: Partial<SpeechSegment>) {
-    // Use the freshest store row as the base (it carries any concurrent background update) and overlay
-    // the captured user edit last so it can never be clobbered. If the row is GONE from the store, the
-    // segment was DELETED (segments.load does an atomic set(), so there is no transient-missing window) —
-    // do NOT persist, or update_segment's INSERT-ON-CONFLICT would resurrect the just-deleted row.
-    const base = $segments.find((s) => s.id === id);
-    if (!base) {
-      saveState = 'idle';
-      return;
-    }
-    const merged: SpeechSegment = { ...base, ...edit };
-    try {
-      await api.updateSegment(merged);
-      // Reflect the persisted edit back into the store so a subsequent reload doesn't revert it visually.
-      segments.update((arr) => arr.map((s) => (s.id === id ? { ...s, ...edit } : s)));
-      saveState = 'saved';
-      setTimeout(() => {
-        if (saveState === 'saved') saveState = 'idle';
-      }, 2000);
-    } catch (e) {
-      saveState = 'idle';
-      notifications.error($t('notifications.saveFailed'), { detail: String(e) });
-    }
-  }
-
-  // Immediately fire the pending debounced save (if any), cancelling its timer. Used to drain the
-  // queue before it would otherwise be discarded (segment switch, component teardown).
-  function flushPendingSave() {
-    if (saveTimeout) {
-      clearTimeout(saveTimeout);
-      saveTimeout = null;
-    }
-    const id = pendingSaveId;
-    const edit = pendingEdit;
-    pendingSaveId = null;
-    pendingEdit = {};
-    if (id) void persistSegment(id, edit);
-  }
+  // Thin delegates over the tested autosave controller (lib/autosave.ts). The controller owns the
+  // per-segment debounce, the flush-before-rekey (no dropped edit on segment switch), the fresh-row
+  // re-read + field overlay (no clobber of concurrent verify/normalize/background-reload changes), and
+  // the deleted-row guard (getRow null -> no resurrecting INSERT-ON-CONFLICT). Keeping these wrappers
+  // preserves every existing call site's intent without re-deriving that logic inline.
 
   // Cancel a pending save WITHOUT persisting — used when the pending segment is deleted, so its
   // debounced edit can't fire after the row is gone and resurrect it via INSERT-ON-CONFLICT.
   function cancelPendingSave() {
-    if (saveTimeout) {
-      clearTimeout(saveTimeout);
-      saveTimeout = null;
-    }
-    pendingSaveId = null;
-    pendingEdit = {};
+    autosave.cancel();
     if (saveState === 'saving') saveState = 'idle';
   }
 
-  function scheduleAutoSave(patch: Partial<SpeechSegment>) {
-    const seg = $selectedSegment;
-    if (!seg) {
-      saveState = 'idle';
-      return;
-    }
-    const id = seg.id;
-    // If a save is already pending for a DIFFERENT segment, flush it NOW before we reschedule —
-    // otherwise the clearTimeout below cancels it and that segment's edit is never written (the loss
-    // when a user edits segment A then switches to and edits segment B within the 1s window).
-    if (pendingSaveId && pendingSaveId !== id) {
-      flushPendingSave();
-    }
-    saveState = 'saving';
-    if (saveTimeout) clearTimeout(saveTimeout);
-    pendingSaveId = id;
-    // Accumulate the edited fields for THIS segment so multi-field edits (text + speaker) within one
-    // window all persist; keep only this segment's edits (flush above reset pendingEdit on a switch).
-    pendingEdit = { ...pendingEdit, ...patch };
-    saveTimeout = setTimeout(() => {
-      saveTimeout = null;
-      const eid = pendingSaveId;
-      const edit = pendingEdit;
-      pendingSaveId = null;
-      pendingEdit = {};
-      if (eid) void persistSegment(eid, edit);
-    }, 1000);
+  function scheduleAutoSave(edits: Partial<SpeechSegment> = {}) {
+    autosave.schedule(edits);
   }
 
   function finishEditingWord(index: number, newValue: string) {
@@ -489,7 +438,7 @@
     globalKeyboardManager?.destroy();
     // Flush (not just cancel) a pending edit on teardown so a correction typed in the last debounce
     // window before exit is still persisted, rather than silently dropped by a bare clearTimeout.
-    flushPendingSave();
+    autosave.flush();
     if (sessionSaveTimeout) clearTimeout(sessionSaveTimeout);
   });
 
@@ -567,6 +516,7 @@
         description: 'Focus search',
         action: () => document.querySelector<HTMLInputElement>('[type=search]')?.focus(),
         category: 'navigation',
+        allowInEditable: true,
       },
       {
         key: ',',
@@ -669,6 +619,7 @@
         description: 'Command palette',
         action: () => (showCommandPalette = true),
         category: 'general',
+        allowInEditable: true,
       },
     ];
     km.registerAll(shortcuts);
@@ -812,9 +763,16 @@
     }
   }
 
+  // Round-25 #10: a synchronous re-entry guard that covers the window BEFORE isProcessing is set —
+  // i.e. while the native picker and the (awaited) agentic-readiness IPC are pending. Without it, the
+  // Ctrl+O/Ctrl+I shortcuts (not gated by DOM state) could fire a second import that the backend then
+  // rejects with a confusing "Import already in progress" toast.
+  let importStarting = false;
+
   async function handleOpenFile() {
-    if ($isProcessing) return;
+    if ($isProcessing || importStarting) return;
     if (!requireDesktopRuntime()) return;
+    importStarting = true;
     try {
       const path = await api.openAudioFile();
       if (!path) return;
@@ -834,12 +792,15 @@
       pipelinePhase.set('idle');
       statusMessage.set($t('ready'));
       endOperation('open-file');
+    } finally {
+      importStarting = false;
     }
   }
 
   async function handleImport() {
-    if ($isProcessing) return;
+    if ($isProcessing || importStarting) return;
     if (!requireDesktopRuntime()) return;
+    importStarting = true;
     startOperation('import');
     try {
       await warnAgenticReadinessBeforeImport();
@@ -861,6 +822,8 @@
       pipelineTotal.set(0);
       filesProcessed.set(0);
       endOperation('import');
+    } finally {
+      importStarting = false;
     }
   }
 
@@ -871,7 +834,7 @@
     // Re-transcription replaces this segment's text with fresh MACHINE output, so drop any pending
     // autosave for it first — otherwise the debounced pre-edit annotation fires AFTER this write and
     // clobbers the new transcript (the same clobber the delete paths already cancel against).
-    if (pendingSaveId === seg.id) cancelPendingSave();
+    if (autosave.pendingId() === seg.id) cancelPendingSave();
     startOperation('transcribe');
     isProcessing.set(true);
     pipelinePhase.set('transcribing');
@@ -907,7 +870,7 @@
       // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
       // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
       // no pending debounce macrotask can interleave between the await resolving and this line.)
-      if (pendingSaveId === seg.id) cancelPendingSave();
+      if (autosave.pendingId() === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
       notifyActionableError(e, $t('errors.transcriptionFailed'));
@@ -927,7 +890,7 @@
     if (!seg || $isProcessing) return;
     if (!requireDesktopRuntime()) return;
     // Drop any pending autosave for this segment so it can't clobber the fresh machine transcript.
-    if (pendingSaveId === seg.id) cancelPendingSave();
+    if (autosave.pendingId() === seg.id) cancelPendingSave();
     startOperation('transcribe');
     isProcessing.set(true);
     pipelinePhase.set('transcribing');
@@ -946,7 +909,7 @@
       // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
       // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
       // no pending debounce macrotask can interleave between the await resolving and this line.)
-      if (pendingSaveId === seg.id) cancelPendingSave();
+      if (autosave.pendingId() === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
       notifyActionableError(e, $t('errors.transcriptionFailed'));
@@ -965,7 +928,7 @@
     if (!seg || $isProcessing) return;
     if (!requireDesktopRuntime()) return;
     // Drop any pending autosave for this segment so it can't clobber the fresh machine transcript.
-    if (pendingSaveId === seg.id) cancelPendingSave();
+    if (autosave.pendingId() === seg.id) cancelPendingSave();
     startOperation('transcribe');
     isProcessing.set(true);
     pipelinePhase.set('transcribing');
@@ -984,7 +947,7 @@
       // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
       // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
       // no pending debounce macrotask can interleave between the await resolving and this line.)
-      if (pendingSaveId === seg.id) cancelPendingSave();
+      if (autosave.pendingId() === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
       notifyActionableError(e, $t('errors.transcriptionFailed'));
@@ -1004,7 +967,7 @@
     if (!seg || $isProcessing) return;
     if (!requireDesktopRuntime()) return;
     // Drop any pending autosave for this segment so it can't clobber the fresh machine transcript.
-    if (pendingSaveId === seg.id) cancelPendingSave();
+    if (autosave.pendingId() === seg.id) cancelPendingSave();
     startOperation('transcribe');
     isProcessing.set(true);
     pipelinePhase.set('transcribing');
@@ -1018,7 +981,7 @@
       // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
       // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
       // no pending debounce macrotask can interleave between the await resolving and this line.)
-      if (pendingSaveId === seg.id) cancelPendingSave();
+      if (autosave.pendingId() === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
       notifyActionableError(e, $t('errors.transcriptionFailed'));
@@ -1142,6 +1105,14 @@
     try {
       const updatedSeg = { ...seg, verified: nextVerified };
       await api.updateSegment(updatedSeg);
+      // Invalidate any in-flight load so its stale pre-write data won't clobber the verified write.
+      // This closes the race window: a background load dispatched before this write will check its
+      // generation and return early rather than applying pre-write data.
+      segments.bumpLoadGeneration();
+      // Then re-apply verified state for consistency (in case a load started between optimize and bump).
+      segments.update((list) =>
+        list.map((s) => (s.id === seg.id ? { ...s, verified: nextVerified } : s)),
+      );
       await historyStore.refresh();
     } catch (e) {
       // Revert Svelte store state on error
@@ -1461,7 +1432,7 @@
     if ($isProcessing) return;
     if (!requireDesktopRuntime()) return;
     // Cancel a pending autosave for any segment in this batch, so its flush can't resurrect a deleted row.
-    if (pendingSaveId && ids.includes(pendingSaveId)) cancelPendingSave();
+    if (autosave.pendingId() !== null && ids.includes(autosave.pendingId()!)) cancelPendingSave();
     startOperation('batch-delete');
     isProcessing.set(true);
     statusMessage.set($t('batchDelete.progress', { n: String(ids.length) }));
@@ -1489,7 +1460,7 @@
 
     // Cancel any pending autosave for THIS segment before deleting, so its debounced flush can't fire
     // after the row is gone and resurrect it via update_segment's INSERT-ON-CONFLICT.
-    if (pendingSaveId === seg.id) cancelPendingSave();
+    if (autosave.pendingId() === seg.id) cancelPendingSave();
 
     // Optimistic Update
     const originalSegments = $segments;
@@ -1556,6 +1527,9 @@
   }
 
   function selectSegment(seg: SpeechSegment) {
+    // Persist any edit queued for the segment we're LEAVING before switching, so its debounced save
+    // is never dropped by the switch (round-16 data-loss fix).
+    autosave.flush();
     selectedSegmentId.set(seg.id);
     wordTimestamps.set(parseWordTimestamps(seg.alignmentJson));
     currentTime = chunkPlaybackRange(parseSourceMeta(seg.alignmentJson)).startTime;
@@ -2393,7 +2367,7 @@
                   id="raw-ts"
                   dir="rtl"
                   lang="ckb"
-                  class="input h-28 resize-none font-mono text-xs text-right"
+                  class="input h-28 resize-none font-mono text-xs text-end"
                   value={$selectedSegment.rawTranscript}
                   readonly
                 ></textarea>
@@ -2404,7 +2378,7 @@
                   id="norm-ts"
                   dir="rtl"
                   lang="ckb"
-                  class="input h-28 resize-none font-mono text-xs text-right"
+                  class="input h-28 resize-none font-mono text-xs text-end"
                   value={$selectedSegment.normalizedTranscript ?? ''}
                   readonly
                 ></textarea>
@@ -2486,7 +2460,7 @@
                             type="text"
                             dir="rtl"
                             lang="ckb"
-                            class="bg-cortex-800 text-white text-xs px-1 border border-cortex-500 rounded outline-none focus:ring-1 focus:ring-cortex-400 w-16 text-right"
+                            class="bg-cortex-800 text-white text-xs px-1 border border-cortex-500 rounded outline-none focus:ring-1 focus:ring-cortex-400 w-16 text-end"
                             value={w.word}
                             onblur={(e) =>
                               finishEditingWord(idx, (e.target as HTMLInputElement).value)}
@@ -2518,7 +2492,7 @@
               <textarea
                 dir="rtl"
                 lang="ckb"
-                class="input h-32 resize-none font-mono text-sm text-right"
+                class="input h-32 resize-none font-mono text-sm text-end"
                 value={$selectedSegment.annotatedTranscript ?? ''}
                 placeholder={$t('editTranscript')}
                 oninput={(e) => {

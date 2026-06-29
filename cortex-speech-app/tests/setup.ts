@@ -70,6 +70,20 @@ vi.mock('@tauri-apps/api/event', () => ({
   emit: vi.fn(() => Promise.resolve()),
 }));
 
+// jsdom does not implement ResizeObserver, but VirtualList observes its
+// container to keep the virtualization window in sync with the real viewport.
+// Without this, any test that mounts App (which renders VirtualList) throws
+// "ResizeObserver is not defined" during the onMount effect. Provide an inert
+// stub — tests don't drive layout, so observe/disconnect are no-ops.
+if (typeof globalThis.ResizeObserver === 'undefined') {
+  class MockResizeObserver {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+}
+
 // Mock window.matchMedia for theme tests
 Object.defineProperty(window, 'matchMedia', {
   writable: true,

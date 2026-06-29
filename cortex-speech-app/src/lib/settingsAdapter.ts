@@ -19,11 +19,11 @@ export interface BackendSettings {
   assign_speaker_from_filename: boolean;
   enable_diarization: boolean;
   enable_denoising: boolean;
+  autoplay_segments?: boolean;
   max_speakers: number;
   max_wer_threshold: number;
   max_cer_threshold: number;
   enforce_quality_gates: boolean;
-  autoplay_segments?: boolean;
   theme: string;
   llm_mode: string;
   llm_endpoint: string;
@@ -172,6 +172,11 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
 }
 
 export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings): BackendSettings {
+  // Round-23 #11: clearing a `<input type="number">` sets its bound value to `null` (or NaN). The Rust
+  // settings struct declares these as `u32`/`f64`, and serde rejects a present `null` — so a single
+  // emptied field made `update_settings` fail to deserialize and discarded the WHOLE save (every other
+  // edit lost). Coerce each numeric field to a finite number, falling back to the last-saved value.
+  const num = (v: number, fallback: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
   return {
     ...existing,
     theme: themeToBackend(ui.theme),
@@ -180,20 +185,24 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
     auto_align: ui.autoAlign,
     export_format: exportFormatToBackend(ui.exportFormat),
     asr_model_size: asrModelToBackend(ui.asrModel),
-    vad_threshold: ui.vadThreshold,
-    min_segment_duration_ms: ui.minSegmentSec * 1000,
-    max_segment_duration_ms: ui.maxSegmentSec * 1000,
-    num_asr_threads: ui.numThreads,
+    vad_threshold: num(ui.vadThreshold, existing.vad_threshold),
+    min_segment_duration_ms: Number.isFinite(ui.minSegmentSec)
+      ? ui.minSegmentSec * 1000
+      : existing.min_segment_duration_ms,
+    max_segment_duration_ms: Number.isFinite(ui.maxSegmentSec)
+      ? ui.maxSegmentSec * 1000
+      : existing.max_segment_duration_ms,
+    num_asr_threads: num(ui.numThreads, existing.num_asr_threads),
     enable_gpu: ui.enableGpu,
     language: ui.language,
     assign_speaker_from_filename: ui.assignSpeakerFromFilename,
     enable_diarization: ui.enableDiarization,
     enable_denoising: ui.enableDenoising,
-    max_speakers: ui.maxSpeakers,
-    max_wer_threshold: ui.maxWerThreshold,
-    max_cer_threshold: ui.maxCerThreshold,
-    enforce_quality_gates: ui.enforceQualityGates,
     autoplay_segments: ui.autoplaySegments,
+    max_speakers: num(ui.maxSpeakers, existing.max_speakers),
+    max_wer_threshold: num(ui.maxWerThreshold, existing.max_wer_threshold),
+    max_cer_threshold: num(ui.maxCerThreshold, existing.max_cer_threshold),
+    enforce_quality_gates: ui.enforceQualityGates,
     llm_mode: ui.llmMode,
     llm_endpoint: ui.llmEndpoint,
     llm_api_key: ui.llmApiKey,
@@ -203,18 +212,18 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
     llm_system_prompt: ui.llmSystemPrompt,
     llm_model: ui.llmModel,
     external_asr_script_path: ui.externalAsrScriptPath,
-    hf_train_ratio: ui.hfTrainRatio,
-    hf_val_ratio: ui.hfValRatio,
-    hf_test_ratio: ui.hfTestRatio,
-    hf_split_seed: ui.hfSplitSeed,
+    hf_train_ratio: num(ui.hfTrainRatio, existing.hf_train_ratio),
+    hf_val_ratio: num(ui.hfValRatio, existing.hf_val_ratio),
+    hf_test_ratio: num(ui.hfTestRatio, existing.hf_test_ratio),
+    hf_split_seed: num(ui.hfSplitSeed, existing.hf_split_seed),
     hf_speaker_disjoint: ui.hfSpeakerDisjoint,
     hf_license: ui.hfLicense,
     // Listening Jury
     jury_cloud_opt_in: ui.juryCloudOptIn,
     jury_model: ui.juryModel,
     source_reference_models: ui.sourceReferenceModels,
-    jury_self_consistency_n: ui.jurySelfConsistencyN,
+    jury_self_consistency_n: num(ui.jurySelfConsistencyN, existing.jury_self_consistency_n ?? 3),
     jury_autonomy_level: ui.juryAutonomyLevel,
-    jury_t1_threshold: ui.juryT1Threshold,
+    jury_t1_threshold: num(ui.juryT1Threshold, existing.jury_t1_threshold ?? 0.75),
   };
 }

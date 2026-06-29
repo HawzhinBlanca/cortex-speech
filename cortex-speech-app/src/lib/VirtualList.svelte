@@ -18,9 +18,15 @@
   let containerHeight = $state(600);
   let totalHeight = $derived(items.length * itemHeight);
 
-  let startIndex = $derived(Math.max(0, Math.floor(scrollTop / itemHeight) - overscan));
+  // Clamp scrollTop against the CURRENT content height. When `items` shrinks (e.g. a search filter
+  // narrows the list) while scrolled down, the stale scrollTop is only reset by the browser's async
+  // scroll-clamp event; until then a raw scrollTop would make startIndex exceed endIndex, yielding an
+  // empty slice and a blank frame. Clamping keeps startIndex <= endIndex so matches render immediately.
+  let effScroll = $derived(Math.min(scrollTop, Math.max(0, totalHeight - containerHeight)));
+
+  let startIndex = $derived(Math.max(0, Math.floor(effScroll / itemHeight) - overscan));
   let endIndex = $derived(
-    Math.min(items.length, Math.ceil((scrollTop + containerHeight) / itemHeight) + overscan),
+    Math.min(items.length, Math.ceil((effScroll + containerHeight) / itemHeight) + overscan),
   );
   let visibleItems = $derived(items.slice(startIndex, endIndex));
   let offsetY = $derived(startIndex * itemHeight);

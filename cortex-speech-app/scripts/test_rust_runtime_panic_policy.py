@@ -544,16 +544,20 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
 
 def test_commands_batch_transcribe_reports_insert_failures() -> None:
     commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    # Batch transcribe writes results through a GUARDED targeted update
+    # (update_batch_transcription_if_unreviewed) rather than a full insert_segment of the prefetched
+    # (now-stale) snapshot, so a concurrent human verify/edit is never clobbered. It must STILL snapshot
+    # the pre-transcription row for undo and report DB-write failures explicitly (never swallow them).
     required = [
-        "match app_state.lock_db().insert_segment(&seg)",
-        'tracing::error!("Batch transcribe DB insert failed for {id}: {error}")',
+        "match app_state.lock_db().update_batch_transcription_if_unreviewed(",
+        'tracing::error!("Batch transcribe DB update failed for {id}: {error}")',
         "previous_segments.push(pre_transcription_snapshot);",
         "transcribed_ids.push(id.clone());",
     ]
     missing = [pattern for pattern in required if pattern not in commands]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
-        raise AssertionError(f"commands.rs is missing explicit batch-transcribe insert handling:\n{formatted}")
+        raise AssertionError(f"commands.rs is missing explicit batch-transcribe write-failure handling:\n{formatted}")
 
 
 def test_commands_jury_evidence_serialization_is_not_silent() -> None:
@@ -1162,16 +1166,11 @@ def test_asr_pool_recovers_poisoned_state_lock() -> None:
         raise AssertionError("asr.rs must keep a unit test for poisoned ASR pool-state recovery")
 
 
-def test_ood_session_recovers_poisoned_lock() -> None:
-    ood = (REPO_ROOT / "src-tauri/src/quality/ood.rs").read_text(encoding="utf-8")
-    if "fn lock_session<T>(session: &Mutex<T>) -> MutexGuard<'_, T>" not in ood:
-        raise AssertionError("OodDetector must centralize session locking behind lock_session()")
-    if "Recovering poisoned OOD session lock" not in ood:
-        raise AssertionError("OodDetector must warn when recovering a poisoned session lock")
-    if "poisoned.into_inner()" not in ood:
-        raise AssertionError("OodDetector must recover poisoned session locks with poisoned.into_inner()")
-    if "ood_session_lock_recovers_poisoned_lock" not in ood:
-        raise AssertionError("quality/ood.rs must keep a unit test for poisoned OOD session recovery")
+# NOTE: test_ood_session_recovers_poisoned_lock was intentionally removed. The OOD detector no longer
+# holds an ONNX session to lock: the fabricated WavLM / sine-wave-centroid OOD path was deleted for
+# honesty (Round-24 — it scored OOD as distance to a synthetic sine wave) and replaced with a
+# session-free signal-processing heuristic (ZCR + frame-energy variance) in quality/ood.rs. There is no
+# session lock left to poison-recover; re-asserting one here would force re-introducing the dishonest path.
 
 
 def test_global_rate_limiter_recovers_poisoned_lock() -> None:
@@ -1426,7 +1425,6 @@ def main() -> None:
     test_batch_processor_asr_errors_are_not_blank_transcripts()
     test_pipeline_hypothesis_population_reports_failures()
     test_asr_pool_recovers_poisoned_state_lock()
-    test_ood_session_recovers_poisoned_lock()
     test_global_rate_limiter_recovers_poisoned_lock()
     test_audio_fingerprint_cache_recovers_poisoned_lock()
     test_transcript_cache_recovers_poisoned_lock_and_never_zero_capacity()

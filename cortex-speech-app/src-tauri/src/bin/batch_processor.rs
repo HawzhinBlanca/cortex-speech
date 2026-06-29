@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let (_sample_rate, full_pcm) = match audio::decode_to_pcm(path) {
+        let (sample_rate, full_pcm) = match audio::decode_to_pcm(path) {
             Ok(decoded) => decoded,
             Err(e) => {
                 error!("Failed to decode {}: {}", audio_path, e);
@@ -85,27 +85,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut to_delete = Vec::new();
 
         for mut seg in segments {
-            // Parse alignment JSON
-            let alignment: serde_json::Value = if let Some(j) = &seg.alignment_json {
-                serde_json::from_str(j).unwrap_or(serde_json::json!({}))
-            } else {
-                serde_json::json!({})
+            // Slice the per-chunk window from the SAME canonical schema the app writes
+            // (source_start_ms / source_end_ms via SegmentSourceMeta) and errors on. The previous code
+            // read non-existent `source_start_sample`/`source_end_sample` keys and `unwrap_or`-ed into
+            // (0, full_pcm.len()), so EVERY chunk of a multi-chunk file was transcribed against the
+            // WHOLE file and persisted as verified — corrupting the dataset. On a missing/unreadable
+            // window we now SKIP the segment rather than transcribe the whole file.
+            let chunk_pcm: Vec<i16> = match cortex_speech_app_lib::chunking::slice_pcm_by_alignment(
+                &full_pcm,
+                sample_rate,
+                seg.alignment_json.as_deref(),
+            ) {
+                Ok((pcm, _suffix)) => pcm,
+                Err(error) => {
+                    warn!("Skipping segment {}: cannot slice chunk window: {error}", seg.id);
+                    to_delete.push(seg.id.clone());
+                    continue;
+                }
             };
-
-            let start_sample = alignment["source_start_sample"].as_u64().unwrap_or(0) as usize;
-            let end_sample = alignment["source_end_sample"].as_u64().unwrap_or(full_pcm.len() as u64) as usize;
-
-            let safe_start = start_sample.min(full_pcm.len());
-            let safe_end = end_sample.min(full_pcm.len());
-
-            if safe_end <= safe_start {
-                warn!("Invalid chunk boundaries for {}. Deleting.", seg.id);
-                to_delete.push(seg.id.clone());
-                continue;
-            }
-
-            let chunk_pcm = &full_pcm[safe_start..safe_end];
-            if audio::is_silent(chunk_pcm) {
+            if audio::is_silent(&chunk_pcm) {
                 to_delete.push(seg.id.clone());
                 continue;
             }

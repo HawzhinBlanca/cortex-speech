@@ -69,6 +69,14 @@ pub struct BaselineComparison {
     pub paired_segments: usize,
     pub baseline_micro_wer: f64,
     pub system_micro_wer: f64,
+    /// PAIRED micro-CER over the same gold-id intersection as the WER figures above. The promotion
+    /// gate must compare CER on this paired basis — NOT the challenger's full-set micro_cer against the
+    /// champion's frozen stored gold_cer, which can be computed over a different (grown) gold set and
+    /// would let a CER-regressing model pass when evaluated on an easier/larger superset.
+    #[serde(default)]
+    pub baseline_micro_cer: f64,
+    #[serde(default)]
+    pub system_micro_cer: f64,
     pub mapsswe_p_value: f64,
     pub significant_at_05: bool,
     /// True only if the system's paired WER is lower AND the difference is significant.
@@ -76,9 +84,18 @@ pub struct BaselineComparison {
     /// Human-readable description of any per-condition SLICE on which the challenger REGRESSES vs the
     /// baseline (e.g. a length class), even though the aggregate improved. A non-empty list blocks
     /// promotion: shipping a model that is better on average but worse on a slice trades one
-    /// population's accuracy for another. Empty = no slice regressed (or too little data to slice).
+    /// population's accuracy for another. Empty means no slice regressed — but ONLY among the slices
+    /// that had enough data to be evaluated; see [`evaluated_slices`](Self::evaluated_slices).
     #[serde(default)]
     pub slice_regressions: Vec<String>,
+    /// How many length slices actually had enough paired data (>= `MIN_SLICE_SEGS`) to be EVALUATED
+    /// for regression. This disambiguates the two cases an empty `slice_regressions` used to conflate:
+    /// "all slices evaluated, none regressed" (`evaluated_slices > 0`) vs "no slice could be evaluated
+    /// at all" (`evaluated_slices == 0`). The promotion gate treats the latter as UNVERIFIED — not an
+    /// affirmative slice-gate pass — so a small gold set cannot launder unverified slice coverage into
+    /// a green promotion.
+    #[serde(default)]
+    pub evaluated_slices: usize,
 }
 
 /// A complete, reproducible scorecard.
@@ -194,12 +211,18 @@ pub fn build_scorecard(result: &EvalRunResult, baseline: Option<&EvalRunResult>,
     }
 }
 
-/// Paired comparison: align segments by `gold_id`, compute per-segment word errors for
-/// both systems on the shared set, and run MAPSSWE. Only the intersection is used —
-/// the only statistically valid basis for a paired test.
+/// Paired comparison: align segments by the stable `audio_path` (NOT the volatile `gold_id` UUID,
+/// which a gold re-import re-mints), compute per-segment word errors for both systems on the shared
+/// set, and run MAPSSWE. Only the intersection is used — the only statistically valid basis for a
+/// paired test.
 /// Utterance-length difficulty slice — a per-condition slice that needs no extra gold metadata.
+///
+/// Count over the SAME normalized token stream the WER uses (`normalize_for_metrics` splits ZWNJ into
+/// a space, so a raw `split_whitespace` count disagrees with the metric's effective word count on
+/// ZWNJ-joined Sorani words). Bucketing on the raw count would file a segment under the wrong slice and
+/// corrupt the promotion-blocking slice-regression gate.
 fn length_slice(reference: &str) -> &'static str {
-    match reference.split_whitespace().count() {
+    match wer::tokenize_words(&wer::normalize_for_metrics(reference)).len() {
         0..=4 => "short (≤4 words)",
         5..=15 => "medium (5–15 words)",
         _ => "long (>15 words)",
@@ -207,20 +230,33 @@ fn length_slice(reference: &str) -> &'static str {
 }
 
 fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> BaselineComparison {
+    // Pair the two runs on the STABLE natural key audio_path, NOT gold_id. gold_id is a fresh UUID
+    // minted on every re-import (import_gold_segments DELETEs the old gold row for an audio_path and
+    // re-inserts with a new Uuid::new_v4), and persisted eval_segment_results keep the OLD id (there is
+    // no FK repointing them). So a baseline reconstructed from a run persisted BEFORE a gold re-mark
+    // carries different gold_ids than a fresh challenger, the intersection collapses to empty, and the
+    // whole MAPSSWE promotion test (and its slice-regression gate) silently no-ops on identical clips.
+    // audio_path is the logical identity of a gold clip (the column import_gold_segments itself dedups
+    // on) and is unique per run, so it survives re-import.
     let base_by_id: HashMap<&str, &crate::eval::EvalSegmentResult> =
-        baseline.segments.iter().map(|s| (s.gold_id.as_str(), s)).collect();
+        baseline.segments.iter().map(|s| (s.audio_path.as_str(), s)).collect();
 
     let mut sys_errs = Vec::new();
     let mut base_errs = Vec::new();
+    // Paired CHAR errors over the same gold-id intersection, so the CER gate is paired like the WER gate.
+    let mut sys_cer_errs = Vec::new();
+    let mut base_cer_errs = Vec::new();
     // Per-condition slice accumulation (challenger vs baseline word errors, grouped by slice).
     let mut by_slice: std::collections::BTreeMap<&'static str, (Vec<SegmentError>, Vec<SegmentError>)> =
         std::collections::BTreeMap::new();
     for s in &system.segments {
-        if let Some(b) = base_by_id.get(s.gold_id.as_str()) {
+        if let Some(b) = base_by_id.get(s.audio_path.as_str()) {
             let se = word_error(&s.reference, &s.hypothesis);
             let be = word_error(&b.reference, &b.hypothesis);
             sys_errs.push(se);
             base_errs.push(be);
+            sys_cer_errs.push(char_error(&s.reference, &s.hypothesis));
+            base_cer_errs.push(char_error(&b.reference, &b.hypothesis));
             let slot = by_slice.entry(length_slice(&s.reference)).or_default();
             slot.0.push(se);
             slot.1.push(be);
@@ -229,6 +265,8 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
 
     let system_micro_wer = micro_rate(&sys_errs);
     let baseline_micro_wer = micro_rate(&base_errs);
+    let system_micro_cer = micro_rate(&sys_cer_errs);
+    let baseline_micro_cer = micro_rate(&base_cer_errs);
     let p = mapsswe(&sys_errs, &base_errs);
     let significant = p < 0.05;
 
@@ -236,10 +274,12 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
     const MIN_SLICE_SEGS: usize = 5;
     const SLICE_REGRESSION_TOL: f64 = 0.05; // absolute WER
     let mut slice_regressions = Vec::new();
+    let mut evaluated_slices = 0usize;
     for (name, (s_errs, b_errs)) in &by_slice {
         if s_errs.len() < MIN_SLICE_SEGS {
             continue; // too few to slice without noise
         }
+        evaluated_slices += 1;
         let s_wer = micro_rate(s_errs);
         let b_wer = micro_rate(b_errs);
         if s_wer > b_wer + SLICE_REGRESSION_TOL {
@@ -255,10 +295,13 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
         paired_segments: sys_errs.len(),
         baseline_micro_wer,
         system_micro_wer,
+        baseline_micro_cer,
+        system_micro_cer,
         mapsswe_p_value: p,
         significant_at_05: significant,
         beats_baseline: significant && system_micro_wer < baseline_micro_wer,
         slice_regressions,
+        evaluated_slices,
     }
 }
 
@@ -587,8 +630,22 @@ mod tests {
     }
 
     #[test]
+    fn length_slice_counts_normalized_tokens_not_raw_zwnj() {
+        // Round-12 audit: bucket on the SAME normalized token stream the WER uses. ZWNJ (U+200C) is not
+        // whitespace, so normalize_for_metrics splits it into a space and yields one more word than a
+        // raw split_whitespace count. A 4-raw / 5-normalized-token reference must bucket as "medium",
+        // not "short", or the promotion-blocking slice gate is computed over a mis-bucketed population.
+        let r = "ئەو\u{200C}کەسە لە ماڵ بوو"; // first token joins ئەو + کەسە with a ZWNJ
+        assert_eq!(r.split_whitespace().count(), 4, "raw whitespace count is 4");
+        assert_eq!(length_slice(r), "medium (5–15 words)");
+    }
+
+    #[test]
     fn beats_baseline_only_when_lower_and_significant() {
-        let pairs: Vec<(&str, &str)> = (0..12).map(|_| ("/x.wav", "one two three four five")).collect();
+        // Distinct audio paths per segment: gold rows are per-file and re-marking the same file is now
+        // idempotent, so identical paths would collapse into a single gold row.
+        let paths: Vec<String> = (0..12).map(|i| format!("/x{i}.wav")).collect();
+        let pairs: Vec<(&str, &str)> = paths.iter().map(|p| (p.as_str(), "one two three four five")).collect();
         // System: perfect on every segment. Baseline: one error on every segment.
         let sys_hyps: Vec<&str> = (0..12).map(|_| "one two three four five").collect();
         let base_hyps: Vec<&str> = (0..12).map(|_| "one two three four WRONG").collect();
@@ -603,9 +660,79 @@ mod tests {
         assert!(cmp.beats_baseline);
     }
 
+    // A gold re-import (re-mark a clip / re-import the holdout) DELETEs the gold row and re-inserts it
+    // with a fresh gold_id UUID, but the audio_path is stable. A baseline run persisted BEFORE the
+    // re-import keeps the OLD gold_id; a challenger run after it has the NEW gold_id. Pairing on gold_id
+    // would collapse the intersection to 0 and silently no-op the whole MAPSSWE promotion test on
+    // identical clips. Pairing on audio_path must survive the re-import. This reproduces the exact
+    // persist-baseline → re-import-gold → run-challenger → reconstruct-baseline sequence.
+    #[test]
+    fn paired_comparison_survives_gold_reimport_via_audio_path() {
+        use crate::eval::load_eval_run_and_recompute;
+
+        let db = open_mem_db();
+        let pairs = [
+            ("/g/1.wav", "ساڵی نوێ پیرۆز بێت"),
+            ("/g/2.wav", "ئەو لە کوردستان دەژی"),
+            ("/g/3.wav", "کتێبەکە زۆر باش بوو"),
+        ];
+        let inputs: Vec<GoldSegmentInput> = pairs
+            .iter()
+            .map(|(audio, reference)| GoldSegmentInput {
+                audio_path: (*audio).to_string(),
+                reference: (*reference).to_string(),
+                is_holdout: true,
+            })
+            .collect();
+
+        // 1. Import gold + run the baseline; eval_segment_results persist with the ORIGINAL gold_ids.
+        import_gold_segments(&db, inputs.clone()).unwrap();
+        let gold_old = list_gold_segments(&db).unwrap();
+        let base_hyps: Vec<(String, String)> =
+            gold_old.iter().map(|g| (g.id.clone(), "one two three four".to_string())).collect();
+        let baseline_persisted = run_gold_eval(&db, "champion", base_hyps).unwrap();
+        let baseline_run_id = baseline_persisted.run.id.clone();
+
+        // 2. Re-mark the SAME clips as gold → DELETE old rows + re-insert with FRESH gold_ids.
+        import_gold_segments(&db, inputs).unwrap();
+        let gold_new = list_gold_segments(&db).unwrap();
+        // Sanity: the re-import really did mint new ids (otherwise the test proves nothing).
+        let old_ids: std::collections::HashSet<&str> = gold_old.iter().map(|g| g.id.as_str()).collect();
+        assert!(
+            gold_new.iter().all(|g| !old_ids.contains(g.id.as_str())),
+            "re-import must mint fresh gold_ids for the test to be meaningful"
+        );
+
+        // 3. Run the challenger against the NEW gold_ids (perfect transcripts).
+        let chal_hyps: Vec<(String, String)> = gold_new.iter().map(|g| (g.id.clone(), g.reference.clone())).collect();
+        let challenger = run_gold_eval(&db, "challenger", chal_hyps).unwrap();
+
+        // 4. Reconstruct the baseline from its persisted rows — it carries the OLD gold_ids.
+        let (run, segments) =
+            load_eval_run_and_recompute(&db, &baseline_run_id).unwrap().expect("baseline run reloads");
+        let baseline = EvalRunResult { run, segments };
+        // Confirm the gold_ids really diverged between the two runs (the root cause).
+        let chal_gold_ids: std::collections::HashSet<&str> =
+            challenger.segments.iter().map(|s| s.gold_id.as_str()).collect();
+        assert!(
+            baseline.segments.iter().all(|s| !chal_gold_ids.contains(s.gold_id.as_str())),
+            "baseline gold_ids must differ from challenger's (proving gold_id pairing would give 0)"
+        );
+
+        // 5. The paired comparison must still pair all 3 shared clips via audio_path.
+        let sc = build_scorecard(&challenger, Some(&baseline), ScorecardOptions::default());
+        let cmp = sc.vs_baseline.expect("baseline comparison present");
+        assert_eq!(
+            cmp.paired_segments, 3,
+            "paired comparison must survive a gold re-import by keying on audio_path, not gold_id"
+        );
+        assert!(cmp.system_micro_wer < cmp.baseline_micro_wer, "perfect challenger must beat the lossy baseline");
+    }
+
     #[test]
     fn identical_system_does_not_beat_itself() {
-        let pairs: Vec<(&str, &str)> = (0..12).map(|_| ("/x.wav", "one two three")).collect();
+        let paths: Vec<String> = (0..12).map(|i| format!("/x{i}.wav")).collect();
+        let pairs: Vec<(&str, &str)> = paths.iter().map(|p| (p.as_str(), "one two three")).collect();
         let hyps: Vec<&str> = (0..12).map(|_| "one two WRONG").collect();
         let (a, b) = eval_pair(&pairs, &hyps, &hyps, "a", "b");
         let sc = build_scorecard(&a, Some(&b), ScorecardOptions::default());

@@ -7,6 +7,11 @@ pub struct WordTimestamp {
     pub word: String,
     pub start: f64,
     pub end: f64,
+    // Default to 0.0 when absent. Without this, a caller-supplied alignment_json whose words omit
+    // `confidence` failed to deserialize, word_timestamps_from_alignment returned None, and
+    // is_low_confidence FAILED OPEN (returned false) — letting a low/zero-confidence segment escape the
+    // quality gate. A missing confidence now reads as 0.0 (low) and is correctly flagged.
+    #[serde(default)]
     pub confidence: f64,
 }
 
