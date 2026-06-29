@@ -2230,11 +2230,39 @@ impl ProcessingPipeline {
         let pcm = chunking::slice_pcm_by_alignment(&pcm, sample_rate, alignment_json)?.0;
 
         let timer = crate::inference::InferenceTimer::start("align");
+        // Prefer REAL CTC forced alignment from the fine-tuned MMS-CTC (Wav2Vec2 char-head) model when
+        // it is installed — exact per-word boundaries from the same model family that transcribes, vs
+        // the bundled aligner or the energy heuristic.
+        if let Some(words) = Self::align_via_finetuned_mms(&pcm, text) {
+            timer.finish(true);
+            return Ok((words, aligner::AlignmentQuality::CtcForced));
+        }
         let aligner = aligner::ForcedAligner::new(&self.model_manager.models_dir, self.settings.enable_gpu)
             .map_err(AppError::Other)?;
         let result = aligner.align(&pcm, audio::TARGET_SAMPLE_RATE, text);
         timer.finish(result.is_ok());
         Ok(result?)
+    }
+
+    /// Real CTC forced alignment of a known transcript against the fine-tuned MMS-CTC (Wav2Vec2)
+    /// model's emissions, when that model is installed. Returns None (caller falls back to the bundled
+    /// aligner / energy heuristic) if the model is absent or the alignment is degenerate.
+    fn align_via_finetuned_mms(pcm: &[i16], text: &str) -> Option<Vec<aligner::WordTimestamp>> {
+        if text.trim().is_empty() || pcm.is_empty() {
+            return None;
+        }
+        let (onnx, vocab) = Self::finetuned_model_paths()?;
+        let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+        let (logits, frames, vocab_size, tokens) =
+            crate::wav2vec2_asr::wav2vec2_logits(&onnx, &vocab, "ckb", &f32_pcm).ok()?;
+        if frames == 0 {
+            return None;
+        }
+        // Derive the per-frame stride from the model's own downsampling (≈0.02 s at 16 kHz) so the
+        // frame→time mapping is exact regardless of the export's frame rate.
+        let frame_sec = (pcm.len() as f64 / audio::TARGET_SAMPLE_RATE as f64) / frames as f64;
+        let blank_idx = tokens.iter().position(|t| t == "<pad>").unwrap_or(0);
+        aligner::ctc_logits_to_word_timestamps(&logits, frames, vocab_size, &tokens, blank_idx, text, frame_sec)
     }
 
     pub fn get_waveform(

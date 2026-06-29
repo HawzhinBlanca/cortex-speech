@@ -138,111 +138,11 @@ impl ForcedAligner {
             return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
         }
         let blank_idx = self.tokens.iter().position(|t| t == "<pad>" || t == "_" || t == "<blank>").unwrap_or(0);
-        // The blank token's line index in tokens.txt must address a real column of the CTC logits. A
-        // mismatched model/tokens pair (more token lines than the model's emitted vocab dim) with the
-        // blank past vocab_size would index logits out of bounds and PANIC the alignment worker. Degrade
-        // to the energy heuristic like the other corrupt-model guards above. (Char tokens are already
-        // filtered `idx < vocab_size`, so blank_idx is the only token that can exceed the vocab.)
-        if blank_idx >= vocab_size {
-            return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
+        // The bundled MMS aligner runs at ~50 fps (20 ms/frame) at 16 kHz, matching the 0.02 stride.
+        match ctc_logits_to_word_timestamps(logits, num_frames, vocab_size, &self.tokens, blank_idx, text, 0.02) {
+            Some(word_timestamps) => Ok((word_timestamps, AlignmentQuality::CtcForced)),
+            None => Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic)),
         }
-
-        // Tokenize text
-        let words: Vec<&str> = text.split_whitespace().collect();
-        let mut target_tokens = Vec::new();
-        let mut word_char_to_token_idx = Vec::new();
-
-        for &w in &words {
-            let mut char_indices = Vec::new();
-            for c in w.chars() {
-                let char_str = c.to_lowercase().to_string();
-                if let Some(idx) = self.tokens.iter().position(|t| t == &char_str) {
-                    if idx < vocab_size && idx != blank_idx {
-                        char_indices.push(Some(target_tokens.len()));
-                        target_tokens.push(idx);
-                        continue;
-                    }
-                }
-                char_indices.push(None);
-            }
-            word_char_to_token_idx.push(char_indices);
-        }
-
-        if target_tokens.is_empty() {
-            return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
-        }
-
-        let (path, _best_val) = ctc_align(logits, vocab_size, &target_tokens, blank_idx);
-        if path.is_empty() {
-            return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
-        }
-
-        // Map path back to character index ranges
-        let mut char_alignments = vec![(0usize, 0usize); target_tokens.len()];
-        let mut active_state = usize::MAX;
-        let mut start_frame = 0;
-
-        for (f, &state) in path.iter().enumerate() {
-            if state != active_state {
-                if active_state != usize::MAX && active_state % 2 == 1 {
-                    let char_idx = active_state / 2;
-                    if char_idx < char_alignments.len() {
-                        char_alignments[char_idx] = (start_frame, f);
-                    }
-                }
-                active_state = state;
-                start_frame = f;
-            }
-        }
-        if active_state != usize::MAX && active_state % 2 == 1 {
-            let char_idx = active_state / 2;
-            if char_idx < char_alignments.len() {
-                char_alignments[char_idx] = (start_frame, num_frames);
-            }
-        }
-
-        let mut word_timestamps = Vec::new();
-
-        for (word_idx, &word) in words.iter().enumerate() {
-            let char_indices = &word_char_to_token_idx[word_idx];
-            let mut word_start_frame = usize::MAX;
-            let mut word_end_frame = 0;
-
-            for &opt_idx in char_indices {
-                if let Some(token_idx) = opt_idx {
-                    if token_idx < char_alignments.len() {
-                        let (s, e) = char_alignments[token_idx];
-                        if s < e {
-                            if s < word_start_frame {
-                                word_start_frame = s;
-                            }
-                            if e > word_end_frame {
-                                word_end_frame = e;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let prev_end = word_timestamps.last().map(|w: &WordTimestamp| w.end).unwrap_or(0.0);
-            let raw_start = if word_start_frame != usize::MAX { word_start_frame as f64 * 0.02 } else { prev_end };
-            // Enforce monotonicity: a word never starts before the previous one ended. CTC per-word
-            // frame ranges can be out of order / overlap for characters that mis-aligned (or never
-            // aligned), which otherwise yields word timestamps that jump backwards — breaking the
-            // karaoke highlight and word-tap seeks.
-            let start_time = raw_start.max(prev_end);
-            let raw_end = if word_end_frame > 0 { word_end_frame as f64 * 0.02 } else { start_time + 0.25 };
-            let end_time = raw_end.max(start_time + 0.02);
-
-            word_timestamps.push(WordTimestamp {
-                word: word.to_string(),
-                start: start_time,
-                end: end_time,
-                confidence: 0.95,
-            });
-        }
-
-        Ok((word_timestamps, AlignmentQuality::CtcForced))
     }
 
     pub fn score_consistency(&self, pcm: &[i16], _sample_rate: u32, text: &str) -> Result<f64, String> {
@@ -443,6 +343,108 @@ fn speech_bounds_sec(pcm: &[i16], sample_rate: u32) -> Option<(f64, f64)> {
     Some((start, end))
 }
 
+/// Forced-align a KNOWN transcript against CTC emission logits, returning per-word timestamps.
+/// Shared by the bundled MMS aligner model and the fine-tuned MMS-CTC (Wav2Vec2) path. `logits` is the
+/// flat `[num_frames * vocab_size]` row-major emission matrix, `tokens` the CHAR vocabulary (line index
+/// = logits column), and `frame_sec` the model's per-frame stride in seconds (≈0.02 at 16 kHz for both
+/// models). Returns None when the inputs are degenerate or the text has no alignable characters, so the
+/// caller can fall back to the energy heuristic.
+pub fn ctc_logits_to_word_timestamps(
+    logits: &[f32],
+    num_frames: usize,
+    vocab_size: usize,
+    tokens: &[String],
+    blank_idx: usize,
+    text: &str,
+    frame_sec: f64,
+) -> Option<Vec<WordTimestamp>> {
+    if num_frames == 0 || vocab_size == 0 || blank_idx >= vocab_size || logits.len() < num_frames * vocab_size {
+        return None;
+    }
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut target_tokens = Vec::new();
+    let mut word_char_to_token_idx = Vec::new();
+    for &w in &words {
+        let mut char_indices = Vec::new();
+        for c in w.chars() {
+            let char_str = c.to_lowercase().to_string();
+            if let Some(idx) = tokens.iter().position(|t| t == &char_str) {
+                if idx < vocab_size && idx != blank_idx {
+                    char_indices.push(Some(target_tokens.len()));
+                    target_tokens.push(idx);
+                    continue;
+                }
+            }
+            char_indices.push(None);
+        }
+        word_char_to_token_idx.push(char_indices);
+    }
+    if target_tokens.is_empty() {
+        return None;
+    }
+
+    let (path, _best_val) = ctc_align(logits, vocab_size, &target_tokens, blank_idx);
+    if path.is_empty() {
+        return None;
+    }
+
+    // Map the Viterbi path back to per-character frame ranges (odd states emit char `state/2`).
+    let mut char_alignments = vec![(0usize, 0usize); target_tokens.len()];
+    let mut active_state = usize::MAX;
+    let mut start_frame = 0;
+    for (f, &state) in path.iter().enumerate() {
+        if state != active_state {
+            if active_state != usize::MAX && active_state % 2 == 1 {
+                let char_idx = active_state / 2;
+                if char_idx < char_alignments.len() {
+                    char_alignments[char_idx] = (start_frame, f);
+                }
+            }
+            active_state = state;
+            start_frame = f;
+        }
+    }
+    if active_state != usize::MAX && active_state % 2 == 1 {
+        let char_idx = active_state / 2;
+        if char_idx < char_alignments.len() {
+            char_alignments[char_idx] = (start_frame, num_frames);
+        }
+    }
+
+    let mut word_timestamps = Vec::new();
+    for (word_idx, &word) in words.iter().enumerate() {
+        let char_indices = &word_char_to_token_idx[word_idx];
+        let mut word_start_frame = usize::MAX;
+        let mut word_end_frame = 0;
+        for &opt_idx in char_indices {
+            if let Some(token_idx) = opt_idx {
+                if token_idx < char_alignments.len() {
+                    let (s, e) = char_alignments[token_idx];
+                    if s < e {
+                        word_start_frame = word_start_frame.min(s);
+                        word_end_frame = word_end_frame.max(e);
+                    }
+                }
+            }
+        }
+        // Enforce monotonicity: a word never starts before the previous one ended (mis-aligned chars
+        // could otherwise jump backwards and break the karaoke highlight / word-tap seeks).
+        let prev_end = word_timestamps.last().map(|w: &WordTimestamp| w.end).unwrap_or(0.0);
+        let raw_start = if word_start_frame != usize::MAX { word_start_frame as f64 * frame_sec } else { prev_end };
+        let start_time = raw_start.max(prev_end);
+        let raw_end = if word_end_frame > 0 { word_end_frame as f64 * frame_sec } else { start_time + 0.25 };
+        let end_time = raw_end.max(start_time + frame_sec);
+        word_timestamps.push(WordTimestamp {
+            word: word.to_string(),
+            start: start_time,
+            end: end_time,
+            confidence: 0.95,
+        });
+    }
+    Some(word_timestamps)
+}
+
 fn fallback_align(pcm: &[i16], sample_rate: u32, text: &str) -> Vec<WordTimestamp> {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
@@ -629,6 +631,31 @@ mod tests {
         // All-silence clip degrades to spanning the whole duration rather than collapsing to zero.
         let silent = fallback_align(&vec![0i16; sr * 2], sr as u32, "یەک دوو");
         assert!((silent[1].end - 2.0).abs() < 0.05, "silent clip spans full duration, got {}", silent[1].end);
+    }
+
+    #[test]
+    fn ctc_logits_to_word_timestamps_aligns_chars_to_emitting_frames() {
+        // 4 frames over vocab ["<pad>"(blank), "a", "b", "c"]: frame0 emits 'a', frame1 emits 'b',
+        // frames 2-3 are blank. The word "ab" must align to roughly [0, 2 frames] = [0, 0.04s] — a real
+        // CTC alignment, NOT the heuristic's even spread across the whole clip.
+        let tokens: Vec<String> = ["<pad>", "a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        #[rustfmt::skip]
+        let logits = vec![
+            0.0, 10.0, 0.0, 0.0, // frame 0 -> a
+            0.0, 0.0, 10.0, 0.0, // frame 1 -> b
+            10.0, 0.0, 0.0, 0.0, // frame 2 -> blank
+            10.0, 0.0, 0.0, 0.0, // frame 3 -> blank
+        ];
+        let out = ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 0, "ab", 0.02).expect("alignment");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].word, "ab");
+        assert!(out[0].start < out[0].end, "start before end");
+        assert!(out[0].start <= 0.01, "word starts near frame 0, got {}", out[0].start);
+        assert!(out[0].end <= 0.05, "word ends near frame 2 (not smeared to clip end), got {}", out[0].end);
+        // Degenerate inputs degrade to None so the caller can fall back to the heuristic.
+        assert!(ctc_logits_to_word_timestamps(&logits, 0, 4, &tokens, 0, "ab", 0.02).is_none());
+        assert!(ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 9, "ab", 0.02).is_none(), "blank past vocab");
+        assert!(ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 0, "xyz", 0.02).is_none(), "no alignable chars");
     }
 
     #[test]
