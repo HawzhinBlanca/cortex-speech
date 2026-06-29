@@ -146,7 +146,7 @@ fn build_agentic_readiness(
             "source_reference",
             "Whole-file source references",
             "ready",
-            "Offline mode: local multi-model consensus is used. Enable jury cloud opt-in to also cross-check against Gemini whole-file references.",
+            "Offline mode: cloud whole-file references are off by choice (an optional cross-check; whether local consensus can run is reported by the hypothesis-coverage check). Enable jury cloud opt-in to add Gemini whole-file references.",
         ));
     } else if settings.llm_api_key.trim().is_empty() {
         checks.push(readiness_check(

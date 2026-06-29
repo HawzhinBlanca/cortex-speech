@@ -413,6 +413,7 @@ pub fn ctc_logits_to_word_timestamps(
     }
 
     let mut word_timestamps = Vec::new();
+    let mut aligned_chars = 0usize;
     for (word_idx, &word) in words.iter().enumerate() {
         let char_indices = &word_char_to_token_idx[word_idx];
         let mut word_start_frame = usize::MAX;
@@ -422,6 +423,7 @@ pub fn ctc_logits_to_word_timestamps(
                 if token_idx < char_alignments.len() {
                     let (s, e) = char_alignments[token_idx];
                     if s < e {
+                        aligned_chars += 1;
                         word_start_frame = word_start_frame.min(s);
                         word_end_frame = word_end_frame.max(e);
                     }
@@ -435,14 +437,44 @@ pub fn ctc_logits_to_word_timestamps(
         let start_time = raw_start.max(prev_end);
         let raw_end = if word_end_frame > 0 { word_end_frame as f64 * frame_sec } else { start_time + 0.25 };
         let end_time = raw_end.max(start_time + frame_sec);
-        word_timestamps.push(WordTimestamp {
-            word: word.to_string(),
-            start: start_time,
-            end: end_time,
-            confidence: 0.95,
-        });
+        // REAL per-word confidence = mean of the model's frame certainty (max softmax prob) over the
+        // word's aligned frames, NOT a hardcoded constant — so the review UI's low-confidence highlight
+        // actually fires on doubtful words. A word that never aligned gets a low default.
+        let confidence = if word_start_frame != usize::MAX && word_end_frame > word_start_frame {
+            let mut sum = 0.0f64;
+            for f in word_start_frame..word_end_frame {
+                sum += frame_max_prob(logits, f, vocab_size);
+            }
+            sum / (word_end_frame - word_start_frame) as f64
+        } else {
+            0.3
+        };
+        word_timestamps.push(WordTimestamp { word: word.to_string(), start: start_time, end: end_time, confidence });
+    }
+    // If NOT A SINGLE character aligned to a real frame range, the forced path is degenerate (e.g. the
+    // transcript has more characters than the model emitted frames) — return None so the caller falls
+    // back to the honest energy heuristic instead of stamping fabricated even-spaced timings as
+    // ctc_forced at high confidence.
+    if aligned_chars == 0 {
+        return None;
     }
     Some(word_timestamps)
+}
+
+/// The model's certainty at one CTC frame: the max softmax probability over the vocab, computed
+/// stably as `1 / sum(exp(logit - max_logit))`. Used to give each aligned word a real confidence.
+fn frame_max_prob(logits: &[f32], frame: usize, vocab_size: usize) -> f64 {
+    let start = frame * vocab_size;
+    let Some(row) = logits.get(start..start + vocab_size) else {
+        return 0.0;
+    };
+    let max_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f64 = row.iter().map(|&x| ((x - max_logit) as f64).exp()).sum();
+    if sum_exp > 0.0 {
+        1.0 / sum_exp
+    } else {
+        0.0
+    }
 }
 
 fn fallback_align(pcm: &[i16], sample_rate: u32, text: &str) -> Vec<WordTimestamp> {
@@ -652,10 +684,23 @@ mod tests {
         assert!(out[0].start < out[0].end, "start before end");
         assert!(out[0].start <= 0.01, "word starts near frame 0, got {}", out[0].start);
         assert!(out[0].end <= 0.05, "word ends near frame 2 (not smeared to clip end), got {}", out[0].end);
+        // Real per-word confidence is derived from the emissions (frame max softmax prob), not a
+        // constant 0.95 — the 'a','b' frames have one logit at 10 so the prob is ~1.0.
+        assert!(
+            out[0].confidence > 0.9 && out[0].confidence <= 1.0,
+            "confidence from emissions, got {}",
+            out[0].confidence
+        );
         // Degenerate inputs degrade to None so the caller can fall back to the heuristic.
         assert!(ctc_logits_to_word_timestamps(&logits, 0, 4, &tokens, 0, "ab", 0.02).is_none());
         assert!(ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 9, "ab", 0.02).is_none(), "blank past vocab");
         assert!(ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 0, "xyz", 0.02).is_none(), "no alignable chars");
+        // Transcript longer than the emittable frames -> degenerate path -> None (not fake even timings
+        // stamped ctc_forced). "abcabc" = 6 chars -> 13 CTC states > 4 frames.
+        assert!(
+            ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 0, "abcabc", 0.02).is_none(),
+            "transcript longer than frames"
+        );
     }
 
     #[test]
