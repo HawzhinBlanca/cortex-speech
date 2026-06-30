@@ -653,9 +653,9 @@ pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
     // Cutoff as a fraction of the SOURCE sample rate (cycles per source sample), in (0, 0.5].
     let cutoff = if to_rate < from_rate { (to_rate as f64 / 2.0) / from_rate as f64 } else { 0.5 };
     const RADIUS: i64 = 16; // sinc window half-width, in source samples
-    // Read from `src` (prefiltered on downsample, == samples on upsample), per theirs/base. Every
-    // index below is edge-clamped to [0, n-1], so this is panic-free for every rate — covering the
-    // out-of-bounds case theirs fixed (new_len = ceil(len*ratio) can overshoot the last index).
+                            // Read from `src` (prefiltered on downsample, == samples on upsample), per theirs/base. Every
+                            // index below is edge-clamped to [0, n-1], so this is panic-free for every rate — covering the
+                            // out-of-bounds case theirs fixed (new_len = ceil(len*ratio) can overshoot the last index).
     let n = src.len() as i64;
     let mut out = Vec::with_capacity(new_len);
     for i in 0..new_len {

@@ -216,7 +216,6 @@ pub(crate) fn exclude_holdout_segments(db: &Database, segments: Vec<SpeechSegmen
         .collect())
 }
 
-
 pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportFormat) -> AppResult<()> {
     // Drop held-out gold segments BEFORE counting or writing any format, so the training tables
     // (JSON/JSONL/CSV/Parquet) — including the production bundle that delegates through here — never

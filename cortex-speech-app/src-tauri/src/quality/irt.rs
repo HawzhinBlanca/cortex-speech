@@ -64,8 +64,7 @@ fn build_confusion_slots(hyps: &[&SegmentHypothesis]) -> Option<(Vec<Slot>, Stri
     // than recording a confident empty). Shared by the EM gate and the offline consensus draft, so this
     // input guard protects both. A segment with at least one real hypothesis still yields a draft from the
     // surviving models instead of being dropped.
-    let filtered: Vec<&SegmentHypothesis> =
-        hyps.iter().copied().filter(|h| !h.transcript.trim().is_empty()).collect();
+    let filtered: Vec<&SegmentHypothesis> = hyps.iter().copied().filter(|h| !h.transcript.trim().is_empty()).collect();
     if filtered.is_empty() {
         return None;
     }
@@ -557,7 +556,7 @@ mod tests {
         let blank_strong = SegmentHypothesis {
             segment_id: "segX".to_string(),
             model_id: "omniasr-7b".to_string(), // ability 1.5 -> would be the anchor
-            transcript: "   ".to_string(),       // whitespace-only
+            transcript: "   ".to_string(),      // whitespace-only
             confidence: Some(0.9),
         };
         let blank_weak = SegmentHypothesis {

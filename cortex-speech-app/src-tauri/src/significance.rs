@@ -99,10 +99,8 @@ fn rate(err: f64, len: f64) -> f64 {
 /// zero-reference (1.0-on-nonzero-errors) convention so this point estimate and every bootstrap replica
 /// agree, keeping each CI bracketing its own point.
 pub fn micro_rate(segments: &[SegmentError]) -> f64 {
-    let (err, len) = segments
-        .iter()
-        .filter(|s| s.ref_len > 0.0)
-        .fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
+    let (err, len) =
+        segments.iter().filter(|s| s.ref_len > 0.0).fold((0.0f64, 0.0f64), |(e, l), s| (e + s.errors, l + s.ref_len));
     rate(err, len)
 }
 

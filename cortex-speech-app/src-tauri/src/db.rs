@@ -473,7 +473,6 @@ impl Database {
         self.insert_segment_full(seg)
     }
 
-
     /// Targeted single-column update: sets `verified` without touching any other field.
     /// Returns true if the row was found and updated.
     pub fn update_verified(&self, id: &str, verified: bool) -> AppResult<bool> {
