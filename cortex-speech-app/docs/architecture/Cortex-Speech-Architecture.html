@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cortex Speech — Architecture &amp; Technical Overview</title>
+<style>
+  :root{
+    --ink:#1f1f1d; --ink2:#444441; --muted:#74736c; --line:#e2e0d6; --line2:#cfcdc2;
+    --accent:#5247b8; --accent-bg:#efedf9; --warn:#9a5a2a; --warn-bg:#faece7; --ok:#1d7a5c; --ok-bg:#e6f3ee;
+    --code:#534ab7; --bg:#ffffff; --soft:#faf9f5;
+    --sans:'Segoe UI',system-ui,-apple-system,Roboto,sans-serif; --mono:'Cascadia Code',Consolas,'Courier New',monospace;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  body{font-family:var(--sans);color:var(--ink);background:var(--bg);margin:0;line-height:1.5;font-size:14px}
+  .page{max-width:980px;margin:0 auto;padding:40px 48px}
+  h1{font-size:30px;margin:0 0 4px;letter-spacing:-.01em}
+  h2{font-size:20px;margin:34px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--accent);color:var(--ink)}
+  h3{font-size:15.5px;margin:20px 0 6px;color:var(--accent)}
+  p{margin:8px 0}
+  .lead{font-size:15px;color:var(--ink2);max-width:760px}
+  .meta{color:var(--muted);font-size:12.5px;margin-top:8px}
+  code,.mono{font-family:var(--mono);font-size:.9em;background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:.5px 4px;color:var(--code)}
+  .tag{display:inline-block;font-size:11px;font-weight:600;border-radius:20px;padding:2px 10px;margin:0 4px 4px 0}
+  .tag.acc{background:var(--accent-bg);color:var(--accent)}
+  .tag.warn{background:var(--warn-bg);color:var(--warn)}
+  .tag.ok{background:var(--ok-bg);color:var(--ok)}
+  figure{margin:18px 0;border:1px solid var(--line);border-radius:10px;padding:14px;background:#fff}
+  figure img{width:100%;height:auto;display:block}
+  figcaption{color:var(--muted);font-size:12px;margin-top:8px;text-align:center}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13px}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:600;color:var(--ink2)}
+  tr:nth-child(even) td{background:#fcfbf8}
+  ul{margin:8px 0 8px 0;padding-left:22px}
+  li{margin:3px 0}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:12px 0}
+  .card{border:1px solid var(--line);border-radius:9px;padding:12px 14px;background:#fff}
+  .card h3{margin-top:0}
+  .note{border-left:3px solid var(--accent);background:var(--soft);padding:10px 14px;border-radius:0 8px 8px 0;margin:12px 0;font-size:13.5px}
+  .note.warn{border-color:var(--warn);background:var(--warn-bg)}
+  .kvs{font-size:13px}
+  .kvs b{color:var(--ink)}
+  hr{border:none;border-top:1px solid var(--line);margin:26px 0}
+  footer{color:var(--muted);font-size:12px;margin-top:30px;border-top:1px solid var(--line);padding-top:12px}
+  @media print{ .page{padding:0 8px;max-width:none} h2{break-after:avoid} figure,table,.card{break-inside:avoid} h1{font-size:26px} }
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>Cortex Speech</h1>
+<p class="lead">An offline-first desktop application for <b>Central Kurdish (Sorani)</b> speech transcription, transcript curation, and ML dataset export. The default transcription engine is the user's fine-tuned <b>OmniASR-7B Champion</b> running locally on the GPU; everything works without a network, and any cloud assistance is opt-in and off by default.</p>
+<p class="meta">Architecture &amp; technical overview · generated 2026-06-30 · repo <span class="mono">github.com/HawzhinBlanca/cortex-speech</span> · <span class="mono">main @ 4787d81</span> · stack: Tauri v2 + Svelte 5 (runes) + Rust + SQLite/FTS5</p>
+
+<figure>
+  <img src="cortex-e2e-architecture.svg" alt="Cortex Speech end-to-end architecture diagram">
+  <figcaption>End-to-end data flow: capture → pipeline → ASR engines → jury → human review → storage → validation &amp; export. Solid violet = the OmniASR-7B Champion primary path (default); dashed = cloud (opt-in, off by default).</figcaption>
+</figure>
+
+<h2>1 · What it is</h2>
+<p>Cortex Speech turns raw long-form audio (podcasts, interviews, audiobooks) into a clean, human-verified, license-aware speech dataset for Central Kurdish — a low-resource language. The workflow is:</p>
+<p><span class="tag acc">import</span><span class="tag acc">VAD chunk</span><span class="tag acc">ASR (7B Champion)</span><span class="tag acc">align words</span><span class="tag acc">jury adjudicate</span><span class="tag acc">human review</span><span class="tag acc">validate</span><span class="tag acc">export</span></p>
+<div class="grid">
+  <div class="card"><h3>Design principles</h3><ul>
+    <li><b>Offline-first.</b> Local ASR + alignment + storage; no network needed.</li>
+    <li><b>Honesty-first.</b> Machine output is never presented as human-verified; every transcript carries its engine provenance; metrics come from real runs only.</li>
+    <li><b>Consent-gated cloud.</b> Voice is treated as biometric data (GDPR Art. 9); cloud STT/LLM require explicit opt-in.</li>
+    <li><b>Human-in-the-loop.</b> A jury auto-adjudicates the easy cases and escalates the rest to a fast review UI; the human decision is final.</li>
+  </ul></div>
+  <div class="card"><h3>Tech stack</h3><ul>
+    <li><b>Shell:</b> Tauri v2 (Rust core + WebView2 UI).</li>
+    <li><b>Frontend:</b> Svelte 5 (runes), ~102 IPC commands, EN + CKB (RTL) i18n.</li>
+    <li><b>Backend:</b> Rust — pipeline, ASR, jury, export, storage.</li>
+    <li><b>ASR runtimes:</b> sherpa-onnx (CTC), <span class="mono">ort</span> ONNX (MMS/aligner), Silero VAD, fairseq2+PEFT (7B via WSL GPU).</li>
+    <li><b>Storage:</b> SQLite (WAL) + FTS5 full-text search; transcripts stored NFC.</li>
+  </ul></div>
+</div>
+
+<h2>2 · End-to-end pipeline (Rust core)</h2>
+<p>Import is dispatched from the IPC commands <code>import_audio_file</code> / <code>import_directory</code> (commands.rs), which spawn a background worker so the UI never blocks. The <code>ProcessingPipeline</code> (pipeline.rs) then runs each file through:</p>
+<table>
+  <tr><th>Stage</th><th>What happens</th><th>Key functions / files</th></tr>
+  <tr><td><b>Decode</b></td><td>Audio → 16&nbsp;kHz mono PCM. Short files decode whole; long files stream in 90&nbsp;s windows to bound memory.</td><td><span class="mono">decode_to_pcm_with_timeout</span>, <span class="mono">decode_pcm_windows</span>, <span class="mono">should_stream_decode</span> (audio.rs, chunking.rs)</td></tr>
+  <tr><td><b>VAD chunk</b></td><td>Silero VAD finds speech regions; regions are merged/split/absorbed to honor min/max segment length (no cutting mid-word, no spanning long silences).</td><td><span class="mono">voice_activity_detection</span>, <span class="mono">plan_speech_chunks</span> (chunking.rs)</td></tr>
+  <tr><td><b>ASR dispatch</b></td><td>Each chunk is transcribed by the active engine (default: OmniASR-7B Champion). Confidence + raw text returned per chunk.</td><td><span class="mono">build_segments_from_pcm</span>, <span class="mono">transcribe</span> (pipeline.rs)</td></tr>
+  <tr><td><b>Normalize</b></td><td>Sorani normalization (numerals, hamza/y-k variants) → <span class="mono">normalized_transcript</span>; all text stored Unicode NFC.</td><td><span class="mono">SoraniNormalizer</span> (normalizer.rs)</td></tr>
+  <tr><td><b>Align (words)</b></td><td>Forced alignment gives per-word start/end timestamps for "tap-a-word" review. Uses the fine-tuned MMS-CTC; falls back to the bundled aligner / energy heuristic.</td><td><span class="mono">align_via_finetuned_mms</span>, <span class="mono">ctc_logits_to_word_timestamps</span> (aligner.rs, wav2vec2_asr.rs)</td></tr>
+  <tr><td><b>Persist</b></td><td>Segments + multi-model hypotheses written transactionally to SQLite; FTS5 index auto-syncs.</td><td><span class="mono">persist_segments</span>, <span class="mono">insert_segments_batch</span> (db.rs)</td></tr>
+  <tr><td><b>7B primary pass</b></td><td>When the 7B is the engine, each segment is (re-)transcribed via the warm WSL server with retry. <b>Fail-hard:</b> if the server is unreachable the import is cancelled and its segments rolled back — no placeholder library.</td><td><span class="mono">run_primary_wsl_pass_for_import</span> (pipeline.rs)</td></tr>
+</table>
+<p>After persistence the import callback triggers the jury on a <b>separate WAL DB connection</b> so heavy adjudication never starves the UI's <code>get_segments</code>.</p>
+
+<h2>3 · ASR engines</h2>
+<p>Five engines are wired; routing is by <code>settings.asr_model_size</code> (default <b>WSL7B</b>) plus <code>use_finetuned_asr</code> and consent flags.</p>
+<table>
+  <tr><th>Engine</th><th>model_id</th><th>Runtime</th><th>Role</th></tr>
+  <tr><td><b>OmniASR-7B Champion</b> ★</td><td><span class="mono">omniasr-wsl-7b</span></td><td>base omniASR-LLM-7B-v2 + LoRA adapter, fairseq2+PEFT, ~31&nbsp;GB, WSL GPU server on <span class="mono">127.0.0.1:8799</span></td><td><b>Primary / default.</b> The owner's fine-tuned 7B; produces every import transcript.</td></tr>
+  <tr><td>OmniASR-CTC 300M</td><td><span class="mono">omniasr-ctc-300m</span></td><td>sherpa-onnx (ONNX), ~50&nbsp;MB</td><td>Bundled local fallback / offline default-downloadable model.</td></tr>
+  <tr><td>OmniASR-CTC 1B</td><td><span class="mono">omniasr-ctc-1b</span></td><td>sherpa-onnx (ONNX), ~500&nbsp;MB</td><td>Larger base CTC (opt-in).</td></tr>
+  <tr><td>Fine-tuned MMS-1B</td><td><span class="mono">finetuned-mms-ckb</span></td><td>Wav2Vec2-CTC via <span class="mono">ort</span>, ~970&nbsp;MB, ~18.6% CER</td><td>Used for word alignment, and as an opt-in per-clip re-transcribe engine.</td></tr>
+  <tr><td>ElevenLabs Scribe</td><td><span class="mono">scribe-v1</span></td><td>Cloud REST (opt-in)</td><td>Cloud STT for a second opinion / jury vote — only with <code>cloud_stt_opt_in</code>.</td></tr>
+</table>
+<div class="note"><b>The "which model" answer.</b> There is no "base vs fine-tuned 7B" ambiguity: the OmniASR-7B Champion <i>is</i> the fine-tuned 7B (base + LoRA). The separate fine-tuned <b>MMS-1B</b> is a different, smaller model used mainly for word-timing alignment. Out of the box, transcripts are 100% the 7B Champion.</div>
+
+<h2>4 · Jury — automatic adjudication</h2>
+<p>The jury is a multi-tier confidence router that clears the easy cases automatically and escalates the rest to a human, running on its own DB connection.</p>
+<ul>
+  <li><b>T0 — IRT consensus gate:</b> the per-segment hypotheses (7B + the two CTC models) are aligned into a confusion network and voted by an Item-Response-Theory model; a calibrated <b>conformal threshold</b> + a hypothesis-coverage guard decide auto-accept vs escalate. <span class="mono">fit_irt_consensus</span>, <span class="mono">quality/irt.rs</span>, <span class="mono">jury/mod.rs</span>.</li>
+  <li><b>T1 — tool evidence:</b> text-level grounding / consistency checks.</li>
+  <li><b>T2 — audio judge (opt-in):</b> a cloud model (Gemini) <i>listens</i> to the clip and adjudicates; gated by <code>jury_cloud_opt_in</code>. <span class="mono">jury/t2_listener.rs</span>.</li>
+  <li><b>Escalation:</b> unresolved segments enter the <b>Review Inbox</b> ordered lowest-confidence-first; the <b>Autonomy Dial</b> (Observe → Propose → ActConfirm → ActAuto) sets how much the agent may do unattended.</li>
+</ul>
+<div class="note">For this data the three Sorani ASR models agree only ~40–65% (the two CTC models are architecturally related, so their agreement is correlated and the gate vetoes it) — so the jury mostly escalates, which is why fast human review matters.</div>
+
+<h2>5 · Human review</h2>
+<p><b>ReviewMode.svelte</b> is a distraction-free, one-clip-at-a-time loop. The human decision is authoritative and is never overwritten by later jury runs.</p>
+<div class="grid">
+  <div class="card"><h3>Review actions</h3><ul>
+    <li><b>Word-timing playback</b> — tap a word to hear it; karaoke highlight; playback bounded to the clip span.</li>
+    <li><b>Model-provenance badge</b> — "Draft by &lt;engine&gt; — machine draft, not human-verified", drawn from recorded hypotheses (never inferred).</li>
+    <li><b>Re-transcribe this clip</b> — OmniASR-7B (server) or Fine-tuned MMS-1B (CPU); resets <code>verified=false</code>.</li>
+    <li><b>Mark bad</b> — records a human <i>reject</i>: excluded from export, kept and reversible.</li>
+  </ul></div>
+  <div class="card"><h3>Learning flywheel</h3><ul>
+    <li>Decisions become <code>human_accept</code> / <code>human_edit</code> / <code>human_reject</code> verdicts.</li>
+    <li>Confirmed corrections feed <code>agent_examples</code> (few-shot retrieval) so the agent improves on the owner's style.</li>
+    <li>A LOOP-0 correction memory can auto-apply confirmed fixes to future transcripts (opt-in).</li>
+  </ul></div>
+</div>
+
+<h2>6 · Storage</h2>
+<p>SQLite in WAL mode with FTS5 search and 25 versioned migrations. A single shared mutex-guarded connection serves UI commands; the jury uses its own WAL connection to avoid blocking reads during long operations.</p>
+<table>
+  <tr><th>Table</th><th>Holds</th></tr>
+  <tr><td><span class="mono">speech_segments</span></td><td>The core row: <span class="mono">raw_transcript</span>, <span class="mono">normalized_transcript</span>, <span class="mono">annotated_transcript</span>, <span class="mono">alignment_json</span> (word timings + source window), <span class="mono">verified</span>, <span class="mono">verdict</span>, <span class="mono">human_decision</span>, <span class="mono">confidence</span>, audio QC fields, <span class="mono">model_version_id</span>, gold flag.</td></tr>
+  <tr><td><span class="mono">segment_hypotheses</span></td><td>Per-model drafts: <span class="mono">(segment_id, model_id, transcript, confidence, model_version_id)</span> — the source of the provenance badge + the jury vote.</td></tr>
+  <tr><td><span class="mono">source_transcripts</span></td><td>Whole-file reference transcripts (when configured).</td></tr>
+  <tr><td><span class="mono">agent_examples</span> / <span class="mono">gold_segments</span> / <span class="mono">eval_runs</span></td><td>Few-shot flywheel, held-out gold sets, evaluation scorecards.</td></tr>
+  <tr><td><span class="mono">model_versions</span> / <span class="mono">schema_migrations</span> / <span class="mono">segments_fts</span></td><td>Model registry, migration ledger, full-text index.</td></tr>
+</table>
+
+<h2>7 · Validation &amp; export</h2>
+<p>Export builds an honesty-gated dataset. Three guardrails apply:</p>
+<ul>
+  <li><b>Quality gates:</b> WER/CER thresholds (<code>enforce_quality_gates</code>) and a per-segment <b>training grade</b> — <span class="tag ok">gold</span><span class="tag acc">silver</span><span class="tag warn">review</span><span class="tag warn">reject</span>.</li>
+  <li><b>Leakage guards:</b> held-out gold clips are excluded by content-hash + path (fail-closed even if the file is missing); HuggingFace splits are <b>speaker-disjoint</b> via a union-find guard.</li>
+  <li><b>Privacy:</b> curator/local paths are redacted from published datasets.</li>
+</ul>
+<p>Formats: <b>JSON / JSONL</b>, <b>CSV</b> (formula-injection-safe), <b>Parquet</b>, <b>HuggingFace datasets</b>, <b>WAV/FLAC</b> clips with metadata, and <b>DPO preference pairs</b> for fine-tuning.</p>
+
+<h2>8 · Privacy &amp; consent</h2>
+<p>The app is 100% offline by default. Cloud is reached only behind explicit, acknowledged opt-in:</p>
+<ul>
+  <li><code>cloud_stt_opt_in</code> — ElevenLabs Scribe STT.</li>
+  <li><code>cloud_llm_opt_in</code> — OpenRouter / Gemini LLM refinement.</li>
+  <li><code>jury_cloud_opt_in</code> — the Gemini T2 audio judge.</li>
+</ul>
+<p><code>settings.effective_llm_mode()</code> downgrades cloud → none whenever the relevant flag is off, and the pipeline re-checks consent before building any refiner. API keys are never persisted in tracked files; voice is handled as biometric data with consent + license enforced before any publish/train step.</p>
+
+<h2>9 · State as of this build</h2>
+<p>Recent work landed on <span class="mono">main</span> (verified by cargo fmt/clippy + 823 Rust tests, typecheck/lint + 129 vitest, 20 Python policy gates, and repo-hygiene):</p>
+<table>
+  <tr><th>Commit</th><th>Change</th></tr>
+  <tr><td><span class="mono">48bde15</span></td><td>Integrated a 68-commit hardening line into the branch (30 conflicts reconciled, combining both sides' intent).</td></tr>
+  <tr><td><span class="mono">1a9ae00</span></td><td><b>OmniASR-7B Champion forced as the default</b> + fail-hard import (cancel + rollback when the 7B server is down); sanitized client repo-tracked.</td></tr>
+  <tr><td><span class="mono">4787d81</span></td><td><b>Review feature:</b> per-clip re-transcribe (7B / MMS-1B), model-provenance badge, mark-bad — verified live on the real app.</td></tr>
+</table>
+
+<footer>
+  Cortex Speech — generated architecture overview · 2026-06-30 · For the canonical source see the repository (<span class="mono">CLAUDE.md</span>, <span class="mono">AGENT_CHARTER.md</span>, <span class="mono">docs/</span>). This document is descriptive; the code is authoritative.
+</footer>
+
+</div>
+</body>
+</html>
