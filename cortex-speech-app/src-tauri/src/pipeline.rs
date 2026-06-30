@@ -3039,6 +3039,62 @@ mod tests {
     }
 
     #[test]
+    fn wsl_primary_import_pass_cancels_and_rolls_back_on_infrastructure_failure() {
+        // The owner forces the 7B Champion: if the 7B path errors (server down / unreachable / hung —
+        // here simulated by a missing audio file so transcribe() fails BEFORE spawning any subprocess),
+        // the WHOLE import is cancelled and every segment it just created is rolled back, rather than
+        // leaving a library of "[Pending WSL 7B ASR]" placeholders or silently downgrading. This locks
+        // in that fail-hard contract AND the cascade cleanup that leaves no orphaned hypothesis rows.
+        let settings = AppSettings {
+            asr_model_size: AsrModelSize::WSL7B,
+            // Non-empty => should_use_wsl_primary_asr() is true so the pass actually runs (it Ok(0)-skips
+            // otherwise). The script never executes: transcribe() errors earlier on the missing audio.
+            external_asr_script_path: "cortex_7b_client.py".to_string(),
+            ..AppSettings::default()
+        };
+        let (pipeline, dir) = test_pipeline_with_settings(settings);
+        let db = Database::open(dir.path().join("db.sqlite").to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+
+        // Two freshly-imported segments whose audio file does not exist => transcribe() fails hard
+        // (get_duration_ms on a missing path) on every attempt = an infrastructure failure, not a
+        // reachable-but-silent clip.
+        let missing_audio = dir.path().join("does-not-exist.wav").to_string_lossy().to_string();
+        let mut segments = Vec::new();
+        for i in 0..2 {
+            let seg = SpeechSegment {
+                id: format!("import-{i}"),
+                audio_path: missing_audio.clone(),
+                raw_transcript: "draft text".to_string(),
+                duration_ms: 1000,
+                ..SpeechSegment::default()
+            };
+            db.insert_segment(&seg).unwrap();
+            segments.push(seg);
+        }
+        // A stale hypothesis on the first segment must be cascade-deleted with it (no orphan rows).
+        insert_hypothesis(&db, "import-0", "omniasr-wsl-7b", "stale draft");
+
+        let import_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
+        let result = pipeline.run_primary_wsl_pass_for_import(&db, &mut segments, None);
+
+        // The import is cancelled (fail-hard), not silently downgraded to a weaker engine.
+        let msg = result.expect_err("a 7B infrastructure failure must cancel the import").to_string();
+        assert!(msg.contains("rolled back"), "error must state the rollback: {msg}");
+        assert!(msg.contains("7B server"), "error must name the 7B server: {msg}");
+
+        // Every segment the import created is gone, and the cascade removed the hypothesis with it.
+        assert!(
+            db.get_segments_by_ids(&import_ids).unwrap().is_empty(),
+            "all import segments must be deleted after a fail-hard cancel"
+        );
+        assert!(
+            db.get_hypotheses_for_segment("import-0").unwrap().is_empty(),
+            "segment_hypotheses must cascade-delete with the rolled-back segment (no orphans)"
+        );
+    }
+
+    #[test]
     fn parses_wsl_segment_result_from_stdout_marker() {
         let stdout = "loading model\n__RESULT__={\"raw_transcript\":\"دەقی دروست\",\"confidence\":0.94}\ndone\n";
         let (text, confidence) = super::parse_wsl_segment_result(stdout).unwrap();
