@@ -4,6 +4,7 @@
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import { segments } from './stores/segmentStore';
+  import { isVerifiedGood } from './segmentQuality';
   import { isProcessing, statusMessage, batchProgress } from './stores/uiStore';
   import { startOperation, endOperation } from './invoke';
   import { PARQUET_EXPORT_SUPPORTED } from './appFeatures';
@@ -142,8 +143,10 @@
       notifications.info($t('desktopRuntimeRequired'));
       return;
     }
+    // Export the audio of human-confirmed GOOD clips only — never a human-rejected ("mark bad") clip,
+    // which carries verified=true solely to leave the review queue.
     const verifiedIds = get(segments)
-      .filter((s) => s.verified)
+      .filter((s) => isVerifiedGood(s))
       .map((s) => s.id);
     if (verifiedIds.length === 0) {
       notifications.warning($t('exportAudio.noVerified'));

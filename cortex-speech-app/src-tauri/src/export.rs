@@ -222,6 +222,11 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     // publish the eval set's reference transcripts; closes the eval-on-train leak the HF export
     // already guards against.
     let segments = exclude_holdout_segments(db, db.get_segments(None)?)?;
+    // A human-REJECTED clip ("mark bad" in review) is kept in the library but is bad data the reviewer
+    // discarded — never publish it, and never count it as verified. The HuggingFace/training path
+    // already drops it via training_grade_for_segment; do the same here so the plain JSON/JSONL/CSV/
+    // Parquet tables and `verified_segments` can never label a reject as confirmed-good output.
+    let segments: Vec<SpeechSegment> = segments.into_iter().filter(|s| !quality::is_human_rejected(s)).collect();
     let total_duration: i64 = segments.iter().map(|s| s.duration_ms).sum();
     let verified = segments.iter().filter(|s| s.verified).count();
 
@@ -1815,6 +1820,39 @@ mod tests {
         let body = std::fs::read_to_string(&out).unwrap();
         assert!(body.contains("keep-1"), "the non-holdout segment must still be exported");
         assert!(!body.contains("hold-1"), "the holdout gold clip must NOT leak into the plain export");
+    }
+
+    #[test]
+    fn plain_export_excludes_human_rejected_segments() {
+        // A human-REJECTED clip ("mark bad" in review) is KEPT in the library but must never appear in a
+        // plain JSON/JSONL/CSV/Parquet export, nor be counted as verified — it carries verified=true only
+        // to leave the review queue. Mirrors the human_reject exclusion the HF/training path already does.
+        let db_tmp = NamedTempFile::new().unwrap();
+        let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&sample_segment("keep-1")).unwrap();
+        db.insert_segment(&sample_segment("bad-1")).unwrap();
+        // Reviewer marks it bad: a human 'reject' decision (verdict=human_reject) while verified stays true.
+        db.record_human_decision("bad-1", "reject", None).unwrap();
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let out = tmp_dir.path().join("dataset.json");
+        export_dataset(&db, &out, &ExportFormat::Json).unwrap();
+        let body = std::fs::read_to_string(&out).unwrap();
+        assert!(body.contains("keep-1"), "the confirmed-good segment must still be exported");
+        assert!(!body.contains("bad-1"), "a human-rejected clip must NOT appear in the plain export");
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["metadata"]["verified_segments"].as_u64(),
+            Some(1),
+            "a human-rejected clip must not be counted as verified"
+        );
+        assert_eq!(
+            parsed["metadata"]["total_segments"].as_u64(),
+            Some(1),
+            "a human-rejected clip must not be counted in the exported total"
+        );
     }
 
     #[test]

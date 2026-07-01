@@ -1,6 +1,7 @@
 import { writable, derived } from 'svelte/store';
 import type { SpeechSegment, WordTimestamp } from '../types';
 import * as api from '../commands';
+import { isHumanRejected } from '../segmentQuality';
 
 function createSegmentsStore() {
   const { subscribe, set, update } = writable<SpeechSegment[]>([]);
@@ -131,8 +132,15 @@ export const segmentStats = derived(segments, ($segments) => {
     withAnnotations = 0,
     totalDurationMs = 0;
   for (const s of $segments) {
-    if (s.verified) verified++;
-    else pending++;
+    // A human-rejected clip ("mark bad") carries verified=true only to leave the review queue — it is
+    // neither confirmed-good (verified) nor still-pending, so it counts toward neither bucket.
+    if (isHumanRejected(s)) {
+      // rejected: excluded from both verified and pending, still part of total
+    } else if (s.verified) {
+      verified++;
+    } else {
+      pending++;
+    }
     if (s.annotatedTranscript) withAnnotations++;
     totalDurationMs += s.durationMs;
   }

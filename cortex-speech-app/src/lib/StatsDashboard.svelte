@@ -4,6 +4,7 @@
   import type { DatasetStats, SpeechSegment } from './types';
   import { segments } from './stores/segmentStore';
   import { notifications } from './stores/notificationStore';
+  import { isVerifiedGood } from './segmentQuality';
   import { t } from './i18n';
   import { isTauriRuntime } from './runtime';
 
@@ -39,7 +40,9 @@
   function buildLocalStats(items: SpeechSegment[]): DatasetStats {
     const durationSeconds = items.map((segment) => Math.max(0, segment.durationMs || 0) / 1000);
     const totalDurationSeconds = durationSeconds.reduce((sum, value) => sum + value, 0);
-    const verifiedCount = items.filter((segment) => segment.verified).length;
+    // "Verified" = human-confirmed GOOD. Exclude human-rejected clips ("mark bad"), which carry
+    // verified=true only to leave the review queue — counting them here would inflate the metric.
+    const verifiedCount = items.filter((segment) => isVerifiedGood(segment)).length;
     const totalChars = items.reduce((sum, segment) => {
       const text =
         segment.normalizedTranscript || segment.annotatedTranscript || segment.rawTranscript || '';

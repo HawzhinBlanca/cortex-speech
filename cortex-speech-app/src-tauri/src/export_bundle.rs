@@ -236,6 +236,10 @@ pub fn export_dataset_bundle(
     // manifest counts still include it — re-contaminating the exact eval set the promotion gate measures
     // against.
     let segments = export::exclude_holdout_segments(db, db.get_segments(None)?)?;
+    // Drop human-REJECTED clips ("mark bad") from the whole bundle the same way the plain export and the
+    // training path do — a discarded draft must never be published or counted as verified/training-ready.
+    let segments: Vec<crate::db::SpeechSegment> =
+        segments.into_iter().filter(|s| !quality::is_human_rejected(s)).collect();
     let training_grade_summary = quality::training_grade_summary(&segments);
     let training_ready_machine_segment_ids = training_ready_machine_segment_ids(&segments);
     let source_reference_records = collect_source_reference_bundle_records(db, &segments)?;

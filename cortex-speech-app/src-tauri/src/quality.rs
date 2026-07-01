@@ -220,13 +220,24 @@ pub fn training_grade_summary(segments: &[SpeechSegment]) -> TrainingGradeSummar
     summary
 }
 
+/// True when a human explicitly REJECTED this segment's draft — the review "mark bad" action, or a
+/// jury/import `human_reject` verdict. Such a clip is kept in the library (reversible: re-review to
+/// accept, or re-transcribe) but is bad data the reviewer discarded: it must never appear in an
+/// exported dataset and must never be counted as a "verified" (confirmed-good) segment, even though
+/// its `verified` flag is set true to finalize it out of the review queue. The training/HuggingFace
+/// path already drops it via [`training_grade_for_segment`]; this shared predicate lets the plain
+/// JSON/JSONL/CSV/Parquet exports and quality counts honor a reject exactly the same way.
+pub fn is_human_rejected(seg: &SpeechSegment) -> bool {
+    decision_is(seg.human_decision.as_deref(), &["reject", "human_reject"])
+        || decision_is(seg.verdict.as_deref(), &["human_reject"])
+}
+
 pub fn training_grade_for_segment(seg: &SpeechSegment) -> TrainingGradeReport {
     let (transcript, source) = training_transcript_with_source(seg);
     let text = transcript.trim();
     let mut reasons = Vec::new();
 
-    let human_rejected = decision_is(seg.human_decision.as_deref(), &["reject", "human_reject"])
-        || decision_is(seg.verdict.as_deref(), &["human_reject"]);
+    let human_rejected = is_human_rejected(seg);
 
     if human_rejected {
         reasons.push("human_rejected".to_string());
