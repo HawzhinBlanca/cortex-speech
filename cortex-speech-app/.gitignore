@@ -45,6 +45,13 @@ src-tauri/icons/*.ico
 !src-tauri/icons/icon.png
 !src-tauri/icons/icon.ico
 
+# Generated review bundles (scripts/build_review_page.py). review.html with --embed-audio inlines the
+# clip audio as base64 — i.e. BIOMETRIC VOICE DATA — and the *.wav/*.mp3 ignores above do NOT cover an
+# HTML blob. These are local, per-run review artifacts and must never be committed to a public repo.
+*_review/
+review.html
+review*.html
+
 # Local API keys — never commit
 secrets.env
 **/secrets.env
