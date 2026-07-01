@@ -1,7 +1,9 @@
 <script lang="ts">
+  import { get } from 'svelte/store';
   import { segments } from './stores/segmentStore';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
+  import { settings } from './stores/settingsStore';
   import { t } from './i18n';
   import Waveform from './Waveform.svelte';
   import AudioPlayer from './AudioPlayer.svelte';
@@ -65,6 +67,18 @@
     }
   }
 
+  // The engine id (matching api.engineLabel) that the champion re-transcribe ACTUALLY runs: the
+  // configured primary model, read from settings — never assumed. Keeps the provenance badge honest
+  // if the user switched the primary away from the default 7B.
+  function primaryEngineId(): string {
+    const map: Record<string, string> = {
+      'wsl-7b': 'omniasr-wsl-7b',
+      'ctc-1b': 'omniasr-ctc-1b',
+      'ctc-300m': 'omniasr-ctc-300m',
+    };
+    return map[get(settings).asrModel] ?? 'omniasr-wsl-7b';
+  }
+
   // Re-transcribe THIS clip with a chosen engine when the current draft is wrong. 'champion' routes
   // through the configured primary engine (the OmniASR-7B Champion by default — needs its server up);
   // 'finetuned' runs the embedded fine-tuned MMS-1B (CPU/ONNX, always available). A re-transcription is
@@ -96,8 +110,11 @@
       notifications.success($t('review.retranscribed'));
       // The owner just produced this draft with the chosen engine, so name it on the provenance badge
       // immediately (honest — it's exactly what was used). A single-engine re-transcribe has no
-      // multi-model consensus, so hide that card.
-      draftModels = [engine === 'finetuned' ? 'finetuned-mms-ckb' : 'omniasr-wsl-7b'];
+      // multi-model consensus, so hide that card. The fine-tuned button always runs the MMS-1B; the
+      // champion button runs the CONFIGURED primary engine (pipeline.transcribe), so read it from
+      // settings rather than assuming the 7B — otherwise a user who switched the primary would get a
+      // badge naming a model that never ran.
+      draftModels = [engine === 'finetuned' ? 'finetuned-mms-ckb' : primaryEngineId()];
       consensus = null;
       await ensureWordTimings(updated);
     } catch (e) {
