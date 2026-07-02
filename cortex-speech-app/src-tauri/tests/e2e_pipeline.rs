@@ -9,7 +9,7 @@ use cortex_speech_app_lib::health;
 use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use cortex_speech_app_lib::pipeline::ProcessingPipeline;
-use cortex_speech_app_lib::settings::AppSettings;
+use cortex_speech_app_lib::settings::{AppSettings, AsrModelSize};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -27,12 +27,16 @@ fn setup_pipeline() -> (ProcessingPipeline, String, TempDir) {
     db.initialize().unwrap();
     drop(db);
 
+    // Select the local CTC-300M engine explicitly: the default engine is now WSL7B, which fails hard
+    // without a client script (F2 — no silent downgrade). This test exercises the local import path
+    // (VAD → chunk → local ASR), so it must pick the local engine it always effectively used.
+    let settings = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
     let pipeline = ProcessingPipeline::new(
         db_path_str.clone(),
         Arc::new(SoraniNormalizer::new()),
         Arc::new(TranscriptCache::new(100)),
         Arc::new(AudioFingerprint::new()),
-        Arc::new(AppSettings::default()),
+        Arc::new(settings),
         Arc::new(ModelManager::new(models_dir)),
     );
     (pipeline, db_path_str, tmp)

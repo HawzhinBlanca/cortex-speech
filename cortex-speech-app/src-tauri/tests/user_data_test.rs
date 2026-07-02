@@ -4,7 +4,7 @@ use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use cortex_speech_app_lib::pipeline::ProcessingPipeline;
-use cortex_speech_app_lib::settings::AppSettings;
+use cortex_speech_app_lib::settings::{AppSettings, AsrModelSize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -43,6 +43,8 @@ fn test_user_podcast_file() {
         Arc::new(TranscriptCache::new(100)),
         Arc::new(AudioFingerprint::new()),
         Arc::new(AppSettings {
+            // CTC-300M explicitly: default WSL7B fails hard without a client script (F2).
+            asr_model_size: AsrModelSize::CTC300M,
             vad_threshold: 0.5,
             min_segment_duration_ms: 2000,
             max_segment_duration_ms: 15000,

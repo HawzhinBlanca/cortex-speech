@@ -6,7 +6,7 @@ use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use cortex_speech_app_lib::pipeline::ProcessingPipeline;
-use cortex_speech_app_lib::settings::AppSettings;
+use cortex_speech_app_lib::settings::{AppSettings, AsrModelSize};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tempfile::{NamedTempFile, TempDir};
@@ -19,12 +19,16 @@ fn create_pipeline(db_path: &str) -> (ProcessingPipeline, TempDir) {
     std::fs::write(models_dir.join("omniasr-ctc-300m/tokens.txt"), "# test placeholder\n").unwrap();
     cortex_speech_app_lib::models::init_user_models_dir(models_dir.clone());
 
+    // Select CTC-300M explicitly: the default engine is now WSL7B, which fails hard without a client
+    // script (F2 — no silent downgrade). These tests exercise the local import path, so they pick the
+    // local engine they always effectively used.
+    let settings = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
     let pipeline = ProcessingPipeline::new(
         db_path.to_string(),
         Arc::new(SoraniNormalizer::new()),
         Arc::new(TranscriptCache::new(100)),
         Arc::new(AudioFingerprint::new()),
-        Arc::new(AppSettings::default()),
+        Arc::new(settings),
         Arc::new(ModelManager::new(models_dir)),
     );
     (pipeline, tmp)

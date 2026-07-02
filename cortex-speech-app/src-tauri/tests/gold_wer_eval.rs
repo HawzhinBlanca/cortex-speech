@@ -16,8 +16,7 @@ use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use cortex_speech_app_lib::pipeline::ProcessingPipeline;
-use cortex_speech_app_lib::settings::AppSettings;
-use cortex_speech_app_lib::settings::AsrModelSize;
+use cortex_speech_app_lib::settings::{AppSettings, AsrModelSize};
 use cortex_speech_app_lib::significance::{bootstrap_ci, mapsswe, SegmentError};
 use cortex_speech_app_lib::wer;
 use std::path::{Path, PathBuf};
@@ -367,12 +366,14 @@ fn pipeline_whole_file_wer() {
     let db = Database::open(&db_path_str).unwrap();
     db.initialize().unwrap();
     drop(db);
+    // CTC-300M explicitly: default WSL7B fails hard without a client script (F2).
+    let settings = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
     let pipeline = ProcessingPipeline::new(
         db_path_str.clone(),
         Arc::new(SoraniNormalizer::new()),
         Arc::new(TranscriptCache::new(100)),
         Arc::new(AudioFingerprint::new()),
-        Arc::new(AppSettings::default()),
+        Arc::new(settings),
         Arc::new(ModelManager::new(tmp.path().to_path_buf())),
     );
 

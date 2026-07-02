@@ -365,7 +365,13 @@ pub fn run() {
     }
 
     let settings_path = data_dir.join("settings.json");
-    let settings = AppSettings::load(&settings_path);
+    let mut settings = AppSettings::load(&settings_path);
+    // The headless integration test (real binary in CI) has no WSL 7B server, so the default WSL7B
+    // engine would now fail hard (F2 — no silent downgrade). Force the bundled local CTC-300M engine
+    // there so import→export→validate exercises the real local pipeline. Production paths are untouched.
+    if std::env::var("CORTEX_INTEGRATION_TEST").ok().as_deref() == Some("1") {
+        settings.asr_model_size = crate::settings::AsrModelSize::CTC300M;
+    }
 
     let normalizer = Arc::new(SoraniNormalizer::new());
     let cache = Arc::new(TranscriptCache::new(1000));

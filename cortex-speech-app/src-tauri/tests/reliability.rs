@@ -12,7 +12,7 @@ use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use cortex_speech_app_lib::pipeline::ProcessingPipeline;
 use cortex_speech_app_lib::session::SessionManager;
-use cortex_speech_app_lib::settings::AppSettings;
+use cortex_speech_app_lib::settings::{AppSettings, AsrModelSize};
 use cortex_speech_app_lib::throttle::RateLimiter;
 use tempfile::{NamedTempFile, TempDir};
 
@@ -58,12 +58,15 @@ fn setup_db() -> (Database, String) {
 
 fn create_pipeline(db_path: &str) -> ProcessingPipeline {
     let tmp = TempDir::new().unwrap();
+    // CTC-300M explicitly: the default engine is now WSL7B (fails hard without a client script, F2).
+    // These reliability tests exercise the local import path, so they pick the local engine.
+    let settings = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
     ProcessingPipeline::new(
         db_path.to_string(),
         Arc::new(SoraniNormalizer::new()),
         Arc::new(TranscriptCache::new(100)),
         Arc::new(AudioFingerprint::new()),
-        Arc::new(AppSettings::default()),
+        Arc::new(settings),
         Arc::new(ModelManager::new(tmp.path().to_path_buf())),
     )
 }
