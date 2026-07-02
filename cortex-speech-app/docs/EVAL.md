@@ -11,7 +11,7 @@ via the warm server (`scripts/scorecard_7b.py`, no second model load):
 | Set | 7B micro CER | N | Notes |
 |---|:--:|:--:|---|
 | Committed CC-BY FLEURS `ckb` fixture (clean) | **29.33%** | 1 | single clip — indicative only |
-| Halwest verified 16 kHz set | 59.45% | 66 | **data-artifact-inflated — see below** |
+| ~~Halwest verified 16 kHz set~~ | ~~59.45%~~ | ~~66~~ | ~~**data-artifact-inflated — see appendix**~~ |
 
 **Honest reading — the 60% is the DATA, not the engine.** On the Halwest verified set the 7B scored
 59.45%, but stock OmniASR-CTC-300M scored **61.69% on the identical 66 clips** (`gold_wer_real_omniasr`),
@@ -240,3 +240,19 @@ starting line.
 | هیچ لە دڵم دەرنەچوو | هیچ له دڵم دەرنەچوو | near-exact (orthographic) |
 | گوڵەکانی وەرگرتوو ڕۆیشت | گولهكاني ورگرتو رويشت | Arabic-script confusables + drops |
 | ئاخێکی هەڵکێشا | axékihalkesa | **Latin romanization failure** |
+
+---
+
+## Appendix: Retired measurements
+
+### Halwest verified 16 kHz set (N=66, retired 2026-07-02)
+
+**Measurement:** 7B scored 59.45% CER on 66 clips from the Halwest curated set; stock OmniASR-CTC-300M scored 61.69% on the same clips.
+
+**Reason for retirement:** The 66-clip set exhibits **boundary-drift** (ref text ↔ audio boundaries misaligned). The manifest was built by splitting source text at character offsets, while the audio clips were split at time boundaries, so most clips' audio contains **different words** than their reference rows. The resulting high error rates (~60% for both engines) measure the boundary mismatch, not the engines' actual accuracy. This is a **data artifact, not a signal about model quality**.
+
+**Honest reading:** Both engines score ~60% on this set because the references are wrong. By inspection, the 7B output is coherent, correct Sorani — on-par with or slightly better than stock on the identical audio. The set is **unusable for trustworthy CER measurement**.
+
+**Implication:** The default 7B engine remains unmeasured on a boundary-aligned gold set. The app now fails hard on unresolvable WSL 7B (F2) and the plan calls for a real gold measurement via M1–M3 (FLEURS N=1 as a placeholder, then app-gold N≥300 from the owner's verified corrections).
+
+This row is kept in the appendix (not deleted) as a warning: high CER numbers may reflect data issues, not model failure. Always audit your gold set for boundary integrity before trusting an accuracy claim.

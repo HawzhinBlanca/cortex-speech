@@ -99,8 +99,11 @@ pub struct AppSettings {
     pub jury_t1_threshold: f64,
 
     /// Opt-in: apply LOOP-0 correction memories to the transcript after decoding/refinement, so a
-    /// previously corrected (and independently confirmed) confusion is fixed automatically. Default
-    /// OFF — it rewrites ASR output, so it is a deliberate choice, never a silent surprise.
+    /// previously corrected (and independently confirmed) confusion is fixed automatically. Default OFF.
+    /// CRITICAL (M2): This setting MUST remain disabled until LOOP-0 shadow mode is implemented.
+    /// Currently, enabling it would apply corrections without logging would-fire events — violating
+    /// the requirement that LOOP-0 only activates AFTER measured over-trigger = 0 (C5). Do not enable
+    /// this in production until M2's shadow-mode instrumentation lands.
     #[serde(default)]
     pub loop0_firing_enabled: bool,
 

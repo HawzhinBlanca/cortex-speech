@@ -525,7 +525,7 @@ impl ProcessingPipeline {
                 Ok(Some(_)) => {
                     return Err(AppError::Validation(format!(
                         "OmniASR 7B server is not responding on 127.0.0.1:{WSL_7B_SERVER_PORT} (in WSL). \
-                         Start it (e.g. \"Start 7B server.bat\" / cortex_7b_server.py) and re-import, or \
+                         Start it (e.g. wsl python cortex_7b_server.py from scripts/) and re-import, or \
                          switch the engine to the embedded fine-tuned model. The import was not started, \
                          so nothing was left half-transcribed."
                     )));
@@ -1741,7 +1741,7 @@ impl ProcessingPipeline {
                     );
                 }
                 return Err(AppError::Validation(format!(
-                    "OmniASR 7B server is not running — start it (e.g. \"Start 7B server.bat\") and re-import. \
+                    "OmniASR 7B server is not running — start it (e.g. wsl python cortex_7b_server.py from scripts/) and re-import. \
                      The import was cancelled and its {} segment(s) were rolled back. ({reason})",
                     import_ids.len()
                 )));
