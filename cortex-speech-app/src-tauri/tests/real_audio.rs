@@ -961,6 +961,53 @@ fn pipeline_routes_to_finetuned_when_enabled() {
     );
 }
 
+/// Verify the IMPORT path (not just transcribe()) routes to the fine-tuned engine when enabled.
+/// Before the F2/routing fix, `use_finetuned_asr` was silently ignored during import
+/// (build_segments_from_pcm only branched WSL/cache/local-CTC), so every imported clip was stock
+/// CTC despite the flag. This runs a real single-file import on the committed CC-BY FLEURS fixture
+/// with the flag on and diarization off, and asserts the persisted segment carries a non-empty
+/// Kurdish transcript. Skips cleanly if the fine-tuned model or the fixture is absent.
+#[test]
+#[ignore]
+fn import_routes_to_finetuned_when_enabled() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
+    let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/finetuned-mms-ckb/model.onnx");
+    if !fixture.exists() || !model.exists() {
+        eprintln!("[import-finetuned] fixture or fine-tuned model absent; skipping");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("imp.db").to_string_lossy().to_string();
+    let db = Database::open(&db_path).unwrap();
+    db.initialize().unwrap();
+
+    // Fine-tuned ON, diarization OFF (isolates the ASR routing from the speaker-embedding model).
+    let settings = AppSettings { use_finetuned_asr: true, enable_diarization: false, ..AppSettings::default() };
+    let pipeline = ProcessingPipeline::new(
+        db_path.clone(),
+        Arc::new(SoraniNormalizer::new()),
+        Arc::new(TranscriptCache::new(10)),
+        Arc::new(AudioFingerprint::new()),
+        Arc::new(settings),
+        Arc::new(ModelManager::new(tmp.path().to_path_buf())),
+    );
+
+    let segments = pipeline.process_single_file(&fixture, &db).expect("fine-tuned import must succeed");
+    assert!(!segments.is_empty(), "import must produce at least one segment");
+    let kurdish = segments.iter().any(|s| s.raw_transcript.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)));
+    for s in &segments {
+        eprintln!("[import-finetuned] seg {} raw: {}", s.id, s.raw_transcript);
+        assert!(!s.raw_transcript.trim().is_empty(), "no segment may be blank (no-fabrication guard)");
+        assert!(
+            !s.raw_transcript.contains("[Pending") && !s.raw_transcript.contains("[ASR unavailable"),
+            "fine-tuned import must not leave a placeholder: {}",
+            s.raw_transcript
+        );
+    }
+    assert!(kurdish, "expected at least one Kurdish (Arabic-script) transcript from the fine-tuned import");
+}
+
 /// Minimal JSON-string escaper (no serde_json in the integration-test crate).
 fn json_escape(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);

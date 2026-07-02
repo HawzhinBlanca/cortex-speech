@@ -276,8 +276,9 @@ impl Default for AppSettings {
             // The fine-tuned OmniASR-7B Champion (run via the WSL GPU path) is the owner's main model,
             // so it is the built-in default — a lost/reset settings.json still selects the 7B rather than
             // silently reverting to the weaker base CTC-300M. The 7B client script is resolved from
-            // external_asr_script_path (or the bundled client when that is empty); when neither the script
-            // nor a reachable server is available the import fails hard rather than downgrading.
+            // external_asr_script_path; NO client is bundled, so when the path is empty (and the embedded
+            // fine-tuned engine is not enabled) the import FAILS HARD with an actionable message
+            // (pipeline::wsl7b_primary_unresolved) rather than silently downgrading to stock CTC.
             asr_model_size: AsrModelSize::WSL7B,
             vad_threshold: 0.5,
             min_segment_duration_ms: 3000,

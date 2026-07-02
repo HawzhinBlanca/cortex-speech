@@ -455,6 +455,32 @@ impl ProcessingPipeline {
             && self.settings.external_asr_script_path().is_some()
     }
 
+    /// F2 — the no-silent-downgrade guard. True when the selected primary engine is WSL 7B but no
+    /// client script is configured AND the fine-tuned engine is not available to serve as the
+    /// primary instead. In that state the only thing left below is stock local CTC — which the owner
+    /// never selected — so every primary-transcription entry point must FAIL LOUDLY here rather than
+    /// silently downgrading (the fail-hard contract documented in settings.rs). Hypothesis
+    /// generation is unaffected: it calls the ASR pool directly, not this primary path.
+    fn wsl7b_primary_unresolved(&self) -> bool {
+        self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
+            && self.settings.external_asr_script_path().is_none()
+            && !(self.settings.use_finetuned_asr && Self::finetuned_model_paths().is_some())
+    }
+
+    /// The actionable error returned whenever [`Self::wsl7b_primary_unresolved`] holds. It names all
+    /// three ways out so the user is never stuck: start the 7B server (with the script path set),
+    /// enable the embedded fine-tuned engine, or pick a local CTC model deliberately.
+    fn primary_engine_unavailable_error() -> AppError {
+        AppError::Validation(
+            "OmniASR 7B is the selected engine but no WSL client script is configured \
+             (Settings → \"External ASR script path\" is empty). To transcribe: set that path and \
+             start the 7B server, OR turn on the embedded fine-tuned engine (\"Use fine-tuned \
+             model\"), OR choose a local model (CTC-300M / CTC-1B). Refusing to silently downgrade \
+             to the stock model you did not select."
+                .into(),
+        )
+    }
+
     fn local_asr_model_id(&self) -> &'static str {
         match self.active_local_asr_model_size() {
             crate::settings::AsrModelSize::CTC1B => "omniasr-ctc-1b",
@@ -984,6 +1010,12 @@ impl ProcessingPipeline {
             return Err(AppError::Validation("Empty audio file".into()));
         }
 
+        // F2: fail fast BEFORE any decode/VAD/diarization work if the selected primary engine can't
+        // actually run — never silently transcribe the whole import with the stock model.
+        if self.wsl7b_primary_unresolved() {
+            return Err(Self::primary_engine_unavailable_error());
+        }
+
         self.ensure_source_reference_transcripts(path, db).map_err(|error| {
             AppError::Other(format!(
                 "Whole-file reference transcript failed before chunking {}: {error}",
@@ -1363,7 +1395,39 @@ impl ProcessingPipeline {
                 timer.finish(true);
             }
 
-            let (raw_transcript, confidence) = if self.should_use_wsl_primary_asr() {
+            // Primary-engine override (matches transcribe()): when use_finetuned_asr is set, the
+            // embedded fine-tuned MMS-CTC engine (the measured-best local Sorani engine, ~half the
+            // CER of stock) is the import primary too — otherwise the flag silently did nothing on
+            // import and every clip was transcribed with stock CTC. Any failure/empty output falls
+            // through to the configured engine so import never breaks. Uses the raw chunk PCM, exactly
+            // like transcribe()'s fine-tuned path (no extra RMS/denoise, so the two paths agree).
+            let finetuned_text: Option<String> = if self.settings.use_finetuned_asr {
+                match Self::finetuned_model_paths() {
+                    Some((onnx, vocab)) => match Self::transcribe_chunk_finetuned(&onnx, &vocab, chunk_pcm) {
+                        Ok(t) if !t.trim().is_empty() => Some(t),
+                        Ok(_) => {
+                            tracing::warn!("fine-tuned ASR empty on import chunk; using the configured engine");
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!("fine-tuned ASR failed on import chunk ({e}); using the configured engine");
+                            None
+                        }
+                    },
+                    None => {
+                        tracing::warn!(
+                            "use_finetuned_asr set but the fine-tuned model is absent; using configured engine"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let (raw_transcript, confidence) = if let Some(text) = finetuned_text {
+                (text, None)
+            } else if self.should_use_wsl_primary_asr() {
                 ("[Pending WSL 7B ASR]".to_string(), None)
             } else if let Some(cached) =
                 file_hash.as_deref().and_then(|h| self.cache.get_chunk_by_hash(h, &model_id, Some(&chunk_suffix)))
@@ -2053,6 +2117,13 @@ impl ProcessingPipeline {
                         .into(),
                 ));
             }
+        }
+
+        // F2: the fine-tuned override (above) and the WSL primary pass both declined; if WSL 7B is
+        // the selected engine but unresolvable, fall-through to local CTC here would be the silent
+        // downgrade. Refuse instead (covers manual per-segment re-transcribe, not just import).
+        if self.wsl7b_primary_unresolved() {
+            return Err(Self::primary_engine_unavailable_error());
         }
 
         let model_id = self.local_asr_model_id().to_string();
@@ -3106,6 +3177,48 @@ mod tests {
     fn rejects_missing_wsl_segment_result_stdout_marker() {
         let err = super::parse_wsl_segment_result("loading model\nfinished without result\n").unwrap_err();
         assert!(err.to_string().contains("did not return a valid transcript"));
+    }
+
+    #[test]
+    fn wsl7b_without_script_is_unresolved_not_silently_downgraded() {
+        // F2: WSL 7B selected + empty script + fine-tuned engine off => the ONLY thing left is stock
+        // local CTC, which the owner never chose. The primary path must report "unresolved" so it
+        // fails loudly instead of silently transcribing with 300M.
+        let settings = AppSettings {
+            asr_model_size: AsrModelSize::WSL7B,
+            external_asr_script_path: String::new(),
+            use_finetuned_asr: false,
+            ..AppSettings::default()
+        };
+        let (pipeline, _dir) = test_pipeline_with_settings(settings);
+        assert!(pipeline.wsl7b_primary_unresolved(), "WSL7B + no script + no finetuned must be unresolved");
+        assert!(!pipeline.should_use_wsl_primary_asr(), "no script => not the WSL primary path");
+        let msg = super::ProcessingPipeline::primary_engine_unavailable_error().to_string();
+        assert!(msg.contains("fine-tuned"), "error must name the fine-tuned escape hatch: {msg}");
+        assert!(msg.contains("silently downgrade"), "error must state the no-downgrade contract: {msg}");
+    }
+
+    #[test]
+    fn wsl7b_with_script_is_resolved() {
+        // A configured script means the WSL primary pass runs; not the unresolved/fail-hard state.
+        let settings = AppSettings {
+            asr_model_size: AsrModelSize::WSL7B,
+            external_asr_script_path: "cortex_7b_client.py".to_string(),
+            ..AppSettings::default()
+        };
+        let (pipeline, _dir) = test_pipeline_with_settings(settings);
+        assert!(!pipeline.wsl7b_primary_unresolved(), "a set script path must NOT be unresolved");
+        assert!(pipeline.should_use_wsl_primary_asr());
+    }
+
+    #[test]
+    fn local_ctc_engine_is_never_flagged_unresolved() {
+        // Selecting a local CTC model explicitly is a legitimate primary — never the F2 downgrade state.
+        for size in [AsrModelSize::CTC300M, AsrModelSize::CTC1B] {
+            let settings = AppSettings { asr_model_size: size.clone(), ..AppSettings::default() };
+            let (pipeline, _dir) = test_pipeline_with_settings(settings);
+            assert!(!pipeline.wsl7b_primary_unresolved(), "local CTC {size:?} must not be unresolved");
+        }
     }
 
     #[test]
