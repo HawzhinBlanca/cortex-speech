@@ -12,22 +12,24 @@ test.describe('i18n and locale switching', () => {
     await expect(page.locator('html')).toHaveAttribute('lang', 'ckb');
   });
 
-  test('default state shows EN toggle button (locale is ckb)', async ({ page }) => {
+  test('default state shows the English toggle target (locale is ckb)', async ({ page }) => {
     await page.goto('/');
 
+    // The toggle shows the language you'll switch TO, in its own endonym ('English' / 'کوردی').
     const toggle = page.getByTestId('locale-toggle');
-    await expect(toggle).toHaveText('EN');
+    await expect(toggle).toHaveText('English');
   });
 
   test('toggle switches locale to English', async ({ page }) => {
     await page.goto('/');
 
     const toggle = page.getByTestId('locale-toggle');
-    expect(await toggle.textContent()).toBe('EN');
+    expect(await toggle.textContent()).toBe('English');
 
     await toggle.click();
 
-    await expect(toggle).toHaveText('ckb');
+    // Now in English, the toggle offers Kurdish (endonym).
+    await expect(toggle).toHaveText('کوردی');
   });
 
   test('UI text updates when locale changes', async ({ page }) => {
