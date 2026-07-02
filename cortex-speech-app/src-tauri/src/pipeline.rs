@@ -1656,10 +1656,8 @@ impl ProcessingPipeline {
     /// M2.4: Enqueue background alignment tasks for segments. Non-blocking, best-effort.
     fn enqueue_background_alignments(&self, segments: &[SpeechSegment]) {
         let db_path = self.db_path.clone();
-        let segments_to_align: Vec<(String, String, String)> = segments
-            .iter()
-            .map(|s| (s.id.clone(), s.audio_path.clone(), s.raw_transcript.clone()))
-            .collect();
+        let segments_to_align: Vec<(String, String, String)> =
+            segments.iter().map(|s| (s.id.clone(), s.audio_path.clone(), s.raw_transcript.clone())).collect();
 
         std::thread::spawn(move || {
             for (seg_id, audio_path, transcript) in segments_to_align {

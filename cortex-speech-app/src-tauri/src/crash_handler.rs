@@ -1,11 +1,10 @@
 /// M0.5 — crash observability: log panic to a crash marker file so the app can detect and
 /// report "last session crashed" on next startup.
-
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 
 /// Write a crash marker file when the app panics, so we can detect it on the next startup.
-pub fn install_panic_hook(app_data_dir: &PathBuf) {
+pub fn install_panic_hook(app_data_dir: &Path) {
     let marker_path = app_data_dir.join("last_crash.txt");
 
     let default_hook = std::panic::take_hook();
@@ -23,9 +22,7 @@ pub fn install_panic_hook(app_data_dir: &PathBuf) {
             .map(|l| format!("{}:{}", l.file(), l.line()))
             .unwrap_or_else(|| "unknown location".to_string());
 
-        let crash_info = format!(
-            "CRASH: {} at {}", msg, location
-        );
+        let crash_info = format!("CRASH: {} at {}", msg, location);
 
         // Try to write marker; if it fails, the default panic hook will still run
         let _ = fs::write(&marker_path, &crash_info);
@@ -35,7 +32,7 @@ pub fn install_panic_hook(app_data_dir: &PathBuf) {
 }
 
 /// Check if a crash marker exists and return its content. The app shows this on startup.
-pub fn check_last_crash(app_data_dir: &PathBuf) -> Option<String> {
+pub fn check_last_crash(app_data_dir: &Path) -> Option<String> {
     let marker_path = app_data_dir.join("last_crash.txt");
     if marker_path.exists() {
         fs::read_to_string(&marker_path).ok()
@@ -45,7 +42,7 @@ pub fn check_last_crash(app_data_dir: &PathBuf) -> Option<String> {
 }
 
 /// Clear the crash marker after the user has seen it or after a successful startup.
-pub fn clear_crash_marker(app_data_dir: &PathBuf) {
+pub fn clear_crash_marker(app_data_dir: &Path) {
     let marker_path = app_data_dir.join("last_crash.txt");
     let _ = fs::remove_file(&marker_path);
 }

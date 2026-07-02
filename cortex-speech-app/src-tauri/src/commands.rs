@@ -1286,7 +1286,10 @@ pub fn get_segments(verified: Option<bool>, state: State<'_, AppState>) -> Resul
 /// M2.5: Return segments ordered by suspect-first priority: escalated + low confidence first.
 /// Priority: 1) Jury escalated, 2) Low agent confidence, 3) Chronological.
 #[tauri::command]
-pub fn get_segments_suspect_first(verified: Option<bool>, state: State<'_, AppState>) -> Result<Vec<SpeechSegment>, String> {
+pub fn get_segments_suspect_first(
+    verified: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("get_segments_suspect_first")?;
     let db = state.lock_db();
     db.get_segments_suspect_first(verified).map_err(|e| e.to_string())
@@ -3345,7 +3348,8 @@ pub fn record_human_decision(
         validate::validate_text(t, 100_000, "Corrected transcript")?;
     }
     let db = state.lock_db();
-    db.record_human_decision(&segment_id, &decision, corrected_transcript.as_deref(), timestamp_ms).map_err(|e| e.to_string())?;
+    db.record_human_decision(&segment_id, &decision, corrected_transcript.as_deref(), timestamp_ms)
+        .map_err(|e| e.to_string())?;
 
     // M2.6: Update session with current review segment for cursor persistence on restart.
     let mut session = state.lock_session();

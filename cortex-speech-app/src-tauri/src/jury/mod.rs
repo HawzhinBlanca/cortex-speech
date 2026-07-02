@@ -199,7 +199,10 @@ pub fn run_t0_gate(
     //    learns each engine's real strength over time. Default OFF ⇒ empty priors ⇒ byte-identical to
     //    the hardcoded-heuristic path (no persistence).
     let irt_results = if learn_abilities {
-        let priors = db.load_model_abilities().unwrap_or_default();
+        let priors = db.load_model_abilities().unwrap_or_else(|e| {
+            tracing::warn!("failed to load persisted IRT model abilities; falling back to empty priors: {e}");
+            std::collections::HashMap::new()
+        });
         let r = irt::fit_irt_consensus_with_priors(&all_hyps, &priors);
         if r.abilities_were_fit {
             if let Err(e) = db.save_model_abilities(&r.model_abilities) {

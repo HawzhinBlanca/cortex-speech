@@ -647,17 +647,17 @@ mod tests {
 
                 // Optional: run Python script if available (for environments with Python).
                 // If Python is not available, the test still passes as long as Rust matches the fixture.
-                if let Ok(py_output) = Command::new("python3")
-                    .arg("scripts/sorani_normalize.py")
-                    .arg(input)
-                    .output()
-                {
+                if let Ok(py_output) = Command::new("python3").arg("scripts/sorani_normalize.py").arg(input).output() {
                     if py_output.status.success() {
                         let py_result = String::from_utf8_lossy(&py_output.stdout).trim().to_string();
                         assert_eq!(
-                            py_result, rust_result,
+                            py_result,
+                            rust_result,
                             "Python/Rust mismatch on line {}: input '{}': Python={}, Rust={}",
-                            i + 1, input, py_result, rust_result
+                            i + 1,
+                            input,
+                            py_result,
+                            rust_result
                         );
                     }
                 }

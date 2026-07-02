@@ -772,7 +772,7 @@ def test_jury_db_and_export_paths_do_not_silently_drop_errors() -> None:
     learning = (REPO_ROOT / "src-tauri/src/jury/learning.rs").read_text(encoding="utf-8")
     export = (REPO_ROOT / "src-tauri/src/export.rs").read_text(encoding="utf-8")
     required_jury = [
-        "db.record_human_decision(segment_id, decision, corrected_transcript)",
+        "db.record_human_decision(segment_id, decision, corrected_transcript, timestamp_ms)",
         "rows.collect::<Result<Vec<_>, _>>()?",
     ]
     missing_jury = [pattern for pattern in required_jury if pattern not in jury]

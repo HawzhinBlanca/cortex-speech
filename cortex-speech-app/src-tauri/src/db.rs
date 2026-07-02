@@ -2525,7 +2525,8 @@ mod tests {
         )
         .expect("write agent verdict");
 
-        db.record_human_decision("learn-agent", "edit", Some("human corrected transcript"), None).expect("record human edit");
+        db.record_human_decision("learn-agent", "edit", Some("human corrected transcript"), None)
+            .expect("record human edit");
 
         let fresh = db.get_segment_by_id("learn-agent").expect("load segment").expect("segment exists");
         assert_eq!(fresh.human_decision.as_deref(), Some("edit"));
