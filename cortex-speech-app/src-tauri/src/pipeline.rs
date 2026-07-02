@@ -492,6 +492,63 @@ impl ProcessingPipeline {
             && !(self.settings.use_finetuned_asr && Self::finetuned_model_paths().is_some())
     }
 
+    /// F6 — fast preflight before an import that will drive the WSL 7B primary: confirm the warm
+    /// server is actually accepting connections. The server binds 127.0.0.1:8799 INSIDE WSL's network
+    /// namespace (not reachable from Windows directly), so probe from within WSL with a bash
+    /// `/dev/tcp` open bounded by `timeout`. Without this, a down/hung server is only discovered
+    /// per-segment after a 300 s transcription timeout — up to ~5 minutes of spinner before the
+    /// fail-hard rollback. This turns that into a ~2-second, actionable failure at import start.
+    fn wsl_7b_server_preflight(&self) -> AppResult<()> {
+        if !self.should_use_wsl_primary_asr() {
+            return Ok(());
+        }
+        const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.py
+        let probe = format!("timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{WSL_7B_SERVER_PORT}'");
+        let mut cmd = std::process::Command::new("wsl");
+        cmd.arg("bash").arg("-lc").arg(&probe);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+
+        let mut child =
+            cmd.spawn().map_err(|e| AppError::Other(format!("could not launch WSL to check the 7B server: {e}")))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(_)) => {
+                    return Err(AppError::Validation(format!(
+                        "OmniASR 7B server is not responding on 127.0.0.1:{WSL_7B_SERVER_PORT} (in WSL). \
+                         Start it (e.g. \"Start 7B server.bat\" / cortex_7b_server.py) and re-import, or \
+                         switch the engine to the embedded fine-tuned model. The import was not started, \
+                         so nothing was left half-transcribed."
+                    )));
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        kill_and_reap_wsl_child(&mut child, "7B preflight probe");
+                        return Err(AppError::Validation(
+                            "Timed out checking the OmniASR 7B server (WSL not responding). Ensure WSL and the \
+                             7B server are running, or switch to the embedded fine-tuned engine."
+                                .into(),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    kill_and_reap_wsl_child(&mut child, "7B preflight probe");
+                    return Err(AppError::Other(format!("WSL 7B preflight wait failed: {e}")));
+                }
+            }
+        }
+    }
+
     /// The actionable error returned whenever [`Self::wsl7b_primary_unresolved`] holds. It names all
     /// three ways out so the user is never stuck: start the 7B server (with the script path set),
     /// enable the embedded fine-tuned engine, or pick a local CTC model deliberately.
@@ -1040,6 +1097,9 @@ impl ProcessingPipeline {
         if self.wsl7b_primary_unresolved() {
             return Err(Self::primary_engine_unavailable_error());
         }
+        // F6: when the WSL 7B is primary, confirm its warm server is up before doing any work, so a
+        // down server fails in ~2 s with an actionable message instead of a ~5-minute per-segment hang.
+        self.wsl_7b_server_preflight()?;
 
         self.ensure_source_reference_transcripts(path, db).map_err(|error| {
             AppError::Other(format!(
@@ -3242,6 +3302,26 @@ mod tests {
         let msg = super::ProcessingPipeline::primary_engine_unavailable_error().to_string();
         assert!(msg.contains("fine-tuned"), "error must name the fine-tuned escape hatch: {msg}");
         assert!(msg.contains("silently downgrade"), "error must state the no-downgrade contract: {msg}");
+    }
+
+    #[test]
+    fn preflight_is_noop_when_not_wsl_primary() {
+        // Default engine is not the WSL primary (empty script) => preflight returns Ok without ever
+        // spawning wsl, so a machine without WSL is unaffected.
+        let (pipeline, _dir) = test_pipeline_with_settings(AppSettings::default());
+        assert!(pipeline.wsl_7b_server_preflight().is_ok());
+    }
+
+    #[test]
+    #[ignore] // needs WSL + a running cortex_7b_server.py on 127.0.0.1:8799
+    fn wsl_7b_preflight_passes_when_server_up() {
+        let settings = AppSettings {
+            asr_model_size: AsrModelSize::WSL7B,
+            external_asr_script_path: "cortex_7b_client.py".to_string(),
+            ..AppSettings::default()
+        };
+        let (pipeline, _dir) = test_pipeline_with_settings(settings);
+        pipeline.wsl_7b_server_preflight().expect("preflight must pass when the 7B server is up");
     }
 
     #[test]
