@@ -217,6 +217,26 @@ test.describe('App smoke tests', () => {
     await expect(page.getByTestId('right-panel')).toBeVisible();
   });
 
+  test('review mode: single-key shortcuts focus/blur the editor (F5)', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.getByTestId('segments-empty-state')).not.toBeVisible({ timeout: 15_000 });
+
+    // Enter the one-clip Review & Correct workspace via the nudge CTA.
+    await page.getByTestId('review-nudge-start').click();
+    const editor = page.locator('textarea');
+    await expect(editor).toBeVisible();
+
+    // Move focus off the editor, then 'e' must focus it (single-key flow works from the page body).
+    await page.getByTestId('app-root').click();
+    await expect(editor).not.toBeFocused();
+    await page.keyboard.press('e');
+    await expect(editor).toBeFocused();
+
+    // Escape leaves the editor so single-key review shortcuts resume.
+    await page.keyboard.press('Escape');
+    await expect(editor).not.toBeFocused();
+  });
+
   test('search bar accepts input', async ({ page }) => {
     await page.goto('/');
 
