@@ -7,7 +7,18 @@ targets = [
 version = 2
 yanked = "deny"
 unmaintained = "none"
-ignore = []
+# Documented, dated triage (added 2026-07-02). NOT a blanket suppression: each entry is a specific
+# advisory that is (a) not reachable as a runtime attack surface in Cortex and (b) has no patched
+# version available in the range our dependency tree accepts. Remove each as soon as the upstream
+# bump lands. Re-audit on every dependency update.
+ignore = [
+  # quick-xml XML-parsing DoS (quadratic attr scan / unbounded namespace alloc). quick-xml 0.39.4 is
+  # pulled ONLY by `plist` -> tauri-utils (Tauri's bundle/config tooling); on the Windows target it is
+  # build-time only and never parses attacker-controlled XML at runtime. `cargo update -p quick-xml`
+  # finds no in-range patch (plist pins ^0.39). Revisit when Tauri/plist bump quick-xml.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2
