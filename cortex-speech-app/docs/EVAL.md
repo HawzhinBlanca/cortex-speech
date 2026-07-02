@@ -3,6 +3,27 @@
 > **Real, measured numbers.** Produced by running the live OmniASR-CTC engine on human-transcribed
 > Kurdish audio and scoring against the verified references — no estimates, fully reproducible.
 
+## OmniASR-7B Champion (the DEFAULT engine) — first real measurement (2026-07-02)
+
+The deep audit's #1 gap was that the forced-default WSL 7B engine had **no** measured CER. Measured it
+via the warm server (`scripts/scorecard_7b.py`, no second model load):
+
+| Set | 7B micro CER | N | Notes |
+|---|:--:|:--:|---|
+| Committed CC-BY FLEURS `ckb` fixture (clean) | **29.33%** | 1 | single clip — indicative only |
+| Halwest verified 16 kHz set | 59.45% | 66 | **data-artifact-inflated — see below** |
+
+**Honest reading — the 60% is the DATA, not the engine.** On the Halwest verified set the 7B scored
+59.45%, but stock OmniASR-CTC-300M scored **61.69% on the identical 66 clips** (`gold_wer_real_omniasr`),
+and that harness's content-overlap proxy flags most clips as **"drifted"** (ref text ↔ audio-clip
+boundaries misaligned: the manifest splits text by character offset while audio is split by time, so
+each clip's audio contains different words than its reference row). Both engines score ~60% because the
+reference doesn't match the audio — the set is **unusable for an absolute CER**. By eye the 7B output is
+coherent, correct Sorani. Net: the 7B is **not broken and is on-par-to-slightly-better than stock** on
+identical data; a trustworthy **publishable** 7B CER still needs a boundary-aligned gold set (the clean
+FLEURS is N=1; the original N=900 corpus that produced the fine-tuned 21% below is not on disk). The
+default stays the 7B (owner's choice); the app now fails hard rather than silently downgrading (F2).
+
 ## ⭐ Fine-tuned model — the accuracy cure, measured (2026-06-25)
 
 A user-provided fine-tuned model, **`MMS-CTC-1B` (Wav2Vec2ForCTC, base `facebook/mms-1b-all`)**, is

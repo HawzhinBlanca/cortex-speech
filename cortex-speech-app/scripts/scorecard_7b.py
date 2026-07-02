@@ -30,6 +30,24 @@ def norm(s: str) -> str:
     return " ".join(unicodedata.normalize("NFC", s or "").strip().lower().split())
 
 
+# Punctuation + digit normalization for a FAIR ckb CER: transcription CER conventionally ignores
+# punctuation, and a reference's Arabic-Indic digits (١٠) vs an ASR's verbalized/Latin form are a
+# convention difference, not a recognition error. Set CORTEX_CER_STRIP=1 to apply. Kept OPT-IN so the
+# default norm() stays byte-identical to scorecard_finetuned.py (comparable to the published 21%).
+_AR_DIGITS = {ord(c): str(i) for i, c in enumerate("٠١٢٣٤٥٦٧٨٩")}
+_AR_DIGITS.update({ord(c): str(i) for i, c in enumerate("۰۱۲۳۴۵۶۷۸۹")})
+_PUNCT = "،؛؟٪…«»“”‘’.,!?:;\"'()[]{}-—–/\\"
+
+
+def norm_fair(s: str) -> str:
+    s = unicodedata.normalize("NFC", s or "").strip().lower().translate(_AR_DIGITS)
+    s = "".join(" " if ch in _PUNCT else ch for ch in s)
+    return " ".join(s.split())
+
+
+_NORM = norm_fair if os.environ.get("CORTEX_CER_STRIP") == "1" else norm
+
+
 def edit_distance(a, b) -> int:
     prev = list(range(len(b) + 1))
     for i, ca in enumerate(a, 1):
@@ -78,7 +96,7 @@ def main() -> int:
         except Exception as e:
             print(f"  SKIP {wav}: {e}")
             continue
-        r, h = norm(ref), norm(hyp)
+        r, h = _NORM(ref), _NORM(hyp)
         if not r:
             continue  # zero-reference clip drops out of the ratio-of-sums (matches eval.rs)
         rc, hc = r.replace(" ", ""), h.replace(" ", "")
