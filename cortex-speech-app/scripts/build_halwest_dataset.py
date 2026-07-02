@@ -9,16 +9,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Defaults are neutral (no private local folder name in this public repo); point them at the real
+# source/output with CORTEX_HALWEST_SOURCE_DIR / CORTEX_HALWEST_OUT_DIR.
 SOURCE_DIR = Path(
     os.environ.get(
         "CORTEX_HALWEST_SOURCE_DIR",
-        Path.home() / "Desktop" / "Hawzhin" / "Halwest Voise Samles",
+        Path.home() / "cortex-audio" / "Halwest Voise Samles",
     )
 )
 OUT_DIR = Path(
     os.environ.get(
         "CORTEX_HALWEST_OUT_DIR",
-        Path.home() / "Desktop" / "Hawzhin" / "Halwest_Voice_Dataset",
+        Path.home() / "cortex-audio" / "Halwest_Voice_Dataset",
     )
 )
 SPEAKER_ID = "halwest"

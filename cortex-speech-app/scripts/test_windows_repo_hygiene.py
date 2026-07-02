@@ -8,10 +8,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # not a submodule). The private-path gate must scan that whole public surface, or root-level dev scripts
 # leak the owner's profile path with the gate still green.
 GIT_ROOT = REPO_ROOT.parent
-# Pure DATA files whose tracked content embeds the owner's local audio paths. Exempt from this
-# source-hygiene gate by explicit decision (sanitizing data paths could change how the owner re-uses the
-# dataset); the leak is tracked separately, not silently cleared. Suffix-matched so a script can't hide here.
-DATASET_EXEMPT_SUFFIXES = ("_perfect_dataset.json",)
+# NO exemptions. The private per-owner datasets that used to be exempted here are now gitignored and
+# untracked (F3, 2026-07-02), so the path-hygiene scan holds the entire tracked surface with zero holes.
 SKIP_DIRS = {
     ".claude",  # per-machine editor/tool config (settings.local.json), not shipped app source
     ".git",
@@ -103,6 +101,11 @@ def test_no_hardcoded_local_windows_profile_paths() -> None:
         "/mnt/c/Users/",
         "D:" + "\\Hawzhin",
         "D:/Hawzhin",
+        # The owner's name used as a local FOLDER (a personal-folder path fragment), in either slash
+        # form. Deliberately requires a trailing separator so it catches "…/Hawzhin/…" or
+        # "%CORTEX_AUDIO_LIKE%" but NOT the legitimate public GitHub handle "HawzhinBlanca".
+        "Hawzhin" + "\\",
+        "Hawzhin/",
     ]
     # This file defines the forbidden patterns as string literals and documents them in comments, so it
     # would match itself — a pattern-detector cannot scan its own pattern definitions. Exempt it.
@@ -116,12 +119,8 @@ def test_no_hardcoded_local_windows_profile_paths() -> None:
             for p in iter_repo_paths(REPO_ROOT)
             if p.is_file() and p.suffix.lower() in TEXT_EXTENSIONS
         ]
-    exempt_datasets: list[str] = []
     for rel, path in tracked:
         if rel == self_rel:
-            continue
-        if rel.endswith(DATASET_EXEMPT_SUFFIXES):
-            exempt_datasets.append(rel)
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         for line_no, line in enumerate(text.splitlines(), start=1):
@@ -130,11 +129,6 @@ def test_no_hardcoded_local_windows_profile_paths() -> None:
             normalized = re.sub(r"\\+", "\\\\", line)
             if any(forbidden in normalized for forbidden in forbidden_paths):
                 offenders.append(f"{rel}:{line_no}:{line.strip()}")
-    if exempt_datasets:
-        print(
-            f"  NOTE: {len(exempt_datasets)} dataset data file(s) exempt from path-hygiene "
-            f"(leak tracked separately): {', '.join(sorted(exempt_datasets))}"
-        )
     if offenders:
         formatted = "\n".join(f"- {entry}" for entry in offenders)
         raise AssertionError(f"Tracked files must not hardcode a private local profile path (public repo):\n{formatted}")

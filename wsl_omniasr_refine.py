@@ -189,11 +189,17 @@ def main():
                 (args.segment_id,)
             )
         else:
+            # Audio-path filters are configurable (CORTEX_AUDIO_LIKE / CORTEX_AUDIO_LIKE_2); default
+            # to all segments so no private local folder name is hardcoded in this public repo. The
+            # cutoff is also overridable (CORTEX_REFINE_BEFORE).
+            like_a = os.environ.get('CORTEX_AUDIO_LIKE', '%')
+            like_b = os.environ.get('CORTEX_AUDIO_LIKE_2', '%')
+            cutoff = os.environ.get('CORTEX_REFINE_BEFORE', '2026-06-04 23:26:00')
             cursor.execute(
                 "SELECT id, audio_path, alignment_json, raw_transcript FROM speech_segments "
                 "WHERE (audio_path LIKE ? OR audio_path LIKE ?) "
                 "AND (updated_at IS NULL OR updated_at < ?)",
-                ('%CORTEX_AUDIO_LIKE%', '%Lamo Voice Samples%', '2026-06-04 23:26:00')
+                (like_a, like_b, cutoff)
             )
         rows = cursor.fetchall()
         print(f"Found {len(rows)} segments to refine in database.")

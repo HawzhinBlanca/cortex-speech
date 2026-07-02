@@ -103,9 +103,12 @@ def main():
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
+        # Audio-path filter is configurable (CORTEX_AUDIO_LIKE); defaults to all segments so no
+        # private local folder name is hardcoded in this public repo.
+        audio_like = os.environ.get('CORTEX_AUDIO_LIKE', '%')
         cursor.execute(
             "SELECT id, audio_path, alignment_json, raw_transcript FROM speech_segments WHERE audio_path LIKE ?",
-            ('%CORTEX_AUDIO_LIKE%',)
+            (audio_like,)
         )
         rows = cursor.fetchall()
         print(f"Found {len(rows)} segments to refine in database.")

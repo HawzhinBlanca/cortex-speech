@@ -6,7 +6,10 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 db = os.path.join(os.environ['APPDATA'], 'cortex-speech', 'cortex-speech.db')
 conn = sqlite3.connect(db)
-cursor = conn.execute('SELECT audio_path, COUNT(*) FROM speech_segments WHERE audio_path LIKE ? GROUP BY audio_path', ('%CORTEX_AUDIO_LIKE%',))
+# Audio-path filter is configurable (CORTEX_AUDIO_LIKE); defaults to all segments so no private
+# local folder name is hardcoded in this public repo.
+audio_like = os.environ.get('CORTEX_AUDIO_LIKE', '%')
+cursor = conn.execute('SELECT audio_path, COUNT(*) FROM speech_segments WHERE audio_path LIKE ? GROUP BY audio_path', (audio_like,))
 rows = cursor.fetchall()
 conn.close()
 

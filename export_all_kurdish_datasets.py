@@ -32,9 +32,13 @@ def main():
     # 1. Fetch all distinct audio paths matching the Kurdish folder
     try:
         conn = sqlite3.connect(DB_PATH)
+        # Audio-path filters are configurable (CORTEX_AUDIO_LIKE / CORTEX_AUDIO_LIKE_2); default to
+        # all segments so no private local folder name is hardcoded in this public repo.
+        like_a = os.environ.get('CORTEX_AUDIO_LIKE', '%')
+        like_b = os.environ.get('CORTEX_AUDIO_LIKE_2', '%')
         cursor = conn.execute(
             "SELECT DISTINCT audio_path FROM speech_segments WHERE audio_path LIKE ? OR audio_path LIKE ?",
-            ('%CORTEX_AUDIO_LIKE%', '%Lamo Voice Samples%')
+            (like_a, like_b)
         )
         audio_paths = [r[0] for r in cursor.fetchall()]
         conn.close()
@@ -60,10 +64,12 @@ def main():
         resolved_audio_path = audio_path
         if resolved_audio_path.startswith('\\\\?\\'):
             resolved_audio_path = resolved_audio_path[4:]
-        if "Desktop\\Lamo Voice Samples" in resolved_audio_path:
-            resolved_audio_path = resolved_audio_path.replace("Desktop\\Lamo Voice Samples", "Desktop\\Hawzhin\\Lamo Voice Samples")
-        elif "Desktop/Lamo Voice Samples" in resolved_audio_path:
-            resolved_audio_path = resolved_audio_path.replace("Desktop/Lamo Voice Samples", "Desktop/CortexAudio/Lamo Voice Samples")
+        # Optional owner-machine path fix-up: rewrite a stored prefix to its real on-disk location
+        # via env (CORTEX_PATH_REWRITE_FROM -> CORTEX_PATH_REWRITE_TO). No private path is hardcoded.
+        rewrite_from = os.environ.get('CORTEX_PATH_REWRITE_FROM')
+        rewrite_to = os.environ.get('CORTEX_PATH_REWRITE_TO')
+        if rewrite_from and rewrite_to and rewrite_from in resolved_audio_path:
+            resolved_audio_path = resolved_audio_path.replace(rewrite_from, rewrite_to)
 
         if not os.path.exists(resolved_audio_path):
             print(f"Warning: Original audio file not found at: {resolved_audio_path}. Skipping.")
