@@ -18,6 +18,7 @@ pub mod commands;
 pub mod constrained_decode;
 pub mod corrections;
 pub mod crash;
+pub mod crash_handler;
 pub mod db;
 pub mod denoiser;
 pub mod diarization;
@@ -60,6 +61,10 @@ pub mod throttle;
 pub mod validation;
 pub mod wav2vec2_asr;
 pub mod wer;
+
+// M0.6: Git SHA baked at compile time by build.rs (via rustc-env GIT_SHA). Used by ship-check
+// gate to assert running exe matches HEAD, preventing accidental stale exe deployments.
+pub const GIT_SHA: &str = env!("GIT_SHA");
 
 use cache::TranscriptCache;
 use cancel::CancellationToken;
