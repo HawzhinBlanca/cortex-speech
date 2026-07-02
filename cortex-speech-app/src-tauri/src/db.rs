@@ -1307,15 +1307,24 @@ impl Database {
         agent_confidence: Option<f64>,
         escalated: bool,
     ) -> AppResult<()> {
+        // M2.2: Track T0 (auto-accept) vs T1 (escalate) verdicts for instrumentation.
+        let auto_accept_verdict = if escalated {
+            Some("T1_ESCALATE")
+        } else if verdict == "jury_accept" {
+            Some("T0_ACCEPT")
+        } else {
+            None
+        };
+
         let affected = self.conn.execute(
             "UPDATE speech_segments
-             SET verdict            = ?2,
-                 verdict_transcript = ?3,
-                 rationale          = ?4,
-                 evidence_json      = ?5,
-                 agent_confidence   = ?6,
-                 escalated          = ?7,
-                 updated_at         = datetime('now')
+             SET verdict              = ?2,
+                 verdict_transcript   = ?3,
+                 rationale            = ?4,
+                 evidence_json        = ?5,
+                 agent_confidence     = ?6,
+                 escalated            = ?7,
+                 updated_at           = datetime('now')
              WHERE id = ?1
                AND (human_decision IS NULL OR human_decision = '')
                AND (verdict IS NULL OR verdict NOT IN ('human_accept', 'human_edit', 'human_reject'))",
@@ -1326,6 +1335,13 @@ impl Database {
             // correctly does not apply. Logged (not an error) so the no-op is visible without masking it.
             tracing::debug!(
                 "write_segment_verdict({segment_id}, {verdict}): no-op — segment is human-decided or missing"
+            );
+        } else if let Some(verd) = auto_accept_verdict {
+            // M2.2: Record T0/T1 verdict status in decision_verdicts for instrumentation (if segment was updated).
+            let _ = self.conn.execute(
+                "INSERT OR REPLACE INTO decision_verdicts (segment_id, auto_accept_verdict, verdict_computed_at)
+                 VALUES (?1, ?2, datetime('now'))",
+                params![segment_id, verd],
             );
         }
         self.track_write()?;

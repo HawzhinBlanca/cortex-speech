@@ -560,6 +560,18 @@ pub static MIGRATIONS: &[Migration] = &[
                  CREATE INDEX IF NOT EXISTS idx_decision_log_segment_id ON decision_log(segment_id);",
         down_sql: Some("DROP TABLE IF EXISTS decision_log; DROP INDEX IF EXISTS idx_decision_log_segment_id;"),
     },
+    Migration {
+        version: 29,
+        description: "Per-segment T0/T1 jury verdict rows (M2.2) — track T0/T1 verdict status via separate table",
+        up_sql: "CREATE TABLE IF NOT EXISTS decision_verdicts (
+                     segment_id TEXT PRIMARY KEY,
+                     auto_accept_verdict TEXT,
+                     verdict_computed_at TEXT,
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_decision_verdicts_verdict ON decision_verdicts(auto_accept_verdict);",
+        down_sql: Some("DROP TABLE IF EXISTS decision_verdicts; DROP INDEX IF EXISTS idx_decision_verdicts_verdict;"),
+    },
 ];
 
 #[cfg(test)]
