@@ -62,6 +62,31 @@ pub(crate) fn apply_loop0_firing(enabled: bool, db: &crate::db::Database, transc
     }
 }
 
+/// F7 — the LLM-refinement diff guard. Max CER an LLM refinement may sit from the raw ASR text
+/// before it is rejected. A refiner is a light post-editor (fix phonetic/orthographic slips); an LLM
+/// can instead hallucinate a fluent-but-wrong rewrite far from what was actually heard. Without this
+/// bound that rewrite would silently overwrite good, audio-grounded ASR. Mirrors the T2 listener's
+/// `GEMINI_MAX_EDIT_FROM_HYP`.
+const MAX_REFINE_CER_FROM_RAW: f64 = 0.6;
+
+/// Accept an LLM refinement only when it is non-empty AND stays within [`MAX_REFINE_CER_FROM_RAW`]
+/// of the raw ASR text; otherwise keep the raw transcript. This is the single chokepoint every
+/// refine call site routes through so a hallucinated rewrite can never overwrite good ASR.
+pub(crate) fn accept_refinement(raw: &str, refined: &str) -> String {
+    let trimmed = refined.trim();
+    if trimmed.is_empty() {
+        return raw.to_string();
+    }
+    let cer = crate::wer::compute_cer(raw, trimmed);
+    if cer > MAX_REFINE_CER_FROM_RAW {
+        tracing::warn!(
+            "LLM refinement rejected: CER {cer:.2} from raw exceeds {MAX_REFINE_CER_FROM_RAW}; keeping raw ASR text"
+        );
+        return raw.to_string();
+    }
+    trimmed.to_string()
+}
+
 fn subprocess_error_preview(output: &str) -> String {
     let trimmed = output.trim();
     if trimmed.is_empty() {
@@ -1956,7 +1981,10 @@ impl ProcessingPipeline {
                 match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_pcm) {
                     Ok(raw_text) if !raw_text.trim().is_empty() => {
                         let final_text = match self.build_refiner() {
-                            Some(refiner) => refiner.refine_text(&raw_text).unwrap_or_else(|_| raw_text.clone()),
+                            Some(refiner) => match refiner.refine_text(&raw_text) {
+                                Ok(refined) => accept_refinement(&raw_text, &refined),
+                                Err(_) => raw_text.clone(),
+                            },
                             None => raw_text.clone(),
                         };
                         let final_text = self.fire_loop0_if_enabled(&final_text);
@@ -2095,7 +2123,7 @@ impl ProcessingPipeline {
                     match refine_result {
                         Ok(refined) => {
                             tracing::info!("LLM Refinement successful.");
-                            refined
+                            accept_refinement(&raw_transcript, &refined)
                         }
                         Err(e) => {
                             tracing::warn!("LLM Refinement failed: {}. Falling back to raw transcript.", e);
@@ -2133,7 +2161,10 @@ impl ProcessingPipeline {
             // ignored and the raw element would be contaminated with refined text.
             let raw = cached.raw_transcript.clone();
             let refined = match self.build_refiner() {
-                Some(refiner) => refiner.refine_text(&raw).unwrap_or_else(|_| raw.clone()),
+                Some(refiner) => match refiner.refine_text(&raw) {
+                    Ok(refined) => accept_refinement(&raw, &refined),
+                    Err(_) => raw.clone(),
+                },
                 None => raw.clone(),
             };
             let fired = self.fire_loop0_if_enabled(&refined);
@@ -2157,7 +2188,7 @@ impl ProcessingPipeline {
             match refiner.refine_text(&raw_text) {
                 Ok(refined) => {
                     tracing::info!("LLM Refinement successful.");
-                    refined
+                    accept_refinement(&raw_text, &refined)
                 }
                 Err(e) => {
                     tracing::warn!("LLM Refinement failed: {}. Falling back to raw transcript.", e);
@@ -3177,6 +3208,21 @@ mod tests {
     fn rejects_missing_wsl_segment_result_stdout_marker() {
         let err = super::parse_wsl_segment_result("loading model\nfinished without result\n").unwrap_err();
         assert!(err.to_string().contains("did not return a valid transcript"));
+    }
+
+    #[test]
+    fn refinement_guard_keeps_small_edits_and_rejects_hallucinations() {
+        // A light post-edit (fix one letter) is well within the CER bound => accepted.
+        let raw = "ئەم دەقە دروستە بۆ تاقیکردنەوە";
+        let small_edit = "ئەم دەقە دروستە بۆ تاقیکردنەوەی";
+        assert_eq!(super::accept_refinement(raw, small_edit), small_edit);
+
+        // An empty refinement is never accepted (no-blank guard) => raw is kept.
+        assert_eq!(super::accept_refinement(raw, "   "), raw);
+
+        // A wholesale rewrite far from the audio-grounded raw (CER > 0.6) is a hallucination => raw kept.
+        let hallucination = "abcdefghij klmnopqrst uvwxyz 1234567890 zzzz";
+        assert_eq!(super::accept_refinement(raw, hallucination), raw);
     }
 
     #[test]
