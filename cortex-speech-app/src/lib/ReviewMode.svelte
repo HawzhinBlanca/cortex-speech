@@ -349,10 +349,68 @@
     return '';
   }
 
+  // The transcript editor, so single-key shortcuts can focus it (`e`) and Escape can leave it.
+  let editEl = $state<HTMLTextAreaElement | undefined>();
+
+  // Keyboard-first review flow (parity with the Review Inbox): a=accept, e=edit, x=mark-bad,
+  // space=play/pause, r=replay, n/→=next, p/←=prev, Ctrl/Cmd+Enter=save & next. Single-key actions
+  // NEVER fire while typing in the transcript (or any input), and never hijack space/Enter from a
+  // focused button/link — so nothing corrupts the edit text or breaks native control activation.
   function onKeydown(e: KeyboardEvent) {
+    // Save & next: works everywhere, including mid-edit.
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       e.preventDefault();
       submit(false);
+      return;
+    }
+    const el = e.target as HTMLElement | null;
+    const typing =
+      !!el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.isContentEditable);
+    if (typing) {
+      // Escape drops focus so the single-key review shortcuts resume; otherwise let typing through.
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        editEl?.blur();
+      }
+      return;
+    }
+    // Bare single keys only — never steal a browser/OS chord (Ctrl+A, etc.).
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    // Let a focused button/link keep its native space/Enter activation.
+    if ((el?.tagName === 'BUTTON' || el?.tagName === 'A') && (e.key === ' ' || e.key === 'Enter')) {
+      return;
+    }
+    switch (e.key) {
+      case 'a':
+        e.preventDefault();
+        submit(true);
+        break;
+      case 'e':
+        e.preventDefault();
+        editEl?.focus();
+        break;
+      case 'x':
+        e.preventDefault();
+        void markBad();
+        break;
+      case ' ':
+        e.preventDefault();
+        playing = !playing;
+        break;
+      case 'r':
+        e.preventDefault();
+        replay();
+        break;
+      case 'n':
+      case 'ArrowRight':
+        e.preventDefault();
+        void go(1);
+        break;
+      case 'p':
+      case 'ArrowLeft':
+        e.preventDefault();
+        void go(-1);
+        break;
     }
   }
 </script>
@@ -560,6 +618,7 @@
         </div>
         <textarea
           bind:value={editText}
+          bind:this={editEl}
           dir="rtl"
           spellcheck="false"
           class="input font-kurdish mt-3 min-h-[150px] w-full resize-none text-2xl leading-loose"

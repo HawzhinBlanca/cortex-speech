@@ -145,7 +145,7 @@ export const en: Record<string, string> = {
   'review.saveNext': 'Save & next',
   'review.prev': 'Back',
   'review.reset': 'Original',
-  'review.kbdHint': 'Tip: press Ctrl+Enter to save and continue',
+  'review.kbdHint': 'Keys: A accept · E edit · X mark bad · Space play/pause · R replay · N/P next/prev · Ctrl+Enter save & next',
   'review.allDone': 'All clips reviewed!',
   'review.allDoneHint': 'Every clip has been verified. Import more audio to continue.',
   'review.completeTitle': '✓ All {n} clips reviewed',

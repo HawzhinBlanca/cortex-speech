@@ -146,7 +146,7 @@ export const ckb: Record<string, string> = {
   'review.saveNext': 'پاشەکەوت و دواتر',
   'review.prev': 'گەڕانەوە',
   'review.reset': 'بنەڕەت',
-  'review.kbdHint': 'ئامۆژگاری: Ctrl+Enter دابگرە بۆ پاشەکەوت و بەردەوامبوون',
+  'review.kbdHint': 'کلیلەکان: A پەسەندکردن · E دەستکاری · X خراپ · Space لێدان/وەستان · R دووبارە · N/P دواتر/پێشتر · Ctrl+Enter پاشەکەوت و دواتر',
   'review.allDone': 'هەموو پارچەکان پێداچوونەوەیان بۆ کرا!',
   'review.allDoneHint': 'هەموو پارچەکان پشتڕاستکران. دەنگی زیاتر هاوردە بکە بۆ بەردەوامبوون.',
   'review.completeTitle': '✓ هەموو {n} پارچەکە پێداچوونەوەیان بۆ کرا',
