@@ -1407,12 +1407,13 @@ impl Database {
 
     /// Record a human decision (accept/edit/reject) and optionally store a
     /// corrected transcript.  Gold segments are updated but never written to
-    /// agent_examples.
+    /// agent_examples. M2.1: Also logs decision timing to decision_log table.
     pub fn record_human_decision(
         &self,
         segment_id: &str,
         decision: &str,
         corrected_transcript: Option<&str>,
+        timestamp_ms: Option<i64>,
     ) -> AppResult<()> {
         let human_verdict = human_verdict_for_decision(decision)?;
         // NFC-canonicalize the human correction like EVERY other transcript write path (insert/restore/
@@ -1573,6 +1574,15 @@ impl Database {
                     }
                 }
             }
+        }
+
+        // M2.1: Log decision timing to decision_log for instrumentation before M3 marathon.
+        if let Some(ts_ms) = timestamp_ms {
+            tx.execute(
+                "INSERT INTO decision_log (segment_id, decision_type, timestamp_ms, human_decision, created_at)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                params![segment_id, decision, ts_ms, decision],
+            )?;
         }
 
         tx.commit()?;
@@ -1869,7 +1879,7 @@ mod tests {
         // never reverting the human verdict/transcript or re-escalating an accepted segment.
         let db = make_db();
         db.insert_segment(&make_segment("hv1", "/hv1.wav")).unwrap();
-        db.record_human_decision("hv1", "accept", None).unwrap();
+        db.record_human_decision("hv1", "accept", None, None).unwrap();
 
         db.write_segment_verdict("hv1", "jury_accept", Some("machine consensus"), Some("r"), None, Some(0.9), true)
             .unwrap();
@@ -1893,7 +1903,7 @@ mod tests {
         // Otherwise the stale verdict='human_*' both shows as decided on reload and blocks re-jury.
         let db = make_db();
         db.insert_segment(&make_segment("cl1", "/cl1.wav")).unwrap();
-        db.record_human_decision("cl1", "edit", Some("human gold")).unwrap();
+        db.record_human_decision("cl1", "edit", Some("human gold"), None).unwrap();
         assert_eq!(db.get_segment_by_id("cl1").unwrap().unwrap().verdict.as_deref(), Some("human_edit"));
 
         db.clear_human_decision("cl1").unwrap();
@@ -2370,7 +2380,7 @@ mod tests {
         db.insert_segment(&seg).expect("insert");
 
         // A no-op edit: the corrected text equals the raw ASR (up to the learning key).
-        db.record_human_decision("noop-1", "edit", Some("hello world")).expect("record no-op edit");
+        db.record_human_decision("noop-1", "edit", Some("hello world"), None).expect("record no-op edit");
 
         let ledger_rows: i64 =
             db.conn.query_row("SELECT COUNT(*) FROM corrections WHERE segment_id='noop-1'", [], |r| r.get(0)).unwrap();
@@ -2380,7 +2390,7 @@ mod tests {
         let mut seg2 = make_segment("real-1", &audio_path);
         seg2.raw_transcript = "helo wrld".to_string();
         db.insert_segment(&seg2).expect("insert real");
-        db.record_human_decision("real-1", "edit", Some("hello world")).expect("record real edit");
+        db.record_human_decision("real-1", "edit", Some("hello world"), None).expect("record real edit");
         let real_rows: i64 =
             db.conn.query_row("SELECT COUNT(*) FROM corrections WHERE segment_id='real-1'", [], |r| r.get(0)).unwrap();
         assert_eq!(real_rows, 1, "a genuine correction still records a ledger row");
@@ -2474,7 +2484,7 @@ mod tests {
         )
         .expect("write agent verdict");
 
-        db.record_human_decision("learn-agent", "edit", Some("human corrected transcript")).expect("record human edit");
+        db.record_human_decision("learn-agent", "edit", Some("human corrected transcript"), None).expect("record human edit");
 
         let fresh = db.get_segment_by_id("learn-agent").expect("load segment").expect("segment exists");
         assert_eq!(fresh.human_decision.as_deref(), Some("edit"));
@@ -2504,7 +2514,7 @@ mod tests {
         db.write_segment_verdict("learn-same", "jury_accept", Some("same   text"), None, None, Some(0.9), true)
             .expect("write agent verdict");
 
-        db.record_human_decision("learn-same", "edit", Some("same text")).expect("record human edit");
+        db.record_human_decision("learn-same", "edit", Some("same text"), None).expect("record human edit");
 
         let count: i64 = db
             .connection()
@@ -2532,7 +2542,7 @@ mod tests {
         db.write_segment_verdict("led-1", "jury_accept", Some("agent guess"), None, None, Some(0.7), true)
             .expect("write agent verdict");
 
-        db.record_human_decision("led-1", "edit", Some("right text")).expect("record edit");
+        db.record_human_decision("led-1", "edit", Some("right text"), None).expect("record edit");
 
         let (segment_id, hash, raw_hyp, fix, jury, mv): (
             Option<String>,
@@ -2568,7 +2578,7 @@ mod tests {
         seg.raw_transcript = "ok text".to_string();
         db.insert_segment(&seg).expect("insert segment");
 
-        db.record_human_decision("led-acc", "accept", None).expect("record accept");
+        db.record_human_decision("led-acc", "accept", None, None).expect("record accept");
 
         let count: i64 = db
             .connection()
@@ -2585,7 +2595,7 @@ mod tests {
         seg.raw_transcript = "wrong".to_string();
         db.insert_segment(&seg).expect("insert segment");
 
-        db.record_human_decision("led-missing", "edit", Some("right")).expect("edit must still succeed");
+        db.record_human_decision("led-missing", "edit", Some("right"), None).expect("edit must still succeed");
 
         let fresh = db.get_segment_by_id("led-missing").expect("load").expect("exists");
         assert_eq!(fresh.human_decision.as_deref(), Some("edit"), "the verdict is recorded despite missing audio");
@@ -2602,7 +2612,7 @@ mod tests {
         let mut seg = make_segment("mem-1", "/data/audio/mem-1.wav");
         seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
         db.insert_segment(&seg).expect("insert");
-        db.record_human_decision("mem-1", "edit", Some("ئەو ساڵە خراپ بوو")).expect("edit");
+        db.record_human_decision("mem-1", "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
 
         let (wrong, human, hits): (String, String, i64) = db
             .connection()
@@ -2624,7 +2634,7 @@ mod tests {
             let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
             seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
             db.insert_segment(&seg).expect("insert");
-            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو")).expect("edit");
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
         }
         let (rows, max_hits): (i64, i64) = db
             .connection()
@@ -2646,7 +2656,7 @@ mod tests {
         seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
         db.insert_segment(&seg).expect("insert");
         db.connection().execute("UPDATE speech_segments SET is_gold = 1 WHERE id = 'mem-gold'", []).expect("mark gold");
-        db.record_human_decision("mem-gold", "edit", Some("ئەو ساڵە خراپ بوو")).expect("edit");
+        db.record_human_decision("mem-gold", "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
 
         let count: i64 = db
             .connection()
@@ -2661,7 +2671,7 @@ mod tests {
         let mut seg = make_segment("lm-1", "/data/audio/lm-1.wav");
         seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
         db.insert_segment(&seg).expect("insert");
-        db.record_human_decision("lm-1", "edit", Some("ئەو ساڵە خراپ بوو")).expect("edit");
+        db.record_human_decision("lm-1", "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
 
         let mems = db.load_correction_memories().expect("load");
         assert_eq!(mems.len(), 1);
@@ -2681,7 +2691,7 @@ mod tests {
             let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
             seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
             db.insert_segment(&seg).expect("insert");
-            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو")).expect("edit");
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
         }
 
         let mems = db.load_correction_memories().expect("load");

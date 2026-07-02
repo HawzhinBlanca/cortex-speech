@@ -2735,7 +2735,7 @@ mod tests {
                 ..Default::default()
             };
             db.insert_segment(&seg).unwrap();
-            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو")).unwrap();
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).unwrap();
         }
         let input = "ئەو ساڵە باش بوو";
         // Opt-in OFF -> the transcript is untouched.
@@ -2931,7 +2931,7 @@ mod tests {
                     ..Default::default()
                 };
                 db.insert_segment(&seg).unwrap();
-                db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو")).unwrap();
+                db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).unwrap();
             }
         }
         assert_eq!(

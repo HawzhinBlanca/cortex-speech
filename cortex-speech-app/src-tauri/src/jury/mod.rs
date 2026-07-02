@@ -387,14 +387,15 @@ pub fn write_verdict(
 }
 
 /// Record the final human decision and write to `agent_examples` for few-shot
-/// memory (skipped if the segment is gold-holdout).
+/// memory (skipped if the segment is gold-holdout). M2.1: Accepts optional timestamp_ms for decision timing.
 pub fn record_human_decision(
     db: &Database,
     segment_id: &str,
     decision: &str, // "accept" | "edit" | "reject"
     corrected_transcript: Option<&str>,
+    timestamp_ms: Option<i64>,
 ) -> AppResult<()> {
-    db.record_human_decision(segment_id, decision, corrected_transcript)
+    db.record_human_decision(segment_id, decision, corrected_transcript, timestamp_ms)
 }
 
 /// The normalized word set of a transcript, for lexical-relevance scoring. Uses the char-only
@@ -855,7 +856,7 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         db.insert_segment(&make_seg("s-hv", "raw text")).unwrap();
-        db.record_human_decision("s-hv", "accept", None).unwrap();
+        db.record_human_decision("s-hv", "accept", None, None).unwrap();
 
         write_verdict(&db, "s-hv", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).unwrap();
 

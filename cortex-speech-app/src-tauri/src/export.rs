@@ -1833,7 +1833,7 @@ mod tests {
         db.insert_segment(&sample_segment("keep-1")).unwrap();
         db.insert_segment(&sample_segment("bad-1")).unwrap();
         // Reviewer marks it bad: a human 'reject' decision (verdict=human_reject) while verified stays true.
-        db.record_human_decision("bad-1", "reject", None).unwrap();
+        db.record_human_decision("bad-1", "reject", None, None).unwrap();
 
         let tmp_dir = tempfile::tempdir().unwrap();
         let out = tmp_dir.path().join("dataset.json");

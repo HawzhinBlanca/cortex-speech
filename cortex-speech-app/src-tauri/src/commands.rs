@@ -3327,6 +3327,7 @@ pub fn record_human_decision(
     segment_id: String,
     decision: String,
     corrected_transcript: Option<String>,
+    timestamp_ms: Option<i64>,
 ) -> Result<(), String> {
     RATE_LIMITER.check("record_human_decision")?;
     // Round-22 #4: validate the id and bound the free text, matching every other write command.
@@ -3335,7 +3336,7 @@ pub fn record_human_decision(
         validate::validate_text(t, 100_000, "Corrected transcript")?;
     }
     let db = state.lock_db();
-    db.record_human_decision(&segment_id, &decision, corrected_transcript.as_deref()).map_err(|e| e.to_string())
+    db.record_human_decision(&segment_id, &decision, corrected_transcript.as_deref(), timestamp_ms).map_err(|e| e.to_string())
 }
 
 /// P3-3: Revert a segment back to unreviewed state (NULL human_decision).

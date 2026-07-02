@@ -545,6 +545,21 @@ pub static MIGRATIONS: &[Migration] = &[
                  );",
         down_sql: Some("DROP TABLE IF EXISTS model_abilities;"),
     },
+    Migration {
+        version: 28,
+        description: "Decision timing log (M2.1) — record segment IDs, decision types, and timing (ms since segment came into focus)",
+        up_sql: "CREATE TABLE IF NOT EXISTS decision_log (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     segment_id TEXT NOT NULL,
+                     decision_type TEXT NOT NULL,
+                     timestamp_ms INTEGER NOT NULL,
+                     human_decision TEXT,
+                     created_at TEXT DEFAULT (datetime('now')),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_decision_log_segment_id ON decision_log(segment_id);",
+        down_sql: Some("DROP TABLE IF EXISTS decision_log; DROP INDEX IF EXISTS idx_decision_log_segment_id;"),
+    },
 ];
 
 #[cfg(test)]
