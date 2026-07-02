@@ -1645,7 +1645,40 @@ impl ProcessingPipeline {
 
         // insert_segments_batch wraps inserts in its own transaction; do not nest SAVEPOINTs.
         db.insert_segments_batch(&segments)?;
+
+        // M2.4: Spawn background alignment tasks (low priority, non-blocking).
+        // Alignment is optional — review can proceed while alignment runs in background.
+        self.enqueue_background_alignments(&segments);
+
         Ok(segments)
+    }
+
+    /// M2.4: Enqueue background alignment tasks for segments. Non-blocking, best-effort.
+    fn enqueue_background_alignments(&self, segments: &[SpeechSegment]) {
+        let db_path = self.db_path.clone();
+        let segments_to_align: Vec<(String, String, String)> = segments
+            .iter()
+            .map(|s| (s.id.clone(), s.audio_path.clone(), s.raw_transcript.clone()))
+            .collect();
+
+        std::thread::spawn(move || {
+            for (seg_id, audio_path, transcript) in segments_to_align {
+                // Each alignment runs independently; failures don't block others.
+                // M2.4: Alignment is optional — import continues while background thread runs.
+                if let Ok((_, pcm)) = audio::decode_to_pcm(&audio_path) {
+                    if let Ok(words) = crate::aligner::align(&pcm, 16000, &transcript) {
+                        if let Ok(json) = serde_json::to_string(&words) {
+                            if let Ok(db) = crate::db::Database::open(&db_path) {
+                                let _ = db.connection().execute(
+                                    "UPDATE speech_segments SET alignment_json = ?1 WHERE id = ?2",
+                                    rusqlite::params![json, seg_id],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     fn run_primary_wsl_pass_for_import(

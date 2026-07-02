@@ -816,6 +816,31 @@ impl Database {
         Ok(segments)
     }
 
+    /// M2.5: Return segments ordered by suspect-first priority for ReviewInbox.
+    /// Jury escalated segments first, then low-confidence (suspicious) segments, then chronological.
+    pub fn get_segments_suspect_first(&self, verified: Option<bool>) -> AppResult<Vec<SpeechSegment>> {
+        let col_list = "id, created_at, audio_path, raw_transcript, normalized_transcript,
+                        annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
+                        confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
+                        verdict, verdict_transcript, rationale, evidence_json,
+                        agent_confidence, escalated, human_decision, corrected_at, is_gold,
+                        alignment_quality";
+        let mut query = format!("SELECT {col_list} FROM speech_segments");
+        if let Some(v) = verified {
+            query.push_str(&format!(" WHERE verified = {}", if v { 1 } else { 0 }));
+        }
+        // Priority: escalated (jury doubts) first, then low agent confidence (suspicious), then chronological.
+        query.push_str(" ORDER BY escalated DESC, COALESCE(agent_confidence, 0.5) ASC, created_at DESC, id ASC");
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map([], Self::map_row)?;
+        let mut segments = Vec::new();
+        for row in rows {
+            segments.push(row?);
+        }
+        Ok(segments)
+    }
+
     pub fn search_segments(&self, text: &str) -> AppResult<Vec<SpeechSegment>> {
         let match_query = to_fts5_match(&normalize_search_query(text));
         // Whitespace-only / empty input is an empty result, not an FTS5 `MATCH ""` error.

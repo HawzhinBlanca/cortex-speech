@@ -81,6 +81,8 @@ pub struct SessionManager {
     // explicit frontend save would be clobbered seconds later. Seeded from disk on `restore`.
     search_query: String,
     sort_order: String,
+    // M2.6: Current review segment ID for cursor persistence across restarts.
+    selected_segment_id: Option<String>,
 }
 
 impl SessionManager {
@@ -94,6 +96,7 @@ impl SessionManager {
             last_save: 0,
             search_query: String::new(),
             sort_order: "newest".to_string(),
+            selected_segment_id: None,
         }
     }
 
@@ -103,6 +106,11 @@ impl SessionManager {
     pub fn set_view_state(&mut self, search_query: String, sort_order: String) {
         self.search_query = search_query;
         self.sort_order = sort_order;
+    }
+
+    /// M2.6: Set the current review segment ID for cursor persistence across restarts.
+    pub fn set_current_segment(&mut self, segment_id: &str) {
+        self.selected_segment_id = Some(segment_id.to_string());
     }
 
     pub fn save_path(&self) -> PathBuf {
@@ -125,6 +133,8 @@ impl SessionManager {
         let mut state = SessionState::from_db(db)?;
         state.search_query = self.search_query.clone();
         state.sort_order = self.sort_order.clone();
+        // M2.6: Persist the current review segment for cursor recovery on restart.
+        state.selected_segment_id = self.selected_segment_id.clone();
         let json = serde_json::to_string_pretty(&state)
             .map_err(|e| crate::error::AppError::Other(format!("Session serialize: {e}")))?;
         let tmp_path = self.save_dir.join("session.json.tmp");
