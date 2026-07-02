@@ -173,3 +173,27 @@
 
 **Next**: Implement M2.4–M2.6 (6–8 hours), then hand off to M3 (owner review) and M4–M7 (accuracy retrain, moat, polish, audit).
 
+
+### Work Allocation & Dependency Chain
+
+**Completed this session** (executable, verified):
+- M0.1–M0.7: Core fixes + observability (32 commits, all gates green)
+- M2.1–M2.3: Database instrumentation (3 migrations, 741 tests pass)
+
+**Documented/scoped, ready for next session**:
+- M1: Engine decision runbook (docs/M1_ENGINE_DECISION_RUNBOOK.md) — GPU-bound on owner's machine
+- M2.4–M2.6: Code sketches (M2_INSTRUMENTATION_CHECKLIST.md) — 8 hours remaining
+  - M2.4: align() background worker at import
+  - M2.5: ReviewInbox suspect-first queue (escalation + memory hits + outliers)
+  - M2.6: Session cursor persistence (selected_segment_id + scroll offset)
+- M3: Owner review marathon (weeks, measured gold collection) — user-driven
+- M4–M7: Retrain/moat/polish/audit — depend on M3 data
+
+**Critical path forward**:
+1. Execute M2.4–M2.6 (8h) → M2 complete
+2. Owner runs M3 (weeks) → gold data + 500+ decisions
+3. Execute M4 (retrain) on 7B weights (WSL 31GB) → new champion
+4. Execute M5–M7 (DirectML, punctuation, re-audit)
+5. Final grade: measured end-to-end accuracy on gold + moat
+
+---
