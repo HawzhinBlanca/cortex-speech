@@ -116,6 +116,13 @@ pub struct AppSettings {
     /// changes the refinement prompt, so it is a deliberate, validate-on-your-data choice.
     #[serde(default)]
     pub ger_refinement_enabled: bool,
+
+    /// Opt-in: persist the EM-fitted per-model IRT abilities and warm-start the next T0 consensus from
+    /// them, so the jury learns each engine's real strength over time instead of restarting from the
+    /// hardcoded priors every run. Default OFF — when off, T0 behavior is byte-identical to the
+    /// hardcoded-prior path (no persistence, no warm-start).
+    #[serde(default)]
+    pub irt_ability_learning_enabled: bool,
 }
 
 fn default_hf_train_ratio() -> f64 {
@@ -323,6 +330,7 @@ impl Default for AppSettings {
             loop0_firing_enabled: false,
             use_finetuned_asr: false,
             ger_refinement_enabled: false,
+            irt_ability_learning_enabled: false,
         }
     }
 }

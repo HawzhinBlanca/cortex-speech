@@ -1109,6 +1109,37 @@ impl Database {
         Ok(list)
     }
 
+    /// Load the persisted per-model IRT abilities (F7). Empty when learning has never run, in which
+    /// case the consensus falls back to the hardcoded heuristic priors (identical to the old behavior).
+    pub fn load_model_abilities(&self) -> AppResult<std::collections::HashMap<String, f64>> {
+        let mut stmt = self.conn.prepare("SELECT model_id, ability FROM model_abilities")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))?;
+        let mut map = std::collections::HashMap::new();
+        for r in rows {
+            let (id, ability) = r?;
+            map.insert(id, ability);
+        }
+        Ok(map)
+    }
+
+    /// Upsert the EM-fitted per-model IRT abilities (F7). Only finite abilities are stored.
+    pub fn save_model_abilities(&self, abilities: &std::collections::HashMap<String, f64>) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO model_abilities (model_id, ability, updated_at) VALUES (?1, ?2, datetime('now'))
+                 ON CONFLICT(model_id) DO UPDATE SET ability = excluded.ability, updated_at = excluded.updated_at",
+            )?;
+            for (model_id, ability) in abilities {
+                if ability.is_finite() {
+                    stmt.execute(rusqlite::params![model_id, ability])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Returns the number of rows actually changed — human-reviewed rows are skipped by the guard,
     /// so this can be less than `updates.len()`; callers must report THIS, not the attempted count.
     pub fn update_segment_consensus_batch(&self, updates: &[(String, String, String, f64)]) -> AppResult<usize> {
@@ -1683,6 +1714,23 @@ mod tests {
             duration_ms: 1000,
             ..SpeechSegment::default()
         }
+    }
+
+    #[test]
+    fn model_abilities_round_trip_and_upsert() {
+        let db = make_db();
+        assert!(db.load_model_abilities().unwrap().is_empty(), "no abilities before any learning run");
+        let mut a = std::collections::HashMap::new();
+        a.insert("omniasr-wsl-7b".to_string(), 1.5);
+        a.insert("omniasr-ctc-300m".to_string(), -0.5);
+        a.insert("nan-model".to_string(), f64::NAN); // must be dropped (non-finite)
+        db.save_model_abilities(&a).unwrap();
+        let loaded = db.load_model_abilities().unwrap();
+        assert_eq!(loaded.len(), 2, "the NaN ability must not be stored");
+        assert!((loaded["omniasr-wsl-7b"] - 1.5).abs() < 1e-9);
+        // Upsert overwrites the prior value for the same model.
+        db.save_model_abilities(&std::collections::HashMap::from([("omniasr-wsl-7b".to_string(), 2.2)])).unwrap();
+        assert!((db.load_model_abilities().unwrap()["omniasr-wsl-7b"] - 2.2).abs() < 1e-9);
     }
 
     // The jury db-lock fix (with_jury_db) opens a SECOND, dedicated connection from Database::path so

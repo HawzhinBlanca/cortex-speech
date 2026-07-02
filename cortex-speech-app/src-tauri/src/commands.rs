@@ -3116,8 +3116,11 @@ pub fn list_gold_segments(state: State<'_, AppState>) -> Result<Vec<crate::eval:
 pub fn run_t0_gate(state: State<'_, AppState>, segment_ids: Vec<String>) -> Result<crate::jury::T0GateReport, String> {
     RATE_LIMITER.check("run_t0_gate")?;
     let db = state.lock_db();
-    let autonomy = state.lock_settings().jury_autonomy_level.clone();
-    crate::jury::run_t0_gate(&db, &segment_ids, &autonomy).map_err(|e| e.to_string())
+    let (autonomy, learn) = {
+        let s = state.lock_settings();
+        (s.jury_autonomy_level.clone(), s.irt_ability_learning_enabled)
+    };
+    crate::jury::run_t0_gate(&db, &segment_ids, &autonomy, learn).map_err(|e| e.to_string())
 }
 
 /// Turn the human-corrected segments of one source file into a holdout GOLD benchmark entry. Run it
@@ -3906,7 +3909,13 @@ pub fn run_jury_pipeline_core(
     let t0_report = if t0_candidate_ids.is_empty() {
         crate::jury::T0GateReport { total: 0, auto_accepted: 0, escalated: 0, decisions: Vec::new() }
     } else {
-        crate::jury::run_t0_gate(db, &t0_candidate_ids, &settings.jury_autonomy_level).map_err(|e| e.to_string())?
+        crate::jury::run_t0_gate(
+            db,
+            &t0_candidate_ids,
+            &settings.jury_autonomy_level,
+            settings.irt_ability_learning_enabled,
+        )
+        .map_err(|e| e.to_string())?
     };
 
     if !t0_candidate_ids.is_empty() {

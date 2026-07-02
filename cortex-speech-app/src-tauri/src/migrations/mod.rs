@@ -535,6 +535,16 @@ pub static MIGRATIONS: &[Migration] = &[
         up_sql: "CREATE INDEX IF NOT EXISTS idx_segments_human_decision ON speech_segments(human_decision);",
         down_sql: Some("DROP INDEX IF EXISTS idx_segments_human_decision;"),
     },
+    Migration {
+        version: 27,
+        description: "Persist EM-fitted IRT model abilities so the jury warm-starts across runs (F7, opt-in)",
+        up_sql: "CREATE TABLE IF NOT EXISTS model_abilities (
+                     model_id TEXT PRIMARY KEY,
+                     ability REAL NOT NULL,
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+        down_sql: Some("DROP TABLE IF EXISTS model_abilities;"),
+    },
 ];
 
 #[cfg(test)]
@@ -639,6 +649,19 @@ mod tests {
         let again = run_migrations(&db).unwrap();
         assert!(again.is_empty());
         assert_eq!(get_current_version(&db).unwrap(), max_version);
+    }
+
+    #[test]
+    fn migration_v27_creates_model_abilities_table() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let exists: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_abilities'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(exists, 1, "the v27 model_abilities table must exist after initialize()");
     }
 
     #[test]

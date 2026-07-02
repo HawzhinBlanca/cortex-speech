@@ -183,6 +183,7 @@ pub fn run_t0_gate(
     db: &Database,
     segment_ids: &[String],
     autonomy: &crate::settings::AutonLevel,
+    learn_abilities: bool,
 ) -> AppResult<T0GateReport> {
     // 1. Load only the requested segments (not the full dataset).
     let all_segs = db.get_segments_by_ids(segment_ids)?;
@@ -193,8 +194,22 @@ pub fn run_t0_gate(
     // We still need all verified segments to calibrate the conformal threshold.
     let all_verified = db.get_segments(Some(true))?;
 
-    // 2. Run IRT over all hypotheses
-    let irt_results = irt::fit_irt_consensus(&all_hyps);
+    // 2. Run IRT over all hypotheses. When ability-learning is enabled (opt-in, F7), warm-start the
+    //    consensus from the persisted per-model abilities and persist the freshly-fit ones so the jury
+    //    learns each engine's real strength over time. Default OFF ⇒ empty priors ⇒ byte-identical to
+    //    the hardcoded-heuristic path (no persistence).
+    let irt_results = if learn_abilities {
+        let priors = db.load_model_abilities().unwrap_or_default();
+        let r = irt::fit_irt_consensus_with_priors(&all_hyps, &priors);
+        if r.abilities_were_fit {
+            if let Err(e) = db.save_model_abilities(&r.model_abilities) {
+                tracing::warn!("failed to persist IRT model abilities: {e}");
+            }
+        }
+        r
+    } else {
+        irt::fit_irt_consensus(&all_hyps)
+    };
 
     // 3. Calibrate the conformal threshold on the SAME IRT-based nonconformity score the gate uses
     //    below. Previously the threshold was calibrated on seg.confidence-based nonconformity while
@@ -819,7 +834,7 @@ mod tests {
         }
 
         // Observe: pure observation — the report counts the segment but NO verdict is committed.
-        let obs = run_t0_gate(&db, &["s-dial".to_string()], &AutonLevel::Observe).unwrap();
+        let obs = run_t0_gate(&db, &["s-dial".to_string()], &AutonLevel::Observe, false).unwrap();
         assert_eq!(obs.total, 1);
         assert!(
             db.get_segment_by_id("s-dial").unwrap().unwrap().verdict.as_deref().unwrap_or("").is_empty(),
@@ -827,7 +842,7 @@ mod tests {
         );
 
         // ActConfirm: the SAME segment now gets its escalated verdict written — the dial changed backend behavior.
-        let act = run_t0_gate(&db, &["s-dial".to_string()], &AutonLevel::ActConfirm).unwrap();
+        let act = run_t0_gate(&db, &["s-dial".to_string()], &AutonLevel::ActConfirm, false).unwrap();
         assert_eq!(act.escalated, 1);
         assert_eq!(db.get_segment_by_id("s-dial").unwrap().unwrap().verdict.as_deref(), Some("escalated"));
     }
@@ -875,7 +890,7 @@ mod tests {
             })
             .unwrap();
         }
-        let report = run_t0_gate(&db, &["s-uncal".to_string()], &AutonLevel::ActConfirm).unwrap();
+        let report = run_t0_gate(&db, &["s-uncal".to_string()], &AutonLevel::ActConfirm, false).unwrap();
         assert_eq!(report.auto_accepted, 0, "no calibrated bucket → nothing may auto-accept");
         assert_eq!(report.escalated, 1, "the segment fails closed to human review");
         assert!(matches!(report.decisions[0], T0Decision::EscalateToT1 { .. }));

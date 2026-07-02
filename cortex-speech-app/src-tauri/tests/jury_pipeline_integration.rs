@@ -86,7 +86,7 @@ fn test_jury_pipeline_t0_escalates_and_t1_resolves() {
 
     // 1. Run T0 Gate (default autonomy = ActConfirm: auto-accept agreements, escalate the rest).
     let t0_report =
-        jury::run_t0_gate(&db, &[seg_id.to_string()], &cortex_speech_app_lib::settings::AutonLevel::ActConfirm)
+        jury::run_t0_gate(&db, &[seg_id.to_string()], &cortex_speech_app_lib::settings::AutonLevel::ActConfirm, false)
             .unwrap();
     println!("T0 report: {:?}", t0_report);
     assert_eq!(t0_report.total, 1);

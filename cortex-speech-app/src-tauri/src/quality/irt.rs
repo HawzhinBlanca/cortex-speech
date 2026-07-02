@@ -27,6 +27,9 @@ pub struct IrtResults {
     pub segment_confidences: HashMap<String, f64>,
     pub model_abilities: HashMap<String, f64>,
     pub segment_difficulties: HashMap<String, f64>,
+    /// True only when the EM actually updated abilities (≥10 segments this batch). The caller persists
+    /// `model_abilities` only when this holds, so the store never captures un-fit heuristic priors.
+    pub abilities_were_fit: bool,
 }
 
 /// Helper to assign initial model abilities based on name heuristics.
@@ -153,6 +156,15 @@ fn build_confusion_slots(hyps: &[&SegmentHypothesis]) -> Option<(Vec<Slot>, Stri
 /// Fits a 1PL Item Response Theory (IRT) model using the Expectation-Maximization (EM) algorithm
 /// over multiple transcript hypotheses to compute a phonetic consensus transcript and posterior confidence.
 pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
+    fit_irt_consensus_with_priors(hypotheses, &HashMap::new())
+}
+
+/// Same as [`fit_irt_consensus`] but seeds each model's ability from `priors` when present (else the
+/// hardcoded heuristic). An EMPTY `priors` map makes this byte-identical to the heuristic-only path,
+/// so the default gate is unchanged; a populated map warm-starts from previously-learned abilities.
+/// The EM's regularization still anchors to the base heuristic prior, so learned abilities cannot
+/// drift unboundedly across runs.
+pub fn fit_irt_consensus_with_priors(hypotheses: &[SegmentHypothesis], priors: &HashMap<String, f64>) -> IrtResults {
     let mut segment_hyps: HashMap<String, Vec<&SegmentHypothesis>> = HashMap::new();
     for h in hypotheses {
         segment_hyps.entry(h.segment_id.clone()).or_default().push(h);
@@ -169,7 +181,9 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
         };
         for slot in &slots {
             for obs in &slot.observations {
-                model_abilities.entry(obs.model_id.clone()).or_insert_with(|| get_initial_ability(&obs.model_id));
+                model_abilities.entry(obs.model_id.clone()).or_insert_with(|| {
+                    priors.get(&obs.model_id).copied().unwrap_or_else(|| get_initial_ability(&obs.model_id))
+                });
             }
         }
         segment_difficulties.insert(segment_id.clone(), 0.0);
@@ -292,7 +306,13 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
         }
     }
 
-    IrtResults { consensus_transcripts, segment_confidences, model_abilities, segment_difficulties }
+    IrtResults {
+        consensus_transcripts,
+        segment_confidences,
+        model_abilities,
+        segment_difficulties,
+        abilities_were_fit: update_abilities,
+    }
 }
 
 /// Reduce one segment's aligned slots to `(consensus_text, confidence)`, or `None` for a degenerate
@@ -436,6 +456,36 @@ mod tests {
             observations: Vec::new(),
             posteriors: posteriors.to_vec(),
         }
+    }
+
+    #[test]
+    fn empty_priors_match_heuristic_and_priors_warm_start_seeding() {
+        let hyps = vec![
+            SegmentHypothesis {
+                segment_id: "s1".into(),
+                model_id: "omniasr-ctc-300m".into(),
+                transcript: "ئەمە دەنگە".into(),
+                confidence: Some(0.8),
+            },
+            SegmentHypothesis {
+                segment_id: "s1".into(),
+                model_id: "custom-x".into(),
+                transcript: "ئەمە دەنگ".into(),
+                confidence: Some(0.7),
+            },
+        ];
+        // Backward-compat: the wrapper == the empty-priors variant, so the default gate is unchanged.
+        let a = fit_irt_consensus(&hyps);
+        let b = fit_irt_consensus_with_priors(&hyps, &HashMap::new());
+        assert_eq!(a.model_abilities, b.model_abilities);
+        assert!(!a.abilities_were_fit, "one segment (<10) must NOT fit abilities");
+        let heuristic = *a.model_abilities.get("custom-x").expect("custom-x present");
+        // Warm-start: a stored prior seeds the ability (single segment ⇒ EM doesn't update ⇒ stays the seed).
+        let priors = HashMap::from([("custom-x".to_string(), 2.5)]);
+        let c = fit_irt_consensus_with_priors(&hyps, &priors);
+        let warm = *c.model_abilities.get("custom-x").expect("custom-x present");
+        assert!((warm - 2.5).abs() < 1e-9, "warm-start must seed custom-x from the stored 2.5, got {warm}");
+        assert!((warm - heuristic).abs() > 1e-6, "warm-started ability must differ from the heuristic seed");
     }
 
     #[test]
