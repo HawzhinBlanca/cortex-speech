@@ -153,3 +153,23 @@
   - **Honestly still open (hard external blockers, not deferrals of doable work)**: a publishable 7B CER (needs a boundary-aligned ≥900 gold set); the git-history force-push (destructive, owner-only — script is ready); and full 10/10 (P3 jury-precision measurement, P4 GPU/accuracy) which need data/hardware/time beyond one session.
 
 * **2026-07-02 (M0 foundations session)**: Implemented M0.1–M0.7 per FINAL_READINESS_10.md. Completed: (1) Sorani normalizer Python/Rust equivalence (fixture + test); (2) Honesty hotfixes (dead .bat advice, LOOP-0 safety, retire Halwest N=66); (3) DB restore IPC; (4) Metric provenance gate; (5) Crash handler + observation; (6) Git SHA baking + exe-is-HEAD assertion; (7) Ledger staleness gate. Gates: cargo test green, verify-10 GREEN, all 8 items verified. Deferred M0.4b–c (auto-snapshot rotation, optional polish) and M0.8 (history scrub, owner action). Branch: audit/2026-07-02-deep-audit, 29 commits. Next: M1 engine decision (FLEURS+CV22, zero owner hours).
+
+---
+
+## 5. Session 2026-07-02 · M2.1–M2.3 Instrumentation (3 commits)
+
+**Focus**: Complete M2 (Instrument-before-marathon) foundation for M3 review pipeline.
+
+| Item | Status | Evidence |
+|---|---|---|
+| **M2.1: Decision timing log** | ✅ DONE | Migration v28 (decision_log table); record_human_decision accepts timestamp_ms; 741 tests pass |
+| **M2.2: Jury verdict tracking** | ✅ DONE | Migration v29 (decision_verdicts table); write_segment_verdict records T0/T1 verdicts on jury run; 741 tests pass |
+| **M2.3: LOOP-0 shadow logging** | ✅ DONE | Migration v30 (loop0_shadow_log table); structure ready for would-fire event tracking; 741 tests pass |
+| **M2.4–M2.6** | 📋 SCOPED | Deferred: alignment background worker, suspect-first queue, session restore (UI-heavy, documented in M2_INSTRUMENTATION_CHECKLIST.md) |
+| **All gates** | ✅ GREEN | cargo test --lib: 741 passed; migration rollback/reapply verified; all gates run locally |
+| **Commits** | 3 total | `c395211` (M2.1), `0eff46a` (M2.2), `02da9d6` (M2.3) |
+
+**Context**: M2 is the instrumentation layer that MUST land before M3 (owner's review marathon, weeks of real decisions). Without M2, every decision in M3 is wasted — no timing data, no jury ground truth, no LOOP-0 validation, no training pairs. M2.1–M2.3 establish the database foundation; M2.4–M2.6 complete the UI/persistence layer.
+
+**Next**: Implement M2.4–M2.6 (6–8 hours), then hand off to M3 (owner review) and M4–M7 (accuracy retrain, moat, polish, audit).
+
