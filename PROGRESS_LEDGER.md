@@ -197,3 +197,47 @@
 5. Final grade: measured end-to-end accuracy on gold + moat
 
 ---
+
+### M2 Completion (All 6 items delivered)
+
+| Item | Code | Status | Gate |
+|---|---|---|---|
+| M2.1 | decision_log migration v28 | ✅ | 741 tests |
+| M2.2 | decision_verdicts migration v29 | ✅ | 741 tests |
+| M2.3 | loop0_shadow_log migration v30 | ✅ | 741 tests |
+| M2.4 | align() background worker post-import | ✅ | 741 tests |
+| M2.5 | get_segments_suspect_first() query + ordering | ✅ | 741 tests |
+| M2.6 | SessionManager.selected_segment_id persistence | ✅ | 741 tests |
+
+**M2 Summary**: Instrumentation foundation complete. Every decision in M3 will be:
+- Timestamped (M2.1: decision_log)
+- Verdicted (M2.2: T0/T1 tracking via decision_verdicts)
+- LOOP-0-validated (M2.3: would-fire shadow log)
+- Aligned (M2.4: word timings from background thread)
+- Prioritized for review (M2.5: suspect-first queue)
+- Restorable (M2.6: cursor persistence)
+
+**Total this session**: M0 partial (7/8) + M2 complete (6/6) = **13/14 items executed** (93%).
+
+---
+
+### M2 Completion (All 6 items delivered)
+
+| Item | Code | Status | Gate |
+|---|---|---|---|
+| M2.1 | decision_log migration v28 | ✅ | 741 tests |
+| M2.2 | decision_verdicts migration v29 | ✅ | 741 tests |
+| M2.3 | loop0_shadow_log migration v30 | ✅ | 741 tests |
+| M2.4 | align() background worker post-import | ✅ | 741 tests |
+| M2.5 | get_segments_suspect_first() query + ordering | ✅ | 741 tests |
+| M2.6 | SessionManager.selected_segment_id persistence | ✅ | 741 tests |
+
+**M2 Summary**: Instrumentation foundation complete. Every decision in M3 will be:
+- Timestamped (M2.1: decision_log)
+- Verdicted (M2.2: T0/T1 tracking via decision_verdicts)
+- LOOP-0-validated (M2.3: would-fire shadow log)
+- Aligned (M2.4: word timings from background thread)
+- Prioritized for review (M2.5: suspect-first queue)
+- Restorable (M2.6: cursor persistence)
+
+**Total this session**: M0 partial (7/8) + M2 complete (6/6) = **13/14 items executed** (93%).
