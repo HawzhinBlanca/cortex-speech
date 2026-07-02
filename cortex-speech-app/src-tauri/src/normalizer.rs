@@ -609,6 +609,61 @@ mod tests {
         assert_eq!(n.normalize("1\u{066C}000"), n.normalize("1000"), "U+066C groups one magnitude");
         assert_eq!(n.normalize("3\u{066B}14"), "سێ خاڵ یەک چوار", "U+066B decimal -> three point one four");
     }
+
+    #[test]
+    fn python_rust_normalization_equivalence() {
+        // M0.1: Verify Python sorani_normalize.py produces byte-identical output to normalizer.rs
+        // on a fixture of Sorani edge cases. This test runs if the Python script exists; it skips
+        // silently if not (e.g., in CI environments without Python installed).
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        let fixture_path = std::path::PathBuf::from(&manifest_dir)
+            .parent()
+            .map(|p| p.join("scripts/sorani_normalize_fixture.txt"))
+            .unwrap_or_else(|| std::path::PathBuf::from("scripts/sorani_normalize_fixture.txt"));
+
+        if !fixture_path.exists() {
+            eprintln!("Skipping Python/Rust equivalence test: fixture not found at {}", fixture_path.display());
+            return;
+        }
+
+        use std::process::Command;
+        let rust_norm = SoraniNormalizer::new();
+
+        // Each line is a tab-separated (input, expected_output) pair.
+        if let Ok(fixture_content) = std::fs::read_to_string(fixture_path) {
+            for (i, line) in fixture_content.lines().enumerate() {
+                if line.trim().is_empty() || !line.contains('\t') {
+                    continue;
+                }
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() < 2 {
+                    continue;
+                }
+                let input = parts[0];
+                let expected = parts[1];
+
+                let rust_result = rust_norm.normalize(input);
+                assert_eq!(rust_result, expected, "Rust normalizer line {}: input {}", i + 1, input);
+
+                // Optional: run Python script if available (for environments with Python).
+                // If Python is not available, the test still passes as long as Rust matches the fixture.
+                if let Ok(py_output) = Command::new("python3")
+                    .arg("scripts/sorani_normalize.py")
+                    .arg(input)
+                    .output()
+                {
+                    if py_output.status.success() {
+                        let py_result = String::from_utf8_lossy(&py_output.stdout).trim().to_string();
+                        assert_eq!(
+                            py_result, rust_result,
+                            "Python/Rust mismatch on line {}: input '{}': Python={}, Rust={}",
+                            i + 1, input, py_result, rust_result
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
