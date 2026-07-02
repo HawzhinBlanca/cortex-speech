@@ -336,6 +336,24 @@
     currentTime = range.startTime + w.start;
     playing = true;
   }
+  // Double-tap a word → jump into the editor with THAT word selected, so the reviewer types the fix
+  // immediately. This only SELECTS text (never rewrites it), so it can't corrupt an edited transcript:
+  // prefer the i-th editor token when the alignment is intact, else the first exact match, else just
+  // focus. The single-click play still fires (you hear the word, then correct it).
+  function editWord(w: WordTimestamp, i: number) {
+    if (!editEl) return;
+    editEl.focus();
+    const text = editText;
+    // Offsets of each non-whitespace token, in order.
+    const tokens: Array<{ start: number; len: number; word: string }> = [];
+    const re = /\S+/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) tokens.push({ start: m.index, len: m[0].length, word: m[0] });
+    let target = tokens[i] && tokens[i].word === w.word ? tokens[i] : tokens.find((t) => t.word === w.word);
+    if (target) {
+      editEl.setSelectionRange(target.start, target.start + target.len);
+    }
+  }
   function replay() {
     currentTime = playStart;
     playing = true;
@@ -541,7 +559,8 @@
                   ? 'word-active'
                   : ''}"
                 onclick={() => playFromWord(w)}
-                title={`${w.start.toFixed(2)}s · ${Math.round((w.confidence ?? 1) * 100)}%`}
+                ondblclick={() => editWord(w, i)}
+                title={`${w.start.toFixed(2)}s · ${Math.round((w.confidence ?? 1) * 100)}% — tap to hear, double-tap to edit`}
               >
                 {w.word}
               </button>
