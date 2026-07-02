@@ -131,8 +131,9 @@ would be simpler, faster, and testable. No import journal: a crash mid-import me
   change; the charter requires per-iteration ledger updates.
 - Locks held across inference: diarization embedder (`pipeline.rs:1032–1039`), denoiser
   (`:1041–1047`), Silero VAD session (`audio.rs:833–840`), aligner session (`aligner.rs:99–127`).
-- Missing DB indices on `human_decision`/`verdict` (export/review filters table-scan);
-  `agent_import_reports` grows unbounded.
+- Missing DB index on `human_decision` (export/review filters table-scan). [Correction 2026-07-02:
+  `verdict`/`escalated`/`audio_path`/`verified` are already indexed — only `human_decision` was
+  missing; fixed in migration v26.] `agent_import_reports` grows unbounded.
 - Cancellation not checked inside diarization/rediarize loops.
 
 ## 4. The plan — six phases, every one exits through a measured, user-observable gate
