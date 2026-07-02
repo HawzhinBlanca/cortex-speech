@@ -572,6 +572,19 @@ pub static MIGRATIONS: &[Migration] = &[
                  CREATE INDEX IF NOT EXISTS idx_decision_verdicts_verdict ON decision_verdicts(auto_accept_verdict);",
         down_sql: Some("DROP TABLE IF EXISTS decision_verdicts; DROP INDEX IF EXISTS idx_decision_verdicts_verdict;"),
     },
+    Migration {
+        version: 30,
+        description: "LOOP-0 shadow logging (M2.3) — track would-fire memory events without mutations",
+        up_sql: "CREATE TABLE IF NOT EXISTS loop0_shadow_log (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     segment_id TEXT NOT NULL,
+                     memory_fired BOOLEAN,
+                     created_at TEXT DEFAULT (datetime('now')),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_loop0_shadow_segment ON loop0_shadow_log(segment_id);",
+        down_sql: Some("DROP TABLE IF EXISTS loop0_shadow_log; DROP INDEX IF EXISTS idx_loop0_shadow_segment;"),
+    },
 ];
 
 #[cfg(test)]
