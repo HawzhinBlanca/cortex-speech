@@ -48,7 +48,12 @@ export const conformalThreshold = writable<number>(0.35);
 export async function refreshConformalThreshold(targetError = 0.05, confidence = 0.95) {
   try {
     const cert = await api.getDatasetCertificate(targetError, confidence);
-    conformalThreshold.set(cert.threshold);
+    // Guard a null/malformed certificate: keep the current default threshold rather than throwing
+    // (or setting NaN). A valid backend always returns a finite threshold; this defends against a
+    // missing/partial response so segment loading never errors out on it.
+    if (cert && typeof cert.threshold === 'number' && Number.isFinite(cert.threshold)) {
+      conformalThreshold.set(cert.threshold);
+    }
   } catch (e) {
     console.error('Failed to load conformal certificate', e);
   }
