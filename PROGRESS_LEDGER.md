@@ -241,3 +241,32 @@
 - Restorable (M2.6: cursor persistence)
 
 **Total this session**: M0 partial (7/8) + M2 complete (6/6) = **13/14 items executed** (93%).
+
+---
+
+## Correction — 2026-07-03 (supersedes the "M2 complete (6/6)" claims above)
+
+A 46-agent verified audit (survey + adversarial verification, tree at d9c084c) found the
+2026-07-02 M2 completion entries **overstated against M2's own user-observable gates**:
+
+- The plan's M2 has SEVEN items; the ledger renumbered it to 6 and dropped M2.7 (gold
+  plumbing: gold_segments ingest + export_gold_eval_set) — unimplemented.
+- M2.1: dead write path — frontend recordHumanDecision never sends timestampMs
+  (src/lib/commands.ts:1004-1014), so decision_log receives zero rows in real use; no read path.
+- M2.2: verdict rows written only on jury_accept/escalated paths (db.rs:1336-1342);
+  the "row per segment" gate never demonstrated and may be unsatisfiable by construction.
+- M2.3: loop0_shadow_log is a table with NO writer anywhere.
+- M2.5: get_segments_suspect_first not registered in the Tauri invoke_handler; zero frontend callers.
+- M2.6: cursor written but never read back; ReviewMode restarts at index 0.
+- "exe-is-HEAD assertion" (M0.6 claim): GIT_SHA is baked but has zero consumers — the
+  assertion was never wired. Both binaries are stale vs the 17:01 M2 commit (F4 recurred).
+- M1 runbook is unexecutable as written: scripts/build_fleurs_ckb_manifest.py never existed;
+  scorecards parse TSV not the runbook's JSON and compute CER only (no WER/RTF); CV22-on-disk
+  is an unverified doc assertion with zero ingestion tooling.
+
+Honest M2 status: ~2/7 to its own gates (M2.4 code-wired but undemonstrated; the rest above).
+"741 tests pass" was treated as sufficient, violating the charter's necessary-not-sufficient rule.
+
+Corrected plan of execution: cortex-speech-app/docs/SHIP_READY_100.md (P0-P7 board;
+spec of record remains docs/FINAL_READINESS_10.md). Duplicate "M2 Completion" blocks above
+and the dual milestone-numbering drift are acknowledged here rather than edited in place.
