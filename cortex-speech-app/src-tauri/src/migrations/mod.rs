@@ -525,6 +525,16 @@ pub static MIGRATIONS: &[Migration] = &[
              ALTER TABLE agent_examples DROP COLUMN corrector_model_id;",
         ),
     },
+    Migration {
+        version: 26,
+        description: "Index human_decision for review/export hot-path filters (F8)",
+        // Every export filters human-rejected segments (is_human_rejected) and the label-quality
+        // lift query selects WHERE human_decision IS NOT NULL — both table-scanned a growing
+        // speech_segments. verdict/escalated/audio_path/verified are already indexed; human_decision
+        // was the one hot filter column without one.
+        up_sql: "CREATE INDEX IF NOT EXISTS idx_segments_human_decision ON speech_segments(human_decision);",
+        down_sql: Some("DROP INDEX IF EXISTS idx_segments_human_decision;"),
+    },
 ];
 
 #[cfg(test)]
@@ -629,6 +639,21 @@ mod tests {
         let again = run_migrations(&db).unwrap();
         assert!(again.is_empty());
         assert_eq!(get_current_version(&db).unwrap(), max_version);
+    }
+
+    #[test]
+    fn migration_v26_creates_human_decision_index() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let exists: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_segments_human_decision'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "the v26 human_decision index must exist after initialize()");
     }
 
     #[test]
