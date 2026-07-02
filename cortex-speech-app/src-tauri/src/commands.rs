@@ -2240,6 +2240,16 @@ pub fn db_backup(dest: String, state: State<'_, AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
+pub fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), String> {
+    // M0.4: Restore a previously backed-up database snapshot. The file must be a valid SQLite
+    // database (PRAGMA integrity_check on open verifies this). This completes the backup/restore
+    // pair so the app is never at risk of data loss mid-import or mid-review.
+    let validated = validate::validate_file_path(&src)?;
+    let mut db = state.lock_db();
+    db.restore(&validated).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn db_vacuum(state: State<'_, AppState>) -> Result<(), String> {
     let db = state.lock_db();
     db.vacuum().map_err(|e| e.to_string())

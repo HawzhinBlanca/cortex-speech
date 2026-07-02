@@ -504,6 +504,7 @@ pub fn run() {
             commands::check_audio,
             commands::db_info,
             commands::db_backup,
+            commands::db_restore,
             commands::db_vacuum,
             commands::db_wal_checkpoint,
             commands::models_status,
