@@ -11,6 +11,8 @@ export interface AppSettings {
   autoAlign: boolean;
   exportFormat: ExportFormat;
   asrModel: AsrModel;
+  /** P2.3: use the embedded fine-tuned MMS-CTC engine (best local Sorani) — overrides asrModel. */
+  useFinetuned: boolean;
   vadThreshold: number;
   minSegmentSec: number;
   maxSegmentSec: number;
@@ -58,6 +60,9 @@ export const defaultSettings: AppSettings = {
   // The fine-tuned OmniASR-7B Champion (WSL GPU path) is the owner's main model and the app default,
   // matching the Rust AppSettings default — a reset never silently reverts to the weaker base CTC.
   asrModel: 'wsl-7b',
+  // P2.3: off by default here (mirrors the Rust default); the ASR-tab toggle enables the embedded
+  // fine-tuned engine, which overrides asrModel when on. Backend default flip awaits the M1 decision.
+  useFinetuned: false,
   vadThreshold: 0.5,
   minSegmentSec: 3,
   maxSegmentSec: 15,

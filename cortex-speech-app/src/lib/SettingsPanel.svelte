@@ -297,9 +297,23 @@
             <span class="text-sm text-muted">{$t('settings.autoplaySegments')}</span>
           </label>
         {:else if activeTab === 'asr'}
+          <label class="flex items-center gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              bind:checked={localSettings.useFinetuned}
+              class="accent-cortex-500"
+              data-testid="use-finetuned-toggle"
+            />
+            <span class="text-sm text-muted">{$t('settings.useFinetuned')}</span>
+          </label>
+          <p class="-mt-1 ms-8 text-xs text-subtle">{$t('settings.useFinetunedHint')}</p>
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('asrModel')}</span>
-            <select class="input flex-1" bind:value={localSettings.asrModel}>
+            <select
+              class="input flex-1"
+              bind:value={localSettings.asrModel}
+              disabled={localSettings.useFinetuned}
+            >
               <option value="ctc-300m">Meta OmniASR CTC 300M</option>
               <option value="ctc-1b">Meta OmniASR CTC 1B</option>
               <option value="wsl-7b">Meta OmniASR 7B (WSL GPU)</option>

@@ -530,6 +530,9 @@ export const ckb: Record<string, string> = {
   'wsl.stillRunning': 'باشترکردن هێشتا کار دەکات. تکایە هەڵیوەشێنەرەوە یان چاوەڕێ بکە تا تەواو دەبێت.',
   // Settings panel labels
   'settings.autoplaySegments': 'لێدانی خۆکاری بەشەکان لە کاتی هەڵبژاردن',
+  'settings.useFinetuned': 'مۆدێلی ڕاهێنراو بەکاربهێنە',
+  'settings.useFinetunedHint':
+    'باشترین وردی کوردیی ناوخۆیی (پێوانەکراو ٪٢١ هەڵەی پیت، N=900) — لەسەر CPU، بێ ڕێکخستن. سەروپۆشی ئەندازیارەکەی خوارەوە دەکات.',
   'settings.externalAsrScript': 'سکریپتی دابینکەری ASR ی دەرەکی',
   'settings.localApiEndpoint': 'ئەندپۆینتی API ی ناوخۆیی',
   'settings.modelName': 'ناوی مۆدێل',

@@ -531,6 +531,9 @@ export const en: Record<string, string> = {
   'wsl.stillRunning': 'Refinement is still running. Please cancel or wait for it to complete.',
   // Settings panel labels
   'settings.autoplaySegments': 'Autoplay Segments on Selection',
+  'settings.useFinetuned': 'Use fine-tuned model',
+  'settings.useFinetunedHint':
+    'Best local Sorani accuracy (measured 21.0% CER, N=900) — runs on CPU, no setup. Overrides the engine below.',
   'settings.externalAsrScript': 'External ASR Provider Script',
   'settings.localApiEndpoint': 'Local API Endpoint',
   'settings.modelName': 'Model Name',

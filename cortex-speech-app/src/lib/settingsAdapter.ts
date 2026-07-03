@@ -6,6 +6,7 @@ export interface BackendSettings {
   output_dir: string;
   asr_provider: string;
   asr_model_size: string;
+  use_finetuned_asr?: boolean;
   vad_threshold: number;
   min_segment_duration_ms: number;
   max_segment_duration_ms: number;
@@ -130,6 +131,7 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
     autoAlign: raw.auto_align,
     exportFormat: exportFormatFromBackend(raw.export_format),
     asrModel: asrModelFromBackend(raw.asr_model_size),
+    useFinetuned: raw.use_finetuned_asr ?? false,
     vadThreshold: raw.vad_threshold,
     minSegmentSec: Math.round(raw.min_segment_duration_ms / 1000),
     maxSegmentSec: Math.round(raw.max_segment_duration_ms / 1000),
@@ -185,6 +187,7 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
     auto_align: ui.autoAlign,
     export_format: exportFormatToBackend(ui.exportFormat),
     asr_model_size: asrModelToBackend(ui.asrModel),
+    use_finetuned_asr: ui.useFinetuned,
     vad_threshold: num(ui.vadThreshold, existing.vad_threshold),
     min_segment_duration_ms: Number.isFinite(ui.minSegmentSec)
       ? ui.minSegmentSec * 1000
