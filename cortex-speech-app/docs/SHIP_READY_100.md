@@ -27,6 +27,31 @@ Scorecard); P6 DirectML; P7 the re-audit + honest 10/10 call. The **next highest
 is P2.2** — one GPU afternoon on the now-runnable M1 harness produces the measured default-engine
 number that closes C1.
 
+### Hardening sprint (later 2026-07-03) — adversarial self-review of this session's own code
+
+After the feature work above, ran a multi-round brutal self-review of every line added this session
+(the standard: never call it done on "plumbing runs" — inspect the real behavior). Outcome:
+
+- **3 real defects found + fixed**, each with a regression test + live rebuild: (1) import-**resume
+  orphaned segments** — the post-import jury runs once at the end keyed on `imported_ids`, so a crash
+  left pre-crash files persisted-but-never-adjudicated; resume now folds them back in. (2) **relink
+  wrong-audio collision** — two missing sources sharing a basename were both repointed to one found
+  file; now refused (the recurring wrong-audio class). (3) **import-job crash-ghost buildup** — stale
+  `running` jobs accumulated across crashes + could trigger a spurious resume prompt; `begin_import_job`
+  now reaps them.
+- **2 completeness gaps closed**: the retrain/gold export commands and the model-integrity/build-SHA
+  checks were backend-only (unreachable) — now wired into a **"Dataset & model tools"** section in
+  Stats, so the RETRAIN_RUNBOOK is executable in-app. `docs/RETRAIN_RUNBOOK.md` added (M5 cycle).
+- **Full-suite certification** at HEAD: `cargo test --lib` 768/0, fmt + clippy-all-targets clean,
+  frontend typecheck/eslint/vitest 132, python policies green; the one intermittently-red
+  integration test (a GUI startup timing race) made **deterministic** (test-only retry).
+- **Privacy pass (the #1 law)**: export manifests use relative UUID clip paths (no profile-path/PII
+  leak), snapshots copy a settings.json whose API key is cleared-before-persist, holdout leak-guard
+  holds — all already regression-gated. Clean.
+
+Automatable/headless-verifiable surface is now **exhausted and certified green**; the plan's forward
+motion is entirely owner/GPU-gated (P2.2 first).
+
 ---
 
 > Written 2026-07-03 from a 46-agent verified audit of the tree at `d9c084c`
