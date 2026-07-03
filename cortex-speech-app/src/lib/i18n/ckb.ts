@@ -394,6 +394,7 @@ export const ckb: Record<string, string> = {
   'stats.verified': 'پشتڕاستکراو',
   'stats.uniqueSpeakers': 'قسەکەرە جیاوازەکان',
   'stats.reviewSpeed': 'ناوەندی چرکە/پارچە',
+  'stats.dbSize': 'قەبارەی بنکەدراوە',
   'stats.qualityTitle': 'جۆری داتاسێت',
   'stats.emptyTranscripts': 'نووسینەوەی بەتاڵ',
   'stats.lowConfidence': 'متمانەی کەم',

@@ -252,8 +252,28 @@ pub fn record_agent_import_report_with_options(
         params![id, source, status, audio_paths_json, segment_ids_json, report_json],
     )?;
 
+    // P3.8: retention — this table appends one (often large `report_json`) row per import and had no
+    // DELETE, so it grew without bound over months of daily use. Keep the newest N; prune older.
+    prune_agent_import_reports(db, MAX_AGENT_IMPORT_REPORTS)?;
+
     get_agent_import_report(db, &id)?
         .ok_or_else(|| crate::error::AppError::Other("Agent import report was not persisted".into()))
+}
+
+/// Newest agent-import reports to retain; older ones are pruned after each insert (P3.8).
+const MAX_AGENT_IMPORT_REPORTS: usize = 500;
+
+/// Delete all but the newest `keep` agent-import reports (by created_at, id-tiebroken like the list
+/// query). Returns rows deleted. Extracted so retention is unit-testable with a small `keep`.
+pub(crate) fn prune_agent_import_reports(db: &Database, keep: usize) -> AppResult<usize> {
+    let deleted = db.connection().execute(
+        "DELETE FROM agent_import_reports
+         WHERE id NOT IN (
+             SELECT id FROM agent_import_reports ORDER BY datetime(created_at) DESC, id DESC LIMIT ?1
+         )",
+        params![keep as i64],
+    )?;
+    Ok(deleted)
 }
 
 pub fn list_agent_import_reports(db: &Database, limit: Option<usize>) -> AppResult<Vec<AgentImportReport>> {
@@ -1002,6 +1022,32 @@ mod tests {
         assert_eq!(job.status, "queued");
         cancel_job(&db, &job.id).unwrap();
         assert_eq!(get_job(&db, &job.id).unwrap().unwrap().status, "cancelled");
+    }
+
+    #[test]
+    fn prune_agent_import_reports_keeps_newest() {
+        // P3.8: retention — keep the newest N, delete older, so the table can't grow unbounded.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        for (id, at) in [("r1", "2020-01-01 00:00:01"), ("r2", "2020-01-01 00:00:02"), ("r3", "2020-01-01 00:00:03")] {
+            db.connection()
+                .execute(
+                    "INSERT INTO agent_import_reports (id, source, status, audio_paths_json, segment_ids_json, report_json, created_at)
+                     VALUES (?1, 'file', 'ok', '[]', '[]', '{}', ?2)",
+                    params![id, at],
+                )
+                .unwrap();
+        }
+        assert_eq!(prune_agent_import_reports(&db, 2).unwrap(), 1, "one oldest report pruned");
+        let ids: Vec<String> = db
+            .connection()
+            .prepare("SELECT id FROM agent_import_reports ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids, vec!["r2".to_string(), "r3".to_string()], "newest two kept, r1 pruned");
     }
 
     #[test]

@@ -393,6 +393,7 @@ export const en: Record<string, string> = {
   'stats.verified': 'Verified',
   'stats.uniqueSpeakers': 'Unique Speakers',
   'stats.reviewSpeed': 'Median s/segment',
+  'stats.dbSize': 'Database size',
   'stats.fingerprints': 'Audio fingerprints',
   'stats.qualityTitle': 'Dataset Quality',
   'stats.emptyTranscripts': 'Empty transcripts',

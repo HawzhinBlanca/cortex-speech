@@ -90,6 +90,7 @@
         .slice(0, 5),
       // Review timing is backend-only (derived from decision_log); the non-Tauri fallback has none.
       reviewTiming: { decisionsLogged: 0, medianSeconds: null, samples: 0 },
+      dbSizeBytes: 0, // backend-only (PRAGMA page_count × page_size)
     };
   }
 
@@ -214,6 +215,14 @@
           <div class="text-xs text-cortex-400">
             {$t('stats.reviewSpeed')} ({stats.reviewTiming.samples})
           </div>
+        </div>
+      {/if}
+      {#if stats.dbSizeBytes > 0}
+        <div class="bg-cortex-800/30 rounded-lg p-3" data-testid="stat-db-size">
+          <div class="text-2xl font-bold text-cortex-300">
+            {(stats.dbSizeBytes / 1048576).toFixed(1)} MB
+          </div>
+          <div class="text-xs text-cortex-400">{$t('stats.dbSize')}</div>
         </div>
       {/if}
       {#if fingerprintCount !== null}

@@ -19,6 +19,8 @@ pub struct DatasetStats {
     /// M2.1 / P1.1: review-throughput timing derived from the decision_log rows. Zero/None until the
     /// owner has made decisions in the app (the marathon's review-speed baseline lives here).
     pub review_timing: ReviewTimingStats,
+    /// P3.8: on-disk database size (page_count × page_size), surfaced so months of growth are visible.
+    pub db_size_bytes: u64,
 }
 
 /// Review-throughput instrumentation (M2.1). `median_seconds` is the median gap between consecutive
@@ -102,8 +104,16 @@ fn compute_review_timing(conn: &rusqlite::Connection) -> AppResult<ReviewTimingS
     Ok(ReviewTimingStats { decisions_logged, median_seconds, samples: deltas.len() })
 }
 
+/// On-disk DB size in bytes from within the connection (no path needed): page_count × page_size (P3.8).
+fn db_size_bytes(conn: &rusqlite::Connection) -> u64 {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(0);
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(0);
+    (page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64)
+}
+
 pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
     let conn = db.connection();
+    let size_bytes = db_size_bytes(conn);
 
     // Single-pass SQL aggregate — O(1) memory and index-assisted, instead of materializing
     // the whole table into a Vec and reducing it in Rust while holding the DB lock.
@@ -140,7 +150,7 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
     )?;
 
     if total == 0 {
-        return Ok(DatasetStats::default());
+        return Ok(DatasetStats { db_size_bytes: size_bytes, ..Default::default() });
     }
 
     let total = total as usize;
@@ -187,6 +197,7 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
         },
         top_speakers,
         review_timing: compute_review_timing(conn)?,
+        db_size_bytes: size_bytes,
     })
 }
 
@@ -211,6 +222,7 @@ impl Default for DatasetStats {
             },
             top_speakers: Vec::new(),
             review_timing: ReviewTimingStats::default(),
+            db_size_bytes: 0,
         }
     }
 }
@@ -277,6 +289,16 @@ mod tests {
         assert_eq!(rt.decisions_logged, 0);
         assert_eq!(rt.median_seconds, None);
         assert_eq!(rt.samples, 0);
+    }
+
+    #[test]
+    fn compute_stats_reports_nonzero_db_size() {
+        // P3.8: an initialized DB (with its schema pages) has a nonzero page-based size, surfaced so
+        // months of growth are visible.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let st = compute_stats(&db).unwrap();
+        assert!(st.db_size_bytes > 0, "db size should be nonzero: {}", st.db_size_bytes);
     }
 
     #[test]

@@ -116,6 +116,8 @@ export interface DatasetStats {
   durationHistogram: DurationHistogram;
   topSpeakers: SpeakerStat[];
   reviewTiming: ReviewTimingStats;
+  /** P3.8: on-disk database size in bytes. */
+  dbSizeBytes: number;
 }
 
 /** M2.1 / P1.1: review-throughput timing from decision_log. */
