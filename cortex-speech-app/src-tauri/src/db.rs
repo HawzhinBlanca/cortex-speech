@@ -1017,10 +1017,31 @@ impl Database {
     /// same file name exists under `search_dir`, repoint every segment on that old path to the found one.
     /// Basename match (speech_segments store no content hash to verify against); the owner points at the
     /// folder they moved the audio to. Returns how many distinct paths were relinked + how many remain.
+    ///
+    /// AMBIGUITY GUARD: if two DISTINCT missing source paths share a basename (e.g. `interview.wav`
+    /// imported from two different folders), a single found `interview.wav` cannot be known to be the
+    /// right one for both — blindly repointing both would serve the WRONG audio for one recording on
+    /// playback/re-transcription. Such colliding paths are left missing (and warned), never guessed.
     pub fn relink_audio(&self, search_dir: &Path) -> AppResult<RelinkResult> {
+        let missing = self.audio_health()?.missing_paths;
+        // Count distinct missing paths per basename so we can refuse ambiguous relinks.
+        let mut basename_counts: std::collections::HashMap<std::ffi::OsString, usize> =
+            std::collections::HashMap::new();
+        for old in &missing {
+            if let Some(name) = Path::new(old).file_name() {
+                *basename_counts.entry(name.to_os_string()).or_insert(0) += 1;
+            }
+        }
         let mut relinked = 0usize;
-        for old in self.audio_health()?.missing_paths {
-            let Some(name) = Path::new(&old).file_name() else { continue };
+        for old in &missing {
+            let Some(name) = Path::new(old).file_name() else { continue };
+            if basename_counts.get(name).copied().unwrap_or(0) > 1 {
+                tracing::warn!(
+                    "relink: '{}' shares its filename with another missing source — skipped (ambiguous, would risk the wrong audio)",
+                    old
+                );
+                continue;
+            }
             let candidate = search_dir.join(name);
             if candidate.is_file() {
                 let new_path = candidate.to_string_lossy().to_string();
@@ -3012,6 +3033,26 @@ mod tests {
         let result = db.relink_audio(tmp.path()).unwrap(); // no clip named missing.wav in the dir
         assert_eq!(result.relinked, 0);
         assert_eq!(result.still_missing, 1, "an unmatched missing path stays missing");
+    }
+
+    #[test]
+    fn relink_refuses_ambiguous_basename_collisions() {
+        // P3.3 ambiguity guard: two DISTINCT missing sources share a basename. A single found file of
+        // that name cannot be known to be the right one for both — relink must refuse both (leaving
+        // them missing) rather than silently repoint segments to the WRONG recording's audio.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = make_db();
+        db.insert_segment(&make_segment("from_a", "/old/folderA/interview.wav")).unwrap();
+        db.insert_segment(&make_segment("from_b", "/old/folderB/interview.wav")).unwrap();
+        // The owner points relink at a folder that happens to contain ONE interview.wav.
+        std::fs::write(tmp.path().join("interview.wav"), b"audio").unwrap();
+
+        let result = db.relink_audio(tmp.path()).unwrap();
+        assert_eq!(result.relinked, 0, "ambiguous basename -> nothing relinked");
+        assert_eq!(result.still_missing, 2, "both colliding sources stay missing, not mis-linked");
+        // Neither segment was repointed — the original (missing) paths are untouched.
+        assert_eq!(db.get_segment_by_id("from_a").unwrap().unwrap().audio_path, "/old/folderA/interview.wav");
+        assert_eq!(db.get_segment_by_id("from_b").unwrap().unwrap().audio_path, "/old/folderB/interview.wav");
     }
 
     #[test]
