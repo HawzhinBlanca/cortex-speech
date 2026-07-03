@@ -122,21 +122,61 @@ def _git_head(app_root: Path) -> str | None:
         return None
 
 
+def _source_changed_since(app_root: Path, baked_sha: str, source_dirs: list[str], source_files: list[str]) -> list[str] | None:
+    """Source-relative paths changed between the baked commit and HEAD, or None if git can't tell.
+
+    The SHA-equality check is only a proxy for "the exe reflects the current source." When HEAD
+    advances for non-source reasons (docs, ledger), the exe is still fresh. This narrows the SHA
+    check to what actually matters: did any SOURCE file change since the exe was built?
+    """
+    paths = [*source_dirs, *source_files]
+    try:
+        out = subprocess.run(
+            ["git", "diff", "--name-only", baked_sha, "HEAD", "--", *paths],
+            cwd=app_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return [line for line in out.stdout.splitlines() if line.strip()]
+
+
 def main() -> int:
     exe_exists = EXE_PATH.is_file()
     exe_mtime = EXE_PATH.stat().st_mtime if exe_exists else 0.0
     baked_sha = extract_baked_sha(EXE_PATH.read_bytes()) if exe_exists else None
     head_sha = _git_head(APP_ROOT)
+
+    # Narrow the SHA-equality check to what matters: if HEAD advanced past the baked commit but no
+    # SOURCE file changed (e.g. a docs/ledger commit), the exe still reflects the source — treat the
+    # baked commit as HEAD-equivalent for the gate and say so.
+    effective_head = head_sha
+    note = None
+    if (
+        exe_exists
+        and baked_sha not in (None, "unknown")
+        and head_sha is not None
+        and not (head_sha.startswith(baked_sha) or baked_sha.startswith(head_sha))
+    ):
+        changed = _source_changed_since(APP_ROOT, baked_sha, SOURCE_DIRS, SOURCE_FILES)
+        if changed is not None and len(changed) == 0:
+            effective_head = baked_sha
+            note = f"HEAD advanced to {head_sha[:12]}… via non-source commits; no source changed since the build."
+
     newest_src_mtime, newest_src_file = newest_source(APP_ROOT, SOURCE_DIRS, SOURCE_FILES)
 
     problems = evaluate_freshness(
         exe_exists=exe_exists,
         exe_mtime=exe_mtime,
         baked_sha=baked_sha,
-        head_sha=head_sha,
+        head_sha=effective_head,
         newest_src_mtime=newest_src_mtime,
         newest_src_file=str(newest_src_file.relative_to(APP_ROOT)) if newest_src_file else None,
     )
+    if note and not problems:
+        print(f"note: {note}", flush=True)
 
     if problems:
         print("EXE FRESHNESS GATE: FAIL", flush=True)
