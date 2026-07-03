@@ -987,6 +987,24 @@ export async function createGoldFromFile(audioPath: string): Promise<number> {
   return invoke<number>('create_gold_from_file', { audioPath });
 }
 
+/** M2.7 / P1.6: summary of an export_gold_eval_set run. */
+export interface GoldEvalExport {
+  manifestPath: string;
+  totalGold: number;
+  exported: number;
+  skipped: number;
+}
+
+/** M2.7 / P1.6: bulk-promote every reviewed source file into the gold set; returns rows created. */
+export async function importVerifiedSegmentsAsGold(): Promise<number> {
+  return invoke<number>('import_verified_segments_as_gold');
+}
+
+/** M2.7 / P1.6: export the gold set (manifest.jsonl + 16 kHz WAV clips) under outDir. */
+export async function exportGoldEvalSet(outDir: string): Promise<GoldEvalExport> {
+  return invoke<GoldEvalExport>('export_gold_eval_set', { outDir });
+}
+
 /** A reproducible scorecard built from already-computed gold-eval results. */
 export interface ScorecardResponse {
   scorecard: unknown;

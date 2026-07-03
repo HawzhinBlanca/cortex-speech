@@ -3171,6 +3171,29 @@ pub fn create_gold_from_file(audio_path: String, state: State<'_, AppState>) -> 
     crate::eval::create_gold_from_verified_file(&db, &audio_path).map_err(|e| e.to_string())
 }
 
+/// M2.7 / P1.6: bulk-promote every reviewed source file into the gold set. Returns rows created.
+#[tauri::command]
+pub fn import_verified_segments_as_gold(state: State<'_, AppState>) -> Result<usize, String> {
+    STRICT_RATE_LIMITER.check("import_verified_segments_as_gold")?;
+    let db = state.lock_db();
+    crate::eval::import_verified_segments_as_gold(&db).map_err(|e| e.to_string())
+}
+
+/// M2.7 / P1.6: export the gold set as a portable eval set (manifest.jsonl + 16 kHz WAV clips) under
+/// `out_dir`. Returns the export summary (counts + manifest path).
+#[tauri::command]
+pub fn export_gold_eval_set(
+    out_dir: String,
+    state: State<'_, AppState>,
+) -> Result<crate::eval::GoldEvalExport, String> {
+    STRICT_RATE_LIMITER.check("export_gold_eval_set")?;
+    if out_dir.contains('\0') {
+        return Err("Output path contains null bytes".to_string());
+    }
+    let db = state.lock_db();
+    crate::eval::export_gold_eval_set(&db, std::path::Path::new(&out_dir)).map_err(|e| e.to_string())
+}
+
 /// Report which cloud providers have an API key configured (provider NAMES only — never the key
 /// values), so the user can confirm the keys they pasted into secrets.env were detected.
 #[tauri::command]

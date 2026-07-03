@@ -480,6 +480,8 @@ pub fn run() {
             commands::get_champion_model,
             commands::import_model_checkpoint,
             commands::create_gold_from_file,
+            commands::import_verified_segments_as_gold,
+            commands::export_gold_eval_set,
             commands::get_configured_providers,
             commands::transcribe_audio_with_scribe,
             commands::add_scribe_votes,

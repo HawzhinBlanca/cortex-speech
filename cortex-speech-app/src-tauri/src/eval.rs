@@ -142,6 +142,118 @@ pub fn create_gold_from_verified_file(db: &Database, audio_path: &str) -> AppRes
     import_gold_segments(db, vec![GoldSegmentInput { audio_path: audio_path.to_string(), reference, is_holdout: true }])
 }
 
+/// M2.7 / P1.6: bulk-promote every source file that has human-reviewed segments into the gold set
+/// (file-level, reusing the boundary-safe concatenation of `create_gold_from_verified_file`). Idempotent
+/// — re-running replaces each file's gold row rather than duplicating it. A file that turns out to have
+/// no reviewed segments (a race) is skipped with a log, never failing the batch. Returns rows created.
+pub fn import_verified_segments_as_gold(db: &Database) -> AppResult<usize> {
+    let paths: Vec<String> = {
+        let mut stmt = db.connection().prepare(
+            "SELECT DISTINCT audio_path FROM speech_segments
+             WHERE human_decision IS NOT NULL AND human_decision != '' ORDER BY audio_path",
+        )?;
+        let rows: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+        rows
+    };
+    let mut total = 0usize;
+    for path in paths {
+        match create_gold_from_verified_file(db, &path) {
+            Ok(n) => total += n,
+            Err(error) => tracing::warn!("gold promotion skipped for {path}: {error}"),
+        }
+    }
+    Ok(total)
+}
+
+/// Summary of an `export_gold_eval_set` run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoldEvalExport {
+    pub manifest_path: String,
+    pub total_gold: usize,
+    pub exported: usize,
+    /// Gold rows whose source audio could not be decoded (missing/corrupt) — excluded so the eval set
+    /// stays self-consistent (every manifest row has a real clip).
+    pub skipped: usize,
+}
+
+/// One JSONL row in the exported gold eval-set manifest — the trainer/eval schema.
+#[derive(Serialize)]
+struct GoldManifestRow<'a> {
+    /// Relative to the manifest, so the exported set is portable.
+    audio_path: String,
+    sentence: &'a str,
+    is_holdout: bool,
+    duration_seconds: f64,
+}
+
+/// Write a 16 kHz mono 16-bit PCM WAV clip.
+fn write_wav_16k_mono(path: &std::path::Path, pcm: &[i16], sample_rate: u32) -> AppResult<()> {
+    let spec =
+        hound::WavSpec { channels: 1, sample_rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| crate::error::AppError::Other(format!("gold clip WAV create: {e}")))?;
+    for &s in pcm {
+        writer.write_sample(s).map_err(|e| crate::error::AppError::Other(format!("gold clip WAV write: {e}")))?;
+    }
+    writer.finalize().map_err(|e| crate::error::AppError::Other(format!("gold clip WAV finalize: {e}")))?;
+    Ok(())
+}
+
+/// M2.7 / P1.6: export the gold set as a portable eval set — a `manifest.jsonl` (one
+/// `{audio_path, sentence, is_holdout, duration_seconds}` row per gold clip) plus a self-contained
+/// 16 kHz mono WAV per row under `clips/`. This is what the engine benchmark scores against; the
+/// `is_holdout` flag is carried through so a downstream TRAINING pack can exclude it (holdout is a
+/// train-time exclusion, not an eval-time one — the eval set deliberately includes it). Gold whose
+/// source audio can no longer be decoded is skipped so the set stays self-consistent.
+pub fn export_gold_eval_set(db: &Database, out_dir: &std::path::Path) -> AppResult<GoldEvalExport> {
+    use std::io::Write as _;
+    let gold = list_gold_segments(db)?;
+    let clips_dir = out_dir.join("clips");
+    std::fs::create_dir_all(&clips_dir).map_err(crate::error::AppError::Io)?;
+
+    let manifest_path = out_dir.join("manifest.jsonl");
+    let mut manifest =
+        std::io::BufWriter::new(std::fs::File::create(&manifest_path).map_err(crate::error::AppError::Io)?);
+
+    let mut exported = 0usize;
+    let mut skipped = 0usize;
+    for g in &gold {
+        let (sample_rate, pcm) = match crate::audio::decode_to_pcm(&g.audio_path) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                tracing::warn!("gold eval-set: skipping {} (source undecodable): {error}", g.id);
+                skipped += 1;
+                continue;
+            }
+        };
+        let clip_rel = format!("clips/{}.wav", g.id);
+        if let Err(error) = write_wav_16k_mono(&clips_dir.join(format!("{}.wav", g.id)), &pcm, sample_rate) {
+            tracing::warn!("gold eval-set: skipping {} (clip write failed): {error}", g.id);
+            skipped += 1;
+            continue;
+        }
+        let row = GoldManifestRow {
+            audio_path: clip_rel,
+            sentence: &g.reference,
+            is_holdout: g.is_holdout,
+            duration_seconds: pcm.len() as f64 / sample_rate as f64,
+        };
+        let line = serde_json::to_string(&row)
+            .map_err(|e| crate::error::AppError::Other(format!("gold manifest serialize: {e}")))?;
+        writeln!(manifest, "{line}").map_err(crate::error::AppError::Io)?;
+        exported += 1;
+    }
+    manifest.flush().map_err(crate::error::AppError::Io)?;
+
+    Ok(GoldEvalExport {
+        manifest_path: manifest_path.to_string_lossy().into_owned(),
+        total_gold: gold.len(),
+        exported,
+        skipped,
+    })
+}
+
 /// Load all gold segments from the DB.
 pub fn list_gold_segments(db: &Database) -> AppResult<Vec<GoldSegment>> {
     let conn = db.connection();
@@ -695,6 +807,105 @@ mod tests {
 
         // A file with no reviewed segments errors (correct it in the app first).
         assert!(create_gold_from_verified_file(&db, "/clips/missing.wav").is_err());
+    }
+
+    #[test]
+    fn import_verified_segments_as_gold_promotes_every_reviewed_file() {
+        // P1.6: bulk ingest promotes each distinct reviewed source file (file-level), skipping files
+        // with no reviewed segments.
+        let db = open_mem_db();
+        for (id, path) in [("a1", "/clips/a.wav"), ("b1", "/clips/b.wav")] {
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: id.to_string(),
+                audio_path: path.to_string(),
+                raw_transcript: "draft".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET human_decision='accept', verdict_transcript='گۆڵد' WHERE id=?1",
+                    params![id],
+                )
+                .unwrap();
+        }
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "c1".to_string(),
+            audio_path: "/clips/c.wav".to_string(),
+            raw_transcript: "unreviewed".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let n = import_verified_segments_as_gold(&db).unwrap();
+        assert_eq!(n, 2, "the two reviewed files become gold; the unreviewed file is skipped");
+        assert_eq!(list_gold_segments(&db).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn export_gold_eval_set_writes_manifest_and_clips() {
+        // P1.6: the exported eval set is a JSONL manifest + a self-contained 16 kHz WAV per gold row.
+        let db = open_mem_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wav_path = tmp.path().join("clip.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut w = hound::WavWriter::create(&wav_path, spec).unwrap();
+            for i in 0..16000i32 {
+                w.write_sample(((i % 100) - 50) as i16).unwrap(); // ~1 second
+            }
+            w.finalize().unwrap();
+        }
+        let wav_str = wav_path.to_string_lossy().to_string();
+        import_gold_segments(
+            &db,
+            vec![GoldSegmentInput { audio_path: wav_str, reference: "ڕەفەرێنس".to_string(), is_holdout: true }],
+        )
+        .unwrap();
+
+        let out = tempfile::TempDir::new().unwrap();
+        let export = export_gold_eval_set(&db, out.path()).unwrap();
+        assert_eq!(export.total_gold, 1);
+        assert_eq!(export.exported, 1);
+        assert_eq!(export.skipped, 0);
+
+        let manifest = std::fs::read_to_string(out.path().join("manifest.jsonl")).unwrap();
+        let lines: Vec<&str> = manifest.lines().collect();
+        assert_eq!(lines.len(), 1, "one manifest row per exported gold clip");
+        let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row["sentence"], "ڕەفەرێنس");
+        assert_eq!(row["is_holdout"], true, "the holdout flag is carried through for downstream training exclusion");
+        let clip_rel = row["audio_path"].as_str().unwrap();
+        assert!(clip_rel.starts_with("clips/"), "audio_path is relative for portability");
+        assert!((row["duration_seconds"].as_f64().unwrap() - 1.0).abs() < 0.1, "~1s clip");
+        assert!(out.path().join(clip_rel).exists(), "the referenced clip WAV was written");
+    }
+
+    #[test]
+    fn export_gold_eval_set_skips_undecodable_source() {
+        // A gold row whose source can't be decoded is skipped so the eval set stays self-consistent.
+        let db = open_mem_db();
+        import_gold_segments(
+            &db,
+            vec![GoldSegmentInput {
+                audio_path: "/nonexistent/x.wav".to_string(),
+                reference: "r".to_string(),
+                is_holdout: false,
+            }],
+        )
+        .unwrap();
+        let out = tempfile::TempDir::new().unwrap();
+        let export = export_gold_eval_set(&db, out.path()).unwrap();
+        assert_eq!(export.total_gold, 1);
+        assert_eq!(export.exported, 0);
+        assert_eq!(export.skipped, 1);
+        let manifest = std::fs::read_to_string(out.path().join("manifest.jsonl")).unwrap();
+        assert!(manifest.trim().is_empty(), "no row for a skipped clip");
     }
 
     #[test]
