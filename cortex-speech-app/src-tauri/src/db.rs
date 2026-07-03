@@ -1311,6 +1311,29 @@ impl Database {
 
     // ── Jury DB helpers ───────────────────────────────────────────────────────
 
+    /// M2.2 / P1.2: classify a MACHINE verdict as T0 (auto-resolved, no human needed) or T1
+    /// (escalated to a human) and record it in decision_verdicts — the denominator/index for the C4
+    /// auto-accept-precision measurement. Human verdicts (`human_*`) and any unknown string record
+    /// nothing: they are not machine auto-accept decisions. The raw verdict stays on
+    /// speech_segments.verdict, so a C4 query can still recover auto_accept-vs-jury_accept-vs-jury_edit.
+    /// Call ONLY after the verdict UPDATE affected the row (segment was not already human-decided), so a
+    /// stale/late machine verdict never plants a phantom T0/T1 over a human's decision.
+    pub fn record_decision_verdict(&self, segment_id: &str, verdict: &str, escalated: bool) -> AppResult<()> {
+        let auto_accept_verdict = if escalated || verdict == "escalated" {
+            "T1_ESCALATE"
+        } else if matches!(verdict, "auto_accept" | "jury_accept" | "jury_edit") {
+            "T0_ACCEPT"
+        } else {
+            return Ok(());
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO decision_verdicts (segment_id, auto_accept_verdict, verdict_computed_at)
+             VALUES (?1, ?2, datetime('now'))",
+            params![segment_id, auto_accept_verdict],
+        )?;
+        Ok(())
+    }
+
     /// Write a MACHINE jury verdict to a segment (T0/T1/T2 and the agentic/escalation paths).
     ///
     /// The human-review path is `record_human_decision`, NOT this function. A machine verdict must never
@@ -1332,15 +1355,6 @@ impl Database {
         agent_confidence: Option<f64>,
         escalated: bool,
     ) -> AppResult<()> {
-        // M2.2: Track T0 (auto-accept) vs T1 (escalate) verdicts for instrumentation.
-        let auto_accept_verdict = if escalated {
-            Some("T1_ESCALATE")
-        } else if verdict == "jury_accept" {
-            Some("T0_ACCEPT")
-        } else {
-            None
-        };
-
         let affected = self.conn.execute(
             "UPDATE speech_segments
              SET verdict              = ?2,
@@ -1361,13 +1375,9 @@ impl Database {
             tracing::debug!(
                 "write_segment_verdict({segment_id}, {verdict}): no-op — segment is human-decided or missing"
             );
-        } else if let Some(verd) = auto_accept_verdict {
-            // M2.2: Record T0/T1 verdict status in decision_verdicts for instrumentation (if segment was updated).
-            let _ = self.conn.execute(
-                "INSERT OR REPLACE INTO decision_verdicts (segment_id, auto_accept_verdict, verdict_computed_at)
-                 VALUES (?1, ?2, datetime('now'))",
-                params![segment_id, verd],
-            );
+        } else {
+            // M2.2/P1.2: record the T0/T1 classification for the C4 denominator (no-op for human/unknown).
+            self.record_decision_verdict(segment_id, verdict, escalated)?;
         }
         self.track_write()?;
         Ok(())
@@ -1811,6 +1821,35 @@ mod tests {
         dedicated.write_segment_verdict("s1", "jury_accept", Some("hi"), None, None, Some(0.9), false).unwrap();
         let seen = primary.get_segment_by_id("s1").unwrap().unwrap();
         assert_eq!(seen.verdict.as_deref(), Some("jury_accept"));
+    }
+
+    #[test]
+    fn write_segment_verdict_records_all_machine_verdict_classes() {
+        // P1.2: decision_verdicts must classify every machine verdict for the C4 denominator. Before the
+        // fix only jury_accept recorded a row; auto_accept and jury_edit (also auto-resolutions) dropped.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        for id in ["aa", "je", "es", "hv"] {
+            db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+        }
+        db.record_human_decision("hv", "accept", None, None).unwrap();
+
+        db.write_segment_verdict("aa", "auto_accept", Some("m"), None, None, Some(0.9), false).unwrap();
+        db.write_segment_verdict("je", "jury_edit", Some("m"), None, None, Some(0.8), false).unwrap();
+        db.write_segment_verdict("es", "escalated", None, None, None, None, true).unwrap();
+        db.write_segment_verdict("hv", "auto_accept", Some("m"), None, None, Some(0.9), false).unwrap();
+
+        let verdict_of = |id: &str| -> Option<String> {
+            db.connection()
+                .query_row("SELECT auto_accept_verdict FROM decision_verdicts WHERE segment_id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .ok()
+        };
+        assert_eq!(verdict_of("aa").as_deref(), Some("T0_ACCEPT"), "auto_accept is a T0 auto-resolution");
+        assert_eq!(verdict_of("je").as_deref(), Some("T0_ACCEPT"), "jury_edit is a T0 auto-resolution");
+        assert_eq!(verdict_of("es").as_deref(), Some("T1_ESCALATE"), "escalated is T1");
+        assert_eq!(verdict_of("hv"), None, "human-decided segment gets no machine verdict row");
     }
 
     #[test]

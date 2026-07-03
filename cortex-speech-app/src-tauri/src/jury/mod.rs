@@ -366,6 +366,14 @@ pub fn write_verdict(
         ],
     )?;
 
+    // M2.2/P1.2: record the T0/T1 classification in decision_verdicts for the C4 auto-accept-precision
+    // denominator. This path (the IRT-consensus jury) previously recorded NOTHING, so auto-accepts from
+    // the main jury were invisible to C4. Gated on affected > 0 so a verdict the guard above did NOT
+    // write (human-decided segment) never plants a phantom machine verdict.
+    if affected > 0 {
+        db.record_decision_verdict(segment_id, &verdict.to_string(), verdict == Verdict::Escalated)?;
+    }
+
     // Flywheel capture: when the jury ACCEPTS a transcript that differs from the raw ASR, the model
     // corrected OmniASR — record it as a provenance-tagged PSEUDO example (never auto-trained; gated
     // behind human review). Best-effort: a capture failure must not fail the verdict write. Gated on
@@ -873,6 +881,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 's-hv'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(captured, 0, "no model-correction example may be captured when the verdict write no-ops");
+    }
+
+    #[test]
+    fn write_verdict_records_t0_t1_in_decision_verdicts() {
+        // P1.2: the IRT-consensus jury path previously wrote NO decision_verdicts row, so auto-accepts
+        // from the main jury were invisible to the C4 auto-accept-precision denominator. Now
+        // AutoAccept -> T0_ACCEPT, Escalated -> T1_ESCALATE, and a late write over a human decision
+        // records nothing.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&make_seg("t0", "raw a")).unwrap();
+        db.insert_segment(&make_seg("t1", "raw b")).unwrap();
+        db.insert_segment(&make_seg("hv", "raw c")).unwrap();
+        db.record_human_decision("hv", "accept", None, None).unwrap();
+
+        write_verdict(&db, "t0", Verdict::AutoAccept, Some("machine"), None, None, Some(0.9)).unwrap();
+        write_verdict(&db, "t1", Verdict::Escalated, None, None, None, None).unwrap();
+        write_verdict(&db, "hv", Verdict::AutoAccept, Some("machine"), None, None, Some(0.9)).unwrap();
+
+        let count_of = |id: &str, verd: &str| -> i64 {
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM decision_verdicts WHERE segment_id = ?1 AND auto_accept_verdict = ?2",
+                    params![id, verd],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count_of("t0", "T0_ACCEPT"), 1, "AutoAccept must record a T0 verdict row");
+        assert_eq!(count_of("t1", "T1_ESCALATE"), 1, "Escalated must record a T1 verdict row");
+        let hv_rows: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM decision_verdicts WHERE segment_id = 'hv'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hv_rows, 0, "a segment the human already decided gets no machine verdict row");
     }
 
     #[test]
