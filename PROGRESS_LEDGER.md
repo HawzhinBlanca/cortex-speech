@@ -424,3 +424,19 @@ found the fail-hard error references a "Use fine-tuned model" toggle that does N
 use_finetuned_asr can only be set by hand-editing settings.json. Add the SettingsPanel toggle +
 settingsAdapter field + IPC so the measured champion engine is selectable from the UI. The actual
 default-engine FLIP awaits P2.2's measurement (owner GPU).
+
+## P2.3 OOBE fix (2026-07-03) — fine-tuned engine now selectable in the UI
+
+a72722f: added the "Use fine-tuned model" toggle the fail-hard error referenced but which didn't
+exist (use_finetuned_asr was hand-edit-only). Wired end-to-end (settingsStore field, settingsAdapter
+both directions, SettingsPanel checkbox that disables the engine dropdown since fine-tuned overrides
+it, CKB + testid + measured-accuracy hint). Rebuilt -> freshness GREEN (exe at HEAD a72722f); the
+running app now has it. The DEFAULT-engine flip still awaits the M1 measurement (P2.2, owner GPU).
+
+P2 status: P2.1 tooling COMPLETE (runnable M1 benchmark); P2.2 = owner GPU run; P2.3 UI toggle done,
+default-flip + settings migration await P2.2's result.
+
+NEXT AUTOMATABLE: P3 marathon-safe daily driver. Starting P3.1 — auto-snapshot rotation (deferred
+M0.4b): rotating-10 DB snapshots on start + periodic (incl. settings.json + champion pointer), so a
+corruption event before the marathon can't destroy weeks of the owner's review labor. Then P3.2
+import journal/resume, P3.3 audio durability, P3.4 model integrity, P3.7 path robustness, P3.8 pruning.
