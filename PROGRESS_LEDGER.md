@@ -657,3 +657,20 @@ export_finetune_pack" step had no button; dev-console only).
 FRONTEND SWEEP COMPLETE. Across 4 self-review rounds this session: 3 real Rust defects fixed +
 1 dead-binding/feature-completeness gap closed, each gated + rebuilt live. Remaining plan work is
 owner/GPU-gated (P2.2 benchmark highest-leverage).
+
+## Self-review round 5 (2026-07-03) — last backend-only IPC wired to UI
+
+Closed the final reachability gap found in round 4: verify_finetuned_model_integrity + app_git_sha
+were registered backend IPC with no frontend wrapper (unreachable by the owner).
+- FIXED (fc835f5): added commands.ts wrappers + a "Verify model integrity" button and a
+  "Build: <sha>" line in the Stats dataset-tools section. Owner can now trigger the P3.4 full-SHA
+  champion-integrity check and see the running build. EN+CKB keys balanced (407==407).
+- Gates: typecheck 0, eslint clean, vitest 132/132, python policies green. Exe rebuilt (6m03s),
+  freshness GREEN. HONESTY: button->IPC click-path needs the real Tauri app (not headless-preview
+  exercisable) — stated, not claimed verified.
+
+SELF-REVIEW SURFACE EXHAUSTED. 5 rounds this session: 3 real Rust defects fixed (resume orphaning,
+relink wrong-audio, import-job crash-ghost) + 2 feature-completeness gaps closed (retrain/gold
+export tools + model-integrity/build-info now reachable in-app). Every session backend command now
+has a frontend path. Remaining plan work is genuinely owner/GPU-gated — P2.2 three-engine benchmark
+is the highest-leverage next step and only the owner can run it.
