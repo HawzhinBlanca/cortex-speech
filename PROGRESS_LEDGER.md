@@ -440,3 +440,17 @@ NEXT AUTOMATABLE: P3 marathon-safe daily driver. Starting P3.1 — auto-snapshot
 M0.4b): rotating-10 DB snapshots on start + periodic (incl. settings.json + champion pointer), so a
 corruption event before the marathon can't destroy weeks of the owner's review labor. Then P3.2
 import journal/resume, P3.3 audio durability, P3.4 model integrity, P3.7 path robustness, P3.8 pruning.
+
+## P3.1 auto-snapshot rotation (2026-07-03) — marathon-data safety
+
+2644cb5 (deferred M0.4b): snapshot.rs takes rotating snapshots (SQLite online backup + config copies)
+into <data_dir>/snapshots/snapshot_<ts>/, keeping newest 10; wired into startup + a 10-min periodic
+thread (fresh read connection, never holds the app DB mutex; skipped headless). Tested (backup preserves
+data, rotation prunes oldest, absent-root no-op). Closes the single-point-of-failure for the owner's
+review labor before the gold marathon.
+
+Exe now stale (backend change) — batching the rebuild after a few more P3 backend items.
+
+NEXT: P3.4 model-file integrity (bundled model.onnx/vocab SHA pin verified at load — a corrupt model
+would silently degrade the 21% CER; audit flagged empty *_ARCHIVE_SHA256 pins). Then P3.8 retention/
+pruning (unbounded agent_import_reports etc.), P3.3 audio durability, P3.2 import journal/resume.
