@@ -155,6 +155,60 @@
     }
   }
 
+  // P5.1 / M5: dataset & retrain tools. These surface the previously-unreachable backend export
+  // commands so the RETRAIN_RUNBOOK is actually executable from the app (not dev-console only).
+  // `toolBusy` holds the id of the running action so exactly one runs at a time and its button shows
+  // progress. Each mirrors the proven relinkMissingAudio pattern (dir dialog -> IPC -> toast).
+  let toolBusy = $state<string | null>(null);
+
+  async function pickDirAnd<T>(id: string, run: (dir: string) => Promise<T>): Promise<T | null> {
+    if (!tauriAvailable || toolBusy) return null;
+    toolBusy = id;
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const dir = await open({ directory: true, multiple: false });
+      if (typeof dir !== 'string') return null;
+      return await run(dir);
+    } catch (e) {
+      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+      return null;
+    } finally {
+      toolBusy = null;
+    }
+  }
+
+  async function exportFinetunePack() {
+    const r = await pickDirAnd('finetunePack', (dir) => api.exportFinetunePack(dir));
+    if (r) {
+      notifications.success(
+        $t('stats.finetunePackDone')
+          .replace('{n}', String(r.emitted))
+          .replace('{h}', String(r.excludedHoldout))
+          .replace('{s}', String(r.skipped)),
+      );
+    }
+  }
+
+  async function exportGoldEvalSet() {
+    const r = await pickDirAnd('goldEval', (dir) => api.exportGoldEvalSet(dir));
+    if (r) {
+      notifications.success($t('stats.goldEvalDone').replace('{n}', String(r.exported)));
+    }
+  }
+
+  async function importVerifiedAsGold() {
+    if (!tauriAvailable || toolBusy) return;
+    toolBusy = 'importGold';
+    try {
+      const created = await api.importVerifiedSegmentsAsGold();
+      notifications.success($t('stats.importGoldDone').replace('{n}', String(created)));
+    } catch (e) {
+      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+    } finally {
+      toolBusy = null;
+    }
+  }
+
   async function fetchInferenceStats() {
     if (!tauriAvailable) {
       inferenceStats = null;
@@ -533,6 +587,45 @@
             {$t('inference.modelLoad')}: {fmtMs(inferenceStats.model_load_ms)}
           </div>
         {/if}
+      </div>
+    {/if}
+
+    {#if tauriAvailable}
+      <div class="space-y-2 pt-2 border-t border-cortex-800/50" data-testid="dataset-tools">
+        <h3 class="text-xs font-semibold text-cortex-300 uppercase tracking-wider">
+          {$t('stats.tools')}
+        </h3>
+        <div class="flex flex-col gap-2">
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
+            data-testid="import-verified-gold-btn"
+            disabled={toolBusy !== null}
+            onclick={importVerifiedAsGold}
+          >
+            {toolBusy === 'importGold' ? $t('stats.toolWorking') : $t('stats.importVerifiedGold')}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
+            data-testid="export-gold-eval-btn"
+            disabled={toolBusy !== null}
+            onclick={exportGoldEvalSet}
+          >
+            {toolBusy === 'goldEval' ? $t('stats.toolWorking') : $t('stats.exportGoldEvalSet')}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
+            data-testid="export-finetune-pack-btn"
+            disabled={toolBusy !== null}
+            onclick={exportFinetunePack}
+          >
+            {toolBusy === 'finetunePack'
+              ? $t('stats.toolWorking')
+              : $t('stats.exportFinetunePack')}
+          </button>
+        </div>
       </div>
     {/if}
   {:else if errorMessage}
