@@ -497,3 +497,21 @@ Exe stale (P3.3 user-facing) — batching rebuild after P3.7.
 NEXT: P3.7 Windows/Sorani path robustness (Arabic-script filenames, spaces, long paths through FTS +
 WSL translation + export naming) — bounded test item. Then P3.2 import journal/resume (the large
 marathon-safety item: a crash mid-import loses all transcription work). Then rebuild the P3 batch.
+
+## P3.7 path robustness (2026-07-03) + P3.3/P3.7 batch rebuilt
+
+c01e765: regression tests proving Sorani/Windows path robustness (no bug) — a >200-char Arabic-script
+audio_path round-trips; FTS (unicode61) finds by Sorani transcript word; path-only tokens don't
+false-match; sanitize_filename keeps Sorani letters, replaces unsafe chars.
+
+REBUILT the P3.3 (audio durability) + P3.7 batch: exe at HEAD c01e765, freshness GREEN, relink_audio/
+get_audio_health confirmed in the binary. Running app now has audio-relink + all P3 safety features.
+
+P3 status: P3.1 snapshots, P3.3 audio durability, P3.4 model integrity, P3.7 path robustness, P3.8
+retention+db-size — ALL DONE + shipped. Owner-gated: P3.5 WSL drills, P3.6 export spot-check, P3.9
+multi-hour perf.
+
+NEXT (last large automatable item): P3.2 import journal/resume — segments batch-insert ONLY at
+pipeline end (pipeline.rs), so a crash 2h into a 3h import persists NOTHING. Add per-segment
+persistence + a "Resume import" path so long imports survive interruption (marathon depends on many
+long imports).
