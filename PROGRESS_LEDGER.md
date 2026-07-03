@@ -521,8 +521,8 @@ long imports).
 72c1c08: migration v31 (import_jobs + import_job_files) + db methods (begin/mark-done/complete/
 find-interrupted/discard, best-effort-designed, retention to 50 finished jobs) + tests. Durable
 resume record — a crash leaves a 'running' job with its completed files; find_interrupted_import_job
-returns it at startup. Also fixed a P3.7 test hygiene slip (C:/Users/x placeholder -> D:/media);
-lesson recorded: run python-policies EVERY iteration, not just cargo/clippy/fmt.
+returns it at startup. Also fixed a P3.7 test hygiene slip (a Users-profile placeholder path -> a
+neutral drive path); lesson recorded: run python-policies EVERY iteration, not just cargo/clippy/fmt.
 
 NEXT (P3.2 chunk 2 — the wiring, own focused step): wire begin/mark-done/complete into
 import_directory (additive best-effort) + a resume-skip param (None = normal, so behavior unchanged) +

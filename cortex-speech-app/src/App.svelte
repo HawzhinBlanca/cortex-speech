@@ -160,6 +160,30 @@
     'activeLearning',
   ];
 
+  // P3.2: a crashed directory import offered for resume at startup.
+  let interruptedImport = $state<import('./lib/commands').ImportJob | null>(null);
+  async function resumeImport() {
+    const job = interruptedImport;
+    if (!job) return;
+    interruptedImport = null;
+    try {
+      await api.resumeInterruptedImport();
+      notifications.success($t('import.resumeStarted'));
+    } catch (e) {
+      notifications.error($t('import.resumeFailed'), { detail: String(e) });
+    }
+  }
+  async function dismissInterruptedImport() {
+    const job = interruptedImport;
+    if (!job) return;
+    interruptedImport = null;
+    try {
+      await api.discardInterruptedImport(job.id);
+    } catch (e) {
+      console.error('Discard interrupted import failed:', e);
+    }
+  }
+
   async function restoreAndApplySession() {
     if (!tauriAvailable) return;
     try {
@@ -436,6 +460,8 @@
       await loadLatestAgentStageEvents();
       await loadSettings();
       await restoreAndApplySession();
+      // P3.2: a still-'running' import job at startup means a crash interrupted a directory import.
+      interruptedImport = await api.getInterruptedImport().catch(() => null);
     } else {
       segments.set([]);
       segmentsLoading = false;
@@ -1564,6 +1590,37 @@
 </script>
 
 <div class="h-screen flex flex-col bg-app text-default" data-testid="app-root">
+  {#if interruptedImport}
+    <div
+      class="flex items-center justify-between gap-3 border-b border-amber-600/40 bg-amber-950/40 px-4 py-2"
+      data-testid="resume-import-banner"
+    >
+      <span class="text-sm text-amber-200">
+        {$t('import.interrupted')
+          .replace('{done}', String(interruptedImport.completedPaths.length))
+          .replace('{total}', String(interruptedImport.totalFiles))
+          .replace('{dir}', interruptedImport.dir)}
+      </span>
+      <div class="flex items-center gap-2">
+        <button
+          type="button"
+          class="btn btn-primary !text-xs"
+          data-testid="resume-import-btn"
+          onclick={resumeImport}
+        >
+          {$t('import.resume')}
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost !text-xs"
+          data-testid="dismiss-import-btn"
+          onclick={dismissInterruptedImport}
+        >
+          {$t('import.discard')}
+        </button>
+      </div>
+    </div>
+  {/if}
   <!-- Top Bar -->
   <header
     data-testid="top-bar"

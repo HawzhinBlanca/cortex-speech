@@ -849,14 +849,18 @@ impl ProcessingPipeline {
         cancel: Option<CancellationToken>,
         callback: impl Fn(PipelineEvent),
     ) -> AppResult<()> {
-        self.import_directory_with_agent_run_id(dir_path, cancel, None, callback)
+        self.import_directory_with_agent_run_id(dir_path, cancel, None, None, callback)
     }
 
+    /// `resume_completed`: when resuming a crashed import, the set of file paths already imported in the
+    /// interrupted run — they are skipped (their segments already persisted, per-file). `None` for a
+    /// normal import, so the default path's behavior is unchanged.
     pub fn import_directory_with_agent_run_id(
         &self,
         dir_path: &Path,
         cancel: Option<CancellationToken>,
         agent_run_id: Option<&str>,
+        resume_completed: Option<&std::collections::HashSet<String>>,
         callback: impl Fn(PipelineEvent),
     ) -> AppResult<()> {
         let db = self.open_db()?;
@@ -891,6 +895,9 @@ impl ProcessingPipeline {
 
         let source_paths: Vec<String> = files.iter().map(|path| path.to_string_lossy().to_string()).collect();
         let total = files.len();
+        // P3.2: open a resume journal for this import (best-effort — a journal failure never fails the
+        // import). A crash leaves this job 'running'; the next launch can offer to resume it.
+        let job_id: Option<String> = db.begin_import_job(&dir_path.to_string_lossy(), total).ok();
         callback(PipelineEvent::Started { total });
         callback(PipelineEvent::Phase { phase: "importing".into() });
         self.set_import_status(0, total, "");
@@ -914,6 +921,23 @@ impl ProcessingPipeline {
             }
 
             let fname = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+            let file_path_str = file.to_string_lossy().to_string();
+
+            // P3.2: when resuming, a file already imported in the interrupted run is skipped — its
+            // segments were persisted per-file, so re-processing would only create duplicates.
+            if resume_completed.is_some_and(|done| done.contains(&file_path_str)) {
+                succeeded += 1;
+                if let Some(ref jid) = job_id {
+                    let _ = db.mark_import_file_done(jid, &file_path_str);
+                }
+                callback(PipelineEvent::Progress {
+                    current: idx + 1,
+                    total,
+                    file: fname.clone(),
+                    status: "Already imported — skipped (resume)".into(),
+                });
+                continue;
+            }
 
             callback(PipelineEvent::Progress {
                 current: idx + 1,
@@ -977,6 +1001,10 @@ impl ProcessingPipeline {
                     ));
                     callback(multi_model_hypothesis_stage(&db, fname.clone(), &segments));
                     succeeded += 1;
+                    // P3.2: record this file as done in the resume journal (best-effort).
+                    if let Some(ref jid) = job_id {
+                        let _ = db.mark_import_file_done(jid, &file_path_str);
+                    }
                     imported_ids.extend(segments.iter().map(|s| s.id.clone()));
                     if segments.len() > 1 {
                         tracing::info!("Imported {} annotatable segments from {}", segments.len(), file.display());
@@ -1076,6 +1104,10 @@ impl ProcessingPipeline {
             }
         }
 
+        // P3.2: a clean finish — the job is no longer an interruption to resume (best-effort).
+        if let Some(ref jid) = job_id {
+            let _ = db.complete_import_job(jid);
+        }
         callback(PipelineEvent::Completed { total, succeeded, failed });
         self.finish_import_status();
         Ok(())
@@ -3002,7 +3034,7 @@ mod tests {
         let token = crate::cancel::CancellationToken::new();
         token.cancel(); // pre-cancel so the loop's first token.check()? returns Err before any decode
 
-        let res = pipeline.import_directory_with_agent_run_id(&import_dir, Some(token), None, |_evt| {});
+        let res = pipeline.import_directory_with_agent_run_id(&import_dir, Some(token), None, None, |_evt| {});
         assert!(res.is_err(), "a cancelled import returns Err");
         assert!(!pipeline.import_status().running, "running must be cleared after a cancelled import");
     }

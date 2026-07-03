@@ -436,7 +436,7 @@ pub fn import_directory(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
         // Panic-guard the directory worker (same rationale as the single-file path): an unwound
         // panic must not leave the import UI stuck "processing".
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pipeline.import_directory_with_agent_run_id(&dir_path, cancel, Some(&agent_run_id), |event| {
+            pipeline.import_directory_with_agent_run_id(&dir_path, cancel, Some(&agent_run_id), None, |event| {
                 emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "directory");
             })
         }));
@@ -467,6 +467,97 @@ pub fn import_directory(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
     });
 
     Ok(serde_json::json!({ "status": "started" }))
+}
+
+/// P3.2: the crashed directory import to resume, if any. Query at STARTUP — when no import is active,
+/// a still-'running' job is a crash.
+#[tauri::command]
+pub fn get_interrupted_import(state: State<'_, AppState>) -> Result<Option<crate::db::ImportJob>, String> {
+    RATE_LIMITER.check("get_interrupted_import")?;
+    let db = state.lock_db();
+    db.find_interrupted_import_job().map_err(|e| e.to_string())
+}
+
+/// P3.2: discard an interrupted import job (the user chose not to resume).
+#[tauri::command]
+pub fn discard_interrupted_import(job_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    STRICT_RATE_LIMITER.check("discard_interrupted_import")?;
+    validate::validate_identifier(&job_id)?;
+    let db = state.lock_db();
+    db.discard_import_job(&job_id).map_err(|e| e.to_string())
+}
+
+/// P3.2: resume the interrupted directory import — re-run its folder, skipping files already imported
+/// in the crashed run (their segments persisted per-file). Retires the old crashed job so it is not
+/// offered again; the fresh import job now tracks progress.
+#[tauri::command]
+pub fn resume_interrupted_import(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    RATE_LIMITER.check("resume_interrupted_import")?;
+    let job = {
+        let db = state.lock_db();
+        db.find_interrupted_import_job().map_err(|e| e.to_string())?
+    };
+    let Some(job) = job else { return Err("No interrupted import to resume".into()) };
+    let dir_path = std::path::PathBuf::from(&job.dir);
+    if !dir_path.is_dir() {
+        return Err(format!("The import folder no longer exists: {}", job.dir));
+    }
+    let completed: std::collections::HashSet<String> = job.completed_paths.into_iter().collect();
+
+    state.try_start_import()?;
+    {
+        // Retire the crashed job now that we are resuming it; the fresh import job supersedes it.
+        let db = state.lock_db();
+        let _ = db.discard_import_job(&job.id);
+    }
+    let cancel = Some(state.start_cancel_token());
+    let pipeline = state.lock_pipeline().clone();
+    let agent_run_id = uuid::Uuid::new_v4().to_string();
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        struct ImportGuard {
+            app: tauri::AppHandle,
+        }
+        impl Drop for ImportGuard {
+            fn drop(&mut self) {
+                if let Some(app_state) = self.app.try_state::<AppState>() {
+                    app_state.finish_import();
+                }
+            }
+        }
+        let _guard = ImportGuard { app: app_clone.clone() };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pipeline.import_directory_with_agent_run_id(
+                &dir_path,
+                cancel,
+                Some(&agent_run_id),
+                Some(&completed),
+                |event| emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "directory"),
+            )
+        }));
+        let result = match caught {
+            Ok(r) => r,
+            Err(_) => {
+                Err(crate::error::AppError::Other("Import failed unexpectedly (internal error); see logs.".to_string()))
+            }
+        };
+        if let Err(e) = result {
+            let error = e.to_string();
+            tracing::warn!("Resume import failed: {error}");
+            emit_or_log(
+                &app_clone,
+                "pipeline-error",
+                serde_json::json!({ "file": dir_path.to_string_lossy(), "error": error }),
+            );
+            let payload = serde_json::json!({ "total": 0, "succeeded": 0, "failed": 1, "cancelled": false, "source": "directory" });
+            emit_or_log(&app_clone, "import-complete", payload.clone());
+            emit_or_log(&app_clone, "pipeline-complete", payload);
+        }
+    });
+    Ok(serde_json::json!({ "status": "started", "resuming": true }))
 }
 
 #[tauri::command]

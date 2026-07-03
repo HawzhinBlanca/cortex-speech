@@ -15,6 +15,27 @@ export async function importDirectory(): Promise<{ status: string }> {
   return invoke('import_directory');
 }
 
+/** P3.2: a directory import interrupted by a crash, offered for resume at startup. */
+export interface ImportJob {
+  id: string;
+  dir: string;
+  totalFiles: number;
+  completedPaths: string[];
+  createdAt: string;
+}
+
+export async function getInterruptedImport(): Promise<ImportJob | null> {
+  return invoke<ImportJob | null>('get_interrupted_import');
+}
+
+export async function resumeInterruptedImport(): Promise<{ status: string; resuming: boolean }> {
+  return invoke('resume_interrupted_import');
+}
+
+export async function discardInterruptedImport(jobId: string): Promise<void> {
+  return invoke('discard_interrupted_import', { jobId });
+}
+
 export async function importAudioFile(path: string): Promise<{ status: string; source?: string }> {
   return invoke('import_audio_file', { path });
 }
