@@ -88,6 +88,8 @@
             b.segmentCount - a.segmentCount || b.totalDurationSeconds - a.totalDurationSeconds,
         )
         .slice(0, 5),
+      // Review timing is backend-only (derived from decision_log); the non-Tauri fallback has none.
+      reviewTiming: { decisionsLogged: 0, medianSeconds: null, samples: 0 },
     };
   }
 
@@ -204,6 +206,16 @@
         <div class="text-2xl font-bold text-cortex-300">{stats.uniqueSpeakers}</div>
         <div class="text-xs text-cortex-400">{$t('stats.uniqueSpeakers')}</div>
       </div>
+      {#if stats.reviewTiming && stats.reviewTiming.medianSeconds !== null}
+        <div class="bg-cortex-800/30 rounded-lg p-3" data-testid="stat-review-speed">
+          <div class="text-2xl font-bold text-cortex-300">
+            {stats.reviewTiming.medianSeconds.toFixed(1)}s
+          </div>
+          <div class="text-xs text-cortex-400">
+            {$t('stats.reviewSpeed')} ({stats.reviewTiming.samples})
+          </div>
+        </div>
+      {/if}
       {#if fingerprintCount !== null}
         <div class="bg-cortex-800/30 rounded-lg p-3" data-testid="stat-fingerprints">
           <div class="text-2xl font-bold text-cortex-300">{fingerprintCount}</div>

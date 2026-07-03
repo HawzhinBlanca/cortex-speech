@@ -115,6 +115,15 @@ export interface DatasetStats {
   avgCharsPerSegment: number;
   durationHistogram: DurationHistogram;
   topSpeakers: SpeakerStat[];
+  reviewTiming: ReviewTimingStats;
+}
+
+/** M2.1 / P1.1: review-throughput timing from decision_log. */
+export interface ReviewTimingStats {
+  decisionsLogged: number;
+  /** Median within-session seconds per decision, or null with fewer than 2 timed decisions. */
+  medianSeconds: number | null;
+  samples: number;
 }
 
 export interface DurationHistogram {

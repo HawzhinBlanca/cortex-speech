@@ -1005,11 +1005,15 @@ export async function recordHumanDecision(
   segmentId: string,
   decision: 'accept' | 'edit' | 'reject',
   correctedTranscript?: string | null,
+  timestampMs: number = Date.now(),
 ): Promise<void> {
+  // M2.1 / P1.1: send the decision timestamp so decision_log is actually populated (it was dead
+  // before — the backend only inserts `if let Some(ts_ms)`, and this wrapper never passed one).
   return invoke<void>('record_human_decision', {
     segmentId,
     decision,
     correctedTranscript: correctedTranscript ?? null,
+    timestampMs,
   });
 }
 

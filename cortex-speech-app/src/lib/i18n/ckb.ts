@@ -390,6 +390,7 @@ export const ckb: Record<string, string> = {
   'stats.totalDuration': 'کۆی ماوە',
   'stats.verified': 'پشتڕاستکراو',
   'stats.uniqueSpeakers': 'قسەکەرە جیاوازەکان',
+  'stats.reviewSpeed': 'ناوەندی چرکە/پارچە',
   'stats.qualityTitle': 'جۆری داتاسێت',
   'stats.emptyTranscripts': 'نووسینەوەی بەتاڵ',
   'stats.lowConfidence': 'متمانەی کەم',

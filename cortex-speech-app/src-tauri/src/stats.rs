@@ -16,7 +16,27 @@ pub struct DatasetStats {
     pub avg_chars_per_segment: f64,
     pub duration_histogram: DurationHistogram,
     pub top_speakers: Vec<SpeakerStat>,
+    /// M2.1 / P1.1: review-throughput timing derived from the decision_log rows. Zero/None until the
+    /// owner has made decisions in the app (the marathon's review-speed baseline lives here).
+    pub review_timing: ReviewTimingStats,
 }
+
+/// Review-throughput instrumentation (M2.1). `median_seconds` is the median gap between consecutive
+/// human decisions, counting only within-session gaps (deltas above `SESSION_GAP_MS` are treated as
+/// breaks, not review time). This is the honest s/segment figure the C3 ≥3× gate measures against.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewTimingStats {
+    /// Total rows in decision_log (one per recorded human decision that carried a timestamp).
+    pub decisions_logged: usize,
+    /// Median within-session seconds per decision, or None when there are fewer than 2 timed decisions.
+    pub median_seconds: Option<f64>,
+    /// Number of consecutive-decision deltas that fell within a session and fed the median.
+    pub samples: usize,
+}
+
+/// Consecutive decisions more than this far apart are between-session breaks, not review time.
+const SESSION_GAP_MS: i64 = 300_000; // 5 minutes
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +77,29 @@ pub fn list_speakers(db: &Database) -> AppResult<Vec<SpeakerStat>> {
         .collect::<Result<_, _>>()?;
     speakers.sort_by(|a, b| b.segment_count.cmp(&a.segment_count).then_with(|| a.speaker_id.cmp(&b.speaker_id)));
     Ok(speakers)
+}
+
+/// Median within-session seconds per decision from the ordered decision_log timestamps (M2.1).
+fn compute_review_timing(conn: &rusqlite::Connection) -> AppResult<ReviewTimingStats> {
+    let mut stmt = conn.prepare("SELECT timestamp_ms FROM decision_log ORDER BY timestamp_ms ASC")?;
+    let timestamps: Vec<i64> = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<Result<_, _>>()?;
+    let decisions_logged = timestamps.len();
+
+    // Consecutive positive deltas within a session; median is robust to the odd long pause.
+    let mut deltas: Vec<i64> =
+        timestamps.windows(2).map(|w| w[1] - w[0]).filter(|&d| d > 0 && d <= SESSION_GAP_MS).collect();
+    deltas.sort_unstable();
+
+    let median_seconds = if deltas.is_empty() {
+        None
+    } else {
+        let mid = deltas.len() / 2;
+        let median_ms =
+            if deltas.len() % 2 == 1 { deltas[mid] as f64 } else { (deltas[mid - 1] + deltas[mid]) as f64 / 2.0 };
+        Some(median_ms / 1000.0)
+    };
+
+    Ok(ReviewTimingStats { decisions_logged, median_seconds, samples: deltas.len() })
 }
 
 pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
@@ -143,6 +186,7 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
             over_30s: o30 as usize,
         },
         top_speakers,
+        review_timing: compute_review_timing(conn)?,
     })
 }
 
@@ -166,6 +210,7 @@ impl Default for DatasetStats {
                 over_30s: 0,
             },
             top_speakers: Vec::new(),
+            review_timing: ReviewTimingStats::default(),
         }
     }
 }
@@ -200,6 +245,38 @@ mod tests {
         }
         assert_eq!(list_speakers(&db).unwrap().len(), 12, "every distinct speaker is returned");
         assert_eq!(compute_stats(&db).unwrap().top_speakers.len(), 10, "the dashboard summary stays capped at 10");
+    }
+
+    #[test]
+    fn review_timing_median_uses_within_session_deltas_only() {
+        // P1.1: proves decision_log is actually populated (the M2.1 write path was dead) AND that the
+        // median read path counts only within-session gaps.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        for i in 0..4 {
+            db.insert_segment(&seg(&format!("d{i}"), 3_000, false, Some("A"), "x")).unwrap();
+        }
+        // Decisions at 1s, 4s, 6s (within-session deltas 3s, 2s) then one 500s later (a break, excluded).
+        db.record_human_decision("d0", "accept", None, Some(1_000)).unwrap();
+        db.record_human_decision("d1", "accept", None, Some(4_000)).unwrap();
+        db.record_human_decision("d2", "accept", None, Some(6_000)).unwrap();
+        db.record_human_decision("d3", "accept", None, Some(500_000)).unwrap();
+
+        let rt = compute_stats(&db).unwrap().review_timing;
+        assert_eq!(rt.decisions_logged, 4, "every timestamped decision is logged");
+        assert_eq!(rt.samples, 2, "the 494s break delta is excluded as a between-session gap");
+        assert_eq!(rt.median_seconds, Some(2.5), "median of within-session deltas 3s and 2s is 2.5s");
+    }
+
+    #[test]
+    fn review_timing_is_empty_without_timed_decisions() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&seg("s1", 3_000, false, None, "x")).unwrap();
+        let rt = compute_stats(&db).unwrap().review_timing;
+        assert_eq!(rt.decisions_logged, 0);
+        assert_eq!(rt.median_seconds, None);
+        assert_eq!(rt.samples, 0);
     }
 
     #[test]
