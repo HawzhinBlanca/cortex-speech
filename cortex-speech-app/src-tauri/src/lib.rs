@@ -481,6 +481,7 @@ pub fn run() {
             commands::transcribe_segment,
             commands::transcribe_segment_constrained,
             commands::transcribe_segment_finetuned,
+            commands::verify_finetuned_model_integrity,
             commands::batch_transcribe,
             commands::normalize_text,
             commands::align_segment,

@@ -925,6 +925,34 @@ fn decode_finetuned_clip_16k(audio_path: &str, alignment_json: Option<&str>) -> 
     Ok(pcm16)
 }
 
+/// Resolve the fine-tuned model + vocab paths: `CORTEX_FINETUNED_ONNX`/`CORTEX_FINETUNED_VOCAB`
+/// (dev/testing) or `finetuned-mms-ckb/{model.onnx,vocab.json}` in the active then bundled models dir.
+fn resolve_finetuned_paths() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    if let (Ok(o), Ok(v)) = (std::env::var("CORTEX_FINETUNED_ONNX"), std::env::var("CORTEX_FINETUNED_VOCAB")) {
+        return Ok((std::path::PathBuf::from(o), std::path::PathBuf::from(v)));
+    }
+    for base in [crate::models::active_models_dir(), crate::models::bundled_models_dir()] {
+        let dir = base.join("finetuned-mms-ckb");
+        let onnx = dir.join("model.onnx");
+        let vocab = dir.join("vocab.json");
+        if onnx.exists() && vocab.exists() {
+            return Ok((onnx, vocab));
+        }
+    }
+    Err("fine-tuned model not found (models/finetuned-mms-ckb/{model.onnx,vocab.json})".to_string())
+}
+
+/// P3.4: verify the bundled fine-tuned model's integrity — the DEFINITIVE full model.onnx + vocab.json
+/// SHA-256 (hashes the full ~970 MB, so it is on demand, not per-load). The fast size+vocab guard runs
+/// at every model load. Returns a confirmation string or a mismatch error.
+#[tauri::command]
+pub fn verify_finetuned_model_integrity() -> Result<String, String> {
+    STRICT_RATE_LIMITER.check("verify_finetuned_model_integrity")?;
+    let (onnx, vocab) = resolve_finetuned_paths()?;
+    crate::wav2vec2_asr::verify_finetuned_full(&onnx, &vocab)?;
+    Ok(format!("verified: {}", onnx.display()))
+}
+
 /// Opt-in: transcribe a segment with the fine-tuned Kurdish Wav2Vec2-CTC model (ONNX via `ort`),
 /// which roughly halves CER vs the stock OmniASR path (see docs/EVAL.md). Additive — the default
 /// `transcribe_segment` path is unchanged. Resolves the model from `CORTEX_FINETUNED_ONNX` +
@@ -939,30 +967,7 @@ pub fn transcribe_segment_finetuned(
     if let Some(ref aj) = alignment_json {
         validate::validate_alignment_json(aj)?;
     }
-    let (onnx, vocab) = if let (Ok(o), Ok(v)) =
-        (std::env::var("CORTEX_FINETUNED_ONNX"), std::env::var("CORTEX_FINETUNED_VOCAB"))
-    {
-        (std::path::PathBuf::from(o), std::path::PathBuf::from(v))
-    } else {
-        // Resolve finetuned-mms-ckb/{model.onnx,vocab.json} from the active (user/APPDATA) models
-        // dir, then the bundled models dir (installer resources / dev tree).
-        let mut found = None;
-        for base in [crate::models::active_models_dir(), crate::models::bundled_models_dir()] {
-            let dir = base.join("finetuned-mms-ckb");
-            let onnx = dir.join("model.onnx");
-            let vocab = dir.join("vocab.json");
-            if onnx.exists() && vocab.exists() {
-                found = Some((onnx, vocab));
-                break;
-            }
-        }
-        match found {
-            Some(p) => p,
-            None => {
-                return Err("fine-tuned model not found (models/finetuned-mms-ckb/{model.onnx,vocab.json})".to_string())
-            }
-        }
-    };
+    let (onnx, vocab) = resolve_finetuned_paths()?;
     // Decode ONLY this segment's clip window (16 kHz). Every VAD chunk shares the whole-source
     // audio_path with its range in alignment_json; decoding the WHOLE source first (the old path) failed
     // on long recordings ("audio too large to decode in one pass") even though the clip is a few

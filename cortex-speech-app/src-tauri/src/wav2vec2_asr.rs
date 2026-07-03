@@ -20,6 +20,70 @@ const PAD_ID: usize = 0;
 static SESSION_CACHE: LazyLock<Mutex<Option<(std::path::PathBuf, ort::session::Session)>>> =
     LazyLock::new(|| Mutex::new(None));
 
+// ── P3.4: bundled fine-tuned model integrity ────────────────────────────────────────────────────
+// The champion MMS-CTC-ckb model produced the published 21.0% CER; a truncated/incomplete-copy or
+// swapped file would silently degrade transcripts (the exact thing the honesty law forbids). These
+// pins are for the CURRENT bundled model — UPDATE them when it is retrained/replaced (M5). Computed
+// from src-tauri/models/finetuned-mms-ckb/.
+pub const FINETUNED_MODEL_SHA256: &str = "6147ea5d986d38c85aadd4c5d8d05bd9bc982e48b119d24b51b375548e49396c";
+pub const FINETUNED_MODEL_BYTES: u64 = 970_251_415;
+pub const FINETUNED_VOCAB_SHA256: &str = "31dcd5c4361451991bd8241eb99bdc822d2ef2d8a4906404884c2196aa8f3a41";
+
+/// True when `onnx_path` is the bundled fine-tuned model (`…/finetuned-mms-ckb/model.onnx`). A custom
+/// `CORTEX_FINETUNED_ONNX` or the alignment model is not this file and is not pinned.
+fn is_bundled_finetuned(onnx_path: &Path) -> bool {
+    onnx_path.file_name().and_then(|n| n.to_str()) == Some("model.onnx")
+        && onnx_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("finetuned-mms-ckb")
+}
+
+/// Verify a model/vocab pair against an expected model byte-size + vocab SHA. model.onnx gets only the
+/// (instant) size check here — it catches a truncated/incomplete copy, the realistic corruption — while
+/// the small vocab gets a full SHA. Extracted so the pass/fail logic is unit-testable without the 970 MB
+/// model. The definitive full model SHA is `verify_finetuned_full` (on-demand).
+fn verify_integrity_against(
+    onnx_path: &Path,
+    expected_bytes: u64,
+    vocab_path: &Path,
+    expected_vocab_sha: &str,
+) -> Result<(), String> {
+    let size = std::fs::metadata(onnx_path).map_err(|e| format!("stat model.onnx: {e}"))?.len();
+    if size != expected_bytes {
+        return Err(format!(
+            "fine-tuned model.onnx integrity: expected {expected_bytes} bytes, found {size} — the file is truncated or replaced; re-install the model."
+        ));
+    }
+    let vocab_sha = crate::models::compute_file_sha256(vocab_path)?;
+    if vocab_sha != expected_vocab_sha {
+        return Err(format!(
+            "fine-tuned vocab.json integrity: SHA mismatch (expected {expected_vocab_sha}, got {vocab_sha}) — re-install the model."
+        ));
+    }
+    Ok(())
+}
+
+/// P3.4 fast load-time integrity guard for the bundled fine-tuned model (size + vocab SHA, both instant).
+/// Non-bundled ONNX paths skip the check.
+pub fn verify_finetuned_fast(onnx_path: &Path, vocab_path: &Path) -> Result<(), String> {
+    if !is_bundled_finetuned(onnx_path) {
+        return Ok(());
+    }
+    verify_integrity_against(onnx_path, FINETUNED_MODEL_BYTES, vocab_path, FINETUNED_VOCAB_SHA256)
+}
+
+/// P3.4 definitive full-SHA verification of the bundled fine-tuned model + vocab (on demand — the
+/// `verify_finetuned_model_integrity` IPC). Hashes the full 970 MB model, so it is NOT run per-load.
+pub fn verify_finetuned_full(onnx_path: &Path, vocab_path: &Path) -> Result<(), String> {
+    let model_sha = crate::models::compute_file_sha256(onnx_path)?;
+    if model_sha != FINETUNED_MODEL_SHA256 {
+        return Err(format!("model.onnx SHA mismatch (expected {FINETUNED_MODEL_SHA256}, got {model_sha})"));
+    }
+    let vocab_sha = crate::models::compute_file_sha256(vocab_path)?;
+    if vocab_sha != FINETUNED_VOCAB_SHA256 {
+        return Err(format!("vocab.json SHA mismatch (expected {FINETUNED_VOCAB_SHA256}, got {vocab_sha})"));
+    }
+    Ok(())
+}
+
 /// Zero-mean / unit-variance normalize the waveform (HF `zero_mean_unit_var_norm`, population var).
 pub fn normalize_audio(audio: &[f32]) -> Vec<f32> {
     let n = audio.len().max(1) as f32;
@@ -100,6 +164,10 @@ pub fn wav2vec2_logits(
     // path must not permanently break BOTH fine-tuned transcription and alignment until app restart.
     let mut guard = SESSION_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if guard.as_ref().map(|(p, _)| p.as_path() != onnx_path).unwrap_or(true) {
+        // P3.4: verify the bundled fine-tuned model's integrity before loading it (once per model-path,
+        // since the session is cached). A truncated/swapped model would otherwise silently degrade the
+        // measured accuracy. Non-bundled paths are a no-op.
+        verify_finetuned_fast(onnx_path, vocab_path)?;
         let session = ort::session::Session::builder()
             .map_err(|e| format!("ort builder: {e}"))?
             .commit_from_file(onnx_path)
@@ -150,6 +218,43 @@ pub fn run_wav2vec2(onnx_path: &Path, vocab_path: &Path, lang: &str, audio: &[f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_bundled_finetuned_matches_only_the_pinned_path() {
+        assert!(is_bundled_finetuned(Path::new("/x/models/finetuned-mms-ckb/model.onnx")));
+        assert!(is_bundled_finetuned(Path::new("C:/a/finetuned-mms-ckb/model.onnx")));
+        assert!(!is_bundled_finetuned(Path::new("/x/omniasr-ctc-300m/model.onnx")), "other engine");
+        assert!(!is_bundled_finetuned(Path::new("/x/finetuned-mms-ckb/other.onnx")), "wrong file");
+        assert!(!is_bundled_finetuned(Path::new("/custom/exported.onnx")), "custom override");
+    }
+
+    #[test]
+    fn verify_integrity_against_passes_and_fails_correctly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let onnx = tmp.path().join("model.onnx");
+        let vocab = tmp.path().join("vocab.json");
+        std::fs::write(&onnx, vec![0u8; 1234]).unwrap(); // exactly 1234 bytes
+        std::fs::write(&vocab, b"{\"ckb\":{}}").unwrap();
+        let vocab_sha = crate::models::compute_file_sha256(&vocab).unwrap();
+
+        // Correct size + correct vocab SHA -> Ok.
+        assert!(verify_integrity_against(&onnx, 1234, &vocab, &vocab_sha).is_ok());
+
+        // Wrong model size (truncation) -> Err.
+        let err = verify_integrity_against(&onnx, 9999, &vocab, &vocab_sha).unwrap_err();
+        assert!(err.contains("truncated or replaced"), "size mismatch surfaced: {err}");
+
+        // Right size, wrong vocab SHA (corruption) -> Err.
+        let err = verify_integrity_against(&onnx, 1234, &vocab, &"0".repeat(64)).unwrap_err();
+        assert!(err.contains("SHA mismatch"), "vocab mismatch surfaced: {err}");
+    }
+
+    #[test]
+    fn verify_finetuned_fast_skips_non_bundled_paths() {
+        // A non-bundled path must not error even if the files don't exist — the pin only guards the
+        // bundled champion; custom/alignment models are out of scope.
+        assert!(verify_finetuned_fast(Path::new("/custom/exported.onnx"), Path::new("/custom/vocab.json")).is_ok());
+    }
 
     #[test]
     fn normalize_is_zero_mean_unit_var() {
