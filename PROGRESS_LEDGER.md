@@ -601,3 +601,18 @@ real correctness bug in the P3.2 import-resume feature I shipped earlier this se
   reasoned + compiled, NOT run on real audio — stated plainly, not claimed as measured.
 - Exe rebuilt (npm build + cargo build --release, 6m44s); freshness GREEN at e9f7844 — the running
   app carries the fix.
+
+## Self-review defect hunt round 2 (2026-07-03) — relink ambiguity hazard hardened
+
+Adversarial re-read of the remaining session Rust (snapshot rotation, audio_health/relink, the M2
+instrumentation writers, model integrity pins). Bill of health:
+- snapshot.rs, integrity pins (fail-CLOSED, both mismatch branches tested), record_decision_verdict
+  (INSERT OR REPLACE = idempotent), record_loop0_shadow (append-only but only at genuine persist
+  time) — all CLEAN and already tested.
+- Cross-verified last round's resume fix does NOT double-count the M2 tables: shadow logging runs
+  only inside process_single_file (resume skips it) and decision_verdicts REPLACEs by segment_id.
+- HARDENED (d4fc35f): relink_audio basename-collision hazard. Two distinct missing sources sharing
+  a basename + one found file of that name would silently repoint BOTH -> wrong audio for one
+  recording (the recurring wrong-audio class). Now refused + warned; regression test pins it.
+- Gates: clippy -D warnings clean, 3 relink tests green, python policies green. Exe rebuilt
+  (6m06s), freshness GREEN — running app carries the guard.
