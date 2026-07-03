@@ -62,6 +62,16 @@ pub(crate) fn apply_loop0_firing(enabled: bool, db: &crate::db::Database, transc
     }
 }
 
+/// M2.3 / P1.3: true when LOOP-0 WOULD change this transcript (a confirmed correction memory matches).
+/// This is the pure shadow signal — it never mutates and is independent of the firing opt-in, so the C5
+/// over-trigger decision can be measured while firing stays default-off.
+pub(crate) fn loop0_would_fire(memories: &[crate::corrections::MemoryEntry], text: &str) -> bool {
+    !memories.is_empty()
+        && !text.trim().is_empty()
+        && crate::corrections::apply_memories(text, memories, &crate::corrections::FiringConfig::default()).as_str()
+            != text
+}
+
 /// F7 — the LLM-refinement diff guard. Max CER an LLM refinement may sit from the raw ASR text
 /// before it is rejected. A refiner is a light post-editor (fix phonetic/orthographic slips); an LLM
 /// can instead hallucinate a fluent-but-wrong rewrite far from what was actually heard. Without this
@@ -1646,11 +1656,39 @@ impl ProcessingPipeline {
         // insert_segments_batch wraps inserts in its own transaction; do not nest SAVEPOINTs.
         db.insert_segments_batch(&segments)?;
 
+        // M2.3/P1.3: shadow-record LOOP-0 would-fire per segment (no mutation), now that the rows exist
+        // (the loop0_shadow_log FK requires it). Feeds the C5 over-trigger decision while firing is off.
+        self.shadow_log_loop0(db, &segments);
+
         // M2.4: Spawn background alignment tasks (low priority, non-blocking).
         // Alignment is optional — review can proceed while alignment runs in background.
         self.enqueue_background_alignments(&segments);
 
         Ok(segments)
+    }
+
+    /// M2.3 / P1.3: for each freshly persisted segment, record whether LOOP-0 WOULD have fired on its
+    /// finalized transcript (annotated ▸ normalized ▸ raw), WITHOUT mutating anything. Memories are
+    /// loaded once. Best-effort: a load or write failure logs and never fails the import.
+    fn shadow_log_loop0(&self, db: &Database, segments: &[SpeechSegment]) {
+        let memories = match db.load_correction_memories() {
+            Ok(memories) => memories,
+            Err(error) => {
+                tracing::warn!("LOOP-0 shadow logging skipped: failed to load correction memories: {error}");
+                return;
+            }
+        };
+        for seg in segments {
+            let text = seg
+                .annotated_transcript
+                .as_deref()
+                .or(seg.normalized_transcript.as_deref())
+                .unwrap_or(&seg.raw_transcript);
+            let would_fire = loop0_would_fire(&memories, text);
+            if let Err(error) = db.record_loop0_shadow(&seg.id, would_fire) {
+                tracing::warn!("LOOP-0 shadow log write failed for {}: {error}", seg.id);
+            }
+        }
     }
 
     /// M2.4: Enqueue background alignment tasks for segments. Non-blocking, best-effort.
@@ -2777,6 +2815,29 @@ mod tests {
             "ئەو ساڵە خراپ بوو",
             "the learned correction must fire when enabled"
         );
+    }
+
+    #[test]
+    fn loop0_would_fire_is_the_shadow_signal_independent_of_the_toggle() {
+        // P1.3: the shadow predicate is true iff a confirmed correction memory would change the text —
+        // regardless of the firing opt-in, and without mutating anything. This is what feeds C5.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        for id in ["wf-1", "wf-2"] {
+            let seg = SpeechSegment {
+                id: id.to_string(),
+                audio_path: format!("/audio/{id}.wav"),
+                raw_transcript: "ئەو ساڵە باش بوو".to_string(),
+                ..Default::default()
+            };
+            db.insert_segment(&seg).unwrap();
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).unwrap();
+        }
+        let mems = db.load_correction_memories().unwrap();
+        assert!(super::loop0_would_fire(&mems, "ئەو ساڵە باش بوو"), "a matching memory would fire");
+        assert!(!super::loop0_would_fire(&mems, "شتێکی جیاواز"), "unrelated text would not fire");
+        assert!(!super::loop0_would_fire(&mems, "   "), "blank text never fires");
+        assert!(!super::loop0_would_fire(&[], "ئەو ساڵە باش بوو"), "no memories -> never fires");
     }
 
     #[test]

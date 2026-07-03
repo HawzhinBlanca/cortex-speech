@@ -1311,6 +1311,18 @@ impl Database {
 
     // ── Jury DB helpers ───────────────────────────────────────────────────────
 
+    /// M2.3 / P1.3: record what LOOP-0 WOULD have done for a segment WITHOUT mutating it. `memory_fired`
+    /// is true when a correction memory would have changed the finalized transcript. One row per shadow
+    /// observation; the C5 over-trigger decision joins these to the human's later decision at analysis
+    /// time (an over-trigger is a would-fire the human subsequently contradicts).
+    pub fn record_loop0_shadow(&self, segment_id: &str, memory_fired: bool) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO loop0_shadow_log (segment_id, memory_fired) VALUES (?1, ?2)",
+            params![segment_id, memory_fired],
+        )?;
+        Ok(())
+    }
+
     /// M2.2 / P1.2: classify a MACHINE verdict as T0 (auto-resolved, no human needed) or T1
     /// (escalated to a human) and record it in decision_verdicts — the denominator/index for the C4
     /// auto-accept-precision measurement. Human verdicts (`human_*`) and any unknown string record
@@ -2782,6 +2794,25 @@ mod tests {
         let out =
             crate::corrections::apply_memories("ئەو ساڵە باش بوو", &mems, &crate::corrections::FiringConfig::default());
         assert_eq!(out, "ئەو ساڵە خراپ بوو", "capture x2 -> DB -> load -> fire reproduces the human fix");
+    }
+
+    #[test]
+    fn loop0_shadow_log_records_would_fire_flag() {
+        // P1.3: each shadow observation persists a row with its memory_fired flag (the C5 data source).
+        let db = make_db();
+        db.insert_segment(&make_segment("sh-1", "/data/audio/sh-1.wav")).expect("insert");
+        db.record_loop0_shadow("sh-1", true).expect("shadow true");
+        db.record_loop0_shadow("sh-1", false).expect("shadow false");
+
+        let rows: Vec<i64> = db
+            .connection()
+            .prepare("SELECT memory_fired FROM loop0_shadow_log WHERE segment_id = 'sh-1' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![1, 0], "both shadow observations persist with their flags");
     }
 
     #[test]
