@@ -13,6 +13,7 @@
   import {
     segments,
     selectedSegmentId,
+    filterVerified,
     wordTimestamps,
     searchQuery,
     sortOrder,
@@ -168,6 +169,14 @@
         if (restored.sort_order && VALID_SORT_ORDERS.includes(restored.sort_order as SortOrder)) {
           sortOrder.set(restored.sort_order as SortOrder);
         }
+        // M2.6/P1.5: restore the review filter + cursor (segments are already loaded at this point).
+        // Only reselect a cursor that still exists in the loaded set, so a deleted segment is a no-op.
+        if (restored.filter_verified !== null && restored.filter_verified !== undefined) {
+          filterVerified.set(restored.filter_verified);
+        }
+        if (restored.selected_segment_id && get(segments).some((s) => s.id === restored.selected_segment_id)) {
+          selectedSegmentId.set(restored.selected_segment_id);
+        }
       }
     } catch (e) {
       console.error('Session restore failed:', e);
@@ -181,10 +190,11 @@
   $effect(() => {
     const q = $searchQuery;
     const s = $sortOrder;
+    const fv = $filterVerified;
     if (!sessionRestored || !tauriAvailable) return;
     if (sessionSaveTimeout) clearTimeout(sessionSaveTimeout);
     sessionSaveTimeout = setTimeout(() => {
-      void api.saveSession(q, s).catch((e) => console.error('Session save failed:', e));
+      void api.saveSession(q, s, fv).catch((e) => console.error('Session save failed:', e));
     }, 800);
   });
   let datasetPromotionStage = $derived.by(

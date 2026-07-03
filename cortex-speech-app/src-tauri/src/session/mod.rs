@@ -83,6 +83,8 @@ pub struct SessionManager {
     sort_order: String,
     // M2.6: Current review segment ID for cursor persistence across restarts.
     selected_segment_id: Option<String>,
+    // M2.6/P1.5: the review verified-filter, held in memory so every save persists it.
+    filter_verified: Option<bool>,
 }
 
 impl SessionManager {
@@ -97,15 +99,17 @@ impl SessionManager {
             search_query: String::new(),
             sort_order: "newest".to_string(),
             selected_segment_id: None,
+            filter_verified: None,
         }
     }
 
     /// Update the in-memory view-state that every subsequent save persists. Called from the frontend
     /// whenever the user's search query or sort order changes, so a later counts-only auto_save keeps
     /// it instead of resetting it.
-    pub fn set_view_state(&mut self, search_query: String, sort_order: String) {
+    pub fn set_view_state(&mut self, search_query: String, sort_order: String, filter_verified: Option<bool>) {
         self.search_query = search_query;
         self.sort_order = sort_order;
+        self.filter_verified = filter_verified;
     }
 
     /// M2.6: Set the current review segment ID for cursor persistence across restarts.
@@ -133,8 +137,9 @@ impl SessionManager {
         let mut state = SessionState::from_db(db)?;
         state.search_query = self.search_query.clone();
         state.sort_order = self.sort_order.clone();
-        // M2.6: Persist the current review segment for cursor recovery on restart.
+        // M2.6: Persist the current review segment + filter for cursor recovery on restart.
         state.selected_segment_id = self.selected_segment_id.clone();
+        state.filter_verified = self.filter_verified;
         let json = serde_json::to_string_pretty(&state)
             .map_err(|e| crate::error::AppError::Other(format!("Session serialize: {e}")))?;
         let tmp_path = self.save_dir.join("session.json.tmp");
@@ -201,9 +206,13 @@ impl SessionManager {
             Ok(state) => {
                 tracing::info!("Restored session: {} segments, {} verified", state.segment_count, state.verified_count);
                 // Seed the in-memory view-state so the next counts-only auto_save preserves the
-                // restored search/sort instead of overwriting them with defaults.
+                // restored fields instead of overwriting them with defaults. P1.5: cursor + filter are
+                // seeded too — otherwise an auto_save before the first decision would clobber the
+                // restored cursor back to None.
                 self.search_query = state.search_query.clone();
                 self.sort_order = state.sort_order.clone();
+                self.selected_segment_id = state.selected_segment_id.clone();
+                self.filter_verified = state.filter_verified;
                 Ok(Some(state))
             }
             Err(e) => {
@@ -376,16 +385,27 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
 
-        // Session 1: the user sets a search + sort, which is saved.
+        // Session 1: the user sets a search + sort + filter + review cursor, which is saved.
         let mut first = SessionManager::new(tmp.path().to_path_buf());
-        first.set_view_state("بەڕێوە".to_string(), "duration".to_string());
+        first.set_view_state("بەڕێوە".to_string(), "duration".to_string(), Some(false));
+        first.set_current_segment("seg-42");
         first.save(&db).unwrap();
 
-        // Session 2 ("restart"): a fresh manager over the same dir restores the view-state.
+        // Session 2 ("restart"): a fresh manager over the same dir restores the full view-state.
         let mut second = SessionManager::new(tmp.path().to_path_buf());
         let restored = second.restore().unwrap().expect("a saved session is restored");
         assert_eq!(restored.search_query, "بەڕێوە");
         assert_eq!(restored.sort_order, "duration");
+        assert_eq!(restored.filter_verified, Some(false), "P1.5: the review filter is restored");
+        assert_eq!(restored.selected_segment_id.as_deref(), Some("seg-42"), "P1.5: the cursor is restored");
+
+        // P1.5 regression: restore must SEED the manager cursor, so a later counts-only auto_save does
+        // NOT clobber the restored cursor back to None before the first decision.
+        second.last_save = 0;
+        second.auto_save(&db).unwrap();
+        let json = std::fs::read_to_string(second.save_path()).unwrap();
+        assert!(json.contains("\"selected_segment_id\": \"seg-42\""), "cursor survived auto_save: {json}");
+        assert!(json.contains("\"filter_verified\": false"), "filter survived auto_save: {json}");
     }
 
     #[test]
@@ -395,7 +415,7 @@ mod tests {
         db.initialize().unwrap();
 
         let mut manager = SessionManager::new(tmp.path().to_path_buf());
-        manager.set_view_state("query".to_string(), "confidence".to_string());
+        manager.set_view_state("query".to_string(), "confidence".to_string(), None);
         manager.save(&db).unwrap();
 
         // A later counts-only auto_save (the periodic mutation-triggered path) must NOT reset the

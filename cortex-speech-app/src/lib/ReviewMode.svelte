@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get } from 'svelte/store';
-  import { segments } from './stores/segmentStore';
+  import { segments, selectedSegmentId } from './stores/segmentStore';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import { settings } from './stores/settingsStore';
@@ -57,6 +57,18 @@
   });
 
   let index = $state(0);
+  // M2.6/P1.5: on first queue availability, resume at the restored session cursor (the last segment
+  // the reviewer acted on) instead of always restarting at 0. One-shot — never fights later navigation.
+  let cursorRestored = $state(false);
+  $effect(() => {
+    if (cursorRestored || queue.length === 0) return;
+    const targetId = $selectedSegmentId;
+    if (targetId) {
+      const pos = queue.findIndex((s) => s.id === targetId);
+      if (pos >= 0) index = pos;
+    }
+    cursorRestored = true;
+  });
   const current = $derived(queue[index] ?? null);
   const reviewedCount = $derived($segments.filter((s) => s.verified).length);
   // Every clip verified — surface the "you're done, here's what's next" completion banner.

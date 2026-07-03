@@ -459,6 +459,10 @@ export async function importModelCheckpoint(args: {
 export interface SessionState {
   search_query: string;
   sort_order: string;
+  // M2.6 / P1.5: the review cursor + filter, restored on launch (the backend already persists them
+  // on every human decision; these were serialized but never read back by the UI).
+  selected_segment_id: string | null;
+  filter_verified: boolean | null;
   segment_count: number;
   verified_count: number;
 }
@@ -469,8 +473,12 @@ export async function restoreSession(): Promise<SessionState | null> {
 }
 
 /** Persist the current search query + sort order so they survive a restart. */
-export async function saveSession(searchQuery: string, sortOrder: string): Promise<void> {
-  return invoke('save_session', { searchQuery, sortOrder });
+export async function saveSession(
+  searchQuery: string,
+  sortOrder: string,
+  filterVerified: boolean | null = null,
+): Promise<void> {
+  return invoke('save_session', { searchQuery, sortOrder, filterVerified });
 }
 
 /** Number of audio fingerprints stored for duplicate-import detection. */

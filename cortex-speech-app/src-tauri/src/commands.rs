@@ -1847,12 +1847,17 @@ pub fn clear_tracing_spans() -> Result<(), String> {
 /// Persist the user's view-state (search query + sort order) so it survives a restart. The values
 /// are held in the session manager so the periodic counts-only auto_save preserves them too.
 #[tauri::command]
-pub fn save_session(search_query: String, sort_order: String, state: State<'_, AppState>) -> Result<(), String> {
+pub fn save_session(
+    search_query: String,
+    sort_order: String,
+    filter_verified: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     validate::validate_text(&search_query, 1000, "search_query")?;
     validate::validate_text(&sort_order, 64, "sort_order")?;
     let db = state.lock_db();
     let mut session = state.lock_session();
-    session.set_view_state(search_query, sort_order);
+    session.set_view_state(search_query, sort_order, filter_verified);
     session.save(&db).map_err(|e| e.to_string())
 }
 
