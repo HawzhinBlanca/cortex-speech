@@ -616,3 +616,25 @@ instrumentation writers, model integrity pins). Bill of health:
   recording (the recurring wrong-audio class). Now refused + warned; regression test pins it.
 - Gates: clippy -D warnings clean, 3 relink tests green, python policies green. Exe rebuilt
   (6m06s), freshness GREEN — running app carries the guard.
+
+## Self-review defect hunt round 3 (2026-07-03) — import-journal crash-ghost buildup fixed
+
+Finished the sweep on the last unreviewed session code (import_jobs journal methods,
+export_finetune_pack, FK/CASCADE assumptions). Findings:
+- export_finetune_pack: CLEAN — dedup key (audio_path|alignment|norm-text) is span-aware, clip
+  filenames keyed on unique seg.id (no collision), holdout leak-guard + empty/undecodable skip all
+  correct.
+- FK second-leak hypothesis DISPROVEN: PRAGMA foreign_keys=ON at open, so the retention prune's
+  reliance on CASCADE to clear import_job_files is sound (the explicit double-delete in discard is
+  just defensive, not evidence the pragma is off).
+- FIXED (2dda20f): stale 'running' import jobs accumulated across repeated un-resumed crashes
+  (find_interrupted returns only the newest; retention prune skips 'running'). Also could surface a
+  spurious resume prompt for an old crash after resuming a newer one. begin_import_job now reaps
+  prior 'running' -> 'abandoned' (imports are single-flight). Regression test pins it.
+- Gates: clippy -D warnings clean, 3 journal tests green, python policies green. Exe rebuilt
+  (5m50s), freshness GREEN.
+
+SWEEP COMPLETE: 3 rounds of adversarial self-review of this session's ~2000 lines of new Rust
+found + fixed 3 real defects (resume orphaned segments, relink wrong-audio collision, import-job
+crash-ghost buildup), each with a regression test and a live rebuild. Remaining plan work is
+owner/GPU-gated (P2.2 benchmark highest-leverage).
