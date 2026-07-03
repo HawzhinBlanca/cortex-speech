@@ -381,3 +381,19 @@ all have working producers, so the marathon's decisions will actually count (the
 NEXT: P1.7 — rebuild to freshness-green (npm build + cargo release; exe bakes all P1 code) and
 demonstrate the M2 checklist observed gates on the HEAD exe. P1.8 — record the review-throughput
 baseline (owner, once driving the rebuilt app). Then P2 (engine decision).
+
+## P1.7 rebuild (2026-07-03) — exe now HEAD-fresh with all P1 code
+
+Rebuilt (npm build + cargo release, 6m17s). Freshness gate GREEN: exe bakes HEAD e7cbf5d exactly,
+newer than all sources. Confirmed the new P1 IPC commands are in the binary
+(get_segments_suspect_first, export_gold_eval_set, import_verified_segments_as_gold). The running
+app now contains every P1 instrumentation change.
+
+OWNER-GATED (not automatable headlessly — need a configured engine + real audio + human decisions):
+- P1.7 observed gates: import -> review -> 10 decisions -> stats median card visible; fresh-import
+  word-chip coverage; kill-exe session-restore drill. These are the first M3 session.
+- P1.8: record the review-throughput baseline (decision_log now populates it live).
+
+NEXT AUTOMATABLE: P2.1 — make M1 executable (write build_fleurs_ckb_manifest.py emitting TSV; a
+CV22 ckb manifest builder; add WER + RTF to the CER-only scorecards; fix the runbook JSON/TSV
+mismatch). Then P2.2 (owner GPU benchmark) and P2.3 (flip default + settings migration + UI).
