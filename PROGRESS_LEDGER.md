@@ -305,10 +305,13 @@ review-throughput baseline. Batch all P1 code, then ONE rebuild to freshness-gre
   passed, WER gate, hygiene/privacy policies, clippy -D warnings, fmt).
 - Added the CLAUDE.md-documented data-testid="segment-card" anchor to the sidebar button.
 - PII git-history scrub (C8, owner-approved): git filter-repo removed both
-  *_perfect_dataset.json from ALL history + redacted profile-path/SQL-LIKE forms. Verified
-  0 all-history occurrences of: the dataset files, C:\Users\hawzh, Desktop\Hawzhin\,
-  %Hawzhin\ SQL LIKE. Public handle HawzhinBlanca preserved (812 refs). Backup bundle at
-  ../cortex-prescrub-backup.bundle. Force-pushed c204595..2bec3cb to origin/main (lease held).
+  *_perfect_dataset.json from ALL history + redacted the owner Windows-profile path prefix,
+  the Desktop dataset-folder path form, and the SQL-LIKE owner pattern. Verified 0 all-history
+  occurrences of every redacted form (dataset files + the three path/LIKE patterns). Public
+  handle HawzhinBlanca preserved (812 refs; redaction is path-specific, never the bare name).
+  Backup bundle at ../cortex-prescrub-backup.bundle. Force-pushed c204595..2bec3cb to
+  origin/main (lease held). (This entry deliberately avoids quoting the literal path forms so
+  it does not itself trip the hygiene gate.)
 - Deleted the merged audit branch; gitignored generated run*.jsonl. Dependabot PR branches
   left as-is (each dep bump needs its own tested merge).
 
