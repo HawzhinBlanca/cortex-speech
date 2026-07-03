@@ -411,3 +411,16 @@ REMAINING P2.1: build_fleurs_ckb_manifest.py (FLEURS ckb_IQ downloader emitting 
 an HF download, so it's writeable here but only owner-machine-verifiable; CV22 is the working fallback.
 Then P2.2 (owner GPU three-engine benchmark -> CER/WER/RTF) and P2.3 (flip default + settings migration
 + engine UI control).
+
+## P2.1 COMPLETE (2026-07-03) — M1 is runnable end-to-end
+
+CV22 builder (00c84c9) + FLEURS builder (c45ab0c) both emit the <wav>\tref TSV the scorecards parse
+(+ .sha256, --wsl-paths); scorecards now compute CER + WER + RTF (66ceeea, asr_metrics unit-tested,
+CER byte-identical). Runbook JSON/TSV mismatch fixed. The three-engine benchmark can run on CV22
+(on disk) or FLEURS (owner download) with no missing tooling.
+
+NEXT AUTOMATABLE: P2.3 infrastructure (independent of P2.2's GPU result) — the OOBE fix. The audit
+found the fail-hard error references a "Use fine-tuned model" toggle that does NOT exist in the UI;
+use_finetuned_asr can only be set by hand-editing settings.json. Add the SettingsPanel toggle +
+settingsAdapter field + IPC so the measured champion engine is selectable from the UI. The actual
+default-engine FLIP awaits P2.2's measurement (owner GPU).
