@@ -3,14 +3,21 @@
 
 The 108-commit gap that happened before 07-02 must never happen again. This gate runs
 at pre-commit or CI and fails if the ledger's latest entry is >3 commits old.
+
+Implementation note: this measures the gate's stated intent DIRECTLY — the number of commits
+since PROGRESS_LEDGER.md itself was last updated in git. An earlier version keyed off today's
+CALENDAR date appearing in the ledger, which false-fired at every midnight rollover (a day with no
+work still demanded a "date-bump" entry, polluting the ledger with non-work) and, conversely, could
+pass while many code commits piled up as long as today's date happened to appear in some old entry.
+Counting commits-since-ledger-update is both false-positive-free at rollover AND strictly stricter
+where it matters (a burst of code commits with no ledger entry reds regardless of the calendar date).
 """
-import re
 import subprocess
 from pathlib import Path
 
 
 def test_ledger_staleness(max_commits_lag=3):
-    """Check PROGRESS_LEDGER.md is not stale."""
+    """Fail if PROGRESS_LEDGER.md is >max_commits_lag commits behind HEAD."""
     repo_root = Path(__file__).parent.parent.parent  # go up to git root
     ledger = repo_root / "PROGRESS_LEDGER.md"
 
@@ -18,51 +25,31 @@ def test_ledger_staleness(max_commits_lag=3):
         print("SKIP: PROGRESS_LEDGER.md not found")
         return
 
-    # Extract the most recent date from the ledger (look for "2026-" patterns)
-    content = ledger.read_text(encoding="utf-8")
-    dates = re.findall(r"2026-\d{2}-\d{2}", content)
-    if not dates:
-        print("SKIP: no dates found in ledger")
-        return
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=repo_root, text=True).strip()
 
-    latest_ledger_date = sorted(dates)[-1]
-
-    # Get the current commit count and the last commit message
     try:
-        log = subprocess.check_output(
-            ["git", "log", "--oneline", "-20"],
-            cwd=repo_root,
-            text=True
-        )
-    except Exception as e:
-        print(f"SKIP: could not read git log: {e}")
+        # An uncommitted ledger edit (staged or unstaged) means an entry is being added right now —
+        # treat as current so the gate never blocks the very commit that updates the ledger.
+        if git("status", "--porcelain", "--", "PROGRESS_LEDGER.md"):
+            print("[OK] PROGRESS_LEDGER.md: pending edit in working tree (entry being added)")
+            return
+        last_ledger_commit = git("log", "-1", "--format=%H", "--", "PROGRESS_LEDGER.md")
+        if not last_ledger_commit:
+            print("SKIP: PROGRESS_LEDGER.md not yet committed")
+            return
+        commits_since = int(git("rev-list", "--count", f"{last_ledger_commit}..HEAD") or "0")
+    except Exception as e:  # noqa: BLE001 — a git hiccup must not hard-fail the policy suite
+        print(f"SKIP: could not read git history: {e}")
         return
 
-    commits = log.strip().split("\n")
-    # For a simpler check: if the ledger has an entry for today's date (2026-07-02), it's current.
-    # Otherwise, fail if there are >max_commits_lag commits since the most recent ledger date.
-    import datetime
-    today = datetime.date.today().strftime("%Y-%m-%d")
-
-    if today in content:
-        # Today's date is in the ledger, it's current
-        commits_since_ledger = 0
-    else:
-        # Count commits since the latest ledger date
-        commits_since_ledger = 0
-        for commit in commits:
-            # Look for the date in the commit message
-            if latest_ledger_date in commit:
-                break
-            commits_since_ledger += 1
-
-    if commits_since_ledger > max_commits_lag:
+    if commits_since > max_commits_lag:
         raise AssertionError(
-            f"PROGRESS_LEDGER.md is stale: {commits_since_ledger} commits since last entry "
+            f"PROGRESS_LEDGER.md is stale: {commits_since} commits since it was last updated "
             f"(limit is {max_commits_lag}). Please add an entry to the ledger."
         )
 
-    print(f"[OK] PROGRESS_LEDGER.md: up to date (latest entry: {latest_ledger_date})")
+    print(f"[OK] PROGRESS_LEDGER.md: up to date ({commits_since} commit(s) since last update)")
 
 
 if __name__ == "__main__":
