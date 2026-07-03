@@ -483,3 +483,17 @@ all three safety features.
 NEXT: P3.3 audio durability (segments reference absolute audio_path in place; a moved/renamed file
 silently breaks playback/re-transcribe/jury — add a missing-audio detection + relink path). Then P3.7
 Windows/Sorani path robustness, and the larger P3.2 import journal/resume (crash mid-import = lost work).
+
+## P3.3 audio durability (2026-07-03)
+
+a92895c: db.audio_health() (distinct missing source files) + db.relink_audio(dir) (basename relink —
+speech_segments carry no content hash, so the practical "moved to a new folder" match). IPC
+(get_audio_health/relink_audio) + StatsDashboard amber "N missing" banner with a Relink… folder-picker
+button. Tested (move->missing->relink->healthy; unmatched stays missing). Closes the silent
+moved/renamed-audio break in playback/re-transcribe/jury.
+
+Exe stale (P3.3 user-facing) — batching rebuild after P3.7.
+
+NEXT: P3.7 Windows/Sorani path robustness (Arabic-script filenames, spaces, long paths through FTS +
+WSL translation + export naming) — bounded test item. Then P3.2 import journal/resume (the large
+marathon-safety item: a crash mid-import loses all transcription work). Then rebuild the P3 batch.
