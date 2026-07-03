@@ -556,6 +556,28 @@ export async function getDatasetStats(): Promise<DatasetStats> {
   return invoke<DatasetStats>('get_dataset_stats');
 }
 
+/** P3.3: which distinct source audio files are missing on disk. */
+export interface AudioHealth {
+  totalFiles: number;
+  missingFiles: number;
+  missingPaths: string[];
+}
+
+/** P3.3: outcome of a basename-based relink. */
+export interface RelinkResult {
+  relinked: number;
+  stillMissing: number;
+}
+
+export async function getAudioHealth(): Promise<AudioHealth> {
+  return invoke<AudioHealth>('get_audio_health');
+}
+
+/** P3.3: relink missing source audio by basename against a folder the owner picks. */
+export async function relinkAudio(searchDir: string): Promise<RelinkResult> {
+  return invoke<RelinkResult>('relink_audio', { searchDir });
+}
+
 /** Complete speaker list (not the truncated top-10 dashboard summary) for the speaker manager. */
 export async function getSpeakers(): Promise<SpeakerStat[]> {
   return invoke<SpeakerStat[]>('get_speakers');

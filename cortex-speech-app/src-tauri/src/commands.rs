@@ -2285,6 +2285,25 @@ pub fn db_vacuum(state: State<'_, AppState>) -> Result<(), String> {
     db.vacuum().map_err(|e| e.to_string())
 }
 
+/// P3.3: report which distinct source audio files are missing on disk (moved/renamed/deleted).
+#[tauri::command]
+pub fn get_audio_health(state: State<'_, AppState>) -> Result<crate::db::AudioHealth, String> {
+    RATE_LIMITER.check("get_audio_health")?;
+    let db = state.lock_db();
+    db.audio_health().map_err(|e| e.to_string())
+}
+
+/// P3.3: relink missing source audio by basename against a folder the owner picks.
+#[tauri::command]
+pub fn relink_audio(search_dir: String, state: State<'_, AppState>) -> Result<crate::db::RelinkResult, String> {
+    STRICT_RATE_LIMITER.check("relink_audio")?;
+    if search_dir.contains('\0') {
+        return Err("Search directory contains null bytes".to_string());
+    }
+    let db = state.lock_db();
+    db.relink_audio(std::path::Path::new(&search_dir)).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn db_wal_checkpoint(state: State<'_, AppState>) -> Result<(), String> {
     let db = state.lock_db();

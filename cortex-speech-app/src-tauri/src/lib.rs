@@ -550,6 +550,8 @@ pub fn run() {
             commands::db_backup,
             commands::db_restore,
             commands::db_vacuum,
+            commands::get_audio_health,
+            commands::relink_audio,
             commands::db_wal_checkpoint,
             commands::models_status,
             commands::models_download,

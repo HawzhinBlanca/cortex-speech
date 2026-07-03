@@ -41,6 +41,23 @@ pub struct SpeechSegment {
     pub alignment_quality: Option<String>,
 }
 
+/// P3.3: which distinct source audio files are missing on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioHealth {
+    pub total_files: usize,
+    pub missing_files: usize,
+    pub missing_paths: Vec<String>,
+}
+
+/// P3.3: outcome of a basename-based relink.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelinkResult {
+    pub relinked: usize,
+    pub still_missing: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentHypothesis {
@@ -971,6 +988,42 @@ impl Database {
     pub fn wal_checkpoint(&self) -> AppResult<()> {
         self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         Ok(())
+    }
+
+    /// P3.3: audio durability — segments reference their source audio by absolute path in place, so a
+    /// file the owner moves/renames over months of use silently breaks playback, re-transcription, and
+    /// the jury's source-reference guard. Report which distinct audio files are now missing.
+    pub fn audio_health(&self) -> AppResult<AudioHealth> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT audio_path FROM speech_segments")?;
+        let paths: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+        let total_files = paths.len();
+        let mut missing_paths: Vec<String> = paths.into_iter().filter(|p| !Path::new(p).exists()).collect();
+        missing_paths.sort();
+        Ok(AudioHealth { total_files, missing_files: missing_paths.len(), missing_paths })
+    }
+
+    /// P3.3: relink missing source audio by basename — for each missing `audio_path`, if a file with the
+    /// same file name exists under `search_dir`, repoint every segment on that old path to the found one.
+    /// Basename match (speech_segments store no content hash to verify against); the owner points at the
+    /// folder they moved the audio to. Returns how many distinct paths were relinked + how many remain.
+    pub fn relink_audio(&self, search_dir: &Path) -> AppResult<RelinkResult> {
+        let mut relinked = 0usize;
+        for old in self.audio_health()?.missing_paths {
+            let Some(name) = Path::new(&old).file_name() else { continue };
+            let candidate = search_dir.join(name);
+            if candidate.is_file() {
+                let new_path = candidate.to_string_lossy().to_string();
+                let n = self.conn.execute(
+                    "UPDATE speech_segments SET audio_path = ?2 WHERE audio_path = ?1",
+                    params![old, new_path],
+                )?;
+                if n > 0 {
+                    relinked += 1;
+                }
+            }
+        }
+        self.track_write()?;
+        Ok(RelinkResult { relinked, still_missing: self.audio_health()?.missing_files })
     }
 
     pub fn insert_hypothesis(&self, hyp: &SegmentHypothesis) -> AppResult<()> {
@@ -2813,6 +2866,50 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(rows, vec![1, 0], "both shadow observations persist with their flags");
+    }
+
+    #[test]
+    fn audio_health_detects_missing_and_relink_repoints_by_basename() {
+        // P3.3: a moved/renamed source file becomes "missing"; pointing relink at the new folder
+        // repoints every segment on that path (basename match).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("clip.wav");
+        std::fs::write(&src, b"audio").unwrap();
+        let db = make_db();
+        for id in ["a", "b"] {
+            db.insert_segment(&make_segment(id, &src.to_string_lossy())).unwrap();
+        }
+        assert_eq!(db.audio_health().unwrap().missing_files, 0, "present file -> healthy");
+
+        // Owner reorganizes: move the file to a new folder (same name).
+        let newdir = tmp.path().join("moved");
+        std::fs::create_dir(&newdir).unwrap();
+        let moved = newdir.join("clip.wav");
+        std::fs::rename(&src, &moved).unwrap();
+
+        let health = db.audio_health().unwrap();
+        assert_eq!(health.total_files, 1, "two segments, one distinct source file");
+        assert_eq!(health.missing_files, 1, "the moved file is missing");
+
+        let result = db.relink_audio(&newdir).unwrap();
+        assert_eq!(result.relinked, 1);
+        assert_eq!(result.still_missing, 0);
+        assert_eq!(db.audio_health().unwrap().missing_files, 0, "relinked -> healthy");
+        assert_eq!(
+            db.get_segment_by_id("a").unwrap().unwrap().audio_path,
+            moved.to_string_lossy().to_string(),
+            "both segments repointed to the found file"
+        );
+    }
+
+    #[test]
+    fn relink_leaves_unmatched_paths_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = make_db();
+        db.insert_segment(&make_segment("x", "/gone/missing.wav")).unwrap();
+        let result = db.relink_audio(tmp.path()).unwrap(); // no clip named missing.wav in the dir
+        assert_eq!(result.relinked, 0);
+        assert_eq!(result.still_missing, 1, "an unmatched missing path stays missing");
     }
 
     #[test]

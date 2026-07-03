@@ -9,6 +9,8 @@
   import { isTauriRuntime } from './runtime';
 
   let stats = $state<DatasetStats | null>(null);
+  let audioHealth = $state<import('./commands').AudioHealth | null>(null);
+  let relinking = $state(false);
   let quality = $state<import('./commands').DatasetQuality | null>(null);
   let cert = $state<import('./commands').ConformalCertificate | null>(null);
   let inferenceStats = $state<{
@@ -116,6 +118,11 @@
       } catch (err) {
         console.error('Failed to load conformal certificate', err);
       }
+      try {
+        audioHealth = await api.getAudioHealth();
+      } catch (err) {
+        console.error('Failed to load audio health', err);
+      }
     } catch (e) {
       errorMessage = String(e);
       notifications.error($t('stats.failed'), { detail: String(e) });
@@ -125,6 +132,28 @@
   }
 
   function track(..._args: unknown[]) {}
+
+  // P3.3: relink missing source audio by pointing at the folder the owner moved it to.
+  async function relinkMissingAudio() {
+    if (!tauriAvailable || relinking) return;
+    relinking = true;
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const dir = await open({ directory: true, multiple: false });
+      if (typeof dir !== 'string') return;
+      const result = await api.relinkAudio(dir);
+      notifications.success(
+        $t('stats.relinkDone')
+          .replace('{n}', String(result.relinked))
+          .replace('{m}', String(result.stillMissing)),
+      );
+      await fetchStats();
+    } catch (e) {
+      notifications.error($t('stats.relinkFailed'), { detail: String(e) });
+    } finally {
+      relinking = false;
+    }
+  }
 
   async function fetchInferenceStats() {
     if (!tauriAvailable) {
@@ -188,6 +217,25 @@
       {/each}
     </div>
   {:else if stats}
+    {#if audioHealth && audioHealth.missingFiles > 0}
+      <div
+        class="mb-3 flex items-center justify-between gap-3 rounded-lg border border-amber-600/40 bg-amber-950/30 p-3"
+        data-testid="audio-missing-banner"
+      >
+        <span class="text-sm text-amber-300">
+          {$t('stats.audioMissing').replace('{n}', String(audioHealth.missingFiles))}
+        </span>
+        <button
+          type="button"
+          class="btn btn-primary !text-xs"
+          data-testid="relink-audio-btn"
+          disabled={relinking}
+          onclick={relinkMissingAudio}
+        >
+          {relinking ? $t('stats.relinking') : $t('stats.relink')}
+        </button>
+      </div>
+    {/if}
     <div class="grid grid-cols-2 gap-3">
       <div class="bg-cortex-800/30 rounded-lg p-3">
         <div class="text-2xl font-bold text-cortex-200">{stats.totalSegments}</div>
