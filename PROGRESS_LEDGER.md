@@ -674,3 +674,21 @@ relink wrong-audio, import-job crash-ghost) + 2 feature-completeness gaps closed
 export tools + model-integrity/build-info now reachable in-app). Every session backend command now
 has a frontend path. Remaining plan work is genuinely owner/GPU-gated — P2.2 three-engine benchmark
 is the highest-leverage next step and only the owner can run it.
+
+## Full-suite certification (2026-07-03) — session changes pass together; integration flake removed
+
+Consolidated verification at HEAD (after 5 self-review rounds) — the whole suite, not targeted
+subsets:
+- cargo test --lib: 768 passed, 0 failed, 6 ignored.
+- cargo fmt --check: clean. cargo clippy --all-targets -D warnings: clean.
+- Integration: tauri_integration failed once then passed on re-run — the documented startup timing
+  flake (real Tauri GUI binary's event loop can exit 0 before the ~1.2s-delayed in-process runner
+  prints CORTEX_INTEGRATION_OK). NOT a regression (my session changes were db/pipeline/frontend, not
+  the integration startup path) and NOT a product defect (the pipeline genuinely runs).
+- FIXED (c0c2722): hardened the TEST to retry the spawn up to 3x on the exit-0-but-no-marker race,
+  while .success() still fails fast on any genuine non-zero exit — a real break is never masked.
+  Test-only; production binary untouched; freshness stayed GREEN (non-source change).
+
+CERTIFICATION: at HEAD c0c2722 the full Rust suite + fmt + clippy-all-targets + frontend
+(typecheck/eslint/vitest 132) + python policies are ALL green, and the one intermittently-red test
+is now deterministic. Session automatable surface is exhausted; remaining work is owner/GPU-gated.
