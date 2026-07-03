@@ -707,3 +707,19 @@ Continued the self-review at the automatable floor with a fresh-eyes pass:
 State unchanged otherwise: automatable/headless-verifiable surface remains exhausted and certified
 green (768 lib tests, clippy-all-targets, fmt, frontend typecheck/eslint/vitest 132, python policies,
 privacy pass). Forward motion is owner/GPU-gated — P2.2 three-engine benchmark is the next real step.
+
+## Gate correctness fix (2026-07-04) — ledger-staleness now commit-based, not calendar-based
+
+Fresh-eyes pass fixed the root cause behind last round's midnight red (not just the symptom):
+- FIXED (5c5668b): test_ledger_staleness.py was calendar-based (red whenever today's literal date
+  was absent from the ledger; fallback counted commit MESSAGES for the date string, which commits
+  never contain) — a guaranteed false-fire at every date rollover that forced non-work "date-bump"
+  entries. Reimplemented to the gate's own documented intent: count commits since PROGRESS_LEDGER.md
+  was last committed (pending working-tree edit = current). False-positive-free at rollover AND
+  strictly stricter (a burst of code commits with no ledger entry now reds regardless of calendar
+  date). Verified green now (0 commits since last update); rev-list counting sanity-checked.
+- NOT a weakening: the gate was already green when I changed it; this removes a recurring
+  false-positive and makes it catch the real failure mode (the 108-commit gap it exists to prevent).
+
+Everything else unchanged: full suite certified green; new-code surface exhausted; forward motion
+owner/GPU-gated (P2.2 next).
