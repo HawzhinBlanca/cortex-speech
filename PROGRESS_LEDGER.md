@@ -296,3 +296,21 @@ median read panel); P1.2 verdict row per segment; P1.3 LOOP-0 shadow writer; P1.
 get_segments_suspect_first + review toggle; P1.5 session cursor read-back; P1.6 M2.7 gold
 plumbing (export_gold_eval_set); P1.7 rebuild + run M2 checklist observed gates; P1.8 record
 review-throughput baseline. Batch all P1 code, then ONE rebuild to freshness-green.
+
+## GitHub hygiene + merge to main + PII history scrub (2026-07-03) — C8 CLOSED
+
+- Merged audit/2026-07-02-deep-audit -> main (fast-forward, 41 commits) and pushed.
+- CODEOWNERS: @hawzh -> @HawzhinBlanca (the old handle was a nonexistent user).
+- Ship-readiness proof: `make ship-check` GREEN (23 reliability tests, soak 167s, e2e 47
+  passed, WER gate, hygiene/privacy policies, clippy -D warnings, fmt).
+- Added the CLAUDE.md-documented data-testid="segment-card" anchor to the sidebar button.
+- PII git-history scrub (C8, owner-approved): git filter-repo removed both
+  *_perfect_dataset.json from ALL history + redacted profile-path/SQL-LIKE forms. Verified
+  0 all-history occurrences of: the dataset files, C:\Users\hawzh, Desktop\Hawzhin\,
+  %Hawzhin\ SQL LIKE. Public handle HawzhinBlanca preserved (812 refs). Backup bundle at
+  ../cortex-prescrub-backup.bundle. Force-pushed c204595..2bec3cb to origin/main (lease held).
+- Deleted the merged audit branch; gitignored generated run*.jsonl. Dependabot PR branches
+  left as-is (each dep bump needs its own tested merge).
+
+C8 (zero owner PII in public surface) green. C9 (exe provably HEAD) green via the P0.2 gate
+after the post-scrub rebuild.
