@@ -549,3 +549,18 @@ benchmark, P3.5/6/9 drills, P4 marathon, P5 retrain execution, P6 DirectML, P7 r
 NEXT AUTOMATABLE: P5.1 export_finetune_pack — the training-pack variant of export_gold_eval_set
 (trainer manifest schema + 16kHz clips from human-verified segments, gold/holdout-EXCLUDED, deduped;
 extend the holdout-leak test). Plumbing can land before the M3 data exists.
+
+## P5.1 export_finetune_pack (2026-07-03) — retrain plumbing (holdout-excluded)
+
+2619e9b: eval::export_finetune_pack emits the trainer manifest ({audio_path, sentence,
+duration_seconds}) + 16kHz clips from human-verified segments, reusing decode_finetuned_clip_16k
+(now pub(crate)). THE LEAK GUARD reuses export::exclude_holdout_segments (path AND content hash) so
+holdout gold never enters training. Deduped by (span, normalized text). IPC + TS wrapper. Test: a
+holdout-matching verified segment is excluded, its text never in the manifest (the plan's leak gate).
+Flaky tauri_integration failure once — passed on re-run (additive change, not integration path).
+
+Exe stale (P5.1 backend+frontend) — batching rebuild after the next P5 item.
+
+NEXT: expose the existing gate_and_promote via IPC + a Promote button (audit: apparatus exists but
+unreachable; a deliberately-worse adapter must be visibly REFUSED with reasons). Then registry-driven
+champion (remove hardcoded adapter path) + corpus ledger. Then rebuild the P5 batch.
