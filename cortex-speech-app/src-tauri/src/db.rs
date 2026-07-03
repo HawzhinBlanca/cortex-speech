@@ -1064,6 +1064,18 @@ impl Database {
     /// small. Journal writes are best-effort at the call sites — a failure here never fails an import.
     pub fn begin_import_job(&self, dir: &str, total_files: usize) -> AppResult<String> {
         let id = uuid::Uuid::new_v4().to_string();
+        // Reap stale crashes first. Imports are single-flight (try_start_import guards the only call
+        // site), so when a NEW import begins any lingering 'running' job is a PRIOR crash the user did
+        // not resume — the startup resume prompt already had its chance before this new import started.
+        // Marking them 'abandoned' keeps exactly one 'running' job (the active one), so:
+        //   * find_interrupted_import_job stays unambiguous — no spurious "resume?" for an old crash
+        //     after the user already resumed a newer one, and
+        //   * 'running' rows can't accumulate unboundedly across repeated crashes (abandoned rows are
+        //     status != 'running', so the retention prune below reaps them + CASCADE clears their files).
+        self.conn.execute(
+            "UPDATE import_jobs SET status = 'abandoned', updated_at = datetime('now') WHERE status = 'running'",
+            [],
+        )?;
         self.conn.execute(
             "INSERT INTO import_jobs (id, dir, total_files, status) VALUES (?1, ?2, ?3, 'running')",
             params![id, dir, total_files as i64],
@@ -3101,6 +3113,28 @@ mod tests {
 
         db.complete_import_job(&job).unwrap();
         assert!(db.find_interrupted_import_job().unwrap().is_none(), "completed job is not an interruption");
+    }
+
+    #[test]
+    fn begin_import_job_reaps_prior_running_crashes() {
+        // P3.2 robustness: a crash leaves a job 'running' forever. When a new import begins, that stale
+        // crash must be reaped so (a) it can't accumulate across repeated crashes and (b) resuming the
+        // NEW job never leaves an old crash lurking to prompt a spurious resume later.
+        let db = make_db();
+        let crashed = db.begin_import_job("C:/audio/first", 5).unwrap();
+        db.mark_import_file_done(&crashed, "C:/audio/first/a.wav").unwrap();
+        // No complete/discard — simulate a crash. A second import starts.
+        let fresh = db.begin_import_job("C:/audio/second", 2).unwrap();
+
+        // Exactly one 'running' job now, and it is the fresh one — the crash was reaped, not surfaced.
+        let running: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM import_jobs WHERE status = 'running'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(running, 1, "only the active import is 'running'; the prior crash is abandoned");
+        let found = db.find_interrupted_import_job().unwrap().unwrap();
+        assert_eq!(found.id, fresh, "the interruption is the fresh import, never the reaped crash");
+        assert_eq!(found.dir, "C:/audio/second");
     }
 
     #[test]
