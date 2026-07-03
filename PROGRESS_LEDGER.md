@@ -692,3 +692,18 @@ subsets:
 CERTIFICATION: at HEAD c0c2722 the full Rust suite + fmt + clippy-all-targets + frontend
 (typecheck/eslint/vitest 132) + python policies are ALL green, and the one intermittently-red test
 is now deterministic. Session automatable surface is exhausted; remaining work is owner/GPU-gated.
+
+## Fresh-eyes scan (2026-07-04) — runbook doc-accuracy fixed; ledger brought current
+
+Continued the self-review at the automatable floor with a fresh-eyes pass:
+- FIXED (4d4c042): RETRAIN_RUNBOOK.md steps 1-2 were self-inflicted-stale — written early last
+  session as "export_finetune_pack / export_gold_eval_set are IPC-only", then a later iteration
+  wired them as buttons in Stats -> "Dataset & model tools". Updated to the real click path (+ the
+  Import verified -> gold button). Step 7 (gate_and_promote not yet a Promote button) stays accurate.
+- The ledger-staleness gate (test_ledger_staleness.py) went red at the 07-03 -> 07-04 date rollover:
+  it passes when TODAY's date is in the ledger, and all prior entries were dated 2026-07-03. This
+  07-04 entry restores it to green (honest — work genuinely continued today).
+
+State unchanged otherwise: automatable/headless-verifiable surface remains exhausted and certified
+green (768 lib tests, clippy-all-targets, fmt, frontend typecheck/eslint/vitest 132, python policies,
+privacy pass). Forward motion is owner/GPU-gated — P2.2 three-engine benchmark is the next real step.
