@@ -2049,6 +2049,8 @@
                 {@const sourceName = truncateFilename(segmentSourceFilename(item.audioPath))}
                 {@const chunkBadge = segmentChunkLabel(item.alignmentJson)}
                 <button
+                  data-testid="segment-card"
+                  data-id={item.id}
                   class="w-full text-start p-2.5 rounded-xl transition-all duration-300 h-full flex items-start group
                 {item.id === $selectedSegmentId
                     ? 'bg-gradient-to-br from-cortex-800/80 to-cortex-900/80 ring-1 ring-cortex-400 shadow-[0_0_15px_rgba(56,189,248,0.15)] scale-[1.02] transform'
