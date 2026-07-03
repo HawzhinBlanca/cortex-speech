@@ -397,3 +397,17 @@ OWNER-GATED (not automatable headlessly — need a configured engine + real audi
 NEXT AUTOMATABLE: P2.1 — make M1 executable (write build_fleurs_ckb_manifest.py emitting TSV; a
 CV22 ckb manifest builder; add WER + RTF to the CER-only scorecards; fix the runbook JSON/TSV
 mismatch). Then P2.2 (owner GPU benchmark) and P2.3 (flip default + settings migration + UI).
+
+## P2.1 progress (2026-07-03) — making M1 executable
+
+- CV22 ckb manifest builder (00c84c9): scripts/build_cv22_ckb_manifest.py handles the real tar-packed
+  CV22 audio (--extract), emits the <wav>\tref TSV the scorecards parse (+ .sha256), --wsl-paths for
+  the WSL 7B server. Unit-tested + smoke-parsed all 5,344 real test.tsv rows. Runbook TSV/JSON fix.
+- WER + timing in scorecards (66ceeea): scripts/asr_metrics.py (unit-tested word metric + seeded
+  bootstrap). scorecard_7b.py -> +WER +throughput; scorecard_finetuned.py -> +WER +real RTF (soundfile
+  durations). CER paths byte-identical (published 21%/29.4% + regression gate unaffected).
+
+REMAINING P2.1: build_fleurs_ckb_manifest.py (FLEURS ckb_IQ downloader emitting the same TSV) — needs
+an HF download, so it's writeable here but only owner-machine-verifiable; CV22 is the working fallback.
+Then P2.2 (owner GPU three-engine benchmark -> CER/WER/RTF) and P2.3 (flip default + settings migration
++ engine UI control).
