@@ -343,3 +343,22 @@ Each committed with all gates green (cargo test full, clippy -D warnings, fmt, p
 python-policies; +typecheck/vitest for P1.1). Remaining P1: P1.3 LOOP-0 shadow writer,
 P1.4 register+wire suspect-first, P1.5 session cursor read-back, P1.6 M2.7 gold plumbing,
 then ONE rebuild to freshness-green (P1.7) + baseline (P1.8).
+
+## P1 progress cont. (2026-07-03) — P1.3-P1.5
+
+- P1.3 (d071aec): LOOP-0 shadow WRITER — loop0_shadow_log had zero producers, so C5 would collect
+  nothing. Added pipeline::loop0_would_fire (pure shadow predicate) + shadow_log_loop0 pass in
+  persist_segments (after insert; FK needs the rows) + db::record_loop0_shadow. No mutation; firing
+  stays off. Tests: predicate + db round-trip.
+- P1.4 (fc435d7): wired the suspect-first queue (was dead IPC — unregistered, no callers). Registered
+  get_segments_suspect_first + getSegmentsSuspectFirst wrapper + a reactive "Suspect first" toggle in
+  ReviewMode (escalated > low-confidence > chronological), off by default. CKB + aria + testid.
+- P1.5 (f165072): restore review cursor + filter on launch (was written every decision, never read
+  back -> always restarted at 0). ALSO fixed a latent clobber: restore() didn't seed the manager
+  cursor, so an auto_save before the first decision wiped it. Full save->restore round-trip of
+  cursor+filter end-to-end + regression test.
+
+All committed with full gates green (cargo test, clippy -D warnings, fmt, panic/tauri policies,
+python-policies; +typecheck/vitest for frontend). Remaining P1: P1.6 (M2.7 gold plumbing:
+export_gold_eval_set) — the last and largest; then P1.7 rebuild-to-freshness-green + drive the M2
+observed gates, P1.8 baseline.
