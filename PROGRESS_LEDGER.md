@@ -469,3 +469,17 @@ P3 so far: P3.1 auto-snapshots + P3.4 model integrity (both backend). Exe stale 
 NEXT: P3.8 retention/pruning for unbounded tables (agent_import_reports has no DELETE;
 decision_verdicts/loop0_shadow_log grow with the marathon) + surface DB file size. Then rebuild the
 P3 backend batch to freshness-green; P3.3 audio durability; P3.2 import journal/resume.
+
+## P3.8 retention + DB size (2026-07-03) + P3 batch rebuild
+
+d64e98b: prune_agent_import_reports(keep=500) after each insert (was unbounded; the one real leak —
+the instrumentation tables are marathon DATA, left intact). DatasetStats.db_size_bytes via PRAGMA
+page_count×page_size; "Database size" StatsDashboard card. Tested.
+
+REBUILT the P3 backend batch (P3.1 snapshots + P3.4 model integrity + P3.8): exe at HEAD d64e98b,
+freshness GREEN, verify_finetuned_model_integrity confirmed in the binary. The running app now has
+all three safety features.
+
+NEXT: P3.3 audio durability (segments reference absolute audio_path in place; a moved/renamed file
+silently breaks playback/re-transcribe/jury — add a missing-audio detection + relink path). Then P3.7
+Windows/Sorani path robustness, and the larger P3.2 import journal/resume (crash mid-import = lost work).
