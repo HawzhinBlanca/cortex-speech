@@ -930,11 +930,21 @@ impl ProcessingPipeline {
                 if let Some(ref jid) = job_id {
                     let _ = db.mark_import_file_done(jid, &file_path_str);
                 }
+                // Resume-correctness fix: fold this already-imported file's segments back into the
+                // jury batch. The post-import jury (below) runs once at the end keyed on
+                // `imported_ids`; a crash interrupts BEFORE that jury ever runs, so segments
+                // persisted pre-crash were never adjudicated. Skipping them silently would leave
+                // them persisted-but-un-adjudicated (no reference commit, no review routing). Pull
+                // their ids in so the end-of-run jury covers the whole resumed import.
+                match db.segment_ids_for_audio_path(&file_path_str) {
+                    Ok(ids) => imported_ids.extend(ids),
+                    Err(e) => tracing::warn!("resume: could not fetch segment ids for {file_path_str}: {e}"),
+                }
                 callback(PipelineEvent::Progress {
                     current: idx + 1,
                     total,
                     file: fname.clone(),
-                    status: "Already imported — skipped (resume)".into(),
+                    status: "Already imported — re-adjudicating (resume)".into(),
                 });
                 continue;
             }

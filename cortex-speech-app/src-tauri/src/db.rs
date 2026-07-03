@@ -1245,6 +1245,16 @@ impl Database {
         Ok(records)
     }
 
+    /// P3.2 (resume fix): segment IDs previously imported from a given source audio file. Used on
+    /// import-resume to fold already-imported files back into the post-import jury batch — the jury
+    /// runs once at the end keyed on the freshly-imported ids, so without this the files persisted
+    /// before a crash would never be adjudicated (they are skipped from re-processing on resume).
+    pub fn segment_ids_for_audio_path(&self, audio_path: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM speech_segments WHERE audio_path = ?1 ORDER BY rowid")?;
+        let rows = stmt.query_map(params![audio_path], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn get_all_hypotheses(&self) -> AppResult<Vec<SegmentHypothesis>> {
         let mut stmt =
             self.conn.prepare("SELECT segment_id, model_id, transcript, confidence FROM segment_hypotheses")?;
@@ -1916,6 +1926,22 @@ mod tests {
             duration_ms: 1000,
             ..SpeechSegment::default()
         }
+    }
+
+    #[test]
+    fn segment_ids_for_audio_path_returns_only_that_files_segments() {
+        // P3.2 resume fix: on import-resume, already-imported files are folded back into the jury
+        // batch by their segment ids. This pins that the lookup returns exactly (and only) the
+        // segments of the requested source file, so a resumed import re-adjudicates the right set.
+        let db = make_db();
+        db.insert_segment(&make_segment("a1", "/audio/one.wav")).unwrap();
+        db.insert_segment(&make_segment("a2", "/audio/one.wav")).unwrap();
+        db.insert_segment(&make_segment("b1", "/audio/two.wav")).unwrap();
+
+        let ids = db.segment_ids_for_audio_path("/audio/one.wav").unwrap();
+        assert_eq!(ids, vec!["a1".to_string(), "a2".to_string()], "only one.wav's segments, in insert order");
+        assert_eq!(db.segment_ids_for_audio_path("/audio/two.wav").unwrap(), vec!["b1".to_string()]);
+        assert!(db.segment_ids_for_audio_path("/audio/missing.wav").unwrap().is_empty(), "unknown path -> empty");
     }
 
     #[test]
