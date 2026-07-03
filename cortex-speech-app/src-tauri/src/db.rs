@@ -58,6 +58,17 @@ pub struct RelinkResult {
     pub still_missing: usize,
 }
 
+/// P3.2: a directory-import job in the resume journal (a crash leaves one 'running').
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportJob {
+    pub id: String,
+    pub dir: String,
+    pub total_files: usize,
+    pub completed_paths: Vec<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentHypothesis {
@@ -1024,6 +1035,71 @@ impl Database {
         }
         self.track_write()?;
         Ok(RelinkResult { relinked, still_missing: self.audio_health()?.missing_files })
+    }
+
+    // ── P3.2: import journal (resume a directory import interrupted by a crash) ──────────────────
+
+    /// Open a new import job (status 'running'). Also prunes old finished jobs so the journal stays
+    /// small. Journal writes are best-effort at the call sites — a failure here never fails an import.
+    pub fn begin_import_job(&self, dir: &str, total_files: usize) -> AppResult<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO import_jobs (id, dir, total_files, status) VALUES (?1, ?2, ?3, 'running')",
+            params![id, dir, total_files as i64],
+        )?;
+        // Retention: keep the newest 50 FINISHED jobs (running jobs are always kept — they may be crashes).
+        self.conn.execute(
+            "DELETE FROM import_jobs WHERE status != 'running' AND id NOT IN (
+                 SELECT id FROM import_jobs WHERE status != 'running'
+                 ORDER BY datetime(created_at) DESC, id DESC LIMIT 50
+             )",
+            [],
+        )?;
+        Ok(id)
+    }
+
+    /// Record that `path` finished processing in job `job_id` (idempotent).
+    pub fn mark_import_file_done(&self, job_id: &str, path: &str) -> AppResult<()> {
+        self.conn
+            .execute("INSERT OR IGNORE INTO import_job_files (job_id, path) VALUES (?1, ?2)", params![job_id, path])?;
+        self.conn.execute("UPDATE import_jobs SET updated_at = datetime('now') WHERE id = ?1", params![job_id])?;
+        Ok(())
+    }
+
+    /// Mark a job finished (a clean end): it is no longer an interruption to resume.
+    pub fn complete_import_job(&self, job_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE import_jobs SET status = 'completed', updated_at = datetime('now') WHERE id = ?1",
+            params![job_id],
+        )?;
+        Ok(())
+    }
+
+    /// Discard an interrupted job (the user chose not to resume). Deletes both tables explicitly so it
+    /// works whether or not the foreign-keys pragma is enabling CASCADE.
+    pub fn discard_import_job(&self, job_id: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM import_job_files WHERE job_id = ?1", params![job_id])?;
+        self.conn.execute("DELETE FROM import_jobs WHERE id = ?1", params![job_id])?;
+        Ok(())
+    }
+
+    /// The most recent still-'running' job — a crash never calls `complete_import_job`, so it stays
+    /// running. Intended to be queried at STARTUP (when no import is active, a running job IS a crash).
+    pub fn find_interrupted_import_job(&self) -> AppResult<Option<ImportJob>> {
+        let head = self.conn.query_row(
+            "SELECT id, dir, total_files, created_at FROM import_jobs
+             WHERE status = 'running' ORDER BY datetime(created_at) DESC, id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?)),
+        );
+        let (id, dir, total_files, created_at) = match head {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut stmt = self.conn.prepare("SELECT path FROM import_job_files WHERE job_id = ?1")?;
+        let completed_paths: Vec<String> = stmt.query_map(params![id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        Ok(Some(ImportJob { id, dir, total_files: total_files as usize, completed_paths, created_at }))
     }
 
     pub fn insert_hypothesis(&self, hyp: &SegmentHypothesis) -> AppResult<()> {
@@ -2917,7 +2993,7 @@ mod tests {
         // P3.7: a real Sorani corpus has Arabic-script filenames with spaces and long paths. Storage,
         // round-trip, and (transcript-scoped) FTS search must all survive them.
         let db = make_db();
-        let long_dir = format!("C:/Users/x/Desktop/کوردی ساؤند سامپڵز/{}", "پارچە ".repeat(40));
+        let long_dir = format!("D:/media/کوردی ساؤند سامپڵز/{}", "پارچە ".repeat(40));
         let audio_path = format!("{long_dir}/گەشتی مێژوویی.wav");
         assert!(audio_path.chars().count() > 200, "path is >200 chars: {}", audio_path.chars().count());
         let mut seg = make_segment("sr-1", &audio_path);
@@ -2937,6 +3013,38 @@ mod tests {
         // transcript-scoped, so a folder name never yields a false positive.
         let by_path_token = db.search_segments("سامپڵز").unwrap();
         assert!(!by_path_token.iter().any(|s| s.id == "sr-1"), "a path-only token does not match");
+    }
+
+    #[test]
+    fn import_journal_records_progress_and_finds_interruption() {
+        // P3.2: a running job with some files done is the interruption to resume; completing clears it.
+        let db = make_db();
+        assert!(db.find_interrupted_import_job().unwrap().is_none(), "no job -> no interruption");
+
+        let job = db.begin_import_job("C:/audio", 3).unwrap();
+        db.mark_import_file_done(&job, "C:/audio/a.wav").unwrap();
+        db.mark_import_file_done(&job, "C:/audio/b.wav").unwrap();
+        db.mark_import_file_done(&job, "C:/audio/a.wav").unwrap(); // idempotent
+
+        let found = db.find_interrupted_import_job().unwrap().unwrap();
+        assert_eq!(found.id, job);
+        assert_eq!(found.dir, "C:/audio");
+        assert_eq!(found.total_files, 3);
+        assert_eq!(found.completed_paths.len(), 2, "idempotent mark -> 2 distinct completed files");
+
+        db.complete_import_job(&job).unwrap();
+        assert!(db.find_interrupted_import_job().unwrap().is_none(), "completed job is not an interruption");
+    }
+
+    #[test]
+    fn discard_import_job_removes_it_and_its_files() {
+        let db = make_db();
+        let job = db.begin_import_job("C:/x", 1).unwrap();
+        db.mark_import_file_done(&job, "C:/x/a.wav").unwrap();
+        db.discard_import_job(&job).unwrap();
+        assert!(db.find_interrupted_import_job().unwrap().is_none());
+        let files: i64 = db.connection().query_row("SELECT COUNT(*) FROM import_job_files", [], |r| r.get(0)).unwrap();
+        assert_eq!(files, 0, "discard removed the job's file rows");
     }
 
     #[test]

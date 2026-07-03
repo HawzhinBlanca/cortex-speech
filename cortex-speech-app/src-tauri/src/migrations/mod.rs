@@ -585,6 +585,28 @@ pub static MIGRATIONS: &[Migration] = &[
                  CREATE INDEX IF NOT EXISTS idx_loop0_shadow_segment ON loop0_shadow_log(segment_id);",
         down_sql: Some("DROP TABLE IF EXISTS loop0_shadow_log; DROP INDEX IF EXISTS idx_loop0_shadow_segment;"),
     },
+    Migration {
+        version: 31,
+        description: "Import journal (P3.2) — record directory-import progress so a crash mid-import is resumable",
+        up_sql: "CREATE TABLE IF NOT EXISTS import_jobs (
+                     id TEXT PRIMARY KEY,
+                     dir TEXT NOT NULL,
+                     total_files INTEGER NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'running',
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 CREATE TABLE IF NOT EXISTS import_job_files (
+                     job_id TEXT NOT NULL,
+                     path TEXT NOT NULL,
+                     PRIMARY KEY (job_id, path),
+                     FOREIGN KEY(job_id) REFERENCES import_jobs(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_import_jobs_status ON import_jobs(status);",
+        down_sql: Some(
+            "DROP TABLE IF EXISTS import_job_files; DROP TABLE IF EXISTS import_jobs; DROP INDEX IF EXISTS idx_import_jobs_status;",
+        ),
+    },
 ];
 
 #[cfg(test)]
