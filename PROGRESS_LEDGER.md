@@ -362,3 +362,22 @@ All committed with full gates green (cargo test, clippy -D warnings, fmt, panic/
 python-policies; +typecheck/vitest for frontend). Remaining P1: P1.6 (M2.7 gold plumbing:
 export_gold_eval_set) — the last and largest; then P1.7 rebuild-to-freshness-green + drive the M2
 observed gates, P1.8 baseline.
+
+## P1 CODE COMPLETE (2026-07-03) — M2 instrumentation now genuinely works
+
+All six P1 items landed with full gates green (cargo test, clippy -D warnings, fmt, panic/tauri
+policies, python-policies; +typecheck/vitest per frontend touch):
+- P1.1 (57518f4) decision_log timing was dead -> now collected + median s/segment in StatsDashboard.
+- P1.2 (47ad7ae) decision_verdicts recorded on BOTH jury paths (C4 denominator was silently incomplete).
+- P1.3 (d071aec) loop0_shadow_log WRITER added (C5 over-trigger data; was a table with no producer).
+- P1.4 (fc435d7) suspect-first queue wired (was dead IPC) — reactive ReviewMode toggle.
+- P1.5 (f165072) review cursor + filter restore on launch (+ fixed a latent auto_save clobber).
+- P1.6 (60c9982) M2.7 gold plumbing: import_verified_segments_as_gold + export_gold_eval_set
+  (manifest.jsonl + 16 kHz clips), the dropped M2 item. Gates M3 freeze + M5 pack.
+
+The three M2 tables that were empty/dead (decision_log, decision_verdicts, loop0_shadow_log) now
+all have working producers, so the marathon's decisions will actually count (the keystone).
+
+NEXT: P1.7 — rebuild to freshness-green (npm build + cargo release; exe bakes all P1 code) and
+demonstrate the M2 checklist observed gates on the HEAD exe. P1.8 — record the review-throughput
+baseline (owner, once driving the rebuilt app). Then P2 (engine decision).
