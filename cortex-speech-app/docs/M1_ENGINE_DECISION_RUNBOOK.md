@@ -2,20 +2,33 @@
 
 **Milestone**: Measure three ASR engines on frozen gold sets (FLEURS ckb_IQ + Common Voice 22 ckb) and apply the decision protocol to determine the default engine. **Zero owner time** (GPU-only, ~4-6 hours wall-clock).
 
-## M1.1 · Freeze FLEURS ckb_IQ test split
+## M1.1 · Freeze the eval manifests (TSV — the format the scorecards parse)
 
-**What**: Download google/fleurs ckb_IQ test split, create a frozen manifest (SHA-pinned), commit to repo.
+> **Manifest format (P2.1 correction):** every scorecard (`scorecard_7b.py`, `scorecard_finetuned.py`,
+> `measure_finetuned_cer.py`) reads a **TSV** manifest — one `<wav_path>\t<reference>` row per clip
+> (optional `\t<gender>\t<age>`). Emit `.tsv`, **not** `.json`. Each builder also writes a `.sha256`
+> sidecar so the eval set is pinned.
+
+**CV22 ckb (on disk — no download; builder ready):**
 
 ```bash
 cd cortex-speech-app
-python scripts/build_fleurs_ckb_manifest.py --output scripts/fleurs_ckb_iq_frozen.json
-# Outputs:
-#   - scripts/fleurs_ckb_iq_frozen.json (manifest: audio index, reference, gender, age)
-#   - scripts/fleurs_ckb_iq_frozen.txt (SHA-256 of the manifest)
-git add scripts/fleurs_ckb_iq_frozen.* && git commit -m "feat(m1.1): freeze FLEURS ckb_IQ test split"
+# One-time: unpack the tar-packed audio shard for the split, then build the frozen manifest.
+python scripts/build_cv22_ckb_manifest.py \
+    --cv22-dir "$CORTEX_CV22_DIR" --split test --extract --wsl-paths \
+    --output scripts/cv22_ckb_test_frozen.tsv
+# Outputs scripts/cv22_ckb_test_frozen.tsv (+ .sha256). ~5.3k clips in the ckb test split.
+# --wsl-paths rewrites C:\ -> /mnt/c/ so scorecard_7b.py (runs in WSL) can read the paths.
+git add scripts/cv22_ckb_test_frozen.tsv* && git commit -m "feat(m1.1): freeze CV22 ckb test manifest"
 ```
 
-**Expected output**: N=~200-500 clips (ckb_IQ test split size varies; exact N recorded in manifest).
+**FLEURS ckb_IQ (one-time ~1–2 GB download):** the `build_fleurs_ckb_manifest.py` downloader is still
+to be written (it must emit the SAME `<wav_path>\t<reference>` TSV as the CV22 builder). Until it
+lands, run the CV22 leg (above) — the decision protocol works on either set, and CV22 is the
+designated fallback. When the FLEURS builder exists it will produce `scripts/fleurs_ckb_iq_frozen.tsv`.
+
+**Expected output**: CV22 ckb test ≈ 5.3k clips; FLEURS ckb_IQ ≈ 350 sentences (wide CI — report the
+interval, never headline a tight point estimate).
 
 ## M1.2 · Contamination statement
 
@@ -34,17 +47,16 @@ grep "fleurs\|ckb" /mnt/f/Kurdish\ Sorani\ Dataset/Kurdish_Sorani_ASR_Combined_v
 
 ### 7B (warm server):
 ```bash
-wsl python scripts/scorecard_7b.py scripts/fleurs_ckb_iq_frozen.json 3000 \
-  > /tmp/7b_fleurs_results.tsv
+wsl python scripts/scorecard_7b.py scripts/cv22_ckb_test_frozen.tsv 3000 \
+  > /tmp/7b_cv22_results.tsv
 # Computes: CER (%), WER (%), micro aggregation, Bisani & Ney bootstrap CI
-# Outputs to ledger:
-# - 7B / FLEURS / CER: [X.XX%, CI: [a, b]]
+# (swap in scripts/fleurs_ckb_iq_frozen.tsv once the FLEURS builder lands)
 ```
 
 ### Fine-tuned MMS-1B:
 ```bash
-python scripts/measure_finetuned_cer.py scripts/fleurs_ckb_iq_frozen.json 3000 \
-  > /tmp/finetuned_fleurs_results.tsv
+python scripts/measure_finetuned_cer.py scripts/cv22_ckb_test_frozen.tsv 3000 \
+  > /tmp/finetuned_cv22_results.tsv
 # Identical normalization + bootstrap as 7B
 ```
 
@@ -99,12 +111,14 @@ pub fn new() -> Self {
 ## Commands to run (summary for quick copy-paste)
 
 ```bash
-# Step 1: Freeze manifests
-python cortex-speech-app/scripts/build_fleurs_ckb_manifest.py --output cortex-speech-app/scripts/fleurs_ckb_iq_frozen.json
+# Step 1: Freeze the CV22 manifest (TSV; FLEURS builder still to be written — see M1.1)
+python cortex-speech-app/scripts/build_cv22_ckb_manifest.py \
+    --cv22-dir "$CORTEX_CV22_DIR" --split test --extract --wsl-paths \
+    --output cortex-speech-app/scripts/cv22_ckb_test_frozen.tsv
 
 # Step 2: Run benchmarks (GPU-heavy, ~2h each)
-wsl python cortex-speech-app/scripts/scorecard_7b.py cortex-speech-app/scripts/fleurs_ckb_iq_frozen.json 3000
-python cortex-speech-app/scripts/measure_finetuned_cer.py cortex-speech-app/scripts/fleurs_ckb_iq_frozen.json 3000
+wsl python cortex-speech-app/scripts/scorecard_7b.py cortex-speech-app/scripts/cv22_ckb_test_frozen.tsv 3000
+python cortex-speech-app/scripts/measure_finetuned_cer.py cortex-speech-app/scripts/cv22_ckb_test_frozen.tsv 3000
 cd cortex-speech-app && cargo test --manifest-path src-tauri/Cargo.toml --test real_audio -- --ignored omniasr_on_fleurs --nocapture
 
 # Step 3: Record results in EVAL.md with artifacts (command SHA, dataset SHA, N, metric, CI)
