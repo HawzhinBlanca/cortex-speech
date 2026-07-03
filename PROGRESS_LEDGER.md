@@ -515,3 +515,17 @@ NEXT (last large automatable item): P3.2 import journal/resume — segments batc
 pipeline end (pipeline.rs), so a crash 2h into a 3h import persists NOTHING. Add per-segment
 persistence + a "Resume import" path so long imports survive interruption (marathon depends on many
 long imports).
+
+## P3.2 import-journal FOUNDATION (2026-07-03)
+
+72c1c08: migration v31 (import_jobs + import_job_files) + db methods (begin/mark-done/complete/
+find-interrupted/discard, best-effort-designed, retention to 50 finished jobs) + tests. Durable
+resume record — a crash leaves a 'running' job with its completed files; find_interrupted_import_job
+returns it at startup. Also fixed a P3.7 test hygiene slip (C:/Users/x placeholder -> D:/media);
+lesson recorded: run python-policies EVERY iteration, not just cargo/clippy/fmt.
+
+NEXT (P3.2 chunk 2 — the wiring, own focused step): wire begin/mark-done/complete into
+import_directory (additive best-effort) + a resume-skip param (None = normal, so behavior unchanged) +
+get_interrupted_import / resume_interrupted_import / discard_interrupted_import commands + a startup
+Resume/Discard banner. Then rebuild. (Within-single-long-file incremental persistence stays deferred —
+risky core refactor, owner-testable P3.9.)
