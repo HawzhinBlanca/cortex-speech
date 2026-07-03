@@ -564,3 +564,21 @@ Exe stale (P5.1 backend+frontend) — batching rebuild after the next P5 item.
 NEXT: expose the existing gate_and_promote via IPC + a Promote button (audit: apparatus exists but
 unreachable; a deliberately-worse adapter must be visibly REFUSED with reasons). Then registry-driven
 champion (remove hardcoded adapter path) + corpus ledger. Then rebuild the P5 batch.
+
+## Consolidation (2026-07-03) — session work rebuilt + verified + board updated
+
+c36ba06: rebuilt to freshness-GREEN (exe at HEAD, export_finetune_pack confirmed in the binary);
+updated docs/SHIP_READY_100.md with an honest session-progress status. The running app now carries
+EVERYTHING built this session (P0, hygiene+scrub+merge, all P1, P2.1, P2.3 toggle, all automatable P3,
+P5.1). Every item was committed with all gates green (cargo test, clippy -D warnings, fmt,
+python-policies incl. hygiene, typecheck/vitest/lint where frontend touched).
+
+HONEST STATE: the automatable scope is essentially complete. Remaining is owner/GPU-gated —
+P2.2 three-engine benchmark (the next highest-leverage step; M1 harness is now runnable), P3.5/6/9
+drills, P4 marathon, P5 retrain execution, P6 DirectML, P7 re-audit. gate_and_promote is NOT exposed
+via a Promote button because it needs a real Scorecard from a live challenger eval (owner/GPU) — the
+functions exist and the M5 runbook uses them.
+
+NEXT: write docs/RETRAIN_RUNBOOK.md — accurate owner-facing steps tying the now-existing plumbing
+together (export_finetune_pack -> QLoRA train on the 4090 -> import_model_checkpoint -> gate_and_promote
+on frozen app-gold), so the owner can execute the M5 cycle when M3 data exists.
