@@ -638,3 +638,22 @@ SWEEP COMPLETE: 3 rounds of adversarial self-review of this session's ~2000 line
 found + fixed 3 real defects (resume orphaned segments, relink wrong-audio collision, import-job
 crash-ghost buildup), each with a regression test and a live rebuild. Remaining plan work is
 owner/GPU-gated (P2.2 benchmark highest-leverage).
+
+## Self-review round 4 (2026-07-03) — frontend sweep: dead retrain bindings wired to UI
+
+Adversarial sweep of the session's frontend TS. Finding: 3 command wrappers (exportFinetunePack,
+exportGoldEvalSet, importVerifiedSegmentsAsGold) existed in commands.ts but had ZERO callers — dead
+bindings, AND they made the RETRAIN_RUNBOOK non-executable from the app (its "run
+export_finetune_pack" step had no button; dev-console only).
+- FIXED (dc580a0): wired all 3 into a "Dataset & model tools" section in StatsDashboard, mirroring
+  the proven relinkMissingAudio pattern (dir dialog -> IPC -> toast with real counts), single-flight
+  via toolBusy. EN+CKB i18n keys added (403==403 balanced).
+- Noted (not fixed): app_git_sha + verify_finetuned_model_integrity are registered backend IPC with
+  NO frontend wrapper — a lesser "backend-only" gap, left for a later diagnostics panel.
+- Gates: typecheck 0 errors, eslint clean, vitest 132/132, python policies green. Exe rebuilt
+  (6m05s), freshness GREEN. HONESTY: button->IPC click-path needs the real Tauri app to confirm —
+  not exercisable in a headless vite preview (stated in the commit, not claimed as verified).
+
+FRONTEND SWEEP COMPLETE. Across 4 self-review rounds this session: 3 real Rust defects fixed +
+1 dead-binding/feature-completeness gap closed, each gated + rebuilt live. Remaining plan work is
+owner/GPU-gated (P2.2 benchmark highest-leverage).
