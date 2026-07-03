@@ -2913,6 +2913,33 @@ mod tests {
     }
 
     #[test]
+    fn sorani_paths_and_fts_search_are_robust() {
+        // P3.7: a real Sorani corpus has Arabic-script filenames with spaces and long paths. Storage,
+        // round-trip, and (transcript-scoped) FTS search must all survive them.
+        let db = make_db();
+        let long_dir = format!("C:/Users/x/Desktop/کوردی ساؤند سامپڵز/{}", "پارچە ".repeat(40));
+        let audio_path = format!("{long_dir}/گەشتی مێژوویی.wav");
+        assert!(audio_path.chars().count() > 200, "path is >200 chars: {}", audio_path.chars().count());
+        let mut seg = make_segment("sr-1", &audio_path);
+        seg.raw_transcript = "ئەمە دەقێکی کوردی گرنگە".to_string();
+        db.insert_segment(&seg).unwrap();
+
+        // The long non-ASCII path round-trips byte-identical.
+        let got = db.get_segment_by_id("sr-1").unwrap().unwrap();
+        assert_eq!(got.audio_path, audio_path, "non-ASCII long path round-trips intact");
+        assert_eq!(got.raw_transcript, "ئەمە دەقێکی کوردی گرنگە");
+
+        // FTS finds the segment by a Sorani transcript word (unicode61 tokenizer).
+        let by_transcript = db.search_segments("کوردی").unwrap();
+        assert!(by_transcript.iter().any(|s| s.id == "sr-1"), "FTS finds the Sorani segment by transcript content");
+
+        // A token present only in the PATH (not the transcript) must NOT match — search is
+        // transcript-scoped, so a folder name never yields a false positive.
+        let by_path_token = db.search_segments("سامپڵز").unwrap();
+        assert!(!by_path_token.iter().any(|s| s.id == "sr-1"), "a path-only token does not match");
+    }
+
+    #[test]
     fn source_transcript_upsert_roundtrips_latest_reference() {
         let db = make_db();
         let first = SourceTranscriptRecord {

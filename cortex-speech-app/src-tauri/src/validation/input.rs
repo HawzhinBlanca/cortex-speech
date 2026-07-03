@@ -100,6 +100,16 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_filename_keeps_sorani_letters_replaces_unsafe() {
+        // P3.7: export filenames derive from Sorani source names — Arabic-script letters (Unicode
+        // alphanumeric) must be KEPT so the name stays meaningful; only unsafe chars become '_'.
+        assert_eq!(sanitize_filename("کوردی"), "کوردی", "Sorani letters are preserved");
+        assert_eq!(sanitize_filename("clip 01/bad:name"), "clip_01_bad_name", "space + path/reserved -> _");
+        assert_eq!(sanitize_filename("gesht-01.wav"), "gesht-01.wav", "safe punctuation kept");
+        assert!(!sanitize_filename("گەشتی مێژوویی").contains(' '), "no spaces survive in an export filename");
+    }
+
+    #[test]
     fn test_sanitize_filename() {
         assert_eq!(sanitize_filename("hello.txt"), "hello.txt");
         assert_eq!(sanitize_filename("../evil/path"), ".._evil_path");
