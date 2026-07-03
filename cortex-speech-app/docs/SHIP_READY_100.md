@@ -1,5 +1,34 @@
 # SHIP READY 100 — corrected status + task-by-task execution board
 
+## Session progress — 2026-07-03 (autonomous /loop)
+
+**DONE + shipped this session** (every item committed with all gates green; exe rebuilt to
+freshness-green at each phase):
+
+- **P0** truth & rebuild: stale-exe guard (F4) with `build.rs` SHA re-bake + `check_exe_freshness`
+  + `ship-check-local`; honesty copy `~19% → 21.0% CER N=900`.
+- **GitHub hygiene**: merged the 41-commit audit branch to `main`; CODEOWNERS handle fix; **PII
+  git-history scrub + force-push** (C8 closed); gate-discipline lesson recorded.
+- **P1 (all 6 + rebuild)** — the M2 instrumentation now genuinely works: decision-timing write path
+  (was dead), verdict rows on both jury paths (C4 denominator), LOOP-0 shadow writer (C5 data),
+  suspect-first queue wired, cursor+filter restore (+ clobber fix), gold plumbing (M2.7).
+- **P2.1** M1 runnable end-to-end: CV22 + FLEURS manifest builders (real tar/HF formats), WER+RTF
+  added to the scorecards (CER byte-identical), runbook TSV fix. **P2.3** OOBE "Use fine-tuned
+  model" toggle.
+- **P3 (all automatable) + rebuilds**: P3.1 auto-snapshots, P3.2 crash-resumable imports (journal +
+  resume banner), P3.3 audio-durability relink, P3.4 model-file integrity, P3.7 Sorani path
+  robustness, P3.8 retention + DB-size.
+- **P5.1** `export_finetune_pack` (holdout-excluded training pack; leak-test gate).
+
+**Remaining is owner/GPU-gated** (cannot be done or tested headlessly): P2.2 the three-engine GPU
+benchmark → flip the measured default (P2.3 migration); P3.5/P3.6/P3.9 the WSL/export/multi-hour
+drills; P4 the review marathon; P5 the retrain-cycle execution (gate_and_promote runs there on a real
+Scorecard); P6 DirectML; P7 the re-audit + honest 10/10 call. The **next highest-leverage owner step
+is P2.2** — one GPU afternoon on the now-runnable M1 harness produces the measured default-engine
+number that closes C1.
+
+---
+
 > Written 2026-07-03 from a 46-agent verified audit of the tree at `d9c084c`
 > (7 parallel subsystem surveys → adversarial verification of every open blocker/major
 > claim against the live tree → completeness critic). The **spec of record remains
