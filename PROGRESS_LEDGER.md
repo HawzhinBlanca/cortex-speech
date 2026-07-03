@@ -270,3 +270,29 @@ Honest M2 status: ~2/7 to its own gates (M2.4 code-wired but undemonstrated; the
 Corrected plan of execution: cortex-speech-app/docs/SHIP_READY_100.md (P0-P7 board;
 spec of record remains docs/FINAL_READINESS_10.md). Duplicate "M2 Completion" blocks above
 and the dual milestone-numbering drift are acknowledged here rather than edited in place.
+
+## SHIP_READY_100 execution — P0 COMPLETE (2026-07-03, autonomous loop)
+
+P0.2 stale-exe guard (deep-audit F4) — CLOSED with a demonstrated red->green:
+- lib.rs: `#[used] static GIT_SHA_MARKER = concat!("CORTEX_BUILD_SHA:", GIT_SHA)` (contiguous
+  rodata, linker-retained) + `app_git_sha` IPC command (commands.rs) exposing the baked SHA.
+- scripts/check_exe_freshness.py (LOCAL gate) + scripts/test_exe_freshness.py (11 CI-safe unit
+  tests, auto-run by python-policies). Makefile: `check-fresh` + `ship-check-local`
+  (build-app -> check-fresh -> ship-check).
+- Demonstrated RED on the stale exe (source newer + marker absent); rebuilt via build-app;
+  now GREEN: `EXE FRESHNESS GATE: OK (exe at HEAD a1003c2...)`, baked SHA == git HEAD exactly.
+P0.4 honesty copy — CLOSED: "~19% CER" -> published 21.0% CER [19.93,22.04] N=900 in en.ts,
+  ckb.ts, commands.ts, App.svelte, settings.rs.
+P0.1 rebuild — DONE (npm run build + cargo build --release 6m06s; exe now HEAD-fresh).
+P0.3 ledger correction — DONE (M2 ~2/7 correction entry above).
+
+Gates green on this machine: cargo clippy -D warnings, cargo fmt --check, cargo test (full),
+npm run typecheck (393/0), npm test (132/132), npm run lint, npm run test:python-policies,
+and the new `make check-fresh`. Commits: a1003c2 (P0.2+P0.4), 20582e0 (gate repairs),
+796468f (plan board + ledger correction).
+
+NEXT (P1 — make M2 actually true): P1.1 fix M2.1 dead write path (frontend send timestampMs +
+median read panel); P1.2 verdict row per segment; P1.3 LOOP-0 shadow writer; P1.4 register
+get_segments_suspect_first + review toggle; P1.5 session cursor read-back; P1.6 M2.7 gold
+plumbing (export_gold_eval_set); P1.7 rebuild + run M2 checklist observed gates; P1.8 record
+review-throughput baseline. Batch all P1 code, then ONE rebuild to freshness-green.
