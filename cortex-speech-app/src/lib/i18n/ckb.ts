@@ -18,7 +18,7 @@ export const ckb: Record<string, string> = {
   transcribeConstrained: 'تەنها کوردی',
   transcribeConstrainedTitle: 'نووسینەوە بە دیکۆدی بەربەستکراوی پیتی کوردی (دەرئەنجامی کوردی دەستەبەر دەکات)',
   transcribeFinetuned: 'مۆدێلی ڕاهێنراو',
-  transcribeFinetunedTitle: 'نووسینەوە بە مۆدێلی ڕاهێنراوی کوردی (~٪١٩ هەڵە، نزیکەی نیوەی هەڵەی مۆدێلی بنەڕەت)',
+  transcribeFinetunedTitle: 'نووسینەوە بە مۆدێلی ڕاهێنراوی کوردی (پێوانەکراو ٪٢١ هەڵەی پیت، N=900)',
   transcribing: 'نووسینەوە...',
   verify: 'پشتڕاستکردن',
   unverify: 'لابردنی پشتڕاستکردن',

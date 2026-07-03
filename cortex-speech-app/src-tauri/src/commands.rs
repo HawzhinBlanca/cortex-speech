@@ -831,6 +831,14 @@ pub fn import_audio_file(
     Ok(serde_json::json!({ "status": "started", "source": "file" }))
 }
 
+/// P0.2 — expose the git SHA baked into the running exe at build time so the frontend/e2e harness
+/// (and a curious user, via the About panel) can confirm the running binary matches a given commit.
+/// Referencing `crate::GIT_SHA` here also guarantees the const is retained in the compiled binary.
+#[tauri::command]
+pub fn app_git_sha() -> String {
+    crate::GIT_SHA.to_string()
+}
+
 #[tauri::command]
 pub fn app_health(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("app_health")?;

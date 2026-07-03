@@ -9,7 +9,7 @@ export const en: Record<string, string> = {
   transcribeConstrained: 'Kurdish-only',
   transcribeConstrainedTitle: 'Transcribe with constrained Kurdish-script decode (guarantees Kurdish output)',
   transcribeFinetuned: 'Fine-tuned',
-  transcribeFinetunedTitle: 'Transcribe with the fine-tuned Kurdish model (~19% CER, roughly half the stock error)',
+  transcribeFinetunedTitle: 'Transcribe with the fine-tuned Kurdish model (measured 21.0% CER, N=900)',
   'scribe.transcribe': 'Scribe (cloud)',
   'scribe.transcribeTitle': 'Re-transcribe this segment with ElevenLabs Scribe (cloud STT)',
   'scribe.vote': '+ Scribe vote',

@@ -921,7 +921,7 @@
     }
   }
 
-  // Opt-in: transcribe the selected segment with the embedded fine-tuned Kurdish model (~19% CER)
+  // Opt-in: transcribe the selected segment with the embedded fine-tuned Kurdish model (measured 21.0% CER, N=900)
   // via `transcribe_segment_finetuned`. The default `handleTranscribe` (sherpa) path is unchanged.
   async function handleTranscribeFinetuned() {
     const seg = $selectedSegment;

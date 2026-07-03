@@ -107,8 +107,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub loop0_firing_enabled: bool,
 
-    /// Use the embedded fine-tuned MMS-CTC engine (best local Sorani quality — roughly half the CER
-    /// of stock OmniASR; see docs/EVAL.md) as the PRIMARY transcription engine, overriding
+    /// Use the embedded fine-tuned MMS-CTC engine (best local Sorani quality — measured 21.0% CER
+    /// [19.93, 22.04] N=900 vs stock OmniASR 29.4%; see docs/EVAL.md) as the PRIMARY transcription engine, overriding
     /// `asr_model_size`. Falls back to the configured engine if the fine-tuned model is absent or
     /// errors, so transcription never breaks. Default OFF (the model is large; opt in per machine).
     #[serde(default)]

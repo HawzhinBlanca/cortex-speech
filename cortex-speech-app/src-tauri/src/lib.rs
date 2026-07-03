@@ -62,9 +62,17 @@ pub mod validation;
 pub mod wav2vec2_asr;
 pub mod wer;
 
-// M0.6: Git SHA baked at compile time by build.rs (via rustc-env GIT_SHA). Used by ship-check
-// gate to assert running exe matches HEAD, preventing accidental stale exe deployments.
+// M0.6 / P0.2: Git SHA baked at compile time by build.rs (via rustc-env GIT_SHA). Exposed to the
+// frontend via the `app_git_sha` IPC command, and embedded as a greppable, contiguous rodata marker
+// (below) so `scripts/check_exe_freshness.py` can extract it from the binary WITHOUT running the exe
+// and assert the running binary matches HEAD — closing the stale-exe trap (deep-audit F4).
 pub const GIT_SHA: &str = env!("GIT_SHA");
+
+/// Contiguous, prefixed marker forced into the binary so a static (non-executing) check can recover
+/// the baked SHA. `#[used]` keeps the linker from stripping it; `concat!` guarantees the prefix and
+/// SHA are one literal in rodata. Grep pattern: `CORTEX_BUILD_SHA:<40 hex>`.
+#[used]
+static GIT_SHA_MARKER: &str = concat!("CORTEX_BUILD_SHA:", env!("GIT_SHA"));
 
 use cache::TranscriptCache;
 use cancel::CancellationToken;
@@ -440,6 +448,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_health,
+            commands::app_git_sha,
             commands::open_audio_file,
             commands::import_directory,
             commands::import_audio_file,
