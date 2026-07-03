@@ -1062,6 +1062,17 @@ export async function exportFinetunePack(outDir: string): Promise<FinetunePackRe
   return invoke<FinetunePackResult>('export_finetune_pack', { outDir });
 }
 
+/** P3.4: on-demand full-SHA integrity check of the bundled fine-tuned model + vocab. Resolves to a
+ *  "verified: <path>" message; rejects with a mismatch message if the model is corrupt/replaced. */
+export async function verifyFinetunedModelIntegrity(): Promise<string> {
+  return invoke<string>('verify_finetuned_model_integrity');
+}
+
+/** P0.2: the git SHA the running binary was built from (baked at build time). Used for build-info display. */
+export async function appGitSha(): Promise<string> {
+  return invoke<string>('app_git_sha');
+}
+
 /** A reproducible scorecard built from already-computed gold-eval results. */
 export interface ScorecardResponse {
   scorecard: unknown;

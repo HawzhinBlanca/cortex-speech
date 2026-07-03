@@ -160,6 +160,7 @@
   // `toolBusy` holds the id of the running action so exactly one runs at a time and its button shows
   // progress. Each mirrors the proven relinkMissingAudio pattern (dir dialog -> IPC -> toast).
   let toolBusy = $state<string | null>(null);
+  let buildSha = $state<string | null>(null);
 
   async function pickDirAnd<T>(id: string, run: (dir: string) => Promise<T>): Promise<T | null> {
     if (!tauriAvailable || toolBusy) return null;
@@ -209,6 +210,21 @@
     }
   }
 
+  // P3.4: full-SHA integrity check of the bundled fine-tuned model (a few seconds — hashes 970 MB).
+  // Surfaces the on-demand backend guard so the owner can confirm the champion is intact/uncorrupted.
+  async function verifyModelIntegrity() {
+    if (!tauriAvailable || toolBusy) return;
+    toolBusy = 'verify';
+    try {
+      const message = await api.verifyFinetunedModelIntegrity();
+      notifications.success($t('stats.verifyModelOk'), { detail: message });
+    } catch (e) {
+      notifications.error($t('stats.verifyModelFailed'), { detail: String(e) });
+    } finally {
+      toolBusy = null;
+    }
+  }
+
   async function fetchInferenceStats() {
     if (!tauriAvailable) {
       inferenceStats = null;
@@ -224,6 +240,13 @@
   onMount(() => {
     fetchStats();
     fetchInferenceStats();
+    if (tauriAvailable) {
+      // Build-info is a non-essential diagnostic — leave it hidden if the call fails.
+      api
+        .appGitSha()
+        .then((sha) => (buildSha = sha))
+        .catch(() => {});
+    }
   });
 
   let fetchDebounceTimer: ReturnType<typeof setTimeout>;
@@ -625,7 +648,21 @@
               ? $t('stats.toolWorking')
               : $t('stats.exportFinetunePack')}
           </button>
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
+            data-testid="verify-model-btn"
+            disabled={toolBusy !== null}
+            onclick={verifyModelIntegrity}
+          >
+            {toolBusy === 'verify' ? $t('stats.toolWorking') : $t('stats.verifyModel')}
+          </button>
         </div>
+        {#if buildSha}
+          <div class="text-[10px] text-cortex-600 font-mono" data-testid="build-sha">
+            {$t('stats.buildSha')}: {buildSha.slice(0, 12)}
+          </div>
+        {/if}
       </div>
     {/if}
   {:else if errorMessage}
