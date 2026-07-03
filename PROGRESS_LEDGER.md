@@ -326,3 +326,20 @@ cached the build-script output across commits. This undermined the whole P0.2 ga
 build.rs now emits `cargo:rerun-if-changed` for `.git/HEAD` and `.git/logs/HEAD` (reflog updates
 on every HEAD change), so the SHA re-bakes on every commit/checkout. Final rebuild after this
 verifies the exe stamps the correct HEAD and `make check-fresh` is green.
+
+## P1 progress (2026-07-03, autonomous loop) — making M2 instrumentation actually work
+
+- P1.1 (57518f4): decision_log was DEAD (frontend never sent a timestamp). Fixed
+  recordHumanDecision to send Date.now(); added ReviewTimingStats (median within-session
+  s/decision, >5min breaks excluded) into DatasetStats + a "Median s/segment" StatsDashboard
+  card (CKB + guarded render). Tests prove the write path now populates decision_log.
+- P1.2 (47ad7ae): decision_verdicts was inconsistently populated — the IRT-consensus jury
+  (jury::write_verdict) recorded NOTHING and db::write_segment_verdict missed auto_accept, so
+  the C4 auto-accept-precision denominator was silently incomplete. New db::record_decision_verdict
+  centralizes T0/T1 classification ({auto_accept,jury_accept,jury_edit}->T0, escalated->T1,
+  human/unknown->none); both write paths call it (affected>0 guard). Tests cover both paths.
+
+Each committed with all gates green (cargo test full, clippy -D warnings, fmt, panic-policy,
+python-policies; +typecheck/vitest for P1.1). Remaining P1: P1.3 LOOP-0 shadow writer,
+P1.4 register+wire suspect-first, P1.5 session cursor read-back, P1.6 M2.7 gold plumbing,
+then ONE rebuild to freshness-green (P1.7) + baseline (P1.8).
