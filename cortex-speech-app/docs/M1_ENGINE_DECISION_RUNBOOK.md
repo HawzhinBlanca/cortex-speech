@@ -22,10 +22,19 @@ python scripts/build_cv22_ckb_manifest.py \
 git add scripts/cv22_ckb_test_frozen.tsv* && git commit -m "feat(m1.1): freeze CV22 ckb test manifest"
 ```
 
-**FLEURS ckb_IQ (one-time ~1–2 GB download):** the `build_fleurs_ckb_manifest.py` downloader is still
-to be written (it must emit the SAME `<wav_path>\t<reference>` TSV as the CV22 builder). Until it
-lands, run the CV22 leg (above) — the decision protocol works on either set, and CV22 is the
-designated fallback. When the FLEURS builder exists it will produce `scripts/fleurs_ckb_iq_frozen.tsv`.
+**FLEURS ckb_IQ (one-time ~1–2 GB download):**
+
+```bash
+pip install datasets soundfile   # one-time
+python scripts/build_fleurs_ckb_manifest.py --output-dir scripts/fleurs_ckb_iq --wsl-paths
+# Writes scripts/fleurs_ckb_iq/clips/*.wav + scripts/fleurs_ckb_iq/fleurs_ckb_iq_frozen.tsv (+ .sha256).
+git add scripts/fleurs_ckb_iq/fleurs_ckb_iq_frozen.tsv* && git commit -m "feat(m1.1): freeze FLEURS ckb_IQ test manifest"
+```
+
+The FLEURS-ckb WER row is the one directly comparable to ElevenLabs Scribe's published **32.1% WER**
+(theirs is WER on FLEURS-ckb) — but the split is only ~350 sentences, so **report the CI, never a
+tight point estimate**, and note the contamination caveat (M1.2). CV22 remains the larger, boundary-
+aligned fallback if the download fails.
 
 **Expected output**: CV22 ckb test ≈ 5.3k clips; FLEURS ckb_IQ ≈ 350 sentences (wide CI — report the
 interval, never headline a tight point estimate).
