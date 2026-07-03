@@ -34,9 +34,11 @@ the leak guard in step 1 — but you should also never hand-mix them.
 
 ## Step 1 — Export the fine-tune training pack (in-app)
 
-Run the **`export_finetune_pack`** IPC command (`src-tauri/src/commands.rs`, backed by
-`eval::export_finetune_pack`). It walks every **human-verified** segment and writes, under your
-chosen output dir:
+In the app, open **Stats → "Dataset & model tools"** and click **Export fine-tune pack** (pick your
+output folder when prompted). This calls the **`export_finetune_pack`** command
+(`src-tauri/src/commands.rs`, backed by `eval::export_finetune_pack`); the result toast reports
+clips emitted / holdout excluded / skipped. It walks every **human-verified** segment and writes,
+under your chosen output dir:
 
 - `finetune_manifest.jsonl` — one row per clip: `{audio_path, sentence, duration_seconds}` (the
   trainer's schema). `sentence` is the human gold text (corrected ▸ annotated ▸ normalized ▸ raw).
@@ -53,10 +55,12 @@ twice, and empty-transcript / undecodable clips are skipped.
 
 ## Step 2 — Freeze the gold eval set (in-app)
 
-Run **`export_gold_eval_set`** (→ `eval::export_gold_eval_set`). It writes `manifest.jsonl` +
-`clips/` for your **gold** segments. This is the frozen benchmark the promotion gate measures on.
-Freeze it once per retrain cycle and do not touch it until after the gate decision — that is what
-makes the CER comparison honest and reproducible.
+In the same **Stats → "Dataset & model tools"** panel, click **Export gold eval set** (→
+`eval::export_gold_eval_set`). It writes `manifest.jsonl` + `clips/` for your **gold** segments.
+This is the frozen benchmark the promotion gate measures on. Freeze it once per retrain cycle and do
+not touch it until after the gate decision — that is what makes the CER comparison honest and
+reproducible. (The same panel's **Import verified → gold** button first promotes your reviewed source
+files into the gold set, if you have not already.)
 
 Convert the manifest to the TSV the scorecard scripts expect (`<clip_path>\t<reference>` per line)
 if you have not already; `scripts/scorecard_finetuned.py` and `measure_finetuned_cer.py` both read a
