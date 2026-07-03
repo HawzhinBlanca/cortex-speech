@@ -454,3 +454,18 @@ Exe now stale (backend change) — batching the rebuild after a few more P3 back
 NEXT: P3.4 model-file integrity (bundled model.onnx/vocab SHA pin verified at load — a corrupt model
 would silently degrade the 21% CER; audit flagged empty *_ARCHIVE_SHA256 pins). Then P3.8 retention/
 pruning (unbounded agent_import_reports etc.), P3.3 audio durability, P3.2 import journal/resume.
+
+## P3.4 model integrity (2026-07-03)
+
+62b63ea: pinned the bundled fine-tuned model.onnx (SHA + 970,251,415 bytes) + vocab.json SHA in
+wav2vec2_asr.rs. verify_finetuned_fast (size + vocab SHA, instant) runs at the cached session load,
+gated to the bundled path; verify_finetuned_full (full model SHA) exposed via the
+verify_finetuned_model_integrity IPC. Factored resolve_finetuned_paths (DRY). Tested. Pins must be
+updated on retrain/replace (M5) — noted inline. Protects the 21% CER trust chain from a
+truncated/swapped model.
+
+P3 so far: P3.1 auto-snapshots + P3.4 model integrity (both backend). Exe stale — batching rebuild.
+
+NEXT: P3.8 retention/pruning for unbounded tables (agent_import_reports has no DELETE;
+decision_verdicts/loop0_shadow_log grow with the marathon) + surface DB file size. Then rebuild the
+P3 backend batch to freshness-green; P3.3 audio durability; P3.2 import journal/resume.
