@@ -19,7 +19,7 @@ from build_cv22_ckb_manifest import build, find_columns, sanitize_reference, to_
 
 
 def test_to_wsl_path_rewrites_windows_drive() -> None:
-    assert to_wsl_path("C:\\Users\\x\\a.mp3") == "/mnt/c/Users/x/a.mp3"
+    assert to_wsl_path("C:\\data\\x\\a.mp3") == "/mnt/c/data/x/a.mp3"
     assert to_wsl_path("D:/data/b.mp3") == "/mnt/d/data/b.mp3"
     assert to_wsl_path("/mnt/c/already") == "/mnt/c/already"
 

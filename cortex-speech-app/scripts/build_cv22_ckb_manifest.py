@@ -27,7 +27,7 @@ from pathlib import Path
 
 
 def to_wsl_path(p: str) -> str:
-    """C:\\Users\\x -> /mnt/c/Users/x (idempotent for already-POSIX paths)."""
+    r"""C:\data\x -> /mnt/c/data/x (idempotent for already-POSIX paths)."""
     p = p.replace("\\", "/")
     if len(p) >= 2 and p[1] == ":":
         drive = p[0].lower()

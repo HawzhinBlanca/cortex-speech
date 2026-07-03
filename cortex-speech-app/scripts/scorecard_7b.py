@@ -20,7 +20,13 @@ import os
 import random
 import socket
 import sys
+import time
 import unicodedata
+
+# P2.1: WER + timing telemetry (M1.3 needs CER + WER + RTF). CER stays inline/byte-identical below.
+from asr_metrics import bootstrap_ci as boot_ci
+from asr_metrics import micro as micro_rate
+from asr_metrics import word_pair
 
 HOST = os.environ.get("CORTEX_7B_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CORTEX_7B_PORT", "8799"))
@@ -88,11 +94,15 @@ def main() -> int:
 
     rows = [l.rstrip("\n").split("\t") for l in open(manifest, encoding="utf-8") if "\t" in l]
     per_clip = []  # (char_dist, char_ref_len)
+    word_clip = []  # P2.1: (word_dist, word_ref_len) for WER, scored on the SAME normalized pairs
     pairs = []
+    total_proc_s = 0.0  # P2.1: cumulative transcription wall-clock for throughput/RTF
     for i, row in enumerate(rows):
         wav, ref = row[0], row[1]
         try:
+            t0 = time.perf_counter()
             hyp = transcribe_7b(wav)
+            total_proc_s += time.perf_counter() - t0
         except Exception as e:
             print(f"  SKIP {wav}: {e}")
             continue
@@ -101,6 +111,7 @@ def main() -> int:
             continue  # zero-reference clip drops out of the ratio-of-sums (matches eval.rs)
         rc, hc = r.replace(" ", ""), h.replace(" ", "")
         per_clip.append((edit_distance(list(rc), list(hc)), len(rc)))
+        word_clip.append(word_pair(r, h))
         pairs.append({"ref": ref, "hyp": hyp})
         if (i + 1) % 25 == 0:
             print(f"  ...{i+1}/{len(rows)}")
@@ -125,18 +136,44 @@ def main() -> int:
     lo = boots[int(0.025 * len(boots))]
     hi = boots[int(0.975 * len(boots)) - 1]
 
+    # P2.1: WER (micro + seeded bootstrap CI, same recipe as CER) and processing throughput. RTF
+    # (proc/audio) needs a per-clip audio-duration source the generic manifest doesn't carry, so we
+    # report throughput (clips/s + mean s/clip) as the honest speed metric here.
+    wer = micro_rate(word_clip)
+    wlo, whi = boot_ci(word_clip, n_boot, 42)
+    mean_proc_s = total_proc_s / n if n else 0.0
+    throughput = n / total_proc_s if total_proc_s > 0 else 0.0
+
     out_tsv = os.path.join(os.path.dirname(os.path.abspath(manifest)), "omni7b_results.tsv")
     with open(out_tsv, "w", encoding="utf-8") as f:
-        f.write("char_dist\tchar_ref_len\n")
-        for d, r in per_clip:
-            f.write(f"{d}\t{r}\n")
+        f.write("char_dist\tchar_ref_len\tword_dist\tword_ref_len\n")
+        for (d, r), (wd, wr) in zip(per_clip, word_clip):
+            f.write(f"{d}\t{r}\t{wd}\t{wr}\n")
     out_json = os.path.join(os.path.dirname(os.path.abspath(manifest)), "omni7b_eval_summary.json")
     with open(out_json, "w", encoding="utf-8") as f:
-        json.dump({"n": n, "micro_cer": micro, "ci_lo": lo, "ci_hi": hi, "examples": pairs[:10]},
-                  f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                "n": n,
+                "micro_cer": micro,
+                "ci_lo": lo,
+                "ci_hi": hi,
+                "micro_wer": wer,
+                "wer_ci_lo": wlo,
+                "wer_ci_hi": whi,
+                "total_proc_s": total_proc_s,
+                "mean_proc_s": mean_proc_s,
+                "throughput_clips_per_s": throughput,
+                "examples": pairs[:10],
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     print("=" * 60)
     print(f"  OmniASR-7B (warm server) micro CER = {micro*100:.2f}%   95% CI [{lo*100:.2f}%, {hi*100:.2f}%]   N={n}")
+    print(f"  OmniASR-7B (warm server) micro WER = {wer*100:.2f}%   95% CI [{wlo*100:.2f}%, {whi*100:.2f}%]   N={n}")
+    print(f"  throughput = {throughput:.2f} clips/s ({mean_proc_s:.3f} s/clip; {total_proc_s:.1f}s total)")
     print(f"  (fine-tuned MMS-1B: 21.00% [19.93, 22.04] N=900; stock CTC-300M: 29.40% N=400)")
     print(f"  per-clip -> {out_tsv}")
     print("=" * 60)
