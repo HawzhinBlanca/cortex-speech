@@ -1048,6 +1048,20 @@ export async function exportGoldEvalSet(outDir: string): Promise<GoldEvalExport>
   return invoke<GoldEvalExport>('export_gold_eval_set', { outDir });
 }
 
+/** M5.1 / P5.1: summary of an export_finetune_pack run. */
+export interface FinetunePackResult {
+  manifestPath: string;
+  totalVerified: number;
+  excludedHoldout: number;
+  emitted: number;
+  skipped: number;
+}
+
+/** M5.1 / P5.1: export a fine-tune training pack from verified segments (holdout-excluded) under outDir. */
+export async function exportFinetunePack(outDir: string): Promise<FinetunePackResult> {
+  return invoke<FinetunePackResult>('export_finetune_pack', { outDir });
+}
+
 /** A reproducible scorecard built from already-computed gold-eval results. */
 export interface ScorecardResponse {
   scorecard: unknown;

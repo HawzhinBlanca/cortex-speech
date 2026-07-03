@@ -975,7 +975,7 @@ pub fn transcribe_segment_constrained(
 /// window decoder, early-stopping once past the window. Falls back to a whole-file decode when there is
 /// no window (a single-segment file, which is small). Fixes the per-clip fine-tuned re-transcribe
 /// failing with "audio too large to decode in one pass" on long recordings.
-fn decode_finetuned_clip_16k(audio_path: &str, alignment_json: Option<&str>) -> Result<Vec<i16>, String> {
+pub(crate) fn decode_finetuned_clip_16k(audio_path: &str, alignment_json: Option<&str>) -> Result<Vec<i16>, String> {
     let meta = alignment_json.and_then(crate::chunking::SegmentSourceMeta::from_alignment_json);
     let Some(meta) = meta else {
         let (rate, pcm) = crate::audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
@@ -3307,6 +3307,21 @@ pub fn export_gold_eval_set(
     }
     let db = state.lock_db();
     crate::eval::export_gold_eval_set(&db, std::path::Path::new(&out_dir)).map_err(|e| e.to_string())
+}
+
+/// M5.1 / P5.1: export a fine-tune training pack (trainer manifest + 16 kHz clips) from human-verified
+/// segments under `out_dir`, EXCLUDING holdout gold (the leak guard). Returns the pack summary.
+#[tauri::command]
+pub fn export_finetune_pack(
+    out_dir: String,
+    state: State<'_, AppState>,
+) -> Result<crate::eval::FinetunePackResult, String> {
+    STRICT_RATE_LIMITER.check("export_finetune_pack")?;
+    if out_dir.contains('\0') {
+        return Err("Output path contains null bytes".to_string());
+    }
+    let db = state.lock_db();
+    crate::eval::export_finetune_pack(&db, std::path::Path::new(&out_dir)).map_err(|e| e.to_string())
 }
 
 /// Report which cloud providers have an API key configured (provider NAMES only — never the key

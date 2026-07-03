@@ -254,6 +254,103 @@ pub fn export_gold_eval_set(db: &Database, out_dir: &std::path::Path) -> AppResu
     })
 }
 
+/// Summary of an `export_finetune_pack` run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinetunePackResult {
+    pub manifest_path: String,
+    pub total_verified: usize,
+    /// Verified segments dropped because their audio is a HOLDOUT gold clip (the eval-set leak guard).
+    pub excluded_holdout: usize,
+    pub emitted: usize,
+    /// Skipped for an empty transcript, a duplicate, or undecodable audio.
+    pub skipped: usize,
+}
+
+/// One JSONL row in the fine-tune pack — the trainer's schema.
+#[derive(Serialize)]
+struct FinetuneRow<'a> {
+    audio_path: String,
+    sentence: &'a str,
+    duration_seconds: f64,
+}
+
+/// The human gold transcript for a verified segment (corrected ▸ annotated ▸ normalized ▸ raw),
+/// matching `create_gold_from_verified_file`'s preference.
+fn segment_gold_text(seg: &crate::db::SpeechSegment) -> &str {
+    [seg.verdict_transcript.as_deref(), seg.annotated_transcript.as_deref(), seg.normalized_transcript.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|text| !text.trim().is_empty())
+        .unwrap_or(&seg.raw_transcript)
+}
+
+/// M5.1 / P5.1: export a fine-tune training pack from the HUMAN-VERIFIED segments — the trainer's
+/// manifest schema (`{audio_path, sentence, duration_seconds}`) + a 16 kHz WAV clip per row under
+/// `clips/`. HOLDOUT gold clips are excluded (path AND content hash, via `exclude_holdout_segments`) so
+/// training never contaminates the eval set the promotion gate measures against — the single most
+/// important guard here. Rows are deduped by (audio span, normalized text) so a re-imported duplicate
+/// is not trained on twice; segments with an empty transcript or undecodable audio are skipped.
+pub fn export_finetune_pack(db: &Database, out_dir: &std::path::Path) -> AppResult<FinetunePackResult> {
+    use std::io::Write as _;
+    let verified = db.get_segments(Some(true))?;
+    let total_verified = verified.len();
+    // THE LEAK GUARD: drop any verified segment whose audio is a holdout gold clip.
+    let kept = crate::export::exclude_holdout_segments(db, verified)?;
+    let excluded_holdout = total_verified - kept.len();
+
+    let clips_dir = out_dir.join("clips");
+    std::fs::create_dir_all(&clips_dir).map_err(crate::error::AppError::Io)?;
+    let manifest_path = out_dir.join("finetune_manifest.jsonl");
+    let mut manifest =
+        std::io::BufWriter::new(std::fs::File::create(&manifest_path).map_err(crate::error::AppError::Io)?);
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut emitted = 0usize;
+    let mut skipped = 0usize;
+    for seg in &kept {
+        let text = segment_gold_text(seg);
+        if text.trim().is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let norm = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let dedup_key = format!("{}|{}|{}", seg.audio_path, seg.alignment_json.as_deref().unwrap_or(""), norm);
+        if !seen.insert(dedup_key) {
+            skipped += 1;
+            continue;
+        }
+        let pcm = match crate::commands::decode_finetuned_clip_16k(&seg.audio_path, seg.alignment_json.as_deref()) {
+            Ok(pcm) if !pcm.is_empty() => pcm,
+            _ => {
+                tracing::warn!("finetune pack: skipping {} (clip undecodable)", seg.id);
+                skipped += 1;
+                continue;
+            }
+        };
+        let clip_rel = format!("clips/{}.wav", seg.id);
+        write_wav_16k_mono(&clips_dir.join(format!("{}.wav", seg.id)), &pcm, crate::audio::TARGET_SAMPLE_RATE)?;
+        let row = FinetuneRow {
+            audio_path: clip_rel,
+            sentence: text,
+            duration_seconds: pcm.len() as f64 / crate::audio::TARGET_SAMPLE_RATE as f64,
+        };
+        let line = serde_json::to_string(&row)
+            .map_err(|e| crate::error::AppError::Other(format!("finetune manifest serialize: {e}")))?;
+        writeln!(manifest, "{line}").map_err(crate::error::AppError::Io)?;
+        emitted += 1;
+    }
+    manifest.flush().map_err(crate::error::AppError::Io)?;
+
+    Ok(FinetunePackResult {
+        manifest_path: manifest_path.to_string_lossy().into_owned(),
+        total_verified,
+        excluded_holdout,
+        emitted,
+        skipped,
+    })
+}
+
 /// Load all gold segments from the DB.
 pub fn list_gold_segments(db: &Database) -> AppResult<Vec<GoldSegment>> {
     let conn = db.connection();
@@ -906,6 +1003,68 @@ mod tests {
         assert_eq!(export.skipped, 1);
         let manifest = std::fs::read_to_string(out.path().join("manifest.jsonl")).unwrap();
         assert!(manifest.trim().is_empty(), "no row for a skipped clip");
+    }
+
+    #[test]
+    fn finetune_pack_excludes_holdout_and_emits_verified() {
+        // P5.1: THE leak guard — a verified segment whose audio is a HOLDOUT gold clip must never enter
+        // the training pack (it would contaminate the eval set the promotion gate measures against).
+        let db = open_mem_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Real 16 kHz WAV so the KEEP segment's clip extracts.
+        let keep_wav = tmp.path().join("keep.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut w = hound::WavWriter::create(&keep_wav, spec).unwrap();
+            for i in 0..16000i32 {
+                w.write_sample(((i % 100) - 50) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        // KEEP: a verified segment on a non-holdout file.
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "keep".into(),
+            audio_path: keep_wav.to_string_lossy().to_string(),
+            raw_transcript: "ڕاستکراوە".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.update_verified("keep", true).unwrap();
+        // LEAK: a holdout gold entry + a verified segment on the SAME audio path.
+        import_gold_segments(
+            &db,
+            vec![GoldSegmentInput { audio_path: "/leak.wav".into(), reference: "r".into(), is_holdout: true }],
+        )
+        .unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "leak".into(),
+            audio_path: "/leak.wav".into(),
+            raw_transcript: "گۆڵد".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.update_verified("leak", true).unwrap();
+
+        let out = tempfile::TempDir::new().unwrap();
+        let result = export_finetune_pack(&db, out.path()).unwrap();
+        assert_eq!(result.total_verified, 2);
+        assert_eq!(result.excluded_holdout, 1, "the holdout-matching segment is excluded (leak guard)");
+        assert_eq!(result.emitted, 1, "only the non-holdout verified segment is emitted");
+
+        let manifest = std::fs::read_to_string(out.path().join("finetune_manifest.jsonl")).unwrap();
+        let lines: Vec<&str> = manifest.lines().collect();
+        assert_eq!(lines.len(), 1, "one training row for the kept segment");
+        let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row["sentence"], "ڕاستکراوە");
+        let clip_rel = row["audio_path"].as_str().unwrap();
+        assert!(clip_rel.starts_with("clips/"), "audio_path is relative");
+        assert!(out.path().join(clip_rel).is_file(), "the training clip was written");
+        assert!(!manifest.contains("گۆڵد"), "the holdout segment's text never enters the pack");
     }
 
     #[test]
