@@ -55,6 +55,7 @@ pub mod secret_redaction;
 pub mod session;
 pub mod settings;
 pub mod significance;
+pub mod snapshot;
 pub mod stats;
 pub mod telemetry;
 pub mod throttle;
@@ -375,6 +376,31 @@ pub fn run() {
     };
     if let Err(e) = db.initialize() {
         fatal_app_error(format!("Failed to initialize database schema: {e}"));
+    }
+
+    // P3.1/M0.4b: rotating auto-snapshots of the DB + config state. One on startup (so a corruption is
+    // recoverable from the moment the app runs), then every 10 minutes — protecting the marathon's
+    // irreplaceable review labor without any user action. Skipped in headless test modes.
+    const SNAPSHOT_KEEP: usize = 10;
+    const SNAPSHOT_INTERVAL_SECS: u64 = 600;
+    if !smoke_test {
+        if let Err(e) = crate::snapshot::take_snapshot(&db, &data_dir, SNAPSHOT_KEEP) {
+            tracing::warn!("startup DB snapshot failed: {e}");
+        }
+        let snap_db_path = db_path.clone();
+        let snap_data_dir = data_dir.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(SNAPSHOT_INTERVAL_SECS));
+            // A fresh read connection avoids holding the app's DB mutex for the backup's duration.
+            match Database::open(snap_db_path.to_string_lossy().as_ref()) {
+                Ok(snap_db) => {
+                    if let Err(e) = crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
+                        tracing::warn!("periodic DB snapshot failed: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("periodic snapshot: could not open db: {e}"),
+            }
+        });
     }
 
     let settings_path = data_dir.join("settings.json");
