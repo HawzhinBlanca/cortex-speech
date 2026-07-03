@@ -314,3 +314,12 @@ review-throughput baseline. Batch all P1 code, then ONE rebuild to freshness-gre
 
 C8 (zero owner PII in public surface) green. C9 (exe provably HEAD) green via the P0.2 gate
 after the post-scrub rebuild.
+
+## P0.2 hardening (2026-07-03): build.rs SHA-staleness bug fixed
+
+A post-scrub rebuild revealed the baked GIT_SHA was STALE (exe stamped the scrub commit, not
+the built HEAD) because build.rs ran `git rev-parse HEAD` without a `rerun-if-changed`, so cargo
+cached the build-script output across commits. This undermined the whole P0.2 gate. Fixed:
+build.rs now emits `cargo:rerun-if-changed` for `.git/HEAD` and `.git/logs/HEAD` (reflog updates
+on every HEAD change), so the SHA re-bakes on every commit/checkout. Final rebuild after this
+verifies the exe stamps the correct HEAD and `make check-fresh` is green.
