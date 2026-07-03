@@ -460,6 +460,7 @@ pub fn run() {
             commands::align_segment,
             commands::get_segment_consensus,
             commands::get_segments,
+            commands::get_segments_suspect_first,
             commands::search_segments,
             commands::update_segment,
             commands::delete_segment,

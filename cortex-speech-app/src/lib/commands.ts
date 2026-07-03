@@ -137,6 +137,20 @@ export async function getSegments(verified?: boolean): Promise<SpeechSegment[]> 
   return data;
 }
 
+/**
+ * M2.5 / P1.4: segments ordered suspect-first — escalated (jury doubts) first, then lowest agent
+ * confidence, then chronological. Feeds the ReviewMode suspect-first queue toggle so the reviewer
+ * lands on the riskiest clips first.
+ */
+export async function getSegmentsSuspectFirst(verified?: boolean): Promise<SpeechSegment[]> {
+  const data = await invoke<SpeechSegment[]>('get_segments_suspect_first', { verified });
+  if (!Array.isArray(data)) {
+    console.error('getSegmentsSuspectFirst: expected array, got', typeof data);
+    return [];
+  }
+  return data;
+}
+
 export async function searchSegments(query: string): Promise<SpeechSegment[]> {
   return invoke<SpeechSegment[]>('search_segments', { query });
 }

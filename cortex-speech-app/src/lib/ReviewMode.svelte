@@ -19,12 +19,40 @@
   }
   let { onExport, onDone }: Props = $props();
 
+  // M2.5/P1.4: suspect-first queue toggle. When on, the pending group is reordered by the backend's
+  // suspect ranking (escalated first, then lowest agent confidence, then chronological) so the reviewer
+  // lands on the riskiest clips first. Off by default — the plain pending-first order is unchanged.
+  let suspectFirst = $state(false);
+  // Cached id→rank from the backend command; new segments (not in the map) sort to the end.
+  let suspectRank = $state<Map<string, number> | null>(null);
+
+  async function toggleSuspectFirst() {
+    const next = !suspectFirst;
+    if (next) {
+      try {
+        const ordered = await api.getSegmentsSuspectFirst();
+        suspectRank = new Map(ordered.map((s, i) => [s.id, i]));
+      } catch (e) {
+        notifications.error($t('review.suspectFirstFailed'), { detail: String(e) });
+        return; // stay off if the fetch failed
+      }
+    } else {
+      suspectRank = null;
+    }
+    suspectFirst = next;
+    index = 0; // land on the top of the reordered queue
+  }
+
   // Simple, focused review queue: one clip at a time. Pending (unverified) first,
   // then the rest — so a reviewer always lands on work that needs doing.
   const queue = $derived.by<SpeechSegment[]>(() => {
     const all = $segments;
     const pending = all.filter((s) => !s.verified);
     const done = all.filter((s) => s.verified);
+    if (suspectFirst && suspectRank) {
+      const rank = suspectRank;
+      pending.sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity));
+    }
     return [...pending, ...done];
   });
 
@@ -477,9 +505,23 @@
               .replace('{n}', String(index + 1))
               .replace('{total}', String(queue.length))}
           </span>
-          <span class="badge {isVerified ? 'badge-verified' : 'badge-pending'}">
-            {isVerified ? $t('verified') : $t('pending')}
-          </span>
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              data-testid="suspect-first-toggle"
+              onclick={toggleSuspectFirst}
+              title={$t('review.suspectFirstHint')}
+              aria-pressed={suspectFirst}
+              class="rounded-md border px-2 py-1 text-xs transition-colors {suspectFirst
+                ? 'border-accent bg-accent/15 text-accent'
+                : 'border-surface-3 text-subtle hover:text-muted'}"
+            >
+              {$t('review.suspectFirst')}
+            </button>
+            <span class="badge {isVerified ? 'badge-verified' : 'badge-pending'}">
+              {isVerified ? $t('verified') : $t('pending')}
+            </span>
+          </div>
         </div>
         <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-surface-3">
           <div class="h-full rounded-full bg-accent transition-all duration-300" style="width: {pct}%"></div>
