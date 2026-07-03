@@ -582,3 +582,22 @@ functions exist and the M5 runbook uses them.
 NEXT: write docs/RETRAIN_RUNBOOK.md — accurate owner-facing steps tying the now-existing plumbing
 together (export_finetune_pack -> QLoRA train on the 4090 -> import_model_checkpoint -> gate_and_promote
 on frozen app-gold), so the owner can execute the M5 cycle when M3 data exists.
+
+## Self-review defect hunt (2026-07-03) — resume orphaned-segments bug found + fixed
+
+Adversarial re-read of THIS session's own Rust (the "brutal reality check" standard) surfaced a
+real correctness bug in the P3.2 import-resume feature I shipped earlier this session:
+
+- BUG: the post-import jury runs ONCE at the end, keyed on `imported_ids`. A crash interrupts the
+  import BEFORE that jury ever runs. On resume, already-imported files are skipped and were NOT
+  added to `imported_ids`, so segments persisted before the crash were never adjudicated — no
+  reference commit, no review-queue routing. Orphaned, persisted-but-un-adjudicated segments.
+- FIX (e9f7844): on the resume skip-path, fold each already-imported file's segments back into the
+  jury batch via new `db.segment_ids_for_audio_path()`. The end-of-run jury now covers the whole
+  resumed import. Regression test `segment_ids_for_audio_path_returns_only_that_files_segments`
+  pins the accessor (only that file's segments, insert order, empty on unknown path).
+- HONESTY: accessor + db suite verified (56 db tests green, clippy -D warnings clean, python
+  policies green). The full crash->resume->jury path needs the ASR models, so that end-to-end is
+  reasoned + compiled, NOT run on real audio — stated plainly, not claimed as measured.
+- Exe rebuilt (npm build + cargo build --release, 6m44s); freshness GREEN at e9f7844 — the running
+  app carries the fix.
