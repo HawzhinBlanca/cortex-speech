@@ -529,3 +529,23 @@ import_directory (additive best-effort) + a resume-skip param (None = normal, so
 get_interrupted_import / resume_interrupted_import / discard_interrupted_import commands + a startup
 Resume/Discard banner. Then rebuild. (Within-single-long-file incremental persistence stays deferred —
 risky core refactor, owner-testable P3.9.)
+
+## P3.2 COMPLETE + P3 automatable hardening DONE (2026-07-03)
+
+748ce95: wired the import journal into import_directory (resume_completed skip-set, None=normal so
+unchanged; best-effort begin/mark-done/complete) + get_interrupted_import/resume_interrupted_import/
+discard_interrupted_import commands + a startup Resume/Discard banner. Rebuilt: exe at HEAD 748ce95,
+freshness GREEN, resume commands in the binary. A crashed directory import is now resumable (skips
+already-imported files).
+
+ALL AUTOMATABLE P3 DONE + SHIPPED: P3.1 snapshots, P3.2 import resume, P3.3 audio durability, P3.4
+model integrity, P3.7 path robustness, P3.8 retention+db-size. Owner-gated remaining: P3.5 WSL drills,
+P3.6 export spot-check, P3.9 multi-hour perf (P3.10 git done).
+
+Session automatable scope essentially complete: P0, hygiene+PII scrub+merge, P1.1-P1.7 (M2
+instrumentation live), P2.1 (M1 runnable), P2.3 toggle, all P3 hardening. Owner/GPU-gated: P2.2
+benchmark, P3.5/6/9 drills, P4 marathon, P5 retrain execution, P6 DirectML, P7 re-audit.
+
+NEXT AUTOMATABLE: P5.1 export_finetune_pack — the training-pack variant of export_gold_eval_set
+(trainer manifest schema + 16kHz clips from human-verified segments, gold/holdout-EXCLUDED, deduped;
+extend the holdout-leak test). Plumbing can land before the M3 data exists.
