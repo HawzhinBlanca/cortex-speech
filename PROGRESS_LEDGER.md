@@ -796,3 +796,22 @@ dependency rlibs (persisted after cargo clean -p; required FULL cargo clean). Al
 garbage from disk-cached artifacts. RECOMMEND the owner check disk health (chkdsk / SMART) and AV
 exclusions for the repo + toolchain dirs; if it recurs, memtest. The exe is REBUILDING from scratch
 in the background; freshness gate is RED until it lands — will confirm and re-verify when done.
+
+## Machine instability ROOT-CAUSED to a GPU driver fault (2026-07-04 ~08:30)
+
+The 4-toolchain failure cascade (vitest forks dying, MSVC LNK1000, thin-LTO bitcode corruption,
+rustc STATUS_ACCESS_VIOLATION + a second rustc panic) is now explained: Windows System log shows
+THREE nvlddmkm (NVIDIA display driver) faults, Event 153, at 08:30:59-08:31:35 — immediately before
+the first toolchain failure. No WHEA hardware (RAM/CPU machine-check) errors logged. A kernel-mode
+GPU driver fault destabilizing system memory matches the observed signature exactly.
+
+HONEST STATE: B1 + B2 fixes are SAFE (committed + pushed at 71365e9/e081d60; all code gates ran
+green BEFORE the instability). The release exe is currently MISSING (cargo clean during the failed
+rebuild) — freshness gate RED until a post-reboot rebuild succeeds. NOT retry-looping builds on an
+unstable kernel: a silently-corrupted binary would be worse than a missing one.
+
+OWNER ACTION (when convenient): 1) if nothing GPU-critical is running, REBOOT (clears the
+driver-corrupted state); 2) rerun `cargo build --release` in src-tauri, then
+`python scripts/check_exe_freshness.py` — expect GREEN; 3) if toolchain crashes persist after the
+reboot, then chkdsk + Windows Memory Diagnostic; 4) check what was using the GPU at 08:30 (driver
+crash under load — if it recurs, update/clean-install the NVIDIA driver before the P2.2 benchmark).
