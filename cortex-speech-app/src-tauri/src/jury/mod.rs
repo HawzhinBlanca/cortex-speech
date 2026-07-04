@@ -312,7 +312,12 @@ pub fn run_t0_gate(
             T0Decision::EscalateToT1 { .. } => {
                 // Observe is pure observation: it stages nothing and commits no verdict.
                 if !matches!(autonomy, crate::settings::AutonLevel::Observe) {
-                    write_verdict(db, &seg.id, Verdict::Escalated, None, None, None, None)?;
+                    // True-10 audit: carry the IRT confidence on the ESCALATED verdict too. Every
+                    // escalated row used to write agent_confidence=None, so the suspect-first
+                    // ordering (COALESCE(agent_confidence, 0.5) ASC) saw a constant and silently
+                    // degraded to recency — "riskiest-first" was nominal. With the real confidence
+                    // persisted, the most-disagreed-on clips genuinely surface first.
+                    write_verdict(db, &seg.id, Verdict::Escalated, None, None, None, Some(irt_confidence))?;
                 }
                 escalated += 1;
             }

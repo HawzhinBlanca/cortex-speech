@@ -1962,6 +1962,28 @@ mod tests {
     }
 
     #[test]
+    fn suspect_first_ranks_escalated_by_real_confidence_not_recency() {
+        // True-10 audit: escalated rows used to carry agent_confidence=None, collapsing the second
+        // sort key (COALESCE(agent_confidence, 0.5) ASC) to a constant — "suspect-first" silently
+        // degraded to recency. With the jury now persisting the IRT confidence on escalation, the
+        // most-doubted clip genuinely ranks first; a legacy None row slots at the 0.5 midpoint.
+        let db = make_db();
+        for id in ["confident", "shaky", "legacy"] {
+            db.insert_segment(&make_segment(id, "/audio/s.wav")).unwrap();
+        }
+        db.write_segment_verdict("confident", "escalated", None, None, None, Some(0.9), true).unwrap();
+        db.write_segment_verdict("shaky", "escalated", None, None, None, Some(0.2), true).unwrap();
+        db.write_segment_verdict("legacy", "escalated", None, None, None, None, true).unwrap();
+
+        let ordered: Vec<String> = db.get_segments_suspect_first(None).unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            ordered,
+            vec!["shaky".to_string(), "legacy".to_string(), "confident".to_string()],
+            "lowest jury confidence first; a legacy None row sits at the 0.5 midpoint"
+        );
+    }
+
+    #[test]
     fn segment_ids_for_audio_path_returns_only_that_files_segments() {
         // P3.2 resume fix: on import-resume, already-imported files are folded back into the jury
         // batch by their segment ids. This pins that the lookup returns exactly (and only) the
