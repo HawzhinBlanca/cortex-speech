@@ -824,3 +824,23 @@ new nvlddmkm faults in the last hour, but the kernel/memory state from the 08:30
 HOLDING all source work and full-build probes (each failed build is minutes of disk churn on an
 unstable kernel). Future wakes use a seconds-cheap `rustc hello.rs` probe + uptime check; the real
 rebuild resumes after a fresh boot. B1+B2 remain safely pushed; exe still missing (freshness RED).
+
+## ROOT CAUSE REVISED (2026-07-04 ~12:20) — Defender config change at 08:31, not hardware
+
+The from-scratch -j4 rebuild ALSO failed (rustc_serialize panic; ~600 dep crates compiled clean,
+then one metadata read hit garbage) — yet zero hardware/disk/NTFS events logged all day. New
+evidence: Windows Defender Operational log shows Event 5007 (antimalware platform CONFIGURATION
+CHANGED) at 08:31:10 — the exact minute of the nvlddmkm blips and the onset of ALL toolchain
+failures. Real-time protection: ON; exclusions unreadable without admin (likely none). AV
+interception of toolchain I/O explains the full signature (fork spawn deaths, LNK1000, LTO bitcode
+garbage, rmeta decode panics) with no hardware errors — and builds ran fine for hours before 08:31.
+
+OWNER ACTION (requires admin), in order:
+1. Add Defender exclusions (admin PowerShell):
+   Add-MpPreference -ExclusionPath "$env:USERPROFILE\Desktop\CORTEX","$env:USERPROFILE\.cargo","$env:USERPROFILE\.rustup"
+   Add-MpPreference -ExclusionProcess "rustc.exe","cargo.exe","link.exe","node.exe"
+   (also a large permanent build-speed win)
+2. Reboot (clears whatever the 08:31 config change destabilized).
+3. Then I rebuild + verify freshness GREEN.
+HOLDING all builds until then — three from-scratch attempts is enough evidence; more churn proves
+nothing new. B1+B2 remain safely pushed (a807949/71365e9); exe missing; freshness RED.
