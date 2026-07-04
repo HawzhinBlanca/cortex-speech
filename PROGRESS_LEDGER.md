@@ -866,3 +866,16 @@ REVISED WORK PLAN (evidence-based): dev-profile verification (cargo test --lib, 
 node gates are PROVEN to work on the machine in its current state — so the audit fix plan RESUMES
 now with dev-verified commits; only the release-exe rebuild waits for the hardware fix. Freshness
 stays RED (exe missing) until then — documented, not hidden.
+
+## Dataset-quality majors 1+2 FIXED (2026-07-04) — dev-verified under the hardware constraint
+
+95cb570: (1) gold references now REFUSE files with rejected chunks (the known-wrong draft can no
+longer poison a WER/CER reference, and a silently-truncated reference can't either — actionable
+refusal message; bulk promoter warns+skips); (2) ValidationPanel scores the SAME raw hypothesis as
+quality.rs via the now-shared quality::hypothesis_transcript — no more false HighWer/HighCer Errors
+blocking exports on verbalized-number transcripts. Tests pin both.
+Verified dev-profile (clippy clean; gold 31 / validation 17 / wer_gate green; policies green).
+NOTE: a rustc panic mid-verification was fixed by clearing target/debug/incremental (poisoned by
+the earlier crashes) + CARGO_INCREMENTAL=0 — the instability contaminates caches that then fail
+deterministically; clearing them restores dev workability. Release exe still awaits the hardware
+fix (freshness RED). Remaining in the cluster: Sorani normalization of exported training text.
