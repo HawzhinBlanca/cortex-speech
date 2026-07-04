@@ -599,6 +599,34 @@ export async function relinkAudio(searchDir: string): Promise<RelinkResult> {
   return invoke<RelinkResult>('relink_audio', { searchDir });
 }
 
+/** B2: a past corruption quarantine, if any, plus how many restore snapshots exist. */
+export interface QuarantineNotice {
+  quarantinedFiles: string[];
+  snapshotCount: number;
+  newestSnapshotSegments: number | null;
+}
+
+export async function getQuarantineNotice(): Promise<QuarantineNotice> {
+  return invoke<QuarantineNotice>('get_quarantine_notice');
+}
+
+/** B2: one rotating auto-snapshot in the restore picker (newest first). */
+export interface SnapshotInfo {
+  name: string;
+  timestamp: number;
+  dbSizeBytes: number;
+  segmentCount: number | null;
+}
+
+export async function listDbSnapshots(): Promise<SnapshotInfo[]> {
+  return invoke<SnapshotInfo[]>('list_db_snapshots');
+}
+
+/** B2: restore the live database from a named auto-snapshot (destructive — confirm first). */
+export async function restoreDbFromSnapshot(name: string): Promise<void> {
+  return invoke<void>('restore_db_from_snapshot', { name });
+}
+
 /** Complete speaker list (not the truncated top-10 dashboard summary) for the speaker manager. */
 export async function getSpeakers(): Promise<SpeakerStat[]> {
   return invoke<SpeakerStat[]>('get_speakers');

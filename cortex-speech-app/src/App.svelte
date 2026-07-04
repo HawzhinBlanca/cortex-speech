@@ -162,6 +162,8 @@
 
   // P3.2: a crashed directory import offered for resume at startup.
   let interruptedImport = $state<import('./lib/commands').ImportJob | null>(null);
+  // B2: non-null when a corruption quarantine happened; the banner stays until dismissed this session.
+  let quarantineNotice = $state<import('./lib/commands').QuarantineNotice | null>(null);
   async function resumeImport() {
     const job = interruptedImport;
     if (!job) return;
@@ -462,6 +464,12 @@
       await restoreAndApplySession();
       // P3.2: a still-'running' import job at startup means a crash interrupted a directory import.
       interruptedImport = await api.getInterruptedImport().catch(() => null);
+      // B2: a past corruption event quarantined a database file — say so LOUDLY, with the restore
+      // count, instead of letting the owner work on silently in an empty library.
+      quarantineNotice = await api
+        .getQuarantineNotice()
+        .then((n) => (n.quarantinedFiles.length > 0 ? n : null))
+        .catch(() => null);
     } else {
       segments.set([]);
       segmentsLoading = false;
@@ -1590,6 +1598,26 @@
 </script>
 
 <div class="h-screen flex flex-col bg-app text-default" data-testid="app-root">
+  {#if quarantineNotice}
+    <div
+      class="flex items-center justify-between gap-3 border-b border-red-600/50 bg-red-950/50 px-4 py-2"
+      data-testid="quarantine-banner"
+    >
+      <span class="text-sm text-red-200">
+        {$t('db.quarantined')
+          .replace('{files}', String(quarantineNotice.quarantinedFiles.length))
+          .replace('{snapshots}', String(quarantineNotice.snapshotCount))}
+      </span>
+      <button
+        type="button"
+        class="btn btn-ghost !text-xs"
+        data-testid="dismiss-quarantine-btn"
+        onclick={() => (quarantineNotice = null)}
+      >
+        {$t('db.quarantineDismiss')}
+      </button>
+    </div>
+  {/if}
   {#if interruptedImport}
     <div
       class="flex items-center justify-between gap-3 border-b border-amber-600/40 bg-amber-950/40 px-4 py-2"

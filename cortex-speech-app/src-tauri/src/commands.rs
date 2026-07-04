@@ -2376,6 +2376,61 @@ pub fn db_vacuum(state: State<'_, AppState>) -> Result<(), String> {
     db.vacuum().map_err(|e| e.to_string())
 }
 
+/// B2: report whether a past corruption event quarantined a database (files named
+/// `cortex-speech.corrupt.<ts>` in the data dir), plus how many restore snapshots exist — so the
+/// frontend can show a loud banner instead of the owner silently working in an empty library.
+#[tauri::command]
+pub fn get_quarantine_notice(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    RATE_LIMITER.check("get_quarantine_notice")?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    let mut quarantined: Vec<String> = std::fs::read_dir(&data_dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // recover_database_at renames to `<stem>.corrupt.<ts>[.n]` (+ sidecars); count main files only.
+            (name.contains(".corrupt.") && !name.ends_with("-wal") && !name.ends_with("-shm")).then_some(name)
+        })
+        .collect();
+    quarantined.sort();
+    let snapshots = crate::snapshot::list_snapshots(&data_dir);
+    Ok(serde_json::json!({
+        "quarantinedFiles": quarantined,
+        "snapshotCount": snapshots.len(),
+        "newestSnapshotSegments": snapshots.first().and_then(|s| s.segment_count),
+    }))
+}
+
+/// B2: list the rotating auto-snapshots (newest first) for the restore picker.
+#[tauri::command]
+pub fn list_db_snapshots(state: State<'_, AppState>) -> Result<Vec<crate::snapshot::SnapshotInfo>, String> {
+    RATE_LIMITER.check("list_db_snapshots")?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    Ok(crate::snapshot::list_snapshots(&data_dir))
+}
+
+/// B2: restore the live database from a named auto-snapshot. The name must be a bare
+/// `snapshot_<digits>` component (no separators — cannot traverse), and the snapshot must contain a
+/// DB file. Restore goes through the same SQLite online-backup path as `db_restore`.
+#[tauri::command]
+pub fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    STRICT_RATE_LIMITER.check("restore_db_from_snapshot")?;
+    let valid =
+        name.strip_prefix("snapshot_").is_some_and(|ts| !ts.is_empty() && ts.bytes().all(|b| b.is_ascii_digit()));
+    if !valid {
+        return Err(format!("invalid snapshot name '{name}'"));
+    }
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    let src = data_dir.join("snapshots").join(&name).join("cortex-speech.db");
+    if !src.is_file() {
+        return Err(format!("snapshot '{name}' has no database file"));
+    }
+    let mut db = state.lock_db();
+    db.restore(&src).map_err(|e| e.to_string())?;
+    tracing::info!("database restored from auto-snapshot {name}");
+    Ok(())
+}
+
 /// P3.3: report which distinct source audio files are missing on disk (moved/renamed/deleted).
 #[tauri::command]
 pub fn get_audio_health(state: State<'_, AppState>) -> Result<crate::db::AudioHealth, String> {

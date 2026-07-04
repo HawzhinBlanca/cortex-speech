@@ -211,6 +211,44 @@
     }
   }
 
+  // B2: restore-from-snapshot picker. `snapshots` non-null = list expanded. Restoring overwrites the
+  // live library, so it demands an explicit confirm; on success the whole app reloads (every store —
+  // segments, session cursor, stats — must re-derive from the restored DB).
+  let snapshots = $state<import('./commands').SnapshotInfo[] | null>(null);
+
+  async function toggleSnapshotList() {
+    if (!tauriAvailable || toolBusy) return;
+    if (snapshots) {
+      snapshots = null;
+      return;
+    }
+    toolBusy = 'listSnapshots';
+    try {
+      snapshots = await api.listDbSnapshots();
+    } catch (e) {
+      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+    } finally {
+      toolBusy = null;
+    }
+  }
+
+  async function restoreSnapshot(name: string, segmentCount: number | null) {
+    if (!tauriAvailable || toolBusy) return;
+    const message = $t('stats.restoreConfirm')
+      .replace('{name}', name)
+      .replace('{n}', segmentCount === null ? '?' : String(segmentCount));
+    if (!window.confirm(message)) return;
+    toolBusy = 'restore';
+    try {
+      await api.restoreDbFromSnapshot(name);
+      // Full reload: the restored DB invalidates every in-memory store.
+      window.location.reload();
+    } catch (e) {
+      notifications.error($t('stats.restoreFailed'), { detail: String(e) });
+      toolBusy = null;
+    }
+  }
+
   // P3.4: full-SHA integrity check of the bundled fine-tuned model (a few seconds — hashes 970 MB).
   // Surfaces the on-demand backend guard so the owner can confirm the champion is intact/uncorrupted.
   async function verifyModelIntegrity() {
@@ -658,7 +696,45 @@
           >
             {toolBusy === 'verify' ? $t('stats.toolWorking') : $t('stats.verifyModel')}
           </button>
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
+            data-testid="restore-snapshot-btn"
+            disabled={toolBusy !== null}
+            onclick={toggleSnapshotList}
+          >
+            {toolBusy === 'listSnapshots' ? $t('stats.toolWorking') : $t('stats.restoreSnapshot')}
+          </button>
         </div>
+        {#if snapshots}
+          <div class="space-y-1 max-h-40 overflow-y-auto" data-testid="snapshot-list">
+            {#if snapshots.length === 0}
+              <p class="text-[10px] text-cortex-500">{$t('stats.noSnapshots')}</p>
+            {:else}
+              {#each snapshots as snap}
+                <div class="flex items-center gap-2 text-xs bg-cortex-800/30 rounded-lg px-2 py-1">
+                  <span class="text-cortex-300 font-mono flex-1">
+                    {new Date(snap.timestamp * 1000).toLocaleString()}
+                  </span>
+                  <span class="text-cortex-400">
+                    {snap.segmentCount === null
+                      ? '?'
+                      : snap.segmentCount}
+                    {$t('stats.segShort')} · {(snap.dbSizeBytes / 1048576).toFixed(1)} MB
+                  </span>
+                  <button
+                    type="button"
+                    class="btn btn-primary !text-[10px] !px-2 !py-0.5"
+                    disabled={toolBusy !== null}
+                    onclick={() => restoreSnapshot(snap.name, snap.segmentCount)}
+                  >
+                    {toolBusy === 'restore' ? $t('stats.toolWorking') : $t('stats.restore')}
+                  </button>
+                </div>
+              {/each}
+            {/if}
+          </div>
+        {/if}
         {#if buildSha}
           <div class="text-[10px] text-cortex-600 font-mono" data-testid="build-sha">
             {$t('stats.buildSha')}: {buildSha.slice(0, 12)}

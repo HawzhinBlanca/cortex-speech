@@ -414,6 +414,15 @@ export const en: Record<string, string> = {
     'Fine-tune pack: {n} clip(s) emitted, {h} holdout excluded, {r} refused by the grade rubric, {s} skipped.',
   'stats.goldEvalDone': 'Gold eval set: {n} clip(s) exported.',
   'stats.importGoldDone': '{n} verified source file(s) imported as gold.',
+  'stats.restoreSnapshot': 'Restore from snapshot…',
+  'stats.restore': 'Restore',
+  'stats.noSnapshots': 'No auto-snapshots yet.',
+  'stats.restoreConfirm':
+    'Replace the CURRENT library with snapshot {name} ({n} segments)? Everything newer than this snapshot will be lost. The app reloads after the restore.',
+  'stats.restoreFailed': 'Restore failed',
+  'db.quarantined':
+    'Your library was quarantined after database corruption ({files} file(s) saved aside). {snapshots} auto-snapshot(s) are available — open Stats → Restore from snapshot.',
+  'db.quarantineDismiss': 'Dismiss',
   'stats.verifyModel': 'Verify model integrity',
   'stats.verifyModelOk': 'Model integrity verified — checksums match.',
   'stats.verifyModelFailed': 'Model integrity check failed',

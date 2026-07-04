@@ -384,8 +384,10 @@ pub fn run() {
     const SNAPSHOT_KEEP: usize = 10;
     const SNAPSHOT_INTERVAL_SECS: u64 = 600;
     if !smoke_test {
-        if let Err(e) = crate::snapshot::take_snapshot(&db, &data_dir, SNAPSHOT_KEEP) {
-            tracing::warn!("startup DB snapshot failed: {e}");
+        match crate::snapshot::take_snapshot(&db, &data_dir, SNAPSHOT_KEEP) {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::warn!("startup DB snapshot skipped by the empty-DB guard"),
+            Err(e) => tracing::warn!("startup DB snapshot failed: {e}"),
         }
         let snap_db_path = db_path.clone();
         let snap_data_dir = data_dir.clone();
@@ -393,11 +395,10 @@ pub fn run() {
             std::thread::sleep(std::time::Duration::from_secs(SNAPSHOT_INTERVAL_SECS));
             // A fresh read connection avoids holding the app's DB mutex for the backup's duration.
             match Database::open(snap_db_path.to_string_lossy().as_ref()) {
-                Ok(snap_db) => {
-                    if let Err(e) = crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
-                        tracing::warn!("periodic DB snapshot failed: {e}");
-                    }
-                }
+                Ok(snap_db) => match crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("periodic DB snapshot failed: {e}"),
+                },
                 Err(e) => tracing::warn!("periodic snapshot: could not open db: {e}"),
             }
         });
@@ -554,6 +555,9 @@ pub fn run() {
             commands::db_backup,
             commands::db_restore,
             commands::db_vacuum,
+            commands::get_quarantine_notice,
+            commands::list_db_snapshots,
+            commands::restore_db_from_snapshot,
             commands::get_audio_health,
             commands::relink_audio,
             commands::db_wal_checkpoint,
