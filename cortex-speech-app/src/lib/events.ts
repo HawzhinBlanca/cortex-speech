@@ -1,5 +1,12 @@
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { get } from 'svelte/store';
 import { notifications } from './stores/notificationStore';
+import { t } from './i18n';
+
+// True-10 audit: every notification here was hardcoded English, so in the CKB locale the app went
+// mixed-language exactly where pipeline status/errors need to be clearest. Module-scope translator
+// (evaluated per call, so a locale switch applies immediately).
+const tr = (key: string, params?: Record<string, string>) => get(t)(key, params);
 import {
   isProcessing,
   pipelinePhase,
@@ -86,15 +93,17 @@ async function refreshAfterImport(payload: ImportComplete): Promise<void> {
   if (payload.source !== 'file') {
     if (payload.failed > 0) {
       notifications.warning(
-        `Completed: ${payload.succeeded} OK, ${payload.failed} failed (of ${payload.total})`,
+        tr('events.importPartial', {
+          ok: String(payload.succeeded),
+          failed: String(payload.failed),
+          total: String(payload.total),
+        }),
       );
     } else if (payload.total > 0) {
-      notifications.success(
-        `Successfully processed ${payload.total} file${payload.total === 1 ? '' : 's'}`,
-      );
+      notifications.success(tr('events.importSuccess', { n: String(payload.total) }));
     }
   } else if (payload.failed > 0) {
-    notifications.error('Import failed', { detail: 'See pipeline error for details' });
+    notifications.error(tr('events.importFailed'), { detail: tr('events.importFailedDetail') });
   }
 
   isProcessing.set(false);
@@ -109,7 +118,7 @@ async function refreshAfterImport(payload: ImportComplete): Promise<void> {
     try {
       await onImportComplete(payload);
     } catch (e) {
-      notifications.error('Failed to refresh segments', { detail: String(e) });
+      notifications.error(tr('events.refreshFailed'), { detail: String(e) });
     }
   }
 }
@@ -120,39 +129,22 @@ async function refreshAfterBatch(payload: BatchProgressEvent): Promise<void> {
   pipelinePhase.set('idle');
   agentPipelineStages.set([]);
 
+  const batchOps: Record<string, { partial: string; success: string }> = {
+    transcribe: { partial: 'events.batchTranscribePartial', success: 'events.transcribed' },
+    verify: { partial: 'events.batchVerifyPartial', success: 'events.verified' },
+    assign_speaker: { partial: 'events.batchSpeakerPartial', success: 'events.speakerAssigned' },
+    normalize: { partial: 'events.batchNormalizePartial', success: 'events.normalized' },
+  };
   if (payload.cancelled) {
-    notifications.warning('Batch operation cancelled');
-  } else if (payload.operation === 'transcribe') {
+    notifications.warning(tr('events.batchCancelled'));
+  } else if (payload.operation && batchOps[payload.operation]) {
+    const keys = batchOps[payload.operation];
     if ((payload.failed ?? 0) > 0) {
       notifications.warning(
-        `Batch transcribe: ${payload.succeeded ?? 0} OK, ${payload.failed ?? 0} failed`,
+        tr(keys.partial, { ok: String(payload.succeeded ?? 0), failed: String(payload.failed ?? 0) }),
       );
     } else if ((payload.succeeded ?? 0) > 0) {
-      notifications.success(`Transcribed ${payload.succeeded} segment(s)`);
-    }
-  } else if (payload.operation === 'verify') {
-    if ((payload.failed ?? 0) > 0) {
-      notifications.warning(
-        `Batch verify: ${payload.succeeded ?? 0} OK, ${payload.failed ?? 0} failed`,
-      );
-    } else if ((payload.succeeded ?? 0) > 0) {
-      notifications.success(`Verified ${payload.succeeded} segment(s)`);
-    }
-  } else if (payload.operation === 'assign_speaker') {
-    if ((payload.failed ?? 0) > 0) {
-      notifications.warning(
-        `Batch speaker assign: ${payload.succeeded ?? 0} OK, ${payload.failed ?? 0} failed`,
-      );
-    } else if ((payload.succeeded ?? 0) > 0) {
-      notifications.success(`Assigned speaker on ${payload.succeeded} segment(s)`);
-    }
-  } else if (payload.operation === 'normalize') {
-    if ((payload.failed ?? 0) > 0) {
-      notifications.warning(
-        `Batch normalize: ${payload.succeeded ?? 0} OK, ${payload.failed ?? 0} failed`,
-      );
-    } else if ((payload.succeeded ?? 0) > 0) {
-      notifications.success(`Normalized ${payload.succeeded} segment(s)`);
+      notifications.success(tr(keys.success, { n: String(payload.succeeded) }));
     }
   }
 
@@ -160,7 +152,7 @@ async function refreshAfterBatch(payload: BatchProgressEvent): Promise<void> {
     try {
       await onBatchComplete(payload);
     } catch (e) {
-      notifications.error('Failed to refresh after batch operation', { detail: String(e) });
+      notifications.error(tr('events.batchRefreshFailed'), { detail: String(e) });
     }
   }
 }
@@ -191,7 +183,7 @@ export async function startEventListeners() {
 
   const unlistenError = await listen<PipelineError>('pipeline-error', (event) => {
     const { file, error } = event.payload;
-    notifications.error(`Error processing ${file}`, { detail: error });
+    notifications.error(tr('events.processingError', { file }), { detail: error });
   });
   unlisteners.push(unlistenError);
 
@@ -209,7 +201,7 @@ export async function startEventListeners() {
     isProcessing.set(true);
     pipelinePhase.set('importing');
     agentPipelineStages.set([]);
-    notifications.info('Pipeline started');
+    notifications.info(tr('events.pipelineStarted'));
   });
   unlisteners.push(unlistenStarted);
 
@@ -249,17 +241,19 @@ export async function startEventListeners() {
       // Honest completion: never a plain green "success" when segments failed or nothing was written.
       void segments.load();
       if (failed > 0) {
-        notifications.warning(`WSL 7B batch: ${transcribed} transcribed, ${failed} failed`);
+        notifications.warning(
+          tr('events.wslPartial', { ok: String(transcribed), failed: String(failed) }),
+        );
       } else if (transcribed > 0) {
-        notifications.success(`WSL 7B batch complete: ${transcribed} transcribed`);
+        notifications.success(tr('events.wslDone', { n: String(transcribed) }));
       } else {
-        notifications.info('WSL 7B batch: no segments needed transcription');
+        notifications.info(tr('events.wslNothing'));
       }
     } else if (status === 'cancelled') {
       void segments.load();
-      notifications.warning(`WSL 7B batch cancelled (${transcribed} transcribed before stopping)`);
+      notifications.warning(tr('events.wslCancelled', { n: String(transcribed) }));
     } else {
-      notifications.error(`WSL 7B refinement failed (exit code ${exit_code})`);
+      notifications.error(tr('events.wslFailed', { code: String(exit_code) }));
     }
   });
   unlisteners.push(unlistenWslStatus);
