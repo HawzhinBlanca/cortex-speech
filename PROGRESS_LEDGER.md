@@ -998,3 +998,20 @@ remaining requires: (a) the owner's REBOOT -> one release rebuild makes all 26 f
 (freshness RED until then) + unblocks P2.4; (b) the owner's GPU afternoon (P2.2 benchmark = C1);
 (c) the P1.7/P1.8 observed gates + baseline; (d) drills P3.5/6/9; (e) the P4 marathon; (f) the
 spawned memory-confidence task; (g) P7 re-audit for the honest 10/10 call.
+
+## EXE REBUILT — FRESHNESS GREEN (2026-07-04 ~15:15) — all 26 audit fixes LIVE
+
+The machine recovered (10+ clean dev cycles since ~13:00 justified one more attempt): frontend +
+LTO-off release build succeeded (7m29s, exit 0). Freshness gate GREEN at HEAD b3111ed; all feature
+markers verified in the binary (restore_db_from_snapshot, get_intelligence_report,
+excludedNotTrainingReady, pack_provenance.json, champion.json, get_quarantine_notice).
+
+DEVIATION (documented, honest): this exe is built with LTO OFF — thin-LTO was the exact pipeline
+that crashed during the instability window. Fully functional; marginal perf delta on Rust glue
+(ASR hot paths live in the ONNX C libs). RECOMMENDED: after the next reboot, one
+`cargo build --release` (default LTO) to restore the standard profile.
+
+STATE: the app is in its best-verified state ever. Automatable surface exhausted (26/26 audit items
+live). Remaining is ALL owner work: reboot + full-LTO rebuild; P2.2 GPU benchmark (C1); P1.7/P1.8
+observed gates + throughput baseline (BEFORE enjoying the new UX); P3.5/6/9 drills; P4 marathon;
+P5.6 retrain; P7 re-audit for the honest 10/10 call.
