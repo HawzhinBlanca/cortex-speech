@@ -895,3 +895,11 @@ RFC4180/injection-safe CSV. The "highest grade output datasets" code surface fro
 fully addressed except owner-gated threshold calibration. Remaining audit clusters: reliability
 (silent finetuned downgrade counter, snapshot-health surfacing), UX (batch cancel, autoplay,
 undo, Space unification...), intelligence read-side, P5.2/P2.4/P5.4/P5.5.
+
+## Reliability major FIXED (2026-07-04) — silent finetuned downgrade now loud (F2 restored)
+
+Per-import atomic counters + a completion-time PipelineEvent::Error with real counts ('3 of 10
+chunks' / 'ALL 10') and an actionable pointer to the integrity check. Both import entry points
+covered. Pure helper unit-tested; pipeline module 46/46 green dev-profile. Remaining in the
+reliability cluster: snapshot-failure/disk-space visibility in health + Diagnostics; the dead
+memory-pressure check.
