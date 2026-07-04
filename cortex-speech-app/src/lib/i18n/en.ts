@@ -139,6 +139,9 @@ export const en: Record<string, string> = {
   'review.markBadTitle': 'Flag this clip as bad — excluded from export, kept so you can re-transcribe later.',
   'review.markedBad': 'Marked bad — excluded from export. Backspace to undo.',
   'review.undone': 'Decision undone — the clip is back in the queue.',
+  'review.searchScope':
+    'Reviewing a search subset: {n} of {m} clips — clear the search to review everything.',
+  'review.searchScopeEmpty': 'No clips match the current search — clear it to review everything.',
   'review.undoFailed': 'Undo failed',
   'review.replay': 'Replay',
   'review.acceptAsIs': 'Looks good',

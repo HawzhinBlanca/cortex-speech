@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get } from 'svelte/store';
-  import { segments, selectedSegmentId } from './stores/segmentStore';
+  import { segments, selectedSegmentId, filteredSegments, searchQuery } from './stores/segmentStore';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import { settings } from './stores/settingsStore';
@@ -49,10 +49,16 @@
     index = 0; // land on the top of the reordered queue
   }
 
+  // True-10 audit: a curate-mode SEARCH now scopes the review queue (review one source file, one
+  // speaker, or any search subset) — with an explicit banner so the scope is never silent. Only the
+  // search scopes; the verified-filter is ignored here because review mode has its own
+  // pending-first ordering (a verified-only filter would render the queue permanently "all done").
+  const searchScoped = $derived($searchQuery.trim().length > 0);
+
   // Simple, focused review queue: one clip at a time. Pending (unverified) first,
   // then the rest — so a reviewer always lands on work that needs doing.
   const queue = $derived.by<SpeechSegment[]>(() => {
-    const all = $segments;
+    const all = searchScoped ? $filteredSegments : $segments;
     const pending = all.filter((s) => !s.verified);
     const done = all.filter((s) => s.verified);
     if (suspectFirst && suspectRank) {
@@ -519,7 +525,11 @@
 
 {#if !current}
   <div class="flex h-full items-center justify-center p-6">
-    <EmptyState variant="empty" title={$t('review.allDone')} description={$t('review.allDoneHint')} />
+    <EmptyState
+      variant="empty"
+      title={$t('review.allDone')}
+      description={searchScoped ? $t('review.searchScopeEmpty') : $t('review.allDoneHint')}
+    />
   </div>
 {:else}
   {@const isVerified = current.verified}
@@ -548,6 +558,18 @@
               </button>
             {/if}
           </div>
+        </div>
+      {/if}
+
+      {#if searchScoped}
+        <!-- Scope is never silent: the reviewer always sees they're on a subset. -->
+        <div
+          class="rounded-lg border border-amber-600/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-300"
+          data-testid="review-scope-banner"
+        >
+          {$t('review.searchScope')
+            .replace('{n}', String(queue.length))
+            .replace('{m}', String($segments.length))}
         </div>
       {/if}
 

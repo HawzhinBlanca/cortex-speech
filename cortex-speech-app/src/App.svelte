@@ -528,6 +528,16 @@
         category: 'file',
       },
       {
+        // True-10 audit: the primary daily workspace (Review & Correct) was mouse-only — no hotkey,
+        // absent from the palette and the Ctrl+/ help.
+        key: 'e',
+        ctrl: true,
+        shift: true,
+        description: 'Review & correct',
+        action: enterReviewMode,
+        category: 'navigation',
+      },
+      {
         key: 's',
         ctrl: true,
         description: 'Save annotation',
