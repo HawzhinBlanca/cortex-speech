@@ -972,3 +972,10 @@ pack_provenance.json inside every training pack + durable corpus_ledger.jsonl in
 manifestSha256 pins the exact rows a champion traces back to. 23 audit items closed today.
 Automatable remainder: P5.4 WSL DR runbook (docs), events.ts i18n (minor), P2.4 (deferred —
 needs stable machine for heavy ASR gates), finetuned-juror + memory-confidence (spawned/coupled).
+
+## events.ts i18n SHIPPED (2026-07-04) — 24 audit items closed today
+
+All pipeline/batch/WSL notifications localized (22 strings, EN+CKB 443==443). Automatable remainder
+is now: P5.4 WSL DR runbook (docs), SettingsPanel consent-copy CKB (follow-up), P2.4 (machine-gated),
+finetuned-juror + memory-confidence (spawned/coupled). The audit's automatable fix plan is
+essentially executed; the exe rebuild still awaits the owner's reboot (freshness RED).
