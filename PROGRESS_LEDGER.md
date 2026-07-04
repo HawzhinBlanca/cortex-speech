@@ -903,3 +903,11 @@ chunks' / 'ALL 10') and an actionable pointer to the integrity check. Both impor
 covered. Pure helper unit-tested; pipeline module 46/46 green dev-profile. Remaining in the
 reliability cluster: snapshot-failure/disk-space visibility in health + Diagnostics; the dead
 memory-pressure check.
+
+## Reliability cluster COMPLETE (2026-07-04) — snapshot/disk health + real backpressure
+
+Snapshot last-success/consecutive-failures now in health_check; free-disk-bytes for the data volume
+added; memory-pressure check measures AVAILABLE memory and the batch loop acts on it (warn + 2s
+backpressure). With B2 + the F2 loud-downgrade fix, ALL audit reliability items are closed except
+the quarantine-banner frontend toast for snapshot-failure streaks (UX cluster). 8 audit items done
+today, all dev-verified; release exe still awaits the owner's reboot/hardware check.
