@@ -36,6 +36,10 @@
   // Persisted app settings (mirrors Settings). Seeded on mount, written on a dial change so it can be
   // persisted via update_settings, and read to surface the cloud-T2 (jury) consent state in the header.
   let settings: AppSettings | null = null;
+  // Keyboard play/pause state for the current clip (Space); reset on queue navigation so a new
+  // clip never inherits the previous clip's playing flag.
+  let inboxPlaying = false;
+  $: if (currentIndex >= 0) inboxPlaying = false;
   // Guard against double-submission from rapid key presses.
   let isSubmitting = false;
 
@@ -314,6 +318,13 @@
         reject();
         break;
       case ' ':
+        // True-10 audit: Space now means play/pause in BOTH review surfaces (it was SKIP here while
+        // play/pause in ReviewMode — a reflexive Space silently skipped the current item, and the
+        // inbox had no keyboard play at all while adjudicating biometric audio by ear).
+        e.preventDefault();
+        inboxPlaying = !inboxPlaying;
+        break;
+      case 's':
         e.preventDefault();
         skip();
         break;
@@ -485,6 +496,7 @@
                   startTime={inboxRange.startTime}
                   endTime={inboxRange.endTime}
                   autoplay={settings?.autoplaySegments ?? false}
+                  bind:playing={inboxPlaying}
                 />
               {/key}
               <div class="waveform-stub">

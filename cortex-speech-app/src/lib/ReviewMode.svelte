@@ -170,9 +170,11 @@
   async function markBad() {
     const seg = current;
     if (!seg || saving || retranscribing) return;
-    if (!window.confirm($t('review.markBadConfirm'))) return;
+    // No blocking confirm (true-10 audit): 'x' is undoable via Backspace now, so a native
+    // window.confirm per press only broke the keyboard flow.
     saving = true;
     try {
+      undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
       // recordHumanDecision FIRST so a validation failure aborts before updateSegment commits (same
       // ordering rationale as submit()).
       await api.recordHumanDecision(seg.id, 'reject', null);
@@ -182,7 +184,35 @@
       notifications.success($t('review.markedBad'));
       advance();
     } catch (e) {
+      undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
       notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+    } finally {
+      saving = false;
+    }
+  }
+
+  // True-10 audit: in-loop undo. The global Ctrl+Z only reverts update_segment (not the human
+  // decision), leaving split state; this mirrors the inbox instead — clear the decision AND restore
+  // the pre-decision segment in one action, then re-land the cursor on the undone clip.
+  let undoHistory = $state<{ id: string; prev: SpeechSegment }[]>([]);
+
+  async function undoLast() {
+    const last = undoHistory[undoHistory.length - 1];
+    if (!last || saving) return;
+    saving = true;
+    undoHistory = undoHistory.slice(0, -1);
+    try {
+      await api.clearHumanDecision(last.id);
+      await api.updateSegment(last.prev);
+      segments.update((list) => list.map((s) => (s.id === last.id ? last.prev : s)));
+      editCache.delete(last.id);
+      const idx = queue.findIndex((s) => s.id === last.id);
+      if (idx >= 0) index = idx;
+      notifications.success($t('review.undone'));
+    } catch (e) {
+      // Not undone — put the entry back so the undo stays retryable.
+      undoHistory = [...undoHistory, last];
+      notifications.error($t('review.undoFailed'), { detail: String(e) });
     } finally {
       saving = false;
     }
@@ -315,6 +345,7 @@
     const isEdit = !acceptAsIs && text !== original;
     const updated: SpeechSegment = { ...seg, annotatedTranscript: text, verified: true };
     try {
+      undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
       // BOTH calls are required, recordHumanDecision FIRST: it validates the decision (an empty edit
       // throws here) so a failure aborts BEFORE updateSegment commits — no split state where the clip
       // is `verified` with no human_decision (or a blanked transcript). recordHumanDecision records the
@@ -331,6 +362,7 @@
       notifications.success($t('saved'));
       advance();
     } catch (e) {
+      undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
       notifications.error($t('notifications.saveFailed'), { detail: String(e) });
     } finally {
       saving = false;
@@ -468,6 +500,10 @@
       case 'ArrowLeft':
         e.preventDefault();
         void go(-1);
+        break;
+      case 'Backspace':
+        e.preventDefault();
+        void undoLast();
         break;
     }
   }
