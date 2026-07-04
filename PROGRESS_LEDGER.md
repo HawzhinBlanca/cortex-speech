@@ -979,3 +979,10 @@ All pipeline/batch/WSL notifications localized (22 strings, EN+CKB 443==443). Au
 is now: P5.4 WSL DR runbook (docs), SettingsPanel consent-copy CKB (follow-up), P2.4 (machine-gated),
 finetuned-juror + memory-confidence (spawned/coupled). The audit's automatable fix plan is
 essentially executed; the exe rebuild still awaits the owner's reboot (freshness RED).
+
+## Consent copy localized (2026-07-04) — 25 audit items closed today
+
+The three cloud opt-in consent texts (STT/LLM/jury-T2) now render in the user's language (careful
+CKB translations; EN unchanged). The audit's i18n finding is fully closed. Automatable remainder:
+P5.4 WSL DR runbook only. Everything else awaits: the owner's reboot (exe rebuild + P2.4), the
+owner's GPU (P2.2 etc.), or the spawned memory-confidence task.
