@@ -386,11 +386,10 @@
               bind:checked={localSettings.cloudSttOptIn}
               onchange={saveQuietly}
             />
+            <!-- Consent copy MUST be in the user's language (true-10 audit): voice is biometric,
+                 and the opt-in text is where clarity matters most. -->
             <span class="text-xs text-amber-100">
-              Cloud transcription (ElevenLabs Scribe). When on, importing a file sends its audio to
-              ElevenLabs and uses Scribe's transcript instead of the local model — one API call per
-              file. Requires an ElevenLabs key in secrets.env. Keep this off for fully offline dataset
-              work.
+              {$t('settings.cloudSttConsent')}
             </span>
           </label>
           {#if tauriAvailable && localSettings.cloudSttOptIn}
@@ -601,8 +600,7 @@
                   onchange={saveQuietly}
                 />
                 <span class="text-xs text-amber-100">
-                  I understand Gemini sends transcript text to Google. Keep this disabled for fully
-                  offline dataset work.
+                  {$t('settings.cloudLlmConsent')}
                 </span>
               </label>
               <label class="flex flex-col gap-1">
@@ -686,8 +684,8 @@
                 onchange={saveQuietly}
               />
               <span class="text-xs text-amber-100">
-                <strong>I understand</strong> that enabling T2 sends audio clips to Google Gemini. Keep
-                disabled for fully offline / air-gapped dataset work.
+                <strong>{$t('settings.juryT2ConsentLead')}</strong>
+                {$t('settings.juryT2Consent')}
               </span>
             </label>
 

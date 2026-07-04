@@ -408,6 +408,13 @@ export const en: Record<string, string> = {
   'stats.relinking': 'Relinking…',
   'stats.relinkDone': 'Relinked {n} file(s); {m} still missing.',
   'stats.relinkFailed': 'Relink failed',
+  'settings.cloudSttConsent':
+    "Cloud transcription (ElevenLabs Scribe). When on, importing a file sends its audio to ElevenLabs and uses Scribe's transcript instead of the local model — one API call per file. Requires an ElevenLabs key in secrets.env. Keep this off for fully offline dataset work.",
+  'settings.cloudLlmConsent':
+    'I understand Gemini sends transcript text to Google. Keep this disabled for fully offline dataset work.',
+  'settings.juryT2ConsentLead': 'I understand',
+  'settings.juryT2Consent':
+    'that enabling T2 sends audio clips to Google Gemini. Keep disabled for fully offline / air-gapped dataset work.',
   'events.importPartial': 'Completed: {ok} OK, {failed} failed (of {total})',
   'events.importSuccess': 'Successfully processed {n} file(s)',
   'events.importFailed': 'Import failed',

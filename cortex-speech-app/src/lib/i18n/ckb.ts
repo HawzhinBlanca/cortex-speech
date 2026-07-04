@@ -409,6 +409,13 @@ export const ckb: Record<string, string> = {
   'stats.relinking': 'دووبارە دەبەسترێتەوە…',
   'stats.relinkDone': '{n} فایل دووبارە بەسترایەوە؛ {m} هێشتا نەماون.',
   'stats.relinkFailed': 'دووبارە بەستنەوە سەرکەوتوو نەبوو',
+  'settings.cloudSttConsent':
+    'نووسینەوەی هەوری (ElevenLabs Scribe). کاتێک چالاک بێت، هێنانی فایلێک دەنگەکەی دەنێرێت بۆ ElevenLabs و نووسینەوەی Scribe بەکاردەهێنێت لە جیاتی مۆدێلی ناوخۆیی — یەک داواکاری API بۆ هەر فایلێک. پێویستی بە کلیلی ElevenLabs هەیە لە secrets.env. بۆ کاری داتاسێتی بە تەواوی ئۆفلاین ئەمە ناچالاک بهێڵەرەوە.',
+  'settings.cloudLlmConsent':
+    'تێدەگەم کە Gemini دەقی نووسینەوە دەنێرێت بۆ Google. بۆ کاری داتاسێتی بە تەواوی ئۆفلاین ئەمە ناچالاک بهێڵەرەوە.',
+  'settings.juryT2ConsentLead': 'تێدەگەم',
+  'settings.juryT2Consent':
+    'کە چالاککردنی T2 پارچە دەنگەکان دەنێرێت بۆ Google Gemini. بۆ کاری داتاسێتی بە تەواوی ئۆفلاین/دابڕاو ناچالاک بهێڵەرەوە.',
   'events.importPartial': 'تەواو بوو: {ok} سەرکەوتوو، {failed} شکستی هێنا (لە {total})',
   'events.importSuccess': '{n} فایل بە سەرکەوتوویی پرۆسێس کرا',
   'events.importFailed': 'هێنان سەرکەوتوو نەبوو',
