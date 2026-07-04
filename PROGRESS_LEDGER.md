@@ -957,3 +957,11 @@ LOOP-0 over-trigger count (green only at 0 — the C5 go-live bar) and auto-acce
 review (C4) with honest denominators. Join semantics unit-tested. 21 audit items closed today.
 Remaining read-side: memory-confidence updates (Beta-posterior, pre-firing prerequisite);
 finetuned-juror wiring stays coupled to owner re-measurement. Then P5.2/P2.4/P5.4/P5.5.
+
+## P5.2 app side SHIPPED (2026-07-04) — champion.json pointer
+
+sync_champion_pointer mirrors champions to <data_dir>/champion.json at startup (atomic, snapshotted,
+idempotent; 31 registry tests green). Server-side one-line read documented in RETRAIN_RUNBOOK.
+Memory-confidence work spawned as a dedicated task (needs fresh-context design care). 22 audit items
+closed today. Remaining automatable: P2.4 regression-gate wiring (needs stable machine — heavy ASR),
+P5.4/P5.5 docs, events.ts i18n, finetuned-juror (owner-measurement-coupled).
