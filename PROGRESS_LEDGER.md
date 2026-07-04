@@ -844,3 +844,25 @@ OWNER ACTION (requires admin), in order:
 3. Then I rebuild + verify freshness GREEN.
 HOLDING all builds until then — three from-scratch attempts is enough evidence; more churn proves
 nothing new. B1+B2 remain safely pushed (a807949/71365e9); exe missing; freshness RED.
+
+## DIAGNOSIS COMPLETE (2026-07-04 ~13:10) — load-dependent hardware instability since ~08:30
+
+Full discrimination matrix (all real runs):
+- trivial rustc compile x3: PASS | tiny release build WITH proc macros: PASS (7.86s)
+- dev-profile FULL graph (cargo check, opt-0): PASS (1m49s) | dev-profile cargo test --lib + clippy
+  all-targets: PASSED at ~09:50 (post-instability-onset)
+- release FULL graph (opt-3): 4 attempts CRASH at RANDOM crates (web_atoms, app lib x2, zerocopy)
+  with rustc ACCESS_VIOLATION / rustc_serialize panics — incl. 2 from-scratch cleans and 1 LTO-off
+VERDICT: small+medium loads fine; sustained heavy multi-core LLVM-opt load crashes randomly =
+HARDWARE (RAM/thermal/power) degraded at ~08:30 — the nvlddmkm GPU faults at 08:30:59 were the same
+event's first symptom. The Defender 5007 at 08:31 is likely coincidental/secondary (a minimal AV
+repro would have failed; it passed). No WHEA/disk events = silent (non-ECC-style) corruption.
+
+OWNER ACTIONS: 1) reboot; 2) check temps under load (HWiNFO) + cooling; 3) Windows Memory
+Diagnostic or memtest86+ overnight; 4) if XMP/EXPO enabled, drop to JEDEC and retest; 5) then ONE
+full `cargo build --release` restores the exe (B1+B2 inside) -> freshness GREEN.
+
+REVISED WORK PLAN (evidence-based): dev-profile verification (cargo test --lib, clippy, fmt) and
+node gates are PROVEN to work on the machine in its current state — so the audit fix plan RESUMES
+now with dev-verified commits; only the release-exe rebuild waits for the hardware fix. Freshness
+stays RED (exe missing) until then — documented, not hidden.
