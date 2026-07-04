@@ -949,3 +949,11 @@ Escalated verdicts persist the IRT confidence; the review queue's riskiest-first
 ranks by jury doubt instead of silently degrading to recency (regression test pins 0.2 < None@0.5 <
 0.9; 57 jury tests green). 20 audit items closed today. Next: LOOP-0 shadow-precision report +
 C4 auto-accept-precision report (the go-live evidence surfaces).
+
+## Intelligence read-side 2/3 (2026-07-04) — C5/C4 evidence surfaces shipped
+
+db.intelligence_report() + get_intelligence_report IPC + Stats 'Intelligence evidence' card:
+LOOP-0 over-trigger count (green only at 0 — the C5 go-live bar) and auto-accept precision vs human
+review (C4) with honest denominators. Join semantics unit-tested. 21 audit items closed today.
+Remaining read-side: memory-confidence updates (Beta-posterior, pre-firing prerequisite);
+finetuned-juror wiring stays coupled to owner re-measurement. Then P5.2/P2.4/P5.4/P5.5.
