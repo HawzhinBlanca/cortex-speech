@@ -911,3 +911,13 @@ added; memory-pressure check measures AVAILABLE memory and the batch loop acts o
 backpressure). With B2 + the F2 loud-downgrade fix, ALL audit reliability items are closed except
 the quarantine-banner frontend toast for snapshot-failure streaks (UX cluster). 8 audit items done
 today, all dev-verified; release exe still awaits the owner's reboot/hardware check.
+
+## UX cluster part 1 (2026-07-04) — batch cancel + autoplay + live Undo button
+
+Three audit UX majors fixed (see commit): the un-cancellable batch transcribe now has the same
+Cancel as imports; autoplay-on-advance honored in BOTH review surfaces (the single biggest
+review-speed lever); the inbox Undo button's legacy-reactivity deadness fixed at all five mutation
+sites. Frontend gates green (typecheck 0/eslint/vitest 132 serialized). Remaining UX majors:
+ReviewMode undo (+ drop the mark-bad window.confirm), Space-key unification + inbox keyboard play,
+then the minors (filter-scoped queue, rail scrollIntoView, shortcut discoverability, ⌘→Ctrl,
+i18n of events.ts). 11 audit items closed today.
