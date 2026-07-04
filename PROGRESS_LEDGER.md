@@ -929,3 +929,10 @@ split-state Ctrl+Z trap is bypassed), mark-bad confirm dropped (undoable now), S
 BOTH review surfaces with inbox keyboard play added (skip -> 's'). Frontend gates green. 14 audit
 items closed today. Remaining UX minors: filter-scoped review queue, rail scrollIntoView + source-file
 context, shortcut discoverability + review-mode hotkey, Mac-glyph fix, events.ts i18n.
+
+## UX minors batch 1 (2026-07-04) — glyphs, rail follow, source context
+
+Platform-aware key labels (Ctrl not ⌘ on Windows, shared helper), inbox rail scrollIntoView on
+cursor move, ReviewMode 'filename · chunk i/n' orientation line. Frontend gates green. 17 audit
+items closed today. Remaining automatable: filter-scoped review queue, review-mode hotkey +
+shortcut discoverability, events.ts i18n, intelligence read-side cluster, P5.2/P2.4/P5.4/P5.5.
