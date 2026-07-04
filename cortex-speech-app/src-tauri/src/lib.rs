@@ -556,6 +556,7 @@ pub fn run() {
             commands::db_restore,
             commands::db_vacuum,
             commands::get_quarantine_notice,
+            commands::get_intelligence_report,
             commands::list_db_snapshots,
             commands::restore_db_from_snapshot,
             commands::get_audio_health,

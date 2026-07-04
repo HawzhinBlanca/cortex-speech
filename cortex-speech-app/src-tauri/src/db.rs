@@ -1495,6 +1495,56 @@ impl Database {
         Ok(())
     }
 
+    /// True-10 audit: the READ side of the intelligence instrumentation. loop0_shadow_log and
+    /// decision_verdicts were write-only — the C5 (LOOP-0 go-live) and C4 (auto-accept precision)
+    /// decisions were impossible to make in-app. This joins both against the humans' subsequent
+    /// decisions:
+    ///
+    /// * LOOP-0 shadow: `fired_but_human_accepted_original` is the OVER-TRIGGER count (the memory
+    ///   would have changed text a human then confirmed was already right) — C5 requires this to be
+    ///   0 before `loop0_firing_enabled` may ever be turned on. `fired_and_human_edited` is
+    ///   inconclusive-positive (the text did need changing; whether the memory's change matched the
+    ///   human's is not knowable from the flag alone).
+    /// * C4: of the machine's T0 auto-accepts that a human later reviewed, how many did the human
+    ///   confirm vs contradict (edit/reject) — the honest precision behind any autonomy increase.
+    pub fn intelligence_report(&self) -> AppResult<serde_json::Value> {
+        let loop0 = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(l.memory_fired), 0),
+                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('edit','human_edit') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('reject','human_reject') THEN 1 ELSE 0 END), 0)
+             FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id",
+            [],
+            |row| {
+                Ok(serde_json::json!({
+                    "totalObservations": row.get::<_, i64>(0)?,
+                    "wouldFire": row.get::<_, i64>(1)?,
+                    "firedButHumanAcceptedOriginal": row.get::<_, i64>(2)?,
+                    "firedAndHumanEdited": row.get::<_, i64>(3)?,
+                    "firedAndHumanRejected": row.get::<_, i64>(4)?,
+                }))
+            },
+        )?;
+        let c4 = self.conn.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T0_ACCEPT' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T1_ESCALATE' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T0_ACCEPT' AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T0_ACCEPT' AND s.human_decision IN ('edit','human_edit','reject','human_reject') THEN 1 ELSE 0 END), 0)
+             FROM decision_verdicts dv JOIN speech_segments s ON s.id = dv.segment_id",
+            [],
+            |row| {
+                Ok(serde_json::json!({
+                    "t0Accepts": row.get::<_, i64>(0)?,
+                    "t1Escalations": row.get::<_, i64>(1)?,
+                    "t0HumanConfirmed": row.get::<_, i64>(2)?,
+                    "t0HumanContradicted": row.get::<_, i64>(3)?,
+                }))
+            },
+        )?;
+        Ok(serde_json::json!({ "loop0Shadow": loop0, "autoAcceptPrecision": c4 }))
+    }
+
     /// M2.2 / P1.2: classify a MACHINE verdict as T0 (auto-resolved, no human needed) or T1
     /// (escalated to a human) and record it in decision_verdicts — the denominator/index for the C4
     /// auto-accept-precision measurement. Human verdicts (`human_*`) and any unknown string record
@@ -1959,6 +2009,42 @@ mod tests {
             duration_ms: 1000,
             ..SpeechSegment::default()
         }
+    }
+
+    #[test]
+    fn intelligence_report_joins_shadow_and_verdicts_against_human_decisions() {
+        // True-10 audit: the C5/C4 read side. Over-trigger = would-fire + human accepted the
+        // ORIGINAL text unchanged (the memory would have corrupted a correct transcript). C4
+        // precision = of T0 auto-accepts a human later reviewed, confirmed vs contradicted.
+        let db = make_db();
+        for id in ["ot", "edited", "unreviewed", "t0-ok", "t0-bad", "t1"] {
+            db.insert_segment(&make_segment(id, "/audio/i.wav")).unwrap();
+        }
+        // LOOP-0 shadow: 'ot' would fire but the human accepted the original -> OVER-TRIGGER.
+        db.record_loop0_shadow("ot", true).unwrap();
+        db.record_loop0_shadow("edited", true).unwrap();
+        db.record_loop0_shadow("unreviewed", true).unwrap();
+        db.connection().execute("UPDATE speech_segments SET human_decision='accept' WHERE id='ot'", []).unwrap();
+        db.connection().execute("UPDATE speech_segments SET human_decision='edit' WHERE id='edited'", []).unwrap();
+        // C4: two T0 accepts (one confirmed, one contradicted) + one T1 escalation.
+        db.record_decision_verdict("t0-ok", "auto_accept", false).unwrap();
+        db.record_decision_verdict("t0-bad", "jury_accept", false).unwrap();
+        db.record_decision_verdict("t1", "escalated", true).unwrap();
+        db.connection().execute("UPDATE speech_segments SET human_decision='accept' WHERE id='t0-ok'", []).unwrap();
+        db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='t0-bad'", []).unwrap();
+
+        let report = db.intelligence_report().unwrap();
+        let loop0 = &report["loop0Shadow"];
+        assert_eq!(loop0["totalObservations"], 3);
+        assert_eq!(loop0["wouldFire"], 3);
+        assert_eq!(loop0["firedButHumanAcceptedOriginal"], 1, "'ot' is the one over-trigger");
+        assert_eq!(loop0["firedAndHumanEdited"], 1);
+        assert_eq!(loop0["firedAndHumanRejected"], 0);
+        let c4 = &report["autoAcceptPrecision"];
+        assert_eq!(c4["t0Accepts"], 2);
+        assert_eq!(c4["t1Escalations"], 1);
+        assert_eq!(c4["t0HumanConfirmed"], 1);
+        assert_eq!(c4["t0HumanContradicted"], 1);
     }
 
     #[test]

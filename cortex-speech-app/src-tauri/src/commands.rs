@@ -2411,6 +2411,15 @@ pub fn get_quarantine_notice(state: State<'_, AppState>) -> Result<serde_json::V
     }))
 }
 
+/// Intelligence read-side: LOOP-0 shadow precision (the C5 go-live evidence) + auto-accept
+/// precision (C4) joined against subsequent human decisions.
+#[tauri::command]
+pub fn get_intelligence_report(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    RATE_LIMITER.check("get_intelligence_report")?;
+    let db = state.lock_db();
+    db.intelligence_report().map_err(|e| e.to_string())
+}
+
 /// B2: list the rotating auto-snapshots (newest first) for the restore picker.
 #[tauri::command]
 pub fn list_db_snapshots(state: State<'_, AppState>) -> Result<Vec<crate::snapshot::SnapshotInfo>, String> {

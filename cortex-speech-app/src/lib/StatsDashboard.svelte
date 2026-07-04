@@ -161,6 +161,8 @@
   // progress. Each mirrors the proven relinkMissingAudio pattern (dir dialog -> IPC -> toast).
   let toolBusy = $state<string | null>(null);
   let buildSha = $state<string | null>(null);
+  // Intelligence read-side (C4/C5 evidence). Non-essential — hidden if the call fails.
+  let intel = $state<import('./commands').IntelligenceReport | null>(null);
 
   async function pickDirAnd<T>(id: string, run: (dir: string) => Promise<T>): Promise<T | null> {
     if (!tauriAvailable || toolBusy) return null;
@@ -284,6 +286,10 @@
       api
         .appGitSha()
         .then((sha) => (buildSha = sha))
+        .catch(() => {});
+      api
+        .getIntelligenceReport()
+        .then((r) => (intel = r))
         .catch(() => {});
     }
   });
@@ -649,6 +655,50 @@
             {$t('inference.modelLoad')}: {fmtMs(inferenceStats.model_load_ms)}
           </div>
         {/if}
+      </div>
+    {/if}
+
+    {#if intel && (intel.loop0Shadow.totalObservations > 0 || intel.autoAcceptPrecision.t0Accepts + intel.autoAcceptPrecision.t1Escalations > 0)}
+      <div class="space-y-2 pt-2 border-t border-cortex-800/50" data-testid="intelligence-report">
+        <h3 class="text-xs font-semibold text-cortex-300 uppercase tracking-wider">
+          {$t('stats.intelTitle')}
+        </h3>
+        <div class="grid grid-cols-2 gap-2">
+          <div class="bg-cortex-800/30 rounded-lg p-2">
+            <div
+              class="text-sm font-bold {intel.loop0Shadow.firedButHumanAcceptedOriginal === 0
+                ? 'text-emerald-300'
+                : 'text-red-300'}"
+              data-testid="loop0-overtriggers"
+            >
+              {intel.loop0Shadow.firedButHumanAcceptedOriginal}
+            </div>
+            <div class="text-[10px] text-cortex-400">
+              {$t('stats.loop0OverTriggers')} ({intel.loop0Shadow.wouldFire}/{intel.loop0Shadow
+                .totalObservations} {$t('stats.loop0WouldFire')})
+            </div>
+          </div>
+          <div class="bg-cortex-800/30 rounded-lg p-2">
+            <div class="text-sm font-bold text-cortex-200" data-testid="c4-precision">
+              {intel.autoAcceptPrecision.t0HumanConfirmed +
+                intel.autoAcceptPrecision.t0HumanContradicted >
+              0
+                ? `${(
+                    (100 * intel.autoAcceptPrecision.t0HumanConfirmed) /
+                    (intel.autoAcceptPrecision.t0HumanConfirmed +
+                      intel.autoAcceptPrecision.t0HumanContradicted)
+                  ).toFixed(0)}%`
+                : '—'}
+            </div>
+            <div class="text-[10px] text-cortex-400">
+              {$t('stats.c4Precision')} ({intel.autoAcceptPrecision.t0HumanConfirmed}/{intel
+                .autoAcceptPrecision.t0HumanConfirmed +
+                intel.autoAcceptPrecision.t0HumanContradicted}
+              · T0 {intel.autoAcceptPrecision.t0Accepts} / T1 {intel.autoAcceptPrecision
+                .t1Escalations})
+            </div>
+          </div>
+        </div>
       </div>
     {/if}
 

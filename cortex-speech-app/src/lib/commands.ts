@@ -599,6 +599,28 @@ export async function relinkAudio(searchDir: string): Promise<RelinkResult> {
   return invoke<RelinkResult>('relink_audio', { searchDir });
 }
 
+/** Intelligence read-side: LOOP-0 shadow precision (C5 go-live evidence) + auto-accept precision (C4). */
+export interface IntelligenceReport {
+  loop0Shadow: {
+    totalObservations: number;
+    wouldFire: number;
+    /** OVER-TRIGGER count — must be 0 before LOOP-0 firing may ever be enabled (C5). */
+    firedButHumanAcceptedOriginal: number;
+    firedAndHumanEdited: number;
+    firedAndHumanRejected: number;
+  };
+  autoAcceptPrecision: {
+    t0Accepts: number;
+    t1Escalations: number;
+    t0HumanConfirmed: number;
+    t0HumanContradicted: number;
+  };
+}
+
+export async function getIntelligenceReport(): Promise<IntelligenceReport> {
+  return invoke<IntelligenceReport>('get_intelligence_report');
+}
+
 /** B2: a past corruption quarantine, if any, plus how many restore snapshots exist. */
 export interface QuarantineNotice {
   quarantinedFiles: string[];
