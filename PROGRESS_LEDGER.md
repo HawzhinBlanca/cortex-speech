@@ -986,3 +986,15 @@ The three cloud opt-in consent texts (STT/LLM/jury-T2) now render in the user's 
 CKB translations; EN unchanged). The audit's i18n finding is fully closed. Automatable remainder:
 P5.4 WSL DR runbook only. Everything else awaits: the owner's reboot (exe rebuild + P2.4), the
 owner's GPU (P2.2 etc.), or the spawned memory-confidence task.
+
+## P5.4 SHIPPED (2026-07-04) — WSL DR runbook with live-probed facts; automatable surface EXHAUSTED
+
+WSL_DR_RUNBOOK.md written from a live probe of the running WSL (cortex_env Python 3.12.3; fairseq2
+cache now 59 GB — memory said 31 GB, it grew; pins fairseq2 0.6/torch 2.8.0/peft 0.19.1/
+transformers 4.46.3; 4090 visible). Backup priority 1 = the adapter weights (irreplaceable).
+
+26 audit items closed today. THE AUDIT'S AUTOMATABLE FIX PLAN IS NOW FULLY EXECUTED. Everything
+remaining requires: (a) the owner's REBOOT -> one release rebuild makes all 26 fixes live
+(freshness RED until then) + unblocks P2.4; (b) the owner's GPU afternoon (P2.2 benchmark = C1);
+(c) the P1.7/P1.8 observed gates + baseline; (d) drills P3.5/6/9; (e) the P4 marathon; (f) the
+spawned memory-confidence task; (g) P7 re-audit for the honest 10/10 call.
