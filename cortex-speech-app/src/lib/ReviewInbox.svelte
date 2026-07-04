@@ -143,7 +143,9 @@
     const idx = currentIndex;
     isSubmitting = true;
     try {
-      history.push({ id: cur.id, decision: 'accept', prev: { ...cur } });
+      // Reassignment (not .push) — this component is legacy-mode, so only assignment invalidates
+      // `disabled={history.length === 0}`; mutation left the Undo button permanently disabled.
+      history = [...history, { id: cur.id, decision: 'accept', prev: { ...cur } }];
       await api.recordHumanDecision(cur.id, 'accept', null);
       queue[idx] = { ...cur, humanDecision: 'accept' };
       statusMsg = $t('inbox.status.accepted');
@@ -151,7 +153,7 @@
     } catch (e) {
       // The decision did not persist: drop the phantom undo entry pushed above and
       // tell the reviewer, rather than silently swallowing it (unhandled rejection).
-      history.pop();
+      history = history.slice(0, -1);
       statusMsg = $t('inbox.status.acceptFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
@@ -174,7 +176,7 @@
     const text = editText.trim();
     isSubmitting = true;
     try {
-      history.push({ id: cur.id, decision: 'edit', prev: { ...cur } });
+      history = [...history, { id: cur.id, decision: 'edit', prev: { ...cur } }];
       await api.recordHumanDecision(cur.id, 'edit', text);
       queue[idx] = {
         ...cur,
@@ -185,7 +187,7 @@
       statusMsg = $t('inbox.status.edited');
       advance();
     } catch (e) {
-      history.pop();
+      history = history.slice(0, -1);
       statusMsg = $t('inbox.status.editFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
@@ -198,13 +200,13 @@
     const idx = currentIndex;
     isSubmitting = true;
     try {
-      history.push({ id: cur.id, decision: 'reject', prev: { ...cur } });
+      history = [...history, { id: cur.id, decision: 'reject', prev: { ...cur } }];
       await api.recordHumanDecision(cur.id, 'reject', null);
       queue[idx] = { ...cur, humanDecision: 'reject' };
       statusMsg = $t('inbox.status.rejected');
       advance();
     } catch (e) {
-      history.pop();
+      history = history.slice(0, -1);
       statusMsg = $t('inbox.status.rejectFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
@@ -255,8 +257,9 @@
   }
 
   async function undo() {
-    const last = history.pop();
+    const last = history[history.length - 1];
     if (!last) return;
+    history = history.slice(0, -1); // reassignment: keeps the Undo button's disabled binding live
     try {
       // P3-3: Clear the human decision entirely (set to NULL) instead of
       // overwriting it with a fake 'accept' — that was corrupting agent_examples.
@@ -273,7 +276,7 @@
       // The decision was NOT cleared — put the history entry back so the undo can be
       // retried, and tell the user instead of failing silently (which previously also
       // dropped the entry, making the undo permanently unretryable).
-      history.push(last);
+      history = [...history, last];
       statusMsg = $t('inbox.status.undoFailed', { err: String(e) });
     }
   }
@@ -475,11 +478,13 @@
           <div class="waveform-zone" dir="ltr" aria-label="Audio playback">
             {#if current.audioPath}
               {#key current.id}
+                <!-- True-10 audit: honor the autoplay setting (was hardcoded off) — advancing the
+                     queue auto-plays the clip so adjudication needs zero play clicks. -->
                 <AudioPlayer
                   audioPath={current.audioPath}
                   startTime={inboxRange.startTime}
                   endTime={inboxRange.endTime}
-                  autoplay={false}
+                  autoplay={settings?.autoplaySegments ?? false}
                 />
               {/key}
               <div class="waveform-stub">

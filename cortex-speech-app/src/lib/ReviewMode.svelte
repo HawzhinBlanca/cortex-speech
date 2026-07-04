@@ -574,6 +574,9 @@
       <!-- Audio player — bounded to the SPOKEN SPAN (first→last word) when word timings exist, so Play
            hears the exact words and not the silence/music the VAD chunk padded around them; otherwise
            the whole clip. -->
+      <!-- True-10 audit: honor the autoplay setting (it was hardcoded off here while honored in
+           curate mode) — with it on, advancing to the next clip auto-plays the bounded spoken span,
+           removing one keypress + wait per clip, hundreds of times per review sitting. -->
       <AudioPlayer
         audioPath={current.audioPath}
         startTime={playStart}
@@ -581,7 +584,7 @@
         bind:currentTime
         bind:duration={playerDuration}
         bind:playing
-        autoplay={false}
+        autoplay={$settings.autoplaySegments}
       />
 
       <!-- Listen-strip: tap a word to hear it; low-confidence words are highlighted -->

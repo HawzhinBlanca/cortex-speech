@@ -2905,6 +2905,14 @@
             $batchProgress.total ||
             '?'}
         </span>
+        <!-- True-10 audit: the app's LONGEST operation had no cancel affordance while nearly every
+             button is disabled during it — a mistaken batch locked the UI with no visible way out,
+             even though the backend cancel token exists. Same cancel as the import branches. -->
+        <button
+          class="text-red-400 hover:text-red-300 px-1.5 py-0.5 border border-red-500/30 rounded shrink-0"
+          data-testid="cancel-batch-transcribe-btn"
+          onclick={cancelOperation}>{$t('pipeline.cancel')}</button
+        >
       {:else if $pipelinePhase === 'adjudicating'}
         <span class="flex items-center gap-1 text-amber-400">
           <svg class="animate-spin w-3 h-3" fill="none" viewBox="0 0 24 24"
