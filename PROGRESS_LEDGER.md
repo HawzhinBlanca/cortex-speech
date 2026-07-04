@@ -936,3 +936,9 @@ Platform-aware key labels (Ctrl not ⌘ on Windows, shared helper), inbox rail s
 cursor move, ReviewMode 'filename · chunk i/n' orientation line. Frontend gates green. 17 audit
 items closed today. Remaining automatable: filter-scoped review queue, review-mode hotkey +
 shortcut discoverability, events.ts i18n, intelligence read-side cluster, P5.2/P2.4/P5.4/P5.5.
+
+## UX minors batch 2 (2026-07-04) — filter-scoped review + review hotkey
+
+Search now scopes the review queue (explicit banner, never silent; scoped empty-state); Ctrl+Shift+E
+opens Review & Correct (palette + help discoverable). 19 audit items closed today. Remaining
+automatable: events.ts i18n (minor), intelligence read-side cluster, P5.2/P2.4/P5.4/P5.5.
