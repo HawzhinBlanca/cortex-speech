@@ -743,3 +743,20 @@ grade output datasets." Responded on the app's actual deliverable — the export
 State: certified green; the export/grading core is verified correct and appropriately strict for
 highest-grade output. The last inputs to an honest "highest-grade" call remain owner/GPU-gated
 (measured CER on real audio via the M1 benchmark / retrain).
+
+## True-10 gap audit (2026-07-04) — the honest answer to "what remains"
+
+Owner asked what remains for a true 10/10. Ran a 5-agent live-tree audit (UX / reliability /
+intelligence / plan / dataset; 756k tokens, 178 tool calls, every finding file:line-cited).
+docs/TRUE_10_GAP_AUDIT_2026-07-04.md is the full record. Headlines:
+- NEW BLOCKER B1: export_finetune_pack ships mark-bad clips (verified=true includes rejects; rubric
+  never consulted) — falsifies FINAL_TEST_CHECKLIST's Part C.1 claim. Fix first.
+- NEW BLOCKER B2: corruption quarantine boots an empty DB whose rotating snapshots evict all good
+  snapshots in ~90min; no banner, no restore UI.
+- HONESTY CORRECTION: prior "automatable surface exhausted" ledger claims were OVERSTATED — P5.2,
+  P5.4, P5.5, P2.4 plus every automatable finding above were open. Retracted.
+- The intelligence system captures learning but consumes it almost nowhere by default (LOOP-0
+  shadow-only + write-only log; T0 structurally zero; best engine not a juror; suspect-first ~recency).
+- Owner-gated to the 10/10 CALL: P2.2 benchmark (C1), P1.7/P1.8, P3.5/6/9 drills, P4 marathon
+  (3/500 decisions), P5.6 retrain, P7 re-audit.
+Next loop iterations execute the sequenced fix plan (B1 first).
