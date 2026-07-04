@@ -139,6 +139,14 @@ today the final promotion is a code step (call `gate_and_promote(db, challenger_
 the step-5 scorecard into `gate_and_promote` is the natural next M5 code task; until then, do the
 gate decision deliberately and record it in the ledger.
 
+**The champion pointer (P5.2, shipped):** the app mirrors the registry's champions to
+`<data_dir>/champion.json` at every startup (`registry::sync_champion_pointer` — atomic write,
+id + checkpoint path + SHA per family; the file also rides the auto-snapshots). After a promotion,
+relaunch the app (or call the sync) so the pointer reflects the new champion. **One-time server-side
+change:** `cortex_7b_server.py` currently hardcodes `ADAPTER = f"{EXPORT}/adapter_weights"` — make it
+read the ckb family's `checkpointPath` from `champion.json` (fall back to the current constant when
+the file/family is absent) so a promotion actually swaps the serving engine on next server start.
+
 ---
 
 ## What "done" looks like for one retrain cycle

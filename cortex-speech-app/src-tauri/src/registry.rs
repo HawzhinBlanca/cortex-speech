@@ -123,6 +123,46 @@ pub fn promote_to_champion(db: &Database, id: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// P5.2 (true-10 audit): mirror the registry's champions to `<data_dir>/champion.json` so external
+/// consumers — the WSL 7B server, whose adapter path was previously HARDCODED, making promotion a
+/// no-op at its final step — can resolve the current champion without reading the app database.
+/// Written atomically (tmp + rename); snapshot.rs already lists champion.json in EXTRA_STATE, so
+/// the pointer rides the rotating auto-snapshots. Returns true when the file was (re)written.
+/// Called at startup (so a promotion made by any path is reflected on next launch) and intended to
+/// be called by the future Promote action (P5.3).
+pub fn sync_champion_pointer(db: &Database, data_dir: &std::path::Path) -> AppResult<bool> {
+    let conn = db.connection();
+    let mut stmt = conn
+        .prepare(&format!("SELECT {SELECT_COLS} FROM model_versions WHERE status = 'champion' ORDER BY family ASC"))?;
+    let mut rows = stmt.query([])?;
+    let mut families = serde_json::Map::new();
+    while let Some(row) = rows.next()? {
+        let champion = map_version(row)?;
+        families.insert(
+            champion.family.clone(),
+            serde_json::json!({
+                "id": champion.id,
+                "checkpointPath": champion.checkpoint_path,
+                "checkpointSha256": champion.checkpoint_sha256,
+                "source": champion.source,
+                "license": champion.license,
+            }),
+        );
+    }
+    let payload = serde_json::json!({ "schema": 1, "champions": families });
+    let text = serde_json::to_string_pretty(&payload)
+        .map_err(|e| AppError::Other(format!("champion pointer serialize: {e}")))?;
+    let path = data_dir.join("champion.json");
+    // Skip the write when unchanged so the file's mtime stays meaningful for external watchers.
+    if std::fs::read_to_string(&path).map(|old| old == text).unwrap_or(false) {
+        return Ok(false);
+    }
+    let tmp = data_dir.join("champion.json.tmp");
+    std::fs::write(&tmp, &text).map_err(AppError::Io)?;
+    std::fs::rename(&tmp, &path).map_err(AppError::Io)?;
+    Ok(true)
+}
+
 /// The current champion for a family, if one is crowned.
 pub fn get_champion(db: &Database, family: &str) -> AppResult<Option<ModelVersion>> {
     let conn = db.connection();
@@ -518,6 +558,34 @@ mod tests {
             source: source.to_string(),
             license: "Apache-2.0".to_string(),
         }
+    }
+
+    #[test]
+    fn champion_pointer_mirrors_promotions_and_skips_unchanged_writes() {
+        // P5.2: promotion must be resolvable OUTSIDE the app db — the WSL 7B server reads
+        // champion.json instead of a hardcoded adapter path.
+        let db = open();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // No champions yet -> an empty pointer is still written (schema present, zero families).
+        assert!(sync_champion_pointer(&db, tmp.path()).unwrap(), "first sync writes the file");
+        let text = std::fs::read_to_string(tmp.path().join("champion.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["schema"], 1);
+        assert!(v["champions"].as_object().unwrap().is_empty());
+
+        // Promote one -> the pointer carries id + sha + path for its family.
+        register_candidate(&db, &candidate("m1", "omniasr-7b", "user-finetuned", "abc123")).unwrap();
+        promote_to_champion(&db, "m1").unwrap();
+        assert!(sync_champion_pointer(&db, tmp.path()).unwrap(), "changed registry rewrites the file");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path().join("champion.json")).unwrap()).unwrap();
+        assert_eq!(v["champions"]["omniasr-7b"]["id"], "m1");
+        assert_eq!(v["champions"]["omniasr-7b"]["checkpointSha256"], "abc123");
+        assert_eq!(v["champions"]["omniasr-7b"]["checkpointPath"], "/models/x.pt");
+
+        // Unchanged registry -> no rewrite (mtime stays meaningful for external watchers).
+        assert!(!sync_champion_pointer(&db, tmp.path()).unwrap(), "unchanged content is not rewritten");
     }
 
     #[test]

@@ -378,6 +378,13 @@ pub fn run() {
         fatal_app_error(format!("Failed to initialize database schema: {e}"));
     }
 
+    // P5.2: mirror the registry's champions to <data_dir>/champion.json at startup so external
+    // consumers (the WSL 7B server) resolve the CURRENT champion — promotion is no longer a no-op
+    // at its final step. Best-effort: a pointer-write failure never blocks startup.
+    if let Err(e) = crate::registry::sync_champion_pointer(&db, &data_dir) {
+        tracing::warn!("champion pointer sync failed: {e}");
+    }
+
     // P3.1/M0.4b: rotating auto-snapshots of the DB + config state. One on startup (so a corruption is
     // recoverable from the moment the app runs), then every 10 minutes — protecting the marathon's
     // irreplaceable review labor without any user action. Skipped in headless test modes.
