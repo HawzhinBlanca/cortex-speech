@@ -815,3 +815,12 @@ driver-corrupted state); 2) rerun `cargo build --release` in src-tauri, then
 `python scripts/check_exe_freshness.py` — expect GREEN; 3) if toolchain crashes persist after the
 reboot, then chkdsk + Windows Memory Diagnostic; 4) check what was using the GPU at 08:30 (driver
 crash under load — if it recurs, update/clean-install the NVIDIA driver before the P2.2 benchmark).
+
+## Recovery probe (2026-07-04 ~10:30) — machine still unstable, awaiting reboot
+
+Build probe after the GPU-driver fault: rustc panicked AGAIN (rustc_serialize, reading metadata;
+BUILD_EXIT:101 — third consecutive rustc crash). Uptime 7.0h confirms NO reboot has happened; no
+new nvlddmkm faults in the last hour, but the kernel/memory state from the 08:30 fault persists.
+HOLDING all source work and full-build probes (each failed build is minutes of disk churn on an
+unstable kernel). Future wakes use a seconds-cheap `rustc hello.rs` probe + uptime check; the real
+rebuild resumes after a fresh boot. B1+B2 remain safely pushed; exe still missing (freshness RED).
