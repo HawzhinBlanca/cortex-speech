@@ -411,7 +411,8 @@ export const ckb: Record<string, string> = {
   'stats.importVerifiedGold': 'هێنانی پشتڕاستکراوەکان → زێڕین',
   'stats.toolWorking': 'کاردەکات…',
   'stats.toolFailed': 'کردارەکە سەرکەوتوو نەبوو',
-  'stats.finetunePackDone': 'پاکەتی مەشق: {n} پارچە دەرهێنرا، {h} هۆڵداوت دەرکرا، {s} تێپەڕێنرا.',
+  'stats.finetunePackDone':
+    'پاکەتی مەشق: {n} پارچە دەرهێنرا، {h} هۆڵداوت دەرکرا، {r} بە پێوەری پلە ڕەتکرایەوە، {s} تێپەڕێنرا.',
   'stats.goldEvalDone': 'کۆمەڵەی هەڵسەنگاندنی زێڕین: {n} پارچە دەرهێنرا.',
   'stats.importGoldDone': '{n} فایلی سەرچاوەی پشتڕاستکراو وەک زێڕین هێنرا.',
   'stats.verifyModel': 'پشکنینی تەواوەتی مۆدێل',

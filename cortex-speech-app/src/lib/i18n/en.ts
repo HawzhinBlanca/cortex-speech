@@ -410,7 +410,8 @@ export const en: Record<string, string> = {
   'stats.importVerifiedGold': 'Import verified → gold',
   'stats.toolWorking': 'Working…',
   'stats.toolFailed': 'Operation failed',
-  'stats.finetunePackDone': 'Fine-tune pack: {n} clip(s) emitted, {h} holdout excluded, {s} skipped.',
+  'stats.finetunePackDone':
+    'Fine-tune pack: {n} clip(s) emitted, {h} holdout excluded, {r} refused by the grade rubric, {s} skipped.',
   'stats.goldEvalDone': 'Gold eval set: {n} clip(s) exported.',
   'stats.importGoldDone': '{n} verified source file(s) imported as gold.',
   'stats.verifyModel': 'Verify model integrity',

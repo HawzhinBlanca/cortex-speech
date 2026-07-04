@@ -262,6 +262,11 @@ pub struct FinetunePackResult {
     pub total_verified: usize,
     /// Verified segments dropped because their audio is a HOLDOUT gold clip (the eval-set leak guard).
     pub excluded_holdout: usize,
+    /// Verified segments the training-grade rubric refused (the B1 guard): human-rejected (mark-bad
+    /// carries verified=true only to leave the review queue), severe audio issues, placeholder text,
+    /// or any other non-training-ready grade. Without this filter a REJECTED clip's bad draft would
+    /// ship as a training label.
+    pub excluded_not_training_ready: usize,
     pub emitted: usize,
     /// Skipped for an empty transcript, a duplicate, or undecodable audio.
     pub skipped: usize,
@@ -275,22 +280,22 @@ struct FinetuneRow<'a> {
     duration_seconds: f64,
 }
 
-/// The human gold transcript for a verified segment (corrected ▸ annotated ▸ normalized ▸ raw),
-/// matching `create_gold_from_verified_file`'s preference.
-fn segment_gold_text(seg: &crate::db::SpeechSegment) -> &str {
-    [seg.verdict_transcript.as_deref(), seg.annotated_transcript.as_deref(), seg.normalized_transcript.as_deref()]
-        .into_iter()
-        .flatten()
-        .find(|text| !text.trim().is_empty())
-        .unwrap_or(&seg.raw_transcript)
-}
-
-/// M5.1 / P5.1: export a fine-tune training pack from the HUMAN-VERIFIED segments — the trainer's
-/// manifest schema (`{audio_path, sentence, duration_seconds}`) + a 16 kHz WAV clip per row under
-/// `clips/`. HOLDOUT gold clips are excluded (path AND content hash, via `exclude_holdout_segments`) so
-/// training never contaminates the eval set the promotion gate measures against — the single most
-/// important guard here. Rows are deduped by (audio span, normalized text) so a re-imported duplicate
-/// is not trained on twice; segments with an empty transcript or undecodable audio are skipped.
+/// M5.1 / P5.1: export a fine-tune training pack from the segments the training-grade rubric
+/// certifies — the trainer's manifest schema (`{audio_path, sentence, duration_seconds}`) + a 16 kHz
+/// WAV clip per row under `clips/`. Two guards, both load-bearing:
+///
+/// 1. HOLDOUT leak guard: gold holdout clips are excluded (path AND content hash, via
+///    `exclude_holdout_segments`) so training never contaminates the eval set the promotion gate
+///    measures against.
+/// 2. RUBRIC guard (B1): every candidate must be `training_ready` per
+///    `quality::training_grade_for_segment` (GOLD/SILVER only). `verified=true` alone is NOT
+///    sufficient — mark-bad sets verified=true merely to leave the review queue, so without the
+///    rubric a human-REJECTED clip's bad draft would ship as a training label. The rubric also
+///    refuses severe audio issues and placeholder text, and its transcript preference (unlike a
+///    naive verdict-first pick) never selects a rejected verdict draft.
+///
+/// Rows are deduped by (audio span, normalized text) so a re-imported duplicate is not trained on
+/// twice; segments with an empty transcript or undecodable audio are skipped.
 pub fn export_finetune_pack(db: &Database, out_dir: &std::path::Path) -> AppResult<FinetunePackResult> {
     use std::io::Write as _;
     let verified = db.get_segments(Some(true))?;
@@ -298,6 +303,13 @@ pub fn export_finetune_pack(db: &Database, out_dir: &std::path::Path) -> AppResu
     // THE LEAK GUARD: drop any verified segment whose audio is a holdout gold clip.
     let kept = crate::export::exclude_holdout_segments(db, verified)?;
     let excluded_holdout = total_verified - kept.len();
+
+    // THE RUBRIC GUARD (B1): only training-ready (GOLD/SILVER) rows may ship, and the shipped
+    // sentence is the rubric's own transcript — the single source of truth shared with the CSV/HF
+    // exports' training_transcript column.
+    let graded: Vec<(&crate::db::SpeechSegment, crate::quality::TrainingGradeReport)> =
+        kept.iter().map(|seg| (seg, crate::quality::training_grade_for_segment(seg))).collect();
+    let excluded_not_training_ready = graded.iter().filter(|(_, report)| !report.training_ready).count();
 
     let clips_dir = out_dir.join("clips");
     std::fs::create_dir_all(&clips_dir).map_err(crate::error::AppError::Io)?;
@@ -308,8 +320,8 @@ pub fn export_finetune_pack(db: &Database, out_dir: &std::path::Path) -> AppResu
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut emitted = 0usize;
     let mut skipped = 0usize;
-    for seg in &kept {
-        let text = segment_gold_text(seg);
+    for (seg, report) in graded.iter().filter(|(_, report)| report.training_ready) {
+        let text = report.transcript.as_str();
         if text.trim().is_empty() {
             skipped += 1;
             continue;
@@ -346,6 +358,7 @@ pub fn export_finetune_pack(db: &Database, out_dir: &std::path::Path) -> AppResu
         manifest_path: manifest_path.to_string_lossy().into_owned(),
         total_verified,
         excluded_holdout,
+        excluded_not_training_ready,
         emitted,
         skipped,
     })
@@ -1065,6 +1078,80 @@ mod tests {
         assert!(clip_rel.starts_with("clips/"), "audio_path is relative");
         assert!(out.path().join(clip_rel).is_file(), "the training clip was written");
         assert!(!manifest.contains("گۆڵد"), "the holdout segment's text never enters the pack");
+        assert_eq!(result.excluded_not_training_ready, 0, "both candidates were rubric-clean here");
+    }
+
+    #[test]
+    fn finetune_pack_refuses_mark_bad_and_severe_audio_rows() {
+        // B1 (true-10 audit blocker): verified=true alone must NOT admit a row. Mark-bad sets
+        // verified=true merely to leave the review queue, so without the rubric guard a human-
+        // REJECTED clip's bad draft would ship as a training label; a severe-clipping clip is
+        // equally unfit. Both must be refused and counted, never emitted.
+        let db = open_mem_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wav = tmp.path().join("clips.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+            for i in 0..16000i32 {
+                w.write_sample(((i % 100) - 50) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let wav_str = wav.to_string_lossy().to_string();
+
+        // GOOD: a clean human-verified segment — the only row allowed through.
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "good".into(),
+            audio_path: wav_str.clone(),
+            raw_transcript: "ڕاستکراوە".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.update_verified("good", true).unwrap();
+
+        // MARK-BAD: human rejected it; the review flow still sets verified=true to clear the queue.
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "markbad".into(),
+            audio_path: wav_str.clone(),
+            raw_transcript: "خراپە".into(),
+            alignment_json: Some(r#"{"start_ms":0,"end_ms":400}"#.into()),
+            ..Default::default()
+        })
+        .unwrap();
+        db.update_verified("markbad", true).unwrap();
+        db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='markbad'", []).unwrap();
+
+        // SEVERE AUDIO: verified but the clip is badly clipped — rubric grade REJECT.
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "clipped".into(),
+            audio_path: wav_str.clone(),
+            raw_transcript: "قسەیەک".into(),
+            alignment_json: Some(r#"{"start_ms":400,"end_ms":800}"#.into()),
+            clipping_ratio: Some(0.5),
+            ..Default::default()
+        })
+        .unwrap();
+        db.update_verified("clipped", true).unwrap();
+
+        let out = tempfile::TempDir::new().unwrap();
+        let result = export_finetune_pack(&db, out.path()).unwrap();
+        assert_eq!(result.total_verified, 3);
+        assert_eq!(result.excluded_holdout, 0);
+        assert_eq!(result.excluded_not_training_ready, 2, "mark-bad + severe-clipping both refused");
+        assert_eq!(result.emitted, 1, "only the rubric-clean row ships");
+
+        let manifest = std::fs::read_to_string(out.path().join("finetune_manifest.jsonl")).unwrap();
+        assert!(manifest.contains("ڕاستکراوە"), "the clean row's text ships");
+        assert!(!manifest.contains("خراپە"), "the rejected draft NEVER becomes a training label");
+        assert!(!manifest.contains("قسەیەک"), "the severe-clipping row never ships");
+        assert!(!out.path().join("clips/markbad.wav").exists(), "no clip written for a refused row");
+        assert!(!out.path().join("clips/clipped.wav").exists(), "no clip written for a refused row");
     }
 
     #[test]

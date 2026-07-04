@@ -1053,6 +1053,8 @@ export interface FinetunePackResult {
   manifestPath: string;
   totalVerified: number;
   excludedHoldout: number;
+  /** Rows the training-grade rubric refused (mark-bad, severe audio, placeholder) — the B1 guard. */
+  excludedNotTrainingReady: number;
   emitted: number;
   skipped: number;
 }

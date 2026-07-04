@@ -53,9 +53,13 @@ Two correctness guarantees the rubric already enforces (do not "fix" around them
 Check each. All must hold for a **pass**.
 
 1. **Only training-ready rows in the training deliverable.** The fine-tune pack
-   (`export_finetune_pack`) is built from verified segments and drops any that fail the rubric; the
-   HF/CSV export carries `training_ready` per row. Acceptance: **every row you ship for training is
-   GOLD or SILVER** (spot-check the `training_grade` column; REJECT/REVIEW rows are not shipped).
+   (`export_finetune_pack`) enforces `quality::training_grade_for_segment` per row — only
+   GOLD/SILVER (`training_ready`) rows ship, and refused rows (mark-bad, severe audio, placeholder)
+   are counted in the result's `excludedNotTrainingReady` (shown in the export toast). *(Corrected
+   2026-07-04: an earlier version of this claim was false — the pack originally admitted every
+   `verified=true` row, which included mark-bad clips; the true-10 audit caught it (B1) and the
+   rubric guard + regression tests now enforce it.)* Acceptance: **every row you ship for training
+   is GOLD or SILVER** (spot-check `training_grade`; a non-zero refused count is the guard working).
 2. **No eval-set leakage.** The fine-tune pack excludes holdout gold clips by **path AND content
    hash** (`export::exclude_holdout_segments`); a non-zero `excludedHoldout` in the result toast is
    the guard working. Acceptance: **train and gold eval sets are disjoint** (they will be, by
