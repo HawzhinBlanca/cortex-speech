@@ -921,3 +921,11 @@ sites. Frontend gates green (typecheck 0/eslint/vitest 132 serialized). Remainin
 ReviewMode undo (+ drop the mark-bad window.confirm), Space-key unification + inbox keyboard play,
 then the minors (filter-scoped queue, rail scrollIntoView, shortcut discoverability, ⌘→Ctrl,
 i18n of events.ts). 11 audit items closed today.
+
+## UX cluster part 2 (2026-07-04) — ReviewMode undo + Space unification
+
+Backspace undo in ReviewMode (one-action decision-clear + segment restore + cursor re-land; the
+split-state Ctrl+Z trap is bypassed), mark-bad confirm dropped (undoable now), Space = play/pause in
+BOTH review surfaces with inbox keyboard play added (skip -> 's'). Frontend gates green. 14 audit
+items closed today. Remaining UX minors: filter-scoped review queue, rail scrollIntoView + source-file
+context, shortcut discoverability + review-mode hotkey, Mac-glyph fix, events.ts i18n.
