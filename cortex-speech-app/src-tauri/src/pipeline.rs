@@ -412,6 +412,12 @@ pub struct ProcessingPipeline {
     import_status: Arc<Mutex<ImportStatus>>,
     diarization_service: Arc<Mutex<Option<crate::diarization::SpeakerEmbeddingService>>>,
     denoiser_service: Arc<Mutex<Option<crate::denoiser::DenoiserService>>>,
+    /// F2 no-silent-downgrade: per-import counters for chunks where the selected fine-tuned engine
+    /// was attempted vs where it silently fell back to the stock engine (absent model / error /
+    /// empty output). Shared across pipeline clones; reset at import start; a non-zero fallback
+    /// count is surfaced as a LOUD completion-time error event — never a log-only downgrade.
+    finetuned_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    finetuned_fallbacks: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ProcessingPipeline {
@@ -434,11 +440,40 @@ impl ProcessingPipeline {
             import_status: Arc::new(Mutex::new(ImportStatus::default())),
             diarization_service: Arc::new(Mutex::new(None)),
             denoiser_service: Arc::new(Mutex::new(None)),
+            finetuned_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            finetuned_fallbacks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     pub fn update_settings(&mut self, settings: AppSettings) {
         self.settings = Arc::new(settings);
+    }
+
+    /// F2: reset the per-import fine-tuned downgrade counters (call at every import entry point).
+    fn reset_finetuned_counters(&self) {
+        self.finetuned_attempts.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.finetuned_fallbacks.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// F2: the LOUD completion-time downgrade message. `None` when no chunk fell back (including
+    /// when the fine-tuned engine was never selected). Pure and unit-tested — the no-silent-downgrade
+    /// contract hangs on this being emitted, not logged.
+    pub(crate) fn finetuned_downgrade_message(attempts: usize, fallbacks: usize) -> Option<String> {
+        if fallbacks == 0 {
+            return None;
+        }
+        Some(if fallbacks >= attempts {
+            format!(
+                "Fine-tuned engine is selected but ALL {attempts} chunk(s) were drafted by the STOCK engine \
+                 instead (model missing or failing) — this import's accuracy is stock-grade, not the selected \
+                 engine's. Run Stats → Verify model integrity."
+            )
+        } else {
+            format!(
+                "Fine-tuned engine fell back to the STOCK engine on {fallbacks} of {attempts} chunk(s) — those \
+                 drafts are stock-grade. Run Stats → Verify model integrity."
+            )
+        })
     }
 
     /// Path to the SQLite database this pipeline writes to. The batch 7B refinement command reads it
@@ -899,6 +934,7 @@ impl ProcessingPipeline {
         // import). A crash leaves this job 'running'; the next launch can offer to resume it.
         let job_id: Option<String> = db.begin_import_job(&dir_path.to_string_lossy(), total).ok();
         callback(PipelineEvent::Started { total });
+        self.reset_finetuned_counters();
         callback(PipelineEvent::Phase { phase: "importing".into() });
         self.set_import_status(0, total, "");
         // RAII: clear import_status.running on EVERY exit path. The per-file `token.check()?` cancel
@@ -1117,6 +1153,15 @@ impl ProcessingPipeline {
         // P3.2: a clean finish — the job is no longer an interruption to resume (best-effort).
         if let Some(ref jid) = job_id {
             let _ = db.complete_import_job(jid);
+        }
+        // F2: a fine-tuned→stock downgrade during this import must end LOUD, not log-only.
+        {
+            let attempts = self.finetuned_attempts.load(std::sync::atomic::Ordering::Relaxed);
+            let fallbacks = self.finetuned_fallbacks.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(error) = Self::finetuned_downgrade_message(attempts, fallbacks) {
+                tracing::error!("finetuned downgrade on import: {error}");
+                callback(PipelineEvent::Error { file: "fine-tuned engine".into(), error });
+            }
         }
         callback(PipelineEvent::Completed { total, succeeded, failed });
         self.finish_import_status();
@@ -1539,7 +1584,12 @@ impl ProcessingPipeline {
             // through to the configured engine so import never breaks. Uses the raw chunk PCM, exactly
             // like transcribe()'s fine-tuned path (no extra RMS/denoise, so the two paths agree).
             let finetuned_text: Option<String> = if self.settings.use_finetuned_asr {
-                match Self::finetuned_model_paths() {
+                // F2: every attempted chunk is counted; every fall-through increments the fallback
+                // counter so the import completion can report the downgrade LOUDLY (a log-only
+                // warn here left a whole import drafted at stock ~29.4% CER instead of the selected
+                // 21.0% engine with nothing visible in the UI).
+                self.finetuned_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let drafted = match Self::finetuned_model_paths() {
                     Some((onnx, vocab)) => match Self::transcribe_chunk_finetuned(&onnx, &vocab, chunk_pcm) {
                         Ok(t) if !t.trim().is_empty() => Some(t),
                         Ok(_) => {
@@ -1557,7 +1607,11 @@ impl ProcessingPipeline {
                         );
                         None
                     }
+                };
+                if drafted.is_none() {
+                    self.finetuned_fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                drafted
             } else {
                 None
             };
@@ -1904,6 +1958,7 @@ impl ProcessingPipeline {
             ((duration_ms as f64 / self.settings.max_segment_duration_ms.max(1) as f64).ceil() as usize).max(1);
 
         on_event(PipelineEvent::Started { total: 1 });
+        self.reset_finetuned_counters();
         on_event(PipelineEvent::Phase { phase: "importing".into() });
         self.set_import_status(0, estimated_chunks, &fname);
 
@@ -2015,6 +2070,15 @@ impl ProcessingPipeline {
             }
             Err(_) => {
                 self.set_import_status(chunks_done, estimated_chunks, &fname);
+            }
+        }
+        // F2: a fine-tuned→stock downgrade during this single-file import must end LOUD too.
+        {
+            let attempts = self.finetuned_attempts.load(std::sync::atomic::Ordering::Relaxed);
+            let fallbacks = self.finetuned_fallbacks.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(error) = Self::finetuned_downgrade_message(attempts, fallbacks) {
+                tracing::error!("finetuned downgrade on import: {error}");
+                on_event(PipelineEvent::Error { file: "fine-tuned engine".into(), error });
             }
         }
         on_event(PipelineEvent::Completed {
@@ -2857,6 +2921,21 @@ mod tests {
             "ئەو ساڵە خراپ بوو",
             "the learned correction must fire when enabled"
         );
+    }
+
+    #[test]
+    fn finetuned_downgrade_message_is_loud_only_when_fallbacks_happened() {
+        // F2 no-silent-downgrade: silence is only allowed when nothing fell back. Partial and total
+        // downgrades produce distinct, actionable messages with real counts.
+        use super::ProcessingPipeline as P;
+        assert_eq!(P::finetuned_downgrade_message(0, 0), None, "engine never selected -> silent");
+        assert_eq!(P::finetuned_downgrade_message(25, 0), None, "all chunks drafted fine-tuned -> silent");
+        let partial = P::finetuned_downgrade_message(10, 3).expect("partial downgrade is loud");
+        assert!(partial.contains("3 of 10"), "partial message carries the real counts: {partial}");
+        assert!(partial.contains("STOCK"), "names the engine that actually drafted: {partial}");
+        let total = P::finetuned_downgrade_message(10, 10).expect("total downgrade is loud");
+        assert!(total.contains("ALL 10"), "total downgrade says ALL with the count: {total}");
+        assert!(total.contains("Verify model integrity"), "actionable next step included: {total}");
     }
 
     #[test]
