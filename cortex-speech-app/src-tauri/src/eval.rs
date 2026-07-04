@@ -112,6 +112,25 @@ pub fn import_gold_segments(db: &Database, inputs: Vec<GoldSegmentInput>) -> App
 /// holdout gold clip (is_holdout = true, so the learning loop never trains on it). Returns the number
 /// of gold rows created. Errors if the file has no reviewed segments — correct it in the app first.
 pub fn create_gold_from_verified_file(db: &Database, audio_path: &str) -> AppResult<usize> {
+    // REJECT GUARD (true-10 audit): a human-REJECTED chunk has no valid text — its draft is known
+    // wrong, yet the holdout WAV still CONTAINS that chunk's speech. Including the rejected draft
+    // poisons the reference with wrong text; silently omitting the chunk poisons it the other way
+    // (the audio has speech the reference lacks, so every eval scores spurious insertions). Neither
+    // is a usable whole-file gold reference — refuse the file until the chunk is corrected.
+    let rejected: i64 = db.connection().query_row(
+        "SELECT COUNT(*) FROM speech_segments
+         WHERE audio_path = ?1
+           AND (human_decision IN ('reject', 'human_reject') OR verdict = 'human_reject')",
+        params![audio_path],
+        |row| row.get(0),
+    )?;
+    if rejected > 0 {
+        return Err(crate::error::AppError::Validation(format!(
+            "'{audio_path}' has {rejected} rejected chunk(s) — their audio is still in the file, so no \
+             correct whole-file reference exists; correct (edit) or re-transcribe them first"
+        )));
+    }
+
     let mut stmt = db.connection().prepare(
         "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(normalized_transcript, ''), raw_transcript)
          FROM speech_segments
@@ -1152,6 +1171,54 @@ mod tests {
         assert!(!manifest.contains("قسەیەک"), "the severe-clipping row never ships");
         assert!(!out.path().join("clips/markbad.wav").exists(), "no clip written for a refused row");
         assert!(!out.path().join("clips/clipped.wav").exists(), "no clip written for a refused row");
+    }
+
+    #[test]
+    fn gold_promotion_refuses_files_with_rejected_chunks() {
+        // True-10 audit: a rejected chunk's draft is known-wrong text, but its speech is still in
+        // the holdout WAV — including the draft poisons the reference one way, omitting the chunk
+        // poisons it the other (spurious insertions on every eval). No correct whole-file reference
+        // exists, so promotion must refuse the file until the chunk is corrected.
+        let db = open_mem_db();
+        for (id, decision, fix) in [("c1", "edit", "alpha"), ("c2", "reject", "WRONG DRAFT"), ("c3", "accept", "gamma")]
+        {
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: id.to_string(),
+                audio_path: "/clips/mixed.wav".to_string(),
+                raw_transcript: "draft".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET human_decision=?2, verdict_transcript=?3 WHERE id=?1",
+                    params![id, decision, fix],
+                )
+                .unwrap();
+        }
+
+        let err = create_gold_from_verified_file(&db, "/clips/mixed.wav").unwrap_err();
+        assert!(err.to_string().contains("rejected chunk"), "refusal explains the reason: {err}");
+        assert!(list_gold_segments(&db).unwrap().is_empty(), "no gold row was created for the poisoned file");
+
+        // The bulk promoter skips the poisoned file (warn) but must not fail the batch; a clean
+        // file still promotes.
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "ok1".to_string(),
+            audio_path: "/clips/clean.wav".to_string(),
+            raw_transcript: "draft".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute("UPDATE speech_segments SET human_decision='accept', verdict_transcript='بەڵێ' WHERE id='ok1'", [])
+            .unwrap();
+        let created = import_verified_segments_as_gold(&db).unwrap();
+        assert_eq!(created, 1, "only the clean file promotes");
+        let gold = list_gold_segments(&db).unwrap();
+        assert_eq!(gold.len(), 1);
+        assert_eq!(gold[0].audio_path, "/clips/clean.wav");
+        assert!(!gold[0].reference.contains("WRONG DRAFT"), "the rejected draft never reaches a gold reference");
     }
 
     #[test]

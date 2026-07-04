@@ -153,7 +153,12 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
             if reference.trim().is_empty() {
                 continue;
             }
-            let hypothesis = seg.normalized_transcript.as_deref().unwrap_or(&seg.raw_transcript);
+            // Score the SAME hypothesis as quality.rs (the RAW ASR output) — compute_wer/cer
+            // canonicalize both sides symmetrically, but the stored normalized_transcript may be
+            // one-way number-verbalized, which irreversibly inflates WER/CER against a digit-form
+            // reference. Scoring normalized here while quality.rs scores raw produced false
+            // HighWer/HighCer Errors that blocked exports on perfect transcripts.
+            let hypothesis = crate::quality::hypothesis_transcript(seg);
             let wer_score = wer::compute_wer(reference, hypothesis);
             let cer_score = wer::compute_cer(reference, hypothesis);
 
@@ -347,6 +352,32 @@ mod tests {
 
         assert_eq!(report.total_segments, 2);
         assert_eq!(report.passed, 0, "both segments sharing a missing audio file must be counted as failed");
+    }
+
+    #[test]
+    fn wer_gate_scores_raw_hypothesis_like_quality_rs() {
+        // True-10 audit: validation scored normalized_transcript while quality.rs deliberately
+        // scores RAW (one-way number verbalization inflates WER/CER irreversibly). A perfect
+        // transcript with verbalized numbers must NOT raise HighWer/HighCer here — previously it
+        // did, and with enforce_quality_gates on that false positive blocked the production bundle.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let mut s = make_seg("num-1", "/fake/num.wav", "تەمەنی ١٤ ساڵ");
+        s.annotated_transcript = Some("تەمەنی ١٤ ساڵ".to_string()); // digit-form human reference
+        s.normalized_transcript = Some("تەمەنی یەک چوار ساڵ".to_string()); // one-way verbalized
+        db.insert_segment(&s).unwrap();
+
+        let report = validate_dataset(&db).unwrap();
+        let high_rate = |issues: &[ValidationIssue]| {
+            issues.iter().any(|i| matches!(i.category, IssueCategory::HighWer | IssueCategory::HighCer))
+        };
+        assert!(
+            !high_rate(&report.errors) && !high_rate(&report.warnings),
+            "a perfect raw transcript must not trip the WER/CER gate because of a verbalized \
+             normalized_transcript; issues: {:?} {:?}",
+            report.errors,
+            report.warnings
+        );
     }
 
     #[test]

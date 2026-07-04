@@ -519,7 +519,11 @@ fn add_audio_quality_reasons(seg: &SpeechSegment, reasons: &mut Vec<String>) -> 
     severe
 }
 
-fn hypothesis_transcript(seg: &SpeechSegment) -> &str {
+/// `pub(crate)`: the ValidationPanel's WER/CER gate (validation/mod.rs) must score the SAME
+/// hypothesis as this quality gate — it previously scored normalized_transcript, so a perfect
+/// transcript with one-way verbalized numbers passed here (0.0) yet raised a HighWer Error there,
+/// blocking exports on a false positive.
+pub(crate) fn hypothesis_transcript(seg: &SpeechSegment) -> &str {
     // Score the RAW ASR output, NOT normalized_transcript. wer::compute_wer/compute_cer apply
     // normalize_for_metrics (verbalize_numbers:false) to BOTH the reference and the hypothesis, so
     // both must enter in the same surface form. The stored normalized_transcript may have been
