@@ -933,9 +933,10 @@ pub fn app_git_sha() -> String {
 #[tauri::command]
 pub fn app_health(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("app_health")?;
+    let data_dir = state.lock_data_dir().clone();
     let db = state.lock_db();
     let mm = state.lock_model_manager();
-    health::health_check(&db, &mm).map_err(|e| e.to_string())
+    health::health_check(&db, &mm, data_dir.as_deref()).map_err(|e| e.to_string())
 }
 
 /// Opt-in: transcribe a segment with the CONSTRAINED Kurdish-token CTC decode (guarantees
@@ -1161,8 +1162,17 @@ pub fn batch_transcribe(
         let normalizer_arc = app_clone.try_state::<AppState>().map(|s| Arc::clone(&s.normalizer));
 
         for (i, id) in ids.iter().enumerate() {
-            if i % 10 == 0 {
-                health::check_memory_pressure();
+            // Real backpressure (the old call discarded its result): under genuine memory pressure
+            // (<1 GiB available) warn loudly and pause briefly so the OS can reclaim, instead of
+            // marching a heavy ASR loop into an OOM kill mid-batch.
+            if i % 10 == 0 && health::check_memory_pressure() {
+                tracing::warn!(
+                    "memory pressure during batch transcribe ({} MiB available) — pausing 2s at segment {}/{}",
+                    health::available_memory_mb(),
+                    i,
+                    ids.len()
+                );
+                std::thread::sleep(std::time::Duration::from_secs(2));
             }
 
             if cancel.is_cancelled() {

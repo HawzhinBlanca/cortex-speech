@@ -24,10 +24,44 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+// ── Snapshot health (true-10 audit): the safety net must never fail silently for months. ────────
+// take_snapshot records every outcome here; health_check surfaces it. A guard-skip (Ok(None)) is
+// neither a success nor a failure — last_success simply ages, which is itself the honest signal.
+static LAST_SUCCESS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONSECUTIVE_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Point-in-time view of the auto-snapshot safety net for `health_check`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotHealth {
+    /// Unix seconds of the last successful snapshot this run; `None` if none succeeded yet.
+    pub last_success_epoch_secs: Option<u64>,
+    pub consecutive_failures: usize,
+}
+
+pub fn snapshot_health() -> SnapshotHealth {
+    let last = LAST_SUCCESS_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    SnapshotHealth {
+        last_success_epoch_secs: (last > 0).then_some(last),
+        consecutive_failures: CONSECUTIVE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
 /// Take a rotating snapshot into `<data_dir>/snapshots/snapshot_<ts>/`, then prune to newest `keep`.
 /// Returns `Ok(None)` when the EMPTY-DB GUARD refuses the snapshot (see below) — a skip, not an error.
 pub fn take_snapshot(db: &Database, data_dir: &Path, keep: usize) -> AppResult<Option<PathBuf>> {
-    take_snapshot_at(db, data_dir, keep, now_secs())
+    let result = take_snapshot_at(db, data_dir, keep, now_secs());
+    match &result {
+        Ok(Some(_)) => {
+            LAST_SUCCESS_EPOCH.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+            CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(None) => {}
+        Err(_) => {
+            CONSECUTIVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    result
 }
 
 /// `take_snapshot` with an explicit timestamp (testable without same-second collisions).
@@ -234,6 +268,31 @@ mod tests {
         empty_db.initialize().unwrap();
         let snap = take_snapshot_at(&empty_db, tmp.path(), 5, 1000).unwrap();
         assert!(snap.is_some(), "a brand-new empty library still gets its first snapshot");
+    }
+
+    #[test]
+    fn snapshot_health_tracks_success_and_consecutive_failures() {
+        // True-10 audit: the safety net must never fail silently — health_check reads these
+        // counters. A failing snapshot (data_dir path occupied by a FILE, so the snapshot dir
+        // cannot be created) increments consecutive_failures; a success resets them and stamps
+        // last_success. (Statics are process-wide; assert on relative movement, not absolutes.)
+        let db = seeded_db();
+
+        // Failure: 'snapshots' cannot be created because a file sits at data_dir/snapshots' parent.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocked_data_dir = tmp.path().join("blocked");
+        std::fs::write(&blocked_data_dir, b"a file, not a dir").unwrap();
+        let before = snapshot_health().consecutive_failures;
+        assert!(take_snapshot(&db, &blocked_data_dir, 3).is_err(), "file-at-data-dir must fail");
+        let after_fail = snapshot_health();
+        assert_eq!(after_fail.consecutive_failures, before + 1, "failure increments the counter");
+
+        // Success: counters reset, last_success stamped.
+        let good_dir = tempfile::TempDir::new().unwrap();
+        assert!(take_snapshot(&db, good_dir.path(), 3).unwrap().is_some());
+        let after_ok = snapshot_health();
+        assert_eq!(after_ok.consecutive_failures, 0, "success resets the failure streak");
+        assert!(after_ok.last_success_epoch_secs.is_some(), "success stamps last_success");
     }
 
     #[test]
