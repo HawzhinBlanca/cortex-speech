@@ -735,8 +735,11 @@ pub fn export_huggingface_dataset(
                         let verified_str = if seg.verified { "1" } else { "0" };
                         let training_ready_str = if grade.training_ready { "1" } else { "0" };
                         let reasons = grade.reasons.join("; ");
-                        // Formula-injection guard on the free-text columns only.
-                        let hf_transcript = csv_safe_cell(grade.transcript.as_str());
+                        // Canonical Sorani orthography for the shipped transcription (ك/ک, ي/ی, ه/ھ
+                        // unified — mixed codepoint variants inflate the CTC label space downstream),
+                        // then the formula-injection guard on the free-text columns only.
+                        let canonical_transcript = crate::normalizer::canonical_training_text(&grade.transcript);
+                        let hf_transcript = csv_safe_cell(&canonical_transcript);
                         let hf_speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                         let hf_reasons = csv_safe_cell(reasons.as_str());
 
@@ -840,6 +843,12 @@ This dataset was exported from Cortex Speech Processor.
 | Validation | {} | {:.2} |
 | Test | {} | {:.2} |
 | **Total** | {} | {:.2} |
+
+## Text Normalization Policy
+The `transcription` column is orthographically canonicalized for Sorani: Arabic-script codepoint
+variants are unified (Kaf ك→ک, Yeh ي→ی, Heh→ھ/ە forms; tatweel/ZWNJ folded) so each grapheme has
+one form across human-typed and ASR-produced text. Digits are preserved exactly as written (no
+number verbalization), and diacritics are left untouched.
 "#,
         settings.hf_license,
         settings.hf_license,

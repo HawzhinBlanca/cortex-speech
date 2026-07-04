@@ -43,6 +43,17 @@ pub struct SoraniNormalizer {
     config: NormalizationConfig,
 }
 
+/// Canonical orthography for SHIPPED TRAINING TEXT (the HF `transcription` column and the
+/// fine-tune pack `sentence`): char-only unification so ك/ک, ي/ی, ه/ھ variants collapse to one
+/// form. Human-typed corrections and ASR output otherwise mix codepoint variants in one dataset,
+/// inflating the CTC label space of the retrain corpus (and Arabic-only forms may not even exist
+/// in the model's ckb vocab). Numbers and diacritics are left exactly as written — no one-way
+/// verbalization ever enters shipped text.
+pub fn canonical_training_text(text: &str) -> String {
+    static CHAR_ONLY: LazyLock<SoraniNormalizer> = LazyLock::new(SoraniNormalizer::char_only);
+    CHAR_ONLY.normalize(text)
+}
+
 impl Default for SoraniNormalizer {
     fn default() -> Self {
         Self::new()
@@ -63,6 +74,18 @@ impl SoraniNormalizer {
 
     pub fn with_config(config: NormalizationConfig) -> Self {
         Self { config }
+    }
+
+    /// Char-only canonical configuration: folds the Sorani codepoint variants (Arabic Kaf ك→ک,
+    /// Arabic Yeh ي→ی, Heh forms, ZWNJ/tatweel, hamza) but does NOT touch numbers (no one-way
+    /// verbalization) or diacritics. This is the orthography for keys and SHIPPED TRAINING TEXT.
+    pub fn char_only() -> Self {
+        Self::with_config(NormalizationConfig {
+            normalize_numbers: false,
+            verbalize_numbers: false,
+            normalize_hamza: true,
+            remove_diacritics: false,
+        })
     }
 
     pub fn normalize(&self, text: &str) -> String {
@@ -441,6 +464,17 @@ mod tests {
         assert_eq!(n.normalize("گوناهـ"), "گوناھ");
         assert_eq!(n.normalize("گوناهــ"), "گوناھ");
         assert_eq!(n.normalize("گوناهـ دار"), "گوناھ دار");
+    }
+
+    #[test]
+    fn canonical_training_text_unifies_variants_but_preserves_digits() {
+        // Shipped training text: Arabic Kaf/Yeh fold to the Kurdish forms, while digits stay digits
+        // (no one-way verbalization may ever enter a shipped sentence).
+        let out = canonical_training_text("كوردي ١٤");
+        assert!(out.contains('ک') && out.contains('ی'), "Kaf/Yeh unified to Kurdish forms: {out}");
+        assert!(!out.contains('ك') && !out.contains('ي'), "no Arabic variants remain: {out}");
+        assert!(out.contains("١٤") || out.contains("14"), "digits preserved, never verbalized: {out}");
+        assert!(!out.contains("چوارد"), "no number verbalization in shipped text: {out}");
     }
 
     #[test]

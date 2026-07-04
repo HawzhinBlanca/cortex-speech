@@ -340,12 +340,16 @@ pub fn export_finetune_pack(db: &Database, out_dir: &std::path::Path) -> AppResu
     let mut emitted = 0usize;
     let mut skipped = 0usize;
     for (seg, report) in graded.iter().filter(|(_, report)| report.training_ready) {
-        let text = report.transcript.as_str();
-        if text.trim().is_empty() {
+        // Canonical Sorani orthography for the SHIPPED sentence — ك/ک, ي/ی, ه/ھ variants unified so
+        // the retrain corpus has one label per grapheme (mixed forms inflate the CTC label space).
+        let sentence = crate::normalizer::canonical_training_text(&report.transcript);
+        if sentence.trim().is_empty() {
             skipped += 1;
             continue;
         }
-        let norm = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        // Dedup by the variant-unifying hash form (not plain lowercase) so a re-imported duplicate
+        // written with different codepoint variants still dedups to one training row.
+        let norm = crate::quality::normalize_transcript_for_hash(&sentence);
         let dedup_key = format!("{}|{}|{}", seg.audio_path, seg.alignment_json.as_deref().unwrap_or(""), norm);
         if !seen.insert(dedup_key) {
             skipped += 1;
@@ -363,7 +367,7 @@ pub fn export_finetune_pack(db: &Database, out_dir: &std::path::Path) -> AppResu
         write_wav_16k_mono(&clips_dir.join(format!("{}.wav", seg.id)), &pcm, crate::audio::TARGET_SAMPLE_RATE)?;
         let row = FinetuneRow {
             audio_path: clip_rel,
-            sentence: text,
+            sentence: &sentence,
             duration_seconds: pcm.len() as f64 / crate::audio::TARGET_SAMPLE_RATE as f64,
         };
         let line = serde_json::to_string(&row)
@@ -1171,6 +1175,50 @@ mod tests {
         assert!(!manifest.contains("قسەیەک"), "the severe-clipping row never ships");
         assert!(!out.path().join("clips/markbad.wav").exists(), "no clip written for a refused row");
         assert!(!out.path().join("clips/clipped.wav").exists(), "no clip written for a refused row");
+    }
+
+    #[test]
+    fn finetune_pack_ships_canonical_orthography_and_dedups_variants() {
+        // True-10 audit: human-typed and ASR text mix Sorani codepoint variants (ك/ک, ي/ی). The
+        // shipped sentence must be canonicalized, and two rows on the same audio span differing
+        // ONLY by codepoint variant must dedup to ONE training row.
+        let db = open_mem_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wav = tmp.path().join("v.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+            for i in 0..16000i32 {
+                w.write_sample(((i % 100) - 50) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let wav_str = wav.to_string_lossy().to_string();
+        // Same audio span, same word — one written with Arabic forms, one with Kurdish forms.
+        for (id, text) in [("arabic", "كوردي"), ("kurdish", "کوردی")] {
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: id.to_string(),
+                audio_path: wav_str.clone(),
+                raw_transcript: text.to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            db.update_verified(id, true).unwrap();
+        }
+
+        let out = tempfile::TempDir::new().unwrap();
+        let result = export_finetune_pack(&db, out.path()).unwrap();
+        assert_eq!(result.emitted, 1, "codepoint-variant duplicates collapse to one training row");
+        assert_eq!(result.skipped, 1, "the variant duplicate is skipped as a dup");
+
+        let manifest = std::fs::read_to_string(out.path().join("finetune_manifest.jsonl")).unwrap();
+        assert!(manifest.contains("کوردی"), "the shipped sentence uses the canonical Kurdish forms");
+        assert!(!manifest.contains("كوردي"), "no Arabic codepoint variants ship: {manifest}");
     }
 
     #[test]

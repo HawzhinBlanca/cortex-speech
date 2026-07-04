@@ -10,7 +10,7 @@
 //! normalization noise. This module is pure (no DB, no I/O); wiring the emitted memories into the
 //! `correction_memory` table is a separate, thin step.
 
-use crate::normalizer::{NormalizationConfig, SoraniNormalizer};
+use crate::normalizer::SoraniNormalizer;
 
 /// One learned substitution extracted from a human correction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,13 +30,9 @@ pub struct SubstitutionMemory {
 
 /// The char-only canonical normalizer: folds Kaf/Yeh/Heh/ZWNJ/tatweel/hamza but does NOT verbalize
 /// numbers, so slot/phonetic keys are orthographically canonical without turning digits into words.
+/// Shared with the training-text exports via `SoraniNormalizer::char_only`.
 fn char_only_normalizer() -> SoraniNormalizer {
-    SoraniNormalizer::with_config(NormalizationConfig {
-        normalize_numbers: false,
-        verbalize_numbers: false,
-        normalize_hamza: true,
-        remove_diacritics: false,
-    })
+    SoraniNormalizer::char_only()
 }
 
 #[derive(Clone, Copy)]
