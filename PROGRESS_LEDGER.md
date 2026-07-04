@@ -942,3 +942,10 @@ shortcut discoverability, events.ts i18n, intelligence read-side cluster, P5.2/P
 Search now scopes the review queue (explicit banner, never silent; scoped empty-state); Ctrl+Shift+E
 opens Review & Correct (palette + help discoverable). 19 audit items closed today. Remaining
 automatable: events.ts i18n (minor), intelligence read-side cluster, P5.2/P2.4/P5.4/P5.5.
+
+## Intelligence read-side 1/3 (2026-07-04) — suspect-first is real now
+
+Escalated verdicts persist the IRT confidence; the review queue's riskiest-first ordering actually
+ranks by jury doubt instead of silently degrading to recency (regression test pins 0.2 < None@0.5 <
+0.9; 57 jury tests green). 20 audit items closed today. Next: LOOP-0 shadow-precision report +
+C4 auto-accept-precision report (the go-live evidence surfaces).
