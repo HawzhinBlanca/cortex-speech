@@ -760,3 +760,16 @@ docs/TRUE_10_GAP_AUDIT_2026-07-04.md is the full record. Headlines:
 - Owner-gated to the 10/10 CALL: P2.2 benchmark (C1), P1.7/P1.8, P3.5/6/9 drills, P4 marathon
   (3/500 decisions), P5.6 retrain, P7 re-audit.
 Next loop iterations execute the sequenced fix plan (B1 first).
+
+## B1 FIXED (2026-07-04) — training pack can no longer ship mark-bad clips
+
+The audit's top blocker is closed (a807949): export_finetune_pack now enforces
+quality::training_grade_for_segment — only GOLD/SILVER (training_ready) rows ship; the sentence is
+the rubric's own transcript (never a rejected verdict draft); refused rows are counted
+(excludedNotTrainingReady) and shown in the export toast (EN+CKB). Regression test proves a
+mark-bad row and a severe-clipping row are refused, counted, and never emitted (no manifest row,
+no clip file). FINAL_TEST_CHECKLIST C.1 corrected with an honest note that its earlier claim was
+false until today.
+Gates: 19 eval tests + clippy-all-targets + fmt green; typecheck 0 / eslint / vitest 132 / python
+policies / i18n 407==407. Exe rebuilt (6m47s), freshness GREEN — the running app carries the guard.
+NEXT (audit fix plan): B2 — quarantine banner + snapshot empty-DB guard + restore UI.
