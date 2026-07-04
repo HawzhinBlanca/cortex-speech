@@ -723,3 +723,23 @@ Fresh-eyes pass fixed the root cause behind last round's midnight red (not just 
 
 Everything else unchanged: full suite certified green; new-code surface exhausted; forward motion
 owner/GPU-gated (P2.2 next).
+
+## Dataset-grade review + final-test checklist (2026-07-04)
+
+Owner redirected the loop to "continue till 100% fully reliable, ready for final test with highest
+grade output datasets." Responded on the app's actual deliverable — the exported dataset:
+- Adversarial re-review of the CORE export + grading paths (not the new-this-session code):
+  export_csv (uses the csv crate = RFC4180-correct, PLUS csv_safe_cell formula-injection guard on
+  free-text columns), assign_splits (train/test recording-leakage guard, unit-tested), and
+  quality::training_grade_for_segment (GOLD=human-verified+no-risk, SILVER=jury high-conf+multi-agent
+  evidence, mark-bad checked FIRST so a rejected clip can't be GOLD, review-risk downgrades GOLD->
+  REVIEW). All correct + well-tested — no code change warranted (no fabrication).
+- NEW (503a049): docs/FINAL_TEST_CHECKLIST.md — the missing turnkey final-test + acceptance
+  procedure. Parts A-D: drive the pipeline, the grade rubric, 7 code-grounded acceptance criteria
+  (only GOLD/SILVER shipped; no holdout/split leakage; manifest+SHA256SUMS consistency; CSV integrity;
+  model integrity; quality signals), and a no-estimates sign-off table. Every referenced identifier
+  verified to exist in the tree.
+
+State: certified green; the export/grading core is verified correct and appropriately strict for
+highest-grade output. The last inputs to an honest "highest-grade" call remain owner/GPU-gated
+(measured CER on real audio via the M1 benchmark / retrain).
