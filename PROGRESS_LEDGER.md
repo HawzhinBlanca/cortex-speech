@@ -1015,3 +1015,17 @@ STATE: the app is in its best-verified state ever. Automatable surface exhausted
 live). Remaining is ALL owner work: reboot + full-LTO rebuild; P2.2 GPU benchmark (C1); P1.7/P1.8
 observed gates + throughput baseline (BEFORE enjoying the new UX); P3.5/6/9 drills; P4 marathon;
 P5.6 retrain; P7 re-audit for the honest 10/10 call.
+
+## LTO diagnosis DEFINITIVE (2026-07-04 ~16:20) — large-file I/O corruption; LTO-off exe stands
+
+Controlled elimination completed: fresh rustup toolchain (1.96.0 -> 1.96.1 clean re-download) +
+from-scratch build + thin-LTO STILL fails — LLVM cannot parse bitcode IT JUST WROTE (producer ==
+reader, "Explicit call type is not a function type"). Meanwhile LTO-off full builds succeed (2x).
+Eliminated: toolchain corruption, stale artifacts, compiler version, load-dependent hardware (LTO-off
+is comparably heavy), disk/NTFS/WHEA (zero events). CONCLUSION: something machine-level corrupts
+LARGE file writes/reads since 08:31 — the Defender config change (Event 5007) at exactly 08:31 is
+the prime suspect (giant bitcode blobs are what AV inspects; small/medium files pass).
+
+STANDING STATE: the LTO-off exe (15:15, all 26 fixes) is intact, freshness GREEN — the app is fully
+usable. OWNER unblock for standard-LTO builds: add the Defender exclusions (admin PowerShell, see
+the 12:20 ledger entry) and/or reboot; then one `cargo build --release` restores the standard profile.
