@@ -965,3 +965,10 @@ idempotent; 31 registry tests green). Server-side one-line read documented in RE
 Memory-confidence work spawned as a dedicated task (needs fresh-context design care). 22 audit items
 closed today. Remaining automatable: P2.4 regression-gate wiring (needs stable machine — heavy ASR),
 P5.4/P5.5 docs, events.ts i18n, finetuned-juror (owner-measurement-coupled).
+
+## P5.5 SHIPPED (2026-07-04) — corpus ledger
+
+pack_provenance.json inside every training pack + durable corpus_ledger.jsonl in the data dir;
+manifestSha256 pins the exact rows a champion traces back to. 23 audit items closed today.
+Automatable remainder: P5.4 WSL DR runbook (docs), events.ts i18n (minor), P2.4 (deferred —
+needs stable machine for heavy ASR gates), finetuned-juror + memory-confidence (spawned/coupled).
