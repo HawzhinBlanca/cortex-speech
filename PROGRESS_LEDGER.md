@@ -879,3 +879,19 @@ NOTE: a rustc panic mid-verification was fixed by clearing target/debug/incremen
 the earlier crashes) + CARGO_INCREMENTAL=0 — the instability contaminates caches that then fail
 deterministically; clearing them restores dev workability. Release exe still awaits the hardware
 fix (freshness RED). Remaining in the cluster: Sorani normalization of exported training text.
+
+## Dataset-quality cluster COMPLETE (2026-07-04) — orthography canonicalized (b3dbab1)
+
+Third and final major of the cluster: shipped training text (HF transcription column + finetune
+pack sentence) is now canonical Sorani orthography via the shared char-only normalizer (ك/ک, ي/ی,
+Heh forms unified; digits preserved, never verbalized); the pack dedup key is variant-aware
+(normalize_transcript_for_hash) so codepoint-variant duplicates collapse to one row; the dataset
+card documents the policy. Tests pin both the unification and the variant dedup end-to-end.
+Dev gates green (clippy, pack/normalizer/corrections/export suites, policies).
+
+DATASET INTEGRITY NOW: B1 rubric guard + gold reject guard + validation/quality hypothesis
+unification + canonical orthography + variant dedup + holdout leak guard + split-leakage guard +
+RFC4180/injection-safe CSV. The "highest grade output datasets" code surface from the audit is
+fully addressed except owner-gated threshold calibration. Remaining audit clusters: reliability
+(silent finetuned downgrade counter, snapshot-health surfacing), UX (batch cancel, autoplay,
+undo, Space unification...), intelligence read-side, P5.2/P2.4/P5.4/P5.5.
