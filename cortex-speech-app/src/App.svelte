@@ -31,7 +31,9 @@
   } from './lib/stores/uiStore';
   import { notifications } from './lib/stores/notificationStore';
   import { historyStore } from './lib/stores/historyStore';
-  import { initKeyboardManager, globalKeyboardManager } from './lib/keyboard';
+  import { initKeyboardManager, globalKeyboardManager, modKeyLabel } from './lib/keyboard';
+  // Platform-aware modifier label (Ctrl on Windows, ⌘ on Mac) for the hardcoded kbd hints.
+  const modKey = modKeyLabel();
   import {
     startEventListeners,
     stopEventListeners,
@@ -1929,7 +1931,7 @@
         data-testid="settings-btn"
         class="btn btn-primary !text-xs relative"
         onclick={() => openSettings()}
-        title="⌘,"
+        title="{modKey}+,"
         aria-label={$t('openSettings')}
       >
         <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
@@ -2731,10 +2733,10 @@
         {:else}
           <EmptyState variant="mic" title={$t('selectSegment')}>
             <div class="flex flex-wrap justify-center gap-x-3 gap-y-1 text-xs text-subtle">
-              <span><kbd>⌘O</kbd> {$t('openFile')}</span>
-              <span><kbd>⌘I</kbd> {$t('import')}</span>
-              <span><kbd>⌘T</kbd> {$t('transcribe')}</span>
-              <span><kbd>⌘K</kbd> {$t('shortcuts')}</span>
+              <span><kbd>{modKey}+O</kbd> {$t('openFile')}</span>
+              <span><kbd>{modKey}+I</kbd> {$t('import')}</span>
+              <span><kbd>{modKey}+T</kbd> {$t('transcribe')}</span>
+              <span><kbd>{modKey}+K</kbd> {$t('shortcuts')}</span>
             </div>
           </EmptyState>
         {/if}
@@ -2976,10 +2978,10 @@
       <button
         class="hover:text-cortex-400 transition-colors"
         onclick={() => showKeyboardHelp.set(true)}
-        title="⌘/"
+        title="{modKey}+/"
         aria-label={$t('keyboardShortcuts')}
       >
-        <kbd class="text-[9px]">⌘/</kbd>
+        <kbd class="text-[9px]">{modKey}+/</kbd>
         {$t('shortcuts')}
       </button>
     </div>

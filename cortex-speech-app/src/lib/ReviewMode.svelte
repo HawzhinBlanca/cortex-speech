@@ -8,7 +8,13 @@
   import Waveform from './Waveform.svelte';
   import AudioPlayer from './AudioPlayer.svelte';
   import EmptyState from './EmptyState.svelte';
-  import { parseWordTimestamps, parseSourceMeta, chunkPlaybackRange } from './alignment';
+  import {
+    parseWordTimestamps,
+    parseSourceMeta,
+    chunkPlaybackRange,
+    segmentSourceFilename,
+    segmentChunkLabel,
+  } from './alignment';
   import type { SpeechSegment, WordTimestamp } from './types';
   import type { SegmentConsensus } from './commands';
 
@@ -574,10 +580,19 @@
         <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-surface-3">
           <div class="h-full rounded-full bg-accent transition-all duration-300" style="width: {pct}%"></div>
         </div>
-        <div class="mt-1 text-end text-xs text-subtle">
-          {$t('review.reviewedCount')
-            .replace('{done}', String(reviewedCount))
-            .replace('{total}', String($segments.length))}
+        <div class="mt-1 flex items-center justify-between gap-3 text-xs text-subtle">
+          <!-- True-10 audit: source-file orientation — in a hundreds-of-clips sitting the reviewer
+               had no idea WHICH recording the current clip came from. -->
+          <span class="truncate" dir="ltr" title={current.audioPath} data-testid="review-source-file">
+            {segmentSourceFilename(current.audioPath)}{segmentChunkLabel(current.alignmentJson)
+              ? ` · ${segmentChunkLabel(current.alignmentJson)}`
+              : ''}
+          </span>
+          <span class="shrink-0">
+            {$t('review.reviewedCount')
+              .replace('{done}', String(reviewedCount))
+              .replace('{total}', String($segments.length))}
+          </span>
         </div>
       </div>
 

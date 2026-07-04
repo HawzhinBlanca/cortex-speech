@@ -86,12 +86,22 @@ export class KeyboardManager {
 
   formatShortcut(s: Shortcut): string {
     const parts: string[] = [];
-    if (s.ctrl) parts.push('⌘');
-    if (s.shift) parts.push('⇧');
-    if (s.alt) parts.push('⌥');
+    if (s.ctrl) parts.push(modKeyLabel());
+    if (s.shift) parts.push(isMacPlatform() ? '⇧' : 'Shift');
+    if (s.alt) parts.push(isMacPlatform() ? '⌥' : 'Alt');
     parts.push(s.key.toUpperCase());
     return parts.join('+');
   }
+}
+
+/// True-10 audit: this app runs on Windows — showing Mac ⌘/⇧/⌥ glyphs everywhere was wrong.
+/// Platform-aware labels, shared by the palette, help modal, and the hardcoded kbd hints.
+export function isMacPlatform(): boolean {
+  return typeof navigator !== 'undefined' && navigator.platform.includes('Mac');
+}
+
+export function modKeyLabel(): string {
+  return isMacPlatform() ? '⌘' : 'Ctrl';
 }
 
 export let globalKeyboardManager: KeyboardManager | null = null;

@@ -40,6 +40,15 @@
   // clip never inherits the previous clip's playing flag.
   let inboxPlaying = false;
   $: if (currentIndex >= 0) inboxPlaying = false;
+  // True-10 audit: keep the active rail row visible — past ~15 items the aria-current row scrolled
+  // below the fold of a 200-item queue with no way to see where you are.
+  $: if (currentIndex >= 0) void scrollRailToCurrent();
+  async function scrollRailToCurrent() {
+    await tick();
+    document
+      .querySelector('.rail-list [aria-current="true"]')
+      ?.scrollIntoView({ block: 'nearest' });
+  }
   // Guard against double-submission from rapid key presses.
   let isSubmitting = false;
 
