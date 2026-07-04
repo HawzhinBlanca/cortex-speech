@@ -3394,8 +3394,10 @@ pub fn export_finetune_pack(
     if out_dir.contains('\0') {
         return Err("Output path contains null bytes".to_string());
     }
+    // P5.5: every pack export appends its provenance line to the durable corpus ledger.
+    let ledger = state.lock_data_dir().clone().map(|d| d.join("corpus_ledger.jsonl"));
     let db = state.lock_db();
-    crate::eval::export_finetune_pack(&db, std::path::Path::new(&out_dir)).map_err(|e| e.to_string())
+    crate::eval::export_finetune_pack(&db, std::path::Path::new(&out_dir), ledger.as_deref()).map_err(|e| e.to_string())
 }
 
 /// Report which cloud providers have an API key configured (provider NAMES only — never the key

@@ -1101,6 +1101,8 @@ export async function exportGoldEvalSet(outDir: string): Promise<GoldEvalExport>
 /** M5.1 / P5.1: summary of an export_finetune_pack run. */
 export interface FinetunePackResult {
   manifestPath: string;
+  /** P5.5: pins the exact rows this pack contains — the corpus-ledger key. */
+  manifestSha256: string;
   totalVerified: number;
   excludedHoldout: number;
   /** Rows the training-grade rubric refused (mark-bad, severe audio, placeholder) — the B1 guard. */

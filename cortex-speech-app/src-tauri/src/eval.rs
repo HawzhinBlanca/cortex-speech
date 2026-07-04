@@ -278,6 +278,8 @@ pub fn export_gold_eval_set(db: &Database, out_dir: &std::path::Path) -> AppResu
 #[serde(rename_all = "camelCase")]
 pub struct FinetunePackResult {
     pub manifest_path: String,
+    /// P5.5: pins the exact rows this pack contains — the corpus-ledger key a champion traces back to.
+    pub manifest_sha256: String,
     pub total_verified: usize,
     /// Verified segments dropped because their audio is a HOLDOUT gold clip (the eval-set leak guard).
     pub excluded_holdout: usize,
@@ -315,7 +317,11 @@ struct FinetuneRow<'a> {
 ///
 /// Rows are deduped by (audio span, normalized text) so a re-imported duplicate is not trained on
 /// twice; segments with an empty transcript or undecodable audio are skipped.
-pub fn export_finetune_pack(db: &Database, out_dir: &std::path::Path) -> AppResult<FinetunePackResult> {
+pub fn export_finetune_pack(
+    db: &Database,
+    out_dir: &std::path::Path,
+    corpus_ledger_path: Option<&std::path::Path>,
+) -> AppResult<FinetunePackResult> {
     use std::io::Write as _;
     let verified = db.get_segments(Some(true))?;
     let total_verified = verified.len();
@@ -376,9 +382,41 @@ pub fn export_finetune_pack(db: &Database, out_dir: &std::path::Path) -> AppResu
         emitted += 1;
     }
     manifest.flush().map_err(crate::error::AppError::Io)?;
+    drop(manifest);
+
+    // P5.5 (corpus ledger): every training pack is traceable to its exact data. A self-describing
+    // provenance record goes INSIDE the pack (pack_provenance.json) and the same line is appended to
+    // the durable <data_dir>/corpus_ledger.jsonl (survives pack deletion) when a ledger path is
+    // given. The manifest SHA pins the exact rows a future champion was trained on.
+    let manifest_sha256 = crate::models::compute_file_sha256(&manifest_path)
+        .map_err(|e| crate::error::AppError::Other(format!("pack manifest sha: {e}")))?;
+    let provenance = serde_json::json!({
+        "schema": 1,
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "appGitSha": crate::GIT_SHA,
+        "manifestSha256": manifest_sha256,
+        "emitted": emitted,
+        "skipped": skipped,
+        "excludedHoldout": excluded_holdout,
+        "excludedNotTrainingReady": excluded_not_training_ready,
+        "totalVerified": total_verified,
+        "selectionPolicy": "training_ready (GOLD/SILVER) via quality::training_grade_for_segment; holdout-excluded; canonical Sorani orthography; variant-aware dedup",
+    });
+    let provenance_text = serde_json::to_string_pretty(&provenance)
+        .map_err(|e| crate::error::AppError::Other(format!("pack provenance serialize: {e}")))?;
+    std::fs::write(out_dir.join("pack_provenance.json"), &provenance_text).map_err(crate::error::AppError::Io)?;
+    if let Some(ledger) = corpus_ledger_path {
+        use std::io::Write as _;
+        let line = serde_json::to_string(&provenance)
+            .map_err(|e| crate::error::AppError::Other(format!("corpus ledger serialize: {e}")))?;
+        let mut file =
+            std::fs::OpenOptions::new().create(true).append(true).open(ledger).map_err(crate::error::AppError::Io)?;
+        writeln!(file, "{line}").map_err(crate::error::AppError::Io)?;
+    }
 
     Ok(FinetunePackResult {
         manifest_path: manifest_path.to_string_lossy().into_owned(),
+        manifest_sha256,
         total_verified,
         excluded_holdout,
         excluded_not_training_ready,
@@ -1087,7 +1125,8 @@ mod tests {
         db.update_verified("leak", true).unwrap();
 
         let out = tempfile::TempDir::new().unwrap();
-        let result = export_finetune_pack(&db, out.path()).unwrap();
+        let ledger = out.path().join("corpus_ledger.jsonl");
+        let result = export_finetune_pack(&db, out.path(), Some(&ledger)).unwrap();
         assert_eq!(result.total_verified, 2);
         assert_eq!(result.excluded_holdout, 1, "the holdout-matching segment is excluded (leak guard)");
         assert_eq!(result.emitted, 1, "only the non-holdout verified segment is emitted");
@@ -1102,6 +1141,19 @@ mod tests {
         assert!(out.path().join(clip_rel).is_file(), "the training clip was written");
         assert!(!manifest.contains("گۆڵد"), "the holdout segment's text never enters the pack");
         assert_eq!(result.excluded_not_training_ready, 0, "both candidates were rubric-clean here");
+
+        // P5.5: the pack is self-describing and the durable corpus ledger got the same record.
+        let prov: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.path().join("pack_provenance.json")).unwrap()).unwrap();
+        assert_eq!(prov["manifestSha256"], result.manifest_sha256.as_str());
+        assert_eq!(prov["emitted"], 1);
+        assert_eq!(prov["excludedHoldout"], 1);
+        let ledger_text = std::fs::read_to_string(&ledger).unwrap();
+        let ledger_line: serde_json::Value = serde_json::from_str(ledger_text.lines().next().unwrap()).unwrap();
+        assert_eq!(ledger_line["manifestSha256"], result.manifest_sha256.as_str(), "ledger mirrors provenance");
+        // The SHA really pins the manifest bytes.
+        let recomputed = crate::models::compute_file_sha256(std::path::Path::new(&result.manifest_path)).unwrap();
+        assert_eq!(recomputed, result.manifest_sha256);
     }
 
     #[test]
@@ -1163,7 +1215,7 @@ mod tests {
         db.update_verified("clipped", true).unwrap();
 
         let out = tempfile::TempDir::new().unwrap();
-        let result = export_finetune_pack(&db, out.path()).unwrap();
+        let result = export_finetune_pack(&db, out.path(), None).unwrap();
         assert_eq!(result.total_verified, 3);
         assert_eq!(result.excluded_holdout, 0);
         assert_eq!(result.excluded_not_training_ready, 2, "mark-bad + severe-clipping both refused");
@@ -1212,7 +1264,7 @@ mod tests {
         }
 
         let out = tempfile::TempDir::new().unwrap();
-        let result = export_finetune_pack(&db, out.path()).unwrap();
+        let result = export_finetune_pack(&db, out.path(), None).unwrap();
         assert_eq!(result.emitted, 1, "codepoint-variant duplicates collapse to one training row");
         assert_eq!(result.skipped, 1, "the variant duplicate is skipped as a dup");
 
