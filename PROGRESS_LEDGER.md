@@ -773,3 +773,26 @@ false until today.
 Gates: 19 eval tests + clippy-all-targets + fmt green; typecheck 0 / eslint / vitest 132 / python
 policies / i18n 407==407. Exe rebuilt (6m47s), freshness GREEN — the running app carries the guard.
 NEXT (audit fix plan): B2 — quarantine banner + snapshot empty-DB guard + restore UI.
+
+## B2 FIXED (2026-07-04) — snapshots can no longer self-destruct; quarantine loud; restore UI
+
+Audit blocker B2 closed in code (71365e9), three linked fixes:
+1. EMPTY-DB GUARD: take_snapshot refuses when the live DB has 0 segments but prior snapshots exist —
+   a post-quarantine empty library can no longer rotate out the only good copies (test proves the
+   good snapshot survives repeated refused cycles and stays restorable). First-run still snapshots.
+2. QUARANTINE BANNER: get_quarantine_notice IPC + red startup banner (quarantined files + snapshot
+   count) — corruption is now LOUD, not a silent empty library.
+3. RESTORE UI: list_db_snapshots (newest-first, per-snapshot segment count; damaged shows '?') +
+   restore_db_from_snapshot (name validated, no traversal) + picker in Stats tools with explicit
+   confirm; app reloads after restore.
+Gates: clippy-all-targets clean, 6 snapshot tests, typecheck 0, eslint, vitest 132/132, python
+policies, i18n 414==414.
+
+MACHINE-HEALTH FLAG (honest observation, not app code): three independent toolchain corruption
+events within ~1 hour on this machine — (a) vitest worker forks dying at spawn + npm "could not
+determine Node.js install directory", (b) MSVC LNK1000 internal error during Pass2, (c) thin-LTO
+"can't skip to bit"/"Malformed global initializer"/LLVM SmallVector-overflow across MULTIPLE
+dependency rlibs (persisted after cargo clean -p; required FULL cargo clean). All three read
+garbage from disk-cached artifacts. RECOMMEND the owner check disk health (chkdsk / SMART) and AV
+exclusions for the repo + toolchain dirs; if it recurs, memtest. The exe is REBUILDING from scratch
+in the background; freshness gate is RED until it lands — will confirm and re-verify when done.
