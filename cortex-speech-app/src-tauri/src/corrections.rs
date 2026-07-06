@@ -270,6 +270,59 @@ pub fn classify_memory_outcome(
     }
 }
 
+/// Indices of the memories that would ACTUALLY fire on `text` — ONE winner per word slot (the closest
+/// phonetic match clearing the structural gates), mirroring `apply_memories`'s selection exactly. The
+/// eligibility gates are disabled (via `cfg`) so a not-yet-confident memory is still counted. Deduped:
+/// a memory that wins several slots appears once.
+fn firing_winner_indices(text: &str, memories: &[MemoryEntry], cfg: &FiringConfig) -> Vec<usize> {
+    let normalizer = char_only_normalizer();
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let norm: Vec<String> = words.iter().map(|w| normalizer.normalize(w)).collect();
+    let mut winners = Vec::new();
+    for (i, word_norm) in norm.iter().enumerate() {
+        let left = if i > 0 { norm[i - 1].as_str() } else { "" };
+        let right = norm.get(i + 1).map(String::as_str).unwrap_or("");
+        let slot_key = format!("{left}|{right}");
+        let best = memories
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.slot_key == slot_key && m.confidence > cfg.tau_conf && m.hit_count >= cfg.min_hits)
+            .map(|(idx, m)| (idx, crate::diff::phonetic::normalized_phonetic_word_distance(word_norm, &m.phonetic_key)))
+            .filter(|(_, dist)| *dist <= cfg.phon_tau)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((idx, _)) = best {
+            if !winners.contains(&idx) {
+                winners.push(idx);
+            }
+        }
+    }
+    winners
+}
+
+/// Classify firing-outcome evidence for a human decision on ONE segment, crediting only the memory
+/// that would ACTUALLY fire at each slot (winner-take-all, matching runtime `apply_memories`). This
+/// prevents a losing sibling memory in the same slot — e.g. the same wrong token remembered with two
+/// different human fixes — from collecting a spurious confirm/override it could never earn at decode
+/// time. Returns `(index_into_memories, outcome)` for each firing, non-Neutral memory.
+pub fn classify_memory_outcomes(
+    original: &str,
+    reference: &str,
+    memories: &[MemoryEntry],
+    cfg: &FiringConfig,
+) -> Vec<(usize, MemoryOutcome)> {
+    let eval_cfg = FiringConfig { phon_tau: cfg.phon_tau, tau_conf: f64::NEG_INFINITY, min_hits: 0 };
+    firing_winner_indices(original, memories, &eval_cfg)
+        .into_iter()
+        .filter_map(|idx| match classify_memory_outcome(original, reference, &memories[idx], cfg) {
+            MemoryOutcome::Neutral => None,
+            outcome => Some((idx, outcome)),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +534,21 @@ mod tests {
         );
         // The memory's slot does not occur here -> it never fires -> Neutral (no evidence).
         assert_eq!(classify_memory_outcome("شتێکی جیاواز", "شتێکی جیاواز", &entry, &cfg), MemoryOutcome::Neutral,);
+    }
+
+    #[test]
+    fn classify_memory_outcomes_credits_only_the_slot_winner() {
+        // Two sibling memories in the SAME slot (ساڵە|بوو), both near "باش" phonetically. Only the one
+        // the runtime would fire (the exact match) may collect evidence — the loser earns nothing.
+        let m1 = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1); // wrong=باش (exact)
+        let m2 = captured_entry("ئەو ساڵە پاش بوو", "ئەو ساڵە چاک بوو", 1.0, 1); // wrong=پاش (near, loses)
+        assert_eq!(m1.slot_key, m2.slot_key, "both memories occupy the same slot");
+        let mems = vec![m1, m2];
+        let cfg = FiringConfig::default();
+        // Human ACCEPTED the original "…باش…": the winner over-triggered. Exactly ONE credit (the winner).
+        let outcomes = classify_memory_outcomes("ئەو ساڵە باش بوو", "ئەو ساڵە باش بوو", &mems, &cfg);
+        assert_eq!(outcomes.len(), 1, "only the slot winner is credited, not the losing sibling: {outcomes:?}");
+        assert_eq!(outcomes[0].0, 0, "the exact-match memory (index 0) wins the slot");
+        assert_eq!(outcomes[0].1, MemoryOutcome::Override, "accept-of-original -> over-trigger");
     }
 }

@@ -1801,13 +1801,15 @@ impl Database {
         let confidence_updates: Vec<MemoryOutcomeUpdate> = match (is_gold, confidence_reference.as_deref()) {
             (0, Some(reference)) => {
                 let cfg = crate::corrections::FiringConfig::default();
-                self.load_correction_memories()?
+                let mems = self.load_correction_memories()?;
+                // Winner-take-all per slot (matches runtime firing): only the memory that would actually
+                // fire at each slot is credited, so a losing sibling in the same slot earns no spurious
+                // confirm/override.
+                crate::corrections::classify_memory_outcomes(&finalized_text, reference, &mems, &cfg)
                     .into_iter()
-                    .filter_map(|m| {
-                        match crate::corrections::classify_memory_outcome(&finalized_text, reference, &m, &cfg) {
-                            crate::corrections::MemoryOutcome::Neutral => None,
-                            outcome => Some((m.slot_key, m.wrong_token, m.human_token, outcome)),
-                        }
+                    .map(|(idx, outcome)| {
+                        let m = &mems[idx];
+                        (m.slot_key.clone(), m.wrong_token.clone(), m.human_token.clone(), outcome)
                     })
                     .collect()
             }
