@@ -1030,6 +1030,12 @@ impl Database {
 
     pub fn restore<P: AsRef<Path>>(&mut self, src: P) -> AppResult<()> {
         let src_conn = Connection::open(src.as_ref())?;
+        // Verify the SOURCE snapshot is a healthy database BEFORE overwriting the live one, so a corrupt
+        // snapshot fails fast with a clear error instead of part-way through the backup copy.
+        let integrity: String = src_conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if integrity.trim() != "ok" {
+            return Err(AppError::Other(format!("snapshot database failed its integrity check: {integrity}")));
+        }
         let backup = backup::Backup::new(&src_conn, &mut self.conn)?;
         backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
         Ok(())
@@ -3348,6 +3354,28 @@ mod tests {
         let ot_after =
             db.intelligence_report().expect("report")["loop0Shadow"]["firedButHumanAcceptedOriginal"].as_i64().unwrap();
         assert_eq!(ot_after, 1, "the over-trigger evidence SURVIVES deletion via the durable archive");
+    }
+
+    #[test]
+    fn restore_rejects_a_corrupt_source_before_overwriting_the_live_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let live_path = tmp.path().join("live.db");
+        let mut live = Database::open(live_path.to_str().unwrap()).unwrap();
+        live.initialize().unwrap();
+
+        // A healthy snapshot restores fine.
+        let good_path = tmp.path().join("good.db");
+        {
+            let good = Database::open(good_path.to_str().unwrap()).unwrap();
+            good.initialize().unwrap();
+        }
+        live.restore(&good_path).expect("a healthy snapshot restores");
+
+        // A garbage source is REJECTED (integrity/open failure) — no partial overwrite of the live DB.
+        let bad_path = tmp.path().join("bad.db");
+        std::fs::write(&bad_path, b"this is not a sqlite database at all").unwrap();
+        assert!(live.restore(&bad_path).is_err(), "a corrupt snapshot must be rejected");
+        assert!(live.segment_count().is_ok(), "the live database is still usable after a rejected restore");
     }
 
     #[test]
