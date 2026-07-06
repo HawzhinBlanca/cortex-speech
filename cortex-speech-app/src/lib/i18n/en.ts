@@ -461,6 +461,8 @@ export const en: Record<string, string> = {
   'stats.restoreFileConfirm':
     'Replace the CURRENT library with the selected backup file? Everything not in that backup will be lost. The app reloads after the restore.',
   'stats.restoreSnapshot': 'Restore from snapshot…',
+  'stats.compactDb': 'Compact database',
+  'stats.compactDone': 'Database compacted — space reclaimed and search index rebuilt.',
   'stats.restore': 'Restore',
   'stats.noSnapshots': 'No auto-snapshots yet.',
   'stats.restoreConfirm':

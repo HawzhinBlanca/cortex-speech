@@ -1184,6 +1184,13 @@ speaker-clustering state machine with high regression risk and the memory win is
   the AudioPlayer does *bounded* playback by seeking within the full source, so slicing needs a
   grant-model + player change verified by ear on real audio; shipping it blind would risk breaking
   playback, which the honesty rule forbids.
+- **dead-IPC cleanup (maintenance triad)** completing the theme behind #4.5's "dead backup/restore IPC":
+  `db_vacuum` was *also* a registered-but-uncallable command (wrapper `dbVacuum` existed, no UI caller), so
+  a long-lived personal library bloated by months of deletes/re-transcribes could only grow — no user
+  recourse. Added a **"Compact database"** button (`data-testid="compact-db-btn"`) → `db.vacuum()` (VACUUM +
+  the FTS rebuild that vacuum's rowid-renumber requires). Stats → tools now exposes the full triad:
+  Backup / Restore-from-file / Restore-from-snapshot / **Compact**. EN + CKB strings in parity (now 605=605).
+  typecheck 0-err, eslint clean, vitest 134/134.
 - **#4.5 (last piece)** the `db_backup` IPC was a dead command — a wrapper (`dbBackup`) existed but no
   UI called it, so the only copies of the library were the rotating auto-snapshots sitting in the app
   data dir *next to the live DB* (one disk failure loses both). Added a **"Backup to folder…"** button

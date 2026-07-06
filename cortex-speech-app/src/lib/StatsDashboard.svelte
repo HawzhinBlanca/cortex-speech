@@ -230,6 +230,22 @@
     }
   }
 
+  // Reclaim disk from a library bloated by months of deletes / re-transcribes (VACUUM), then rebuild
+  // the FTS index the vacuum's rowid-renumbering can desync (handled backend-side in db.vacuum()). The
+  // db_vacuum IPC previously had no caller — a long-lived personal DB could only grow.
+  async function compactDatabase() {
+    if (!tauriAvailable || toolBusy) return;
+    toolBusy = 'compact';
+    try {
+      await api.dbVacuum();
+      notifications.success($t('stats.compactDone'));
+    } catch (e) {
+      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+    } finally {
+      toolBusy = null;
+    }
+  }
+
   // B2: restore-from-snapshot picker. `snapshots` non-null = list expanded. Restoring overwrites the
   // live library, so it demands an explicit confirm; on success the whole app reloads (every store —
   // segments, session cursor, stats — must re-derive from the restored DB).
@@ -819,6 +835,15 @@
             onclick={toggleSnapshotList}
           >
             {toolBusy === 'listSnapshots' ? $t('stats.toolWorking') : $t('stats.restoreSnapshot')}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
+            data-testid="compact-db-btn"
+            disabled={toolBusy !== null}
+            onclick={compactDatabase}
+          >
+            {toolBusy === 'compact' ? $t('stats.toolWorking') : $t('stats.compactDb')}
           </button>
         </div>
         {#if snapshots}
