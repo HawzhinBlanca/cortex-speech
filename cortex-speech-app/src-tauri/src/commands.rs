@@ -2906,7 +2906,12 @@ fn run_wsl_refinement_loop(
             return Ok(WslRefinementSummary { transcribed, failed, cancelled: true });
         }
         emit_or_log(app, "wsl-log", format!("[{}/{}] transcribing {}...", idx + 1, total, id));
-        match crate::pipeline::run_wsl_segment_transcript_with_script(external_script, id, Some(&WSL_REFINE_CANCEL)) {
+        match crate::pipeline::run_wsl_segment_transcript_with_script(
+            external_script,
+            id,
+            db_path,
+            Some(&WSL_REFINE_CANCEL),
+        ) {
             Ok((raw_transcript, confidence)) => {
                 let normalized = if auto_normalize && !raw_transcript.is_empty() {
                     Some(normalizer.normalize(&raw_transcript))

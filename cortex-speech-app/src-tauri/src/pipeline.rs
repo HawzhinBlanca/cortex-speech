@@ -219,6 +219,28 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
 /// request waits its turn, then gets its FULL fresh timeout budget once it actually runs.
 static WSL_7B_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The port the OmniASR-7B warm server listens on inside WSL. SINGLE source of truth — shared by the
+/// preflight probe AND passed to the client via `CORTEX_7B_PORT`, so the app, client, and server can't
+/// drift (a mismatch would even green-light the preflight against the wrong service).
+pub(crate) const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.py
+
+/// Translate a Windows path to its WSL `/mnt` view (mirrors `cortex_7b_client.py`'s `win_to_wsl`), so
+/// the app can hand the client a `CORTEX_7B_DB` that follows a moved data dir instead of the client's
+/// hardcoded default. `C:\a\b` -> `/mnt/c/a/b`; a `\\?\` extended-length prefix is stripped; a
+/// non-drive path is returned with backslashes normalised.
+pub(crate) fn win_path_to_wsl(p: &str) -> String {
+    let mut s = p.replace('\\', "/");
+    if let Some(rest) = s.strip_prefix("//?/") {
+        s = rest.to_string();
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() > 2 && bytes[1] == b':' {
+        let drive = s[..1].to_ascii_lowercase();
+        return format!("/mnt/{drive}{}", &s[2..]);
+    }
+    s
+}
+
 /// Spawn the configured external WSL ASR client for ONE segment and return its parsed transcript.
 ///
 /// Shared by the per-segment pipeline path (`cancel = None`) and the batch refinement command. The
@@ -230,6 +252,7 @@ static WSL_7B_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) fn run_wsl_segment_transcript_with_script(
     external_script: &str,
     segment_id: &str,
+    db_path: &str,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> AppResult<(String, Option<f64>)> {
     // Hold the process-wide gate for the whole spawn+wait so cross-path 7B calls never collide on the
@@ -237,7 +260,13 @@ pub(crate) fn run_wsl_segment_transcript_with_script(
     let _gate = WSL_7B_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let mut cmd = std::process::Command::new("wsl");
-    cmd.arg("/root/cortex_env/bin/python3")
+    // Pass the DB path + port to the client via `env` (WSL does not propagate Windows env into Linux),
+    // so the client follows a MOVED data dir / non-default port instead of its hardcoded fallbacks — the
+    // app is the single source of truth for both.
+    cmd.arg("env")
+        .arg(format!("CORTEX_7B_DB={}", win_path_to_wsl(db_path)))
+        .arg(format!("CORTEX_7B_PORT={WSL_7B_SERVER_PORT}"))
+        .arg("/root/cortex_env/bin/python3")
         .arg(external_script)
         .arg("--segment-id")
         .arg(segment_id)
@@ -585,7 +614,7 @@ impl ProcessingPipeline {
         if !self.should_use_wsl_primary_asr() {
             return Ok(());
         }
-        const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.py
+        // Uses the module-level WSL_7B_SERVER_PORT (same value handed to the client) — one source of truth.
         let probe = format!("timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{WSL_7B_SERVER_PORT}'");
         let mut cmd = std::process::Command::new("wsl");
         cmd.arg("bash").arg("-lc").arg(&probe);
@@ -2868,7 +2897,7 @@ impl ProcessingPipeline {
                 "External ASR provider is not configured. Set the WSL script path in Settings before using the 7B provider.".into(),
             ));
         };
-        run_wsl_segment_transcript_with_script(&external_script, segment_id, None)
+        run_wsl_segment_transcript_with_script(&external_script, segment_id, &self.db_path, None)
     }
 
     pub fn align(
@@ -4027,5 +4056,15 @@ mod tests {
             super::parse_wsl_segment_result("some noise\nno result here").is_err(),
             "absence of a __RESULT__ line is an infra failure"
         );
+    }
+
+    #[test]
+    fn win_path_to_wsl_translates_drive_paths() {
+        assert_eq!(super::win_path_to_wsl(r"C:\Users\hawzh\AppData\x.db"), "/mnt/c/Users/hawzh/AppData/x.db");
+        assert_eq!(super::win_path_to_wsl(r"D:\a\b"), "/mnt/d/a/b");
+        // Extended-length prefix stripped, then drive-mapped.
+        assert_eq!(super::win_path_to_wsl(r"\\?\C:\a"), "/mnt/c/a");
+        // Already-POSIX / non-drive path: backslashes normalised, returned as-is.
+        assert_eq!(super::win_path_to_wsl("/mnt/c/already"), "/mnt/c/already");
     }
 }
