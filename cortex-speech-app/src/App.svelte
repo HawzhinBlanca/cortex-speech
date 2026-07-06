@@ -1186,13 +1186,13 @@
     }
     try {
       const description = await historyStore.undo();
-      notifications.info(`Undo: ${description ?? 'Last action reverted'}`);
+      notifications.info($t('notifications.undone', { what: description ?? $t('notifications.lastActionReverted') }));
       await loadSegments();
       if (historyPanel) {
         historyPanel.recordAction(`Reverted: ${description ?? 'action'}`, 'edit');
       }
     } catch (e) {
-      notifications.error(`Undo failed: ${e}`);
+      notifications.error($t('notifications.undoFailedDetail', { error: String(e) }));
     }
   }
 
@@ -1202,13 +1202,13 @@
     if (viewMode === 'review' || $showReviewInbox) return;
     try {
       const description = await historyStore.redo();
-      notifications.info(`Redo: ${description ?? 'Last action reapplied'}`);
+      notifications.info($t('notifications.redone', { what: description ?? $t('notifications.lastActionReapplied') }));
       await loadSegments();
       if (historyPanel) {
         historyPanel.recordAction(`Redone: ${description ?? 'action'}`, 'edit');
       }
     } catch (e) {
-      notifications.error(`Redo failed: ${e}`);
+      notifications.error($t('notifications.redoFailedDetail', { error: String(e) }));
     }
   }
 
@@ -2667,7 +2667,7 @@
                   </div>
                 {:else}
                   <p class="text-cortex-500 italic">
-                    No word timestamps available. Click 'Align' to align the text with audio.
+                    {$t('editor.noWordTimestamps')}
                   </p>
                 {/if}
               </div>
