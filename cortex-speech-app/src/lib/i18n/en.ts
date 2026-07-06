@@ -521,6 +521,12 @@ export const en: Record<string, string> = {
   'shortcuts.closeHint': 'Press {key} to close',
   'shortcuts.esc': 'Esc',
   'notifications.loadSegmentsFailed': 'Failed to load segments',
+  'notifications.undoInReview': 'Press Backspace to undo the last review decision',
+  'notifications.snapshotFailing':
+    'Auto-backup has failed {count} times in a row — your library is not being snapshotted. Check free disk space and the logs folder.',
+  'notifications.lowDisk': 'Low disk space: {gb} GB free. Snapshots, exports, and the database can start failing.',
+  'notifications.missingModels': 'Missing required model(s): {models}.',
+  'notifications.previousCrash': 'The previous session crashed: {summary}. Full details are in the logs folder.',
   'notifications.transcriptionComplete': 'Transcription complete',
   'notifications.textNormalized': 'Text normalized',
   'notifications.normalizationFailed': 'Normalization failed',

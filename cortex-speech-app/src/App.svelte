@@ -402,16 +402,14 @@
       const GiB = 1024 ** 3;
       if ((h.snapshot_consecutive_failures ?? 0) >= 3) {
         notifications.error(
-          `Auto-backup has failed ${h.snapshot_consecutive_failures} times in a row — your library is not being snapshotted. Check free disk space and the logs folder.`,
+          $t('notifications.snapshotFailing', { count: String(h.snapshot_consecutive_failures) }),
         );
       }
       if (h.free_disk_bytes != null && h.free_disk_bytes < 2 * GiB) {
-        notifications.error(
-          `Low disk space: ${(h.free_disk_bytes / GiB).toFixed(1)} GB free. Snapshots, exports, and the database can start failing.`,
-        );
+        notifications.error($t('notifications.lowDisk', { gb: (h.free_disk_bytes / GiB).toFixed(1) }));
       }
       if ((h.missing_models?.length ?? 0) > 0) {
-        notifications.error(`Missing required model(s): ${h.missing_models.join(', ')}.`);
+        notifications.error($t('notifications.missingModels', { models: h.missing_models.join(', ') }));
       }
     } catch (e) {
       console.error('health check failed', e);
@@ -511,7 +509,7 @@
         .takeLastCrash()
         .then((crash) => {
           if (crash) {
-            notifications.error(`The previous session crashed: ${crash}. Full details are in the logs folder.`);
+            notifications.error($t('notifications.previousCrash', { summary: crash }));
           }
         })
         .catch((e) => console.error('crash check failed', e));
@@ -1183,7 +1181,7 @@
     // was decided, and the confidence flywheel was fed a decision that is now retracted). Those surfaces
     // have their OWN paired undo (Backspace = clearHumanDecision + restore); defer to it here.
     if (viewMode === 'review' || $showReviewInbox) {
-      notifications.info('Press Backspace to undo the last review decision');
+      notifications.info($t('notifications.undoInReview'));
       return;
     }
     try {

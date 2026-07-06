@@ -521,6 +521,12 @@ export const ckb: Record<string, string> = {
   'shortcuts.closeHint': '{key} بگرە بۆ داخستن',
   'shortcuts.esc': 'Esc',
   'notifications.loadSegmentsFailed': 'بارکردنی بەشەکان سەرکەوتوو نەبوو',
+  'notifications.undoInReview': 'بۆ گەڕاندنەوەی دوایین بڕیاری پێداچوونەوە، Backspace دابگرە',
+  'notifications.snapshotFailing':
+    'باکئەپی خۆکار {count} جار بەدوای یەکدا شکستی هێناوە — کتێبخانەکەت باکئەپ ناکرێت. بۆشایی دیسک و فۆڵدەری لۆگەکان بپشکنە.',
+  'notifications.lowDisk': 'بۆشایی دیسک کەمە: {gb} گیگابایت بەردەستە. باکئەپ، هەناردەکردن و بنکەدراوە دەکرێت سەرنەکەون.',
+  'notifications.missingModels': 'مۆدێل(ەکان)ی پێویست بوونیان نییە: {models}.',
+  'notifications.previousCrash': 'دانیشتنی پێشوو تووشی هەڵە بوو: {summary}. وردەکاری تەواو لە فۆڵدەری لۆگەکاندایە.',
   'notifications.transcriptionComplete': 'نووسین تەواو بوو',
   'notifications.textNormalized': 'دەق ئاسانکرا',
   'notifications.normalizationFailed': 'ئاسانکردن سەرکەوتوو نەبوو',
