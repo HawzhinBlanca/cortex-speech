@@ -944,14 +944,23 @@ export async function getInferenceStats(): Promise<{
   return invoke('get_inference_stats');
 }
 
-export async function appHealth(): Promise<{
+export interface AppHealth {
   status: string;
   db_size: number;
   uptime: number;
   segment_count: number;
   memory_mb: number;
   missing_models: string[];
-}> {
+  missing_optional_models?: string[];
+  /** Epoch seconds of the last successful auto-snapshot, or 0 if none yet this session. */
+  snapshot_last_success_epoch_secs?: number;
+  /** Consecutive auto-snapshot failures — a rising streak means the safety net is silently down. */
+  snapshot_consecutive_failures?: number;
+  /** Free bytes on the volume holding the data dir, or null when it couldn't be determined. */
+  free_disk_bytes?: number | null;
+}
+
+export async function appHealth(): Promise<AppHealth> {
   return invoke('app_health');
 }
 

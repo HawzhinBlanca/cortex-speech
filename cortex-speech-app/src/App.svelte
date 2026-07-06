@@ -391,6 +391,32 @@
 
   // Unlisten for the native window close-request hook (registered in onMount, cleared in onDestroy).
   let closeUnlisten: (() => void) | undefined;
+  let healthInterval: ReturnType<typeof setInterval> | undefined;
+
+  // Surface the safety-net failures that were previously invisible (the auto-snapshot net can go down
+  // for months and disk exhaustion was computed then dropped). Runs at startup and on an interval; the
+  // file log (data_dir/logs) has the detail. Best-effort — a failed health probe never disrupts the app.
+  async function checkHealthAndWarn() {
+    try {
+      const h = await api.appHealth();
+      const GiB = 1024 ** 3;
+      if ((h.snapshot_consecutive_failures ?? 0) >= 3) {
+        notifications.error(
+          `Auto-backup has failed ${h.snapshot_consecutive_failures} times in a row — your library is not being snapshotted. Check free disk space and the logs folder.`,
+        );
+      }
+      if (h.free_disk_bytes != null && h.free_disk_bytes < 2 * GiB) {
+        notifications.error(
+          `Low disk space: ${(h.free_disk_bytes / GiB).toFixed(1)} GB free. Snapshots, exports, and the database can start failing.`,
+        );
+      }
+      if ((h.missing_models?.length ?? 0) > 0) {
+        notifications.error(`Missing required model(s): ${h.missing_models.join(', ')}.`);
+      }
+    } catch (e) {
+      console.error('health check failed', e);
+    }
+  }
 
   onMount(async () => {
     tauriAvailable = isTauriRuntime();
@@ -475,6 +501,10 @@
         .getQuarantineNotice()
         .then((n) => (n.quarantinedFiles.length > 0 ? n : null))
         .catch(() => null);
+      // Surface silent safety-net failures (auto-snapshot down, low disk, missing models) at startup
+      // and every 5 minutes thereafter.
+      void checkHealthAndWarn();
+      healthInterval = setInterval(() => void checkHealthAndWarn(), 5 * 60 * 1000);
       // Flush the debounced autosave BEFORE the native window closes so the last correction of a
       // session is never lost — onDestroy does not reliably run on a Tauri window close. The flush is
       // bounded by a 3s timeout so a stuck backend can never prevent the app from closing.
@@ -506,6 +536,7 @@
     stopEventListeners();
     globalKeyboardManager?.destroy();
     closeUnlisten?.();
+    if (healthInterval) clearInterval(healthInterval);
     // Flush (not just cancel) a pending edit on teardown so a correction typed in the last debounce
     // window before exit is still persisted, rather than silently dropped by a bare clearTimeout.
     autosave.flush();
