@@ -108,6 +108,59 @@ def evaluate_freshness(
     return problems
 
 
+SOURCE_PREFIXES = [
+    "cortex-speech-app/src/",
+    "cortex-speech-app/src-tauri/src",
+    "cortex-speech-app/src-tauri/build.rs",
+    "cortex-speech-app/src-tauri/Cargo.toml",
+    "cortex-speech-app/src-tauri/tauri.conf.json",
+    "cortex-speech-app/package.json",
+    "cortex-speech-app/index.html",
+]
+
+
+def worktree_source_warnings(
+    worktrees: list[tuple[str, list[str]]], current_root: str, source_prefixes: list[str]
+) -> list[str]:
+    """Pure core (unit-tested): given [(worktree_path, porcelain_status_lines)] and the git root of the
+    checkout being gated, warn for OTHER worktrees carrying UNCOMMITTED changes under a source surface.
+
+    A green freshness gate means only "the built exe matches THIS checkout's HEAD". It must not hide the
+    fact that a sibling worktree has unshipped source edits (the exact stale-exe-vs-worktree scenario this
+    session hit). Non-fatal — WIP on a branch is legitimate; the point is to make it VISIBLE.
+    """
+    warnings: list[str] = []
+    current = str(Path(current_root).resolve())
+    for path, status_lines in worktrees:
+        if str(Path(path).resolve()) == current:
+            continue  # the checkout being gated
+        dirty = [ln for ln in status_lines if ln.strip() and any(pfx in ln for pfx in source_prefixes)]
+        if dirty:
+            warnings.append(
+                f"sibling worktree {path} has {len(dirty)} uncommitted source change(s) not reflected in the built exe"
+            )
+    return warnings
+
+
+def _git_worktrees(app_root: Path) -> list[tuple[str, list[str]]]:
+    """[(worktree_root, porcelain_status_lines)] for every registered worktree; [] if git is unavailable."""
+    try:
+        wt_out = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=app_root, capture_output=True, text=True, check=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    paths = [ln[len("worktree ") :].strip() for ln in wt_out.stdout.splitlines() if ln.startswith("worktree ")]
+    result: list[tuple[str, list[str]]] = []
+    for p in paths:
+        try:
+            st = subprocess.run(["git", "-C", p, "status", "--porcelain"], capture_output=True, text=True, check=True)
+            result.append((p, st.stdout.splitlines()))
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+    return result
+
+
 def _git_head(app_root: Path) -> str | None:
     try:
         out = subprocess.run(
@@ -184,7 +237,18 @@ def main() -> int:
             print(f"  - {p}", flush=True)
         return 1
 
+    # Green means "the exe matches THIS checkout's HEAD" — but a sibling worktree may hold unshipped
+    # source edits (the stale-exe-vs-worktree trap). Surface them loudly; non-fatal (WIP is legitimate).
+    wt_warnings = worktree_source_warnings(_git_worktrees(APP_ROOT), str(APP_ROOT.parent), SOURCE_PREFIXES)
+    for w in wt_warnings:
+        print(f"  ! WARNING: {w}", flush=True)
+
     print(f"EXE FRESHNESS GATE: OK (exe at HEAD {head_sha[:12]}…, newer than all sources)", flush=True)
+    if wt_warnings:
+        print(
+            f"  (note: {len(wt_warnings)} sibling worktree(s) carry uncommitted source — commit + rebuild before shipping)",
+            flush=True,
+        )
     return 0
 
 

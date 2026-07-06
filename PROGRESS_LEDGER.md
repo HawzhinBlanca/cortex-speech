@@ -276,8 +276,8 @@ and the dual milestone-numbering drift are acknowledged here rather than edited 
 P0.2 stale-exe guard (deep-audit F4) — CLOSED with a demonstrated red->green:
 - lib.rs: `#[used] static GIT_SHA_MARKER = concat!("CORTEX_BUILD_SHA:", GIT_SHA)` (contiguous
   rodata, linker-retained) + `app_git_sha` IPC command (commands.rs) exposing the baked SHA.
-- scripts/check_exe_freshness.py (LOCAL gate) + scripts/test_exe_freshness.py (11 CI-safe unit
-  tests, auto-run by python-policies). Makefile: `check-fresh` + `ship-check-local`
+- scripts/check_exe_freshness.py (LOCAL gate, worktree-aware since #1.3) + scripts/test_exe_freshness.py
+  (15 CI-safe unit tests, auto-run by python-policies). Makefile: `check-fresh` + `ship-check-local`
   (build-app -> check-fresh -> ship-check).
 - Demonstrated RED on the stale exe (source newer + marker absent); rebuilt via build-app;
   now GREEN: `EXE FRESHNESS GATE: OK (exe at HEAD a1003c2...)`, baked SHA == git HEAD exactly.
@@ -1160,7 +1160,21 @@ Kept closing the testable ones I'd previously mis-bucketed:
   dominant-speaker(>50%) flag.
 - **#39** Database::restore integrity-checks the source snapshot before overwriting the live DB.
 
-TRULY REMAINING (~13): OWNER-GATED measurement (~7 — the P7 re-audit and the real-number gates; faking
+## Deep-check remediation — ~49/61 (2026-07-07)
+
+- **#1.3** exe-freshness gate is now **worktree-aware**. A green gate means only "the built exe
+  matches THIS checkout's HEAD" — it used to stay silent while a *sibling* worktree carried the real
+  fixes as uncommitted source edits (the exact A3 stale-exe-vs-worktree trap this session lived).
+  `check_exe_freshness.py` now enumerates `git worktree list --porcelain`, reads each worktree's
+  `git status --porcelain`, and prints a loud non-fatal `WARNING` for any *other* worktree with
+  uncommitted changes under a shipped-source surface (`src/`, `src-tauri/src`, build inputs) — WIP is
+  legitimate, so it warns rather than fails, but it can no longer hide unshipped source. Pure core
+  `worktree_source_warnings()` is unit-tested by `test_exe_freshness.py` (4 new cases: warns on a
+  sibling with dirty `pipeline.rs`; skips the gated checkout itself; ignores docs/ledger/tests-only
+  dirt; silent when all clean). 15/15 freshness unit tests green; full python-policies green; live
+  enumeration verified against this repo's 2 worktrees.
+
+TRULY REMAINING (~12): OWNER-GATED measurement (~7 — the P7 re-audit and the real-number gates; faking
 is the one prohibition), media-cache slicing + deeper streaming (unverifiable headlessly → shipping blind
 violates the honesty rule), the nightly's ignored-real-audio fixture wiring (CI-only, already honest via
 ::warning), and a few cosmetic. Every finding implementable AND verifiable in a headless Windows checkout
