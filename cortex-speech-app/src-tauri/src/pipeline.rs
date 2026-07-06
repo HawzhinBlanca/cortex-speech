@@ -3074,8 +3074,16 @@ impl ProcessingPipeline {
                 let (start, end) = if let Some(meta) =
                     seg.alignment_json.as_deref().and_then(chunking::SegmentSourceMeta::from_alignment_json)
                 {
-                    let s = chunking::ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
-                    let e = chunking::ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate);
+                    let (start_ms, end_ms) = (meta.source_start_ms.max(0), meta.source_end_ms.max(0));
+                    // Same u32-wrap guard as chunking::slice_pcm_by_alignment / export::slice_for_export: a
+                    // malformed offset > u32::MAX would wrap mod 2^32 to an in-range index and diarize an
+                    // UNRELATED window, mislabeling this segment's speaker. Skip it rather than fall through
+                    // to (0, pcm.len()) — whole-file diarization of a clip segment is the wrong answer too.
+                    if start_ms > u32::MAX as i64 || end_ms > u32::MAX as i64 {
+                        continue;
+                    }
+                    let s = chunking::ms_to_samples(start_ms as u32, sample_rate);
+                    let e = chunking::ms_to_samples(end_ms as u32, sample_rate);
                     (s, e.min(pcm.len()))
                 } else {
                     (0, pcm.len())

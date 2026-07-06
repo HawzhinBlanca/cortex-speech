@@ -1200,7 +1200,12 @@ speaker-clustering state machine with high regression risk and the memory win is
   transcript — silent TRAINING-DATA corruption (exactly the whole-file-vs-clip class that keeps recurring).
   Added the same guard (skip → None, matching the Option contract) + a regression test proving a 2^32-offset
   now SKIPS instead of wrap-slicing `[0..8000]`. cargo: fmt clean, clippy -D warnings clean, `--lib` 808
-  passed; training-grade-export policy green.
+  passed; training-grade-export policy green. Then swept every other `source_*_ms as u32/usize` slicing
+  site: `commands.rs` clip extraction is SAFE (window-RELATIVE offsets, bounded by the 30 s window, no wrap
+  risk); `pipeline.rs` rediarize (`source_*_ms.max(0) as u32`) shared the same untrusted-alignment
+  reachability (a wrap there mislabels a segment's SPEAKER against an unrelated window) → given the same
+  guard (skip the segment, not fall to whole-file). The two remaining bare casts (`window.offset_ms`) read
+  the decoder's own bounded output, not stored alignment — left as-is.
 - **LOOP-0 confidence adversarial review (the original deliverable) — verified sound + one edge documented**
   Re-read the whole evidence path (`corrections.rs` + `db.rs::record_human_decision`) hunting for real
   correctness bugs. The Beta(1,1) SQL reconstructs `beta_confidence(new_confirm, new_override)` exactly
