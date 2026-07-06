@@ -2453,9 +2453,30 @@ pub fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Res
     if !src.is_file() {
         return Err(format!("snapshot '{name}' has no database file"));
     }
-    let mut db = state.lock_db();
-    db.restore(&src).map_err(|e| e.to_string())?;
-    tracing::info!("database restored from auto-snapshot {name}");
+    {
+        let mut db = state.lock_db();
+        db.restore(&src).map_err(|e| e.to_string())?;
+    } // release the db lock before touching the settings/pipeline locks
+
+    // Restore the snapshot's captured config (settings.json / champion.json) so the app returns to a
+    // CONSISTENT known-good state — not a rolled-back library sitting beside post-disaster settings, or
+    // silently-defaulted settings if the live settings.json was corrupted alongside the DB. Best-effort
+    // per file (the DB is already restored; a config-copy failure only warns).
+    let snap_dir = data_dir.join("snapshots").join(&name);
+    for extra in ["settings.json", "champion.json"] {
+        let from = snap_dir.join(extra);
+        if from.is_file() {
+            if let Err(e) = std::fs::copy(&from, data_dir.join(extra)) {
+                tracing::warn!("snapshot restore: could not restore {extra}: {e}");
+            }
+        }
+    }
+    // Apply the restored settings to memory AND the running pipeline (mirrors update_settings) so the
+    // engine / thresholds / consent flags take effect immediately, not only on the next launch.
+    let restored = crate::settings::AppSettings::load(&data_dir.join("settings.json"));
+    *state.lock_settings() = restored.clone();
+    state.update_pipeline_settings(restored);
+    tracing::info!("database and config restored from auto-snapshot {name}");
     Ok(())
 }
 
