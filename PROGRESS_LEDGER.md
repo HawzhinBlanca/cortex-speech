@@ -1085,3 +1085,23 @@ migration, snapshot-settings restore, media-cache slice, z-order, EN i18n string
 bound, out-of-repo client hardening); and the OWNER-GATED items (fine-tuned juror escalation
 measurement, gold-regression gate wired to a real baseline, `make check-7b`, benchmark marathon, drills,
 P7 re-audit). 10/10 is NOT declared — only the P7 re-audit may do that.
+
+## Deep-check remediation — automatable surface substantially closed (2026-07-06, 19 commits)
+
+Further fixes since the last entry (each gated: clippy -D warnings + cargo test --lib 796;
+typecheck/134-vitest/eslint; python-policies green):
+- **Major #25**: cancel mid-7B-pass now ROLLS BACK the file's segments, so re-importing a cancelled
+  file no longer duplicates every segment.
+- **#43**: snapshot restore also restores the snapshot's settings.json/champion.json and applies them
+  to memory + the running pipeline (consistent known-good state, not a rolled-back DB beside stale config).
+- **enable_gpu honesty** (#34/47/49): the toggle carries a localized note — it affects only the CPU-only
+  local CTC engines; the 7B champion uses the GPU via WSL regardless.
+- **i18n**: the health/crash/undo notifications added this session are localized (EN+CKB), so no new
+  English literals leak into the RTL UI.
+
+TALLY: **~37 of 61 confirmed findings closed** — every blocker and every automatable major, plus the
+bulk of the minors. What remains is OWNER-GATED (real accuracy/escalation measurement, `make check-7b`,
+gold-regression baseline, marathon, drills, P7 re-audit), OUT-OF-REPO (the champion client's VACUUM-INTO
+snapshot + env-passed port/db), the machine-local capstone (rebuild GUI + re-import B7876), or low-value
+polish (media-cache slice, z-order, survivor-bias migration, streaming memory bound, firing provenance).
+The no-fabrication rule holds: 10/10 is declared ONLY by the P7 re-audit on real numbers.
