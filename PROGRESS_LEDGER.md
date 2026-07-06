@@ -1168,8 +1168,13 @@ Kept closing the testable ones I'd previously mis-bucketed:
   (`data-testid="backup-db-btn"`) to Stats → tools, reusing the proven `pickDirAnd` folder-picker: it
   writes the whole library via SQLite online-backup to a **timestamped** file
   (`cortex-speech-backup-<ISO>.db`) inside a folder the owner chooses (external drive / synced folder),
-  so successive backups never collide. EN + CKB strings (`stats.backupDb`, `stats.backupDone`) added in
-  parity. typecheck 0-err (406 files), eslint clean, vitest 134/134.
+  so successive backups never collide. And its **counterpart**: `db_restore` was *also* dead (no
+  wrapper, no caller), leaving that external backup un-restorable through the UI (only auto-snapshots
+  were). Added a `dbRestore` wrapper + a **"Restore from backup file…"** button
+  (`data-testid="restore-file-btn"`): a `.db`-filtered file picker → destructive confirm → backend
+  integrity-check → full app reload — the same safety contract as the snapshot restore. EN + CKB
+  strings added in parity (`stats.backupDb/backupDone/restoreFile/restoreFileConfirm`). typecheck
+  0-err (406 files), eslint clean, vitest 134/134.
 - **#1.3** exe-freshness gate is now **worktree-aware**. A green gate means only "the built exe
   matches THIS checkout's HEAD" — it used to stay silent while a *sibling* worktree carried the real
   fixes as uncommitted source edits (the exact A3 stale-exe-vs-worktree trap this session lived).

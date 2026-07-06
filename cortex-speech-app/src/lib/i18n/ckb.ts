@@ -458,6 +458,9 @@ export const ckb: Record<string, string> = {
   'stats.importGoldDone': '{n} فایلی سەرچاوەی پشتڕاستکراو وەک زێڕین هێنرا.',
   'stats.backupDb': 'پاشەکەوت بۆ بوخچە…',
   'stats.backupDone': 'کتێبخانە پاشەکەوت کرا بۆ {path}',
+  'stats.restoreFile': 'گەڕاندنەوە لە فایلی پاشەکەوت…',
+  'stats.restoreFileConfirm':
+    'کتێبخانەی ئێستا بگۆڕدرێت بە فایلی پاشەکەوتی هەڵبژێردراو؟ هەموو ئەوەی لەو پاشەکەوتەدا نییە لەدەست دەچێت. دوای گەڕاندنەوە ئەپەکە دووبارە بار دەبێتەوە.',
   'stats.restoreSnapshot': 'گەڕاندنەوە لە وێنەی پاشەکەوت…',
   'stats.restore': 'گەڕاندنەوە',
   'stats.noSnapshots': 'هێشتا هیچ وێنەیەکی پاشەکەوتی خۆکار نییە.',

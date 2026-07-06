@@ -268,6 +268,36 @@
     }
   }
 
+  // 4.5 counterpart to backupToFolder: restore the live library from a backup .db file the owner
+  // picks (e.g. the file "Backup to folder…" wrote to an external drive). Destructive — the backend
+  // integrity-checks the source first; on success the whole app reloads (every store re-derives).
+  async function restoreFromFile() {
+    if (!tauriAvailable || toolBusy) return;
+    let src: string;
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const picked = await open({
+        directory: false,
+        multiple: false,
+        filters: [{ name: 'Cortex backup', extensions: ['db'] }],
+      });
+      if (typeof picked !== 'string') return;
+      src = picked;
+    } catch (e) {
+      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+      return;
+    }
+    if (!window.confirm($t('stats.restoreFileConfirm'))) return;
+    toolBusy = 'restoreFile';
+    try {
+      await api.dbRestore(src);
+      window.location.reload();
+    } catch (e) {
+      notifications.error($t('stats.restoreFailed'), { detail: String(e) });
+      toolBusy = null;
+    }
+  }
+
   // P3.4: full-SHA integrity check of the bundled fine-tuned model (a few seconds — hashes 970 MB).
   // Surfaces the on-demand backend guard so the owner can confirm the champion is intact/uncorrupted.
   async function verifyModelIntegrity() {
@@ -771,6 +801,15 @@
             onclick={backupToFolder}
           >
             {toolBusy === 'backup' ? $t('stats.toolWorking') : $t('stats.backupDb')}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
+            data-testid="restore-file-btn"
+            disabled={toolBusy !== null}
+            onclick={restoreFromFile}
+          >
+            {toolBusy === 'restoreFile' ? $t('stats.toolWorking') : $t('stats.restoreFile')}
           </button>
           <button
             type="button"

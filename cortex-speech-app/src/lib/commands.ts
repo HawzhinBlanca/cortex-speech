@@ -900,6 +900,12 @@ export async function dbBackup(dest: string): Promise<void> {
   return invoke('db_backup', { dest });
 }
 
+/** Restore the live library from a backup .db file (the counterpart to dbBackup). Destructive — the
+ *  backend PRAGMA integrity_check's the source before overwriting, so a corrupt file fails fast. */
+export async function dbRestore(src: string): Promise<void> {
+  return invoke('db_restore', { src });
+}
+
 export async function dbVacuum(): Promise<void> {
   return invoke('db_vacuum');
 }

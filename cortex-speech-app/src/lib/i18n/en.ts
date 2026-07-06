@@ -457,6 +457,9 @@ export const en: Record<string, string> = {
   'stats.importGoldDone': '{n} verified source file(s) imported as gold.',
   'stats.backupDb': 'Backup to folder…',
   'stats.backupDone': 'Library backed up to {path}',
+  'stats.restoreFile': 'Restore from backup file…',
+  'stats.restoreFileConfirm':
+    'Replace the CURRENT library with the selected backup file? Everything not in that backup will be lost. The app reloads after the restore.',
   'stats.restoreSnapshot': 'Restore from snapshot…',
   'stats.restore': 'Restore',
   'stats.noSnapshots': 'No auto-snapshots yet.',
