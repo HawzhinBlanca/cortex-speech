@@ -212,6 +212,13 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
     Ok((raw_transcript, confidence))
 }
 
+/// Serializes ALL WSL-7B client spawns process-wide. The champion server is a single-threaded accept
+/// loop, so concurrent app-side callers (an import's per-segment pass, the batch refinement loop, a UI
+/// re-transcribe) would queue on the socket and blow through their client/app timeouts CUMULATIVELY —
+/// misread as "server not running" and rolling back a HEALTHY import. Serializing here means each
+/// request waits its turn, then gets its FULL fresh timeout budget once it actually runs.
+static WSL_7B_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Spawn the configured external WSL ASR client for ONE segment and return its parsed transcript.
 ///
 /// Shared by the per-segment pipeline path (`cancel = None`) and the batch refinement command. The
@@ -225,6 +232,10 @@ pub(crate) fn run_wsl_segment_transcript_with_script(
     segment_id: &str,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> AppResult<(String, Option<f64>)> {
+    // Hold the process-wide gate for the whole spawn+wait so cross-path 7B calls never collide on the
+    // single-threaded server. Poison-tolerant like every other lock in this crate.
+    let _gate = WSL_7B_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let mut cmd = std::process::Command::new("wsl");
     cmd.arg("/root/cortex_env/bin/python3")
         .arg(external_script)
