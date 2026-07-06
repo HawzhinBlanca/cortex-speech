@@ -30,6 +30,12 @@ export interface AutosaveController {
   schedule: (edits: Record<string, unknown>) => void;
   /** Persist any queued edit immediately (call when leaving a segment). */
   flush: () => void;
+  /**
+   * Flush and return a promise that resolves when the in-flight save settles (or immediately when
+   * nothing is queued). Call this on window close so the last edit of a session is never lost to the
+   * debounce — `flush()` is fire-and-forget and would let the window close before the write lands.
+   */
+  flushAsync: () => Promise<void>;
   /** Drop any queued edit without saving (teardown). */
   cancel: () => void;
   /**
@@ -49,12 +55,13 @@ export function createAutosaveController<T extends object>(
 
   // Re-read the FRESH row so a concurrent change to OTHER fields (a verify/normalize/background
   // reload during the debounce) is preserved, then re-apply the user's edited fields so their edit
-  // always wins. Returns false (no save issued) when the row no longer exists.
-  function persist(entry: { id: string; fields: Record<string, unknown> }): boolean {
+  // always wins. Returns the in-flight save promise, or null (no save issued) when the row no longer
+  // exists — callers that only need "was a save issued?" can still test truthiness (null is falsy).
+  function persist(entry: { id: string; fields: Record<string, unknown> }): Promise<void> | null {
     const fresh = deps.getRow(entry.id);
-    if (!fresh) return false;
+    if (!fresh) return null;
     const merged = { ...fresh, ...entry.fields } as T;
-    deps.save(merged).then(
+    return deps.save(merged).then(
       () => {
         if (pending === entry) pending = null;
         deps.onState?.('saved');
@@ -64,7 +71,6 @@ export function createAutosaveController<T extends object>(
         deps.onState?.('idle');
       },
     );
-    return true;
   }
 
   function clearTimer() {
@@ -75,10 +81,15 @@ export function createAutosaveController<T extends object>(
   }
 
   function flush() {
+    void flushAsync();
+  }
+
+  function flushAsync(): Promise<void> {
     clearTimer();
     const entry = pending;
     pending = null;
-    if (entry) persist(entry);
+    if (!entry) return Promise.resolve();
+    return persist(entry) ?? Promise.resolve();
   }
 
   function schedule(edits: Record<string, unknown>) {
@@ -110,5 +121,5 @@ export function createAutosaveController<T extends object>(
     return pending ? pending.id : null;
   }
 
-  return { schedule, flush, cancel, pendingId };
+  return { schedule, flush, flushAsync, cancel, pendingId };
 }

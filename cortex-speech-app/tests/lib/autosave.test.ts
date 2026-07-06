@@ -50,6 +50,45 @@ describe('autosave controller', () => {
     vi.useRealTimers();
   });
 
+  // The close-flush contract: flushAsync issues the queued save immediately and resolves only after
+  // it settles, so a window-close handler can AWAIT it and never lose the last edit to the debounce.
+  it('flushAsync resolves only after the queued save settles', async () => {
+    let resolveSave: (() => void) | undefined;
+    const saved: Row[] = [];
+    const ctrl = createAutosaveController<Row>({
+      targetId: () => 'A',
+      getRow: () => ({ id: 'A', text: 'orig' }),
+      save: (row) =>
+        new Promise<void>((resolve) => {
+          saved.push({ ...row });
+          resolveSave = resolve;
+        }),
+      debounceMs: 1000,
+    });
+    ctrl.schedule({ text: 'last-edit' });
+    // Flush BEFORE the debounce fires: it must issue the save now and return a still-pending promise.
+    const flushed = ctrl.flushAsync();
+    expect(saved).toEqual([{ id: 'A', text: 'last-edit' }]);
+    let settled = false;
+    void flushed.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    resolveSave?.();
+    await flushed;
+    expect(settled).toBe(true);
+  });
+
+  it('flushAsync resolves immediately when nothing is queued', async () => {
+    const ctrl = createAutosaveController<Row>({
+      targetId: () => 'A',
+      getRow: () => ({ id: 'A', text: 'x' }),
+      save: async () => {},
+    });
+    await expect(ctrl.flushAsync()).resolves.toBeUndefined();
+  });
+
   // The core round-16 fix: switching to (and editing) a different segment within the debounce window
   // must FLUSH the prior segment's queued edit, not silently drop it.
   it('flushes the prior segment edit when switching segments mid-debounce', async () => {

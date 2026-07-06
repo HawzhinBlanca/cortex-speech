@@ -110,6 +110,8 @@ export const en: Record<string, string> = {
   deleteSegmentConfirm: 'Delete segment "{name}"? This cannot be undone.',
   editorInteractive: 'Interactive',
   editorTextEditor: 'Text Editor',
+  'review.cannotVerifyPlaceholder':
+    'This clip is not transcribed yet ([Pending WSL 7B ASR] / [ASR unavailable]). Re-transcribe it or mark it bad — it cannot be verified as-is.',
   'review.progress': 'Clip {n} of {total}',
   'review.reviewedCount': '{done} of {total} reviewed',
   'review.editHint': 'Listen, then fix the text if needed',

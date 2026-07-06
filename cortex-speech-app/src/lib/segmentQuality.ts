@@ -21,3 +21,15 @@ export function isHumanRejected(seg: Pick<SpeechSegment, 'humanDecision' | 'verd
 export function isVerifiedGood(seg: Pick<SpeechSegment, 'verified' | 'humanDecision' | 'verdict'>): boolean {
   return seg.verified && !isHumanRejected(seg);
 }
+
+/**
+ * True when a transcript is an ASR PLACEHOLDER, not real text — the sentinel a not-yet-transcribed or
+ * failed 7B segment carries ("[Pending WSL 7B ASR]", "[ASR unavailable...]"). Mirrors the Rust
+ * `quality::is_placeholder_transcript` so the UI never lets the owner "verify" a placeholder as gold
+ * (the backend already excludes it from the training grade — this keeps the review counts honest too).
+ */
+export function isPlaceholderTranscript(text: string | null | undefined): boolean {
+  const t = (text ?? '').trim();
+  const lower = t.toLowerCase();
+  return t.startsWith('[ASR unavailable') || t.startsWith('[Pending') || lower === 'n/a' || lower === 'null';
+}

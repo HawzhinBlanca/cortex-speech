@@ -111,6 +111,8 @@ export const ckb: Record<string, string> = {
   deleteSegmentConfirm: 'بەشی "{name}" بسڕێتەوە؟ ئەمە ناگەڕێتەوە.',
   editorInteractive: 'کارلێک',
   editorTextEditor: 'دەستکاریی دەق',
+  'review.cannotVerifyPlaceholder':
+    'ئەم پارچەیە هێشتا نووسراوی بۆ نەکراوە ([Pending WSL 7B ASR] / [ASR unavailable]). دووبارە نووسراوی بۆ بکە یان وەک خراپ نیشانی بکە — ناتوانرێت وەک خۆی پەسەند بکرێت.',
   'review.progress': 'پارچەی {n} لە {total}',
   'review.reviewedCount': '{done} لە {total} پێداچوونەوەکراو',
   'review.editHint': 'گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە',

@@ -389,6 +389,9 @@
     };
   });
 
+  // Unlisten for the native window close-request hook (registered in onMount, cleared in onDestroy).
+  let closeUnlisten: (() => void) | undefined;
+
   onMount(async () => {
     tauriAvailable = isTauriRuntime();
     const km = initKeyboardManager();
@@ -472,6 +475,26 @@
         .getQuarantineNotice()
         .then((n) => (n.quarantinedFiles.length > 0 ? n : null))
         .catch(() => null);
+      // Flush the debounced autosave BEFORE the native window closes so the last correction of a
+      // session is never lost — onDestroy does not reliably run on a Tauri window close. The flush is
+      // bounded by a 3s timeout so a stuck backend can never prevent the app from closing.
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        const appWindow = getCurrentWindow();
+        closeUnlisten = await appWindow.onCloseRequested(async (event) => {
+          event.preventDefault();
+          try {
+            await Promise.race([
+              autosave.flushAsync(),
+              new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+            ]);
+          } finally {
+            await appWindow.destroy();
+          }
+        });
+      } catch (e) {
+        console.error('Failed to register close-request autosave flush:', e);
+      }
     } else {
       segments.set([]);
       segmentsLoading = false;
@@ -482,6 +505,7 @@
   onDestroy(() => {
     stopEventListeners();
     globalKeyboardManager?.destroy();
+    closeUnlisten?.();
     // Flush (not just cancel) a pending edit on teardown so a correction typed in the last debounce
     // window before exit is still persisted, rather than silently dropped by a bare clearTimeout.
     autosave.flush();
@@ -1112,6 +1136,15 @@
 
   async function handleUndo() {
     if (!requireDesktopRuntime()) return;
+    // The global history stack records only updateSegment, NOT record_human_decision. On the review
+    // surfaces (Review & Correct, and the Inbox overlay) a global Ctrl+Z would revert `verified` but
+    // leave the human_decision row — splitting state (the clip re-enters the queue while the DB says it
+    // was decided, and the confidence flywheel was fed a decision that is now retracted). Those surfaces
+    // have their OWN paired undo (Backspace = clearHumanDecision + restore); defer to it here.
+    if (viewMode === 'review' || $showReviewInbox) {
+      notifications.info('Press Backspace to undo the last review decision');
+      return;
+    }
     try {
       const description = await historyStore.undo();
       notifications.info(`Undo: ${description ?? 'Last action reverted'}`);
@@ -1126,6 +1159,8 @@
 
   async function handleRedo() {
     if (!requireDesktopRuntime()) return;
+    // Same split-state hazard as handleUndo: the global redo has no meaning on the review surfaces.
+    if (viewMode === 'review' || $showReviewInbox) return;
     try {
       const description = await historyStore.redo();
       notifications.info(`Redo: ${description ?? 'Last action reapplied'}`);
