@@ -1206,6 +1206,13 @@ speaker-clustering state machine with high regression risk and the memory win is
   reachability (a wrap there mislabels a segment's SPEAKER against an unrelated window) → given the same
   guard (skip the segment, not fall to whole-file). The two remaining bare casts (`window.offset_ms`) read
   the decoder's own bounded output, not stored alignment — left as-is.
+  Then completed a FULL census of all 8 `from_alignment_json` consumers to prove the class is closed:
+  slice_pcm_by_alignment (guarded), export slice_for_export (guarded ✓), pipeline rediarize (guarded ✓),
+  commands clip-extract (safe: window-relative offsets), commands.rs:2652 (safe: reads ms for sort only),
+  `update_segment_bounds` (safe: validates start/end and overwrites the offsets before re-serializing, no
+  slice), pipeline.rs:1524/1829 (safe: metadata round-trip), agentic reference-window (safe: offset→ratio
+  `.clamp(0.0,1.0)` so token indices stay bounded). Every PCM-slicing consumer of a stored offset is now
+  guarded; the offset-wrap variant of the whole-file-vs-clip class is provably closed.
 - **LOOP-0 confidence adversarial review (the original deliverable) — verified sound + one edge documented**
   Re-read the whole evidence path (`corrections.rs` + `db.rs::record_human_decision`) hunting for real
   correctness bugs. The Beta(1,1) SQL reconstructs `beta_confidence(new_confirm, new_override)` exactly
