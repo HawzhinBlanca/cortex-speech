@@ -648,6 +648,25 @@ pub static MIGRATIONS: &[Migration] = &[
              ALTER TABLE correction_memory DROP COLUMN confirm_count;",
         ),
     },
+    Migration {
+        version: 33,
+        description: "LOOP-0 shadow-evidence archive — survives segment deletion (C5 gate not survivor-biased)",
+        // loop0_shadow_log CASCADE-deletes with its segment, so the owner's normal cleanup (review a bad
+        // clip, then delete it) silently removed exactly the rows most likely to be over-triggers — the
+        // C5 "over-triggers must be 0 before firing go-live" gate then looked SAFER than reality. Before a
+        // segment is deleted, its shadow contribution is aggregated into this single durable counter row,
+        // and intelligence_report adds it to the live counts. One row (id=1), seeded here.
+        up_sql: "CREATE TABLE IF NOT EXISTS loop0_evidence_archive (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     total_observations INTEGER NOT NULL DEFAULT 0,
+                     would_fire INTEGER NOT NULL DEFAULT 0,
+                     fired_human_accepted INTEGER NOT NULL DEFAULT 0,
+                     fired_human_edited INTEGER NOT NULL DEFAULT 0,
+                     fired_human_rejected INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT OR IGNORE INTO loop0_evidence_archive (id) VALUES (1);",
+        down_sql: Some("DROP TABLE IF EXISTS loop0_evidence_archive;"),
+    },
 ];
 
 #[cfg(test)]

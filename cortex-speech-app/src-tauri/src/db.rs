@@ -748,15 +748,59 @@ impl Database {
         Ok(rows_changed > 0)
     }
 
-    pub fn delete_segment(&self, id: &str) -> AppResult<()> {
-        self.conn.execute("DELETE FROM speech_segments WHERE id = ?1", params![id])?;
-        self.track_write()?;
+    /// Fold ONE segment's LOOP-0 shadow evidence into the durable archive BEFORE it is deleted, so the
+    /// C5 over-trigger gate isn't survivor-biased by the owner's normal cleanup (review a bad clip, then
+    /// delete it — exactly the rows most likely to be over-triggers). Uses the same correlation as
+    /// `intelligence_report`. Must run while the segment + its shadow rows still exist (before DELETE).
+    fn archive_loop0_evidence_for(&self, id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE loop0_evidence_archive SET
+                 total_observations = total_observations
+                     + COALESCE((SELECT COUNT(*) FROM loop0_shadow_log WHERE segment_id = ?1), 0),
+                 would_fire = would_fire
+                     + COALESCE((SELECT SUM(memory_fired) FROM loop0_shadow_log WHERE segment_id = ?1), 0),
+                 fired_human_accepted = fired_human_accepted + COALESCE((
+                     SELECT SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END)
+                     FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id WHERE l.segment_id = ?1), 0),
+                 fired_human_edited = fired_human_edited + COALESCE((
+                     SELECT SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('edit','human_edit') THEN 1 ELSE 0 END)
+                     FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id WHERE l.segment_id = ?1), 0),
+                 fired_human_rejected = fired_human_rejected + COALESCE((
+                     SELECT SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('reject','human_reject') THEN 1 ELSE 0 END)
+                     FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id WHERE l.segment_id = ?1), 0)
+             WHERE id = 1",
+            params![id],
+        )?;
         Ok(())
+    }
+
+    pub fn delete_segment(&self, id: &str) -> AppResult<()> {
+        self.conn.execute("SAVEPOINT del_seg", [])?;
+        let result: AppResult<()> = (|| {
+            self.archive_loop0_evidence_for(id)?;
+            self.conn.execute("DELETE FROM speech_segments WHERE id = ?1", params![id])?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("del_seg")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(e) => {
+                self.cleanup_savepoint_after_error("del_seg");
+                Err(e)
+            }
+        }
     }
 
     pub fn delete_segments_batch(&self, ids: &[String]) -> AppResult<()> {
         self.conn.execute("SAVEPOINT batch_delete", [])?;
         let result: AppResult<()> = (|| {
+            // Archive each segment's shadow evidence FIRST (while its shadow rows still exist), then delete.
+            for id in ids {
+                self.archive_loop0_evidence_for(id)?;
+            }
             let mut stmt = self.conn.prepare("DELETE FROM speech_segments WHERE id = ?1")?;
             for id in ids {
                 stmt.execute(params![id])?;
@@ -1511,12 +1555,18 @@ impl Database {
     /// * C4: of the machine's T0 auto-accepts that a human later reviewed, how many did the human
     ///   confirm vs contradict (edit/reject) — the honest precision behind any autonomy increase.
     pub fn intelligence_report(&self) -> AppResult<serde_json::Value> {
+        // Live counts over surviving segments PLUS the durable archive of segments already deleted
+        // (migration v33), so the C5 over-trigger gate is not survivor-biased by ordinary cleanup.
         let loop0 = self.conn.query_row(
-            "SELECT COUNT(*),
-                    COALESCE(SUM(l.memory_fired), 0),
-                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('edit','human_edit') THEN 1 ELSE 0 END), 0),
+            "SELECT COUNT(*) + COALESCE((SELECT total_observations FROM loop0_evidence_archive WHERE id = 1), 0),
+                    COALESCE(SUM(l.memory_fired), 0)
+                        + COALESCE((SELECT would_fire FROM loop0_evidence_archive WHERE id = 1), 0),
+                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END), 0)
+                        + COALESCE((SELECT fired_human_accepted FROM loop0_evidence_archive WHERE id = 1), 0),
+                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('edit','human_edit') THEN 1 ELSE 0 END), 0)
+                        + COALESCE((SELECT fired_human_edited FROM loop0_evidence_archive WHERE id = 1), 0),
                     COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('reject','human_reject') THEN 1 ELSE 0 END), 0)
+                        + COALESCE((SELECT fired_human_rejected FROM loop0_evidence_archive WHERE id = 1), 0)
              FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id",
             [],
             |row| {
@@ -3275,6 +3325,29 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(rows, vec![1, 0], "both shadow observations persist with their flags");
+    }
+
+    #[test]
+    fn deleting_a_segment_preserves_its_loop0_over_trigger_evidence() {
+        // C5 survivor-bias guard: the owner's normal cleanup (review a bad clip, then delete it) must not
+        // erase the over-trigger evidence that gate reads — else the gate looks safer than reality.
+        let db = make_db();
+        let mut seg = make_segment("ov-1", "/data/audio/ov-1.wav");
+        seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+        db.insert_segment(&seg).expect("insert");
+        // Shadow says a memory WOULD fire; the human then accepted the original -> an OVER-TRIGGER.
+        db.record_loop0_shadow("ov-1", true).expect("shadow");
+        db.connection().execute("UPDATE speech_segments SET human_decision='accept' WHERE id='ov-1'", []).expect("hd");
+
+        let ot_before =
+            db.intelligence_report().expect("report")["loop0Shadow"]["firedButHumanAcceptedOriginal"].as_i64().unwrap();
+        assert_eq!(ot_before, 1, "the over-trigger is counted while the segment exists");
+
+        db.delete_segment("ov-1").expect("delete");
+
+        let ot_after =
+            db.intelligence_report().expect("report")["loop0Shadow"]["firedButHumanAcceptedOriginal"].as_i64().unwrap();
+        assert_eq!(ot_after, 1, "the over-trigger evidence SURVIVES deletion via the durable archive");
     }
 
     #[test]
