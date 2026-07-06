@@ -1098,7 +1098,7 @@ pub fn transcribe_segment(
     // possibly-long WSL/ONNX transcription — holding it would serialize every other pipeline command.
     let pipeline = state.lock_pipeline().clone();
     let (raw_text, corrected_text, confidence) = pipeline
-        .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref())
+        .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref(), None)
         .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "text": corrected_text, "rawTranscript": raw_text, "confidence": confidence }))
 }
@@ -1200,7 +1200,7 @@ pub fn batch_transcribe(
             if let Some(seg) = seg {
                 // Capture full snapshot BEFORE transcription for complete undo.
                 let pre_transcription_snapshot = seg.clone();
-                match pipeline.transcribe(Some(id), &seg.audio_path, seg.alignment_json.as_deref()) {
+                match pipeline.transcribe(Some(id), &seg.audio_path, seg.alignment_json.as_deref(), None) {
                     Ok((raw_text, corrected_text, confidence)) => {
                         let normalized = normalizer.normalize(&corrected_text);
                         // Guarded targeted write (NOT a full insert_segment of the stale snapshot): a

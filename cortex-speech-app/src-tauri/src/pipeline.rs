@@ -2021,7 +2021,12 @@ impl ProcessingPipeline {
             let mut last_problem: Option<String> = None;
             let mut infra_failure = false;
             for attempt in 1..=MAX_ATTEMPTS {
-                match self.transcribe(Some(seg.id.as_str()), &seg.audio_path, seg.alignment_json.as_deref()) {
+                match self.transcribe(
+                    Some(seg.id.as_str()),
+                    &seg.audio_path,
+                    seg.alignment_json.as_deref(),
+                    cancel.map(|t| t.as_atomic()),
+                ) {
                     Ok((_raw_text, _corrected_text, _confidence)) => {
                         if let Err(e) = self.refresh_segment_from_db(db, seg) {
                             // A DB hiccup mid-pass otherwise left a partial import (some transcribed, some
@@ -2395,6 +2400,10 @@ impl ProcessingPipeline {
         segment_id: Option<&str>,
         audio_path: &str,
         alignment_json: Option<&str>,
+        // Optional cancel flag threaded down to the WSL-7B subprocess poller so an in-flight 7B call is
+        // killed within ~50 ms of Cancel, not only between segments (import/batch callers pass their
+        // token; one-off callers pass None).
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> AppResult<(String, String, Option<f64>)> {
         let path = Path::new(audio_path);
         let duration_ms = audio::get_duration_ms(path)?;
@@ -2494,7 +2503,7 @@ impl ProcessingPipeline {
 
                 drop(db);
 
-                let (raw_transcript, confidence) = self.run_wsl_segment_transcript(&id)?;
+                let (raw_transcript, confidence) = self.run_wsl_segment_transcript(&id, cancel)?;
 
                 let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
 
@@ -2912,7 +2921,7 @@ impl ProcessingPipeline {
             return Ok(());
         }
 
-        match self.run_wsl_segment_transcript(segment_id) {
+        match self.run_wsl_segment_transcript(segment_id, None) {
             Ok((raw_transcript, confidence)) => {
                 insert_hypothesis_checked(db, segment_id, "omniasr-wsl-7b", raw_transcript, confidence)?;
             }
@@ -2923,13 +2932,17 @@ impl ProcessingPipeline {
         Ok(())
     }
 
-    fn run_wsl_segment_transcript(&self, segment_id: &str) -> AppResult<(String, Option<f64>)> {
+    fn run_wsl_segment_transcript(
+        &self,
+        segment_id: &str,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> AppResult<(String, Option<f64>)> {
         let Some(external_script) = self.settings.external_asr_script_path() else {
             return Err(AppError::Validation(
                 "External ASR provider is not configured. Set the WSL script path in Settings before using the 7B provider.".into(),
             ));
         };
-        run_wsl_segment_transcript_with_script(&external_script, segment_id, &self.db_path, None)
+        run_wsl_segment_transcript_with_script(&external_script, segment_id, &self.db_path, cancel)
     }
 
     pub fn align(

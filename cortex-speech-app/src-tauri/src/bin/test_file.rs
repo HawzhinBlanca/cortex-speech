@@ -74,7 +74,7 @@ fn main() -> AppResult<()> {
             std::thread::sleep(std::time::Duration::from_secs(6));
         }
         println!("Chunk {}: [{} ms]", i, seg.duration_ms);
-        match pipeline.transcribe(Some(&seg.id), &seg.audio_path, seg.alignment_json.as_deref()) {
+        match pipeline.transcribe(Some(&seg.id), &seg.audio_path, seg.alignment_json.as_deref(), None) {
             Ok((raw, corrected, confidence)) => {
                 println!("Raw Draft: {}", raw);
                 println!("Gemini Output: {}", corrected);

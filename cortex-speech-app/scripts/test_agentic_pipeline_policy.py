@@ -112,7 +112,9 @@ def main() -> None:
     assert 'insert_hypothesis_checked(db, segment_id, "omniasr-wsl-7b"' in pipeline, (
         "configured WSL 7B hypothesis pass must preserve a jury candidate"
     )
-    assert "self.run_wsl_segment_transcript(segment_id)" in pipeline, (
+    assert "self.run_wsl_segment_transcript(segment_id" in pipeline, (
+        # Robust prefix: the call now also takes a cancel arg (None for the hypothesis pass). The
+        # invariant is that the pass uses the real external provider, not the exact argument list.
         "automatic WSL 7B hypothesis pass must use the real external provider"
     )
     assert "should_use_wsl_primary_asr" in pipeline, (
