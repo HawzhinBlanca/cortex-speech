@@ -71,7 +71,7 @@ bzip2 = "0.5"
 ureq = { version = "2", features = ["tls", "json"] }
 
 # SHA256 verification for downloaded models
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Compression ratio for ASR repetition detection
 flate2 = "1"
