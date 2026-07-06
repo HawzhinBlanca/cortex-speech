@@ -2828,7 +2828,10 @@ fn run_wsl_refinement_loop(
         ">>> Driving the Meta OmniASR 7B warm client over pending segments (one --segment-id call each)...".to_string(),
     );
 
-    let db = crate::db::Database::open_with_retry(db_path).map_err(|e| e.to_string())?;
+    // Worker connection (background thread): plain `open`, NOT open_with_retry — the boot-time-only
+    // destructive quarantine must not be reachable from a live worker, and the DB was integrity-checked
+    // at boot. `open` sets WAL + busy_timeout for contention.
+    let db = crate::db::Database::open(db_path).map_err(|e| e.to_string())?;
     let segments = db.get_segments(None).map_err(|e| e.to_string())?;
     let targets = select_wsl_refinement_targets(&segments, limit_files, limit_segments, test_one);
 
@@ -4078,11 +4081,13 @@ fn has_final_machine_verdict(seg: &crate::db::SpeechSegment) -> bool {
 fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) -> R) -> R {
     let db_path = { app_state.lock_db().path().to_string() };
     if db_path != ":memory:" {
-        // Round-25 #8: retry the dedicated open (busy_timeout) so a transient lock/contention doesn't
-        // drop us to the shared-handle fallback, which would hold the GLOBAL db Mutex across the jury's
-        // cloud T2 Gemini round-trips and freeze every other DB command for minutes. open_with_retry
-        // makes that fallback extremely rare (only a hard disk/handle failure reaches it).
-        match crate::db::Database::open_with_retry(&db_path) {
+        // Dedicated worker connection so we never hold the GLOBAL db Mutex across the jury's cloud T2
+        // Gemini round-trips (which would freeze every other DB command for minutes). Use plain `open`,
+        // NOT open_with_retry: the latter runs a full PRAGMA integrity_check (a per-review-session tax
+        // that grows with the library) AND reaches the boot-time-only DESTRUCTIVE quarantine decision
+        // from a live worker thread. The file was already integrity-checked at boot; `open` sets WAL +
+        // busy_timeout=10000, which is the actual transient-contention retry we want here.
+        match crate::db::Database::open(&db_path) {
             Ok(db) => return f(&db),
             Err(e) => tracing::warn!(
                 "Jury dedicated db connection open failed after retries ({e}); using the shared handle \

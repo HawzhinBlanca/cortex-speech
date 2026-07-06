@@ -2009,7 +2009,11 @@ impl ProcessingPipeline {
     fn mark_wsl_primary_unavailable(&self, db: &Database, seg: &mut SpeechSegment, reason: &str) -> AppResult<()> {
         let rationale = format!("WSL 7B primary ASR unavailable before jury: {reason}");
         tracing::warn!("{} ({})", rationale, seg.id);
-        db.write_segment_verdict(&seg.id, "escalated", None, Some(&rationale), None, None, true)?;
+        // Explicit lowest confidence (0.0), NOT None: a None here becomes COALESCE(agent_confidence, 0.5)
+        // in the suspect-first queue, tying these unresolved-primary clips (empty/failed 7B, unknown
+        // quality — exactly the ones most needing attention) at the 0.5 plateau to sort by id. 0.0 sorts
+        // them to the very front.
+        db.write_segment_verdict(&seg.id, "escalated", None, Some(&rationale), None, Some(0.0), true)?;
         self.refresh_segment_from_db(db, seg)?;
         Ok(())
     }
@@ -2335,7 +2339,7 @@ impl ProcessingPipeline {
         }
 
         if self.should_use_wsl_primary_asr() {
-            let db = crate::db::Database::open_with_retry(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
+            let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
             let audio_path_str = path.to_string_lossy().to_string();
 
             let segment_id: Option<String> = if let Some(id) = segment_id {
@@ -2379,8 +2383,7 @@ impl ProcessingPipeline {
 
                 let (raw_transcript, confidence) = self.run_wsl_segment_transcript(&id)?;
 
-                let db =
-                    crate::db::Database::open_with_retry(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
+                let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
 
                 let normalized_transcript = if self.settings.auto_normalize && !raw_transcript.is_empty() {
                     let norm_config = crate::normalizer::NormalizationConfig {
