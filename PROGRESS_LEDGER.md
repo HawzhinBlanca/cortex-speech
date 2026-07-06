@@ -1213,6 +1213,16 @@ speaker-clustering state machine with high regression risk and the memory win is
   slice), pipeline.rs:1524/1829 (safe: metadata round-trip), agentic reference-window (safe: offset→ratio
   `.clamp(0.0,1.0)` so token indices stay bounded). Every PCM-slicing consumer of a stored offset is now
   guarded; the offset-wrap variant of the whole-file-vs-clip class is provably closed.
+- **Metric harness (WER/CER) adversarial review — verified sound + boundary pinned** The whole project's
+  "never fabricate a metric" law rests on the harness COMPUTING metrics correctly, so I audited `wer.rs`:
+  `levenshtein` returns `prev[m]` correctly; `compute_wer/cer` = edit-distance / ref-len clamped to 1.0 with
+  honest empty-ref handling; the S/D/I backtrace in `levenshtein_breakdown` is correct AND its `j -= 1`
+  insertion branch can never underflow (when `j == 0, i > 0` the deletion branch always fires first —
+  traced and confirmed). Found one minor TEST gap: the all-deletion boundary was exercised (via
+  `("a b c","")`) but only `total()` was asserted, not the S/D/I split — a future backtrace refactor could
+  mislabel deletions as insertions while keeping the distance right. Added a test pinning both extremes
+  (all-deletion → (0,3,0,3), all-insertion → (0,0,3,0)). cargo: fmt clean, clippy -D warnings clean,
+  `--lib` 809 passed.
 - **LOOP-0 confidence adversarial review (the original deliverable) — verified sound + one edge documented**
   Re-read the whole evidence path (`corrections.rs` + `db.rs::record_human_decision`) hunting for real
   correctness bugs. The Beta(1,1) SQL reconstructs `beta_confidence(new_confirm, new_override)` exactly
