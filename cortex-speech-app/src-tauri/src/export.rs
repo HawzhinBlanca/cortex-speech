@@ -25,7 +25,48 @@ pub struct DatasetMetadata {
     pub total_duration_ms: i64,
     pub verified_segments: usize,
     pub training_grade_summary: TrainingGradeSummary,
+    /// Per-speaker composition so a skewed corpus (one voice dominating) is visible in the dataset card
+    /// itself rather than only in-app — a real fine-tune quality lever for a small single-curator corpus.
+    pub composition: DatasetComposition,
     pub exported_at: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct SpeakerComposition {
+    pub speaker_id: String,
+    pub segments: usize,
+    pub duration_ms: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct DatasetComposition {
+    pub speakers: Vec<SpeakerComposition>,
+    /// The largest single speaker's share of total duration (0..1).
+    pub dominant_speaker_share: f64,
+    /// True when one speaker exceeds 50% of the corpus by duration — flag it for the curator.
+    pub dominant_speaker_over_50pct: bool,
+}
+
+/// Aggregate per-speaker segment/duration counts and the dominant speaker's share of total duration.
+fn compute_composition(segments: &[SpeechSegment]) -> DatasetComposition {
+    use std::collections::HashMap;
+    let mut by_speaker: HashMap<String, (usize, i64)> = HashMap::new();
+    let mut total: i64 = 0;
+    for s in segments {
+        let spk = s.speaker_id.clone().unwrap_or_else(|| "unknown".to_string());
+        let entry = by_speaker.entry(spk).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += s.duration_ms;
+        total += s.duration_ms;
+    }
+    let mut speakers: Vec<SpeakerComposition> = by_speaker
+        .into_iter()
+        .map(|(speaker_id, (segments, duration_ms))| SpeakerComposition { speaker_id, segments, duration_ms })
+        .collect();
+    speakers.sort_by(|a, b| b.duration_ms.cmp(&a.duration_ms).then_with(|| a.speaker_id.cmp(&b.speaker_id)));
+    let dominant_speaker_share =
+        if total > 0 { speakers.first().map(|s| s.duration_ms as f64 / total as f64).unwrap_or(0.0) } else { 0.0 };
+    DatasetComposition { dominant_speaker_over_50pct: dominant_speaker_share > 0.5, dominant_speaker_share, speakers }
 }
 
 #[derive(serde::Serialize)]
@@ -252,6 +293,7 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
         total_duration_ms: total_duration,
         verified_segments: verified,
         training_grade_summary: quality::training_grade_summary(&segments),
+        composition: compute_composition(&segments),
         exported_at: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -1382,6 +1424,11 @@ mod tests {
                 review_segments: 0,
                 rejected_segments: 0,
             },
+            composition: DatasetComposition {
+                speakers: Vec::new(),
+                dominant_speaker_share: 0.0,
+                dominant_speaker_over_50pct: false,
+            },
             exported_at: "2026-06-16T00:00:00Z".to_string(),
         }
     }
@@ -1693,6 +1740,25 @@ mod tests {
         let merged = crate::chunking::merge_word_timestamps(Some(&meta.to_alignment_json()), &words);
         let s = slice_for_export(&full, 16000, Some(&merged)).expect("merged alignment still slices");
         assert_eq!(s.len(), chunking::ms_to_samples(400, 16000), "merged object slices to its 100..500ms window");
+    }
+
+    #[test]
+    fn compute_composition_flags_a_dominant_speaker() {
+        let mk = |id: &str, spk: &str, dur: i64| SpeechSegment {
+            id: id.into(),
+            speaker_id: Some(spk.into()),
+            duration_ms: dur,
+            ..Default::default()
+        };
+        // Speaker A = 8000ms, B = 2000ms -> A dominates (80% of duration > 50%).
+        let c = compute_composition(&[mk("1", "A", 5000), mk("2", "A", 3000), mk("3", "B", 2000)]);
+        assert_eq!(c.speakers.len(), 2);
+        assert_eq!(c.speakers[0].speaker_id, "A", "speakers sorted by duration desc");
+        assert_eq!((c.speakers[0].segments, c.speakers[0].duration_ms), (2, 8000));
+        assert!((c.dominant_speaker_share - 0.8).abs() < 1e-9);
+        assert!(c.dominant_speaker_over_50pct, "one speaker over 50% is flagged");
+        // A balanced corpus is not flagged.
+        assert!(!compute_composition(&[mk("1", "A", 5000), mk("2", "B", 5000)]).dominant_speaker_over_50pct);
     }
 
     #[test]
