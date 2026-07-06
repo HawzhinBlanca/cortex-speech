@@ -81,6 +81,8 @@ export const en: Record<string, string> = {
   asrModel: 'ASR Model',
   threads: 'Threads',
   gpuAcceleration: 'GPU acceleration (CUDA)',
+  gpuAccelerationNote:
+    'Affects the local CTC fallback engines only — they run on CPU in this build. The OmniASR-7B champion always uses the GPU via WSL.',
   vadThreshold: 'VAD Threshold',
   minSegment: 'Min segment',
   maxSegment: 'Max segment',

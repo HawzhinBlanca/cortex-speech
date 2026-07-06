@@ -82,6 +82,8 @@ export const ckb: Record<string, string> = {
   asrModel: 'مۆدێلی ASR',
   threads: 'تڕێدەکان',
   gpuAcceleration: 'خێراکردنی GPU (CUDA)',
+  gpuAccelerationNote:
+    'تەنها کاردانەوەی لەسەر ئەنجینە یەدەگەکانی CTCی ناوخۆیی هەیە — لەم بنیادەدا لەسەر CPU کار دەکەن. شایانی OmniASR-7B هەمیشە GPU بەکاردەهێنێت لە ڕێگەی WSL.',
   vadThreshold: 'ئاستی VAD',
   minSegment: 'کەمترین بەش',
   maxSegment: 'زۆرترین بەش',
