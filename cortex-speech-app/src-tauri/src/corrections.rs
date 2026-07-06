@@ -219,6 +219,57 @@ pub fn firing_error_delta(gold: &[(String, String)], memories: &[MemoryEntry], c
     delta
 }
 
+/// The Beta(1,1)-posterior mean confidence of a memory given its firing-outcome evidence:
+/// `(confirm + 1) / (confirm + override + 2)`. A memory with NO evidence sits at the neutral prior
+/// 0.5 — deliberately BELOW the default `tau_conf` 0.6 — so a freshly captured memory must EARN the
+/// right to fire by accumulating human confirmations. A memory the human keeps overriding decays
+/// toward 0 and drops out of firing eligibility. This is the anti-poisoning mechanism the true-10
+/// audit required before `loop0_firing_enabled` may ever go live (previously `confidence` was frozen
+/// at 1.0 and the `tau_conf` gate was vacuous).
+pub fn beta_confidence(confirm: i64, overrides: i64) -> f64 {
+    (confirm as f64 + 1.0) / (confirm as f64 + overrides as f64 + 2.0)
+}
+
+/// What a single memory WOULD have done to one segment, judged against the human's own answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryOutcome {
+    /// Fired and moved the transcript TOWARD the human's answer — evidence the memory was right.
+    Confirm,
+    /// Fired and moved the transcript AWAY from the human's answer — an over-trigger.
+    Override,
+    /// Did not fire here, or firing left the word-error count unchanged — no evidence either way.
+    Neutral,
+}
+
+/// Classify what a single `memory` would have done to `original` relative to the human's `reference`
+/// answer, using the SAME normalized word-error alignment as [`firing_error_delta`]:
+///
+/// * fired and the result is CLOSER to the human answer -> [`MemoryOutcome::Confirm`]
+/// * fired and the result is FARTHER from the human answer -> [`MemoryOutcome::Override`]
+/// * did not fire, or no net change -> [`MemoryOutcome::Neutral`]
+///
+/// The eligibility gates (`tau_conf`, `min_hits`) are DISABLED here on purpose: confidence is the
+/// quantity we are trying to LEARN, so a memory not yet confident enough to fire must still be able
+/// to accumulate the confirmations that would lift it over the bar — otherwise a fresh memory at the
+/// 0.5 prior could never escape it (a firing deadlock). Only the STRUCTURAL gates (exact slot match
+/// + phonetic distance) apply — they decide whether the memory is even relevant to this slot.
+pub fn classify_memory_outcome(
+    original: &str,
+    reference: &str,
+    memory: &MemoryEntry,
+    cfg: &FiringConfig,
+) -> MemoryOutcome {
+    let eval_cfg = FiringConfig { phon_tau: cfg.phon_tau, tau_conf: f64::NEG_INFINITY, min_hits: 0 };
+    let fired = apply_memories(original, std::slice::from_ref(memory), &eval_cfg);
+    let before = word_error_count(original, reference) as i64;
+    let after = word_error_count(&fired, reference) as i64;
+    match after.cmp(&before) {
+        std::cmp::Ordering::Less => MemoryOutcome::Confirm,
+        std::cmp::Ordering::Greater => MemoryOutcome::Override,
+        std::cmp::Ordering::Equal => MemoryOutcome::Neutral,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +447,39 @@ mod tests {
         let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
         let out = apply_memories("ئەو ساڵە پاش بوو", &[entry], &FiringConfig::default());
         assert_eq!(out, "ئەو ساڵە خراپ بوو", "a near-homophone of the wrong token must fire");
+    }
+
+    // --- evidence-based confidence (Beta(1,1) posterior over confirm/override) ---
+
+    #[test]
+    fn beta_confidence_prior_is_below_tau_and_evidence_moves_it() {
+        let tau = FiringConfig::default().tau_conf;
+        assert!((beta_confidence(0, 0) - 0.5).abs() < 1e-9, "no evidence -> neutral 0.5 prior");
+        assert!(beta_confidence(0, 0) < tau, "the prior sits below tau_conf: a fresh memory cannot fire");
+        assert!(beta_confidence(3, 0) > tau, "confirmations lift confidence above tau_conf");
+        assert!(beta_confidence(0, 3) < tau, "overrides push confidence below tau_conf");
+        // Monotone in each argument.
+        assert!(beta_confidence(5, 0) > beta_confidence(1, 0), "more confirms -> higher");
+        assert!(beta_confidence(0, 5) < beta_confidence(0, 1), "more overrides -> lower");
+    }
+
+    #[test]
+    fn classify_memory_outcome_reads_evidence_even_below_tau_conf() {
+        // The memory's stored confidence is 0.5 (below tau_conf): classify must STILL read its
+        // structural match, or a fresh memory could never accumulate the evidence to climb the gate.
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 0.5, 0);
+        let cfg = FiringConfig::default();
+        // Human edited the same confusion -> the memory's output matches the human answer -> Confirm.
+        assert_eq!(
+            classify_memory_outcome("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", &entry, &cfg),
+            MemoryOutcome::Confirm,
+        );
+        // Human ACCEPTED the original (reference == original) -> the memory over-triggers -> Override.
+        assert_eq!(
+            classify_memory_outcome("ئەو ساڵە باش بوو", "ئەو ساڵە باش بوو", &entry, &cfg),
+            MemoryOutcome::Override,
+        );
+        // The memory's slot does not occur here -> it never fires -> Neutral (no evidence).
+        assert_eq!(classify_memory_outcome("شتێکی جیاواز", "شتێکی جیاواز", &entry, &cfg), MemoryOutcome::Neutral,);
     }
 }

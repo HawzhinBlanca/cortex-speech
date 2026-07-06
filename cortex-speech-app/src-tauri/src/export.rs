@@ -431,27 +431,37 @@ pub fn assign_splits(
 
 /// Decide the PCM slice for a segment's exported WAV from its alignment window.
 ///
-/// Returns `None` when the segment must be SKIPPED: its alignment is present and parses but the
-/// window is out of range relative to the (possibly re-encoded/shortened) decoded buffer, or is
-/// degenerate (end <= start). In that case the OLD code substituted the WHOLE source file, pairing
-/// the entire recording with the segment's short transcript — silent training-data corruption. Only
-/// genuinely-absent or unparseable alignment falls back to the whole file (the intended behaviour).
+/// Returns `None` when the segment must be SKIPPED rather than paired with the wrong audio:
+/// - alignment is present and parses but the window is out of range / degenerate (end <= start), OR
+/// - alignment is PRESENT but has no source offsets (e.g. a bare word-timestamp array — the shape a
+///   clobbered `alignment_json` takes). Emitting the whole file here would pair the entire recording
+///   with a short clip's transcript — the exact silent training-data corruption to prevent.
+///
+/// Only a GENUINELY-ABSENT alignment (`None`) falls back to the whole file, which is correct for a
+/// single-file segment that never carried chunk metadata. Every real chunked segment carries a
+/// `SegmentSourceMeta` (even chunk_count==1 records `source_start_ms=0`), so a present-but-offset-less
+/// alignment can only mean the offsets were lost — skip it, don't guess.
 pub(crate) fn slice_for_export<'a>(
     full_pcm: &'a [i16],
     sample_rate: u32,
     alignment_json: Option<&str>,
 ) -> Option<std::borrow::Cow<'a, [i16]>> {
-    match alignment_json.and_then(chunking::SegmentSourceMeta::from_alignment_json) {
-        Some(meta) => {
-            let start = chunking::ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
-            let end = chunking::ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate).min(full_pcm.len());
-            if end > start && start < full_pcm.len() {
-                Some(std::borrow::Cow::Borrowed(&full_pcm[start..end]))
-            } else {
-                None // present-but-out-of-range window -> skip, never emit the whole file
+    match alignment_json {
+        // Truly no alignment metadata -> a single-file segment; the whole file IS the clip.
+        None => Some(std::borrow::Cow::Borrowed(full_pcm)),
+        Some(json) => match chunking::SegmentSourceMeta::from_alignment_json(json) {
+            Some(meta) => {
+                let start = chunking::ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
+                let end = chunking::ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate).min(full_pcm.len());
+                if end > start && start < full_pcm.len() {
+                    Some(std::borrow::Cow::Borrowed(&full_pcm[start..end]))
+                } else {
+                    None // present-but-out-of-range window -> skip, never emit the whole file
+                }
             }
-        }
-        None => Some(std::borrow::Cow::Borrowed(full_pcm)), // no/unparseable alignment -> whole file (intended)
+            // Present but no source offsets (clobbered/anomalous) -> skip, never emit the whole file.
+            None => None,
+        },
     }
 }
 
@@ -1641,6 +1651,30 @@ mod tests {
         // No alignment -> whole file (intended fallback).
         let whole = slice_for_export(&full, 16000, None).expect("whole file");
         assert_eq!(whole.len(), full.len());
+    }
+
+    #[test]
+    fn slice_for_export_skips_present_but_offsetless_alignment() {
+        // The clobbered shape: alignment_json is a bare word-timestamp array (no source_start_ms), the
+        // exact state a broken background aligner leaves. It must SKIP (None), never fall back to the
+        // whole file — otherwise a 10s clip's transcript would be paired with the entire recording.
+        let full = vec![0i16; 16000];
+        let bare_array = r#"[{"word":"x","start":0.0,"end":1.0,"confidence":0.5}]"#;
+        assert!(
+            slice_for_export(&full, 16000, Some(bare_array)).is_none(),
+            "a present-but-offset-less (clobbered) alignment must be skipped, never emitted whole-file"
+        );
+        // A MERGED object (offsets + words) still slices correctly — the good post-fix shape.
+        let meta = crate::chunking::SegmentSourceMeta {
+            source_start_ms: 100,
+            source_end_ms: 500,
+            chunk_index: 0,
+            chunk_count: 2,
+        };
+        let words = vec![crate::aligner::WordTimestamp { word: "x".into(), start: 0.0, end: 0.4, confidence: 0.5 }];
+        let merged = crate::chunking::merge_word_timestamps(Some(&meta.to_alignment_json()), &words);
+        let s = slice_for_export(&full, 16000, Some(&merged)).expect("merged alignment still slices");
+        assert_eq!(s.len(), chunking::ms_to_samples(400, 16000), "merged object slices to its 100..500ms window");
     }
 
     #[test]

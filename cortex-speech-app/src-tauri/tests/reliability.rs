@@ -335,7 +335,7 @@ fn test_health_check() {
     let (model_mgr, _models_tmp) = setup_model_mgr();
 
     let db = Database::open(&path).unwrap();
-    let health = health_check(&db, &model_mgr).unwrap();
+    let health = health_check(&db, &model_mgr, None).unwrap();
 
     assert_eq!(health["status"], "ok", "Bundled runtime models should satisfy essential health");
     assert!(health.get("db_size").and_then(|v| v.as_i64()).is_some(), "db_size should be present");
@@ -358,7 +358,7 @@ fn test_health_check_with_data() {
     db.insert_segment(&make_seg("health_1", "/a.wav", "hello")).unwrap();
     db.insert_segment(&make_seg("health_2", "/b.wav", "world")).unwrap();
 
-    let health = health_check(&db, &model_mgr).unwrap();
+    let health = health_check(&db, &model_mgr, None).unwrap();
     assert_eq!(health["status"], "ok");
     assert_eq!(health["segment_count"], 2);
     assert!(health["db_size"].as_i64().unwrap_or(0) > 0);
@@ -512,7 +512,7 @@ fn test_health_check_empty_db_fields() {
     let (_db, path) = setup_db();
     let (model_mgr, _models_tmp) = setup_model_mgr();
     let db = Database::open(&path).unwrap();
-    let health = health_check(&db, &model_mgr).unwrap();
+    let health = health_check(&db, &model_mgr, None).unwrap();
 
     let obj = health.as_object().expect("health_check should return JSON object");
     assert!(obj.contains_key("status"), "Must contain 'status'");

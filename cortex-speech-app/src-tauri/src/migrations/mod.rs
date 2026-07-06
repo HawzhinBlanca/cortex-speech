@@ -12,10 +12,31 @@ pub struct Migration {
     pub down_sql: Option<&'static str>,
 }
 
+/// The highest migration version THIS binary knows how to run. A database at a version above this was
+/// created by a NEWER build; operating on it silently (an old exe applies old semantics to a newer
+/// schema — e.g. a pre-v32 build treating `correction_memory.confidence` under the frozen-1.0 rules
+/// it no longer earns) is a data-integrity hazard.
+pub fn max_supported_version() -> i64 {
+    MIGRATIONS.iter().map(|m| m.version).max().unwrap_or(0)
+}
+
 /// Run all pending migrations on the database.
 pub fn run_migrations(db: &Database) -> AppResult<Vec<i64>> {
     ensure_migrations_table(db)?;
     let current_version = get_current_version(db)?;
+
+    // Forward-compatibility guard: refuse to run when the DB schema is NEWER than this build supports,
+    // rather than silently operating on it with stale semantics. (A migration only ever moves the
+    // schema FORWARD, so a lower-version binary has no way to correctly read a higher-version DB.)
+    let max_known = max_supported_version();
+    if current_version > max_known {
+        return Err(crate::error::AppError::Other(format!(
+            "This library is at schema v{current_version}, newer than this build understands (v{max_known}). \
+             It was created by a newer version of Cortex Speech. Update the app before opening this database \
+             — refusing to run to avoid corrupting data under a schema this build does not understand."
+        )));
+    }
+
     let mut applied = Vec::new();
 
     for migration in MIGRATIONS {
@@ -607,6 +628,26 @@ pub static MIGRATIONS: &[Migration] = &[
             "DROP TABLE IF EXISTS import_job_files; DROP TABLE IF EXISTS import_jobs; DROP INDEX IF EXISTS idx_import_jobs_status;",
         ),
     },
+    Migration {
+        version: 32,
+        description: "LOOP-0 evidence-based confidence — per-memory confirm/override counts + Beta(1,1) posterior",
+        // True-10 audit: correction_memory.confidence was frozen at the column DEFAULT 1.0 — nothing
+        // ever wrote it — so the tau_conf firing gate was vacuous and one bad memory would poison
+        // transcripts permanently once firing went live. These two counters record firing-OUTCOME
+        // evidence at human-decision time (a would-fire the human subsequently confirmed vs
+        // contradicted); confidence becomes the Beta(1,1)-posterior mean (confirm+1)/(confirm+override+2).
+        // Recompute every existing row off its (zero) evidence so no legacy memory keeps a fabricated
+        // 1.0 — a memory with no evidence drops to the neutral 0.5 prior, BELOW tau_conf 0.6, and must
+        // earn the right to fire.
+        up_sql: "ALTER TABLE correction_memory ADD COLUMN confirm_count INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE correction_memory ADD COLUMN override_count INTEGER NOT NULL DEFAULT 0;
+                 UPDATE correction_memory
+                    SET confidence = (confirm_count + 1.0) / (confirm_count + override_count + 2.0);",
+        down_sql: Some(
+            "ALTER TABLE correction_memory DROP COLUMN override_count;
+             ALTER TABLE correction_memory DROP COLUMN confirm_count;",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -796,6 +837,46 @@ mod tests {
         assert_eq!(conf, 1.0, "confidence must default to 1.0");
         assert_eq!(hits, 0, "hit_count must default to 0");
         assert_eq!(created_set, 1, "created_at must be populated by its default");
+    }
+
+    #[test]
+    fn refuses_to_run_on_a_schema_newer_than_this_build() {
+        // Forward-compat guard: an old binary must NOT silently operate on a DB migrated by a newer
+        // build (the stale-GUI-over-v32-DB scenario) — it re-plants confidence=1.0 memories, etc.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let future = max_supported_version() + 1;
+        db.connection()
+            .execute(
+                "INSERT INTO schema_migrations (version, description) VALUES (?1, 'from-the-future')",
+                rusqlite::params![future],
+            )
+            .unwrap();
+        let err = run_migrations(&db).expect_err("a newer-than-supported schema must be refused");
+        assert!(err.to_string().contains("newer than this build"), "got: {err}");
+    }
+
+    #[test]
+    fn migration_v32_adds_evidence_confidence_columns() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+
+        // Both firing-outcome counters exist and default to 0. A raw insert keeps the column-default
+        // confidence (v32's recompute only touched rows present at migration time); the live app path
+        // instead sets the Beta prior explicitly. Here we just prove the schema surface exists.
+        conn.execute(
+            "INSERT INTO correction_memory (id, wrong_token, human_token, slot_key, phonetic_key)
+             VALUES ('m32', 'w', 'r', 'L|R', 'p')",
+            [],
+        )
+        .unwrap();
+        let (confirm, overrides): (i64, i64) = conn
+            .query_row("SELECT confirm_count, override_count FROM correction_memory WHERE id='m32'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((confirm, overrides), (0, 0), "confirm/override evidence counters default to 0");
     }
 
     #[test]

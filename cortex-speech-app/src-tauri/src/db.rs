@@ -1776,6 +1776,44 @@ impl Database {
             None
         };
 
+        // LOOP-0 evidence-based confidence (true-10 audit): for every PRE-EXISTING correction memory
+        // that would have fired on this segment, record whether the human's decision confirmed or
+        // contradicted it. The finalized transcript the human reviewed (annotated ▸ normalized ▸ raw)
+        // mirrors `pipeline::shadow_log_loop0`, so the evidence matches the shadow signal.
+        //
+        //   * edit   -> reference is the human's fix; a memory whose firing moves the text TOWARD it is
+        //               a confirm, AWAY is an override (over-trigger).
+        //   * accept -> reference IS the finalized text; any memory that fires there over-triggered on a
+        //               draft the human just confirmed was already correct -> override.
+        //   * reject -> inconclusive (the human discarded the whole clip, not a verdict on any word) -> skip.
+        //
+        // Snapshot the memories BEFORE the capture/upsert below so the memory born from THIS edit cannot
+        // confirm itself. Gold is excluded to match the capture path: gold human-decisions are the firing
+        // eval set (see `firing_error_delta`), and tuning the store on them would leak.
+        let finalized_text =
+            annotated_transcript.as_deref().or(normalized_transcript.as_deref()).unwrap_or(&raw_transcript).to_string();
+        let confidence_reference: Option<String> = match decision {
+            "edit" => corrected_transcript.map(str::to_string),
+            "accept" => Some(finalized_text.clone()),
+            _ => None,
+        };
+        type MemoryOutcomeUpdate = (String, String, String, crate::corrections::MemoryOutcome);
+        let confidence_updates: Vec<MemoryOutcomeUpdate> = match (is_gold, confidence_reference.as_deref()) {
+            (0, Some(reference)) => {
+                let cfg = crate::corrections::FiringConfig::default();
+                self.load_correction_memories()?
+                    .into_iter()
+                    .filter_map(|m| {
+                        match crate::corrections::classify_memory_outcome(&finalized_text, reference, &m, &cfg) {
+                            crate::corrections::MemoryOutcome::Neutral => None,
+                            outcome => Some((m.slot_key, m.wrong_token, m.human_token, outcome)),
+                        }
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
         // The human's verdict, the learning pair, and the audit-ledger row commit together as one
         // atomic correction — a crash can never leave a verdict without its provenance, or vice versa.
         let tx = self.conn.unchecked_transaction()?;
@@ -1844,8 +1882,9 @@ impl Database {
                         let mem_id = uuid::Uuid::new_v4().to_string();
                         tx.execute(
                             "INSERT INTO correction_memory
-                                (id, wrong_token, human_token, slot_key, phonetic_key, source_segment, model_version_id)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                (id, wrong_token, human_token, slot_key, phonetic_key, source_segment,
+                                 model_version_id, confidence)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                             params![
                                 mem_id,
                                 mem.wrong_token,
@@ -1853,12 +1892,41 @@ impl Database {
                                 mem.slot_key,
                                 mem.phonetic_key,
                                 segment_id,
-                                model_version_id
+                                model_version_id,
+                                // Start at the Beta(1,1) prior (0.5), not the frozen 1.0: a fresh memory
+                                // has zero firing-outcome evidence and must earn its way past tau_conf.
+                                crate::corrections::beta_confidence(0, 0)
                             ],
                         )?;
                     }
                 }
             }
+        }
+
+        // Apply the pre-computed LOOP-0 confidence evidence. Each pre-existing memory that would have
+        // fired on this segment gets a confirm or an override; `confidence` becomes the Beta(1,1)
+        // posterior of the updated counts (the SET expressions evaluate against the OLD row values, so
+        // `+1`/`+2`/`+3` reconstruct `beta_confidence(new_confirm, new_override)` exactly). `last_fired_at`
+        // records this shadow-fire against a human-reviewed segment — the column was never written before.
+        for (slot_key, wrong_token, human_token, outcome) in &confidence_updates {
+            let sql = match outcome {
+                crate::corrections::MemoryOutcome::Confirm => {
+                    "UPDATE correction_memory
+                        SET confirm_count = confirm_count + 1,
+                            confidence    = (confirm_count + 2.0) / (confirm_count + override_count + 3.0),
+                            last_fired_at = datetime('now')
+                      WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3"
+                }
+                crate::corrections::MemoryOutcome::Override => {
+                    "UPDATE correction_memory
+                        SET override_count = override_count + 1,
+                            confidence     = (confirm_count + 1.0) / (confirm_count + override_count + 3.0),
+                            last_fired_at  = datetime('now')
+                      WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3"
+                }
+                crate::corrections::MemoryOutcome::Neutral => continue,
+            };
+            tx.execute(sql, params![slot_key, wrong_token, human_token])?;
         }
 
         // M2.1: Log decision timing to decision_log for instrumentation before M3 marathon.
@@ -3066,7 +3134,10 @@ mod tests {
         assert_eq!(mems.len(), 1);
         assert_eq!(mems[0].wrong_token, "باش");
         assert_eq!(mems[0].human_token, "خراپ");
-        assert!(mems[0].confidence >= 1.0, "fresh memory confidence defaults to 1.0");
+        assert!(
+            (mems[0].confidence - 0.5).abs() < 1e-9,
+            "a freshly captured memory starts at the Beta(1,1) prior 0.5 (no firing-outcome evidence yet)"
+        );
         assert_eq!(mems[0].hit_count, 0);
     }
 
@@ -3090,6 +3161,96 @@ mod tests {
         let out =
             crate::corrections::apply_memories("ئەو ساڵە باش بوو", &mems, &crate::corrections::FiringConfig::default());
         assert_eq!(out, "ئەو ساڵە خراپ بوو", "capture x2 -> DB -> load -> fire reproduces the human fix");
+    }
+
+    /// Confirming edits of the SAME confusion must lift a memory's evidence-based confidence from the
+    /// neutral prior up past tau_conf — the "a confirmed memory's confidence rises" half of the audit fix.
+    #[test]
+    fn confirmed_memory_confidence_rises_above_tau_conf() {
+        let db = make_db();
+        let tau = crate::corrections::FiringConfig::default().tau_conf;
+
+        // The first edit CAPTURES the memory at the 0.5 prior — below tau_conf, so it cannot fire yet.
+        let mut seg0 = make_segment("cf-0", "/data/audio/cf-0.wav");
+        seg0.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+        db.insert_segment(&seg0).expect("insert");
+        db.record_human_decision("cf-0", "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
+        let fresh = db.load_correction_memories().expect("load")[0].confidence;
+        assert!(fresh < tau, "a freshly captured memory sits at the 0.5 prior, below tau_conf: {fresh}");
+
+        // Each further human edit of the same confusion is an independent confirmation -> confidence climbs.
+        for id in ["cf-1", "cf-2"] {
+            let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
+            seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+            db.insert_segment(&seg).expect("insert");
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
+        }
+        let confirmed = db.load_correction_memories().expect("load")[0].confidence;
+        assert!(confirmed > tau, "confirming edits must raise confidence above tau_conf: {confirmed}");
+    }
+
+    /// A memory that first earns confidence, then repeatedly over-triggers on drafts the human ACCEPTS
+    /// as-is, must decay back below tau_conf — the anti-poisoning "one bad memory decays" half of the fix.
+    #[test]
+    fn overridden_memory_confidence_decays_below_tau_conf() {
+        let db = make_db();
+        let tau = crate::corrections::FiringConfig::default().tau_conf;
+
+        // Earn confidence with confirming edits of the same confusion (distinct segments).
+        for id in ["bad-1", "bad-2", "bad-3"] {
+            let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
+            seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+            db.insert_segment(&seg).expect("insert");
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
+        }
+        let confident = db.load_correction_memories().expect("load")[0].confidence;
+        assert!(confident > tau, "after confirming edits the memory clears tau_conf: {confident}");
+
+        // Now humans keep ACCEPTING the original in that slot -> every would-fire is an over-trigger.
+        for id in ["ovr-1", "ovr-2", "ovr-3"] {
+            let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
+            seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+            db.insert_segment(&seg).expect("insert");
+            db.record_human_decision(id, "accept", None, None).expect("accept");
+        }
+        let decayed = db.load_correction_memories().expect("load")[0].confidence;
+        assert!(decayed < tau, "repeated over-triggers must decay confidence below tau_conf: {decayed}");
+    }
+
+    /// A confirm/override event stamps `last_fired_at` (previously never written) and increments the
+    /// firing-outcome counters; a gold segment's decision must NOT touch either (eval-leak guard).
+    #[test]
+    fn confidence_evidence_stamps_last_fired_at_and_skips_gold() {
+        let db = make_db();
+        // Capture on the first edit, then a second same-confusion edit lands a confirm.
+        for id in ["lf-1", "lf-2"] {
+            let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
+            seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+            db.insert_segment(&seg).expect("insert");
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
+        }
+        let (fired_set, confirms): (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT last_fired_at IS NOT NULL, confirm_count FROM correction_memory WHERE wrong_token = 'باش'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query");
+        assert_eq!(fired_set, 1, "a confirm event stamps last_fired_at");
+        assert_eq!(confirms, 1, "the second same-confusion edit records exactly one confirm");
+
+        // A gold segment whose text the memory would fire on must leave the evidence untouched.
+        let mut gold = make_segment("lf-gold", "/data/audio/lf-gold.wav");
+        gold.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+        db.insert_segment(&gold).expect("insert");
+        db.connection().execute("UPDATE speech_segments SET is_gold = 1 WHERE id = 'lf-gold'", []).expect("mark gold");
+        db.record_human_decision("lf-gold", "accept", None, None).expect("accept");
+        let overrides: i64 = db
+            .connection()
+            .query_row("SELECT override_count FROM correction_memory WHERE wrong_token = 'باش'", [], |r| r.get(0))
+            .expect("query");
+        assert_eq!(overrides, 0, "a gold-segment decision must not update firing-outcome evidence (eval-leak guard)");
     }
 
     #[test]

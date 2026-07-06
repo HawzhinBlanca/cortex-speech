@@ -166,9 +166,11 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
 
     let mut raw_transcript = String::new();
     let mut confidence: Option<f64> = None;
+    let mut saw_result = false;
     for line in stdout.lines() {
         if let Some(stripped) = line.strip_prefix("__RESULT__=") {
             if let Ok(res) = serde_json::from_str::<WslResult>(stripped) {
+                saw_result = true;
                 raw_transcript = res.raw_transcript;
                 // Sanitize the external script's confidence to a valid posterior: drop non-finite and
                 // clamp into [0,1]. A homegrown script emitting a percentage (e.g. 92.0) must not flow
@@ -178,8 +180,15 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
         }
     }
 
-    if raw_transcript.trim().is_empty() {
-        return Err(AppError::Other("WSL 7B ASR process did not return a valid transcript.".into()));
+    // A reachable server that emits a `__RESULT__` line with an EMPTY transcript is a LEGITIMATE
+    // outcome (a silent/music/noise clip), NOT an infrastructure failure — the client's failure
+    // contract exits non-zero (handled by the caller before we are reached) for a real infra fault and
+    // exits 0 with a `__RESULT__` line otherwise. Returning Err on an empty-but-present result made ONE
+    // silent chunk roll back the ENTIRE import and left the file permanently unimportable via the 7B.
+    // So Err ONLY when no `__RESULT__` line was seen at all; an empty transcript returns Ok and the
+    // caller escalates just that one segment.
+    if !saw_result {
+        return Err(AppError::Other("WSL 7B ASR process did not return a __RESULT__ line.".into()));
     }
 
     Ok((raw_transcript, confidence))
@@ -1274,6 +1283,10 @@ impl ProcessingPipeline {
         )?;
         let mut persisted = self.persist_segments(db, segments)?;
         self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
+        // Deferred to AFTER the 7B pass so both evaluate the real transcript, not the placeholder, and
+        // so alignment does not clobber the slice offsets the pass depends on. See persist_segments.
+        self.shadow_log_loop0(db, &persisted);
+        self.enqueue_background_alignments(&persisted);
         for (seg_id, f32_pcm) in pcm_cache {
             if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
                 log_hypothesis_population_failure(&seg_id, &error);
@@ -1455,6 +1468,9 @@ impl ProcessingPipeline {
 
         let mut persisted = self.persist_segments(db, segments)?;
         self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
+        // Deferred to here so both see the real transcript and alignment doesn't clobber offsets.
+        self.shadow_log_loop0(db, &persisted);
+        self.enqueue_background_alignments(&persisted);
         for (seg_id, f32_pcm) in all_pcm_cache {
             if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
                 log_hypothesis_population_failure(&seg_id, &error);
@@ -1752,13 +1768,13 @@ impl ProcessingPipeline {
         // insert_segments_batch wraps inserts in its own transaction; do not nest SAVEPOINTs.
         db.insert_segments_batch(&segments)?;
 
-        // M2.3/P1.3: shadow-record LOOP-0 would-fire per segment (no mutation), now that the rows exist
-        // (the loop0_shadow_log FK requires it). Feeds the C5 over-trigger decision while firing is off.
-        self.shadow_log_loop0(db, &segments);
-
-        // M2.4: Spawn background alignment tasks (low priority, non-blocking).
-        // Alignment is optional — review can proceed while alignment runs in background.
-        self.enqueue_background_alignments(&segments);
+        // NOTE: neither LOOP-0 shadow logging NOR background word-alignment runs here. Both must see
+        // the REAL transcript, which under the forced WSL-7B engine does not exist yet (segments carry
+        // the "[Pending WSL 7B ASR]" placeholder until run_primary_wsl_pass_for_import fills them in).
+        // Shadowing the placeholder made the C5 over-trigger gate vacuous (always would_fire=false);
+        // aligning before the 7B pass clobbered the slice offsets the 7B client needs. So the caller
+        // runs BOTH only after the primary pass — see the shadow_log_loop0 + enqueue_background_alignments
+        // calls right after run_primary_wsl_pass_for_import.
 
         Ok(segments)
     }
@@ -1787,28 +1803,99 @@ impl ProcessingPipeline {
         }
     }
 
-    /// M2.4: Enqueue background alignment tasks for segments. Non-blocking, best-effort.
+    /// M2.4: Enqueue background word-alignment for segments. Non-blocking, best-effort, opt-in via
+    /// `auto_align`.
+    ///
+    /// CRITICAL invariant (the whole-file-vs-clip bug class): each segment's `alignment_json` holds
+    /// its `{source_start_ms, source_end_ms}` slice offsets, which every LATER reader depends on — the
+    /// WSL-7B re-transcribe client, dataset audio export, clip playback, jury acoustic scoring. This
+    /// alignment therefore MUST (1) slice the clip out of the source by those offsets before aligning
+    /// (word timings clip-local, not smeared across the whole recording) and (2) MERGE its word array
+    /// back under a `words` key via `merge_word_timestamps` — NEVER flat-overwrite `alignment_json`
+    /// with a bare word array, which would destroy the offsets and silently degrade every reader to
+    /// the whole file. (This ran inside `persist_segments` and clobbered offsets; it is now deferred to
+    /// after the 7B pass and repaired to slice+merge.)
     fn enqueue_background_alignments(&self, segments: &[SpeechSegment]) {
+        if !self.settings.auto_align {
+            return;
+        }
+        // Group by source file so each recording is decoded ONCE (a VAD-chunked file yields many
+        // segments sharing one audio_path). Carry each segment's source-offset alignment_json + its
+        // finalized text (annotated ▸ normalized ▸ raw — the real 7B transcript post-pass).
+        let mut by_path: std::collections::HashMap<String, Vec<(String, Option<String>, String)>> =
+            std::collections::HashMap::new();
+        for s in segments {
+            let text = s
+                .annotated_transcript
+                .clone()
+                .or_else(|| s.normalized_transcript.clone())
+                .unwrap_or_else(|| s.raw_transcript.clone());
+            by_path.entry(s.audio_path.clone()).or_default().push((s.id.clone(), s.alignment_json.clone(), text));
+        }
         let db_path = self.db_path.clone();
-        let segments_to_align: Vec<(String, String, String)> =
-            segments.iter().map(|s| (s.id.clone(), s.audio_path.clone(), s.raw_transcript.clone())).collect();
 
         std::thread::spawn(move || {
-            for (seg_id, audio_path, transcript) in segments_to_align {
-                // Each alignment runs independently; failures don't block others.
-                // M2.4: Alignment is optional — import continues while background thread runs.
-                if let Ok((_, pcm)) = audio::decode_to_pcm(&audio_path) {
-                    if let Ok(words) = crate::aligner::align(&pcm, 16000, &transcript) {
-                        if let Ok(json) = serde_json::to_string(&words) {
-                            if let Ok(db) = crate::db::Database::open(&db_path) {
-                                let _ = db.connection().execute(
-                                    "UPDATE speech_segments SET alignment_json = ?1 WHERE id = ?2",
-                                    rusqlite::params![json, seg_id],
-                                );
+            let db = match crate::db::Database::open(&db_path) {
+                Ok(db) => db,
+                Err(error) => {
+                    tracing::warn!("background alignment skipped: could not open db: {error}");
+                    return;
+                }
+            };
+            let (mut aligned, mut failed) = (0usize, 0usize);
+            for (audio_path, jobs) in by_path {
+                let pcm16 =
+                    match audio::decode_to_pcm(&audio_path).and_then(|(sr, pcm)| audio::ensure_pcm_16khz(sr, pcm)) {
+                        Ok((_, pcm)) => pcm,
+                        Err(error) => {
+                            tracing::warn!("background alignment: decode failed for {audio_path}: {error}");
+                            failed += jobs.len();
+                            continue;
+                        }
+                    };
+                for (seg_id, source_alignment, text) in jobs {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    // Slice the clip out of the source by its stored offsets BEFORE aligning.
+                    let sliced = match chunking::slice_pcm_by_alignment(&pcm16, 16000, source_alignment.as_deref()) {
+                        Ok((clip, _)) => clip,
+                        Err(error) => {
+                            tracing::warn!("background alignment: slice failed for {seg_id}: {error}");
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    match crate::aligner::align(&sliced, 16000, &text) {
+                        Ok(words) if !words.is_empty() => {
+                            // MERGE under `words`, preserving source_start_ms/source_end_ms.
+                            let merged = crate::chunking::merge_word_timestamps(source_alignment.as_deref(), &words);
+                            if let Err(error) = db.update_segment_alignment_json(&seg_id, &merged) {
+                                tracing::warn!("background alignment: persist failed for {seg_id}: {error}");
+                                failed += 1;
+                                continue;
                             }
+                            let _ = db.update_alignment_quality(
+                                &seg_id,
+                                crate::aligner::AlignmentQuality::EnergyHeuristic.as_db_str(),
+                            );
+                            aligned += 1;
+                        }
+                        // Empty word list or error: leave the source offsets INTACT (never overwrite).
+                        Ok(_) => failed += 1,
+                        Err(error) => {
+                            tracing::warn!("background alignment failed for {seg_id}: {error}");
+                            failed += 1;
                         }
                     }
                 }
+            }
+            if failed > 0 {
+                tracing::warn!(
+                    "background alignment: {aligned} aligned, {failed} failed/empty (source offsets preserved)"
+                );
+            } else {
+                tracing::debug!("background alignment: {aligned} segment(s) aligned");
             }
         });
     }
@@ -3479,8 +3566,10 @@ mod tests {
 
     #[test]
     fn rejects_missing_wsl_segment_result_stdout_marker() {
+        // No __RESULT__ line at all is the real infrastructure failure. (An empty-but-PRESENT result
+        // is legitimate and returns Ok — see empty_7b_result_is_legitimate_not_infra_failure.)
         let err = super::parse_wsl_segment_result("loading model\nfinished without result\n").unwrap_err();
-        assert!(err.to_string().contains("did not return a valid transcript"));
+        assert!(err.to_string().contains("did not return a __RESULT__ line"));
     }
 
     #[test]
@@ -3825,5 +3914,29 @@ mod tests {
         assert!(preview.contains("[truncated subprocess stderr]"));
         assert!(!preview.contains("extra"));
         assert_eq!(preview.lines().next().unwrap().chars().count(), super::SUBPROCESS_ERROR_PREVIEW_CHARS);
+    }
+
+    #[test]
+    fn empty_7b_result_is_legitimate_not_infra_failure() {
+        // A reachable 7B server emitting a __RESULT__ line with an empty transcript (a silent/music
+        // clip) must parse Ok(("", ..)) so the caller escalates only THAT segment — never Err, which
+        // would roll back the whole import and leave the file permanently unimportable via the 7B.
+        let (text, conf) =
+            super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\": \"\", \"confidence\": null}")
+                .expect("an empty-but-present result is a legitimate outcome, not an infra failure");
+        assert_eq!(text, "");
+        assert_eq!(conf, None);
+
+        // A real transcript still parses.
+        let (text, _) =
+            super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\": \"ئەمە\", \"confidence\": 0.9}")
+                .expect("a real transcript parses");
+        assert_eq!(text, "ئەمە");
+
+        // NO __RESULT__ line at all is the real infrastructure failure -> Err.
+        assert!(
+            super::parse_wsl_segment_result("some noise\nno result here").is_err(),
+            "absence of a __RESULT__ line is an infra failure"
+        );
     }
 }
