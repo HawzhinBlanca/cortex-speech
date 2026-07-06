@@ -52,7 +52,19 @@ pub(crate) fn apply_loop0_firing(enabled: bool, db: &crate::db::Database, transc
     }
     match db.load_correction_memories() {
         Ok(memories) if !memories.is_empty() => {
-            crate::corrections::apply_memories(transcript, &memories, &crate::corrections::FiringConfig::default())
+            let cfg = crate::corrections::FiringConfig::default();
+            // Provenance: a LOOP-0 rewrite is otherwise indistinguishable from raw ASR. Record which
+            // memories fired (to the persistent log) via the shared chokepoint, so ALL firing paths
+            // (import + batch re-transcribe) attribute rewrites consistently.
+            let fired = crate::corrections::fired_memories_summary(transcript, &memories, &cfg);
+            if !fired.is_empty() {
+                tracing::info!(
+                    "LOOP-0 firing rewrote a transcript using {} memory/memories: {}",
+                    fired.len(),
+                    fired.join(", ")
+                );
+            }
+            crate::corrections::apply_memories(transcript, &memories, &cfg)
         }
         Ok(_) => transcript.to_string(),
         Err(error) => {

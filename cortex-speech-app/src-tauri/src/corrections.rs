@@ -323,6 +323,20 @@ pub fn classify_memory_outcomes(
         .collect()
 }
 
+/// Human-readable descriptions of the memories that would ACTUALLY fire on `transcript` under `cfg`
+/// (real eligibility gates + winner-take-all), each as `wrong->human @[slot]`. This is the PROVENANCE
+/// of a LOOP-0 rewrite: without it a fired correction is indistinguishable from raw ASR output. Empty
+/// when nothing fires.
+pub fn fired_memories_summary(transcript: &str, memories: &[MemoryEntry], cfg: &FiringConfig) -> Vec<String> {
+    firing_winner_indices(transcript, memories, cfg)
+        .into_iter()
+        .map(|i| {
+            let m = &memories[i];
+            format!("{}->{} @[{}]", m.wrong_token, m.human_token, m.slot_key)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,5 +564,17 @@ mod tests {
         assert_eq!(outcomes.len(), 1, "only the slot winner is credited, not the losing sibling: {outcomes:?}");
         assert_eq!(outcomes[0].0, 0, "the exact-match memory (index 0) wins the slot");
         assert_eq!(outcomes[0].1, MemoryOutcome::Override, "accept-of-original -> over-trigger");
+    }
+
+    #[test]
+    fn fired_memories_summary_attributes_the_rewrite() {
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
+        let cfg = FiringConfig::default();
+        // Fires on the same confusion -> provenance names the wrong->human swap at its slot.
+        let fired = fired_memories_summary("ئەو ساڵە باش بوو", std::slice::from_ref(&entry), &cfg);
+        assert_eq!(fired.len(), 1);
+        assert!(fired[0].contains("باش->خراپ"), "provenance names the applied correction: {fired:?}");
+        // Nothing fires on unrelated text -> empty provenance.
+        assert!(fired_memories_summary("شتێکی جیاواز", std::slice::from_ref(&entry), &cfg).is_empty());
     }
 }
