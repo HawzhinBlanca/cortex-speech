@@ -49,7 +49,11 @@ impl ExportSegmentRecord {
         sanitized.audio_path = export_audio_ref(&segment.audio_path).to_string();
         Self {
             segment: sanitized,
-            training_transcript: report.transcript,
+            // Canonicalize the SHIPPED training text (fold ك/ک, ي/ی, heh forms, ZWNJ/tatweel; digits
+            // and diacritics untouched) exactly like the HF exporter, so JSON/JSONL/CSV/Parquet emit
+            // byte-identical training_transcript for a segment — mixed orthography must not re-enter the
+            // corpus and fragment the CTC label space through the flat exports.
+            training_transcript: crate::normalizer::canonical_training_text(&report.transcript),
             transcript_source: report.transcript_source,
             training_grade: report.grade,
             training_ready: report.training_ready,
@@ -1014,7 +1018,9 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 let raw = csv_safe_cell(seg.raw_transcript.as_str());
                 let normalized = csv_safe_cell(seg.normalized_transcript.as_deref().unwrap_or(""));
                 let annotated = csv_safe_cell(seg.annotated_transcript.as_deref().unwrap_or(""));
-                let training = csv_safe_cell(grade.transcript.as_str());
+                // Canonicalize the shipped training column like the HF exporter (see ExportSegmentRecord).
+                let training_text = crate::normalizer::canonical_training_text(&grade.transcript);
+                let training = csv_safe_cell(&training_text);
                 let speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                 let reasons_cell = csv_safe_cell(reasons.as_str());
                 wtr.write_record([
@@ -1120,8 +1126,11 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
     let duration_ms: Int64Array = segments.iter().map(|s| Some(s.duration_ms)).collect();
     let speaker_id: StringArray = segments.iter().map(|s| s.speaker_id.as_deref()).collect();
     let verified: BooleanArray = segments.iter().map(|s| Some(s.verified)).collect();
-    let training_transcript: StringArray =
-        grade_reports.iter().map(|report| Some(report.transcript.as_str())).collect();
+    // Canonicalize the shipped training column like the HF/JSON/CSV exporters so all four formats emit
+    // byte-identical training text for a segment (no mixed-orthography re-entry via Parquet).
+    let training_texts: Vec<String> =
+        grade_reports.iter().map(|report| crate::normalizer::canonical_training_text(&report.transcript)).collect();
+    let training_transcript: StringArray = training_texts.iter().map(|t| Some(t.as_str())).collect();
     let transcript_source: StringArray =
         grade_reports.iter().map(|report| Some(report.transcript_source.as_str())).collect();
     let training_grade: StringArray = grade_reports.iter().map(|report| Some(report.grade.as_str())).collect();

@@ -1029,3 +1029,34 @@ the prime suspect (giant bitcode blobs are what AV inspects; small/medium files 
 STANDING STATE: the LTO-off exe (15:15, all 26 fixes) is intact, freshness GREEN — the app is fully
 usable. OWNER unblock for standard-LTO builds: add the Defender exclusions (admin PowerShell, see
 the 12:20 ledger entry) and/or reboot; then one `cargo build --release` restores the standard profile.
+
+## Real 7B run + FINAL DEEP CHECK + 10/10 remediation IN PROGRESS (2026-07-06)
+
+Drove the real OmniASR-7B Champion (WSL/4090) end-to-end on `B7876RX.wav` (17.4 min → 84 distinct
+clean-Sorani segments) and, in doing so, uncovered + fixed a real primary-path data-destruction bug:
+background word-alignment was flat-overwriting each segment's `alignment_json` slice offsets with a
+bare word array, silently degrading every later reader (7B re-transcribe, dataset audio export, clip
+playback) to the WHOLE file. Then ran a **117-agent adversarially-verified deep check** (see
+[docs/DEEP_CHECK_2026-07-06.md](cortex-speech-app/docs/DEEP_CHECK_2026-07-06.md)): honest grade
+**6.5/10**, 61 confirmed findings (12 blocker / 19 major / 30 minor, 1 refuted), phased plan 0–7.
+
+Remediation landed so far (each with a regression gate; `cargo clippy -D warnings` + `cargo test --lib`
+793 green, frontend typecheck/134-vitest/eslint green):
+- **Phase 0** (stop data destruction): aligner slice+merge fix; LOOP-0 shadow + alignment deferred
+  after the 7B pass; empty-7B-transcript is legitimate (no whole-import rollback); export skips a
+  present-but-offset-less alignment instead of emitting whole-file. + evidence-based confidence (v32).
+- **Phase 1**: schema forward-compat guard (old exe refuses a newer DB — protects v32 memories).
+- **Phase 2** (label integrity): ReviewMode/Inbox keyboard isolation + modifier/editable guards;
+  accept-what-you-see; Ctrl+Z defers to surface undo; placeholder can't be verified as gold;
+  autosave `flushAsync` + Tauri onCloseRequested (last edit never lost on close).
+- **Phase 4**: settings BOM tolerance + corrupt-file preservation; rolling **file log** under
+  `<data_dir>/logs` (release GUI no longer discards every non-panic error); worker DB opens use plain
+  `open` (no per-segment integrity scan / destructive quarantine from a live thread).
+- **Phase 5**: gold reference uses annotated (digit) not verbalized-normalized text; flat
+  JSON/JSONL/CSV/Parquet exports ship canonicalized training text.
+- **Phase 6**: 7B-unavailable clips sort to the front of the suspect queue (0.0 not None).
+
+STANDING STATE: fixes are on branch `claude/intelligent-gauss-96ffc9` (5 commits), gated but NOT yet
+in the daily GUI exe — remaining: rebuild + re-import B7876 to repair its offsets; Phase 3 (7B ops),
+6.1 finetuned juror, 6.4 gold-regression gate, Phase 7 minors; then owner-gated re-audit (only place
+10/10 may be declared).

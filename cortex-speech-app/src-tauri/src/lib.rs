@@ -338,22 +338,42 @@ pub fn run() {
         }
     }));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(true)
-        .with_thread_ids(true)
-        .init();
+    // Compute the data dir FIRST so tracing can ALSO write to a rolling log file there. The release GUI
+    // runs with windows_subsystem="windows", which discards stdout — without a file sink EVERY non-panic
+    // warning/error is invisible and the owner has nothing to inspect after a bad import/snapshot/batch.
+    let data_dir = get_app_data_dir();
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        eprintln!("Failed to create app data directory at {data_dir:?}: {e}");
+        fatal_app_error(format!("Failed to create app data directory at {:?}: {e}", data_dir));
+    }
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Rolling daily log under <data_dir>/logs (non-blocking writer). The WorkerGuard must outlive the
+    // process or buffered lines are dropped on exit, so it is leaked intentionally (one per process).
+    let log_dir = data_dir.join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let (file_writer, guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(&log_dir, "cortex.log"));
+    let _ = Box::leak(Box::new(guard));
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_thread_ids(true)
+                    .with_writer(file_writer),
+            )
+            .init();
+    }
 
     models::init_ort_dylib_path();
 
-    let data_dir = get_app_data_dir();
-    if let Err(e) = std::fs::create_dir_all(&data_dir) {
-        fatal_app_error(format!("Failed to create app data directory at {:?}: {e}", data_dir));
-    }
-    // The data dir now exists — let the panic hook write crash dumps there.
+    // The data dir exists and tracing now has a file sink — let the panic hook write crash dumps there.
     let _ = CRASH_DIR.set(data_dir.clone());
 
     models::init_user_models_dir(data_dir.join("models"));
