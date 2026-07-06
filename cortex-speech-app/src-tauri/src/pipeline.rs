@@ -1375,8 +1375,12 @@ impl ProcessingPipeline {
         })?;
 
         let windows = {
-            let guard = lock_decoded_windows(&windows);
-            guard.clone()
+            // MOVE the decoded windows out of the mutex instead of cloning them. The decode callback has
+            // already finished (decode_pcm_windows_with_timeout returned), so nothing else touches the
+            // Vec; cloning here held the ENTIRE file's PCM twice — exactly what the streaming path exists
+            // to avoid. std::mem::take leaves an empty Vec behind and releases the lock without the copy.
+            let mut guard = lock_decoded_windows(&windows);
+            std::mem::take(&mut *guard)
         };
 
         if windows.is_empty() {
