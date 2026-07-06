@@ -459,6 +459,14 @@ pub fn is_placeholder_transcript(text: &str) -> bool {
         || trimmed.eq_ignore_ascii_case("null")
 }
 
+/// True when a segment's EFFECTIVE (human-preferred) transcript is still an ASR placeholder — it carries
+/// no real text and was not corrected by a human. Such rows must never ship in a dataset export (an
+/// export taken mid-import, or after a stuck-placeholder incident, would otherwise emit the literal
+/// "[Pending WSL 7B ASR]" string as a training row).
+pub fn is_effective_placeholder(seg: &SpeechSegment) -> bool {
+    is_placeholder_transcript(effective_transcript(seg))
+}
+
 /// Alignment-quality tier for a clip, decided by the character error rate (CER) between its
 /// reference text and an ASR hypothesis of that same clip. This is the gate that both cleans
 /// a dataset and yields an honest CER — once a clip's audio and text genuinely match, a low
@@ -855,6 +863,20 @@ mod tests {
         let report = training_grade_for_segment(&seg("p1", "[ASR unavailable: oom]", 4000));
         assert!(!report.training_ready);
         assert!(report.reasons.iter().any(|r| r == "placeholder_transcript"));
+    }
+
+    #[test]
+    fn is_effective_placeholder_reflects_the_effective_transcript() {
+        // Raw is a placeholder with no human correction -> effective transcript is a placeholder.
+        assert!(is_effective_placeholder(&seg("p", "[Pending WSL 7B ASR]", 4000)));
+        // A human edit OVER the placeholder makes the effective transcript real text.
+        let mut edited = seg("e", "[Pending WSL 7B ASR]", 4000);
+        edited.verdict = Some("human_edit".to_string());
+        edited.verdict_transcript = Some("ئەمڕۆ هەوا زۆر خۆشە".to_string());
+        edited.human_decision = Some("edit".to_string());
+        assert!(!is_effective_placeholder(&edited), "a human-corrected placeholder is real text");
+        // Real ASR text is never a placeholder.
+        assert!(!is_effective_placeholder(&seg("r", "ئەمڕۆ باشە", 4000)));
     }
 
     #[test]

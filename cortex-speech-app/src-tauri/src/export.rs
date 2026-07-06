@@ -231,6 +231,15 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     // already drops it via training_grade_for_segment; do the same here so the plain JSON/JSONL/CSV/
     // Parquet tables and `verified_segments` can never label a reject as confirmed-good output.
     let segments: Vec<SpeechSegment> = segments.into_iter().filter(|s| !quality::is_human_rejected(s)).collect();
+    // A segment still showing an ASR placeholder as its EFFECTIVE transcript ("[Pending WSL 7B ASR]" /
+    // "[ASR unavailable…]") is not a transcript — never ship the literal placeholder string as a training
+    // row (an export taken mid-import would otherwise do exactly that). Exclude and log the count.
+    let before_pending = segments.len();
+    let segments: Vec<SpeechSegment> = segments.into_iter().filter(|s| !quality::is_effective_placeholder(s)).collect();
+    let pending_excluded = before_pending - segments.len();
+    if pending_excluded > 0 {
+        tracing::warn!("dataset export excluded {pending_excluded} not-yet-transcribed (placeholder) segment(s)");
+    }
     let total_duration: i64 = segments.iter().map(|s| s.duration_ms).sum();
     let verified = segments.iter().filter(|s| s.verified).count();
 
