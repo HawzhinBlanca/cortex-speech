@@ -641,7 +641,11 @@
         key: ',',
         ctrl: true,
         description: 'Open settings',
-        action: () => openSettings(),
+        // Don't open Settings UNDER the Review Inbox overlay (z-50 vs z-[100]) where it would be
+        // invisible while its close-time auto-save writes a stale snapshot. Require the inbox closed.
+        action: () => {
+          if (!$showReviewInbox) openSettings();
+        },
         category: 'navigation',
       },
       {
