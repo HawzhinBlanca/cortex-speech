@@ -1162,6 +1162,17 @@ Kept closing the testable ones I'd previously mis-bucketed:
 
 ## Deep-check remediation — ~50/61 (2026-07-07)
 
+- **#5.3 (free-space half)** the media cache does `std::fs::copy` of the whole source into
+  `media-cache/` per source. Added a **pre-copy free-space guard**: a pure `ensure_cache_room(source_bytes,
+  free_bytes)` (unit-tested, 4 cases) refuses BEFORE writing a partial file when the media-cache volume
+  lacks the file size + 64 MiB headroom — so caching a clip can't drive the disk to zero and corrupt the
+  co-located SQLite WAL, and the owner gets a clear "needs X MB, only Y MB free" error instead of a
+  cryptic half-written-copy failure. `None` free-space (unresolvable volume) degrades gracefully to
+  allow. cargo: fmt clean, clippy -D warnings clean, `--lib` 806 passed / 0 failed.
+  **The other half of #5.3 (cache the SLICE not the whole file) is NOT done and stays open honestly** —
+  the AudioPlayer does *bounded* playback by seeking within the full source, so slicing needs a
+  grant-model + player change verified by ear on real audio; shipping it blind would risk breaking
+  playback, which the honesty rule forbids.
 - **#4.5 (last piece)** the `db_backup` IPC was a dead command — a wrapper (`dbBackup`) existed but no
   UI called it, so the only copies of the library were the rotating auto-snapshots sitting in the app
   data dir *next to the live DB* (one disk failure loses both). Added a **"Backup to folder…"** button

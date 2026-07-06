@@ -109,6 +109,11 @@ impl MediaRegistry {
         std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Create media cache: {e}"))?;
         self.prune_orphaned_cache_files(&cache_dir);
         let cached_path = cache_dir.join(format!("{id}.{ext}"));
+        // Refuse a copy that would fill the disk BEFORE writing a partial file (which would then need
+        // pruning and could have already corrupted a co-located WAL). `source_bytes = 0` when the size
+        // can't be read → the check no-ops, same graceful-degrade as an unresolvable volume.
+        let source_bytes = std::fs::metadata(&source_path).map(|m| m.len()).unwrap_or(0);
+        ensure_cache_room(source_bytes, crate::health::free_disk_bytes_for(&cache_dir))?;
         std::fs::copy(&source_path, &cached_path).map_err(|e| format!("Copy media into app cache: {e}"))?;
 
         let expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
@@ -217,6 +222,33 @@ impl MediaRegistry {
             }
         }
     }
+}
+
+/// Headroom kept free on the media-cache volume beyond the file being copied, so caching a clip can
+/// never drive the disk to 0 — which would corrupt the SQLite WAL and every other writer sharing the
+/// volume. 64 MiB comfortably covers an in-flight WAL + OS slack.
+const MEDIA_CACHE_MARGIN_BYTES: u64 = 64 * 1_048_576;
+
+/// Pure decision (unit-tested): refuse to START a whole-file cache copy that would exhaust the disk.
+///
+/// `free_bytes = None` means the volume could not be resolved (`free_disk_bytes_for`) — degrade
+/// gracefully and allow the copy rather than block playback on an inability to measure. Otherwise the
+/// copy needs the source size PLUS [`MEDIA_CACHE_MARGIN_BYTES`] of headroom, or it is refused with a
+/// clear, actionable error instead of a cryptic half-written-file `std::fs::copy` failure.
+fn ensure_cache_room(source_bytes: u64, free_bytes: Option<u64>) -> Result<(), String> {
+    let Some(free) = free_bytes else { return Ok(()) };
+    let needed = source_bytes.saturating_add(MEDIA_CACHE_MARGIN_BYTES);
+    if free < needed {
+        return Err(format!(
+            "Not enough free disk space to cache this clip for playback: needs {} MB (file {} MB + {} MB headroom), \
+             but only {} MB is free on the media-cache volume. Free some space and try again.",
+            needed / 1_048_576,
+            source_bytes / 1_048_576,
+            MEDIA_CACHE_MARGIN_BYTES / 1_048_576,
+            free / 1_048_576,
+        ));
+    }
+    Ok(())
 }
 
 fn remove_cached_media_file(path: &Path, context: &str) {
@@ -378,6 +410,36 @@ mod tests {
         assert!(Path::new(&second.path).exists());
         assert!(registry.resolve(&second.id).is_ok());
         assert!(registry.resolve(&first.id).is_err());
+    }
+
+    #[test]
+    fn cache_room_allows_when_volume_unresolved() {
+        // free_bytes = None (volume could not be resolved) must not block playback.
+        assert!(ensure_cache_room(500 * 1_048_576, None).is_ok());
+    }
+
+    #[test]
+    fn cache_room_allows_with_ample_space() {
+        // 100 MB file, 10 GB free — comfortably above file + 64 MB margin.
+        assert!(ensure_cache_room(100 * 1_048_576, Some(10 * 1024 * 1_048_576)).is_ok());
+    }
+
+    #[test]
+    fn cache_room_refuses_when_free_below_file_size() {
+        let err = ensure_cache_room(500 * 1_048_576, Some(100 * 1_048_576)).unwrap_err();
+        assert!(err.contains("Not enough free disk space"), "{err}");
+        assert!(err.contains("500 MB") || err.contains("564 MB"), "message names the requirement: {err}");
+    }
+
+    #[test]
+    fn cache_room_enforces_the_headroom_margin() {
+        // Free space is ABOVE the raw file size but BELOW file + 64 MB headroom — must still refuse,
+        // so the copy can't drive the DB/WAL volume to zero.
+        let source = 500 * 1_048_576;
+        let free_just_over_file = source + 1_048_576; // file + 1 MB, < file + 64 MB margin
+        assert!(ensure_cache_room(source, Some(free_just_over_file)).is_err());
+        // Exactly file + margin is the boundary: allowed.
+        assert!(ensure_cache_room(source, Some(source + MEDIA_CACHE_MARGIN_BYTES)).is_ok());
     }
 
     #[test]
