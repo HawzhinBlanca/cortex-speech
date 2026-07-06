@@ -1060,3 +1060,28 @@ STANDING STATE: fixes are on branch `claude/intelligent-gauss-96ffc9` (5 commits
 in the daily GUI exe — remaining: rebuild + re-import B7876 to repair its offsets; Phase 3 (7B ops),
 6.1 finetuned juror, 6.4 gold-regression gate, Phase 7 minors; then owner-gated re-audit (only place
 10/10 may be declared).
+
+## Deep-check remediation continued — ~31/61 findings closed (2026-07-06, 14 commits)
+
+More fixes landed on `claude/intelligent-gauss-96ffc9`, each with a regression gate (Rust
+`clippy -D warnings` + `cargo test --lib` now 796; frontend typecheck/134-vitest/eslint; python
+policies green). Beyond the first batch above:
+
+- **Phase 3 (7B ops)**: server refuses to serve on CPU (`cortex_7b_server.py`, out-of-repo);
+  `batch_importer` acquires the shared single-instance lock; a process-wide gate serializes ALL WSL-7B
+  client spawns so concurrent callers can't stack timeouts into a false "server-down" rollback.
+- **Phase 4**: Gemini mode passes the configured model to OpenRouter (no silent gpt-4o-mini); health
+  checks polled at startup + every 5 min raise notifications on snapshot-failure-streak / low-disk /
+  missing models; the previous session's crash is surfaced once on next launch.
+- **Phase 6 / intelligence**: LOOP-0 confidence evidence is winner-take-all per slot (no sibling
+  double-credit); the **fine-tuned MMS-CTC juror** is wired into `populate_hypotheses` (the
+  escalate-everything root — model-dependent, needs the owner's machine to measure the effect).
+- **Phase 7 reliability minors**: FTS rebuild after VACUUM; `relink_audio` stamps `updated_at`;
+  directory-import cancel token threaded into per-file processing; single-file import RAII status guard;
+  a mid-file decode error now FAILS LOUDLY instead of silently importing a truncated file.
+
+STILL OPEN (honest): the capstone rebuild+re-import of B7876; ~28 lower-value minors (survivor-bias
+migration, snapshot-settings restore, media-cache slice, z-order, EN i18n strings, streaming memory
+bound, out-of-repo client hardening); and the OWNER-GATED items (fine-tuned juror escalation
+measurement, gold-regression gate wired to a real baseline, `make check-7b`, benchmark marathon, drills,
+P7 re-audit). 10/10 is NOT declared — only the P7 re-audit may do that.
