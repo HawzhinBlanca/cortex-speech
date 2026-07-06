@@ -993,6 +993,9 @@ impl Database {
 
     pub fn vacuum(&self) -> AppResult<()> {
         self.conn.execute("VACUUM", [])?;
+        // VACUUM can renumber speech_segments' implicit rowids, silently desyncing the external-content
+        // FTS index (search would return unrelated rows until the next restart). Rebuild it immediately.
+        self.conn.execute("INSERT INTO segments_fts(segments_fts) VALUES('rebuild')", [])?;
         Ok(())
     }
 
@@ -1046,7 +1049,7 @@ impl Database {
             if candidate.is_file() {
                 let new_path = candidate.to_string_lossy().to_string();
                 let n = self.conn.execute(
-                    "UPDATE speech_segments SET audio_path = ?2 WHERE audio_path = ?1",
+                    "UPDATE speech_segments SET audio_path = ?2, updated_at = datetime('now') WHERE audio_path = ?1",
                     params![old, new_path],
                 )?;
                 if n > 0 {

@@ -1052,14 +1052,18 @@ impl ProcessingPipeline {
                 ("index", (idx + 1).to_string()),
                 ("total", total.to_string()),
             ]);
-            let mut result = crate::telemetry::TRACER
-                .record_result("pipeline.import_file", meta, || self.process_single_file(file, &db));
+            // Thread the directory-import cancel token into per-file processing so Cancel interrupts the
+            // CURRENT file (its VAD/ASR/per-segment 7B loop), not only the gap between files — a long
+            // audiobook file could otherwise keep running for minutes after Cancel.
+            let mut result = crate::telemetry::TRACER.record_result("pipeline.import_file", meta, || {
+                self.process_single_file_with_progress(file, &db, cancel.as_ref(), |_, _| {})
+            });
 
             if let Err(ref e) = result {
                 if audio::is_transient_decode_error(e) {
                     tracing::warn!("Transient decode error for {}, retrying once: {e}", file.display());
                     std::thread::sleep(Duration::from_millis(500));
-                    result = self.process_single_file(file, &db);
+                    result = self.process_single_file_with_progress(file, &db, cancel.as_ref(), |_, _| {});
                 }
             }
 
@@ -2081,6 +2085,15 @@ impl ProcessingPipeline {
         self.reset_finetuned_counters();
         on_event(PipelineEvent::Phase { phase: "importing".into() });
         self.set_import_status(0, estimated_chunks, &fname);
+        // RAII: clear `running` on EVERY exit path, including an early `?` from the open_db below, so a
+        // failed single-file import can't leave a phantom in-progress status (mirrors import_directory).
+        struct ImportStatusGuard<'a>(&'a ProcessingPipeline);
+        impl Drop for ImportStatusGuard<'_> {
+            fn drop(&mut self) {
+                self.0.finish_import_status();
+            }
+        }
+        let _status_guard = ImportStatusGuard(self);
 
         let db = self.open_db()?;
         on_event(PipelineEvent::Phase { phase: "reference_transcribing".into() });
@@ -2206,7 +2219,7 @@ impl ProcessingPipeline {
             succeeded: if result.is_ok() { 1 } else { 0 },
             failed: if result.is_err() { 1 } else { 0 },
         });
-        self.finish_import_status();
+        // `running` is cleared by `_status_guard` on scope exit (covers early-return error paths too).
         result
     }
 
