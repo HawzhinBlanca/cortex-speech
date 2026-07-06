@@ -1191,6 +1191,16 @@ speaker-clustering state machine with high regression risk and the memory win is
   the FTS rebuild that vacuum's rowid-renumber requires). Stats → tools now exposes the full triad:
   Backup / Restore-from-file / Restore-from-snapshot / **Compact**. EN + CKB strings in parity (now 605=605).
   typecheck 0-err, eslint clean, vitest 134/134.
+- **IPC-surface sweep (verified clean, no further accidental gaps)** cross-checked all 122 registered Tauri
+  commands vs. frontend callers, AND all 121 `commands.ts` wrappers vs. component references (the latter
+  catches the `db_vacuum` case — a command whose only invoke site was an unused wrapper). The two
+  registered-but-uninvoked commands (`get_champion_model`, `add_segment_hypothesis`) are BOTH deliberately
+  reserved with in-code rationale ("not exposed yet — must run through the eval gate" / "Reserved
+  programmatic API… for CLI/scripted jury orchestration"). `clearCache`/`getCacheInfo` operate on a bounded
+  1000-entry in-memory LRU that self-evicts on restart → correctly needs no button (verified, not assumed).
+  The remaining 24 unreferenced wrappers are reserved orchestration / superseded getters / intra-file
+  helpers — flagged for careful per-item triage (task_ec79f7dd), explicitly NOT mass-wired (some, e.g.
+  `runDpoUpdate`, are dangerous to trigger casually).
 - **#4.5 (last piece)** the `db_backup` IPC was a dead command — a wrapper (`dbBackup`) existed but no
   UI called it, so the only copies of the library were the rotating auto-snapshots sitting in the app
   data dir *next to the live DB* (one disk failure loses both). Added a **"Backup to folder…"** button
