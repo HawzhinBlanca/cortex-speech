@@ -2462,8 +2462,10 @@ pub fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Res
     // CONSISTENT known-good state — not a rolled-back library sitting beside post-disaster settings, or
     // silently-defaulted settings if the live settings.json was corrupted alongside the DB. Best-effort
     // per file (the DB is already restored; a config-copy failure only warns).
+    // Restore exactly the set the snapshot saved (crate::snapshot::EXTRA_STATE) — single source of truth,
+    // so save-side and restore-side can never drift out of sync.
     let snap_dir = data_dir.join("snapshots").join(&name);
-    for extra in ["settings.json", "champion.json"] {
+    for &extra in crate::snapshot::EXTRA_STATE {
         let from = snap_dir.join(extra);
         if from.is_file() {
             if let Err(e) = std::fs::copy(&from, data_dir.join(extra)) {

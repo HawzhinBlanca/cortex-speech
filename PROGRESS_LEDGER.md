@@ -1223,6 +1223,10 @@ speaker-clustering state machine with high regression risk and the memory win is
   (new work is protected too); nothing is pruned until the user clears the quarantine files. Regression
   test proves it with a NON-empty DB (4 snapshots pinned under keep=2, `-wal` sidecar correctly ignored,
   pruning resumes to 2 once cleared). cargo: fmt clean, clippy -D warnings clean, `--lib` 810 passed.
+  Also hardened #4.5 part 2 (restore restores config): `restore_db_from_snapshot` had a hardcoded
+  `["settings.json","champion.json"]` DUPLICATING `snapshot::EXTRA_STATE` — a drift hazard where a file
+  added to the save-side would be silently snapshotted-but-never-restored. Made `EXTRA_STATE` `pub(crate)`
+  and the restore loop consumes it → single source of truth, save/restore can't diverge.
 - **Metric harness (WER/CER) adversarial review — verified sound + boundary pinned** The whole project's
   "never fabricate a metric" law rests on the harness COMPUTING metrics correctly, so I audited `wer.rs`:
   `levenshtein` returns `prev[m]` correctly; `compute_wer/cer` = edit-distance / ref-len clamped to 1.0 with

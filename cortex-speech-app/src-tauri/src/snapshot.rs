@@ -15,7 +15,11 @@ use crate::error::{AppError, AppResult};
 
 /// Small state files copied alongside the DB (best-effort; absent files are skipped). `champion.json`
 /// is the future retrain-champion pointer (M5) — harmless to list before it exists.
-const EXTRA_STATE: &[&str] = &["settings.json", "champion.json"];
+///
+/// SINGLE SOURCE OF TRUTH: `restore_db_from_snapshot` (commands.rs) restores exactly this set, so the
+/// save-side and restore-side can never drift — a file added here is automatically restored, not
+/// silently snapshotted-but-never-restored.
+pub(crate) const EXTRA_STATE: &[&str] = &["settings.json", "champion.json"];
 
 const SNAPSHOT_PREFIX: &str = "snapshot_";
 const DB_FILE: &str = "cortex-speech.db";
