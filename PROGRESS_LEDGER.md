@@ -1131,3 +1131,20 @@ REMAINING (~19), by why-it-can't-close-here — NOT a skipped backlog:
 BOTTOM LINE: every blocker + every automatable major + ~26 minors are closed and gated on
 `claude/intelligent-gauss-96ffc9` (25 commits). The grade is materially above 6.5. It is NOT 10/10 and
 cannot be honestly called that until the P7 re-audit runs the real numbers on the owner's hardware.
+
+## Deep-check remediation — ~44/61 (2026-07-06, 28 commits + 2 out-of-repo champion edits)
+
+Pushed further past "safely-verifiable exhausted", closing more testable findings:
+- **#55(a)** LOOP-0 fired rewrites are now attributed in the log (fired_memories_summary) via the shared
+  chokepoint — provenance for a future firing go-live (firing stays default-off).
+- **#42** shadow over-trigger evidence is ARCHIVED at segment-delete time (migration v33 +
+  loop0_evidence_archive; intelligence_report folds it in), so the C5 gate is no longer survivor-biased
+  by the owner's normal cleanup. Regression test: an over-trigger survives deletion.
+- **#58 / 3.2 (out-of-repo, machine-local)** the champion client retries a torn WAL-copy instead of
+  failing a healthy import; the server refuses to serve on CPU. Both py_compile-clean; they live in
+  `Kurdish_ASR_Model_Export/` so they do NOT travel with this branch — replicate on the other machine.
+
+GENUINELY REMAINING (~14), unchanged in character: OWNER-GATED measurement (~7 — real numbers on the
+4090; faking forbidden), media-cache slicing + deeper-streaming (~2, unverifiable headlessly → shipping
+blind would violate the honesty rule), and cosmetic (~5). Every finding that could be implemented AND
+verified in a headless Windows checkout is done, gated, and pushed. 10/10 remains the P7 re-audit's call.
