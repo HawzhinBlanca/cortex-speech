@@ -2007,7 +2007,16 @@ impl ProcessingPipeline {
             for attempt in 1..=MAX_ATTEMPTS {
                 match self.transcribe(Some(seg.id.as_str()), &seg.audio_path, seg.alignment_json.as_deref()) {
                     Ok((_raw_text, _corrected_text, _confidence)) => {
-                        self.refresh_segment_from_db(db, seg)?;
+                        if let Err(e) = self.refresh_segment_from_db(db, seg) {
+                            // A DB hiccup mid-pass otherwise left a partial import (some transcribed, some
+                            // still placeholder) with no rollback; a re-import would then duplicate it.
+                            tracing::error!(
+                                "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
+                                import_ids.len()
+                            );
+                            let _ = db.delete_segments_batch(&import_ids);
+                            return Err(e);
+                        }
                         let usable = !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
                         if usable {
                             // Record the Champion's output as its hypothesis so the review provenance badge
@@ -2072,7 +2081,14 @@ impl ProcessingPipeline {
             }
             if let Some(reason) = last_problem {
                 tracing::warn!("WSL 7B import: segment {} failed after {MAX_ATTEMPTS} attempts: {reason}", seg.id);
-                self.mark_wsl_primary_unavailable(db, seg, &reason)?;
+                if let Err(e) = self.mark_wsl_primary_unavailable(db, seg, &reason) {
+                    tracing::error!(
+                        "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
+                        import_ids.len()
+                    );
+                    let _ = db.delete_segments_batch(&import_ids);
+                    return Err(e);
+                }
             }
         }
         Ok(updated)
