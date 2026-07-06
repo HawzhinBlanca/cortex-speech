@@ -1160,7 +1160,18 @@ Kept closing the testable ones I'd previously mis-bucketed:
   dominant-speaker(>50%) flag.
 - **#39** Database::restore integrity-checks the source snapshot before overwriting the live DB.
 
-## Deep-check remediation — ~50/61 (2026-07-07)
+## Deep-check remediation — ~51/61 (2026-07-07)
+
+Investigated-and-verified-already-handled this pass (by reading the code, not assuming): nightly
+workflow honesty (both skip branches emit `::warning` + "green ≠ real-audio passed"); directory-import
+cancel (token reaches the per-file 7B child-kill at pipeline.rs:332 via
+`process_single_file_with_progress(.., cancel.as_ref(), ..)` → `run_primary_wsl_pass_for_import(.., cancel)`
+— NOT between-files-only); i18n EN/CKB parity (measured **603 = 603**, zero divergence); the memory-pressure
+backpressure signal (`check_memory_pressure`) is really acted on (warn + 2 s pause before OOM) in the batch
+transcribe loop (commands.rs:1177). The **true-streaming refactor** (process-and-discard each decode window
+instead of accumulating all of them at pipeline.rs:1381) stays **honestly open**: it rewrites the carry-over +
+speaker-clustering state machine with high regression risk and the memory win is unmeasurable headlessly
+(no 1.4 GB file + profiler) — shipping it blind would violate the honesty rule.
 
 - **#5.3 (free-space half)** the media cache does `std::fs::copy` of the whole source into
   `media-cache/` per source. Added a **pre-copy free-space guard**: a pure `ensure_cache_room(source_bytes,
@@ -1198,9 +1209,10 @@ Kept closing the testable ones I'd previously mis-bucketed:
   dirt; silent when all clean). 15/15 freshness unit tests green; full python-policies green; live
   enumeration verified against this repo's 2 worktrees.
 
-TRULY REMAINING (~11): OWNER-GATED measurement (~7 — the P7 re-audit and the real-number gates; faking
-is the one prohibition), media-cache slicing + deeper streaming (unverifiable headlessly → shipping blind
-violates the honesty rule), the nightly's ignored-real-audio fixture wiring (CI-only, already honest via
-::warning), and a few cosmetic. Every finding implementable AND verifiable in a headless Windows checkout
-is done, gated (cargo test --lib 801 + clippy, frontend typecheck/134-vitest/eslint, python-policies),
-and pushed. The grade is well above 6.5; 10/10 is the P7 re-audit's call on real numbers — not mine to fake.
+TRULY REMAINING (~10): OWNER-GATED measurement (~7 — the P7 re-audit and the real-number gates; faking
+is the one prohibition), media-cache SLICING + true-streaming decode (both need real-audio observation:
+playback-by-ear and a 1.4 GB memory profile respectively → shipping blind violates the honesty rule), and a
+few cosmetic. Every finding implementable AND verifiable in a headless Windows checkout is done, gated
+(cargo test --lib 806 + clippy -D warnings, frontend typecheck/134-vitest/eslint, python-policies incl. 15
+exe-freshness unit tests + ledger-staleness), and pushed. The grade is well above 6.5; 10/10 is the P7
+re-audit's call on real numbers — not mine to fake.
