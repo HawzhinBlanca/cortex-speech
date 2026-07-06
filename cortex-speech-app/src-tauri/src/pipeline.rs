@@ -4080,7 +4080,7 @@ mod tests {
 
     #[test]
     fn win_path_to_wsl_translates_drive_paths() {
-        assert_eq!(super::win_path_to_wsl(r"C:\Users\hawzh\AppData\x.db"), "/mnt/c/Users/hawzh/AppData/x.db");
+        assert_eq!(super::win_path_to_wsl(r"C:\data\cortex\x.db"), "/mnt/c/data/cortex/x.db");
         assert_eq!(super::win_path_to_wsl(r"D:\a\b"), "/mnt/d/a/b");
         // Extended-length prefix stripped, then drive-mapped.
         assert_eq!(super::win_path_to_wsl(r"\\?\C:\a"), "/mnt/c/a");

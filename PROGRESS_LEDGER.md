@@ -1105,3 +1105,29 @@ gold-regression baseline, marathon, drills, P7 re-audit), OUT-OF-REPO (the champ
 snapshot + env-passed port/db), the machine-local capstone (rebuild GUI + re-import B7876), or low-value
 polish (media-cache slice, z-order, survivor-bias migration, streaming memory bound, firing provenance).
 The no-fabrication rule holds: 10/10 is declared ONLY by the P7 re-audit on real numbers.
+
+## Deep-check remediation — safely-verifiable surface EXHAUSTED at ~42/61 (2026-07-06, 25 commits)
+
+Final push closed the rest of the safely-verifiable minors (each gated: clippy -D warnings + cargo
+test --lib 797; typecheck/134-vitest/eslint; python-policies green):
+- **#48** Ctrl+, no longer opens Settings under the inbox overlay.
+- **#59** app is the single source of truth for the 7B DB path + port (win_path_to_wsl + env-passed
+  CORTEX_7B_DB/PORT; port const de-triplicated) — killing the stale-DB / wrong-service drift.
+- **#60** a DB error mid-7B-pass now rolls back too (every failure path honors "nothing half-imported").
+- **#53 (partial)** streaming decode moves windows out of the mutex instead of cloning — halves peak RAM.
+- **#50/#34/47/49/i18n** GPU-toggle honesty note + localized health/crash/undo notifications.
+
+REMAINING (~19), by why-it-can't-close-here — NOT a skipped backlog:
+1. OWNER-GATED measurement (~7): fine-tuned-juror escalation number, gold-regression baseline,
+   `make check-7b`, marathon, drills, P7 re-audit. Needs a real run on the 4090; faking the numbers is
+   the one prohibition.
+2. RISKY-WITHOUT-A-RUNNING-APP (~4): media-cache slice + deeper streaming rewrite touch live
+   playback/import; unverifiable headlessly, so shipping blind would lower quality.
+3. PARTIAL-FIX-NEEDS-REDESIGN (~3): survivor-bias needs a durable-counter at delete time (SET NULL alone
+   changes nothing); firing-provenance is latent behind the default-off, owner-gated go-live flag.
+4. OUT-OF-REPO (~2): champion client VACUUM-INTO snapshot etc. — wouldn't transfer via git anyway.
+5. Cosmetic (~3).
+
+BOTTOM LINE: every blocker + every automatable major + ~26 minors are closed and gated on
+`claude/intelligent-gauss-96ffc9` (25 commits). The grade is materially above 6.5. It is NOT 10/10 and
+cannot be honestly called that until the P7 re-audit runs the real numbers on the owner's hardware.
