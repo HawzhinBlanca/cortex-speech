@@ -81,7 +81,7 @@ ndarray = "0.17"
 
 # FFT for mel filterbank feature extraction
 rustfft = "6"
-parquet = { version = "58.3.0", default-features = false, features = ["arrow", "snap"] }
+parquet = { version = "59.0.0", default-features = false, features = ["arrow", "snap"] }
 arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
 
