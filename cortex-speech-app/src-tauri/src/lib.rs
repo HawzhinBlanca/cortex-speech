@@ -502,6 +502,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_health,
+            commands::take_last_crash,
             commands::app_git_sha,
             commands::open_audio_file,
             commands::import_directory,

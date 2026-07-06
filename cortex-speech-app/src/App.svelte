@@ -505,6 +505,16 @@
       // and every 5 minutes thereafter.
       void checkHealthAndWarn();
       healthInterval = setInterval(() => void checkHealthAndWarn(), 5 * 60 * 1000);
+      // Surface a crash from the PREVIOUS session (shown once) — a mid-review panic otherwise relaunches
+      // to a normal-looking app with no hint that a crash (and possible lost unsaved edit) happened.
+      api
+        .takeLastCrash()
+        .then((crash) => {
+          if (crash) {
+            notifications.error(`The previous session crashed: ${crash}. Full details are in the logs folder.`);
+          }
+        })
+        .catch((e) => console.error('crash check failed', e));
       // Flush the debounced autosave BEFORE the native window closes so the last correction of a
       // session is never lost — onDestroy does not reliably run on a Tauri window close. The flush is
       // bounded by a 3s timeout so a stuck backend can never prevent the app from closing.

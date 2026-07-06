@@ -23,9 +23,50 @@ pub fn write_crash_report(data_dir: &Path, location: &str, message: &str, timest
     Some(path)
 }
 
+/// Return a one-line summary of the MOST RECENT crash report (if any) and remove ALL crash reports so
+/// it surfaces exactly once. Called at startup to tell the owner "last session crashed" instead of
+/// letting the report sit unseen (the rolling file log keeps the full detail). Best-effort: any
+/// read/dir error yields `None`.
+pub fn take_latest_crash_summary(data_dir: &Path) -> Option<String> {
+    let dir = data_dir.join("crashes");
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("crash-"))
+        .collect();
+    // The sanitized ISO timestamp in the filename sorts lexicographically, so max = newest.
+    let latest = entries.iter().max_by_key(|e| e.file_name())?;
+    let body = std::fs::read_to_string(latest.path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let summary = format!(
+        "{} at {} (v{})",
+        v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown"),
+        v.get("location").and_then(|l| l.as_str()).unwrap_or("?"),
+        v.get("version").and_then(|x| x.as_str()).unwrap_or("?"),
+    );
+    // Shown once: remove every crash report (crashes are rare; the file log retains detail).
+    for e in &entries {
+        let _ = std::fs::remove_file(e.path());
+    }
+    Some(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn take_latest_crash_summary_returns_newest_and_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(take_latest_crash_summary(tmp.path()).is_none(), "no crashes -> None");
+        write_crash_report(tmp.path(), "a.rs:1:1", "older panic", "2026-06-20T00:00:00Z").unwrap();
+        write_crash_report(tmp.path(), "b.rs:2:2", "newer panic", "2026-06-21T00:00:00Z").unwrap();
+        let summary = take_latest_crash_summary(tmp.path()).expect("a crash summary");
+        assert!(summary.contains("newer panic"), "returns the NEWEST crash: {summary}");
+        assert!(summary.contains("b.rs:2:2"));
+        // Surfaced once: a second call finds nothing (reports cleared).
+        assert!(take_latest_crash_summary(tmp.path()).is_none(), "reports cleared after being surfaced");
+    }
 
     #[test]
     fn writes_a_crash_report_with_the_panic_details() {

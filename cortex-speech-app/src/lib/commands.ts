@@ -964,6 +964,11 @@ export async function appHealth(): Promise<AppHealth> {
   return invoke('app_health');
 }
 
+/** One-line summary of the previous session's crash (surfaced once), or null if it exited cleanly. */
+export async function takeLastCrash(): Promise<string | null> {
+  return invoke('take_last_crash');
+}
+
 export interface AgenticReadinessCheck {
   id: string;
   label: string;

@@ -939,6 +939,15 @@ pub fn app_health(state: State<'_, AppState>) -> Result<serde_json::Value, Strin
     health::health_check(&db, &mm, data_dir.as_deref()).map_err(|e| e.to_string())
 }
 
+/// Return a one-line summary of the most recent crash report (if the last session panicked), surfaced
+/// exactly once. The frontend shows it as a notification on startup so a mid-review crash — after which
+/// the app relaunches looking normal — is no longer silent. The full report stays in the rolling log.
+#[tauri::command]
+pub fn take_last_crash(state: State<'_, AppState>) -> Option<String> {
+    let data_dir = state.lock_data_dir().clone()?;
+    crate::crash::take_latest_crash_summary(&data_dir)
+}
+
 /// Opt-in: transcribe a segment with the CONSTRAINED Kurdish-token CTC decode (guarantees
 /// Kurdish-script output) via the `ort` raw-logits path, instead of the default sherpa-onnx
 /// decode. Additive — it does NOT touch the default `transcribe_segment` path. Loads a fresh ort
