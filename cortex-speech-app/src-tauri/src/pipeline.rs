@@ -1961,7 +1961,17 @@ impl ProcessingPipeline {
             // Honor cancellation between segments: each WSL transcription can ride a 300s timeout, so
             // without this a cancelled import of an N-segment file would keep running for up to N*300s.
             if let Some(token) = cancel {
-                token.check()?;
+                if let Err(cancel_err) = token.check() {
+                    // Roll back THIS file's just-created segments (a mix of transcribed + still-placeholder
+                    // rows) before propagating the cancel, so re-importing the same file cannot duplicate
+                    // every segment. Matches the infra-failure rollback and the F6 "nothing half-imported"
+                    // promise. Earlier files in a directory import are already committed and untouched.
+                    tracing::info!("WSL 7B import cancelled; rolling back {} segment(s)", import_ids.len());
+                    if let Err(e) = db.delete_segments_batch(&import_ids) {
+                        tracing::error!("failed to roll back {} segment(s) after cancel: {e}", import_ids.len());
+                    }
+                    return Err(cancel_err);
+                }
             }
             let mut last_problem: Option<String> = None;
             let mut infra_failure = false;
