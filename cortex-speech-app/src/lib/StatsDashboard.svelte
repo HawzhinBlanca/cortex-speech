@@ -200,6 +200,23 @@
     }
   }
 
+  // 4.5: off-disk backup. The rotating auto-snapshots live in the app data dir alongside the live DB
+  // — one disk failure loses both. This copies the whole library to a folder the owner chooses (an
+  // external drive, a synced folder), into a timestamped file so successive backups never collide.
+  async function backupToFolder() {
+    const r = await pickDirAnd('backup', async (dir) => {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const sep = dir.includes('\\') ? '\\' : '/';
+      const base = dir.endsWith(sep) ? dir : `${dir}${sep}`;
+      const dest = `${base}cortex-speech-backup-${stamp}.db`;
+      await api.dbBackup(dest);
+      return dest;
+    });
+    if (r) {
+      notifications.success($t('stats.backupDone').replace('{path}', r));
+    }
+  }
+
   async function importVerifiedAsGold() {
     if (!tauriAvailable || toolBusy) return;
     toolBusy = 'importGold';
@@ -745,6 +762,15 @@
             onclick={verifyModelIntegrity}
           >
             {toolBusy === 'verify' ? $t('stats.toolWorking') : $t('stats.verifyModel')}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
+            data-testid="backup-db-btn"
+            disabled={toolBusy !== null}
+            onclick={backupToFolder}
+          >
+            {toolBusy === 'backup' ? $t('stats.toolWorking') : $t('stats.backupDb')}
           </button>
           <button
             type="button"

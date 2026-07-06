@@ -456,6 +456,8 @@ export const ckb: Record<string, string> = {
     'پاکەتی مەشق: {n} پارچە دەرهێنرا، {h} هۆڵداوت دەرکرا، {r} بە پێوەری پلە ڕەتکرایەوە، {s} تێپەڕێنرا.',
   'stats.goldEvalDone': 'کۆمەڵەی هەڵسەنگاندنی زێڕین: {n} پارچە دەرهێنرا.',
   'stats.importGoldDone': '{n} فایلی سەرچاوەی پشتڕاستکراو وەک زێڕین هێنرا.',
+  'stats.backupDb': 'پاشەکەوت بۆ بوخچە…',
+  'stats.backupDone': 'کتێبخانە پاشەکەوت کرا بۆ {path}',
   'stats.restoreSnapshot': 'گەڕاندنەوە لە وێنەی پاشەکەوت…',
   'stats.restore': 'گەڕاندنەوە',
   'stats.noSnapshots': 'هێشتا هیچ وێنەیەکی پاشەکەوتی خۆکار نییە.',

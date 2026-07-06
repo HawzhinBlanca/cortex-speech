@@ -455,6 +455,8 @@ export const en: Record<string, string> = {
     'Fine-tune pack: {n} clip(s) emitted, {h} holdout excluded, {r} refused by the grade rubric, {s} skipped.',
   'stats.goldEvalDone': 'Gold eval set: {n} clip(s) exported.',
   'stats.importGoldDone': '{n} verified source file(s) imported as gold.',
+  'stats.backupDb': 'Backup to folder…',
+  'stats.backupDone': 'Library backed up to {path}',
   'stats.restoreSnapshot': 'Restore from snapshot…',
   'stats.restore': 'Restore',
   'stats.noSnapshots': 'No auto-snapshots yet.',

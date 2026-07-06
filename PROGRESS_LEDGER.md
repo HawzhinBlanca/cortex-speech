@@ -1160,8 +1160,16 @@ Kept closing the testable ones I'd previously mis-bucketed:
   dominant-speaker(>50%) flag.
 - **#39** Database::restore integrity-checks the source snapshot before overwriting the live DB.
 
-## Deep-check remediation — ~49/61 (2026-07-07)
+## Deep-check remediation — ~50/61 (2026-07-07)
 
+- **#4.5 (last piece)** the `db_backup` IPC was a dead command — a wrapper (`dbBackup`) existed but no
+  UI called it, so the only copies of the library were the rotating auto-snapshots sitting in the app
+  data dir *next to the live DB* (one disk failure loses both). Added a **"Backup to folder…"** button
+  (`data-testid="backup-db-btn"`) to Stats → tools, reusing the proven `pickDirAnd` folder-picker: it
+  writes the whole library via SQLite online-backup to a **timestamped** file
+  (`cortex-speech-backup-<ISO>.db`) inside a folder the owner chooses (external drive / synced folder),
+  so successive backups never collide. EN + CKB strings (`stats.backupDb`, `stats.backupDone`) added in
+  parity. typecheck 0-err (406 files), eslint clean, vitest 134/134.
 - **#1.3** exe-freshness gate is now **worktree-aware**. A green gate means only "the built exe
   matches THIS checkout's HEAD" — it used to stay silent while a *sibling* worktree carried the real
   fixes as uncommitted source edits (the exact A3 stale-exe-vs-worktree trap this session lived).
@@ -1174,7 +1182,7 @@ Kept closing the testable ones I'd previously mis-bucketed:
   dirt; silent when all clean). 15/15 freshness unit tests green; full python-policies green; live
   enumeration verified against this repo's 2 worktrees.
 
-TRULY REMAINING (~12): OWNER-GATED measurement (~7 — the P7 re-audit and the real-number gates; faking
+TRULY REMAINING (~11): OWNER-GATED measurement (~7 — the P7 re-audit and the real-number gates; faking
 is the one prohibition), media-cache slicing + deeper streaming (unverifiable headlessly → shipping blind
 violates the honesty rule), the nightly's ignored-real-audio fixture wiring (CI-only, already honest via
 ::warning), and a few cosmetic. Every finding implementable AND verifiable in a headless Windows checkout
