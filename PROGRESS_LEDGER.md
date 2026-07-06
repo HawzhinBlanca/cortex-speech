@@ -1191,6 +1191,16 @@ speaker-clustering state machine with high regression risk and the memory win is
   the FTS rebuild that vacuum's rowid-renumber requires). Stats → tools now exposes the full triad:
   Backup / Restore-from-file / Restore-from-snapshot / **Compact**. EN + CKB strings in parity (now 605=605).
   typecheck 0-err, eslint clean, vitest 134/134.
+- **REAL BUG FIXED — export slicer lacked its sibling's u32-wrap guard (training-data integrity)** A
+  hunt through the historically-buggiest slicing paths found `export::slice_for_export` doing a bare
+  `meta.source_start_ms.max(0) as u32` while its sibling `chunking::slice_pcm_by_alignment` explicitly
+  rejects offsets > `u32::MAX` (i64→u32 wraps mod 2^32). `from_alignment_json` deserializes those offsets
+  as raw i64 with no upper bound, so a malformed/corrupted alignment blob with an offset > u32::MAX would
+  WRAP to a small in-range index and export an UNRELATED audio window mislabeled with the segment's
+  transcript — silent TRAINING-DATA corruption (exactly the whole-file-vs-clip class that keeps recurring).
+  Added the same guard (skip → None, matching the Option contract) + a regression test proving a 2^32-offset
+  now SKIPS instead of wrap-slicing `[0..8000]`. cargo: fmt clean, clippy -D warnings clean, `--lib` 808
+  passed; training-grade-export policy green.
 - **LOOP-0 confidence adversarial review (the original deliverable) — verified sound + one edge documented**
   Re-read the whole evidence path (`corrections.rs` + `db.rs::record_human_decision`) hunting for real
   correctness bugs. The Beta(1,1) SQL reconstructs `beta_confidence(new_confirm, new_override)` exactly

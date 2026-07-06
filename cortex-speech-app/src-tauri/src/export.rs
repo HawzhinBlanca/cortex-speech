@@ -506,8 +506,17 @@ pub(crate) fn slice_for_export<'a>(
         None => Some(std::borrow::Cow::Borrowed(full_pcm)),
         Some(json) => match chunking::SegmentSourceMeta::from_alignment_json(json) {
             Some(meta) => {
-                let start = chunking::ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
-                let end = chunking::ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate).min(full_pcm.len());
+                let (start_ms, end_ms) = (meta.source_start_ms.max(0), meta.source_end_ms.max(0));
+                // Reject an absurd offset rather than truncating via `as u32` (i64 -> u32 wraps mod 2^32,
+                // which would silently slice an UNRELATED in-bounds window and EXPORT it mislabeled with
+                // this segment's transcript — training-data corruption). Mirrors the identical guard in
+                // chunking::slice_pcm_by_alignment; a value this large is a malformed/crafted alignment
+                // blob (the app never emits an offset > u32::MAX ms ≈ 49.7 days). Skip, don't emit.
+                if start_ms > u32::MAX as i64 || end_ms > u32::MAX as i64 {
+                    return None;
+                }
+                let start = chunking::ms_to_samples(start_ms as u32, sample_rate);
+                let end = chunking::ms_to_samples(end_ms as u32, sample_rate).min(full_pcm.len());
                 if end > start && start < full_pcm.len() {
                     Some(std::borrow::Cow::Borrowed(&full_pcm[start..end]))
                 } else {
@@ -1740,6 +1749,26 @@ mod tests {
         let merged = crate::chunking::merge_word_timestamps(Some(&meta.to_alignment_json()), &words);
         let s = slice_for_export(&full, 16000, Some(&merged)).expect("merged alignment still slices");
         assert_eq!(s.len(), chunking::ms_to_samples(400, 16000), "merged object slices to its 100..500ms window");
+    }
+
+    #[test]
+    fn slice_for_export_skips_offset_beyond_u32_instead_of_wrap_slicing() {
+        // A malformed/corrupted alignment blob can carry an i64 offset > u32::MAX. A bare `as u32` would
+        // WRAP it (mod 2^32) to a small in-range index and export an UNRELATED window mislabeled with this
+        // segment's transcript — silent training-data corruption. It must SKIP, matching the identical
+        // guard in chunking::slice_pcm_by_alignment. Without the guard: start_ms 2^32 wraps to 0 and
+        // end_ms 2^32+500 wraps to 500, so this would have sliced [0..8000] and returned Some(8000).
+        let full = vec![0i16; 16000];
+        let wrapping = crate::chunking::SegmentSourceMeta {
+            source_start_ms: u32::MAX as i64 + 1, // wraps to 0 under `as u32`
+            source_end_ms: u32::MAX as i64 + 501, // wraps to 500 under `as u32`
+            chunk_index: 0,
+            chunk_count: 1,
+        };
+        assert!(
+            slice_for_export(&full, 16000, Some(&wrapping.to_alignment_json())).is_none(),
+            "an offset > u32::MAX must SKIP, never wrap-slice an unrelated window into the export"
+        );
     }
 
     #[test]
