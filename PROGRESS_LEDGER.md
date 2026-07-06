@@ -1191,6 +1191,19 @@ speaker-clustering state machine with high regression risk and the memory win is
   the FTS rebuild that vacuum's rowid-renumber requires). Stats → tools now exposes the full triad:
   Backup / Restore-from-file / Restore-from-snapshot / **Compact**. EN + CKB strings in parity (now 605=605).
   typecheck 0-err, eslint clean, vitest 134/134.
+- **LOOP-0 confidence adversarial review (the original deliverable) — verified sound + one edge documented**
+  Re-read the whole evidence path (`corrections.rs` + `db.rs::record_human_decision`) hunting for real
+  correctness bugs. The Beta(1,1) SQL reconstructs `beta_confidence(new_confirm, new_override)` exactly
+  (confirm/override use the row's OLD counts, matching the pure fn); winner-selection in
+  `firing_winner_indices` mirrors `apply_memories`'s gate+phonetic filter byte-for-byte; firing never
+  changes word count (so no alignment drift); NaN phonetic distances are filtered before `min_by`. One
+  REAL but rare edge found and PROVEN with a characterization test: `classify_memory_outcomes` scores each
+  winner IN ISOLATION, so when two near-homophones share an identical repeated `left|right` slot (e.g.
+  "…ئەو باش بوو … ئەو پاش بوو…") a winner's own cross-slot over-trigger can cancel its real improvement in
+  the global word-error count and mask a deserved Confirm. It's statistically self-washing (Beta posterior
+  over many decisions) and a leave-one-out "fix" carries its own ambiguous marginal-vs-absolute semantics,
+  so it's DOCUMENTED (in-code KNOWN LIMITATION + a pinning test) rather than rewritten blind under the loop.
+  cargo: fmt clean, clippy -D warnings clean, `--lib` 807 passed.
 - **IPC-surface sweep (verified clean, no further accidental gaps)** cross-checked all 122 registered Tauri
   commands vs. frontend callers, AND all 121 `commands.ts` wrappers vs. component references (the latter
   catches the `db_vacuum` case — a command whose only invoke site was an unused wrapper). The two
