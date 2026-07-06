@@ -62,6 +62,24 @@ pub(crate) fn apply_loop0_firing(enabled: bool, db: &crate::db::Database, transc
     }
 }
 
+/// Map the configured LLM model name to an OpenRouter model id for the consent-gated Gemini/OpenRouter
+/// refine path. An already-namespaced id (`vendor/model`) passes through; a bare `gemini-*` gets the
+/// `google/` prefix; a local-only name (e.g. `heretic-final:latest`) has no OpenRouter equivalent, so we
+/// default to the Gemini-class model the "Gemini" mode implies — never silently to `openai/gpt-4o-mini`.
+fn openrouter_model_id(configured: &str) -> String {
+    let m = configured.trim();
+    if m.is_empty() {
+        return "google/gemini-2.5-pro".to_string();
+    }
+    if m.contains('/') {
+        return m.to_string();
+    }
+    if m.to_ascii_lowercase().starts_with("gemini") {
+        return format!("google/{m}");
+    }
+    "google/gemini-2.5-pro".to_string()
+}
+
 /// M2.3 / P1.3: true when LOOP-0 WOULD change this transcript (a confirmed correction memory matches).
 /// This is the pure shadow signal — it never mutates and is independent of the firing opt-in, so the C5
 /// over-trigger decision can be measured while firing stays default-off.
@@ -2652,7 +2670,11 @@ impl ProcessingPipeline {
                     if let Some(openrouter_key) = crate::api_keys::ApiKeys::load(data_dir).openrouter {
                         return crate::llm_refiner::LlmRefiner::for_openrouter(
                             openrouter_key,
-                            String::new(),
+                            // Pass the CONFIGURED model, not an empty string (which silently defaulted to
+                            // openai/gpt-4o-mini — a different family than the "Gemini" mode the owner chose,
+                            // with no provenance). Map it to an OpenRouter id; a local-only name falls back
+                            // to the Gemini-class model the user expects.
+                            openrouter_model_id(&self.settings.llm_model),
                             self.settings.llm_system_prompt.clone(),
                         );
                     }
@@ -3063,6 +3085,18 @@ mod tests {
             "Gemini mode + OpenRouter key should route through OpenRouter, got: {}",
             refiner.endpoint
         );
+        assert_ne!(refiner.model, "openai/gpt-4o-mini", "Gemini mode must not silently use gpt-4o-mini");
+        assert!(refiner.model.contains("gemini"), "Gemini mode maps to a Gemini-class model, got: {}", refiner.model);
+    }
+
+    #[test]
+    fn openrouter_model_id_maps_families_and_defaults_to_gemini() {
+        assert_eq!(super::openrouter_model_id("google/gemini-2.5-pro"), "google/gemini-2.5-pro");
+        assert_eq!(super::openrouter_model_id("openai/gpt-4o"), "openai/gpt-4o");
+        assert_eq!(super::openrouter_model_id("gemini-2.5-flash"), "google/gemini-2.5-flash");
+        // A local-only name has no OpenRouter equivalent -> Gemini-class default, never gpt-4o-mini.
+        assert_eq!(super::openrouter_model_id("heretic-final:latest"), "google/gemini-2.5-pro");
+        assert_eq!(super::openrouter_model_id("  "), "google/gemini-2.5-pro");
     }
 
     #[test]
