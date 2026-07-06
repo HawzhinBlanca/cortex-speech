@@ -1213,6 +1213,16 @@ speaker-clustering state machine with high regression risk and the memory win is
   slice), pipeline.rs:1524/1829 (safe: metadata round-trip), agentic reference-window (safe: offset→ratio
   `.clamp(0.0,1.0)` so token indices stay bounded). Every PCM-slicing consumer of a stored offset is now
   guarded; the offset-wrap variant of the whole-file-vs-clip class is provably closed.
+- **REAL GAP CLOSED — #4.5 part 1 (corrupt-file prune guard) was never actually implemented** The audit
+  required "snapshot pruning refuses while a `*.corrupt.*` file exists (pin pre-quarantine history)", but
+  only the WEAKER empty-DB guard shipped — and it lapses the moment the user re-imports post-quarantine
+  (`segment_count > 0` lets `take_snapshot_at` snapshot AND prune again, rotating out the pre-corruption
+  history within `keep` cycles — the "weeks of review labor" the finding exists to protect). Implemented
+  the actual guard: `prune_snapshots` now refuses to prune while `has_unacknowledged_quarantine(data_dir)`
+  (a `*.corrupt.*` main file, matching `get_quarantine_notice`'s detection). New snapshots still get taken
+  (new work is protected too); nothing is pruned until the user clears the quarantine files. Regression
+  test proves it with a NON-empty DB (4 snapshots pinned under keep=2, `-wal` sidecar correctly ignored,
+  pruning resumes to 2 once cleared). cargo: fmt clean, clippy -D warnings clean, `--lib` 810 passed.
 - **Metric harness (WER/CER) adversarial review — verified sound + boundary pinned** The whole project's
   "never fabricate a metric" law rests on the harness COMPUTING metrics correctly, so I audited `wer.rs`:
   `levenshtein` returns `prev[m]` correctly; `compute_wer/cer` = edit-distance / ref-len clamped to 1.0 with

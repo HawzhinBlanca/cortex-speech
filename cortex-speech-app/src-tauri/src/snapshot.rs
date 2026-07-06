@@ -150,10 +150,39 @@ pub struct SnapshotInfo {
     pub segment_count: Option<i64>,
 }
 
+/// True when the data dir holds an UNACKNOWLEDGED corruption quarantine — a `*.corrupt.*` file the user
+/// has not yet cleared. Matches `get_quarantine_notice`'s detection (main files only, not `-wal`/`-shm`
+/// sidecars) so the "quarantine present" signal is identical on both sides.
+fn has_unacknowledged_quarantine(data_dir: &Path) -> bool {
+    fs::read_dir(data_dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.contains(".corrupt.") && !name.ends_with("-wal") && !name.ends_with("-shm"))
+        })
+    })
+}
+
 /// Keep the newest `keep` snapshot dirs (ordered by the timestamp embedded in the name), delete older.
 pub fn prune_snapshots(snapshots_root: &Path, keep: usize) -> AppResult<()> {
     if !snapshots_root.is_dir() {
         return Ok(());
+    }
+    // #4.5 data-safety: while an UNACKNOWLEDGED corruption quarantine exists (a `*.corrupt.*` file in the
+    // data dir the user has not cleared), refuse to prune — pin ALL pre-quarantine history so a
+    // post-quarantine re-import can't rotate out the only good copies of weeks of review labor. The
+    // empty-DB guard in `take_snapshot_at` only holds until the first re-import (segment_count > 0 lets it
+    // snapshot + prune again); this holds the line until the user acknowledges by clearing the quarantine
+    // files. Snapshots may accumulate meanwhile — the correct trade for an active, unresolved corruption.
+    if let Some(data_dir) = snapshots_root.parent() {
+        if has_unacknowledged_quarantine(data_dir) {
+            tracing::warn!(
+                "snapshot: unacknowledged corruption quarantine present — refusing to prune so pre-quarantine \
+                 history is pinned until the *.corrupt.* files are cleared"
+            );
+            return Ok(());
+        }
     }
     let mut snaps: Vec<(u64, PathBuf)> = fs::read_dir(snapshots_root)
         .map_err(AppError::Io)?
@@ -234,6 +263,35 @@ mod tests {
     fn prune_is_a_noop_when_root_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
         prune_snapshots(&tmp.path().join("nope"), 5).unwrap(); // must not error
+    }
+
+    #[test]
+    fn prune_refuses_while_an_unacknowledged_quarantine_exists() {
+        // #4.5 part 1: the empty-DB guard only holds until the user re-imports (segment_count > 0). Once
+        // they do, a non-empty DB snapshots + prunes again — and would rotate out the pre-quarantine
+        // history within keep cycles. While a `*.corrupt.*` file is still present (quarantine not cleared),
+        // pruning must REFUSE so that history stays pinned, even with a non-empty (re-populated) library.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let db = seeded_db(); // NON-empty — the empty-DB guard would NOT fire here
+                              // Simulate a corruption quarantine the user has not cleared.
+        std::fs::write(data_dir.join("cortex-speech.corrupt.1781500000"), b"quarantined db").unwrap();
+        // A -wal sidecar of the quarantine must NOT itself count (parity with get_quarantine_notice).
+        std::fs::write(data_dir.join("cortex-speech.corrupt.1781500000-wal"), b"").unwrap();
+
+        for ts in [100u64, 200, 300, 400] {
+            take_snapshot_at(&db, data_dir, 2, ts).unwrap().expect("non-empty db still snapshots");
+        }
+        let root = data_dir.join("snapshots");
+        let kept = std::fs::read_dir(&root).unwrap().flatten().filter(|e| e.path().is_dir()).count();
+        assert_eq!(kept, 4, "with an unacknowledged quarantine, keep=2 must NOT prune — all history is pinned");
+
+        // Acknowledge the quarantine (clear the files), then a fresh snapshot prunes normally again.
+        std::fs::remove_file(data_dir.join("cortex-speech.corrupt.1781500000")).unwrap();
+        std::fs::remove_file(data_dir.join("cortex-speech.corrupt.1781500000-wal")).unwrap();
+        take_snapshot_at(&db, data_dir, 2, 500).unwrap().expect("snapshots");
+        let kept_after = std::fs::read_dir(&root).unwrap().flatten().filter(|e| e.path().is_dir()).count();
+        assert_eq!(kept_after, 2, "once the quarantine is cleared, keep=2 prunes back to two");
     }
 
     #[test]
