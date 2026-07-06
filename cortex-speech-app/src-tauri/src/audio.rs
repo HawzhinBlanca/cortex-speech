@@ -228,9 +228,19 @@ pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
         let packet = match format.next_packet() {
             Ok(pkt) => pkt,
             Err(symphonia::core::errors::Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break
+                break; // clean end of stream
             }
-            Err(_) => break,
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                tracing::warn!("audio decode: stream reset required mid-file; stopping decode early");
+                break;
+            }
+            Err(e) => {
+                // Non-EOF error mid-file = corrupt/truncated source. Fail loudly rather than silently
+                // importing only the decodable prefix (the old `Err(_) => break` data-loss trap).
+                return Err(AppError::Audio(AudioError::Decode(format!(
+                    "decode stopped on a non-EOF error (corrupt or truncated source?): {e}"
+                ))));
+            }
         };
 
         if packet.track_id() != track_id {
@@ -354,9 +364,22 @@ where
         let packet = match format.next_packet() {
             Ok(pkt) => pkt,
             Err(symphonia::core::errors::Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break; // clean end of stream
+            }
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                // A legitimate mid-stream parameter change (e.g. chained OGG). Re-init is out of scope
+                // here; stop decoding but say so, rather than silently pretending it was EOF.
+                tracing::warn!("audio decode: stream reset required mid-file; stopping decode early");
                 break;
             }
-            Err(_) => break,
+            Err(e) => {
+                // A non-EOF decode error mid-file means the source is corrupt/truncated. Treating it as a
+                // clean end (the old `Err(_) => break`) silently imported only the decodable PREFIX and
+                // dropped the rest — a data-loss trap for a curation app. Fail LOUDLY instead.
+                return Err(AppError::Audio(AudioError::Decode(format!(
+                    "decode stopped on a non-EOF error (corrupt or truncated source?): {e}"
+                ))));
+            }
         };
 
         if packet.track_id() != track_id {
