@@ -2803,6 +2803,24 @@ impl ProcessingPipeline {
             None => tracing::debug!("{model_id_1b} hypothesis model unavailable for {segment_id}"),
         }
 
+        // 3. Fine-tuned MMS-CTC (ckb) — the machine's strongest INDEPENDENT local voter (wav2vec2 family,
+        // ~21% CER), architecturally distinct from the correlated 300M/1B stock CTC pair. Its absence was
+        // a root cause of "the jury escalates ~everything": two weak kin models rarely agree with the 7B,
+        // so IRT confidence stays low and T0 almost never auto-accepts. Only runs when the fine-tuned
+        // model is installed (a no-op otherwise); a failure is best-effort and never fails population.
+        if let Some((onnx, vocab)) = Self::finetuned_model_paths() {
+            let chunk_i16: Vec<i16> = f32_pcm.iter().map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16).collect();
+            match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_i16) {
+                Ok(text) if !text.trim().is_empty() => {
+                    insert_hypothesis_checked(db, segment_id, "finetuned-mms-ckb", text, None)?;
+                }
+                Ok(_) => tracing::debug!("finetuned-mms-ckb hypothesis empty for {segment_id}"),
+                Err(error) => {
+                    tracing::warn!("finetuned-mms-ckb hypothesis transcription failed for {segment_id}: {error}");
+                }
+            }
+        }
+
         self.populate_wsl_hypothesis_if_configured(db, segment_id)?;
 
         Ok(())
