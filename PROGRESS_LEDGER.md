@@ -1148,3 +1148,21 @@ GENUINELY REMAINING (~14), unchanged in character: OWNER-GATED measurement (~7 �
 4090; faking forbidden), media-cache slicing + deeper-streaming (~2, unverifiable headlessly → shipping
 blind would violate the honesty rule), and cosmetic (~5). Every finding that could be implemented AND
 verified in a headless Windows checkout is done, gated, and pushed. 10/10 remains the P7 re-audit's call.
+
+## Deep-check remediation — ~48/61 (2026-07-06, 33 commits + 2 out-of-repo champion edits)
+
+Kept closing the testable ones I'd previously mis-bucketed:
+- **#32** Cancel during import now kills the in-flight 7B child within ~50 ms (CancellationToken
+  threaded through transcribe → the WSL subprocess poller), not only between segments.
+- **flat-export placeholder filter** — a not-yet-transcribed segment ("[Pending WSL 7B ASR]") is
+  excluded from JSON/JSONL/CSV/Parquet exports (was shipping the literal placeholder as a training row).
+- **composition report** — DatasetMetadata now carries per-speaker segment/duration counts + a
+  dominant-speaker(>50%) flag.
+- **#39** Database::restore integrity-checks the source snapshot before overwriting the live DB.
+
+TRULY REMAINING (~13): OWNER-GATED measurement (~7 — the P7 re-audit and the real-number gates; faking
+is the one prohibition), media-cache slicing + deeper streaming (unverifiable headlessly → shipping blind
+violates the honesty rule), the nightly's ignored-real-audio fixture wiring (CI-only, already honest via
+::warning), and a few cosmetic. Every finding implementable AND verifiable in a headless Windows checkout
+is done, gated (cargo test --lib 801 + clippy, frontend typecheck/134-vitest/eslint, python-policies),
+and pushed. The grade is well above 6.5; 10/10 is the P7 re-audit's call on real numbers — not mine to fake.
