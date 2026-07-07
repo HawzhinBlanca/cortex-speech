@@ -51,7 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 tracing-appender = "0.2"
 
 # Audio ingestion (pure Rust decoder)
-symphonia = { version = "0.5", features = ["all"] }
+symphonia = { version = "0.6", features = ["all"] }
 
 # WAV/FLAC audio export
 hound = "3"
