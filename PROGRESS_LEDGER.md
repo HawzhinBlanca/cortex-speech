@@ -1633,3 +1633,16 @@ a gate):
    three ci.yml build jobs. Runtime is unaffected (the fine-tuned engine is opt-in + presence-gated).
    Verified locally: vitest 134/134, `cargo check --bin` clean with the reduced config, README build docs
    updated. This also unblocks main + the dependabot PRs that were red for the same reasons.
+5. SECURITY-PIN FIX: `npm run fetch-models` REJECTed the onnxruntime DLLs (sha mismatch) — the first time
+   that path ever ran in CI. Investigation: the script URL pointed at onnxruntime v1.20.1 while the pinned
+   hashes were for a DIFFERENT build; the owner's local DLL is onnxruntime **1.24.4** (15.4 MB, non-standard
+   source — 10.7 KB providers_shared, no DirectML.dll, so effectively CPU) and matched NEITHER the v1.20.1
+   nor the official v1.22.0/v1.24.4 CPU zips. So the URL+pin never matched and ORT fetch could never succeed
+   (a long-standing reason release.yml failed too). Fix: repointed the URL to the official
+   **v1.24.4 CPU win-x64** release and repinned the two DLL hashes to that release's VERIFIED values
+   (b95efb21… / f2540b89…, confirmed by direct HTTPS download of the official asset here). This STRENGTHENS
+   the integrity gate (it now matches a real, verifiable upstream) and is C-API-compatible with ort
+   2.0.0-rc.12; CPU is all CI + the fine-tuned CPU inference need. OWNER ACTION: run `npm run fetch-models`
+   once locally to realign your models/ with the corrected pins (replaces the mystery-provenance 1.24.4 DLL
+   with the official verified CPU 1.24.4). I did NOT touch your local models. Did not run fetch-models here
+   to avoid clobbering the junctioned checkout; pins independently verified against the official zip.
