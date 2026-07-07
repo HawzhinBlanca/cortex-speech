@@ -109,8 +109,13 @@ def main() -> int:
         r, h = _NORM(ref), _NORM(hyp)
         if not r:
             continue  # zero-reference clip drops out of the ratio-of-sums (matches eval.rs)
-        rc, hc = r.replace(" ", ""), h.replace(" ", "")
-        per_clip.append((edit_distance(list(rc), list(hc)), len(rc)))
+        # CER over the full normalized string WITH interior whitespace — jiwer's default CER definition,
+        # matching scorecard_finetuned.py (jiwer.process_characters) and eval.rs (tokenize_chars keeps
+        # whitespace). The previous `.replace(" ", "")` scored space-INSENSITIVELY, so a word-segmentation
+        # error (a real Sorani ASR error class, e.g. "هاوڕێ من" -> "هاوڕێمن") scored 0% instead of its true
+        # 12.5%, DEFLATING the champion's CER and breaking this script's own "directly comparable to the
+        # fine-tuned 21%" contract. Verified: edit_distance(list(r), list(h)) == jiwer S+D+I on that pair.
+        per_clip.append((edit_distance(list(r), list(h)), len(r)))
         word_clip.append(word_pair(r, h))
         pairs.append({"ref": ref, "hyp": hyp})
         if (i + 1) % 25 == 0:

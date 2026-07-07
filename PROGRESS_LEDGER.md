@@ -1227,6 +1227,19 @@ speaker-clustering state machine with high regression risk and the memory win is
   `["settings.json","champion.json"]` DUPLICATING `snapshot::EXTRA_STATE` — a drift hazard where a file
   added to the save-side would be silently snapshotted-but-never-restored. Made `EXTRA_STATE` `pub(crate)`
   and the restore loop consumes it → single source of truth, save/restore can't diverge.
+- **HONESTY-CRITICAL BUG — the champion's CER was computed with the WRONG (deflated, non-comparable) definition**
+  `scorecard_7b.py` (the OmniASR-7B Champion's headline accuracy — the number that most drives the grade)
+  computed CER on space-STRIPPED text (`r.replace(" ", "")`), while `scorecard_finetuned.py` uses jiwer
+  (interior whitespace KEPT) and `eval.rs`'s `tokenize_chars` also keeps whitespace. So the champion's CER
+  was **space-insensitive**: a word-segmentation error — a real Sorani ASR error class, e.g. "هاوڕێ من" →
+  "هاوڕێمن" — scored **0% instead of its true 12.5%**, DEFLATING the number and breaking the script's own
+  docstring claim of being "directly comparable to the fine-tuned 21.00%". This would have made the owner's
+  default-engine decision (deep-audit F1) rest on an apples-to-oranges comparison. Fixed to score the
+  space-KEPT normalized string (`edit_distance(list(r), list(h))`), EMPIRICALLY VERIFIED to equal
+  `jiwer.process_characters` exactly (dist=1, CER 12.5% on that pair) while the old stripped form scored 0.
+  `crossval_jiwer.py` + `measure_finetuned_cer.py` already used jiwer, so only 7B had drifted. Added a
+  dedicated auto-discovered guard `test_scorecard_cer_consistency.py` (source-pin + jiwer numeric-equivalence)
+  so the definitions can never silently diverge again. python-policies green.
 - **Measurement-tool de-risking — fixed an empty-manifest crash in the 4090 scorecard scripts** The path
   to a real 10/10 is the owner running the accuracy suite on the 4090; a crash there wastes a marathon.
   Audited the scorecards: `scorecard_finetuned.py` (correct micro-CER ratio-of-sums, zero-ref clips dropped
