@@ -1584,12 +1584,22 @@ half-version would add an unverifiable path to a subsystem that is presently cor
 ("nothing is done until MEASURED on real audio") this stays OWNER-GATED, not a headless defect; reclassified
 from "remaining defect" to owner-decision optimization.
 
-TRULY REMAINING (~6): OWNER-GATED measurement (~5 — the P7 re-audit on the 4090, the reliability drills, and
+**RELEASE BUILD certified (2026-07-07).** `npm run build` (frontend, clean) + `cargo build --release`
+(6m27s, optimized, ZERO errors) produced a fresh `src-tauri/target/release/cortex-speech-app.exe` (43 MB)
+from the branch tip — embedding the crossbeam-epoch security fix, the dead-code removal, and every
+correctness fix on this branch. Also `cargo clippy --all-targets --all-features -- -D warnings` = clean.
+This certifies the COMPILE half of `make build-app`. What remains un-runnable headlessly is only the LIVE
+LAUNCH of that exe (`make test-e2e` needs a display + the WSL champion server on the 4090) and the
+real-number accuracy/reliability suite. NOTE: this exe lives in the worktree target, not the owner's daily
+install path — the owner still rebuilds on the main checkout (or copies it) for the daily driver.
+
+TRULY REMAINING (~5): OWNER-GATED measurement (~5 — the P7 re-audit on the 4090, the reliability drills, and
 the gold marathon; faking is the one prohibition), and media-cache slicing / true-streaming decode as an
-owner-decision optimization (needs real-audio listening, see the note just above). Plus the two owner/CI
-build-gated steps
-(`test-e2e` and `make build-app` → a fresh exe). Everything implementable AND verifiable in a headless
-Windows checkout — the charter verify-10 gate, all rust/frontend tests, npm audit, cargo deny (now
+owner-decision optimization (needs real-audio listening, see the note just above). The only build-gated step
+left is the LIVE `make test-e2e` run (the release binary now compiles clean — see the note just above).
+Everything implementable AND verifiable in a headless
+Windows checkout — the charter verify-10 gate, all rust/frontend tests, clippy -D warnings, the clean
+release build, npm audit, cargo deny (now
 advisory-clean), a real committed-fixture accuracy measurement (18.60% CER), and a genuine dead-code cleanup
 — is done, gated, and pushed. 10/10 remains the P7 re-audit's call on the full real-number suite; but the
 automatable portion of the ship gate is now entirely green.
