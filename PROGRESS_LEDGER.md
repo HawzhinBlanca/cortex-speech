@@ -1162,6 +1162,17 @@ Kept closing the testable ones I'd previously mis-bucketed:
 
 ## Deep-check remediation — ~51/61 (2026-07-07)
 
+- **Systematic duplicate-fn scan → found a stale `sanitize_filename` that mangled Sorani filenames** A
+  repo-wide scan for functions defined in 2+ files (the drift-hazard class) surfaced two `sanitize_filename`
+  implementations that had DIVERGED: `validation/input.rs` got the P3.7 fix (Unicode `is_alphanumeric` →
+  KEEPS Sorani letters, exported clips stay meaningfully named), but `agentic.rs`'s separate copy still used
+  `is_ascii_alphanumeric` — folding every Kurdish letter to `_`, so a Sorani-named source produced a
+  `____.model.hash.whole_file_reference.txt` reference file (cosmetic, not a collision — `path_key`'s
+  full-path hash already disambiguates). The P3.7 fix never reached this copy. Changed it to Unicode
+  `is_alphanumeric` to match the exporter (keeping its trim + empty→"artifact" fallback, which the export's
+  pure char-map lacks, so a full merge wasn't right); +1 test pinning `کوردی` → `کوردی`. cargo: fmt clean,
+  clippy -D warnings clean, `--lib` 815 passed. (Scan also checked `percentile` ×3 — different signatures/
+  purposes, f64 vs i64, not duplicates.)
 - **Drift-proofed `learning_text_key` — the "genuine correction vs no-op" key gating BOTH training channels**
   It had TWO byte-identical private copies: `db.rs` (gates the corrections ledger + agent_examples) and
   `jury/learning.rs` (gates the DPO preference dataset). Both decide "wrong ≠ fix" through it. If one grew

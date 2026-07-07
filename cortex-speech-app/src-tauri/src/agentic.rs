@@ -516,7 +516,11 @@ fn guess_audio_mime_type(path: &Path) -> &'static str {
 fn sanitize_filename(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+        // Unicode `is_alphanumeric`, NOT `is_ascii_alphanumeric` — a Sorani stem (e.g. "کوردی") must
+        // stay meaningful in the reference-file name, matching the export sanitizer's P3.7 behavior
+        // (validation::input::sanitize_filename). The old ASCII-only form folded every Kurdish letter to
+        // '_', producing "____"-style names for Sorani sources — inconsistent with the exported clips.
+        if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.') {
             out.push(ch);
         } else {
             out.push('_');
@@ -663,6 +667,17 @@ fn preview_tokens(tokens: &[String], max_tokens: usize) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn sanitize_filename_keeps_sorani_letters_like_the_exporter() {
+        // Aligns with validation::input::sanitize_filename (P3.7): Sorani/Arabic-script letters are
+        // Unicode-alphanumeric and must be KEPT so a reference-file name stays meaningful; only unsafe
+        // characters (spaces, path/reserved) become '_'. The old ASCII-only form mangled کوردی -> "____".
+        assert_eq!(sanitize_filename("کوردی"), "کوردی", "Sorani letters preserved");
+        assert_eq!(sanitize_filename("clip 01/bad:name"), "clip_01_bad_name", "unsafe chars -> _");
+        assert_eq!(sanitize_filename("gesht-01.wav"), "gesht-01.wav", "safe punctuation kept");
+        assert_eq!(sanitize_filename("!!!"), "artifact", "an all-unsafe stem still yields a usable name");
+    }
 
     #[test]
     fn base64_encode_matches_known_vectors() {
