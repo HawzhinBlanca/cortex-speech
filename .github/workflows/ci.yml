@@ -98,6 +98,12 @@ jobs:
       - name: Frontend tests
         run: npm test
 
+      # tauri::generate_context! (compiled by clippy / cargo test below) requires build.frontendDist
+      # ("../dist") to exist. This job never runs `tauri build` (which would trigger the
+      # beforeBuildCommand), so build the frontend explicitly here — mirrors the Linux/macOS smoke jobs.
+      - name: Build frontend (dist/ for tauri generate_context)
+        run: npm run build
+
       - name: Python policy regressions
         run: npm run test:python-policies
 
