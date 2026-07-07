@@ -1162,6 +1162,15 @@ Kept closing the testable ones I'd previously mis-bucketed:
 
 ## Deep-check remediation — ~51/61 (2026-07-07)
 
+- **FULL-GATE CERTIFICATION (branch tip, after the session's ~29 changes) — all green, zero regressions**
+  Ran the complete local gate suite fresh on the branch tip: `cargo fmt --check` clean; `cargo clippy
+  --all-targets -- -D warnings` exit 0; `cargo test --lib` **816 passed / 0 failed / 6 ignored**;
+  `svelte-check`+`tsc` **406 files / 0 errors**; `eslint` clean; `vitest` **134/134**; `npm run
+  test:python-policies` **exit 0 (22 policies)**; working tree clean, HEAD pushed. So every hardening
+  change this session composes cleanly — the branch is in a fully-shippable, regression-free state. The
+  ONLY remaining step to a declared 10/10 is the owner-gated accuracy measurement on the 4090 (the ~7
+  numbers a headless checkout cannot honestly produce): `make build-app` → the now-corrected measurement
+  suite (scorecard_7b space-kept CER, empty-manifest guards, WAV gold fix) → P7 re-audit.
 - **Documented the autosave idempotency invariant (prevents a future double-count footgun)** Audited
   `autosave.ts` (data-safety: the debounced curation-edit saver). Its core is correct — the flush-before-rekey
   genuinely prevents the documented cross-segment data loss. But I traced a real (benign-today) double-save
