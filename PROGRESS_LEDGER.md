@@ -1162,6 +1162,16 @@ Kept closing the testable ones I'd previously mis-bucketed:
 
 ## Deep-check remediation — ~51/61 (2026-07-07)
 
+- **REAL BUG (fresh surface, past 6 clean audits) — a corrupt crash report permanently WEDGED the crash
+  notification and LEAKED reports** `take_latest_crash_summary` returned `None` on the early `.ok()?` if the
+  newest `crash-*.json` couldn't be read/parsed — BEFORE the "remove all reports" loop. But a crash report
+  is written DURING the panic that produced it, so a truncated/half-written file is realistic. Effect: a
+  corrupt latest report made the function return `None` every startup (no "last session crashed" notice ever)
+  AND never cleared any report (they accumulate on disk forever) — the notification silently, permanently
+  broken. Fixed: build the summary with a generic fallback ("the previous session ended unexpectedly —
+  details in the logs folder") for an unreadable/malformed report, and remove EVERY report UNCONDITIONALLY
+  so one corrupt file can never wedge the feature or leak. +1 regression test (corrupt newest → generic
+  notice + all cleared + nothing left on disk). cargo: fmt clean, clippy -D warnings clean, `--lib` 817.
 - **FULL-GATE CERTIFICATION (branch tip, after the session's ~29 changes) — all green, zero regressions**
   Ran the complete local gate suite fresh on the branch tip: `cargo fmt --check` clean; `cargo clippy
   --all-targets -- -D warnings` exit 0; `cargo test --lib` **816 passed / 0 failed / 6 ignored**;

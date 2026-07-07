@@ -36,15 +36,24 @@ pub fn take_latest_crash_summary(data_dir: &Path) -> Option<String> {
         .collect();
     // The sanitized ISO timestamp in the filename sorts lexicographically, so max = newest.
     let latest = entries.iter().max_by_key(|e| e.file_name())?;
-    let body = std::fs::read_to_string(latest.path()).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let summary = format!(
-        "{} at {} (v{})",
-        v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown"),
-        v.get("location").and_then(|l| l.as_str()).unwrap_or("?"),
-        v.get("version").and_then(|x| x.as_str()).unwrap_or("?"),
-    );
-    // Shown once: remove every crash report (crashes are rare; the file log retains detail).
+    // Build the summary from the latest report. A truncated/corrupt report is realistic — it is written
+    // DURING the panic that produced it, so the process can be killed mid-write — and must NOT wedge the
+    // notification: if it can't be read/parsed, fall back to a generic notice rather than returning early.
+    let summary = std::fs::read_to_string(latest.path())
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .map(|v| {
+            format!(
+                "{} at {} (v{})",
+                v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown"),
+                v.get("location").and_then(|l| l.as_str()).unwrap_or("?"),
+                v.get("version").and_then(|x| x.as_str()).unwrap_or("?"),
+            )
+        })
+        .unwrap_or_else(|| "the previous session ended unexpectedly (details in the logs folder)".to_string());
+    // Shown once: remove EVERY crash report REGARDLESS of parse success (crashes are rare; the file log
+    // retains detail). Doing this unconditionally is what prevents a single corrupt report from wedging
+    // the notification forever and leaking reports on disk.
     for e in &entries {
         let _ = std::fs::remove_file(e.path());
     }
@@ -66,6 +75,24 @@ mod tests {
         assert!(summary.contains("b.rs:2:2"));
         // Surfaced once: a second call finds nothing (reports cleared).
         assert!(take_latest_crash_summary(tmp.path()).is_none(), "reports cleared after being surfaced");
+    }
+
+    #[test]
+    fn corrupt_latest_report_still_surfaces_generically_and_clears() {
+        // A crash report is written DURING a panic, so a truncated/half-written file is realistic. The
+        // newest report being unparseable must NOT wedge the notification forever (return None every
+        // startup) nor leak reports — it must surface a generic notice and clear EVERY report.
+        let tmp = tempfile::tempdir().unwrap();
+        write_crash_report(tmp.path(), "a.rs:1:1", "a real older panic", "2026-06-20T00:00:00Z").unwrap();
+        // The NEWEST file (sorts last) is corrupt JSON.
+        let crashes = tmp.path().join("crashes");
+        std::fs::write(crashes.join("crash-2026-06-21T00-00-00Z.json"), b"{ this is not valid json").unwrap();
+
+        let summary = take_latest_crash_summary(tmp.path()).expect("a corrupt latest must STILL surface");
+        assert!(summary.contains("ended unexpectedly"), "generic fallback for a corrupt report: {summary}");
+        // Cleared once: no report (corrupt or valid) survives to wedge the next startup.
+        assert!(take_latest_crash_summary(tmp.path()).is_none(), "all reports cleared despite the corrupt one");
+        assert_eq!(std::fs::read_dir(&crashes).unwrap().count(), 0, "no report leaked on disk");
     }
 
     #[test]
