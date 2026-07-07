@@ -251,8 +251,8 @@ fn transcribe_inline_audio(
         .set("Content-Type", "application/json")
         .send_json(payload)
         .map_err(|e| format!("Gemini inline audio request failed: {}", redact_for_user(e, api_key)))?;
-    let body: Value =
-        crate::http::json_bounded(response).map_err(|e| format!("Failed to parse Gemini inline audio response: {e}"))?;
+    let body: Value = crate::http::json_bounded(response)
+        .map_err(|e| format!("Failed to parse Gemini inline audio response: {e}"))?;
     extract_gemini_text(&body)
 }
 

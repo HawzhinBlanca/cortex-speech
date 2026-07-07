@@ -618,7 +618,10 @@ mod tests {
         // deleted from the canonical form. Wrap the Kurdish word in RLE...PDF and an LRI...PDI isolate
         // plus a leading ALM; the canonical form must be just the letters.
         let out = n.normalize("\u{061C}\u{202B}کورد\u{202C}\u{2066}ی\u{2069}");
-        for cp in ['\u{061C}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'] {
+        for cp in [
+            '\u{061C}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}',
+            '\u{2069}',
+        ] {
             assert!(!out.contains(cp), "bidi control U+{:04X} must be stripped, got {out:?}", cp as u32);
         }
         assert_eq!(out, "کوردی", "bidi controls deleted without introducing spaces");
