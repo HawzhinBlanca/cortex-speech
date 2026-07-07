@@ -1646,3 +1646,50 @@ a gate):
    once locally to realign your models/ with the corrected pins (replaces the mystery-provenance 1.24.4 DLL
    with the official verified CPU 1.24.4). I did NOT touch your local models. Did not run fetch-models here
    to avoid clobbering the junctioned checkout; pins independently verified against the official zip.
+
+## ADVERSARIAL STRESS + BUG-HUNT SWEEP (2026-07-07)
+
+Ran a deep stress pass (proptests @3000 cases + reliability(23) + soak(110s) — all 0 failures) plus SIX
+parallel adversarial hunters (panics, arithmetic/casts, concurrency, resource/error-handling,
+input-validation, frontend/IPC) each given the absolute worktree path and told to verify against live
+source. Honest headline: the codebase is exceptionally hardened — **statistical core CLEAN**
+(significance/stats/scorecard/eval, the honesty-critical math, verified correct incl. bootstrap CI degenerate-N,
+Bessel n-1, p-value var<=0 sign-test fallback, micro/macro empty-ref consistency), arithmetic CLEAN
+(offset-wrap/cast class already guarded), no adversarial-audio panic, concurrency all-but-one hardened. The
+real findings were concentrated; I verified each against current source and FIXED the actionable ones (each
+with cargo check + clippy + `cargo test --lib` = 818 pass, 0 fail):
+
+- **HIGH (one-law):** `db.rs map_row` masked ANY decode error on the jury/gold/human cols (17-26) with a
+  default — a transient/type-mismatch fault could silently read a genuinely gold, human-reviewed segment as
+  `is_gold=false`/`human_decision=None` and let it be overwritten or leak into a training export. Now defaults
+  ONLY on a genuinely-absent column (old schema) and PROPAGATES real errors (`optional_col` helper), matching
+  cols 0-16 and the fail-closed `record_model_correction`.
+- **HIGH (one-law):** `settings.validate()` didn't bounds-check numeric knobs; a NaN `max_wer/cer_threshold`
+  from the webview makes every `metric > threshold` false → ALL segments silently pass the export quality
+  gate. Now rejects non-finite / out-of-[0,1] thresholds (+ vad, split ratios) at the IPC trust boundary
+  (regression test added).
+- **Low-Med:** `wav2vec2_asr` — negative/huge ONNX logits dims (`-1 as usize`) → overflow → OOB panic on a
+  hostile/env-overridden model; unbounded `vec![;max_id+1]` from a hostile vocab.json → OOM. Now rejects
+  non-positive dims + `checked_mul`, and caps vocab id (regression test added).
+- **Low-Med:** WSL-refine CANCEL flag TOCTOU — a cancel racing the previous run's guard could leak a stale
+  cancel that silently aborts the NEXT 7B batch doing zero work. Now resets CANCEL at run start (standard
+  cancellation-token pattern) instead of trusting the end-of-run guard.
+- **Low (defensive):** `diarization`/`denoiser` `sample_rate as i32` → `try_from` no-wrap guard.
+
+FRONTEND findings — verified against live source and the 3 correctness-critical ones FIXED (typecheck 0
+errors, vitest 134/134):
+- **#1 (High) ReviewInbox duplicate human decision on the last queue item** — CONFIRMED + FIXED. advance()
+  does not move past the final item and the verb handlers guarded only `!current || isSubmitting`, so a
+  second keypress on the last clip recorded a DUPLICATE biometric label. Added `|| current.humanDecision`
+  to accept/reject/commitEdit/flag.
+- **#11 (Med) ReviewMode accept-during-retranscribe on a stale draft** — CONFIRMED + FIXED. submit() (and
+  undoLast) guarded only `saving`, not `retranscribing`; a decision mid-retranscribe landed on the old
+  draft. Added `|| retranscribing`.
+- **#4 (Med, RTL) ReviewInbox mixed label+text bidi** — CONFIRMED + FIXED. `.hyp-text` used
+  `unicode-bidi: embed`; a transcript starting with Latin/digit could reorder across the "Raw ASR:" label.
+  Changed to `unicode-bidi: isolate`.
+- **#2 (claimed Med) `$: inboxPlaying=false` fires every reactive pass** — FALSE POSITIVE (verified): the
+  block reads only `currentIndex`, so Svelte-4 dependency tracking re-runs it ONLY on navigation (intended).
+- Remaining frontend candidates (#5 flag()-no-undo, #7-#10 minor) + Low backend items (crash_handler.rs
+  dead-module cleanup, normalizer bidi-control stripping, update_segment_bounds upper cap, db.info
+  sizeBytes-on-stat-fail) — logged for a later batch; lower severity.

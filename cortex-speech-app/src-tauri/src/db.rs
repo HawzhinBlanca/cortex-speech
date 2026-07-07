@@ -1498,6 +1498,23 @@ impl Database {
         Ok(())
     }
 
+    /// Read a column that an older schema may lack (the jury cols were added by Migration v11 and
+    /// alignment_quality by v12). A genuinely ABSENT column (`InvalidColumnIndex`, i.e. a row read
+    /// through a pre-migration schema) yields `None`, and a SQL `NULL` yields `None` — both the
+    /// intended defaults. But a type-mismatch / decode fault PROPAGATES instead of being masked:
+    /// silently defaulting one of these on a decode error would misreport a genuinely gold /
+    /// human-reviewed segment as `is_gold = false` / `human_decision = None`, which the
+    /// human-protection guards key on — the exact silent-corruption the honesty rule forbids. This
+    /// mirrors the strict `?` handling of columns 0-16 and the fail-closed `is_gold` read in
+    /// `record_model_correction`.
+    fn optional_col<T: rusqlite::types::FromSql>(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<Option<T>> {
+        match row.get::<_, Option<T>>(idx) {
+            Ok(value) => Ok(value),
+            Err(rusqlite::Error::InvalidColumnIndex(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
     fn map_row(row: &rusqlite::Row) -> rusqlite::Result<SpeechSegment> {
         Ok(SpeechSegment {
             id: row.get(0)?,
@@ -1517,18 +1534,19 @@ impl Database {
             snr_db: row.get(14)?,
             split: row.get(15)?,
             ood_score: row.get(16)?,
-            // Jury fields — added by Migration v11; default when column missing
-            verdict: row.get(17).unwrap_or(None),
-            verdict_transcript: row.get(18).unwrap_or(None),
-            rationale: row.get(19).unwrap_or(None),
-            evidence_json: row.get(20).unwrap_or(None),
-            agent_confidence: row.get(21).unwrap_or(None),
-            escalated: row.get::<_, i32>(22).unwrap_or(0) != 0,
-            human_decision: row.get(23).unwrap_or(None),
-            corrected_at: row.get(24).unwrap_or(None),
-            is_gold: row.get::<_, i32>(25).unwrap_or(0) != 0,
-            // Alignment quality — added by Migration v12; default to None when column missing
-            alignment_quality: row.get(26).unwrap_or(None),
+            // Jury fields — added by Migration v11. Default ONLY when the column is genuinely absent
+            // (old schema) or NULL; a decode error propagates so it can't silently strip provenance.
+            verdict: Self::optional_col(row, 17)?,
+            verdict_transcript: Self::optional_col(row, 18)?,
+            rationale: Self::optional_col(row, 19)?,
+            evidence_json: Self::optional_col(row, 20)?,
+            agent_confidence: Self::optional_col(row, 21)?,
+            escalated: Self::optional_col::<i32>(row, 22)?.unwrap_or(0) != 0,
+            human_decision: Self::optional_col(row, 23)?,
+            corrected_at: Self::optional_col(row, 24)?,
+            is_gold: Self::optional_col::<i32>(row, 25)?.unwrap_or(0) != 0,
+            // Alignment quality — added by Migration v12; same fail-closed treatment.
+            alignment_quality: Self::optional_col(row, 26)?,
         })
     }
 

@@ -2706,8 +2706,15 @@ pub fn run_wsl_refinement(
         return Err("WSL 7B refinement batch transcription is already running.".into());
     }
     // The running flag is now OURS; every early return below MUST clear it or the guard would wedge.
-    // CANCEL is NOT reset here: the WslRefineRunningGuard cleared it when the previous run ended, so it
-    // is already false, and resetting it here could clobber a cancel that races this claim.
+    // Reset CANCEL at the START of the run (standard cancellation-token pattern) rather than trusting
+    // the previous run's guard to have cleared it. The guard clears CANCEL then RUNNING as two separate
+    // atomic stores, so a `cancel` that read RUNNING==true just before the guard could set CANCEL=true
+    // AFTER the guard cleared it — leaking a stale cancel that would make THIS fresh batch abort
+    // immediately, doing zero work, with no error surfaced. Clearing it here, now that RUNNING is
+    // exclusively ours, drops that leaked value. (The only residual is a cancel landing in the tiny
+    // window between the claim above and this store; that is user-recoverable by clicking cancel again,
+    // whereas the leak was silent and unrecoverable.)
+    WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
 
     // Read everything the worker needs under the locks NOW, then release them so the long per-segment
     // loop holds no AppState lock. A 7B call can take seconds; holding a lock across the loop would

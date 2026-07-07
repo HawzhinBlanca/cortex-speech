@@ -103,9 +103,17 @@ pub fn load_lang_vocab(vocab_path: &Path, lang: &str) -> Result<Vec<String>, Str
     vocab_from_map(sub)
 }
 
+/// A CTC vocab far larger than any real token set indicates a corrupt or hostile vocab.json (an id
+/// like 4e9 would try to allocate billions of empty strings -> OOM abort). Real MMS/Wav2Vec2 heads are
+/// a few thousand tokens; cap well above that so no legitimate model is rejected.
+const MAX_VOCAB_ID: u64 = 1_000_000;
+
 fn vocab_from_map(sub: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<String>, String> {
-    let max_id = sub.values().filter_map(|x| x.as_u64()).max().ok_or_else(|| "empty vocab".to_string())? as usize;
-    let mut toks = vec![String::new(); max_id + 1];
+    let max_id = sub.values().filter_map(|x| x.as_u64()).max().ok_or_else(|| "empty vocab".to_string())?;
+    if max_id > MAX_VOCAB_ID {
+        return Err(format!("vocab.json max token id {max_id} exceeds sane bound {MAX_VOCAB_ID}"));
+    }
+    let mut toks = vec![String::new(); (max_id as usize) + 1];
     for (tok, id) in sub {
         if let Some(i) = id.as_u64() {
             toks[i as usize] = tok.clone();
@@ -186,9 +194,18 @@ pub fn wav2vec2_logits(
     if shape.len() != 3 {
         return Err(format!("unexpected logits rank {shape:?}"));
     }
+    // Reject non-positive dims before casting to usize. An ONNX output legitimately may declare a
+    // dynamic dim as -1 (or 0); `-1i64 as usize` is usize::MAX, so `frames_n * vocab` would overflow
+    // (and could wrap past the buffer guard below), then the per-frame slice at decode time panics
+    // out-of-bounds. A malformed/env-overridden model (verify is skipped for non-bundled paths) must
+    // fail cleanly, not crash the process.
+    if shape[1] <= 0 || shape[2] <= 0 {
+        return Err(format!("logits shape has a non-positive dim {shape:?}"));
+    }
     let frames_n = shape[1] as usize;
     let vocab = shape[2] as usize;
-    if data.len() < frames_n * vocab {
+    let needed = frames_n.checked_mul(vocab).ok_or_else(|| format!("logits shape {shape:?} overflows"))?;
+    if data.len() < needed {
         return Err("logits buffer smaller than shape".to_string());
     }
     let tokens = load_lang_vocab(vocab_path, lang)?;
@@ -205,7 +222,7 @@ pub fn wav2vec2_logits(
             tokens.len()
         ));
     }
-    Ok((data[..frames_n * vocab].to_vec(), frames_n, vocab, tokens))
+    Ok((data[..needed].to_vec(), frames_n, vocab, tokens))
 }
 
 /// Run the fine-tuned Wav2Vec2-CTC model on raw 16 kHz mono audio via `ort` and decode to text.
@@ -226,6 +243,28 @@ mod tests {
         assert!(!is_bundled_finetuned(Path::new("/x/omniasr-ctc-300m/model.onnx")), "other engine");
         assert!(!is_bundled_finetuned(Path::new("/x/finetuned-mms-ckb/other.onnx")), "wrong file");
         assert!(!is_bundled_finetuned(Path::new("/custom/exported.onnx")), "custom override");
+    }
+
+    #[test]
+    fn vocab_from_map_rejects_hostile_or_empty_vocab_without_oom() {
+        use serde_json::json;
+
+        // Empty vocab -> clear error, not a panic.
+        let empty = json!({}).as_object().unwrap().clone();
+        assert!(vocab_from_map(&empty).is_err(), "empty vocab must error");
+
+        // A max id far above any real CTC head must be rejected BEFORE the vec![...; max_id+1]
+        // allocation (a 4e9 id would otherwise try to allocate billions of strings -> OOM abort).
+        let hostile = json!({ "a": 0, "b": 4_000_000_000u64 }).as_object().unwrap().clone();
+        let err = vocab_from_map(&hostile).unwrap_err();
+        assert!(err.contains("exceeds sane bound"), "hostile id surfaced: {err}");
+
+        // A normal small vocab builds a dense token table indexed by id.
+        let ok = json!({ "<pad>": 0, "a": 1, "b": 2 }).as_object().unwrap().clone();
+        let toks = vocab_from_map(&ok).unwrap();
+        assert_eq!(toks.len(), 3);
+        assert_eq!(toks[1], "a");
+        assert_eq!(toks[2], "b");
     }
 
     #[test]

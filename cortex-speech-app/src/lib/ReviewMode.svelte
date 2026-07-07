@@ -212,7 +212,7 @@
 
   async function undoLast() {
     const last = undoHistory[undoHistory.length - 1];
-    if (!last || saving) return;
+    if (!last || saving || retranscribing) return;
     saving = true;
     undoHistory = undoHistory.slice(0, -1);
     try {
@@ -347,7 +347,11 @@
 
   async function submit(acceptAsIs: boolean) {
     const seg = current;
-    if (!seg || saving) return;
+    // Guard `retranscribing` too (retranscribe/markBad already do): a champion re-transcribe can take
+    // several seconds, and accepting/saving mid-flight would record a human decision on the stale
+    // pre-retranscribe draft that the in-flight run is about to overwrite — the human "accept" would
+    // land on text the reviewer no longer sees.
+    if (!seg || saving || retranscribing) return;
     const original = originalText(seg).trim();
     const text = acceptAsIs ? original : editText.trim();
     // Never save an empty edit (mirrors the Save button's disabled guard — the Ctrl+Enter shortcut

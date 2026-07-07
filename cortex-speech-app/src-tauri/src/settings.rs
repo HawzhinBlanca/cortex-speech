@@ -497,6 +497,37 @@ impl AppSettings {
         if self.llm_system_prompt.len() > MAX_PROMPT_LEN {
             return Err(AppError::Validation("LLM system prompt is too long".into()));
         }
+
+        // Server-side bounds on the numeric gate/threshold knobs. Without this a webview payload
+        // (XSS-planted or a hand-edited settings.json) could set e.g. `max_wer_threshold = NaN`,
+        // and every `wer > threshold` comparison is then `false` — so ALL segments silently pass the
+        // export quality gate that should have failed them. A non-finite / out-of-range threshold is
+        // never a legitimate value, so reject it at the trust boundary rather than let it quietly
+        // defeat the load-bearing gate (the project's honesty rule: a gate must never be silently
+        // disabled). Rates that are compared as `metric > threshold` must be finite in [0, 1].
+        for (name, value) in [
+            ("max_wer_threshold", self.max_wer_threshold),
+            ("max_cer_threshold", self.max_cer_threshold),
+            ("jury_t1_threshold", self.jury_t1_threshold),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(AppError::Validation(format!("{name} must be a finite value in [0, 1]")));
+            }
+        }
+        if !self.vad_threshold.is_finite() || !(0.0..=1.0).contains(&self.vad_threshold) {
+            return Err(AppError::Validation("vad_threshold must be a finite value in [0, 1]".into()));
+        }
+        // Split ratios are relative weights (normalized downstream), so only require finite and
+        // non-negative — a NaN/negative weight would corrupt the train/val/test partitioning.
+        for (name, value) in [
+            ("hf_train_ratio", self.hf_train_ratio),
+            ("hf_val_ratio", self.hf_val_ratio),
+            ("hf_test_ratio", self.hf_test_ratio),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(AppError::Validation(format!("{name} must be a finite value >= 0")));
+            }
+        }
         Ok(())
     }
 
@@ -893,6 +924,38 @@ mod tests {
         let huge_endpoint =
             AppSettings { llm_endpoint: format!("https://{}", "a".repeat(3000)), ..AppSettings::default() };
         assert!(matches!(huge_endpoint.validate(), Err(crate::error::AppError::Validation(_))));
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_or_out_of_range_gate_thresholds() {
+        // The default settings must pass — the guard must not reject legitimate values.
+        assert!(AppSettings::default().validate().is_ok(), "default thresholds must validate");
+
+        // A NaN quality-gate threshold makes every `wer > threshold` comparison false, so ALL segments
+        // silently pass the export gate. It must be rejected at the trust boundary, not accepted.
+        for bad in [f64::NAN, f64::INFINITY, -0.1, 1.5] {
+            let s = AppSettings { max_wer_threshold: bad, ..AppSettings::default() };
+            assert!(
+                matches!(s.validate(), Err(crate::error::AppError::Validation(_))),
+                "max_wer_threshold {bad} must be rejected (out of [0,1] / non-finite)"
+            );
+            let s = AppSettings { max_cer_threshold: bad, ..AppSettings::default() };
+            assert!(matches!(s.validate(), Err(crate::error::AppError::Validation(_))), "max_cer_threshold {bad}");
+            let s = AppSettings { jury_t1_threshold: bad, ..AppSettings::default() };
+            assert!(matches!(s.validate(), Err(crate::error::AppError::Validation(_))), "jury_t1_threshold {bad}");
+        }
+
+        // vad_threshold (f32) same contract.
+        for bad in [f32::NAN, f32::INFINITY, -1.0, 2.0] {
+            let s = AppSettings { vad_threshold: bad, ..AppSettings::default() };
+            assert!(matches!(s.validate(), Err(crate::error::AppError::Validation(_))), "vad_threshold {bad}");
+        }
+
+        // Split ratios: finite and non-negative (they are normalized downstream, so >1 is fine).
+        for bad in [f64::NAN, f64::INFINITY, -0.5] {
+            let s = AppSettings { hf_train_ratio: bad, ..AppSettings::default() };
+            assert!(matches!(s.validate(), Err(crate::error::AppError::Validation(_))), "hf_train_ratio {bad}");
+        }
     }
 
     #[test]
