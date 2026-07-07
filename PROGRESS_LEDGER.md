@@ -1574,9 +1574,20 @@ Ran the actual charter/ship gates fresh to find anything still red:
 So of `make ship-check`'s 10 gates, **9 are green here and the 10th (test-e2e) is the owner's `build-app`
 step**. Every automatable ship-gate passes.
 
-TRULY REMAINING (~7): OWNER-GATED measurement (~5 — the P7 re-audit on the 4090, the reliability drills, and
-the gold marathon; faking is the one prohibition), media-cache SLICING + true-streaming decode (need
-real-audio observation this sandbox cannot honestly provide). Plus the two owner/CI build-gated steps
+**Media-cache SLICING — examined and DELIBERATELY NOT implemented (2026-07-07).** `src-tauri/src/media.rs`
+copies the whole source file into a TTL cache; `ensure_cache_room` already refuses a copy that would
+exhaust the disk/WAL volume before writing a byte, so the current whole-file path is *correct and robust*.
+Slicing (decode source → extract the segment's time range → re-encode) is a disk/latency OPTIMIZATION, not a
+correctness fix, and its correctness — zero sample offset, no corruption across wav/mp3/m4a — can only be
+confirmed by LISTENING to the extracted clip, which a headless checkout cannot do. Shipping a WAV-only
+half-version would add an unverifiable path to a subsystem that is presently correct. Per the one law
+("nothing is done until MEASURED on real audio") this stays OWNER-GATED, not a headless defect; reclassified
+from "remaining defect" to owner-decision optimization.
+
+TRULY REMAINING (~6): OWNER-GATED measurement (~5 — the P7 re-audit on the 4090, the reliability drills, and
+the gold marathon; faking is the one prohibition), and media-cache slicing / true-streaming decode as an
+owner-decision optimization (needs real-audio listening, see the note just above). Plus the two owner/CI
+build-gated steps
 (`test-e2e` and `make build-app` → a fresh exe). Everything implementable AND verifiable in a headless
 Windows checkout — the charter verify-10 gate, all rust/frontend tests, npm audit, cargo deny (now
 advisory-clean), a real committed-fixture accuracy measurement (18.60% CER), and a genuine dead-code cleanup
