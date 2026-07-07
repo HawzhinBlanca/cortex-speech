@@ -1227,6 +1227,16 @@ speaker-clustering state machine with high regression risk and the memory win is
   `["settings.json","champion.json"]` DUPLICATING `snapshot::EXTRA_STATE` — a drift hazard where a file
   added to the save-side would be silently snapshotted-but-never-restored. Made `EXTRA_STATE` `pub(crate)`
   and the restore loop consumes it → single source of truth, save/restore can't diverge.
+- **Normalizer adversarial review — sound, + fixed a dead/contradictory digit-separator fold** Audited the
+  load-bearing Sorani normalizer (feeds metrics, LOOP-0 matching, search, dedup): the NFC-first ordering,
+  Kaf/Yeh/hamza folds, ZWNJ→space vs zero-width-strip split, and the subtle word-final-heh logic
+  (`protect_word_final_heh_tatweel` → ھ for a deliberate consonant heh, then `normalize_heh_contextual` →
+  ە for a bare word-final heh) are all correct. Found a real smell in `normalize_digits`: two contradictory
+  passes folded the Arabic THOUSANDS separator U+066C — first to ASCII `,`, then a DEAD second pass to the
+  Arabic comma `،` (no-op, since the first already consumed every U+066C). The ASCII `,` escaped Step-1's
+  punctuation unification, so an ungrouped U+066C emitted a stray ASCII comma inconsistent with the
+  pipeline's all-`،` convention. Collapsed to one correct fold (U+066B→`.`, U+066C→`،` U+060C) + a
+  regression test; all 30 normalizer tests (incl. the idempotence proptest) green, `--lib` 811 passed.
 - **Metric harness (WER/CER) adversarial review — verified sound + boundary pinned** The whole project's
   "never fabricate a metric" law rests on the harness COMPUTING metrics correctly, so I audited `wer.rs`:
   `levenshtein` returns `prev[m]` correctly; `compute_wer/cer` = edit-distance / ref-len clamped to 1.0 with
