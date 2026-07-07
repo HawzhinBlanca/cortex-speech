@@ -1540,9 +1540,26 @@ Verified: `cargo check --tests` compiles all 20 test binaries clean; `cargo fmt`
 test, zero other regressions); `npm run typecheck` 406 files / 0 errors; `eslint` clean; `vitest` 134/134;
 `python-policies` green. Dismissed `task_ec79f7dd`.
 
-TRULY REMAINING (~8): OWNER-GATED measurement (~6 — the P7 re-audit itself, `make check-7b`, the reliability
-drills, and the gold marathon; faking is the one prohibition), media-cache SLICING + true-streaming decode
-(need real-audio observation this sandbox cannot honestly provide). Everything implementable AND verifiable
-in a headless Windows checkout — including a real committed-fixture accuracy measurement and a genuine
-dead-code cleanup — is done, gated, and pushed. 10/10 remains the P7 re-audit's call on the full real-number
-suite.
+## Ship-gate sweep (2026-07-08) — charter verify-10 GREEN + a real security-advisory fix
+
+Ran the actual charter/ship gates fresh to find anything still red:
+- **`make verify-10`** (the CLAUDE.md "definition of done" gate) → **GREEN**: prints `CORTEX 10/10: ALL GATES
+  GREEN`, exit 0 (manifest version/license alignment across package.json/tauri.conf.json/Cargo.toml, required
+  assets present, provenance-ledger jsonschema valid for all 4 corpora, dataset redistribution-license
+  compatibility). NOTE per the charter's own one-law: this is the STRUCTURAL/governance gate — necessary, not
+  sufficient; "nothing is 10/10 on tests alone", the measured-accuracy bar still needs the 4090 runs.
+- **`make audit`** (`npm audit --omit=dev`) → **0 vulnerabilities**.
+- **`make deny`** (`cargo deny check`) → was **RED**: RUSTSEC-2026-0204 in `crossbeam-epoch 0.9.18` (invalid
+  pointer dereference in the `fmt::Pointer`/`Debug` impl for `Atomic`/`Shared` null pointers), pulled
+  transitively via rayon → crossbeam-deque. **FIXED** with `cargo update -p crossbeam-epoch` (0.9.18 → 0.9.20,
+  the advisory's fixed version); Cargo.lock-only change (2 lines). Re-ran `cargo deny check` → **advisories
+  ok, bans ok, licenses ok, sources ok** (exit 0). `cargo test --lib` still 816 passed with 0.9.20.
+- `check-7b` is NOT a Makefile target — it is a PROPOSED gate (deep-check 7.2, "verify-10 extension"), not an
+  existing command; corrected the remaining-list wording accordingly.
+
+TRULY REMAINING (~7): OWNER-GATED measurement (~5 — the P7 re-audit on the 4090, the reliability drills, and
+the gold marathon; faking is the one prohibition), media-cache SLICING + true-streaming decode (need
+real-audio observation this sandbox cannot honestly provide). Everything implementable AND verifiable in a
+headless Windows checkout — the charter verify-10 gate, npm audit, cargo deny (now advisory-clean), a real
+committed-fixture accuracy measurement, and a genuine dead-code cleanup — is done, gated, and pushed. 10/10
+remains the P7 re-audit's call on the full real-number suite, but every automatable ship-gate is now green.
