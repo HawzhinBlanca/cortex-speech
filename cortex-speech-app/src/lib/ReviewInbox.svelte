@@ -148,7 +148,9 @@
 
   // ── Actions ──────────────────────────────────────────────────────────────────
   async function accept() {
-    if (!current || isSubmitting) return;
+    // Already-decided guard: advance() does NOT move past the LAST queue item, so without this a
+    // second keypress on the final clip would record a DUPLICATE human decision (a biometric label).
+    if (!current || isSubmitting || current.humanDecision) return;
     // Snapshot the target before the await — currentIndex/current can change mid-flight if the user
     // clicks another rail item (the rail is not disabled during submit), which would otherwise stamp
     // this decision onto the wrong segment's queue slot.
@@ -183,7 +185,7 @@
   }
 
   async function commitEdit() {
-    if (!current || !editText.trim() || isSubmitting) return;
+    if (!current || !editText.trim() || isSubmitting || current.humanDecision) return;
     const cur = current;
     const idx = currentIndex;
     const text = editText.trim();
@@ -208,7 +210,7 @@
   }
 
   async function reject() {
-    if (!current || isSubmitting) return;
+    if (!current || isSubmitting || current.humanDecision) return;
     const cur = current;
     const idx = currentIndex;
     isSubmitting = true;
@@ -244,7 +246,7 @@
   }
 
   async function flag() {
-    if (!current || isSubmitting) return;
+    if (!current || isSubmitting || current.humanDecision) return;
     const cur = current;
     const idx = currentIndex;
     isSubmitting = true;
@@ -916,7 +918,11 @@
   }
   .hyp-text {
     direction: rtl;
-    unicode-bidi: embed;
+    /* isolate, not embed: the transcript sits inline after an LTR-ish "Raw ASR:" label in an RTL
+       block. `embed` still lets a transcript that STARTS with a Latin token or digit reorder across
+       the label boundary (colon/label jump to the wrong side). `isolate` gives the transcript its
+       own bidi context so it can never reflow the label — same isolation the <bdi> model-name spans use. */
+    unicode-bidi: isolate;
   }
 
   .verdict-text {
