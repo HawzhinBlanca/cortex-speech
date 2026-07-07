@@ -15,7 +15,14 @@ export interface AutosaveDeps<T extends object> {
   targetId: () => string | null;
   /** Freshest row for an id (from the store), or null if it no longer exists. */
   getRow: (id: string) => T | null;
-  /** Persist a merged row. */
+  /**
+   * Persist a merged row. MUST be idempotent (a pure upsert): if the debounce timer's save is still
+   * in-flight when `flush`/`flushAsync` runs (e.g. the window closes the instant after the timer fired),
+   * `pending` is not cleared until that save's `.then`, so the SAME entry can be persisted a SECOND time.
+   * That is harmless for an idempotent field write (the app wires this to `updateSegment`), but a
+   * side-effectful save — recording a human decision, crediting LOOP-0 confidence, appending a ledger
+   * row — would DOUBLE-COUNT. Keep side effects out of this callback; do them on the explicit verify path.
+   */
   save: (row: T) => Promise<void>;
   /** UI state transitions ('saving' on schedule, 'saved' on success, 'idle' on no-op/error). */
   onState?: (state: SaveState) => void;

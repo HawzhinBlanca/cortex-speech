@@ -1162,6 +1162,15 @@ Kept closing the testable ones I'd previously mis-bucketed:
 
 ## Deep-check remediation — ~51/61 (2026-07-07)
 
+- **Documented the autosave idempotency invariant (prevents a future double-count footgun)** Audited
+  `autosave.ts` (data-safety: the debounced curation-edit saver). Its core is correct — the flush-before-rekey
+  genuinely prevents the documented cross-segment data loss. But I traced a real (benign-today) double-save
+  race: if the debounce timer's save is in-flight when `flush`/`flushAsync` runs (window closes the instant
+  after the timer fired), `pending` isn't cleared until that save's `.then`, so the SAME entry can persist
+  twice. Harmless NOW because `save` is wired to `updateSegment` (idempotent field write, App.svelte:140) —
+  but a future maintainer adding a side-effectful save (record-decision / credit-confidence / append-ledger)
+  would silently DOUBLE-COUNT. Documented the "save MUST be a pure idempotent upsert" invariant on the dep
+  so that footgun can't be walked into. typecheck 0-err, eslint clean, vitest 134/134.
 - **Scan cont. → the app ignored the `CORTEX_APP_DATA_DIR` override its own CLI tools honor (split-DB footgun)**
   All four `bin/*` utilities (batch_importer, batch_processor, download_model, test_file) resolve the data
   dir as `CORTEX_APP_DATA_DIR ▸ APPDATA/cortex-speech ▸ cwd`, but the main app's `lib.rs::get_app_data_dir`
