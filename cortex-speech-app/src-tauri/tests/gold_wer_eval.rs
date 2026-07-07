@@ -180,6 +180,102 @@ fn gold_wer_real_omniasr() {
     assert!(result.run.num_segs > 0, "should score at least one clip");
 }
 
+/// P2.4: a bounded, ALWAYS-RUNNING (not `#[ignore]`'d) gold-regression check using the one committed,
+/// CC-BY-4.0 real-audio fixture (`tests/fixtures/fleurs_ckb_sample.{wav,txt}` — see ATTRIBUTION.md), so
+/// the fine-tuned engine's accuracy is exercised on every `cargo test` / `make ship-check` run, not only
+/// on `--ignored` runs that need the owner's private corpus. Model-present-gated: the ~970 MB fine-tuned
+/// ONNX is gitignored, so CI (which has no models) skips honestly via an eprintln, exactly like every
+/// other real-audio test in this file — this never turns CI red for a missing model.
+///
+/// HONESTY SCOPING (deliberately narrower than `scorecard::check_gold_regression`): that gate requires a
+/// baseline with BOTH WER and CER (`docs/finetuned_scorecard_baseline.json` only ever published CER —
+/// see docs/EVAL.md, no fine-tuned WER was ever measured), and its Hoeffding-style bootstrap CI is
+/// DEGENERATE at N=1 (resampling one point always redraws that same point, so the CI half-width is
+/// exactly zero) — asserting the full dual-metric gate here would either fabricate a WER baseline or
+/// wire a hair-trigger, statistically meaningless pass/fail. So this test: (1) actually measures a REAL
+/// CER from the REAL fine-tuned model on REAL committed audio via the real `eval`/`scorecard` machinery
+/// (not a shortcut `wer::compute_cer` call), (2) prints it honestly labeled as N=1, and (3) asserts only
+/// what N=1 CAN honestly support — the pipeline produces a finite, non-degenerate transcript, and it is
+/// not a wild regression (a generous ceiling, not a tight bound masquerading as statistical confidence).
+#[test]
+fn finetuned_gold_regression_on_committed_fleurs_fixture() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let model_dir = manifest_dir.join("models").join("finetuned-mms-ckb");
+    let onnx = model_dir.join("model.onnx");
+    let vocab = model_dir.join("vocab.json");
+    if !onnx.is_file() || !vocab.is_file() {
+        eprintln!(
+            "[gold-regression] skip: fine-tuned model not found under {} (gitignored; not on CI)",
+            model_dir.display()
+        );
+        return;
+    }
+
+    let wav_path = manifest_dir.join("tests/fixtures/fleurs_ckb_sample.wav");
+    let txt_path = manifest_dir.join("tests/fixtures/fleurs_ckb_sample.txt");
+    let reference = std::fs::read_to_string(&txt_path).expect("read committed FLEURS reference text");
+
+    let db = Database::open(":memory:").expect("open db");
+    db.initialize().expect("init db");
+    eval::import_gold_segments(
+        &db,
+        vec![eval::GoldSegmentInput {
+            audio_path: wav_path.to_string_lossy().to_string(),
+            reference: reference.clone(),
+            is_holdout: true,
+        }],
+    )
+    .expect("import the one committed gold row");
+
+    let result = eval::run_gold_eval_with_transcriber(&db, "finetuned-mms-ckb", |seg| {
+        let (sr, pcm) = audio::decode_to_pcm(&seg.audio_path)?;
+        let (_sr, pcm16) = audio::ensure_pcm_16khz(sr, pcm)?;
+        let f32_pcm: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
+        cortex_speech_app_lib::wav2vec2_asr::run_wav2vec2(&onnx, &vocab, "ckb", &f32_pcm).map_err(AppError::Other)
+    })
+    .expect("gold eval with the real fine-tuned model");
+
+    assert_eq!(result.run.num_segs, 1, "the committed fixture is exactly one clip");
+    let hyp = result.segments[0].hypothesis.trim();
+    assert!(!hyp.is_empty(), "the fine-tuned model must produce a non-empty transcript for real speech");
+
+    // Build a REAL Scorecard via the actual scorecard-building code path (not an ad hoc CER calc), so
+    // this test exercises the same machinery the publishable scorecard uses.
+    let opts = cortex_speech_app_lib::scorecard::ScorecardOptions::default();
+    let candidate = cortex_speech_app_lib::scorecard::build_scorecard(&result, None, opts);
+
+    eprintln!("\n========== FINE-TUNED GOLD REGRESSION (N=1, committed FLEURS fixture) ==========");
+    eprintln!("reference : {}", reference.trim());
+    eprintln!("hypothesis: {hyp}");
+    eprintln!("measured micro CER (this ONE clip): {:.4}", candidate.system.micro_cer);
+
+    // The published baseline (docs/finetuned_scorecard_baseline.json) only ever measured CER (N=900);
+    // compare against it HONESTLY labeled as informational at N=1, never asserted as a statistically
+    // valid regression verdict (see the doc comment above for why check_gold_regression's dual-metric,
+    // CI-band gate cannot be honestly applied here).
+    if let Ok(baseline_json) = std::fs::read_to_string(manifest_dir.join("../docs/finetuned_scorecard_baseline.json")) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&baseline_json) {
+            if let Some(baseline_cer_pct) = v.get("cer").and_then(|x| x.as_f64()) {
+                eprintln!(
+                    "published baseline  (N=900): {:.2}% CER — informational only, NOT a valid N=1 vs N=900 \
+                     statistical comparison",
+                    baseline_cer_pct
+                );
+            }
+        }
+    }
+
+    // The one honest, N=1-appropriate assertion: a generous sanity ceiling that would catch a genuine
+    // pipeline break (e.g. a corrupt ONNX, wrong vocab, garbage decode) without pretending N=1 precision
+    // it does not have. 0.5 is far above the published 21% aggregate — it only trips on real breakage.
+    assert!(
+        candidate.system.micro_cer < 0.5,
+        "fine-tuned CER on the committed fixture is {:.4}, far above the 0.5 sanity ceiling — likely a \
+         broken model/decode path, not normal per-clip variance",
+        candidate.system.micro_cer
+    );
+}
+
 // Head-to-head: 300M vs 1B OmniASR on the same clips. Absolute CER is inflated by the
 // dataset's alignment caveat, but the RELATIVE comparison (same audio, both models,
 // normalized) is valid — a model that consistently lowers CER is genuinely better.

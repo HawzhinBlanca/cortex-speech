@@ -1460,3 +1460,55 @@ few cosmetic. Every finding implementable AND verifiable in a headless Windows c
 (cargo test --lib 806 + clippy -D warnings, frontend typecheck/134-vitest/eslint, python-policies incl. 15
 exe-freshness unit tests + ledger-staleness), and pushed. The grade is well above 6.5; 10/10 is the P7
 re-audit's call on real numbers — not mine to fake.
+
+## #6.4 CLOSED — de-`#[ignore]`'d a real gold-regression check with a genuine MEASURED number (2026-07-08)
+
+Closed the one item on the owner-gated list that turned out to be headlessly achievable without
+fabricating anything: a committed real-audio fixture (`tests/fixtures/fleurs_ckb_sample.{wav,txt}`,
+CC-BY-4.0 FLEURS ckb, see ATTRIBUTION.md) already existed, and the fine-tuned model (~970 MB ONNX) is
+present in this checkout's junctioned `models/` — so a real, non-fabricated measurement was actually
+runnable here, not just implementable.
+
+Added `finetuned_gold_regression_on_committed_fleurs_fixture` to `src-tauri/tests/gold_wer_eval.rs` —
+NOT `#[ignore]`'d (runs on every plain `cargo test`), model-present-gated (skips honestly via eprintln
+when the gitignored fine-tuned ONNX is absent, e.g. on CI, exactly like every other real-audio test in
+this file). It decodes the real committed clip, runs the REAL fine-tuned Wav2Vec2-CTC model via
+`wav2vec2_asr::run_wav2vec2`, and builds a real `Scorecard` via the actual `scorecard::build_scorecard`
+machinery (not a shortcut CER calc).
+
+**Deliberately did NOT wire the full `scorecard::check_gold_regression` gate**: that requires a baseline
+with BOTH WER and CER, but `docs/finetuned_scorecard_baseline.json` only ever published CER (no fine-tuned
+WER was ever measured — checked EVAL.md) — populating a WER baseline would mean fabricating one, the exact
+violation this whole session has been hunting and fixing. Separately, `bootstrap_ci` at N=1 is
+mathematically degenerate (resampling one point always redraws that point, so the CI half-width is
+EXACTLY zero) — asserting the full dual-metric CI-band gate at N=1 would be a hair-trigger, statistically
+meaningless pass/fail, not a real regression check. So this test measures and reports the real CER
+honestly labeled as N=1, and asserts only what N=1 can honestly support: a non-empty real transcript and a
+generous sanity ceiling (0.5, far above the 21% aggregate) that would trip on genuine breakage without
+pretending to N=900 precision.
+
+**REAL MEASURED RESULT (not fabricated, actually run in this checkout, 2026-07-08):**
+```
+reference : پێش هاتنی سوپا، هایتی لەوەتەی ساڵی 1800ــەوە تووشی کێشەی پەیوەست بە نەخۆشیەکە نەبوو‎ بوو
+hypothesis: وپێش هاتنی سوپا، حایتی لە وتەی ساڵی 1هە0ەتەوە تووشی کەشەی پێیوەست بە نەخۆشەکە نەبوو
+measured micro CER (this ONE clip, N=1): 0.1860 (18.60%)
+published baseline (N=900): 21.00% CER — informational only, not a valid N=1 vs N=900 comparison
+```
+This single clip's CER (18.60%) sits close to and slightly below the published N=900 aggregate (21.00%)
+— consistent with, not contradicting, the existing measurement. Command: `cargo test --test gold_wer_eval
+finetuned_gold_regression -- --nocapture` (needs `models/finetuned-mms-ckb/{model.onnx,vocab.json}`).
+
+cargo fmt clean, clippy --all-targets -D warnings clean, cargo test --lib 817 passed + the new integration
+test passed for real, python-policies green.
+
+Note on this session's separately-launched adversarial multi-agent re-audit (15 parallel reviewers over
+every subsystem): it hit provider rate limits and every reviewer agent errored out, so it returned "0
+confirmed findings" — that is a NON-RESULT (the reviewers never ran), not a clean bill of health, and is
+recorded here so it is never mistaken for a completed independent audit.
+
+TRULY REMAINING (~9): OWNER-GATED measurement (~6 — the P7 re-audit itself, `make check-7b`, the reliability
+drills, and the gold marathon; faking is the one prohibition), media-cache SLICING + true-streaming decode
+(need real-audio observation this sandbox cannot honestly provide), and the wrapper-triage backlog item
+(task_ec79f7dd, spawned not implemented — deliberately not mass-wired). Everything implementable AND
+verifiable in a headless Windows checkout — including, now, one real committed-fixture accuracy measurement
+— is done, gated, and pushed. 10/10 remains the P7 re-audit's call on the full real-number suite.
