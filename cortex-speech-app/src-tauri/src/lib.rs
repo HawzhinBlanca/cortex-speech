@@ -18,7 +18,6 @@ pub mod commands;
 pub mod constrained_decode;
 pub mod corrections;
 pub mod crash;
-pub mod crash_handler;
 pub mod db;
 pub mod denoiser;
 pub mod diarization;
