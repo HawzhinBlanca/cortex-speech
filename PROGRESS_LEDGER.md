@@ -1557,9 +1557,28 @@ Ran the actual charter/ship gates fresh to find anything still red:
 - `check-7b` is NOT a Makefile target — it is a PROPOSED gate (deep-check 7.2, "verify-10 extension"), not an
   existing command; corrected the remaining-list wording accordingly.
 
+**FULL `make ship-check` status (every gate that runs without the built .exe is now GREEN):**
+| ship-check gate | result |
+|---|---|
+| `verify-10` (charter definition-of-done) | GREEN — prints `CORTEX 10/10: ALL GATES GREEN` |
+| `typecheck` (svelte-check + tsc) | GREEN — 406 files, 0 errors |
+| `lint` (eslint) | GREEN |
+| `fmt-check` (cargo fmt --check) | GREEN |
+| `python-policies` | GREEN — 22 policies |
+| `test-frontend` (vitest) | GREEN — 134/134 |
+| `test-rust` (cargo test, ALL binaries) | GREEN — 816 lib + every integration binary, 0 failures (soak 122 s, reliability 23, tauri_integration, e2e_pipeline, the new real gold-regression measurement, proptests; only model/hardware/live tests `#[ignore]`'d) |
+| `audit` (npm audit --omit=dev) | GREEN — 0 vulnerabilities |
+| `deny` (cargo deny check) | GREEN — advisories/bans/licenses/sources ok (after the RUSTSEC-2026-0204 fix above) |
+| `test-e2e` (`node e2e_real_app.cjs`) | NOT RUN — needs the built `.exe` (`npm run tauri build`); the daily exe predates this branch, so this is an owner/CI step, run after `make build-app` |
+
+So of `make ship-check`'s 10 gates, **9 are green here and the 10th (test-e2e) is the owner's `build-app`
+step**. Every automatable ship-gate passes.
+
 TRULY REMAINING (~7): OWNER-GATED measurement (~5 — the P7 re-audit on the 4090, the reliability drills, and
 the gold marathon; faking is the one prohibition), media-cache SLICING + true-streaming decode (need
-real-audio observation this sandbox cannot honestly provide). Everything implementable AND verifiable in a
-headless Windows checkout — the charter verify-10 gate, npm audit, cargo deny (now advisory-clean), a real
-committed-fixture accuracy measurement, and a genuine dead-code cleanup — is done, gated, and pushed. 10/10
-remains the P7 re-audit's call on the full real-number suite, but every automatable ship-gate is now green.
+real-audio observation this sandbox cannot honestly provide). Plus the two owner/CI build-gated steps
+(`test-e2e` and `make build-app` → a fresh exe). Everything implementable AND verifiable in a headless
+Windows checkout — the charter verify-10 gate, all rust/frontend tests, npm audit, cargo deny (now
+advisory-clean), a real committed-fixture accuracy measurement (18.60% CER), and a genuine dead-code cleanup
+— is done, gated, and pushed. 10/10 remains the P7 re-audit's call on the full real-number suite; but the
+automatable portion of the ship gate is now entirely green.
