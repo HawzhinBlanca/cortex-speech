@@ -1162,6 +1162,22 @@ Kept closing the testable ones I'd previously mis-bucketed:
 
 ## Deep-check remediation — ~51/61 (2026-07-07)
 
+- **REAL BUG — the IRT gate and the review draft broke word-vs-deletion ties DIFFERENTLY** In the jury
+  consensus, `segment_consensus_words` (the review DRAFT) was deliberately fixed to KEEP a word that ties a
+  peer's deletion (explicit deletion-demotion + stable sort, with a comment), but the SAME fix was never
+  applied to `consensus_from_slots` (the GATE that scores auto-accept). The gate used a bare `max_by`, whose
+  last-maximal rule picks the empty ("") candidate on an exact posterior tie — and `build_confusion_slots`
+  seeds candidates as `[anchor_word, ""]` with words pushed AFTER, so "" always sits at a later index and
+  WINS ties. Effect: on a word-vs-deletion tie the gate silently DROPPED the word (could collapse a
+  single-slot consensus to all-deletion `None`), so an auto-accepted transcript could truncate a word the
+  human's review draft kept — the committed text and the reviewable draft disagreed. Fixed the gate's
+  tie-break to demote "" identically (word kept). Regression test proves a `["ئەمە",""]`@`[0.5,0.5]` tie now
+  yields "ئەمە" (was `None`); the non-tie deletion-penalty test still passes (my change only touches exact
+  ties). cargo: fmt clean, clippy -D warnings clean, `--lib` 812 passed. Also audited clean this pass:
+  `consensus_from_slots` confidence math, `segment_consensus_words`, `model_vote_weight`, the T0 gate +
+  autonomy vetoes, `majority_vote`, and the full conformal calibration (Hoeffding + Bonferroni, tie-group
+  cuts, cold-start).
+
 OWNER-DECISION FLAG (methodology, not a bug — do NOT silently change): the accuracy scorecards
 (`scorecard_7b.py` / `scorecard_finetuned.py` / `measure_finetuned_cer.py`) normalize with a SIMPLE
 `norm()` = NFC + lower + whitespace-collapse — deliberately internally consistent so 7B / fine-tuned 21% /
