@@ -19,11 +19,17 @@ static YEH_TWO_DOTS_BELOW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u06D
 static ALEF_MAKSURA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u0649").unwrap());
 static TATWEEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u0640").unwrap());
 static ZWNJ: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u200C").unwrap());
-/// Zero-width format characters that carry NO word boundary (unlike ZWNJ U+200C, handled as a
-/// space): ZWSP (U+200B), ZWJ (U+200D), and BOM/ZWNBSP (U+FEFF). Left in place they make two
-/// visually identical strings normalize differently, breaking dedup/exact-match and inflating
-/// WER/CER.
-static ZERO_WIDTH_FORMAT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u200B\u200D\uFEFF]").unwrap());
+/// Zero-width / directional FORMAT characters that carry NO content and NO word boundary (unlike
+/// ZWNJ U+200C, handled as a space). Left in place they make two visually identical strings normalize
+/// differently, breaking dedup/exact-match and inflating WER/CER, and \u2014 critically for a
+/// right-to-left script \u2014 the bidi controls can also silently reorder how a stored/exported string
+/// renders. Deleted, not spaced:
+///   ZWSP U+200B, ZWJ U+200D, BOM/ZWNBSP U+FEFF,
+///   ALM U+061C (Arabic Letter Mark),
+///   the explicit bidi formatting marks LRE/RLE/PDF/LRO/RLO U+202A-U+202E,
+///   and the bidi isolates LRI/RLI/FSI/PDI U+2066-U+2069.
+static ZERO_WIDTH_FORMAT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\u061C\u200B\u200D\u202A-\u202E\u2066-\u2069\uFEFF]").unwrap());
 static MULTI_SPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 static ARABIC_HAMZA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u0623\u0625]").unwrap());
 static ARABIC_DIACTIRICS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u064B-\u065F\u0670]").unwrap());
@@ -602,6 +608,23 @@ mod tests {
         assert!(!out.contains('\u{200B}'), "ZWSP must be stripped");
         assert!(!out.contains('\u{FEFF}'), "BOM must be stripped");
         assert_eq!(out, "کوردی", "zero-width joiners must be deleted, not turned into spaces");
+    }
+
+    #[test]
+    fn bidi_control_chars_are_stripped() {
+        let n = SoraniNormalizer::new();
+        // Directional formatting marks / isolates / ALM carry no content but (a) make two visually
+        // identical strings dedup differently and (b) can silently reorder RTL rendering. They must be
+        // deleted from the canonical form. Wrap the Kurdish word in RLE...PDF and an LRI...PDI isolate
+        // plus a leading ALM; the canonical form must be just the letters.
+        let out = n.normalize("\u{061C}\u{202B}کورد\u{202C}\u{2066}ی\u{2069}");
+        for cp in [
+            '\u{061C}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}',
+            '\u{2069}',
+        ] {
+            assert!(!out.contains(cp), "bidi control U+{:04X} must be stripped, got {out:?}", cp as u32);
+        }
+        assert_eq!(out, "کوردی", "bidi controls deleted without introducing spaces");
     }
 
     #[test]

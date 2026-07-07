@@ -4506,7 +4506,10 @@ pub fn update_segment_bounds(id: String, start_ms: i64, end_ms: i64, state: Stat
     STRICT_RATE_LIMITER.check("update_segment_bounds")?;
     validate::validate_identifier(&id)?;
 
-    if start_ms < 0 || end_ms < 0 || start_ms >= end_ms {
+    // Upper cap at u32::MAX ms (~49.7 days) matches the export/diarization slicer's offset guard
+    // (chunking.rs) — a bound beyond that is garbage the slicer would reject downstream anyway, so
+    // reject it at the IPC boundary instead of storing an absurd duration/offset from the webview.
+    if start_ms < 0 || end_ms < 0 || start_ms >= end_ms || end_ms > u32::MAX as i64 {
         return Err("Invalid segment bounds".to_string());
     }
 

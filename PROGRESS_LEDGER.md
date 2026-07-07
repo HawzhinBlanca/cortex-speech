@@ -1693,3 +1693,53 @@ errors, vitest 134/134):
 - Remaining frontend candidates (#5 flag()-no-undo, #7-#10 minor) + Low backend items (crash_handler.rs
   dead-module cleanup, normalizer bidi-control stripping, update_segment_bounds upper cap, db.info
   sizeBytes-on-stat-fail) — logged for a later batch; lower severity.
+
+## ROUND 2 HUNT — cloud / migration / export surfaces + backlog (2026-07-07)
+
+Three more adversarial hunters (cloud-egress/parsers, DB migrations/FTS, export/dataset-integrity), each
+verified against live source. Honest headline again: heavily hardened. **Cloud layer** CLEAN (no egress-
+consent bypass, no key leak, no parse panic — consent gates, https-only, redaction, accept_refinement CER
+cap all correct). **Migration/FTS** CLEAN (transactional all-or-nothing migrations, correct FTS triggers,
+indexed hot paths, fail-closed map_row). **Export** mostly clean (holdout coverage at every format, seeded
+speaker-disjoint splits, atomic writes, honest cards). The real findings, verified and FIXED (clippy -D
+warnings clean, cargo test --lib 818 pass):
+
+- **HIGH (one-law):** `export.rs exclude_holdout_segments` FAILED OPEN — a present-but-unhashable clip
+  (transient file lock) `.unwrap_or(false)` was classified NOT-held-out and EXPORTED, so a holdout gold
+  recording re-imported at a different path could leak into the training set (eval-on-train → silently
+  inflated WER/CER). This is the PRIMARY training-export filter and it was weaker than the DPO/LM sibling
+  guards that already fail closed. Now fails CLOSED (unhashable present clip → excluded + warn), gated by the
+  existing holdout.is_empty() short-circuit so no false exclusions in the common no-gold case.
+- **Med (RTL correctness):** normalizer did not strip bidi format/isolate controls (U+202A-202E, U+2066-2069,
+  U+061C) — two visually identical strings could dedup differently and RTL rendering silently reorder. Added
+  them to ZERO_WIDTH_FORMAT (deleted, not spaced); regression test added.
+- **Low (defense-in-depth):** every cloud provider response used `into_json()`, which in ureq is bounded by
+  the read TIMEOUT not by BYTES — a compromised/on-path HTTPS endpoint could OOM via a multi-GB chunked body.
+  Added `http::json_bounded` (64 MiB cap via `into_reader().take`) and routed all 6 sites
+  (agentic/llm_refiner/scribe) through it.
+- **Low (data integrity):** `update_segment_bounds` had no upper cap; a webview `end_ms = i64::MAX` was
+  storable. Now capped at u32::MAX ms, consistent with the slicer's offset guard.
+- **Cleanup:** removed the dead, unhardened duplicate crash module `crash_handler.rs` (69 lines, only its
+  `pub mod` decl referenced it; the live path uses crash.rs).
+
+DELIBERATELY DEFERRED (honest): FRONTEND flag()-no-undo — a correct fix needs a NEW backend "unflag"
+operation (the existing clear_human_decision keeps escalated=1 to reopen for re-adjudication, the opposite of
+unflag), so bodging it risks corrupting verdict state. Also deferred (Low): cloud F1 (surface the LLM-refine
+fallback as a UI warning, not just a log — needs PipelineEvent plumbing), migration F1 (version gate uses
+MAX(version) not an applied-set — a footgun only reachable via the test-only rollback path), FTS
+rebuild-every-boot perf (an intentional safeguard), db.info sizeBytes-on-stat-fail (diagnostics only).
+
+## 10/10 MEASUREMENT HARNESS — one command, owner-gated (2026-07-07)
+
+Added `scripts/run_measurements.py` + `make measure-10 GOLD=<manifest.tsv>` so the owner runs ONE command
+on the 4090 box to produce the real accuracy numbers the literal 10/10 needs. It orchestrates the existing
+per-engine scorecards (scorecard_7b.py champion via the warm WSL socket; scorecard_finetuned.py via ONNX),
+validates prerequisites LOUDLY (gold manifest present + non-empty; 7B server reachable on 127.0.0.1:8799;
+CORTEX_FINETUNED_{MODEL,ONNX} set) and SKIPS an engine with a clear reason rather than inventing a number,
+parses each metric VERBATIM from the scorecard's own stdout, and appends a timestamped block to
+docs/MEASUREMENTS.md stamped with the git SHA + gold-manifest SHA-256 + exact command + full output. It
+cannot fabricate: an unparseable/failed run is recorded as FAILED, never as a value. Verified headlessly:
+py_compile clean, the CER/WER/CI/N parser matches both scorecards' real headline format, empty output ->
+no number, missing manifest -> exit 2, missing prereqs -> SKIPPED (no metrics written), no stray doc
+created. This is the achievable part of the P7 re-audit / gold marathon — the NUMBERS themselves remain
+owner-gated on the 4090 (I will not fabricate them); running `make measure-10` there produces + records them.

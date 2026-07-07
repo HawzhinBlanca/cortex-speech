@@ -58,6 +58,17 @@ build-app:
 	cargo build --release --manifest-path cortex-speech-app/src-tauri/Cargo.toml
 	@echo "app rebuilt (fresh frontend): cortex-speech-app/src-tauri/target/release/cortex-speech-app.exe"
 
+## measure-10: run the REAL accuracy scorecards on a gold manifest and record the numbers into
+## docs/MEASUREMENTS.md (git SHA + manifest SHA-256 + exact command + full output). Owner-gated: run
+## inside WSL on the 4090 box with the warm 7B server up and CORTEX_FINETUNED_{MODEL,ONNX} set.
+## Usage:  make measure-10 GOLD=/mnt/c/path/to/gold.tsv   [BOOTSTRAP=3000] [ENGINES=7b,finetuned]
+## Build a gold manifest first if needed:  python cortex-speech-app/scripts/build_ckb_gold.py 900
+BOOTSTRAP ?= 3000
+ENGINES ?= 7b,finetuned
+measure-10:
+	@test -n "$(GOLD)" || (echo "set GOLD=<gold_manifest.tsv> (WSL-visible path)"; exit 2)
+	python cortex-speech-app/scripts/run_measurements.py "$(GOLD)" --engines "$(ENGINES)" --bootstrap $(BOOTSTRAP)
+
 ## ship-check: full pre-release gate — a SUPERSET of the CI Windows release gate.
 ## Running this green locally must imply CI green: it runs every required CI step.
 ship-check: verify-10 typecheck lint fmt-check python-policies test-frontend test-rust test-e2e audit deny

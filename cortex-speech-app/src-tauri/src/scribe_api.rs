@@ -127,7 +127,7 @@ fn request_scribe_json_from_bytes(
         .set("Content-Type", &content_type)
         .send_bytes(&body)
         .map_err(|e| AppError::Other(format!("Scribe request failed: {}", redact(e.to_string()))))?;
-    resp.into_json().map_err(|e| AppError::Other(format!("Scribe response parse: {e}")))
+    crate::http::json_bounded(resp).map_err(|e| AppError::Other(format!("Scribe response parse: {e}")))
 }
 
 /// Transcribe an audio file with ElevenLabs Scribe. Returns the transcription text. Errors carry the
