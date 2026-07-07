@@ -194,9 +194,7 @@ fn validate_segment(seg: &SpeechSegment) -> AppResult<()> {
     Ok(())
 }
 
-fn learning_text_key(text: &str) -> String {
-    text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
-}
+use crate::normalizer::learning_text_key;
 
 fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String>]) -> Option<String> {
     let corrected_key = learning_text_key(corrected);

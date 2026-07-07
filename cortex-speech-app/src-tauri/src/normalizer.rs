@@ -54,6 +54,18 @@ pub fn canonical_training_text(text: &str) -> String {
     CHAR_ONLY.normalize(text)
 }
 
+/// A LOOSE match key for "is this correction genuine / is this a no-op edit": lowercase + whitespace-
+/// collapse only (NOT Sorani-canonicalized — the db.rs no-op-edit dedup guard compares WITHOUT NFC).
+///
+/// SINGLE source of truth: the corrections-ledger + agent_examples gate (`db.rs`) and the DPO preference
+/// gate (`jury/learning.rs`) both decide "wrong != fix" through THIS key. They previously each had an
+/// identical private copy; if one grew NFC/canonicalization and the other did not, a correction could be
+/// recorded as a genuine pair in one training channel and dropped as a no-op in the other — silently
+/// inconsistent training data. One definition makes that divergence impossible.
+pub fn learning_text_key(text: &str) -> String {
+    text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl Default for SoraniNormalizer {
     fn default() -> Self {
         Self::new()
@@ -610,6 +622,17 @@ mod tests {
         // A genuine prose comma (not a 3-digit grouping) must survive as the Arabic comma, untouched.
         let prose = metric.normalize("سڵاو, دونیا");
         assert!(prose.contains('،'), "prose comma must remain (as ، ): {prose:?}");
+    }
+
+    #[test]
+    fn learning_text_key_is_case_and_whitespace_insensitive_only() {
+        // The shared no-op/genuine-correction key: lowercase + whitespace-collapse, NOTHING else (no NFC,
+        // no Sorani folding) — so the db.rs ledger gate and the jury DPO gate agree byte-for-byte.
+        assert_eq!(learning_text_key("  Hello   World  "), "hello world");
+        assert_eq!(learning_text_key("hello world"), learning_text_key("HELLO\tWORLD"));
+        // It does NOT fold orthographic variants (unlike canonical_training_text) — Arabic vs Kurdish Kaf
+        // stay DISTINCT keys, so a real orthographic correction is not mistaken for a no-op edit.
+        assert_ne!(learning_text_key("كوردی"), learning_text_key("کوردی"));
     }
 
     #[test]

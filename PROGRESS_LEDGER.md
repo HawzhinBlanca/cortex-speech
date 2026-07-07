@@ -1162,6 +1162,15 @@ Kept closing the testable ones I'd previously mis-bucketed:
 
 ## Deep-check remediation — ~51/61 (2026-07-07)
 
+- **Drift-proofed `learning_text_key` — the "genuine correction vs no-op" key gating BOTH training channels**
+  It had TWO byte-identical private copies: `db.rs` (gates the corrections ledger + agent_examples) and
+  `jury/learning.rs` (gates the DPO preference dataset). Both decide "wrong ≠ fix" through it. If one grew
+  NFC/canonicalization and the other did not, the SAME correction could be recorded as a genuine training
+  pair in one channel and dropped as a no-op in the other — silently inconsistent training data (the app's
+  product). Consolidated into one `normalizer::learning_text_key` (both import it); +1 test pinning that it
+  is case/whitespace-insensitive ONLY (does NOT fold Arabic-vs-Kurdish Kaf, so a real orthographic fix is
+  never mistaken for a no-op — deliberately distinct from `canonical_training_text`). No behavior change.
+  cargo: fmt clean, clippy -D warnings clean, `--lib` 814 passed.
 - **Drift-proofed the LOOP-0 finalized-draft selection (structural consistency for the C5 gate)** The
   `annotated ▸ normalized ▸ raw` draft-text formula was inlined in THREE places — `shadow_log_loop0` (the
   C5 go-live shadow signal), `record_human_decision` (the confidence-update evidence), and
