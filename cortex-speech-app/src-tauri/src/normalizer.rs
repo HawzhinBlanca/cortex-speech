@@ -54,6 +54,18 @@ pub fn canonical_training_text(text: &str) -> String {
     CHAR_ONLY.normalize(text)
 }
 
+/// A LOOSE match key for "is this correction genuine / is this a no-op edit": lowercase + whitespace-
+/// collapse only (NOT Sorani-canonicalized — the db.rs no-op-edit dedup guard compares WITHOUT NFC).
+///
+/// SINGLE source of truth: the corrections-ledger + agent_examples gate (`db.rs`) and the DPO preference
+/// gate (`jury/learning.rs`) both decide "wrong != fix" through THIS key. They previously each had an
+/// identical private copy; if one grew NFC/canonicalization and the other did not, a correction could be
+/// recorded as a genuine pair in one training channel and dropped as a no-op in the other — silently
+/// inconsistent training data. One definition makes that divergence impossible.
+pub fn learning_text_key(text: &str) -> String {
+    text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl Default for SoraniNormalizer {
     fn default() -> Self {
         Self::new()
@@ -240,18 +252,15 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
         result = result.replace(arabic_char, &latin.to_string());
     }
     // Native Sorani/Persian-script number separators: ARABIC DECIMAL SEPARATOR U+066B (٫) and ARABIC
-    // THOUSANDS SEPARATOR U+066C (٬). The digit-glyph folding above stops at U+0669, so these would
-    // survive and split a number mid-stream (e.g. ٣٫١٤ -> "3٫14" parses as two unrelated numbers with a
-    // stray separator token). Fold them to the ASCII forms DIGITS_RE already understands (round-22 #8).
-    result = result.replace('\u{066B}', ".").replace('\u{066C}', ",");
-
-    // Normalize the native Arabic number separators the digit fold above leaves behind: the THOUSANDS
-    // separator U+066C and the DECIMAL separator U+066B sit just past the digit block (U+0660-0669) so
-    // they survive folding, and neither regex below recognizes them. Map them to the forms those regexes
-    // already handle — U+066C -> the Arabic comma the pipeline uses, U+066B -> '.'. Without this, the
+    // THOUSANDS SEPARATOR U+066C (٬). The digit-glyph fold above stops at U+0669, so these survive and
+    // would split a number mid-stream (e.g. "٣٫١٤" -> "3٫14" parses as two unrelated numbers with a stray
+    // separator token). Fold the decimal to '.', and the thousands separator to the Arabic comma U+060C
+    // the pipeline already standardizes ASCII ',' to (Step 1) — so the output stays comma-consistent AND
+    // the regexes below (which match both '،' and ',') still strip grouped numbers. Without this the
     // metric path scores "1٬000" as wrong vs "1000" (CER inflation) and the verbalizer reads "٣٫١٤" as
-    // "three ٫ fourteen" instead of "three point one four".
-    result = result.replace('\u{066C}', "،").replace('\u{066B}', ".");
+    // "three ٫ fourteen". (A single fold: the previous second, contradictory pass — U+066C -> ',' then
+    // -> '،' — left the first as dead code and emitted an ASCII comma that escaped the Step-1 unification.)
+    result = result.replace('\u{066B}', ".").replace('\u{066C}', "،");
 
     // Strip thousands separators inside grouped numbers ("1،000" / "1,000" -> "1000") so a formatted
     // number compares equal to its bare form. This runs BEFORE the verbalize early-return below, so it
@@ -613,6 +622,34 @@ mod tests {
         // A genuine prose comma (not a 3-digit grouping) must survive as the Arabic comma, untouched.
         let prose = metric.normalize("سڵاو, دونیا");
         assert!(prose.contains('،'), "prose comma must remain (as ، ): {prose:?}");
+    }
+
+    #[test]
+    fn learning_text_key_is_case_and_whitespace_insensitive_only() {
+        // The shared no-op/genuine-correction key: lowercase + whitespace-collapse, NOTHING else (no NFC,
+        // no Sorani folding) — so the db.rs ledger gate and the jury DPO gate agree byte-for-byte.
+        assert_eq!(learning_text_key("  Hello   World  "), "hello world");
+        assert_eq!(learning_text_key("hello world"), learning_text_key("HELLO\tWORLD"));
+        // It does NOT fold orthographic variants (unlike canonical_training_text) — Arabic vs Kurdish Kaf
+        // stay DISTINCT keys, so a real orthographic correction is not mistaken for a no-op edit.
+        assert_ne!(learning_text_key("كوردی"), learning_text_key("کوردی"));
+    }
+
+    #[test]
+    fn ungrouped_native_thousands_separator_folds_to_arabic_comma_not_stray_ascii() {
+        // A U+066C that is NOT a valid 3-digit grouping (so the thousands regex leaves it in place) must
+        // still fold to the pipeline's Arabic comma U+060C — the same form Step 1 rewrites ASCII ',' to —
+        // never a stray ASCII ',' that escapes the earlier punctuation unification. Regression guard for
+        // the old contradictory two-pass fold (U+066C -> ',' then a dead -> '،') that emitted ASCII.
+        let metric = SoraniNormalizer::with_config(NormalizationConfig {
+            normalize_numbers: true,
+            verbalize_numbers: false,
+            normalize_hamza: true,
+            remove_diacritics: false,
+        });
+        let out = metric.normalize("1\u{066C}00"); // only 2 trailing digits -> not a grouping -> kept
+        assert!(out.contains('\u{060C}'), "ungrouped U+066C must fold to Arabic comma U+060C: {out:?}");
+        assert!(!out.contains(','), "must not leave a stray ASCII comma inconsistent with the pipeline: {out:?}");
     }
 
     #[test]

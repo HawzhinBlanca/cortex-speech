@@ -313,6 +313,14 @@
       }
       return;
     }
+    // Never let a modifier chord (Ctrl+A select-all, Ctrl+F, Ctrl+K palette) fire a bare-key decision,
+    // and never act while focus is in ANY editable element overlaid on the inbox (e.g. the command
+    // palette input) — each mis-fire silently stamps a human adjudication on the current clip.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+      return;
+    }
     switch (e.key) {
       case 'a':
         e.preventDefault();

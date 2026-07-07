@@ -24,6 +24,17 @@ identical data; a trustworthy **publishable** 7B CER still needs a boundary-alig
 FLEURS is N=1; the original N=900 corpus that produced the fine-tuned 21% below is not on disk). The
 default stays the 7B (owner's choice); the app now fails hard rather than silently downgrading (F2).
 
+> **⚠️ CER-definition caveat (added 2026-07-07).** The 7B **59.45%** above came from `scorecard_7b.py`
+> *before* its 2026-07-07 fix, which computed CER on **whitespace-STRIPPED** text (space-insensitive),
+> whereas the stock **61.69%** came from the Rust `gold_wer_real_omniasr` harness, whose CER **KEEPS**
+> interior whitespace (jiwer's definition, matching the fine-tuned 21% below). Space-stripping *deflates*
+> CER — it hides word-segmentation errors — so these two numbers were computed on **different bases** and
+> are **not directly comparable**; the *numeric* "slightly better than stock" read is therefore
+> unreliable (the *by-eye* "coherent, correct Sorani" read is independent and stands). This **compounds**,
+> not replaces, the reference-drift caveat — the set is unusable for an absolute CER regardless. A fair
+> engine comparison needs BOTH re-measured on a boundary-aligned gold set with the now-fixed (space-kept)
+> `scorecard_7b.py`. `scorecard_7b.py` is now guarded against re-drift by `test_scorecard_cer_consistency.py`.
+
 ## ⭐ Fine-tuned model — the accuracy cure, measured (2026-06-25)
 
 A user-provided fine-tuned model, **`MMS-CTC-1B` (Wav2Vec2ForCTC, base `facebook/mms-1b-all`)**, is

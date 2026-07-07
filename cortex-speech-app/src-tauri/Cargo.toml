@@ -48,6 +48,7 @@ tokio = { version = "1", features = ["sync"] }
 # Logging (structured tracing)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+tracing-appender = "0.2"
 
 # Audio ingestion (pure Rust decoder)
 symphonia = { version = "0.5", features = ["all"] }

@@ -389,6 +389,33 @@
     };
   });
 
+  // Unlisten for the native window close-request hook (registered in onMount, cleared in onDestroy).
+  let closeUnlisten: (() => void) | undefined;
+  let healthInterval: ReturnType<typeof setInterval> | undefined;
+
+  // Surface the safety-net failures that were previously invisible (the auto-snapshot net can go down
+  // for months and disk exhaustion was computed then dropped). Runs at startup and on an interval; the
+  // file log (data_dir/logs) has the detail. Best-effort — a failed health probe never disrupts the app.
+  async function checkHealthAndWarn() {
+    try {
+      const h = await api.appHealth();
+      const GiB = 1024 ** 3;
+      if ((h.snapshot_consecutive_failures ?? 0) >= 3) {
+        notifications.error(
+          $t('notifications.snapshotFailing', { count: String(h.snapshot_consecutive_failures) }),
+        );
+      }
+      if (h.free_disk_bytes != null && h.free_disk_bytes < 2 * GiB) {
+        notifications.error($t('notifications.lowDisk', { gb: (h.free_disk_bytes / GiB).toFixed(1) }));
+      }
+      if ((h.missing_models?.length ?? 0) > 0) {
+        notifications.error($t('notifications.missingModels', { models: h.missing_models.join(', ') }));
+      }
+    } catch (e) {
+      console.error('health check failed', e);
+    }
+  }
+
   onMount(async () => {
     tauriAvailable = isTauriRuntime();
     const km = initKeyboardManager();
@@ -472,6 +499,40 @@
         .getQuarantineNotice()
         .then((n) => (n.quarantinedFiles.length > 0 ? n : null))
         .catch(() => null);
+      // Surface silent safety-net failures (auto-snapshot down, low disk, missing models) at startup
+      // and every 5 minutes thereafter.
+      void checkHealthAndWarn();
+      healthInterval = setInterval(() => void checkHealthAndWarn(), 5 * 60 * 1000);
+      // Surface a crash from the PREVIOUS session (shown once) — a mid-review panic otherwise relaunches
+      // to a normal-looking app with no hint that a crash (and possible lost unsaved edit) happened.
+      api
+        .takeLastCrash()
+        .then((crash) => {
+          if (crash) {
+            notifications.error($t('notifications.previousCrash', { summary: crash }));
+          }
+        })
+        .catch((e) => console.error('crash check failed', e));
+      // Flush the debounced autosave BEFORE the native window closes so the last correction of a
+      // session is never lost — onDestroy does not reliably run on a Tauri window close. The flush is
+      // bounded by a 3s timeout so a stuck backend can never prevent the app from closing.
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        const appWindow = getCurrentWindow();
+        closeUnlisten = await appWindow.onCloseRequested(async (event) => {
+          event.preventDefault();
+          try {
+            await Promise.race([
+              autosave.flushAsync(),
+              new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+            ]);
+          } finally {
+            await appWindow.destroy();
+          }
+        });
+      } catch (e) {
+        console.error('Failed to register close-request autosave flush:', e);
+      }
     } else {
       segments.set([]);
       segmentsLoading = false;
@@ -482,6 +543,8 @@
   onDestroy(() => {
     stopEventListeners();
     globalKeyboardManager?.destroy();
+    closeUnlisten?.();
+    if (healthInterval) clearInterval(healthInterval);
     // Flush (not just cancel) a pending edit on teardown so a correction typed in the last debounce
     // window before exit is still persisted, rather than silently dropped by a bare clearTimeout.
     autosave.flush();
@@ -578,7 +641,11 @@
         key: ',',
         ctrl: true,
         description: 'Open settings',
-        action: () => openSettings(),
+        // Don't open Settings UNDER the Review Inbox overlay (z-50 vs z-[100]) where it would be
+        // invisible while its close-time auto-save writes a stale snapshot. Require the inbox closed.
+        action: () => {
+          if (!$showReviewInbox) openSettings();
+        },
         category: 'navigation',
       },
       {
@@ -1112,29 +1179,40 @@
 
   async function handleUndo() {
     if (!requireDesktopRuntime()) return;
+    // The global history stack records only updateSegment, NOT record_human_decision. On the review
+    // surfaces (Review & Correct, and the Inbox overlay) a global Ctrl+Z would revert `verified` but
+    // leave the human_decision row — splitting state (the clip re-enters the queue while the DB says it
+    // was decided, and the confidence flywheel was fed a decision that is now retracted). Those surfaces
+    // have their OWN paired undo (Backspace = clearHumanDecision + restore); defer to it here.
+    if (viewMode === 'review' || $showReviewInbox) {
+      notifications.info($t('notifications.undoInReview'));
+      return;
+    }
     try {
       const description = await historyStore.undo();
-      notifications.info(`Undo: ${description ?? 'Last action reverted'}`);
+      notifications.info($t('notifications.undone', { what: description ?? $t('notifications.lastActionReverted') }));
       await loadSegments();
       if (historyPanel) {
         historyPanel.recordAction(`Reverted: ${description ?? 'action'}`, 'edit');
       }
     } catch (e) {
-      notifications.error(`Undo failed: ${e}`);
+      notifications.error($t('notifications.undoFailedDetail', { error: String(e) }));
     }
   }
 
   async function handleRedo() {
     if (!requireDesktopRuntime()) return;
+    // Same split-state hazard as handleUndo: the global redo has no meaning on the review surfaces.
+    if (viewMode === 'review' || $showReviewInbox) return;
     try {
       const description = await historyStore.redo();
-      notifications.info(`Redo: ${description ?? 'Last action reapplied'}`);
+      notifications.info($t('notifications.redone', { what: description ?? $t('notifications.lastActionReapplied') }));
       await loadSegments();
       if (historyPanel) {
         historyPanel.recordAction(`Redone: ${description ?? 'action'}`, 'edit');
       }
     } catch (e) {
-      notifications.error(`Redo failed: ${e}`);
+      notifications.error($t('notifications.redoFailedDetail', { error: String(e) }));
     }
   }
 
@@ -2593,7 +2671,7 @@
                   </div>
                 {:else}
                   <p class="text-cortex-500 italic">
-                    No word timestamps available. Click 'Align' to align the text with audio.
+                    {$t('editor.noWordTimestamps')}
                   </p>
                 {/if}
               </div>

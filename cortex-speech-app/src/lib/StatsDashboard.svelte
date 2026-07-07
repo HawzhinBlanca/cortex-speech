@@ -200,12 +200,45 @@
     }
   }
 
+  // 4.5: off-disk backup. The rotating auto-snapshots live in the app data dir alongside the live DB
+  // — one disk failure loses both. This copies the whole library to a folder the owner chooses (an
+  // external drive, a synced folder), into a timestamped file so successive backups never collide.
+  async function backupToFolder() {
+    const r = await pickDirAnd('backup', async (dir) => {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const sep = dir.includes('\\') ? '\\' : '/';
+      const base = dir.endsWith(sep) ? dir : `${dir}${sep}`;
+      const dest = `${base}cortex-speech-backup-${stamp}.db`;
+      await api.dbBackup(dest);
+      return dest;
+    });
+    if (r) {
+      notifications.success($t('stats.backupDone').replace('{path}', r));
+    }
+  }
+
   async function importVerifiedAsGold() {
     if (!tauriAvailable || toolBusy) return;
     toolBusy = 'importGold';
     try {
       const created = await api.importVerifiedSegmentsAsGold();
       notifications.success($t('stats.importGoldDone').replace('{n}', String(created)));
+    } catch (e) {
+      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+    } finally {
+      toolBusy = null;
+    }
+  }
+
+  // Reclaim disk from a library bloated by months of deletes / re-transcribes (VACUUM), then rebuild
+  // the FTS index the vacuum's rowid-renumbering can desync (handled backend-side in db.vacuum()). The
+  // db_vacuum IPC previously had no caller — a long-lived personal DB could only grow.
+  async function compactDatabase() {
+    if (!tauriAvailable || toolBusy) return;
+    toolBusy = 'compact';
+    try {
+      await api.dbVacuum();
+      notifications.success($t('stats.compactDone'));
     } catch (e) {
       notifications.error($t('stats.toolFailed'), { detail: String(e) });
     } finally {
@@ -244,6 +277,36 @@
     try {
       await api.restoreDbFromSnapshot(name);
       // Full reload: the restored DB invalidates every in-memory store.
+      window.location.reload();
+    } catch (e) {
+      notifications.error($t('stats.restoreFailed'), { detail: String(e) });
+      toolBusy = null;
+    }
+  }
+
+  // 4.5 counterpart to backupToFolder: restore the live library from a backup .db file the owner
+  // picks (e.g. the file "Backup to folder…" wrote to an external drive). Destructive — the backend
+  // integrity-checks the source first; on success the whole app reloads (every store re-derives).
+  async function restoreFromFile() {
+    if (!tauriAvailable || toolBusy) return;
+    let src: string;
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const picked = await open({
+        directory: false,
+        multiple: false,
+        filters: [{ name: 'Cortex backup', extensions: ['db'] }],
+      });
+      if (typeof picked !== 'string') return;
+      src = picked;
+    } catch (e) {
+      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+      return;
+    }
+    if (!window.confirm($t('stats.restoreFileConfirm'))) return;
+    toolBusy = 'restoreFile';
+    try {
+      await api.dbRestore(src);
       window.location.reload();
     } catch (e) {
       notifications.error($t('stats.restoreFailed'), { detail: String(e) });
@@ -749,11 +812,38 @@
           <button
             type="button"
             class="btn btn-secondary !text-xs !justify-start"
+            data-testid="backup-db-btn"
+            disabled={toolBusy !== null}
+            onclick={backupToFolder}
+          >
+            {toolBusy === 'backup' ? $t('stats.toolWorking') : $t('stats.backupDb')}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
+            data-testid="restore-file-btn"
+            disabled={toolBusy !== null}
+            onclick={restoreFromFile}
+          >
+            {toolBusy === 'restoreFile' ? $t('stats.toolWorking') : $t('stats.restoreFile')}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
             data-testid="restore-snapshot-btn"
             disabled={toolBusy !== null}
             onclick={toggleSnapshotList}
           >
             {toolBusy === 'listSnapshots' ? $t('stats.toolWorking') : $t('stats.restoreSnapshot')}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs !justify-start"
+            data-testid="compact-db-btn"
+            disabled={toolBusy !== null}
+            onclick={compactDatabase}
+          >
+            {toolBusy === 'compact' ? $t('stats.toolWorking') : $t('stats.compactDb')}
           </button>
         </div>
         {#if snapshots}

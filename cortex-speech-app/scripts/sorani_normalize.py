@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""Canonical Sorani Kurdish text normalizer — matches normalizer.rs exactly for byte-identical output.
+"""Canonical Sorani Kurdish text normalizer (standalone CLI utility).
 
-Implements NFC, Kaf/Yeh/Heh/Hamza/digit/whitespace normalization per the UTF-8 spec used by the
-Cortex Speech app (OmniASR-CTC-300M, fine-tuned MMS-1B, 7B evaluations). Every normalization step
-is order-dependent and preserves the Rust semantics so that Python(text) == Rust(text).encode('utf-8').
+Implements the CHARACTER-folding steps of `src-tauri/src/normalizer.rs`, in the same order: NFC,
+Latin→Arabic punctuation, Kaf/Yeh variants, word-final Heh (incl. tatweel-protection), tatweel
+removal, ZWNJ→space, zero-width strip, contextual Heh, Hamza, digit-GLYPH folding (Persian/Arabic →
+Latin), whitespace collapse + trim. For text WITHOUT numeric separators or diacritics this is
+byte-for-byte identical to the Rust `char_only`/metrics output.
+
+SCOPE / KNOWN DIVERGENCES from the full Rust normalizer (verified 2026-07-07):
+  * NUMBERS: this folds digit GLYPHS only. It does NOT fold the native separators (ARABIC DECIMAL
+    U+066B → '.', ARABIC THOUSANDS U+066C → '،'), strip grouped thousands ("1٬000" → "1000"), or
+    verbalize — all of which the Rust does under `normalize_numbers`. So on text with U+066B/U+066C
+    or grouped numbers, Python(text) ≠ Rust(text).
+  * DIACRITICS: harakat/tashkeel are KEPT here by default (Step 7 is opt-in), whereas the Rust
+    metrics config removes them. So this matches a `remove_diacritics: false` Rust config only.
+Do not rely on this for exact metric parity with the app; the Rust normalizer is the source of truth.
 
 Usage: python scripts/sorani_normalize.py <text>   [outputs normalized text to stdout]
        python -c "from scripts.sorani_normalize import norm; print(norm('text'))"

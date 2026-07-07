@@ -497,9 +497,7 @@ fn json_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
     value.get(key).and_then(serde_json::Value::as_f64)
 }
 
-fn learning_text_key(text: &str) -> String {
-    text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
-}
+use crate::normalizer::learning_text_key;
 
 /// POST the DPO preference dataset to a local fine-tuning endpoint.
 pub fn run_dpo_update(db: &Database, endpoint: &str) -> AppResult<String> {

@@ -194,9 +194,7 @@ fn validate_segment(seg: &SpeechSegment) -> AppResult<()> {
     Ok(())
 }
 
-fn learning_text_key(text: &str) -> String {
-    text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
-}
+use crate::normalizer::learning_text_key;
 
 fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String>]) -> Option<String> {
     let corrected_key = learning_text_key(corrected);
@@ -748,15 +746,59 @@ impl Database {
         Ok(rows_changed > 0)
     }
 
-    pub fn delete_segment(&self, id: &str) -> AppResult<()> {
-        self.conn.execute("DELETE FROM speech_segments WHERE id = ?1", params![id])?;
-        self.track_write()?;
+    /// Fold ONE segment's LOOP-0 shadow evidence into the durable archive BEFORE it is deleted, so the
+    /// C5 over-trigger gate isn't survivor-biased by the owner's normal cleanup (review a bad clip, then
+    /// delete it — exactly the rows most likely to be over-triggers). Uses the same correlation as
+    /// `intelligence_report`. Must run while the segment + its shadow rows still exist (before DELETE).
+    fn archive_loop0_evidence_for(&self, id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE loop0_evidence_archive SET
+                 total_observations = total_observations
+                     + COALESCE((SELECT COUNT(*) FROM loop0_shadow_log WHERE segment_id = ?1), 0),
+                 would_fire = would_fire
+                     + COALESCE((SELECT SUM(memory_fired) FROM loop0_shadow_log WHERE segment_id = ?1), 0),
+                 fired_human_accepted = fired_human_accepted + COALESCE((
+                     SELECT SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END)
+                     FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id WHERE l.segment_id = ?1), 0),
+                 fired_human_edited = fired_human_edited + COALESCE((
+                     SELECT SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('edit','human_edit') THEN 1 ELSE 0 END)
+                     FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id WHERE l.segment_id = ?1), 0),
+                 fired_human_rejected = fired_human_rejected + COALESCE((
+                     SELECT SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('reject','human_reject') THEN 1 ELSE 0 END)
+                     FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id WHERE l.segment_id = ?1), 0)
+             WHERE id = 1",
+            params![id],
+        )?;
         Ok(())
+    }
+
+    pub fn delete_segment(&self, id: &str) -> AppResult<()> {
+        self.conn.execute("SAVEPOINT del_seg", [])?;
+        let result: AppResult<()> = (|| {
+            self.archive_loop0_evidence_for(id)?;
+            self.conn.execute("DELETE FROM speech_segments WHERE id = ?1", params![id])?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("del_seg")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(e) => {
+                self.cleanup_savepoint_after_error("del_seg");
+                Err(e)
+            }
+        }
     }
 
     pub fn delete_segments_batch(&self, ids: &[String]) -> AppResult<()> {
         self.conn.execute("SAVEPOINT batch_delete", [])?;
         let result: AppResult<()> = (|| {
+            // Archive each segment's shadow evidence FIRST (while its shadow rows still exist), then delete.
+            for id in ids {
+                self.archive_loop0_evidence_for(id)?;
+            }
             let mut stmt = self.conn.prepare("DELETE FROM speech_segments WHERE id = ?1")?;
             for id in ids {
                 stmt.execute(params![id])?;
@@ -986,6 +1028,12 @@ impl Database {
 
     pub fn restore<P: AsRef<Path>>(&mut self, src: P) -> AppResult<()> {
         let src_conn = Connection::open(src.as_ref())?;
+        // Verify the SOURCE snapshot is a healthy database BEFORE overwriting the live one, so a corrupt
+        // snapshot fails fast with a clear error instead of part-way through the backup copy.
+        let integrity: String = src_conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if integrity.trim() != "ok" {
+            return Err(AppError::Other(format!("snapshot database failed its integrity check: {integrity}")));
+        }
         let backup = backup::Backup::new(&src_conn, &mut self.conn)?;
         backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
         Ok(())
@@ -993,6 +1041,9 @@ impl Database {
 
     pub fn vacuum(&self) -> AppResult<()> {
         self.conn.execute("VACUUM", [])?;
+        // VACUUM can renumber speech_segments' implicit rowids, silently desyncing the external-content
+        // FTS index (search would return unrelated rows until the next restart). Rebuild it immediately.
+        self.conn.execute("INSERT INTO segments_fts(segments_fts) VALUES('rebuild')", [])?;
         Ok(())
     }
 
@@ -1046,7 +1097,7 @@ impl Database {
             if candidate.is_file() {
                 let new_path = candidate.to_string_lossy().to_string();
                 let n = self.conn.execute(
-                    "UPDATE speech_segments SET audio_path = ?2 WHERE audio_path = ?1",
+                    "UPDATE speech_segments SET audio_path = ?2, updated_at = datetime('now') WHERE audio_path = ?1",
                     params![old, new_path],
                 )?;
                 if n > 0 {
@@ -1508,12 +1559,18 @@ impl Database {
     /// * C4: of the machine's T0 auto-accepts that a human later reviewed, how many did the human
     ///   confirm vs contradict (edit/reject) — the honest precision behind any autonomy increase.
     pub fn intelligence_report(&self) -> AppResult<serde_json::Value> {
+        // Live counts over surviving segments PLUS the durable archive of segments already deleted
+        // (migration v33), so the C5 over-trigger gate is not survivor-biased by ordinary cleanup.
         let loop0 = self.conn.query_row(
-            "SELECT COUNT(*),
-                    COALESCE(SUM(l.memory_fired), 0),
-                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('edit','human_edit') THEN 1 ELSE 0 END), 0),
+            "SELECT COUNT(*) + COALESCE((SELECT total_observations FROM loop0_evidence_archive WHERE id = 1), 0),
+                    COALESCE(SUM(l.memory_fired), 0)
+                        + COALESCE((SELECT would_fire FROM loop0_evidence_archive WHERE id = 1), 0),
+                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END), 0)
+                        + COALESCE((SELECT fired_human_accepted FROM loop0_evidence_archive WHERE id = 1), 0),
+                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('edit','human_edit') THEN 1 ELSE 0 END), 0)
+                        + COALESCE((SELECT fired_human_edited FROM loop0_evidence_archive WHERE id = 1), 0),
                     COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('reject','human_reject') THEN 1 ELSE 0 END), 0)
+                        + COALESCE((SELECT fired_human_rejected FROM loop0_evidence_archive WHERE id = 1), 0)
              FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id",
             [],
             |row| {
@@ -1776,6 +1833,50 @@ impl Database {
             None
         };
 
+        // LOOP-0 evidence-based confidence (true-10 audit): for every PRE-EXISTING correction memory
+        // that would have fired on this segment, record whether the human's decision confirmed or
+        // contradicted it. The finalized transcript the human reviewed (annotated ▸ normalized ▸ raw)
+        // mirrors `pipeline::shadow_log_loop0`, so the evidence matches the shadow signal.
+        //
+        //   * edit   -> reference is the human's fix; a memory whose firing moves the text TOWARD it is
+        //               a confirm, AWAY is an override (over-trigger).
+        //   * accept -> reference IS the finalized text; any memory that fires there over-triggered on a
+        //               draft the human just confirmed was already correct -> override.
+        //   * reject -> inconclusive (the human discarded the whole clip, not a verdict on any word) -> skip.
+        //
+        // Snapshot the memories BEFORE the capture/upsert below so the memory born from THIS edit cannot
+        // confirm itself. Gold is excluded to match the capture path: gold human-decisions are the firing
+        // eval set (see `firing_error_delta`), and tuning the store on them would leak.
+        let finalized_text = crate::corrections::loop0_draft_text(
+            annotated_transcript.as_deref(),
+            normalized_transcript.as_deref(),
+            &raw_transcript,
+        )
+        .to_string();
+        let confidence_reference: Option<String> = match decision {
+            "edit" => corrected_transcript.map(str::to_string),
+            "accept" => Some(finalized_text.clone()),
+            _ => None,
+        };
+        type MemoryOutcomeUpdate = (String, String, String, crate::corrections::MemoryOutcome);
+        let confidence_updates: Vec<MemoryOutcomeUpdate> = match (is_gold, confidence_reference.as_deref()) {
+            (0, Some(reference)) => {
+                let cfg = crate::corrections::FiringConfig::default();
+                let mems = self.load_correction_memories()?;
+                // Winner-take-all per slot (matches runtime firing): only the memory that would actually
+                // fire at each slot is credited, so a losing sibling in the same slot earns no spurious
+                // confirm/override.
+                crate::corrections::classify_memory_outcomes(&finalized_text, reference, &mems, &cfg)
+                    .into_iter()
+                    .map(|(idx, outcome)| {
+                        let m = &mems[idx];
+                        (m.slot_key.clone(), m.wrong_token.clone(), m.human_token.clone(), outcome)
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
         // The human's verdict, the learning pair, and the audit-ledger row commit together as one
         // atomic correction — a crash can never leave a verdict without its provenance, or vice versa.
         let tx = self.conn.unchecked_transaction()?;
@@ -1844,8 +1945,9 @@ impl Database {
                         let mem_id = uuid::Uuid::new_v4().to_string();
                         tx.execute(
                             "INSERT INTO correction_memory
-                                (id, wrong_token, human_token, slot_key, phonetic_key, source_segment, model_version_id)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                (id, wrong_token, human_token, slot_key, phonetic_key, source_segment,
+                                 model_version_id, confidence)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                             params![
                                 mem_id,
                                 mem.wrong_token,
@@ -1853,12 +1955,41 @@ impl Database {
                                 mem.slot_key,
                                 mem.phonetic_key,
                                 segment_id,
-                                model_version_id
+                                model_version_id,
+                                // Start at the Beta(1,1) prior (0.5), not the frozen 1.0: a fresh memory
+                                // has zero firing-outcome evidence and must earn its way past tau_conf.
+                                crate::corrections::beta_confidence(0, 0)
                             ],
                         )?;
                     }
                 }
             }
+        }
+
+        // Apply the pre-computed LOOP-0 confidence evidence. Each pre-existing memory that would have
+        // fired on this segment gets a confirm or an override; `confidence` becomes the Beta(1,1)
+        // posterior of the updated counts (the SET expressions evaluate against the OLD row values, so
+        // `+1`/`+2`/`+3` reconstruct `beta_confidence(new_confirm, new_override)` exactly). `last_fired_at`
+        // records this shadow-fire against a human-reviewed segment — the column was never written before.
+        for (slot_key, wrong_token, human_token, outcome) in &confidence_updates {
+            let sql = match outcome {
+                crate::corrections::MemoryOutcome::Confirm => {
+                    "UPDATE correction_memory
+                        SET confirm_count = confirm_count + 1,
+                            confidence    = (confirm_count + 2.0) / (confirm_count + override_count + 3.0),
+                            last_fired_at = datetime('now')
+                      WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3"
+                }
+                crate::corrections::MemoryOutcome::Override => {
+                    "UPDATE correction_memory
+                        SET override_count = override_count + 1,
+                            confidence     = (confirm_count + 1.0) / (confirm_count + override_count + 3.0),
+                            last_fired_at  = datetime('now')
+                      WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3"
+                }
+                crate::corrections::MemoryOutcome::Neutral => continue,
+            };
+            tx.execute(sql, params![slot_key, wrong_token, human_token])?;
         }
 
         // M2.1: Log decision timing to decision_log for instrumentation before M3 marathon.
@@ -3066,7 +3197,10 @@ mod tests {
         assert_eq!(mems.len(), 1);
         assert_eq!(mems[0].wrong_token, "باش");
         assert_eq!(mems[0].human_token, "خراپ");
-        assert!(mems[0].confidence >= 1.0, "fresh memory confidence defaults to 1.0");
+        assert!(
+            (mems[0].confidence - 0.5).abs() < 1e-9,
+            "a freshly captured memory starts at the Beta(1,1) prior 0.5 (no firing-outcome evidence yet)"
+        );
         assert_eq!(mems[0].hit_count, 0);
     }
 
@@ -3092,6 +3226,96 @@ mod tests {
         assert_eq!(out, "ئەو ساڵە خراپ بوو", "capture x2 -> DB -> load -> fire reproduces the human fix");
     }
 
+    /// Confirming edits of the SAME confusion must lift a memory's evidence-based confidence from the
+    /// neutral prior up past tau_conf — the "a confirmed memory's confidence rises" half of the audit fix.
+    #[test]
+    fn confirmed_memory_confidence_rises_above_tau_conf() {
+        let db = make_db();
+        let tau = crate::corrections::FiringConfig::default().tau_conf;
+
+        // The first edit CAPTURES the memory at the 0.5 prior — below tau_conf, so it cannot fire yet.
+        let mut seg0 = make_segment("cf-0", "/data/audio/cf-0.wav");
+        seg0.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+        db.insert_segment(&seg0).expect("insert");
+        db.record_human_decision("cf-0", "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
+        let fresh = db.load_correction_memories().expect("load")[0].confidence;
+        assert!(fresh < tau, "a freshly captured memory sits at the 0.5 prior, below tau_conf: {fresh}");
+
+        // Each further human edit of the same confusion is an independent confirmation -> confidence climbs.
+        for id in ["cf-1", "cf-2"] {
+            let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
+            seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+            db.insert_segment(&seg).expect("insert");
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
+        }
+        let confirmed = db.load_correction_memories().expect("load")[0].confidence;
+        assert!(confirmed > tau, "confirming edits must raise confidence above tau_conf: {confirmed}");
+    }
+
+    /// A memory that first earns confidence, then repeatedly over-triggers on drafts the human ACCEPTS
+    /// as-is, must decay back below tau_conf — the anti-poisoning "one bad memory decays" half of the fix.
+    #[test]
+    fn overridden_memory_confidence_decays_below_tau_conf() {
+        let db = make_db();
+        let tau = crate::corrections::FiringConfig::default().tau_conf;
+
+        // Earn confidence with confirming edits of the same confusion (distinct segments).
+        for id in ["bad-1", "bad-2", "bad-3"] {
+            let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
+            seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+            db.insert_segment(&seg).expect("insert");
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
+        }
+        let confident = db.load_correction_memories().expect("load")[0].confidence;
+        assert!(confident > tau, "after confirming edits the memory clears tau_conf: {confident}");
+
+        // Now humans keep ACCEPTING the original in that slot -> every would-fire is an over-trigger.
+        for id in ["ovr-1", "ovr-2", "ovr-3"] {
+            let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
+            seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+            db.insert_segment(&seg).expect("insert");
+            db.record_human_decision(id, "accept", None, None).expect("accept");
+        }
+        let decayed = db.load_correction_memories().expect("load")[0].confidence;
+        assert!(decayed < tau, "repeated over-triggers must decay confidence below tau_conf: {decayed}");
+    }
+
+    /// A confirm/override event stamps `last_fired_at` (previously never written) and increments the
+    /// firing-outcome counters; a gold segment's decision must NOT touch either (eval-leak guard).
+    #[test]
+    fn confidence_evidence_stamps_last_fired_at_and_skips_gold() {
+        let db = make_db();
+        // Capture on the first edit, then a second same-confusion edit lands a confirm.
+        for id in ["lf-1", "lf-2"] {
+            let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
+            seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+            db.insert_segment(&seg).expect("insert");
+            db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
+        }
+        let (fired_set, confirms): (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT last_fired_at IS NOT NULL, confirm_count FROM correction_memory WHERE wrong_token = 'باش'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query");
+        assert_eq!(fired_set, 1, "a confirm event stamps last_fired_at");
+        assert_eq!(confirms, 1, "the second same-confusion edit records exactly one confirm");
+
+        // A gold segment whose text the memory would fire on must leave the evidence untouched.
+        let mut gold = make_segment("lf-gold", "/data/audio/lf-gold.wav");
+        gold.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+        db.insert_segment(&gold).expect("insert");
+        db.connection().execute("UPDATE speech_segments SET is_gold = 1 WHERE id = 'lf-gold'", []).expect("mark gold");
+        db.record_human_decision("lf-gold", "accept", None, None).expect("accept");
+        let overrides: i64 = db
+            .connection()
+            .query_row("SELECT override_count FROM correction_memory WHERE wrong_token = 'باش'", [], |r| r.get(0))
+            .expect("query");
+        assert_eq!(overrides, 0, "a gold-segment decision must not update firing-outcome evidence (eval-leak guard)");
+    }
+
     #[test]
     fn loop0_shadow_log_records_would_fire_flag() {
         // P1.3: each shadow observation persists a row with its memory_fired flag (the C5 data source).
@@ -3109,6 +3333,51 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(rows, vec![1, 0], "both shadow observations persist with their flags");
+    }
+
+    #[test]
+    fn deleting_a_segment_preserves_its_loop0_over_trigger_evidence() {
+        // C5 survivor-bias guard: the owner's normal cleanup (review a bad clip, then delete it) must not
+        // erase the over-trigger evidence that gate reads — else the gate looks safer than reality.
+        let db = make_db();
+        let mut seg = make_segment("ov-1", "/data/audio/ov-1.wav");
+        seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
+        db.insert_segment(&seg).expect("insert");
+        // Shadow says a memory WOULD fire; the human then accepted the original -> an OVER-TRIGGER.
+        db.record_loop0_shadow("ov-1", true).expect("shadow");
+        db.connection().execute("UPDATE speech_segments SET human_decision='accept' WHERE id='ov-1'", []).expect("hd");
+
+        let ot_before =
+            db.intelligence_report().expect("report")["loop0Shadow"]["firedButHumanAcceptedOriginal"].as_i64().unwrap();
+        assert_eq!(ot_before, 1, "the over-trigger is counted while the segment exists");
+
+        db.delete_segment("ov-1").expect("delete");
+
+        let ot_after =
+            db.intelligence_report().expect("report")["loop0Shadow"]["firedButHumanAcceptedOriginal"].as_i64().unwrap();
+        assert_eq!(ot_after, 1, "the over-trigger evidence SURVIVES deletion via the durable archive");
+    }
+
+    #[test]
+    fn restore_rejects_a_corrupt_source_before_overwriting_the_live_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let live_path = tmp.path().join("live.db");
+        let mut live = Database::open(live_path.to_str().unwrap()).unwrap();
+        live.initialize().unwrap();
+
+        // A healthy snapshot restores fine.
+        let good_path = tmp.path().join("good.db");
+        {
+            let good = Database::open(good_path.to_str().unwrap()).unwrap();
+            good.initialize().unwrap();
+        }
+        live.restore(&good_path).expect("a healthy snapshot restores");
+
+        // A garbage source is REJECTED (integrity/open failure) — no partial overwrite of the live DB.
+        let bad_path = tmp.path().join("bad.db");
+        std::fs::write(&bad_path, b"this is not a sqlite database at all").unwrap();
+        assert!(live.restore(&bad_path).is_err(), "a corrupt snapshot must be rejected");
+        assert!(live.segment_count().is_ok(), "the live database is still usable after a rejected restore");
     }
 
     #[test]

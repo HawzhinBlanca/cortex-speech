@@ -204,27 +204,6 @@ export async function exportDataset(path: string, format: string): Promise<void>
   return invoke<void>('export_dataset', { path, format });
 }
 
-export interface DatasetRun {
-  id: string;
-  name: string;
-  status: string;
-  config: Record<string, unknown>;
-  createdAt: string;
-  completedAt: string | null;
-}
-
-export interface JobStatus {
-  id: string;
-  kind: string;
-  status: string;
-  progress: number;
-  cancellable: boolean;
-  summary: string | null;
-  error: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
 export interface AgentSourceReferenceSummary {
   audioPath: string;
   modelId: string;
@@ -366,14 +345,6 @@ export async function exportDatasetBundle(
   });
 }
 
-export async function createDatasetRun(name?: string): Promise<DatasetRun> {
-  return invoke<DatasetRun>('create_dataset_run', { name: name ?? null });
-}
-
-export async function listDatasetRuns(): Promise<DatasetRun[]> {
-  return invoke<DatasetRun[]>('list_dataset_runs');
-}
-
 export async function listAgentImportReports(limit = 25): Promise<AgentImportReport[]> {
   return invoke<AgentImportReport[]>('list_agent_import_reports', { limit });
 }
@@ -383,26 +354,6 @@ export async function listAgentStageEvents(
   limit = 50,
 ): Promise<AgentStageEvent[]> {
   return invoke<AgentStageEvent[]>('list_agent_stage_events', { runId: runId ?? null, limit });
-}
-
-export async function startJob(
-  kind: string,
-  summary?: string,
-  cancellable = false,
-): Promise<JobStatus> {
-  return invoke<JobStatus>('start_job', {
-    kind,
-    summary: summary ?? null,
-    cancellable,
-  });
-}
-
-export async function getJobStatus(id: string): Promise<JobStatus> {
-  return invoke<JobStatus>('get_job_status', { id });
-}
-
-export async function cancelJob(id: string): Promise<void> {
-  return invoke<void>('cancel_job', { id });
 }
 
 export async function getBlockingValidationIssues(
@@ -900,6 +851,12 @@ export async function dbBackup(dest: string): Promise<void> {
   return invoke('db_backup', { dest });
 }
 
+/** Restore the live library from a backup .db file (the counterpart to dbBackup). Destructive — the
+ *  backend PRAGMA integrity_check's the source before overwriting, so a corrupt file fails fast. */
+export async function dbRestore(src: string): Promise<void> {
+  return invoke('db_restore', { src });
+}
+
 export async function dbVacuum(): Promise<void> {
   return invoke('db_vacuum');
 }
@@ -944,15 +901,29 @@ export async function getInferenceStats(): Promise<{
   return invoke('get_inference_stats');
 }
 
-export async function appHealth(): Promise<{
+export interface AppHealth {
   status: string;
   db_size: number;
   uptime: number;
   segment_count: number;
   memory_mb: number;
   missing_models: string[];
-}> {
+  missing_optional_models?: string[];
+  /** Epoch seconds of the last successful auto-snapshot, or 0 if none yet this session. */
+  snapshot_last_success_epoch_secs?: number;
+  /** Consecutive auto-snapshot failures — a rising streak means the safety net is silently down. */
+  snapshot_consecutive_failures?: number;
+  /** Free bytes on the volume holding the data dir, or null when it couldn't be determined. */
+  free_disk_bytes?: number | null;
+}
+
+export async function appHealth(): Promise<AppHealth> {
   return invoke('app_health');
+}
+
+/** One-line summary of the previous session's crash (surfaced once), or null if it exited cleanly. */
+export async function takeLastCrash(): Promise<string | null> {
+  return invoke('take_last_crash');
 }
 
 export interface AgenticReadinessCheck {

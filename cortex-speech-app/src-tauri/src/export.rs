@@ -25,7 +25,48 @@ pub struct DatasetMetadata {
     pub total_duration_ms: i64,
     pub verified_segments: usize,
     pub training_grade_summary: TrainingGradeSummary,
+    /// Per-speaker composition so a skewed corpus (one voice dominating) is visible in the dataset card
+    /// itself rather than only in-app — a real fine-tune quality lever for a small single-curator corpus.
+    pub composition: DatasetComposition,
     pub exported_at: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct SpeakerComposition {
+    pub speaker_id: String,
+    pub segments: usize,
+    pub duration_ms: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct DatasetComposition {
+    pub speakers: Vec<SpeakerComposition>,
+    /// The largest single speaker's share of total duration (0..1).
+    pub dominant_speaker_share: f64,
+    /// True when one speaker exceeds 50% of the corpus by duration — flag it for the curator.
+    pub dominant_speaker_over_50pct: bool,
+}
+
+/// Aggregate per-speaker segment/duration counts and the dominant speaker's share of total duration.
+fn compute_composition(segments: &[SpeechSegment]) -> DatasetComposition {
+    use std::collections::HashMap;
+    let mut by_speaker: HashMap<String, (usize, i64)> = HashMap::new();
+    let mut total: i64 = 0;
+    for s in segments {
+        let spk = s.speaker_id.clone().unwrap_or_else(|| "unknown".to_string());
+        let entry = by_speaker.entry(spk).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += s.duration_ms;
+        total += s.duration_ms;
+    }
+    let mut speakers: Vec<SpeakerComposition> = by_speaker
+        .into_iter()
+        .map(|(speaker_id, (segments, duration_ms))| SpeakerComposition { speaker_id, segments, duration_ms })
+        .collect();
+    speakers.sort_by(|a, b| b.duration_ms.cmp(&a.duration_ms).then_with(|| a.speaker_id.cmp(&b.speaker_id)));
+    let dominant_speaker_share =
+        if total > 0 { speakers.first().map(|s| s.duration_ms as f64 / total as f64).unwrap_or(0.0) } else { 0.0 };
+    DatasetComposition { dominant_speaker_over_50pct: dominant_speaker_share > 0.5, dominant_speaker_share, speakers }
 }
 
 #[derive(serde::Serialize)]
@@ -49,7 +90,11 @@ impl ExportSegmentRecord {
         sanitized.audio_path = export_audio_ref(&segment.audio_path).to_string();
         Self {
             segment: sanitized,
-            training_transcript: report.transcript,
+            // Canonicalize the SHIPPED training text (fold ك/ک, ي/ی, heh forms, ZWNJ/tatweel; digits
+            // and diacritics untouched) exactly like the HF exporter, so JSON/JSONL/CSV/Parquet emit
+            // byte-identical training_transcript for a segment — mixed orthography must not re-enter the
+            // corpus and fragment the CTC label space through the flat exports.
+            training_transcript: crate::normalizer::canonical_training_text(&report.transcript),
             transcript_source: report.transcript_source,
             training_grade: report.grade,
             training_ready: report.training_ready,
@@ -227,6 +272,15 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     // already drops it via training_grade_for_segment; do the same here so the plain JSON/JSONL/CSV/
     // Parquet tables and `verified_segments` can never label a reject as confirmed-good output.
     let segments: Vec<SpeechSegment> = segments.into_iter().filter(|s| !quality::is_human_rejected(s)).collect();
+    // A segment still showing an ASR placeholder as its EFFECTIVE transcript ("[Pending WSL 7B ASR]" /
+    // "[ASR unavailable…]") is not a transcript — never ship the literal placeholder string as a training
+    // row (an export taken mid-import would otherwise do exactly that). Exclude and log the count.
+    let before_pending = segments.len();
+    let segments: Vec<SpeechSegment> = segments.into_iter().filter(|s| !quality::is_effective_placeholder(s)).collect();
+    let pending_excluded = before_pending - segments.len();
+    if pending_excluded > 0 {
+        tracing::warn!("dataset export excluded {pending_excluded} not-yet-transcribed (placeholder) segment(s)");
+    }
     let total_duration: i64 = segments.iter().map(|s| s.duration_ms).sum();
     let verified = segments.iter().filter(|s| s.verified).count();
 
@@ -239,6 +293,7 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
         total_duration_ms: total_duration,
         verified_segments: verified,
         training_grade_summary: quality::training_grade_summary(&segments),
+        composition: compute_composition(&segments),
         exported_at: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -431,27 +486,46 @@ pub fn assign_splits(
 
 /// Decide the PCM slice for a segment's exported WAV from its alignment window.
 ///
-/// Returns `None` when the segment must be SKIPPED: its alignment is present and parses but the
-/// window is out of range relative to the (possibly re-encoded/shortened) decoded buffer, or is
-/// degenerate (end <= start). In that case the OLD code substituted the WHOLE source file, pairing
-/// the entire recording with the segment's short transcript — silent training-data corruption. Only
-/// genuinely-absent or unparseable alignment falls back to the whole file (the intended behaviour).
+/// Returns `None` when the segment must be SKIPPED rather than paired with the wrong audio:
+/// - alignment is present and parses but the window is out of range / degenerate (end <= start), OR
+/// - alignment is PRESENT but has no source offsets (e.g. a bare word-timestamp array — the shape a
+///   clobbered `alignment_json` takes). Emitting the whole file here would pair the entire recording
+///   with a short clip's transcript — the exact silent training-data corruption to prevent.
+///
+/// Only a GENUINELY-ABSENT alignment (`None`) falls back to the whole file, which is correct for a
+/// single-file segment that never carried chunk metadata. Every real chunked segment carries a
+/// `SegmentSourceMeta` (even chunk_count==1 records `source_start_ms=0`), so a present-but-offset-less
+/// alignment can only mean the offsets were lost — skip it, don't guess.
 pub(crate) fn slice_for_export<'a>(
     full_pcm: &'a [i16],
     sample_rate: u32,
     alignment_json: Option<&str>,
 ) -> Option<std::borrow::Cow<'a, [i16]>> {
-    match alignment_json.and_then(chunking::SegmentSourceMeta::from_alignment_json) {
-        Some(meta) => {
-            let start = chunking::ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
-            let end = chunking::ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate).min(full_pcm.len());
-            if end > start && start < full_pcm.len() {
-                Some(std::borrow::Cow::Borrowed(&full_pcm[start..end]))
-            } else {
-                None // present-but-out-of-range window -> skip, never emit the whole file
+    match alignment_json {
+        // Truly no alignment metadata -> a single-file segment; the whole file IS the clip.
+        None => Some(std::borrow::Cow::Borrowed(full_pcm)),
+        Some(json) => match chunking::SegmentSourceMeta::from_alignment_json(json) {
+            Some(meta) => {
+                let (start_ms, end_ms) = (meta.source_start_ms.max(0), meta.source_end_ms.max(0));
+                // Reject an absurd offset rather than truncating via `as u32` (i64 -> u32 wraps mod 2^32,
+                // which would silently slice an UNRELATED in-bounds window and EXPORT it mislabeled with
+                // this segment's transcript — training-data corruption). Mirrors the identical guard in
+                // chunking::slice_pcm_by_alignment; a value this large is a malformed/crafted alignment
+                // blob (the app never emits an offset > u32::MAX ms ≈ 49.7 days). Skip, don't emit.
+                if start_ms > u32::MAX as i64 || end_ms > u32::MAX as i64 {
+                    return None;
+                }
+                let start = chunking::ms_to_samples(start_ms as u32, sample_rate);
+                let end = chunking::ms_to_samples(end_ms as u32, sample_rate).min(full_pcm.len());
+                if end > start && start < full_pcm.len() {
+                    Some(std::borrow::Cow::Borrowed(&full_pcm[start..end]))
+                } else {
+                    None // present-but-out-of-range window -> skip, never emit the whole file
+                }
             }
-        }
-        None => Some(std::borrow::Cow::Borrowed(full_pcm)), // no/unparseable alignment -> whole file (intended)
+            // Present but no source offsets (clobbered/anomalous) -> skip, never emit the whole file.
+            None => None,
+        },
     }
 }
 
@@ -1004,7 +1078,9 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 let raw = csv_safe_cell(seg.raw_transcript.as_str());
                 let normalized = csv_safe_cell(seg.normalized_transcript.as_deref().unwrap_or(""));
                 let annotated = csv_safe_cell(seg.annotated_transcript.as_deref().unwrap_or(""));
-                let training = csv_safe_cell(grade.transcript.as_str());
+                // Canonicalize the shipped training column like the HF exporter (see ExportSegmentRecord).
+                let training_text = crate::normalizer::canonical_training_text(&grade.transcript);
+                let training = csv_safe_cell(&training_text);
                 let speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                 let reasons_cell = csv_safe_cell(reasons.as_str());
                 wtr.write_record([
@@ -1110,8 +1186,11 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
     let duration_ms: Int64Array = segments.iter().map(|s| Some(s.duration_ms)).collect();
     let speaker_id: StringArray = segments.iter().map(|s| s.speaker_id.as_deref()).collect();
     let verified: BooleanArray = segments.iter().map(|s| Some(s.verified)).collect();
-    let training_transcript: StringArray =
-        grade_reports.iter().map(|report| Some(report.transcript.as_str())).collect();
+    // Canonicalize the shipped training column like the HF/JSON/CSV exporters so all four formats emit
+    // byte-identical training text for a segment (no mixed-orthography re-entry via Parquet).
+    let training_texts: Vec<String> =
+        grade_reports.iter().map(|report| crate::normalizer::canonical_training_text(&report.transcript)).collect();
+    let training_transcript: StringArray = training_texts.iter().map(|t| Some(t.as_str())).collect();
     let transcript_source: StringArray =
         grade_reports.iter().map(|report| Some(report.transcript_source.as_str())).collect();
     let training_grade: StringArray = grade_reports.iter().map(|report| Some(report.grade.as_str())).collect();
@@ -1353,6 +1432,11 @@ mod tests {
                 silver_segments: 0,
                 review_segments: 0,
                 rejected_segments: 0,
+            },
+            composition: DatasetComposition {
+                speakers: Vec::new(),
+                dominant_speaker_share: 0.0,
+                dominant_speaker_over_50pct: false,
             },
             exported_at: "2026-06-16T00:00:00Z".to_string(),
         }
@@ -1641,6 +1725,69 @@ mod tests {
         // No alignment -> whole file (intended fallback).
         let whole = slice_for_export(&full, 16000, None).expect("whole file");
         assert_eq!(whole.len(), full.len());
+    }
+
+    #[test]
+    fn slice_for_export_skips_present_but_offsetless_alignment() {
+        // The clobbered shape: alignment_json is a bare word-timestamp array (no source_start_ms), the
+        // exact state a broken background aligner leaves. It must SKIP (None), never fall back to the
+        // whole file — otherwise a 10s clip's transcript would be paired with the entire recording.
+        let full = vec![0i16; 16000];
+        let bare_array = r#"[{"word":"x","start":0.0,"end":1.0,"confidence":0.5}]"#;
+        assert!(
+            slice_for_export(&full, 16000, Some(bare_array)).is_none(),
+            "a present-but-offset-less (clobbered) alignment must be skipped, never emitted whole-file"
+        );
+        // A MERGED object (offsets + words) still slices correctly — the good post-fix shape.
+        let meta = crate::chunking::SegmentSourceMeta {
+            source_start_ms: 100,
+            source_end_ms: 500,
+            chunk_index: 0,
+            chunk_count: 2,
+        };
+        let words = vec![crate::aligner::WordTimestamp { word: "x".into(), start: 0.0, end: 0.4, confidence: 0.5 }];
+        let merged = crate::chunking::merge_word_timestamps(Some(&meta.to_alignment_json()), &words);
+        let s = slice_for_export(&full, 16000, Some(&merged)).expect("merged alignment still slices");
+        assert_eq!(s.len(), chunking::ms_to_samples(400, 16000), "merged object slices to its 100..500ms window");
+    }
+
+    #[test]
+    fn slice_for_export_skips_offset_beyond_u32_instead_of_wrap_slicing() {
+        // A malformed/corrupted alignment blob can carry an i64 offset > u32::MAX. A bare `as u32` would
+        // WRAP it (mod 2^32) to a small in-range index and export an UNRELATED window mislabeled with this
+        // segment's transcript — silent training-data corruption. It must SKIP, matching the identical
+        // guard in chunking::slice_pcm_by_alignment. Without the guard: start_ms 2^32 wraps to 0 and
+        // end_ms 2^32+500 wraps to 500, so this would have sliced [0..8000] and returned Some(8000).
+        let full = vec![0i16; 16000];
+        let wrapping = crate::chunking::SegmentSourceMeta {
+            source_start_ms: u32::MAX as i64 + 1, // wraps to 0 under `as u32`
+            source_end_ms: u32::MAX as i64 + 501, // wraps to 500 under `as u32`
+            chunk_index: 0,
+            chunk_count: 1,
+        };
+        assert!(
+            slice_for_export(&full, 16000, Some(&wrapping.to_alignment_json())).is_none(),
+            "an offset > u32::MAX must SKIP, never wrap-slice an unrelated window into the export"
+        );
+    }
+
+    #[test]
+    fn compute_composition_flags_a_dominant_speaker() {
+        let mk = |id: &str, spk: &str, dur: i64| SpeechSegment {
+            id: id.into(),
+            speaker_id: Some(spk.into()),
+            duration_ms: dur,
+            ..Default::default()
+        };
+        // Speaker A = 8000ms, B = 2000ms -> A dominates (80% of duration > 50%).
+        let c = compute_composition(&[mk("1", "A", 5000), mk("2", "A", 3000), mk("3", "B", 2000)]);
+        assert_eq!(c.speakers.len(), 2);
+        assert_eq!(c.speakers[0].speaker_id, "A", "speakers sorted by duration desc");
+        assert_eq!((c.speakers[0].segments, c.speakers[0].duration_ms), (2, 8000));
+        assert!((c.dominant_speaker_share - 0.8).abs() < 1e-9);
+        assert!(c.dominant_speaker_over_50pct, "one speaker over 50% is flagged");
+        // A balanced corpus is not flagged.
+        assert!(!compute_composition(&[mk("1", "A", 5000), mk("2", "B", 5000)]).dominant_speaker_over_50pct);
     }
 
     #[test]

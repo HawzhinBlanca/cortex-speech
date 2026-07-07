@@ -316,6 +316,27 @@ mod tests {
     }
 
     #[test]
+    fn breakdown_pins_sdi_split_at_the_all_deletion_and_all_insertion_boundaries() {
+        // The backtrace's `j -= 1` (insertion) branch must never be reached with j == 0, and the
+        // all-deletion / all-insertion extremes must attribute EVERY error to the right bucket — not
+        // merely keep total() correct. A refactor that mislabeled deletions as insertions (or vice
+        // versa) would keep the edit distance right while silently corrupting the S/D/I breakdown that
+        // feeds the honesty-critical error report; this pins both extremes so that can't slip through.
+        let all_del = word_error_breakdown("alpha beta gamma", ""); // hyp empty -> j hits 0
+        assert_eq!(
+            (all_del.substitutions, all_del.deletions, all_del.insertions, all_del.ref_len),
+            (0, 3, 0, 3),
+            "every reference word with no hypothesis is a DELETION"
+        );
+        let all_ins = word_error_breakdown("", "alpha beta gamma"); // ref empty -> i is 0
+        assert_eq!(
+            (all_ins.substitutions, all_ins.deletions, all_ins.insertions, all_ins.ref_len),
+            (0, 0, 3, 0),
+            "every hypothesis word with no reference is an INSERTION"
+        );
+    }
+
+    #[test]
     fn one_substitution_wer() {
         assert!((compute_wer("hello world", "hello earth") - 0.5).abs() < 1e-9);
     }

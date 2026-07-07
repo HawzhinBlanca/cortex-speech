@@ -340,6 +340,7 @@
             />
             <span class="text-sm text-muted">{$t('gpuAcceleration')}</span>
           </label>
+          <p class="text-xs text-subtle ms-7 -mt-1">{$t('gpuAccelerationNote')}</p>
         {:else if activeTab === 'audio'}
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('vadThreshold')}</span>

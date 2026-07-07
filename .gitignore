@@ -80,3 +80,9 @@ __pycache__/
 # by the dataset scripts; must never enter the public repo (F3 privacy fix, 2026-07-02).
 *_perfect_dataset.json
 podcast_transcription.txt
+
+# Claude Code local state (machine-local; never commit). settings.local.json holds per-machine
+# tool permissions; .claude/worktrees/ is scratch checkouts. Shared .claude config (settings.json,
+# skills) is intentionally NOT ignored — mirrors cortex-speech-app/.gitignore's convention.
+.claude/settings.local.json
+.claude/worktrees/

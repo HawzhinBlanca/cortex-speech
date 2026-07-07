@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a small seed-fixed Sorani gold manifest from the user's local corpus for CER measurement.
 
-Extracts N real (incompressible — not a zero placeholder) audio clips from chunk_7.zip, transcodes
+Extracts N real (not a zero/placeholder — see _looks_real) audio clips from chunk_7.zip, transcodes
 each to 16 kHz mono WAV via ffmpeg, looks up its verified Sorani reference in the transcription TSV,
 and writes a manifest: <wav_path>\t<reference>. Eval-only; nothing is committed.
 """
@@ -28,15 +28,26 @@ if not ZIP or not TSV:
     sys.exit("set CORTEX_CORPUS_ZIP and CORTEX_CORPUS_TSV to the corpus archive + transcription TSV")
 
 
+def _looks_real(zi: zipfile.ZipInfo) -> bool:
+    """A real audio entry, not a zero/placeholder. The incompressibility heuristic ('a real clip barely
+    shrinks in the zip') only holds for ALREADY-COMPRESSED formats — a genuine PCM .wav DOES shrink when
+    zipped (speech has redundancy, ~50-70%), so applying the ratio test to .wav wrongly drops real clips.
+    Gate the ratio on the compressed formats only; for .wav the size floor + a successful ffmpeg decode
+    below are the real-audio proof."""
+    if zi.file_size <= 8000:
+        return False
+    if zi.filename.lower().endswith((".mp3", ".m4a", ".ogg")):
+        return zi.compress_size >= 0.85 * zi.file_size
+    return True  # .wav
+
+
 def main() -> int:
     os.makedirs(OUT, exist_ok=True)
     zf = zipfile.ZipFile(ZIP)
     real = [
-        zi for zi in zf.infolist()
-        if not zi.is_dir()
-        and zi.filename.lower().endswith((".mp3", ".wav", ".m4a", ".ogg"))
-        and zi.file_size > 8000
-        and zi.compress_size >= 0.85 * zi.file_size  # incompressible => real audio, not a placeholder
+        zi
+        for zi in zf.infolist()
+        if not zi.is_dir() and zi.filename.lower().endswith((".mp3", ".wav", ".m4a", ".ogg")) and _looks_real(zi)
     ]
     random.seed(SEED)
     random.shuffle(real)

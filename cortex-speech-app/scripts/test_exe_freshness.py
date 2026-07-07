@@ -13,7 +13,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_exe_freshness import evaluate_freshness, extract_baked_sha, newest_source  # noqa: E402
+from check_exe_freshness import (  # noqa: E402
+    SOURCE_PREFIXES,
+    evaluate_freshness,
+    extract_baked_sha,
+    newest_source,
+    worktree_source_warnings,
+)
 
 HEAD = "a" * 40
 OTHER = "b" * 40
@@ -132,6 +138,39 @@ def test_newest_source_picks_latest_file(tmp_path: Path) -> None:
     mtime, newest = newest_source(app, ["src", "src-tauri/src"], [])
     assert mtime == 5000.0
     assert newest == new
+
+
+def test_worktree_warns_on_sibling_with_uncommitted_source() -> None:
+    # The exact scenario this session hit: the main checkout built the exe, but a sibling worktree
+    # carries the real fixes as uncommitted edits. Green-at-HEAD must not hide that.
+    worktrees = [
+        ("/repo/main", []),  # the checkout being gated — clean
+        ("/repo/.claude/worktrees/wt1", [" M cortex-speech-app/src-tauri/src/pipeline.rs"]),
+    ]
+    warnings = worktree_source_warnings(worktrees, "/repo/main", SOURCE_PREFIXES)
+    assert len(warnings) == 1, warnings
+    assert "wt1" in warnings[0] and "1 uncommitted" in warnings[0], warnings
+
+
+def test_worktree_skips_the_gated_checkout_itself() -> None:
+    # Uncommitted source in the checkout being gated is the freshness check's own job (mtime/SHA),
+    # not a sibling warning — don't double-report it.
+    worktrees = [("/repo/main", [" M cortex-speech-app/src/App.svelte"])]
+    assert worktree_source_warnings(worktrees, "/repo/main", SOURCE_PREFIXES) == []
+
+
+def test_worktree_ignores_non_source_dirty() -> None:
+    # A sibling dirtied only in docs/ledger/tests is not an unshipped-source risk.
+    worktrees = [
+        ("/repo/main", []),
+        ("/repo/wt2", [" M docs/DEEP_CHECK.md", "?? PROGRESS_LEDGER.md", " M cortex-speech-app/src-tauri/tests/x.rs"]),
+    ]
+    assert worktree_source_warnings(worktrees, "/repo/main", SOURCE_PREFIXES) == []
+
+
+def test_worktree_no_warnings_when_all_clean() -> None:
+    worktrees = [("/repo/main", []), ("/repo/wt3", [])]
+    assert worktree_source_warnings(worktrees, "/repo/main", SOURCE_PREFIXES) == []
 
 
 def _run() -> int:

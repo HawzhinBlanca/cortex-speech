@@ -276,8 +276,8 @@ and the dual milestone-numbering drift are acknowledged here rather than edited 
 P0.2 stale-exe guard (deep-audit F4) — CLOSED with a demonstrated red->green:
 - lib.rs: `#[used] static GIT_SHA_MARKER = concat!("CORTEX_BUILD_SHA:", GIT_SHA)` (contiguous
   rodata, linker-retained) + `app_git_sha` IPC command (commands.rs) exposing the baked SHA.
-- scripts/check_exe_freshness.py (LOCAL gate) + scripts/test_exe_freshness.py (11 CI-safe unit
-  tests, auto-run by python-policies). Makefile: `check-fresh` + `ship-check-local`
+- scripts/check_exe_freshness.py (LOCAL gate, worktree-aware since #1.3) + scripts/test_exe_freshness.py
+  (15 CI-safe unit tests, auto-run by python-policies). Makefile: `check-fresh` + `ship-check-local`
   (build-app -> check-fresh -> ship-check).
 - Demonstrated RED on the stale exe (source newer + marker absent); rebuilt via build-app;
   now GREEN: `EXE FRESHNESS GATE: OK (exe at HEAD a1003c2...)`, baked SHA == git HEAD exactly.
@@ -1029,3 +1029,620 @@ the prime suspect (giant bitcode blobs are what AV inspects; small/medium files 
 STANDING STATE: the LTO-off exe (15:15, all 26 fixes) is intact, freshness GREEN — the app is fully
 usable. OWNER unblock for standard-LTO builds: add the Defender exclusions (admin PowerShell, see
 the 12:20 ledger entry) and/or reboot; then one `cargo build --release` restores the standard profile.
+
+## Real 7B run + FINAL DEEP CHECK + 10/10 remediation IN PROGRESS (2026-07-06)
+
+Drove the real OmniASR-7B Champion (WSL/4090) end-to-end on `B7876RX.wav` (17.4 min → 84 distinct
+clean-Sorani segments) and, in doing so, uncovered + fixed a real primary-path data-destruction bug:
+background word-alignment was flat-overwriting each segment's `alignment_json` slice offsets with a
+bare word array, silently degrading every later reader (7B re-transcribe, dataset audio export, clip
+playback) to the WHOLE file. Then ran a **117-agent adversarially-verified deep check** (see
+[docs/DEEP_CHECK_2026-07-06.md](cortex-speech-app/docs/DEEP_CHECK_2026-07-06.md)): honest grade
+**6.5/10**, 61 confirmed findings (12 blocker / 19 major / 30 minor, 1 refuted), phased plan 0–7.
+
+Remediation landed so far (each with a regression gate; `cargo clippy -D warnings` + `cargo test --lib`
+793 green, frontend typecheck/134-vitest/eslint green):
+- **Phase 0** (stop data destruction): aligner slice+merge fix; LOOP-0 shadow + alignment deferred
+  after the 7B pass; empty-7B-transcript is legitimate (no whole-import rollback); export skips a
+  present-but-offset-less alignment instead of emitting whole-file. + evidence-based confidence (v32).
+- **Phase 1**: schema forward-compat guard (old exe refuses a newer DB — protects v32 memories).
+- **Phase 2** (label integrity): ReviewMode/Inbox keyboard isolation + modifier/editable guards;
+  accept-what-you-see; Ctrl+Z defers to surface undo; placeholder can't be verified as gold;
+  autosave `flushAsync` + Tauri onCloseRequested (last edit never lost on close).
+- **Phase 4**: settings BOM tolerance + corrupt-file preservation; rolling **file log** under
+  `<data_dir>/logs` (release GUI no longer discards every non-panic error); worker DB opens use plain
+  `open` (no per-segment integrity scan / destructive quarantine from a live thread).
+- **Phase 5**: gold reference uses annotated (digit) not verbalized-normalized text; flat
+  JSON/JSONL/CSV/Parquet exports ship canonicalized training text.
+- **Phase 6**: 7B-unavailable clips sort to the front of the suspect queue (0.0 not None).
+
+STANDING STATE: fixes are on branch `claude/intelligent-gauss-96ffc9` (5 commits), gated but NOT yet
+in the daily GUI exe — remaining: rebuild + re-import B7876 to repair its offsets; Phase 3 (7B ops),
+6.1 finetuned juror, 6.4 gold-regression gate, Phase 7 minors; then owner-gated re-audit (only place
+10/10 may be declared).
+
+## Deep-check remediation continued — ~31/61 findings closed (2026-07-06, 14 commits)
+
+More fixes landed on `claude/intelligent-gauss-96ffc9`, each with a regression gate (Rust
+`clippy -D warnings` + `cargo test --lib` now 796; frontend typecheck/134-vitest/eslint; python
+policies green). Beyond the first batch above:
+
+- **Phase 3 (7B ops)**: server refuses to serve on CPU (`cortex_7b_server.py`, out-of-repo);
+  `batch_importer` acquires the shared single-instance lock; a process-wide gate serializes ALL WSL-7B
+  client spawns so concurrent callers can't stack timeouts into a false "server-down" rollback.
+- **Phase 4**: Gemini mode passes the configured model to OpenRouter (no silent gpt-4o-mini); health
+  checks polled at startup + every 5 min raise notifications on snapshot-failure-streak / low-disk /
+  missing models; the previous session's crash is surfaced once on next launch.
+- **Phase 6 / intelligence**: LOOP-0 confidence evidence is winner-take-all per slot (no sibling
+  double-credit); the **fine-tuned MMS-CTC juror** is wired into `populate_hypotheses` (the
+  escalate-everything root — model-dependent, needs the owner's machine to measure the effect).
+- **Phase 7 reliability minors**: FTS rebuild after VACUUM; `relink_audio` stamps `updated_at`;
+  directory-import cancel token threaded into per-file processing; single-file import RAII status guard;
+  a mid-file decode error now FAILS LOUDLY instead of silently importing a truncated file.
+
+STILL OPEN (honest): the capstone rebuild+re-import of B7876; ~28 lower-value minors (survivor-bias
+migration, snapshot-settings restore, media-cache slice, z-order, EN i18n strings, streaming memory
+bound, out-of-repo client hardening); and the OWNER-GATED items (fine-tuned juror escalation
+measurement, gold-regression gate wired to a real baseline, `make check-7b`, benchmark marathon, drills,
+P7 re-audit). 10/10 is NOT declared — only the P7 re-audit may do that.
+
+## Deep-check remediation — automatable surface substantially closed (2026-07-06, 19 commits)
+
+Further fixes since the last entry (each gated: clippy -D warnings + cargo test --lib 796;
+typecheck/134-vitest/eslint; python-policies green):
+- **Major #25**: cancel mid-7B-pass now ROLLS BACK the file's segments, so re-importing a cancelled
+  file no longer duplicates every segment.
+- **#43**: snapshot restore also restores the snapshot's settings.json/champion.json and applies them
+  to memory + the running pipeline (consistent known-good state, not a rolled-back DB beside stale config).
+- **enable_gpu honesty** (#34/47/49): the toggle carries a localized note — it affects only the CPU-only
+  local CTC engines; the 7B champion uses the GPU via WSL regardless.
+- **i18n**: the health/crash/undo notifications added this session are localized (EN+CKB), so no new
+  English literals leak into the RTL UI.
+
+TALLY: **~37 of 61 confirmed findings closed** — every blocker and every automatable major, plus the
+bulk of the minors. What remains is OWNER-GATED (real accuracy/escalation measurement, `make check-7b`,
+gold-regression baseline, marathon, drills, P7 re-audit), OUT-OF-REPO (the champion client's VACUUM-INTO
+snapshot + env-passed port/db), the machine-local capstone (rebuild GUI + re-import B7876), or low-value
+polish (media-cache slice, z-order, survivor-bias migration, streaming memory bound, firing provenance).
+The no-fabrication rule holds: 10/10 is declared ONLY by the P7 re-audit on real numbers.
+
+## Deep-check remediation — safely-verifiable surface EXHAUSTED at ~42/61 (2026-07-06, 25 commits)
+
+Final push closed the rest of the safely-verifiable minors (each gated: clippy -D warnings + cargo
+test --lib 797; typecheck/134-vitest/eslint; python-policies green):
+- **#48** Ctrl+, no longer opens Settings under the inbox overlay.
+- **#59** app is the single source of truth for the 7B DB path + port (win_path_to_wsl + env-passed
+  CORTEX_7B_DB/PORT; port const de-triplicated) — killing the stale-DB / wrong-service drift.
+- **#60** a DB error mid-7B-pass now rolls back too (every failure path honors "nothing half-imported").
+- **#53 (partial)** streaming decode moves windows out of the mutex instead of cloning — halves peak RAM.
+- **#50/#34/47/49/i18n** GPU-toggle honesty note + localized health/crash/undo notifications.
+
+REMAINING (~19), by why-it-can't-close-here — NOT a skipped backlog:
+1. OWNER-GATED measurement (~7): fine-tuned-juror escalation number, gold-regression baseline,
+   `make check-7b`, marathon, drills, P7 re-audit. Needs a real run on the 4090; faking the numbers is
+   the one prohibition.
+2. RISKY-WITHOUT-A-RUNNING-APP (~4): media-cache slice + deeper streaming rewrite touch live
+   playback/import; unverifiable headlessly, so shipping blind would lower quality.
+3. PARTIAL-FIX-NEEDS-REDESIGN (~3): survivor-bias needs a durable-counter at delete time (SET NULL alone
+   changes nothing); firing-provenance is latent behind the default-off, owner-gated go-live flag.
+4. OUT-OF-REPO (~2): champion client VACUUM-INTO snapshot etc. — wouldn't transfer via git anyway.
+5. Cosmetic (~3).
+
+BOTTOM LINE: every blocker + every automatable major + ~26 minors are closed and gated on
+`claude/intelligent-gauss-96ffc9` (25 commits). The grade is materially above 6.5. It is NOT 10/10 and
+cannot be honestly called that until the P7 re-audit runs the real numbers on the owner's hardware.
+
+## Deep-check remediation — ~44/61 (2026-07-06, 28 commits + 2 out-of-repo champion edits)
+
+Pushed further past "safely-verifiable exhausted", closing more testable findings:
+- **#55(a)** LOOP-0 fired rewrites are now attributed in the log (fired_memories_summary) via the shared
+  chokepoint — provenance for a future firing go-live (firing stays default-off).
+- **#42** shadow over-trigger evidence is ARCHIVED at segment-delete time (migration v33 +
+  loop0_evidence_archive; intelligence_report folds it in), so the C5 gate is no longer survivor-biased
+  by the owner's normal cleanup. Regression test: an over-trigger survives deletion.
+- **#58 / 3.2 (out-of-repo, machine-local)** the champion client retries a torn WAL-copy instead of
+  failing a healthy import; the server refuses to serve on CPU. Both py_compile-clean; they live in
+  `Kurdish_ASR_Model_Export/` so they do NOT travel with this branch — replicate on the other machine.
+
+GENUINELY REMAINING (~14), unchanged in character: OWNER-GATED measurement (~7 — real numbers on the
+4090; faking forbidden), media-cache slicing + deeper-streaming (~2, unverifiable headlessly → shipping
+blind would violate the honesty rule), and cosmetic (~5). Every finding that could be implemented AND
+verified in a headless Windows checkout is done, gated, and pushed. 10/10 remains the P7 re-audit's call.
+
+## Deep-check remediation — ~48/61 (2026-07-06, 33 commits + 2 out-of-repo champion edits)
+
+Kept closing the testable ones I'd previously mis-bucketed:
+- **#32** Cancel during import now kills the in-flight 7B child within ~50 ms (CancellationToken
+  threaded through transcribe → the WSL subprocess poller), not only between segments.
+- **flat-export placeholder filter** — a not-yet-transcribed segment ("[Pending WSL 7B ASR]") is
+  excluded from JSON/JSONL/CSV/Parquet exports (was shipping the literal placeholder as a training row).
+- **composition report** — DatasetMetadata now carries per-speaker segment/duration counts + a
+  dominant-speaker(>50%) flag.
+- **#39** Database::restore integrity-checks the source snapshot before overwriting the live DB.
+
+## Deep-check remediation — ~51/61 (2026-07-07)
+
+- **REAL BUG (fresh surface, past 6 clean audits) — a corrupt crash report permanently WEDGED the crash
+  notification and LEAKED reports** `take_latest_crash_summary` returned `None` on the early `.ok()?` if the
+  newest `crash-*.json` couldn't be read/parsed — BEFORE the "remove all reports" loop. But a crash report
+  is written DURING the panic that produced it, so a truncated/half-written file is realistic. Effect: a
+  corrupt latest report made the function return `None` every startup (no "last session crashed" notice ever)
+  AND never cleared any report (they accumulate on disk forever) — the notification silently, permanently
+  broken. Fixed: build the summary with a generic fallback ("the previous session ended unexpectedly —
+  details in the logs folder") for an unreadable/malformed report, and remove EVERY report UNCONDITIONALLY
+  so one corrupt file can never wedge the feature or leak. +1 regression test (corrupt newest → generic
+  notice + all cleared + nothing left on disk). cargo: fmt clean, clippy -D warnings clean, `--lib` 817.
+- **FULL-GATE CERTIFICATION (branch tip, after the session's ~29 changes) — all green, zero regressions**
+  Ran the complete local gate suite fresh on the branch tip: `cargo fmt --check` clean; `cargo clippy
+  --all-targets -- -D warnings` exit 0; `cargo test --lib` **816 passed / 0 failed / 6 ignored**;
+  `svelte-check`+`tsc` **406 files / 0 errors**; `eslint` clean; `vitest` **134/134**; `npm run
+  test:python-policies` **exit 0 (22 policies)**; working tree clean, HEAD pushed. So every hardening
+  change this session composes cleanly — the branch is in a fully-shippable, regression-free state. The
+  ONLY remaining step to a declared 10/10 is the owner-gated accuracy measurement on the 4090 (the ~7
+  numbers a headless checkout cannot honestly produce): `make build-app` → the now-corrected measurement
+  suite (scorecard_7b space-kept CER, empty-manifest guards, WAV gold fix) → P7 re-audit.
+- **Documented the autosave idempotency invariant (prevents a future double-count footgun)** Audited
+  `autosave.ts` (data-safety: the debounced curation-edit saver). Its core is correct — the flush-before-rekey
+  genuinely prevents the documented cross-segment data loss. But I traced a real (benign-today) double-save
+  race: if the debounce timer's save is in-flight when `flush`/`flushAsync` runs (window closes the instant
+  after the timer fired), `pending` isn't cleared until that save's `.then`, so the SAME entry can persist
+  twice. Harmless NOW because `save` is wired to `updateSegment` (idempotent field write, App.svelte:140) —
+  but a future maintainer adding a side-effectful save (record-decision / credit-confidence / append-ledger)
+  would silently DOUBLE-COUNT. Documented the "save MUST be a pure idempotent upsert" invariant on the dep
+  so that footgun can't be walked into. typecheck 0-err, eslint clean, vitest 134/134.
+- **Scan cont. → the app ignored the `CORTEX_APP_DATA_DIR` override its own CLI tools honor (split-DB footgun)**
+  All four `bin/*` utilities (batch_importer, batch_processor, download_model, test_file) resolve the data
+  dir as `CORTEX_APP_DATA_DIR ▸ APPDATA/cortex-speech ▸ cwd`, but the main app's `lib.rs::get_app_data_dir`
+  never checked `CORTEX_APP_DATA_DIR` (headless-temp ▸ platform-base only). So a user who set it to relocate
+  the library (e.g. to another drive) would silently split them: the batch importer wrote to the override
+  dir while the app kept reading `APPDATA\cortex-speech` — two databases, and the whole point of the batch
+  importer + single-instance lock is that they share ONE. Reachability: nothing currently sets it (verified
+  — only the 4 bins reference it), so it's latent, but a real footgun. Made the app honor it at top priority
+  via a pure `data_dir_override()` (byte-identical to the bins) + test. cargo: fmt clean, clippy -D warnings
+  clean, `--lib` 816 passed, python-policies green. (Scan also cleared `app_data_dir` ×4 in bin/ — mutually
+  identical.)
+- **Systematic duplicate-fn scan → found a stale `sanitize_filename` that mangled Sorani filenames** A
+  repo-wide scan for functions defined in 2+ files (the drift-hazard class) surfaced two `sanitize_filename`
+  implementations that had DIVERGED: `validation/input.rs` got the P3.7 fix (Unicode `is_alphanumeric` →
+  KEEPS Sorani letters, exported clips stay meaningfully named), but `agentic.rs`'s separate copy still used
+  `is_ascii_alphanumeric` — folding every Kurdish letter to `_`, so a Sorani-named source produced a
+  `____.model.hash.whole_file_reference.txt` reference file (cosmetic, not a collision — `path_key`'s
+  full-path hash already disambiguates). The P3.7 fix never reached this copy. Changed it to Unicode
+  `is_alphanumeric` to match the exporter (keeping its trim + empty→"artifact" fallback, which the export's
+  pure char-map lacks, so a full merge wasn't right); +1 test pinning `کوردی` → `کوردی`. cargo: fmt clean,
+  clippy -D warnings clean, `--lib` 815 passed. (Scan also checked `percentile` ×3 — different signatures/
+  purposes, f64 vs i64, not duplicates.)
+- **Drift-proofed `learning_text_key` — the "genuine correction vs no-op" key gating BOTH training channels**
+  It had TWO byte-identical private copies: `db.rs` (gates the corrections ledger + agent_examples) and
+  `jury/learning.rs` (gates the DPO preference dataset). Both decide "wrong ≠ fix" through it. If one grew
+  NFC/canonicalization and the other did not, the SAME correction could be recorded as a genuine training
+  pair in one channel and dropped as a no-op in the other — silently inconsistent training data (the app's
+  product). Consolidated into one `normalizer::learning_text_key` (both import it); +1 test pinning that it
+  is case/whitespace-insensitive ONLY (does NOT fold Arabic-vs-Kurdish Kaf, so a real orthographic fix is
+  never mistaken for a no-op — deliberately distinct from `canonical_training_text`). No behavior change.
+  cargo: fmt clean, clippy -D warnings clean, `--lib` 814 passed.
+- **Drift-proofed the LOOP-0 finalized-draft selection (structural consistency for the C5 gate)** The
+  `annotated ▸ normalized ▸ raw` draft-text formula was inlined in THREE places — `shadow_log_loop0` (the
+  C5 go-live shadow signal), `record_human_decision` (the confidence-update evidence), and
+  `enqueue_background_alignments`. Verified identical NOW, but a future edit to one and not the others would
+  silently make the shadow gate measure a different distribution than the evidence updates on — quietly
+  invalidating the go-live decision. Extracted `corrections::loop0_draft_text()` as the single source of
+  truth (its doc pins WHY it excludes `verdict_transcript`: that is the human's answer/reference, not the
+  draft the memory rewrote — distinct from `training_transcript_with_source`, which prefers the verdict
+  because it selects the SHIPPED text). All 3 sites now call it; +1 unit test. Same rationale as the
+  EXTRA_STATE fix. cargo: fmt clean, clippy -D warnings clean, `--lib` 813 passed, python-policies green.
+  Also audited clean this pass: frontend/backend placeholder detection (identical 4-pattern defs), the
+  4-format training-text canonicalization (all via `training_grade_for_segment` + `canonical_training_text`),
+  and the export-vs-LOOP-0 best-text selection (intentionally different, both correct).
+- **REAL BUG — the IRT gate and the review draft broke word-vs-deletion ties DIFFERENTLY** In the jury
+  consensus, `segment_consensus_words` (the review DRAFT) was deliberately fixed to KEEP a word that ties a
+  peer's deletion (explicit deletion-demotion + stable sort, with a comment), but the SAME fix was never
+  applied to `consensus_from_slots` (the GATE that scores auto-accept). The gate used a bare `max_by`, whose
+  last-maximal rule picks the empty ("") candidate on an exact posterior tie — and `build_confusion_slots`
+  seeds candidates as `[anchor_word, ""]` with words pushed AFTER, so "" always sits at a later index and
+  WINS ties. Effect: on a word-vs-deletion tie the gate silently DROPPED the word (could collapse a
+  single-slot consensus to all-deletion `None`), so an auto-accepted transcript could truncate a word the
+  human's review draft kept — the committed text and the reviewable draft disagreed. Fixed the gate's
+  tie-break to demote "" identically (word kept). Regression test proves a `["ئەمە",""]`@`[0.5,0.5]` tie now
+  yields "ئەمە" (was `None`); the non-tie deletion-penalty test still passes (my change only touches exact
+  ties). cargo: fmt clean, clippy -D warnings clean, `--lib` 812 passed. Also audited clean this pass:
+  `consensus_from_slots` confidence math, `segment_consensus_words`, `model_vote_weight`, the T0 gate +
+  autonomy vetoes, `majority_vote`, and the full conformal calibration (Hoeffding + Bonferroni, tie-group
+  cuts, cold-start).
+
+- **Honesty fix — `sorani_normalize.py` claimed a byte-identical Rust parity it does not have** Its
+  docstring asserted "matches normalizer.rs exactly for byte-identical output" and `Python(text) ==
+  Rust(text)`. VERIFIED false (via codepoint dumps): the CHARACTER folding is correct (`كوردي` → `کوردی`
+  matches Rust), but the NUMBER handling diverges — Python folds digit GLYPHS only and LEAVES the native
+  separators (`1٬000` keeps U+066C; `٣٫١٤` keeps U+066B) where the Rust folds them to `.`/`،`, strips
+  grouped thousands, and (optionally) verbalizes; Python also keeps diacritics by default. So it matches NO
+  single Rust config exactly. Pre-existing (not from the U+066C fix), and the utility is unused (no importer,
+  not in any gate), but a false parity claim in an honesty-first repo would mislead anyone who trusts it.
+  Corrected the docstring to state the exact scope + KNOWN DIVERGENCES rather than pretend parity (Rust
+  remains the source of truth). py_compile + python-policies green.
+
+OWNER-DECISION FLAG (methodology, not a bug — do NOT silently change): the accuracy scorecards
+(`scorecard_7b.py` / `scorecard_finetuned.py` / `measure_finetuned_cer.py`) normalize with a SIMPLE
+`norm()` = NFC + lower + whitespace-collapse — deliberately internally consistent so 7B / fine-tuned 21% /
+stock 29.4% stay comparable to EACH OTHER and to minimal-normalization external benchmarks. This is
+DIFFERENT from the app's live `eval.rs::normalize_for_metrics`, which additionally folds Sorani
+orthographic variants (Kaf/Yeh/Heh/hamza) via the full `SoraniNormalizer`. Consequence: if the gold
+references and the model output use INCONSISTENT orthography (e.g. Arabic Kaf U+0643 vs Kurdish Keheh
+U+06A9), the scorecard counts that as a CER error while eval.rs folds it away — so the published scorecard
+CER can be HIGHER (stricter) than the app's in-UI number for the same model. Neither is "wrong"; they serve
+different purposes. BEFORE the P7 re-audit publishes a headline Sorani CER, DECIDE which basis it should use
+(strict/comparable-to-external vs orthography-folded/app-internal) and state it explicitly — otherwise a
+reviewer will hit two different "CER for model X" numbers. `sorani_normalize.py` (a full-fold Python port,
+byte-identical to normalizer.rs) exists if the folded basis is chosen. `asr_metrics.py`, `crossval_jiwer.py`
+(isolates metric MATH on already-Rust-normalized input), and `create_halwest_gold_subset.py` (gated TTS
+path) audited and clean.
+
+Investigated-and-verified-already-handled this pass (by reading the code, not assuming): nightly
+workflow honesty (both skip branches emit `::warning` + "green ≠ real-audio passed"); directory-import
+cancel (token reaches the per-file 7B child-kill at pipeline.rs:332 via
+`process_single_file_with_progress(.., cancel.as_ref(), ..)` → `run_primary_wsl_pass_for_import(.., cancel)`
+— NOT between-files-only); i18n EN/CKB parity (measured **603 = 603**, zero divergence); the memory-pressure
+backpressure signal (`check_memory_pressure`) is really acted on (warn + 2 s pause before OOM) in the batch
+transcribe loop (commands.rs:1177). The **true-streaming refactor** (process-and-discard each decode window
+instead of accumulating all of them at pipeline.rs:1381) stays **honestly open**: it rewrites the carry-over +
+speaker-clustering state machine with high regression risk and the memory win is unmeasurable headlessly
+(no 1.4 GB file + profiler) — shipping it blind would violate the honesty rule.
+
+- **#5.3 (free-space half)** the media cache does `std::fs::copy` of the whole source into
+  `media-cache/` per source. Added a **pre-copy free-space guard**: a pure `ensure_cache_room(source_bytes,
+  free_bytes)` (unit-tested, 4 cases) refuses BEFORE writing a partial file when the media-cache volume
+  lacks the file size + 64 MiB headroom — so caching a clip can't drive the disk to zero and corrupt the
+  co-located SQLite WAL, and the owner gets a clear "needs X MB, only Y MB free" error instead of a
+  cryptic half-written-copy failure. `None` free-space (unresolvable volume) degrades gracefully to
+  allow. cargo: fmt clean, clippy -D warnings clean, `--lib` 806 passed / 0 failed.
+  **The other half of #5.3 (cache the SLICE not the whole file) is NOT done and stays open honestly** —
+  the AudioPlayer does *bounded* playback by seeking within the full source, so slicing needs a
+  grant-model + player change verified by ear on real audio; shipping it blind would risk breaking
+  playback, which the honesty rule forbids.
+- **dead-IPC cleanup (maintenance triad)** completing the theme behind #4.5's "dead backup/restore IPC":
+  `db_vacuum` was *also* a registered-but-uncallable command (wrapper `dbVacuum` existed, no UI caller), so
+  a long-lived personal library bloated by months of deletes/re-transcribes could only grow — no user
+  recourse. Added a **"Compact database"** button (`data-testid="compact-db-btn"`) → `db.vacuum()` (VACUUM +
+  the FTS rebuild that vacuum's rowid-renumber requires). Stats → tools now exposes the full triad:
+  Backup / Restore-from-file / Restore-from-snapshot / **Compact**. EN + CKB strings in parity (now 605=605).
+  typecheck 0-err, eslint clean, vitest 134/134.
+- **REAL BUG FIXED — export slicer lacked its sibling's u32-wrap guard (training-data integrity)** A
+  hunt through the historically-buggiest slicing paths found `export::slice_for_export` doing a bare
+  `meta.source_start_ms.max(0) as u32` while its sibling `chunking::slice_pcm_by_alignment` explicitly
+  rejects offsets > `u32::MAX` (i64→u32 wraps mod 2^32). `from_alignment_json` deserializes those offsets
+  as raw i64 with no upper bound, so a malformed/corrupted alignment blob with an offset > u32::MAX would
+  WRAP to a small in-range index and export an UNRELATED audio window mislabeled with the segment's
+  transcript — silent TRAINING-DATA corruption (exactly the whole-file-vs-clip class that keeps recurring).
+  Added the same guard (skip → None, matching the Option contract) + a regression test proving a 2^32-offset
+  now SKIPS instead of wrap-slicing `[0..8000]`. cargo: fmt clean, clippy -D warnings clean, `--lib` 808
+  passed; training-grade-export policy green. Then swept every other `source_*_ms as u32/usize` slicing
+  site: `commands.rs` clip extraction is SAFE (window-RELATIVE offsets, bounded by the 30 s window, no wrap
+  risk); `pipeline.rs` rediarize (`source_*_ms.max(0) as u32`) shared the same untrusted-alignment
+  reachability (a wrap there mislabels a segment's SPEAKER against an unrelated window) → given the same
+  guard (skip the segment, not fall to whole-file). The two remaining bare casts (`window.offset_ms`) read
+  the decoder's own bounded output, not stored alignment — left as-is.
+  Then completed a FULL census of all 8 `from_alignment_json` consumers to prove the class is closed:
+  slice_pcm_by_alignment (guarded), export slice_for_export (guarded ✓), pipeline rediarize (guarded ✓),
+  commands clip-extract (safe: window-relative offsets), commands.rs:2652 (safe: reads ms for sort only),
+  `update_segment_bounds` (safe: validates start/end and overwrites the offsets before re-serializing, no
+  slice), pipeline.rs:1524/1829 (safe: metadata round-trip), agentic reference-window (safe: offset→ratio
+  `.clamp(0.0,1.0)` so token indices stay bounded). Every PCM-slicing consumer of a stored offset is now
+  guarded; the offset-wrap variant of the whole-file-vs-clip class is provably closed.
+- **REAL GAP CLOSED — #4.5 part 1 (corrupt-file prune guard) was never actually implemented** The audit
+  required "snapshot pruning refuses while a `*.corrupt.*` file exists (pin pre-quarantine history)", but
+  only the WEAKER empty-DB guard shipped — and it lapses the moment the user re-imports post-quarantine
+  (`segment_count > 0` lets `take_snapshot_at` snapshot AND prune again, rotating out the pre-corruption
+  history within `keep` cycles — the "weeks of review labor" the finding exists to protect). Implemented
+  the actual guard: `prune_snapshots` now refuses to prune while `has_unacknowledged_quarantine(data_dir)`
+  (a `*.corrupt.*` main file, matching `get_quarantine_notice`'s detection). New snapshots still get taken
+  (new work is protected too); nothing is pruned until the user clears the quarantine files. Regression
+  test proves it with a NON-empty DB (4 snapshots pinned under keep=2, `-wal` sidecar correctly ignored,
+  pruning resumes to 2 once cleared). cargo: fmt clean, clippy -D warnings clean, `--lib` 810 passed.
+  Also hardened #4.5 part 2 (restore restores config): `restore_db_from_snapshot` had a hardcoded
+  `["settings.json","champion.json"]` DUPLICATING `snapshot::EXTRA_STATE` — a drift hazard where a file
+  added to the save-side would be silently snapshotted-but-never-restored. Made `EXTRA_STATE` `pub(crate)`
+  and the restore loop consumes it → single source of truth, save/restore can't diverge.
+- **Gold-builder fix — the incompressibility filter silently dropped real WAV clips** `build_ckb_gold.py`
+  screened corpus entries with `compress_size >= 0.85*file_size` ("incompressible => real audio"). That
+  heuristic only holds for ALREADY-COMPRESSED formats: a genuine PCM `.wav` DOES shrink when zipped (speech
+  redundancy, ~50-70%), so a real WAV clip scored ~0.6 and was dropped as a "placeholder". The owner's own
+  audio (Halwest) is WAV, so a gold set built from it would be silently under-sampled/biased → less reliable
+  CER/WER. Extracted `_looks_real()`: apply the ratio test ONLY to mp3/m4a/ogg; for `.wav` the >8 KB size
+  floor + a successful ffmpeg decode are the real-audio proof. VERIFIED: mp3-real kept, mp3-placeholder
+  dropped (both unchanged), wav-real (60 KB/100 KB) NOW kept (old 0.85 ratio dropped it), tiny dropped —
+  zero change for the primary CV22 (MP3) corpus. `asr_metrics.py` (WER + bootstrap) audited and clean.
+- **HONESTY-CRITICAL BUG — the champion's CER was computed with the WRONG (deflated, non-comparable) definition**
+  `scorecard_7b.py` (the OmniASR-7B Champion's headline accuracy — the number that most drives the grade)
+  computed CER on space-STRIPPED text (`r.replace(" ", "")`), while `scorecard_finetuned.py` uses jiwer
+  (interior whitespace KEPT) and `eval.rs`'s `tokenize_chars` also keeps whitespace. So the champion's CER
+  was **space-insensitive**: a word-segmentation error — a real Sorani ASR error class, e.g. "هاوڕێ من" →
+  "هاوڕێمن" — scored **0% instead of its true 12.5%**, DEFLATING the number and breaking the script's own
+  docstring claim of being "directly comparable to the fine-tuned 21.00%". This would have made the owner's
+  default-engine decision (deep-audit F1) rest on an apples-to-oranges comparison. Fixed to score the
+  space-KEPT normalized string (`edit_distance(list(r), list(h))`), EMPIRICALLY VERIFIED to equal
+  `jiwer.process_characters` exactly (dist=1, CER 12.5% on that pair) while the old stripped form scored 0.
+  `crossval_jiwer.py` + `measure_finetuned_cer.py` already used jiwer, so only 7B had drifted. Added a
+  dedicated auto-discovered guard `test_scorecard_cer_consistency.py` (source-pin + jiwer numeric-equivalence)
+  so the definitions can never silently diverge again. python-policies green.
+- **Measurement-tool de-risking — fixed an empty-manifest crash in the 4090 scorecard scripts** The path
+  to a real 10/10 is the owner running the accuracy suite on the 4090; a crash there wastes a marathon.
+  Audited the scorecards: `scorecard_finetuned.py` (correct micro-CER ratio-of-sums, zero-ref clips dropped
+  from numerator AND denominator matching eval.rs, seeded utterance-bootstrap CI, baseline-regression gate)
+  and `scorecard_stats.py` both called their seeded bootstrap's `random.randrange(n)` with NO `n==0`
+  guard — an empty/all-empty-ref/headers-only manifest would die with a cryptic `ValueError: empty range`
+  (and stats would then divide by zero on the per-script frac). `scorecard_7b.py` already guarded n==0, so
+  brought the other two into parity: fail cleanly with an actionable message. VERIFIED by running
+  `scorecard_stats.py` on a header-only TSV (clean exit 2) and a 2-row TSV (correct CER 7.89% = 3/38,
+  WER 11.11% = 1/9). python-policies green.
+- **Cloud-consent guardrail audit — enforcement airtight, + closed a regression-gate GAP** Audited every
+  cloud egress path against the opt-out-by-default guardrail. LLM: `effective_llm_mode()` downgrades to None
+  without `cloud_llm_opt_in` (incl. Local-pointed-at-a-remote-endpoint, via a PARSED loopback check that
+  blocks `localhost.evil.com`), and both `llm_refinement_permitted` + `build_refiner` consume it. STT
+  (Scribe uploads segment AUDIO — stricter): all three egress points gate on `cloud_stt_opt_in` —
+  `require_cloud_stt_consent` at the `transcribe_audio_with_scribe` + `add_scribe_votes` IPC boundaries
+  (before the key is even loaded) and `scribe_api_key_if_enabled` on the import path; `get_configured_providers`
+  is names-only (no egress). Enforcement is CLEAN. But the privacy POLICY test pinned only the LLM/jury gates,
+  not the Scribe ones — a refactor could silently drop `require_cloud_stt_consent` from either command with no
+  gate failing. Extended `test_cloud_privacy_policy.py` to pin all three Scribe consent points + assert BOTH
+  egress commands call the guard (call-site count ≥ 2). python-policies green.
+- **Normalizer adversarial review — sound, + fixed a dead/contradictory digit-separator fold** Audited the
+  load-bearing Sorani normalizer (feeds metrics, LOOP-0 matching, search, dedup): the NFC-first ordering,
+  Kaf/Yeh/hamza folds, ZWNJ→space vs zero-width-strip split, and the subtle word-final-heh logic
+  (`protect_word_final_heh_tatweel` → ھ for a deliberate consonant heh, then `normalize_heh_contextual` →
+  ە for a bare word-final heh) are all correct. Found a real smell in `normalize_digits`: two contradictory
+  passes folded the Arabic THOUSANDS separator U+066C — first to ASCII `,`, then a DEAD second pass to the
+  Arabic comma `،` (no-op, since the first already consumed every U+066C). The ASCII `,` escaped Step-1's
+  punctuation unification, so an ungrouped U+066C emitted a stray ASCII comma inconsistent with the
+  pipeline's all-`،` convention. Collapsed to one correct fold (U+066B→`.`, U+066C→`،` U+060C) + a
+  regression test; all 30 normalizer tests (incl. the idempotence proptest) green, `--lib` 811 passed.
+- **Metric harness (WER/CER) adversarial review — verified sound + boundary pinned** The whole project's
+  "never fabricate a metric" law rests on the harness COMPUTING metrics correctly, so I audited `wer.rs`:
+  `levenshtein` returns `prev[m]` correctly; `compute_wer/cer` = edit-distance / ref-len clamped to 1.0 with
+  honest empty-ref handling; the S/D/I backtrace in `levenshtein_breakdown` is correct AND its `j -= 1`
+  insertion branch can never underflow (when `j == 0, i > 0` the deletion branch always fires first —
+  traced and confirmed). Found one minor TEST gap: the all-deletion boundary was exercised (via
+  `("a b c","")`) but only `total()` was asserted, not the S/D/I split — a future backtrace refactor could
+  mislabel deletions as insertions while keeping the distance right. Added a test pinning both extremes
+  (all-deletion → (0,3,0,3), all-insertion → (0,0,3,0)). cargo: fmt clean, clippy -D warnings clean,
+  `--lib` 809 passed.
+- **LOOP-0 confidence adversarial review (the original deliverable) — verified sound + one edge documented**
+  Re-read the whole evidence path (`corrections.rs` + `db.rs::record_human_decision`) hunting for real
+  correctness bugs. The Beta(1,1) SQL reconstructs `beta_confidence(new_confirm, new_override)` exactly
+  (confirm/override use the row's OLD counts, matching the pure fn); winner-selection in
+  `firing_winner_indices` mirrors `apply_memories`'s gate+phonetic filter byte-for-byte; firing never
+  changes word count (so no alignment drift); NaN phonetic distances are filtered before `min_by`. One
+  REAL but rare edge found and PROVEN with a characterization test: `classify_memory_outcomes` scores each
+  winner IN ISOLATION, so when two near-homophones share an identical repeated `left|right` slot (e.g.
+  "…ئەو باش بوو … ئەو پاش بوو…") a winner's own cross-slot over-trigger can cancel its real improvement in
+  the global word-error count and mask a deserved Confirm. It's statistically self-washing (Beta posterior
+  over many decisions) and a leave-one-out "fix" carries its own ambiguous marginal-vs-absolute semantics,
+  so it's DOCUMENTED (in-code KNOWN LIMITATION + a pinning test) rather than rewritten blind under the loop.
+  cargo: fmt clean, clippy -D warnings clean, `--lib` 807 passed.
+- **IPC-surface sweep (verified clean, no further accidental gaps)** cross-checked all 122 registered Tauri
+  commands vs. frontend callers, AND all 121 `commands.ts` wrappers vs. component references (the latter
+  catches the `db_vacuum` case — a command whose only invoke site was an unused wrapper). The two
+  registered-but-uninvoked commands (`get_champion_model`, `add_segment_hypothesis`) are BOTH deliberately
+  reserved with in-code rationale ("not exposed yet — must run through the eval gate" / "Reserved
+  programmatic API… for CLI/scripted jury orchestration"). `clearCache`/`getCacheInfo` operate on a bounded
+  1000-entry in-memory LRU that self-evicts on restart → correctly needs no button (verified, not assumed).
+  The remaining 24 unreferenced wrappers are reserved orchestration / superseded getters / intra-file
+  helpers — flagged for careful per-item triage (task_ec79f7dd), explicitly NOT mass-wired (some, e.g.
+  `runDpoUpdate`, are dangerous to trigger casually).
+- **#4.5 (last piece)** the `db_backup` IPC was a dead command — a wrapper (`dbBackup`) existed but no
+  UI called it, so the only copies of the library were the rotating auto-snapshots sitting in the app
+  data dir *next to the live DB* (one disk failure loses both). Added a **"Backup to folder…"** button
+  (`data-testid="backup-db-btn"`) to Stats → tools, reusing the proven `pickDirAnd` folder-picker: it
+  writes the whole library via SQLite online-backup to a **timestamped** file
+  (`cortex-speech-backup-<ISO>.db`) inside a folder the owner chooses (external drive / synced folder),
+  so successive backups never collide. And its **counterpart**: `db_restore` was *also* dead (no
+  wrapper, no caller), leaving that external backup un-restorable through the UI (only auto-snapshots
+  were). Added a `dbRestore` wrapper + a **"Restore from backup file…"** button
+  (`data-testid="restore-file-btn"`): a `.db`-filtered file picker → destructive confirm → backend
+  integrity-check → full app reload — the same safety contract as the snapshot restore. EN + CKB
+  strings added in parity (`stats.backupDb/backupDone/restoreFile/restoreFileConfirm`). typecheck
+  0-err (406 files), eslint clean, vitest 134/134.
+- **#1.3** exe-freshness gate is now **worktree-aware**. A green gate means only "the built exe
+  matches THIS checkout's HEAD" — it used to stay silent while a *sibling* worktree carried the real
+  fixes as uncommitted source edits (the exact A3 stale-exe-vs-worktree trap this session lived).
+  `check_exe_freshness.py` now enumerates `git worktree list --porcelain`, reads each worktree's
+  `git status --porcelain`, and prints a loud non-fatal `WARNING` for any *other* worktree with
+  uncommitted changes under a shipped-source surface (`src/`, `src-tauri/src`, build inputs) — WIP is
+  legitimate, so it warns rather than fails, but it can no longer hide unshipped source. Pure core
+  `worktree_source_warnings()` is unit-tested by `test_exe_freshness.py` (4 new cases: warns on a
+  sibling with dirty `pipeline.rs`; skips the gated checkout itself; ignores docs/ledger/tests-only
+  dirt; silent when all clean). 15/15 freshness unit tests green; full python-policies green; live
+  enumeration verified against this repo's 2 worktrees.
+
+TRULY REMAINING (~10): OWNER-GATED measurement (~7 — the P7 re-audit and the real-number gates; faking
+is the one prohibition), media-cache SLICING + true-streaming decode (both need real-audio observation:
+playback-by-ear and a 1.4 GB memory profile respectively → shipping blind violates the honesty rule), and a
+few cosmetic. Every finding implementable AND verifiable in a headless Windows checkout is done, gated
+(cargo test --lib 806 + clippy -D warnings, frontend typecheck/134-vitest/eslint, python-policies incl. 15
+exe-freshness unit tests + ledger-staleness), and pushed. The grade is well above 6.5; 10/10 is the P7
+re-audit's call on real numbers — not mine to fake.
+
+## #6.4 CLOSED — de-`#[ignore]`'d a real gold-regression check with a genuine MEASURED number (2026-07-08)
+
+Closed the one item on the owner-gated list that turned out to be headlessly achievable without
+fabricating anything: a committed real-audio fixture (`tests/fixtures/fleurs_ckb_sample.{wav,txt}`,
+CC-BY-4.0 FLEURS ckb, see ATTRIBUTION.md) already existed, and the fine-tuned model (~970 MB ONNX) is
+present in this checkout's junctioned `models/` — so a real, non-fabricated measurement was actually
+runnable here, not just implementable.
+
+Added `finetuned_gold_regression_on_committed_fleurs_fixture` to `src-tauri/tests/gold_wer_eval.rs` —
+NOT `#[ignore]`'d (runs on every plain `cargo test`), model-present-gated (skips honestly via eprintln
+when the gitignored fine-tuned ONNX is absent, e.g. on CI, exactly like every other real-audio test in
+this file). It decodes the real committed clip, runs the REAL fine-tuned Wav2Vec2-CTC model via
+`wav2vec2_asr::run_wav2vec2`, and builds a real `Scorecard` via the actual `scorecard::build_scorecard`
+machinery (not a shortcut CER calc).
+
+**Deliberately did NOT wire the full `scorecard::check_gold_regression` gate**: that requires a baseline
+with BOTH WER and CER, but `docs/finetuned_scorecard_baseline.json` only ever published CER (no fine-tuned
+WER was ever measured — checked EVAL.md) — populating a WER baseline would mean fabricating one, the exact
+violation this whole session has been hunting and fixing. Separately, `bootstrap_ci` at N=1 is
+mathematically degenerate (resampling one point always redraws that point, so the CI half-width is
+EXACTLY zero) — asserting the full dual-metric CI-band gate at N=1 would be a hair-trigger, statistically
+meaningless pass/fail, not a real regression check. So this test measures and reports the real CER
+honestly labeled as N=1, and asserts only what N=1 can honestly support: a non-empty real transcript and a
+generous sanity ceiling (0.5, far above the 21% aggregate) that would trip on genuine breakage without
+pretending to N=900 precision.
+
+**REAL MEASURED RESULT (not fabricated, actually run in this checkout, 2026-07-08):**
+```
+reference : پێش هاتنی سوپا، هایتی لەوەتەی ساڵی 1800ــەوە تووشی کێشەی پەیوەست بە نەخۆشیەکە نەبوو‎ بوو
+hypothesis: وپێش هاتنی سوپا، حایتی لە وتەی ساڵی 1هە0ەتەوە تووشی کەشەی پێیوەست بە نەخۆشەکە نەبوو
+measured micro CER (this ONE clip, N=1): 0.1860 (18.60%)
+published baseline (N=900): 21.00% CER — informational only, not a valid N=1 vs N=900 comparison
+```
+This single clip's CER (18.60%) sits close to and slightly below the published N=900 aggregate (21.00%)
+— consistent with, not contradicting, the existing measurement. Command: `cargo test --test gold_wer_eval
+finetuned_gold_regression -- --nocapture` (needs `models/finetuned-mms-ckb/{model.onnx,vocab.json}`).
+
+cargo fmt clean, clippy --all-targets -D warnings clean, cargo test --lib 817 passed + the new integration
+test passed for real, python-policies green.
+
+Note on this session's separately-launched adversarial multi-agent re-audit (15 parallel reviewers over
+every subsystem): it hit provider rate limits and every reviewer agent errored out, so it returned "0
+confirmed findings" — that is a NON-RESULT (the reviewers never ran), not a clean bill of health, and is
+recorded here so it is never mistaken for a completed independent audit.
+
+## Wrapper-triage backlog CLOSED (2026-07-08) — dead job/dataset-run subsystem removed
+
+Completed `task_ec79f7dd` (previously spawned, not yet done) properly rather than mass-wiring buttons: traced
+each of the 27 unreferenced `commands.ts` wrappers to its backend command and, for the ones with NO caller
+anywhere (not the IPC handler's own IPC name, not any other Rust function, not any test besides its own),
+confirmed genuine dead code vs. reserved/CLI-driven APIs before touching anything:
+
+- **DELETED (fully orphaned end-to-end, verified via full-repo grep before removal):** the generic "job"
+  subsystem (`start_job`/`get_job_status`/`cancel_job` IPC commands, `runs::create_job`/`get_job`/`cancel_job`,
+  the `JobStatus` struct/TS-interface, `map_job`) and the "dataset run" tracking subsystem
+  (`create_dataset_run`/`list_dataset_runs`/`get_dataset_run` — the last had no IPC registration or frontend
+  wrapper at all — the `DatasetRun` struct/TS-interface, `map_dataset_run`) — both superseded by the LIVE
+  `AgentImportReport`/event-based progress system the app actually uses; their only test coverage was one
+  shared unit test (`persists_dataset_runs_and_jobs`), removed with them. `DatasetRunConfig`/`config_from_settings`
+  were KEPT — genuinely used by the live `export_bundle.rs` feature (confirmed via grep before deciding).
+  DB tables (`job_history`, `dataset_runs`) left alone — dropping tables retroactively is a needless
+  destructive schema change; an orphaned empty table is harmless.
+- **LEFT ALONE, documented as reserved (verified NOT dead, just unwired-to-UI):** `clearCache`/`getCacheInfo`
+  (bounded 1000-entry in-memory LRU, no persistent-growth problem to fix), `get_champion_model`/
+  `add_segment_hypothesis` (in-code "reserved programmatic API" comments), `export_dataset_bundle` (a real,
+  complete production-bundle feature with blocking-validation gating — wiring a button would need a proper
+  validation-issue-rendering UI, not a naive click handler; left for a real UI-design pass, not a quick fix),
+  and the jury/training/dataset-orchestration cluster (`runConsensusRefinery`/`runDpoUpdate`/`runT0Gate`/
+  `runT2ForSegment`/`computeAcousticScores`/`computeAnnotationDriftScorecard`/`runGoldEval`/
+  `importGoldSegments`/`listGoldSegments`/`getFewShotExamples` — reserved/CLI-driven, some (DPO update)
+  genuinely dangerous to expose behind a casual click).
+- **`updateSegmentBounds`** — a real, out-of-scope FEATURE (segment boundary re-editing), not dead code;
+  needs a UI design decision, left undone rather than half-built.
+
+Verified: `cargo check --tests` compiles all 20 test binaries clean; `cargo fmt` clean; `cargo clippy
+--all-targets -D warnings` exit 0; `cargo test --lib` **816 passed** (817 → 816, exactly the one removed
+test, zero other regressions); `npm run typecheck` 406 files / 0 errors; `eslint` clean; `vitest` 134/134;
+`python-policies` green. Dismissed `task_ec79f7dd`.
+
+## Ship-gate sweep (2026-07-08) — charter verify-10 GREEN + a real security-advisory fix
+
+Ran the actual charter/ship gates fresh to find anything still red:
+- **`make verify-10`** (the CLAUDE.md "definition of done" gate) → **GREEN**: prints `CORTEX 10/10: ALL GATES
+  GREEN`, exit 0 (manifest version/license alignment across package.json/tauri.conf.json/Cargo.toml, required
+  assets present, provenance-ledger jsonschema valid for all 4 corpora, dataset redistribution-license
+  compatibility). NOTE per the charter's own one-law: this is the STRUCTURAL/governance gate — necessary, not
+  sufficient; "nothing is 10/10 on tests alone", the measured-accuracy bar still needs the 4090 runs.
+- **`make audit`** (`npm audit --omit=dev`) → **0 vulnerabilities**.
+- **`make deny`** (`cargo deny check`) → was **RED**: RUSTSEC-2026-0204 in `crossbeam-epoch 0.9.18` (invalid
+  pointer dereference in the `fmt::Pointer`/`Debug` impl for `Atomic`/`Shared` null pointers), pulled
+  transitively via rayon → crossbeam-deque. **FIXED** with `cargo update -p crossbeam-epoch` (0.9.18 → 0.9.20,
+  the advisory's fixed version); Cargo.lock-only change (2 lines). Re-ran `cargo deny check` → **advisories
+  ok, bans ok, licenses ok, sources ok** (exit 0). `cargo test --lib` still 816 passed with 0.9.20.
+- `check-7b` is NOT a Makefile target — it is a PROPOSED gate (deep-check 7.2, "verify-10 extension"), not an
+  existing command; corrected the remaining-list wording accordingly.
+
+**FULL `make ship-check` status (every gate that runs without the built .exe is now GREEN):**
+| ship-check gate | result |
+|---|---|
+| `verify-10` (charter definition-of-done) | GREEN — prints `CORTEX 10/10: ALL GATES GREEN` |
+| `typecheck` (svelte-check + tsc) | GREEN — 406 files, 0 errors |
+| `lint` (eslint) | GREEN |
+| `fmt-check` (cargo fmt --check) | GREEN |
+| `python-policies` | GREEN — 22 policies |
+| `test-frontend` (vitest) | GREEN — 134/134 |
+| `test-rust` (cargo test, ALL binaries) | GREEN — 816 lib + every integration binary, 0 failures (soak 122 s, reliability 23, tauri_integration, e2e_pipeline, the new real gold-regression measurement, proptests; only model/hardware/live tests `#[ignore]`'d) |
+| `audit` (npm audit --omit=dev) | GREEN — 0 vulnerabilities |
+| `deny` (cargo deny check) | GREEN — advisories/bans/licenses/sources ok (after the RUSTSEC-2026-0204 fix above) |
+| `test-e2e` (`node e2e_real_app.cjs`) | NOT RUN — needs the built `.exe` (`npm run tauri build`); the daily exe predates this branch, so this is an owner/CI step, run after `make build-app` |
+
+So of `make ship-check`'s 10 gates, **9 are green here and the 10th (test-e2e) is the owner's `build-app`
+step**. Every automatable ship-gate passes.
+
+**Media-cache SLICING — examined and DELIBERATELY NOT implemented (2026-07-07).** `src-tauri/src/media.rs`
+copies the whole source file into a TTL cache; `ensure_cache_room` already refuses a copy that would
+exhaust the disk/WAL volume before writing a byte, so the current whole-file path is *correct and robust*.
+Slicing (decode source → extract the segment's time range → re-encode) is a disk/latency OPTIMIZATION, not a
+correctness fix, and its correctness — zero sample offset, no corruption across wav/mp3/m4a — can only be
+confirmed by LISTENING to the extracted clip, which a headless checkout cannot do. Shipping a WAV-only
+half-version would add an unverifiable path to a subsystem that is presently correct. Per the one law
+("nothing is done until MEASURED on real audio") this stays OWNER-GATED, not a headless defect; reclassified
+from "remaining defect" to owner-decision optimization.
+
+**RELEASE BUILD certified (2026-07-07).** `npm run build` (frontend, clean) + `cargo build --release`
+(6m27s, optimized, ZERO errors) produced a fresh `src-tauri/target/release/cortex-speech-app.exe` (43 MB)
+from the branch tip — embedding the crossbeam-epoch security fix, the dead-code removal, and every
+correctness fix on this branch. Also `cargo clippy --all-targets --all-features -- -D warnings` = clean.
+This certifies the COMPILE half of `make build-app`. What remains un-runnable headlessly is only the LIVE
+LAUNCH of that exe (`make test-e2e` needs a display + the WSL champion server on the 4090) and the
+real-number accuracy/reliability suite. NOTE: this exe lives in the worktree target, not the owner's daily
+install path — the owner still rebuilds on the main checkout (or copies it) for the daily driver.
+
+TRULY REMAINING (~5): OWNER-GATED measurement (~5 — the P7 re-audit on the 4090, the reliability drills, and
+the gold marathon; faking is the one prohibition), and media-cache slicing / true-streaming decode as an
+owner-decision optimization (needs real-audio listening, see the note just above). The only build-gated step
+left is the LIVE `make test-e2e` run (the release binary now compiles clean — see the note just above).
+Everything implementable AND verifiable in a headless
+Windows checkout — the charter verify-10 gate, all rust/frontend tests, clippy -D warnings, the clean
+release build, npm audit, cargo deny (now
+advisory-clean), a real committed-fixture accuracy measurement (18.60% CER), and a genuine dead-code cleanup
+— is done, gated, and pushed. 10/10 remains the P7 re-audit's call on the full real-number suite; but the
+automatable portion of the ship gate is now entirely green.
+
+## CI GREENING — PR #28 opened, pre-existing repo-wide Release Gate breakage fixed (2026-07-07)
+
+Opened PR #28 (claude/intelligent-gauss-96ffc9 -> main, 71 commits) and drove the GitHub Actions
+"Release Gate" to green. KEY FINDING: the Release Gate has been RED on `main` for every run since
+2026-07-04 — pre-existing, repo-wide breakage, NOT caused by this branch (verified: none of the failing
+files were touched by the branch; main's HEAD carries the identical failing lines). Root causes + fixes,
+each scoped to the repo's own "hosted CI has no models / no heavy scientific stack" design (never weakening
+a gate):
+
+1. `npm ci` EUSAGE "Missing: picomatch@4.0.5 from lock file" (all 3 build jobs). picomatch 4.0.5 published
+   after the lock was generated; CI's node 22 (npm 10) re-resolved svelte-check's caret to 4.0.5 but the
+   lock pinned 4.0.4 (local npm 11 masked it). Fix: regenerated the lock with `npm@10 --package-lock-only`;
+   verified `npm@10 ci --dry-run` exits 0. (8863476)
+2. numpy ModuleNotFoundError in scripts/test_build_fleurs_manifest.py (Linux/macOS python-policies). The
+   policy runner auto-collects every test_*.py; this build-tooling test needs numpy+soundfile which hosted
+   runners don't install. Fix: guard the imports, skip loudly when absent — still runs in full where the
+   deps exist. Proven: with numpy blocked it prints SKIP and exits 0. (9067a6f)
+3. tauriConfigSecurity.test.ts asserted the gitignored base ONNX models physically exist (Windows vitest).
+   Fix: presence-gate the size probe; bundle DECLARATION stays unconditionally asserted. (83ef9e7)
+4. `cargo build` failed tauri-build's bundle.resources existence check — the models weren't provisioned in
+   ci.yml (release.yml fetches them, ci.yml didn't), AND the USER-PROVIDED fine-tuned model is in
+   bundle.resources but is not publicly fetchable (so NO hosted runner, incl. release.yml, could ever
+   satisfy it). Fix (owner-approved architecture): default tauri.conf.json + tauri.windows.conf.json now
+   list only the fetchable base models; the fine-tuned model moved to an explicit local-build override
+   `src-tauri/tauri.finetuned.conf.json` (build with `npm run tauri build -- --config
+   src-tauri/tauri.finetuned.conf.json` on a machine that has the file); added `npm run fetch-models` to all
+   three ci.yml build jobs. Runtime is unaffected (the fine-tuned engine is opt-in + presence-gated).
+   Verified locally: vitest 134/134, `cargo check --bin` clean with the reduced config, README build docs
+   updated. This also unblocks main + the dependabot PRs that were red for the same reasons.
+5. SECURITY-PIN FIX: `npm run fetch-models` REJECTed the onnxruntime DLLs (sha mismatch) — the first time
+   that path ever ran in CI. Investigation: the script URL pointed at onnxruntime v1.20.1 while the pinned
+   hashes were for a DIFFERENT build; the owner's local DLL is onnxruntime **1.24.4** (15.4 MB, non-standard
+   source — 10.7 KB providers_shared, no DirectML.dll, so effectively CPU) and matched NEITHER the v1.20.1
+   nor the official v1.22.0/v1.24.4 CPU zips. So the URL+pin never matched and ORT fetch could never succeed
+   (a long-standing reason release.yml failed too). Fix: repointed the URL to the official
+   **v1.24.4 CPU win-x64** release and repinned the two DLL hashes to that release's VERIFIED values
+   (b95efb21… / f2540b89…, confirmed by direct HTTPS download of the official asset here). This STRENGTHENS
+   the integrity gate (it now matches a real, verifiable upstream) and is C-API-compatible with ort
+   2.0.0-rc.12; CPU is all CI + the fine-tuned CPU inference need. OWNER ACTION: run `npm run fetch-models`
+   once locally to realign your models/ with the corrected pins (replaces the mystery-provenance 1.24.4 DLL
+   with the official verified CPU 1.24.4). I did NOT touch your local models. Did not run fetch-models here
+   to avoid clobbering the junctioned checkout; pins independently verified against the official zip.

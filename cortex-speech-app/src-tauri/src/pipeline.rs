@@ -52,7 +52,19 @@ pub(crate) fn apply_loop0_firing(enabled: bool, db: &crate::db::Database, transc
     }
     match db.load_correction_memories() {
         Ok(memories) if !memories.is_empty() => {
-            crate::corrections::apply_memories(transcript, &memories, &crate::corrections::FiringConfig::default())
+            let cfg = crate::corrections::FiringConfig::default();
+            // Provenance: a LOOP-0 rewrite is otherwise indistinguishable from raw ASR. Record which
+            // memories fired (to the persistent log) via the shared chokepoint, so ALL firing paths
+            // (import + batch re-transcribe) attribute rewrites consistently.
+            let fired = crate::corrections::fired_memories_summary(transcript, &memories, &cfg);
+            if !fired.is_empty() {
+                tracing::info!(
+                    "LOOP-0 firing rewrote a transcript using {} memory/memories: {}",
+                    fired.len(),
+                    fired.join(", ")
+                );
+            }
+            crate::corrections::apply_memories(transcript, &memories, &cfg)
         }
         Ok(_) => transcript.to_string(),
         Err(error) => {
@@ -60,6 +72,24 @@ pub(crate) fn apply_loop0_firing(enabled: bool, db: &crate::db::Database, transc
             transcript.to_string()
         }
     }
+}
+
+/// Map the configured LLM model name to an OpenRouter model id for the consent-gated Gemini/OpenRouter
+/// refine path. An already-namespaced id (`vendor/model`) passes through; a bare `gemini-*` gets the
+/// `google/` prefix; a local-only name (e.g. `heretic-final:latest`) has no OpenRouter equivalent, so we
+/// default to the Gemini-class model the "Gemini" mode implies — never silently to `openai/gpt-4o-mini`.
+fn openrouter_model_id(configured: &str) -> String {
+    let m = configured.trim();
+    if m.is_empty() {
+        return "google/gemini-2.5-pro".to_string();
+    }
+    if m.contains('/') {
+        return m.to_string();
+    }
+    if m.to_ascii_lowercase().starts_with("gemini") {
+        return format!("google/{m}");
+    }
+    "google/gemini-2.5-pro".to_string()
 }
 
 /// M2.3 / P1.3: true when LOOP-0 WOULD change this transcript (a confirmed correction memory matches).
@@ -166,9 +196,11 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
 
     let mut raw_transcript = String::new();
     let mut confidence: Option<f64> = None;
+    let mut saw_result = false;
     for line in stdout.lines() {
         if let Some(stripped) = line.strip_prefix("__RESULT__=") {
             if let Ok(res) = serde_json::from_str::<WslResult>(stripped) {
+                saw_result = true;
                 raw_transcript = res.raw_transcript;
                 // Sanitize the external script's confidence to a valid posterior: drop non-finite and
                 // clamp into [0,1]. A homegrown script emitting a percentage (e.g. 92.0) must not flow
@@ -178,11 +210,47 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
         }
     }
 
-    if raw_transcript.trim().is_empty() {
-        return Err(AppError::Other("WSL 7B ASR process did not return a valid transcript.".into()));
+    // A reachable server that emits a `__RESULT__` line with an EMPTY transcript is a LEGITIMATE
+    // outcome (a silent/music/noise clip), NOT an infrastructure failure — the client's failure
+    // contract exits non-zero (handled by the caller before we are reached) for a real infra fault and
+    // exits 0 with a `__RESULT__` line otherwise. Returning Err on an empty-but-present result made ONE
+    // silent chunk roll back the ENTIRE import and left the file permanently unimportable via the 7B.
+    // So Err ONLY when no `__RESULT__` line was seen at all; an empty transcript returns Ok and the
+    // caller escalates just that one segment.
+    if !saw_result {
+        return Err(AppError::Other("WSL 7B ASR process did not return a __RESULT__ line.".into()));
     }
 
     Ok((raw_transcript, confidence))
+}
+
+/// Serializes ALL WSL-7B client spawns process-wide. The champion server is a single-threaded accept
+/// loop, so concurrent app-side callers (an import's per-segment pass, the batch refinement loop, a UI
+/// re-transcribe) would queue on the socket and blow through their client/app timeouts CUMULATIVELY —
+/// misread as "server not running" and rolling back a HEALTHY import. Serializing here means each
+/// request waits its turn, then gets its FULL fresh timeout budget once it actually runs.
+static WSL_7B_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The port the OmniASR-7B warm server listens on inside WSL. SINGLE source of truth — shared by the
+/// preflight probe AND passed to the client via `CORTEX_7B_PORT`, so the app, client, and server can't
+/// drift (a mismatch would even green-light the preflight against the wrong service).
+pub(crate) const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.py
+
+/// Translate a Windows path to its WSL `/mnt` view (mirrors `cortex_7b_client.py`'s `win_to_wsl`), so
+/// the app can hand the client a `CORTEX_7B_DB` that follows a moved data dir instead of the client's
+/// hardcoded default. `C:\a\b` -> `/mnt/c/a/b`; a `\\?\` extended-length prefix is stripped; a
+/// non-drive path is returned with backslashes normalised.
+pub(crate) fn win_path_to_wsl(p: &str) -> String {
+    let mut s = p.replace('\\', "/");
+    if let Some(rest) = s.strip_prefix("//?/") {
+        s = rest.to_string();
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() > 2 && bytes[1] == b':' {
+        let drive = s[..1].to_ascii_lowercase();
+        return format!("/mnt/{drive}{}", &s[2..]);
+    }
+    s
 }
 
 /// Spawn the configured external WSL ASR client for ONE segment and return its parsed transcript.
@@ -196,10 +264,21 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
 pub(crate) fn run_wsl_segment_transcript_with_script(
     external_script: &str,
     segment_id: &str,
+    db_path: &str,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> AppResult<(String, Option<f64>)> {
+    // Hold the process-wide gate for the whole spawn+wait so cross-path 7B calls never collide on the
+    // single-threaded server. Poison-tolerant like every other lock in this crate.
+    let _gate = WSL_7B_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let mut cmd = std::process::Command::new("wsl");
-    cmd.arg("/root/cortex_env/bin/python3")
+    // Pass the DB path + port to the client via `env` (WSL does not propagate Windows env into Linux),
+    // so the client follows a MOVED data dir / non-default port instead of its hardcoded fallbacks — the
+    // app is the single source of truth for both.
+    cmd.arg("env")
+        .arg(format!("CORTEX_7B_DB={}", win_path_to_wsl(db_path)))
+        .arg(format!("CORTEX_7B_PORT={WSL_7B_SERVER_PORT}"))
+        .arg("/root/cortex_env/bin/python3")
         .arg(external_script)
         .arg("--segment-id")
         .arg(segment_id)
@@ -547,7 +626,7 @@ impl ProcessingPipeline {
         if !self.should_use_wsl_primary_asr() {
             return Ok(());
         }
-        const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.py
+        // Uses the module-level WSL_7B_SERVER_PORT (same value handed to the client) — one source of truth.
         let probe = format!("timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{WSL_7B_SERVER_PORT}'");
         let mut cmd = std::process::Command::new("wsl");
         cmd.arg("bash").arg("-lc").arg(&probe);
@@ -1014,14 +1093,18 @@ impl ProcessingPipeline {
                 ("index", (idx + 1).to_string()),
                 ("total", total.to_string()),
             ]);
-            let mut result = crate::telemetry::TRACER
-                .record_result("pipeline.import_file", meta, || self.process_single_file(file, &db));
+            // Thread the directory-import cancel token into per-file processing so Cancel interrupts the
+            // CURRENT file (its VAD/ASR/per-segment 7B loop), not only the gap between files — a long
+            // audiobook file could otherwise keep running for minutes after Cancel.
+            let mut result = crate::telemetry::TRACER.record_result("pipeline.import_file", meta, || {
+                self.process_single_file_with_progress(file, &db, cancel.as_ref(), |_, _| {})
+            });
 
             if let Err(ref e) = result {
                 if audio::is_transient_decode_error(e) {
                     tracing::warn!("Transient decode error for {}, retrying once: {e}", file.display());
                     std::thread::sleep(Duration::from_millis(500));
-                    result = self.process_single_file(file, &db);
+                    result = self.process_single_file_with_progress(file, &db, cancel.as_ref(), |_, _| {});
                 }
             }
 
@@ -1274,6 +1357,10 @@ impl ProcessingPipeline {
         )?;
         let mut persisted = self.persist_segments(db, segments)?;
         self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
+        // Deferred to AFTER the 7B pass so both evaluate the real transcript, not the placeholder, and
+        // so alignment does not clobber the slice offsets the pass depends on. See persist_segments.
+        self.shadow_log_loop0(db, &persisted);
+        self.enqueue_background_alignments(&persisted);
         for (seg_id, f32_pcm) in pcm_cache {
             if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
                 log_hypothesis_population_failure(&seg_id, &error);
@@ -1300,8 +1387,12 @@ impl ProcessingPipeline {
         })?;
 
         let windows = {
-            let guard = lock_decoded_windows(&windows);
-            guard.clone()
+            // MOVE the decoded windows out of the mutex instead of cloning them. The decode callback has
+            // already finished (decode_pcm_windows_with_timeout returned), so nothing else touches the
+            // Vec; cloning here held the ENTIRE file's PCM twice — exactly what the streaming path exists
+            // to avoid. std::mem::take leaves an empty Vec behind and releases the lock without the copy.
+            let mut guard = lock_decoded_windows(&windows);
+            std::mem::take(&mut *guard)
         };
 
         if windows.is_empty() {
@@ -1455,6 +1546,9 @@ impl ProcessingPipeline {
 
         let mut persisted = self.persist_segments(db, segments)?;
         self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
+        // Deferred to here so both see the real transcript and alignment doesn't clobber offsets.
+        self.shadow_log_loop0(db, &persisted);
+        self.enqueue_background_alignments(&persisted);
         for (seg_id, f32_pcm) in all_pcm_cache {
             if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
                 log_hypothesis_population_failure(&seg_id, &error);
@@ -1752,13 +1846,13 @@ impl ProcessingPipeline {
         // insert_segments_batch wraps inserts in its own transaction; do not nest SAVEPOINTs.
         db.insert_segments_batch(&segments)?;
 
-        // M2.3/P1.3: shadow-record LOOP-0 would-fire per segment (no mutation), now that the rows exist
-        // (the loop0_shadow_log FK requires it). Feeds the C5 over-trigger decision while firing is off.
-        self.shadow_log_loop0(db, &segments);
-
-        // M2.4: Spawn background alignment tasks (low priority, non-blocking).
-        // Alignment is optional — review can proceed while alignment runs in background.
-        self.enqueue_background_alignments(&segments);
+        // NOTE: neither LOOP-0 shadow logging NOR background word-alignment runs here. Both must see
+        // the REAL transcript, which under the forced WSL-7B engine does not exist yet (segments carry
+        // the "[Pending WSL 7B ASR]" placeholder until run_primary_wsl_pass_for_import fills them in).
+        // Shadowing the placeholder made the C5 over-trigger gate vacuous (always would_fire=false);
+        // aligning before the 7B pass clobbered the slice offsets the 7B client needs. So the caller
+        // runs BOTH only after the primary pass — see the shadow_log_loop0 + enqueue_background_alignments
+        // calls right after run_primary_wsl_pass_for_import.
 
         Ok(segments)
     }
@@ -1775,11 +1869,11 @@ impl ProcessingPipeline {
             }
         };
         for seg in segments {
-            let text = seg
-                .annotated_transcript
-                .as_deref()
-                .or(seg.normalized_transcript.as_deref())
-                .unwrap_or(&seg.raw_transcript);
+            let text = crate::corrections::loop0_draft_text(
+                seg.annotated_transcript.as_deref(),
+                seg.normalized_transcript.as_deref(),
+                &seg.raw_transcript,
+            );
             let would_fire = loop0_would_fire(&memories, text);
             if let Err(error) = db.record_loop0_shadow(&seg.id, would_fire) {
                 tracing::warn!("LOOP-0 shadow log write failed for {}: {error}", seg.id);
@@ -1787,28 +1881,100 @@ impl ProcessingPipeline {
         }
     }
 
-    /// M2.4: Enqueue background alignment tasks for segments. Non-blocking, best-effort.
+    /// M2.4: Enqueue background word-alignment for segments. Non-blocking, best-effort, opt-in via
+    /// `auto_align`.
+    ///
+    /// CRITICAL invariant (the whole-file-vs-clip bug class): each segment's `alignment_json` holds
+    /// its `{source_start_ms, source_end_ms}` slice offsets, which every LATER reader depends on — the
+    /// WSL-7B re-transcribe client, dataset audio export, clip playback, jury acoustic scoring. This
+    /// alignment therefore MUST (1) slice the clip out of the source by those offsets before aligning
+    /// (word timings clip-local, not smeared across the whole recording) and (2) MERGE its word array
+    /// back under a `words` key via `merge_word_timestamps` — NEVER flat-overwrite `alignment_json`
+    /// with a bare word array, which would destroy the offsets and silently degrade every reader to
+    /// the whole file. (This ran inside `persist_segments` and clobbered offsets; it is now deferred to
+    /// after the 7B pass and repaired to slice+merge.)
     fn enqueue_background_alignments(&self, segments: &[SpeechSegment]) {
+        if !self.settings.auto_align {
+            return;
+        }
+        // Group by source file so each recording is decoded ONCE (a VAD-chunked file yields many
+        // segments sharing one audio_path). Carry each segment's source-offset alignment_json + its
+        // finalized text (annotated ▸ normalized ▸ raw — the real 7B transcript post-pass).
+        let mut by_path: std::collections::HashMap<String, Vec<(String, Option<String>, String)>> =
+            std::collections::HashMap::new();
+        for s in segments {
+            let text = crate::corrections::loop0_draft_text(
+                s.annotated_transcript.as_deref(),
+                s.normalized_transcript.as_deref(),
+                &s.raw_transcript,
+            )
+            .to_string();
+            by_path.entry(s.audio_path.clone()).or_default().push((s.id.clone(), s.alignment_json.clone(), text));
+        }
         let db_path = self.db_path.clone();
-        let segments_to_align: Vec<(String, String, String)> =
-            segments.iter().map(|s| (s.id.clone(), s.audio_path.clone(), s.raw_transcript.clone())).collect();
 
         std::thread::spawn(move || {
-            for (seg_id, audio_path, transcript) in segments_to_align {
-                // Each alignment runs independently; failures don't block others.
-                // M2.4: Alignment is optional — import continues while background thread runs.
-                if let Ok((_, pcm)) = audio::decode_to_pcm(&audio_path) {
-                    if let Ok(words) = crate::aligner::align(&pcm, 16000, &transcript) {
-                        if let Ok(json) = serde_json::to_string(&words) {
-                            if let Ok(db) = crate::db::Database::open(&db_path) {
-                                let _ = db.connection().execute(
-                                    "UPDATE speech_segments SET alignment_json = ?1 WHERE id = ?2",
-                                    rusqlite::params![json, seg_id],
-                                );
+            let db = match crate::db::Database::open(&db_path) {
+                Ok(db) => db,
+                Err(error) => {
+                    tracing::warn!("background alignment skipped: could not open db: {error}");
+                    return;
+                }
+            };
+            let (mut aligned, mut failed) = (0usize, 0usize);
+            for (audio_path, jobs) in by_path {
+                let pcm16 =
+                    match audio::decode_to_pcm(&audio_path).and_then(|(sr, pcm)| audio::ensure_pcm_16khz(sr, pcm)) {
+                        Ok((_, pcm)) => pcm,
+                        Err(error) => {
+                            tracing::warn!("background alignment: decode failed for {audio_path}: {error}");
+                            failed += jobs.len();
+                            continue;
+                        }
+                    };
+                for (seg_id, source_alignment, text) in jobs {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    // Slice the clip out of the source by its stored offsets BEFORE aligning.
+                    let sliced = match chunking::slice_pcm_by_alignment(&pcm16, 16000, source_alignment.as_deref()) {
+                        Ok((clip, _)) => clip,
+                        Err(error) => {
+                            tracing::warn!("background alignment: slice failed for {seg_id}: {error}");
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    match crate::aligner::align(&sliced, 16000, &text) {
+                        Ok(words) if !words.is_empty() => {
+                            // MERGE under `words`, preserving source_start_ms/source_end_ms.
+                            let merged = crate::chunking::merge_word_timestamps(source_alignment.as_deref(), &words);
+                            if let Err(error) = db.update_segment_alignment_json(&seg_id, &merged) {
+                                tracing::warn!("background alignment: persist failed for {seg_id}: {error}");
+                                failed += 1;
+                                continue;
                             }
+                            let _ = db.update_alignment_quality(
+                                &seg_id,
+                                crate::aligner::AlignmentQuality::EnergyHeuristic.as_db_str(),
+                            );
+                            aligned += 1;
+                        }
+                        // Empty word list or error: leave the source offsets INTACT (never overwrite).
+                        Ok(_) => failed += 1,
+                        Err(error) => {
+                            tracing::warn!("background alignment failed for {seg_id}: {error}");
+                            failed += 1;
                         }
                     }
                 }
+            }
+            if failed > 0 {
+                tracing::warn!(
+                    "background alignment: {aligned} aligned, {failed} failed/empty (source offsets preserved)"
+                );
+            } else {
+                tracing::debug!("background alignment: {aligned} segment(s) aligned");
             }
         });
     }
@@ -1841,14 +2007,38 @@ impl ProcessingPipeline {
             // Honor cancellation between segments: each WSL transcription can ride a 300s timeout, so
             // without this a cancelled import of an N-segment file would keep running for up to N*300s.
             if let Some(token) = cancel {
-                token.check()?;
+                if let Err(cancel_err) = token.check() {
+                    // Roll back THIS file's just-created segments (a mix of transcribed + still-placeholder
+                    // rows) before propagating the cancel, so re-importing the same file cannot duplicate
+                    // every segment. Matches the infra-failure rollback and the F6 "nothing half-imported"
+                    // promise. Earlier files in a directory import are already committed and untouched.
+                    tracing::info!("WSL 7B import cancelled; rolling back {} segment(s)", import_ids.len());
+                    if let Err(e) = db.delete_segments_batch(&import_ids) {
+                        tracing::error!("failed to roll back {} segment(s) after cancel: {e}", import_ids.len());
+                    }
+                    return Err(cancel_err);
+                }
             }
             let mut last_problem: Option<String> = None;
             let mut infra_failure = false;
             for attempt in 1..=MAX_ATTEMPTS {
-                match self.transcribe(Some(seg.id.as_str()), &seg.audio_path, seg.alignment_json.as_deref()) {
+                match self.transcribe(
+                    Some(seg.id.as_str()),
+                    &seg.audio_path,
+                    seg.alignment_json.as_deref(),
+                    cancel.map(|t| t.as_atomic()),
+                ) {
                     Ok((_raw_text, _corrected_text, _confidence)) => {
-                        self.refresh_segment_from_db(db, seg)?;
+                        if let Err(e) = self.refresh_segment_from_db(db, seg) {
+                            // A DB hiccup mid-pass otherwise left a partial import (some transcribed, some
+                            // still placeholder) with no rollback; a re-import would then duplicate it.
+                            tracing::error!(
+                                "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
+                                import_ids.len()
+                            );
+                            let _ = db.delete_segments_batch(&import_ids);
+                            return Err(e);
+                        }
                         let usable = !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
                         if usable {
                             // Record the Champion's output as its hypothesis so the review provenance badge
@@ -1913,7 +2103,14 @@ impl ProcessingPipeline {
             }
             if let Some(reason) = last_problem {
                 tracing::warn!("WSL 7B import: segment {} failed after {MAX_ATTEMPTS} attempts: {reason}", seg.id);
-                self.mark_wsl_primary_unavailable(db, seg, &reason)?;
+                if let Err(e) = self.mark_wsl_primary_unavailable(db, seg, &reason) {
+                    tracing::error!(
+                        "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
+                        import_ids.len()
+                    );
+                    let _ = db.delete_segments_batch(&import_ids);
+                    return Err(e);
+                }
             }
         }
         Ok(updated)
@@ -1922,7 +2119,11 @@ impl ProcessingPipeline {
     fn mark_wsl_primary_unavailable(&self, db: &Database, seg: &mut SpeechSegment, reason: &str) -> AppResult<()> {
         let rationale = format!("WSL 7B primary ASR unavailable before jury: {reason}");
         tracing::warn!("{} ({})", rationale, seg.id);
-        db.write_segment_verdict(&seg.id, "escalated", None, Some(&rationale), None, None, true)?;
+        // Explicit lowest confidence (0.0), NOT None: a None here becomes COALESCE(agent_confidence, 0.5)
+        // in the suspect-first queue, tying these unresolved-primary clips (empty/failed 7B, unknown
+        // quality — exactly the ones most needing attention) at the 0.5 plateau to sort by id. 0.0 sorts
+        // them to the very front.
+        db.write_segment_verdict(&seg.id, "escalated", None, Some(&rationale), None, Some(0.0), true)?;
         self.refresh_segment_from_db(db, seg)?;
         Ok(())
     }
@@ -1961,6 +2162,15 @@ impl ProcessingPipeline {
         self.reset_finetuned_counters();
         on_event(PipelineEvent::Phase { phase: "importing".into() });
         self.set_import_status(0, estimated_chunks, &fname);
+        // RAII: clear `running` on EVERY exit path, including an early `?` from the open_db below, so a
+        // failed single-file import can't leave a phantom in-progress status (mirrors import_directory).
+        struct ImportStatusGuard<'a>(&'a ProcessingPipeline);
+        impl Drop for ImportStatusGuard<'_> {
+            fn drop(&mut self) {
+                self.0.finish_import_status();
+            }
+        }
+        let _status_guard = ImportStatusGuard(self);
 
         let db = self.open_db()?;
         on_event(PipelineEvent::Phase { phase: "reference_transcribing".into() });
@@ -2086,7 +2296,7 @@ impl ProcessingPipeline {
             succeeded: if result.is_ok() { 1 } else { 0 },
             failed: if result.is_err() { 1 } else { 0 },
         });
-        self.finish_import_status();
+        // `running` is cleared by `_status_guard` on scope exit (covers early-return error paths too).
         result
     }
 
@@ -2191,6 +2401,10 @@ impl ProcessingPipeline {
         segment_id: Option<&str>,
         audio_path: &str,
         alignment_json: Option<&str>,
+        // Optional cancel flag threaded down to the WSL-7B subprocess poller so an in-flight 7B call is
+        // killed within ~50 ms of Cancel, not only between segments (import/batch callers pass their
+        // token; one-off callers pass None).
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> AppResult<(String, String, Option<f64>)> {
         let path = Path::new(audio_path);
         let duration_ms = audio::get_duration_ms(path)?;
@@ -2248,7 +2462,7 @@ impl ProcessingPipeline {
         }
 
         if self.should_use_wsl_primary_asr() {
-            let db = crate::db::Database::open_with_retry(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
+            let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
             let audio_path_str = path.to_string_lossy().to_string();
 
             let segment_id: Option<String> = if let Some(id) = segment_id {
@@ -2290,10 +2504,9 @@ impl ProcessingPipeline {
 
                 drop(db);
 
-                let (raw_transcript, confidence) = self.run_wsl_segment_transcript(&id)?;
+                let (raw_transcript, confidence) = self.run_wsl_segment_transcript(&id, cancel)?;
 
-                let db =
-                    crate::db::Database::open_with_retry(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
+                let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
 
                 let normalized_transcript = if self.settings.auto_normalize && !raw_transcript.is_empty() {
                     let norm_config = crate::normalizer::NormalizationConfig {
@@ -2562,7 +2775,11 @@ impl ProcessingPipeline {
                     if let Some(openrouter_key) = crate::api_keys::ApiKeys::load(data_dir).openrouter {
                         return crate::llm_refiner::LlmRefiner::for_openrouter(
                             openrouter_key,
-                            String::new(),
+                            // Pass the CONFIGURED model, not an empty string (which silently defaulted to
+                            // openai/gpt-4o-mini — a different family than the "Gemini" mode the owner chose,
+                            // with no provenance). Map it to an OpenRouter id; a local-only name falls back
+                            // to the Gemini-class model the user expects.
+                            openrouter_model_id(&self.settings.llm_model),
                             self.settings.llm_system_prompt.clone(),
                         );
                     }
@@ -2667,6 +2884,24 @@ impl ProcessingPipeline {
             None => tracing::debug!("{model_id_1b} hypothesis model unavailable for {segment_id}"),
         }
 
+        // 3. Fine-tuned MMS-CTC (ckb) — the machine's strongest INDEPENDENT local voter (wav2vec2 family,
+        // ~21% CER), architecturally distinct from the correlated 300M/1B stock CTC pair. Its absence was
+        // a root cause of "the jury escalates ~everything": two weak kin models rarely agree with the 7B,
+        // so IRT confidence stays low and T0 almost never auto-accepts. Only runs when the fine-tuned
+        // model is installed (a no-op otherwise); a failure is best-effort and never fails population.
+        if let Some((onnx, vocab)) = Self::finetuned_model_paths() {
+            let chunk_i16: Vec<i16> = f32_pcm.iter().map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16).collect();
+            match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_i16) {
+                Ok(text) if !text.trim().is_empty() => {
+                    insert_hypothesis_checked(db, segment_id, "finetuned-mms-ckb", text, None)?;
+                }
+                Ok(_) => tracing::debug!("finetuned-mms-ckb hypothesis empty for {segment_id}"),
+                Err(error) => {
+                    tracing::warn!("finetuned-mms-ckb hypothesis transcription failed for {segment_id}: {error}");
+                }
+            }
+        }
+
         self.populate_wsl_hypothesis_if_configured(db, segment_id)?;
 
         Ok(())
@@ -2687,7 +2922,7 @@ impl ProcessingPipeline {
             return Ok(());
         }
 
-        match self.run_wsl_segment_transcript(segment_id) {
+        match self.run_wsl_segment_transcript(segment_id, None) {
             Ok((raw_transcript, confidence)) => {
                 insert_hypothesis_checked(db, segment_id, "omniasr-wsl-7b", raw_transcript, confidence)?;
             }
@@ -2698,13 +2933,17 @@ impl ProcessingPipeline {
         Ok(())
     }
 
-    fn run_wsl_segment_transcript(&self, segment_id: &str) -> AppResult<(String, Option<f64>)> {
+    fn run_wsl_segment_transcript(
+        &self,
+        segment_id: &str,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> AppResult<(String, Option<f64>)> {
         let Some(external_script) = self.settings.external_asr_script_path() else {
             return Err(AppError::Validation(
                 "External ASR provider is not configured. Set the WSL script path in Settings before using the 7B provider.".into(),
             ));
         };
-        run_wsl_segment_transcript_with_script(&external_script, segment_id, None)
+        run_wsl_segment_transcript_with_script(&external_script, segment_id, &self.db_path, cancel)
     }
 
     pub fn align(
@@ -2836,8 +3075,16 @@ impl ProcessingPipeline {
                 let (start, end) = if let Some(meta) =
                     seg.alignment_json.as_deref().and_then(chunking::SegmentSourceMeta::from_alignment_json)
                 {
-                    let s = chunking::ms_to_samples(meta.source_start_ms.max(0) as u32, sample_rate);
-                    let e = chunking::ms_to_samples(meta.source_end_ms.max(0) as u32, sample_rate);
+                    let (start_ms, end_ms) = (meta.source_start_ms.max(0), meta.source_end_ms.max(0));
+                    // Same u32-wrap guard as chunking::slice_pcm_by_alignment / export::slice_for_export: a
+                    // malformed offset > u32::MAX would wrap mod 2^32 to an in-range index and diarize an
+                    // UNRELATED window, mislabeling this segment's speaker. Skip it rather than fall through
+                    // to (0, pcm.len()) — whole-file diarization of a clip segment is the wrong answer too.
+                    if start_ms > u32::MAX as i64 || end_ms > u32::MAX as i64 {
+                        continue;
+                    }
+                    let s = chunking::ms_to_samples(start_ms as u32, sample_rate);
+                    let e = chunking::ms_to_samples(end_ms as u32, sample_rate);
                     (s, e.min(pcm.len()))
                 } else {
                     (0, pcm.len())
@@ -2973,6 +3220,18 @@ mod tests {
             "Gemini mode + OpenRouter key should route through OpenRouter, got: {}",
             refiner.endpoint
         );
+        assert_ne!(refiner.model, "openai/gpt-4o-mini", "Gemini mode must not silently use gpt-4o-mini");
+        assert!(refiner.model.contains("gemini"), "Gemini mode maps to a Gemini-class model, got: {}", refiner.model);
+    }
+
+    #[test]
+    fn openrouter_model_id_maps_families_and_defaults_to_gemini() {
+        assert_eq!(super::openrouter_model_id("google/gemini-2.5-pro"), "google/gemini-2.5-pro");
+        assert_eq!(super::openrouter_model_id("openai/gpt-4o"), "openai/gpt-4o");
+        assert_eq!(super::openrouter_model_id("gemini-2.5-flash"), "google/gemini-2.5-flash");
+        // A local-only name has no OpenRouter equivalent -> Gemini-class default, never gpt-4o-mini.
+        assert_eq!(super::openrouter_model_id("heretic-final:latest"), "google/gemini-2.5-pro");
+        assert_eq!(super::openrouter_model_id("  "), "google/gemini-2.5-pro");
     }
 
     #[test]
@@ -3479,8 +3738,10 @@ mod tests {
 
     #[test]
     fn rejects_missing_wsl_segment_result_stdout_marker() {
+        // No __RESULT__ line at all is the real infrastructure failure. (An empty-but-PRESENT result
+        // is legitimate and returns Ok — see empty_7b_result_is_legitimate_not_infra_failure.)
         let err = super::parse_wsl_segment_result("loading model\nfinished without result\n").unwrap_err();
-        assert!(err.to_string().contains("did not return a valid transcript"));
+        assert!(err.to_string().contains("did not return a __RESULT__ line"));
     }
 
     #[test]
@@ -3825,5 +4086,39 @@ mod tests {
         assert!(preview.contains("[truncated subprocess stderr]"));
         assert!(!preview.contains("extra"));
         assert_eq!(preview.lines().next().unwrap().chars().count(), super::SUBPROCESS_ERROR_PREVIEW_CHARS);
+    }
+
+    #[test]
+    fn empty_7b_result_is_legitimate_not_infra_failure() {
+        // A reachable 7B server emitting a __RESULT__ line with an empty transcript (a silent/music
+        // clip) must parse Ok(("", ..)) so the caller escalates only THAT segment — never Err, which
+        // would roll back the whole import and leave the file permanently unimportable via the 7B.
+        let (text, conf) =
+            super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\": \"\", \"confidence\": null}")
+                .expect("an empty-but-present result is a legitimate outcome, not an infra failure");
+        assert_eq!(text, "");
+        assert_eq!(conf, None);
+
+        // A real transcript still parses.
+        let (text, _) =
+            super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\": \"ئەمە\", \"confidence\": 0.9}")
+                .expect("a real transcript parses");
+        assert_eq!(text, "ئەمە");
+
+        // NO __RESULT__ line at all is the real infrastructure failure -> Err.
+        assert!(
+            super::parse_wsl_segment_result("some noise\nno result here").is_err(),
+            "absence of a __RESULT__ line is an infra failure"
+        );
+    }
+
+    #[test]
+    fn win_path_to_wsl_translates_drive_paths() {
+        assert_eq!(super::win_path_to_wsl(r"C:\data\cortex\x.db"), "/mnt/c/data/cortex/x.db");
+        assert_eq!(super::win_path_to_wsl(r"D:\a\b"), "/mnt/d/a/b");
+        // Extended-length prefix stripped, then drive-mapped.
+        assert_eq!(super::win_path_to_wsl(r"\\?\C:\a"), "/mnt/c/a");
+        // Already-POSIX / non-drive path: backslashes normalised, returned as-is.
+        assert_eq!(super::win_path_to_wsl("/mnt/c/already"), "/mnt/c/already");
     }
 }

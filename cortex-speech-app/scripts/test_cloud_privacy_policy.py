@@ -54,6 +54,33 @@ def test_t2_audio_cloud_calls_require_jury_opt_in() -> None:
     assert_contains(commands, "Gemini API key is required for T2", COMMANDS_RS.name)
 
 
+def test_cloud_stt_scribe_egress_requires_opt_in() -> None:
+    # The cloud-LLM and jury-T2 gates are pinned above, but the ElevenLabs Scribe (cloud STT) egress
+    # paths upload SEGMENT AUDIO — a stricter privacy surface. Every Scribe egress must be gated behind
+    # cloud_stt_opt_in, or a refactor could silently ship audio off-device with no consent.
+    settings = read(SETTINGS_RS)
+    commands = read(COMMANDS_RS)
+    pipeline = read(PIPELINE_RS)
+
+    # Opt-out by default.
+    assert_contains(settings, "cloud_stt_opt_in: false", SETTINGS_RS.name)
+    # The IPC-boundary guard exists and enforces the opt-in.
+    assert_contains(
+        commands, "fn require_cloud_stt_consent(state: &AppState) -> Result<(), String>", COMMANDS_RS.name
+    )
+    assert_contains(commands, "if state.lock_settings().cloud_stt_opt_in", COMMANDS_RS.name)
+    # BOTH Scribe egress commands (whole-file transcribe + jury votes) must call the guard — dropping it
+    # from either would upload audio to ElevenLabs with no consent. Count the enforced call sites.
+    call_sites = commands.count("require_cloud_stt_consent(&state)?")
+    if call_sites < 2:
+        raise AssertionError(
+            f"both Scribe egress commands must call require_cloud_stt_consent (found {call_sites} call site(s))"
+        )
+    # The import path gates the key itself behind the same opt-in (defense in depth).
+    assert_contains(pipeline, "fn scribe_api_key_if_enabled", PIPELINE_RS.name)
+    assert_contains(pipeline, "if !self.settings.cloud_stt_opt_in", PIPELINE_RS.name)
+
+
 def test_api_keys_are_not_persisted_or_returned_to_client() -> None:
     settings = read(SETTINGS_RS)
 
@@ -96,6 +123,7 @@ def test_release_docs_keep_cloud_privacy_gate() -> None:
 def main() -> None:
     test_cloud_llm_defaults_are_opt_out()
     test_gemini_refinement_requires_effective_opt_in_mode()
+    test_cloud_stt_scribe_egress_requires_opt_in()
     test_t2_audio_cloud_calls_require_jury_opt_in()
     test_api_keys_are_not_persisted_or_returned_to_client()
     test_cloud_error_paths_redact_secrets()

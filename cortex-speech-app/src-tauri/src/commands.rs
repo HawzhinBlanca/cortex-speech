@@ -939,6 +939,15 @@ pub fn app_health(state: State<'_, AppState>) -> Result<serde_json::Value, Strin
     health::health_check(&db, &mm, data_dir.as_deref()).map_err(|e| e.to_string())
 }
 
+/// Return a one-line summary of the most recent crash report (if the last session panicked), surfaced
+/// exactly once. The frontend shows it as a notification on startup so a mid-review crash — after which
+/// the app relaunches looking normal — is no longer silent. The full report stays in the rolling log.
+#[tauri::command]
+pub fn take_last_crash(state: State<'_, AppState>) -> Option<String> {
+    let data_dir = state.lock_data_dir().clone()?;
+    crate::crash::take_latest_crash_summary(&data_dir)
+}
+
 /// Opt-in: transcribe a segment with the CONSTRAINED Kurdish-token CTC decode (guarantees
 /// Kurdish-script output) via the `ort` raw-logits path, instead of the default sherpa-onnx
 /// decode. Additive — it does NOT touch the default `transcribe_segment` path. Loads a fresh ort
@@ -1089,7 +1098,7 @@ pub fn transcribe_segment(
     // possibly-long WSL/ONNX transcription — holding it would serialize every other pipeline command.
     let pipeline = state.lock_pipeline().clone();
     let (raw_text, corrected_text, confidence) = pipeline
-        .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref())
+        .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref(), None)
         .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "text": corrected_text, "rawTranscript": raw_text, "confidence": confidence }))
 }
@@ -1191,7 +1200,7 @@ pub fn batch_transcribe(
             if let Some(seg) = seg {
                 // Capture full snapshot BEFORE transcription for complete undo.
                 let pre_transcription_snapshot = seg.clone();
-                match pipeline.transcribe(Some(id), &seg.audio_path, seg.alignment_json.as_deref()) {
+                match pipeline.transcribe(Some(id), &seg.audio_path, seg.alignment_json.as_deref(), None) {
                     Ok((raw_text, corrected_text, confidence)) => {
                         let normalized = normalizer.normalize(&corrected_text);
                         // Guarded targeted write (NOT a full insert_segment of the stale snapshot): a
@@ -1557,25 +1566,6 @@ pub fn export_huggingface_dataset(path: String, state: State<'_, AppState>) -> R
 }
 
 #[tauri::command]
-pub fn create_dataset_run(name: Option<String>, state: State<'_, AppState>) -> Result<crate::runs::DatasetRun, String> {
-    RATE_LIMITER.check("create_dataset_run")?;
-    let db = state.lock_db();
-    let settings = state.lock_settings().clone();
-    // Round-23 #3: record the ACTUAL denoising state. The denoiser silently passes audio through when
-    // its optional model is absent, so the run config must not claim denoising that did not run.
-    let denoising_active = state.lock_model_manager().denoiser_present();
-    crate::runs::create_dataset_run(&db, name, crate::runs::config_from_settings(&settings, denoising_active))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn list_dataset_runs(state: State<'_, AppState>) -> Result<Vec<crate::runs::DatasetRun>, String> {
-    RATE_LIMITER.check("list_dataset_runs")?;
-    let db = state.lock_db();
-    crate::runs::list_dataset_runs(&db).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub fn list_agent_import_reports(
     limit: Option<usize>,
     state: State<'_, AppState>,
@@ -1594,36 +1584,6 @@ pub fn list_agent_stage_events(
     RATE_LIMITER.check("list_agent_stage_events")?;
     let db = state.lock_db();
     crate::runs::list_agent_stage_events(&db, run_id.as_deref(), limit).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn start_job(
-    kind: String,
-    summary: Option<String>,
-    cancellable: Option<bool>,
-    state: State<'_, AppState>,
-) -> Result<crate::runs::JobStatus, String> {
-    RATE_LIMITER.check("start_job")?;
-    validate::validate_identifier(&kind)?;
-    let db = state.lock_db();
-    crate::runs::create_job(&db, kind, summary, cancellable.unwrap_or(false)).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn get_job_status(id: String, state: State<'_, AppState>) -> Result<crate::runs::JobStatus, String> {
-    RATE_LIMITER.check("get_job_status")?;
-    validate::validate_identifier(&id)?;
-    let db = state.lock_db();
-    crate::runs::get_job(&db, &id).map_err(|e| e.to_string())?.ok_or_else(|| format!("Job not found: {id}"))
-}
-
-#[tauri::command]
-pub fn cancel_job(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("cancel_job")?;
-    validate::validate_identifier(&id)?;
-    state.cancel_current_operation();
-    let db = state.lock_db();
-    crate::runs::cancel_job(&db, &id).map_err(|e| e.to_string())
 }
 
 /// The model registry, newest-first within each family — what a registry panel lists.
@@ -2444,9 +2404,32 @@ pub fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Res
     if !src.is_file() {
         return Err(format!("snapshot '{name}' has no database file"));
     }
-    let mut db = state.lock_db();
-    db.restore(&src).map_err(|e| e.to_string())?;
-    tracing::info!("database restored from auto-snapshot {name}");
+    {
+        let mut db = state.lock_db();
+        db.restore(&src).map_err(|e| e.to_string())?;
+    } // release the db lock before touching the settings/pipeline locks
+
+    // Restore the snapshot's captured config (settings.json / champion.json) so the app returns to a
+    // CONSISTENT known-good state — not a rolled-back library sitting beside post-disaster settings, or
+    // silently-defaulted settings if the live settings.json was corrupted alongside the DB. Best-effort
+    // per file (the DB is already restored; a config-copy failure only warns).
+    // Restore exactly the set the snapshot saved (crate::snapshot::EXTRA_STATE) — single source of truth,
+    // so save-side and restore-side can never drift out of sync.
+    let snap_dir = data_dir.join("snapshots").join(&name);
+    for &extra in crate::snapshot::EXTRA_STATE {
+        let from = snap_dir.join(extra);
+        if from.is_file() {
+            if let Err(e) = std::fs::copy(&from, data_dir.join(extra)) {
+                tracing::warn!("snapshot restore: could not restore {extra}: {e}");
+            }
+        }
+    }
+    // Apply the restored settings to memory AND the running pipeline (mirrors update_settings) so the
+    // engine / thresholds / consent flags take effect immediately, not only on the next launch.
+    let restored = crate::settings::AppSettings::load(&data_dir.join("settings.json"));
+    *state.lock_settings() = restored.clone();
+    state.update_pipeline_settings(restored);
+    tracing::info!("database and config restored from auto-snapshot {name}");
     Ok(())
 }
 
@@ -2828,7 +2811,10 @@ fn run_wsl_refinement_loop(
         ">>> Driving the Meta OmniASR 7B warm client over pending segments (one --segment-id call each)...".to_string(),
     );
 
-    let db = crate::db::Database::open_with_retry(db_path).map_err(|e| e.to_string())?;
+    // Worker connection (background thread): plain `open`, NOT open_with_retry — the boot-time-only
+    // destructive quarantine must not be reachable from a live worker, and the DB was integrity-checked
+    // at boot. `open` sets WAL + busy_timeout for contention.
+    let db = crate::db::Database::open(db_path).map_err(|e| e.to_string())?;
     let segments = db.get_segments(None).map_err(|e| e.to_string())?;
     let targets = select_wsl_refinement_targets(&segments, limit_files, limit_segments, test_one);
 
@@ -2873,7 +2859,12 @@ fn run_wsl_refinement_loop(
             return Ok(WslRefinementSummary { transcribed, failed, cancelled: true });
         }
         emit_or_log(app, "wsl-log", format!("[{}/{}] transcribing {}...", idx + 1, total, id));
-        match crate::pipeline::run_wsl_segment_transcript_with_script(external_script, id, Some(&WSL_REFINE_CANCEL)) {
+        match crate::pipeline::run_wsl_segment_transcript_with_script(
+            external_script,
+            id,
+            db_path,
+            Some(&WSL_REFINE_CANCEL),
+        ) {
             Ok((raw_transcript, confidence)) => {
                 let normalized = if auto_normalize && !raw_transcript.is_empty() {
                     Some(normalizer.normalize(&raw_transcript))
@@ -4078,11 +4069,13 @@ fn has_final_machine_verdict(seg: &crate::db::SpeechSegment) -> bool {
 fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) -> R) -> R {
     let db_path = { app_state.lock_db().path().to_string() };
     if db_path != ":memory:" {
-        // Round-25 #8: retry the dedicated open (busy_timeout) so a transient lock/contention doesn't
-        // drop us to the shared-handle fallback, which would hold the GLOBAL db Mutex across the jury's
-        // cloud T2 Gemini round-trips and freeze every other DB command for minutes. open_with_retry
-        // makes that fallback extremely rare (only a hard disk/handle failure reaches it).
-        match crate::db::Database::open_with_retry(&db_path) {
+        // Dedicated worker connection so we never hold the GLOBAL db Mutex across the jury's cloud T2
+        // Gemini round-trips (which would freeze every other DB command for minutes). Use plain `open`,
+        // NOT open_with_retry: the latter runs a full PRAGMA integrity_check (a per-review-session tax
+        // that grows with the library) AND reaches the boot-time-only DESTRUCTIVE quarantine decision
+        // from a live worker thread. The file was already integrity-checked at boot; `open` sets WAL +
+        // busy_timeout=10000, which is the actual transient-contention retry we want here.
+        match crate::db::Database::open(&db_path) {
             Ok(db) => return f(&db),
             Err(e) => tracing::warn!(
                 "Jury dedicated db connection open failed after retries ({e}); using the shared handle \

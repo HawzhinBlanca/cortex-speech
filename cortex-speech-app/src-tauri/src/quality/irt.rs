@@ -338,7 +338,17 @@ fn consensus_from_slots(slots: &[Slot]) -> Option<(String, f64)> {
             .posteriors
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                // On an exact posterior TIE, KEEP the word: demote the empty (deletion) candidate so a
+                // word that ties a deletion wins, matching segment_consensus_words (the review draft).
+                // Without this, max_by's last-maximal rule picks "" whenever it sits at a later candidate
+                // index (it does — build_confusion_slots seeds `[anchor_word, ""]` then pushes more words),
+                // so the GATE's consensus (and any auto-accepted text) could silently truncate a word the
+                // human's draft kept — the two must agree slot-for-slot.
+                let a_empty = slot.candidates.get(a.0).is_some_and(|c| c.is_empty());
+                let b_empty = slot.candidates.get(b.0).is_some_and(|c| c.is_empty());
+                a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal).then(b_empty.cmp(&a_empty))
+            })
             .map(|(idx, _)| idx)
             .unwrap_or(0);
         let best_token = &slot.candidates[max_idx];
@@ -512,6 +522,19 @@ mod tests {
         // Every slot won by "" -> empty consensus -> None (omitted, not a fabricated score).
         assert!(consensus_from_slots(&[slot(&["x", ""], &[0.1, 0.9]), slot(&["y", ""], &[0.2, 0.8])]).is_none());
         assert!(consensus_from_slots(&[]).is_none());
+    }
+
+    #[test]
+    fn gate_consensus_keeps_a_word_over_a_tied_deletion_like_the_draft() {
+        // The GATE (consensus_from_slots) must break a word-vs-deletion posterior TIE the same way the
+        // review DRAFT (segment_consensus_words) does — KEEP the word — so an auto-accepted consensus can
+        // never silently truncate a word the human's draft kept. `build_confusion_slots` seeds candidates
+        // as `[anchor_word, ""]`, so "" sits at the later index; before the tie-break fix, max_by's
+        // last-maximal rule picked "" here and the whole consensus collapsed to None (all-deletion).
+        let (text, conf) = consensus_from_slots(&[slot(&["ئەمە", ""], &[0.5, 0.5])])
+            .expect("a word tying a deletion must yield a consensus, not an all-deletion None");
+        assert_eq!(text, "ئەمە", "the gate must KEEP a word that ties a deletion, matching the draft");
+        assert!((conf - 0.5).abs() < 1e-9, "the kept word contributes its 0.5 posterior over 1 slot");
     }
 
     #[test]

@@ -220,8 +220,12 @@ def test_wsl_refinement_batch_is_panic_safe_and_cancellable() -> None:
         # A panic in the loop still emits a terminal wsl-status so the panel never wedges at "running".
         "std::panic::catch_unwind(std::panic::AssertUnwindSafe(",
         # Drive the shared per-segment warm client (not a one-shot batch spawn), passing the cancel
-        # flag so a long clip is interrupted promptly instead of blocking the whole batch.
-        "crate::pipeline::run_wsl_segment_transcript_with_script(external_script, id, Some(&WSL_REFINE_CANCEL))",
+        # flag so a long clip is interrupted promptly instead of blocking the whole batch. (Checked as
+        # two robust tokens rather than one exact call string, which rustfmt wraps across lines once the
+        # client also receives db_path — the safety invariant is: the client is driven AND the cancel
+        # flag is passed to it.)
+        "run_wsl_segment_transcript_with_script(",
+        "Some(&WSL_REFINE_CANCEL)",
         # Writes go through the human-decision-safe update so a batch never clobbers reviewed text.
         "db.update_asr_transcript_if_unreviewed(id, &raw_transcript, normalized.as_deref(), confidence)",
     ]
@@ -1360,8 +1364,11 @@ def test_pipeline_decoded_window_accumulator_recovers_poisoned_lock() -> None:
         raise AssertionError("Decoded-window accumulator locking must recover poisoned locks with poisoned.into_inner()")
     if "lock_decoded_windows(&acc).push(window)" not in pipeline:
         raise AssertionError("Streaming decode callback must push windows through lock_decoded_windows()")
-    if "let guard = lock_decoded_windows(&windows);" not in pipeline:
-        raise AssertionError("Streaming decode must clone accumulated windows through lock_decoded_windows()")
+    if "lock_decoded_windows(&windows)" not in pipeline:
+        # The outer access to the accumulator must still go through the poison-safe helper. (It now MOVEs
+        # the Vec out via std::mem::take instead of cloning it — the safety invariant is the guarded
+        # access, not the copy.)
+        raise AssertionError("Streaming decode must access accumulated windows through lock_decoded_windows()")
     if "decoded_window_accumulator_recovers_poisoned_lock" not in pipeline:
         raise AssertionError("pipeline.rs must keep a unit test for poisoned decoded-window recovery")
 

@@ -15,7 +15,14 @@ export interface AutosaveDeps<T extends object> {
   targetId: () => string | null;
   /** Freshest row for an id (from the store), or null if it no longer exists. */
   getRow: (id: string) => T | null;
-  /** Persist a merged row. */
+  /**
+   * Persist a merged row. MUST be idempotent (a pure upsert): if the debounce timer's save is still
+   * in-flight when `flush`/`flushAsync` runs (e.g. the window closes the instant after the timer fired),
+   * `pending` is not cleared until that save's `.then`, so the SAME entry can be persisted a SECOND time.
+   * That is harmless for an idempotent field write (the app wires this to `updateSegment`), but a
+   * side-effectful save — recording a human decision, crediting LOOP-0 confidence, appending a ledger
+   * row — would DOUBLE-COUNT. Keep side effects out of this callback; do them on the explicit verify path.
+   */
   save: (row: T) => Promise<void>;
   /** UI state transitions ('saving' on schedule, 'saved' on success, 'idle' on no-op/error). */
   onState?: (state: SaveState) => void;
@@ -30,6 +37,12 @@ export interface AutosaveController {
   schedule: (edits: Record<string, unknown>) => void;
   /** Persist any queued edit immediately (call when leaving a segment). */
   flush: () => void;
+  /**
+   * Flush and return a promise that resolves when the in-flight save settles (or immediately when
+   * nothing is queued). Call this on window close so the last edit of a session is never lost to the
+   * debounce — `flush()` is fire-and-forget and would let the window close before the write lands.
+   */
+  flushAsync: () => Promise<void>;
   /** Drop any queued edit without saving (teardown). */
   cancel: () => void;
   /**
@@ -49,12 +62,13 @@ export function createAutosaveController<T extends object>(
 
   // Re-read the FRESH row so a concurrent change to OTHER fields (a verify/normalize/background
   // reload during the debounce) is preserved, then re-apply the user's edited fields so their edit
-  // always wins. Returns false (no save issued) when the row no longer exists.
-  function persist(entry: { id: string; fields: Record<string, unknown> }): boolean {
+  // always wins. Returns the in-flight save promise, or null (no save issued) when the row no longer
+  // exists — callers that only need "was a save issued?" can still test truthiness (null is falsy).
+  function persist(entry: { id: string; fields: Record<string, unknown> }): Promise<void> | null {
     const fresh = deps.getRow(entry.id);
-    if (!fresh) return false;
+    if (!fresh) return null;
     const merged = { ...fresh, ...entry.fields } as T;
-    deps.save(merged).then(
+    return deps.save(merged).then(
       () => {
         if (pending === entry) pending = null;
         deps.onState?.('saved');
@@ -64,7 +78,6 @@ export function createAutosaveController<T extends object>(
         deps.onState?.('idle');
       },
     );
-    return true;
   }
 
   function clearTimer() {
@@ -75,10 +88,15 @@ export function createAutosaveController<T extends object>(
   }
 
   function flush() {
+    void flushAsync();
+  }
+
+  function flushAsync(): Promise<void> {
     clearTimer();
     const entry = pending;
     pending = null;
-    if (entry) persist(entry);
+    if (!entry) return Promise.resolve();
+    return persist(entry) ?? Promise.resolve();
   }
 
   function schedule(edits: Record<string, unknown>) {
@@ -110,5 +128,5 @@ export function createAutosaveController<T extends object>(
     return pending ? pending.id : null;
   }
 
-  return { schedule, flush, cancel, pendingId };
+  return { schedule, flush, flushAsync, cancel, pendingId };
 }

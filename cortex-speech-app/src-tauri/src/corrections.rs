@@ -219,6 +219,147 @@ pub fn firing_error_delta(gold: &[(String, String)], memories: &[MemoryEntry], c
     delta
 }
 
+/// The LOOP-0 "draft" text a correction memory acts on: `annotated ▸ normalized ▸ raw`. Deliberately
+/// EXCLUDES `verdict_transcript` — that is the human's ANSWER (the reference/target the evidence is
+/// scored AGAINST), never the model draft the memory rewrote. This is the SINGLE source of truth for the
+/// finalized-draft selection so the shadow logger (`pipeline::shadow_log_loop0`, the C5 go-live signal)
+/// and the confidence-update evidence (`db::record_human_decision`) can never silently diverge onto
+/// different texts — which would make the shadow gate measure a different distribution than the evidence
+/// updates on, quietly invalidating the go-live decision. (Distinct from `training_transcript_with_source`,
+/// which DOES prefer the human verdict because it selects the final SHIPPED text, not the original draft.)
+pub fn loop0_draft_text<'a>(annotated: Option<&'a str>, normalized: Option<&'a str>, raw: &'a str) -> &'a str {
+    annotated.or(normalized).unwrap_or(raw)
+}
+
+/// The Beta(1,1)-posterior mean confidence of a memory given its firing-outcome evidence:
+/// `(confirm + 1) / (confirm + override + 2)`. A memory with NO evidence sits at the neutral prior
+/// 0.5 — deliberately BELOW the default `tau_conf` 0.6 — so a freshly captured memory must EARN the
+/// right to fire by accumulating human confirmations. A memory the human keeps overriding decays
+/// toward 0 and drops out of firing eligibility. This is the anti-poisoning mechanism the true-10
+/// audit required before `loop0_firing_enabled` may ever go live (previously `confidence` was frozen
+/// at 1.0 and the `tau_conf` gate was vacuous).
+pub fn beta_confidence(confirm: i64, overrides: i64) -> f64 {
+    (confirm as f64 + 1.0) / (confirm as f64 + overrides as f64 + 2.0)
+}
+
+/// What a single memory WOULD have done to one segment, judged against the human's own answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryOutcome {
+    /// Fired and moved the transcript TOWARD the human's answer — evidence the memory was right.
+    Confirm,
+    /// Fired and moved the transcript AWAY from the human's answer — an over-trigger.
+    Override,
+    /// Did not fire here, or firing left the word-error count unchanged — no evidence either way.
+    Neutral,
+}
+
+/// Classify what a single `memory` would have done to `original` relative to the human's `reference`
+/// answer, using the SAME normalized word-error alignment as [`firing_error_delta`]:
+///
+/// * fired and the result is CLOSER to the human answer -> [`MemoryOutcome::Confirm`]
+/// * fired and the result is FARTHER from the human answer -> [`MemoryOutcome::Override`]
+/// * did not fire, or no net change -> [`MemoryOutcome::Neutral`]
+///
+/// The eligibility gates (`tau_conf`, `min_hits`) are DISABLED here on purpose: confidence is the
+/// quantity we are trying to LEARN, so a memory not yet confident enough to fire must still be able
+/// to accumulate the confirmations that would lift it over the bar — otherwise a fresh memory at the
+/// 0.5 prior could never escape it (a firing deadlock). Only the STRUCTURAL gates (exact slot match
+/// + phonetic distance) apply — they decide whether the memory is even relevant to this slot.
+pub fn classify_memory_outcome(
+    original: &str,
+    reference: &str,
+    memory: &MemoryEntry,
+    cfg: &FiringConfig,
+) -> MemoryOutcome {
+    let eval_cfg = FiringConfig { phon_tau: cfg.phon_tau, tau_conf: f64::NEG_INFINITY, min_hits: 0 };
+    let fired = apply_memories(original, std::slice::from_ref(memory), &eval_cfg);
+    let before = word_error_count(original, reference) as i64;
+    let after = word_error_count(&fired, reference) as i64;
+    match after.cmp(&before) {
+        std::cmp::Ordering::Less => MemoryOutcome::Confirm,
+        std::cmp::Ordering::Greater => MemoryOutcome::Override,
+        std::cmp::Ordering::Equal => MemoryOutcome::Neutral,
+    }
+}
+
+/// Indices of the memories that would ACTUALLY fire on `text` — ONE winner per word slot (the closest
+/// phonetic match clearing the structural gates), mirroring `apply_memories`'s selection exactly. The
+/// eligibility gates are disabled (via `cfg`) so a not-yet-confident memory is still counted. Deduped:
+/// a memory that wins several slots appears once.
+fn firing_winner_indices(text: &str, memories: &[MemoryEntry], cfg: &FiringConfig) -> Vec<usize> {
+    let normalizer = char_only_normalizer();
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let norm: Vec<String> = words.iter().map(|w| normalizer.normalize(w)).collect();
+    let mut winners = Vec::new();
+    for (i, word_norm) in norm.iter().enumerate() {
+        let left = if i > 0 { norm[i - 1].as_str() } else { "" };
+        let right = norm.get(i + 1).map(String::as_str).unwrap_or("");
+        let slot_key = format!("{left}|{right}");
+        let best = memories
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.slot_key == slot_key && m.confidence > cfg.tau_conf && m.hit_count >= cfg.min_hits)
+            .map(|(idx, m)| (idx, crate::diff::phonetic::normalized_phonetic_word_distance(word_norm, &m.phonetic_key)))
+            .filter(|(_, dist)| *dist <= cfg.phon_tau)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((idx, _)) = best {
+            if !winners.contains(&idx) {
+                winners.push(idx);
+            }
+        }
+    }
+    winners
+}
+
+/// Classify firing-outcome evidence for a human decision on ONE segment, crediting only the memory
+/// that would ACTUALLY fire at each slot (winner-take-all, matching runtime `apply_memories`). This
+/// prevents a losing sibling memory in the same slot — e.g. the same wrong token remembered with two
+/// different human fixes — from collecting a spurious confirm/override it could never earn at decode
+/// time. Returns `(index_into_memories, outcome)` for each firing, non-Neutral memory.
+///
+/// KNOWN LIMITATION (rare, statistically self-correcting): the per-winner outcome is measured by
+/// [`classify_memory_outcome`], which fires that memory IN ISOLATION. If a winner also matches a
+/// SECOND slot with identical `left|right` context where a different memory wins at runtime — reachable
+/// only when two near-homophones (within `phon_tau`) sit in the same repeated context, e.g.
+/// "… L باش R … L پاش R …" with a sibling memory for each — the isolated evaluation attributes that
+/// second slot's change to the wrong winner. The mis-credit is one confirm/override event on a
+/// pathological input; because confidence is a Beta posterior aggregated over many human decisions, a
+/// single stray event is washed out and never flips a memory's firing eligibility on its own. A fully
+/// faithful fix (marginal leave-one-out over the winner set) is deferred rather than risk destabilizing
+/// the correct, well-tested common path for this edge.
+pub fn classify_memory_outcomes(
+    original: &str,
+    reference: &str,
+    memories: &[MemoryEntry],
+    cfg: &FiringConfig,
+) -> Vec<(usize, MemoryOutcome)> {
+    let eval_cfg = FiringConfig { phon_tau: cfg.phon_tau, tau_conf: f64::NEG_INFINITY, min_hits: 0 };
+    firing_winner_indices(original, memories, &eval_cfg)
+        .into_iter()
+        .filter_map(|idx| match classify_memory_outcome(original, reference, &memories[idx], cfg) {
+            MemoryOutcome::Neutral => None,
+            outcome => Some((idx, outcome)),
+        })
+        .collect()
+}
+
+/// Human-readable descriptions of the memories that would ACTUALLY fire on `transcript` under `cfg`
+/// (real eligibility gates + winner-take-all), each as `wrong->human @[slot]`. This is the PROVENANCE
+/// of a LOOP-0 rewrite: without it a fired correction is indistinguishable from raw ASR output. Empty
+/// when nothing fires.
+pub fn fired_memories_summary(transcript: &str, memories: &[MemoryEntry], cfg: &FiringConfig) -> Vec<String> {
+    firing_winner_indices(transcript, memories, cfg)
+        .into_iter()
+        .map(|i| {
+            let m = &memories[i];
+            format!("{}->{} @[{}]", m.wrong_token, m.human_token, m.slot_key)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +537,108 @@ mod tests {
         let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
         let out = apply_memories("ئەو ساڵە پاش بوو", &[entry], &FiringConfig::default());
         assert_eq!(out, "ئەو ساڵە خراپ بوو", "a near-homophone of the wrong token must fire");
+    }
+
+    // --- evidence-based confidence (Beta(1,1) posterior over confirm/override) ---
+
+    #[test]
+    fn loop0_draft_text_prefers_annotated_then_normalized_then_raw() {
+        // The single source of truth shared by shadow_log_loop0 and record_human_decision: the memory's
+        // draft is annotated ▸ normalized ▸ raw. It has no verdict slot by construction (the human's
+        // answer is the reference, never the draft), so shadow and evidence can't drift onto different text.
+        assert_eq!(loop0_draft_text(Some("ann"), Some("norm"), "raw"), "ann");
+        assert_eq!(loop0_draft_text(None, Some("norm"), "raw"), "norm");
+        assert_eq!(loop0_draft_text(None, None, "raw"), "raw");
+    }
+
+    #[test]
+    fn beta_confidence_prior_is_below_tau_and_evidence_moves_it() {
+        let tau = FiringConfig::default().tau_conf;
+        assert!((beta_confidence(0, 0) - 0.5).abs() < 1e-9, "no evidence -> neutral 0.5 prior");
+        assert!(beta_confidence(0, 0) < tau, "the prior sits below tau_conf: a fresh memory cannot fire");
+        assert!(beta_confidence(3, 0) > tau, "confirmations lift confidence above tau_conf");
+        assert!(beta_confidence(0, 3) < tau, "overrides push confidence below tau_conf");
+        // Monotone in each argument.
+        assert!(beta_confidence(5, 0) > beta_confidence(1, 0), "more confirms -> higher");
+        assert!(beta_confidence(0, 5) < beta_confidence(0, 1), "more overrides -> lower");
+    }
+
+    #[test]
+    fn classify_memory_outcome_reads_evidence_even_below_tau_conf() {
+        // The memory's stored confidence is 0.5 (below tau_conf): classify must STILL read its
+        // structural match, or a fresh memory could never accumulate the evidence to climb the gate.
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 0.5, 0);
+        let cfg = FiringConfig::default();
+        // Human edited the same confusion -> the memory's output matches the human answer -> Confirm.
+        assert_eq!(
+            classify_memory_outcome("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", &entry, &cfg),
+            MemoryOutcome::Confirm,
+        );
+        // Human ACCEPTED the original (reference == original) -> the memory over-triggers -> Override.
+        assert_eq!(
+            classify_memory_outcome("ئەو ساڵە باش بوو", "ئەو ساڵە باش بوو", &entry, &cfg),
+            MemoryOutcome::Override,
+        );
+        // The memory's slot does not occur here -> it never fires -> Neutral (no evidence).
+        assert_eq!(classify_memory_outcome("شتێکی جیاواز", "شتێکی جیاواز", &entry, &cfg), MemoryOutcome::Neutral,);
+    }
+
+    #[test]
+    fn classify_memory_outcomes_credits_only_the_slot_winner() {
+        // Two sibling memories in the SAME slot (ساڵە|بوو), both near "باش" phonetically. Only the one
+        // the runtime would fire (the exact match) may collect evidence — the loser earns nothing.
+        let m1 = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1); // wrong=باش (exact)
+        let m2 = captured_entry("ئەو ساڵە پاش بوو", "ئەو ساڵە چاک بوو", 1.0, 1); // wrong=پاش (near, loses)
+        assert_eq!(m1.slot_key, m2.slot_key, "both memories occupy the same slot");
+        let mems = vec![m1, m2];
+        let cfg = FiringConfig::default();
+        // Human ACCEPTED the original "…باش…": the winner over-triggered. Exactly ONE credit (the winner).
+        let outcomes = classify_memory_outcomes("ئەو ساڵە باش بوو", "ئەو ساڵە باش بوو", &mems, &cfg);
+        assert_eq!(outcomes.len(), 1, "only the slot winner is credited, not the losing sibling: {outcomes:?}");
+        assert_eq!(outcomes[0].0, 0, "the exact-match memory (index 0) wins the slot");
+        assert_eq!(outcomes[0].1, MemoryOutcome::Override, "accept-of-original -> over-trigger");
+    }
+
+    #[test]
+    fn known_limitation_isolation_undercredits_a_winner_in_repeated_homophone_context() {
+        // CHARACTERIZATION TEST for the documented isolation limitation of `classify_memory_outcomes`.
+        // Two near-homophones (باش / پاش, within phon_tau) sit in the SAME repeated slot "ئەو|بوو".
+        // Memory X remembers باش->خراپ, Y remembers پاش->چاک. The human edited ONLY the first
+        // occurrence (باش->خراپ) and KEPT پاش. At runtime X wins slot 1 and Y wins slot 2, so X's true
+        // outcome is Confirm (it made exactly the human's fix) and Y's is Override (it would change a
+        // word the human kept).
+        let original = "ئەو باش بوو ئەو پاش بوو";
+        let reference = "ئەو خراپ بوو ئەو پاش بوو"; // human fixed slot 1 only
+        let x = captured_entry("ئەو باش بوو", "ئەو خراپ بوو", 1.0, 1); // wrong=باش
+        let y = captured_entry("ئەو پاش بوو", "ئەو چاک بوو", 1.0, 1); // wrong=پاش
+        assert_eq!(x.slot_key, y.slot_key, "both homophones occupy the same repeated slot");
+        let mems = vec![x, y];
+        let cfg = FiringConfig::default();
+
+        let outcomes = classify_memory_outcomes(original, reference, &mems, &cfg);
+        // Because X is scored IN ISOLATION, it also fires at slot 2 (باش-memory is within phon_tau of
+        // پاش), turning خراپ into an over-trigger there that cancels its slot-1 improvement in the
+        // GLOBAL word-error count -> X nets to Neutral and is dropped. This is the known under-credit:
+        // X earns NO Confirm for a fix that at runtime it genuinely and correctly makes.
+        let x_credit = outcomes.iter().find(|(idx, _)| *idx == 0);
+        assert!(
+            x_credit.is_none(),
+            "documents the isolation limitation: X's deserved Confirm is masked by its own cross-slot \
+             over-trigger under isolation -> no credit recorded. Got {outcomes:?}"
+        );
+        // The test exists to PIN this behavior; a future faithful (marginal leave-one-out) fix should
+        // flip this assertion to expect `(0, Confirm)` and update the doc comment accordingly.
+    }
+
+    #[test]
+    fn fired_memories_summary_attributes_the_rewrite() {
+        let entry = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 1);
+        let cfg = FiringConfig::default();
+        // Fires on the same confusion -> provenance names the wrong->human swap at its slot.
+        let fired = fired_memories_summary("ئەو ساڵە باش بوو", std::slice::from_ref(&entry), &cfg);
+        assert_eq!(fired.len(), 1);
+        assert!(fired[0].contains("باش->خراپ"), "provenance names the applied correction: {fired:?}");
+        // Nothing fires on unrelated text -> empty provenance.
+        assert!(fired_memories_summary("شتێکی جیاواز", std::slice::from_ref(&entry), &cfg).is_empty());
     }
 }

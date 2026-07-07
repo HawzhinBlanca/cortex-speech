@@ -116,7 +116,11 @@ def main() -> None:
     assert "export_huggingface_writes_machine_ready_rows_with_matching_ready_agentic_report" in export, (
         "HF export needs a positive regression for covered machine-ready rows"
     )
-    assert "grade.transcript.as_str()" in export, "HF export must write the selected training transcript"
+    assert "canonical_training_text(&grade.transcript)" in export, (
+        "exports must write the CANONICALIZED rubric-selected training transcript (grade.transcript), "
+        "so JSON/JSONL/CSV/Parquet/HF all emit byte-identical training text and no mixed orthography "
+        "re-enters the corpus"
+    )
     assert "training_grade_summary.json" in export_bundle, "bundle must include grade summary artifact"
     assert "training_grade_details.json" in export_bundle, "bundle must include per-segment grade details"
     assert "build_training_grade_details" in export_bundle, "bundle must build auditable per-segment grade details"

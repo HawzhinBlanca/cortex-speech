@@ -132,7 +132,12 @@ pub fn create_gold_from_verified_file(db: &Database, audio_path: &str) -> AppRes
     }
 
     let mut stmt = db.connection().prepare(
-        "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(normalized_transcript, ''), raw_transcript)
+        // Preference order MUST match the training/eval hypothesis surface form (quality::hypothesis_
+        // transcript is RAW ASR, with digits): verdict_transcript (human-decided) ▸ annotated_transcript
+        // (human edit) ▸ raw_transcript. NEVER normalized_transcript — with verbalize_numbers on it turns
+        // "٥" into "پێنج", so every future eval hypothesis (which emits digits) scores a built-in WER/CER
+        // penalty against the gold reference that no model can beat, corrupting the promotion-gate numbers.
+        "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(annotated_transcript, ''), raw_transcript)
          FROM speech_segments
          WHERE audio_path = ?1 AND human_decision IS NOT NULL AND human_decision != ''
          -- `, rowid ASC` tiebreaker: all of one file's chunks batch-insert in the same created_at
@@ -978,6 +983,34 @@ mod tests {
 
         // A file with no reviewed segments errors (correct it in the app first).
         assert!(create_gold_from_verified_file(&db, "/clips/missing.wav").is_err());
+    }
+
+    #[test]
+    fn gold_reference_prefers_annotated_over_verbalized_normalized() {
+        // The gold reference must match the raw-ASR hypothesis surface form (digits), so it uses
+        // annotated_transcript, never the number-VERBALIZED normalized_transcript — otherwise every
+        // future eval hypothesis carries a built-in WER/CER penalty vs the gold that no model can beat.
+        let db = open_mem_db();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "g1".to_string(),
+            audio_path: "/clips/nums.wav".to_string(),
+            raw_transcript: "raw".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET human_decision='accept', verdict_transcript='',
+                     annotated_transcript='ساڵی ٥', normalized_transcript='ساڵی پێنج' WHERE id='g1'",
+                [],
+            )
+            .unwrap();
+        create_gold_from_verified_file(&db, "/clips/nums.wav").unwrap();
+        let gold = list_gold_segments(&db).unwrap();
+        assert_eq!(
+            gold[0].reference, "ساڵی ٥",
+            "gold reference uses the annotated digit form, not the verbalized normalized text"
+        );
     }
 
     #[test]

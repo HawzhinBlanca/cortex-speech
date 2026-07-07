@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "_comment": "Local/opt-in build override: adds the USER-PROVIDED fine-tuned MMS-CTC Kurdish model to the bundle. The base configs (tauri.conf.json / tauri.windows.conf.json) intentionally list only the base models that scripts/fetch_models.py can download + SHA-256-verify, so hosted CI (ci.yml) and hosted release (release.yml) can build on a fresh checkout. The fine-tuned model is NOT publicly fetchable, so it can only be bundled on a machine that already has models/finetuned-mms-ckb/{model.onnx,vocab.json} on disk. Build with it via:  npm run tauri build -- --config src-tauri/tauri.finetuned.conf.json  (Tauri array-merges by REPLACEMENT, so this lists the full resource set, not just the delta). At runtime the fine-tuned engine is opt-in and presence-gated (commands.rs / pipeline.rs return a clean 'not found' when absent), so an installer built without this override simply omits that one optional engine.",
+  "bundle": {
+    "resources": [
+      "models/silero_vad_v4.onnx",
+      "models/omniasr-ctc-300m/model.int8.onnx",
+      "models/omniasr-ctc-300m/tokens.txt",
+      "models/onnxruntime.dll/onnxruntime.dll",
+      "models/onnxruntime.dll/onnxruntime_providers_shared.dll",
+      "models/finetuned-mms-ckb/model.onnx",
+      "models/finetuned-mms-ckb/vocab.json"
+    ]
+  }
+}

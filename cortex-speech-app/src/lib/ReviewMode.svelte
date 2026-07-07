@@ -4,6 +4,7 @@
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import { settings } from './stores/settingsStore';
+  import { showReviewInbox } from './stores/uiStore';
   import { t } from './i18n';
   import Waveform from './Waveform.svelte';
   import AudioPlayer from './AudioPlayer.svelte';
@@ -15,6 +16,7 @@
     segmentSourceFilename,
     segmentChunkLabel,
   } from './alignment';
+  import { isPlaceholderTranscript } from './segmentQuality';
   import type { SpeechSegment, WordTimestamp } from './types';
   import type { SegmentConsensus } from './commands';
 
@@ -351,6 +353,14 @@
     // Never save an empty edit (mirrors the Save button's disabled guard — the Ctrl+Enter shortcut
     // would otherwise bypass it, blank the transcript, and split the segment's state).
     if (!acceptAsIs && !text) return;
+    // Never let a placeholder ("[Pending WSL 7B ASR]" / "[ASR unavailable…]") be verified as gold: the
+    // owner must re-transcribe it or mark it bad. Accepting it would count a non-transcript as reviewed
+    // (inflating verified counts) while the export rubric silently drops it. An edit that REPLACES the
+    // placeholder with real text is allowed (text is no longer a placeholder).
+    if (isPlaceholderTranscript(text)) {
+      notifications.error($t('review.cannotVerifyPlaceholder'));
+      return;
+    }
     saving = true;
     // Map to a real human decision: an actual change is an "edit" (the typed text becomes gold), a
     // no-change save is an "accept".
@@ -365,7 +375,12 @@
       // marks `verified` (queue/progress advance) and writes annotated_transcript where the editor +
       // FTS search read it. If updateSegment fails after recordHumanDecision, the clip stays unverified
       // (in the queue) and re-review self-heals it.
-      await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', isEdit ? text : null);
+      // Accept-what-you-SEE: pass the displayed text even on accept so verdict_transcript (the
+      // COALESCE-preferred gold source) becomes exactly what the human approved. Passing null let an
+      // UNSEEN jury verdict_transcript survive and get exported as human-verified gold. For an edit the
+      // typed text is the label; for an accept the displayed original is. (Backend only captures a
+      // LOOP-0 memory / ledger row on 'edit', so an accept with text stays a pure verdict overwrite.)
+      await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', text);
       await api.updateSegment(updated);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       editCache.delete(seg.id); // persisted — drop the in-progress copy
@@ -459,6 +474,12 @@
   // NEVER fire while typing in the transcript (or any input), and never hijack space/Enter from a
   // focused button/link — so nothing corrupts the edit text or breaks native control activation.
   function onKeydown(e: KeyboardEvent) {
+    // The Review Inbox overlays this surface with its OWN window keydown handler. While it is open,
+    // every keystroke belongs to the inbox — firing review-mode actions (accept/reject/undo/save) on
+    // the HIDDEN clip behind it silently records human decisions the owner never made, corrupting gold
+    // labels. Guard FIRST, before the Ctrl+Enter save, or an inbox edit's Ctrl+Enter also saves+verifies
+    // the invisible ReviewMode clip.
+    if (get(showReviewInbox)) return;
     // Save & next: works everywhere, including mid-edit.
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       e.preventDefault();

@@ -954,7 +954,7 @@ fn pipeline_routes_to_finetuned_when_enabled() {
     );
 
     let (raw, _final_text, conf) =
-        pipeline.transcribe(None, fixture.to_str().unwrap(), None).expect("fine-tuned pipeline transcribe");
+        pipeline.transcribe(None, fixture.to_str().unwrap(), None, None).expect("fine-tuned pipeline transcribe");
     eprintln!("[pipeline-finetuned] raw: {raw}  conf={conf:?}");
     assert!(conf.is_none(), "the fine-tuned engine returns no confidence (proves it was the engine used)");
     assert!(!raw.trim().is_empty(), "fine-tuned pipeline must not return a blank transcript");

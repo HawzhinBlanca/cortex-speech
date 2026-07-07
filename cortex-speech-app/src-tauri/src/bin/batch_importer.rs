@@ -20,6 +20,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Batch Importer...");
 
     let app_data_dir = app_data_dir();
+
+    // Single-instance guard shared with the GUI (same cortex.lock): refuse to run against the live DB
+    // while the app — or another importer — is open, so two writers never contend on the WAL DB or the
+    // one warm 7B server, and per-process import dedup can't double-import a file. Return the error from
+    // main (a recoverable, non-panicking exit) rather than aborting inside processing.
+    let _lock = cortex_speech_app_lib::flock::InstanceLock::try_lock(&app_data_dir)
+        .map_err(|e| format!("Cannot start batch importer: {e}. Close the Cortex app (or another importer) first."))?;
+
     let db_path = app_data_dir.join("cortex-speech.db");
 
     let db = Database::open_with_retry(&db_path.to_string_lossy())?;

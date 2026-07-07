@@ -412,30 +412,54 @@ impl AppSettings {
             }
         }
         match std::fs::read_to_string(path) {
-            Ok(s) => match serde_json::from_str::<AppSettings>(&s) {
-                Ok(mut settings) => {
-                    if !settings.llm_api_key.is_empty() {
-                        settings.llm_api_key_configured = true;
-                        settings.llm_api_key.clear();
-                        if let Err(e) = settings.save(path) {
-                            tracing::warn!(
-                                "Failed to scrub plaintext LLM key from settings file at {}: {e}",
-                                path.display()
-                            );
+            Ok(s) => {
+                // Tolerate a leading UTF-8 BOM: a settings.json saved by e.g. PowerShell's
+                // `Out-File -Encoding utf8` (the owner's primary shell) carries a U+FEFF that serde_json
+                // does NOT skip, which would otherwise silently discard EVERY persisted setting — engine
+                // selection, WSL script path, thresholds, consent flags — and fall back to defaults.
+                let parseable = s.strip_prefix('\u{feff}').unwrap_or(&s);
+                match serde_json::from_str::<AppSettings>(parseable) {
+                    Ok(mut settings) => {
+                        if !settings.llm_api_key.is_empty() {
+                            settings.llm_api_key_configured = true;
+                            settings.llm_api_key.clear();
+                            if let Err(e) = settings.save(path) {
+                                tracing::warn!(
+                                    "Failed to scrub plaintext LLM key from settings file at {}: {e}",
+                                    path.display()
+                                );
+                            }
                         }
+                        settings
                     }
-                    settings
+                    Err(e) => {
+                        // The file EXISTS but is unparseable (bad hand-edit, UTF-16, truncation). Preserve
+                        // it BEFORE returning defaults so the next update_settings save cannot overwrite —
+                        // and permanently destroy — the still-recoverable original.
+                        tracing::warn!("Failed to parse settings file at {}: {}; using defaults", path.display(), e);
+                        Self::preserve_unparseable_settings(path);
+                        Self::default()
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to parse settings file at {}: {}; using defaults", path.display(), e);
-                    Self::default()
-                }
-            },
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
                 tracing::warn!("Failed to read settings file at {}: {}; using defaults", path.display(), e);
                 Self::default()
             }
+        }
+    }
+
+    /// Rename an unparseable settings file to `settings.json.corrupt-<epoch>` so a subsequent save of
+    /// the defaults can never clobber the owner's recoverable original. Best-effort.
+    fn preserve_unparseable_settings(path: &std::path::Path) {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(format!(".corrupt-{ts}"));
+        let backup = std::path::PathBuf::from(backup);
+        match std::fs::rename(path, &backup) {
+            Ok(()) => tracing::warn!("Preserved unparseable settings as {}", backup.display()),
+            Err(e) => tracing::warn!("Could not preserve unparseable settings at {}: {e}", path.display()),
         }
     }
 
@@ -579,6 +603,40 @@ mod tests {
         // The owner's main model is the fine-tuned OmniASR-7B Champion (WSL GPU path), so it is the
         // built-in default — a reset/lost settings.json must not silently revert to the weaker base CTC.
         assert_eq!(AppSettings::default().asr_model_size, AsrModelSize::WSL7B);
+    }
+
+    #[test]
+    fn load_tolerates_utf8_bom_instead_of_silently_resetting() {
+        // A settings.json saved with a UTF-8 BOM (PowerShell Out-File default) must still parse — not
+        // fall back to Default and silently swap the engine + every preference.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let base = AppSettings { asr_model_size: AsrModelSize::CTC1B, ..AppSettings::default() };
+        let json = format!("\u{feff}{}", serde_json::to_string(&base).unwrap());
+        std::fs::write(&path, json).unwrap();
+        let loaded = AppSettings::load(&path);
+        assert_eq!(
+            loaded.asr_model_size,
+            AsrModelSize::CTC1B,
+            "a BOM-prefixed settings.json must parse, not silently reset to defaults"
+        );
+    }
+
+    #[test]
+    fn unparseable_settings_are_preserved_not_destroyed() {
+        // An unparseable file must be moved aside so a later save of the defaults cannot overwrite the
+        // owner's still-recoverable original.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{ not valid json ").unwrap();
+        let _ = AppSettings::load(&path); // returns defaults
+        assert!(!path.exists(), "the unparseable file is moved aside, not left in place");
+        let preserved = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(preserved, 1, "the unparseable settings file is preserved as .corrupt-<ts>");
     }
 
     #[test]

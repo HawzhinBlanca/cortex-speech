@@ -36,8 +36,12 @@ SILERO_URL = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/d
 # ort 2.0 (load-dynamic) does NOT bundle the runtime — the matching ONNX Runtime win-x64 build
 # provides onnxruntime.dll + onnxruntime_providers_shared.dll. The SHA-256 below is authoritative;
 # if a different ONNX Runtime version is used the hash check will reject it (adjust the version then).
+# Pinned to the official 1.24.4 CPU win-x64 release, which is C-API-compatible with ort 2.0.0-rc.12
+# (Cargo.toml) and runs the fine-tuned MMS-CTC model on CPU. The earlier v1.20.1 URL never matched the
+# pinned hashes (the pins were for a newer runtime), so this fetch step could never succeed until now;
+# the two hashes below were verified by downloading this exact official release over HTTPS.
 ORT_WIN_ZIP = (
-    "https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-win-x64-1.20.1.zip"
+    "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-win-x64-1.24.4.zip"
 )
 
 # dest is relative to src-tauri/models/. sha256 is authoritative (matches the in-repo pins in
@@ -62,13 +66,13 @@ ITEMS = [
     },
     {
         "dest": "onnxruntime.dll/onnxruntime.dll",
-        "sha256": "8b695444d1a35ed0c8338b8c14438b3be5e0a3b222b88b1e7b4ce8753f135b50",
+        "sha256": "b95efb2113b603bbbf3f191061c5516a871ed546893c820e4f3b7b6c358dbf2a",
         "archive": ORT_WIN_ZIP,
         "member": "onnxruntime.dll",
     },
     {
         "dest": "onnxruntime.dll/onnxruntime_providers_shared.dll",
-        "sha256": "ebc55b0f28e8a79cbf78e810a7f510ba70e75a2dfbcfcc6aca31ab2b8710a59a",
+        "sha256": "f2540b89707b47895c2a732bfd04e34a695c580d22301ef44c0f01f09b001673",
         "archive": ORT_WIN_ZIP,
         "member": "onnxruntime_providers_shared.dll",
     },
