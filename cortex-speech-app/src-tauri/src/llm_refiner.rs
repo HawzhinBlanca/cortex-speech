@@ -105,7 +105,7 @@ impl LlmRefiner {
             .send_json(payload)
             .map_err(|e| format!("Local LLM request failed: {}", redact_api_key(&e.to_string(), &self.api_key)))?;
 
-        let body: Value = resp.into_json().map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+        let body: Value = crate::http::json_bounded(resp).map_err(|e| format!("Failed to parse JSON response: {}", e))?;
 
         if let Some(content) = body["choices"][0]["message"]["content"].as_str() {
             Ok(content.trim().to_string())
@@ -149,7 +149,7 @@ impl LlmRefiner {
             .send_json(payload)
             .map_err(|e| format!("Gemini API request failed: {}", redact_api_key(&e.to_string(), &self.api_key)))?;
 
-        let body: Value = resp.into_json().map_err(|e| format!("Failed to parse Gemini response: {}", e))?;
+        let body: Value = crate::http::json_bounded(resp).map_err(|e| format!("Failed to parse Gemini response: {}", e))?;
 
         // Concatenate ALL text parts — Gemini can split a refined transcript across content.parts[0..N]
         // (and a 2.5-class "thinking" model may emit a leading thought part); reading parts[0] alone

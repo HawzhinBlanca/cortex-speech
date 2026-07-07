@@ -32,6 +32,22 @@ pub static DOWNLOAD_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .build()
 });
 
+/// Upper bound on a provider JSON response body. ureq's `Response::into_json()` streams via
+/// `into_reader()`, which — unlike `into_string()`'s built-in 10 MB cap — is bounded only by the
+/// read TIMEOUT, not by bytes. A compromised or on-path HTTPS endpoint that trickles a multi-GB
+/// chunked body within the read window could otherwise drive `serde_json::from_reader` to OOM the
+/// process. 64 MiB is far above any real STT/LLM API reply.
+pub const MAX_JSON_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Parse an untrusted provider response as JSON with a hard byte cap. Use this instead of
+/// `resp.into_json()` everywhere a cloud/LLM endpoint's body is deserialized: an over-limit body
+/// yields a bounded read that fails to parse (returns `Err`) rather than an unbounded allocation.
+pub fn json_bounded<T: serde::de::DeserializeOwned>(resp: ureq::Response) -> Result<T, String> {
+    use std::io::Read;
+    let reader = resp.into_reader().take(MAX_JSON_RESPONSE_BYTES);
+    serde_json::from_reader(reader).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

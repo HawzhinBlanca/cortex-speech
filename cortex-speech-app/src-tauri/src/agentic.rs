@@ -251,7 +251,8 @@ fn transcribe_inline_audio(
         .set("Content-Type", "application/json")
         .send_json(payload)
         .map_err(|e| format!("Gemini inline audio request failed: {}", redact_for_user(e, api_key)))?;
-    let body: Value = response.into_json().map_err(|e| format!("Failed to parse Gemini inline audio response: {e}"))?;
+    let body: Value =
+        crate::http::json_bounded(response).map_err(|e| format!("Failed to parse Gemini inline audio response: {e}"))?;
     extract_gemini_text(&body)
 }
 
@@ -310,8 +311,8 @@ fn upload_gemini_file(audio_path: &Path, api_key: &str, mime_type: &str) -> Resu
         .send(file)
         .map_err(|e| format!("Gemini file upload failed: {}", redact_for_user(e, api_key)))?;
 
-    let body: Value =
-        upload_response.into_json().map_err(|e| format!("Failed to parse Gemini file upload response: {e}"))?;
+    let body: Value = crate::http::json_bounded(upload_response)
+        .map_err(|e| format!("Failed to parse Gemini file upload response: {e}"))?;
     let file = body.get("file").ok_or_else(|| "Gemini upload response missing file metadata".to_string())?;
     let name = file
         .get("name")
@@ -359,8 +360,8 @@ fn generate_from_uploaded_file(
         .set("Content-Type", "application/json")
         .send_json(payload)
         .map_err(|e| format!("Gemini uploaded audio request failed: {}", redact_for_user(e, api_key)))?;
-    let body: Value =
-        response.into_json().map_err(|e| format!("Failed to parse Gemini uploaded audio response: {e}"))?;
+    let body: Value = crate::http::json_bounded(response)
+        .map_err(|e| format!("Failed to parse Gemini uploaded audio response: {e}"))?;
     extract_gemini_text(&body)
 }
 
