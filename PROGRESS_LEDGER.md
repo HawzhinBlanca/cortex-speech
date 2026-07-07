@@ -1603,3 +1603,33 @@ release build, npm audit, cargo deny (now
 advisory-clean), a real committed-fixture accuracy measurement (18.60% CER), and a genuine dead-code cleanup
 — is done, gated, and pushed. 10/10 remains the P7 re-audit's call on the full real-number suite; but the
 automatable portion of the ship gate is now entirely green.
+
+## CI GREENING — PR #28 opened, pre-existing repo-wide Release Gate breakage fixed (2026-07-07)
+
+Opened PR #28 (claude/intelligent-gauss-96ffc9 -> main, 71 commits) and drove the GitHub Actions
+"Release Gate" to green. KEY FINDING: the Release Gate has been RED on `main` for every run since
+2026-07-04 — pre-existing, repo-wide breakage, NOT caused by this branch (verified: none of the failing
+files were touched by the branch; main's HEAD carries the identical failing lines). Root causes + fixes,
+each scoped to the repo's own "hosted CI has no models / no heavy scientific stack" design (never weakening
+a gate):
+
+1. `npm ci` EUSAGE "Missing: picomatch@4.0.5 from lock file" (all 3 build jobs). picomatch 4.0.5 published
+   after the lock was generated; CI's node 22 (npm 10) re-resolved svelte-check's caret to 4.0.5 but the
+   lock pinned 4.0.4 (local npm 11 masked it). Fix: regenerated the lock with `npm@10 --package-lock-only`;
+   verified `npm@10 ci --dry-run` exits 0. (8863476)
+2. numpy ModuleNotFoundError in scripts/test_build_fleurs_manifest.py (Linux/macOS python-policies). The
+   policy runner auto-collects every test_*.py; this build-tooling test needs numpy+soundfile which hosted
+   runners don't install. Fix: guard the imports, skip loudly when absent — still runs in full where the
+   deps exist. Proven: with numpy blocked it prints SKIP and exits 0. (9067a6f)
+3. tauriConfigSecurity.test.ts asserted the gitignored base ONNX models physically exist (Windows vitest).
+   Fix: presence-gate the size probe; bundle DECLARATION stays unconditionally asserted. (83ef9e7)
+4. `cargo build` failed tauri-build's bundle.resources existence check — the models weren't provisioned in
+   ci.yml (release.yml fetches them, ci.yml didn't), AND the USER-PROVIDED fine-tuned model is in
+   bundle.resources but is not publicly fetchable (so NO hosted runner, incl. release.yml, could ever
+   satisfy it). Fix (owner-approved architecture): default tauri.conf.json + tauri.windows.conf.json now
+   list only the fetchable base models; the fine-tuned model moved to an explicit local-build override
+   `src-tauri/tauri.finetuned.conf.json` (build with `npm run tauri build -- --config
+   src-tauri/tauri.finetuned.conf.json` on a machine that has the file); added `npm run fetch-models` to all
+   three ci.yml build jobs. Runtime is unaffected (the fine-tuned engine is opt-in + presence-gated).
+   Verified locally: vitest 134/134, `cargo check --bin` clean with the reduced config, README build docs
+   updated. This also unblocks main + the dependabot PRs that were red for the same reasons.

@@ -59,14 +59,21 @@ describe('Tauri config security boundaries', () => {
       { path: 'models/onnxruntime.dll/onnxruntime.dll', minBytes: 10_000_000 },
       { path: 'models/onnxruntime.dll/onnxruntime_providers_shared.dll', minBytes: 1_000 },
     ];
-    // The embedded fine-tuned Kurdish model is USER-PROVIDED (not fetched from a public upstream
-    // like the base models), so it must be DECLARED in the bundle but its (large, gitignored) file
-    // is only size-checked when present.
     const finetunedPaths = ['models/finetuned-mms-ckb/model.onnx', 'models/finetuned-mms-ckb/vocab.json'];
+    const basePaths = requiredResources.map((resource) => resource.path);
     const resources = config.bundle?.resources ?? [];
-    const requiredPaths = [...requiredResources.map((resource) => resource.path), ...finetunedPaths];
 
-    expect(resources).toEqual(requiredPaths);
+    // The DEFAULT bundle lists only the base models that scripts/fetch_models.py can download +
+    // SHA-256-verify, so hosted CI (ci.yml) and hosted release (release.yml) can build from a fresh
+    // checkout. The USER-PROVIDED fine-tuned model is NOT publicly fetchable, so it is intentionally
+    // absent here and added only via the local-build override (asserted below). tauri.windows.conf.json
+    // must stay in lock-step with the default, or a Windows build would demand a resource the default
+    // omits.
+    expect(resources).toEqual(basePaths);
+    const windowsConfig = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'src-tauri', 'tauri.windows.conf.json'), 'utf-8'),
+    ) as TauriConfig;
+    expect(windowsConfig.bundle?.resources ?? []).toEqual(basePaths);
     expect(resources).not.toContain('models/*');
     expect(resources).not.toContain('models/**');
     expect(resources).toContain(APP_CONFIG.models.vadPath);
@@ -79,14 +86,23 @@ describe('Tauri config security boundaries', () => {
       `OMNIASR_CTC_300M_TOKENS: &str = "${stripModelsPrefix(APP_CONFIG.models.omniasrTokens)}"`,
     );
 
+    // The fine-tuned model is bundled ONLY through the explicit local-build override
+    // (tauri.finetuned.conf.json, passed via `tauri build --config`). Assert that override still
+    // DECLARES the full set (base + fine-tuned) so the opt-in engine can never be silently dropped from
+    // a real installer, and stays a strict superset of the default.
+    const finetunedConfig = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'src-tauri', 'tauri.finetuned.conf.json'), 'utf-8'),
+    ) as TauriConfig;
+    const finetunedResources = finetunedConfig.bundle?.resources ?? [];
+    expect(finetunedResources).toEqual([...basePaths, ...finetunedPaths]);
+
     // The base ONNX models (silero/omniasr/onnxruntime DLLs) are large and gitignored; hosted CI
-    // runners deliberately don't carry them — the same design as the e2e:real gate, which only runs
-    // where the models exist (see ci.yml). The bundle DECLARATION is asserted unconditionally above
-    // (`resources` === requiredPaths, so a dropped model still fails here). This loop additionally
+    // runners deliberately don't carry them until `npm run fetch-models` runs — same design as the
+    // e2e:real gate, which only runs where the models exist (see ci.yml). The bundle DECLARATION is
+    // asserted unconditionally above (a dropped model fails `toEqual`). This loop additionally
     // size-checks each file WHEN PRESENT, so the truncated/corrupt-file guard still fires on any
-    // model-bearing machine (local dev / the release runner) while a bare checkout skips the
-    // physical probe instead of asserting a gitignored blob into existence. Mirrors the
-    // finetuned-model block below.
+    // model-bearing machine (local dev / the release runner) while a bare checkout skips the physical
+    // probe instead of asserting a gitignored blob into existence.
     for (const resource of requiredResources) {
       const resourcePath = resolve(process.cwd(), 'src-tauri', resource.path);
 
@@ -96,7 +112,6 @@ describe('Tauri config security boundaries', () => {
     }
 
     for (const p of finetunedPaths) {
-      expect(resources).toContain(p);
       const fp = resolve(process.cwd(), 'src-tauri', p);
       if (existsSync(fp)) {
         expect(statSync(fp).size).toBeGreaterThan(0);

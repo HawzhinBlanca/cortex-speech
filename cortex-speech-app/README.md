@@ -112,9 +112,19 @@ models/finetuned-mms-ckb/
 
 Export from a fine-tuned HF `Wav2Vec2ForCTC` with `CORTEX_FINETUNED_MODEL=<hf-dir>
 CORTEX_FINETUNED_ONNX=<out.onnx> python scripts/export_finetuned_onnx.py`, then int8-quantize
-(`onnxruntime.quantization.quantize_dynamic`). It is gitignored and, when present, bundled into the
-installer. Without it, the **Fine-tuned** button reports the model is not installed and the stock
-engines keep working.
+(`onnxruntime.quantization.quantize_dynamic`). The file is gitignored and **not publicly fetchable**,
+so it is intentionally **excluded from the default bundle** — that keeps hosted CI and the hosted
+release able to build from a fresh checkout with only `npm run fetch-models`. To bundle it into an
+installer, build on a machine that has the file and pass the opt-in override:
+
+```
+npm run tauri build -- --config src-tauri/tauri.finetuned.conf.json
+```
+
+Without the override (or the file), the installer simply omits this one optional engine and the
+**Fine-tuned** button reports the model is not installed — the stock engines keep working either way.
+At runtime the app resolves the model from the app-data or bundled `models/` dir and degrades
+gracefully when it is absent.
 
 ### Bundled (release installer)
 

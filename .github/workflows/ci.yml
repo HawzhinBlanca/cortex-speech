@@ -81,6 +81,14 @@ jobs:
       - name: Install Node dependencies
         run: npm ci
 
+      # Download + SHA-256-verify the gitignored BASE models into src-tauri/models/ so tauri-build
+      # finds the declared bundle.resources when `cargo` compiles the crate (clippy/test run build.rs
+      # -> tauri-build, which validates resource existence). The USER-PROVIDED fine-tuned model is not
+      # publicly fetchable and is intentionally excluded from the default bundle (see
+      # tauri.finetuned.conf.json); it is not needed here.
+      - name: Fetch + verify base models (bundle.resources)
+        run: npm run fetch-models
+
       - name: Install Playwright browser
         run: npx playwright install chromium
 
@@ -150,6 +158,9 @@ jobs:
           components: clippy, rustfmt
 
       - run: npm ci
+      # Base models must exist before cargo build: tauri-build (build.rs) validates bundle.resources.
+      # The fine-tuned model is excluded from the default bundle (see tauri.finetuned.conf.json).
+      - run: npm run fetch-models
       - run: npm run test:python-policies
       - run: npm run build
       - run: cargo build --manifest-path src-tauri/Cargo.toml --bin cortex-speech-app
@@ -179,6 +190,9 @@ jobs:
           components: clippy, rustfmt
 
       - run: npm ci
+      # Base models must exist before cargo build: tauri-build (build.rs) validates bundle.resources.
+      # The fine-tuned model is excluded from the default bundle (see tauri.finetuned.conf.json).
+      - run: npm run fetch-models
       - run: npm run test:python-policies
       - run: npm run build
       - run: cargo build --manifest-path src-tauri/Cargo.toml --bin cortex-speech-app
