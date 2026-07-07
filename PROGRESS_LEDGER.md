@@ -1227,6 +1227,16 @@ speaker-clustering state machine with high regression risk and the memory win is
   `["settings.json","champion.json"]` DUPLICATING `snapshot::EXTRA_STATE` — a drift hazard where a file
   added to the save-side would be silently snapshotted-but-never-restored. Made `EXTRA_STATE` `pub(crate)`
   and the restore loop consumes it → single source of truth, save/restore can't diverge.
+- **Measurement-tool de-risking — fixed an empty-manifest crash in the 4090 scorecard scripts** The path
+  to a real 10/10 is the owner running the accuracy suite on the 4090; a crash there wastes a marathon.
+  Audited the scorecards: `scorecard_finetuned.py` (correct micro-CER ratio-of-sums, zero-ref clips dropped
+  from numerator AND denominator matching eval.rs, seeded utterance-bootstrap CI, baseline-regression gate)
+  and `scorecard_stats.py` both called their seeded bootstrap's `random.randrange(n)` with NO `n==0`
+  guard — an empty/all-empty-ref/headers-only manifest would die with a cryptic `ValueError: empty range`
+  (and stats would then divide by zero on the per-script frac). `scorecard_7b.py` already guarded n==0, so
+  brought the other two into parity: fail cleanly with an actionable message. VERIFIED by running
+  `scorecard_stats.py` on a header-only TSV (clean exit 2) and a 2-row TSV (correct CER 7.89% = 3/38,
+  WER 11.11% = 1/9). python-policies green.
 - **Cloud-consent guardrail audit — enforcement airtight, + closed a regression-gate GAP** Audited every
   cloud egress path against the opt-out-by-default guardrail. LLM: `effective_llm_mode()` downgrades to None
   without `cloud_llm_opt_in` (incl. Local-pointed-at-a-remote-endpoint, via a PARSED loopback check that

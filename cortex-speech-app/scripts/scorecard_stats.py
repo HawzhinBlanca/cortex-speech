@@ -53,6 +53,16 @@ def main():
             rows.append((row[0], row[1], row[2], int(row[3]), int(row[4]), int(row[5]), int(row[6])))
 
     n = len(rows)
+    if n == 0:
+        # Empty/headers-only results.tsv. Fail cleanly — otherwise bootstrap_ci's randrange(0) throws a
+        # cryptic ValueError, and the per-script frac (len(rs)/n) below would divide by zero.
+        print(
+            f"no scorable rows in {path}: expected a header + data rows of "
+            "gender/age/script/char_dist/char_ref_len/word_dist/word_ref_len "
+            "(run the per-clip scorecard first to produce results.tsv).",
+            file=sys.stderr,
+        )
+        return 2
     cer = micro(rows, CHAR_DIST, CHAR_REF)
     wer = micro(rows, WORD_DIST, WORD_REF)
     lo, hi = bootstrap_ci(rows, CHAR_DIST, CHAR_REF, b)

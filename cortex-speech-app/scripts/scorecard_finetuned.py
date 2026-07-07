@@ -74,6 +74,17 @@ def main() -> int:
         if (i + 1) % 50 == 0:
             print(f"  ...{i+1}/{len(rows)}")
 
+    if not per_clip:
+        # Every row was empty-reference (dropped from the ratio-of-sums) or the manifest had no
+        # tab-separated rows. Fail CLEANLY with an actionable message — otherwise the seeded bootstrap
+        # below calls random.randrange(0) and dies with a cryptic ValueError mid-measurement.
+        print(
+            "no scorable clips: every manifest row was empty-reference or not tab-separated. "
+            "Expected lines of 'wav<TAB>ref[<TAB>gender<TAB>age]'; check the gold manifest path/format.",
+            file=sys.stderr,
+        )
+        return 2
+
     dists = np.array([d for d, _ in per_clip], dtype=float)
     refs = np.array([r for _, r in per_clip], dtype=float)
     micro = dists.sum() / max(refs.sum(), 1.0)
