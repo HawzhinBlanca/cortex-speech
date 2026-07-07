@@ -1506,9 +1506,43 @@ every subsystem): it hit provider rate limits and every reviewer agent errored o
 confirmed findings" — that is a NON-RESULT (the reviewers never ran), not a clean bill of health, and is
 recorded here so it is never mistaken for a completed independent audit.
 
-TRULY REMAINING (~9): OWNER-GATED measurement (~6 — the P7 re-audit itself, `make check-7b`, the reliability
+## Wrapper-triage backlog CLOSED (2026-07-08) — dead job/dataset-run subsystem removed
+
+Completed `task_ec79f7dd` (previously spawned, not yet done) properly rather than mass-wiring buttons: traced
+each of the 27 unreferenced `commands.ts` wrappers to its backend command and, for the ones with NO caller
+anywhere (not the IPC handler's own IPC name, not any other Rust function, not any test besides its own),
+confirmed genuine dead code vs. reserved/CLI-driven APIs before touching anything:
+
+- **DELETED (fully orphaned end-to-end, verified via full-repo grep before removal):** the generic "job"
+  subsystem (`start_job`/`get_job_status`/`cancel_job` IPC commands, `runs::create_job`/`get_job`/`cancel_job`,
+  the `JobStatus` struct/TS-interface, `map_job`) and the "dataset run" tracking subsystem
+  (`create_dataset_run`/`list_dataset_runs`/`get_dataset_run` — the last had no IPC registration or frontend
+  wrapper at all — the `DatasetRun` struct/TS-interface, `map_dataset_run`) — both superseded by the LIVE
+  `AgentImportReport`/event-based progress system the app actually uses; their only test coverage was one
+  shared unit test (`persists_dataset_runs_and_jobs`), removed with them. `DatasetRunConfig`/`config_from_settings`
+  were KEPT — genuinely used by the live `export_bundle.rs` feature (confirmed via grep before deciding).
+  DB tables (`job_history`, `dataset_runs`) left alone — dropping tables retroactively is a needless
+  destructive schema change; an orphaned empty table is harmless.
+- **LEFT ALONE, documented as reserved (verified NOT dead, just unwired-to-UI):** `clearCache`/`getCacheInfo`
+  (bounded 1000-entry in-memory LRU, no persistent-growth problem to fix), `get_champion_model`/
+  `add_segment_hypothesis` (in-code "reserved programmatic API" comments), `export_dataset_bundle` (a real,
+  complete production-bundle feature with blocking-validation gating — wiring a button would need a proper
+  validation-issue-rendering UI, not a naive click handler; left for a real UI-design pass, not a quick fix),
+  and the jury/training/dataset-orchestration cluster (`runConsensusRefinery`/`runDpoUpdate`/`runT0Gate`/
+  `runT2ForSegment`/`computeAcousticScores`/`computeAnnotationDriftScorecard`/`runGoldEval`/
+  `importGoldSegments`/`listGoldSegments`/`getFewShotExamples` — reserved/CLI-driven, some (DPO update)
+  genuinely dangerous to expose behind a casual click).
+- **`updateSegmentBounds`** — a real, out-of-scope FEATURE (segment boundary re-editing), not dead code;
+  needs a UI design decision, left undone rather than half-built.
+
+Verified: `cargo check --tests` compiles all 20 test binaries clean; `cargo fmt` clean; `cargo clippy
+--all-targets -D warnings` exit 0; `cargo test --lib` **816 passed** (817 → 816, exactly the one removed
+test, zero other regressions); `npm run typecheck` 406 files / 0 errors; `eslint` clean; `vitest` 134/134;
+`python-policies` green. Dismissed `task_ec79f7dd`.
+
+TRULY REMAINING (~8): OWNER-GATED measurement (~6 — the P7 re-audit itself, `make check-7b`, the reliability
 drills, and the gold marathon; faking is the one prohibition), media-cache SLICING + true-streaming decode
-(need real-audio observation this sandbox cannot honestly provide), and the wrapper-triage backlog item
-(task_ec79f7dd, spawned not implemented — deliberately not mass-wired). Everything implementable AND
-verifiable in a headless Windows checkout — including, now, one real committed-fixture accuracy measurement
-— is done, gated, and pushed. 10/10 remains the P7 re-audit's call on the full real-number suite.
+(need real-audio observation this sandbox cannot honestly provide). Everything implementable AND verifiable
+in a headless Windows checkout — including a real committed-fixture accuracy measurement and a genuine
+dead-code cleanup — is done, gated, and pushed. 10/10 remains the P7 re-audit's call on the full real-number
+suite.

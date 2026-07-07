@@ -1566,25 +1566,6 @@ pub fn export_huggingface_dataset(path: String, state: State<'_, AppState>) -> R
 }
 
 #[tauri::command]
-pub fn create_dataset_run(name: Option<String>, state: State<'_, AppState>) -> Result<crate::runs::DatasetRun, String> {
-    RATE_LIMITER.check("create_dataset_run")?;
-    let db = state.lock_db();
-    let settings = state.lock_settings().clone();
-    // Round-23 #3: record the ACTUAL denoising state. The denoiser silently passes audio through when
-    // its optional model is absent, so the run config must not claim denoising that did not run.
-    let denoising_active = state.lock_model_manager().denoiser_present();
-    crate::runs::create_dataset_run(&db, name, crate::runs::config_from_settings(&settings, denoising_active))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn list_dataset_runs(state: State<'_, AppState>) -> Result<Vec<crate::runs::DatasetRun>, String> {
-    RATE_LIMITER.check("list_dataset_runs")?;
-    let db = state.lock_db();
-    crate::runs::list_dataset_runs(&db).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub fn list_agent_import_reports(
     limit: Option<usize>,
     state: State<'_, AppState>,
@@ -1603,36 +1584,6 @@ pub fn list_agent_stage_events(
     RATE_LIMITER.check("list_agent_stage_events")?;
     let db = state.lock_db();
     crate::runs::list_agent_stage_events(&db, run_id.as_deref(), limit).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn start_job(
-    kind: String,
-    summary: Option<String>,
-    cancellable: Option<bool>,
-    state: State<'_, AppState>,
-) -> Result<crate::runs::JobStatus, String> {
-    RATE_LIMITER.check("start_job")?;
-    validate::validate_identifier(&kind)?;
-    let db = state.lock_db();
-    crate::runs::create_job(&db, kind, summary, cancellable.unwrap_or(false)).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn get_job_status(id: String, state: State<'_, AppState>) -> Result<crate::runs::JobStatus, String> {
-    RATE_LIMITER.check("get_job_status")?;
-    validate::validate_identifier(&id)?;
-    let db = state.lock_db();
-    crate::runs::get_job(&db, &id).map_err(|e| e.to_string())?.ok_or_else(|| format!("Job not found: {id}"))
-}
-
-#[tauri::command]
-pub fn cancel_job(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("cancel_job")?;
-    validate::validate_identifier(&id)?;
-    state.cancel_current_operation();
-    let db = state.lock_db();
-    crate::runs::cancel_job(&db, &id).map_err(|e| e.to_string())
 }
 
 /// The model registry, newest-first within each family — what a registry panel lists.

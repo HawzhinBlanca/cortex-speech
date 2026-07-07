@@ -18,31 +18,6 @@ pub struct DatasetRunConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DatasetRun {
-    pub id: String,
-    pub name: String,
-    pub status: String,
-    pub config: DatasetRunConfig,
-    pub created_at: String,
-    pub completed_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct JobStatus {
-    pub id: String,
-    pub kind: String,
-    pub status: String,
-    pub progress: f64,
-    pub cancellable: bool,
-    pub summary: Option<String>,
-    pub error: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AgentStageEvent {
     pub id: i64,
     pub run_id: String,
@@ -795,76 +770,6 @@ fn build_orchestration_stages(
     stages
 }
 
-pub fn create_dataset_run(db: &Database, name: Option<String>, config: DatasetRunConfig) -> AppResult<DatasetRun> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let name = name.unwrap_or_else(|| format!("dataset-run-{}", &id[..8]));
-    let config_json = serde_json::to_string(&config)?;
-    db.connection().execute(
-        "INSERT INTO dataset_runs (id, name, status, config_json) VALUES (?1, ?2, 'active', ?3)",
-        params![id, name, config_json],
-    )?;
-    get_dataset_run(db, &id)?.ok_or_else(|| crate::error::AppError::Other("Dataset run was not persisted".into()))
-}
-
-pub fn list_dataset_runs(db: &Database) -> AppResult<Vec<DatasetRun>> {
-    let mut stmt = db.connection().prepare(
-        "SELECT id, name, status, config_json, created_at, completed_at
-         FROM dataset_runs ORDER BY created_at DESC",
-    )?;
-    let rows = stmt.query_map([], map_dataset_run)?;
-    let mut runs = Vec::new();
-    for row in rows {
-        runs.push(row?);
-    }
-    Ok(runs)
-}
-
-pub fn get_dataset_run(db: &Database, id: &str) -> AppResult<Option<DatasetRun>> {
-    let mut stmt = db.connection().prepare(
-        "SELECT id, name, status, config_json, created_at, completed_at
-         FROM dataset_runs WHERE id = ?1",
-    )?;
-    let mut rows = stmt.query(params![id])?;
-    if let Some(row) = rows.next()? {
-        Ok(Some(map_dataset_run(row)?))
-    } else {
-        Ok(None)
-    }
-}
-
-pub fn create_job(db: &Database, kind: String, summary: Option<String>, cancellable: bool) -> AppResult<JobStatus> {
-    let id = uuid::Uuid::new_v4().to_string();
-    db.connection().execute(
-        "INSERT INTO job_history (id, kind, status, progress, cancellable, summary)
-         VALUES (?1, ?2, 'queued', 0, ?3, ?4)",
-        params![id, kind, cancellable as i32, summary],
-    )?;
-    get_job(db, &id)?.ok_or_else(|| crate::error::AppError::Other("Job was not persisted".into()))
-}
-
-pub fn get_job(db: &Database, id: &str) -> AppResult<Option<JobStatus>> {
-    let mut stmt = db.connection().prepare(
-        "SELECT id, kind, status, progress, cancellable, summary, error, created_at, updated_at
-         FROM job_history WHERE id = ?1",
-    )?;
-    let mut rows = stmt.query(params![id])?;
-    if let Some(row) = rows.next()? {
-        Ok(Some(map_job(row)?))
-    } else {
-        Ok(None)
-    }
-}
-
-pub fn cancel_job(db: &Database, id: &str) -> AppResult<()> {
-    db.connection().execute(
-        "UPDATE job_history
-         SET status = 'cancelled', progress = CASE WHEN progress > 0 THEN progress ELSE 0 END, updated_at = datetime('now')
-         WHERE id = ?1",
-        params![id],
-    )?;
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn record_agent_stage_event(
     db: &Database,
@@ -965,34 +870,6 @@ fn map_agent_import_report(row: &rusqlite::Row) -> rusqlite::Result<AgentImportR
     })
 }
 
-fn map_dataset_run(row: &rusqlite::Row) -> rusqlite::Result<DatasetRun> {
-    let config_json: String = row.get(3)?;
-    let config = serde_json::from_str(&config_json)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
-    Ok(DatasetRun {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        status: row.get(2)?,
-        config,
-        created_at: row.get(4)?,
-        completed_at: row.get(5)?,
-    })
-}
-
-fn map_job(row: &rusqlite::Row) -> rusqlite::Result<JobStatus> {
-    Ok(JobStatus {
-        id: row.get(0)?,
-        kind: row.get(1)?,
-        status: row.get(2)?,
-        progress: row.get(3)?,
-        cancellable: row.get::<_, i32>(4)? != 0,
-        summary: row.get(5)?,
-        error: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,21 +884,6 @@ mod tests {
         assert!(config_from_settings(&on, true).denoising, "requested and active -> recorded true");
         let off = crate::settings::AppSettings { enable_denoising: false, ..Default::default() };
         assert!(!config_from_settings(&off, true).denoising, "not requested -> false regardless of model");
-    }
-
-    #[test]
-    fn persists_dataset_runs_and_jobs() {
-        let db = Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
-        let settings = crate::settings::AppSettings::default();
-        let run = create_dataset_run(&db, Some("test".into()), config_from_settings(&settings, true)).unwrap();
-        assert_eq!(run.name, "test");
-        assert_eq!(list_dataset_runs(&db).unwrap().len(), 1);
-
-        let job = create_job(&db, "export".into(), Some("bundle".into()), true).unwrap();
-        assert_eq!(job.status, "queued");
-        cancel_job(&db, &job.id).unwrap();
-        assert_eq!(get_job(&db, &job.id).unwrap().unwrap().status, "cancelled");
     }
 
     #[test]

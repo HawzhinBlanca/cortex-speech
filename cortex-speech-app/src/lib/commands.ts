@@ -204,27 +204,6 @@ export async function exportDataset(path: string, format: string): Promise<void>
   return invoke<void>('export_dataset', { path, format });
 }
 
-export interface DatasetRun {
-  id: string;
-  name: string;
-  status: string;
-  config: Record<string, unknown>;
-  createdAt: string;
-  completedAt: string | null;
-}
-
-export interface JobStatus {
-  id: string;
-  kind: string;
-  status: string;
-  progress: number;
-  cancellable: boolean;
-  summary: string | null;
-  error: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
 export interface AgentSourceReferenceSummary {
   audioPath: string;
   modelId: string;
@@ -366,14 +345,6 @@ export async function exportDatasetBundle(
   });
 }
 
-export async function createDatasetRun(name?: string): Promise<DatasetRun> {
-  return invoke<DatasetRun>('create_dataset_run', { name: name ?? null });
-}
-
-export async function listDatasetRuns(): Promise<DatasetRun[]> {
-  return invoke<DatasetRun[]>('list_dataset_runs');
-}
-
 export async function listAgentImportReports(limit = 25): Promise<AgentImportReport[]> {
   return invoke<AgentImportReport[]>('list_agent_import_reports', { limit });
 }
@@ -383,26 +354,6 @@ export async function listAgentStageEvents(
   limit = 50,
 ): Promise<AgentStageEvent[]> {
   return invoke<AgentStageEvent[]>('list_agent_stage_events', { runId: runId ?? null, limit });
-}
-
-export async function startJob(
-  kind: string,
-  summary?: string,
-  cancellable = false,
-): Promise<JobStatus> {
-  return invoke<JobStatus>('start_job', {
-    kind,
-    summary: summary ?? null,
-    cancellable,
-  });
-}
-
-export async function getJobStatus(id: string): Promise<JobStatus> {
-  return invoke<JobStatus>('get_job_status', { id });
-}
-
-export async function cancelJob(id: string): Promise<void> {
-  return invoke<void>('cancel_job', { id });
 }
 
 export async function getBlockingValidationIssues(
