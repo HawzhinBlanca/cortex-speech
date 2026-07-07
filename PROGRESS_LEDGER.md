@@ -1162,6 +1162,19 @@ Kept closing the testable ones I'd previously mis-bucketed:
 
 ## Deep-check remediation — ~51/61 (2026-07-07)
 
+- **Drift-proofed the LOOP-0 finalized-draft selection (structural consistency for the C5 gate)** The
+  `annotated ▸ normalized ▸ raw` draft-text formula was inlined in THREE places — `shadow_log_loop0` (the
+  C5 go-live shadow signal), `record_human_decision` (the confidence-update evidence), and
+  `enqueue_background_alignments`. Verified identical NOW, but a future edit to one and not the others would
+  silently make the shadow gate measure a different distribution than the evidence updates on — quietly
+  invalidating the go-live decision. Extracted `corrections::loop0_draft_text()` as the single source of
+  truth (its doc pins WHY it excludes `verdict_transcript`: that is the human's answer/reference, not the
+  draft the memory rewrote — distinct from `training_transcript_with_source`, which prefers the verdict
+  because it selects the SHIPPED text). All 3 sites now call it; +1 unit test. Same rationale as the
+  EXTRA_STATE fix. cargo: fmt clean, clippy -D warnings clean, `--lib` 813 passed, python-policies green.
+  Also audited clean this pass: frontend/backend placeholder detection (identical 4-pattern defs), the
+  4-format training-text canonicalization (all via `training_grade_for_segment` + `canonical_training_text`),
+  and the export-vs-LOOP-0 best-text selection (intentionally different, both correct).
 - **REAL BUG — the IRT gate and the review draft broke word-vs-deletion ties DIFFERENTLY** In the jury
   consensus, `segment_consensus_words` (the review DRAFT) was deliberately fixed to KEEP a word that ties a
   peer's deletion (explicit deletion-demotion + stable sort, with a comment), but the SAME fix was never

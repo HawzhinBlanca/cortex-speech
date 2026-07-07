@@ -1869,11 +1869,11 @@ impl ProcessingPipeline {
             }
         };
         for seg in segments {
-            let text = seg
-                .annotated_transcript
-                .as_deref()
-                .or(seg.normalized_transcript.as_deref())
-                .unwrap_or(&seg.raw_transcript);
+            let text = crate::corrections::loop0_draft_text(
+                seg.annotated_transcript.as_deref(),
+                seg.normalized_transcript.as_deref(),
+                &seg.raw_transcript,
+            );
             let would_fire = loop0_would_fire(&memories, text);
             if let Err(error) = db.record_loop0_shadow(&seg.id, would_fire) {
                 tracing::warn!("LOOP-0 shadow log write failed for {}: {error}", seg.id);
@@ -1903,11 +1903,12 @@ impl ProcessingPipeline {
         let mut by_path: std::collections::HashMap<String, Vec<(String, Option<String>, String)>> =
             std::collections::HashMap::new();
         for s in segments {
-            let text = s
-                .annotated_transcript
-                .clone()
-                .or_else(|| s.normalized_transcript.clone())
-                .unwrap_or_else(|| s.raw_transcript.clone());
+            let text = crate::corrections::loop0_draft_text(
+                s.annotated_transcript.as_deref(),
+                s.normalized_transcript.as_deref(),
+                &s.raw_transcript,
+            )
+            .to_string();
             by_path.entry(s.audio_path.clone()).or_default().push((s.id.clone(), s.alignment_json.clone(), text));
         }
         let db_path = self.db_path.clone();

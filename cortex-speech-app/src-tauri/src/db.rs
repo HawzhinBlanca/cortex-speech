@@ -1849,8 +1849,12 @@ impl Database {
         // Snapshot the memories BEFORE the capture/upsert below so the memory born from THIS edit cannot
         // confirm itself. Gold is excluded to match the capture path: gold human-decisions are the firing
         // eval set (see `firing_error_delta`), and tuning the store on them would leak.
-        let finalized_text =
-            annotated_transcript.as_deref().or(normalized_transcript.as_deref()).unwrap_or(&raw_transcript).to_string();
+        let finalized_text = crate::corrections::loop0_draft_text(
+            annotated_transcript.as_deref(),
+            normalized_transcript.as_deref(),
+            &raw_transcript,
+        )
+        .to_string();
         let confidence_reference: Option<String> = match decision {
             "edit" => corrected_transcript.map(str::to_string),
             "accept" => Some(finalized_text.clone()),

@@ -219,6 +219,18 @@ pub fn firing_error_delta(gold: &[(String, String)], memories: &[MemoryEntry], c
     delta
 }
 
+/// The LOOP-0 "draft" text a correction memory acts on: `annotated ▸ normalized ▸ raw`. Deliberately
+/// EXCLUDES `verdict_transcript` — that is the human's ANSWER (the reference/target the evidence is
+/// scored AGAINST), never the model draft the memory rewrote. This is the SINGLE source of truth for the
+/// finalized-draft selection so the shadow logger (`pipeline::shadow_log_loop0`, the C5 go-live signal)
+/// and the confidence-update evidence (`db::record_human_decision`) can never silently diverge onto
+/// different texts — which would make the shadow gate measure a different distribution than the evidence
+/// updates on, quietly invalidating the go-live decision. (Distinct from `training_transcript_with_source`,
+/// which DOES prefer the human verdict because it selects the final SHIPPED text, not the original draft.)
+pub fn loop0_draft_text<'a>(annotated: Option<&'a str>, normalized: Option<&'a str>, raw: &'a str) -> &'a str {
+    annotated.or(normalized).unwrap_or(raw)
+}
+
 /// The Beta(1,1)-posterior mean confidence of a memory given its firing-outcome evidence:
 /// `(confirm + 1) / (confirm + override + 2)`. A memory with NO evidence sits at the neutral prior
 /// 0.5 — deliberately BELOW the default `tau_conf` 0.6 — so a freshly captured memory must EARN the
@@ -528,6 +540,16 @@ mod tests {
     }
 
     // --- evidence-based confidence (Beta(1,1) posterior over confirm/override) ---
+
+    #[test]
+    fn loop0_draft_text_prefers_annotated_then_normalized_then_raw() {
+        // The single source of truth shared by shadow_log_loop0 and record_human_decision: the memory's
+        // draft is annotated ▸ normalized ▸ raw. It has no verdict slot by construction (the human's
+        // answer is the reference, never the draft), so shadow and evidence can't drift onto different text.
+        assert_eq!(loop0_draft_text(Some("ann"), Some("norm"), "raw"), "ann");
+        assert_eq!(loop0_draft_text(None, Some("norm"), "raw"), "norm");
+        assert_eq!(loop0_draft_text(None, None, "raw"), "raw");
+    }
 
     #[test]
     fn beta_confidence_prior_is_below_tau_and_evidence_moves_it() {
