@@ -59,7 +59,8 @@ impl DenoiserService {
 
     pub fn process(&self, pcm: &[f32], sample_rate: u32) -> Vec<f32> {
         if let Some(ref denoiser) = self.denoiser {
-            let res = denoiser.run(pcm, sample_rate as i32);
+            // try_from, not `as i32`: a sample_rate above i32::MAX would wrap negative into the FFI.
+            let res = denoiser.run(pcm, i32::try_from(sample_rate).unwrap_or(i32::MAX));
             res.samples
         } else {
             pcm.to_vec()

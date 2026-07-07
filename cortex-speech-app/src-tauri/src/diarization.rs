@@ -46,7 +46,9 @@ impl SpeakerEmbeddingService {
     pub fn compute_embedding(&self, samples: &[f32], sample_rate: u32) -> Vec<f32> {
         if let Some(ref manager) = self.manager {
             if let Some(stream) = manager.create_stream() {
-                stream.accept_waveform(sample_rate as i32, samples);
+                // try_from, not `as i32`: a sample_rate above i32::MAX would wrap to a negative rate
+                // into the sherpa FFI. Realistic decoded rates are ~16 kHz, so the fallback is unreached.
+                stream.accept_waveform(i32::try_from(sample_rate).unwrap_or(i32::MAX), samples);
                 manager.compute(&stream).unwrap_or_default()
             } else {
                 Vec::new()
