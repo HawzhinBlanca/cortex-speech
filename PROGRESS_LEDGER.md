@@ -1162,6 +1162,22 @@ Kept closing the testable ones I'd previously mis-bucketed:
 
 ## Deep-check remediation — ~51/61 (2026-07-07)
 
+OWNER-DECISION FLAG (methodology, not a bug — do NOT silently change): the accuracy scorecards
+(`scorecard_7b.py` / `scorecard_finetuned.py` / `measure_finetuned_cer.py`) normalize with a SIMPLE
+`norm()` = NFC + lower + whitespace-collapse — deliberately internally consistent so 7B / fine-tuned 21% /
+stock 29.4% stay comparable to EACH OTHER and to minimal-normalization external benchmarks. This is
+DIFFERENT from the app's live `eval.rs::normalize_for_metrics`, which additionally folds Sorani
+orthographic variants (Kaf/Yeh/Heh/hamza) via the full `SoraniNormalizer`. Consequence: if the gold
+references and the model output use INCONSISTENT orthography (e.g. Arabic Kaf U+0643 vs Kurdish Keheh
+U+06A9), the scorecard counts that as a CER error while eval.rs folds it away — so the published scorecard
+CER can be HIGHER (stricter) than the app's in-UI number for the same model. Neither is "wrong"; they serve
+different purposes. BEFORE the P7 re-audit publishes a headline Sorani CER, DECIDE which basis it should use
+(strict/comparable-to-external vs orthography-folded/app-internal) and state it explicitly — otherwise a
+reviewer will hit two different "CER for model X" numbers. `sorani_normalize.py` (a full-fold Python port,
+byte-identical to normalizer.rs) exists if the folded basis is chosen. `asr_metrics.py`, `crossval_jiwer.py`
+(isolates metric MATH on already-Rust-normalized input), and `create_halwest_gold_subset.py` (gated TTS
+path) audited and clean.
+
 Investigated-and-verified-already-handled this pass (by reading the code, not assuming): nightly
 workflow honesty (both skip branches emit `::warning` + "green ≠ real-audio passed"); directory-import
 cancel (token reaches the per-file 7B child-kill at pipeline.rs:332 via
