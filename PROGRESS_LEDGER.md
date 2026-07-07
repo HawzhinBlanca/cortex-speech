@@ -1227,6 +1227,15 @@ speaker-clustering state machine with high regression risk and the memory win is
   `["settings.json","champion.json"]` DUPLICATING `snapshot::EXTRA_STATE` — a drift hazard where a file
   added to the save-side would be silently snapshotted-but-never-restored. Made `EXTRA_STATE` `pub(crate)`
   and the restore loop consumes it → single source of truth, save/restore can't diverge.
+- **Gold-builder fix — the incompressibility filter silently dropped real WAV clips** `build_ckb_gold.py`
+  screened corpus entries with `compress_size >= 0.85*file_size` ("incompressible => real audio"). That
+  heuristic only holds for ALREADY-COMPRESSED formats: a genuine PCM `.wav` DOES shrink when zipped (speech
+  redundancy, ~50-70%), so a real WAV clip scored ~0.6 and was dropped as a "placeholder". The owner's own
+  audio (Halwest) is WAV, so a gold set built from it would be silently under-sampled/biased → less reliable
+  CER/WER. Extracted `_looks_real()`: apply the ratio test ONLY to mp3/m4a/ogg; for `.wav` the >8 KB size
+  floor + a successful ffmpeg decode are the real-audio proof. VERIFIED: mp3-real kept, mp3-placeholder
+  dropped (both unchanged), wav-real (60 KB/100 KB) NOW kept (old 0.85 ratio dropped it), tiny dropped —
+  zero change for the primary CV22 (MP3) corpus. `asr_metrics.py` (WER + bootstrap) audited and clean.
 - **HONESTY-CRITICAL BUG — the champion's CER was computed with the WRONG (deflated, non-comparable) definition**
   `scorecard_7b.py` (the OmniASR-7B Champion's headline accuracy — the number that most drives the grade)
   computed CER on space-STRIPPED text (`r.replace(" ", "")`), while `scorecard_finetuned.py` uses jiwer
