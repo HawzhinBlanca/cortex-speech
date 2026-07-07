@@ -247,10 +247,27 @@ pub(crate) fn exclude_holdout_segments(db: &Database, segments: Vec<SpeechSegmen
             } else {
                 *path_cache.entry(seg.audio_path.clone()).or_insert_with(|| {
                     let path = std::path::Path::new(&seg.audio_path);
-                    path.exists()
-                        && crate::pipeline::source_audio_identity(path)
-                            .map(|id| holdout.contains(&id.content_hash))
-                            .unwrap_or(false)
+                    if !path.exists() {
+                        return false;
+                    }
+                    match crate::pipeline::source_audio_identity(path) {
+                        Ok(id) => holdout.contains(&id.content_hash),
+                        // Fail CLOSED: a present-but-unhashable clip (transient file lock, permission
+                        // blip, partial read) may be the SAME CONTENT as a holdout gold clip re-imported
+                        // at a DIFFERENT path — which the exact-path check above would miss. Excluding an
+                        // unverifiable present clip protects the eval set from leaking into the training
+                        // export (eval-on-train contamination — silently inflated WER/CER). This mirrors
+                        // the fail-closed DPO / LM-corpus holdout guards in jury/learning.rs; the
+                        // holdout.is_empty() short-circuit above means this can only exclude when a
+                        // content-hash holdout is actually registered.
+                        Err(e) => {
+                            tracing::warn!(
+                                "Holdout check could not hash {}: {e} — excluding it fail-closed",
+                                path.display()
+                            );
+                            true
+                        }
+                    }
                 })
             };
             if held_out {
