@@ -700,7 +700,20 @@ fn is_headless_mode() -> bool {
         || matches!(std::env::var("CORTEX_AUDIOBOOK_PIPELINE").ok().as_deref(), Some("1"))
 }
 
+/// The explicit `CORTEX_APP_DATA_DIR` override, if set. Shared with the `bin/*` CLI tools
+/// (batch_importer/batch_processor/download_model/test_file) so the app and its batch utilities ALWAYS
+/// resolve to the SAME data dir — they share the live DB and the single-instance lock. Pure for testing.
+fn data_dir_override(env_val: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env_val.map(PathBuf::from) // matches the bin/*.rs override exactly (no empty-string filtering)
+}
+
 fn get_app_data_dir() -> PathBuf {
+    // The CLI tools honored CORTEX_APP_DATA_DIR but the app did not, so setting it (e.g. to relocate the
+    // library to another drive) silently split them: the batch importer wrote to the override dir while
+    // the app kept reading APPDATA\cortex-speech. Honor it here too, at top priority, so they never diverge.
+    if let Some(dir) = data_dir_override(std::env::var_os("CORTEX_APP_DATA_DIR")) {
+        return dir;
+    }
     if is_headless_mode() {
         let suffix = if std::env::var("CORTEX_AUDIOBOOK_PIPELINE").ok().as_deref() == Some("1") {
             "cortex-audiobook"
@@ -762,6 +775,14 @@ mod tests {
             batch_state: Mutex::new(BatchState::Idle),
             media_registry: Mutex::new(MediaRegistry::default()),
         }
+    }
+
+    #[test]
+    fn data_dir_override_matches_the_cli_tools() {
+        // The app must honor CORTEX_APP_DATA_DIR exactly as bin/*.rs does, or setting it splits the app
+        // and the batch importer onto different databases (they share the live DB + single-instance lock).
+        assert_eq!(data_dir_override(Some("D:/cortex-data".into())), Some(PathBuf::from("D:/cortex-data")));
+        assert_eq!(data_dir_override(None), None, "unset -> fall through to headless/platform resolution");
     }
 
     #[test]

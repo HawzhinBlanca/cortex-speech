@@ -1162,6 +1162,17 @@ Kept closing the testable ones I'd previously mis-bucketed:
 
 ## Deep-check remediation — ~51/61 (2026-07-07)
 
+- **Scan cont. → the app ignored the `CORTEX_APP_DATA_DIR` override its own CLI tools honor (split-DB footgun)**
+  All four `bin/*` utilities (batch_importer, batch_processor, download_model, test_file) resolve the data
+  dir as `CORTEX_APP_DATA_DIR ▸ APPDATA/cortex-speech ▸ cwd`, but the main app's `lib.rs::get_app_data_dir`
+  never checked `CORTEX_APP_DATA_DIR` (headless-temp ▸ platform-base only). So a user who set it to relocate
+  the library (e.g. to another drive) would silently split them: the batch importer wrote to the override
+  dir while the app kept reading `APPDATA\cortex-speech` — two databases, and the whole point of the batch
+  importer + single-instance lock is that they share ONE. Reachability: nothing currently sets it (verified
+  — only the 4 bins reference it), so it's latent, but a real footgun. Made the app honor it at top priority
+  via a pure `data_dir_override()` (byte-identical to the bins) + test. cargo: fmt clean, clippy -D warnings
+  clean, `--lib` 816 passed, python-policies green. (Scan also cleared `app_data_dir` ×4 in bin/ — mutually
+  identical.)
 - **Systematic duplicate-fn scan → found a stale `sanitize_filename` that mangled Sorani filenames** A
   repo-wide scan for functions defined in 2+ files (the drift-hazard class) surfaced two `sanitize_filename`
   implementations that had DIVERGED: `validation/input.rs` got the P3.7 fix (Unicode `is_alphanumeric` →
