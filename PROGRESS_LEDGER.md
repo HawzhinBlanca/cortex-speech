@@ -1178,6 +1178,17 @@ Kept closing the testable ones I'd previously mis-bucketed:
   autonomy vetoes, `majority_vote`, and the full conformal calibration (Hoeffding + Bonferroni, tie-group
   cuts, cold-start).
 
+- **Honesty fix — `sorani_normalize.py` claimed a byte-identical Rust parity it does not have** Its
+  docstring asserted "matches normalizer.rs exactly for byte-identical output" and `Python(text) ==
+  Rust(text)`. VERIFIED false (via codepoint dumps): the CHARACTER folding is correct (`كوردي` → `کوردی`
+  matches Rust), but the NUMBER handling diverges — Python folds digit GLYPHS only and LEAVES the native
+  separators (`1٬000` keeps U+066C; `٣٫١٤` keeps U+066B) where the Rust folds them to `.`/`،`, strips
+  grouped thousands, and (optionally) verbalizes; Python also keeps diacritics by default. So it matches NO
+  single Rust config exactly. Pre-existing (not from the U+066C fix), and the utility is unused (no importer,
+  not in any gate), but a false parity claim in an honesty-first repo would mislead anyone who trusts it.
+  Corrected the docstring to state the exact scope + KNOWN DIVERGENCES rather than pretend parity (Rust
+  remains the source of truth). py_compile + python-policies green.
+
 OWNER-DECISION FLAG (methodology, not a bug — do NOT silently change): the accuracy scorecards
 (`scorecard_7b.py` / `scorecard_finetuned.py` / `measure_finetuned_cer.py`) normalize with a SIMPLE
 `norm()` = NFC + lower + whitespace-collapse — deliberately internally consistent so 7B / fine-tuned 21% /
