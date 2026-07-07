@@ -1227,6 +1227,17 @@ speaker-clustering state machine with high regression risk and the memory win is
   `["settings.json","champion.json"]` DUPLICATING `snapshot::EXTRA_STATE` — a drift hazard where a file
   added to the save-side would be silently snapshotted-but-never-restored. Made `EXTRA_STATE` `pub(crate)`
   and the restore loop consumes it → single source of truth, save/restore can't diverge.
+- **Cloud-consent guardrail audit — enforcement airtight, + closed a regression-gate GAP** Audited every
+  cloud egress path against the opt-out-by-default guardrail. LLM: `effective_llm_mode()` downgrades to None
+  without `cloud_llm_opt_in` (incl. Local-pointed-at-a-remote-endpoint, via a PARSED loopback check that
+  blocks `localhost.evil.com`), and both `llm_refinement_permitted` + `build_refiner` consume it. STT
+  (Scribe uploads segment AUDIO — stricter): all three egress points gate on `cloud_stt_opt_in` —
+  `require_cloud_stt_consent` at the `transcribe_audio_with_scribe` + `add_scribe_votes` IPC boundaries
+  (before the key is even loaded) and `scribe_api_key_if_enabled` on the import path; `get_configured_providers`
+  is names-only (no egress). Enforcement is CLEAN. But the privacy POLICY test pinned only the LLM/jury gates,
+  not the Scribe ones — a refactor could silently drop `require_cloud_stt_consent` from either command with no
+  gate failing. Extended `test_cloud_privacy_policy.py` to pin all three Scribe consent points + assert BOTH
+  egress commands call the guard (call-site count ≥ 2). python-policies green.
 - **Normalizer adversarial review — sound, + fixed a dead/contradictory digit-separator fold** Audited the
   load-bearing Sorani normalizer (feeds metrics, LOOP-0 matching, search, dedup): the NFC-first ordering,
   Kaf/Yeh/hamza folds, ZWNJ→space vs zero-width-strip split, and the subtle word-final-heh logic
