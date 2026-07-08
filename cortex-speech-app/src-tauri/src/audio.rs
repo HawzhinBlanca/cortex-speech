@@ -1364,8 +1364,8 @@ mod tests {
         // The other decode tests only check that DIFFERENT audio yields DIFFERENT PCM (relative), which
         // would NOT catch a decoder bump that stopped normalizing i16 to [-1, 1] (every sample would be
         // 32768× off). This test would. Pattern spans zero, both signs, small/large magnitudes, and the
-        // i16 extremes.
-        clear_pcm_cache();
+        // i16 extremes. Uses a unique temp file (its own content hash), so it needs no cache clear and
+        // leaves the shared global PCM cache untouched for the other tests running in parallel.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("scaling_roundtrip.wav");
         let spec =
@@ -1483,10 +1483,14 @@ mod tests {
 
     #[test]
     fn pcm_cache_clear_recovers_poisoned_lock() {
+        // cargo runs tests in parallel and they SHARE the global PCM cache, so this test must not assume
+        // the cache is otherwise empty. Assert on this test's OWN unique key ("poisoned.wav", used by no
+        // other test) instead of an absolute len(): a concurrent decode_to_pcm legitimately leaves
+        // unrelated entries, which made the old `assert_eq!(len, 1)` flaky under CI's test ordering.
         {
             let mut cache = lock_pcm_cache();
             cache.put("poisoned.wav".into(), (TARGET_SAMPLE_RATE, vec![1, 2, 3]));
-            assert_eq!(cache.len(), 1);
+            assert!(cache.contains("poisoned.wav"), "entry must be present immediately after put");
         }
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1495,7 +1499,7 @@ mod tests {
         }));
 
         clear_pcm_cache();
-        assert_eq!(lock_pcm_cache().len(), 0);
+        assert!(!lock_pcm_cache().contains("poisoned.wav"), "clear must recover the poisoned lock and drop the entry");
         assert_eq!(pcm_cache_capacity().get(), 10);
     }
 
