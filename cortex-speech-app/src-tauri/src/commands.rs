@@ -1421,6 +1421,9 @@ pub fn get_segments_suspect_first(
 #[tauri::command]
 pub fn search_segments(query: String, state: State<'_, AppState>) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("search_segments")?;
+    // Bound the free-text query like every other text-accepting command (save_session caps its
+    // search_query at 1000): an unbounded multi-MB string otherwise reaches the FTS5 MATCH parser.
+    validate::validate_text(&query, 1000, "Search query")?;
     let db = state.lock_db();
     db.search_segments(&query).map_err(|e| e.to_string())
 }
@@ -1929,12 +1932,16 @@ pub fn save_session(
 
 #[tauri::command]
 pub fn restore_session(state: State<'_, AppState>) -> Result<Option<crate::session::SessionState>, String> {
+    RATE_LIMITER.check("restore_session")?;
     let mut session = state.lock_session();
     session.restore().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn validate_dataset_cmd(state: State<'_, AppState>) -> Result<crate::validation::ValidationReport, String> {
+    // Rate-limited like its read siblings: this runs a full-dataset validation scan under the db lock,
+    // so an unthrottled webview loop would starve every other DB command.
+    RATE_LIMITER.check("validate_dataset_cmd")?;
     let db = state.lock_db();
     let settings = state.lock_settings();
     crate::validation::validate_dataset_with_settings(&db, &settings).map_err(|e| e.to_string())
@@ -2336,8 +2343,16 @@ pub fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), String>
     // database (PRAGMA integrity_check on open verifies this). This completes the backup/restore
     // pair so the app is never at risk of data loss mid-import or mid-review.
     let validated = validate::validate_file_path(&src)?;
-    let mut db = state.lock_db();
-    db.restore(&validated).map_err(|e| e.to_string())
+    {
+        let mut db = state.lock_db();
+        db.restore(&validated).map_err(|e| e.to_string())?;
+    } // release the db lock before taking the history lock (consistent ordering)
+      // The in-memory undo/redo stack holds Commands (DeleteSegments, BatchTranscribe, ...) that
+      // reference rows from the PRE-restore database. Replaying one via Undo after the restore would
+      // apply a stale mutation to a different dataset — resurrecting or corrupting rows. Clear it so
+      // undo can never cross the restore boundary.
+    state.lock_history().clear();
+    Ok(())
 }
 
 #[tauri::command]
@@ -2429,6 +2444,9 @@ pub fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Res
     let restored = crate::settings::AppSettings::load(&data_dir.join("settings.json"));
     *state.lock_settings() = restored.clone();
     state.update_pipeline_settings(restored);
+    // Clear the undo/redo stack: it references pre-restore rows and replaying it would corrupt the
+    // restored dataset (see db_restore).
+    state.lock_history().clear();
     tracing::info!("database and config restored from auto-snapshot {name}");
     Ok(())
 }
