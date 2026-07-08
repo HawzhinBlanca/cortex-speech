@@ -51,7 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 tracing-appender = "0.2"
 
 # Audio ingestion (pure Rust decoder)
-symphonia = { version = "0.5", features = ["all"] }
+symphonia = { version = "0.6", features = ["all"] }
 
 # WAV/FLAC audio export
 hound = "3"
@@ -72,7 +72,7 @@ bzip2 = "0.5"
 ureq = { version = "2", features = ["tls", "json"] }
 
 # SHA256 verification for downloaded models
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Compression ratio for ASR repetition detection
 flate2 = "1"
@@ -82,9 +82,9 @@ ndarray = "0.17"
 
 # FFT for mel filterbank feature extraction
 rustfft = "6"
-parquet = { version = "58.3.0", default-features = false, features = ["arrow", "snap"] }
-arrow-array = "58.3.0"
-arrow-schema = "58.3.0"
+parquet = { version = "59.0.0", default-features = false, features = ["arrow", "snap"] }
+arrow-array = "59.0.0"
+arrow-schema = "59.0.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

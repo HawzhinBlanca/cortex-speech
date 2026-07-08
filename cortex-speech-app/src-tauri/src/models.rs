@@ -218,7 +218,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
         }
         hasher.update(&buf[..n]);
     }
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = hex_lower(&hasher.finalize());
     if hash != expected {
         remove_model_temp_file(path, "SHA256-mismatched model download");
         return Err(format!("SHA256 mismatch: expected {expected}, got {hash}"));
@@ -851,6 +851,18 @@ fn omniasr_ctc_1b_present_in(model_dir: &Path) -> bool {
         && model_file_meets_min_size(model_dir, OMNIASR_CTC_1B_TOKENS, 100)
 }
 
+/// Lowercase hex of a byte slice. sha2 0.11's `finalize()` output (a `hybrid_array::Array`) no longer
+/// implements `LowerHex`, so the old `format!("{:x}", ...)` form no longer compiles — encode the bytes
+/// explicitly here (no extra dependency).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Compute the SHA-256 of a file as a lowercase hex string — the content-address shared by archive
 /// verification and registry import (a model checkpoint is identified by exactly this hash).
 pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
@@ -864,7 +876,7 @@ pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 /// Hard ceiling on any single model/archive download. The SHA-256 verify runs only AFTER the full
