@@ -92,6 +92,11 @@
           }
         } else if (payload.type === 'completed') {
           downloading = false;
+          // Refresh the per-model status so the ✓ / size column reflects the just-finished download.
+          // The awaited downloadAll() path also refreshes, but if the backend signals completion via
+          // THIS event (before/after that await resolves) the row would otherwise stay stale (○ / "Not
+          // downloaded") until the panel is reopened. loadStatus() is a read; safe to call again here.
+          loadStatus();
         }
       },
     );

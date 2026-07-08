@@ -370,7 +370,11 @@
     return () => clearTimeout(fetchDebounceTimer);
   });
 
+  // All three are fed values straight off the backend DatasetStats/cert. A null/undefined/NaN field
+  // (e.g. an empty DB, or a field the backend omitted) would make `.toFixed` throw and drop the WHOLE
+  // stats card into its error branch. Return a placeholder for non-finite input instead.
   function fmt(s: number) {
+    if (!Number.isFinite(s)) return '\u2014';
     const h = Math.floor(s / 3600);
     const m = Math.floor((s % 3600) / 60);
     const sec = Math.floor(s % 60);
@@ -380,10 +384,12 @@
   }
 
   function pct(v: number) {
+    if (!Number.isFinite(v)) return '\u2014';
     return `${v.toFixed(1)}%`;
   }
 
   function fmtMs(v: number) {
+    if (!Number.isFinite(v)) return '\u2014';
     if (v < 1) return `${(v * 1000).toFixed(0)}\u00b5s`;
     if (v < 1000) return `${v.toFixed(1)}ms`;
     return `${(v / 1000).toFixed(2)}s`;
@@ -613,7 +619,9 @@
               <div class="text-[9px] text-cortex-400">{$t('stats.certifiedSegments')}</div>
             </div>
             <div class="bg-cortex-950/40 p-2 rounded-lg border border-cortex-800/20">
-              <div class="text-lg font-bold text-cortex-200">{cert.threshold.toFixed(3)}</div>
+              <div class="text-lg font-bold text-cortex-200">
+                {Number.isFinite(cert.threshold) ? cert.threshold.toFixed(3) : '—'}
+              </div>
               <div class="text-[9px] text-cortex-400">Decision Threshold (τ)</div>
             </div>
           </div>

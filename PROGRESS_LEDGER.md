@@ -1812,3 +1812,26 @@ DEFERRED (lower priority, next batch): IPC F4 (path-validation consistency on 4 
 (ModelDownload 'completed' event doesn't refresh the list), #5 (StatsDashboard unguarded pct/fmt on backend
 fields), #7 (consent toggle optimistic — no rollback on IPC failure; safety-relevant but failure-triggered),
 #8 (SettingsPanel onDestroy redundant double-write). Logged honestly, not silently dropped.
+
+## /loop iteration 3 — cleared the deferred UI backlog (2026-07-08)
+
+Implemented the already-verified deferred items (no new hunting); typecheck 0, vitest 134, lint clean:
+- **#7 (safety):** SettingsPanel saveQuietly() now ROLLS BACK to the last-persisted state + surfaces
+  notifications.error when updateSettings rejects — a cloud-consent toggle can no longer show as applied
+  while the backend has the opposite (silent consent mismatch on an offline-first app).
+- **#4:** ModelDownload refreshes the per-model status list on the 'completed' event (row no longer stuck on
+  ○/"Not downloaded" until reopen).
+- **#5:** StatsDashboard fmt/pct/fmtMs + the cert threshold render are finite-guarded (return '—') so a
+  null/NaN backend field can't crash the whole stats card into its error branch.
+
+STILL DEFERRED (deliberately, low value / risky): IPC F4 (routing the 4 dir-picker/basename commands through
+validate_file_path risks breaking legit output-dir flows — dirs that don't exist yet fail canonicalize; the
+shared-validator UNC fix already covers the real read-path risk) and frontend #8 (onDestroy redundant write
+— backend is idempotent per the autosave invariant, so it's a no-op cost not a correctness bug). These are
+the honest floor: not worth the change risk for the value.
+
+END OF AUTONOMOUS BACKLOG. Every headlessly-verifiable surface has now had an adversarial pass (panics,
+arithmetic, concurrency, resource/error, input-validation, review + non-review frontend, cloud, migrations,
+export, audio/VAD/chunking, jury/consensus, IPC command surface); real findings fixed + tested, over-rated/
+false ones called as such, low-value/risky ones deferred with reasons. What remains is owner-gated on the
+4090 (make measure-10 numbers, live e2e).
