@@ -21,6 +21,22 @@ pub fn validate_file_path(path: &str) -> Result<String, String> {
     // Canonicalize to resolve any `..` or symlinks
     let canonical = std::fs::canonicalize(path).map_err(|e| format!("Invalid path: {e}"))?;
 
+    // Reject UNC / network paths on Windows. `canonicalize` resolves a `\\server\share\...` path to a
+    // verbatim-UNC form, and any command that then reads it (get_waveform, get_audio_duration,
+    // transcribe_segment_*, ...) opens an OUTBOUND SMB connection to `server` — an attacker-controlled
+    // host via a crafted `\\attacker.com\share\x.wav` from the webview means an NTLM-relay /
+    // credential-leak. Block it at the shared validator so the whole path surface is covered at once.
+    // Local disk paths canonicalize to a Disk prefix (`\\?\C:\...`) and are unaffected.
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if let Some(Component::Prefix(prefix)) = canonical.components().next() {
+            if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..)) {
+                return Err("Network (UNC) paths are not allowed".to_string());
+            }
+        }
+    }
+
     Ok(canonical.to_string_lossy().to_string())
 }
 

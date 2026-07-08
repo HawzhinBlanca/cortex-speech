@@ -61,10 +61,14 @@
 
   async function loadActiveLearningQueue() {
     activeQueueLoading = true;
-    // Clamp user inputs — HTML min/max don't prevent typed values
-    const clampedTarget = Math.max(0.01, Math.min(0.5, targetError));
-    const clampedConf = Math.max(0.5, Math.min(0.99, confidenceLevel));
-    const clampedLimit = Math.max(1, Math.min(100, Math.floor(queueLimit)));
+    // Clamp user inputs — HTML min/max don't prevent typed values, and a CLEARED field binds NaN
+    // (Math.floor(NaN)=NaN slips through Math.max/min and reaches the IPC call). NaN-safe clamp with a
+    // sensible default; the limit floor is 5 to match the input's min="5".
+    const clamp = (v: number, lo: number, hi: number, dflt: number): number =>
+      Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : dflt;
+    const clampedTarget = clamp(targetError, 0.01, 0.5, 0.1);
+    const clampedConf = clamp(confidenceLevel, 0.5, 0.99, 0.95);
+    const clampedLimit = clamp(Math.floor(queueLimit), 5, 100, 20);
     try {
       const queue = await api.getActiveLearningQueue(clampedTarget, clampedConf, clampedLimit);
       activeQueue = queue;

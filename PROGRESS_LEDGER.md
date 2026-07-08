@@ -1782,3 +1782,33 @@ owner-gated on the 4090 (I will not fabricate them); running `make measure-10` t
 Net of the /loop: flag-undo shipped, cloud-F1 honestly deferred, one real determinism fix from the core hunt
 (jury T2), and the two deepest cores verified clean. No fabricated fixes; over-rated/false findings called as
 such.
+
+## /loop iteration 2 — IPC surface + non-review frontend hunt (2026-07-08)
+
+Cloud-F1 re-examined and held again (honest): 3 refiner sites in transcribe() + pipeline decoupled from
+AppHandle → surfacing needs a signature refactor of the core path, not worth it for a correct+logged result.
+i18n EN/CKB parity verified CLEAN (137/139 CKB values translated; the 2 ASCII are the `ASR` acronym +
+`English` endonym). Two fresh hunters (IPC command surface; non-review frontend), findings verified + FIXED
+(clippy -D warnings clean, cargo test --lib 820, typecheck 0, vitest 134):
+- **IPC F3 (MED correctness):** db_restore / restore_db_from_snapshot swapped the DB but left the in-memory
+  undo/redo stack holding PRE-restore Commands → a post-restore Undo replayed a stale mutation against the
+  restored dataset (resurrect/corrupt rows). Both now `lock_history().clear()` after a successful restore.
+- **IPC F5 (security):** validate_file_path allowed UNC paths; on Windows `\\attacker.com\share\x.wav`
+  canonicalizes to verbatim-UNC and a read opens an OUTBOUND SMB connection (NTLM relay / credential leak).
+  Now rejects UNC/VerbatimUNC prefixes at the shared validator (covers the whole path surface).
+- **IPC F1/F2 (consistency):** added the missing RATE_LIMITER guard to validate_dataset_cmd (full-table scan
+  under the db lock) + restore_session; bounded search_segments' free-text query (validate_text 1000) like
+  its siblings.
+- **Frontend #1 (HIGH data-loss):** SettingsPanel's `$effect` re-mirrored the store into local editing state
+  on EVERY $settings change, so saveQuietly()/toggles reverted in-progress edits (e.g. the reference-models
+  text box). Removed it; seed the local buffers once at declaration.
+- **Frontend #2 (HIGH):** SettingsPanel number inputs bind NaN on a cleared field → shipped to updateSettings
+  (u32 fields fail deserialize → the setting silently doesn't save). coerceSettingsForRuntime() now reverts
+  any non-finite numeric to its last-persisted value (both save paths).
+- **Frontend #3/#6:** ValidationPanel queue-limit clamp made NaN-safe (floor aligned to min=5);
+  DatasetMerge JSON textarea set dir="ltr" so pasted Sorani values can't bidi-scramble the JSON.
+
+DEFERRED (lower priority, next batch): IPC F4 (path-validation consistency on 4 commands), frontend #4
+(ModelDownload 'completed' event doesn't refresh the list), #5 (StatsDashboard unguarded pct/fmt on backend
+fields), #7 (consent toggle optimistic — no rollback on IPC failure; safety-relevant but failure-triggered),
+#8 (SettingsPanel onDestroy redundant double-write). Logged honestly, not silently dropped.
