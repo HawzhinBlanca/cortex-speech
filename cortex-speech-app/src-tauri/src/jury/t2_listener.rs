@@ -357,7 +357,18 @@ fn resolve_debate_fallback(
     let judge_b_transcript = hypotheses
         .iter()
         .find(|h| h.model_id == "omniasr-ctc-1b")
-        .or_else(|| hypotheses.get(1))
+        // When the 1b shadow judge is absent, pick a local hypothesis DETERMINISTICALLY — the smallest
+        // (model_id, transcript) among substantive (non-empty) hypotheses — NOT by arbitrary DB row
+        // order. The old positional `.get(1)`/`.first()` made the swap-stable accept-vs-escalate decision
+        // depend on hypothesis ordering (reorder the rows -> a different judge_b -> a different verdict for
+        // the SAME inputs). This mirrors the deterministic-sort discipline the IRT M-step and the
+        // consensus vote tie-break already enforce, so a T2 debate is reproducible.
+        .or_else(|| {
+            hypotheses
+                .iter()
+                .filter(|h| !h.transcript.trim().is_empty())
+                .min_by(|a, b| a.model_id.cmp(&b.model_id).then_with(|| a.transcript.cmp(&b.transcript)))
+        })
         .or_else(|| hypotheses.first())
         .map(|h| h.transcript.as_str())
         .unwrap_or("");
@@ -552,6 +563,25 @@ mod tests {
         let v = r.verdict.expect("verdict");
         assert_eq!(v.transcript, "کوردستان");
         assert!(!v.self_consistency_agreement, "a debate accept is not a self-consistency majority");
+    }
+
+    #[test]
+    fn debate_fallback_judge_b_is_order_independent_without_the_1b_model() {
+        // With no omniasr-ctc-1b hypothesis, judge_b must be chosen DETERMINISTICALLY (smallest
+        // (model_id, transcript)), not by DB row order. Otherwise reordering the hypotheses flips the
+        // swap-stable accept/escalate decision for identical inputs. The old positional `.get(1)` would
+        // pick a different judge_b for the two orderings below; the deterministic pick gives the same.
+        let samples = [gs("کوردستان"), gs("کوردستان"), gs("ئێران"), gs("هەولێر")];
+        let order1 = vec![hyp("z-model", "ئێران"), hyp("a-model", "کوردستان")];
+        let order2 = vec![hyp("a-model", "کوردستان"), hyp("z-model", "ئێران")];
+        let r1 = resolve_debate_fallback(&samples, &order1, &[]);
+        let r2 = resolve_debate_fallback(&samples, &order2, &[]);
+        assert_eq!(r1.must_escalate, r2.must_escalate, "accept/escalate must not depend on hypothesis order");
+        assert_eq!(
+            r1.verdict.map(|v| v.transcript),
+            r2.verdict.map(|v| v.transcript),
+            "the chosen transcript must not depend on hypothesis order"
+        );
     }
 
     #[test]
