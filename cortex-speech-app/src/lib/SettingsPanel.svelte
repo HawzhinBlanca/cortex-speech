@@ -22,7 +22,10 @@
   >($settingsTab);
   let saving = $state(false);
   let exportingAudio = $state(false);
-  let sourceReferenceModelsInput = $state('');
+  // Seeded ONCE from the store here (like localSettings above). It must NOT be re-mirrored from
+  // $settings on every store change — see the removed $effect: saveQuietly()/toggles write the store
+  // mid-edit, and re-seeding would revert whatever the user is currently typing (silent data loss).
+  let sourceReferenceModelsInput = $state(($settings.sourceReferenceModels ?? []).join(', '));
   // Lowercase provider names whose key is present in secrets.env (e.g. "elevenlabs").
   // Read-only signal so cloud opt-ins can warn when their key is missing; never holds key values.
   let configuredProviders = $state<string[]>([]);
@@ -32,11 +35,6 @@
   // so we must NOT gate it globally — only suppress it for an explicit Cancel.)
   let cancelled = $state(false);
 
-  $effect(() => {
-    const nextSettings = $settings;
-    localSettings = { ...nextSettings };
-    sourceReferenceModelsInput = nextSettings.sourceReferenceModels.join(', ');
-  });
   $effect(() => {
     activeTab = $settingsTab;
   });
@@ -69,6 +67,23 @@
     if (localSettings.exportFormat === 'parquet' && !PARQUET_EXPORT_SUPPORTED) {
       localSettings = { ...localSettings, exportFormat: 'json' };
     }
+    // A <input type="number"> binds NaN when the user clears the field to retype it. Shipping NaN to
+    // updateSettings either fails backend deserialization (u32 fields — the setting silently doesn't
+    // save) or, for a float threshold, defeats a gate. Revert any non-finite numeric field to its
+    // LAST-PERSISTED value (no invented bounds that could reject a legitimate entry; the backend still
+    // enforces the [0,1] threshold ranges).
+    const prev = get(settings);
+    const finite = (v: number, fallback: number): number => (Number.isFinite(v) ? v : fallback);
+    localSettings = {
+      ...localSettings,
+      vadThreshold: finite(localSettings.vadThreshold, prev.vadThreshold),
+      minSegmentSec: finite(localSettings.minSegmentSec, prev.minSegmentSec),
+      maxSegmentSec: finite(localSettings.maxSegmentSec, prev.maxSegmentSec),
+      maxSpeakers: finite(localSettings.maxSpeakers, prev.maxSpeakers),
+      maxWerThreshold: finite(localSettings.maxWerThreshold, prev.maxWerThreshold),
+      maxCerThreshold: finite(localSettings.maxCerThreshold, prev.maxCerThreshold),
+      jurySelfConsistencyN: finite(localSettings.jurySelfConsistencyN, prev.jurySelfConsistencyN),
+    };
   }
 
   async function saveQuietly() {
