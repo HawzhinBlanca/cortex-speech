@@ -133,15 +133,30 @@ pub fn list_snapshots(data_dir: &Path) -> Vec<SnapshotInfo> {
             let ts = name.strip_prefix(SNAPSHOT_PREFIX)?.parse::<u64>().ok()?;
             let db_file = path.join(DB_FILE);
             let db_size_bytes = fs::metadata(&db_file).map(|m| m.len()).unwrap_or(0);
-            // Segment count via a plain read connection; a snapshot that can't open reports None so a
-            // damaged snapshot is visibly distinct from an empty one in the picker.
-            let segment_count =
-                Database::open(db_file.to_string_lossy().as_ref()).ok().and_then(|db| db.segment_count().ok());
+            // Segment count via a strictly READ-ONLY connection. Database::open runs
+            // `PRAGMA journal_mode=WAL` — a WRITE that mutates the file header and spawns -wal/-shm
+            // sidecars. Doing that to a FROZEN snapshot on every restore-picker open / quarantine-banner
+            // poll violates its immutability and could leave a -wal beside it that a later restore
+            // unexpectedly replays. A snapshot that can't open reports None, so a damaged one stays
+            // visibly distinct from an empty one in the picker.
+            let segment_count = count_snapshot_segments_readonly(&db_file);
             Some(SnapshotInfo { name, timestamp: ts, db_size_bytes, segment_count })
         })
         .collect();
     snaps.sort_by_key(|snap| std::cmp::Reverse(snap.timestamp));
     snaps
+}
+
+/// Count segments in a snapshot DB WITHOUT mutating it — a strictly read-only open with NO
+/// journal-mode pragma, so a frozen snapshot inspected by the restore picker / quarantine poll is never
+/// written to (see list_snapshots). Returns None if the snapshot can't be opened/read.
+fn count_snapshot_segments_readonly(db_file: &Path) -> Option<i64> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_file,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row("SELECT COUNT(*) FROM speech_segments", [], |row| row.get::<_, i64>(0)).ok()
 }
 
 /// Metadata for one snapshot in the restore picker.
@@ -225,6 +240,23 @@ mod tests {
         })
         .unwrap();
         db
+    }
+
+    #[test]
+    fn read_only_segment_count_does_not_mutate_the_frozen_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        let snap = take_snapshot_at(&db, tmp.path(), 10, 1000).unwrap().expect("non-empty db snapshots");
+        let snap_db = snap.join(DB_FILE);
+        // Clear any WAL sidecars from creation so we can detect ones NEW to inspection.
+        let _ = std::fs::remove_file(snap.join(format!("{DB_FILE}-wal")));
+        let _ = std::fs::remove_file(snap.join(format!("{DB_FILE}-shm")));
+
+        // The read-only count returns the right number WITHOUT writing to the frozen snapshot. The old
+        // Database::open path ran `PRAGMA journal_mode=WAL` and would re-create the -wal/-shm sidecars.
+        assert_eq!(count_snapshot_segments_readonly(&snap_db), Some(1));
+        assert!(!snap.join(format!("{DB_FILE}-wal")).exists(), "read-only inspection must not create a -wal");
+        assert!(!snap.join(format!("{DB_FILE}-shm")).exists(), "read-only inspection must not create a -shm");
     }
 
     #[test]

@@ -867,6 +867,15 @@ pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Hard ceiling on any single model/archive download. The SHA-256 verify runs only AFTER the full
+/// write, so without this a compromised/on-path host (or the mutable GitHub `raw/<commit>` origin)
+/// could trickle a multi-GB body within the read timeout and fill the disk BEFORE the hash rejects it
+/// — wedging unrelated writers (the SQLite WAL, other temps). No legitimate pinned artifact is anywhere
+/// near this (the largest is the ~365 MB OmniASR archive); the exact bytes are still enforced by
+/// verify_sha256. Backstop only — mirrors http::MAX_JSON_RESPONSE_BYTES on the JSON path. We do NOT cap
+/// against the server-supplied Content-Length, which a malicious host controls.
+const MAX_DOWNLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+
 fn write_reader_to_temp<R: Read>(
     mut reader: R,
     tmp_path: &Path,
@@ -887,6 +896,10 @@ fn write_reader_to_temp<R: Read>(
             }
             file.write_all(&buffer[..n]).map_err(|e| format!("{write_context}: {e}"))?;
             downloaded += n as u64;
+            if downloaded > MAX_DOWNLOAD_BYTES {
+                // Abort mid-stream so an oversized body can't fill the disk; the temp is removed below.
+                return Err(format!("{read_context}: download exceeded the {MAX_DOWNLOAD_BYTES}-byte safety cap"));
+            }
             if total_size > 0 {
                 progress_cb((downloaded as f32 / total_size as f32) * progress_scale);
             }

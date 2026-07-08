@@ -979,6 +979,12 @@ pub fn voice_activity_detection(pcm: &[i16], sample_rate: u32, threshold: f32) -
                 drop(guard);
                 Ok::<_, AppError>((session, _sd))
             } else {
+                // Re-verify the pinned VAD model against its manifest hash before loading it — parity
+                // with the ASR load-time integrity gate (asr.rs). Catches a silero_vad file swapped or
+                // corrupted on disk AFTER its download-time verification. Runs only on a cache miss (the
+                // session is cached below), so it's a one-time 2 MB hash, not per-call.
+                crate::models::verify_model_path_runtime(&model_path, "silero_vad_v4.onnx")
+                    .map_err(|e| AppError::Onnx(format!("VAD model integrity: {e}")))?;
                 let mut builder =
                     Session::builder().map_err(|e| AppError::Onnx(format!("VAD session builder: {e}")))?;
                 let session = builder
