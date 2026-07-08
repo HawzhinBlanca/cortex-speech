@@ -3609,6 +3609,16 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
     db.clear_human_decision(&segment_id).map_err(|e| e.to_string())
 }
 
+/// Undo a review-inbox `flag()`: clear the escalation the flag set. Distinct from clear_human_decision
+/// (which reopens a decided row by SETTING escalated=1); this is the inverse of flag.
+#[tauri::command]
+pub fn clear_escalation(state: State<'_, AppState>, segment_id: String) -> Result<(), String> {
+    RATE_LIMITER.check("clear_escalation")?;
+    validate::validate_identifier(&segment_id)?;
+    let db = state.lock_db();
+    db.clear_escalation(&segment_id).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn write_segment_verdict(

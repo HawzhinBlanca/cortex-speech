@@ -251,6 +251,10 @@
     const idx = currentIndex;
     isSubmitting = true;
     try {
+      // Record an undo entry BEFORE the await (same as accept/reject) so an accidental `f` — a common
+      // fat-finger next to `e`/`x` — is recoverable via Backspace/Undo instead of permanently escalating
+      // the segment. The 'flag' tag routes undo() to clear the escalation rather than a human decision.
+      history = [...history, { id: cur.id, decision: 'flag', prev: { ...cur } }];
       await api.writeSegmentVerdict(
         cur.id,
         'escalated',
@@ -264,7 +268,8 @@
       statusMsg = $t('inbox.status.flagged');
       advance();
     } catch (e) {
-      // flag() records no undo history, so just surface the failure.
+      // Persist failed: drop the phantom undo entry pushed above and surface the failure.
+      history = history.slice(0, -1);
       statusMsg = $t('inbox.status.flagFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
@@ -276,9 +281,14 @@
     if (!last) return;
     history = history.slice(0, -1); // reassignment: keeps the Undo button's disabled binding live
     try {
-      // P3-3: Clear the human decision entirely (set to NULL) instead of
-      // overwriting it with a fake 'accept' — that was corrupting agent_examples.
-      await api.clearHumanDecision(last.id);
+      // A flag set `escalated` (not a human_decision), so it needs the inverse op. Everything else is a
+      // human decision, cleared to NULL (P3-3: not overwritten with a fake 'accept', which corrupted
+      // agent_examples).
+      if (last.decision === 'flag') {
+        await api.clearEscalation(last.id);
+      } else {
+        await api.clearHumanDecision(last.id);
+      }
       const idx = queue.findIndex((s) => s.id === last.id);
       if (idx >= 0) {
         queue[idx] = { ...last.prev };

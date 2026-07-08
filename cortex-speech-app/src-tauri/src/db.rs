@@ -1717,6 +1717,27 @@ impl Database {
         Ok(())
     }
 
+    /// Reverse a UI `flag()` escalation (the review-inbox Undo path): clear the `escalated` flag and the
+    /// machine `'escalated'` verdict + rationale that flag wrote, WITHOUT touching a human_decision (flag
+    /// never sets one). This is the exact inverse of flag — unlike `clear_human_decision`, which
+    /// deliberately SETS escalated=1 to reopen a human-decided row for re-adjudication. Guarded to a
+    /// still-undecided row so it can never stomp a human decision made after the flag; idempotent. Every
+    /// SET expression references the row's PRE-UPDATE values (SQLite semantics), so both CASEs see the
+    /// original verdict.
+    pub fn clear_escalation(&self, segment_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE speech_segments
+             SET escalated  = 0,
+                 verdict    = CASE WHEN verdict = 'escalated' THEN NULL ELSE verdict END,
+                 rationale  = CASE WHEN verdict = 'escalated' THEN NULL ELSE rationale END,
+                 updated_at = datetime('now')
+             WHERE id = ?1 AND (human_decision IS NULL OR human_decision = '')",
+            params![segment_id],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
     /// Capture a MODEL correction (the jury auto-correcting OmniASR) as a provenance-tagged PSEUDO
     /// example: `source='model'`, `verified_by_human=0`. Unlike a human edit, this is NOT trusted
     /// training data — it is a candidate for human review / a future gated pseudo-label pass, and is
@@ -2453,6 +2474,41 @@ mod tests {
         // A fresh machine verdict now applies (the human-decision guard no longer blocks it).
         db.write_segment_verdict("cl1", "jury_accept", Some("machine"), None, None, Some(0.8), false).unwrap();
         assert_eq!(db.get_segment_by_id("cl1").unwrap().unwrap().verdict.as_deref(), Some("jury_accept"));
+    }
+
+    #[test]
+    fn clear_escalation_is_the_exact_inverse_of_a_flag() {
+        // A UI flag() sets verdict='escalated' + escalated=1. Undo must clear BOTH (unlike
+        // clear_human_decision, which sets escalated=1). And it must NOT touch a segment that a human
+        // decided after the flag.
+        let db = make_db();
+        db.insert_segment(&make_segment("fl1", "/fl1.wav")).unwrap();
+        db.write_segment_verdict(
+            "fl1",
+            "escalated",
+            None,
+            Some("Flagged for second-pass adjudication"),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let flagged = db.get_segment_by_id("fl1").unwrap().unwrap();
+        assert!(flagged.escalated && flagged.verdict.as_deref() == Some("escalated"));
+
+        db.clear_escalation("fl1").unwrap();
+        let un = db.get_segment_by_id("fl1").unwrap().unwrap();
+        assert!(!un.escalated, "escalated flag must be cleared (inverse of flag)");
+        assert_eq!(un.verdict, None, "the 'escalated' verdict must be cleared");
+        assert_eq!(un.rationale, None, "the flag rationale must be cleared");
+
+        // Guard: once a human has decided, clear_escalation must be a no-op (never stomp a decision).
+        db.insert_segment(&make_segment("fl2", "/fl2.wav")).unwrap();
+        db.write_segment_verdict("fl2", "escalated", None, Some("flag"), None, None, true).unwrap();
+        db.record_human_decision("fl2", "accept", None, None).unwrap();
+        db.clear_escalation("fl2").unwrap();
+        let kept = db.get_segment_by_id("fl2").unwrap().unwrap();
+        assert_eq!(kept.human_decision.as_deref(), Some("accept"), "a human-decided row must be untouched");
     }
 
     #[test]
