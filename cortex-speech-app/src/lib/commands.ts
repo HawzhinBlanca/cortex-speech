@@ -1155,6 +1155,11 @@ export async function clearHumanDecision(segmentId: string): Promise<void> {
   return invoke<void>('clear_human_decision', { segmentId });
 }
 
+/** Undo a review-inbox flag(): clear the escalation it set (inverse of flag, unlike clearHumanDecision). */
+export async function clearEscalation(segmentId: string): Promise<void> {
+  return invoke<void>('clear_escalation', { segmentId });
+}
+
 export async function writeSegmentVerdict(
   segmentId: string,
   verdict: string,

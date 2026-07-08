@@ -612,6 +612,7 @@ pub fn run() {
             commands::get_escalation_queue,
             commands::record_human_decision,
             commands::clear_human_decision,
+            commands::clear_escalation,
             commands::write_segment_verdict,
             commands::get_few_shot_examples,
             commands::get_escalation_rate_trend,
