@@ -64,11 +64,16 @@
         {$t('merge.bodyHint')}
       </p>
 
+      <!-- dir="ltr": this is a JSON/code field. Without it, pasted Sorani transcript VALUES render RTL
+           and bidi-reorder the surrounding LTR brackets/commas/keys, scrambling the JSON so the user
+           can't sanity-check it before merge. LTR keeps the structure stable; RTL runs isolate to their
+           own tokens. -->
       <textarea
         class="flex-1 bg-cortex-900 border border-cortex-800 rounded-lg p-3 text-[10px] font-mono text-cortex-300 focus:outline-none focus:border-cortex-600 resize-none"
         placeholder={'[{"id": "...", "rawTranscript": "..." }, ...]'}
         bind:value={jsonContent}
         spellcheck="false"
+        dir="ltr"
       ></textarea>
     </div>
 
