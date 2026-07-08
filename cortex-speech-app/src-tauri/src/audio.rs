@@ -1353,6 +1353,45 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    #[test]
+    fn decode_to_pcm_preserves_i16_sample_values_within_1_lsb() {
+        use hound::{WavSpec, WavWriter};
+        use tempfile::TempDir;
+
+        // ABSOLUTE-value scaling guard (added after the symphonia 0.6 migration). A 16 kHz MONO WAV
+        // decodes with NO resample and NO downmix, so the ONLY difference between the written samples
+        // and the decoded PCM is the i16 -> f32 (÷32768) -> i16 (×32767) round-trip, which is ≤ ~1 LSB.
+        // The other decode tests only check that DIFFERENT audio yields DIFFERENT PCM (relative), which
+        // would NOT catch a decoder bump that stopped normalizing i16 to [-1, 1] (every sample would be
+        // 32768× off). This test would. Pattern spans zero, both signs, small/large magnitudes, and the
+        // i16 extremes. Uses a unique temp file (its own content hash), so it needs no cache clear and
+        // leaves the shared global PCM cache untouched for the other tests running in parallel.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("scaling_roundtrip.wav");
+        let spec =
+            WavSpec { channels: 1, sample_rate: 16000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+
+        let input: Vec<i16> = (0..2048)
+            .map(|i| ((i as f64 * std::f64::consts::TAU / 128.0).sin() * 30000.0) as i16)
+            .chain([0i16, 1, -1, 100, -100, 16384, -16384, i16::MAX, i16::MIN])
+            .collect();
+        {
+            let mut writer = WavWriter::create(&path, spec).unwrap();
+            for &s in &input {
+                writer.write_sample(s).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let (rate, decoded) = decode_to_pcm(&path).unwrap();
+        assert_eq!(rate, TARGET_SAMPLE_RATE);
+        assert_eq!(decoded.len(), input.len(), "mono 16 kHz decode must preserve the exact sample count");
+
+        let max_err =
+            input.iter().zip(&decoded).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs()).max().unwrap_or(0);
+        assert!(max_err <= 2, "i16 sample round-trip drifted by {max_err} LSB — i16<->f32 scaling regression?");
+    }
+
     fn write_constant_wav(path: &Path, sample: i16) {
         use hound::{WavSpec, WavWriter};
         let spec =
@@ -1444,10 +1483,14 @@ mod tests {
 
     #[test]
     fn pcm_cache_clear_recovers_poisoned_lock() {
+        // cargo runs tests in parallel and they SHARE the global PCM cache, so this test must not assume
+        // the cache is otherwise empty. Assert on this test's OWN unique key ("poisoned.wav", used by no
+        // other test) instead of an absolute len(): a concurrent decode_to_pcm legitimately leaves
+        // unrelated entries, which made the old `assert_eq!(len, 1)` flaky under CI's test ordering.
         {
             let mut cache = lock_pcm_cache();
             cache.put("poisoned.wav".into(), (TARGET_SAMPLE_RATE, vec![1, 2, 3]));
-            assert_eq!(cache.len(), 1);
+            assert!(cache.contains("poisoned.wav"), "entry must be present immediately after put");
         }
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1456,7 +1499,7 @@ mod tests {
         }));
 
         clear_pcm_cache();
-        assert_eq!(lock_pcm_cache().len(), 0);
+        assert!(!lock_pcm_cache().contains("poisoned.wav"), "clear must recover the poisoned lock and drop the entry");
         assert_eq!(pcm_cache_capacity().get(), 10);
     }
 
