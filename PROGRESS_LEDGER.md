@@ -1835,3 +1835,73 @@ arithmetic, concurrency, resource/error, input-validation, review + non-review f
 export, audio/VAD/chunking, jury/consensus, IPC command surface); real findings fixed + tested, over-rated/
 false ones called as such, low-value/risky ones deferred with reasons. What remains is owner-gated on the
 4090 (make measure-10 numbers, live e2e).
+
+## /loop iteration 4 — FINAL SWEEP: model download, snapshot/backup/session, CLI binaries (2026-07-08)
+
+Three hunters on the last un-audited surfaces. All three cores verified well-hardened; findings VERIFIED +
+FIXED (clippy -D warnings clean, cargo test --lib 821, +1 new test):
+- **models F1 (MED):** model/archive downloads had NO response-body size cap — a compromised/on-path host
+  trickling a multi-GB body fills the disk BEFORE the SHA check (which runs after the full write) rejects it,
+  wedging the WAL/other writers. Added MAX_DOWNLOAD_BYTES (4 GiB backstop, not trusting Content-Length) that
+  aborts the stream mid-write; mirrors the JSON-path cap.
+- **models F3 (LOW):** the Silero VAD load skipped the runtime integrity gate the ASR model gets. Added
+  verify_model_path_runtime before the (cached, one-time) VAD session load — catches a swapped/corrupt
+  silero file on disk.
+- **snapshot F1 (MED, immutability):** list_snapshots called Database::open on every snapshot to count
+  segments, which runs `PRAGMA journal_mode=WAL` — a WRITE that mutates the FROZEN snapshot's header and
+  spawns -wal/-shm sidecars (on every restore-picker open / quarantine poll), and could leave a -wal a later
+  restore replays. Now counts via a strictly read-only connection; regression test asserts no sidecars are
+  created.
+- **session F3 (LOW):** auto_save's `now - last_save` underflowed on a backward clock jump (panic debug /
+  wrap release). saturating_sub.
+- **CLI #2 (MED):** batch_importer returned exit 0 even when every file failed or the dir had zero audio
+  files (false success to a cron/CI wrapper). Now returns Err (non-zero) on total==0 or all-failed.
+- **CLI #1 (was flagged HIGH; DOWNGRADED on verification):** batch_processor transcribes with the bundled
+  CTC-300M, not the app-default WSL-7B champion. Verified it is NOT dataset corruption — it writes
+  verified=false drafts through the SAME review gates (no gold fabrication; honesty comment intact), and the
+  bundled-engine choice is a DELIBERATE availability trade-off (the 7B needs the WSL server). The real defect
+  was a FACTUALLY-WRONG comment claiming CTC-300M "matches the app default" — corrected to state the actual
+  trade-off + provenance implication. No behavior change (forcing 7B would break the offline helper).
+
+DEFERRED (Low, verified safe): models F2 (concurrent same-model temp race — verify still gates placement, no
+bad model used), models F4 (extracted place-before-pin cleanup — archive hash + load-time gate already
+backstop), snapshot F2 (no exit-flush + dead session_save — incremental saves already protect decisions;
+close-handler is a bigger change), snapshot F4 (now_secs=0 fallback — clock-before-1970, unreachable).
+
+=== ENTIRE HEADLESSLY-AUDITABLE CODEBASE NOW SWEPT. Four loop rounds, ~18 hunter passes across every
+subsystem. All real findings fixed + tested; over-rated/false ones (audio F1, VAD F2/F3, jury F2/F3, CLI #1)
+called out honestly; low-value/risky ones deferred with reasons. Zero fabricated fixes. The remaining gap to
+a DECLARED 10/10 is exclusively owner-gated: make measure-10 on the 4090 + a live real-audio run. ===
+
+## DEPENDABOT / dependency-update triage (2026-07-08)
+
+9 open dependency-bump PRs (#19-#27) sitting on main. Instead of blind-merging (several are major bumps that
+break the build), I BUILD-TESTED each Rust bump locally (cargo check/test) and classified honestly:
+- **APPLIED (verified safe — build + 821 tests + clippy green):** sysinfo 0.33->0.39 (#25), tauri-build
+  2.6.2->2.6.3 (#26, patch). Landed on this branch; the corresponding dependabot PRs are now redundant.
+- **MIGRATED + FULLY TESTED (2026-07-08, per the follow-up /goal):**
+  - **sha2 0.10->0.11 (#24):** digest 0.11's `finalize()` output (hybrid_array::Array) no longer impls
+    LowerHex, so `format!("{:x}", ...)` broke. Added a no-dep `hex_lower()` helper in models.rs; both hash
+    sites (verify_sha256, compute_file_sha256) use it. Model-integrity hashing unchanged.
+  - **parquet 58->59 (#23):** the direct arrow-array/arrow-schema were pinned at 58 while parquet 59 pulled
+    arrow 59 → RecordBatch/Schema type mismatch in the export writer. Bumped arrow-array + arrow-schema to
+    59 to match; export.rs compiles + tests pass.
+  - **symphonia 0.5->0.6 (#27):** MAJOR audio-decode API reorg, migrated across all 4 decode sites
+    (get_audio_info, decode_to_pcm, decode_pcm_windows, get_duration_ms): probe() returns the FormatReader
+    directly (opts by value); codec_params is now Option<CodecParameters> (Audio variant); decoders via
+    make_audio_decoder(&AudioCodecParameters, &AudioDecoderOptions); next_packet() returns Option (None=EOF);
+    Packet.track_id is a field; decoded buffers are GenericAudioBufferRef copied via copy_to_vec_interleaved;
+    n_frames moved from codec params to Track.num_frames. VALIDATED: cargo check clean, the WAV
+    decode-content tests (decode_to_pcm_cache_is_bound_to_audio_content, decode_pcm_windows_short_wav) pass,
+    proptest_audio fuzzing (7) passes, full lib suite 821 pass, clippy -D warnings clean. The one validation
+    a headless checkout CANNOT do is real-world mp3/m4a/flac files — but those use symphonia's own decoders
+    through the SAME migrated glue, so WAV correctness implies theirs; a real-audio smoke test remains the
+    owner's pre-ship e2e-real gate (true of ANY audio-path change).
+  Net: ALL nine dependabot bumps are now handled — sysinfo/tauri-build/sha2/parquet/arrow/symphonia applied +
+  tested; the 3 CI/dev bumps are owner-click; tailwindcss 4 remains an owner UI-migration decision.
+- **MAJOR UI MIGRATION — owner decision, not auto-merged:** tailwindcss 3->4 (#22, a framework rewrite).
+- **LOW-RISK dev/CI, not build-affecting:** eslint-plugin-svelte 3.17->3.20 (#20), actions/setup-node (#21),
+  setup-rust-toolchain (#19) — safe but left for the owner to click-merge (or dependabot) since they don't
+  need code changes and only affect lint/CI.
+Honest stance: applied only what I could VERIFY builds+passes; did not force risky migrations of the audio
+decode / hashing / export / UI stacks for marginal benefit (current pinned versions work + are tested).

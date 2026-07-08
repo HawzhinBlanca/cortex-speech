@@ -119,10 +119,11 @@ pub fn check_audio_file<P: AsRef<Path>>(path: P) -> AppResult<AudioInfo> {
         return Err(AppError::Audio(AudioError::Decode(format!("File is empty: {}", path.display()))));
     }
 
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
     let file =
         std::fs::File::open(path).map_err(|e| AppError::Audio(AudioError::Decode(format!("Cannot open: {e}"))))?;
@@ -133,21 +134,24 @@ pub fn check_audio_file<P: AsRef<Path>>(path: P) -> AppResult<AudioInfo> {
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+    let format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
         .map_err(|e| AppError::Audio(AudioError::Decode(format!("Cannot probe format: {e}"))))?;
 
-    let track = probed
-        .format
+    let track = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .find(|t| matches!(t.codec_params, Some(CodecParameters::Audio(_))))
         .ok_or_else(|| AppError::Audio(AudioError::NoTracks(path.to_path_buf())))?;
 
-    let params = &track.codec_params;
-    let n_frames = params.n_frames.unwrap_or(0);
-    let sample_rate = params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE) as f64;
-    let channels = params.channels.map(|c| c.count() as u16).unwrap_or(1);
+    // n_frames moved from codec params to the Track in 0.6; audio rate/channels live on the Audio variant.
+    let audio = match &track.codec_params {
+        Some(CodecParameters::Audio(p)) => p,
+        _ => return Err(AppError::Audio(AudioError::NoTracks(path.to_path_buf()))),
+    };
+    let n_frames = track.num_frames.unwrap_or(0);
+    let sample_rate = audio.sample_rate.unwrap_or(TARGET_SAMPLE_RATE) as f64;
+    let channels = audio.channels.as_ref().map(|c| c.count() as u16).unwrap_or(1);
 
     if sample_rate <= 0.0 {
         return Err(AppError::Audio(AudioError::Decode("Invalid sample rate in file".into())));
@@ -180,12 +184,16 @@ pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
     let _span = crate::telemetry::TRACER
         .start_span("audio.decode_to_pcm", crate::telemetry::Tracer::metadata(vec![("path", path_str.clone())]));
 
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
+    // symphonia 0.6 migration: probe() returns the FormatReader directly (opts by value); codec_params
+    // is an Option<CodecParameters> enum (audio track = the Audio variant); decoders come from
+    // make_audio_decoder; decoded buffers are GenericAudioBufferRef and copy out via
+    // copy_to_vec_interleaved. Behaviour is identical to the 0.5 SampleBuffer path.
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
     let file = std::fs::File::open(path.as_ref()).map_err(AppError::Io)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -195,24 +203,22 @@ pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
         hint.with_extension(ext);
     }
 
-    let fmt_opts = FormatOptions::default();
-    let meta_opts = MetadataOptions::default();
-    let dec_opts = DecoderOptions::default();
-
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &fmt_opts, &meta_opts)
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
         .map_err(|e| AppError::Audio(AudioError::Decode(e.to_string())))?;
-    let mut format = probed.format;
 
     let track = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .find(|t| matches!(t.codec_params, Some(CodecParameters::Audio(_))))
         .ok_or_else(|| AppError::Audio(AudioError::NoTracks(path.as_ref().to_path_buf())))?;
 
-    let codec_params = track.codec_params.clone();
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(p)) => p.clone(),
+        _ => return Err(AppError::Audio(AudioError::NoTracks(path.as_ref().to_path_buf()))),
+    };
     let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &dec_opts)
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| AppError::Audio(AudioError::Decode(e.to_string())))?;
 
     let track_id = track.id;
@@ -224,11 +230,13 @@ pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
     let mut actual_channels = 0u32;
     let mut actual_sample_rate = 0u32;
 
+    let mut sample_buf: Vec<f32> = Vec::new();
     loop {
         let packet = match format.next_packet() {
-            Ok(pkt) => pkt,
+            Ok(Some(pkt)) => pkt,
+            Ok(None) => break, // clean end of stream (0.6 signals EOF with None, not an UnexpectedEof err)
             Err(symphonia::core::errors::Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break; // clean end of stream
+                break;
             }
             Err(symphonia::core::errors::Error::ResetRequired) => {
                 tracing::warn!("audio decode: stream reset required mid-file; stopping decode early");
@@ -243,24 +251,24 @@ pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
             }
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
         let decoded = decoder.decode(&packet).map_err(|e| AppError::Audio(AudioError::Decode(e.to_string())))?;
-        if decoded.spec().channels.count() == 0 {
+        let spec = decoded.spec();
+        if spec.channels().count() == 0 {
             continue;
         }
 
         if actual_channels == 0 {
-            actual_channels = decoded.spec().channels.count() as u32;
-            actual_sample_rate = decoded.spec().rate;
+            actual_channels = spec.channels().count() as u32;
+            actual_sample_rate = spec.rate();
         }
 
-        let mut sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-        sample_buf.copy_interleaved_ref(decoded);
-        let samples = sample_buf.samples();
-        all_samples.extend_from_slice(samples);
+        sample_buf.clear();
+        decoded.copy_to_vec_interleaved(&mut sample_buf);
+        all_samples.extend_from_slice(&sample_buf);
         if all_samples.len() > MAX_DECODE_SAMPLES {
             return Err(AppError::Audio(AudioError::Decode(format!(
                 "audio too large to decode in one pass (> {MAX_DECODE_SAMPLES} samples)"
@@ -275,12 +283,12 @@ pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
     let channels = if actual_channels > 0 {
         actual_channels
     } else {
-        codec_params.channels.map(|c| c.count()).unwrap_or(1) as u32
+        audio_params.channels.as_ref().map(|c| c.count()).unwrap_or(1) as u32
     };
     let sample_rate = if actual_sample_rate > 0 {
         actual_sample_rate
     } else {
-        codec_params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE)
+        audio_params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE)
     };
     let pcm = interleaved_f32_to_pcm_i16(&all_samples, channels, sample_rate);
 
@@ -305,12 +313,12 @@ where
         crate::telemetry::Tracer::metadata(vec![("path", path.to_string_lossy().to_string())]),
     );
 
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
     let file = std::fs::File::open(path).map_err(AppError::Io)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -320,25 +328,27 @@ where
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
         .map_err(|e| AppError::Audio(AudioError::Decode(e.to_string())))?;
-    let mut format = probed.format;
 
     let track = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .find(|t| matches!(t.codec_params, Some(CodecParameters::Audio(_))))
         .ok_or_else(|| AppError::Audio(AudioError::NoTracks(path.to_path_buf())))?;
 
-    let codec_params = track.codec_params.clone();
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(p)) => p.clone(),
+        _ => return Err(AppError::Audio(AudioError::NoTracks(path.to_path_buf()))),
+    };
     let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| AppError::Audio(AudioError::Decode(e.to_string())))?;
 
     let track_id = track.id;
-    let mut channels = codec_params.channels.map(|c| c.count()).unwrap_or(1) as u32;
-    let mut sample_rate = codec_params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE);
+    let mut channels = audio_params.channels.as_ref().map(|c| c.count()).unwrap_or(1) as u32;
+    let mut sample_rate = audio_params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE);
     let mut window_frames = ((window_ms as u64) * sample_rate as u64 / 1000).max(1) as usize;
     let mut window_cap = window_frames * channels as usize;
     let mut spec_updated = false;
@@ -360,11 +370,13 @@ where
         Ok(())
     };
 
+    let mut frame_buf: Vec<f32> = Vec::new();
     loop {
         let packet = match format.next_packet() {
-            Ok(pkt) => pkt,
+            Ok(Some(pkt)) => pkt,
+            Ok(None) => break, // clean end of stream (0.6 signals EOF with None)
             Err(symphonia::core::errors::Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break; // clean end of stream
+                break;
             }
             Err(symphonia::core::errors::Error::ResetRequired) => {
                 // A legitimate mid-stream parameter change (e.g. chained OGG). Re-init is out of scope
@@ -382,26 +394,27 @@ where
             }
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
         let decoded = decoder.decode(&packet).map_err(|e| AppError::Audio(AudioError::Decode(e.to_string())))?;
-        if decoded.spec().channels.count() == 0 {
+        let spec = decoded.spec();
+        if spec.channels().count() == 0 {
             continue;
         }
 
         if !spec_updated {
-            channels = decoded.spec().channels.count() as u32;
-            sample_rate = decoded.spec().rate;
+            channels = spec.channels().count() as u32;
+            sample_rate = spec.rate();
             window_frames = ((window_ms as u64) * sample_rate as u64 / 1000).max(1) as usize;
             window_cap = window_frames * channels as usize;
             spec_updated = true;
         }
 
-        let mut sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-        sample_buf.copy_interleaved_ref(decoded);
-        buf.extend_from_slice(sample_buf.samples());
+        frame_buf.clear();
+        decoded.copy_to_vec_interleaved(&mut frame_buf);
+        buf.extend_from_slice(&frame_buf);
 
         while buf.len() >= window_cap {
             let chunk: Vec<f32> = buf.drain(..window_cap).collect();
@@ -475,10 +488,11 @@ fn send_decode_worker_result<T>(
 
 /// Get audio duration in milliseconds.
 pub fn get_duration_ms<P: AsRef<Path>>(path: P) -> AppResult<i64> {
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
     let file = std::fs::File::open(path.as_ref())?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -488,24 +502,27 @@ pub fn get_duration_ms<P: AsRef<Path>>(path: P) -> AppResult<i64> {
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+    let format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
         .map_err(|e| AppError::Audio(AudioError::Decode(e.to_string())))?;
-    let track = probed
-        .format
+    let track = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .find(|t| matches!(t.codec_params, Some(CodecParameters::Audio(_))))
         .ok_or_else(|| AppError::Audio(AudioError::NoTracks(path.as_ref().to_path_buf())))?;
 
-    let params = &track.codec_params;
-    let sample_rate = params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE) as f64;
+    let audio = match &track.codec_params {
+        Some(CodecParameters::Audio(p)) => p,
+        _ => return Err(AppError::Audio(AudioError::NoTracks(path.as_ref().to_path_buf()))),
+    };
+    let track_num_frames = track.num_frames;
+    let sample_rate = audio.sample_rate.unwrap_or(TARGET_SAMPLE_RATE) as f64;
 
     if sample_rate <= 0.0 {
         return Err(AppError::Audio(AudioError::Decode("Invalid sample rate".into())));
     }
 
-    match params.n_frames {
+    match track_num_frames {
         // Container reported a real frame count (the common path): cheap, metadata-only.
         Some(n) if n > 0 => Ok(frames_to_duration_ms(n, sample_rate)),
         // No usable frame count (VBR MP3 without a Xing/Info header, streamed OGG/WebM, some
@@ -979,6 +996,12 @@ pub fn voice_activity_detection(pcm: &[i16], sample_rate: u32, threshold: f32) -
                 drop(guard);
                 Ok::<_, AppError>((session, _sd))
             } else {
+                // Re-verify the pinned VAD model against its manifest hash before loading it — parity
+                // with the ASR load-time integrity gate (asr.rs). Catches a silero_vad file swapped or
+                // corrupted on disk AFTER its download-time verification. Runs only on a cache miss (the
+                // session is cached below), so it's a one-time 2 MB hash, not per-call.
+                crate::models::verify_model_path_runtime(&model_path, "silero_vad_v4.onnx")
+                    .map_err(|e| AppError::Onnx(format!("VAD model integrity: {e}")))?;
                 let mut builder =
                     Session::builder().map_err(|e| AppError::Onnx(format!("VAD session builder: {e}")))?;
                 let session = builder

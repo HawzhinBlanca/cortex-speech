@@ -57,6 +57,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Importing directory: {}", target_dir.display());
 
+    // import_directory returns Ok(()) even when every file failed or the dir has zero audio files
+    // (per-file faults only emit PipelineEvent::Error). Capture the final tally so this binary's EXIT
+    // CODE reflects reality — otherwise a cron/CI wrapper pointed at a mistyped/empty dir sees exit 0
+    // and believes the import succeeded when it did nothing.
+    let outcome = std::cell::Cell::new((0usize, 0usize, 0usize)); // (total, succeeded, failed)
     pipeline.import_directory(&target_dir, None, |event| {
         use cortex_speech_app_lib::pipeline::PipelineEvent;
         match event {
@@ -65,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             PipelineEvent::Completed { total, succeeded, failed } => {
                 println!("Completed: Total {}, Succeeded {}, Failed {}", total, succeeded, failed);
+                outcome.set((total, succeeded, failed));
             }
             PipelineEvent::Error { file, error } => {
                 println!("Error in {}: {}", file, error);
@@ -72,6 +78,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     })?;
+
+    let (total, succeeded, failed) = outcome.get();
+    if total == 0 {
+        return Err(format!("No audio files found to import in {}", target_dir.display()).into());
+    }
+    if succeeded == 0 {
+        return Err(format!("Import failed: all {failed} file(s) failed").into());
+    }
 
     println!("Batch Importer Finished!");
     Ok(())

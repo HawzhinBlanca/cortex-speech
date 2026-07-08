@@ -123,7 +123,10 @@ impl SessionManager {
 
     pub fn auto_save(&mut self, db: &Database) -> AppResult<()> {
         let now = now_epoch_secs();
-        if now - self.last_save < self.save_interval_secs {
+        // saturating_sub, not `-`: if the wall clock jumps backward (NTP correction, manual set) so
+        // now < last_save, a plain u64 subtraction underflows (panic in debug / wrap in release). The
+        // saturating form yields 0 (< interval) so a backward jump simply defers the next save.
+        if now.saturating_sub(self.last_save) < self.save_interval_secs {
             return Ok(());
         }
         self.save(db)?;

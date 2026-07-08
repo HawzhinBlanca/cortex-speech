@@ -218,7 +218,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
         }
         hasher.update(&buf[..n]);
     }
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = hex_lower(&hasher.finalize());
     if hash != expected {
         remove_model_temp_file(path, "SHA256-mismatched model download");
         return Err(format!("SHA256 mismatch: expected {expected}, got {hash}"));
@@ -851,6 +851,18 @@ fn omniasr_ctc_1b_present_in(model_dir: &Path) -> bool {
         && model_file_meets_min_size(model_dir, OMNIASR_CTC_1B_TOKENS, 100)
 }
 
+/// Lowercase hex of a byte slice. sha2 0.11's `finalize()` output (a `hybrid_array::Array`) no longer
+/// implements `LowerHex`, so the old `format!("{:x}", ...)` form no longer compiles — encode the bytes
+/// explicitly here (no extra dependency).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Compute the SHA-256 of a file as a lowercase hex string — the content-address shared by archive
 /// verification and registry import (a model checkpoint is identified by exactly this hash).
 pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
@@ -864,8 +876,17 @@ pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_lower(&hasher.finalize()))
 }
+
+/// Hard ceiling on any single model/archive download. The SHA-256 verify runs only AFTER the full
+/// write, so without this a compromised/on-path host (or the mutable GitHub `raw/<commit>` origin)
+/// could trickle a multi-GB body within the read timeout and fill the disk BEFORE the hash rejects it
+/// — wedging unrelated writers (the SQLite WAL, other temps). No legitimate pinned artifact is anywhere
+/// near this (the largest is the ~365 MB OmniASR archive); the exact bytes are still enforced by
+/// verify_sha256. Backstop only — mirrors http::MAX_JSON_RESPONSE_BYTES on the JSON path. We do NOT cap
+/// against the server-supplied Content-Length, which a malicious host controls.
+const MAX_DOWNLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 
 fn write_reader_to_temp<R: Read>(
     mut reader: R,
@@ -887,6 +908,10 @@ fn write_reader_to_temp<R: Read>(
             }
             file.write_all(&buffer[..n]).map_err(|e| format!("{write_context}: {e}"))?;
             downloaded += n as u64;
+            if downloaded > MAX_DOWNLOAD_BYTES {
+                // Abort mid-stream so an oversized body can't fill the disk; the temp is removed below.
+                return Err(format!("{read_context}: download exceeded the {MAX_DOWNLOAD_BYTES}-byte safety cap"));
+            }
             if total_size > 0 {
                 progress_cb((downloaded as f32 / total_size as f32) * progress_scale);
             }

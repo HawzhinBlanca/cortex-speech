@@ -51,8 +51,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = app_data_dir.join("models");
     let asr_pool = AsrPool::new();
     let asr_config = AsrLoadConfig {
-        // Match the app default and bundled runtime model. Requesting CTC1B here
-        // makes this helper fail on the standard packaged install.
+        // This offline batch helper fills UNVERIFIED drafts with the always-present BUNDLED engine
+        // (OmniASR-CTC-300M = AsrModelSize::default()). NOTE: that is NOT the app default — the GUI's
+        // default is the WSL-7B champion (settings.rs) — but the 7B needs the WSL server running and the
+        // fine-tuned CTC-1B isn't on a standard install, either of which would make this headless helper
+        // fail. The drafts it writes are verified=false and flow through the SAME review/agentic gates as
+        // any unreviewed draft (no gold fabrication — see the write below), so this is a deliberate
+        // availability trade-off, not the silent downgrade of the user's SELECTED engine that the GUI's
+        // F2 guard forbids. Expect bundled-engine draft quality (higher CER than the 7B) from a batch run.
         num_threads: 8,
         ..AsrLoadConfig::default()
     };
