@@ -1743,3 +1743,22 @@ py_compile clean, the CER/WER/CI/N parser matches both scorecards' real headline
 no number, missing manifest -> exit 2, missing prereqs -> SKIPPED (no metrics written), no stray doc
 created. This is the achievable part of the P7 re-audit / gold marathon — the NUMBERS themselves remain
 owner-gated on the 4090 (I will not fabricate them); running `make measure-10` there produces + records them.
+
+## /loop — remaining self-assigned jobs #3/#4/#5 (2026-07-08)
+
+- **#3 flag() undo — DONE.** Added `db.clear_escalation` + `clear_escalation` IPC command + `clearEscalation`
+  TS binding, and wired ReviewInbox flag() to record an undo entry (tagged 'flag') with undo() routing a
+  'flag' entry to the escalation-clear (the inverse of flag, unlike clear_human_decision which sets
+  escalated=1). Regression test covers the round-trip + the human-decided no-op guard. cargo test --lib
+  pass, typecheck 0 errors, vitest 134/134. (commit b691c89)
+- **#4 surface LLM-refine fallback in the UI — DELIBERATELY DEFERRED (honest).** It is LOW severity (the
+  transcript is CORRECT on fallback — accept_refinement already guards substitution — and the failure IS
+  logged at WARN). The clean fix is disproportionate: `ProcessingPipeline::transcribe()` (pipeline.rs:2399)
+  swallows the refiner error and returns raw, and it takes NO event callback; surfacing it to the UI would
+  need either a return-signature change threaded through its ~4 real callers + internal returns, or a
+  context-aware warning channel (writing self.import_status unconditionally would pollute the single-segment
+  re-transcribe path). Not worth an invasive refactor of the core transcribe path for a cosmetic notice on a
+  correct result; left as-is (logged). Would revisit only alongside a broader pipeline-event refactor.
+- **#5 hunt the un-swept cores — IN PROGRESS.** Launched two adversarial hunters on the last un-audited
+  high-risk surfaces: audio decode / VAD / chunking (segment boundaries, streaming-vs-whole-file, offset
+  rebasing) and jury / IRT / consensus / conformal calibration + LOOP-0. Findings verified + fixed next.
