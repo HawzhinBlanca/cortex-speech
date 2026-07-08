@@ -39,7 +39,7 @@ thiserror = "2"
 blake3 = "1"
 rayon = "1"
 lru = "0.16"
-sysinfo = "0.33"
+sysinfo = "0.39"
 unicode-normalization = "0.1.23"
 
 # Async runtime

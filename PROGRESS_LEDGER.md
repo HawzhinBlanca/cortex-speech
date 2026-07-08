@@ -1872,3 +1872,22 @@ close-handler is a bigger change), snapshot F4 (now_secs=0 fallback — clock-be
 subsystem. All real findings fixed + tested; over-rated/false ones (audio F1, VAD F2/F3, jury F2/F3, CLI #1)
 called out honestly; low-value/risky ones deferred with reasons. Zero fabricated fixes. The remaining gap to
 a DECLARED 10/10 is exclusively owner-gated: make measure-10 on the 4090 + a live real-audio run. ===
+
+## DEPENDABOT / dependency-update triage (2026-07-08)
+
+9 open dependency-bump PRs (#19-#27) sitting on main. Instead of blind-merging (several are major bumps that
+break the build), I BUILD-TESTED each Rust bump locally (cargo check/test) and classified honestly:
+- **APPLIED (verified safe — build + 821 tests + clippy green):** sysinfo 0.33->0.39 (#25), tauri-build
+  2.6.2->2.6.3 (#26, patch). Landed on this branch; the corresponding dependabot PRs are now redundant.
+- **BREAKS THE BUILD — needs real migration, NOT merged (tested breakage):**
+  - symphonia 0.5->0.6 (#27): ~20 errors — major audio-decode API rewrite (probe/SampleBuffer/DecoderOptions
+    moved, CODEC_TYPE_NULL gone). Touches the critical decode path; owner should migrate deliberately.
+  - sha2 0.10->0.11 (#24): digest 0.11 output type change breaks the `{:x}` hash formatting (model integrity
+    hashing). Small but load-bearing migration.
+  - parquet 58->59 (#23): 2 arrow-59 type mismatches in the export path.
+- **MAJOR UI MIGRATION — owner decision, not auto-merged:** tailwindcss 3->4 (#22, a framework rewrite).
+- **LOW-RISK dev/CI, not build-affecting:** eslint-plugin-svelte 3.17->3.20 (#20), actions/setup-node (#21),
+  setup-rust-toolchain (#19) — safe but left for the owner to click-merge (or dependabot) since they don't
+  need code changes and only affect lint/CI.
+Honest stance: applied only what I could VERIFY builds+passes; did not force risky migrations of the audio
+decode / hashing / export / UI stacks for marginal benefit (current pinned versions work + are tested).
