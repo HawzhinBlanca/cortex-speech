@@ -1759,6 +1759,26 @@ owner-gated on the 4090 (I will not fabricate them); running `make measure-10` t
   context-aware warning channel (writing self.import_status unconditionally would pollute the single-segment
   re-transcribe path). Not worth an invasive refactor of the core transcribe path for a cosmetic notice on a
   correct result; left as-is (logged). Would revisit only alongside a broader pipeline-event refactor.
-- **#5 hunt the un-swept cores — IN PROGRESS.** Launched two adversarial hunters on the last un-audited
-  high-risk surfaces: audio decode / VAD / chunking (segment boundaries, streaming-vs-whole-file, offset
-  rebasing) and jury / IRT / consensus / conformal calibration + LOOP-0. Findings verified + fixed next.
+- **#5 hunt the un-swept cores — DONE.** Two adversarial hunters on the last un-audited high-risk surfaces;
+  both cores came back exceptionally hardened. Every finding VERIFIED against live source; one real fix, the
+  rest non-actionable on verification (reported honestly, not fabricated):
+  - JURY/IRT/consensus/conformal/LOOP-0: clean bills on consensus tie-break, Hoeffding+Bonferroni
+    calibration, LOOP-0 Beta posterior, T0/T1 gate, T2 grounding. ONE real fix: **T2 debate `judge_b` was
+    DB-row-order dependent** (positional `.get(1)`/`.first()` fallback when 1b absent) → the swap-stable
+    accept/escalate decision could flip on reorder. FIXED deterministically (smallest (model_id,transcript)
+    among substantive hyps) + order-independence regression test. (commit 9e1f2c5). F2 (calibration set
+    includes hard-vetoed segs) verified CONSERVATIVE (coverage better than certified, not a leak) — no
+    action. F3 (C4 INSERT OR REPLACE) narrow + guarded — no action.
+  - AUDIO/VAD/chunking: clean bills on duration, resampler, slice_pcm_by_alignment, silence-aware split,
+    merge/absorb regions, streaming carry-forward rebasing, Silero segmentation. Claimed findings verified
+    NON-ACTIONABLE: F1 (streaming-vs-whole-file per-window resample) is REAL but LOW magnitude — ZERO drift
+    for 48 kHz (exact 1/3 ratio) and ~ms over an hour for 44.1 kHz; an invasive rearchitect of the tested
+    decode path isn't warranted for a sub-frame effect (over-rated HIGH by the hunter). F2 (energy-VAD
+    trailing length) is a FALSE POSITIVE — `num_frames - seg_start` and the in-loop `i - seg_start` count
+    speech frames identically. F3 (is_silent before normalize) is a FALSE POSITIVE — is_silent drops only
+    all-samples-<-56 dBFS true silence; real quiet speech has peaks above the floor and IS normalized, and
+    the proposed "fix" would amplify micro-noise into hallucinated speech.
+
+Net of the /loop: flag-undo shipped, cloud-F1 honestly deferred, one real determinism fix from the core hunt
+(jury T2), and the two deepest cores verified clean. No fabricated fixes; over-rated/false findings called as
+such.
