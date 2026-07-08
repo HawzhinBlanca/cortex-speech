@@ -88,12 +88,24 @@
 
   async function saveQuietly() {
     coerceSettingsForRuntime();
+    if (!tauriAvailable) {
+      settings.set(localSettings);
+      return;
+    }
+    const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
     settings.set(localSettings);
-    if (!tauriAvailable) return;
     try {
       await api.updateSettings(localSettings);
     } catch (e) {
       console.error('Auto-save settings failed:', e);
+      // Roll BACK so the UI can't show a consent toggle (or any setting) as applied when the backend
+      // REJECTED the write. A silent consent mismatch — the user believes cloud STT/LLM is on (or off)
+      // while the backend disagrees — is safety-critical for an offline-first app. Revert local + store
+      // to the last-persisted state and surface the failure instead of only logging it.
+      localSettings = { ...prev };
+      sourceReferenceModelsInput = (prev.sourceReferenceModels ?? []).join(', ');
+      settings.set(prev);
+      notifications.error($t('settingsSaveFailed'), { detail: String(e) });
     }
   }
 
