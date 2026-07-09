@@ -2012,3 +2012,24 @@ space-stripped. The 7B stays HONESTLY UNMEASURED against stock until P2.2. Remai
 minors: AudioPlayer stale-src Space race, waveform a11y seek, Mac-glyph formatter dedup, i18n
 literals, inbox 200-cap banner) are genuinely minor and deferred — lower priority than the
 owner's reconciliation of this branch with the concurrent main "10/10 gate" effort.
+
+## Audit backlog MERGED + daily app rebuilt ship-ready (2026-07-09)
+
+PR #37 (clusters A-G, the full TRUE_RATING backlog + 2 CI fixes) merged to main (e2944d6). The
+main checkout was advanced and the daily app REBUILT from the merged main:
+- Frontend rebuilt (npm run build) + release exe rebuilt (cargo build --release, 7m35s).
+- EXE FRESHNESS GATE: GREEN (exe at HEAD e2944d6, newer than all sources) — the running app now
+  carries every audit fix (review-mode blocker, engine truth, honest metrics, dataset integrity,
+  DR spine, security/CI). Verified on rustc 1.97.0 (CI toolchain).
+- Ship-check surface green: verify_10.py "CORTEX 10/10: ALL GATES GREEN", cargo fmt --check,
+  clippy --all-targets -D warnings, cargo test (833 lib + integration, 0 failed), typecheck 0/406,
+  vitest 141, eslint, python policies (25). test-e2e/audit/deny validated by the green CI Windows
+  Release Gate on identical content.
+
+CONCURRENT-SESSION WIP HANDLED: another session's uncommitted "proof-metadata + 10/10-gate" effort
+(confidence_source/cloud_call/decoder_config_hash/normalizer_version columns, ConfidenceSource in
+asr.rs, get_segments_page pagination, Makefile gate scaffold) was committed + pushed to branch
+feat/proof-metadata-10-10-gate (f4b09e7) to preserve it, but NOT merged: it does not compile even on
+its own base (8 SpeechSegment initializers un-updated for the new columns) and its migration is v34,
+which COLLIDES with main's v34 c4_evidence_archive (must renumber to v35 when finished). Honest call:
+no unverified half-feature onto a clean CI-green main. The feature awaits a proper completion pass.
