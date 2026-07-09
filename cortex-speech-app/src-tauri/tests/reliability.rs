@@ -389,10 +389,12 @@ fn test_multi_threaded_lock_ordering_same_order() {
         std::thread::sleep(Duration::from_millis(30));
     });
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Same slow-CI-runner rationale as the other deadlock detectors in this file: a real deadlock
+    // never resolves, so 60s still catches it without false-firing on a loaded runner.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !t1.is_finished() || !t2.is_finished() {
         if Instant::now() > deadline {
-            panic!("Deadlock detected: threads did not complete within 5s");
+            panic!("Deadlock detected: threads did not complete within 60s");
         }
         std::thread::sleep(Duration::from_millis(10));
     }

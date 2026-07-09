@@ -2,7 +2,7 @@
 
 ## 1. Overall 10/10 Gate Status
 
-* **Stop Condition (`verify-10` checker)**: **GREEN — narrow M0/M1 gate only** (`make verify-10` exits 0: manifest sync, asset presence, ledger schema, license-compatibility). This is **NOT** the full-charter 10/10 — the deep gates (published reproducible CER/WER scorecard, RTF, signing/SLSA, fuzz/mutants) are unbuilt. Honest full-charter grade **~4.7/10** — see [docs/BLUEPRINT_9_5.md](docs/BLUEPRINT_9_5.md).
+* **Stop Condition (`verify-10` checker)**: **GREEN — narrow M0/M1 gate only** (`make verify-10` exits 0: manifest sync, asset presence, ledger schema, license-compatibility). This is **NOT** the full-charter 10/10. **Honest grade as of 2026-07-09: ≈7/10** (36-agent adversarially-verified audit, [docs/TRUE_RATING_2026-07-09.md](docs/TRUE_RATING_2026-07-09.md)); lineage 6.5 (07-02) → 6.5 (07-06 deep-check) → ~7.0 (07-09). The scorecard table below is the ORIGINAL Wave-0 blueprint scorecard, retained for history; the current per-dimension grades live in the 07-09 rating doc. The remaining gap to a declared 10/10 is owner-gated measurement (P2.2 benchmark → marathon → retrain cycle → P7 re-audit).
 * **Scorecard Progress**:
 
 | Dimension | Initial Score | Current Score | Exit Criteria Met? |
@@ -1905,3 +1905,36 @@ break the build), I BUILD-TESTED each Rust bump locally (cargo check/test) and c
   need code changes and only affect lint/CI.
 Honest stance: applied only what I could VERIFY builds+passes; did not force risky migrations of the audio
 decode / hashing / export / UI stacks for marginal benefit (current pinned versions work + are tested).
+
+## TRUE RATING + competitive audit; CI un-redded; exe made fresh (2026-07-09)
+
+Owner asked for a deep audit + honest rating vs the top 3 + the path to "top 3 in history".
+Delivered docs/TRUE_RATING_2026-07-09.md (36-agent adversarially-verified audit, 3.45M subagent
+tokens; 4 cited web-research tracks; all local gates re-RUN at HEAD, not claimed). Highlights:
+
+- FIXED TODAY (PR #36): main's Release Gate red (flaky 5s deadlock deadline -> 60s in all 3
+  detector tests; 0.18s locally, cannot classically deadlock) + Nightly red (soak job compiled
+  tauri-build without base models -> added the ci.yml fetch-models provisioning step).
+- FIXED TODAY: the daily exe was STALE (built 07-04 b3111ed; ~110 commits behind incl. the A1
+  aligner data-destruction fix). Frontend + release rebuilt; freshness gate GREEN at HEAD.
+  HONESTY CORRECTION: the 07-04 "freshness GREEN" ledger line silently went stale when the July
+  5-8 stream merged; the headline "~4.7/10" block was also stale — both corrected.
+- Gates verified green today: verify-10, 24+ python policy suites, vitest 132/132, typecheck
+  0/393, fmt, clippy-all-targets, FULL cargo test (822 lib + integration), exe freshness.
+- Dimension grades (adversarial verification, REFUTED dropped): security/privacy 8.5,
+  claims-evidence 8, reliability/DR 7.5, dataset 7, ASR 6.5, UX 6.5 (1 NEW BLOCKER: global
+  shortcuts fire on the hidden curate segment during review), gates/CI 6.5, intelligence 4.5.
+  Topline ~7/10. New confirmed backlog (B + ~14 majors) sequenced in the rating doc — top items:
+  review keyboard isolation, inbox edit-text cross-segment leak, e.key dead under CKB layout,
+  engine-dispatch truth (use_finetuned_asr+WSL7B mis-attribution), finetuned-juror ability
+  weight, T1/T2 escalation NULLing IRT confidence (suspect-first regressed to recency),
+  offset-less rows ship whole-recording clips, T2 Gemini bypasses json_bounded.
+- Competitive truth (cited): no product covers Cortex's 3 axes (top comparators: Label Studio,
+  Prodigy, NeMo SDP); Scribe v1 still 32.1% WER FLEURS-ckb (v2 unpublished for ckb; cloud-only,
+  retains audio by default); base omniASR-7B-LLM = 6.0% CER ckb_Arab (Meta official) — the
+  champion's ceiling is high, but the 7B remains UNMEASURED on a valid gold set (EVAL.md:267)
+  and the live DB has 87 segments / 0 human decisions — the marathon has never started.
+- Path to "top-3 in history" (in the doc, each step cited): P2.2 benchmark (one GPU afternoon,
+  zero review-hours) -> intelligence majors -> 500-decision marathon (first conversational
+  Sorani number) -> one retrain cycle + KenLM fusion (~36% rel. WER, cited) + pseudo-labeling
+  (Gaelic recipe 35.2->23.1) -> P7 re-audit. No accuracy claim is made for the 7B until P2.2 runs.
