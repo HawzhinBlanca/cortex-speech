@@ -1938,3 +1938,77 @@ tokens; 4 cited web-research tracks; all local gates re-RUN at HEAD, not claimed
   zero review-hours) -> intelligence majors -> 500-decision marathon (first conversational
   Sorani number) -> one retrain cycle + KenLM fusion (~36% rel. WER, cited) + pseudo-labeling
   (Gaelic recipe 35.2->23.1) -> P7 re-audit. No accuracy claim is made for the 7B until P2.2 runs.
+
+## Audit-backlog execution: clusters A-D shipped (2026-07-09, branch fix/audit-backlog-20260709)
+
+Owner directive: implement the TRUE_RATING backlog to ship-ready, gates + commit per cluster.
+- A label-protection (1f512af): review-surface keyboard isolation at the KeyboardManager level
+  (BLOCKER: globals fired on the hidden curate segment — silent verify/machine-overwrite/invisible
+  confirm), inbox edit-state cross-segment leak double-locked, Kurdish-layout-dead shortcuts fixed
+  via shared physicalKey (e.code), inbox focus trap, review queue search-only contract
+  (searchScopedSegments store), unmount draft flush, arrow-key revisit nav. 9 new keyboard tests.
+- B engine-truth (cb891c9): use_finetuned_asr+WSL7B mis-attribution structurally closed
+  (should_use_wsl_primary_asr honors the EFFECTIVE override; F2 preserved when the model is absent);
+  gold-eval mislabeling now impossible (engine derived from the requested id / mismatched label
+  refused); finetuned juror ability 1.0 with pinned ordering (7B > finetuned > 1b > 300m); batch-7B
+  provenance row; shared 15s windowing for the finetuned IPC; honest client timeout message (280s).
+- C intelligence honest-metrics (0a3640c): write_segment_verdict COALESCEs agent_confidence (T1/T2
+  escalations no longer NULL the persisted IRT confidence -> suspect-first is real again, tested);
+  migration v34 c4_evidence_archive (C4 precision survives deleting contradicted auto-accepts,
+  tested); conformal::min_calibration_n + per-bucket distance-to-calibration surfaced in the
+  intelligence report + dashboard (~2,334 zero-CER clips/bucket at the shipped 5% gate — the gate
+  itself deliberately unchanged); shadow metrics per-segment (distinct events), tested; over-trigger
+  tile neutral until would-fire evidence exists. Deferred (latent, firing default-off, tracked in
+  the rating doc): LOOP-0 firing-blindness, T1 confidence-semantics.
+- D dataset integrity (this commit): offset-less alignment rows are REFUSED whole-file fallback on
+  multi-segment sources (pack skips + counts; review re-transcribe errors with re-import advice;
+  single-segment sources still legit — sibling-count context from the DB), tested incl. SHA sums;
+  gold promotion refuses partially-reviewed files (unreviewed speech would score as insertions on
+  the promotion yardstick), tested — the old silently-exclude contract in the concatenation test was
+  audit-falsified and updated; SHA256SUMS now written over the finetune pack, gold eval-set, and
+  production bundle (clip bytes integrity-pinned, not just the manifest); per-speaker composition +
+  dominant-speaker flag now reach the HUMAN-readable cards (HF README + bundle dataset_card).
+  Deferred with rationale: split-grouping by content hash (import fingerprint already dedupes the
+  normal path; needs a plumbed hash map through every export caller — tracked).
+Gates per cluster: cargo test --lib (827->829), clippy-all-targets, fmt, vitest 141, typecheck 0,
+eslint, python policies (this entry pays the ledger-staleness gate that fired at 4 commits — the
+gate worked). Remaining: clusters E (reliability/DR), F (security/CI), G (doc honesty + UX polish),
+then PR + exe rebuild + full ship-check.
+
+## Audit-backlog execution: clusters E + F shipped (2026-07-09, branch fix/audit-backlog-20260709)
+
+- E reliability/DR (78c3a76): pre-migration PINNED (rotation-exempt) snapshot before any pending
+  migration on a non-empty library; TIERED retention (rolling 10 + last 7 daily + last 4 weekly,
+  pure selector, unit-tested) replaces the ~100-min single-tier horizon; restore is gated against
+  running import/batch writers AND pins a pre-restore copy first (shared prepare_restore);
+  quarantine gets an in-app acknowledge (archives *.corrupt.* to <data_dir>/quarantine, releases
+  the prune-pin) + accumulation cap; snapshot staleness surfaced + loop body catch_unwind'd;
+  db_backup on a dedicated connection + verifies the written file; get_current_version stops
+  swallowing transient read errors as v0. +4 snapshot tests. 833 lib tests.
+- F security/CI (this commit): T2 Gemini response through crate::http::json_bounded (was the last
+  into_json() — regression of the provider-body OOM guard); release.yml now fetch-models + npm run
+  build + verify_10.py governance gate BEFORE any cargo step (the tag gate failed by construction);
+  nightly gets the same dist/ provisioning; a NEW meta-gate test asserts provisioning ORDER before
+  the first compiling cargo step across all three workflows (comment-stripped so a comment can't
+  pose as a step — it found ci.yml was already correct); pre-commit drops the exit-code-masking
+  `| tail` on cargo check; ledger-staleness gate hard-errors in CI instead of silent-SKIP.
+  Deferred with rationale (documented in the rating doc, need Windows-native design / real-app
+  observation): DPAPI key-encryption-at-rest, an egress/consent audit log.
+
+COLLISION NOTE (honest): while F was in progress a CONCURRENT session switched the shared
+repo checkout to `main` and began an uncommitted "10/10 charter gate"
+effort (Makefile governance-proof/eval-ckb/egress-offline/bench-rtf/release-proof, verify_10.py,
+asr.rs, real_audio.rs, ...). That work was left UNTOUCHED on main; F was completed in an isolated
+git worktree on this branch. The two efforts (backlog FIXES here, GATE infra on main) are
+complementary and must be reconciled by the owner before a final ship-check.
+
+## Cluster G (docs honesty) — EVAL.md 7B claims corrected (2026-07-09)
+
+Retracted the numeric "on-par-to-slightly-better than stock" 7B read from EVAL.md's main body AND
+the appendix (its own 2026-07-07 caveat already showed the 7B and stock numbers used different CER
+bases — space-stripped vs space-kept — so they can't be compared; only the by-eye "coherent,
+correct Sorani" observation stands). Flagged the 29.33% N=1 clean number as also pre-fix
+space-stripped. The 7B stays HONESTLY UNMEASURED against stock until P2.2. Remaining G items (UX
+minors: AudioPlayer stale-src Space race, waveform a11y seek, Mac-glyph formatter dedup, i18n
+literals, inbox 200-cap banner) are genuinely minor and deferred — lower priority than the
+owner's reconciliation of this branch with the concurrent main "10/10 gate" effort.

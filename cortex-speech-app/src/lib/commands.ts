@@ -566,6 +566,16 @@ export interface IntelligenceReport {
     t0HumanConfirmed: number;
     t0HumanContradicted: number;
   };
+  /** Honest distance-to-calibration for the T0 auto-accept gate: per-SNR-bucket verified counts vs
+   * the minimum needed at ZERO CER (a hard lower bound — real data needs more). Explains why the
+   * jury escalates everything at low data volumes instead of leaving it a mystery (C3). Optional so
+   * an older backend (pre-v34 exe) doesn't break the dashboard. */
+  conformalCalibration?: {
+    targetErrorCer: number;
+    perBucketDelta: number;
+    minNeededAtZeroCer: number;
+    buckets: Array<{ bucket: string; verifiedWithReference: number; minNeededAtZeroCer: number }>;
+  };
 }
 
 export async function getIntelligenceReport(): Promise<IntelligenceReport> {
@@ -847,8 +857,17 @@ export async function dbInfo(): Promise<{
   return invoke('db_info');
 }
 
-export async function dbBackup(dest: string): Promise<void> {
+/** Back up the live library to `dest` on a DEDICATED connection (the UI stays responsive), then
+ * verify the WRITTEN file (integrity check + segment count) — a disaster copy that is itself bad
+ * must fail now, not at the disaster. */
+export async function dbBackup(dest: string): Promise<{ integrityOk: boolean; segmentCount: number }> {
   return invoke('db_backup', { dest });
+}
+
+/** Archive every quarantined `*.corrupt.*` artifact into `<data_dir>/quarantine/`, releasing the
+ * snapshot prune-pin explicitly (bytes stay salvageable). Returns how many files were archived. */
+export async function acknowledgeQuarantine(): Promise<number> {
+  return invoke('acknowledge_quarantine');
 }
 
 /** Restore the live library from a backup .db file (the counterpart to dbBackup). Destructive — the

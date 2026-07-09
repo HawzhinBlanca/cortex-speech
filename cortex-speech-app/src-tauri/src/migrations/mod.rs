@@ -50,11 +50,21 @@ pub fn run_migrations(db: &Database) -> AppResult<Vec<i64>> {
     Ok(applied)
 }
 
-/// Get the current schema version.
+/// Get the current schema version. A missing `schema_migrations` table (a genuinely fresh database)
+/// is version 0; ANY OTHER error propagates. Previously every error collapsed to 0 (true-10 audit
+/// 2026-07-09): a transient misread (I/O, SQLITE_BUSY) then both skipped the newer-schema guard and
+/// re-applied ALL migrations — failing at v2's ADD COLUMN with "duplicate column name", a startup
+/// error pointing nowhere near the real transient cause.
 pub fn get_current_version(db: &Database) -> AppResult<i64> {
     let result: Result<i64, _> =
         db.connection().query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row.get(0));
-    Ok(result.unwrap_or(0))
+    match result {
+        Ok(version) => Ok(version),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg))) if msg.contains("no such table") => Ok(0),
+        Err(e) => Err(crate::error::AppError::Other(format!(
+            "could not read the schema version (transient database error, NOT a fresh database): {e}"
+        ))),
+    }
 }
 
 fn ensure_migrations_table(db: &Database) -> AppResult<()> {
@@ -666,6 +676,26 @@ pub static MIGRATIONS: &[Migration] = &[
                  );
                  INSERT OR IGNORE INTO loop0_evidence_archive (id) VALUES (1);",
         down_sql: Some("DROP TABLE IF EXISTS loop0_evidence_archive;"),
+    },
+    Migration {
+        version: 34,
+        description: "C4 auto-accept evidence archive — survives segment deletion (precision not survivor-biased)",
+        // Same bug class v33 fixed for the C5 gate, applied to the C4 denominator (true-10 audit
+        // 2026-07-09): decision_verdicts CASCADE-deletes with its segment, so deleting a reviewed
+        // bad clip removed exactly the T0_ACCEPT rows whose humans CONTRADICTED the machine — the C4
+        // auto-accept precision (the gate that authorizes raising the autonomy dial) could only
+        // drift optimistic. Before a segment is deleted, its decision_verdicts row + human-decision
+        // correlation are folded into this durable counter row, and intelligence_report adds it to
+        // the live counts. One row (id=1), seeded here.
+        up_sql: "CREATE TABLE IF NOT EXISTS c4_evidence_archive (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     t0_accepts INTEGER NOT NULL DEFAULT 0,
+                     t1_escalations INTEGER NOT NULL DEFAULT 0,
+                     t0_human_confirmed INTEGER NOT NULL DEFAULT 0,
+                     t0_human_contradicted INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT OR IGNORE INTO c4_evidence_archive (id) VALUES (1);",
+        down_sql: Some("DROP TABLE IF EXISTS c4_evidence_archive;"),
     },
 ];
 

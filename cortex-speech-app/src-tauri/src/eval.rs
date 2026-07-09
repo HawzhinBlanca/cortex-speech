@@ -131,6 +131,26 @@ pub fn create_gold_from_verified_file(db: &Database, audio_path: &str) -> AppRes
         )));
     }
 
+    // COMPLETENESS GUARD (true-10 audit 2026-07-09): the same hazard the reject guard describes,
+    // from the other side — an UNREVIEWED chunk's speech is in the holdout WAV but its text is
+    // missing from the concatenated reference, so every future engine benchmark scores those spans
+    // as spurious insertions, permanently inflating WER/CER on the very yardstick the promotion
+    // gate measures against. Refuse until every chunk of the file carries a human decision;
+    // import_verified_segments_as_gold skips incomplete files via its warn-and-continue path.
+    let unreviewed: i64 = db.connection().query_row(
+        "SELECT COUNT(*) FROM speech_segments
+         WHERE audio_path = ?1 AND (human_decision IS NULL OR human_decision = '')",
+        params![audio_path],
+        |row| row.get(0),
+    )?;
+    if unreviewed > 0 {
+        return Err(crate::error::AppError::Validation(format!(
+            "'{audio_path}' has {unreviewed} unreviewed chunk(s) — their speech would be in the holdout \
+             WAV but missing from the reference (every eval then scores spurious insertions); review \
+             every chunk of the file before promoting it to gold"
+        )));
+    }
+
     let mut stmt = db.connection().prepare(
         // Preference order MUST match the training/eval hypothesis surface form (quality::hypothesis_
         // transcript is RAW ASR, with digits): verdict_transcript (human-decided) ▸ annotated_transcript
@@ -269,6 +289,10 @@ pub fn export_gold_eval_set(db: &Database, out_dir: &std::path::Path) -> AppResu
         exported += 1;
     }
     manifest.flush().map_err(crate::error::AppError::Io)?;
+    drop(manifest);
+    // Integrity over the manifest + every clip: a truncated/partially-copied gold WAV would silently
+    // corrupt the yardstick every promotion decision measures against (true-10 audit 2026-07-09).
+    crate::export::write_sha256sums(out_dir)?;
 
     Ok(GoldEvalExport {
         manifest_path: manifest_path.to_string_lossy().into_owned(),
@@ -347,6 +371,21 @@ pub fn export_finetune_pack(
     let mut manifest =
         std::io::BufWriter::new(std::fs::File::create(&manifest_path).map_err(crate::error::AppError::Io)?);
 
+    // Sibling counts over the WHOLE library (not just verified rows): a segment whose alignment is
+    // offset-less may only fall back to whole-file decode when its source truly has one segment —
+    // on a multi-segment source that fallback shipped the entire recording as one "clip" (true-10
+    // audit 2026-07-09; decode_finetuned_clip_16k enforces it, this map supplies the context).
+    let sibling_counts: std::collections::HashMap<String, i64> = {
+        let mut stmt = db
+            .connection()
+            .prepare("SELECT audio_path, COUNT(*) FROM speech_segments GROUP BY audio_path")
+            .map_err(crate::error::AppError::from)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(crate::error::AppError::from)?;
+        rows.collect::<Result<_, _>>().map_err(crate::error::AppError::from)?
+    };
+
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut emitted = 0usize;
     let mut skipped = 0usize;
@@ -366,8 +405,18 @@ pub fn export_finetune_pack(
             skipped += 1;
             continue;
         }
-        let pcm = match crate::commands::decode_finetuned_clip_16k(&seg.audio_path, seg.alignment_json.as_deref()) {
+        let single_segment_source = sibling_counts.get(&seg.audio_path).copied().unwrap_or(1) <= 1;
+        let pcm = match crate::commands::decode_finetuned_clip_16k(
+            &seg.audio_path,
+            seg.alignment_json.as_deref(),
+            single_segment_source,
+        ) {
             Ok(pcm) if !pcm.is_empty() => pcm,
+            Err(reason) => {
+                tracing::warn!("finetune pack: skipping {} ({reason})", seg.id);
+                skipped += 1;
+                continue;
+            }
             _ => {
                 tracing::warn!("finetune pack: skipping {} (clip undecodable)", seg.id);
                 skipped += 1;
@@ -410,6 +459,10 @@ pub fn export_finetune_pack(
     let provenance_text = serde_json::to_string_pretty(&provenance)
         .map_err(|e| crate::error::AppError::Other(format!("pack provenance serialize: {e}")))?;
     std::fs::write(out_dir.join("pack_provenance.json"), &provenance_text).map_err(crate::error::AppError::Io)?;
+    // Integrity over EVERY pack file (clips included), written last so it also covers the provenance
+    // record: manifestSha256 alone pins the rows but not the audio bytes — a truncated/partially-
+    // copied WAV was undetectable while the manifest SHA stayed green (true-10 audit 2026-07-09).
+    crate::export::write_sha256sums(out_dir)?;
     if let Some(ledger) = corpus_ledger_path {
         use std::io::Write as _;
         let line = serde_json::to_string(&provenance)
@@ -961,7 +1014,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        // An UNREVIEWED segment of the same file must be excluded from the gold reference.
+        // True-10 audit 2026-07-09 CONTRACT CHANGE: an unreviewed segment of the same file no longer
+        // silently drops out of the reference (its speech would stay in the holdout WAV unlabeled,
+        // scoring spurious insertions on every eval) — promotion now REFUSES the incomplete file.
         db.insert_segment(&crate::db::SpeechSegment {
             id: "c3".to_string(),
             audio_path: "/clips/nawras.wav".to_string(),
@@ -969,17 +1024,27 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        let err = create_gold_from_verified_file(&db, "/clips/nawras.wav").unwrap_err();
+        assert!(err.to_string().contains("unreviewed chunk"), "incomplete file is refused: {err}");
 
+        // Review the last chunk (with a later timestamp so order is deterministic) — now it promotes
+        // and the reference includes EVERY chunk's speech, in time order.
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET human_decision='edit', verdict_transcript='ناوەندی نوێ',
+                 created_at='2020-01-01 00:00:03' WHERE id='c3'",
+                [],
+            )
+            .unwrap();
         let created = create_gold_from_verified_file(&db, "/clips/nawras.wav").unwrap();
         assert_eq!(created, 1, "one whole-file gold entry");
         let gold = list_gold_segments(&db).unwrap();
         assert_eq!(gold.len(), 1);
         assert!(gold[0].is_holdout, "gold must be holdout so the learning loop never trains on it");
         assert_eq!(
-            gold[0].reference, "ساڵی نوێ پیرۆز بەخێربێیت بۆ کوردستان",
-            "corrected segments are concatenated in time order"
+            gold[0].reference, "ساڵی نوێ پیرۆز بەخێربێیت بۆ کوردستان ناوەندی نوێ",
+            "corrected segments are concatenated in time order, covering every chunk"
         );
-        assert!(!gold[0].reference.contains("unreviewed"), "unreviewed segments are excluded");
 
         // A file with no reviewed segments errors (correct it in the app first).
         assert!(create_gold_from_verified_file(&db, "/clips/missing.wav").is_err());
@@ -1190,6 +1255,67 @@ mod tests {
     }
 
     #[test]
+    fn finetune_pack_refuses_offsetless_alignment_on_multi_segment_sources() {
+        // True-10 audit 2026-07-09 MAJOR: a chunk whose alignment_json is present but offset-less
+        // (the historically-shipped clobber wrote word-array-only blobs) used to collapse into the
+        // whole-file decode branch — the ENTIRE recording shipped as one "clip" labeled with a
+        // single sentence, while the HF exporter correctly skipped the same row. On a MULTI-segment
+        // source the pack must skip it; a truly single-segment source may still mean whole-file.
+        let db = open_mem_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wav = tmp.path().join("multi.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+            for i in 0..32000i32 {
+                w.write_sample(((i % 100) - 50) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let path = wav.to_string_lossy().to_string();
+        // Chunk with intact offsets: emits.
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "intact".into(),
+            audio_path: path.clone(),
+            raw_transcript: "چاکە".into(),
+            alignment_json: Some(
+                r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":2}"#.into(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+        db.update_verified("intact", true).unwrap();
+        // Sibling chunk whose offsets were clobbered to a bare word array: must be SKIPPED,
+        // never shipped as the whole recording.
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "clobbered".into(),
+            audio_path: path.clone(),
+            raw_transcript: "خراپ".into(),
+            alignment_json: Some(r#"[{"word":"خراپ","start":0.0,"end":0.5,"confidence":0.9}]"#.into()),
+            ..Default::default()
+        })
+        .unwrap();
+        db.update_verified("clobbered", true).unwrap();
+
+        let out = tempfile::TempDir::new().unwrap();
+        let result = export_finetune_pack(&db, out.path(), None).unwrap();
+        assert_eq!(result.emitted, 1, "only the offset-intact chunk ships");
+        assert_eq!(result.skipped, 1, "the clobbered chunk is skipped and counted");
+        assert!(!out.path().join("clips/clobbered.wav").exists(), "no whole-recording clip is ever written");
+        let manifest = std::fs::read_to_string(out.path().join("finetune_manifest.jsonl")).unwrap();
+        assert!(!manifest.contains("خراپ"), "the clobbered row's sentence never enters the manifest");
+        // The pack now carries integrity sums over every file (clips included).
+        let sums = std::fs::read_to_string(out.path().join("SHA256SUMS")).unwrap();
+        assert!(sums.contains("finetune_manifest.jsonl"));
+        assert!(sums.contains("clips/intact.wav"), "clip bytes are integrity-pinned: {sums}");
+    }
+
+    #[test]
     fn finetune_pack_refuses_mark_bad_and_severe_audio_rows() {
         // B1 (true-10 audit blocker): verified=true alone must NOT admit a row. Mark-bad sets
         // verified=true merely to leave the review queue, so without the rubric guard a human-
@@ -1352,6 +1478,44 @@ mod tests {
         assert_eq!(gold.len(), 1);
         assert_eq!(gold[0].audio_path, "/clips/clean.wav");
         assert!(!gold[0].reference.contains("WRONG DRAFT"), "the rejected draft never reaches a gold reference");
+    }
+
+    #[test]
+    fn gold_promotion_refuses_partially_reviewed_files() {
+        // True-10 audit 2026-07-09: the same hazard as the reject guard, from the other side — an
+        // UNREVIEWED chunk's speech is in the holdout WAV but its text is missing from the
+        // concatenated reference, so every future engine benchmark scores those spans as spurious
+        // insertions, permanently inflating WER/CER on the promotion yardstick. Refuse until every
+        // chunk carries a decision; the bulk promoter skips the incomplete file without failing.
+        let db = open_mem_db();
+        for (id, decision) in [("p1", Some("accept")), ("p2", None), ("p3", Some("edit"))] {
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: id.to_string(),
+                audio_path: "/clips/partial.wav".to_string(),
+                raw_transcript: "draft".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            if let Some(d) = decision {
+                db.connection()
+                    .execute(
+                        "UPDATE speech_segments SET human_decision=?2, verdict_transcript='fix' WHERE id=?1",
+                        params![id, d],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let err = create_gold_from_verified_file(&db, "/clips/partial.wav").unwrap_err();
+        assert!(err.to_string().contains("unreviewed chunk"), "refusal explains the reason: {err}");
+        assert!(list_gold_segments(&db).unwrap().is_empty(), "no incomplete gold reference is minted");
+
+        // Reviewing the last chunk unblocks promotion.
+        db.connection()
+            .execute("UPDATE speech_segments SET human_decision='accept', verdict_transcript='mid' WHERE id='p2'", [])
+            .unwrap();
+        let created = create_gold_from_verified_file(&db, "/clips/partial.wav").unwrap();
+        assert_eq!(created, 1, "a fully-reviewed file promotes");
     }
 
     #[test]

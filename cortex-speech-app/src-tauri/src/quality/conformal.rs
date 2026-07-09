@@ -88,6 +88,35 @@ pub fn calibrate_threshold(scored: &[(f64, f64)], target_error: f64, confidence_
     (best_threshold, best_bound, true)
 }
 
+/// The MINIMUM calibration-set size at which the Bonferroni-corrected Hoeffding bound can reach
+/// `target_error` even with PERFECT data (empirical risk 0): the smallest n satisfying
+/// `sqrt(ln(n/delta) / (2n)) <= target_error`, via the fixed point `n = ln(n/delta) / (2t²)`.
+///
+/// Why this exists (true-10 audit 2026-07-09): at the shipped T0 constants (target 5% CER,
+/// per-bucket delta 0.02) this is ≈2,334 perfectly-transcribed verified clips PER SNR BUCKET —
+/// the gate is mathematically unreachable at a single user's realistic volumes, and nothing said
+/// so. The intelligence report now surfaces this distance honestly instead of the user just
+/// experiencing "the jury escalates everything" with no visible reason. This function deliberately
+/// does NOT loosen anything — the gate's conservatism is correct; its opacity was the bug.
+pub fn min_calibration_n(target_error: f64, delta: f64) -> usize {
+    if target_error <= 0.0 {
+        return usize::MAX;
+    }
+    let delta = delta.max(1e-9);
+    let t2 = 2.0 * target_error * target_error;
+    // Fixed-point iteration; converges in a handful of steps for every realistic input.
+    let mut n = 100.0_f64;
+    for _ in 0..64 {
+        let next = ((n / delta).ln() / t2).max(10.0);
+        if (next - n).abs() < 0.5 {
+            n = next;
+            break;
+        }
+        n = next;
+    }
+    n.ceil() as usize
+}
+
 /// Calibrates the conformal threshold using verified segments as the calibration set.
 /// If there are fewer than 10 verified segments, it falls back to a default heuristic.
 pub fn calibrate_and_certify(
@@ -210,6 +239,22 @@ mod tests {
         let (t, _b, cal) = calibrate_threshold(&scored, 0.4, 0.90);
         assert!(cal, "30 clean spread points should calibrate at target 0.4");
         assert!(t > 0.0);
+    }
+
+    #[test]
+    fn min_calibration_n_matches_the_shipped_gate_distance() {
+        // At the shipped T0 constants (5% target, Bonferroni per-bucket delta 0.02) the certify
+        // condition needs ~2,334 zero-CER verified clips in ONE bucket — pin the order of magnitude
+        // so a constants change is reflected in the surfaced distance, and sanity-check the bound:
+        // at n = min_n the Hoeffding term must be <= target, and at n/2 it must not be.
+        let n = min_calibration_n(0.05, 0.02);
+        assert!((2_000..3_000).contains(&n), "expected ~2,334, got {n}");
+        let hoeff = |k: f64| ((k / 0.02_f64).ln() / (2.0 * k)).sqrt();
+        assert!(hoeff(n as f64) <= 0.05 + 1e-9);
+        assert!(hoeff(n as f64 / 2.0) > 0.05);
+        // A lenient target is reachable with far less data — the honest "on-ramp" the report shows.
+        assert!(min_calibration_n(0.15, 0.02) < 300);
+        assert_eq!(min_calibration_n(0.0, 0.02), usize::MAX, "zero target is never reachable");
     }
 
     #[test]

@@ -48,7 +48,7 @@ pub struct DatasetComposition {
 }
 
 /// Aggregate per-speaker segment/duration counts and the dominant speaker's share of total duration.
-fn compute_composition(segments: &[SpeechSegment]) -> DatasetComposition {
+pub(crate) fn compute_composition(segments: &[SpeechSegment]) -> DatasetComposition {
     use std::collections::HashMap;
     let mut by_speaker: HashMap<String, (usize, i64)> = HashMap::new();
     let mut total: i64 = 0;
@@ -67,6 +67,28 @@ fn compute_composition(segments: &[SpeechSegment]) -> DatasetComposition {
     let dominant_speaker_share =
         if total > 0 { speakers.first().map(|s| s.duration_ms as f64 / total as f64).unwrap_or(0.0) } else { 0.0 };
     DatasetComposition { dominant_speaker_over_50pct: dominant_speaker_share > 0.5, dominant_speaker_share, speakers }
+}
+
+/// Markdown rendering of the composition for the HUMAN-READABLE dataset cards (HF README.md and the
+/// bundle's dataset_card.md). The skew warning is a stated fine-tune quality lever, but it previously
+/// reached only dataset.json — the two artifacts actually called dataset cards omitted it, so a
+/// consumer of the HF directory never saw the imbalance (true-10 audit 2026-07-09).
+pub(crate) fn composition_markdown(comp: &DatasetComposition) -> String {
+    let mut md = String::from("\n## Speaker Composition\n| Speaker | Segments | Duration (s) |\n|---|---|---|\n");
+    for s in &comp.speakers {
+        let speaker = s.speaker_id.replace('|', "\\|");
+        md.push_str(&format!("| {} | {} | {:.1} |\n", speaker, s.segments, s.duration_ms as f64 / 1000.0));
+    }
+    md.push_str(&format!(
+        "\nDominant speaker share of total duration: {:.1}%{}\n",
+        comp.dominant_speaker_share * 100.0,
+        if comp.dominant_speaker_over_50pct {
+            " — WARNING: one speaker exceeds 50% of the corpus; consider balancing before fine-tuning."
+        } else {
+            ""
+        }
+    ));
+    md
 }
 
 #[derive(serde::Serialize)]
@@ -563,7 +585,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// `sha256sum -c SHA256SUMS`. Lines are `<hex>  <relative/path>`, sorted by path with
 /// forward slashes, deterministic regardless of filesystem walk order. Excludes the
 /// `SHA256SUMS` file itself and any `.tmp` staging files.
-fn write_sha256sums(dir: &std::path::Path) -> AppResult<()> {
+///
+/// pub(crate): the fine-tune pack, gold eval-set, and production bundle reuse this — a truncated/
+/// corrupted clip (this machine's ledger root-caused an LTO failure to large-file I/O corruption)
+/// was undetectable while a manifest-only SHA stayed green (true-10 audit 2026-07-09).
+pub(crate) fn write_sha256sums(dir: &std::path::Path) -> AppResult<()> {
     fn collect(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) -> AppResult<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
@@ -940,7 +966,7 @@ The `transcription` column is orthographically canonicalized for Sorani: Arabic-
 variants are unified (Kaf ك→ک, Yeh ي→ی, Heh→ھ/ە forms; tatweel/ZWNJ folded) so each grapheme has
 one form across human-typed and ASR-produced text. Digits are preserved exactly as written (no
 number verbalization), and diacritics are left untouched.
-"#,
+{composition_md}"#,
         settings.hf_license,
         settings.hf_license,
         env!("CARGO_PKG_VERSION"),
@@ -953,7 +979,21 @@ number verbalization), and diacritics are left untouched.
         test_count,
         test_secs,
         total_count,
-        total_secs
+        total_secs,
+        composition_md = {
+            // Composition of the rows ACTUALLY exported (post drop-unavailable), so the card
+            // describes the shipped dataset, not the pre-filter library.
+            let exported_id_set: std::collections::HashSet<&str> =
+                train_ids.iter().chain(val_ids.iter()).chain(test_ids.iter()).map(String::as_str).collect();
+            let exported: Vec<SpeechSegment> = train_segs
+                .iter()
+                .chain(val_segs.iter())
+                .chain(test_segs.iter())
+                .filter(|s| exported_id_set.contains(s.id.as_str()))
+                .cloned()
+                .collect();
+            composition_markdown(&compute_composition(&exported))
+        }
     );
     write_text_atomic(&dir.join("README.md"), &readme)?;
 

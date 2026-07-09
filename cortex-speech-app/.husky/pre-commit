@@ -1,4 +1,7 @@
 npx lint-staged
-cd src-tauri && cargo check 2>&1 | tail -5
+# No pipe on cargo check (true-10 audit 2026-07-09): `cargo check | tail -5` reported tail's exit 0,
+# so a compile-broken backend committed cleanly while the hook printed "passed" — a gate that lies.
+# --quiet keeps the hook readable; the exit code now propagates and aborts the commit.
+(cd src-tauri && cargo check --quiet)
 echo "---"
 echo "Pre-commit checks passed. Run 'npm run test' and 'cargo test' before pushing."

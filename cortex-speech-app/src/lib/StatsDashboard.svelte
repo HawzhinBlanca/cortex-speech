@@ -204,16 +204,22 @@
   // — one disk failure loses both. This copies the whole library to a folder the owner chooses (an
   // external drive, a synced folder), into a timestamped file so successive backups never collide.
   async function backupToFolder() {
+    let verifiedCount = 0;
     const r = await pickDirAnd('backup', async (dir) => {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
       const sep = dir.includes('\\') ? '\\' : '/';
       const base = dir.endsWith(sep) ? dir : `${dir}${sep}`;
       const dest = `${base}cortex-speech-backup-${stamp}.db`;
-      await api.dbBackup(dest);
+      // The backend verifies the WRITTEN file (integrity + count) — surface that proof in the toast
+      // so "backup done" always means "backup verified" (true-10 audit 2026-07-09).
+      const verified = await api.dbBackup(dest);
+      verifiedCount = verified.segmentCount;
       return dest;
     });
     if (r) {
-      notifications.success($t('stats.backupDone').replace('{path}', r));
+      notifications.success(
+        `${$t('stats.backupDone').replace('{path}', r)} — ${$t('stats.backupVerified', { count: String(verifiedCount) })}`,
+      );
     }
   }
 
@@ -736,17 +742,27 @@
         </h3>
         <div class="grid grid-cols-2 gap-2">
           <div class="bg-cortex-800/30 rounded-lg p-2">
+            <!-- Emerald ONLY when the gate has actually been exercised (some would-fire evidence
+                 exists): an evidence-free 0 rendered green visually asserted the C5 "over-triggers
+                 must be 0" go-live gate was passing when there was no evidence at all (true-10
+                 audit 2026-07-09). Neutral until wouldFire > 0. -->
             <div
-              class="text-sm font-bold {intel.loop0Shadow.firedButHumanAcceptedOriginal === 0
-                ? 'text-emerald-300'
-                : 'text-red-300'}"
+              class="text-sm font-bold {intel.loop0Shadow.wouldFire === 0
+                ? 'text-cortex-400'
+                : intel.loop0Shadow.firedButHumanAcceptedOriginal === 0
+                  ? 'text-emerald-300'
+                  : 'text-red-300'}"
               data-testid="loop0-overtriggers"
             >
-              {intel.loop0Shadow.firedButHumanAcceptedOriginal}
+              {intel.loop0Shadow.wouldFire === 0
+                ? '—'
+                : intel.loop0Shadow.firedButHumanAcceptedOriginal}
             </div>
             <div class="text-[10px] text-cortex-400">
               {$t('stats.loop0OverTriggers')} ({intel.loop0Shadow.wouldFire}/{intel.loop0Shadow
-                .totalObservations} {$t('stats.loop0WouldFire')})
+                .totalObservations} {$t('stats.loop0WouldFire')}{intel.loop0Shadow.wouldFire === 0
+                ? ` · ${$t('stats.noEvidenceYet')}`
+                : ''})
             </div>
           </div>
           <div class="bg-cortex-800/30 rounded-lg p-2">
@@ -770,6 +786,24 @@
             </div>
           </div>
         </div>
+        {#if intel.conformalCalibration}
+          <!-- Honest distance-to-calibration: why the jury escalates everything today, and how far
+               auto-accept is per acoustic bucket at the shipped 5%-CER gate (true-10 audit C3). -->
+          <div class="bg-cortex-800/30 rounded-lg p-2" data-testid="conformal-progress">
+            <div class="text-[10px] text-cortex-400 mb-1">
+              {$t('stats.conformalProgress', {
+                n: String(intel.conformalCalibration.minNeededAtZeroCer),
+              })}
+            </div>
+            <div class="flex flex-wrap gap-x-3 gap-y-0.5">
+              {#each intel.conformalCalibration.buckets as b (b.bucket)}
+                <span class="text-[10px] text-cortex-500">
+                  <bdi>{b.bucket}</bdi>: {b.verifiedWithReference}/{b.minNeededAtZeroCer}
+                </span>
+              {/each}
+            </div>
+          </div>
+        {/if}
       </div>
     {/if}
 

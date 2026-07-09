@@ -985,12 +985,34 @@ pub fn transcribe_segment_constrained(
 /// window decoder, early-stopping once past the window. Falls back to a whole-file decode when there is
 /// no window (a single-segment file, which is small). Fixes the per-clip fine-tuned re-transcribe
 /// failing with "audio too large to decode in one pass" on long recordings.
-pub(crate) fn decode_finetuned_clip_16k(audio_path: &str, alignment_json: Option<&str>) -> Result<Vec<i16>, String> {
-    let meta = alignment_json.and_then(crate::chunking::SegmentSourceMeta::from_alignment_json);
-    let Some(meta) = meta else {
+pub(crate) fn decode_finetuned_clip_16k(
+    audio_path: &str,
+    alignment_json: Option<&str>,
+    // ALIGNMENT PRESENT BUT OFFSET-LESS is ambiguous: a legitimately-aligned SINGLE-segment file
+    // carries `{"words":[...]}` with no source offsets (whole-file decode is CORRECT), while a
+    // clobbered CHUNK of a multi-segment source carries the same shape (whole-file decode ships the
+    // entire recording as one "clip" — the true-10 audit's training-data-corruption major, the exact
+    // shape the HF/audio exporters refuse). Only the CALLER can tell them apart, by whether the
+    // source has sibling segments in the DB — so it must say whether whole-file is permitted.
+    allow_whole_file_without_offsets: bool,
+) -> Result<Vec<i16>, String> {
+    let whole_file = || -> Result<Vec<i16>, String> {
         let (rate, pcm) = crate::audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
         let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, pcm).map_err(|e| e.to_string())?;
-        return Ok(pcm16);
+        Ok(pcm16)
+    };
+    let Some(alignment) = alignment_json.map(str::trim).filter(|a| !a.is_empty()) else {
+        // Truly absent alignment: a single-segment import — whole file is the clip.
+        return whole_file();
+    };
+    let Some(meta) = crate::chunking::SegmentSourceMeta::from_alignment_json(alignment) else {
+        if allow_whole_file_without_offsets {
+            return whole_file();
+        }
+        return Err("alignment_json is present but carries no source offsets (a legacy/clobbered \
+                    word-array blob) on a multi-segment source — refusing the whole-file fallback; \
+                    re-import the file through the current build to regenerate its slice offsets"
+            .to_string());
     };
     let start_ms = meta.source_start_ms.max(0);
     let end_ms = meta.source_end_ms.max(start_ms);
@@ -1062,6 +1084,7 @@ pub fn verify_finetuned_model_integrity() -> Result<String, String> {
 pub fn transcribe_segment_finetuned(
     audio_path: String,
     alignment_json: Option<String>,
+    state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("transcribe_segment_finetuned")?;
     validate::validate_file_path(&audio_path)?;
@@ -1069,13 +1092,30 @@ pub fn transcribe_segment_finetuned(
         validate::validate_alignment_json(aj)?;
     }
     let (onnx, vocab) = resolve_finetuned_paths()?;
+    // Offset-less alignment is only whole-file-safe when this source has NO sibling chunks (see
+    // decode_finetuned_clip_16k): on a multi-segment source it would silently re-transcribe the
+    // entire recording into one segment (true-10 audit 2026-07-09).
+    let sibling_count: i64 = {
+        let db = state.lock_db();
+        db.connection()
+            .query_row(
+                "SELECT COUNT(*) FROM speech_segments WHERE audio_path = ?1",
+                rusqlite::params![audio_path],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?
+    };
     // Decode ONLY this segment's clip window (16 kHz). Every VAD chunk shares the whole-source
     // audio_path with its range in alignment_json; decoding the WHOLE source first (the old path) failed
     // on long recordings ("audio too large to decode in one pass") even though the clip is a few
     // seconds. The windowed decode reads just the clip, so re-transcribe works on any source length.
-    let clip = decode_finetuned_clip_16k(&audio_path, alignment_json.as_deref())?;
-    let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
-    let text = crate::wav2vec2_asr::run_wav2vec2(&onnx, &vocab, "ckb", &audio)?;
+    let clip = decode_finetuned_clip_16k(&audio_path, alignment_json.as_deref(), sibling_count <= 1)?;
+    // Route through the pipeline's shared windowed wrapper, NOT run_wav2vec2 directly: the model is
+    // trained on short utterances and a single unbounded pass over >15 s (a raised max-segment
+    // setting, or a whole-file/no-meta clip) duplicates text — the pipeline path sub-splits into
+    // ~15 s windows for exactly that reason (true-10 audit 2026-07-09: one engine, two call paths,
+    // two different qualities).
+    let text = crate::pipeline::ProcessingPipeline::transcribe_chunk_finetuned(&onnx, &vocab, &clip)?;
     Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
 }
 
@@ -2331,10 +2371,55 @@ pub fn db_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> 
 }
 
 #[tauri::command]
-pub fn db_backup(dest: String, state: State<'_, AppState>) -> Result<(), String> {
+pub fn db_backup(dest: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let validated = validate::validate_output_path(&dest)?;
-    let db = state.lock_db();
-    db.backup(&validated).map_err(|e| e.to_string())
+    // Dedicated connection (true-10 audit 2026-07-09): holding the global DB mutex for the whole
+    // online backup froze every DB-touching command for the full copy duration on a slow external
+    // drive — the periodic snapshot path already uses its own connection; so does this now.
+    let db_path = {
+        let db = state.lock_db();
+        db.path().to_string()
+    };
+    let backup_db = crate::db::Database::open(&db_path).map_err(|e| e.to_string())?;
+    backup_db.backup(&validated).map_err(|e| e.to_string())?;
+    // Verify the file we WROTE — an off-disk "disaster copy" that is itself bad (destination volume
+    // corruption) must fail the backup NOW, not at the disaster. Read-only open: never mutate it.
+    let conn = rusqlite::Connection::open_with_flags(
+        &validated,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("backup written but could not be opened for verification: {e}"))?;
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| format!("backup written but failed verification: {e}"))?;
+    if integrity != "ok" {
+        return Err(format!("backup written but FAILED integrity check: {integrity}"));
+    }
+    let segment_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM speech_segments", [], |row| row.get(0))
+        .map_err(|e| format!("backup written but could not count segments: {e}"))?;
+    Ok(serde_json::json!({ "integrityOk": true, "segmentCount": segment_count }))
+}
+
+/// Shared restore precondition (true-10 audit 2026-07-09): refuse while an import/batch worker may
+/// be writing, and pin a rotation-exempt copy of the CURRENT live DB first so a mis-restore of the
+/// wrong snapshot is itself recoverable (previously only from a ≤10-min rolling snapshot that
+/// rotated out within ~100 minutes).
+fn prepare_restore(state: &State<'_, AppState>) -> Result<(), String> {
+    if state.writers_active() {
+        return Err("An import or batch operation is running — cancel it or let it finish before \
+                    restoring. Restoring mid-write would mix pre-restore rows into the restored \
+                    library and re-arm stale undo history."
+            .to_string());
+    }
+    if let Some(data_dir) = state.lock_data_dir().clone() {
+        let db = state.lock_db();
+        match crate::snapshot::take_pinned_snapshot(&db, &data_dir, "prerestore", 3) {
+            Ok(path) => tracing::info!("pre-restore snapshot pinned at {}", path.display()),
+            Err(e) => tracing::warn!("pre-restore snapshot failed (continuing with restore): {e}"),
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2343,6 +2428,7 @@ pub fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), String>
     // database (PRAGMA integrity_check on open verifies this). This completes the backup/restore
     // pair so the app is never at risk of data loss mid-import or mid-review.
     let validated = validate::validate_file_path(&src)?;
+    prepare_restore(&state)?;
     {
         let mut db = state.lock_db();
         db.restore(&validated).map_err(|e| e.to_string())?;
@@ -2353,6 +2439,17 @@ pub fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), String>
       // undo can never cross the restore boundary.
     state.lock_history().clear();
     Ok(())
+}
+
+/// Release the quarantine prune-pin EXPLICITLY: archive every `*.corrupt.*` artifact into
+/// `<data_dir>/quarantine/` (bytes stay salvageable via `.recover`) so pruning resumes. Previously
+/// the pin had NO in-app release — snapshots accumulated a full DB copy every 10 minutes forever
+/// (true-10 audit 2026-07-09). Returns how many files were archived.
+#[tauri::command]
+pub fn acknowledge_quarantine(state: State<'_, AppState>) -> Result<usize, String> {
+    STRICT_RATE_LIMITER.check("acknowledge_quarantine")?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    crate::snapshot::acknowledge_quarantine(&data_dir).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2419,6 +2516,7 @@ pub fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Res
     if !src.is_file() {
         return Err(format!("snapshot '{name}' has no database file"));
     }
+    prepare_restore(&state)?;
     {
         let mut db = state.lock_db();
         db.restore(&src).map_err(|e| e.to_string())?;
@@ -2899,6 +2997,20 @@ fn run_wsl_refinement_loop(
                 match db.update_asr_transcript_if_unreviewed(id, &raw_transcript, normalized.as_deref(), confidence) {
                     Ok(true) => {
                         transcribed += 1;
+                        // Record the champion's provenance hypothesis like BOTH other 7B paths do
+                        // (import pass + single re-transcribe) — without it the review badge cannot
+                        // name the producing engine for batch-refined segments and the jury lacks
+                        // the champion's highest-weight vote for exactly these clips (true-10 audit
+                        // 2026-07-09). Best-effort: a provenance-write failure must not fail the
+                        // (successful) transcription.
+                        if let Err(e) = db.insert_hypothesis(&crate::db::SegmentHypothesis {
+                            segment_id: id.to_string(),
+                            model_id: "omniasr-wsl-7b".to_string(),
+                            transcript: raw_transcript.clone(),
+                            confidence,
+                        }) {
+                            tracing::warn!("could not record omniasr-wsl-7b provenance for {id}: {e}");
+                        }
                         emit_or_log(
                             app,
                             "wsl-log",

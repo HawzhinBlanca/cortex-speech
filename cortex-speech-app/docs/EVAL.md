@@ -10,7 +10,7 @@ via the warm server (`scripts/scorecard_7b.py`, no second model load):
 
 | Set | 7B micro CER | N | Notes |
 |---|:--:|:--:|---|
-| Committed CC-BY FLEURS `ckb` fixture (clean) | **29.33%** | 1 | single clip — indicative only |
+| Committed CC-BY FLEURS `ckb` fixture (clean) | **29.33%** | 1 | single clip — indicative only; ALSO computed by the pre-2026-07-07 space-STRIPPED `scorecard_7b.py` (see caveat), so not comparable to the space-kept 21%/29.4% numbers below |
 | ~~Halwest verified 16 kHz set~~ | ~~59.45%~~ | ~~66~~ | ~~**data-artifact-inflated — see appendix**~~ |
 
 **Honest reading — the 60% is the DATA, not the engine.** On the Halwest verified set the 7B scored
@@ -19,10 +19,14 @@ and that harness's content-overlap proxy flags most clips as **"drifted"** (ref 
 boundaries misaligned: the manifest splits text by character offset while audio is split by time, so
 each clip's audio contains different words than its reference row). Both engines score ~60% because the
 reference doesn't match the audio — the set is **unusable for an absolute CER**. By eye the 7B output is
-coherent, correct Sorani. Net: the 7B is **not broken and is on-par-to-slightly-better than stock** on
-identical data; a trustworthy **publishable** 7B CER still needs a boundary-aligned gold set (the clean
-FLEURS is N=1; the original N=900 corpus that produced the fine-tuned 21% below is not on disk). The
-default stays the 7B (owner's choice); the app now fails hard rather than silently downgrading (F2).
+coherent, correct Sorani. Net (corrected 2026-07-09): the 7B is **not broken** — the *by-eye* read
+(coherent, correct Sorani) is solid. **The engine remains UNMEASURED against stock on a valid basis:**
+the numeric "on-par-to-slightly-better than stock" read is **retracted** here — the caveat below shows
+the 7B and stock numbers were computed on different CER bases (space-stripped vs space-kept), so they
+cannot be compared, and the whole set is reference-drifted anyway. A trustworthy 7B CER still needs a
+boundary-aligned gold set (the clean FLEURS is N=1, and itself space-stripped; the original N=900 corpus
+that produced the fine-tuned 21% below is not on disk). The default stays the 7B (owner's choice); the
+app now fails hard rather than silently downgrading (F2).
 
 > **⚠️ CER-definition caveat (added 2026-07-07).** The 7B **59.45%** above came from `scorecard_7b.py`
 > *before* its 2026-07-07 fix, which computed CER on **whitespace-STRIPPED** text (space-insensitive),
@@ -262,7 +266,7 @@ starting line.
 
 **Reason for retirement:** The 66-clip set exhibits **boundary-drift** (ref text ↔ audio boundaries misaligned). The manifest was built by splitting source text at character offsets, while the audio clips were split at time boundaries, so most clips' audio contains **different words** than their reference rows. The resulting high error rates (~60% for both engines) measure the boundary mismatch, not the engines' actual accuracy. This is a **data artifact, not a signal about model quality**.
 
-**Honest reading:** Both engines score ~60% on this set because the references are wrong. By inspection, the 7B output is coherent, correct Sorani — on-par with or slightly better than stock on the identical audio. The set is **unusable for trustworthy CER measurement**.
+**Honest reading:** Both engines score ~60% on this set because the references are wrong. By inspection, the 7B output is coherent, correct Sorani. The set is **unusable for trustworthy CER measurement**, so NO numeric 7B-vs-stock comparison is drawn from it (the earlier "on-par with or slightly better than stock" numeric read was retracted 2026-07-09 — the two numbers used different CER bases; only the by-eye "coherent, correct Sorani" observation stands).
 
 **Implication:** The default 7B engine remains unmeasured on a boundary-aligned gold set. The app now fails hard on unresolvable WSL 7B (F2) and the plan calls for a real gold measurement via M1–M3 (FLEURS N=1 as a placeholder, then app-gold N≥300 from the owner's verified corrections).
 

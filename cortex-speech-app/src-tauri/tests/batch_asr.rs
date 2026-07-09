@@ -57,7 +57,7 @@ fn test_batch_asr_sample() {
         let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         by_ext.entry(ext).or_default().push(f.clone());
     }
-    for (_, files) in by_ext.iter() {
+    for files in by_ext.values() {
         for f in files.iter().take(5) {
             if !sample.contains(f) {
                 sample.push(f.clone());

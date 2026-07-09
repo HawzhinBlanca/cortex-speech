@@ -307,6 +307,15 @@ impl AppState {
     pub fn update_pipeline_settings(&self, settings: AppSettings) {
         self.lock_pipeline().update_settings(settings);
     }
+
+    /// True while an import or batch worker may be WRITING. The restore gate (true-10 audit
+    /// 2026-07-09): restoring mid-import let the worker keep upserting pre-restore segments into the
+    /// just-restored library through its own pipeline connection, and a batch finishing AFTER
+    /// restore pushed a stale undo command into the freshly-cleared history — pressing Ctrl+Z then
+    /// replayed pre-restore rows into the restored dataset.
+    pub fn writers_active(&self) -> bool {
+        *self.lock_import_state() == ImportState::Running || *self.lock_batch_state() == BatchState::Running
+    }
 }
 
 /// Where panic crash dumps are written — set once the app data dir exists (see `run`).
@@ -393,6 +402,27 @@ pub fn run() {
         Ok(db) => db,
         Err(e) => fatal_app_error(format!("Failed to open database at {:?}: {e}", db_path)),
     };
+    // PRE-MIGRATION pinned snapshot (true-10 audit 2026-07-09): a semantically-buggy migration (a
+    // wrong UPDATE predicate, a lossy rewrite) commits cleanly — the all-or-nothing transaction only
+    // protects against SQL errors — and the post-migration startup snapshot then rotates every
+    // pre-upgrade copy out within ~90 minutes of first launch, exactly when the user is most
+    // exposed. Before running any pending migration on a NON-empty library, pin a rotation-exempt
+    // copy under snapshots/pinned/. Best-effort: a pin failure warns, never blocks startup.
+    {
+        let current = crate::migrations::get_current_version(&db).unwrap_or(0);
+        let max_known = crate::migrations::max_supported_version();
+        if current > 0 && current < max_known {
+            match crate::snapshot::take_pinned_snapshot(
+                &db,
+                &data_dir,
+                &format!("premigration_v{current}_to_v{max_known}"),
+                3,
+            ) {
+                Ok(path) => tracing::info!("pre-migration snapshot pinned at {}", path.display()),
+                Err(e) => tracing::warn!("pre-migration snapshot failed (continuing): {e}"),
+            }
+        }
+    }
     if let Err(e) = db.initialize() {
         fatal_app_error(format!("Failed to initialize database schema: {e}"));
     }
@@ -419,13 +449,22 @@ pub fn run() {
         let snap_data_dir = data_dir.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(SNAPSHOT_INTERVAL_SECS));
-            // A fresh read connection avoids holding the app's DB mutex for the backup's duration.
-            match Database::open(snap_db_path.to_string_lossy().as_ref()) {
-                Ok(snap_db) => match crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("periodic DB snapshot failed: {e}"),
-                },
-                Err(e) => tracing::warn!("periodic snapshot: could not open db: {e}"),
+            // catch_unwind (true-10 audit 2026-07-09): a panic in the loop body silently killed the
+            // safety-net thread for the rest of the session — the failure counter only saw Err, not
+            // panics. A panic now counts as a failure (health surfaces it) and the loop survives.
+            let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // A fresh read connection avoids holding the app's DB mutex for the backup's duration.
+                match Database::open(snap_db_path.to_string_lossy().as_ref()) {
+                    Ok(snap_db) => match crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("periodic DB snapshot failed: {e}"),
+                    },
+                    Err(e) => tracing::warn!("periodic snapshot: could not open db: {e}"),
+                }
+            }));
+            if iteration.is_err() {
+                crate::snapshot::record_snapshot_panic();
+                tracing::error!("periodic snapshot iteration PANICKED — counted as a failure; loop continues");
             }
         });
     }
@@ -578,6 +617,7 @@ pub fn run() {
             commands::db_restore,
             commands::db_vacuum,
             commands::get_quarantine_notice,
+            commands::acknowledge_quarantine,
             commands::get_intelligence_report,
             commands::list_db_snapshots,
             commands::restore_db_from_snapshot,
