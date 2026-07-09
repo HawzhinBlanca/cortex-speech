@@ -982,6 +982,21 @@
     }
   }
 
+  // When the OmniASR-7B champion is unavailable or fails (its WSL server is down), the app NEVER
+  // silently drops to a smaller model. It surfaces a choice: retry the champion once its server is
+  // up, or transcribe this one clip with the offline model. The dialog names both engines so the
+  // owner always knows which produced the text.
+  function promptChampionFallback(retryChampion: () => void, useOffline: () => void) {
+    showConfirmDialog.set({
+      title: $t('asr.championUnavailableTitle'),
+      message: $t('asr.championUnavailableMessage'),
+      confirmLabel: $t('asr.tryAgain'),
+      danger: false,
+      onConfirm: retryChampion,
+      secondary: { label: $t('asr.useOfflineModel'), onClick: useOffline },
+    });
+  }
+
   async function handleTranscribe() {
     const seg = $selectedSegment;
     if (!seg || $isProcessing) return;
@@ -1028,7 +1043,13 @@
       if (autosave.pendingId() === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
-      notifyActionableError(e, $t('errors.transcriptionFailed'));
+      // The champion (7B) is the primary engine. If it's down, offer retry-or-offline instead of a
+      // dead-end error — the app never silently substitutes a smaller model on this path.
+      if (api.is7bUnavailableError(e)) {
+        promptChampionFallback(handleTranscribe, handleTranscribeFinetuned);
+      } else {
+        notifyActionableError(e, $t('errors.transcriptionFailed'));
+      }
     } finally {
       isProcessing.set(false);
       pipelinePhase.set('idle');

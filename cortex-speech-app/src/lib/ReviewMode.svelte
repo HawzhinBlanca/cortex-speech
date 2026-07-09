@@ -4,7 +4,7 @@
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import { settings } from './stores/settingsStore';
-  import { showReviewInbox } from './stores/uiStore';
+  import { showReviewInbox, showConfirmDialog } from './stores/uiStore';
   import { physicalKey } from './keyboard';
   import { t } from './i18n';
   import Waveform from './Waveform.svelte';
@@ -183,7 +183,19 @@
       consensus = null;
       await ensureWordTimings(updated);
     } catch (e) {
-      notifications.error($t('review.retranscribeFailed'), { detail: String(e) });
+      // Champion (7B) down: offer retry-or-offline rather than a dead-end. Never a silent downgrade.
+      if (engine === 'champion' && api.is7bUnavailableError(e)) {
+        showConfirmDialog.set({
+          title: $t('asr.championUnavailableTitle'),
+          message: $t('asr.championUnavailableMessage'),
+          confirmLabel: $t('asr.tryAgain'),
+          danger: false,
+          onConfirm: () => retranscribe('champion'),
+          secondary: { label: $t('asr.useOfflineModel'), onClick: () => retranscribe('finetuned') },
+        });
+      } else {
+        notifications.error($t('review.retranscribeFailed'), { detail: String(e) });
+      }
     } finally {
       retranscribing = false;
     }

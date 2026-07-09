@@ -66,6 +66,17 @@ export interface ConfirmDialog {
   message: string;
   onConfirm: () => void | Promise<void>;
   onCancel?: () => void;
+  /** Confirm-button label. Defaults to t('confirm'). */
+  confirmLabel?: string;
+  /** Cancel-button label. Defaults to t('cancel'). */
+  cancelLabel?: string;
+  /**
+   * Style the confirm button. Defaults to `true` (destructive red) so existing delete/reset
+   * dialogs are unchanged; pass `false` for a non-destructive primary action (e.g. "Try again").
+   */
+  danger?: boolean;
+  /** Optional third action rendered between Cancel and Confirm (e.g. an alternative path). */
+  secondary?: { label: string; onClick: () => void | Promise<void> };
 }
 
 export const showConfirmDialog = writable<ConfirmDialog | null>(null);

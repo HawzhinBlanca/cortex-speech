@@ -140,6 +140,11 @@ export const ckb: Record<string, string> = {
   'review.retranscribing': 'دووبارە نووسینەوە...',
   'review.retranscribed': 'دووبارە نووسرایەوە.',
   'review.retranscribeFailed': 'دووبارە نووسینەوە سەرکەوتوو نەبوو',
+  'asr.championUnavailableTitle': 'مۆدێلی قارەمانی OmniASR-7B بەردەست نییە',
+  'asr.championUnavailableMessage':
+    'مۆدێلی قارەمانی OmniASR-7B (باشترین مۆدێل) وەڵام نادات — لەوانەیە سێرڤەرەکەی کارناکات. دەستی پێبکەرەوە و دووبارە هەوڵبدەرەوە، یان ئەم پارچەیە بە مۆدێلی ئۆفڵاین بنووسەوە. ئەپەکە هەرگیز بەبێ ئاگادارکردنەوە مۆدێلێکی بچووکتر لە جێگەی بەکارناهێنێت.',
+  'asr.tryAgain': 'دووبارە هەوڵدانی 7B',
+  'asr.useOfflineModel': 'بەکارهێنانی مۆدێلی ئۆفڵاین',
   'review.markBad': 'نیشانکردن وەک خراپ',
   'review.markBadTitle': 'ئەم پارچەیە وەک خراپ نیشان بکە — لە هەناردە دەردەکرێت، دەمێنێتەوە بۆ دووبارە نووسینەوەی دواتر.',
   'review.markedBad': 'وەک خراپ نیشانکرا — لە هەناردە دەرکرا. Backspace بۆ گەڕاندنەوە.',
