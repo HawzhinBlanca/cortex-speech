@@ -151,6 +151,15 @@ pub enum ConfidenceSource {
     Heuristic,
 }
 
+impl ConfidenceSource {
+    pub fn as_db_value(self) -> &'static str {
+        match self {
+            ConfidenceSource::RealPosterior => "real_posterior",
+            ConfidenceSource::Heuristic => "heuristic",
+        }
+    }
+}
+
 fn confidence_from_asr_result(text: &str, ys_log_probs: &[f64]) -> (Option<f64>, ConfidenceSource) {
     // Empty/whitespace output is never high-confidence, even if the model exposed per-token probs for the
     // blank-collapsed result. A confident-empty would persist a high confidence on a BLANK transcript,
@@ -341,7 +350,11 @@ impl KurdishAsrService {
         self.recognizer.is_some()
     }
 
-    pub fn transcribe(&mut self, audio: &[f32], sample_rate: u32) -> Result<(String, Option<f64>), String> {
+    pub fn transcribe(
+        &mut self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<(String, Option<f64>, ConfidenceSource), String> {
         let recognizer = self.recognizer.as_ref().ok_or("ASR model not loaded")?;
 
         if sample_rate != SAMPLE_RATE {
@@ -349,8 +362,8 @@ impl KurdishAsrService {
         }
 
         if audio.len() <= CHUNK_SAMPLES {
-            let (text, confidence) = self.transcribe_chunk(recognizer, audio, sample_rate)?;
-            return Ok((text.trim().to_string(), confidence));
+            let (text, confidence, source) = self.transcribe_chunk(recognizer, audio, sample_rate)?;
+            return Ok((text.trim().to_string(), confidence, source));
         }
 
         tracing::info!(
@@ -361,6 +374,7 @@ impl KurdishAsrService {
 
         let mut all_text = String::new();
         let mut confidences = Vec::new();
+        let mut sources = Vec::new();
         let mut current_idx = 0;
         let mut chunk_idx = 0;
 
@@ -410,7 +424,7 @@ impl KurdishAsrService {
             );
 
             match self.transcribe_chunk(recognizer, chunk_audio, sample_rate) {
-                Ok((text, confidence)) => {
+                Ok((text, confidence, source)) => {
                     let text = text.trim();
                     if !text.is_empty() {
                         if !all_text.is_empty() {
@@ -420,6 +434,7 @@ impl KurdishAsrService {
                         if let Some(c) = confidence {
                             confidences.push(c);
                         }
+                        sources.push(source);
                     }
                 }
                 Err(e) => {
@@ -445,8 +460,14 @@ impl KurdishAsrService {
         } else {
             Some(confidences.iter().sum::<f64>() / confidences.len() as f64)
         };
+        let confidence_source =
+            if !sources.is_empty() && sources.iter().all(|source| *source == ConfidenceSource::RealPosterior) {
+                ConfidenceSource::RealPosterior
+            } else {
+                ConfidenceSource::Heuristic
+            };
 
-        Ok((all_text, average_confidence))
+        Ok((all_text, average_confidence, confidence_source))
     }
 
     fn transcribe_chunk(
@@ -454,11 +475,11 @@ impl KurdishAsrService {
         recognizer: &OfflineRecognizer,
         audio: &[f32],
         sample_rate: u32,
-    ) -> Result<(String, Option<f64>), String> {
+    ) -> Result<(String, Option<f64>, ConfidenceSource), String> {
         // Guard: empty slices can occur at exact chunk boundaries.
         // Passing an empty waveform to ONNX may panic or return garbage.
         if audio.is_empty() {
-            return Ok((String::new(), Some(0.0)));
+            return Ok((String::new(), Some(0.0), ConfidenceSource::Heuristic));
         }
 
         let stream = recognizer.create_stream();
@@ -503,12 +524,8 @@ impl KurdishAsrService {
 
             sherpa_onnx_sys::SherpaOnnxDestroyOfflineStreamResultJson(json_cstr);
 
-            let (text, confidence, _source) = parse_asr_result_json(&json_str)?;
-            // TODO(confidence-source): thread `_source` up to the segment write (migration
-            // v20) so conformal/IRT/autonomy can distinguish real posteriors from the
-            // heuristic fallback. transcribe()/transcribe_chunk() signatures kept stable
-            // for now to avoid rippling through pipeline/commands.
-            Ok((text, confidence))
+            let (text, confidence, source) = parse_asr_result_json(&json_str)?;
+            Ok((text, confidence, source))
         }
     }
 }
@@ -733,7 +750,7 @@ mod tests {
 
         let transcribed = pool.with_service(&model_dir, &config, |asr| {
             if !asr.is_available() {
-                return Ok((String::new(), None));
+                return Ok((String::new(), None, ConfidenceSource::Heuristic));
             }
             asr.transcribe(&[0.0f32; 16000], 16000)
         });
@@ -776,7 +793,7 @@ mod tests {
         let result = asr.transcribe(&[], 16000);
         // Should return Ok with an empty transcript (not a panic).
         match result {
-            Ok((text, _)) => assert!(text.is_empty(), "empty audio should yield empty transcript"),
+            Ok((text, _, _)) => assert!(text.is_empty(), "empty audio should yield empty transcript"),
             Err(e) => {
                 // If ASR model is not loaded, the outer `transcribe` will return Err("ASR model not loaded")
                 // which is also acceptable — the guard is inside transcribe_chunk, called only when a

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SpeechSegment, WordTimestamp, DatasetStats, SpeakerStat } from './types';
+import type { SpeechSegment, SegmentsPage, WordTimestamp, DatasetStats, SpeakerStat } from './types';
 import type { AppSettings } from './stores/settingsStore';
 import {
   mapBackendToFrontend,
@@ -59,7 +59,14 @@ export async function transcribeSegment(
   audioPath: string,
   alignmentJson?: string | null,
   segmentId?: string | null,
-): Promise<{ text: string; rawTranscript: string }> {
+): Promise<{
+  text: string;
+  rawTranscript: string;
+  confidence?: number | null;
+  confidenceSource?: string | null;
+  modelVersionId?: string | null;
+  cloudCall?: boolean;
+}> {
   return invoke('transcribe_segment', {
     segmentId: segmentId ?? null,
     audioPath,
@@ -154,6 +161,29 @@ export async function getSegments(verified?: boolean): Promise<SpeechSegment[]> 
   if (!Array.isArray(data)) {
     console.error('getSegments: expected array, got', typeof data);
     return [];
+  }
+  return data;
+}
+
+export interface GetSegmentsPageOptions {
+  verified?: boolean | null;
+  query?: string | null;
+  sort?: string;
+  limit?: number;
+  cursor?: string | null;
+}
+
+export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Promise<SegmentsPage> {
+  const data = await invoke<SegmentsPage>('get_segments_page', {
+    verified: options.verified ?? null,
+    query: options.query ?? null,
+    sort: options.sort ?? 'newest',
+    limit: options.limit ?? 300,
+    cursor: options.cursor ?? null,
+  });
+  if (!data || !Array.isArray(data.items)) {
+    console.error('getSegmentsPage: expected page payload, got', typeof data);
+    return { items: [], total: 0, nextCursor: null };
   }
   return data;
 }

@@ -1,17 +1,21 @@
-.PHONY: help verify-10 gate test-rust test-frontend lint typecheck \
-        fmt-check python-policies test-e2e audit deny ship-check build-app \
-        check-fresh ship-check-local
+.PHONY: help governance-proof verify-10 gate test-rust test-frontend lint typecheck \
+        fmt-check python-policies test-e2e audit deny eval-ckb egress-offline \
+        bench-rtf release-proof ship-check build-app check-fresh ship-check-local
 
 ## help: list available targets
 help:
 	@grep -E '^##' $(MAKEFILE_LIST) | sed -e 's/## //'
 
-## verify-10: the charter's 10/10 gate (manifest sync, ledger schema, license compatibility)
-verify-10:
+## governance-proof: manifest sync, required assets, ledger schema, license compatibility
+governance-proof:
 	python scripts/verify_10.py
 
-## gate: alias for verify-10
-gate: verify-10
+## verify-10: full charter gate; prints 10/10 only after every proof/release/reliability gate is green
+verify-10: governance-proof python-policies test-frontend typecheck lint fmt-check test-rust audit deny eval-ckb egress-offline bench-rtf release-proof
+	@echo "CORTEX 10/10: ALL GATES GREEN"
+
+## gate: alias for the narrow governance proof (use verify-10 for the full charter gate)
+gate: governance-proof
 
 ## test-rust: backend unit + integration tests
 test-rust:
@@ -69,9 +73,35 @@ measure-10:
 	@test -n "$(GOLD)" || (echo "set GOLD=<gold_manifest.tsv> (WSL-visible path)"; exit 2)
 	python cortex-speech-app/scripts/run_measurements.py "$(GOLD)" --engines "$(ENGINES)" --bootstrap $(BOOTSTRAP)
 
+## eval-ckb: public CKB accuracy proof; fail-closed until FLEURS + AsoSoft artifact harness is wired
+eval-ckb:
+	@echo "eval-ckb is not yet a public benchmark gate."
+	@echo "Required: pinned FLEURS ckb_iq + AsoSoft run, local ASR-on-gold, Sorani normalization, JSONL edits, 95% CI, MAPSSWE."
+	@echo "Current smoke to run manually: cd cortex-speech-app && cargo test --manifest-path src-tauri/Cargo.toml --test real_audio gold_eval_asr_uses_real_engine_not_caller_hypotheses -- --nocapture"
+	@exit 2
+
+## egress-offline: runtime zero-outbound-socket proof for the default ASR/jury/eval/updater path
+egress-offline:
+	@echo "egress-offline is not yet a runtime socket gate."
+	@echo "Required: default config ASR + jury + eval + updater under a network monitor with zero outbound connects."
+	@exit 2
+
+## bench-rtf: local real-time-factor benchmark on a pinned fixture/model
+bench-rtf:
+	@test -f cortex-speech-app/src-tauri/models/omniasr-ctc-300m/model.int8.onnx || (echo "missing OmniASR CTC-300M model; run cd cortex-speech-app && npm run fetch-models"; exit 2)
+	cd cortex-speech-app && cargo test --manifest-path src-tauri/Cargo.toml --test real_audio -- --ignored omniasr_rtf_on_committed_fleurs_ckb_fixture --nocapture
+
+## release-proof: signed installer/updater, SBOM, and artifact-attestation verification
+release-proof:
+	@test -n "$(RELEASE_DIR)" || (echo "set RELEASE_DIR=<directory containing signed installer, updater signature, SBOM, and attestation>"; exit 2)
+	@test -f "$(RELEASE_DIR)/sbom.cdx.json" || (echo "missing $(RELEASE_DIR)/sbom.cdx.json"; exit 2)
+	@test -f "$(RELEASE_DIR)/attestation.jsonl" || (echo "missing $(RELEASE_DIR)/attestation.jsonl"; exit 2)
+	@test -f "$(RELEASE_DIR)/latest.json" || (echo "missing signed updater latest.json"; exit 2)
+	@echo "release-proof artifact presence checks passed; signature and attestation cryptographic verification still require release CI credentials."
+
 ## ship-check: full pre-release gate — a SUPERSET of the CI Windows release gate.
 ## Running this green locally must imply CI green: it runs every required CI step.
-ship-check: verify-10 typecheck lint fmt-check python-policies test-frontend test-rust test-e2e audit deny
+ship-check: governance-proof typecheck lint fmt-check python-policies test-frontend test-rust test-e2e audit deny
 	@echo ""
 	@echo "================================================="
 	@echo "  CORTEX ship-check complete — all CI gates green."

@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Transcribe. Batch mode must fail loudly on ASR runtime errors;
             // otherwise a backend fault looks like a blank transcript and can
             // incorrectly delete the segment.
-            let asr_result: Result<(String, Option<f64>), String> =
+            let asr_result: Result<(String, Option<f64>, cortex_speech_app_lib::asr::ConfidenceSource), String> =
                 asr_pool.with_service(&model_dir, &asr_config, |asr| {
                     if !asr.is_available() {
                         return Err("ASR service is unavailable; models may not be downloaded".to_string());
@@ -128,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         format!("ASR transcription failed for segment {} in {}: {error}", seg.id, audio_path)
                     })
                 });
-            let (text, confidence) = match asr_result {
+            let (text, confidence, confidence_source) = match asr_result {
                 Ok(result) => result,
                 Err(error) => {
                     error!("{error}");
@@ -157,6 +157,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             seg.raw_transcript = text;
             seg.normalized_transcript = Some(norm);
             seg.confidence = confidence;
+            seg.confidence_source = Some(confidence_source.as_db_value().to_string());
+            seg.model_version_id = Some("omniasr-ctc-300m".to_string());
+            seg.cloud_call = false;
+            seg.decoder_config_hash = None;
+            seg.normalizer_version = Some("sorani-normalizer-v1".to_string());
 
             to_update.push(seg);
         }

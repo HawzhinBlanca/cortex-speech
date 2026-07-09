@@ -534,7 +534,13 @@ fn test_omniasr_on_real_audio() {
     let transcript = asr.transcribe(&f32_pcm, 16000).expect("OmniASR transcription should succeed");
     let elapsed = start.elapsed();
 
-    eprintln!("[omniasr] Transcript ({} chars, confidence: {:?}):\n{}", transcript.0.len(), transcript.1, transcript.0);
+    eprintln!(
+        "[omniasr] Transcript ({} chars, confidence: {:?}, source: {:?}):\n{}",
+        transcript.0.len(),
+        transcript.1,
+        transcript.2,
+        transcript.0
+    );
     eprintln!("[omniasr] Inference took {:.2}s", elapsed.as_secs_f64());
 
     let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/omniasr_transcript.txt");
@@ -576,7 +582,7 @@ fn omniasr_on_committed_fleurs_ckb_fixture() {
 
     let mut asr = KurdishAsrService::new(&model_dir, false).expect("ASR init with real models");
     assert!(asr.is_available(), "ASR should be available");
-    let (text, _conf) = asr.transcribe(&f32_pcm, 16000).expect("OmniASR transcription should succeed");
+    let (text, _conf, _source) = asr.transcribe(&f32_pcm, 16000).expect("OmniASR transcription should succeed");
     let trimmed = text.trim();
     eprintln!("[fleurs-gate] transcript ({} chars): {trimmed}", trimmed.len());
 
@@ -691,7 +697,7 @@ fn test_gold_eval_real_asr_closes_the_loop() {
         let (_sr, pcm16) = audio::ensure_pcm_16khz(sr, pcm)?;
         let f32_pcm: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
         asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
-            .map(|(text, _conf)| text)
+            .map(|(text, _conf, _source)| text)
             .map_err(cortex_speech_app_lib::error::AppError::Other)
     })
     .expect("gold eval with real ASR");
@@ -953,10 +959,10 @@ fn pipeline_routes_to_finetuned_when_enabled() {
         Arc::new(ModelManager::new(tmp.path().to_path_buf())),
     );
 
-    let (raw, _final_text, conf) =
-        pipeline.transcribe(None, fixture.to_str().unwrap(), None, None).expect("fine-tuned pipeline transcribe");
-    eprintln!("[pipeline-finetuned] raw: {raw}  conf={conf:?}");
-    assert!(conf.is_none(), "the fine-tuned engine returns no confidence (proves it was the engine used)");
+    let draft = pipeline.transcribe(None, fixture.to_str().unwrap(), None, None).expect("fine-tuned pipeline transcribe");
+    let raw = draft.raw_text;
+    eprintln!("[pipeline-finetuned] raw: {raw}  conf={:?}", draft.confidence);
+    assert!(draft.confidence.is_none(), "the fine-tuned engine returns no confidence (proves it was the engine used)");
     assert!(!raw.trim().is_empty(), "fine-tuned pipeline must not return a blank transcript");
     assert!(
         raw.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)),

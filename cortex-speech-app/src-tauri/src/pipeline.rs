@@ -19,6 +19,17 @@ use uuid::Uuid;
 
 const SUBPROCESS_ERROR_PREVIEW_CHARS: usize = 4096;
 const SOURCE_AUDIO_HASH_BUFFER_BYTES: usize = 128 * 1024;
+const NORMALIZER_VERSION: &str = "sorani-normalizer-v1";
+
+#[derive(Debug, Clone)]
+pub struct TranscriptionDraft {
+    pub raw_text: String,
+    pub final_text: String,
+    pub confidence: Option<f64>,
+    pub confidence_source: Option<String>,
+    pub model_version_id: Option<String>,
+    pub cloud_call: bool,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct SourceAudioIdentity {
@@ -728,7 +739,9 @@ impl ProcessingPipeline {
             if !asr.is_available() {
                 return Err(AppError::Other("ASR model not loaded".into()));
             }
-            asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(text, _confidence)| text).map_err(AppError::Other)
+            asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
+                .map(|(text, _confidence, _source)| text)
+                .map_err(AppError::Other)
         })
     }
 
@@ -1710,34 +1723,44 @@ impl ProcessingPipeline {
                 None
             };
 
-            let (raw_transcript, confidence) = if let Some(text) = finetuned_text {
-                (text, None)
+            let (raw_transcript, confidence, confidence_source, model_version_id) = if let Some(text) = finetuned_text {
+                (
+                    text,
+                    None,
+                    Some("fine_tuned_no_posterior".to_string()),
+                    Some("finetuned-mms-ckb".to_string()),
+                )
             } else if self.should_use_wsl_primary_asr() {
-                ("[Pending WSL 7B ASR]".to_string(), None)
+                (
+                    "[Pending WSL 7B ASR]".to_string(),
+                    None,
+                    Some("not_run".to_string()),
+                    Some("omniasr-wsl-7b".to_string()),
+                )
             } else if let Some(cached) =
                 file_hash.as_deref().and_then(|h| self.cache.get_chunk_by_hash(h, &model_id, Some(&chunk_suffix)))
             {
-                (cached.raw_transcript, None)
+                (cached.raw_transcript, None, Some("cache_replay".to_string()), Some(model_id.clone()))
             } else {
-                let (text, conf) = self.with_asr(|asr| {
+                let (text, conf, source) = self.with_asr(|asr| {
                     if asr.is_available() {
                         let timer = crate::inference::InferenceTimer::start("asr");
                         let result = asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE);
                         timer.finish(result.is_ok());
                         match result {
-                            Ok((t, c)) => (t, c),
+                            Ok((t, c, source)) => (t, c, Some(source.as_db_value().to_string())),
                             Err(e) => {
                                 tracing::warn!(
                                     "ASR transcription failed for {} chunk {}: {e}",
                                     path.display(),
                                     chunk_index
                                 );
-                                (format!("[ASR unavailable: {e}]"), None)
+                                (format!("[ASR unavailable: {e}]"), None, Some("not_available".to_string()))
                             }
                         }
                     } else {
                         tracing::warn!("ASR model not available for {} chunk {}", path.display(), chunk_index);
-                        (String::new(), Some(0.0))
+                        (String::new(), Some(0.0), Some("not_available".to_string()))
                     }
                 });
 
@@ -1756,7 +1779,7 @@ impl ProcessingPipeline {
                         self.cache.set_chunk_by_hash(h, Some(&chunk_suffix), entry);
                     }
                 }
-                (text, conf)
+                (text, conf, source, Some(model_id.clone()))
             };
 
             let normalized = if self.settings.auto_normalize && !raw_transcript.is_empty() {
@@ -1771,6 +1794,7 @@ impl ProcessingPipeline {
             } else {
                 None
             };
+            let normalizer_version = normalized.as_ref().map(|_| NORMALIZER_VERSION.to_string());
 
             let speaker_id = diarization_labels.get(chunk_index).and_then(|l| l.clone()).or(speaker_hint.clone());
 
@@ -1816,6 +1840,11 @@ impl ProcessingPipeline {
                 corrected_at: None,
                 is_gold: false,
                 alignment_quality: None, // set to 'ctc_forced' or 'energy_heuristic' after align()
+                model_version_id,
+                confidence_source,
+                cloud_call: false,
+                decoder_config_hash: None,
+                normalizer_version,
             });
         }
 
@@ -2028,7 +2057,7 @@ impl ProcessingPipeline {
                     seg.alignment_json.as_deref(),
                     cancel.map(|t| t.as_atomic()),
                 ) {
-                    Ok((_raw_text, _corrected_text, _confidence)) => {
+                    Ok(_draft) => {
                         if let Err(e) = self.refresh_segment_from_db(db, seg) {
                             // A DB hiccup mid-pass otherwise left a partial import (some transcribed, some
                             // still placeholder) with no rollback; a re-import would then duplicate it.
@@ -2405,7 +2434,7 @@ impl ProcessingPipeline {
         // killed within ~50 ms of Cancel, not only between segments (import/batch callers pass their
         // token; one-off callers pass None).
         cancel: Option<&std::sync::atomic::AtomicBool>,
-    ) -> AppResult<(String, String, Option<f64>)> {
+    ) -> AppResult<TranscriptionDraft> {
         let path = Path::new(audio_path);
         let duration_ms = audio::get_duration_ms(path)?;
         if duration_ms == 0 {
@@ -2445,7 +2474,15 @@ impl ProcessingPipeline {
                                 }
                             }
                         }
-                        return Ok((raw_text, final_text, None));
+                        let cloud_call = self.llm_refinement_uses_cloud();
+                        return Ok(TranscriptionDraft {
+                            raw_text,
+                            final_text,
+                            confidence: None,
+                            confidence_source: Some("fine_tuned_no_posterior".to_string()),
+                            model_version_id: Some("finetuned-mms-ckb".to_string()),
+                            cloud_call,
+                        });
                     }
                     Ok(_) => {
                         tracing::warn!("fine-tuned ASR returned empty output; falling back to the configured engine")
@@ -2528,6 +2565,9 @@ impl ProcessingPipeline {
                         &raw_transcript,
                         normalized_transcript.as_deref(),
                         confidence,
+                        Some("external_provider"),
+                        Some("omniasr-wsl-7b"),
+                        false,
                     )
                     .map_err(|e| AppError::Other(format!("Failed to update segment in database: {}", e)))?;
                 if !updated {
@@ -2586,7 +2626,15 @@ impl ProcessingPipeline {
                 // before it is returned/stored (opt-in; default off; best-effort).
                 let final_text = apply_loop0_firing(self.settings.loop0_firing_enabled, &db, &final_text);
 
-                return Ok((raw_transcript, final_text, confidence));
+                let cloud_call = self.llm_refinement_uses_cloud();
+                return Ok(TranscriptionDraft {
+                    raw_text: raw_transcript,
+                    final_text,
+                    confidence,
+                    confidence_source: Some("external_provider".to_string()),
+                    model_version_id: Some("omniasr-wsl-7b".to_string()),
+                    cloud_call,
+                });
             } else {
                 return Err(AppError::Other(
                     "Segment not found in database. Please import the audio file first to generate speech segments."
@@ -2616,11 +2664,18 @@ impl ProcessingPipeline {
                 None => raw.clone(),
             };
             let fired = self.fire_loop0_if_enabled(&refined);
-            return Ok((raw, fired, None));
+            return Ok(TranscriptionDraft {
+                raw_text: raw,
+                final_text: fired,
+                confidence: None,
+                confidence_source: Some("cache_replay".to_string()),
+                model_version_id: Some(model_id.clone()),
+                cloud_call: self.llm_refinement_uses_cloud(),
+            });
         }
 
         let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-        let (raw_text, confidence) = self.with_asr(|asr| {
+        let (raw_text, confidence, confidence_source) = self.with_asr(|asr| {
             if !asr.is_available() {
                 return Err(AppError::Other("ASR model not loaded".into()));
             }
@@ -2675,7 +2730,14 @@ impl ProcessingPipeline {
         }
 
         let final_text = self.fire_loop0_if_enabled(&final_text);
-        Ok((raw_text, final_text, confidence))
+        Ok(TranscriptionDraft {
+            raw_text,
+            final_text,
+            confidence,
+            confidence_source: Some(confidence_source.as_db_value().to_string()),
+            model_version_id: Some(model_id),
+            cloud_call: self.llm_refinement_uses_cloud(),
+        })
     }
 
     /// Apply LOOP-0 firing to a finalized transcript, opening a short-lived DB connection only when
@@ -2743,6 +2805,14 @@ impl ProcessingPipeline {
     /// when the user has not opted in.
     fn llm_refinement_permitted(&self) -> bool {
         self.settings.effective_llm_mode() != crate::settings::LlmMode::None
+    }
+
+    fn llm_refinement_uses_cloud(&self) -> bool {
+        match self.settings.effective_llm_mode() {
+            crate::settings::LlmMode::Gemini => true,
+            crate::settings::LlmMode::Local => !self.settings.llm_endpoint_is_local(),
+            crate::settings::LlmMode::None => false,
+        }
     }
 
     /// Build the LLM refiner. When the configured mode is the cloud (Gemini) and an OPENROUTER_API_KEY
@@ -2825,7 +2895,7 @@ impl ProcessingPipeline {
             });
 
             match res {
-                Ok((text, _conf)) => {
+                Ok((text, _conf, _source)) => {
                     hypotheses.push((gold.id.clone(), text));
                 }
                 Err(e) => {
@@ -2855,7 +2925,7 @@ impl ProcessingPipeline {
             Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE))
         });
         match res_300m {
-            Some(Ok((text, conf))) => insert_hypothesis_checked(db, segment_id, model_id_300m, text, conf)?,
+            Some(Ok((text, conf, _source))) => insert_hypothesis_checked(db, segment_id, model_id_300m, text, conf)?,
             Some(Err(error)) => {
                 tracing::warn!("{model_id_300m} hypothesis transcription failed for {segment_id}: {error}");
             }
@@ -2877,7 +2947,7 @@ impl ProcessingPipeline {
             Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE))
         });
         match res_1b {
-            Some(Ok((text, conf))) => insert_hypothesis_checked(db, segment_id, model_id_1b, text, conf)?,
+            Some(Ok((text, conf, _source))) => insert_hypothesis_checked(db, segment_id, model_id_1b, text, conf)?,
             Some(Err(error)) => {
                 tracing::warn!("{model_id_1b} hypothesis transcription failed for {segment_id}: {error}");
             }

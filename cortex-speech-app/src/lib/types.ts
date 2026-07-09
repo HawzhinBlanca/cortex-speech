@@ -32,6 +32,17 @@ export interface SpeechSegment {
   isGold?: boolean;
   /** 'ctc_forced' | 'energy_heuristic' | null (never aligned) — Migration v12 */
   alignmentQuality?: string | null;
+  modelVersionId?: string | null;
+  confidenceSource?: string | null;
+  cloudCall?: boolean;
+  decoderConfigHash?: string | null;
+  normalizerVersion?: string | null;
+}
+
+export interface SegmentsPage {
+  items: SpeechSegment[];
+  total: number;
+  nextCursor: string | null;
 }
 
 export interface GoldSegment {

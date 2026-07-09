@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CORTEX 10/10 verification gates.
+"""CORTEX governance verification gates.
 
 Self-locating: all paths resolve relative to the repository root (the parent of
 this script's directory), so the gate runs identically from any working
@@ -248,7 +248,7 @@ def check_license_compatibility():
 
 def main():
     print("==================================================")
-    print("          CORTEX 10/10 VERIFICATION GATES         ")
+    print("          CORTEX GOVERNANCE VERIFICATION          ")
     print("==================================================")
     print(f"(repo root: {REPO_ROOT})")
 
@@ -261,7 +261,7 @@ def main():
 
     print("--------------------------------------------------")
     if all(gates):
-        print("CORTEX 10/10: ALL GATES GREEN")
+        print("CORTEX GOVERNANCE: ALL GATES GREEN")
         sys.exit(0)
     print("CORTEX VERIFICATION FAILED: RED GATES PRESENT")
     sys.exit(1)

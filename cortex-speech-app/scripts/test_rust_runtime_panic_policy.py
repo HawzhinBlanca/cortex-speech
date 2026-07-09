@@ -226,8 +226,11 @@ def test_wsl_refinement_batch_is_panic_safe_and_cancellable() -> None:
         # flag is passed to it.)
         "run_wsl_segment_transcript_with_script(",
         "Some(&WSL_REFINE_CANCEL)",
-        # Writes go through the human-decision-safe update so a batch never clobbers reviewed text.
-        "db.update_asr_transcript_if_unreviewed(id, &raw_transcript, normalized.as_deref(), confidence)",
+        # Writes go through the human-decision-safe update so a batch never clobbers reviewed text,
+        # and the 7B provenance is persisted instead of falling back to unknown/heuristic.
+        "db.update_asr_transcript_if_unreviewed(",
+        'Some("external_provider")',
+        'Some("omniasr-wsl-7b")',
     ]
     missing = [pattern for pattern in required if pattern not in commands]
     if missing:

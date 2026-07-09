@@ -1,4 +1,4 @@
-import { writable, derived } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
 import type { SpeechSegment, WordTimestamp } from '../types';
 import * as api from '../commands';
 import { isHumanRejected } from '../segmentQuality';
@@ -16,7 +16,13 @@ function createSegmentsStore() {
     async load() {
       const seq = ++loadSeq;
       try {
-        const data = await api.getSegments();
+        const page = await api.getSegmentsPage({
+          verified: get(filterVerified),
+          query: get(searchQuery) || null,
+          sort: get(sortOrder),
+          limit: 300,
+        });
+        const data = page.items;
         if (seq !== loadSeq) return; // stale load — a newer one is in flight or a write invalidated it
         set(data);
         // Refresh threshold after loading segments

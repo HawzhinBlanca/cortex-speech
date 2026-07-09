@@ -1,5 +1,5 @@
 use crate::error::{AppError, AppResult};
-use rusqlite::{backup, params, Connection};
+use rusqlite::{backup, params, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
@@ -39,6 +39,24 @@ pub struct SpeechSegment {
     // ── Alignment quality (Migration v12) ─────────────────────────
     /// "ctc_forced" | "energy_heuristic" | None (never aligned)
     pub alignment_quality: Option<String>,
+    /// Existing model registry id (Migration v22), e.g. "omniasr-ctc-300m".
+    pub model_version_id: Option<String>,
+    /// "real_posterior" | "heuristic" | provider-specific value. Heuristic confidence is not calibrated.
+    pub confidence_source: Option<String>,
+    /// Whether producing this segment transcript involved sending audio/transcript to a cloud provider.
+    pub cloud_call: bool,
+    /// Hash of decoder/runtime settings that materially affect the transcript.
+    pub decoder_config_hash: Option<String>,
+    /// Version of the Sorani normalizer used for normalized_transcript / metrics.
+    pub normalizer_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentsPage {
+    pub items: Vec<SpeechSegment>,
+    pub total: usize,
+    pub next_cursor: Option<String>,
 }
 
 /// P3.3: which distinct source audio files are missing on disk.
@@ -168,6 +186,14 @@ fn to_fts5_match(query: &str) -> String {
 
 /// The only split labels the export/stats math understands.
 const VALID_SPLITS: &[&str] = &["train", "validation", "test"];
+
+const SEGMENT_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript, normalized_transcript,
+                    annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
+                    confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
+                    verdict, verdict_transcript, rationale, evidence_json,
+                    agent_confidence, escalated, human_decision, corrected_at, is_gold,
+                    alignment_quality, model_version_id, confidence_source, cloud_call,
+                    decoder_config_hash, normalizer_version";
 
 /// Reject structurally-invalid segments at the DB write boundary, before they can
 /// corrupt the downstream split/stats/training-grade math that every later stage
@@ -370,8 +396,9 @@ impl Database {
         self.conn.execute(
             "INSERT INTO speech_segments
                 (id, audio_path, raw_transcript, normalized_transcript,
-                 annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score, alignment_quality)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score, alignment_quality,
+                 model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(?18, 'unknown@pre-registry'), COALESCE(?19, 'unknown'), ?20, ?21, ?22)
              ON CONFLICT(id) DO UPDATE SET
                 audio_path=excluded.audio_path,
                 raw_transcript=excluded.raw_transcript,
@@ -389,6 +416,11 @@ impl Database {
                 split=excluded.split,
                 ood_score=excluded.ood_score,
                 alignment_quality=excluded.alignment_quality,
+                model_version_id=excluded.model_version_id,
+                confidence_source=excluded.confidence_source,
+                cloud_call=excluded.cloud_call,
+                decoder_config_hash=excluded.decoder_config_hash,
+                normalizer_version=excluded.normalizer_version,
                 updated_at=datetime('now')",
             params![
                 seg.id, seg.audio_path, raw_nfc,
@@ -397,6 +429,11 @@ impl Database {
                 seg.verified as i32, seg.confidence, seg.ctc_score,
                 seg.clipping_ratio, seg.rms_db, seg.snr_db, seg.split,
                 seg.ood_score, seg.alignment_quality,
+                seg.model_version_id,
+                seg.confidence_source,
+                seg.cloud_call as i32,
+                seg.decoder_config_hash,
+                seg.normalizer_version,
             ],
         )?;
         self.track_write()?;
@@ -428,9 +465,11 @@ impl Database {
                  annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence,
                  ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
                  verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
-                 human_decision, corrected_at, is_gold, alignment_quality, updated_at)
+                 human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
+                 confidence_source, cloud_call, decoder_config_hash, normalizer_version, updated_at)
              VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, datetime('now'))
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+                 COALESCE(?28, 'unknown@pre-registry'), COALESCE(?29, 'unknown'), ?30, ?31, ?32, datetime('now'))
              ON CONFLICT(id) DO UPDATE SET
                 created_at=excluded.created_at,
                 audio_path=excluded.audio_path,
@@ -458,6 +497,11 @@ impl Database {
                 corrected_at=excluded.corrected_at,
                 is_gold=excluded.is_gold,
                 alignment_quality=excluded.alignment_quality,
+                model_version_id=excluded.model_version_id,
+                confidence_source=excluded.confidence_source,
+                cloud_call=excluded.cloud_call,
+                decoder_config_hash=excluded.decoder_config_hash,
+                normalizer_version=excluded.normalizer_version,
                 updated_at=datetime('now')",
             params![
                 seg.id,
@@ -487,6 +531,11 @@ impl Database {
                 seg.corrected_at,
                 seg.is_gold as i32,
                 seg.alignment_quality,
+                seg.model_version_id,
+                seg.confidence_source,
+                seg.cloud_call as i32,
+                seg.decoder_config_hash,
+                seg.normalizer_version,
             ],
         )?;
         self.track_write()?;
@@ -526,10 +575,11 @@ impl Database {
         self.conn.execute("SAVEPOINT batch_insert", [])?;
         let result: AppResult<()> = (|| {
             let mut stmt = self.conn.prepare(
-                "INSERT INTO speech_segments 
-                    (id, audio_path, raw_transcript, normalized_transcript, 
-                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                "INSERT INTO speech_segments
+                    (id, audio_path, raw_transcript, normalized_transcript,
+                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
+                     model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'), ?19, ?20, ?21)
                  ON CONFLICT(id) DO UPDATE SET
                     audio_path=excluded.audio_path,
                     raw_transcript=excluded.raw_transcript,
@@ -546,6 +596,11 @@ impl Database {
                     snr_db=excluded.snr_db,
                     split=excluded.split,
                     ood_score=excluded.ood_score,
+                    model_version_id=excluded.model_version_id,
+                    confidence_source=excluded.confidence_source,
+                    cloud_call=excluded.cloud_call,
+                    decoder_config_hash=excluded.decoder_config_hash,
+                    normalizer_version=excluded.normalizer_version,
                     updated_at=datetime('now')"
             )?;
             for seg in segments {
@@ -568,6 +623,11 @@ impl Database {
                     seg.snr_db,
                     seg.split,
                     seg.ood_score,
+                    seg.model_version_id,
+                    seg.confidence_source,
+                    seg.cloud_call as i32,
+                    seg.decoder_config_hash,
+                    seg.normalizer_version,
                 ])?;
             }
             Ok(())
@@ -594,18 +654,25 @@ impl Database {
         let result: AppResult<()> = (|| {
             let mut check_stmt = self.conn.prepare("SELECT id FROM speech_segments WHERE id = ?1")?;
             let mut insert_stmt = self.conn.prepare(
-                "INSERT INTO speech_segments 
-                    (id, audio_path, raw_transcript, normalized_transcript, 
-                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+                "INSERT INTO speech_segments
+                    (id, audio_path, raw_transcript, normalized_transcript,
+                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
+                     model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'), ?19, ?20, ?21)"
             )?;
             // Guard: never overwrite human decisions; only update unreviewed rows.
             let mut update_stmt = self.conn.prepare(
                 "UPDATE speech_segments SET
                     audio_path=?2, raw_transcript=?3, normalized_transcript=?4, 
                     annotated_transcript=?5, alignment_json=?6, duration_ms=?7, 
-                    speaker_id=?8, verified=?9, confidence=?10, ctc_score=?11, 
-                    clipping_ratio=?12, rms_db=?13, snr_db=?14, split=?15, ood_score=?16, updated_at=datetime('now')
+                    speaker_id=?8, verified=?9, confidence=?10, ctc_score=?11,
+                    clipping_ratio=?12, rms_db=?13, snr_db=?14, split=?15, ood_score=?16,
+                    model_version_id=COALESCE(?17, 'unknown@pre-registry'),
+                    confidence_source=COALESCE(?18, 'unknown'),
+                    cloud_call=?19,
+                    decoder_config_hash=?20,
+                    normalizer_version=?21,
+                    updated_at=datetime('now')
                  WHERE id=?1
                    AND (human_decision IS NULL OR human_decision = '')
                    AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
@@ -635,6 +702,11 @@ impl Database {
                         seg.snr_db,
                         seg.split,
                         seg.ood_score,
+                        seg.model_version_id,
+                        seg.confidence_source,
+                        seg.cloud_call as i32,
+                        seg.decoder_config_hash,
+                        seg.normalizer_version,
                     ])?;
                     if changed > 0 {
                         updated += 1;
@@ -657,6 +729,11 @@ impl Database {
                         seg.snr_db,
                         seg.split,
                         seg.ood_score,
+                        seg.model_version_id,
+                        seg.confidence_source,
+                        seg.cloud_call as i32,
+                        seg.decoder_config_hash,
+                        seg.normalizer_version,
                     ])?;
                     created += 1;
                 }
@@ -685,6 +762,9 @@ impl Database {
         raw_transcript: &str,
         normalized_transcript: Option<&str>,
         confidence: Option<f64>,
+        confidence_source: Option<&str>,
+        model_version_id: Option<&str>,
+        cloud_call: bool,
     ) -> AppResult<bool> {
         // NFC-canonicalize before writing the FTS-indexed columns, exactly like insert_segment /
         // update_segment. The WSL 7B branch feeds raw ASR output here, which can arrive decomposed;
@@ -696,11 +776,22 @@ impl Database {
              SET raw_transcript        = ?2,
                  normalized_transcript = ?3,
                  confidence            = ?4,
+                 confidence_source     = COALESCE(?5, 'unknown'),
+                 model_version_id      = COALESCE(?6, 'unknown@pre-registry'),
+                 cloud_call            = ?7,
                  updated_at            = datetime('now')
              WHERE id = ?1
                AND (human_decision IS NULL OR human_decision = '')
                AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
-            params![segment_id, raw_nfc, normalized_nfc, confidence],
+            params![
+                segment_id,
+                raw_nfc,
+                normalized_nfc,
+                confidence,
+                confidence_source,
+                model_version_id,
+                cloud_call as i32,
+            ],
         )?;
         self.track_write()?;
         Ok(rows_changed > 0)
@@ -724,6 +815,9 @@ impl Database {
         raw_transcript: &str,
         normalized_transcript: Option<&str>,
         confidence: Option<f64>,
+        confidence_source: Option<&str>,
+        model_version_id: Option<&str>,
+        cloud_call: bool,
         annotated_seed: &str,
     ) -> AppResult<bool> {
         let raw_nfc = to_nfc(raw_transcript);
@@ -734,13 +828,25 @@ impl Database {
              SET raw_transcript        = ?2,
                  normalized_transcript = ?3,
                  confidence            = ?4,
-                 annotated_transcript  = COALESCE(annotated_transcript, ?5),
+                 confidence_source     = COALESCE(?5, 'unknown'),
+                 model_version_id      = COALESCE(?6, 'unknown@pre-registry'),
+                 cloud_call            = ?7,
+                 annotated_transcript  = COALESCE(annotated_transcript, ?8),
                  updated_at            = datetime('now')
              WHERE id = ?1
                AND verified = 0
                AND (human_decision IS NULL OR human_decision = '')
                AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
-            params![segment_id, raw_nfc, normalized_nfc, confidence, annotated_nfc],
+            params![
+                segment_id,
+                raw_nfc,
+                normalized_nfc,
+                confidence,
+                confidence_source,
+                model_version_id,
+                cloud_call as i32,
+                annotated_nfc,
+            ],
         )?;
         self.track_write()?;
         Ok(rows_changed > 0)
@@ -823,15 +929,8 @@ impl Database {
     }
 
     pub fn get_segment_by_id(&self, id: &str) -> AppResult<Option<SpeechSegment>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, audio_path, raw_transcript, normalized_transcript,
-                    annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
-                    confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
-                    verdict, verdict_transcript, rationale, evidence_json,
-                    agent_confidence, escalated, human_decision, corrected_at, is_gold,
-                    alignment_quality
-             FROM speech_segments WHERE id = ?1",
-        )?;
+        let query = format!("SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments WHERE id = ?1");
+        let mut stmt = self.conn.prepare(&query)?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(Self::map_row(row)?))
@@ -844,15 +943,8 @@ impl Database {
     /// Used by the media registry to verify playback access without a full table scan.
     /// Returns `Ok(Some(...))` when found, `Ok(None)` when no segment matches the path.
     pub fn get_segment_by_audio_path(&self, audio_path: &str) -> AppResult<Option<SpeechSegment>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, audio_path, raw_transcript, normalized_transcript,
-                    annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
-                    confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
-                    verdict, verdict_transcript, rationale, evidence_json,
-                    agent_confidence, escalated, human_decision, corrected_at, is_gold,
-                    alignment_quality
-             FROM speech_segments WHERE audio_path = ?1 LIMIT 1",
-        )?;
+        let query = format!("SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments WHERE audio_path = ?1 LIMIT 1");
+        let mut stmt = self.conn.prepare(&query)?;
         let mut rows = stmt.query(params![audio_path])?;
         if let Some(row) = rows.next()? {
             Ok(Some(Self::map_row(row)?))
@@ -862,13 +954,7 @@ impl Database {
     }
 
     pub fn get_segments(&self, verified: Option<bool>) -> AppResult<Vec<SpeechSegment>> {
-        let col_list = "id, created_at, audio_path, raw_transcript, normalized_transcript,
-                        annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
-                        confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
-                        verdict, verdict_transcript, rationale, evidence_json,
-                        agent_confidence, escalated, human_decision, corrected_at, is_gold,
-                        alignment_quality";
-        let mut query = format!("SELECT {col_list} FROM speech_segments");
+        let mut query = format!("SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments");
         if let Some(v) = verified {
             query.push_str(&format!(" WHERE verified = {}", if v { 1 } else { 0 }));
         }
@@ -886,16 +972,79 @@ impl Database {
         Ok(segments)
     }
 
+    pub fn get_segments_page(
+        &self,
+        verified: Option<bool>,
+        text_query: Option<&str>,
+        sort: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> AppResult<SegmentsPage> {
+        let limit = limit.clamp(1, 500);
+        let offset = cursor.and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut bind_values: Vec<Value> = Vec::new();
+        if let Some(v) = verified {
+            bind_values.push(Value::Integer(if v { 1 } else { 0 }));
+            where_parts.push(format!("verified = ?{}", bind_values.len()));
+        }
+        if let Some(raw_query) = text_query.map(str::trim).filter(|value| !value.is_empty()) {
+            let match_query = to_fts5_match(&normalize_search_query(raw_query));
+            if match_query.is_empty() {
+                return Ok(SegmentsPage { items: Vec::new(), total: 0, next_cursor: None });
+            }
+            let scoped_query = format!("{{raw_transcript normalized_transcript annotated_transcript}} : ({match_query})");
+            bind_values.push(Value::Text(scoped_query));
+            where_parts.push(format!("id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?{})", bind_values.len()));
+        }
+        let where_sql = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_parts.join(" AND "))
+        };
+        let order_sql = match sort {
+            "oldest" => "datetime(created_at) ASC, id ASC",
+            "duration" => "duration_ms DESC, id ASC",
+            "verified" => "verified DESC, datetime(created_at) DESC, id ASC",
+            "confidence" => "COALESCE(confidence, 1.0) ASC, id ASC",
+            "activeLearning" | "active_learning" => {
+                "ABS(((1.0 - COALESCE(confidence, 0.5)) + (0.1 * -COALESCE(ctc_score, -5.0))) - 0.35) ASC, id ASC"
+            }
+            "suspectFirst" | "suspect_first" => {
+                "escalated DESC, COALESCE(agent_confidence, 0.5) ASC, datetime(created_at) DESC, id ASC"
+            }
+            _ => "datetime(created_at) DESC, id ASC",
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM speech_segments{where_sql}");
+        let total: i64 = self
+            .conn
+            .query_row(&count_sql, rusqlite::params_from_iter(bind_values.iter()), |row| row.get(0))?;
+
+        let mut page_values = bind_values.clone();
+        page_values.push(Value::Integer(limit as i64));
+        page_values.push(Value::Integer(offset as i64));
+        let limit_idx = page_values.len() - 1;
+        let offset_idx = page_values.len();
+        let page_sql = format!(
+            "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments{where_sql} ORDER BY {order_sql} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+        );
+        let mut stmt = self.conn.prepare(&page_sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(page_values.iter()), Self::map_row)?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        let next_offset = offset + items.len();
+        let next_cursor = if next_offset < total as usize { Some(next_offset.to_string()) } else { None };
+        Ok(SegmentsPage { items, total: total as usize, next_cursor })
+    }
+
     /// M2.5: Return segments ordered by suspect-first priority for ReviewInbox.
     /// Jury escalated segments first, then low-confidence (suspicious) segments, then chronological.
     pub fn get_segments_suspect_first(&self, verified: Option<bool>) -> AppResult<Vec<SpeechSegment>> {
-        let col_list = "id, created_at, audio_path, raw_transcript, normalized_transcript,
-                        annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
-                        confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
-                        verdict, verdict_transcript, rationale, evidence_json,
-                        agent_confidence, escalated, human_decision, corrected_at, is_gold,
-                        alignment_quality";
-        let mut query = format!("SELECT {col_list} FROM speech_segments");
+        let mut query = format!("SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments");
         if let Some(v) = verified {
             query.push_str(&format!(" WHERE verified = {}", if v { 1 } else { 0 }));
         }
@@ -922,17 +1071,13 @@ impl Database {
         // false-positive segments whose transcript did not contain it. Restrict the match to the
         // transcript columns with an FTS5 column filter so only transcript content is searched.
         let scoped_query = format!("{{raw_transcript normalized_transcript annotated_transcript}} : ({match_query})");
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, audio_path, raw_transcript, normalized_transcript,
-                    annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
-                    confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
-                    verdict, verdict_transcript, rationale, evidence_json,
-                    agent_confidence, escalated, human_decision, corrected_at, is_gold,
-                    alignment_quality
+        let query = format!(
+            "SELECT {SEGMENT_SELECT_COLUMNS}
              FROM speech_segments
              WHERE id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?1)
-             ORDER BY created_at DESC, id ASC",
-        )?;
+             ORDER BY created_at DESC, id ASC"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
         let rows = stmt.query_map(params![scoped_query], Self::map_row)?;
         let mut segments = Vec::new();
         for row in rows {
@@ -948,12 +1093,6 @@ impl Database {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let col_list = "id, created_at, audio_path, raw_transcript, normalized_transcript,
-                        annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
-                        confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
-                        verdict, verdict_transcript, rationale, evidence_json,
-                        agent_confidence, escalated, human_decision, corrected_at, is_gold,
-                        alignment_quality";
         // SQLite caps bound parameters per statement (SQLITE_MAX_VARIABLE_NUMBER — only 999 on older
         // builds). A large selection (delete/undo of thousands of segments) would overflow a single
         // IN(?,?,…) and fail with "too many SQL variables", so fetch in bounded chunks and re-impose
@@ -963,7 +1102,8 @@ impl Database {
         for chunk in ids.chunks(CHUNK) {
             // Build a parameterised placeholder list: (?1,?2,...?N)
             let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
-            let query = format!("SELECT {col_list} FROM speech_segments WHERE id IN ({})", placeholders.join(","));
+            let query =
+                format!("SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments WHERE id IN ({})", placeholders.join(","));
             let mut stmt = self.conn.prepare(&query)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), Self::map_row)?;
             for row in rows {
@@ -1547,6 +1687,11 @@ impl Database {
             is_gold: Self::optional_col::<i32>(row, 25)?.unwrap_or(0) != 0,
             // Alignment quality — added by Migration v12; same fail-closed treatment.
             alignment_quality: Self::optional_col(row, 26)?,
+            model_version_id: Self::optional_col(row, 27)?,
+            confidence_source: Self::optional_col(row, 28)?,
+            cloud_call: Self::optional_col::<i32>(row, 29)?.unwrap_or(0) != 0,
+            decoder_config_hash: Self::optional_col(row, 30)?,
+            normalizer_version: Self::optional_col(row, 31)?,
         })
     }
 
@@ -2067,20 +2212,15 @@ impl Database {
 
     /// Return escalated segments ordered riskiest-first (lowest agent_confidence).
     pub fn get_escalation_queue(&self, limit: usize) -> AppResult<Vec<SpeechSegment>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, audio_path, raw_transcript, normalized_transcript,
-                    annotated_transcript, alignment_json, duration_ms, speaker_id,
-                    verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db,
-                    split, ood_score,
-                    verdict, verdict_transcript, rationale, evidence_json,
-                    agent_confidence, escalated, human_decision, corrected_at, is_gold,
-                    alignment_quality
+        let query = format!(
+            "SELECT {SEGMENT_SELECT_COLUMNS}
              FROM speech_segments
              WHERE escalated = 1
                AND (human_decision IS NULL OR human_decision = '')
              ORDER BY COALESCE(agent_confidence, 0.5) ASC, id ASC
-             LIMIT ?1",
-        )?;
+             LIMIT ?1"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
         let rows = stmt.query_map(params![limit as i64], Self::map_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -2392,9 +2532,22 @@ mod tests {
 
         // update_asr_transcript_if_unreviewed
         db.insert_segment(&make_segment("u1", "/u1.wav")).unwrap();
-        assert!(db.update_asr_transcript_if_unreviewed("u1", decomposed, Some(decomposed), Some(0.9)).unwrap());
+        assert!(db
+            .update_asr_transcript_if_unreviewed(
+                "u1",
+                decomposed,
+                Some(decomposed),
+                Some(0.9),
+                Some("heuristic"),
+                Some("omniasr-ctc-300m"),
+                false,
+            )
+            .unwrap());
         let s1 = db.get_segment_by_audio_path("/u1.wav").unwrap().unwrap();
         assert_eq!(s1.raw_transcript, composed, "ASR-update raw_transcript must be stored NFC");
+        assert_eq!(s1.confidence_source.as_deref(), Some("heuristic"));
+        assert_eq!(s1.model_version_id.as_deref(), Some("omniasr-ctc-300m"));
+        assert!(!s1.cloud_call);
         assert!(db.search_segments(composed).unwrap().iter().any(|s| s.id == "u1"), "NFC query must find it");
 
         // update_segment_consensus_batch
@@ -2915,6 +3068,9 @@ mod tests {
                 "fresh asr",
                 Some("fresh asr"),
                 Some(0.9),
+                Some("heuristic"),
+                Some("omniasr-ctc-300m"),
+                false,
                 "fresh asr",
             )
             .expect("update verified");
@@ -2930,12 +3086,24 @@ mod tests {
         fresh.annotated_transcript = None;
         db.insert_segment(&fresh).expect("insert fresh");
         let updated = db
-            .update_batch_transcription_if_unreviewed("fresh-1", "new asr", Some("new asr"), Some(0.8), "new asr")
+            .update_batch_transcription_if_unreviewed(
+                "fresh-1",
+                "new asr",
+                Some("new asr"),
+                Some(0.8),
+                Some("heuristic"),
+                Some("omniasr-ctc-300m"),
+                false,
+                "new asr",
+            )
             .expect("update fresh");
         assert!(updated, "an unreviewed row is updated");
         let after = db.get_segment_by_id("fresh-1").unwrap().unwrap();
         assert_eq!(after.raw_transcript, "new asr");
         assert_eq!(after.annotated_transcript.as_deref(), Some("new asr"), "annotation seeded when empty");
+        assert_eq!(after.confidence_source.as_deref(), Some("heuristic"));
+        assert_eq!(after.model_version_id.as_deref(), Some("omniasr-ctc-300m"));
+        assert!(!after.cloud_call);
 
         // (d): an unverified row the user annotated (without verifying) keeps that annotation; only
         // the ASR fields refresh — the seed is ignored because COALESCE reads the CURRENT row.
@@ -2944,7 +3112,16 @@ mod tests {
         annotated.annotated_transcript = Some("user typed".to_string());
         db.insert_segment(&annotated).expect("insert annotated");
         let updated = db
-            .update_batch_transcription_if_unreviewed("annot-1", "new asr", Some("new asr"), Some(0.7), "seed ignored")
+            .update_batch_transcription_if_unreviewed(
+                "annot-1",
+                "new asr",
+                Some("new asr"),
+                Some(0.7),
+                Some("real_posterior"),
+                Some("omniasr-ctc-1b"),
+                false,
+                "seed ignored",
+            )
             .expect("update annotated");
         assert!(updated, "an unverified annotated row still refreshes ASR");
         let after = db.get_segment_by_id("annot-1").unwrap().unwrap();
@@ -2954,6 +3131,8 @@ mod tests {
             "existing annotation preserved (COALESCE)"
         );
         assert_eq!(after.raw_transcript, "new asr", "raw ASR refreshed on an unverified row");
+        assert_eq!(after.confidence_source.as_deref(), Some("real_posterior"));
+        assert_eq!(after.model_version_id.as_deref(), Some("omniasr-ctc-1b"));
     }
 
     #[test]

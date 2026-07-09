@@ -85,7 +85,9 @@ fn gold_wer_real_omniasr() {
         let (sr, pcm) = audio::decode_to_pcm(&seg.audio_path)?;
         let (_sr, pcm16) = audio::ensure_pcm_16khz(sr, pcm)?;
         let f32_pcm: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
-        asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(text, _conf)| text).map_err(AppError::Other)
+        asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
+            .map(|(text, _conf, _source)| text)
+            .map_err(AppError::Other)
     })
     .expect("gold eval with real ASR");
     let elapsed = t0.elapsed().as_secs_f64();
@@ -334,8 +336,14 @@ fn compare_300m_vs_1b() {
         };
         let (_sr, p16) = audio::ensure_pcm_16khz(sr, pcm).expect("16khz");
         let f32_pcm: Vec<f32> = p16.iter().map(|&s| s as f32 / 32768.0).collect();
-        let h3 = a300.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(t, _)| t).unwrap_or_default();
-        let h1 = a1b.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(t, _)| t).unwrap_or_default();
+        let h3 = a300
+            .transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
+            .map(|(t, _, _)| t)
+            .unwrap_or_default();
+        let h1 = a1b
+            .transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
+            .map(|(t, _, _)| t)
+            .unwrap_or_default();
         worksheet.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t\n",
             n + 1,
@@ -406,7 +414,7 @@ fn whole_file_wer_real_omniasr() {
     let f32_pcm: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
     let secs = f32_pcm.len() as f64 / 16000.0;
     eprintln!("[whole-wer] decoded {secs:.1}s audio; transcribing whole file…");
-    let (hyp, _conf) = asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).expect("transcribe whole file");
+    let (hyp, _conf, _source) = asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE).expect("transcribe whole file");
     let elapsed = t0.elapsed().as_secs_f64();
 
     let norm = SoraniNormalizer::new();

@@ -667,6 +667,28 @@ pub static MIGRATIONS: &[Migration] = &[
                  INSERT OR IGNORE INTO loop0_evidence_archive (id) VALUES (1);",
         down_sql: Some("DROP TABLE IF EXISTS loop0_evidence_archive;"),
     },
+    Migration {
+        version: 34,
+        description: "Persist segment proof metadata for confidence source, cloud use, decoder config, and normalizer version",
+        // These columns turn transcript quality from a naked number into evidence. Legacy rows are
+        // deliberately marked `unknown`, not `real_posterior`, so calibration/autonomy gates fail closed
+        // until a fresh ASR pass records the real source. `cloud_call` defaults false because historical
+        // local rows did not record a cloud event; explicit cloud providers must set it true at write time.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN confidence_source TEXT NOT NULL DEFAULT 'unknown';
+                 ALTER TABLE speech_segments ADD COLUMN cloud_call INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE speech_segments ADD COLUMN decoder_config_hash TEXT;
+                 ALTER TABLE speech_segments ADD COLUMN normalizer_version TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_segments_cloud_call ON speech_segments(cloud_call);
+                 CREATE INDEX IF NOT EXISTS idx_segments_confidence_source ON speech_segments(confidence_source);",
+        down_sql: Some(
+            "DROP INDEX IF EXISTS idx_segments_confidence_source;
+             DROP INDEX IF EXISTS idx_segments_cloud_call;
+             ALTER TABLE speech_segments DROP COLUMN normalizer_version;
+             ALTER TABLE speech_segments DROP COLUMN decoder_config_hash;
+             ALTER TABLE speech_segments DROP COLUMN cloud_call;
+             ALTER TABLE speech_segments DROP COLUMN confidence_source;",
+        ),
+    },
 ];
 
 #[cfg(test)]

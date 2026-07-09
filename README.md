@@ -34,8 +34,9 @@ curation, and dataset export. Tauri v2 + Svelte 5 + Rust, running **Meta OmniASR
 ## Local quality gate
 
 ```bash
-make verify-10     # repo/license/asset/provenance integrity gate (M0/M1)
-make ship-check    # full local pre-release gate
+make governance-proof  # repo/license/asset/provenance integrity gate (M0/M1)
+make ship-check        # CI-equivalent local pre-release gate
+make verify-10         # full charter gate; fails closed until eval/egress/release proofs are live
 ```
 
 ## License

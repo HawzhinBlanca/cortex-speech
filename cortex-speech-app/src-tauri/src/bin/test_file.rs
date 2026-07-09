@@ -75,14 +75,17 @@ fn main() -> AppResult<()> {
         }
         println!("Chunk {}: [{} ms]", i, seg.duration_ms);
         match pipeline.transcribe(Some(&seg.id), &seg.audio_path, seg.alignment_json.as_deref(), None) {
-            Ok((raw, corrected, confidence)) => {
-                println!("Raw Draft: {}", raw);
-                println!("Gemini Output: {}", corrected);
-                if !raw.trim().is_empty() {
+            Ok(draft) => {
+                println!("Raw Draft: {}", draft.raw_text);
+                println!("Gemini Output: {}", draft.final_text);
+                if !draft.raw_text.trim().is_empty() {
                     non_empty_transcripts += 1;
                 }
-                if let Some(c) = confidence {
+                if let Some(c) = draft.confidence {
                     println!("ASR Confidence: {:.2}%", c * 100.0);
+                }
+                if let Some(source) = draft.confidence_source.as_deref() {
+                    println!("ASR Confidence Source: {}", source);
                 }
             }
             Err(e) => {

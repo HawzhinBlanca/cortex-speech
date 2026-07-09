@@ -11,7 +11,7 @@
 
 use crate::aligner;
 use crate::audio;
-use crate::db::SpeechSegment;
+use crate::db::{SegmentsPage, SpeechSegment};
 use crate::diff::TextDiff;
 use crate::health;
 use crate::history::Command;
@@ -1097,10 +1097,17 @@ pub fn transcribe_segment(
     // Clone the pipeline (Arc-wrapped internals) so the global pipeline mutex is released before the
     // possibly-long WSL/ONNX transcription — holding it would serialize every other pipeline command.
     let pipeline = state.lock_pipeline().clone();
-    let (raw_text, corrected_text, confidence) = pipeline
+    let draft = pipeline
         .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref(), None)
         .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "text": corrected_text, "rawTranscript": raw_text, "confidence": confidence }))
+    Ok(serde_json::json!({
+        "text": draft.final_text,
+        "rawTranscript": draft.raw_text,
+        "confidence": draft.confidence,
+        "confidenceSource": draft.confidence_source,
+        "modelVersionId": draft.model_version_id,
+        "cloudCall": draft.cloud_call
+    }))
 }
 
 #[tauri::command]
@@ -1201,8 +1208,8 @@ pub fn batch_transcribe(
                 // Capture full snapshot BEFORE transcription for complete undo.
                 let pre_transcription_snapshot = seg.clone();
                 match pipeline.transcribe(Some(id), &seg.audio_path, seg.alignment_json.as_deref(), None) {
-                    Ok((raw_text, corrected_text, confidence)) => {
-                        let normalized = normalizer.normalize(&corrected_text);
+                    Ok(draft) => {
+                        let normalized = normalizer.normalize(&draft.final_text);
                         // Guarded targeted write (NOT a full insert_segment of the stale snapshot): a
                         // human may have verified/edited this row since the batch prefetched it. This
                         // writes only the ASR fields, seeds the annotation solely when still empty
@@ -1210,10 +1217,13 @@ pub fn batch_transcribe(
                         // rows — so a concurrent curator decision can never be silently lost.
                         match app_state.lock_db().update_batch_transcription_if_unreviewed(
                             id,
-                            &raw_text,
+                            &draft.raw_text,
                             Some(normalized.as_str()),
-                            confidence,
-                            &corrected_text,
+                            draft.confidence,
+                            draft.confidence_source.as_deref(),
+                            draft.model_version_id.as_deref(),
+                            draft.cloud_call,
+                            &draft.final_text,
                         ) {
                             Ok(true) => {
                                 previous_segments.push(pre_transcription_snapshot);
@@ -1404,6 +1414,38 @@ pub fn get_segments(verified: Option<bool>, state: State<'_, AppState>) -> Resul
     RATE_LIMITER.check("get_segments")?;
     let db = state.lock_db();
     db.get_segments(verified).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_segments_page(
+    verified: Option<bool>,
+    query: Option<String>,
+    sort: Option<String>,
+    limit: Option<usize>,
+    cursor: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<SegmentsPage, String> {
+    RATE_LIMITER.check("get_segments_page")?;
+    if let Some(ref query) = query {
+        validate::validate_text(query, 1000, "Search query")?;
+    }
+    let sort = sort.unwrap_or_else(|| "newest".to_string());
+    validate::validate_text(&sort, 64, "Segment sort")?;
+    match sort.as_str() {
+        "newest" | "oldest" | "duration" | "verified" | "confidence" | "activeLearning" | "active_learning"
+        | "suspectFirst" | "suspect_first" => {}
+        _ => return Err(format!("Invalid segment sort: {sort}")),
+    }
+    if let Some(ref cursor) = cursor {
+        validate::validate_text(cursor, 32, "Segment page cursor")?;
+        if !cursor.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err("Invalid segment page cursor".to_string());
+        }
+    }
+    let limit = limit.unwrap_or(200).clamp(1, 500);
+    let db = state.lock_db();
+    db.get_segments_page(verified, query.as_deref(), &sort, limit, cursor.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 /// M2.5: Return segments ordered by suspect-first priority: escalated + low confidence first.
@@ -2896,7 +2938,15 @@ fn run_wsl_refinement_loop(
                 } else {
                     None
                 };
-                match db.update_asr_transcript_if_unreviewed(id, &raw_transcript, normalized.as_deref(), confidence) {
+                match db.update_asr_transcript_if_unreviewed(
+                    id,
+                    &raw_transcript,
+                    normalized.as_deref(),
+                    confidence,
+                    Some("external_provider"),
+                    Some("omniasr-wsl-7b"),
+                    false,
+                ) {
                     Ok(true) => {
                         transcribed += 1;
                         emit_or_log(

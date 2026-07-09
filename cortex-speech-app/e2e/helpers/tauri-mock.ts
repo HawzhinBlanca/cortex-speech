@@ -110,6 +110,8 @@ export async function installTauriMock(page: Page): Promise<void> {
         },
       ) => {
         switch (cmd) {
+          case 'get_segments_page':
+            return { items: [mockSegment], total: 1, nextCursor: null };
           case 'get_segments':
             return [mockSegment];
           case 'get_settings':
