@@ -2001,3 +2001,14 @@ effort (Makefile governance-proof/eval-ckb/egress-offline/bench-rtf/release-proo
 asr.rs, real_audio.rs, ...). That work was left UNTOUCHED on main; F was completed in an isolated
 git worktree on this branch. The two efforts (backlog FIXES here, GATE infra on main) are
 complementary and must be reconciled by the owner before a final ship-check.
+
+## Cluster G (docs honesty) — EVAL.md 7B claims corrected (2026-07-09)
+
+Retracted the numeric "on-par-to-slightly-better than stock" 7B read from EVAL.md's main body AND
+the appendix (its own 2026-07-07 caveat already showed the 7B and stock numbers used different CER
+bases — space-stripped vs space-kept — so they can't be compared; only the by-eye "coherent,
+correct Sorani" observation stands). Flagged the 29.33% N=1 clean number as also pre-fix
+space-stripped. The 7B stays HONESTLY UNMEASURED against stock until P2.2. Remaining G items (UX
+minors: AudioPlayer stale-src Space race, waveform a11y seek, Mac-glyph formatter dedup, i18n
+literals, inbox 200-cap banner) are genuinely minor and deferred — lower priority than the
+owner's reconciliation of this branch with the concurrent main "10/10 gate" effort.
