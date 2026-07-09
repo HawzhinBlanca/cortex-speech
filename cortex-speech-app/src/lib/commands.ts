@@ -55,6 +55,21 @@ export async function cancelOperation(): Promise<void> {
   return invoke<void>('cancel_operation');
 }
 
+/**
+ * Sentinel the backend embeds (pipeline.rs `ASR_7B_UNAVAILABLE_TAG`) in every error that means
+ * "the OmniASR-7B champion is the selected engine but it is unavailable / failed". When a transcribe
+ * call rejects carrying this token, the UI offers the user an explicit choice — retry the champion
+ * or transcribe this clip with the offline model — instead of a dead-end. The app NEVER silently
+ * downgrades to a smaller model on the primary path. Keep in sync with the Rust constant.
+ */
+export const ASR_7B_UNAVAILABLE_TAG = 'E_ASR_7B_UNAVAILABLE';
+
+/** True when a transcription error is the "7B champion unavailable/failed" signal above. */
+export function is7bUnavailableError(e: unknown): boolean {
+  const msg = typeof e === 'string' ? e : ((e as { message?: unknown } | null)?.message ?? '');
+  return String(msg).includes(ASR_7B_UNAVAILABLE_TAG) || String(e).includes(ASR_7B_UNAVAILABLE_TAG);
+}
+
 export async function transcribeSegment(
   audioPath: string,
   alignmentJson?: string | null,

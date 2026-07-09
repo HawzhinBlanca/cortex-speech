@@ -94,6 +94,35 @@ describe('ConfirmDialog', () => {
     });
   });
 
+  it('renders a secondary action with custom labels and fires only its handler', async () => {
+    render(ConfirmDialog);
+    const onConfirm = vi.fn();
+    const onSecondary = vi.fn();
+    showConfirmDialog.set({
+      title: '7B down',
+      message: 'Champion unavailable',
+      confirmLabel: 'Try 7B again',
+      danger: false,
+      onConfirm,
+      secondary: { label: 'Use offline model', onClick: onSecondary },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Use offline model' })).toBeInTheDocument();
+    });
+    // Custom confirm label is used instead of the default 'Confirm'.
+    expect(screen.getByRole('button', { name: 'Try 7B again' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Confirm' })).not.toBeInTheDocument();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Use offline model' }));
+
+    expect(onSecondary).toHaveBeenCalledOnce();
+    expect(onConfirm).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+  });
+
   it('does not fire the destructive onConfirm on a stray Enter (Cancel is the safe default)', async () => {
     // By design (ConfirmDialog.svelte): Cancel is autofocused so a stray Enter
     // dismisses rather than firing the destructive action. Pin that safety contract —

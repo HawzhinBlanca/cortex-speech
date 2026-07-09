@@ -139,6 +139,13 @@ export const en: Record<string, string> = {
   'review.retranscribing': 'Re-transcribing…',
   'review.retranscribed': 'Re-transcribed.',
   'review.retranscribeFailed': 'Re-transcription failed',
+  // The OmniASR-7B champion is the only engine that produces a transcript by default. When it is
+  // down, the app asks the owner instead of silently using a smaller model.
+  'asr.championUnavailableTitle': 'OmniASR-7B champion unavailable',
+  'asr.championUnavailableMessage':
+    "The OmniASR-7B champion (the best model) isn't responding — its server may be down. Start it and try again, or transcribe this one clip with the offline model. The app never silently uses a smaller model in its place.",
+  'asr.tryAgain': 'Try 7B again',
+  'asr.useOfflineModel': 'Use offline model',
   'review.markBad': 'Mark bad',
   'review.markBadTitle': 'Flag this clip as bad — excluded from export, kept so you can re-transcribe later.',
   'review.markedBad': 'Marked bad — excluded from export. Backspace to undo.',
