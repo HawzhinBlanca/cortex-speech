@@ -2033,3 +2033,40 @@ feat/proof-metadata-10-10-gate (f4b09e7) to preserve it, but NOT merged: it does
 its own base (8 SpeechSegment initializers un-updated for the new columns) and its migration is v34,
 which COLLIDES with main's v34 c4_evidence_archive (must renumber to v35 when finished). Honest call:
 no unverified half-feature onto a clean CI-green main. The feature awaits a proper completion pass.
+
+## 7B champion-or-ask policy + MEASURED champion CER on real audio (2026-07-09)
+
+Owner directive: the OmniASR-7B champion is the ONLY engine that may become the transcript; if it
+fails, the app must ASK (retry the champion / use the offline model), never silently downgrade.
+
+SHIPPED (merged to main 072ebb2, pushed 48c21e2..072ebb2):
+- feat(asr) e6aff3b: ASR_7B_UNAVAILABLE_TAG sentinel on every "7B selected but unavailable/failed"
+  error (unresolved-primary, both preflight failures, per-segment WSL failure); frontend
+  is7bUnavailableError() + a retry/offline ConfirmDialog in App.svelte handleTranscribe and
+  ReviewMode retranscribe('champion'); EN+CKB strings. No silent small-model substitution on the
+  primary path. Gated: Rust 834 lib tests, clippy --all-targets -D warnings, fmt, vitest 144,
+  typecheck 0/406, eslint, python policies — all green (rustc 1.97).
+- fix(e2e) 516763a: the real-app harness accepted the in-progress placeholder "[Pending WSL 7B ASR]"
+  as a real transcript (false green). Now waits past bracketed/"pending" placeholders and fails
+  honestly. Caught LIVE on this run.
+- Release exe REBUILT from main: npm run build + cargo build --release (8m10s). EXE FRESHNESS GATE
+  GREEN (exe at HEAD 072ebb2). New exe smoke-launched OK (WebView up ~6s).
+
+REAL-DATA RUNS (drove the actual cortex-speech-app.exe via e2e_real_app.cjs, warm 7B server on the
+4090 :8799): podcast.wav -> 24 VAD segments -> 24/24 coherent Sorani; Halwest1.wav (news broadcast)
+-> 26 VAD segments -> 26/26 coherent Sorani incl. proper nouns (Pezeshkian/Khamenei/Graham/Musk/
+Ilam/Kermanshah). Self-contained review pages built (podcast_7b_review/, halwest_7b_review/,
+--embed-audio). Drafts written back to the app DB (0 placeholders).
+
+MEASURED CER (real harness, no fabrication):
+- Command: wsl scripts/scorecard_7b.py <manifest> 2000  (warm cortex_7b_server.py, seed-42 bootstrap)
+- Model: OmniASR-7B Champion = base omniASR-LLM-7B-v2.pt (30 GB) + LoRA adapter
+  Kurdish_ASR_Model_Export/OmniASR_7B_Champion/adapter_weights/adapter_model.safetensors
+- Data: Common Voice 22 ckb TEST split, 400 clips sampled seed 42 (of 5344), MP3->16 kHz WAV
+- RESULT: micro CER = 5.04%  95% CI [4.62%, 5.52%]  N=400 ; WER = 27.46% [25.47, 29.50] ; ~1.0 s/clip
+- Same harness/norm baselines: fine-tuned MMS-1B 21.00% [19.93,22.04] N=900 ; stock CTC-300M 29.40%.
+  => champion ~4x better than the next-best local model.
+- HONEST CAVEATS (do not overclaim): (1) train/test disjointness UNVERIFIED — the base 7B (Meta) or
+  the LoRA may have seen Common Voice ckb; if so 5.04% is optimistic. Clean confirmation needs a set
+  with KNOWN disjointness (FLEURS-ckb, not yet downloaded here — cache is metadata-only). (2) Do NOT
+  cross-compare to Scribe 32.1% WER (that is FLEURS-ckb; ours is CV22-ckb — different dataset).
