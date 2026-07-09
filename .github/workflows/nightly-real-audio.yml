@@ -55,12 +55,17 @@ jobs:
             cortex-speech-app/src-tauri/target
           key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('cortex-speech-app/src-tauri/Cargo.lock') }}
 
-      # Base models must exist before ANY cargo build in this job: build.rs -> tauri-build
-      # validates bundle.resources (models/silero_vad_v4.onnx), so the soak step below fails
-      # to even compile without them. Same provisioning step ci.yml uses (fixes the nightly
-      # "resource path models/silero_vad_v4.onnx doesn't exist" failure).
+      # Base models AND a built dist/ must exist before ANY cargo build in this job: build.rs ->
+      # tauri-build validates bundle.resources (models/silero_vad_v4.onnx) and the crate's
+      # tauri::generate_context! (compiled by the test binaries) requires build.frontendDist
+      # ("../dist"). Same provisioning ci.yml uses (fixes the nightly "resource path
+      # models/silero_vad_v4.onnx doesn't exist" failure - and the dist/ failure right behind it).
       - name: Fetch + verify base models (bundle.resources)
         run: npm run fetch-models
+      - name: Install Node dependencies (for the frontend build below)
+        run: npm ci
+      - name: Build frontend (tauri generate_context needs ../dist)
+        run: npm run build
 
       - name: Run ignored real-audio tests when fixtures available
         env:

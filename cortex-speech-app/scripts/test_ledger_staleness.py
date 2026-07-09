@@ -12,6 +12,7 @@ pass while many code commits piled up as long as today's date happened to appear
 Counting commits-since-ledger-update is both false-positive-free at rollover AND strictly stricter
 where it matters (a burst of code commits with no ledger entry reds regardless of the calendar date).
 """
+import os
 import subprocess
 from pathlib import Path
 
@@ -39,8 +40,14 @@ def test_ledger_staleness(max_commits_lag=3):
             print("SKIP: PROGRESS_LEDGER.md not yet committed")
             return
         commits_since = int(git("rev-list", "--count", f"{last_ledger_commit}..HEAD") or "0")
-    except Exception as e:  # noqa: BLE001 — a git hiccup must not hard-fail the policy suite
-        print(f"SKIP: could not read git history: {e}")
+    except Exception as e:  # noqa: BLE001
+        # In CI a git failure must be a HARD error: a silent SKIP inside an overall-green policy run
+        # converts the anti-drift gate into a pass exactly where nobody is watching (true-10 audit
+        # 2026-07-09). Locally, keep the ergonomic skip but print it in ::warning form so it is
+        # visible in gate output rather than scrolling by as an OK-looking line.
+        if os.environ.get("GITHUB_ACTIONS"):
+            raise AssertionError(f"ledger-staleness gate could not read git history in CI: {e}") from e
+        print(f"::warning title=Ledger gate skipped::could not read git history locally: {e}")
         return
 
     if commits_since > max_commits_lag:

@@ -1974,3 +1974,30 @@ Gates per cluster: cargo test --lib (827->829), clippy-all-targets, fmt, vitest 
 eslint, python policies (this entry pays the ledger-staleness gate that fired at 4 commits — the
 gate worked). Remaining: clusters E (reliability/DR), F (security/CI), G (doc honesty + UX polish),
 then PR + exe rebuild + full ship-check.
+
+## Audit-backlog execution: clusters E + F shipped (2026-07-09, branch fix/audit-backlog-20260709)
+
+- E reliability/DR (78c3a76): pre-migration PINNED (rotation-exempt) snapshot before any pending
+  migration on a non-empty library; TIERED retention (rolling 10 + last 7 daily + last 4 weekly,
+  pure selector, unit-tested) replaces the ~100-min single-tier horizon; restore is gated against
+  running import/batch writers AND pins a pre-restore copy first (shared prepare_restore);
+  quarantine gets an in-app acknowledge (archives *.corrupt.* to <data_dir>/quarantine, releases
+  the prune-pin) + accumulation cap; snapshot staleness surfaced + loop body catch_unwind'd;
+  db_backup on a dedicated connection + verifies the written file; get_current_version stops
+  swallowing transient read errors as v0. +4 snapshot tests. 833 lib tests.
+- F security/CI (this commit): T2 Gemini response through crate::http::json_bounded (was the last
+  into_json() — regression of the provider-body OOM guard); release.yml now fetch-models + npm run
+  build + verify_10.py governance gate BEFORE any cargo step (the tag gate failed by construction);
+  nightly gets the same dist/ provisioning; a NEW meta-gate test asserts provisioning ORDER before
+  the first compiling cargo step across all three workflows (comment-stripped so a comment can't
+  pose as a step — it found ci.yml was already correct); pre-commit drops the exit-code-masking
+  `| tail` on cargo check; ledger-staleness gate hard-errors in CI instead of silent-SKIP.
+  Deferred with rationale (documented in the rating doc, need Windows-native design / real-app
+  observation): DPAPI key-encryption-at-rest, an egress/consent audit log.
+
+COLLISION NOTE (honest): while F was in progress a CONCURRENT session switched the shared
+C:\Users\hawzh\Desktop\CORTEX checkout to `main` and began an uncommitted "10/10 charter gate"
+effort (Makefile governance-proof/eval-ckb/egress-offline/bench-rtf/release-proof, verify_10.py,
+asr.rs, real_audio.rs, ...). That work was left UNTOUCHED on main; F was completed in an isolated
+git worktree on this branch. The two efforts (backlog FIXES here, GATE infra on main) are
+complementary and must be reconciled by the owner before a final ship-check.
