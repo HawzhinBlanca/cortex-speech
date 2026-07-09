@@ -1996,7 +1996,7 @@ then PR + exe rebuild + full ship-check.
   observation): DPAPI key-encryption-at-rest, an egress/consent audit log.
 
 COLLISION NOTE (honest): while F was in progress a CONCURRENT session switched the shared
-C:\Users\hawzh\Desktop\CORTEX checkout to `main` and began an uncommitted "10/10 charter gate"
+repo checkout to `main` and began an uncommitted "10/10 charter gate"
 effort (Makefile governance-proof/eval-ckb/egress-offline/bench-rtf/release-proof, verify_10.py,
 asr.rs, real_audio.rs, ...). That work was left UNTOUCHED on main; F was completed in an isolated
 git worktree on this branch. The two efforts (backlog FIXES here, GATE infra on main) are
