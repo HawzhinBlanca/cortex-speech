@@ -1074,8 +1074,12 @@ pub fn transcribe_segment_finetuned(
     // on long recordings ("audio too large to decode in one pass") even though the clip is a few
     // seconds. The windowed decode reads just the clip, so re-transcribe works on any source length.
     let clip = decode_finetuned_clip_16k(&audio_path, alignment_json.as_deref())?;
-    let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
-    let text = crate::wav2vec2_asr::run_wav2vec2(&onnx, &vocab, "ckb", &audio)?;
+    // Route through the pipeline's shared windowed wrapper, NOT run_wav2vec2 directly: the model is
+    // trained on short utterances and a single unbounded pass over >15 s (a raised max-segment
+    // setting, or a whole-file/no-meta clip) duplicates text — the pipeline path sub-splits into
+    // ~15 s windows for exactly that reason (true-10 audit 2026-07-09: one engine, two call paths,
+    // two different qualities).
+    let text = crate::pipeline::ProcessingPipeline::transcribe_chunk_finetuned(&onnx, &vocab, &clip)?;
     Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
 }
 
@@ -2899,6 +2903,20 @@ fn run_wsl_refinement_loop(
                 match db.update_asr_transcript_if_unreviewed(id, &raw_transcript, normalized.as_deref(), confidence) {
                     Ok(true) => {
                         transcribed += 1;
+                        // Record the champion's provenance hypothesis like BOTH other 7B paths do
+                        // (import pass + single re-transcribe) — without it the review badge cannot
+                        // name the producing engine for batch-refined segments and the jury lacks
+                        // the champion's highest-weight vote for exactly these clips (true-10 audit
+                        // 2026-07-09). Best-effort: a provenance-write failure must not fail the
+                        // (successful) transcription.
+                        if let Err(e) = db.insert_hypothesis(&crate::db::SegmentHypothesis {
+                            segment_id: id.to_string(),
+                            model_id: "omniasr-wsl-7b".to_string(),
+                            transcript: raw_transcript.clone(),
+                            confidence,
+                        }) {
+                            tracing::warn!("could not record omniasr-wsl-7b provenance for {id}: {e}");
+                        }
                         emit_or_log(
                             app,
                             "wsl-log",

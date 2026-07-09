@@ -602,6 +602,15 @@ impl ProcessingPipeline {
     fn should_use_wsl_primary_asr(&self) -> bool {
         self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
             && self.settings.external_asr_script_path().is_some()
+            // ENGINE TRUTH (true-10 audit 2026-07-09): use_finetuned_asr is documented as
+            // "overriding asr_model_size" — when the override is EFFECTIVE (flag on AND the model
+            // present), the fine-tuned engine is the primary drafter, so the 7B pass must not run:
+            // it re-attributed the fine-tuned text as an "omniasr-wsl-7b" hypothesis (wrong badge,
+            // double vote for one engine in the jury) and hard-required a server that never
+            // transcribes. Mirrors wsl7b_primary_unresolved below: with the flag on but the model
+            // ABSENT, the 7B remains the primary and this stays true (never a silent stock
+            // downgrade — the F2 contract).
+            && !(self.settings.use_finetuned_asr && Self::finetuned_model_paths().is_some())
     }
 
     /// F2 — the no-silent-downgrade guard. True when the selected primary engine is WSL 7B but no
@@ -712,7 +721,22 @@ impl ProcessingPipeline {
     /// `AppState` lock is held across the (slow) ASR loop.
     pub fn run_gold_eval_asr(&self, model_id: Option<&str>) -> AppResult<crate::eval::EvalRunResult> {
         let db = self.open_db()?;
-        let model_id = model_id.map(|s| s.to_string()).unwrap_or_else(|| self.local_asr_model_id().to_string());
+        let active_id = self.local_asr_model_id();
+        // HONESTY GUARD (true-10 audit 2026-07-09): this entrypoint always transcribes with the
+        // ACTIVE pooled local engine (transcribe_audio_file_raw → with_asr → asr_config), so a
+        // caller-supplied label that names a DIFFERENT engine would persist a mislabeled WER/CER
+        // row. Refuse the mismatch instead of recording it.
+        if let Some(requested) = model_id {
+            if requested != active_id {
+                return Err(AppError::Validation(format!(
+                    "run_gold_eval_asr transcribes with the active local engine '{active_id}', but \
+                     the run was requested under the label '{requested}'. Eval rows are persisted \
+                     under that label, so it must match the engine that actually runs — switch the \
+                     active model or drop the label."
+                )));
+            }
+        }
+        let model_id = active_id.to_string();
         crate::eval::run_gold_eval_with_transcriber(&db, &model_id, |seg| {
             self.transcribe_audio_file_raw(&seg.audio_path)
         })
@@ -2710,7 +2734,10 @@ impl ProcessingPipeline {
     /// Transcribe one decoded chunk (16 kHz mono i16) with the fine-tuned engine. The fine-tuned
     /// model is trained on short utterances, so a single >~15 s pass can duplicate text — sub-split a
     /// long chunk into balanced ~15 s windows and join the per-window transcripts.
-    fn transcribe_chunk_finetuned(onnx: &Path, vocab: &Path, chunk_pcm: &[i16]) -> Result<String, String> {
+    // pub(crate): the transcribe_segment_finetuned IPC must share this windowing instead of calling
+    // run_wav2vec2 directly — a single unbounded pass over >15 s audio duplicates text on this model
+    // (true-10 audit 2026-07-09: same engine, two call paths, different quality).
+    pub(crate) fn transcribe_chunk_finetuned(onnx: &Path, vocab: &Path, chunk_pcm: &[i16]) -> Result<String, String> {
         const MAX_WIN: usize = 15 * 16000;
         let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
         let n = f32_pcm.len();
@@ -2790,6 +2817,23 @@ impl ProcessingPipeline {
     }
 
     pub fn run_gold_eval_local(&self, model_id: &str) -> AppResult<crate::eval::EvalRunResult> {
+        // HONESTY GUARD (true-10 audit 2026-07-09): the eval row is persisted under `model_id`, so
+        // the engine that transcribes MUST be derived from that id. Previously this always ran the
+        // ACTIVE local engine and labeled the run with whatever the caller typed — a row labeled
+        // "finetuned-mms-ckb" or "omniasr-wsl-7b" could be pure stock CTC output, a mislabeled
+        // metric in the app's own honest-CER entrypoint. Only the locally runnable CTC engines are
+        // accepted; anything else is an explicit error, never a silently mislabeled number.
+        let model_size = match model_id {
+            "omniasr-ctc-300m" => crate::settings::AsrModelSize::CTC300M,
+            "omniasr-ctc-1b" => crate::settings::AsrModelSize::CTC1B,
+            other => {
+                return Err(AppError::Validation(format!(
+                    "run_gold_eval_local can only run the local CTC engines it can label honestly \
+                     (omniasr-ctc-300m, omniasr-ctc-1b); got '{other}'. Eval rows are persisted \
+                     under this id, so the transcribing engine must match it exactly."
+                )));
+            }
+        };
         // Open our own DB connection so no AppState lock is held across the (slow) decode+ASR loop —
         // mirrors run_gold_eval_asr. Holding the global db/pipeline mutexes here froze the whole UI.
         let db = self.open_db()?;
@@ -2797,7 +2841,12 @@ impl ProcessingPipeline {
         let mut hypotheses = Vec::new();
 
         let model_dir = self.model_manager.resolved_dir();
-        let config = self.asr_config();
+        let config = asr::AsrLoadConfig {
+            model_size,
+            enable_gpu: self.settings.enable_gpu,
+            num_threads: self.settings.num_asr_threads,
+            language: self.settings.language.clone(),
+        };
         self.asr_pool.warmup(&model_dir, &config)?;
 
         for gold in &gold_segments {

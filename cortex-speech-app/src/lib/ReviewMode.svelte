@@ -128,12 +128,20 @@
   // configured primary model, read from settings — never assumed. Keeps the provenance badge honest
   // if the user switched the primary away from the default 7B.
   function primaryEngineId(): string {
+    const s = get(settings);
+    // useFinetunedAsr is documented as OVERRIDING the model selection: with it on, the backend's
+    // transcribe() drafts with the fine-tuned MMS before any configured-engine code runs — a badge
+    // naming the configured model would be the exact wrong-engine attribution this function exists
+    // to prevent (true-10 audit 2026-07-09). (If the fine-tuned files are missing the backend falls
+    // back to the configured engine; the fully-honest fix is the backend returning the engine id it
+    // used — until then this matches the documented, common case.)
+    if (s.useFinetuned) return 'finetuned-mms-ckb';
     const map: Record<string, string> = {
       'wsl-7b': 'omniasr-wsl-7b',
       'ctc-1b': 'omniasr-ctc-1b',
       'ctc-300m': 'omniasr-ctc-300m',
     };
-    return map[get(settings).asrModel] ?? 'omniasr-wsl-7b';
+    return map[s.asrModel] ?? 'omniasr-wsl-7b';
   }
 
   // Re-transcribe THIS clip with a chosen engine when the current draft is wrong. 'champion' routes
