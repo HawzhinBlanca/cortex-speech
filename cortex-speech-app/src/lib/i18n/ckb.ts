@@ -445,6 +445,8 @@ export const ckb: Record<string, string> = {
   'stats.intelTitle': 'بەڵگەی زیرەکی',
   'stats.loop0OverTriggers': 'زیادە-چالاککردنی LOOP-0 — دەبێت ٠ بێت بۆ چالاککردن',
   'stats.loop0WouldFire': 'چالاک دەبوو',
+  'stats.noEvidenceYet': 'هێشتا بەڵگە نییە',
+  'stats.conformalProgress': 'پێشکەوتنی ڕاهێنانی پەسەندکردنی خۆکار - نزیکەی {n} کلیپی پشتڕاستکراوی تەواو پێویستە بۆ هەر پۆلێک لە دەروازەی ٥٪ CER',
   'stats.c4Precision': 'وردی پەسەندکردنی خۆکار بەرامبەر پێداچوونەوەی مرۆڤ',
   'stats.tools': 'ئامرازەکانی داتاسێت و مۆدێل',
   'stats.exportFinetunePack': 'دەرهێنانی پاکەتی مەشق',

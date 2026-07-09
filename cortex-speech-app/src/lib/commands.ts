@@ -566,6 +566,16 @@ export interface IntelligenceReport {
     t0HumanConfirmed: number;
     t0HumanContradicted: number;
   };
+  /** Honest distance-to-calibration for the T0 auto-accept gate: per-SNR-bucket verified counts vs
+   * the minimum needed at ZERO CER (a hard lower bound — real data needs more). Explains why the
+   * jury escalates everything at low data volumes instead of leaving it a mystery (C3). Optional so
+   * an older backend (pre-v34 exe) doesn't break the dashboard. */
+  conformalCalibration?: {
+    targetErrorCer: number;
+    perBucketDelta: number;
+    minNeededAtZeroCer: number;
+    buckets: Array<{ bucket: string; verifiedWithReference: number; minNeededAtZeroCer: number }>;
+  };
 }
 
 export async function getIntelligenceReport(): Promise<IntelligenceReport> {

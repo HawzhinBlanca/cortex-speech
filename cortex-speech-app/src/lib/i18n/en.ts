@@ -444,6 +444,8 @@ export const en: Record<string, string> = {
   'stats.intelTitle': 'Intelligence evidence',
   'stats.loop0OverTriggers': 'LOOP-0 over-triggers — must be 0 to enable firing',
   'stats.loop0WouldFire': 'would fire',
+  'stats.noEvidenceYet': 'no evidence yet',
+  'stats.conformalProgress': 'Auto-accept calibration progress - needs ~{n} perfect verified clips per bucket at the 5% CER gate',
   'stats.c4Precision': 'Auto-accept precision vs human review',
   'stats.tools': 'Dataset & model tools',
   'stats.exportFinetunePack': 'Export fine-tune pack',
