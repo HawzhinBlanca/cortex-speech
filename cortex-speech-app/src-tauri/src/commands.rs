@@ -985,12 +985,34 @@ pub fn transcribe_segment_constrained(
 /// window decoder, early-stopping once past the window. Falls back to a whole-file decode when there is
 /// no window (a single-segment file, which is small). Fixes the per-clip fine-tuned re-transcribe
 /// failing with "audio too large to decode in one pass" on long recordings.
-pub(crate) fn decode_finetuned_clip_16k(audio_path: &str, alignment_json: Option<&str>) -> Result<Vec<i16>, String> {
-    let meta = alignment_json.and_then(crate::chunking::SegmentSourceMeta::from_alignment_json);
-    let Some(meta) = meta else {
+pub(crate) fn decode_finetuned_clip_16k(
+    audio_path: &str,
+    alignment_json: Option<&str>,
+    // ALIGNMENT PRESENT BUT OFFSET-LESS is ambiguous: a legitimately-aligned SINGLE-segment file
+    // carries `{"words":[...]}` with no source offsets (whole-file decode is CORRECT), while a
+    // clobbered CHUNK of a multi-segment source carries the same shape (whole-file decode ships the
+    // entire recording as one "clip" — the true-10 audit's training-data-corruption major, the exact
+    // shape the HF/audio exporters refuse). Only the CALLER can tell them apart, by whether the
+    // source has sibling segments in the DB — so it must say whether whole-file is permitted.
+    allow_whole_file_without_offsets: bool,
+) -> Result<Vec<i16>, String> {
+    let whole_file = || -> Result<Vec<i16>, String> {
         let (rate, pcm) = crate::audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
         let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, pcm).map_err(|e| e.to_string())?;
-        return Ok(pcm16);
+        Ok(pcm16)
+    };
+    let Some(alignment) = alignment_json.map(str::trim).filter(|a| !a.is_empty()) else {
+        // Truly absent alignment: a single-segment import — whole file is the clip.
+        return whole_file();
+    };
+    let Some(meta) = crate::chunking::SegmentSourceMeta::from_alignment_json(alignment) else {
+        if allow_whole_file_without_offsets {
+            return whole_file();
+        }
+        return Err("alignment_json is present but carries no source offsets (a legacy/clobbered \
+                    word-array blob) on a multi-segment source — refusing the whole-file fallback; \
+                    re-import the file through the current build to regenerate its slice offsets"
+            .to_string());
     };
     let start_ms = meta.source_start_ms.max(0);
     let end_ms = meta.source_end_ms.max(start_ms);
@@ -1062,6 +1084,7 @@ pub fn verify_finetuned_model_integrity() -> Result<String, String> {
 pub fn transcribe_segment_finetuned(
     audio_path: String,
     alignment_json: Option<String>,
+    state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("transcribe_segment_finetuned")?;
     validate::validate_file_path(&audio_path)?;
@@ -1069,11 +1092,24 @@ pub fn transcribe_segment_finetuned(
         validate::validate_alignment_json(aj)?;
     }
     let (onnx, vocab) = resolve_finetuned_paths()?;
+    // Offset-less alignment is only whole-file-safe when this source has NO sibling chunks (see
+    // decode_finetuned_clip_16k): on a multi-segment source it would silently re-transcribe the
+    // entire recording into one segment (true-10 audit 2026-07-09).
+    let sibling_count: i64 = {
+        let db = state.lock_db();
+        db.connection()
+            .query_row(
+                "SELECT COUNT(*) FROM speech_segments WHERE audio_path = ?1",
+                rusqlite::params![audio_path],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?
+    };
     // Decode ONLY this segment's clip window (16 kHz). Every VAD chunk shares the whole-source
     // audio_path with its range in alignment_json; decoding the WHOLE source first (the old path) failed
     // on long recordings ("audio too large to decode in one pass") even though the clip is a few
     // seconds. The windowed decode reads just the clip, so re-transcribe works on any source length.
-    let clip = decode_finetuned_clip_16k(&audio_path, alignment_json.as_deref())?;
+    let clip = decode_finetuned_clip_16k(&audio_path, alignment_json.as_deref(), sibling_count <= 1)?;
     // Route through the pipeline's shared windowed wrapper, NOT run_wav2vec2 directly: the model is
     // trained on short utterances and a single unbounded pass over >15 s (a raised max-segment
     // setting, or a whole-file/no-meta clip) duplicates text — the pipeline path sub-splits into

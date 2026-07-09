@@ -1938,3 +1938,39 @@ tokens; 4 cited web-research tracks; all local gates re-RUN at HEAD, not claimed
   zero review-hours) -> intelligence majors -> 500-decision marathon (first conversational
   Sorani number) -> one retrain cycle + KenLM fusion (~36% rel. WER, cited) + pseudo-labeling
   (Gaelic recipe 35.2->23.1) -> P7 re-audit. No accuracy claim is made for the 7B until P2.2 runs.
+
+## Audit-backlog execution: clusters A-D shipped (2026-07-09, branch fix/audit-backlog-20260709)
+
+Owner directive: implement the TRUE_RATING backlog to ship-ready, gates + commit per cluster.
+- A label-protection (1f512af): review-surface keyboard isolation at the KeyboardManager level
+  (BLOCKER: globals fired on the hidden curate segment — silent verify/machine-overwrite/invisible
+  confirm), inbox edit-state cross-segment leak double-locked, Kurdish-layout-dead shortcuts fixed
+  via shared physicalKey (e.code), inbox focus trap, review queue search-only contract
+  (searchScopedSegments store), unmount draft flush, arrow-key revisit nav. 9 new keyboard tests.
+- B engine-truth (cb891c9): use_finetuned_asr+WSL7B mis-attribution structurally closed
+  (should_use_wsl_primary_asr honors the EFFECTIVE override; F2 preserved when the model is absent);
+  gold-eval mislabeling now impossible (engine derived from the requested id / mismatched label
+  refused); finetuned juror ability 1.0 with pinned ordering (7B > finetuned > 1b > 300m); batch-7B
+  provenance row; shared 15s windowing for the finetuned IPC; honest client timeout message (280s).
+- C intelligence honest-metrics (0a3640c): write_segment_verdict COALESCEs agent_confidence (T1/T2
+  escalations no longer NULL the persisted IRT confidence -> suspect-first is real again, tested);
+  migration v34 c4_evidence_archive (C4 precision survives deleting contradicted auto-accepts,
+  tested); conformal::min_calibration_n + per-bucket distance-to-calibration surfaced in the
+  intelligence report + dashboard (~2,334 zero-CER clips/bucket at the shipped 5% gate — the gate
+  itself deliberately unchanged); shadow metrics per-segment (distinct events), tested; over-trigger
+  tile neutral until would-fire evidence exists. Deferred (latent, firing default-off, tracked in
+  the rating doc): LOOP-0 firing-blindness, T1 confidence-semantics.
+- D dataset integrity (this commit): offset-less alignment rows are REFUSED whole-file fallback on
+  multi-segment sources (pack skips + counts; review re-transcribe errors with re-import advice;
+  single-segment sources still legit — sibling-count context from the DB), tested incl. SHA sums;
+  gold promotion refuses partially-reviewed files (unreviewed speech would score as insertions on
+  the promotion yardstick), tested — the old silently-exclude contract in the concatenation test was
+  audit-falsified and updated; SHA256SUMS now written over the finetune pack, gold eval-set, and
+  production bundle (clip bytes integrity-pinned, not just the manifest); per-speaker composition +
+  dominant-speaker flag now reach the HUMAN-readable cards (HF README + bundle dataset_card).
+  Deferred with rationale: split-grouping by content hash (import fingerprint already dedupes the
+  normal path; needs a plumbed hash map through every export caller — tracked).
+Gates per cluster: cargo test --lib (827->829), clippy-all-targets, fmt, vitest 141, typecheck 0,
+eslint, python policies (this entry pays the ledger-staleness gate that fired at 4 commits — the
+gate worked). Remaining: clusters E (reliability/DR), F (security/CI), G (doc honesty + UX polish),
+then PR + exe rebuild + full ship-check.
