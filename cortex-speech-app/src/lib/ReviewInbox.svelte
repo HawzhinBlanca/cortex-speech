@@ -12,6 +12,7 @@
 
   import { onMount, onDestroy, tick } from 'svelte';
   import * as api from './commands';
+  import { physicalKey } from './keyboard';
   import { t } from './i18n';
   import { parseSourceMeta, chunkPlaybackRange } from './alignment';
   import type { SpeechSegment } from './types';
@@ -39,7 +40,17 @@
   // Keyboard play/pause state for the current clip (Space); reset on queue navigation so a new
   // clip never inherits the previous clip's playing flag.
   let inboxPlaying = false;
-  $: if (currentIndex >= 0) inboxPlaying = false;
+  // True-10 audit MAJOR: edit state must also reset on rail navigation — isEditing/editText used to
+  // survive a rail click, so "E on segment A → click B → Save" recorded A's transcript as B's human
+  // 'edit' decision (a permanent wrong gold label). editingForId is the second lock: commitEdit
+  // refuses to persist when the segment changed since startEdit.
+  let editingForId: string | null = null;
+  $: if (currentIndex >= 0) {
+    inboxPlaying = false;
+    isEditing = false;
+    editText = '';
+    editingForId = null;
+  }
   // True-10 audit: keep the active rail row visible — past ~15 items the aria-current row scrolled
   // below the fold of a 200-item queue with no way to see where you are.
   $: if (currentIndex >= 0) void scrollRailToCurrent();
@@ -179,6 +190,7 @@
     if (!current) return;
     editText = current.verdictTranscript ?? current.rawTranscript ?? '';
     isEditing = true;
+    editingForId = current.id;
     await tick();
     editTextarea?.focus();
     editTextarea?.select();
@@ -186,6 +198,15 @@
 
   async function commitEdit() {
     if (!current || !editText.trim() || isSubmitting || current.humanDecision) return;
+    // Never write text opened for one segment onto another: if the queue navigated since startEdit
+    // (any path the reactive reset above might not cover), drop the stale edit instead of persisting
+    // a wrong gold label.
+    if (editingForId !== current.id) {
+      isEditing = false;
+      editText = '';
+      editingForId = null;
+      return;
+    }
     const cur = current;
     const idx = currentIndex;
     const text = editText.trim();
@@ -333,7 +354,12 @@
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
       return;
     }
-    switch (e.key) {
+    // Match on the PHYSICAL key (layout-independent): with the owner's Central Kurdish layout
+    // active, e.key is 'ا'/'ب'/… and every letter shortcut below went dead until the OS layout was
+    // toggled back — once per edited clip. physicalKey maps KeyA→'a', Digit1→'1' and falls back to
+    // e.key for Space/Backspace/Escape/arrows.
+    const key = physicalKey(e);
+    switch (key) {
       case 'a':
         e.preventDefault();
         accept();
@@ -369,9 +395,19 @@
         e.preventDefault();
         onClose();
         break;
+      case 'ArrowRight':
+        // Non-destructive revisit navigation (true-10 audit: the inbox forced a mouse rail-click for
+        // any move that wasn't a decision — or a destructive Backspace-undo to go back).
+        e.preventDefault();
+        if (currentIndex < queue.length - 1) currentIndex += 1;
+        break;
+      case 'ArrowLeft':
+        e.preventDefault();
+        if (currentIndex > 0) currentIndex -= 1;
+        break;
       default:
-        if (e.key >= '1' && e.key <= '9') {
-          const idx = parseInt(e.key) - 1;
+        if (key >= '1' && key <= '9') {
+          const idx = parseInt(key) - 1;
           if (idx < queue.length) {
             currentIndex = idx;
           }

@@ -32,6 +32,7 @@
   import { notifications } from './lib/stores/notificationStore';
   import { historyStore } from './lib/stores/historyStore';
   import { initKeyboardManager, globalKeyboardManager, modKeyLabel } from './lib/keyboard';
+  import { focusTrap } from './lib/actions/focusTrap';
   // Platform-aware modifier label (Ctrl on Windows, ⌘ on Mac) for the hardcoded kbd hints.
   const modKey = modKeyLabel();
   import {
@@ -419,6 +420,13 @@
   onMount(async () => {
     tauriAvailable = isTauriRuntime();
     const km = initKeyboardManager();
+    // True-10 audit BLOCKER fix: while a review surface owns the keyboard (Review & Correct mode or
+    // the Review Inbox overlay), every global shortcut acts on the HIDDEN curate selection —
+    // Ctrl+Enter/Ctrl+D silently verified an invisible segment with no human decision (export-
+    // eligible gold nobody reviewed), Ctrl+T machine-overwrote it, Delete opened a confirm dialog
+    // UNDER the inbox. The manager suppresses all non-allowInReview shortcuts whenever this probe is
+    // true; probing at dispatch time keeps it correct for future shortcuts too.
+    km.setReviewSurfaceProbe(() => viewMode === 'review' || $showReviewInbox);
     registerShortcuts(km);
     setImportCompleteHandler(async (payload) => {
       try {
@@ -607,7 +615,16 @@
         action: handleSaveAnnotation,
         category: 'edit',
       },
-      { key: 'z', ctrl: true, description: 'Undo', action: () => handleUndo(), category: 'edit' },
+      {
+        key: 'z',
+        ctrl: true,
+        description: 'Undo',
+        action: () => handleUndo(),
+        category: 'edit',
+        // handleUndo self-guards on the review surfaces with a helpful "use Backspace here" notice —
+        // let it through so the reviewer learns the paired-undo model instead of silence.
+        allowInReview: true,
+      },
       {
         key: 'z',
         ctrl: true,
@@ -615,6 +632,7 @@
         description: 'Redo',
         action: () => handleRedo(),
         category: 'edit',
+        allowInReview: true, // handleRedo self-guards on review surfaces (no-op there)
       },
       {
         key: 'd',
@@ -743,6 +761,9 @@
         action: () => (showCommandPalette = true),
         category: 'general',
         allowInEditable: true,
+        // The palette renders above both review surfaces and its commands re-check their own
+        // preconditions — the one global that is genuinely review-safe.
+        allowInReview: true,
       },
     ];
     km.registerAll(shortcuts);
@@ -3096,7 +3117,9 @@
 {/if}
 
 {#if $showReviewInbox}
-  <div class="fixed inset-0 z-[100] flex items-stretch justify-center p-6 glass">
+  <!-- use:focusTrap (true-10 audit): the inbox was the ONLY overlay without one — Tab walked into
+       the invisible background app and Enter activated top-bar buttons sight-unseen. -->
+  <div class="fixed inset-0 z-[100] flex items-stretch justify-center p-6 glass" use:focusTrap>
     <ErrorBoundary>
       <ReviewInbox onClose={() => showReviewInbox.set(false)} />
     </ErrorBoundary>

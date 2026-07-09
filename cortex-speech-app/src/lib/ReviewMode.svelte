@@ -1,10 +1,11 @@
 <script lang="ts">
   import { get } from 'svelte/store';
-  import { segments, selectedSegmentId, filteredSegments, searchQuery } from './stores/segmentStore';
+  import { segments, selectedSegmentId, searchScopedSegments, searchQuery } from './stores/segmentStore';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import { settings } from './stores/settingsStore';
   import { showReviewInbox } from './stores/uiStore';
+  import { physicalKey } from './keyboard';
   import { t } from './i18n';
   import Waveform from './Waveform.svelte';
   import AudioPlayer from './AudioPlayer.svelte';
@@ -59,8 +60,10 @@
 
   // Simple, focused review queue: one clip at a time. Pending (unverified) first,
   // then the rest — so a reviewer always lands on work that needs doing.
+  // searchScopedSegments (NOT filteredSegments) enforces the search-only contract above: the
+  // curate "✓ Verified" chip must never leak in and empty the queue (true-10 audit).
   const queue = $derived.by<SpeechSegment[]>(() => {
-    const all = searchScoped ? $filteredSegments : $segments;
+    const all = searchScoped ? $searchScopedSegments : $segments;
     const pending = all.filter((s) => !s.verified);
     const done = all.filter((s) => s.verified);
     if (suspectFirst && suspectRank) {
@@ -433,6 +436,25 @@
     if (current) editText = originalText(current);
   }
 
+  // Unmount flush (true-10 audit): editCache is component-local, so leaving review mode via the
+  // ActivityRail destroyed any in-progress correction with zero warning — the same data-loss class
+  // the curate autosave work eliminated. Persist the dirty edit as a DRAFT on teardown, exactly like
+  // go() does on navigation (annotatedTranscript only — never verified, so it is not a decision).
+  // Root-level $effect: its teardown runs once, on component destroy.
+  $effect(() => {
+    return () => {
+      const seg = current;
+      if (!seg || !dirty || saving) return;
+      const draft: SpeechSegment = { ...seg, annotatedTranscript: editText.trim() };
+      segments.update((list) => list.map((s) => (s.id === seg.id ? draft : s)));
+      // Fire-and-forget: teardown cannot await. Surface a failure — the notification store outlives
+      // this component — so a lost draft is never silent.
+      api.updateSegment(draft).catch((e) => {
+        notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+      });
+    };
+  });
+
   // Tap a word → seek there and play, so a reviewer can verify it by ear instantly. Word times are
   // clip-relative; add the clip's start offset to land at the right place in the source file.
   function playFromWord(w: WordTimestamp) {
@@ -507,7 +529,11 @@
     if ((el?.tagName === 'BUTTON' || el?.tagName === 'A') && (e.key === ' ' || e.key === 'Enter')) {
       return;
     }
-    switch (e.key) {
+    // Match on the PHYSICAL key (layout-independent): the owner types Sorani corrections with a
+    // Central Kurdish layout active, where e.key is 'ا'/'ب'/… — every advertised letter shortcut
+    // (A/E/X/R/N/P) went dead after Escape-ing the textarea until the OS layout was toggled back,
+    // once per edited clip. physicalKey maps KeyA→'a' and falls back to e.key for Space/arrows/⌫.
+    switch (physicalKey(e)) {
       case 'a':
         e.preventDefault();
         submit(true);
