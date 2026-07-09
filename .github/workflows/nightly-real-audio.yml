@@ -55,6 +55,13 @@ jobs:
             cortex-speech-app/src-tauri/target
           key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('cortex-speech-app/src-tauri/Cargo.lock') }}
 
+      # Base models must exist before ANY cargo build in this job: build.rs -> tauri-build
+      # validates bundle.resources (models/silero_vad_v4.onnx), so the soak step below fails
+      # to even compile without them. Same provisioning step ci.yml uses (fixes the nightly
+      # "resource path models/silero_vad_v4.onnx doesn't exist" failure).
+      - name: Fetch + verify base models (bundle.resources)
+        run: npm run fetch-models
+
       - name: Run ignored real-audio tests when fixtures available
         env:
           CORTEX_REAL_AUDIO_DIR: ${{ github.event.inputs.real_audio_dir || vars.CORTEX_REAL_AUDIO_DIR || '' }}

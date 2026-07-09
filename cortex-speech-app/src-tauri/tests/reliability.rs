@@ -389,10 +389,12 @@ fn test_multi_threaded_lock_ordering_same_order() {
         std::thread::sleep(Duration::from_millis(30));
     });
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Same slow-CI-runner rationale as the other deadlock detectors in this file: a real deadlock
+    // never resolves, so 60s still catches it without false-firing on a loaded runner.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !t1.is_finished() || !t2.is_finished() {
         if Instant::now() > deadline {
-            panic!("Deadlock detected: threads did not complete within 5s");
+            panic!("Deadlock detected: threads did not complete within 60s");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -427,10 +429,12 @@ fn test_multi_threaded_lock_ordering_opposite_order() {
         let _result = a2.try_lock();
     });
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Same slow-CI-runner rationale as test_concurrent_db_access_no_deadlock: a real deadlock
+    // never resolves, so 60s still catches it without false-firing on a loaded runner.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !t1.is_finished() || !t2.is_finished() {
         if Instant::now() > deadline {
-            panic!("Threads did not complete within 5s (possible deadlock)");
+            panic!("Threads did not complete within 60s (possible deadlock)");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -464,10 +468,14 @@ fn test_concurrent_db_access_no_deadlock() {
         }
     });
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // A real deadlock never resolves, so a generous deadline still catches it while a tight one
+    // false-fires on slow shared CI runners: 5s failed the 2026-07-08 main Release Gate (and one
+    // branch run) on disk-bound inserts that complete in 0.18s locally. 60s keeps the detector
+    // honest without the flake.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !t1.is_finished() || !t2.is_finished() {
         if Instant::now() > deadline {
-            panic!("Concurrent DB access deadlocked within 5s");
+            panic!("Concurrent DB access deadlocked within 60s");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
