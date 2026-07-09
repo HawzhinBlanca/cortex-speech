@@ -406,6 +406,17 @@
           $t('notifications.snapshotFailing', { count: String(h.snapshot_consecutive_failures) }),
         );
       }
+      // Staleness (true-10 audit): the failure counter only sees Err — a wedged/restarting backup
+      // that never errors, or a dead loop thread, showed nothing. last_success aging past 3
+      // intervals (30 min) on a non-empty library is the honest stall signal.
+      const lastOk = h.snapshot_last_success_epoch_secs;
+      if (lastOk != null && Date.now() / 1000 - lastOk > 3 * 600 && ($segmentStats?.total ?? 0) > 0) {
+        notifications.error(
+          $t('notifications.snapshotStale', {
+            minutes: String(Math.round((Date.now() / 1000 - lastOk) / 60)),
+          }),
+        );
+      }
       if (h.free_disk_bytes != null && h.free_disk_bytes < 2 * GiB) {
         notifications.error($t('notifications.lowDisk', { gb: (h.free_disk_bytes / GiB).toFixed(1) }));
       }
@@ -1719,14 +1730,36 @@
           .replace('{files}', String(quarantineNotice.quarantinedFiles.length))
           .replace('{snapshots}', String(quarantineNotice.snapshotCount))}
       </span>
-      <button
-        type="button"
-        class="btn btn-ghost !text-xs"
-        data-testid="dismiss-quarantine-btn"
-        onclick={() => (quarantineNotice = null)}
-      >
-        {$t('db.quarantineDismiss')}
-      </button>
+      <div class="flex items-center gap-2">
+        <!-- Acknowledge & archive (true-10 audit): the pin had no in-app release — pruning stayed
+             refused forever while snapshots accumulated a full DB copy every 10 minutes. Archiving
+             the *.corrupt.* files into <data_dir>/quarantine/ releases the pin, keeps the bytes
+             salvageable, and is the honest exit from the quarantine state. -->
+        <button
+          type="button"
+          class="btn btn-secondary !text-xs"
+          data-testid="acknowledge-quarantine-btn"
+          onclick={async () => {
+            try {
+              const moved = await api.acknowledgeQuarantine();
+              notifications.success($t('db.quarantineAcknowledged', { count: String(moved) }));
+              quarantineNotice = null;
+            } catch (e) {
+              notifications.error($t('db.quarantineAcknowledgeFailed'), { detail: String(e) });
+            }
+          }}
+        >
+          {$t('db.quarantineAcknowledge')}
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost !text-xs"
+          data-testid="dismiss-quarantine-btn"
+          onclick={() => (quarantineNotice = null)}
+        >
+          {$t('db.quarantineDismiss')}
+        </button>
+      </div>
     </div>
   {/if}
   {#if interruptedImport}

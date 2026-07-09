@@ -204,16 +204,22 @@
   // — one disk failure loses both. This copies the whole library to a folder the owner chooses (an
   // external drive, a synced folder), into a timestamped file so successive backups never collide.
   async function backupToFolder() {
+    let verifiedCount = 0;
     const r = await pickDirAnd('backup', async (dir) => {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
       const sep = dir.includes('\\') ? '\\' : '/';
       const base = dir.endsWith(sep) ? dir : `${dir}${sep}`;
       const dest = `${base}cortex-speech-backup-${stamp}.db`;
-      await api.dbBackup(dest);
+      // The backend verifies the WRITTEN file (integrity + count) — surface that proof in the toast
+      // so "backup done" always means "backup verified" (true-10 audit 2026-07-09).
+      const verified = await api.dbBackup(dest);
+      verifiedCount = verified.segmentCount;
       return dest;
     });
     if (r) {
-      notifications.success($t('stats.backupDone').replace('{path}', r));
+      notifications.success(
+        `${$t('stats.backupDone').replace('{path}', r)} — ${$t('stats.backupVerified', { count: String(verifiedCount) })}`,
+      );
     }
   }
 

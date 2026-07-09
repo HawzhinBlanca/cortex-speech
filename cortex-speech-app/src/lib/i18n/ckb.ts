@@ -460,6 +460,7 @@ export const ckb: Record<string, string> = {
   'stats.importGoldDone': '{n} فایلی سەرچاوەی پشتڕاستکراو وەک زێڕین هێنرا.',
   'stats.backupDb': 'پاشەکەوت بۆ بوخچە…',
   'stats.backupDone': 'کتێبخانە پاشەکەوت کرا بۆ {path}',
+  'stats.backupVerified': 'پشتڕاستکرایەوە ({count} پارچە)',
   'stats.restoreFile': 'گەڕاندنەوە لە فایلی پاشەکەوت…',
   'stats.restoreFileConfirm':
     'کتێبخانەی ئێستا بگۆڕدرێت بە فایلی پاشەکەوتی هەڵبژێردراو؟ هەموو ئەوەی لەو پاشەکەوتەدا نییە لەدەست دەچێت. دوای گەڕاندنەوە ئەپەکە دووبارە بار دەبێتەوە.',
@@ -474,6 +475,10 @@ export const ckb: Record<string, string> = {
   'db.quarantined':
     'کتێبخانەکەت دوای تێکچوونی بنکەدراوە کەرەنتین کرا ({files} فایل لەلاوە پاشەکەوت کرا). {snapshots} وێنەی پاشەکەوتی خۆکار بەردەستە — بڕۆ بۆ ئامار → گەڕاندنەوە لە وێنەی پاشەکەوت.',
   'db.quarantineDismiss': 'داخستن',
+  'db.quarantineAcknowledge': 'پەسەندکردن و ئەرشیفکردن',
+  'db.quarantineAcknowledged':
+    '{count} فایلی کەرەنتینکراو ئەرشیف کرا بۆ فۆڵدەری quarantine - سڕینەوەی وێنە کۆنەکان دەستی پێکردەوە',
+  'db.quarantineAcknowledgeFailed': 'نەتوانرا فایلە کەرەنتینکراوەکان ئەرشیف بکرێن',
   'stats.verifyModel': 'پشکنینی تەواوەتی مۆدێل',
   'stats.verifyModelOk': 'تەواوەتی مۆدێل پشتڕاستکرایەوە — چێکسەمەکان یەکدەگرنەوە.',
   'stats.verifyModelFailed': 'پشکنینی تەواوەتی مۆدێل سەرکەوتوو نەبوو',
@@ -533,6 +538,8 @@ export const ckb: Record<string, string> = {
   'notifications.undoInReview': 'بۆ گەڕاندنەوەی دوایین بڕیاری پێداچوونەوە، Backspace دابگرە',
   'notifications.snapshotFailing':
     'باکئەپی خۆکار {count} جار بەدوای یەکدا شکستی هێناوە — کتێبخانەکەت باکئەپ ناکرێت. بۆشایی دیسک و فۆڵدەری لۆگەکان بپشکنە.',
+  'notifications.snapshotStale':
+    'وێنە خۆکارەکان بۆ ماوەی {minutes} خولەکە سەرکەوتوو نەبوون - تۆڕی پاراستن لەوانەیە وەستابێت؛ بۆشایی دیسک و لۆگەکە بپشکنە',
   'notifications.lowDisk': 'بۆشایی دیسک کەمە: {gb} گیگابایت بەردەستە. باکئەپ، هەناردەکردن و بنکەدراوە دەکرێت سەرنەکەون.',
   'notifications.missingModels': 'مۆدێل(ەکان)ی پێویست بوونیان نییە: {models}.',
   'notifications.previousCrash': 'دانیشتنی پێشوو تووشی هەڵە بوو: {summary}. وردەکاری تەواو لە فۆڵدەری لۆگەکاندایە.',

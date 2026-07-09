@@ -2371,10 +2371,55 @@ pub fn db_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> 
 }
 
 #[tauri::command]
-pub fn db_backup(dest: String, state: State<'_, AppState>) -> Result<(), String> {
+pub fn db_backup(dest: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let validated = validate::validate_output_path(&dest)?;
-    let db = state.lock_db();
-    db.backup(&validated).map_err(|e| e.to_string())
+    // Dedicated connection (true-10 audit 2026-07-09): holding the global DB mutex for the whole
+    // online backup froze every DB-touching command for the full copy duration on a slow external
+    // drive — the periodic snapshot path already uses its own connection; so does this now.
+    let db_path = {
+        let db = state.lock_db();
+        db.path().to_string()
+    };
+    let backup_db = crate::db::Database::open(&db_path).map_err(|e| e.to_string())?;
+    backup_db.backup(&validated).map_err(|e| e.to_string())?;
+    // Verify the file we WROTE — an off-disk "disaster copy" that is itself bad (destination volume
+    // corruption) must fail the backup NOW, not at the disaster. Read-only open: never mutate it.
+    let conn = rusqlite::Connection::open_with_flags(
+        &validated,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("backup written but could not be opened for verification: {e}"))?;
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| format!("backup written but failed verification: {e}"))?;
+    if integrity != "ok" {
+        return Err(format!("backup written but FAILED integrity check: {integrity}"));
+    }
+    let segment_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM speech_segments", [], |row| row.get(0))
+        .map_err(|e| format!("backup written but could not count segments: {e}"))?;
+    Ok(serde_json::json!({ "integrityOk": true, "segmentCount": segment_count }))
+}
+
+/// Shared restore precondition (true-10 audit 2026-07-09): refuse while an import/batch worker may
+/// be writing, and pin a rotation-exempt copy of the CURRENT live DB first so a mis-restore of the
+/// wrong snapshot is itself recoverable (previously only from a ≤10-min rolling snapshot that
+/// rotated out within ~100 minutes).
+fn prepare_restore(state: &State<'_, AppState>) -> Result<(), String> {
+    if state.writers_active() {
+        return Err("An import or batch operation is running — cancel it or let it finish before \
+                    restoring. Restoring mid-write would mix pre-restore rows into the restored \
+                    library and re-arm stale undo history."
+            .to_string());
+    }
+    if let Some(data_dir) = state.lock_data_dir().clone() {
+        let db = state.lock_db();
+        match crate::snapshot::take_pinned_snapshot(&db, &data_dir, "prerestore", 3) {
+            Ok(path) => tracing::info!("pre-restore snapshot pinned at {}", path.display()),
+            Err(e) => tracing::warn!("pre-restore snapshot failed (continuing with restore): {e}"),
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2383,6 +2428,7 @@ pub fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), String>
     // database (PRAGMA integrity_check on open verifies this). This completes the backup/restore
     // pair so the app is never at risk of data loss mid-import or mid-review.
     let validated = validate::validate_file_path(&src)?;
+    prepare_restore(&state)?;
     {
         let mut db = state.lock_db();
         db.restore(&validated).map_err(|e| e.to_string())?;
@@ -2393,6 +2439,17 @@ pub fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), String>
       // undo can never cross the restore boundary.
     state.lock_history().clear();
     Ok(())
+}
+
+/// Release the quarantine prune-pin EXPLICITLY: archive every `*.corrupt.*` artifact into
+/// `<data_dir>/quarantine/` (bytes stay salvageable via `.recover`) so pruning resumes. Previously
+/// the pin had NO in-app release — snapshots accumulated a full DB copy every 10 minutes forever
+/// (true-10 audit 2026-07-09). Returns how many files were archived.
+#[tauri::command]
+pub fn acknowledge_quarantine(state: State<'_, AppState>) -> Result<usize, String> {
+    STRICT_RATE_LIMITER.check("acknowledge_quarantine")?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    crate::snapshot::acknowledge_quarantine(&data_dir).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2459,6 +2516,7 @@ pub fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Res
     if !src.is_file() {
         return Err(format!("snapshot '{name}' has no database file"));
     }
+    prepare_restore(&state)?;
     {
         let mut db = state.lock_db();
         db.restore(&src).map_err(|e| e.to_string())?;

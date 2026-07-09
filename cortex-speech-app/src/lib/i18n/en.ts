@@ -459,6 +459,7 @@ export const en: Record<string, string> = {
   'stats.importGoldDone': '{n} verified source file(s) imported as gold.',
   'stats.backupDb': 'Backup to folder…',
   'stats.backupDone': 'Library backed up to {path}',
+  'stats.backupVerified': 'verified ({count} segments)',
   'stats.restoreFile': 'Restore from backup file…',
   'stats.restoreFileConfirm':
     'Replace the CURRENT library with the selected backup file? Everything not in that backup will be lost. The app reloads after the restore.',
@@ -473,6 +474,10 @@ export const en: Record<string, string> = {
   'db.quarantined':
     'Your library was quarantined after database corruption ({files} file(s) saved aside). {snapshots} auto-snapshot(s) are available — open Stats → Restore from snapshot.',
   'db.quarantineDismiss': 'Dismiss',
+  'db.quarantineAcknowledge': 'Acknowledge & archive',
+  'db.quarantineAcknowledged':
+    '{count} quarantined file(s) archived to the quarantine folder - snapshot pruning resumed',
+  'db.quarantineAcknowledgeFailed': 'Could not archive the quarantined files',
   'stats.verifyModel': 'Verify model integrity',
   'stats.verifyModelOk': 'Model integrity verified — checksums match.',
   'stats.verifyModelFailed': 'Model integrity check failed',
@@ -533,6 +538,8 @@ export const en: Record<string, string> = {
   'notifications.undoInReview': 'Press Backspace to undo the last review decision',
   'notifications.snapshotFailing':
     'Auto-backup has failed {count} times in a row — your library is not being snapshotted. Check free disk space and the logs folder.',
+  'notifications.snapshotStale':
+    'Auto-snapshots have not succeeded for {minutes} minutes - the safety net may be stalled; check free disk space and the log',
   'notifications.lowDisk': 'Low disk space: {gb} GB free. Snapshots, exports, and the database can start failing.',
   'notifications.missingModels': 'Missing required model(s): {models}.',
   'notifications.previousCrash': 'The previous session crashed: {summary}. Full details are in the logs folder.',

@@ -50,11 +50,21 @@ pub fn run_migrations(db: &Database) -> AppResult<Vec<i64>> {
     Ok(applied)
 }
 
-/// Get the current schema version.
+/// Get the current schema version. A missing `schema_migrations` table (a genuinely fresh database)
+/// is version 0; ANY OTHER error propagates. Previously every error collapsed to 0 (true-10 audit
+/// 2026-07-09): a transient misread (I/O, SQLITE_BUSY) then both skipped the newer-schema guard and
+/// re-applied ALL migrations — failing at v2's ADD COLUMN with "duplicate column name", a startup
+/// error pointing nowhere near the real transient cause.
 pub fn get_current_version(db: &Database) -> AppResult<i64> {
     let result: Result<i64, _> =
         db.connection().query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row.get(0));
-    Ok(result.unwrap_or(0))
+    match result {
+        Ok(version) => Ok(version),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg))) if msg.contains("no such table") => Ok(0),
+        Err(e) => Err(crate::error::AppError::Other(format!(
+            "could not read the schema version (transient database error, NOT a fresh database): {e}"
+        ))),
+    }
 }
 
 fn ensure_migrations_table(db: &Database) -> AppResult<()> {
