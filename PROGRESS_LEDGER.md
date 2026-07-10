@@ -2272,3 +2272,22 @@ NEXT AGENT: see docs/HANDOFF_NEXT_AGENT.md — build (frontend first), run the C
 get_settings no longer hangs while the dialog is open, cargo test/clippy/typecheck, add a regression
 gate (assert both commands are async + no blocking_pick_*), rebuild at HEAD, cortex_doctor READY,
 real-audio smoke, commit + push. Also audit other sync commands for the same blocking footgun.
+
+## CRASH FIXED + VERIFIED: main-thread dialog freeze on Open/Import (2026-07-11, f01ab66)
+
+The owner-reported "crash" on Open audio / Import is FIXED and proven at runtime (not merely
+compiled). Root cause (confirmed earlier): open_audio_file + import_directory were sync
+#[tauri::command]s calling blocking_pick_file()/blocking_pick_folder() on the MAIN THREAD, freezing
+the whole UI while the native picker was open. Fix: both -> async fn + non-blocking
+pick_file/pick_folder + tokio::sync::oneshot; import_directory fetches app.state::<AppState>() after
+the await (no State held across .await).
+
+VERBATIM runtime proof (CDP repro: open dialog, then invoke get_settings with a 5s race):
+  BEFORE fix: "get_settings result after 5008ms: TIMED_OUT_HANG  >>> MAIN THREAD BLOCKED BY DIALOG <<<"
+  AFTER fix (open_audio_file):  "get_settings result after 6ms: RETURNED  >>> main thread responsive <<<"
+  AFTER fix (import_directory): "get_settings result after 5ms: RETURNED  >>> main thread responsive <<<"
+Gates: cargo test --lib 835 passed/0 failed; clippy --all-targets -D warnings clean; typecheck
+0 errors/406 files. Regression gate added: scripts/test_rust_runtime_panic_policy.py::
+test_file_dialog_commands_do_not_block_the_main_thread (asserts both commands stay async + no
+blocking_pick_*). Why e2e missed it: e2e_real_app.cjs calls import_audio_file directly, bypassing
+the dialog; no Windows WER crash event ever existed (it was a freeze, not a native crash).
