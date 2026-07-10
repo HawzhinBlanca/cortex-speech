@@ -9,6 +9,11 @@
     audioPath: string;
     startTime?: number;
     endTime?: number;
+    // Transport display bounds. Default to the playback window, but a caller can pass the FULL span
+    // so a transient tap-a-word (which narrows startTime/endTime to ~0.4s for playback) doesn't
+    // collapse the scrubber + time read-out to 0:00 on every tap.
+    displayStart?: number;
+    displayEnd?: number;
     currentTime?: number;
     duration?: number;
     autoplay?: boolean;
@@ -18,6 +23,8 @@
     audioPath,
     startTime = 0,
     endTime = 0,
+    displayStart,
+    displayEnd,
     currentTime = $bindable(0),
     duration = $bindable(0),
     autoplay = false,
@@ -34,10 +41,13 @@
   // timeline (0:00 → clip length) instead of the whole source file, so a short sentence
   // doesn't render as a multi-minute bar you can't navigate. Internal playback still uses
   // absolute (whole-file) time; only the read-out + slider are clip-relative.
-  const clipMode = $derived(endTime > startTime);
-  const clipLength = $derived(clipMode ? endTime - startTime : duration);
+  // Display bounds fall back to the playback window when the caller doesn't override them.
+  const dispStart = $derived(displayStart ?? startTime);
+  const dispEnd = $derived(displayEnd ?? endTime);
+  const clipMode = $derived(dispEnd > dispStart);
+  const clipLength = $derived(clipMode ? dispEnd - dispStart : duration);
   const clipPosition = $derived(
-    clipMode ? Math.max(0, Math.min(currentTime - startTime, clipLength)) : currentTime,
+    clipMode ? Math.max(0, Math.min(currentTime - dispStart, clipLength)) : currentTime,
   );
 
   function toggleRate() {
@@ -130,6 +140,16 @@
     }
   });
 
+  // A parent can retarget the playback window MID-PLAY (tap-a-word bounds playback to that one
+  // word by overriding endTime). The clip-stop timer was scheduled against the OLD endTime, so
+  // without this the word playback bleeds on to the old boundary — reschedule whenever the
+  // boundary itself changes. (The seek $effect above only reschedules on currentTime jumps, which
+  // misses a boundary change with an unchanged playhead, e.g. tapping the word being spoken.)
+  $effect(() => {
+    void endTime;
+    if (playing) scheduleClipStop();
+  });
+
   function reportPlaybackFailure(message: string, cause: unknown) {
     error = message;
     playing = false;
@@ -149,7 +169,11 @@
   }
   function scheduleClipStop() {
     clearClipStop();
-    if (!audioEl || endTime <= startTime) return; // not a bounded clip
+    // Bail while paused: a word-length window (~0.3s) can be shorter than a cold play() promise, so a
+    // timer armed here (by the seek/endTime effects, which fire before play() resolves) would pause
+    // the still-starting element and reject play() with a spurious error. Every paused→playing
+    // transition re-arms this via attemptPlay's .then once playback has actually begun.
+    if (!audioEl || audioEl.paused || endTime <= startTime) return;
     const remainingSec = (endTime - audioEl.currentTime) / (playbackRate || 1);
     if (remainingSec <= 0) return;
     clipStopTimer = setTimeout(
@@ -213,6 +237,9 @@
   function handleTimeUpdate() {
     if (!audioEl) return;
     currentTime = audioEl.currentTime;
+    // When the precise clip-stop timer is armed, let IT own the exact stop/loop. Acting here too, at
+    // the ~250ms timeupdate granularity, can double-loop a short word window at the seam.
+    if (clipStopTimer) return;
     if (endTime > 0 && audioEl.currentTime >= endTime) {
       if (loop) {
         // Respect startTime when looping a clip.
@@ -242,8 +269,8 @@
 
   function seek(e: Event) {
     const target = e.currentTarget as HTMLInputElement;
-    // Slider value is clip-relative when bounded; map back to absolute file time.
-    const abs = clipMode ? startTime + parseFloat(target.value) : parseFloat(target.value);
+    // Slider value is display-relative when bounded; map back to absolute file time.
+    const abs = clipMode ? dispStart + parseFloat(target.value) : parseFloat(target.value);
     if (audioEl) {
       audioEl.currentTime = abs;
       currentTime = abs;

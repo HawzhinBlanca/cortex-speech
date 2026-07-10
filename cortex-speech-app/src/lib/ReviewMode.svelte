@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { get } from 'svelte/store';
   import { segments, selectedSegmentId, searchScopedSegments, searchQuery } from './stores/segmentStore';
   import * as api from './commands';
@@ -17,6 +18,7 @@
     segmentSourceFilename,
     segmentChunkLabel,
   } from './alignment';
+  import { wordPlayBounds, replaceWordToken } from './wordEdit';
   import { isPlaceholderTranscript } from './segmentQuality';
   import type { SpeechSegment, WordTimestamp } from './types';
   import type { SegmentConsensus } from './commands';
@@ -168,6 +170,7 @@
       await api.updateSegment(updated);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       editText = text;
+      editedChips = {}; // a fresh draft replaces the transcript wholesale — drop stale chip fixes
       // The re-transcribed draft is the new baseline (not a "dirty" edit). Do NOT reset lastLoadedId —
       // the clip id is unchanged, so the load effect must stay a no-op; resetting it would re-run
       // loadConsensus and wipe the provenance badge we set just below.
@@ -345,6 +348,8 @@
     editText = editCache.get(seg.id) ?? lastLoadedOriginal;
     currentTime = 0;
     playing = false;
+    editingWordIndex = null; // never carry an open chip editor across clips
+    editedChips = {}; // chip fixes are per-clip display state; don't leak them onto the next clip
     loadWaveform(seg);
     void ensureWordTimings(seg);
     void loadConsensus(seg);
@@ -413,6 +418,7 @@
       editCache.delete(seg.id); // persisted — drop the in-progress copy
       lastLoadedOriginal = text; // the saved text is now the baseline for dirty-tracking
       editText = text;
+      editedChips = {}; // the fixes are now baked into the saved transcript; drop the overlay
       notifications.success($t('saved'));
       advance();
     } catch (e) {
@@ -454,6 +460,7 @@
   }
   function resetToOriginal() {
     if (current) editText = originalText(current);
+    editedChips = {}; // revert the chip overlay too, so it can't claim a fix the reset gold lacks
   }
 
   // Unmount flush (true-10 audit): editCache is component-local, so leaving review mode via the
@@ -475,31 +482,111 @@
     };
   });
 
-  // Tap a word → seek there and play, so a reviewer can verify it by ear instantly. Word times are
-  // clip-relative; add the clip's start offset to land at the right place in the source file.
-  function playFromWord(w: WordTimestamp) {
-    currentTime = range.startTime + w.start;
+  // Transient word-bounded playback window. While set, the player plays exactly
+  // [wordStartOverride, wordEndOverride] — so tapping a word plays THAT word (and Loop loops that
+  // word, not the whole span, because BOTH bounds are overridden). Cleared whenever playback stops
+  // (word finished, pause, clip switch) or on any non-word retarget (replay, waveform seek), so the
+  // main Play button always plays the full spoken span.
+  let wordStartOverride = $state<number | null>(null);
+  let wordEndOverride = $state<number | null>(null);
+  function clearWordOverride() {
+    wordStartOverride = null;
+    wordEndOverride = null;
+  }
+  $effect(() => {
+    if (!playing) clearWordOverride();
+  });
+
+  // Which word chip is being edited in place (null = none). Reset on clip change.
+  let editingWordIndex = $state<number | null>(null);
+  // Display-only overlay of committed chip fixes (index → corrected word). Shows the reviewer's
+  // correction on the strip WITHOUT mutating alignment_json — the gold lives in editText; the chip's
+  // word text + timings stay the ASR alignment (a listening aid). Reset on clip change / Reset, so
+  // Accept-as-is / undo never revert to a chip that claims a fix the gold transcript lacks.
+  let editedChips = $state<Record<number, string>>({});
+  const chipText = (w: WordTimestamp, i: number) => editedChips[i] ?? w.word;
+
+  // The word-strip container, so an explicit close (Enter/Escape) can restore focus to the chip
+  // (WCAG 2.4.3 — a removed <input> otherwise drops focus to <body>). NOT called on blur: a Tab/click
+  // away already moved focus correctly, and yanking it back would fight the reviewer.
+  let stripEl = $state<HTMLElement | undefined>();
+  function refocusChip(i: number) {
+    void tick().then(() => stripEl?.querySelector<HTMLButtonElement>(`[data-chip="${i}"]`)?.focus());
+  }
+
+  // Single tap / Enter / Space on a word chip = hear EXACTLY that word. Listen-only: it never opens
+  // an input or steals keyboard focus, so the single-key review flow keeps working. Word times are
+  // clip-relative; wordPlayBounds returns absolute file time, padded + clamped.
+  function playWord(w: WordTimestamp) {
+    const b = wordPlayBounds(w, range.startTime, range.endTime, SPOKEN_PAD);
+    // Idempotent: a double-click dispatches click,click,dblclick — don't hard-reseek the same word
+    // 2–3× (an audible stutter) when it is already the active playing window.
+    if (playing && wordStartOverride === b.start && wordEndOverride === b.end) return;
+    wordStartOverride = b.start;
+    wordEndOverride = b.end;
+    currentTime = b.start;
     playing = true;
   }
-  // Double-tap a word → jump into the editor with THAT word selected, so the reviewer types the fix
-  // immediately. This only SELECTS text (never rewrites it), so it can't corrupt an edited transcript:
-  // prefer the i-th editor token when the alignment is intact, else the first exact match, else just
-  // focus. The single-click play still fires (you hear the word, then correct it).
+
+  // Double-tap / F2 on a chip = edit that word inline (and hear it). A DELIBERATE gesture, so a plain
+  // listen tap never mounts an input under the reviewer's keystrokes.
+  function startWordEdit(w: WordTimestamp, i: number) {
+    playWord(w);
+    editingWordIndex = i;
+  }
+
+  // Commit an inline chip edit into the working transcript (the gold). Empty or unchanged = cancel,
+  // never a silent delete. replaceWordToken is STRICT: it rewrites only the confidently-located
+  // token (position when the counts corroborate it, else a UNIQUE exact match), else returns null
+  // and we fall back to selecting the word in the transcript editor — never guess-rewrite a repeated
+  // Sorani word. editText is the only thing persisted; the chip fix is shown via editedChips, so
+  // alignment_json never diverges from the gold.
+  // Returns true when the caller should restore focus to the chip (clean commit or unchanged cancel);
+  // false when it fell back to the transcript editor (editWord moved focus there — leave it).
+  function commitWordEdit(i: number, w: WordTimestamp, value: string, viaBlur = false): boolean {
+    if (editingWordIndex !== i) return false; // stale blur after Escape/commit already closed it
+    editingWordIndex = null;
+    const current = chipText(w, i);
+    const fix = value.trim();
+    if (!fix || fix === current) return true; // unchanged / empty = cancel, no rewrite
+    const replaced = replaceWordToken(editText, i, current, fix, words.length);
+    if (replaced === null) {
+      // Ambiguous / diverged — can't place the fix confidently. On an explicit Enter, jump the human
+      // into the transcript editor to place it; on a passive blur, just cancel (don't yank focus).
+      if (!viaBlur) editWord(w, i);
+      return false;
+    }
+    editText = replaced;
+    editedChips = { ...editedChips, [i]: fix };
+    return true;
+  }
+
+  function cancelWordEdit(i: number) {
+    if (editingWordIndex === i) editingWordIndex = null;
+  }
+
+  function focusOnMount(node: HTMLInputElement) {
+    node.focus();
+    node.select();
+  }
+
+  // editWord: select THAT word in the transcript textarea (never rewrites it) — the safe fallback
+  // when an inline edit can't be located confidently. Prefer the i-th editor token when it still
+  // matches, else the first exact match, else just focus.
   function editWord(w: WordTimestamp, i: number) {
     if (!editEl) return;
     editEl.focus();
     const text = editText;
-    // Offsets of each non-whitespace token, in order.
     const tokens: Array<{ start: number; len: number; word: string }> = [];
     const re = /\S+/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) tokens.push({ start: m.index, len: m[0].length, word: m[0] });
-    let target = tokens[i] && tokens[i].word === w.word ? tokens[i] : tokens.find((t) => t.word === w.word);
-    if (target) {
-      editEl.setSelectionRange(target.start, target.start + target.len);
-    }
+    const wanted = chipText(w, i);
+    const target = tokens[i] && tokens[i].word === wanted ? tokens[i] : tokens.find((t) => t.word === wanted);
+    if (target) editEl.setSelectionRange(target.start, target.start + target.len);
   }
   function replay() {
+    clearWordOverride(); // replay the WHOLE spoken span, not a stale tapped-word window
     currentTime = playStart;
     playing = true;
   }
@@ -697,7 +784,10 @@
           duration={clipLength}
           {playing}
           wordTimestamps={words}
-          onSeek={(time) => (currentTime = range.startTime + time)}
+          onSeek={(time) => {
+            clearWordOverride(); // a manual scrub leaves word-playback mode; play on to the span end
+            currentTime = range.startTime + time;
+          }}
         />
       </div>
 
@@ -721,10 +811,14 @@
       <!-- True-10 audit: honor the autoplay setting (it was hardcoded off here while honored in
            curate mode) — with it on, advancing to the next clip auto-plays the bounded spoken span,
            removing one keypress + wait per clip, hundreds of times per review sitting. -->
+      <!-- start/endTime honour the transient tap-a-word override so a tapped word plays (and loops)
+           exactly itself; otherwise the full spoken span. -->
       <AudioPlayer
         audioPath={current.audioPath}
-        startTime={playStart}
-        endTime={playEnd}
+        startTime={wordStartOverride ?? playStart}
+        endTime={wordEndOverride ?? playEnd}
+        displayStart={playStart}
+        displayEnd={playEnd}
         bind:currentTime
         bind:duration={playerDuration}
         bind:playing
@@ -750,21 +844,61 @@
             </button>
           </div>
           <div
+            bind:this={stripEl}
             dir="rtl"
             class="font-kurdish mt-3 flex flex-wrap items-center gap-x-1 gap-y-2 text-2xl leading-loose"
           >
             {#each words as w, i (i)}
-              <button
-                type="button"
-                class="review-word {confClass(w.confidence)} {i === activeWordIndex
-                  ? 'word-active'
-                  : ''}"
-                onclick={() => playFromWord(w)}
-                ondblclick={() => editWord(w, i)}
-                title={`${w.start.toFixed(2)}s · ${Math.round((w.confidence ?? 1) * 100)}% — tap to hear, double-tap to edit`}
-              >
-                {w.word}
-              </button>
+              {#if editingWordIndex === i}
+                <!-- Inline chip editor: opened by a DELIBERATE double-tap / F2 (never a plain listen
+                     tap). Enter/blur commits (empty or unchanged = cancel), Escape cancels.
+                     stopPropagation so Enter/Ctrl+Enter can't leak to the window review shortcuts and
+                     save-verify the clip out from under a half-typed fix. -->
+                <input
+                  type="text"
+                  dir="rtl"
+                  lang="ckb"
+                  class="review-word-input"
+                  style={`width: ${Math.max(5, chipText(w, i).length + 3)}ch`}
+                  value={chipText(w, i)}
+                  aria-label={$t('review.editWordAria')}
+                  onblur={(e) => commitWordEdit(i, w, (e.target as HTMLInputElement).value, true)}
+                  onkeydown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      if (commitWordEdit(i, w, (e.target as HTMLInputElement).value)) refocusChip(i);
+                    } else if (e.key === 'Escape') {
+                      cancelWordEdit(i);
+                      refocusChip(i);
+                    }
+                  }}
+                  use:focusOnMount
+                />
+              {:else}
+                <button
+                  type="button"
+                  data-chip={i}
+                  class="review-word {editedChips[i] ? 'word-edited' : confClass(w.confidence)} {i ===
+                  activeWordIndex
+                    ? 'word-active'
+                    : ''}"
+                  onclick={() => playWord(w)}
+                  ondblclick={() => startWordEdit(w, i)}
+                  onkeydown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      playWord(w);
+                    } else if (e.key === 'F2') {
+                      e.preventDefault();
+                      startWordEdit(w, i);
+                    }
+                  }}
+                  title={`${w.start.toFixed(2)}s · ${Math.round((w.confidence ?? 1) * 100)}% — ${$t('review.wordChipHint')}`}
+                >
+                  {chipText(w, i)}
+                </button>
+              {/if}
             {/each}
           </div>
         </div>
@@ -788,7 +922,10 @@
               type="button"
               class="btn btn-secondary shrink-0 !text-xs"
               onclick={() => {
-                if (consensus) editText = consensus.draft;
+                if (consensus) {
+                  editText = consensus.draft;
+                  editedChips = {}; // the draft replaces the transcript — drop stale chip fixes
+                }
               }}
             >
               {$t('review.useDraft')}
@@ -944,5 +1081,22 @@
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     box-shadow: inset 0 0 0 2px var(--accent);
     font-weight: 700;
+  }
+  /* A chip carrying a committed inline fix (display overlay) — faint success tint so the reviewer
+     sees which words they corrected without it competing with the active-word highlight. */
+  .review-word.word-edited {
+    background: color-mix(in srgb, var(--success, #22c55e) 16%, transparent);
+  }
+  /* Inline chip editor: same footprint + type as the chip it replaces, accent ring = "editing". */
+  .review-word-input {
+    font: inherit;
+    border-radius: 0.375rem;
+    padding: 0.05rem 0.4rem;
+    color: var(--text);
+    background: var(--surface-3);
+    border: none;
+    outline: none;
+    box-shadow: inset 0 0 0 2px var(--accent);
+    text-align: right;
   }
 </style>

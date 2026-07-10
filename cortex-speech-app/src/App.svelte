@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
   import { get } from 'svelte/store';
   import * as api from './lib/commands';
   import { createAutosaveController } from './lib/autosave';
@@ -9,7 +9,7 @@
     AgentOrchestrationStage,
     AgentStageEvent,
   } from './lib/commands';
-  import type { SpeechSegment } from './lib/types';
+  import type { SpeechSegment, WordTimestamp } from './lib/types';
   import {
     segments,
     selectedSegmentId,
@@ -94,6 +94,7 @@
     truncateFilename,
     segmentChunkLabel,
   } from './lib/alignment';
+  import { wordPlayBounds, replaceWordToken } from './lib/wordEdit';
 
   type HistoryPanelApi = {
     recordAction: (description: string, type: 'edit' | 'verify' | 'delete' | 'import') => void;
@@ -277,35 +278,76 @@
     autosave.schedule(edits);
   }
 
+  // The interactive chip strip, so an explicit editor close (Enter/Escape) restores focus to the
+  // chip (WCAG 2.4.3). Not called on blur — a Tab/click away already moved focus correctly.
+  let interactiveStripEl = $state<HTMLElement | undefined>();
+  function refocusChip(idx: number) {
+    void tick().then(() =>
+      interactiveStripEl?.querySelector<HTMLElement>(`[data-chip="${idx}"]`)?.focus(),
+    );
+  }
+
   function finishEditingWord(index: number, newValue: string) {
-    if (!newValue.trim()) {
+    const fix = newValue.trim();
+    const oldWord = $wordTimestamps[index]?.word;
+    // Unchanged or empty = cancel.
+    if (!fix || fix === oldWord) {
       editingWordIndex = null;
       return;
     }
     const updatedWords = [...$wordTimestamps];
-    updatedWords[index] = { ...updatedWords[index], word: newValue.trim() };
+    updatedWords[index] = { ...updatedWords[index], word: fix };
     wordTimestamps.set(updatedWords);
 
     const seg = $selectedSegment;
     if (seg) {
       const alignmentJson = mergeWordTimestamps(seg.alignmentJson, updatedWords);
-      const annotatedTranscript = updatedWords.map((w) => w.word).join(' ');
-      // Update store so the UI reflects the edit immediately...
-      segments.update((arr) =>
-        arr.map((s) =>
-          s.id === seg.id
-            ? {
-                ...s,
-                alignmentJson,
-                annotatedTranscript,
-              }
-            : s,
-        ),
-      );
-      // ...and persist exactly the fields we changed (merged over the freshest row at flush time).
-      scheduleAutoSave({ alignmentJson, annotatedTranscript });
+      // Apply the ONE word change into the EXISTING transcript (preserving punctuation and any
+      // text-editor-tab / LLM-refined divergence) via the strict token replace — NOT a rebuild from
+      // the bare alignment-word join, which silently drops that divergence. If the token can't be
+      // located confidently (diverged / repeated), update only the alignment word and leave the
+      // transcript untouched rather than corrupt the gold.
+      const currentText = seg.annotatedTranscript ?? '';
+      const replaced = replaceWordToken(currentText, index, oldWord ?? '', fix, updatedWords.length);
+      const patch =
+        replaced !== null ? { alignmentJson, annotatedTranscript: replaced } : { alignmentJson };
+      segments.update((arr) => arr.map((s) => (s.id === seg.id ? { ...s, ...patch } : s)));
+      scheduleAutoSave(patch);
     }
     editingWordIndex = null;
+  }
+
+  // Transient word-bounded playback window: while set, the player plays exactly
+  // [wordStartOverride, wordEndOverride] — tap a word, hear that word (and Loop loops the word, since
+  // BOTH bounds are overridden). Cleared when playback stops, on a manual seek, or on a selection
+  // change (chunks of one source share an audioPath, so the player does NOT reset on switch — a stale
+  // word window would otherwise bleed across chunks).
+  let wordStartOverride = $state<number | null>(null);
+  let wordEndOverride = $state<number | null>(null);
+  function clearWordOverride() {
+    wordStartOverride = null;
+    wordEndOverride = null;
+  }
+  $effect(() => {
+    if (!isAudioPlaying) clearWordOverride();
+  });
+  $effect(() => {
+    void $selectedSegmentId; // any selection change ends word-playback mode
+    clearWordOverride();
+  });
+  // Tap a word → play EXACTLY that word; with an index (double-tap / F2), also open its inline editor
+  // so the fix is typed right where the ear just confirmed the error.
+  function playWordClip(w: WordTimestamp, idx?: number) {
+    const b = wordPlayBounds(w, chunkStartTime, chunkEndTime);
+    // Idempotent play: a double-click dispatches click,click,dblclick — don't hard-reseek the same
+    // word 2–3× (a stutter). Still open the editor (idx) even when the reseek is skipped.
+    if (!(isAudioPlaying && wordStartOverride === b.start && wordEndOverride === b.end)) {
+      wordStartOverride = b.start;
+      wordEndOverride = b.end;
+      currentTime = b.start;
+      isAudioPlaying = true;
+    }
+    if (idx !== undefined) editingWordIndex = idx;
   }
 
   let chunkStartTime = $derived.by(() => {
@@ -757,13 +799,19 @@
       {
         key: 'ArrowLeft',
         description: 'Rewind 5s',
-        action: () => (currentTime = Math.max(0, currentTime - 5)),
+        action: () => {
+          clearWordOverride(); // a manual scrub leaves word-playback mode
+          currentTime = Math.max(0, currentTime - 5);
+        },
         category: 'playback',
       },
       {
         key: 'ArrowRight',
         description: 'Forward 5s',
-        action: () => (currentTime = Math.min(playerDuration, currentTime + 5)),
+        action: () => {
+          clearWordOverride();
+          currentTime = Math.min(playerDuration, currentTime + 5);
+        },
         category: 'playback',
       },
       {
@@ -1725,6 +1773,7 @@
   }
 
   function onSeek(time: number) {
+    clearWordOverride(); // a waveform scrub leaves word-playback mode; play on to the chunk end
     // The waveform emits clip-relative time (its bars are the chunk window); map back to file time.
     currentTime = chunkEndTime > chunkStartTime ? chunkStartTime + time : time;
   }
@@ -2520,10 +2569,13 @@
           </div>
 
           <ErrorBoundary>
+            <!-- endTime honours the transient tap-a-word override so a tapped word stops at ITS end. -->
             <AudioPlayer
               audioPath={$selectedSegment.audioPath}
-              startTime={chunkStartTime}
-              endTime={chunkEndTime}
+              startTime={wordStartOverride ?? chunkStartTime}
+              endTime={wordEndOverride ?? chunkEndTime}
+              displayStart={chunkStartTime}
+              displayEnd={chunkEndTime}
               bind:currentTime
               bind:duration={playerDuration}
               bind:playing={isAudioPlaying}
@@ -2691,46 +2743,63 @@
                   <!-- Kurdish is RTL: this flex row of word-chips must be dir=rtl so the chips
                        lay out right-to-left; otherwise the first spoken word sits leftmost and the
                        words read reversed. -->
-                  <div class="flex flex-wrap gap-x-1.5 gap-y-2" dir="rtl" lang="ckb">
+                  <div class="flex flex-wrap gap-x-1.5 gap-y-2" dir="rtl" lang="ckb" bind:this={interactiveStripEl}>
                     {#each $wordTimestamps as w, idx}
                       <!-- Word times are CLIP-relative; compare/seek against the clip offset so an
                            offset chunk highlights + seeks correctly (not at the whole-file position). -->
                       {@const isActive =
                         currentTime - chunkStartTime >= w.start && currentTime - chunkStartTime <= w.end}
+                      <!-- Single click / Enter / Space = play just this word (listen). Double-click /
+                           F2 = edit it inline. Decoupled so a listen tap never opens an input under
+                           the keyboard and silently rewrites the transcript on blur. -->
                       <span
+                        data-chip={idx}
                         class="relative inline-block px-1.5 py-0.5 rounded cursor-pointer transition-all duration-150 group
                         {isActive
                           ? 'bg-cortex-700 text-default font-bold border-b border-yellow-400'
                           : 'text-cortex-200 hover:bg-cortex-800 hover:text-white'}"
-                        onclick={() => (currentTime = chunkStartTime + w.start)}
-                        ondblclick={() => (editingWordIndex = idx)}
-                        title="{w.word} ({w.start.toFixed(2)}s - {w.end.toFixed(2)}s)"
+                        onclick={() => playWordClip(w)}
+                        ondblclick={() => playWordClip(w, idx)}
+                        title="{w.word} ({w.start.toFixed(2)}s - {w.end.toFixed(2)}s) — {$t('review.wordChipHint')}"
                         role="button"
                         tabindex="0"
+                        aria-keyshortcuts="Enter Space F2"
                         onkeydown={(e) => {
                           if (e.key === 'Enter' || e.key === ' ') {
-                            currentTime = chunkStartTime + w.start;
+                            playWordClip(w);
                             e.preventDefault();
                           } else if (e.key === 'F2') {
-                            // Keyboard path into inline word-edit (double-click is mouse-only).
+                            // Keyboard path into inline word-edit without playback.
                             editingWordIndex = idx;
                             e.preventDefault();
                           }
                         }}
                       >
                         {#if editingWordIndex === idx}
+                          <!-- stopPropagation: the input lives INSIDE the clickable chip — without it
+                               a caret click replays the word and Space/Enter bubble into the chip's
+                               keydown (Space could never be typed into a correction). -->
                           <input
                             type="text"
                             dir="rtl"
                             lang="ckb"
-                            class="bg-cortex-800 text-white text-xs px-1 border border-cortex-500 rounded outline-none focus:ring-1 focus:ring-cortex-400 w-16 text-end"
+                            class="bg-cortex-800 text-white text-xs px-1 border border-cortex-500 rounded outline-none focus:ring-1 focus:ring-cortex-400 w-16 text-start"
                             value={w.word}
+                            aria-label={$t('review.editWordAria')}
+                            onclick={(e) => e.stopPropagation()}
+                            ondblclick={(e) => e.stopPropagation()}
                             onblur={(e) =>
                               finishEditingWord(idx, (e.target as HTMLInputElement).value)}
                             onkeydown={(e) => {
-                              if (e.key === 'Enter')
+                              e.stopPropagation();
+                              if (e.key === 'Enter') {
                                 finishEditingWord(idx, (e.target as HTMLInputElement).value);
-                              if (e.key === 'Escape') editingWordIndex = null;
+                                refocusChip(idx);
+                              }
+                              if (e.key === 'Escape') {
+                                editingWordIndex = null;
+                                refocusChip(idx);
+                              }
                             }}
                             use:focusOnMount
                           />
@@ -2812,14 +2881,14 @@
                       type="button"
                       class="px-1.5 py-0.5 text-[10px] rounded bg-cortex-800 text-cortex-300 font-mono cursor-pointer hover:bg-cortex-700 transition-colors border-0"
                       title="{w.word}: {w.start.toFixed(2)}s - {w.end.toFixed(2)}s"
-                      onclick={() => (currentTime = chunkStartTime + w.start)}
+                      onclick={() => playWordClip(w)}
                       onkeydown={(e) => {
                         if (e.key === 'Enter' || e.key === ' ') {
-                          currentTime = chunkStartTime + w.start;
+                          playWordClip(w);
                           e.preventDefault();
                         }
                       }}
-                      aria-label="Jump to {w.word} at {w.start.toFixed(2)}s">{w.word}</button
+                      aria-label={$t('review.playWordAria').replace('{word}', w.word)}>{w.word}</button
                     >
                   {/each}
                 </div>

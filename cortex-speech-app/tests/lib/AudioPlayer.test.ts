@@ -140,6 +140,37 @@ describe('AudioPlayer', () => {
     expect(screen.queryByText('0:30')).not.toBeInTheDocument();
   });
 
+  it('reschedules the precise clip stop when endTime is retargeted mid-play (tap-a-word)', async () => {
+    mockMediaResolution('C:\\media\\clip.wav');
+    const { rerender } = render(AudioPlayer, {
+      props: { audioPath: 'C:\\input\\clip.wav', startTime: 10, endTime: 20 },
+    });
+    const audio = document.querySelector('audio') as HTMLAudioElement;
+    await waitFor(() => expect(audio.src).toContain('asset://localhost/C:/media/clip.wav'));
+    Object.defineProperty(audio, 'duration', { configurable: true, value: 30 });
+    await fireEvent.loadedMetadata(audio);
+    audio.currentTime = 10.5;
+
+    // The element is actually playing (mocked play() doesn't flip the native paused getter, and
+    // scheduleClipStop correctly bails while paused — so reflect a truly-playing element).
+    Object.defineProperty(audio, 'paused', { configurable: true, value: false });
+
+    vi.useFakeTimers();
+    try {
+      await fireEvent.click(screen.getByRole('button', { name: 'Play' }));
+      await Promise.resolve(); // flush play()'s .then so playing=true + the stop timer arm
+      expect(playMock).toHaveBeenCalled();
+
+      // A parent retargets the window mid-play (tap-a-word): the stop must move from the old
+      // 20s boundary (9.5s away) to the word end (1s away) — without this the word bleeds on.
+      await rerender({ endTime: 11.5 });
+      vi.advanceTimersByTime(1100);
+      expect(pauseMock).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reports loop replay failures instead of silently swallowing them', async () => {
     mockMediaResolution('C:\\media\\clip.wav');
     playMock.mockRejectedValueOnce(new Error('autoplay denied'));

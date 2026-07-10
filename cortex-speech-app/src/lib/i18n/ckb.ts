@@ -119,7 +119,11 @@ export const ckb: Record<string, string> = {
   'review.reviewedCount': '{done} لە {total} پێداچوونەوەکراو',
   'review.editHint': 'گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە',
   'review.listen': 'گوێ بگرە و بیدۆزەرەوە',
-  'review.listenHint': 'کلیک لە وشەیەک بکە بۆ گوێگرتنی. وشە ڕەنگکراوەکان دڵنیایی کەمترن — یەکەم جار ئەوانە بپشکنە.',
+  'review.listenHint':
+    'کلیک لە وشەیەک بکە بۆ گوێگرتنی تەنها ئەو وشەیە؛ دوو جار کلیک (یان F2) بۆ ڕاستکردنەوەی لە شوێنی خۆیدا. وشە ڕەنگکراوەکان دڵنیایی کەمترن — یەکەم جار ئەوانە بپشکنە.',
+  'review.editWordAria': 'دەستکاریکردنی وشە',
+  'review.wordChipHint': 'کلیک بۆ گوێگرتن · دوو جار کلیک بۆ دەستکاری',
+  'review.playWordAria': 'لێدانی وشەی {word}',
   'review.aligningWords': 'ڕێکخستنی وشەکان لەگەڵ دەنگ…',
   'review.playingWordsOnly': 'تەنها وشەکان لێدەدرێن ({sec}چ)',
   'review.playingWholeClip': 'هەموو پارچەکە لێدەدرێت ({sec}چ)',

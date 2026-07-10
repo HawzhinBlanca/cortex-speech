@@ -118,7 +118,11 @@ export const en: Record<string, string> = {
   'review.reviewedCount': '{done} of {total} reviewed',
   'review.editHint': 'Listen, then fix the text if needed',
   'review.listen': 'Listen & locate',
-  'review.listenHint': 'Tap a word to hear it. Coloured words are lower-confidence — check those first.',
+  'review.listenHint':
+    'Tap a word to hear just that word; double-tap (or F2) to fix it in place. Coloured words are lower-confidence — check those first.',
+  'review.editWordAria': 'Edit word',
+  'review.wordChipHint': 'tap to hear · double-tap to edit',
+  'review.playWordAria': 'Play word {word}',
   'review.aligningWords': 'Aligning words to audio…',
   'review.playingWordsOnly': 'Play hears the words only ({sec}s)',
   'review.playingWholeClip': 'Play hears the whole clip ({sec}s)',
