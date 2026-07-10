@@ -1,4 +1,4 @@
-.PHONY: help governance-proof verify-10 gate test-rust test-frontend lint typecheck \
+.PHONY: help governance-proof verify-10 verify-10-quick gate test-rust test-frontend lint typecheck \
         fmt-check python-policies test-e2e audit deny eval-ckb egress-offline \
         bench-rtf release-proof ship-check build-app check-fresh ship-check-local
 
@@ -6,13 +6,19 @@
 help:
 	@grep -E '^##' $(MAKEFILE_LIST) | sed -e 's/## //'
 
-## governance-proof: manifest sync, required assets, ledger schema, license compatibility
+## governance-proof: manifest sync, required assets, ledger schema, license compatibility (static; CI contract)
 governance-proof:
+	python scripts/verify_10.py --static
+
+## verify-10: the personal-use full-charter aggregator (owner amendment 2026-07-10). One honest
+## verdict line: RED / INCOMPLETE / GREEN-PERSONAL-USE-SHIP-READY; "10/10" is only printable when
+## nothing is descoped or owner-gated (post P7 re-audit). Use `-- --quick` via verify-10-quick.
+verify-10:
 	python scripts/verify_10.py
 
-## verify-10: full charter gate; prints 10/10 only after every proof/release/reliability gate is green
-verify-10: governance-proof python-policies test-frontend typecheck lint fmt-check test-rust audit deny eval-ckb egress-offline bench-rtf release-proof
-	@echo "CORTEX 10/10: ALL GATES GREEN"
+## verify-10-quick: tiers 0-1 only (static governance + CI-equivalent code gates)
+verify-10-quick:
+	python scripts/verify_10.py --quick
 
 ## gate: alias for the narrow governance proof (use verify-10 for the full charter gate)
 gate: governance-proof
@@ -99,13 +105,8 @@ release-proof:
 	@test -f "$(RELEASE_DIR)/latest.json" || (echo "missing signed updater latest.json"; exit 2)
 	@echo "release-proof artifact presence checks passed; signature and attestation cryptographic verification still require release CI credentials."
 
-## ship-check: full pre-release gate — a SUPERSET of the CI Windows release gate.
-## Running this green locally must imply CI green: it runs every required CI step.
-ship-check: governance-proof typecheck lint fmt-check python-policies test-frontend test-rust test-e2e audit deny
-	@echo ""
-	@echo "================================================="
-	@echo "  CORTEX ship-check complete — all CI gates green."
-	@echo "================================================="
+## ship-check: alias of verify-10 — one aggregator, one truth (superset of the CI release gate).
+ship-check: verify-10
 
 ## check-fresh: P0.2 stale-exe guard — assert the built release exe is newer than every source
 ## file AND was compiled from the current git HEAD (SHA recovered from the binary, no execution).

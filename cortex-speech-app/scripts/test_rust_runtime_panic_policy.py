@@ -1131,7 +1131,7 @@ def test_pipeline_rediarize_reports_db_update_failures() -> None:
 def test_batch_processor_asr_errors_are_not_blank_transcripts() -> None:
     batch = (REPO_ROOT / "src-tauri/src/bin/batch_processor.rs").read_text(encoding="utf-8")
     required = [
-        "let asr_result: Result<(String, Option<f64>), String>",
+        "let asr_result: Result<(String, Option<f64>, cortex_speech_app_lib::asr::ConfidenceSource), String>",
         "ASR service is unavailable; models may not be downloaded",
         "ASR transcription failed for segment",
         "return Err(std::io::Error::other(error).into());",

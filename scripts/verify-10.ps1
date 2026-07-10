@@ -1,10 +1,12 @@
 #!/usr/bin/env pwsh
-# Cortex Speech - Windows entrypoint for the governance verification gate.
-# Mirrors `make governance-proof` for environments without GNU make.
+# Cortex Speech - Windows entrypoint for the verify-10 aggregator.
+# Mirrors `make verify-10` for environments without GNU make; arguments pass through.
 #
-#   pwsh scripts/verify-10.ps1      # or:  powershell -File scripts/verify-10.ps1
+#   pwsh scripts/verify-10.ps1              # full personal-use aggregator
+#   pwsh scripts/verify-10.ps1 --quick      # tiers 0-1 only
+#   pwsh scripts/verify-10.ps1 --static     # historical governance gate (CI contract)
 #
-# Exits non-zero (propagating verify_10.py's status) if any governance gate is red.
+# Exits non-zero (propagating verify_10.py's status) if any kept gate is red or incomplete.
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $gate = Join-Path $repoRoot "scripts/verify_10.py"
@@ -18,5 +20,5 @@ if (-not $py) {
     exit 2
 }
 
-& $py $gate
+& $py $gate @args
 exit $LASTEXITCODE

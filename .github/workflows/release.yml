@@ -60,7 +60,7 @@ jobs:
       # license-compatibility check. Tags can be cut from ANY commit, so the release path must run
       # it itself rather than assume ci.yml did (true-10 audit).
       - name: Governance gate
-        run: python "${{ github.workspace }}/scripts/verify_10.py"
+        run: python "${{ github.workspace }}/scripts/verify_10.py" --static
       - run: npm run typecheck
       - run: npm test
       - run: npm run test:python-policies

@@ -40,7 +40,7 @@ jobs:
       # corpus being marked for redistribution. Invoked via $GITHUB_WORKSPACE so
       # it is independent of the per-job working directory.
       - name: Verify 10/10 gates (manifests, ledger schema, license compatibility)
-        run: python "${{ github.workspace }}/scripts/verify_10.py"
+        run: python "${{ github.workspace }}/scripts/verify_10.py" --static
 
   windows-release-gate:
     name: Windows Release Gate
