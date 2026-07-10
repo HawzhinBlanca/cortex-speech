@@ -8,6 +8,9 @@
  * Environment:
  *   CORTEX_AUDIO       (required) absolute path to a real audio file to import
  *   CORTEX_APP_EXE     (optional) path to cortex-speech-app.exe; default: repo release build
+ *   CORTEX_APP_DATA_DIR (optional) app profile dir for THIS RUN; default: a fresh disposable temp
+ *                       dir. The owner's real %APPDATA%\cortex-speech profile is REFUSED — a
+ *                       verification run must be incapable of touching the production library.
  *   CORTEX_OUT         (optional) output dir for debug log + run.jsonl; default: repo root
  *   CORTEX_DEBUG_PORT  (optional) WebView2 remote-debug port; default 9222
  *   CORTEX_LOCALE      (optional) 'en' | 'ckb'; default 'en'
@@ -20,6 +23,7 @@ const { spawn, execSync } = require('child_process');
 const { chromium } = require('@playwright/test');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 const REPO = __dirname;
 const APP_EXE = process.env.CORTEX_APP_EXE
@@ -31,6 +35,29 @@ const LOCALE = process.env.CORTEX_LOCALE === 'ckb' ? 'ckb' : 'en';
 // Clearing the DB is OPT-IN (default: keep the existing library). A verification run must never be
 // able to erase the owner's real %APPDATA% library by simply being run — the old opt-out default did.
 const CLEAR_DB = process.env.CORTEX_DB_CLEAR === '1' && process.env.CORTEX_SKIP_DB_CLEAR !== '1';
+
+// ── Profile isolation (P0): this test runs against a DISPOSABLE profile, never the real library. ──
+// The app honors CORTEX_APP_DATA_DIR (lib.rs get_app_data_dir), so pointing it at a temp dir gives
+// the run its own DB, settings, lock, and media cache. Models still resolve via the bundled/repo
+// fallback (models.rs active_models_dir), so ASR works in a fresh profile.
+const PROD_PROFILE = process.env.APPDATA ? path.join(process.env.APPDATA, 'cortex-speech') : null;
+const normPath = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
+let DATA_DIR = process.env.CORTEX_APP_DATA_DIR;
+if (DATA_DIR) {
+  if (
+    PROD_PROFILE &&
+    (normPath(DATA_DIR) === normPath(PROD_PROFILE) ||
+      normPath(DATA_DIR).startsWith(normPath(PROD_PROFILE) + path.sep))
+  ) {
+    console.error(
+      'REFUSED: CORTEX_APP_DATA_DIR points at the REAL profile (' + PROD_PROFILE + '). ' +
+        'This harness must never run against the production library — use a disposable directory.',
+    );
+    process.exit(1);
+  }
+} else {
+  DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-e2e-'));
+}
 
 const logFile = path.join(OUT_DIR, 'e2e_real_app_debug.log');
 try { fs.writeFileSync(logFile, ''); } catch (e) { /* non-fatal */ }
@@ -49,15 +76,25 @@ if (!AUDIO) die('CORTEX_AUDIO is required (absolute path to a real audio file).'
 if (!fs.existsSync(AUDIO)) die('CORTEX_AUDIO does not exist: ' + AUDIO);
 if (!fs.existsSync(APP_EXE)) die('App exe not found: ' + APP_EXE + ' (build it or set CORTEX_APP_EXE).');
 
-function killApp() { try { execSync('taskkill /F /IM cortex-speech-app.exe', { stdio: 'ignore' }); } catch (e) {} }
+// Kill ONLY the process tree we spawned (never `taskkill /IM` by image name, which would also kill
+// the owner's own running Cortex). No-op when nothing was spawned.
+let appProcess = null;
+function killApp() {
+  if (appProcess && appProcess.pid) {
+    try { execSync(`taskkill /F /T /PID ${appProcess.pid}`, { stdio: 'ignore' }); } catch (e) {}
+    appProcess = null;
+  }
+}
 
 function dumpRunManifest() {
   // Export the imported/transcribed segments to run.jsonl for build_review_page.py.
-  // Honest by construction: it copies exactly what the DB holds (empty raw_transcript stays empty).
+  // Honest by construction: it copies exactly what THIS RUN's isolated DB holds (never the
+  // production %APPDATA% database).
   const out = path.join(OUT_DIR, 'run.jsonl').replace(/\\/g, '\\\\');
+  const dbPath = path.join(DATA_DIR, 'cortex-speech.db').replace(/\\/g, '\\\\');
   const py = [
     'import sqlite3, os, json, sys',
-    "db=os.path.expandvars(r'%APPDATA%\\\\cortex-speech\\\\cortex-speech.db')",
+    "db=r'" + dbPath + "'",
     'c=sqlite3.connect(db)',
     "rows=c.execute('SELECT id,audio_path,raw_transcript,duration_ms,speaker_id FROM speech_segments ORDER BY created_at').fetchall()",
     'c.close()',
@@ -71,25 +108,34 @@ function dumpRunManifest() {
 }
 
 async function run() {
-  console.log('==> Cleaning up previous app instances...');
-  killApp();
+  console.log(`==> Isolated profile for this run: ${DATA_DIR}`);
+  // A STALE debug-port owner (e.g. a previous run that leaked) would make us drive the wrong
+  // instance. Never kill by image name — detect and refuse instead.
+  const portInUse = await fetch(`http://localhost:${DEBUG_PORT}/json`).then((r) => r.ok, () => false);
+  if (portInUse) {
+    die(
+      `debug port ${DEBUG_PORT} is already answering — a previous instance is still running. ` +
+        'Close it (or set CORTEX_DEBUG_PORT to a free port); this harness only kills processes it spawned.',
+    );
+  }
   if (CLEAR_DB) {
-    console.log('==> Clearing database for a clean run (CORTEX_DB_CLEAR=1; snapshots first)...');
-    // clear_db.py snapshots the DB and refuses without this confirm; it never runs by default, so a
-    // casual `node e2e_real_app.cjs` or the verify-10 real-app leg can NEVER wipe the real library.
+    console.log('==> Clearing the ISOLATED profile DB for a clean run (CORTEX_DB_CLEAR=1; snapshots first)...');
+    // clear_db.py honors CORTEX_APP_DATA_DIR, snapshots first, and refuses without this confirm.
     try {
       execSync('python clear_db.py --yes', {
         cwd: REPO,
-        env: { ...process.env, CORTEX_DB_CLEAR_CONFIRM: '1' },
+        env: { ...process.env, CORTEX_APP_DATA_DIR: DATA_DIR, CORTEX_DB_CLEAR_CONFIRM: '1' },
       });
     } catch (e) { console.log('   db clear skipped:', e.message); }
-  } else {
-    console.log('==> Keeping existing database (set CORTEX_DB_CLEAR=1 for a snapshot-then-clean run).');
   }
 
   console.log(`==> Launching ${path.basename(APP_EXE)} with remote-debugging-port=${DEBUG_PORT}...`);
-  const appProcess = spawn(APP_EXE, [], {
-    env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${DEBUG_PORT}` },
+  appProcess = spawn(APP_EXE, [], {
+    env: {
+      ...process.env,
+      CORTEX_APP_DATA_DIR: DATA_DIR,
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${DEBUG_PORT}`,
+    },
     cwd: path.dirname(APP_EXE), shell: false, detached: false,
   });
   appProcess.stdout.on('data', (d) => console.log(`[App] ${d.toString().trim()}`));

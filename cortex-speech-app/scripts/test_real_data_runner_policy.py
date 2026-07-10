@@ -80,6 +80,24 @@ def test_e2e_never_clears_the_real_db_by_default() -> None:
         raise AssertionError("e2e_real_app.cjs must not clear the DB by default (opt-out); make it opt-in")
 
 
+def test_e2e_is_isolated_from_the_production_profile() -> None:
+    # P0 isolation contract: the harness runs against a DISPOSABLE profile, refuses the real one,
+    # kills only the process tree it spawned, and reads its manifest from the isolated DB.
+    e2e = E2E.read_text(encoding="utf-8")
+    # 1. Disposable profile by default + production-profile refusal.
+    assert_contains(e2e, "mkdtempSync", E2E.name)
+    assert_contains(e2e, "REFUSED: CORTEX_APP_DATA_DIR points at the REAL profile", E2E.name)
+    # 2. The spawned exe is pointed at the isolated profile.
+    assert_contains(e2e, "CORTEX_APP_DATA_DIR: DATA_DIR", E2E.name)
+    # 3. Never kill by image name — that would kill the owner's own running app.
+    if "/IM cortex-speech-app.exe" in e2e:
+        raise AssertionError("e2e_real_app.cjs must not taskkill by image name; kill only the spawned PID tree")
+    assert_contains(e2e, "taskkill /F /T /PID", E2E.name)
+    # 4. The run manifest must come from the isolated DB, never the production %APPDATA% path.
+    if "%APPDATA%" in e2e and "cortex-speech.db" in e2e.split("%APPDATA%")[1][:80]:
+        raise AssertionError("e2e_real_app.cjs must not read the production %APPDATA% database")
+
+
 def test_clear_db_snapshots_before_deleting_and_requires_confirmation() -> None:
     clr = CLEAR_DB.read_text(encoding="utf-8")
     # Refuses without explicit confirmation.
@@ -97,6 +115,7 @@ def main() -> None:
     test_recursive_remove_only_exists_inside_safety_helper()
     test_package_real_audio_scripts_use_the_checked_runner()
     test_e2e_never_clears_the_real_db_by_default()
+    test_e2e_is_isolated_from_the_production_profile()
     test_clear_db_snapshots_before_deleting_and_requires_confirmation()
     print("real-data runner policy regression passed")
 

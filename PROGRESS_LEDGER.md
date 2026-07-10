@@ -2325,3 +2325,32 @@ adequately-powered disparity); gender axis is underpowered (25 female clips) so 
 gated. Owner to ratify/tighten the budget; to be re-derived from CORDI per-dialect data
 (owner-gated: cordi-dialect-fairness). Still NOT-BUILT after this: egress-runtime (needs exe +
 socket monitor), refinery-lift (needs LLM warm).
+
+## SESSION 2026-07-11 (cont.): pagination + word-tap UX + transcript export + engine pill + e2e isolation
+
+Five commits, each gated (verbatim outputs in the commit messages):
+
+- 217803d fix(review): load the WHOLE library — segmentStore.load() walks every backend page
+  (was: first 300 rows only, silently hiding the rest from review/lists/stats). Gate: 10k/11/
+  50,001/0-row fake-backend tests (12/12), incl. honest truncation flag at the 50k ceiling.
+- b3e832f feat(review): tap a word = hear EXACTLY that word; double-tap/F2 = fix it inline.
+  Hardened across TWO adversarial multi-agent reviews (19 findings, then 7 — all fixed; both
+  rounds' scenarios traced in-code). Gold safety: strict token replace (repeated-Sorani-word
+  ambiguity → refuse + fallback), unchanged/empty = cancel, chip overlay display-only.
+  Gates: wordEdit 14 tests, AudioPlayer retarget test, 163 vitest, typecheck, clippy.
+- 6892e54 feat(export): TXT/SRT/VTT transcript export (the product gap vs Descript/MacWhisper).
+  7 Rust unit tests + clippy. NOT yet clicked in a live UI (needs release rebuild).
+- c556517 feat(engine): header engine-status pill (Ready/Offline/Starting) + one-click
+  start_champion_engine (spawns start_7b_server.ps1 detached via CORTEX_7B_START_SCRIPT).
+  4 component tests; live WSL probe path remains #[ignore] (owner machine).
+- (this commit) fix(e2e): P0 test isolation — e2e_real_app.cjs now runs against a DISPOSABLE
+  profile (fresh mkdtemp CORTEX_APP_DATA_DIR; REFUSES the real %APPDATA%\cortex-speech), kills
+  only its own spawned PID tree (never taskkill-by-image, which killed the owner's running app),
+  reads its run manifest from the isolated DB, and refuses a stale debug port instead of killing
+  strangers. Gate: test_real_data_runner_policy.py::test_e2e_is_isolated_from_the_production_profile.
+
+Owner directive this session: /loop "continuously implement these and harden" per the external
+audit (honest ≈7/10; ordered plan: test isolation & main-thread safety → job/7B supervision →
+recovery/storage → decomposition → calibrated intelligence → quieter UX). NEXT UP: async/
+spawn_blocking migration of slow sync commands (audit: 120 commands, ~2 async) with a
+responsiveness heartbeat gate.
