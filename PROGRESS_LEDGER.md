@@ -2070,3 +2070,84 @@ MEASURED CER (real harness, no fabrication):
   the LoRA may have seen Common Voice ckb; if so 5.04% is optimistic. Clean confirmation needs a set
   with KNOWN disjointness (FLEURS-ckb, not yet downloaded here — cache is metadata-only). (2) Do NOT
   cross-compare to Scribe 32.1% WER (that is FLEURS-ckb; ours is CV22-ckb — different dataset).
+
+## Second-PC reproduction + MEASURED FLEURS-ckb champion CER + ask-dialog verify + FTS import fix (2026-07-10)
+
+Picked up the two open tasks on a SECOND PC (dual RTX 3090 Ti, WSL2 Ubuntu) per
+docs/CONTINUE_ON_ANOTHER_PC.md. Branch `autonomous-day-20260710`.
+
+**Setup reproduced (everything found BY NAME, no hardcoded profile paths):**
+- `npm ci`; `python scripts/fetch_models.py` (+ `--check`) — VAD + CTC-300M + onnxruntime, all
+  SHA-256 verified.
+- Champion located by name: base `omniASR-LLM-7B-v2.pt` (~30 GB) in the fairseq2 asset cache; LoRA
+  `adapter_model.safetensors` + `omniASR_tokenizer_written_v2.model` under
+  `Kurdish_ASR_Model_Export/OmniASR_7B_Champion/` and a self-contained `omniasr_champion_package/`.
+  `cortex_7b_server.py` was NOT on this PC (the private glue the doc says to carry) — reconstructed it
+  from the package's Flask `server.py` load recipe, speaking the TCP line protocol on
+  127.0.0.1:8799 that `cortex_7b_client.py` / `scripts/scorecard_7b.py` expect.
+  - PITFALL fixed: fairseq2's SentencePiece loader URI-encodes the tokenizer path, so a model dir with
+    spaces became `%20`-mangled ("cannot be opened"). Copied the model dir to a space-free location and
+    pointed the server there (`CORTEX_7B_MODEL_DIR`). Smoke clip decodes near-perfect vs its reference.
+- Champion venv (torch 2.8+cu128, fairseq2 0.6, omnilingual_asr 0.2.0, peft, soundfile) already present.
+- `%APPDATA%\cortex-speech\settings.json` wired to WSL7B via the app's OWN `update_settings` IPC. NOTE:
+  a hand-written PARTIAL settings.json is quarantined `.corrupt-<ts>` — `AppSettings` has 15 required
+  (non-`serde(default)`) fields, so the persisted file must be COMPLETE (write it through the app, not by hand).
+- Provisioned the stdlib-only WSL client interpreter the exe invokes (absent on this PC) so the 7B
+  client path (import + per-segment) can run.
+- Frontend build → `cargo build --release --bin cortex-speech-app` → `check_exe_freshness.py` GREEN.
+  NOTE: all-targets `cargo build --release` / `cargo clippy --all-targets` / `cargo test` fail on this
+  box only at the auxiliary bins `batch_processor`/`batch_importer` ("crate `tauri_runtime_wry` required
+  in rlib format") — a pre-existing Tauri all-targets quirk unrelated to any change here; the app bin +
+  lib build clean and CI (app-bin only) is unaffected.
+
+**OPEN TASK 1 — FLEURS-ckb clean CER (the disjoint number the CV22 entry above asked for): MEASURED**
+- Built the frozen FLEURS ckb_IQ **test** manifest (922 clips) decoding via `Audio(decode=False)` +
+  soundfile (the doc's torchcodec/CUDA-12 avoidance), 16 kHz mono WAV. (Real split is 922, not the
+  doc's ~350 estimate.)
+- Command: `wsl scripts/scorecard_7b.py fleurs_ckb_iq_frozen.tsv 2000` against the WARM
+  `cortex_7b_server.py` (:8799); seed-42 bootstrap; default NFC+lower+space norm (byte-identical to the
+  21.00% / 29.40% baselines).
+- Model: OmniASR-7B Champion = base `omniASR-LLM-7B-v2.pt` + Kurdish LoRA `adapter_model.safetensors`.
+- **RESULT: micro CER = 7.03%  95% CI [6.53%, 7.55%]  N=922 ; WER = 32.93% [31.89%, 33.98%] ; 4.13 s/clip.**
+- Honest reads:
+  - Confirms CV22's 5.04% was optimistic on disjointness: on FLEURS-ckb (KNOWN disjoint) the champion is
+    **7.03% CER**, ~2 pts higher. 7.03% is the honest clean number.
+  - Same-dataset vs ElevenLabs Scribe v1 (published **32.1% WER on FLEURS-ckb**): champion **32.93% WER**
+    — on par (marginally behind on WER; CER 7.03% is strong). Now a FAIR same-dataset comparison (removes
+    the CV22 "different dataset" caveat).
+  - CAVEAT: the default norm counts digit-verbalization (٥→پێنج) and Arabic→Latin digits (١٠٠→100) as
+    errors, inflating both CER and WER; a `CORTEX_CER_STRIP=1` fair run would be lower but non-comparable
+    to the published byte-identical baselines. Meta's official base omniASR-7B-LLM = 6.0% CER ckb_Arab —
+    7.03% for the LoRA champion on FLEURS ckb_IQ is a consistent ballpark.
+
+**OPEN TASK 2 — ask-dialog verify (no silent downgrade): VERIFIED on the real exe**
+- With the 7B server DOWN, drove the real `cortex-speech-app.exe` (WSL7B primary) on a real ckb segment:
+  - `transcribe_segment` REJECTED with `E_ASR_7B_UNAVAILABLE`: "WSL 7B ASR process failed: 7B engine not
+    running: cannot reach the OmniASR-7B server on 127.0.0.1:8799 ([Errno 111] Connection refused)" — the
+    client reached the socket, so the cause is provably server-down.
+  - The app surfaced the "OmniASR-7B champion unavailable" dialog with "Try 7B again" + "Use offline
+    model". NO silent downgrade to a smaller model.
+- Driver: a CDP harness invoking `transcribe_segment` AND clicking the Transcribe button; both the
+  backend rejection and the UI dialog asserted.
+
+**BUG FOUND + FIXED during the positive-path e2e — `segments_fts` missing `audio_path` broke ALL imports:**
+- Root cause: the FTS5 shadow `segments_fts` was created 4-col (`id, raw_transcript,
+  normalized_transcript, annotated_transcript`) while the `segments_ai/ad/au` triggers write
+  `audio_path`. Every segment INSERT therefore failed ("table segments_fts has no column named
+  audio_path"); the import transaction rolled back and VAD "produced 0 segments" — **a fresh install
+  could not ingest ANY audio.** The divergence: db.rs `initialize()`'s AUTHORITATIVE 6-col schema vs
+  migration v1's 4-col copy (`001_initial.sql`); the "6-col runs first so it wins" assumption failed here.
+- Fix: migration **v35** rebuilds `segments_fts` to the authoritative 6-col shape (FTS5 has no ALTER ADD
+  COLUMN) + rebuilds from external content. Idempotent. Regression test
+  `v35_repairs_divergent_segments_fts_so_segment_writes_succeed` reproduces the broken state (INSERT
+  rejected) and asserts the repair (INSERT succeeds).
+- VERIFIED end-to-end on real audio: applied v35 to the live DB (schema_migrations 34→35; `segments_fts`
+  gained `audio_path`); re-ran `e2e_real_app.cjs` on a real ckb clip → **REAL-DATA RUN OK: 1 VAD segment,
+  champion transcript 148 chars** ("هەروەها بەشداربووە لە هەڵکەندنی قالبی دراو …"); run.jsonl + a
+  self-contained review page built.
+
+**Gates (this branch, real output):** `cargo fmt --check` ok; `cargo clippy --lib --bin
+cortex-speech-app -D warnings` ok; `cargo test --lib` **835 passed / 0 failed / 6 ignored** (incl. the
+new v35 test); `npm run typecheck` 0; `npm run lint` ok; vitest **144/144**; `npm run
+test:python-policies` ok (incl. windows-repo-hygiene); `check_exe_freshness.py` GREEN; real-audio import
+e2e + ask-dialog verify PASS.
