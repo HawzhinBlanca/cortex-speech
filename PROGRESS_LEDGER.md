@@ -2237,3 +2237,15 @@ updated); scripts/start_7b_server.ps1 (idempotent one-click engine start, waits 
 scripts/cortex_doctor.ps1 (9-check read-only preflight, proven on this rig: 8/9 PASS with the one
 FAIL correctly flagging the e2e-held app instance). Next: final rebuild at HEAD, doctor 9/9,
 real-audiobook smoke, push.
+
+## TONIGHT-READINESS PROVEN (2026-07-10 19:52, HEAD cd0782c)
+
+Final chain verbatim: exe rebuilt at HEAD ("Finished `release` profile ... in 6m 31s");
+cortex_doctor.ps1 -> "VERDICT: READY for real use - every preflight check passed" (9/9, incl.
+exe-freshness at cd0782c, champion server up, settings=WSL7B, 465.8 GiB free);
+real-audiobook smoke via e2e_real_app.cjs on cortex_audiobook_curated wav ->
+"REAL-DATA RUN OK: 1 segments; first transcript 155 chars" (coherent Sorani from the champion).
+Known non-blocker: local LLM refinement 404s (custom Ollama model heretic-final:latest not
+provisioned on this PC) and falls back to the raw champion transcript - graceful, no fabrication.
+Owner runs scripts/cortex_doctor.ps1 before tonight's session; scripts/start_7b_server.ps1
+restarts the engine after any reboot.
