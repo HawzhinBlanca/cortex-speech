@@ -2201,3 +2201,39 @@ architecture guide (every model/tool named exactly, verified against source by a
 critic; caught + corrected one would-be fabrication: default LLM refiner is local Ollama
 heretic-final:latest, NOT a cloud model). Next: WS2 (verify-10 aggregator + proof-metadata
 branch) then WS6 reliability drills.
+
+## WS2 LANDED: proof-metadata v36 merged + verify-10 is now the personal-use full-charter aggregator (2026-07-10)
+
+WS2a - feat/proof-metadata-10-10-gate completed and merged (eac4157): 8 SpeechSegment initializers
+fixed, migration renumbered v34->v36 (v35 = FTS repair), confidence_source/cloud_call/
+decoder_config_hash/normalizer_version + get_segments_page landed. Verified on this rig:
+`cargo test --lib` -> "835 passed; 0 failed; 6 ignored" (worktree AND main checkout);
+clippy --all-targets -D warnings clean; svelte-check 0/406 files; vitest 144/144.
+
+WS2b - scripts/verify_10.py rewritten as the aggregator: 23 kept gates in 4 tiers, per-gate logs,
+statuses PASS/FAIL/SKIP-ENV/NOT-BUILT + 8 SKIPPED-BY-OWNER-DECISION + 5 OWNER-GATED-PENDING rows
+always printed; single honest verdict (RED/INCOMPLETE/GREEN-PERSONAL-USE); the literal 10/10 line
+unprintable until nothing is descoped/owner-gated (post P7). --static preserves the CI contract
+(ci.yml/release.yml updated to pass it; "CORTEX GOVERNANCE: ALL GATES GREEN" exit 0 verified).
+
+The aggregator's first sweeps found and fixed REAL defects (the point of the exercise):
+1. App.svelte health-loop null-deref (would also fire in prod on backend error) -> guarded.
+2. validation.spec empty-library test silently neutered by the get_segments_page migration
+   (override only covered get_segments) -> override extended; 5/5 specs pass.
+3. Stale policy byte-pin vs the ConfidenceSource tuple -> pin updated, semantics unweakened.
+4. LNK1104 Windows linker file-lock flake -> --jobs 4 + one logged retry in the cargo gates.
+5. Playwright browsers absent on this rig -> installed; axe spec now prints failing nodes.
+
+FINAL SWEEP (verbatim tail): "kept gates run: 23 - 19 PASS, 0 FAIL, 4 skipped (env/not-built)" ->
+"VERDICT: INCOMPLETE - 4 kept gate(s) could not run (egress-runtime, fuzz-smoke, refinery-lift,
+fairness-gender-age). Green cannot be claimed." Those 4 are WS3b/WS4 builds - the honest distance.
+ignored-real-model PASS 121.2s (37 gates, cloud-key test excluded); deny PASS (cargo-deny 0.20.2);
+real-app-e2e PASS 13.5s; rtf-bench PASS 20.8s.
+
+TONIGHT PACK (owner does real work in the app tonight): cortex_7b_server.py COMMITTED to
+cortex-speech-app/scripts/ (bus-factor-1 closed; env-var paths, running instance sha256
+5e2f94128d265ad6ecc23d181e79873eb64401a6e50d0deb0de7266d4ab51b80, code byte-identical, docstring
+updated); scripts/start_7b_server.ps1 (idempotent one-click engine start, waits for port);
+scripts/cortex_doctor.ps1 (9-check read-only preflight, proven on this rig: 8/9 PASS with the one
+FAIL correctly flagging the e2e-held app instance). Next: final rebuild at HEAD, doctor 9/9,
+real-audiobook smoke, push.
