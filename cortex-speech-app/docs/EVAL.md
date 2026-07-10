@@ -3,7 +3,30 @@
 > **Real, measured numbers.** Produced by running the live OmniASR-CTC engine on human-transcribed
 > Kurdish audio and scoring against the verified references — no estimates, fully reproducible.
 
-## OmniASR-7B Champion (the DEFAULT engine) — first real measurement (2026-07-02)
+## OmniASR-7B Champion (the DEFAULT engine)
+
+### ⭐ Same-set three-engine scorecard — FLEURS ckb_IQ test, N=922 (2026-07-10)
+
+The fair comparison this document demanded (boundary-aligned gold set, space-KEPT CER, identical clips
++ normalization for every engine) now exists — pinned record with SHAs + exact commands in
+[MEASUREMENTS.md](MEASUREMENTS.md), frozen manifest committed at `docs/eval/fleurs_ckb_iq_frozen.rel.tsv`:
+
+| Engine (identical 922 clips) | micro CER | 95% CI | micro WER | Harness |
+|---|:--:|:--:|:--:|---|
+| **OmniASR-7B champion (base + Kurdish LoRA)** | **7.03%** | [6.53%, 7.55%] | 32.93% [31.89%, 33.98%] | `scorecard_7b.py` (warm server, space-kept) |
+| Fine-tuned MMS-CTC-1B (HF fp32) | 9.32% | — (harness prints point estimate only) | — | `measure_finetuned_cer.py` |
+| Stock OmniASR-CTC-300M (int8) | 11.34% | [10.83%, 11.93%] | 50.01% | Rust `ckb_scorecard_on_gold` + `scorecard_stats.py` |
+
+The champion is the measured-best local engine on known-disjoint data: **−4.3 CER pts vs stock (38%
+relative), −2.3 pts vs the fine-tuned 1B (25% relative)**. Same-set context: ElevenLabs Scribe v1
+publishes **32.1% WER on FLEURS-ckb** — the champion's 32.93% [31.89, 33.98] is statistically on par.
+Honest caveats: the default normalization counts digit verbalization (٥→پێنج) and Arabic→Latin digit
+form (١٠٠→100) as errors, penalizing the 7B's verbalization style — the true recognition gap vs Scribe
+is likely smaller/reversed but is NOT claimed until measured under an owner-approved fair basis; the
+CV22 5.04% (2026-07-09) stays caveated for unverified train/test disjointness — FLEURS 7.03% is the
+honest headline.
+
+### First real measurement — historical record (2026-07-02)
 
 The deep audit's #1 gap was that the forced-default WSL 7B engine had **no** measured CER. Measured it
 via the warm server (`scripts/scorecard_7b.py`, no second model load):
@@ -268,6 +291,10 @@ starting line.
 
 **Honest reading:** Both engines score ~60% on this set because the references are wrong. By inspection, the 7B output is coherent, correct Sorani. The set is **unusable for trustworthy CER measurement**, so NO numeric 7B-vs-stock comparison is drawn from it (the earlier "on-par with or slightly better than stock" numeric read was retracted 2026-07-09 — the two numbers used different CER bases; only the by-eye "coherent, correct Sorani" observation stands).
 
-**Implication:** The default 7B engine remains unmeasured on a boundary-aligned gold set. The app now fails hard on unresolvable WSL 7B (F2) and the plan calls for a real gold measurement via M1–M3 (FLEURS N=1 as a placeholder, then app-gold N≥300 from the owner's verified corrections).
+**Implication (updated 2026-07-10):** This gap is now closed — the default 7B engine was MEASURED on a
+boundary-aligned, known-disjoint gold set: **FLEURS ckb_IQ test, N=922: micro CER 7.03% [6.53%, 7.55%],
+WER 32.93% [31.89%, 33.98%]** (same-set stock CTC-300M 11.34% [10.83%, 11.93%], fine-tuned MMS-1B 9.32%;
+pinned record in docs/MEASUREMENTS.md). The app still fails hard on unresolvable WSL 7B (F2); the
+app-gold N≥300 conversational benchmark from the owner's verified corrections remains open (M3).
 
 This row is kept in the appendix (not deleted) as a warning: high CER numbers may reflect data issues, not model failure. Always audit your gold set for boundary integrity before trusting an accuracy claim.

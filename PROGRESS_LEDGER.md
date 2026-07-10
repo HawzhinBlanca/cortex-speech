@@ -2151,3 +2151,23 @@ cortex-speech-app -D warnings` ok; `cargo test --lib` **835 passed / 0 failed / 
 new v35 test); `npm run typecheck` 0; `npm run lint` ok; vitest **144/144**; `npm run
 test:python-policies` ok (incl. windows-repo-hygiene); `check_exe_freshness.py` GREEN; real-audio import
 e2e + ask-dialog verify PASS.
+
+## P2.2 same-set three-engine scorecard MEASURED + pinned (2026-07-10, branch autonomous-day-20260710)
+
+The engine comparison every prior entry caveated as impossible ("different datasets/N/bases") now
+exists on ONE known-disjoint set: FLEURS ckb_IQ test, N=922, identical clips + space-KEPT
+normalization for all three engines. Pinned record (SHAs, exact commands, verbatim harness output):
+docs/MEASUREMENTS.md; frozen manifest committed at docs/eval/fleurs_ckb_iq_frozen.rel.tsv (.sha256).
+
+- **Champion 7B+LoRA: 7.03% CER [6.53, 7.55], WER 32.93% [31.89, 33.98]** (warm server, ~4.1 s/clip)
+- Fine-tuned MMS-1B: 9.32% CER (HF fp32 CPU; harness prints point estimate only — CI leg tracked)
+- Stock CTC-300M: 11.34% CER [10.83, 11.93], WER 50.01% (Rust harness + scorecard_stats.py)
+
+C1 engine decision recorded in MEASUREMENTS.md: champion stays default on measured evidence (-4.3
+CER pts vs stock / -2.3 vs fine-tuned); same-set Scribe v1 context 32.1% WER => statistically on par,
+with the digit-verbalization normalization caveat. EVAL.md headline + stale "remains unmeasured"
+claims corrected (doc-honesty debt from TRUE_RATING cluster G). Model pins hashed for the record:
+base .pt sha256 1b29a40..., LoRA adapter c348ade..., tokenizer 8aa11a1... Also shipped this session:
+docs/SHIP_FINAL_PLAN.md — 10-agent evidence-cited audit of everything left for full-charter 10/10
+(58 items: 36 automatable in 7 workstreams, 22 owner-gated with the Gold Marathon as THE bottleneck).
+Next per WS1: SeamlessM4T-v2 baseline + MAPSSWE on this same frozen set.
