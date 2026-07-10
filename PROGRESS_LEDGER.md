@@ -2249,3 +2249,26 @@ Known non-blocker: local LLM refinement 404s (custom Ollama model heretic-final:
 provisioned on this PC) and falls back to the raw champion transcript - graceful, no fabrication.
 Owner runs scripts/cortex_doctor.ps1 before tonight's session; scripts/start_7b_server.ps1
 restarts the engine after any reboot.
+
+## CRASH DIAGNOSED (open audio / import freeze) — fix applied, NOT yet built/verified (2026-07-11)
+
+Owner reported the app "crashes" on clicking Open audio or Import. ROOT CAUSE CONFIRMED (not
+guessed): open_audio_file + import_directory in commands.rs were SYNC #[tauri::command]s calling
+blocking_pick_file()/blocking_pick_folder(). Sync Tauri commands run on the MAIN THREAD, so the
+blocking native picker froze the whole UI. Proof via CDP repro: with the dialog open, invoke
+('get_settings') hung the full 5s timeout -> main thread blocked ("MAIN THREAD BLOCKED BY DIALOG").
+No Windows WER crash event exists (checked 6h) = a freeze, not a native crash. e2e never caught it
+because e2e_real_app.cjs calls import_audio_file DIRECTLY, bypassing the dialog. Dialog-open and
+import of .wav AND .mp3 all verified working under automation, so ONLY the main-thread dialog block
+was the defect.
+
+FIX APPLIED to commands.rs (uncommitted working-tree change; build was interrupted, so NOT yet
+compiled/verified/committed): both commands -> async fn + non-blocking .pick_file/.pick_folder +
+tokio::sync::oneshot; import_directory fetches app.state::<AppState>() AFTER the await. Prereqs
+verified: use tauri::Manager present, tokio features=["sync"], pick_file/pick_folder exist in
+tauri-plugin-dialog 2.7.1.
+
+NEXT AGENT: see docs/HANDOFF_NEXT_AGENT.md — build (frontend first), run the CDP hang-repro to prove
+get_settings no longer hangs while the dialog is open, cargo test/clippy/typecheck, add a regression
+gate (assert both commands are async + no blocking_pick_*), rebuild at HEAD, cortex_doctor READY,
+real-audio smoke, commit + push. Also audit other sync commands for the same blocking footgun.
