@@ -1028,15 +1028,14 @@ impl Database {
             if match_query.is_empty() {
                 return Ok(SegmentsPage { items: Vec::new(), total: 0, next_cursor: None });
             }
-            let scoped_query = format!("{{raw_transcript normalized_transcript annotated_transcript}} : ({match_query})");
+            let scoped_query =
+                format!("{{raw_transcript normalized_transcript annotated_transcript}} : ({match_query})");
             bind_values.push(Value::Text(scoped_query));
-            where_parts.push(format!("id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?{})", bind_values.len()));
+            where_parts
+                .push(format!("id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?{})", bind_values.len()));
         }
-        let where_sql = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", where_parts.join(" AND "))
-        };
+        let where_sql =
+            if where_parts.is_empty() { String::new() } else { format!(" WHERE {}", where_parts.join(" AND ")) };
         let order_sql = match sort {
             "oldest" => "datetime(created_at) ASC, id ASC",
             "duration" => "duration_ms DESC, id ASC",
@@ -1052,9 +1051,8 @@ impl Database {
         };
 
         let count_sql = format!("SELECT COUNT(*) FROM speech_segments{where_sql}");
-        let total: i64 = self
-            .conn
-            .query_row(&count_sql, rusqlite::params_from_iter(bind_values.iter()), |row| row.get(0))?;
+        let total: i64 =
+            self.conn.query_row(&count_sql, rusqlite::params_from_iter(bind_values.iter()), |row| row.get(0))?;
 
         let mut page_values = bind_values.clone();
         page_values.push(Value::Integer(limit as i64));
@@ -1136,8 +1134,10 @@ impl Database {
         for chunk in ids.chunks(CHUNK) {
             // Build a parameterised placeholder list: (?1,?2,...?N)
             let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
-            let query =
-                format!("SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments WHERE id IN ({})", placeholders.join(","));
+            let query = format!(
+                "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments WHERE id IN ({})",
+                placeholders.join(",")
+            );
             let mut stmt = self.conn.prepare(&query)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), Self::map_row)?;
             for row in rows {

@@ -1769,12 +1769,7 @@ impl ProcessingPipeline {
             };
 
             let (raw_transcript, confidence, confidence_source, model_version_id) = if let Some(text) = finetuned_text {
-                (
-                    text,
-                    None,
-                    Some("fine_tuned_no_posterior".to_string()),
-                    Some("finetuned-mms-ckb".to_string()),
-                )
+                (text, None, Some("fine_tuned_no_posterior".to_string()), Some("finetuned-mms-ckb".to_string()))
             } else if self.should_use_wsl_primary_asr() {
                 (
                     "[Pending WSL 7B ASR]".to_string(),

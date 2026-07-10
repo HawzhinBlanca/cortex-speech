@@ -959,7 +959,8 @@ fn pipeline_routes_to_finetuned_when_enabled() {
         Arc::new(ModelManager::new(tmp.path().to_path_buf())),
     );
 
-    let draft = pipeline.transcribe(None, fixture.to_str().unwrap(), None, None).expect("fine-tuned pipeline transcribe");
+    let draft =
+        pipeline.transcribe(None, fixture.to_str().unwrap(), None, None).expect("fine-tuned pipeline transcribe");
     let raw = draft.raw_text;
     eprintln!("[pipeline-finetuned] raw: {raw}  conf={:?}", draft.confidence);
     assert!(draft.confidence.is_none(), "the fine-tuned engine returns no confidence (proves it was the engine used)");

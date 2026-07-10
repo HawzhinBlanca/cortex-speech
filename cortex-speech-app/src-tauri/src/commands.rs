@@ -276,15 +276,22 @@ pub(crate) fn build_agentic_readiness_snapshot(
 }
 
 #[tauri::command]
-pub fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
+pub async fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     RATE_LIMITER.check("open_audio_file")?;
     use tauri_plugin_dialog::DialogExt;
-    let path = app
-        .dialog()
+    // MUST be async + non-blocking: this command runs on the main thread, and blocking_pick_file
+    // there freezes the ENTIRE app UI for as long as the picker is open (confirmed: a second
+    // command hangs while the dialog is up). pick_file schedules the native dialog on the event
+    // loop and delivers the result via a oneshot without ever blocking the main thread.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
         .file()
         .add_filter("Audio", &["wav", "mp3", "flac", "m4a", "ogg", "aac", "opus", "mp4", "webm", "wma", "mov"])
-        .blocking_pick_file();
-    Ok(path.and_then(|p| p.as_path().map(|p| p.to_string_lossy().to_string())))
+        .pick_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+    let picked = rx.await.map_err(|_| "file dialog closed unexpectedly".to_string())?;
+    Ok(picked.and_then(|p| p.as_path().map(|p| p.to_string_lossy().to_string())))
 }
 
 fn emit_or_log<T>(app: &tauri::AppHandle, event: &str, payload: T)
@@ -402,16 +409,24 @@ fn log_jury_pipeline_failure(context: &str, error: &str) {
 }
 
 #[tauri::command]
-pub fn import_directory(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn import_directory(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("import_directory")?;
     use tauri_plugin_dialog::DialogExt;
-    let dir = app.dialog().file().blocking_pick_folder();
+    // async + non-blocking folder picker — blocking_pick_folder on this main-thread command froze
+    // the whole UI while the picker was open (same footgun as open_audio_file). State is fetched
+    // AFTER the await so no State borrow is held across it.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |picked| {
+        let _ = tx.send(picked);
+    });
+    let dir = rx.await.map_err(|_| "folder dialog closed unexpectedly".to_string())?;
     let dir_path = match dir.and_then(|p| p.as_path().map(|p| p.to_path_buf())) {
         Some(p) => p,
         None => return Err("No directory selected".into()),
     };
     validate::validate_file_path(&dir_path.to_string_lossy())?;
 
+    let state = app.state::<AppState>();
     state.try_start_import()?;
 
     let cancel = Some(state.start_cancel_token());
@@ -1484,8 +1499,7 @@ pub fn get_segments_page(
     }
     let limit = limit.unwrap_or(200).clamp(1, 500);
     let db = state.lock_db();
-    db.get_segments_page(verified, query.as_deref(), &sort, limit, cursor.as_deref())
-        .map_err(|e| e.to_string())
+    db.get_segments_page(verified, query.as_deref(), &sort, limit, cursor.as_deref()).map_err(|e| e.to_string())
 }
 
 /// M2.5: Return segments ordered by suspect-first priority: escalated + low confidence first.

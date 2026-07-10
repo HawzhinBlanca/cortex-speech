@@ -1128,6 +1128,41 @@ def test_pipeline_rediarize_reports_db_update_failures() -> None:
         raise AssertionError(f"pipeline.rs is missing explicit rediarization DB update handling:\n{formatted}")
 
 
+def test_file_dialog_commands_do_not_block_the_main_thread() -> None:
+    """Regression gate for the 2026-07-11 crash: open_audio_file / import_directory were SYNC
+    #[tauri::command]s calling blocking_pick_file()/blocking_pick_folder(). Sync commands run on the
+    MAIN THREAD, so the blocking native picker froze the ENTIRE app UI while open (confirmed: a second
+    command hung the full timeout while the dialog was up). Both MUST stay `async fn` and use the
+    non-blocking pick_file/pick_folder callback form so the dialog never blocks the event loop.
+    """
+    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+
+    def body_of(sig: str) -> str:
+        start = commands.index(sig)
+        rest = commands[start + len(sig):]
+        end = len(rest)
+        for marker in ("\n#[tauri::command]", "\npub fn ", "\npub async fn "):
+            idx = rest.find(marker)
+            if idx != -1:
+                end = min(end, idx)
+        return rest[:end]
+
+    for sig in ("pub async fn open_audio_file", "pub async fn import_directory"):
+        if sig not in commands:
+            raise AssertionError(
+                f"commands.rs: '{sig}' must exist and be ASYNC (a sync dialog command blocks the "
+                f"main thread and freezes the whole UI — see the 2026-07-11 crash)."
+            )
+        body = body_of(sig)
+        if "blocking_pick" in body:
+            raise AssertionError(
+                f"commands.rs: {sig} calls a blocking_pick_* dialog on the main thread — it MUST use "
+                f"the non-blocking pick_file/pick_folder callback form or it freezes the app UI."
+            )
+        if "pick_file(" not in body and "pick_folder(" not in body:
+            raise AssertionError(f"commands.rs: {sig} must open its dialog via non-blocking pick_file/pick_folder.")
+
+
 def test_batch_processor_asr_errors_are_not_blank_transcripts() -> None:
     batch = (REPO_ROOT / "src-tauri/src/bin/batch_processor.rs").read_text(encoding="utf-8")
     required = [
