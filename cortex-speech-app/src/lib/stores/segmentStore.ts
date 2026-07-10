@@ -3,6 +3,13 @@ import type { SpeechSegment, WordTimestamp } from '../types';
 import * as api from '../commands';
 import { isHumanRejected } from '../segmentQuality';
 
+// Fetch the whole library by walking every backend page. Page size is the backend's max (fewest
+// round-trips). MAX_LOAD is a defensive ceiling so a pathological library can't exhaust memory or
+// hang the load — it is far above any realistic personal review set, and when it IS hit we keep the
+// true `total` and flag the view truncated instead of silently hiding rows.
+const PAGE_SIZE = 500;
+const MAX_LOAD = 50_000;
+
 function createSegmentsStore() {
   const { subscribe, set, update } = writable<SpeechSegment[]>([]);
   let loadSeq = 0;
@@ -15,16 +22,35 @@ function createSegmentsStore() {
     },
     async load() {
       const seq = ++loadSeq;
+      // Snapshot the filter params ONCE: a mid-load store change must not drift the query across
+      // pages. A real change bumps loadSeq elsewhere, and this run bails at the next stale-check.
+      const verified = get(filterVerified);
+      const query = get(searchQuery) || null;
+      const sort = get(sortOrder);
       try {
-        const page = await api.getSegmentsPage({
-          verified: get(filterVerified),
-          query: get(searchQuery) || null,
-          sort: get(sortOrder),
-          limit: 300,
-        });
-        const data = page.items;
-        if (seq !== loadSeq) return; // stale load — a newer one is in flight or a write invalidated it
-        set(data);
+        const acc: SpeechSegment[] = [];
+        let cursor: string | null = null;
+        let total = 0;
+        // Walk EVERY page. The old code took only the first 300 rows, so any larger library silently
+        // dropped everything past 300 from review, lists, and every store-derived stat.
+        do {
+          const page = await api.getSegmentsPage({ verified, query, sort, limit: PAGE_SIZE, cursor });
+          if (seq !== loadSeq) return; // a newer load or a write superseded this run
+          total = page.total;
+          acc.push(...page.items);
+          cursor = page.nextCursor;
+          if (page.items.length === 0) break; // defensive: never spin on a non-null cursor + empty page
+        } while (cursor && acc.length < MAX_LOAD);
+        set(acc);
+        libraryTotal.set(total);
+        const truncated = acc.length < total;
+        libraryTruncated.set(truncated);
+        if (truncated) {
+          console.warn(
+            `Loaded ${acc.length} of ${total} segments (MAX_LOAD=${MAX_LOAD} reached). ` +
+              'Narrow with search/filter to review the rest.',
+          );
+        }
         // Refresh threshold after loading segments
         await refreshConformalThreshold();
       } catch (e) {
@@ -35,6 +61,11 @@ function createSegmentsStore() {
 }
 
 export const segments = createSegmentsStore();
+// True backend row count for the current filter (may exceed segments.length only when MAX_LOAD is
+// hit). `libraryTruncated` = the loaded view is a prefix of a larger library — surface it, never
+// hide it. For any realistic personal library these are `segments.length` and `false`.
+export const libraryTotal = writable(0);
+export const libraryTruncated = writable(false);
 export const selectedSegmentId = writable<string | null>(null);
 export const wordTimestamps = writable<WordTimestamp[]>([]);
 export const filterVerified = writable<boolean | null>(null);
