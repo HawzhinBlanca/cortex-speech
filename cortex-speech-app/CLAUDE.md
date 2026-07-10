@@ -79,6 +79,12 @@ Per `AGENT_CHARTER.md`: on a clean checkout, a single `make verify-10` exits 0 a
 `CORTEX 10/10: ALL GATES GREEN`. Until that command exists and passes, you are not done —
 partial completion means keep going, and nothing is called "10/10" on tests alone.
 
+**Owner decision (2026-07-10): "ship" = personal use.** The app ships to the owner's own
+machine for daily personal use — distribution items (installer signing, stores, updater
+hosting, macOS) are out of scope and never block "ship". The bar is NOT lowered: ship-ready
+still means a truly reliable, bug-free app; every honesty, privacy, reliability, and
+correctness gate stays mandatory.
+
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan

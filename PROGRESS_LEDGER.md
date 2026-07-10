@@ -2187,3 +2187,17 @@ Full same-set ladder now: champion 7.03% > MMS-1B 9.32% > stock 11.34% > Seamles
 Honest caveats unchanged: read speech (FLEURS), strict space-kept digit-counting basis, conversational
 number still requires the owner marathon (SHIP_FINAL_PLAN #37/#41). WS1 statistical core is CLOSED;
 remaining WS1 tail: AsoSoft-600 leg + fine-tuned CI leg. Next: WS2 (verify-10 full-charter aggregator).
+
+## OWNER DECISION: "ship" = personal use, fully reliable (2026-07-10)
+
+The owner defined the ship target: ship to HIS OWN PERSONAL USE — a truly reliable, bug-free
+daily tool on his own machine. Distribution (#52: certs, stores, updater hosting, macOS) remains
+descoped and no longer blocks "ship"; adoption/maturity (#57) likewise. NOTHING else is waived —
+the honesty law, privacy guarantees, and every reliability/correctness gate stay mandatory and
+unweakened. Definition recorded in: cortex-speech-app/CLAUDE.md, AGENT_CHARTER.md (root + app),
+docs/SHIP_FINAL_PLAN.md (with re-prioritized order: WS2 -> WS6 -> WS3 -> WS4 -> WS7 -> WS5,
+reliability first). Also delivered this session: docs/CORTEX_APP_FLOW_GUIDE.html — full e2e
+architecture guide (every model/tool named exactly, verified against source by a 6-agent map +
+critic; caught + corrected one would-be fabrication: default LLM refiner is local Ollama
+heretic-final:latest, NOT a cloud model). Next: WS2 (verify-10 aggregator + proof-metadata
+branch) then WS6 reliability drills.

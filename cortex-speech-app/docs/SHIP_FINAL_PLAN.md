@@ -10,6 +10,15 @@ The critical path that is NOT automatable is one thing: the **Gold Marathon** (�
 review decisions), which alone unblocks 7 downstream measurements. Nothing here permits declaring
 10/10 early — the declaration belongs to the P7 re-audit (#58) after the numbers exist.
 
+**Owner decision (2026-07-10) — what "ship" means:** ship = the owner's PERSONAL daily use on
+his own machine, truly reliable and bug-free. Distribution (#52) stays descoped; the store/
+signing legs of #49/#52 and the adoption axis (#57) do not block ship. Nothing else is waived —
+reliability, correctness, privacy, and honesty gates all remain. **Re-prioritized workstream
+order for personal-use ship:** WS2 (verify-10 aggregator) → WS6 (ServerSupervisor + reliability
+drill matrix — the daily-use pain points) → WS3 (runtime egress proof, fuzz/mutants, ignored
+gates) → WS4 (nightly gates) → WS7 (codebase health) → WS5 (accuracy levers, optional — the
+engine is already measured best).
+
 ## A · Automatable now — the 7 workstreams (execute in order)
 
 ### WS1 — Land the measurement record (items 1–4, 25, 36) — IN PROGRESS
