@@ -1,5 +1,10 @@
 # HANDOFF — continue Cortex Speech (2026-07-11)
 
+> **PARTIALLY SUPERSEDED (2026-07-11):** the crash below is FIXED + committed (`f01ab66`). The live
+> issues are now: (1) the `clear_db.py` data-loss default (fixed here — snapshot + opt-in), (2)
+> segment pagination truncating at 300, (3) app-owned 7B ServerSupervisor, (4) the reliability drill
+> matrix. See PROGRESS_LEDGER.md (newest first) for the current state.
+
 > **You are picking up mid-task from another chat session.** Before doing anything, learn the
 > context so you don't redo or undo work:
 > 1. Read **PROGRESS_LEDGER.md** (newest entries first) — the honest, evidence-cited history.
@@ -7,7 +12,7 @@
 > 3. Read **cortex-speech-app/CLAUDE.md** — the one law (never fabricate a metric; nothing "done"
 >    until user-observable or measured on real audio) and the owner's ship definition.
 > 4. If you can access it, the prior chat transcript is at
->    `C:\Users\Wareen\.claude\projects\C--Users-Wareen-Desktop-CORTEX\ccc681aa-5e49-4c32-ad02-37e0f3cdc628.jsonl`
+>    `%USERPROFILE%\.claude\projects\<cortex-session-dir>\<session-id>.jsonl`
 >    (this session did the WS2 merge, the verify-10 aggregator, the desktop icon, and the crash diagnosis below).
 > 5. Recall memory: **[[ship-means-personal-use]]** — "ship" = the owner's personal daily use,
 >    truly reliable and bug-free; distribution is descoped, but NO reliability/honesty/correctness
@@ -40,7 +45,7 @@ before editing: `use tauri::Manager;` is present (commands.rs:31), tokio has `fe
 and `pick_file`/`pick_folder` exist in tauri-plugin-dialog 2.7.1.
 
 **Your immediate steps:**
-1. `cd C:/Users/Wareen/Desktop/cortex-speech` and build the exe the RIGHT way:
+1. `cd <repo-root>` and build the exe the RIGHT way:
    `cd cortex-speech-app && npm run build && cargo build --release --manifest-path src-tauri/Cargo.toml`
    (frontend first — a bare `cargo build` ships a stale UI). If it does not compile, fix the two
    edited functions (most likely: a lifetime/`Send` issue around the oneshot or `as_path()`).

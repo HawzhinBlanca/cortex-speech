@@ -28,7 +28,9 @@ const AUDIO = process.env.CORTEX_AUDIO;
 const OUT_DIR = process.env.CORTEX_OUT || REPO;
 const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9222';
 const LOCALE = process.env.CORTEX_LOCALE === 'ckb' ? 'ckb' : 'en';
-const SKIP_DB_CLEAR = process.env.CORTEX_SKIP_DB_CLEAR === '1';
+// Clearing the DB is OPT-IN (default: keep the existing library). A verification run must never be
+// able to erase the owner's real %APPDATA% library by simply being run — the old opt-out default did.
+const CLEAR_DB = process.env.CORTEX_DB_CLEAR === '1' && process.env.CORTEX_SKIP_DB_CLEAR !== '1';
 
 const logFile = path.join(OUT_DIR, 'e2e_real_app_debug.log');
 try { fs.writeFileSync(logFile, ''); } catch (e) { /* non-fatal */ }
@@ -71,9 +73,18 @@ function dumpRunManifest() {
 async function run() {
   console.log('==> Cleaning up previous app instances...');
   killApp();
-  if (!SKIP_DB_CLEAR) {
-    console.log('==> Clearing database for a clean run...');
-    try { execSync('python clear_db.py', { cwd: REPO }); } catch (e) { console.log('   db clear skipped:', e.message); }
+  if (CLEAR_DB) {
+    console.log('==> Clearing database for a clean run (CORTEX_DB_CLEAR=1; snapshots first)...');
+    // clear_db.py snapshots the DB and refuses without this confirm; it never runs by default, so a
+    // casual `node e2e_real_app.cjs` or the verify-10 real-app leg can NEVER wipe the real library.
+    try {
+      execSync('python clear_db.py --yes', {
+        cwd: REPO,
+        env: { ...process.env, CORTEX_DB_CLEAR_CONFIRM: '1' },
+      });
+    } catch (e) { console.log('   db clear skipped:', e.message); }
+  } else {
+    console.log('==> Keeping existing database (set CORTEX_DB_CLEAR=1 for a snapshot-then-clean run).');
   }
 
   console.log(`==> Launching ${path.basename(APP_EXE)} with remote-debugging-port=${DEBUG_PORT}...`);

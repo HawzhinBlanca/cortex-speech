@@ -5,6 +5,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = REPO_ROOT / "scripts" / "test-real-data.ps1"
+E2E = REPO_ROOT / "e2e_real_app.cjs"
+CLEAR_DB = REPO_ROOT / "clear_db.py"
 
 
 def runner_text() -> str:
@@ -69,10 +71,33 @@ def test_package_real_audio_scripts_use_the_checked_runner() -> None:
             raise AssertionError(f"package.json {name} must invoke scripts/test-real-data.ps1 safely")
 
 
+def test_e2e_never_clears_the_real_db_by_default() -> None:
+    # A reliability test must never be CAPABLE of erasing the owner's real library just by being run.
+    # DB-clear is opt-in (CORTEX_DB_CLEAR=1), never the old opt-out default.
+    e2e = E2E.read_text(encoding="utf-8")
+    assert_contains(e2e, "process.env.CORTEX_DB_CLEAR === '1'", E2E.name)
+    if "if (!SKIP_DB_CLEAR)" in e2e:
+        raise AssertionError("e2e_real_app.cjs must not clear the DB by default (opt-out); make it opt-in")
+
+
+def test_clear_db_snapshots_before_deleting_and_requires_confirmation() -> None:
+    clr = CLEAR_DB.read_text(encoding="utf-8")
+    # Refuses without explicit confirmation.
+    assert_contains(clr, "CORTEX_DB_CLEAR_CONFIRM", CLEAR_DB.name)
+    assert_contains(clr, "REFUSING to clear", CLEAR_DB.name)
+    # Snapshot MUST happen before any DELETE — a clear is always recoverable.
+    snap_at = clr.find("shutil.copy2")
+    del_at = clr.find("DELETE FROM")
+    if snap_at < 0 or del_at < 0 or snap_at > del_at:
+        raise AssertionError("clear_db.py must snapshot the DB (shutil.copy2) BEFORE any DELETE FROM")
+
+
 def main() -> None:
     test_mp4_temp_cleanup_is_constrained_to_temp()
     test_recursive_remove_only_exists_inside_safety_helper()
     test_package_real_audio_scripts_use_the_checked_runner()
+    test_e2e_never_clears_the_real_db_by_default()
+    test_clear_db_snapshots_before_deleting_and_requires_confirmation()
     print("real-data runner policy regression passed")
 
 
