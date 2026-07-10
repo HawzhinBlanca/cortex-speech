@@ -1,0 +1,24 @@
+{
+  "metric": "micro_cer",
+  "unit": "percent",
+  "model": "OmniASR-CTC-300M (sherpa-onnx int8, stock, language=ckb)",
+  "date": "2026-06-24",
+  "seed": 42,
+  "normalization": "SoraniNormalizer + NFC",
+  "n_floor": 50,
+  "budget_pts": 10.0,
+  "groups": {
+    "gender": {
+      "male":   {"n": 375, "cer": 29.66},
+      "female": {"n": 25,  "cer": 25.37}
+    },
+    "age": {
+      "twenties": {"n": 307, "cer": 29.35},
+      "thirties": {"n": 51,  "cer": 24.46},
+      "teens":    {"n": 25,  "cer": 31.72},
+      "forties":  {"n": 11,  "cer": 33.18}
+    }
+  },
+  "provenance": "Per-group micro CER transcribed verbatim from cortex-speech-app/docs/EVAL.md 'Fairness slice (per-group micro CER)' — the stock OmniASR-CTC-300M N=400 gold run (seed=42, 2026-06-24). The raw per-clip results.tsv is eval-only and intentionally NOT committed (no audio and no reference text ships in the repo; see EVAL.md 'Dataset' + DATA_GOVERNANCE.md), so the gate consumes these committed aggregates. Regenerate: run the ckb_scorecard_on_gold test to emit results.tsv, then scripts/scorecard_stats.py <results.tsv>, and update these numbers.",
+  "note": "Machine-readable source for the fairness-gender-age gate (scripts/fairness_gate.py; verify_10 Tier 3). The gate enforces max-min micro-CER disparity <= budget_pts across subgroups with n >= n_floor; smaller subgroups are printed but NOT gated, because EVAL.md flags female/teens/forties as directional-not-conclusive. With n_floor=50 the age axis is gated (twenties vs thirties -> 4.89 pts) and the gender axis is currently UNDERPOWERED (only male has n>=50) so it is reported but not gated until more balanced data exists. budget_pts=10.0 is PROVISIONAL (~2x the current adequately-powered disparity of 4.89 pts) and owner-tunable; it is to be re-derived from CORDI per-dialect metadata (owner-gated: cordi-dialect-fairness)."
+}

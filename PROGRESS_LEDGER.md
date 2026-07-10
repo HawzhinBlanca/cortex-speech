@@ -2291,3 +2291,37 @@ Gates: cargo test --lib 835 passed/0 failed; clippy --all-targets -D warnings cl
 test_file_dialog_commands_do_not_block_the_main_thread (asserts both commands stay async + no
 blocking_pick_*). Why e2e missed it: e2e_real_app.cjs calls import_audio_file directly, bypassing
 the dialog; no Windows WER crash event ever existed (it was a freeze, not a native crash).
+
+## WS4: fairness-gender-age gate BUILT + GREEN — one verify-10 NOT-BUILT leg closed (2026-07-11)
+
+Parallel work while Codex owns the crash-fix follow-up; no shared files touched. The verify_10
+`fairness-gender-age` leg was hardcoded NOT-BUILT; it is now a real, runnable gate.
+
+- `cortex-speech-app/docs/fairness_scorecard.json` — machine-readable aggregate transcribed VERBATIM
+  from docs/EVAL.md 'Fairness slice' (stock OmniASR-CTC-300M, N=400, seed=42, 2026-06-24). Raw
+  per-clip results.tsv stays uncommitted (eval-only: no audio/text in repo), so the gate reads the
+  committed aggregate. Provenance + regenerate steps recorded in the file.
+- `cortex-speech-app/scripts/fairness_gate.py` — enforces max-min micro-CER disparity <= budget
+  across subgroups with n >= n_floor; smaller cells reported-not-gated (EVAL.md calls
+  female/teens/forties directional-not-conclusive); FAILs loud (exit 2) if no axis is powered
+  enough to gate. `--selftest` covers 4 logic invariants.
+- `cortex-speech-app/scripts/test_fairness_gate_policy.py` — auto-discovered by
+  run_python_policies.py (so it rides `npm run test:python-policies` + CI).
+- `scripts/verify_10.py` — `fairness-gender-age` flipped from `not-built` to a `cmd` gate.
+
+VERBATIM proof:
+  fairness_gate.py --selftest -> "fairness_gate selftest passed"
+  fairness_gate.py (committed data) -> exit 0:
+    [gender] male n=375 29.66% [gated], female n=25 25.37% [reported n<50]
+             -> UNDERPOWERED (<2 groups n>=50); reported, not gated
+    [age] twenties n=307 29.35% + thirties n=51 24.46% gated; teens/forties reported
+             -> max-min disparity 4.89 pts <= budget 10.00  [PASS]
+    -> GREEN
+  verify_10 run_gate('fairness-gender-age') -> kind now 'cmd', status PASS 0.2s
+  test_fairness_gate_policy.py -> "fairness gate policy regression passed"
+
+OWNER DECISION NEEDED (surfaced, not assumed): budget_pts=10.0 is provisional (~2x current 4.89-pt
+adequately-powered disparity); gender axis is underpowered (25 female clips) so it is reported, not
+gated. Owner to ratify/tighten the budget; to be re-derived from CORDI per-dialect data
+(owner-gated: cordi-dialect-fairness). Still NOT-BUILT after this: egress-runtime (needs exe +
+socket monitor), refinery-lift (needs LLM warm).

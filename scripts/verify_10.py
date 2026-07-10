@@ -458,7 +458,7 @@ GATES = [
     ("fuzz-smoke", 3, "fn", _fn_fuzz_smoke, None, _probe_fuzz, "Engineering rigor: 5 fuzz targets, 0 crashes"),
     ("rtf-bench", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --test real_audio -- --ignored omniasr_rtf_on_committed_fleurs_ckb_fixture --nocapture', REPO_ROOT, _probe_rtf, "Latency: RTF on this rig (baseline-regression gate: WS4)"),
     ("refinery-lift", 3, "not-built", "WS4: fixed-seed injected-error synthetic benchmark", None, None, "Refinery: >=30% CER reduction at <=15% escalation"),
-    ("fairness-gender-age", 3, "not-built", "WS4: disparity gate on existing corpus metadata", None, None, "Fairness (CORDI dialect leg is owner-gated)"),
+    ("fairness-gender-age", 3, "cmd", f'"{sys.executable}" "{APP / "scripts" / "fairness_gate.py"}"', REPO_ROOT, None, "WS4: gender/age CER disparity budget on committed corpus metadata (CORDI dialect leg owner-gated)"),
 ]
 
 # Charter DoD legs descoped by the owner amendment (2026-07-10) — always printed.
