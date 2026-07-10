@@ -1,23 +1,32 @@
 <script lang="ts">
-  import { showConfirmDialog } from './stores/uiStore';
+  import { showConfirmDialog, type ConfirmDialog } from './stores/uiStore';
   import { t } from './i18n';
   import Modal from './Modal.svelte';
 
-  let dialog = $state<{ title?: string; message: string; onConfirm: () => void } | null>(null);
+  let dialog = $state<ConfirmDialog | null>(null);
 
   $effect(() => {
     dialog = $showConfirmDialog;
   });
 
-  function confirm() {
-    if (dialog) {
-      dialog.onConfirm();
-      showConfirmDialog.set(null);
-    }
+  // Close BEFORE running the handler so a handler that opens a fresh dialog (e.g. "Try again" that
+  // fails and re-prompts) isn't immediately wiped by our own close.
+  async function confirm() {
+    const d = dialog;
+    showConfirmDialog.set(null);
+    await d?.onConfirm();
+  }
+
+  async function runSecondary() {
+    const d = dialog;
+    showConfirmDialog.set(null);
+    await d?.secondary?.onClick();
   }
 
   function cancel() {
+    const d = dialog;
     showConfirmDialog.set(null);
+    d?.onCancel?.();
   }
 </script>
 
@@ -29,7 +38,13 @@
 
   {#snippet footer()}
     <!-- svelte-ignore a11y_autofocus -->
-    <button class="btn btn-secondary" autofocus onclick={cancel}>{$t('cancel')}</button>
-    <button class="btn btn-danger" onclick={confirm}>{$t('confirm')}</button>
+    <button class="btn btn-secondary" autofocus onclick={cancel}>{dialog?.cancelLabel ?? $t('cancel')}</button>
+    {#if dialog?.secondary}
+      <button class="btn btn-secondary" onclick={runSecondary}>{dialog.secondary.label}</button>
+    {/if}
+    <button
+      class="btn {dialog?.danger === false ? 'btn-primary' : 'btn-danger'}"
+      onclick={confirm}>{dialog?.confirmLabel ?? $t('confirm')}</button
+    >
   {/snippet}
 </Modal>

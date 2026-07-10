@@ -27,6 +27,14 @@ def workflow(name: str) -> str:
     return (WORKFLOWS_DIR / name).read_text(encoding="utf-8")
 
 
+def workflow_steps_text(name: str) -> str:
+    """Workflow text with YAML full-line comments removed, so ``.find()`` matches REAL step
+    commands rather than commands merely mentioned in an explanatory comment — e.g. ci.yml's
+    ``# tauri::generate_context! (compiled by clippy / cargo test below) ...`` note would otherwise
+    register as an earlier ``cargo test`` step and make the ordering check false-fire."""
+    return "\n".join(line for line in workflow(name).splitlines() if not line.lstrip().startswith("#"))
+
+
 def release_docs() -> str:
     return (REPO_ROOT / "docs" / "RELEASE.md").read_text(encoding="utf-8")
 
@@ -104,6 +112,46 @@ def test_playwright_browser_install_precedes_e2e() -> None:
         raise AssertionError("release.yml must install Playwright Chromium before npm run test:e2e")
 
 
+def test_provisioning_precedes_every_compiling_cargo_step() -> None:
+    """The failure class that broke main twice in two days (2026-07-08 Release Gate, 2026-07-09
+    Nightly): any workflow step that COMPILES the crate runs build.rs -> tauri-build, which
+    validates bundle.resources (needs `npm run fetch-models`) and compiles
+    tauri::generate_context!, which needs a built ../dist (`npm run build`). Presence is not
+    enough - ORDER is the contract. This gate-on-the-gate previously asserted presence only, so a
+    workflow that could not run was still policy-green (true-10 audit 2026-07-09)."""
+    compiling = ["cargo fmt", "cargo clippy", "cargo test", "cargo build"]
+    for name in ["ci.yml", "release.yml", "nightly-real-audio.yml"]:
+        text = workflow_steps_text(name)  # comment lines stripped so a comment can't pose as a step
+        first_cargo = min((idx for idx in (text.find(cmd) for cmd in compiling) if idx >= 0), default=-1)
+        if first_cargo < 0:
+            continue
+        fetch = text.find("npm run fetch-models")
+        if fetch < 0:
+            raise AssertionError(f"{name} compiles the crate but never runs `npm run fetch-models`")
+        if fetch > first_cargo:
+            raise AssertionError(
+                f"{name}: `npm run fetch-models` must come BEFORE the first compiling cargo step "
+                f"(build.rs validates bundle.resources)"
+            )
+        # Plain substring is unambiguous: "npm run tauri build" does not contain "npm run build",
+        # and a newline-suffixed pattern would be CRLF-fragile.
+        build = text.find("npm run build")
+        if build < 0:
+            raise AssertionError(f"{name} compiles the crate but never builds the frontend (`npm run build`)")
+        if build > first_cargo:
+            raise AssertionError(
+                f"{name}: `npm run build` must come BEFORE the first compiling cargo step "
+                f"(tauri::generate_context! needs ../dist)"
+            )
+
+
+def test_release_runs_the_governance_gate() -> None:
+    """Tags can be cut from ANY commit, so release.yml must run verify_10.py itself (manifest/
+    version alignment, ledger schema, license compatibility) rather than assume ci.yml did
+    (true-10 audit 2026-07-09)."""
+    assert_contains(workflow("release.yml"), "verify_10.py", "release.yml")
+
+
 def test_nightly_real_audio_fails_on_real_regressions_but_skips_missing_fixtures() -> None:
     nightly = workflow("nightly-real-audio.yml")
     if "continue-on-error" in nightly:
@@ -123,6 +171,8 @@ def main() -> None:
     test_cargo_deny_install_is_pinned()
     test_release_docs_and_tag_workflow_share_clean_gate()
     test_playwright_browser_install_precedes_e2e()
+    test_provisioning_precedes_every_compiling_cargo_step()
+    test_release_runs_the_governance_gate()
     test_nightly_real_audio_fails_on_real_regressions_but_skips_missing_fixtures()
     print("workflow policy regression passed")
 

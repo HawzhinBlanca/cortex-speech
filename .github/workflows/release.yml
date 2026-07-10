@@ -47,6 +47,20 @@ jobs:
         run: npx playwright install --with-deps chromium
       - if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: npx playwright install chromium
+      # Base models AND a built dist/ must exist BEFORE any cargo step: build.rs -> tauri-build
+      # validates bundle.resources (models/silero_vad_v4.onnx, ...) and tauri::generate_context!
+      # (compiled by clippy and cargo test below) requires build.frontendDist ("../dist"). This is
+      # the same provisioning ci.yml uses - without it the tag gate failed by construction (the
+      # 2026-07-09 nightly red was exactly this class; true-10 audit).
+      - name: Fetch + verify models (bundle.resources)
+        run: npm run fetch-models
+      - name: Build frontend (generate_context needs ../dist)
+        run: npm run build
+      # Governance gate (verify_10.py): manifest/version alignment, ledger schema, and the
+      # license-compatibility check. Tags can be cut from ANY commit, so the release path must run
+      # it itself rather than assume ci.yml did (true-10 audit).
+      - name: Governance gate
+        run: python "${{ github.workspace }}/scripts/verify_10.py"
       - run: npm run typecheck
       - run: npm test
       - run: npm run test:python-policies
@@ -57,10 +71,6 @@ jobs:
       - run: npm run test:e2e
       - run: npm audit --omit=dev
       - run: cargo deny --manifest-path src-tauri/Cargo.toml check
-      # Fetch + SHA-256-verify the gitignored model files into src-tauri/models/ so the bundle
-      # step finds the declared bundle.resources on a fresh checkout (blocker #1, from-source).
-      - name: Fetch + verify models
-        run: npm run fetch-models
       - name: Build Tauri app
         run: npm run tauri build
       - name: Code-sign installers (Authenticode) when a cert is provided

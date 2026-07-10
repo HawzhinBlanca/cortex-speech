@@ -148,16 +148,26 @@ async function run() {
   await transcribeBtn.click();
   await page.waitForTimeout(3000);
 
+  // A transcript still wrapped in brackets ("[Pending WSL 7B ASR]", "[Transcribing…]") is an
+  // in-progress PLACEHOLDER, not real output — the 7B call has not landed yet. Treating it as the
+  // transcript was a false green (it slipped past the blank-only guard and reported a placeholder as
+  // success). Keep polling PAST the placeholder for the real text; if it never resolves, fail honestly.
+  const isPlaceholder = (t) => /^\[.*\]$/.test(t) || /pending|transcrib/i.test(t);
   let rawText = '';
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 150; i++) { // up to 5 min: a cold 7B segment can take minutes
     rawText = ((await page.locator('#raw-ts').inputValue().catch(() => '')) || '').trim();
-    if (rawText) break;
+    if (rawText && !isPlaceholder(rawText)) break;
+    if (i % 15 === 0 && rawText) console.log(`   still waiting for real ASR (placeholder: ${JSON.stringify(rawText)})... ${i * 2}s`);
     await sleep(2000);
   }
   console.log('==> Model hypothesis:', JSON.stringify(rawText));
 
-  // NO-FABRICATION GUARD: a blank transcript is a real failure, not something to paper over.
+  // NO-FABRICATION GUARD: a blank OR still-placeholder transcript is a real failure, not something to
+  // paper over. Reporting "[Pending WSL 7B ASR]" as a transcript is exactly the fabrication this guards.
   if (!rawText) throw new Error('ASR returned a BLANK transcript (no-fabrication guard) -- refusing to report success.');
+  if (isPlaceholder(rawText)) {
+    throw new Error(`ASR never resolved past the placeholder ${JSON.stringify(rawText)} (7B did not complete) -- refusing to report a placeholder as success.`);
+  }
 
   dumpRunManifest();
 

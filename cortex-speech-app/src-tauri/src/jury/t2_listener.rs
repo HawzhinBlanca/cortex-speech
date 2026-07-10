@@ -153,7 +153,13 @@ fn call_gemini_audio(
         .send_json(payload)
         .map_err(|e| format!("Gemini API request failed: {}", redact_api_key(&e.to_string(), api_key)))?;
 
-    let body: serde_json::Value = resp.into_json().map_err(|e| format!("Failed to parse Gemini response: {e}"))?;
+    // json_bounded, NOT into_json (true-10 audit 2026-07-09 — regression of the provider-body OOM
+    // guard): T2 is the highest-volume cloud endpoint (n_samples Gemini calls per contested segment,
+    // per-segment over a whole batch); into_json streams bounded only by the read TIMEOUT, so a
+    // trickled multi-GB body could allocate unbounded and OOM the process mid-review. The 64 MiB cap
+    // matches every sibling provider deserialization (llm_refiner/scribe/agentic).
+    let body: serde_json::Value =
+        crate::http::json_bounded(resp).map_err(|e| format!("Failed to parse Gemini response: {e}"))?;
 
     // Concatenate ALL text parts. Gemini can split one response across content.parts[0..N] (and a
     // 2.5-class "thinking" model can emit a leading thought part), so indexing parts[0] alone would

@@ -756,6 +756,7 @@ impl Database {
     /// Safely update the ASR transcript for a segment only if a human has NOT
     /// already reviewed it. This is the correct API for the WSL 7B branch to
     /// persist refined transcripts without overwriting user edits.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_asr_transcript_if_unreviewed(
         &self,
         segment_id: &str,
@@ -809,6 +810,7 @@ impl Database {
     ///   • never touches `verified`, and
     ///   • skips any row a human has verified or reviewed since the batch began.
     /// Returns Ok(true) if the row was updated, Ok(false) if it was skipped as human-owned.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_batch_transcription_if_unreviewed(
         &self,
         segment_id: &str,
@@ -857,21 +859,51 @@ impl Database {
     /// delete it — exactly the rows most likely to be over-triggers). Uses the same correlation as
     /// `intelligence_report`. Must run while the segment + its shadow rows still exist (before DELETE).
     fn archive_loop0_evidence_for(&self, id: &str) -> AppResult<()> {
+        // Per-SEGMENT semantics (true-10 audit 2026-07-09): a segment re-processed N times holds N
+        // shadow rows, but the C5 gate reasons about distinct events — one clip, one human decision,
+        // at most one over-trigger. Fold MAX(memory_fired) per segment (this fn archives exactly one
+        // segment), matching intelligence_report's DISTINCT-segment live counts.
         self.conn.execute(
             "UPDATE loop0_evidence_archive SET
                  total_observations = total_observations
-                     + COALESCE((SELECT COUNT(*) FROM loop0_shadow_log WHERE segment_id = ?1), 0),
+                     + COALESCE((SELECT COUNT(DISTINCT segment_id) FROM loop0_shadow_log WHERE segment_id = ?1), 0),
                  would_fire = would_fire
-                     + COALESCE((SELECT SUM(memory_fired) FROM loop0_shadow_log WHERE segment_id = ?1), 0),
+                     + COALESCE((SELECT MAX(memory_fired) FROM loop0_shadow_log WHERE segment_id = ?1), 0),
                  fired_human_accepted = fired_human_accepted + COALESCE((
-                     SELECT SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END)
+                     SELECT MAX(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END)
                      FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id WHERE l.segment_id = ?1), 0),
                  fired_human_edited = fired_human_edited + COALESCE((
-                     SELECT SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('edit','human_edit') THEN 1 ELSE 0 END)
+                     SELECT MAX(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('edit','human_edit') THEN 1 ELSE 0 END)
                      FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id WHERE l.segment_id = ?1), 0),
                  fired_human_rejected = fired_human_rejected + COALESCE((
-                     SELECT SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('reject','human_reject') THEN 1 ELSE 0 END)
+                     SELECT MAX(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('reject','human_reject') THEN 1 ELSE 0 END)
                      FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id WHERE l.segment_id = ?1), 0)
+             WHERE id = 1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// v34 twin of [`Self::archive_loop0_evidence_for`], for the C4 auto-accept-precision denominator:
+    /// decision_verdicts CASCADE-deletes with its segment, so the owner's normal cleanup (review a bad
+    /// clip, then delete it) removed exactly the T0_ACCEPT rows whose humans CONTRADICTED the machine —
+    /// the precision gating any autonomy increase could only drift optimistic (true-10 audit
+    /// 2026-07-09). Must run while the segment + its verdict row still exist (before DELETE).
+    fn archive_c4_evidence_for(&self, id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE c4_evidence_archive SET
+                 t0_accepts = t0_accepts + COALESCE((
+                     SELECT COUNT(*) FROM decision_verdicts WHERE segment_id = ?1 AND auto_accept_verdict = 'T0_ACCEPT'), 0),
+                 t1_escalations = t1_escalations + COALESCE((
+                     SELECT COUNT(*) FROM decision_verdicts WHERE segment_id = ?1 AND auto_accept_verdict = 'T1_ESCALATE'), 0),
+                 t0_human_confirmed = t0_human_confirmed + COALESCE((
+                     SELECT COUNT(*) FROM decision_verdicts dv JOIN speech_segments s ON s.id = dv.segment_id
+                     WHERE dv.segment_id = ?1 AND dv.auto_accept_verdict = 'T0_ACCEPT'
+                       AND s.human_decision IN ('accept','human_accept')), 0),
+                 t0_human_contradicted = t0_human_contradicted + COALESCE((
+                     SELECT COUNT(*) FROM decision_verdicts dv JOIN speech_segments s ON s.id = dv.segment_id
+                     WHERE dv.segment_id = ?1 AND dv.auto_accept_verdict = 'T0_ACCEPT'
+                       AND s.human_decision IN ('edit','human_edit','reject','human_reject')), 0)
              WHERE id = 1",
             params![id],
         )?;
@@ -882,6 +914,7 @@ impl Database {
         self.conn.execute("SAVEPOINT del_seg", [])?;
         let result: AppResult<()> = (|| {
             self.archive_loop0_evidence_for(id)?;
+            self.archive_c4_evidence_for(id)?;
             self.conn.execute("DELETE FROM speech_segments WHERE id = ?1", params![id])?;
             Ok(())
         })();
@@ -901,9 +934,10 @@ impl Database {
     pub fn delete_segments_batch(&self, ids: &[String]) -> AppResult<()> {
         self.conn.execute("SAVEPOINT batch_delete", [])?;
         let result: AppResult<()> = (|| {
-            // Archive each segment's shadow evidence FIRST (while its shadow rows still exist), then delete.
+            // Archive each segment's shadow + C4 evidence FIRST (while its rows still exist), then delete.
             for id in ids {
                 self.archive_loop0_evidence_for(id)?;
+                self.archive_c4_evidence_for(id)?;
             }
             let mut stmt = self.conn.prepare("DELETE FROM speech_segments WHERE id = ?1")?;
             for id in ids {
@@ -1724,17 +1758,28 @@ impl Database {
     pub fn intelligence_report(&self) -> AppResult<serde_json::Value> {
         // Live counts over surviving segments PLUS the durable archive of segments already deleted
         // (migration v33), so the C5 over-trigger gate is not survivor-biased by ordinary cleanup.
+        // Per-SEGMENT counts (true-10 audit 2026-07-09): shadow_log holds one row per OBSERVATION and
+        // re-processed segments accumulate several, but C5 reasons about distinct events — one clip,
+        // one human decision, at most one over-trigger. Aggregate per segment first (MAX(memory_fired)
+        // = "ever would have fired for this clip"), then count segments; the v33/v34 archives fold the
+        // same per-segment semantics at delete time. (Archive rows accumulated before this change may
+        // carry per-observation counts — a conservative overstatement for the C5 "must be 0" gate.)
         let loop0 = self.conn.query_row(
-            "SELECT COUNT(*) + COALESCE((SELECT total_observations FROM loop0_evidence_archive WHERE id = 1), 0),
-                    COALESCE(SUM(l.memory_fired), 0)
+            "WITH per_seg AS (
+                 SELECT l.segment_id, MAX(l.memory_fired) AS fired, s.human_decision AS hd
+                 FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id
+                 GROUP BY l.segment_id
+             )
+             SELECT COUNT(*) + COALESCE((SELECT total_observations FROM loop0_evidence_archive WHERE id = 1), 0),
+                    COALESCE(SUM(fired), 0)
                         + COALESCE((SELECT would_fire FROM loop0_evidence_archive WHERE id = 1), 0),
-                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN fired = 1 AND hd IN ('accept','human_accept') THEN 1 ELSE 0 END), 0)
                         + COALESCE((SELECT fired_human_accepted FROM loop0_evidence_archive WHERE id = 1), 0),
-                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('edit','human_edit') THEN 1 ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN fired = 1 AND hd IN ('edit','human_edit') THEN 1 ELSE 0 END), 0)
                         + COALESCE((SELECT fired_human_edited FROM loop0_evidence_archive WHERE id = 1), 0),
-                    COALESCE(SUM(CASE WHEN l.memory_fired = 1 AND s.human_decision IN ('reject','human_reject') THEN 1 ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN fired = 1 AND hd IN ('reject','human_reject') THEN 1 ELSE 0 END), 0)
                         + COALESCE((SELECT fired_human_rejected FROM loop0_evidence_archive WHERE id = 1), 0)
-             FROM loop0_shadow_log l JOIN speech_segments s ON s.id = l.segment_id",
+             FROM per_seg",
             [],
             |row| {
                 Ok(serde_json::json!({
@@ -1746,11 +1791,17 @@ impl Database {
                 }))
             },
         )?;
+        // Live counts PLUS the v34 durable archive — deleting a reviewed clip must not shrink
+        // t0HumanContradicted (the C4 precision could only drift optimistic; same class as v33/C5).
         let c4 = self.conn.query_row(
-            "SELECT COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T0_ACCEPT' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T1_ESCALATE' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T0_ACCEPT' AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END), 0),
+            "SELECT COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T0_ACCEPT' THEN 1 ELSE 0 END), 0)
+                        + COALESCE((SELECT t0_accepts FROM c4_evidence_archive WHERE id = 1), 0),
+                    COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T1_ESCALATE' THEN 1 ELSE 0 END), 0)
+                        + COALESCE((SELECT t1_escalations FROM c4_evidence_archive WHERE id = 1), 0),
+                    COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T0_ACCEPT' AND s.human_decision IN ('accept','human_accept') THEN 1 ELSE 0 END), 0)
+                        + COALESCE((SELECT t0_human_confirmed FROM c4_evidence_archive WHERE id = 1), 0),
                     COALESCE(SUM(CASE WHEN dv.auto_accept_verdict = 'T0_ACCEPT' AND s.human_decision IN ('edit','human_edit','reject','human_reject') THEN 1 ELSE 0 END), 0)
+                        + COALESCE((SELECT t0_human_contradicted FROM c4_evidence_archive WHERE id = 1), 0)
              FROM decision_verdicts dv JOIN speech_segments s ON s.id = dv.segment_id",
             [],
             |row| {
@@ -1762,7 +1813,49 @@ impl Database {
                 }))
             },
         )?;
-        Ok(serde_json::json!({ "loop0Shadow": loop0, "autoAcceptPrecision": c4 }))
+        // C3 honesty (true-10 audit 2026-07-09): the T0 auto-accept gate needs a Hoeffding-certified
+        // per-SNR-bucket calibration set, and at the shipped constants that means ~thousands of
+        // perfectly-transcribed verified clips PER BUCKET — previously invisible, so the user just
+        // experienced "the jury escalates everything" with no stated reason or distance. Surface the
+        // per-bucket progress: verified-with-reference counts vs the minimum needed at ZERO CER
+        // (a hard lower bound — real data needs more). The gate itself is deliberately unchanged.
+        let mut bucket_counts = [0i64; crate::quality::conformal::N_SNR_BUCKETS];
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT snr_db FROM speech_segments
+                 WHERE verified = 1 AND annotated_transcript IS NOT NULL AND TRIM(annotated_transcript) != ''",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, Option<f64>>(0))?;
+            for snr in rows {
+                bucket_counts[crate::quality::conformal::snr_bucket(snr?)] += 1;
+            }
+        }
+        // The T0 gate's shipped constants (jury/mod.rs): target 5% CER at 90% joint confidence,
+        // Bonferroni-split across the buckets.
+        let target_error = 0.05;
+        let per_bucket_delta = (1.0 - 0.90) / crate::quality::conformal::N_SNR_BUCKETS as f64;
+        let min_needed = crate::quality::conformal::min_calibration_n(target_error, per_bucket_delta);
+        let bucket_labels = ["<5 dB (very noisy)", "5-15 dB", "15-25 dB", ">25 dB (clean)", "unknown SNR"];
+        let calibration: Vec<serde_json::Value> = (0..crate::quality::conformal::N_SNR_BUCKETS)
+            .map(|b| {
+                serde_json::json!({
+                    "bucket": bucket_labels[b],
+                    "verifiedWithReference": bucket_counts[b],
+                    "minNeededAtZeroCer": min_needed,
+                })
+            })
+            .collect();
+        let conformal_progress = serde_json::json!({
+            "targetErrorCer": target_error,
+            "perBucketDelta": per_bucket_delta,
+            "minNeededAtZeroCer": min_needed,
+            "buckets": calibration,
+        });
+        Ok(serde_json::json!({
+            "loop0Shadow": loop0,
+            "autoAcceptPrecision": c4,
+            "conformalCalibration": conformal_progress,
+        }))
     }
 
     /// M2.2 / P1.2: classify a MACHINE verdict as T0 (auto-resolved, no human needed) or T1
@@ -1809,13 +1902,20 @@ impl Database {
         agent_confidence: Option<f64>,
         escalated: bool,
     ) -> AppResult<()> {
+        // agent_confidence uses COALESCE(?6, existing): a machine verdict that carries NO confidence
+        // signal must never destroy a previously persisted one. The T1/T2 escalation paths (cloud-off,
+        // audio-prep failure, no-majority) all write None moments after run_t0_gate persisted the real
+        // IRT confidence for the same segment — the unconditional overwrite NULLed it, and both
+        // suspect-first orderings (COALESCE(agent_confidence, 0.5)) collapsed back to recency: the one
+        // live review-speed feature was silently nominal (true-10 audit 2026-07-09). No caller has a
+        // legitimate "clear the confidence" case; callers that HAVE a signal pass Some and still win.
         let affected = self.conn.execute(
             "UPDATE speech_segments
              SET verdict              = ?2,
                  verdict_transcript   = ?3,
                  rationale            = ?4,
                  evidence_json        = ?5,
-                 agent_confidence     = ?6,
+                 agent_confidence     = COALESCE(?6, agent_confidence),
                  escalated            = ?7,
                  updated_at           = datetime('now')
              WHERE id = ?1
@@ -2468,6 +2568,52 @@ mod tests {
         assert_eq!(verdict_of("je").as_deref(), Some("T0_ACCEPT"), "jury_edit is a T0 auto-resolution");
         assert_eq!(verdict_of("es").as_deref(), Some("T1_ESCALATE"), "escalated is T1");
         assert_eq!(verdict_of("hv"), None, "human-decided segment gets no machine verdict row");
+    }
+
+    #[test]
+    fn v35_repairs_divergent_segments_fts_so_segment_writes_succeed() {
+        // Regression (real-app import failure, 2026-07-10): a 4-column segments_fts (missing audio_path)
+        // left by a mis-ordered init, while the segments_ai/ad/au triggers reference audio_path, makes
+        // EVERY segment INSERT fail ("table segments_fts has no column named audio_path"). The import
+        // transaction then rolls back and VAD "produces 0 segments" — the app cannot ingest any audio.
+        // v35 rebuilds the FTS shadow table to the authoritative 6-column shape.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        // Reproduce the broken divergent state: drop the correct FTS table and recreate migration v1's
+        // 4-column copy under the (audio_path-referencing) triggers that initialize() created.
+        db.connection()
+            .execute_batch(
+                "DROP TABLE IF EXISTS segments_fts;
+                 CREATE VIRTUAL TABLE segments_fts USING fts5(
+                     id, raw_transcript, normalized_transcript, annotated_transcript,
+                     content='speech_segments', content_rowid='rowid');",
+            )
+            .unwrap();
+        assert!(
+            db.insert_segment(&make_segment("broken", "/a.wav")).is_err(),
+            "a 4-column segments_fts under audio_path triggers must reject segment inserts (the real bug)"
+        );
+
+        // Re-apply the repair migration (rewind past v35 so run_migrations re-runs it). v36's
+        // proof-metadata ALTERs are not idempotent, so undo them first (its down_sql) or the
+        // re-run fails on "duplicate column name".
+        db.connection()
+            .execute_batch(
+                "DROP INDEX IF EXISTS idx_segments_confidence_source;
+                 DROP INDEX IF EXISTS idx_segments_cloud_call;
+                 ALTER TABLE speech_segments DROP COLUMN normalizer_version;
+                 ALTER TABLE speech_segments DROP COLUMN decoder_config_hash;
+                 ALTER TABLE speech_segments DROP COLUMN cloud_call;
+                 ALTER TABLE speech_segments DROP COLUMN confidence_source;",
+            )
+            .unwrap();
+        db.connection().execute("DELETE FROM schema_migrations WHERE version >= 35", []).unwrap();
+        crate::migrations::run_migrations(&db).unwrap();
+
+        // After v35, the write the import path depends on succeeds again.
+        db.insert_segment(&make_segment("fixed", "/b.wav"))
+            .expect("segment INSERT must succeed after v35 rebuilds segments_fts with audio_path");
     }
 
     #[test]
@@ -3828,5 +3974,84 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert!(all.iter().any(|record| record.model_id == "gemini-2.5-pro"));
         assert!(all.iter().any(|record| record.model_id == "gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn escalation_write_with_no_confidence_preserves_the_persisted_irt_confidence() {
+        // True-10 audit 2026-07-09 (suspect-first regression): run_t0_gate persists the real IRT
+        // confidence on an escalated verdict, then the T1/T2 escalation paths (cloud-off,
+        // audio-prep failure, no-majority) re-write "escalated" with agent_confidence=None moments
+        // later. The unconditional overwrite NULLed the confidence and both suspect-first orderings
+        // (COALESCE(agent_confidence, 0.5)) collapsed to recency. COALESCE in the UPDATE must keep
+        // the earlier signal; a caller WITH a signal must still win.
+        let db = make_db();
+        db.insert_segment(&make_segment("esc", "/audio/esc.wav")).unwrap();
+        db.write_segment_verdict("esc", "escalated", None, None, None, Some(0.83), true).unwrap();
+        db.write_segment_verdict("esc", "escalated", None, Some("cloud off"), None, None, true).unwrap();
+        let seg = db.get_segment_by_id("esc").unwrap().unwrap();
+        assert_eq!(seg.agent_confidence, Some(0.83), "a None re-write must not destroy the IRT confidence");
+        // A later write that CARRIES a signal still replaces it.
+        db.write_segment_verdict("esc", "escalated", None, None, None, Some(0.41), true).unwrap();
+        let seg = db.get_segment_by_id("esc").unwrap().unwrap();
+        assert_eq!(seg.agent_confidence, Some(0.41));
+    }
+
+    #[test]
+    fn c4_precision_survives_deleting_a_contradicted_auto_accept() {
+        // True-10 audit 2026-07-09 (v34, same class as the v33 C5 fix): deleting a reviewed bad
+        // clip CASCADE-deleted its decision_verdicts row, shrinking t0HumanContradicted — the C4
+        // precision that authorizes raising the autonomy dial could only drift optimistic. The
+        // archive must preserve the contradiction across the delete.
+        let db = make_db();
+        db.insert_segment(&make_segment("good", "/audio/g.wav")).unwrap();
+        db.insert_segment(&make_segment("bad", "/audio/b.wav")).unwrap();
+        // Two T0 auto-accepts; the human confirms one and contradicts the other.
+        db.write_segment_verdict("good", "auto_accept", Some("ok"), None, None, Some(0.9), false).unwrap();
+        db.write_segment_verdict("bad", "auto_accept", Some("wrong"), None, None, Some(0.9), false).unwrap();
+        db.record_human_decision("good", "accept", None, None).unwrap();
+        db.record_human_decision("bad", "reject", None, None).unwrap();
+
+        let before = db.intelligence_report().unwrap();
+        assert_eq!(before["autoAcceptPrecision"]["t0HumanContradicted"], 1);
+        assert_eq!(before["autoAcceptPrecision"]["t0HumanConfirmed"], 1);
+
+        // The owner's documented cleanup: review the bad clip, then delete it.
+        db.delete_segment("bad").unwrap();
+
+        let after = db.intelligence_report().unwrap();
+        assert_eq!(
+            after["autoAcceptPrecision"]["t0HumanContradicted"], 1,
+            "deleting the contradicted clip must not erase the contradiction (survivor bias)"
+        );
+        assert_eq!(after["autoAcceptPrecision"]["t0Accepts"], 2, "the T0 denominator survives too");
+        // And batch delete folds the archive the same way.
+        db.delete_segments_batch(&["good".to_string()]).unwrap();
+        let final_report = db.intelligence_report().unwrap();
+        assert_eq!(final_report["autoAcceptPrecision"]["t0HumanConfirmed"], 1);
+        assert_eq!(final_report["autoAcceptPrecision"]["t0Accepts"], 2);
+    }
+
+    #[test]
+    fn shadow_metrics_count_distinct_segments_not_observations() {
+        // True-10 audit 2026-07-09: a re-processed segment accumulates several shadow rows, but C5
+        // reasons about distinct events — one clip, one human decision, at most one over-trigger.
+        let db = make_db();
+        db.insert_segment(&make_segment("re", "/audio/re.wav")).unwrap();
+        db.record_loop0_shadow("re", true).unwrap();
+        db.record_loop0_shadow("re", true).unwrap();
+        db.record_loop0_shadow("re", false).unwrap();
+        db.record_human_decision("re", "accept", None, None).unwrap();
+        let report = db.intelligence_report().unwrap();
+        assert_eq!(report["loop0Shadow"]["totalObservations"], 1, "one segment, not three rows");
+        assert_eq!(report["loop0Shadow"]["wouldFire"], 1);
+        assert_eq!(
+            report["loop0Shadow"]["firedButHumanAcceptedOriginal"], 1,
+            "one physical over-trigger event, not two"
+        );
+        // The per-segment semantics survive deletion through the archive.
+        db.delete_segment("re").unwrap();
+        let after = db.intelligence_report().unwrap();
+        assert_eq!(after["loop0Shadow"]["firedButHumanAcceptedOriginal"], 1);
+        assert_eq!(after["loop0Shadow"]["totalObservations"], 1);
     }
 }

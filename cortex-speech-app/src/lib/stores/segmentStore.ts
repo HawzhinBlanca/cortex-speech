@@ -110,6 +110,28 @@ export const selectedSegment = derived(
   ([$segments, $selectedSegmentId]) => $segments.find((s) => s.id === $selectedSegmentId) ?? null,
 );
 
+/** The one search predicate, shared by every search-scoped view (curate filter + review queue). */
+function applySearchScope(
+  segments: SpeechSegment[],
+  query: string,
+  searchResults: SpeechSegment[] | null,
+): SpeechSegment[] {
+  if (!query) return segments;
+  if (searchResults !== null) {
+    const ids = new Set(searchResults.map((s) => s.id));
+    return segments.filter((s) => ids.has(s.id));
+  }
+  const q = query.toLowerCase();
+  return segments.filter(
+    (s) =>
+      s.audioPath?.toLowerCase().includes(q) ||
+      (s.rawTranscript?.toLowerCase() ?? '').includes(q) ||
+      (s.normalizedTranscript?.toLowerCase() ?? '').includes(q) ||
+      (s.annotatedTranscript?.toLowerCase() ?? '').includes(q) ||
+      (s.speakerId?.toLowerCase() ?? '').includes(q),
+  );
+}
+
 export const filteredSegments = derived(
   [segments, filterVerified, searchQuery, searchResults, sortOrder, conformalThreshold],
   ([$segments, $filterVerified, $searchQuery, $searchResults, $sortOrder, $conformalThreshold]) => {
@@ -117,24 +139,20 @@ export const filteredSegments = derived(
     if ($filterVerified !== null) {
       result = result.filter((s) => s.verified === $filterVerified);
     }
-    if ($searchQuery) {
-      if ($searchResults !== null) {
-        const ids = new Set($searchResults.map((s) => s.id));
-        result = result.filter((s) => ids.has(s.id));
-      } else {
-        const q = $searchQuery.toLowerCase();
-        result = result.filter(
-          (s) =>
-            s.audioPath?.toLowerCase().includes(q) ||
-            (s.rawTranscript?.toLowerCase() ?? '').includes(q) ||
-            (s.normalizedTranscript?.toLowerCase() ?? '').includes(q) ||
-            (s.annotatedTranscript?.toLowerCase() ?? '').includes(q) ||
-            (s.speakerId?.toLowerCase() ?? '').includes(q),
-        );
-      }
-    }
+    result = applySearchScope(result, $searchQuery, $searchResults);
     return sortSegments(result, $sortOrder, $conformalThreshold);
   },
+);
+
+/**
+ * Search scope ONLY — no verified-filter, no sort. This is the review queue's documented contract:
+ * deriving it from `filteredSegments` (which applies `filterVerified` FIRST) made the "✓ Verified"
+ * chip + any search yield a false "All clips reviewed" while unverified matches existed (true-10
+ * audit). Review mode owns its own pending-first ordering, so sorting is deliberately absent too.
+ */
+export const searchScopedSegments = derived(
+  [segments, searchQuery, searchResults],
+  ([$segments, $searchQuery, $searchResults]) => applySearchScope($segments, $searchQuery, $searchResults),
 );
 
 export const segmentStats = derived(segments, ($segments) => {

@@ -55,6 +55,21 @@ export async function cancelOperation(): Promise<void> {
   return invoke<void>('cancel_operation');
 }
 
+/**
+ * Sentinel the backend embeds (pipeline.rs `ASR_7B_UNAVAILABLE_TAG`) in every error that means
+ * "the OmniASR-7B champion is the selected engine but it is unavailable / failed". When a transcribe
+ * call rejects carrying this token, the UI offers the user an explicit choice — retry the champion
+ * or transcribe this clip with the offline model — instead of a dead-end. The app NEVER silently
+ * downgrades to a smaller model on the primary path. Keep in sync with the Rust constant.
+ */
+export const ASR_7B_UNAVAILABLE_TAG = 'E_ASR_7B_UNAVAILABLE';
+
+/** True when a transcription error is the "7B champion unavailable/failed" signal above. */
+export function is7bUnavailableError(e: unknown): boolean {
+  const msg = typeof e === 'string' ? e : ((e as { message?: unknown } | null)?.message ?? '');
+  return String(msg).includes(ASR_7B_UNAVAILABLE_TAG) || String(e).includes(ASR_7B_UNAVAILABLE_TAG);
+}
+
 export async function transcribeSegment(
   audioPath: string,
   alignmentJson?: string | null,
@@ -596,6 +611,16 @@ export interface IntelligenceReport {
     t0HumanConfirmed: number;
     t0HumanContradicted: number;
   };
+  /** Honest distance-to-calibration for the T0 auto-accept gate: per-SNR-bucket verified counts vs
+   * the minimum needed at ZERO CER (a hard lower bound — real data needs more). Explains why the
+   * jury escalates everything at low data volumes instead of leaving it a mystery (C3). Optional so
+   * an older backend (pre-v34 exe) doesn't break the dashboard. */
+  conformalCalibration?: {
+    targetErrorCer: number;
+    perBucketDelta: number;
+    minNeededAtZeroCer: number;
+    buckets: Array<{ bucket: string; verifiedWithReference: number; minNeededAtZeroCer: number }>;
+  };
 }
 
 export async function getIntelligenceReport(): Promise<IntelligenceReport> {
@@ -877,8 +902,17 @@ export async function dbInfo(): Promise<{
   return invoke('db_info');
 }
 
-export async function dbBackup(dest: string): Promise<void> {
+/** Back up the live library to `dest` on a DEDICATED connection (the UI stays responsive), then
+ * verify the WRITTEN file (integrity check + segment count) — a disaster copy that is itself bad
+ * must fail now, not at the disaster. */
+export async function dbBackup(dest: string): Promise<{ integrityOk: boolean; segmentCount: number }> {
   return invoke('db_backup', { dest });
+}
+
+/** Archive every quarantined `*.corrupt.*` artifact into `<data_dir>/quarantine/`, releasing the
+ * snapshot prune-pin explicitly (bytes stay salvageable). Returns how many files were archived. */
+export async function acknowledgeQuarantine(): Promise<number> {
+  return invoke('acknowledge_quarantine');
 }
 
 /** Restore the live library from a backup .db file (the counterpart to dbBackup). Destructive — the

@@ -135,9 +135,11 @@ def main():
             pass
 
     req = {"audio_path": win_to_wsl(audio_path), "start_ms": start_ms, "end_ms": end_ms}
+    # 280 s: below the app's own 300 s per-attempt budget (pipeline.rs) but no longer 120 s shorter —
+    # the old 180 s made the client the effective (and mislabeled) timeout authority.
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(180)
+        s.settimeout(280)
         s.connect((HOST, PORT))
         s.sendall((json.dumps(req) + "\n").encode("utf-8"))
         buf = b""
@@ -147,6 +149,14 @@ def main():
                 break
             buf += d
         s.close()
+    except socket.timeout:
+        # Distinct from "not running": the server ACCEPTED the connection but did not answer in time
+        # (GPU busy with a training run, or the 31 GB model still warming). Saying "not running" here
+        # sent the owner to restart a healthy server (true-10 audit 2026-07-09).
+        fail(EX_UNREACHABLE,
+             f"7B server reachable but timed out after 280 s on {HOST}:{PORT} - it is likely busy "
+             f"(GPU shared with a training run?) or still loading the model. Wait and re-transcribe; "
+             f"do not restart the server.")
     except (ConnectionRefusedError, OSError) as e:
         fail(EX_UNREACHABLE,
              f"7B engine not running: cannot reach the OmniASR-7B server on {HOST}:{PORT} ({e}). "

@@ -1,0 +1,102 @@
+# MEASUREMENTS — pinned accuracy records (never fabricated)
+
+Every number here is parsed verbatim from a real harness run, stamped with the git SHA, the manifest
+SHA-256 + row count, the model pins, and the exact command. New records are appended by
+`make measure-10` (scripts/run_measurements.py) or, when runs are orchestrated manually, by pasting
+the harness's own stdout — never by hand-computing or estimating. If a run fails, the failure is
+recorded, never a placeholder number.
+
+---
+
+## 2026-07-10 — Same-set three-engine scorecard, FLEURS ckb_IQ **test** (N=922)
+
+The first apples-to-apples engine comparison on a **known-disjoint, boundary-aligned** gold set:
+identical 922 clips, identical NFC+lower+whitespace (space-KEPT) normalization for all engines.
+
+### Frozen eval set
+- google/fleurs `ckb_iq` **test** split, all 922 rows with non-empty audio+reference (0 skipped),
+  16 kHz mono PCM_16 WAV, decoded via `Audio(decode=False)` + soundfile.
+- Machine manifest SHA-256 (absolute WSL paths, as scored):
+  `bb5737581094e7ce4e717eb3b7726c693cfd3799eb8a03a4b0032eee1af58ac5  fleurs_ckb_iq_frozen.tsv`
+- Committed portable copy (identical rows, clip-relative paths):
+  [`docs/eval/fleurs_ckb_iq_frozen.rel.tsv`](eval/fleurs_ckb_iq_frozen.rel.tsv) —
+  `b5509f52090e6de15e6d9bf37e02b41759716de0543df304def7f66aa3c30c13` (`.sha256` sidecar committed).
+  Rebuild clips with `scripts/build_fleurs_ckb_manifest.py` (FLEURS is CC-BY-4.0; see ATTRIBUTION.md).
+
+### Results (verbatim harness headlines)
+
+| Engine (identical 922 clips) | micro CER | 95% CI | micro WER | 95% CI |
+|---|:--:|:--:|:--:|:--:|
+| **OmniASR-7B champion (base + Kurdish LoRA)** | **7.03%** | [6.53%, 7.55%] | 32.93% | [31.89%, 33.98%] |
+| Fine-tuned MMS-CTC-1B (HF fp32, CPU) | 9.32% | — (point estimate only) | — | — |
+| Stock OmniASR-CTC-300M (sherpa-onnx int8) | 11.34% | [10.83%, 11.93%] | 50.01% | — |
+
+1. **OmniASR-7B champion** — git SHA `a44b1b7` at run time (scorecard code byte-identical through
+   `6bbe551`; later commits touched only docs + db migrations), warm `cortex_7b_server.py` on
+   127.0.0.1:8799 (WSL2, RTX 3090 Ti, bf16).
+   Command: `wsl python3 scripts/scorecard_7b.py <manifest> 2000`
+   Verbatim: `OmniASR-7B (warm server) micro CER = 7.03%   95% CI [6.53%, 7.55%]   N=922` ·
+   `micro WER = 32.93%   95% CI [31.89%, 33.98%]   N=922` ·
+   `throughput = 0.24 clips/s (4.125 s/clip; 3803.3s total)`
+   Model pins: base `omniASR-LLM-7B-v2.pt` (30 GB, fairseq2 asset cache) SHA-256
+   `1b29a4045ddfbe9125e6c9d465d5bc29063eea256ace37c129742edc07aed17a`;
+   LoRA `adapter_model.safetensors` SHA-256
+   `c348ade8a8160319e7e6f070addb3c7b066b70716390e8f4ae548c7db7af3750`;
+   tokenizer `omniASR_tokenizer_written_v2.model` SHA-256
+   `8aa11a1092142ef472537476ef6e76541123e2f0d789b79f3ebd119008240b1e`.
+2. **Fine-tuned MMS-CTC-1B** — git SHA `316a549` at run time (same code-identity note), HF
+   `Wav2Vec2ForCTC` fp32 on CPU (`CUDA_VISIBLE_DEVICES=""`; GPUs held by the warm 7B server).
+   Command: `CORTEX_FINETUNED_MODEL=<MMS_CTC_1B_Champion dir> python scripts/measure_finetuned_cer.py <manifest>`
+   Verbatim: `MMS-CTC-1B (fine-tuned) micro CER = 9.32%   (N=922)`
+   Caveat: this harness prints a point estimate only (no CI/WER); the ONNX-based
+   `scorecard_finetuned.py` CI leg on this set is tracked in SHIP_FINAL_PLAN WS1.
+3. **Stock OmniASR-CTC-300M** — git SHA `316a549` at run time (same code-identity note), int8 ONNX
+   from `scripts/fetch_models.py` (SHA-256-pinned there).
+   Command: `CORTEX_GOLD_MANIFEST=<manifest> CORTEX_GOLD_RESULTS=<out.tsv> cargo test --test real_audio ckb_scorecard_on_gold -- --ignored --nocapture`, then `python scripts/scorecard_stats.py <out.tsv> 2000`
+   Verbatim: `[scorecard] N=922 micro_CER=0.1134 micro_WER=0.5001 (ckb, OmniASR-CTC-300M)` ·
+   stats: `micro CER = 11.34%   95% CI [10.83%, 11.93%]` · output-script split: `arab N=922 (100%)`.
+
+### C1 engine decision (M1.3) — recorded
+
+**The OmniASR-7B champion remains the default engine, now on measured evidence:** best CER on the
+known-disjoint same-set benchmark (−4.3 pts vs stock, 38% relative; −2.3 pts vs fine-tuned 1B, 25%
+relative), 100%-Arabic-script output, coherent proper-noun handling (verified in real-app e2e).
+Same-set external context: ElevenLabs Scribe v1 publishes 32.1% WER on FLEURS-ckb; the champion's
+32.93% [31.89, 33.98] is statistically on par — with the caveat that this normalization counts digit
+verbalization/format as errors, which penalizes the champion's style. Trade-off accepted by policy:
+the champion needs the warm WSL server (~4.1 s/clip here) and the app ASKS (retry/offline) rather
+than silently downgrading when it is down (verified 2026-07-10). Fallback order for the offline
+path: fine-tuned MMS-1B (9.32%) over stock CTC-300M (11.34%) — matching the shipped juror-ability
+ordering (7B > finetuned > 1b > 300m).
+
+### SeamlessM4T-v2 external baseline + MAPSSWE significance (added same day)
+
+4. **SeamlessM4T-v2** (the charter-required external baseline; stock Whisper is explicitly invalid
+   for ckb) — git SHA `ca16a38`, `facebook/seamless-m4t-v2-large` via transformers
+   `SeamlessM4Tv2ForSpeechToText`, `tgt_lang="ckb"`, fp32 CPU, same frozen manifest + normalization.
+   Command: `python scripts/scorecard_seamless.py <manifest> <out.tsv> 2000`
+   Verbatim: `SeamlessM4T-v2 micro CER = 12.71%   95% CI [12.02%, 13.44%]   N=922` ·
+   `micro WER = 42.38%   95% CI [41.17%, 43.59%]   N=922` · `(10.88 s/clip; 10030s total)`
+
+**MAPSSWE matched-pairs significance** (`python scripts/mapsswe_compare.py <A.tsv> <B.tsv>`,
+verbatim output; per-clip TSVs pair 1:1 in manifest order, N=922):
+
+```
+MAPSSWE word: champion7b 32.93% vs seamlessv2 42.38%  mean diff/seg = -1.793  z = -16.10  p = 2.415e-58   -> champion7b better  (SIGNIFICANT p<0.05)
+MAPSSWE char: champion7b  7.03% vs seamlessv2 12.71%  mean diff/seg = -6.999  z = -24.41  p = 1.301e-131  -> champion7b better  (SIGNIFICANT p<0.05)
+MAPSSWE word: champion7b 32.93% vs stock300m  50.01%  mean diff/seg = -3.241  z = -28.59  p = 1.025e-179  -> champion7b better  (SIGNIFICANT p<0.05)
+MAPSSWE char: champion7b  7.03% vs stock300m  11.34%  mean diff/seg = -5.312  z = -26.26  p = 5.849e-152  -> champion7b better  (SIGNIFICANT p<0.05)
+```
+
+**Charter comparison gate (line 13/48) — MET on this set:** MAPSSWE p<0.05 ✓ AND champion ci_high <
+baseline ci_low on both metrics (CER 7.55% < 12.02% ✓; WER 33.98% < 41.17% ✓) vs SeamlessM4T-v2.
+
+### Honest caveats
+- The CV22-ckb champion number (5.04% CER, 2026-07-09) predates this record and keeps its
+  unverified-disjointness caveat; **7.03% on FLEURS is the honest headline** until disjointness on
+  CV22 is proven.
+- FLEURS is read speech; no conversational Sorani number exists yet anywhere (that requires the
+  app-gold set from the owner's review marathon — SHIP_FINAL_PLAN §B #37/#41).
+- Digit/punctuation normalization is the strict space-kept basis shared by all three engines here;
+  a `CORTEX_CER_STRIP=1` "fair" basis exists in `scorecard_7b.py` but is deliberately NOT used for
+  the headline (owner methodology decision pending — SHIP_FINAL_PLAN §B #45).

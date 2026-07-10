@@ -1938,3 +1938,266 @@ tokens; 4 cited web-research tracks; all local gates re-RUN at HEAD, not claimed
   zero review-hours) -> intelligence majors -> 500-decision marathon (first conversational
   Sorani number) -> one retrain cycle + KenLM fusion (~36% rel. WER, cited) + pseudo-labeling
   (Gaelic recipe 35.2->23.1) -> P7 re-audit. No accuracy claim is made for the 7B until P2.2 runs.
+
+## Audit-backlog execution: clusters A-D shipped (2026-07-09, branch fix/audit-backlog-20260709)
+
+Owner directive: implement the TRUE_RATING backlog to ship-ready, gates + commit per cluster.
+- A label-protection (1f512af): review-surface keyboard isolation at the KeyboardManager level
+  (BLOCKER: globals fired on the hidden curate segment — silent verify/machine-overwrite/invisible
+  confirm), inbox edit-state cross-segment leak double-locked, Kurdish-layout-dead shortcuts fixed
+  via shared physicalKey (e.code), inbox focus trap, review queue search-only contract
+  (searchScopedSegments store), unmount draft flush, arrow-key revisit nav. 9 new keyboard tests.
+- B engine-truth (cb891c9): use_finetuned_asr+WSL7B mis-attribution structurally closed
+  (should_use_wsl_primary_asr honors the EFFECTIVE override; F2 preserved when the model is absent);
+  gold-eval mislabeling now impossible (engine derived from the requested id / mismatched label
+  refused); finetuned juror ability 1.0 with pinned ordering (7B > finetuned > 1b > 300m); batch-7B
+  provenance row; shared 15s windowing for the finetuned IPC; honest client timeout message (280s).
+- C intelligence honest-metrics (0a3640c): write_segment_verdict COALESCEs agent_confidence (T1/T2
+  escalations no longer NULL the persisted IRT confidence -> suspect-first is real again, tested);
+  migration v34 c4_evidence_archive (C4 precision survives deleting contradicted auto-accepts,
+  tested); conformal::min_calibration_n + per-bucket distance-to-calibration surfaced in the
+  intelligence report + dashboard (~2,334 zero-CER clips/bucket at the shipped 5% gate — the gate
+  itself deliberately unchanged); shadow metrics per-segment (distinct events), tested; over-trigger
+  tile neutral until would-fire evidence exists. Deferred (latent, firing default-off, tracked in
+  the rating doc): LOOP-0 firing-blindness, T1 confidence-semantics.
+- D dataset integrity (this commit): offset-less alignment rows are REFUSED whole-file fallback on
+  multi-segment sources (pack skips + counts; review re-transcribe errors with re-import advice;
+  single-segment sources still legit — sibling-count context from the DB), tested incl. SHA sums;
+  gold promotion refuses partially-reviewed files (unreviewed speech would score as insertions on
+  the promotion yardstick), tested — the old silently-exclude contract in the concatenation test was
+  audit-falsified and updated; SHA256SUMS now written over the finetune pack, gold eval-set, and
+  production bundle (clip bytes integrity-pinned, not just the manifest); per-speaker composition +
+  dominant-speaker flag now reach the HUMAN-readable cards (HF README + bundle dataset_card).
+  Deferred with rationale: split-grouping by content hash (import fingerprint already dedupes the
+  normal path; needs a plumbed hash map through every export caller — tracked).
+Gates per cluster: cargo test --lib (827->829), clippy-all-targets, fmt, vitest 141, typecheck 0,
+eslint, python policies (this entry pays the ledger-staleness gate that fired at 4 commits — the
+gate worked). Remaining: clusters E (reliability/DR), F (security/CI), G (doc honesty + UX polish),
+then PR + exe rebuild + full ship-check.
+
+## Audit-backlog execution: clusters E + F shipped (2026-07-09, branch fix/audit-backlog-20260709)
+
+- E reliability/DR (78c3a76): pre-migration PINNED (rotation-exempt) snapshot before any pending
+  migration on a non-empty library; TIERED retention (rolling 10 + last 7 daily + last 4 weekly,
+  pure selector, unit-tested) replaces the ~100-min single-tier horizon; restore is gated against
+  running import/batch writers AND pins a pre-restore copy first (shared prepare_restore);
+  quarantine gets an in-app acknowledge (archives *.corrupt.* to <data_dir>/quarantine, releases
+  the prune-pin) + accumulation cap; snapshot staleness surfaced + loop body catch_unwind'd;
+  db_backup on a dedicated connection + verifies the written file; get_current_version stops
+  swallowing transient read errors as v0. +4 snapshot tests. 833 lib tests.
+- F security/CI (this commit): T2 Gemini response through crate::http::json_bounded (was the last
+  into_json() — regression of the provider-body OOM guard); release.yml now fetch-models + npm run
+  build + verify_10.py governance gate BEFORE any cargo step (the tag gate failed by construction);
+  nightly gets the same dist/ provisioning; a NEW meta-gate test asserts provisioning ORDER before
+  the first compiling cargo step across all three workflows (comment-stripped so a comment can't
+  pose as a step — it found ci.yml was already correct); pre-commit drops the exit-code-masking
+  `| tail` on cargo check; ledger-staleness gate hard-errors in CI instead of silent-SKIP.
+  Deferred with rationale (documented in the rating doc, need Windows-native design / real-app
+  observation): DPAPI key-encryption-at-rest, an egress/consent audit log.
+
+COLLISION NOTE (honest): while F was in progress a CONCURRENT session switched the shared
+repo checkout to `main` and began an uncommitted "10/10 charter gate"
+effort (Makefile governance-proof/eval-ckb/egress-offline/bench-rtf/release-proof, verify_10.py,
+asr.rs, real_audio.rs, ...). That work was left UNTOUCHED on main; F was completed in an isolated
+git worktree on this branch. The two efforts (backlog FIXES here, GATE infra on main) are
+complementary and must be reconciled by the owner before a final ship-check.
+
+## Cluster G (docs honesty) — EVAL.md 7B claims corrected (2026-07-09)
+
+Retracted the numeric "on-par-to-slightly-better than stock" 7B read from EVAL.md's main body AND
+the appendix (its own 2026-07-07 caveat already showed the 7B and stock numbers used different CER
+bases — space-stripped vs space-kept — so they can't be compared; only the by-eye "coherent,
+correct Sorani" observation stands). Flagged the 29.33% N=1 clean number as also pre-fix
+space-stripped. The 7B stays HONESTLY UNMEASURED against stock until P2.2. Remaining G items (UX
+minors: AudioPlayer stale-src Space race, waveform a11y seek, Mac-glyph formatter dedup, i18n
+literals, inbox 200-cap banner) are genuinely minor and deferred — lower priority than the
+owner's reconciliation of this branch with the concurrent main "10/10 gate" effort.
+
+## Audit backlog MERGED + daily app rebuilt ship-ready (2026-07-09)
+
+PR #37 (clusters A-G, the full TRUE_RATING backlog + 2 CI fixes) merged to main (e2944d6). The
+main checkout was advanced and the daily app REBUILT from the merged main:
+- Frontend rebuilt (npm run build) + release exe rebuilt (cargo build --release, 7m35s).
+- EXE FRESHNESS GATE: GREEN (exe at HEAD e2944d6, newer than all sources) — the running app now
+  carries every audit fix (review-mode blocker, engine truth, honest metrics, dataset integrity,
+  DR spine, security/CI). Verified on rustc 1.97.0 (CI toolchain).
+- Ship-check surface green: verify_10.py "CORTEX 10/10: ALL GATES GREEN", cargo fmt --check,
+  clippy --all-targets -D warnings, cargo test (833 lib + integration, 0 failed), typecheck 0/406,
+  vitest 141, eslint, python policies (25). test-e2e/audit/deny validated by the green CI Windows
+  Release Gate on identical content.
+
+CONCURRENT-SESSION WIP HANDLED: another session's uncommitted "proof-metadata + 10/10-gate" effort
+(confidence_source/cloud_call/decoder_config_hash/normalizer_version columns, ConfidenceSource in
+asr.rs, get_segments_page pagination, Makefile gate scaffold) was committed + pushed to branch
+feat/proof-metadata-10-10-gate (f4b09e7) to preserve it, but NOT merged: it does not compile even on
+its own base (8 SpeechSegment initializers un-updated for the new columns) and its migration is v34,
+which COLLIDES with main's v34 c4_evidence_archive (must renumber to v35 when finished). Honest call:
+no unverified half-feature onto a clean CI-green main. The feature awaits a proper completion pass.
+
+## 7B champion-or-ask policy + MEASURED champion CER on real audio (2026-07-09)
+
+Owner directive: the OmniASR-7B champion is the ONLY engine that may become the transcript; if it
+fails, the app must ASK (retry the champion / use the offline model), never silently downgrade.
+
+SHIPPED (merged to main 072ebb2, pushed 48c21e2..072ebb2):
+- feat(asr) e6aff3b: ASR_7B_UNAVAILABLE_TAG sentinel on every "7B selected but unavailable/failed"
+  error (unresolved-primary, both preflight failures, per-segment WSL failure); frontend
+  is7bUnavailableError() + a retry/offline ConfirmDialog in App.svelte handleTranscribe and
+  ReviewMode retranscribe('champion'); EN+CKB strings. No silent small-model substitution on the
+  primary path. Gated: Rust 834 lib tests, clippy --all-targets -D warnings, fmt, vitest 144,
+  typecheck 0/406, eslint, python policies — all green (rustc 1.97).
+- fix(e2e) 516763a: the real-app harness accepted the in-progress placeholder "[Pending WSL 7B ASR]"
+  as a real transcript (false green). Now waits past bracketed/"pending" placeholders and fails
+  honestly. Caught LIVE on this run.
+- Release exe REBUILT from main: npm run build + cargo build --release (8m10s). EXE FRESHNESS GATE
+  GREEN (exe at HEAD 072ebb2). New exe smoke-launched OK (WebView up ~6s).
+
+REAL-DATA RUNS (drove the actual cortex-speech-app.exe via e2e_real_app.cjs, warm 7B server on the
+4090 :8799): podcast.wav -> 24 VAD segments -> 24/24 coherent Sorani; Halwest1.wav (news broadcast)
+-> 26 VAD segments -> 26/26 coherent Sorani incl. proper nouns (Pezeshkian/Khamenei/Graham/Musk/
+Ilam/Kermanshah). Self-contained review pages built (podcast_7b_review/, halwest_7b_review/,
+--embed-audio). Drafts written back to the app DB (0 placeholders).
+
+MEASURED CER (real harness, no fabrication):
+- Command: wsl scripts/scorecard_7b.py <manifest> 2000  (warm cortex_7b_server.py, seed-42 bootstrap)
+- Model: OmniASR-7B Champion = base omniASR-LLM-7B-v2.pt (30 GB) + LoRA adapter
+  Kurdish_ASR_Model_Export/OmniASR_7B_Champion/adapter_weights/adapter_model.safetensors
+- Data: Common Voice 22 ckb TEST split, 400 clips sampled seed 42 (of 5344), MP3->16 kHz WAV
+- RESULT: micro CER = 5.04%  95% CI [4.62%, 5.52%]  N=400 ; WER = 27.46% [25.47, 29.50] ; ~1.0 s/clip
+- Same harness/norm baselines: fine-tuned MMS-1B 21.00% [19.93,22.04] N=900 ; stock CTC-300M 29.40%.
+  => champion ~4x better than the next-best local model.
+- HONEST CAVEATS (do not overclaim): (1) train/test disjointness UNVERIFIED — the base 7B (Meta) or
+  the LoRA may have seen Common Voice ckb; if so 5.04% is optimistic. Clean confirmation needs a set
+  with KNOWN disjointness (FLEURS-ckb, not yet downloaded here — cache is metadata-only). (2) Do NOT
+  cross-compare to Scribe 32.1% WER (that is FLEURS-ckb; ours is CV22-ckb — different dataset).
+
+## Second-PC reproduction + MEASURED FLEURS-ckb champion CER + ask-dialog verify + FTS import fix (2026-07-10)
+
+Picked up the two open tasks on a SECOND PC (dual RTX 3090 Ti, WSL2 Ubuntu) per
+docs/CONTINUE_ON_ANOTHER_PC.md. Branch `autonomous-day-20260710`.
+
+**Setup reproduced (everything found BY NAME, no hardcoded profile paths):**
+- `npm ci`; `python scripts/fetch_models.py` (+ `--check`) — VAD + CTC-300M + onnxruntime, all
+  SHA-256 verified.
+- Champion located by name: base `omniASR-LLM-7B-v2.pt` (~30 GB) in the fairseq2 asset cache; LoRA
+  `adapter_model.safetensors` + `omniASR_tokenizer_written_v2.model` under
+  `Kurdish_ASR_Model_Export/OmniASR_7B_Champion/` and a self-contained `omniasr_champion_package/`.
+  `cortex_7b_server.py` was NOT on this PC (the private glue the doc says to carry) — reconstructed it
+  from the package's Flask `server.py` load recipe, speaking the TCP line protocol on
+  127.0.0.1:8799 that `cortex_7b_client.py` / `scripts/scorecard_7b.py` expect.
+  - PITFALL fixed: fairseq2's SentencePiece loader URI-encodes the tokenizer path, so a model dir with
+    spaces became `%20`-mangled ("cannot be opened"). Copied the model dir to a space-free location and
+    pointed the server there (`CORTEX_7B_MODEL_DIR`). Smoke clip decodes near-perfect vs its reference.
+- Champion venv (torch 2.8+cu128, fairseq2 0.6, omnilingual_asr 0.2.0, peft, soundfile) already present.
+- `%APPDATA%\cortex-speech\settings.json` wired to WSL7B via the app's OWN `update_settings` IPC. NOTE:
+  a hand-written PARTIAL settings.json is quarantined `.corrupt-<ts>` — `AppSettings` has 15 required
+  (non-`serde(default)`) fields, so the persisted file must be COMPLETE (write it through the app, not by hand).
+- Provisioned the stdlib-only WSL client interpreter the exe invokes (absent on this PC) so the 7B
+  client path (import + per-segment) can run.
+- Frontend build → `cargo build --release --bin cortex-speech-app` → `check_exe_freshness.py` GREEN.
+  NOTE: all-targets `cargo build --release` / `cargo clippy --all-targets` / `cargo test` fail on this
+  box only at the auxiliary bins `batch_processor`/`batch_importer` ("crate `tauri_runtime_wry` required
+  in rlib format") — a pre-existing Tauri all-targets quirk unrelated to any change here; the app bin +
+  lib build clean and CI (app-bin only) is unaffected.
+
+**OPEN TASK 1 — FLEURS-ckb clean CER (the disjoint number the CV22 entry above asked for): MEASURED**
+- Built the frozen FLEURS ckb_IQ **test** manifest (922 clips) decoding via `Audio(decode=False)` +
+  soundfile (the doc's torchcodec/CUDA-12 avoidance), 16 kHz mono WAV. (Real split is 922, not the
+  doc's ~350 estimate.)
+- Command: `wsl scripts/scorecard_7b.py fleurs_ckb_iq_frozen.tsv 2000` against the WARM
+  `cortex_7b_server.py` (:8799); seed-42 bootstrap; default NFC+lower+space norm (byte-identical to the
+  21.00% / 29.40% baselines).
+- Model: OmniASR-7B Champion = base `omniASR-LLM-7B-v2.pt` + Kurdish LoRA `adapter_model.safetensors`.
+- **RESULT: micro CER = 7.03%  95% CI [6.53%, 7.55%]  N=922 ; WER = 32.93% [31.89%, 33.98%] ; 4.13 s/clip.**
+- Honest reads:
+  - Confirms CV22's 5.04% was optimistic on disjointness: on FLEURS-ckb (KNOWN disjoint) the champion is
+    **7.03% CER**, ~2 pts higher. 7.03% is the honest clean number.
+  - Same-dataset vs ElevenLabs Scribe v1 (published **32.1% WER on FLEURS-ckb**): champion **32.93% WER**
+    — on par (marginally behind on WER; CER 7.03% is strong). Now a FAIR same-dataset comparison (removes
+    the CV22 "different dataset" caveat).
+  - CAVEAT: the default norm counts digit-verbalization (٥→پێنج) and Arabic→Latin digits (١٠٠→100) as
+    errors, inflating both CER and WER; a `CORTEX_CER_STRIP=1` fair run would be lower but non-comparable
+    to the published byte-identical baselines. Meta's official base omniASR-7B-LLM = 6.0% CER ckb_Arab —
+    7.03% for the LoRA champion on FLEURS ckb_IQ is a consistent ballpark.
+
+**OPEN TASK 2 — ask-dialog verify (no silent downgrade): VERIFIED on the real exe**
+- With the 7B server DOWN, drove the real `cortex-speech-app.exe` (WSL7B primary) on a real ckb segment:
+  - `transcribe_segment` REJECTED with `E_ASR_7B_UNAVAILABLE`: "WSL 7B ASR process failed: 7B engine not
+    running: cannot reach the OmniASR-7B server on 127.0.0.1:8799 ([Errno 111] Connection refused)" — the
+    client reached the socket, so the cause is provably server-down.
+  - The app surfaced the "OmniASR-7B champion unavailable" dialog with "Try 7B again" + "Use offline
+    model". NO silent downgrade to a smaller model.
+- Driver: a CDP harness invoking `transcribe_segment` AND clicking the Transcribe button; both the
+  backend rejection and the UI dialog asserted.
+
+**BUG FOUND + FIXED during the positive-path e2e — `segments_fts` missing `audio_path` broke ALL imports:**
+- Root cause: the FTS5 shadow `segments_fts` was created 4-col (`id, raw_transcript,
+  normalized_transcript, annotated_transcript`) while the `segments_ai/ad/au` triggers write
+  `audio_path`. Every segment INSERT therefore failed ("table segments_fts has no column named
+  audio_path"); the import transaction rolled back and VAD "produced 0 segments" — **a fresh install
+  could not ingest ANY audio.** The divergence: db.rs `initialize()`'s AUTHORITATIVE 6-col schema vs
+  migration v1's 4-col copy (`001_initial.sql`); the "6-col runs first so it wins" assumption failed here.
+- Fix: migration **v35** rebuilds `segments_fts` to the authoritative 6-col shape (FTS5 has no ALTER ADD
+  COLUMN) + rebuilds from external content. Idempotent. Regression test
+  `v35_repairs_divergent_segments_fts_so_segment_writes_succeed` reproduces the broken state (INSERT
+  rejected) and asserts the repair (INSERT succeeds).
+- VERIFIED end-to-end on real audio: applied v35 to the live DB (schema_migrations 34→35; `segments_fts`
+  gained `audio_path`); re-ran `e2e_real_app.cjs` on a real ckb clip → **REAL-DATA RUN OK: 1 VAD segment,
+  champion transcript 148 chars** ("هەروەها بەشداربووە لە هەڵکەندنی قالبی دراو …"); run.jsonl + a
+  self-contained review page built.
+
+**Gates (this branch, real output):** `cargo fmt --check` ok; `cargo clippy --lib --bin
+cortex-speech-app -D warnings` ok; `cargo test --lib` **835 passed / 0 failed / 6 ignored** (incl. the
+new v35 test); `npm run typecheck` 0; `npm run lint` ok; vitest **144/144**; `npm run
+test:python-policies` ok (incl. windows-repo-hygiene); `check_exe_freshness.py` GREEN; real-audio import
+e2e + ask-dialog verify PASS.
+
+## P2.2 same-set three-engine scorecard MEASURED + pinned (2026-07-10, branch autonomous-day-20260710)
+
+The engine comparison every prior entry caveated as impossible ("different datasets/N/bases") now
+exists on ONE known-disjoint set: FLEURS ckb_IQ test, N=922, identical clips + space-KEPT
+normalization for all three engines. Pinned record (SHAs, exact commands, verbatim harness output):
+docs/MEASUREMENTS.md; frozen manifest committed at docs/eval/fleurs_ckb_iq_frozen.rel.tsv (.sha256).
+
+- **Champion 7B+LoRA: 7.03% CER [6.53, 7.55], WER 32.93% [31.89, 33.98]** (warm server, ~4.1 s/clip)
+- Fine-tuned MMS-1B: 9.32% CER (HF fp32 CPU; harness prints point estimate only — CI leg tracked)
+- Stock CTC-300M: 11.34% CER [10.83, 11.93], WER 50.01% (Rust harness + scorecard_stats.py)
+
+C1 engine decision recorded in MEASUREMENTS.md: champion stays default on measured evidence (-4.3
+CER pts vs stock / -2.3 vs fine-tuned); same-set Scribe v1 context 32.1% WER => statistically on par,
+with the digit-verbalization normalization caveat. EVAL.md headline + stale "remains unmeasured"
+claims corrected (doc-honesty debt from TRUE_RATING cluster G). Model pins hashed for the record:
+base .pt sha256 1b29a40..., LoRA adapter c348ade..., tokenizer 8aa11a1... Also shipped this session:
+docs/SHIP_FINAL_PLAN.md — 10-agent evidence-cited audit of everything left for full-charter 10/10
+(58 items: 36 automatable in 7 workstreams, 22 owner-gated with the Gold Marathon as THE bottleneck).
+Next per WS1: SeamlessM4T-v2 baseline + MAPSSWE on this same frozen set.
+
+## SeamlessM4T-v2 baseline MEASURED + MAPSSWE: charter comparison gate MET (2026-07-10)
+
+The charter-required external baseline (line 13/48; stock Whisper explicitly invalid for ckb) is now
+measured on the SAME frozen FLEURS ckb_IQ test set (N=922, identical normalization):
+- **SeamlessM4T-v2: micro CER 12.71% [12.02, 13.44], WER 42.38% [41.17, 43.59]** (fp32 CPU, 10.9 s/clip)
+- Command: python scripts/scorecard_seamless.py <manifest> <out.tsv> 2000 (new script, committed)
+- MAPSSWE matched-pairs (new scripts/mapsswe_compare.py, per-clip TSVs paired 1:1):
+  champion vs SeamlessM4T-v2: word z=-16.10 p=2.4e-58; char z=-24.41 p=1.3e-131 -> SIGNIFICANT
+  champion vs stock-300M:     word z=-28.59 p=1.0e-179; char z=-26.26 p=5.8e-152 -> SIGNIFICANT
+- **Charter gate MET on this set: MAPSSWE p<0.05 AND champion ci_high < baseline ci_low on BOTH
+  metrics (CER 7.55 < 12.02; WER 33.98 < 41.17).** Pinned verbatim in docs/MEASUREMENTS.md.
+Full same-set ladder now: champion 7.03% > MMS-1B 9.32% > stock 11.34% > SeamlessM4T-v2 12.71% CER.
+Honest caveats unchanged: read speech (FLEURS), strict space-kept digit-counting basis, conversational
+number still requires the owner marathon (SHIP_FINAL_PLAN #37/#41). WS1 statistical core is CLOSED;
+remaining WS1 tail: AsoSoft-600 leg + fine-tuned CI leg. Next: WS2 (verify-10 full-charter aggregator).
+
+## OWNER DECISION: "ship" = personal use, fully reliable (2026-07-10)
+
+The owner defined the ship target: ship to HIS OWN PERSONAL USE — a truly reliable, bug-free
+daily tool on his own machine. Distribution (#52: certs, stores, updater hosting, macOS) remains
+descoped and no longer blocks "ship"; adoption/maturity (#57) likewise. NOTHING else is waived —
+the honesty law, privacy guarantees, and every reliability/correctness gate stay mandatory and
+unweakened. Definition recorded in: cortex-speech-app/CLAUDE.md, AGENT_CHARTER.md (root + app),
+docs/SHIP_FINAL_PLAN.md (with re-prioritized order: WS2 -> WS6 -> WS3 -> WS4 -> WS7 -> WS5,
+reliability first). Also delivered this session: docs/CORTEX_APP_FLOW_GUIDE.html — full e2e
+architecture guide (every model/tool named exactly, verified against source by a 6-agent map +
+critic; caught + corrected one would-be fabrication: default LLM refiner is local Ollama
+heretic-final:latest, NOT a cloud model). Next: WS2 (verify-10 aggregator + proof-metadata
+branch) then WS6 reliability drills.

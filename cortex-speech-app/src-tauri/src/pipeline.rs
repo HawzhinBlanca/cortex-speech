@@ -247,6 +247,24 @@ static WSL_7B_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// drift (a mismatch would even green-light the preflight against the wrong service).
 pub(crate) const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.py
 
+/// Machine-readable sentinel embedded in every "the OmniASR-7B champion is the selected primary
+/// engine but it is unavailable / failed" error. The frontend matches on this token to offer the
+/// user an EXPLICIT choice — retry the champion once its server is up, or transcribe this one clip
+/// with the offline model — instead of a dead-end error. The app NEVER silently substitutes a
+/// smaller model on the primary path; a small-model transcript is produced only on a deliberate
+/// user action. Keep the value in sync with `ASR_7B_UNAVAILABLE_TAG` in `src/lib/commands.ts`.
+pub(crate) const ASR_7B_UNAVAILABLE_TAG: &str = "E_ASR_7B_UNAVAILABLE";
+
+/// Wrap a primary-7B transcription failure so the UI can classify it (see [`ASR_7B_UNAVAILABLE_TAG`])
+/// and present the retry-or-offline choice. Preserves the original actionable text.
+pub(crate) fn tag_7b_unavailable(err: AppError) -> AppError {
+    let msg = err.to_string();
+    if msg.contains(ASR_7B_UNAVAILABLE_TAG) {
+        return err; // already tagged upstream — don't double-prefix
+    }
+    AppError::Validation(format!("{ASR_7B_UNAVAILABLE_TAG}: {msg}"))
+}
+
 /// Translate a Windows path to its WSL `/mnt` view (mirrors `cortex_7b_client.py`'s `win_to_wsl`), so
 /// the app can hand the client a `CORTEX_7B_DB` that follows a moved data dir instead of the client's
 /// hardcoded default. `C:\a\b` -> `/mnt/c/a/b`; a `\\?\` extended-length prefix is stripped; a
@@ -613,6 +631,15 @@ impl ProcessingPipeline {
     fn should_use_wsl_primary_asr(&self) -> bool {
         self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
             && self.settings.external_asr_script_path().is_some()
+            // ENGINE TRUTH (true-10 audit 2026-07-09): use_finetuned_asr is documented as
+            // "overriding asr_model_size" — when the override is EFFECTIVE (flag on AND the model
+            // present), the fine-tuned engine is the primary drafter, so the 7B pass must not run:
+            // it re-attributed the fine-tuned text as an "omniasr-wsl-7b" hypothesis (wrong badge,
+            // double vote for one engine in the jury) and hard-required a server that never
+            // transcribes. Mirrors wsl7b_primary_unresolved below: with the flag on but the model
+            // ABSENT, the 7B remains the primary and this stays true (never a silent stock
+            // downgrade — the F2 contract).
+            && !(self.settings.use_finetuned_asr && Self::finetuned_model_paths().is_some())
     }
 
     /// F2 — the no-silent-downgrade guard. True when the selected primary engine is WSL 7B but no
@@ -659,20 +686,21 @@ impl ProcessingPipeline {
                 Ok(Some(status)) if status.success() => return Ok(()),
                 Ok(Some(_)) => {
                     return Err(AppError::Validation(format!(
-                        "OmniASR 7B server is not responding on 127.0.0.1:{WSL_7B_SERVER_PORT} (in WSL). \
-                         Start it (e.g. wsl python cortex_7b_server.py from scripts/) and re-import, or \
-                         switch the engine to the embedded fine-tuned model. The import was not started, \
-                         so nothing was left half-transcribed."
+                        "{ASR_7B_UNAVAILABLE_TAG}: OmniASR-7B server is not responding on \
+                         127.0.0.1:{WSL_7B_SERVER_PORT} (in WSL). Start it (e.g. wsl python \
+                         cortex_7b_server.py from scripts/) and try again, or transcribe with the \
+                         offline model. The import was not started, so nothing was left \
+                         half-transcribed."
                     )));
                 }
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
                         kill_and_reap_wsl_child(&mut child, "7B preflight probe");
-                        return Err(AppError::Validation(
-                            "Timed out checking the OmniASR 7B server (WSL not responding). Ensure WSL and the \
-                             7B server are running, or switch to the embedded fine-tuned engine."
-                                .into(),
-                        ));
+                        return Err(AppError::Validation(format!(
+                            "{ASR_7B_UNAVAILABLE_TAG}: Timed out checking the OmniASR-7B server (WSL \
+                             not responding). Ensure WSL and the 7B server are running and try \
+                             again, or transcribe with the offline model."
+                        )));
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -684,18 +712,20 @@ impl ProcessingPipeline {
         }
     }
 
-    /// The actionable error returned whenever [`Self::wsl7b_primary_unresolved`] holds. It names all
-    /// three ways out so the user is never stuck: start the 7B server (with the script path set),
-    /// enable the embedded fine-tuned engine, or pick a local CTC model deliberately.
+    /// The actionable, UI-classified error returned whenever [`Self::wsl7b_primary_unresolved`]
+    /// holds. Carries [`ASR_7B_UNAVAILABLE_TAG`] so the frontend presents the two deliberate ways
+    /// forward — start the 7B server (with the client script set) and retry the champion, or
+    /// transcribe this one clip with the offline model — never a silent downgrade.
     fn primary_engine_unavailable_error() -> AppError {
-        AppError::Validation(
-            "OmniASR 7B is the selected engine but no WSL client script is configured \
-             (Settings → \"External ASR script path\" is empty). To transcribe: set that path and \
-             start the 7B server, OR turn on the embedded fine-tuned engine (\"Use fine-tuned \
-             model\"), OR choose a local model (CTC-300M / CTC-1B). Refusing to silently downgrade \
-             to the stock model you did not select."
-                .into(),
-        )
+        // Tagged so the UI offers the retry-or-offline choice rather than a dead-end (see
+        // ASR_7B_UNAVAILABLE_TAG). The app never silently downgrades to a smaller model.
+        AppError::Validation(format!(
+            "{ASR_7B_UNAVAILABLE_TAG}: OmniASR-7B (the champion) is the selected engine but its WSL \
+             client script is not configured (Settings → \"External ASR script path\" is empty). \
+             Start the 7B server and set that path to transcribe with the champion, or choose the \
+             offline model for this clip. Refusing to silently downgrade to a smaller model you did \
+             not select."
+        ))
     }
 
     fn local_asr_model_id(&self) -> &'static str {
@@ -723,7 +753,22 @@ impl ProcessingPipeline {
     /// `AppState` lock is held across the (slow) ASR loop.
     pub fn run_gold_eval_asr(&self, model_id: Option<&str>) -> AppResult<crate::eval::EvalRunResult> {
         let db = self.open_db()?;
-        let model_id = model_id.map(|s| s.to_string()).unwrap_or_else(|| self.local_asr_model_id().to_string());
+        let active_id = self.local_asr_model_id();
+        // HONESTY GUARD (true-10 audit 2026-07-09): this entrypoint always transcribes with the
+        // ACTIVE pooled local engine (transcribe_audio_file_raw → with_asr → asr_config), so a
+        // caller-supplied label that names a DIFFERENT engine would persist a mislabeled WER/CER
+        // row. Refuse the mismatch instead of recording it.
+        if let Some(requested) = model_id {
+            if requested != active_id {
+                return Err(AppError::Validation(format!(
+                    "run_gold_eval_asr transcribes with the active local engine '{active_id}', but \
+                     the run was requested under the label '{requested}'. Eval rows are persisted \
+                     under that label, so it must match the engine that actually runs — switch the \
+                     active model or drop the label."
+                )));
+            }
+        }
+        let model_id = active_id.to_string();
         crate::eval::run_gold_eval_with_transcriber(&db, &model_id, |seg| {
             self.transcribe_audio_file_raw(&seg.audio_path)
         })
@@ -2541,7 +2586,10 @@ impl ProcessingPipeline {
 
                 drop(db);
 
-                let (raw_transcript, confidence) = self.run_wsl_segment_transcript(&id, cancel)?;
+                // Tag a 7B failure (server down / timeout / empty) so the UI offers retry-or-offline
+                // instead of a dead-end — and NEVER silently falls through to a smaller model here.
+                let (raw_transcript, confidence) =
+                    self.run_wsl_segment_transcript(&id, cancel).map_err(tag_7b_unavailable)?;
 
                 let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
 
@@ -2772,7 +2820,10 @@ impl ProcessingPipeline {
     /// Transcribe one decoded chunk (16 kHz mono i16) with the fine-tuned engine. The fine-tuned
     /// model is trained on short utterances, so a single >~15 s pass can duplicate text — sub-split a
     /// long chunk into balanced ~15 s windows and join the per-window transcripts.
-    fn transcribe_chunk_finetuned(onnx: &Path, vocab: &Path, chunk_pcm: &[i16]) -> Result<String, String> {
+    // pub(crate): the transcribe_segment_finetuned IPC must share this windowing instead of calling
+    // run_wav2vec2 directly — a single unbounded pass over >15 s audio duplicates text on this model
+    // (true-10 audit 2026-07-09: same engine, two call paths, different quality).
+    pub(crate) fn transcribe_chunk_finetuned(onnx: &Path, vocab: &Path, chunk_pcm: &[i16]) -> Result<String, String> {
         const MAX_WIN: usize = 15 * 16000;
         let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
         let n = f32_pcm.len();
@@ -2860,6 +2911,23 @@ impl ProcessingPipeline {
     }
 
     pub fn run_gold_eval_local(&self, model_id: &str) -> AppResult<crate::eval::EvalRunResult> {
+        // HONESTY GUARD (true-10 audit 2026-07-09): the eval row is persisted under `model_id`, so
+        // the engine that transcribes MUST be derived from that id. Previously this always ran the
+        // ACTIVE local engine and labeled the run with whatever the caller typed — a row labeled
+        // "finetuned-mms-ckb" or "omniasr-wsl-7b" could be pure stock CTC output, a mislabeled
+        // metric in the app's own honest-CER entrypoint. Only the locally runnable CTC engines are
+        // accepted; anything else is an explicit error, never a silently mislabeled number.
+        let model_size = match model_id {
+            "omniasr-ctc-300m" => crate::settings::AsrModelSize::CTC300M,
+            "omniasr-ctc-1b" => crate::settings::AsrModelSize::CTC1B,
+            other => {
+                return Err(AppError::Validation(format!(
+                    "run_gold_eval_local can only run the local CTC engines it can label honestly \
+                     (omniasr-ctc-300m, omniasr-ctc-1b); got '{other}'. Eval rows are persisted \
+                     under this id, so the transcribing engine must match it exactly."
+                )));
+            }
+        };
         // Open our own DB connection so no AppState lock is held across the (slow) decode+ASR loop —
         // mirrors run_gold_eval_asr. Holding the global db/pipeline mutexes here froze the whole UI.
         let db = self.open_db()?;
@@ -2867,7 +2935,12 @@ impl ProcessingPipeline {
         let mut hypotheses = Vec::new();
 
         let model_dir = self.model_manager.resolved_dir();
-        let config = self.asr_config();
+        let config = asr::AsrLoadConfig {
+            model_size,
+            enable_gpu: self.settings.enable_gpu,
+            num_threads: self.settings.num_asr_threads,
+            language: self.settings.language.clone(),
+        };
         self.asr_pool.warmup(&model_dir, &config)?;
 
         for gold in &gold_segments {
@@ -3212,6 +3285,36 @@ mod tests {
     use crate::settings::{AppSettings, AsrModelSize};
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn primary_7b_failures_carry_the_ui_sentinel_and_never_leak_a_small_model() {
+        use super::{tag_7b_unavailable, ASR_7B_UNAVAILABLE_TAG};
+        use crate::error::AppError;
+
+        // The "7B selected but not wired up" error the UI keys on to show retry-or-offline.
+        let unavailable = super::ProcessingPipeline::primary_engine_unavailable_error().to_string();
+        assert!(
+            unavailable.contains(ASR_7B_UNAVAILABLE_TAG),
+            "the UI relies on this sentinel to offer the choice instead of a dead-end: {unavailable}"
+        );
+        assert!(
+            unavailable.to_lowercase().contains("champion") || unavailable.contains("OmniASR-7B"),
+            "the error must name the champion so the user knows which engine is required: {unavailable}"
+        );
+
+        // A raw server-down failure gets tagged at the call site.
+        let tagged = tag_7b_unavailable(AppError::Other("connection refused".into())).to_string();
+        assert!(tagged.contains(ASR_7B_UNAVAILABLE_TAG));
+        assert!(tagged.contains("connection refused"), "original cause is preserved for the log/detail");
+
+        // Idempotent: an already-tagged error is not double-prefixed.
+        let once = tag_7b_unavailable(AppError::Validation(format!("{ASR_7B_UNAVAILABLE_TAG}: x")));
+        assert_eq!(
+            once.to_string().matches(ASR_7B_UNAVAILABLE_TAG).count(),
+            1,
+            "double-tagging would corrupt the sentinel match"
+        );
+    }
 
     #[test]
     fn loop0_firing_respects_opt_in_and_fires_when_enabled() {
@@ -3565,6 +3668,7 @@ mod tests {
             corrected_at: None,
             is_gold: false,
             alignment_quality: None,
+            ..SpeechSegment::default()
         }
     }
 
@@ -3844,7 +3948,14 @@ mod tests {
         assert!(pipeline.wsl7b_primary_unresolved(), "WSL7B + no script + no finetuned must be unresolved");
         assert!(!pipeline.should_use_wsl_primary_asr(), "no script => not the WSL primary path");
         let msg = super::ProcessingPipeline::primary_engine_unavailable_error().to_string();
-        assert!(msg.contains("fine-tuned"), "error must name the fine-tuned escape hatch: {msg}");
+        assert!(
+            msg.contains(super::ASR_7B_UNAVAILABLE_TAG),
+            "error must carry the UI sentinel so the app offers retry-or-offline, not a dead-end: {msg}"
+        );
+        assert!(
+            msg.contains("offline model"),
+            "error must name the offline-model choice the owner can deliberately pick: {msg}"
+        );
         assert!(msg.contains("silently downgrade"), "error must state the no-downgrade contract: {msg}");
     }
 

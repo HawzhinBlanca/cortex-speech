@@ -33,6 +33,7 @@ fn make_seg(id: &str, path: &str, text: &str) -> SpeechSegment {
         corrected_at: None,
         is_gold: false,
         alignment_quality: None,
+        ..SpeechSegment::default()
     }
 }
 

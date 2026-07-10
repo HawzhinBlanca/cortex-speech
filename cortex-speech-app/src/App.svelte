@@ -32,6 +32,7 @@
   import { notifications } from './lib/stores/notificationStore';
   import { historyStore } from './lib/stores/historyStore';
   import { initKeyboardManager, globalKeyboardManager, modKeyLabel } from './lib/keyboard';
+  import { focusTrap } from './lib/actions/focusTrap';
   // Platform-aware modifier label (Ctrl on Windows, ⌘ on Mac) for the hardcoded kbd hints.
   const modKey = modKeyLabel();
   import {
@@ -405,6 +406,17 @@
           $t('notifications.snapshotFailing', { count: String(h.snapshot_consecutive_failures) }),
         );
       }
+      // Staleness (true-10 audit): the failure counter only sees Err — a wedged/restarting backup
+      // that never errors, or a dead loop thread, showed nothing. last_success aging past 3
+      // intervals (30 min) on a non-empty library is the honest stall signal.
+      const lastOk = h.snapshot_last_success_epoch_secs;
+      if (lastOk != null && Date.now() / 1000 - lastOk > 3 * 600 && ($segmentStats?.total ?? 0) > 0) {
+        notifications.error(
+          $t('notifications.snapshotStale', {
+            minutes: String(Math.round((Date.now() / 1000 - lastOk) / 60)),
+          }),
+        );
+      }
       if (h.free_disk_bytes != null && h.free_disk_bytes < 2 * GiB) {
         notifications.error($t('notifications.lowDisk', { gb: (h.free_disk_bytes / GiB).toFixed(1) }));
       }
@@ -419,6 +431,13 @@
   onMount(async () => {
     tauriAvailable = isTauriRuntime();
     const km = initKeyboardManager();
+    // True-10 audit BLOCKER fix: while a review surface owns the keyboard (Review & Correct mode or
+    // the Review Inbox overlay), every global shortcut acts on the HIDDEN curate selection —
+    // Ctrl+Enter/Ctrl+D silently verified an invisible segment with no human decision (export-
+    // eligible gold nobody reviewed), Ctrl+T machine-overwrote it, Delete opened a confirm dialog
+    // UNDER the inbox. The manager suppresses all non-allowInReview shortcuts whenever this probe is
+    // true; probing at dispatch time keeps it correct for future shortcuts too.
+    km.setReviewSurfaceProbe(() => viewMode === 'review' || $showReviewInbox);
     registerShortcuts(km);
     setImportCompleteHandler(async (payload) => {
       try {
@@ -607,7 +626,16 @@
         action: handleSaveAnnotation,
         category: 'edit',
       },
-      { key: 'z', ctrl: true, description: 'Undo', action: () => handleUndo(), category: 'edit' },
+      {
+        key: 'z',
+        ctrl: true,
+        description: 'Undo',
+        action: () => handleUndo(),
+        category: 'edit',
+        // handleUndo self-guards on the review surfaces with a helpful "use Backspace here" notice —
+        // let it through so the reviewer learns the paired-undo model instead of silence.
+        allowInReview: true,
+      },
       {
         key: 'z',
         ctrl: true,
@@ -615,6 +643,7 @@
         description: 'Redo',
         action: () => handleRedo(),
         category: 'edit',
+        allowInReview: true, // handleRedo self-guards on review surfaces (no-op there)
       },
       {
         key: 'd',
@@ -743,6 +772,9 @@
         action: () => (showCommandPalette = true),
         category: 'general',
         allowInEditable: true,
+        // The palette renders above both review surfaces and its commands re-check their own
+        // preconditions — the one global that is genuinely review-safe.
+        allowInReview: true,
       },
     ];
     km.registerAll(shortcuts);
@@ -950,6 +982,21 @@
     }
   }
 
+  // When the OmniASR-7B champion is unavailable or fails (its WSL server is down), the app NEVER
+  // silently drops to a smaller model. It surfaces a choice: retry the champion once its server is
+  // up, or transcribe this one clip with the offline model. The dialog names both engines so the
+  // owner always knows which produced the text.
+  function promptChampionFallback(retryChampion: () => void, useOffline: () => void) {
+    showConfirmDialog.set({
+      title: $t('asr.championUnavailableTitle'),
+      message: $t('asr.championUnavailableMessage'),
+      confirmLabel: $t('asr.tryAgain'),
+      danger: false,
+      onConfirm: retryChampion,
+      secondary: { label: $t('asr.useOfflineModel'), onClick: useOffline },
+    });
+  }
+
   async function handleTranscribe() {
     const seg = $selectedSegment;
     if (!seg || $isProcessing) return;
@@ -996,7 +1043,13 @@
       if (autosave.pendingId() === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
-      notifyActionableError(e, $t('errors.transcriptionFailed'));
+      // The champion (7B) is the primary engine. If it's down, offer retry-or-offline instead of a
+      // dead-end error — the app never silently substitutes a smaller model on this path.
+      if (api.is7bUnavailableError(e)) {
+        promptChampionFallback(handleTranscribe, handleTranscribeFinetuned);
+      } else {
+        notifyActionableError(e, $t('errors.transcriptionFailed'));
+      }
     } finally {
       isProcessing.set(false);
       pipelinePhase.set('idle');
@@ -1698,14 +1751,36 @@
           .replace('{files}', String(quarantineNotice.quarantinedFiles.length))
           .replace('{snapshots}', String(quarantineNotice.snapshotCount))}
       </span>
-      <button
-        type="button"
-        class="btn btn-ghost !text-xs"
-        data-testid="dismiss-quarantine-btn"
-        onclick={() => (quarantineNotice = null)}
-      >
-        {$t('db.quarantineDismiss')}
-      </button>
+      <div class="flex items-center gap-2">
+        <!-- Acknowledge & archive (true-10 audit): the pin had no in-app release — pruning stayed
+             refused forever while snapshots accumulated a full DB copy every 10 minutes. Archiving
+             the *.corrupt.* files into <data_dir>/quarantine/ releases the pin, keeps the bytes
+             salvageable, and is the honest exit from the quarantine state. -->
+        <button
+          type="button"
+          class="btn btn-secondary !text-xs"
+          data-testid="acknowledge-quarantine-btn"
+          onclick={async () => {
+            try {
+              const moved = await api.acknowledgeQuarantine();
+              notifications.success($t('db.quarantineAcknowledged', { count: String(moved) }));
+              quarantineNotice = null;
+            } catch (e) {
+              notifications.error($t('db.quarantineAcknowledgeFailed'), { detail: String(e) });
+            }
+          }}
+        >
+          {$t('db.quarantineAcknowledge')}
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost !text-xs"
+          data-testid="dismiss-quarantine-btn"
+          onclick={() => (quarantineNotice = null)}
+        >
+          {$t('db.quarantineDismiss')}
+        </button>
+      </div>
     </div>
   {/if}
   {#if interruptedImport}
@@ -3096,7 +3171,9 @@
 {/if}
 
 {#if $showReviewInbox}
-  <div class="fixed inset-0 z-[100] flex items-stretch justify-center p-6 glass">
+  <!-- use:focusTrap (true-10 audit): the inbox was the ONLY overlay without one — Tab walked into
+       the invisible background app and Enter activated top-bar buttons sight-unseen. -->
+  <div class="fixed inset-0 z-[100] flex items-stretch justify-center p-6 glass" use:focusTrap>
     <ErrorBoundary>
       <ReviewInbox onClose={() => showReviewInbox.set(false)} />
     </ErrorBoundary>

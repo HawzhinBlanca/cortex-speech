@@ -639,6 +639,7 @@ mod tests {
             corrected_at: None,
             is_gold: false,
             alignment_quality: None,
+            ..SpeechSegment::default()
         }
     }
 

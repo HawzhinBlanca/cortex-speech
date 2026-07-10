@@ -6,6 +6,12 @@
 Turn Cortex Speech into a genuine 10/10 best-in-class tool: a fully-offline, git-versioned, signed, auto-updating Central Kurdish (Sorani) speech-transcription and dataset-curation desktop app whose every public claim is independently reproducible by a stranger AND legally + ethically redistributable. Accuracy, ethics, and verifiability must all be GATED in CI, never merely asserted. The project's entire credibility rests on REAL, never fabricated, accuracy numbers — honesty is the non-negotiable foundation. The full charter is saved at the repository root (`AGENT_CHARTER.md`) and is reloaded at the start of every iteration.
 
 ## Definition of Done (the objective 10/10 gate)
+
+> **Owner amendment (2026-07-10) — what "ship" means:** Ship = the OWNER'S PERSONAL USE on his
+> own machine: a truly reliable, bug-free daily tool. Distribution legs (signed installer,
+> winget/Homebrew/Flathub, auto-updater hosting, HF publishing, macOS) are DESCOPED by owner
+> decision and do not block ship. Nothing else is waived — every honesty, privacy, reliability,
+> accuracy, and correctness gate remains mandatory and unweakened.
 - DONE means: on a clean checkout of main, a single command `make verify-10` exits 0 and prints `CORTEX 10/10: ALL GATES GREEN`. Until that command exists and passes, the agent is NOT done; partial completion (e.g. 9/10) means keep going.
 - Git + integrity: repo under git on protected main with a signed tag; tauri.conf.json/package.json/src-tauri/Cargo.toml versions byte-equal the canonical CHANGELOG version (2.1.0, currently 2.0.0 in manifests); declared SPDX byte-equals LICENSE+NOTICE (Apache-2.0, currently MIT in Cargo.toml); Cargo.toml repository URL is the real remote (currently placeholder github.com/cortex/kurdish-speech).
 - Sorani-aware metrics: wer::normalize_for_metrics routes through SoraniNormalizer + Unicode NFC identically for ref and hyp (today wer.rs:20 only lowercases/collapses whitespace); golden tests prove Kaf/Yeh/ZWNJ-equivalent strings score 0 WER; compute_wer/compute_cer match jiwer on a fixed fixture; micro AND macro WER emitted; bootstrap CI + MAPSSWE match a reference implementation.

@@ -139,6 +139,13 @@ export const en: Record<string, string> = {
   'review.retranscribing': 'Re-transcribing…',
   'review.retranscribed': 'Re-transcribed.',
   'review.retranscribeFailed': 'Re-transcription failed',
+  // The OmniASR-7B champion is the only engine that produces a transcript by default. When it is
+  // down, the app asks the owner instead of silently using a smaller model.
+  'asr.championUnavailableTitle': 'OmniASR-7B champion unavailable',
+  'asr.championUnavailableMessage':
+    "The OmniASR-7B champion (the best model) isn't responding — its server may be down. Start it and try again, or transcribe this one clip with the offline model. The app never silently uses a smaller model in its place.",
+  'asr.tryAgain': 'Try 7B again',
+  'asr.useOfflineModel': 'Use offline model',
   'review.markBad': 'Mark bad',
   'review.markBadTitle': 'Flag this clip as bad — excluded from export, kept so you can re-transcribe later.',
   'review.markedBad': 'Marked bad — excluded from export. Backspace to undo.',
@@ -444,6 +451,8 @@ export const en: Record<string, string> = {
   'stats.intelTitle': 'Intelligence evidence',
   'stats.loop0OverTriggers': 'LOOP-0 over-triggers — must be 0 to enable firing',
   'stats.loop0WouldFire': 'would fire',
+  'stats.noEvidenceYet': 'no evidence yet',
+  'stats.conformalProgress': 'Auto-accept calibration progress - needs ~{n} perfect verified clips per bucket at the 5% CER gate',
   'stats.c4Precision': 'Auto-accept precision vs human review',
   'stats.tools': 'Dataset & model tools',
   'stats.exportFinetunePack': 'Export fine-tune pack',
@@ -457,6 +466,7 @@ export const en: Record<string, string> = {
   'stats.importGoldDone': '{n} verified source file(s) imported as gold.',
   'stats.backupDb': 'Backup to folder…',
   'stats.backupDone': 'Library backed up to {path}',
+  'stats.backupVerified': 'verified ({count} segments)',
   'stats.restoreFile': 'Restore from backup file…',
   'stats.restoreFileConfirm':
     'Replace the CURRENT library with the selected backup file? Everything not in that backup will be lost. The app reloads after the restore.',
@@ -471,6 +481,10 @@ export const en: Record<string, string> = {
   'db.quarantined':
     'Your library was quarantined after database corruption ({files} file(s) saved aside). {snapshots} auto-snapshot(s) are available — open Stats → Restore from snapshot.',
   'db.quarantineDismiss': 'Dismiss',
+  'db.quarantineAcknowledge': 'Acknowledge & archive',
+  'db.quarantineAcknowledged':
+    '{count} quarantined file(s) archived to the quarantine folder - snapshot pruning resumed',
+  'db.quarantineAcknowledgeFailed': 'Could not archive the quarantined files',
   'stats.verifyModel': 'Verify model integrity',
   'stats.verifyModelOk': 'Model integrity verified — checksums match.',
   'stats.verifyModelFailed': 'Model integrity check failed',
@@ -531,6 +545,8 @@ export const en: Record<string, string> = {
   'notifications.undoInReview': 'Press Backspace to undo the last review decision',
   'notifications.snapshotFailing':
     'Auto-backup has failed {count} times in a row — your library is not being snapshotted. Check free disk space and the logs folder.',
+  'notifications.snapshotStale':
+    'Auto-snapshots have not succeeded for {minutes} minutes - the safety net may be stalled; check free disk space and the log',
   'notifications.lowDisk': 'Low disk space: {gb} GB free. Snapshots, exports, and the database can start failing.',
   'notifications.missingModels': 'Missing required model(s): {models}.',
   'notifications.previousCrash': 'The previous session crashed: {summary}. Full details are in the logs folder.',

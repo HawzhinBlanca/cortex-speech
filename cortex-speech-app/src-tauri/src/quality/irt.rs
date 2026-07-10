@@ -39,6 +39,16 @@ fn get_initial_ability(model_id: &str) -> f64 {
         2.0
     } else if lower.contains("7b") {
         1.5
+    } else if lower.contains("finetuned") || lower.contains("mms") {
+        // The owner's fine-tuned MMS-CTC voter ("finetuned-mms-ckb", measured 21.00% CER
+        // [19.93, 22.04] N=900 vs stock CTC-1B ~29.4% — docs/EVAL.md): the strongest INDEPENDENT
+        // local voter, added (5529ccd) precisely to break the correlated stock 300M/1B kin pair.
+        // Without this branch it fell to the `else` arm (0.0 → weight 1.0) and was outvoted by the
+        // kin pair (1.41 + 0.71) on every disagreement — the exact failure the weighting exists to
+        // prevent (true-10 audit 2026-07-09). Above stock 1B, below the 7B champion and the cloud
+        // judge, per the measured CER ordering. Checked BEFORE "1b" so a fine-tuned id that ever
+        // embeds a size suffix can't be misfiled as stock.
+        1.0
     } else if lower.contains("1b") {
         0.5
     } else if lower.contains("300m") {
@@ -459,6 +469,28 @@ pub fn segment_consensus_words(hypotheses: &[SegmentHypothesis]) -> Vec<Consensu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ability_ordering_pins_the_measured_cer_ranking() {
+        // The prior must follow the MEASURED quality ordering (docs/EVAL.md): 7B champion, then the
+        // fine-tuned MMS (21.0% CER), then stock CTC-1B (~29.4%), then stock 300M. Regression gate
+        // for the true-10 audit finding where "finetuned-mms-ckb" matched no branch (ability 0.0)
+        // and the correlated stock kin pair outvoted the measured-best local engine on every
+        // disagreement.
+        let seventy_b = get_initial_ability("omniasr-wsl-7b");
+        let finetuned = get_initial_ability("finetuned-mms-ckb");
+        let one_b = get_initial_ability("omniasr-ctc-1b");
+        let three_hundred_m = get_initial_ability("omniasr-ctc-300m");
+        assert!(seventy_b > finetuned, "7B champion must outrank the fine-tuned voter");
+        assert!(finetuned > one_b, "fine-tuned MMS (21.0% CER) must outrank stock 1B (~29.4%)");
+        assert!(one_b > three_hundred_m, "stock 1B must outrank stock 300M");
+        // The kin pair together must NOT outvote the fine-tuned voter + the 300M's own weight is
+        // irrelevant to that inequality — pin the exact failure mode: weight(finetuned) must exceed
+        // weight(1b), the stronger kin, so a finetuned+7B agreement beats any stock pair.
+        assert!(finetuned.exp2() > one_b.exp2());
+        // And the cloud judge stays on top of local engines.
+        assert!(get_initial_ability("gemini-2.5-pro") > seventy_b);
+    }
 
     fn slot(candidates: &[&str], posteriors: &[f64]) -> Slot {
         Slot {
