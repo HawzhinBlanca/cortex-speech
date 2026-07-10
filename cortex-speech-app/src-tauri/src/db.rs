@@ -2429,6 +2429,40 @@ mod tests {
     }
 
     #[test]
+    fn v35_repairs_divergent_segments_fts_so_segment_writes_succeed() {
+        // Regression (real-app import failure, 2026-07-10): a 4-column segments_fts (missing audio_path)
+        // left by a mis-ordered init, while the segments_ai/ad/au triggers reference audio_path, makes
+        // EVERY segment INSERT fail ("table segments_fts has no column named audio_path"). The import
+        // transaction then rolls back and VAD "produces 0 segments" — the app cannot ingest any audio.
+        // v35 rebuilds the FTS shadow table to the authoritative 6-column shape.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        // Reproduce the broken divergent state: drop the correct FTS table and recreate migration v1's
+        // 4-column copy under the (audio_path-referencing) triggers that initialize() created.
+        db.connection()
+            .execute_batch(
+                "DROP TABLE IF EXISTS segments_fts;
+                 CREATE VIRTUAL TABLE segments_fts USING fts5(
+                     id, raw_transcript, normalized_transcript, annotated_transcript,
+                     content='speech_segments', content_rowid='rowid');",
+            )
+            .unwrap();
+        assert!(
+            db.insert_segment(&make_segment("broken", "/a.wav")).is_err(),
+            "a 4-column segments_fts under audio_path triggers must reject segment inserts (the real bug)"
+        );
+
+        // Re-apply the repair migration (rewind past v35 so run_migrations re-runs it).
+        db.connection().execute("DELETE FROM schema_migrations WHERE version >= 35", []).unwrap();
+        crate::migrations::run_migrations(&db).unwrap();
+
+        // After v35, the write the import path depends on succeeds again.
+        db.insert_segment(&make_segment("fixed", "/b.wav"))
+            .expect("segment INSERT must succeed after v35 rebuilds segments_fts with audio_path");
+    }
+
+    #[test]
     fn search_does_not_match_the_audio_path_column() {
         // Round-23 #7: a token that appears ONLY in the file path must NOT return the segment — search
         // is over transcript content, not folder/file names.

@@ -697,6 +697,26 @@ pub static MIGRATIONS: &[Migration] = &[
                  INSERT OR IGNORE INTO c4_evidence_archive (id) VALUES (1);",
         down_sql: Some("DROP TABLE IF EXISTS c4_evidence_archive;"),
     },
+    Migration {
+        version: 35,
+        description: "Repair segments_fts: rebuild with the audio_path column so segment writes succeed",
+        // A divergence between the AUTHORITATIVE segments_fts schema (db.rs initialize(): 6 columns incl.
+        // audio_path) and migration v1's copy (001_initial.sql: 4 columns, NO audio_path) can leave a DB
+        // with a 4-column segments_fts while the segments_ai/ad/au triggers reference audio_path. Result:
+        // EVERY segment INSERT fails with "table segments_fts has no column named audio_path", the import
+        // transaction rolls back, and VAD "produces 0 segments" — the app cannot ingest ANY audio. FTS5 has
+        // no ALTER ADD COLUMN, so rebuild the shadow table to the authoritative 6-column shape and
+        // repopulate from its external-content table. Idempotent: on an already-correct DB this
+        // drops+recreates an identical table. The triggers resolve segments_fts by name at fire time, so
+        // recreating it under them is safe.
+        up_sql: "DROP TABLE IF EXISTS segments_fts;
+                 CREATE VIRTUAL TABLE segments_fts USING fts5(
+                     id UNINDEXED, audio_path, raw_transcript, normalized_transcript, annotated_transcript,
+                     content=speech_segments, content_rowid=rowid, tokenize='unicode61'
+                 );
+                 INSERT INTO segments_fts(segments_fts) VALUES('rebuild');",
+        down_sql: Some("DROP TABLE IF EXISTS segments_fts;"),
+    },
 ];
 
 #[cfg(test)]
