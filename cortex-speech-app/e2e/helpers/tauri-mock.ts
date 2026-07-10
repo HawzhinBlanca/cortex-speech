@@ -112,6 +112,19 @@ export async function installTauriMock(page: Page): Promise<void> {
         switch (cmd) {
           case 'get_segments_page':
             return { items: [mockSegment], total: 1, nextCursor: null };
+          case 'app_health':
+            // Healthy report matching the real app_health contract, so the health loop's
+            // real code path runs in e2e instead of dereferencing the default null.
+            return {
+              db_ok: true,
+              db_size_bytes: 1024,
+              memory_mb: 100,
+              missing_models: [],
+              missing_optional_models: [],
+              snapshot_last_success_epoch_secs: Math.floor(Date.now() / 1000),
+              snapshot_consecutive_failures: 0,
+              free_disk_bytes: 100 * 1024 ** 3,
+            };
           case 'get_segments':
             return [mockSegment];
           case 'get_settings':

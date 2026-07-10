@@ -7,6 +7,12 @@ const WCAG_AA = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
 
 async function violations(page: Page) {
   const results = await new AxeBuilder({ page }).withTags(WCAG_AA).analyze();
+  // On failure, print the offending nodes so the violation is diagnosable from the log alone.
+  for (const v of results.violations) {
+    for (const n of v.nodes) {
+      console.log(`[axe] ${v.id}: ${n.target.join(' ')} — ${n.failureSummary?.split('\n')[1] ?? ''}`);
+    }
+  }
   // Map to id + node count so a failure prints WHICH rules broke and where.
   return results.violations.map((v) => `${v.id} x${v.nodes.length}`);
 }

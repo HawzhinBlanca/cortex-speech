@@ -400,6 +400,7 @@
   async function checkHealthAndWarn() {
     try {
       const h = await api.appHealth();
+      if (!h) return; // defensive: a null health report must never crash the health loop
       const GiB = 1024 ** 3;
       if ((h.snapshot_consecutive_failures ?? 0) >= 3) {
         notifications.error(

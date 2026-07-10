@@ -25,6 +25,8 @@ test.describe('Dataset validation panel', () => {
       if (!internals) return;
       const invoke = internals.invoke.bind(internals);
       internals.invoke = async (cmd: string) => {
+        // The store loads via the paged command now; keep the legacy override too.
+        if (cmd === 'get_segments_page') return { items: [], total: 0, nextCursor: null };
         if (cmd === 'get_segments') return [];
         return invoke(cmd);
       };
