@@ -2171,3 +2171,19 @@ base .pt sha256 1b29a40..., LoRA adapter c348ade..., tokenizer 8aa11a1... Also s
 docs/SHIP_FINAL_PLAN.md — 10-agent evidence-cited audit of everything left for full-charter 10/10
 (58 items: 36 automatable in 7 workstreams, 22 owner-gated with the Gold Marathon as THE bottleneck).
 Next per WS1: SeamlessM4T-v2 baseline + MAPSSWE on this same frozen set.
+
+## SeamlessM4T-v2 baseline MEASURED + MAPSSWE: charter comparison gate MET (2026-07-10)
+
+The charter-required external baseline (line 13/48; stock Whisper explicitly invalid for ckb) is now
+measured on the SAME frozen FLEURS ckb_IQ test set (N=922, identical normalization):
+- **SeamlessM4T-v2: micro CER 12.71% [12.02, 13.44], WER 42.38% [41.17, 43.59]** (fp32 CPU, 10.9 s/clip)
+- Command: python scripts/scorecard_seamless.py <manifest> <out.tsv> 2000 (new script, committed)
+- MAPSSWE matched-pairs (new scripts/mapsswe_compare.py, per-clip TSVs paired 1:1):
+  champion vs SeamlessM4T-v2: word z=-16.10 p=2.4e-58; char z=-24.41 p=1.3e-131 -> SIGNIFICANT
+  champion vs stock-300M:     word z=-28.59 p=1.0e-179; char z=-26.26 p=5.8e-152 -> SIGNIFICANT
+- **Charter gate MET on this set: MAPSSWE p<0.05 AND champion ci_high < baseline ci_low on BOTH
+  metrics (CER 7.55 < 12.02; WER 33.98 < 41.17).** Pinned verbatim in docs/MEASUREMENTS.md.
+Full same-set ladder now: champion 7.03% > MMS-1B 9.32% > stock 11.34% > SeamlessM4T-v2 12.71% CER.
+Honest caveats unchanged: read speech (FLEURS), strict space-kept digit-counting basis, conversational
+number still requires the owner marathon (SHIP_FINAL_PLAN #37/#41). WS1 statistical core is CLOSED;
+remaining WS1 tail: AsoSoft-600 leg + fine-tuned CI leg. Next: WS2 (verify-10 full-charter aggregator).

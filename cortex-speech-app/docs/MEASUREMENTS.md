@@ -69,6 +69,28 @@ than silently downgrading when it is down (verified 2026-07-10). Fallback order 
 path: fine-tuned MMS-1B (9.32%) over stock CTC-300M (11.34%) — matching the shipped juror-ability
 ordering (7B > finetuned > 1b > 300m).
 
+### SeamlessM4T-v2 external baseline + MAPSSWE significance (added same day)
+
+4. **SeamlessM4T-v2** (the charter-required external baseline; stock Whisper is explicitly invalid
+   for ckb) — git SHA `ca16a38`, `facebook/seamless-m4t-v2-large` via transformers
+   `SeamlessM4Tv2ForSpeechToText`, `tgt_lang="ckb"`, fp32 CPU, same frozen manifest + normalization.
+   Command: `python scripts/scorecard_seamless.py <manifest> <out.tsv> 2000`
+   Verbatim: `SeamlessM4T-v2 micro CER = 12.71%   95% CI [12.02%, 13.44%]   N=922` ·
+   `micro WER = 42.38%   95% CI [41.17%, 43.59%]   N=922` · `(10.88 s/clip; 10030s total)`
+
+**MAPSSWE matched-pairs significance** (`python scripts/mapsswe_compare.py <A.tsv> <B.tsv>`,
+verbatim output; per-clip TSVs pair 1:1 in manifest order, N=922):
+
+```
+MAPSSWE word: champion7b 32.93% vs seamlessv2 42.38%  mean diff/seg = -1.793  z = -16.10  p = 2.415e-58   -> champion7b better  (SIGNIFICANT p<0.05)
+MAPSSWE char: champion7b  7.03% vs seamlessv2 12.71%  mean diff/seg = -6.999  z = -24.41  p = 1.301e-131  -> champion7b better  (SIGNIFICANT p<0.05)
+MAPSSWE word: champion7b 32.93% vs stock300m  50.01%  mean diff/seg = -3.241  z = -28.59  p = 1.025e-179  -> champion7b better  (SIGNIFICANT p<0.05)
+MAPSSWE char: champion7b  7.03% vs stock300m  11.34%  mean diff/seg = -5.312  z = -26.26  p = 5.849e-152  -> champion7b better  (SIGNIFICANT p<0.05)
+```
+
+**Charter comparison gate (line 13/48) — MET on this set:** MAPSSWE p<0.05 ✓ AND champion ci_high <
+baseline ci_low on both metrics (CER 7.55% < 12.02% ✓; WER 33.98% < 41.17% ✓) vs SeamlessM4T-v2.
+
 ### Honest caveats
 - The CV22-ckb champion number (5.04% CER, 2026-07-09) predates this record and keeps its
   unverified-disjointness caveat; **7.03% on FLEURS is the honest headline** until disjointness on
