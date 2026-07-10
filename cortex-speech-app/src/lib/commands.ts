@@ -254,6 +254,21 @@ export async function exportTranscript(path: string, format: 'txt' | 'srt' | 'vt
   return invoke<void>('export_transcript', { path, format });
 }
 
+export interface EngineStatus {
+  ready: boolean;
+  port: number;
+}
+
+/** Health of the champion (OmniASR-7B) warm server, for the engine-status pill. */
+export async function getChampionEngineStatus(): Promise<EngineStatus> {
+  return invoke<EngineStatus>('get_champion_engine_status');
+}
+
+/** Start the champion 7B server (WSL) from the app; returns immediately, then poll status. */
+export async function startChampionEngine(): Promise<void> {
+  return invoke<void>('start_champion_engine');
+}
+
 export interface AgentSourceReferenceSummary {
   audioPath: string;
   modelId: string;

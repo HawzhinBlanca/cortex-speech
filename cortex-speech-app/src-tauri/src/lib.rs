@@ -567,6 +567,8 @@ pub fn run() {
             commands::merge_dataset_json,
             commands::export_dataset,
             commands::export_transcript,
+            commands::get_champion_engine_status,
+            commands::start_champion_engine,
             commands::export_dataset_bundle,
             commands::export_huggingface_dataset,
             commands::list_agent_import_reports,

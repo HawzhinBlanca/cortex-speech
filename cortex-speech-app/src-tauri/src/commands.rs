@@ -1642,6 +1642,52 @@ pub fn export_transcript(path: String, format: String, state: State<'_, AppState
     crate::transcript_export::export_transcript(&db, Path::new(&validated_path), fmt).map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineStatus {
+    /// The champion (OmniASR-7B) warm server is answering on its WSL loopback port.
+    pub ready: bool,
+    pub port: u16,
+}
+
+/// Bounded (~5s) health check of the champion 7B engine, for the UI status pill. Cheap + side-effect
+/// free (a TCP probe), so the frontend can poll it.
+#[tauri::command]
+pub fn get_champion_engine_status() -> EngineStatus {
+    EngineStatus { ready: crate::pipeline::probe_wsl_7b_server(3), port: crate::pipeline::WSL_7B_SERVER_PORT }
+}
+
+/// Start the champion 7B server (WSL) FROM THE APP so the owner never hand-runs a terminal. Spawns
+/// the committed start script DETACHED and returns immediately; the UI then polls
+/// get_champion_engine_status until ready (warm-up loads ~30 GB, 1-5 min). The script path comes from
+/// CORTEX_7B_START_SCRIPT (the desktop launcher sets it); without it we return an actionable error
+/// rather than guess a path.
+#[tauri::command]
+pub fn start_champion_engine() -> Result<(), String> {
+    STRICT_RATE_LIMITER.check("start_champion_engine")?;
+    let script = std::env::var("CORTEX_7B_START_SCRIPT").map_err(|_| {
+        "Set CORTEX_7B_START_SCRIPT to the full path of scripts/start_7b_server.ps1 (the desktop \
+         launcher sets it), or run that script once from a terminal."
+            .to_string()
+    })?;
+    if !Path::new(&script).is_file() {
+        return Err(format!("CORTEX_7B_START_SCRIPT does not point at a file: {script}"));
+    }
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.arg("-NoProfile").arg("-ExecutionPolicy").arg("Bypass").arg("-File").arg(&script);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    // Detach: the start script waits up to 8 min for warm-up; do NOT block the command on it.
+    cmd.spawn().map(|_child| ()).map_err(|e| format!("could not launch the engine start script: {e}"))
+}
+
 #[tauri::command]
 pub fn export_dataset_bundle(
     path: String,

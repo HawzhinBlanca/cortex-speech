@@ -265,6 +265,43 @@ pub(crate) fn tag_7b_unavailable(err: AppError) -> AppError {
     AppError::Validation(format!("{ASR_7B_UNAVAILABLE_TAG}: {msg}"))
 }
 
+/// Lean, side-effect-free health probe of the OmniASR-7B warm server: TCP-connect 127.0.0.1:PORT
+/// inside WSL's network namespace (the loopback port is NOT reachable from Windows). Returns a bare
+/// bool for the engine-status surface — unlike `wsl_7b_server_preflight`, which fails hard with a
+/// user-facing message on the import path. `timeout_secs` bounds both the in-WSL probe and the child.
+pub(crate) fn probe_wsl_7b_server(timeout_secs: u64) -> bool {
+    let probe = format!("timeout {timeout_secs} bash -c 'exec 3<>/dev/tcp/127.0.0.1/{WSL_7B_SERVER_PORT}'");
+    let mut cmd = std::process::Command::new("wsl");
+    cmd.arg("bash").arg("-lc").arg(&probe);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return false; // no WSL / launch failure → engine is not reachable
+    };
+    // Bound the wait a hair past the in-WSL timeout so a wedged WSL can't hang the status poll.
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs + 2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    kill_and_reap_wsl_child(&mut child, "engine-status probe");
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 /// Translate a Windows path to its WSL `/mnt` view (mirrors `cortex_7b_client.py`'s `win_to_wsl`), so
 /// the app can hand the client a `CORTEX_7B_DB` that follows a moved data dir instead of the client's
 /// hardcoded default. `C:\a\b` -> `/mnt/c/a/b`; a `\\?\` extended-length prefix is stripped; a

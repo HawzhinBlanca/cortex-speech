@@ -62,6 +62,7 @@
   import { PARQUET_EXPORT_SUPPORTED } from './lib/appFeatures';
   import { isTauriRuntime } from './lib/runtime';
   import AudioPlayer from './lib/AudioPlayer.svelte';
+  import EngineStatusPill from './lib/EngineStatusPill.svelte';
   import Waveform from './lib/Waveform.svelte';
   import ErrorBoundary from './lib/ErrorBoundary.svelte';
   import Toast from './lib/Toast.svelte';
@@ -1906,6 +1907,9 @@
         class="text-[10px] text-cortex-500 bg-cortex-900 px-2 py-0.5 rounded-full border border-cortex-800/50"
         >v2.0</span
       >
+      {#if tauriAvailable}
+        <EngineStatusPill />
+      {/if}
       {#if $isProcessing}
         <span class="flex items-center gap-1 text-xs text-cortex-400">
           <svg class="animate-spin w-3 h-3" fill="none" viewBox="0 0 24 24"
