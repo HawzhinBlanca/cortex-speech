@@ -1429,6 +1429,34 @@
     }
   }
 
+  async function handleExportTranscript() {
+    if ($isProcessing || $segmentStats.total === 0) return;
+    if (!requireDesktopRuntime()) return;
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const path = await save({
+        filters: [
+          { name: 'SubRip subtitles', extensions: ['srt'] },
+          { name: 'WebVTT subtitles', extensions: ['vtt'] },
+          { name: 'Plain text', extensions: ['txt'] },
+        ],
+        defaultPath: 'cortex-transcript.srt',
+      });
+      if (path) {
+        const lower = path.toLowerCase();
+        const format: 'txt' | 'srt' | 'vtt' = lower.endsWith('.vtt')
+          ? 'vtt'
+          : lower.endsWith('.txt')
+            ? 'txt'
+            : 'srt';
+        await api.exportTranscript(path, format);
+        notifications.success($t('exportTranscript.success'), { detail: path });
+      }
+    } catch (e) {
+      notifications.error($t('exportTranscript.failed'), { detail: String(e) });
+    }
+  }
+
   async function handleExportHuggingface() {
     if ($isProcessing || $segmentStats.total === 0) return;
     if (!requireDesktopRuntime()) return;
@@ -2014,6 +2042,24 @@
           /></svg
         >
         {$t('export')}
+      </button>
+      <button
+        data-testid="export-transcript-btn"
+        class="btn btn-secondary !text-xs"
+        onclick={handleExportTranscript}
+        disabled={!tauriAvailable || $isProcessing || $segmentStats.total === 0}
+        title={!tauriAvailable ? $t('desktopRuntimeRequired') : $t('exportTranscript.title')}
+        aria-label={$t('exportTranscript')}
+      >
+        <svg class="w-3.5 h-3.5 inline me-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+          ><path
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+          /></svg
+        >
+        {$t('exportTranscript')}
       </button>
       <button
         data-testid="hf-export-btn"

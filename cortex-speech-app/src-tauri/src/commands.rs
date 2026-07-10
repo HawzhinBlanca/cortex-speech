@@ -1631,6 +1631,17 @@ pub fn export_dataset(path: String, format: String, state: State<'_, AppState>) 
     crate::export::export_dataset(&db, Path::new(&validated_path), &fmt).map_err(|e| e.to_string())
 }
 
+/// Export a plain, human-facing transcript / subtitle file (txt | srt | vtt) from the library —
+/// distinct from the ML dataset export. Path is validated the same way; unknown formats fall to txt.
+#[tauri::command]
+pub fn export_transcript(path: String, format: String, state: State<'_, AppState>) -> Result<(), String> {
+    STRICT_RATE_LIMITER.check("export_transcript")?;
+    let validated_path = validate::validate_output_path(&path)?;
+    let fmt = crate::transcript_export::TranscriptFormat::from_str_lossy(&format);
+    let db = state.lock_db();
+    crate::transcript_export::export_transcript(&db, Path::new(&validated_path), fmt).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn export_dataset_bundle(
     path: String,

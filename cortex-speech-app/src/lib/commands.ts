@@ -249,6 +249,11 @@ export async function exportDataset(path: string, format: string): Promise<void>
   return invoke<void>('export_dataset', { path, format });
 }
 
+/** Plain human transcript / subtitle export (format: 'txt' | 'srt' | 'vtt'). */
+export async function exportTranscript(path: string, format: 'txt' | 'srt' | 'vtt'): Promise<void> {
+  return invoke<void>('export_transcript', { path, format });
+}
+
 export interface AgentSourceReferenceSummary {
   audioPath: string;
   modelId: string;

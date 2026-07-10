@@ -1168,7 +1168,7 @@ fn export_records(segments: &[SpeechSegment]) -> Vec<ExportSegmentRecord> {
     segments.iter().map(ExportSegmentRecord::new).collect()
 }
 
-fn write_text_atomic(path: &std::path::Path, text: &str) -> AppResult<()> {
+pub(crate) fn write_text_atomic(path: &std::path::Path, text: &str) -> AppResult<()> {
     let tmp = path.with_extension(format!("{}.tmp", path.extension().and_then(|ext| ext.to_str()).unwrap_or("tmp")));
     remove_file_on_error(
         &tmp,

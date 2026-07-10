@@ -27,6 +27,7 @@ pub mod eval;
 pub mod export;
 pub mod export_audio;
 pub mod export_bundle;
+pub mod transcript_export;
 pub mod features;
 pub mod fingerprint;
 pub mod flock;
@@ -565,6 +566,7 @@ pub fn run() {
             commands::delete_segments_batch,
             commands::merge_dataset_json,
             commands::export_dataset,
+            commands::export_transcript,
             commands::export_dataset_bundle,
             commands::export_huggingface_dataset,
             commands::list_agent_import_reports,

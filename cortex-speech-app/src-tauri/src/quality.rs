@@ -363,7 +363,9 @@ fn non_empty(text: Option<&str>) -> Option<&str> {
     text.filter(|value| !value.trim().is_empty())
 }
 
-fn effective_transcript(seg: &SpeechSegment) -> &str {
+/// The best available human-facing transcript for a segment (verdict → annotated → jury verdict →
+/// normalized → raw ASR). Shared by training-grade logic and the plain transcript/subtitle export.
+pub fn effective_transcript(seg: &SpeechSegment) -> &str {
     training_transcript_with_source(seg).0
 }
 
