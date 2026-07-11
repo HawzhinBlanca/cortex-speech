@@ -453,7 +453,7 @@ GATES = [
     ("exe-freshness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_exe_freshness.py"}"', REPO_ROOT, _probe_exe, "Truth-in-advertising: exe compiled from HEAD"),
     ("real-app-e2e", 2, "cmd", f'node "{APP / "e2e_real_app.cjs"}"', APP, _probe_real_e2e, "THE daily-use reliability gate: real exe, real audio, real transcript"),
     # Tier 3 — deep proof legs (env-gated; skipped honestly when absent)
-    ("egress-runtime", 3, "not-built", "WS3b: socket-interception harness (static test_cloud_privacy_policy.py remains as belt-and-braces)", None, None, "Privacy: zero outbound sockets at runtime"),
+    ("egress-runtime", 3, "not-built", "WS3b: PARTIAL — `npm run test:egress` (scripts/egress_probe.cjs) runtime-proves ZERO external TCP from the backend PID on the default-offline STARTUP+browse path, with an in-run POSITIVE CONTROL that fails loud if the sampler is dead (no vacuous pass); the transcribe-path leg (cloud STT/LLM if consent leaked) + a kernel/ETW socket trace remain owner-gated. Static test_cloud_privacy_policy.py is belt-and-braces.", None, None, "Privacy: zero outbound sockets at runtime"),
     ("ignored-real-model", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored --skip live_transcribe_segments', REPO_ROOT, _probe_silero, "WS3a: the 37 #[ignore] real-model gates (cloud-key test excluded)"),
     ("fuzz-smoke", 3, "fn", _fn_fuzz_smoke, None, _probe_fuzz, "Engineering rigor: 5 fuzz targets, 0 crashes"),
     ("rtf-bench", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --test real_audio -- --ignored omniasr_rtf_on_committed_fleurs_ckb_fixture --nocapture', REPO_ROOT, _probe_rtf, "Latency: RTF on this rig (baseline-regression gate: WS4)"),
