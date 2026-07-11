@@ -2370,3 +2370,33 @@ responsiveness heartbeat gate.
 - Left untouched by owner's choice: untracked 1010PATH.md at root. No .bak/.tmp/.DS_Store cruft
   existed; .gitignore already covered node_modules/target/dist/db/logs/models/audio.
 - Gate: full python-policy suite green (gitignore + windows-repo-hygiene + real-data isolation).
+
+## P0 #2 START — main-thread safety: async migration groundwork + first commands (2026-07-11)
+
+Audit's top reliability priority: Tauri runs SYNC #[tauri::command]s on the main/UI thread, so a slow
+one freezes the window (the class that caused the Open/Import freeze). ~123 sync / 2 async at start.
+
+This increment lays the correct pattern + migrates the export family (understood well from the
+transcript-export work this session):
+- AppState.db: Mutex<Database> → Arc<Mutex<Database>> (contained: field + 2 constructors + a test;
+  lock_db() unchanged) + new db_arc() handle, so a slow command can clone the DB and move blocking
+  work into spawn_blocking WITHOUT borrowing State across an await.
+- run_blocking<T>(f) helper = tokio::task::spawn_blocking wrapper that also turns a task panic into a
+  clean error instead of aborting the process.
+- Converted export_dataset, export_transcript, export_huggingface_dataset to `pub async fn` +
+  run_blocking (DB guard taken INSIDE the task, never across the await). Frontend invoke() unchanged.
+- Gate (ratchet): scripts/test_command_main_thread_policy.py — asserts the migrated slow commands are
+  `pub async fn`, run_blocking exists + is used ≥3×, and each export offloads via state.db_arc(). The
+  list GROWS as migration proceeds; regressing a command to sync fails the gate.
+
+VERBATIM proof:
+  cargo check --lib                       -> Finished (6.6s)
+  cargo clippy --lib -- -D warnings       -> Finished, 0 warnings
+  cargo test --lib                        -> 842 passed; 0 failed; 6 ignored
+  python scripts/test_command_main_thread_policy.py -> command main-thread policy regression passed
+  npm run test:python-policies            -> Python policy regressions finished (green)
+
+STILL TODO on P0 #2 (next iterations): migrate the remaining slow sync commands (ASR/align/hash/
+backup/model-download/eval/jury/the other exports: dataset_bundle, audio, gold_eval, finetune) in
+batches, each added to the ratchet; then the RUNTIME heartbeat proof (drive the exe: a slow command
+running while get_settings stays responsive — needs the built exe / CDP harness).

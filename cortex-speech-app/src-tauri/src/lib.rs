@@ -102,7 +102,9 @@ pub enum BatchState {
 }
 
 pub struct AppState {
-    pub db: Mutex<Database>,
+    // Arc so a slow command can clone the handle and move DB work into `spawn_blocking` (off the
+    // main/UI thread) without borrowing `State` across an await. lock_db() still returns a guard.
+    pub db: Arc<Mutex<Database>>,
     pub pipeline: Mutex<ProcessingPipeline>,
     pub normalizer: Arc<SoraniNormalizer>,
     pub cache: Arc<TranscriptCache>,
@@ -209,6 +211,12 @@ impl AppState {
             tracing::warn!("Recovering poisoned database lock");
             poisoned.into_inner()
         })
+    }
+
+    /// A clonable handle to the DB, for moving blocking work into `spawn_blocking`. Lock it the same
+    /// poison-tolerant way `lock_db` does: `db.lock().unwrap_or_else(|p| p.into_inner())`.
+    pub(crate) fn db_arc(&self) -> Arc<Mutex<Database>> {
+        Arc::clone(&self.db)
     }
 
     pub fn session_save(&self) {
@@ -523,7 +531,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            db: Mutex::new(db),
+            db: Arc::new(Mutex::new(db)),
             pipeline: Mutex::new(pipeline),
             normalizer,
             cache,
@@ -799,7 +807,7 @@ mod tests {
         );
 
         AppState {
-            db: Mutex::new(Database::open(":memory:").unwrap()),
+            db: Arc::new(Mutex::new(Database::open(":memory:").unwrap())),
             pipeline: Mutex::new(pipeline),
             normalizer,
             cache,

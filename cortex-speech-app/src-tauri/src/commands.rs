@@ -76,6 +76,19 @@ fn kill_and_reap_child(child: &mut std::process::Child, context: &str) {
     }
 }
 
+/// Run blocking work (DB scans, serialization, hashing, file I/O) OFF the main/UI thread via a
+/// `spawn_blocking` pool, so a slow `#[tauri::command]` can't freeze the window (Tauri runs sync
+/// commands on the main thread — the same class that caused the Open/Import freeze). A panic in the
+/// task becomes a clean error instead of aborting the process. The closure must own everything it
+/// needs (clone `state.db_arc()` etc. BEFORE calling — never borrow `State` across the await).
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(|e| format!("background task failed: {e}"))?
+}
+
 /// Probe `wsl --status` with a bounded timeout. `wsl --status` is known to hang indefinitely when
 /// the WSL/LxssManager subsystem is wedged; a bare `.output()` would then block the import/jury path
 /// (and the check_* command handlers) forever. This mirrors the kill+reap hardening already on the
@@ -1618,7 +1631,7 @@ pub fn merge_dataset_json(json_content: String, state: State<'_, AppState>) -> R
 }
 
 #[tauri::command]
-pub fn export_dataset(path: String, format: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn export_dataset(path: String, format: String, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("export_dataset")?;
     let validated_path = validate::validate_output_path(&path)?;
     let fmt = match format.to_lowercase().as_str() {
@@ -1627,19 +1640,29 @@ pub fn export_dataset(path: String, format: String, state: State<'_, AppState>) 
         "parquet" => crate::settings::ExportFormat::Parquet,
         _ => crate::settings::ExportFormat::Json,
     };
-    let db = state.lock_db();
-    crate::export::export_dataset(&db, Path::new(&validated_path), &fmt).map_err(|e| e.to_string())
+    // Off the main thread: a full-library export (DB scan + serialize + hash + atomic write) would
+    // otherwise freeze the UI. The DB guard is taken INSIDE the blocking task, never across an await.
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::export::export_dataset(&db, Path::new(&validated_path), &fmt).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Export a plain, human-facing transcript / subtitle file (txt | srt | vtt) from the library —
 /// distinct from the ML dataset export. Path is validated the same way; unknown formats fall to txt.
 #[tauri::command]
-pub fn export_transcript(path: String, format: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn export_transcript(path: String, format: String, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("export_transcript")?;
     let validated_path = validate::validate_output_path(&path)?;
     let fmt = crate::transcript_export::TranscriptFormat::from_str_lossy(&format);
-    let db = state.lock_db();
-    crate::transcript_export::export_transcript(&db, Path::new(&validated_path), fmt).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::transcript_export::export_transcript(&db, Path::new(&validated_path), fmt).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -1713,12 +1736,16 @@ pub fn export_dataset_bundle(
 }
 
 #[tauri::command]
-pub fn export_huggingface_dataset(path: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn export_huggingface_dataset(path: String, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("export_huggingface_dataset")?;
     let validated_path = validate::validate_output_path(&path)?;
-    let db = state.lock_db();
     let settings = state.lock_settings().clone();
-    crate::export::export_huggingface_dataset(&db, Path::new(&validated_path), &settings).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::export::export_huggingface_dataset(&db, Path::new(&validated_path), &settings).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
