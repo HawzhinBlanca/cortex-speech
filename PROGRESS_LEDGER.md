@@ -2897,3 +2897,31 @@ path is an owner-machine check (exe needs rebuild); forward-migration LOGIC is u
 
 Remaining P0 #5 follow-ups: (b) pre-restore safety snapshot before the swap; (c) restore atomicity
 (copy-to-temp-then-swap). NEXT: (b) or (c), or pivot to P0 #4 verifiable-here glue / next 1010PATH.md item.
+
+NOTE (2026-07-11): P0 #5 (b) pre-restore safety snapshot is ALREADY DONE — prepare_restore() (shared by
+db_restore + restore_db_from_snapshot) takes a rotation-exempt "prerestore" pinned snapshot before every
+swap (commands.rs:2653-2668, snapshot::take_pinned_snapshot). Struck from the follow-up list.
+
+## P1 data durability — SHA256SUMS manifest for audio export + shared staging-exclusion fix (2026-07-11)
+
+Audit P1 "manifest/checksum verification for every multi-file export": audio export was the LONE multi-file
+export shipping no integrity manifest (dataset/HF/bundle/gold/finetune all write SHA256SUMS). Fixed:
+export_audio_segments now writes SHA256SUMS last (covers clips + metadata), skipped when nothing exported.
+Adversarial review then caught a REAL latent bug the new call site exposed: the shared write_sha256sums
+staging-exclusion matched only `*.tmp`, but audio clip temps are `<name>.tmp-<pid>-<nonce>` — a crash/
+concurrent leftover fragment would be hashed in as a real artifact. Fixed at the ROOT (all 6 exporters):
+exclusion now also skips `.tmp-<digits/->` with a precise tail check (a genuine `foo.tmp-bar.wav` is kept).
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean
+  cargo test --lib -> 878 passed; 0 failed; 6 ignored. New/updated:
+    export_audio::tests::export_writes_a_sha256sums_manifest_that_covers_the_clips_and_detects_tampering;
+    export::tests::sha256sums_manifest_covers_files_and_verifies extended (both staging shapes excluded,
+    real .tmp- file kept); two export_audio result.files assertions updated for the SHA256SUMS entry.
+  python scripts/run_python_policies.py -> all 23 regressions passed
+  Adversarial 1-lens Workflow: found the staging-exclusion defect -> FIXED; cleared frontend contract,
+    empty-guard, placement, PII.
+
+NEXT: a fresh 1010PATH.md item — candidates: P0 #9 runtime egress proof (needs a socket-interception harness;
+meaningful version exercises the transcribe path — larger/owner-model-gated), P1 architecture decomposition of
+a god-file (pure extraction + tests), or P1 calibrated-confidence honesty (partly owner-gated on real data).
