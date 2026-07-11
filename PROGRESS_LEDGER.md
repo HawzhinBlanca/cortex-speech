@@ -2738,6 +2738,28 @@ VERBATIM proof (Windows):
   Adversarial 3-lens Workflow (correctness / privacy-offline / forward-compat) -> 0 defects; confirmed
     no bare `jobs` table pre-exists (only the distinct import_jobs table in db.rs).
 
-NEXT increment: wire ONE long op (candidate: import_directory or a batch export) through a jobs row —
-insert queued → running with progress ticks → succeeded/failed with a stable error_code — and add a
-get_jobs / resume-on-startup path. That step is where durability becomes user-observable.
+## P0 #3 cont. — durable-job DB accessors + crash recovery, unit-tested (2026-07-11)
+
+Second increment: persistence for the pure JobState machine (still no command wired — next step).
+- jobs.rs: `Job` struct (id/kind/state/progress/completed/total/error_code).
+- db.rs (methods on Database): create_or_get_job (idempotent on key — retry/double-click resumes the
+  same job), transition_job (enforces can_transition_to; illegal edge REJECTED; stamps started_at/
+  finished_at), update_job_progress (clamps 0..=1 to respect the CHECK), get_job, and
+  mark_orphaned_running_jobs_failed (STARTUP crash recovery: a still-`running` job → failed/INTERRUPTED,
+  so the UI shows "interrupted" not a ghost).
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean (7-col row → `JobRow` type alias)
+  cargo test --lib -> 871 passed; 0 failed; 6 ignored. New db::tests:
+    create_or_get_job_is_idempotent_on_the_key, null_key_jobs_are_never_deduped,
+    transition_job_enforces_the_lifecycle_and_stamps_times (illegal double-complete rejected, state
+    unchanged), progress_is_clamped_to_the_check_range (1.4→1.0, -0.5→0.0),
+    orphaned_running_jobs_are_reaped_as_interrupted_on_startup (only running reaped; finished+queued
+    untouched), get_job_returns_none_for_a_missing_id
+  python scripts/run_python_policies.py -> all 23 regressions passed (rust runtime panic policy incl.:
+    accessors use ?/ok_or_else, no unwrap in non-test code)
+
+NEXT increment: wire ONE long op (candidate: import_directory or a batch export) through these
+accessors — create_or_get_job (queued) → transition running with progress ticks → succeeded/failed
+with a stable error_code — call mark_orphaned_running_jobs_failed() at startup, and expose get_jobs to
+the UI. That step is where durability becomes user-observable.
