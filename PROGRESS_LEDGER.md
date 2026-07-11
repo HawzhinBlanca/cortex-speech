@@ -2922,6 +2922,40 @@ VERBATIM proof (Windows):
   Adversarial 1-lens Workflow: found the staging-exclusion defect -> FIXED; cleared frontend contract,
     empty-guard, placement, PII.
 
-NEXT: a fresh 1010PATH.md item — candidates: P0 #9 runtime egress proof (needs a socket-interception harness;
-meaningful version exercises the transcribe path — larger/owner-model-gated), P1 architecture decomposition of
-a god-file (pure extraction + tests), or P1 calibrated-confidence honesty (partly owner-gated on real data).
+## P1 truthful intelligence — conformal certificate discloses confidence-source provenance (2026-07-11)
+
+Audit P1 "calibrated confidence": the dataset conformal certificate scores on each segment's own
+confidence, which on the default offline path is the heuristic 0.90 fallback (OmniASR CTC exposes no token
+posteriors). The readout's "calibrated" badge reflects only STATISTICAL calibration (>=10 verified), so it
+can show green "calibrated" while every calibration confidence is heuristic — implying a guarantee it lacks.
+This surfaces the truth WITHOUT any behavior change.
+
+INVESTIGATION (recorded for the owner — this reframes the audit item): the AUTONOMY path is ALREADY SAFE —
+the T0 auto-accept gate calibrates on the IRT cross-model consensus confidence, NOT seg.confidence
+(conformal.rs:19-34); the heuristic 0.90 does NOT drive autonomous acceptance. Heuristic confidence only
+feeds the informational dataset certificate + active-learning ranking. A blunt "exclude heuristic segments"
+fence was DELIBERATELY NOT done: nonconformity = (1-confidence) + 0.1*(-ctc), so with a constant heuristic
+confidence the discriminative signal is the REAL ctc_score — excluding heuristic segments could DESTROY a
+legitimate ctc-based calibration. => That fence is an OWNER DESIGN DECISION, not a clear bug; this increment
+only DISCLOSES provenance so the number is not over-trusted.
+
+- conformal.rs: ConformalCertificate gains calibrationRealPosterior / calibrationHeuristic (counts of the
+  cal set by confidence_source, computed inside the SAME filter -> identical membership by construction).
+- StatsDashboard.svelte + i18n EN/CKB: an honest note when the basis is entirely heuristic.
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean
+  cargo test --lib -> 879 passed; 0 failed; 6 ignored. New gate: certificate_discloses_calibration_
+    confidence_provenance (real=1, heuristic+legacy-unknown=2, unverified excluded).
+  npm run typecheck -> 0 errors; npm run lint -> clean; npx vitest run -> 176 passed, 0 errors
+  python scripts/run_python_policies.py -> all 23 regressions passed
+  Purely additive (no behavior change) -> no adversarial workflow; membership is structurally identical to
+  the cal set + unit-tested. Frontend note needs a bundle rebuild to view live; logic proven here.
+
+OWNER DESIGN DECISION surfaced (not faked): whether the conformal DATASET certificate + active-learning
+ranking should FENCE OUT heuristic-confidence segments (making the default-path cert honestly uncertain) or
+keep the graceful ctc-based degradation. The autonomy gate is unaffected either way.
+
+NEXT: a fresh 1010PATH.md item — candidates: P0 #9 runtime egress proof (socket-interception harness;
+meaningful version exercises the transcribe path — larger/owner-model-gated), P1 architecture decomposition
+(pure extraction + tests, avoid Codex files), or another crisp verifiable-here item.
