@@ -1233,6 +1233,12 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
         Field::new("normalized_transcript", DataType::Utf8, true),
         Field::new("annotated_transcript", DataType::Utf8, true),
         Field::new("alignment_json", DataType::Utf8, true),
+        // Honesty (audit P1 #8): ship the per-word timing PRECISION marker alongside the timestamps, so a
+        // consumer/trainer can tell `ctc_forced` (precise forced alignment) from `energy_heuristic`
+        // (approximate) and never treat approximate timing as ground truth. JSON/JSONL carry it (flattened
+        // SpeechSegment); Parquet was the one format shipping alignment_json while dropping the marker.
+        // (CSV is a hand-rolled flat header that ships NO alignment fields at all — honest by omission.)
+        Field::new("alignment_quality", DataType::Utf8, true),
         Field::new("duration_ms", DataType::Int64, false),
         Field::new("speaker_id", DataType::Utf8, true),
         Field::new("verified", DataType::Boolean, false),
@@ -1251,6 +1257,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
     let normalized: StringArray = segments.iter().map(|s| s.normalized_transcript.as_deref()).collect();
     let annotated: StringArray = segments.iter().map(|s| s.annotated_transcript.as_deref()).collect();
     let alignment: StringArray = segments.iter().map(|s| s.alignment_json.as_deref()).collect();
+    let alignment_quality: StringArray = segments.iter().map(|s| s.alignment_quality.as_deref()).collect();
     let duration_ms: Int64Array = segments.iter().map(|s| Some(s.duration_ms)).collect();
     let speaker_id: StringArray = segments.iter().map(|s| s.speaker_id.as_deref()).collect();
     let verified: BooleanArray = segments.iter().map(|s| Some(s.verified)).collect();
@@ -1274,6 +1281,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
             Arc::new(normalized),
             Arc::new(annotated),
             Arc::new(alignment),
+            Arc::new(alignment_quality),
             Arc::new(duration_ms),
             Arc::new(speaker_id),
             Arc::new(verified),
@@ -2093,7 +2101,10 @@ mod tests {
         let db_tmp = NamedTempFile::new().unwrap();
         let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&sample_segment("pq-1")).unwrap();
+        let mut seg = sample_segment("pq-1");
+        // Approximate (energy-heuristic) per-word timing — the marker Parquet must ship (audit P1 #8).
+        seg.alignment_quality = Some("energy_heuristic".to_string());
+        db.insert_segment(&seg).unwrap();
 
         let out_tmp = NamedTempFile::new().unwrap();
         let out_path = out_tmp.path().with_extension("parquet");
@@ -2111,6 +2122,15 @@ mod tests {
         assert!(batches[0].schema().field_with_name("training_transcript").is_ok());
         assert!(batches[0].schema().field_with_name("training_grade").is_ok());
         assert!(batches[0].schema().field_with_name("training_ready").is_ok());
+        // Audit P1 #8: the timing-precision marker ships alongside alignment_json (was silently dropped).
+        assert!(
+            batches[0].schema().field_with_name("alignment_quality").is_ok(),
+            "Parquet must carry alignment_quality like the JSON/JSONL formats (CSV ships no alignment fields)"
+        );
+        use arrow_array::Array;
+        let col =
+            batches[0].column_by_name("alignment_quality").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(col.value(0), "energy_heuristic", "the approximate-timing marker must round-trip");
     }
 
     #[test]
