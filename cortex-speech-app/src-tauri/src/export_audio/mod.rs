@@ -41,6 +41,12 @@ pub struct AudioExportResult {
 struct ExportedAudioFile {
     filename: String,
     segment: SpeechSegment,
+    /// Duration of the clip ACTUALLY written to disk, not the segment's stored duration_ms. The
+    /// two drift when slice_for_export clamps an over-long window to the decoded length (source
+    /// re-encoded/shortened after import, or relink_audio pointing at a shorter file) and on the
+    /// no-alignment whole-file fallback. metadata.csv must describe the bytes on disk — same
+    /// invariant the HF exporter already enforces (export.rs clip_dur_ms).
+    clip_duration_ms: i64,
 }
 
 /// Export audio segments from a dataset.
@@ -167,6 +173,9 @@ fn export_single_segment(
                 pcm_samples.len()
             ))
         })?;
+    // Measured BEFORE resampling (resampling changes the sample count but preserves wall-clock
+    // duration); `sample_rate` is the rate the window was sliced at.
+    let clip_duration_ms = (pcm_window.len() as i64).saturating_mul(1000) / i64::from(sample_rate.max(1));
     let pcm_samples = resample_pcm_i16(pcm_window.as_ref(), sample_rate, options.sample_rate);
 
     // Determine output filename
@@ -243,7 +252,7 @@ fn export_single_segment(
         }
     }
 
-    Ok(ExportedAudioFile { filename: output_filename, segment: seg })
+    Ok(ExportedAudioFile { filename: output_filename, segment: seg, clip_duration_ms })
 }
 
 fn write_metadata_csv(
@@ -282,7 +291,7 @@ fn write_metadata_csv(
 
             for item in exported {
                 let seg = &item.segment;
-                let duration_ms = seg.duration_ms.to_string();
+                let duration_ms = item.clip_duration_ms.to_string();
                 let confidence = optional_f64(seg.confidence);
                 let ctc_score = optional_f64(seg.ctc_score);
                 let clipping_ratio = optional_f64(seg.clipping_ratio);
@@ -433,7 +442,7 @@ mod tests {
             raw_transcript: "hello".to_string(),
             ..SpeechSegment::default()
         };
-        let exported = vec![ExportedAudioFile { filename: "ep_s1.wav".to_string(), segment: seg }];
+        let exported = vec![ExportedAudioFile { filename: "ep_s1.wav".to_string(), segment: seg, clip_duration_ms: 0 }];
         write_metadata_csv(tmp.path(), &exported, &AudioExportOptions::default()).unwrap();
         let csv = fs::read_to_string(tmp.path().join("metadata.csv")).unwrap();
         assert!(!csv.contains("studio_user"), "absolute path leaked the OS username:\n{csv}");
@@ -515,6 +524,58 @@ mod tests {
             "the whole source file must NOT be written as this segment's clip"
         );
         assert!(!out_dir.join("metadata.csv").exists(), "no metadata.csv when nothing was exported");
+    }
+
+    #[test]
+    fn metadata_csv_reports_the_clamped_clip_duration_not_the_stored_one() {
+        // A window that STARTS in range but ENDS past the decoded buffer is CLAMPED by
+        // slice_for_export (not skipped): the clip on disk is shorter than the segment's stored
+        // duration_ms. metadata.csv must describe the bytes on disk — the same invariant the HF
+        // exporter enforces (export.rs clip_dur_ms) but that this path used to violate by writing
+        // seg.duration_ms verbatim. Trigger: source re-encoded/shortened after import, or
+        // relink_audio pointing the segment at a shorter file.
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("shortened.wav");
+        make_wav_file(&wav_path); // 1 second @ 16 kHz = 16000 samples
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let meta = SegmentSourceMeta { source_start_ms: 0, source_end_ms: 5000, chunk_index: 0, chunk_count: 1 };
+        let seg = SpeechSegment {
+            id: "clamp1".to_string(),
+            audio_path: wav_path.to_string_lossy().to_string(),
+            raw_transcript: "clamped utterance".to_string(),
+            duration_ms: 5000, // stored value claims 5 s; the decoded source only backs 1 s
+            alignment_json: Some(meta.to_alignment_json()),
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&seg).unwrap();
+
+        let out_dir = tmp.path().join("out");
+        let result = export_audio_segments(
+            &db,
+            &["clamp1".to_string()],
+            &AudioExportOptions {
+                output_dir: out_dir.to_string_lossy().to_string(),
+                format: AudioExportFormat::Wav,
+                sample_rate: 16000,
+                include_metadata: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.succeeded, 1, "a clamped (start-in-range) window exports: {:?}", result.errors);
+
+        let (rate, frames) = output_wav_info(&out_dir.join("shortened_clamp1.wav"));
+        assert_eq!((rate, frames), (16000, 16000), "the clip on disk is the clamped 1-second window");
+
+        let csv = fs::read_to_string(out_dir.join("metadata.csv")).unwrap();
+        let row = csv.lines().nth(1).expect("one data row");
+        assert!(
+            row.contains(",1000,"),
+            "metadata duration_ms must be the WRITTEN clip's 1000 ms, not the stored 5000: {row}"
+        );
+        assert!(!row.contains(",5000,"), "the stored duration the WAV does not back up must not appear: {row}");
     }
 
     #[test]
