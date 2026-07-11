@@ -1211,6 +1211,26 @@ impl Database {
         if integrity.trim() != "ok" {
             return Err(AppError::Other(format!("snapshot database failed its integrity check: {integrity}")));
         }
+        // Forward-compatibility fence: refuse a snapshot whose schema is NEWER than this build supports.
+        // Restore copies the source's pages directly into the live DB, bypassing run_migrations' startup
+        // guard — so without this check, restoring a snapshot made by a newer Cortex Speech would leave
+        // this build silently operating a future schema with stale semantics (the same data-integrity
+        // hazard run_migrations refuses at open). A missing schema_migrations table reads as version 0
+        // (an old/fresh snapshot is safe to restore); a genuine read error propagates.
+        let snap_version: i64 =
+            match src_conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |r| r.get(0)) {
+                Ok(v) => v,
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg))) if msg.contains("no such table") => 0,
+                Err(e) => return Err(e.into()),
+            };
+        let max_known = crate::migrations::max_supported_version();
+        if snap_version > max_known {
+            return Err(AppError::Other(format!(
+                "this snapshot is at schema v{snap_version}, newer than this build supports (v{max_known}) \
+                 — it was created by a newer version of Cortex Speech. Update the app before restoring it. \
+                 Refusing so the current library is not overwritten with a database this build cannot safely read."
+            )));
+        }
         let backup = backup::Backup::new(&src_conn, &mut self.conn)?;
         backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
         Ok(())
@@ -3928,6 +3948,54 @@ mod tests {
         std::fs::write(&bad_path, b"this is not a sqlite database at all").unwrap();
         assert!(live.restore(&bad_path).is_err(), "a corrupt snapshot must be rejected");
         assert!(live.segment_count().is_ok(), "the live database is still usable after a rejected restore");
+    }
+
+    #[test]
+    fn restore_refuses_a_snapshot_from_a_newer_schema_without_clobbering_the_live_db() {
+        // Restore copies pages directly, bypassing run_migrations' startup forward-compat guard. A
+        // snapshot at a schema NEWER than this build must be refused, or the app would silently operate a
+        // future schema with stale semantics — and the current library must survive the refusal intact.
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let live_path = tmp.path().join("live.db");
+        let mut live = Database::open(live_path.to_str().unwrap()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&make_segment("keep-me", "/a.wav")).unwrap();
+
+        // A snapshot that is healthy but records a schema version one past what this build knows.
+        let future_path = tmp.path().join("future.db");
+        let future_version = crate::migrations::max_supported_version() + 1;
+        {
+            let future = Database::open(future_path.to_str().unwrap()).unwrap();
+            future.initialize().unwrap();
+            future
+                .connection()
+                .execute(
+                    "INSERT INTO schema_migrations (version, description, applied_at) \
+                     VALUES (?1, 'from-a-newer-build', datetime('now'))",
+                    params![future_version],
+                )
+                .unwrap();
+        }
+
+        let err = live.restore(&future_path).unwrap_err();
+        assert!(
+            format!("{err}").contains("newer than this build supports"),
+            "a newer-schema snapshot must be refused: {err}"
+        );
+        // The live library is untouched — the segment is still there.
+        assert!(
+            live.get_segment_by_id("keep-me").unwrap().is_some(),
+            "refusing a newer-schema restore must NOT clobber the current library"
+        );
+
+        // A same-version snapshot still restores fine (the fence only blocks strictly-newer schemas).
+        let same_path = tmp.path().join("same.db");
+        {
+            let same = Database::open(same_path.to_str().unwrap()).unwrap();
+            same.initialize().unwrap();
+        }
+        live.restore(&same_path).expect("a current-schema snapshot must still restore");
     }
 
     #[test]
