@@ -68,6 +68,8 @@ ASYNC_SLOW_COMMANDS = [
     "db_backup",
     "db_restore",
     "restore_db_from_snapshot",
+    # Media cache: multi-GB fs::copy moved off the main thread (async fn; see the ponytail note).
+    "register_media_asset",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

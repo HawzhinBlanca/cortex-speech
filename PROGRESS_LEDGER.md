@@ -2592,3 +2592,27 @@ thread (an async wrapper would be churn — assess+document, likely leave as-is)
 (jury/scribe/dpo) + register_media_asset are the only remaining genuine offload candidates (handle
 individually). (b) The RUNTIME heartbeat proof (audit-point #2): drive the built exe/CDP — a slow
 command running while get_settings stays responsive. If the exe can't be driven here, owner-verify.
+
+## P0 #2 — register_media_asset off main thread + Bucket B assessment (2026-07-11)
+
+register_media_asset was the LAST true main-thread freeze: a sync command doing a multi-GB fs::copy
+(grant_source) on the UI thread the first time a large clip plays. Converted to `async fn` (whole
+body off the main thread). It has no `.await`, so the media-registry MutexGuard never crosses a
+suspend point and the future stays Send — verified by cargo check. Ratchet grown to 46 commands.
+ponytail note in-code: a full spawn_blocking offload (not hogging an async worker) needs MediaRegistry
+restructured into check→copy→record phases; deferred (the freeze itself is fixed).
+
+BUCKET B — assessed, INTENTIONALLY LEFT SYNC (converting would be churn, not improvement):
+- batch_transcribe/batch_verify/batch_assign_speaker/batch_normalize/import_audio_file/
+  resume_interrupted_import/run_wsl_refinement already `std::thread::spawn` a DETACHED worker + poll a
+  CancellationToken. The #[tauri::command] itself returns IMMEDIATELY after spawning, so it never
+  blocks the main thread — an async wrapper adds nothing. Correct as-is.
+- cloud-egress (run_jury_pipeline/run_t2_for_segment/run_dpo_update/transcribe_audio_with_scribe/
+  add_scribe_votes) already DROP the global db lock around the network call and are consent-gated;
+  they run on the main thread but the blocking is network I/O the user explicitly triggered. Lower
+  priority; candidates for a later async pass, not a freeze on the default offline path.
+
+VERBATIM proof:
+  cargo check/fmt/clippy --lib -D warnings -> clean
+  cargo test --lib -> 842 passed; 0 failed; 6 ignored
+  python scripts/test_command_main_thread_policy.py -> passed

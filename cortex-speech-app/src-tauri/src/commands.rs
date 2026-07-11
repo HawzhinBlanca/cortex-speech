@@ -1881,7 +1881,14 @@ pub fn get_blocking_validation_issues(
 }
 
 #[tauri::command]
-pub fn register_media_asset(
+// ponytail: `async fn` moves the whole body (incl. the multi-GB cache copy in grant_source) OFF the
+// main/UI thread, which fixes the freeze. It runs on an async worker rather than a spawn_blocking
+// pool because grant_source holds the media-registry MutexGuard across the copy (not Send-movable);
+// a full spawn_blocking offload needs MediaRegistry restructured into check→copy→record phases (or an
+// Arc handle) — deferred. There is no `.await` in the body, so the guard never crosses a suspend
+// point and the future stays Send.
+#[allow(clippy::unused_async)]
+pub async fn register_media_asset(
     audio_path: String,
     state: State<'_, AppState>,
 ) -> Result<crate::media::MediaGrant, String> {
