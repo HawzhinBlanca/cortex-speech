@@ -3077,3 +3077,32 @@ every local gate, is in docs/OWNER_HANDOFF.md. The committed exe/bundle is stale
 live check (npm run build + cargo build --release; kill stray cortex-speech-app.exe first).
 
 Loop STOPPED here — an honest owner-gated stop is success, not failure. Restart with /loop to resume.
+
+## LOOP RESUMED (owner request) — now working the larger verifiable-here-later items
+
+The owner asked to continue after the hand-off, so the loop now takes on the LARGER deferred items (bigger
+than a crisp fix, but with a pure/testable core here). Git hygiene done first: working tree clean; all
+branch commit subjects well-formed (no stray '@'); 1010PATH.md (the owner's private root audit) is now
+gitignored so it can't be committed by accident + no longer clutters status.
+
+### P1 data durability — media playback caches via HARD LINK, not a whole-file copy (2026-07-11)
+
+media.rs copied the ENTIRE source into the asset-protocol media cache on every playback grant (a multi-GB
+audiobook = a full multi-GB temp copy per grant). grant_source now materializes via link_or_copy_into_cache:
+std::fs::hard_link FIRST (instant, zero extra disk, byte-identical, same volume) with the original
+std::fs::copy as the cross-volume / linkless-FS fallback (disk-room check kept only on the copy path). No
+IPC/segment-window change; authorization + TTL + dedup + prune paths untouched.
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean
+  cargo test --lib -> 882 passed; 0 failed; 6 ignored. New media::tests: materializes_..._hard_link_not_a_
+    copy_on_the_same_volume (HardLinked + source bytes + in-place source rewrite visible via the cached
+    entry => link not copy); removing_the_cached_hard_link_never_deletes_the_source. Pre-existing media
+    tests still pass.
+  python scripts/run_python_policies.py -> all 23 regressions passed
+  Adversarial 2-lens Workflow (playback-authorization / cleanup-fallback) -> 0 defects (byte-identical
+    playback, authorization unchanged in both callers incl. commands.rs register_media_asset, cleanup
+    removes only the cache entry so the source survives, copy fallback still room-checked before write).
+HONEST: same-volume only (cross-volume/FAT/exFAT/UNC fall back to copy); exe stale vs HEAD, rebuild to
+exercise live. NEXT larger item candidates: chunking overlap/dedup pure logic (long-recording A/B owner-
+gated), or a non-Codex architecture extraction. Owner-gated list unchanged (see docs/OWNER_HANDOFF.md).
