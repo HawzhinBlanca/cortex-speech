@@ -2616,3 +2616,22 @@ VERBATIM proof:
   cargo check/fmt/clippy --lib -D warnings -> clean
   cargo test --lib -> 842 passed; 0 failed; 6 ignored
   python scripts/test_command_main_thread_policy.py -> passed
+
+## P0 #2 — runtime heartbeat harness committed; live run pending fresh exe (2026-07-11)
+
+Audit-point #2 has TWO parts: (structural) every slow command is now async → dispatched off the main
+thread; ratchet-gated at 46 commands, proven by cargo/clippy/policy every batch. (runtime) a live
+proof the UI stays responsive during slow work.
+
+RUNTIME harness committed: scripts/heartbeat_probe.cjs (npm run test:heartbeat). It drives the built
+exe against a DISPOSABLE profile (refuses %APPDATA%, kills only its own PID tree), fires 8 concurrent
+async get_waveform decodes of the committed CC-BY fixture, and measures get_settings latency IN-PAGE
+for 4 s while they run; PASS = get_settings p95 <= 300 ms (main thread responsive). Needs no
+models/WSL — only the committed fixture. Same repro shape that proved the dialog-freeze fix (f01ab66).
+
+LIVE RUN: the release exe was STALE (built before this migration), so a fresh
+`cargo build --release --bin cortex-speech-app` is in progress; the heartbeat run + verbatim timing
+will be recorded next. If the build/CDP drive can't complete in this environment, OWNER-VERIFY:
+  1) cd cortex-speech-app && cargo build --release --manifest-path src-tauri/Cargo.toml --bin cortex-speech-app
+  2) npm run test:heartbeat
+  Expected: "HEARTBEAT OK: main thread stayed responsive (p95 <Xms <= 300ms)."
