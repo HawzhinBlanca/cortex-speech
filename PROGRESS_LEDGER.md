@@ -2821,6 +2821,26 @@ VERBATIM proof (verifiable-here):
 OWNER-OBSERVABLE: a live visual check (run/fail an export → watch the pill) needs a FRONTEND rebuild on
 the owner's machine; logic is unit-proven here. (The exe/bundle now needs a rebuild to see the pill live.)
 
-NEXT increment: bracket a SECOND durability-less long op (export_finetune_pack or run_gold_eval) through
-run_tracked, extend scripts/jobs_probe.cjs to assert it. Progress ticks (update_job_progress mid-op)
-come when an op exposes a per-unit loop.
+## P0 #3 cont. — second op bracketed: export_huggingface_dataset is a durable job (2026-07-11)
+
+Fifth increment: a SECOND durability-less op is now tracked. export_huggingface_dataset runs inside
+db.run_tracked ("export_huggingface_dataset"/"HF_EXPORT_FAILED"), byte-for-byte the same bracketing as
+export_dataset; the export's real work is unchanged.
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean
+  cargo test --lib -> 875 passed; 0 failed; 6 ignored
+  python scripts/run_python_policies.py -> all 23 regressions passed
+  RUNTIME npm run test:jobs (extended jobs_probe.cjs, fresh release exe, disposable profile):
+    ==> get_jobs before=0 after=2  errors={}
+    ==> recorded job: kind=export_dataset state=succeeded errorCode=null
+    ==> recorded job: kind=export_huggingface_dataset state=succeeded errorCode=null
+    JOBS OK: durable export_dataset + export_huggingface_dataset jobs recorded and 'succeeded' at runtime.
+  Adversarial Workflow (1 focused lens on the HF delta): no defect (settings clone unchanged, no txn
+    wraps the work so create_dir_all/partial-dir behavior untouched, error surface identical, no PII in
+    the job row).
+
+NEXT increment: continue widening job coverage (export_dataset_bundle / export_finetune_pack /
+run_gold_eval), OR pivot to the next audit item (P0 #5 backup/restore fencing, or P0 #4 live supervision
+glue). Progress ticks (update_job_progress mid-op) come when an op exposes a per-unit loop. Owner-machine
+still: live kill-mid-export crash drill (logic unit-proven via orphaned_running_jobs_are_reaped...).
