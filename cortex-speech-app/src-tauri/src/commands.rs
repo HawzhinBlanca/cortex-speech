@@ -1097,11 +1097,15 @@ fn resolve_finetuned_paths() -> Result<(std::path::PathBuf, std::path::PathBuf),
 /// SHA-256 (hashes the full ~970 MB, so it is on demand, not per-load). The fast size+vocab guard runs
 /// at every model load. Returns a confirmation string or a mismatch error.
 #[tauri::command]
-pub fn verify_finetuned_model_integrity() -> Result<String, String> {
+pub async fn verify_finetuned_model_integrity() -> Result<String, String> {
     STRICT_RATE_LIMITER.check("verify_finetuned_model_integrity")?;
-    let (onnx, vocab) = resolve_finetuned_paths()?;
-    crate::wav2vec2_asr::verify_finetuned_full(&onnx, &vocab)?;
-    Ok(format!("verified: {}", onnx.display()))
+    // SHA-256 over a ~970 MB ONNX — off the main thread. No state needed.
+    run_blocking(move || {
+        let (onnx, vocab) = resolve_finetuned_paths()?;
+        crate::wav2vec2_asr::verify_finetuned_full(&onnx, &vocab)?;
+        Ok(format!("verified: {}", onnx.display()))
+    })
+    .await
 }
 
 /// Opt-in: transcribe a segment with the fine-tuned Kurdish Wav2Vec2-CTC model (ONNX via `ort`),
@@ -1984,11 +1988,15 @@ pub fn get_speakers(state: State<'_, AppState>) -> Result<Vec<stats::SpeakerStat
 }
 
 #[tauri::command]
-pub fn get_dataset_quality(state: State<'_, AppState>) -> Result<quality::DatasetQuality, String> {
+pub async fn get_dataset_quality(state: State<'_, AppState>) -> Result<quality::DatasetQuality, String> {
     RATE_LIMITER.check("get_dataset_quality")?;
-    let db = state.lock_db();
-    let settings = state.lock_settings();
-    quality::compute_quality_with_settings(&db, &settings).map_err(|e| e.to_string())
+    let settings = state.lock_settings().clone(); // snapshot before moving into the blocking task
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        quality::compute_quality_with_settings(&db, &settings).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2138,13 +2146,17 @@ pub fn restore_session(state: State<'_, AppState>) -> Result<Option<crate::sessi
 }
 
 #[tauri::command]
-pub fn validate_dataset_cmd(state: State<'_, AppState>) -> Result<crate::validation::ValidationReport, String> {
+pub async fn validate_dataset_cmd(state: State<'_, AppState>) -> Result<crate::validation::ValidationReport, String> {
     // Rate-limited like its read siblings: this runs a full-dataset validation scan under the db lock,
     // so an unthrottled webview loop would starve every other DB command.
     RATE_LIMITER.check("validate_dataset_cmd")?;
-    let db = state.lock_db();
-    let settings = state.lock_settings();
-    crate::validation::validate_dataset_with_settings(&db, &settings).map_err(|e| e.to_string())
+    let settings = state.lock_settings().clone(); // snapshot before moving into the blocking task
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::validation::validate_dataset_with_settings(&db, &settings).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3411,20 +3423,21 @@ pub fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize, Stri
 }
 
 #[tauri::command]
-pub fn get_dataset_certificate(
+pub async fn get_dataset_certificate(
     state: State<'_, AppState>,
     target_error: f64,
     confidence_level: f64,
 ) -> Result<crate::quality::conformal::ConformalCertificate, String> {
     RATE_LIMITER.check("get_dataset_certificate")?;
-
-    let segments = {
-        let db = state.lock_db();
-        db.get_segments(None).map_err(|e| e.to_string())?
-    };
-
-    let cert = crate::quality::conformal::calibrate_and_certify(&segments, target_error, confidence_level);
-    Ok(cert)
+    let db = state.db_arc();
+    run_blocking(move || {
+        let segments = {
+            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            db.get_segments(None).map_err(|e| e.to_string())?
+        };
+        Ok(crate::quality::conformal::calibrate_and_certify(&segments, target_error, confidence_level))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3556,14 +3569,18 @@ pub fn import_gold_segments(
 }
 
 #[tauri::command]
-pub fn run_gold_eval(
+pub async fn run_gold_eval(
     state: State<'_, AppState>,
     model_id: String,
     hypotheses: Vec<(String, String)>,
 ) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval")?;
-    let db = state.lock_db();
-    crate::eval::run_gold_eval(&db, &model_id, hypotheses).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::eval::run_gold_eval(&db, &model_id, hypotheses).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Closed-loop gold eval: runs the real local ASR over the gold set's audio and scores
@@ -3607,13 +3624,17 @@ pub fn build_scorecard(
 /// reviewers had to change the raw ASR output (micro WER/CER with bootstrap CIs). Reads
 /// the live segments directly — unlike `build_scorecard` it needs no held-out eval run.
 #[tauri::command]
-pub fn compute_annotation_drift_scorecard(
+pub async fn compute_annotation_drift_scorecard(
     state: State<'_, AppState>,
 ) -> Result<crate::scorecard::AnnotationDriftScorecard, String> {
     RATE_LIMITER.check("compute_annotation_drift_scorecard")?;
-    let db = state.lock_db();
-    let segments = db.get_segments(None).map_err(|e| e.to_string())?;
-    Ok(crate::scorecard::annotation_drift_scorecard(&segments, Default::default()))
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let segments = db.get_segments(None).map_err(|e| e.to_string())?;
+        Ok(crate::scorecard::annotation_drift_scorecard(&segments, Default::default()))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3634,11 +3655,15 @@ pub fn list_eval_runs(state: State<'_, AppState>) -> Result<Vec<crate::eval::Eva
 
 /// Measured raw-ASR vs post-jury label-quality lift (M3.1) over human-verified segments.
 #[tauri::command]
-pub fn get_label_quality_lift(state: State<'_, AppState>) -> Result<crate::eval::LabelQualityLift, String> {
+pub async fn get_label_quality_lift(state: State<'_, AppState>) -> Result<crate::eval::LabelQualityLift, String> {
     RATE_LIMITER.check("get_label_quality_lift")?;
-    let db = state.lock_db();
-    let triples = crate::eval::load_lift_triples(&db).map_err(|e| e.to_string())?;
-    Ok(crate::eval::compute_label_quality_lift(&triples, 2000, 1234))
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let triples = crate::eval::load_lift_triples(&db).map_err(|e| e.to_string())?;
+        Ok(crate::eval::compute_label_quality_lift(&triples, 2000, 1234))
+    })
+    .await
 }
 
 #[tauri::command]

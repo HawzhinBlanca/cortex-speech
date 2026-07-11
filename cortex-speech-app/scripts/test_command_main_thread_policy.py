@@ -34,6 +34,14 @@ ASYNC_SLOW_COMMANDS = [
     "relink_audio",
     "db_vacuum",
     "merge_dataset_json",
+    # Eval / quality / calibration compute over the whole dataset + a model-integrity hash.
+    "get_dataset_certificate",
+    "run_gold_eval",
+    "compute_annotation_drift_scorecard",
+    "get_label_quality_lift",
+    "validate_dataset_cmd",
+    "get_dataset_quality",
+    "verify_finetuned_model_integrity",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

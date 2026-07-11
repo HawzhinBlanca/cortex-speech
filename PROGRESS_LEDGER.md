@@ -2446,3 +2446,26 @@ commands, compute_acoustic/ood_scores, db_backup/restore, verify_finetuned_model
 the pipeline-clone ASR commands transcribe_segment*/get_waveform/rediarize_segments). Then Bucket B
 individually (batch_*/import_* thread-spawners, cloud-egress jury/scribe/dpo, register_media_asset's
 guard-across-copy). Then the runtime heartbeat proof (needs built exe/CDP — flag if unrunnable here).
+
+## P0 #2 cont. — 7 eval/quality/calibration + hashing commands off the main thread (2026-07-11)
+
+Fourth async-migration batch (Bucket A). All dataset-wide compute that ran on the UI thread:
+- get_dataset_certificate + get_dataset_quality + validate_dataset_cmd (conformal calibrate /
+  quality / validation over ALL segments; the two settings-holders snapshot settings.clone() before
+  the task), run_gold_eval (WER/CER scoring), compute_annotation_drift_scorecard + get_label_quality_lift
+  (full-scan + bootstrap CIs), verify_finetuned_model_integrity (SHA-256 over ~970 MB ONNX — no db,
+  wrapped in run_blocking directly). All now async + run_blocking.
+- Ratchet grown to 24 commands. (get_active_learning_queue deferred — long body, next iteration.)
+
+VERBATIM proof:
+  cargo check --lib                 -> Finished (6.0s)
+  cargo clippy --lib -- -D warnings -> Finished, 0 warnings
+  cargo test --lib                  -> 842 passed; 0 failed; 6 ignored
+  python scripts/test_command_main_thread_policy.py -> command main-thread policy regression passed
+
+NEXT: get_active_learning_queue (long body), the pipeline-clone ASR reads (get_waveform,
+transcribe_segment_constrained/_finetuned, rediarize_segments, run_gold_eval_asr/_local), the
+acoustic/OOD scan commands (compute_acoustic_scores/compute_ood_scores — per-segment re-lock),
+db_backup/db_restore/restore_db_from_snapshot (sequential multi-state — audit each). Then Bucket B
+(thread-spawn batch_*/import_*, cloud-egress jury/scribe/dpo, register_media_asset guard-across-copy)
+INDIVIDUALLY. Then the runtime heartbeat proof (needs built exe/CDP — flag if unrunnable here).
