@@ -159,6 +159,28 @@ fn to_txt(cues: &[Cue]) -> String {
     out
 }
 
+/// Refuse a single-file subtitle export whose cues span MORE THAN ONE source media file. Each source's
+/// cues are timed from that source's own window, so concatenating several into one SRT/VTT produces
+/// timestamps that RESET to zero at every source boundary — a non-monotonic, broken subtitle track
+/// (audit P1: "never concatenate multiple source timelines into one subtitle file"). TXT is the
+/// whole-library format (it labels each source with a `# name` header); subtitles are per-source. Pure
+/// so it is unit-testable without a database.
+fn ensure_single_source_for_subtitles(cues: &[Cue], format: TranscriptFormat) -> AppResult<()> {
+    if !matches!(format, TranscriptFormat::Srt | TranscriptFormat::Vtt) {
+        return Ok(());
+    }
+    let sources: std::collections::BTreeSet<&str> = cues.iter().map(|c| c.audio_path.as_str()).collect();
+    if sources.len() > 1 {
+        return Err(crate::error::AppError::Validation(format!(
+            "Subtitles (SRT/VTT) are per-source: this library spans {} source media files, whose \
+             timelines would collide (timestamps resetting to zero) in one file. Export TXT instead for a \
+             whole multi-source library (it labels each source).",
+            sources.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Read the exportable segments and write the transcript/subtitle file atomically.
 pub fn export_transcript(db: &Database, path: &std::path::Path, format: TranscriptFormat) -> AppResult<()> {
     // Include gold/holdout (the owner wants THEIR transcripts — this is not a training artifact), but
@@ -170,6 +192,8 @@ pub fn export_transcript(db: &Database, path: &std::path::Path, format: Transcri
         .filter(|s| !quality::is_human_rejected(s) && !quality::is_effective_placeholder(s))
         .collect();
     let cues = build_cues(&segments);
+    // Fail closed BEFORE writing: a multi-source subtitle file would ship broken (resetting) timings.
+    ensure_single_source_for_subtitles(&cues, format)?;
     let body = match format {
         TranscriptFormat::Txt => to_txt(&cues),
         TranscriptFormat::Srt => to_srt(&cues),
@@ -198,6 +222,22 @@ mod tests {
             ),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn subtitles_refuse_a_multi_source_library_but_txt_and_single_source_are_allowed() {
+        // Two different source files -> a single SRT/VTT would reset timestamps at the boundary (broken).
+        let multi = build_cues(&[seg("a", "one.wav", "سڵاو", 0, 1000), seg("b", "two.wav", "بەخێربێن", 0, 1000)]);
+        let srt_err = ensure_single_source_for_subtitles(&multi, TranscriptFormat::Srt).unwrap_err();
+        assert!(format!("{srt_err}").contains("per-source"), "SRT multi-source must be refused: {srt_err}");
+        assert!(ensure_single_source_for_subtitles(&multi, TranscriptFormat::Vtt).is_err(), "VTT too");
+        // TXT is the whole-library format — it labels each source, so it is allowed.
+        assert!(ensure_single_source_for_subtitles(&multi, TranscriptFormat::Txt).is_ok());
+        // A single source (multiple segments, same file) exports subtitles fine.
+        let one = build_cues(&[seg("a", "one.wav", "سڵاو", 0, 1000), seg("c", "one.wav", "دوو", 1000, 2000)]);
+        assert!(ensure_single_source_for_subtitles(&one, TranscriptFormat::Srt).is_ok());
+        // Degenerate: no cues at all is not multi-source, so it does not error.
+        assert!(ensure_single_source_for_subtitles(&[], TranscriptFormat::Srt).is_ok());
     }
 
     #[test]
