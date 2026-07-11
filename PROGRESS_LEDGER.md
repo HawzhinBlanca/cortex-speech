@@ -2759,7 +2759,36 @@ VERBATIM proof (Windows):
   python scripts/run_python_policies.py -> all 23 regressions passed (rust runtime panic policy incl.:
     accessors use ?/ok_or_else, no unwrap in non-test code)
 
-NEXT increment: wire ONE long op (candidate: import_directory or a batch export) through these
-accessors — create_or_get_job (queued) → transition running with progress ticks → succeeded/failed
-with a stable error_code — call mark_orphaned_running_jobs_failed() at startup, and expose get_jobs to
-the UI. That step is where durability becomes user-observable.
+## P0 #3 cont. — first real op wired: export_dataset is now a durable job (2026-07-11)
+
+Third increment: the durable-job infra now tracks a REAL op. (Imports already have bespoke durability
+via the older `import_jobs` table, so the generic table's first wire is a durability-less op — a batch
+export.)
+- db.rs run_tracked(job_id, kind, error_code, work): brackets any op as a durable job (queued→running→
+  succeeded|failed). Post-work bookkeeping is BEST-EFFORT on both paths: once `work` returns the op's
+  outcome is decided (file on disk or not), so a failed terminal-stamp write must never flip what the
+  caller sees. list_recent_jobs(limit) for the activity surface.
+- commands.rs: export_dataset runs inside run_tracked ("export_dataset"/"EXPORT_FAILED"); new async
+  get_jobs command (off-main-thread), registered in lib.rs invoke_handler.
+- lib.rs setup: mark_orphaned_running_jobs_failed() active at startup (best-effort; runs before any
+  worker can create a running job → only reaps genuine crash residue).
+- jobs.rs: Job/JobState serialize (JobState via as_str → no token drift).
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean
+  cargo test --lib -> 875 passed; 0 failed; 6 ignored. New db::tests: run_tracked_marks_succeeded...,
+    run_tracked_marks_failed_with_code_and_propagates_the_original_error, run_tracked_gives_work_a_
+    usable_db_handle, list_recent_jobs_returns_newest_first_and_respects_limit
+  python scripts/run_python_policies.py -> all 23 regressions passed
+  Adversarial 3-lens Workflow (startup-safety / export-behavior / run_tracked-correctness): startup
+    reaper safe (no block/abort/deadlock; only reaps genuine crash residue); export output/error surface
+    unchanged, no sensitive data in job rows, no network. Found ONE low-sev false-negative on the
+    success-path `?` (a failed success-stamp reported a real export as failed) → FIXED to best-effort.
+
+OWNER-OBSERVABLE proof PENDING (honest gap): exe rebuilt, but the end-to-end "run an export → get_jobs
+shows succeeded; kill mid-export → next start shows INTERRUPTED" is a runtime check on the owner's
+machine; the get_jobs FRONTEND surface is the next increment. The bracketing LOGIC is unit-proven here.
+
+NEXT increment: (a) small frontend activity surface polling get_jobs (running/succeeded/failed+
+INTERRUPTED pill or list), then (b) bracket a second durability-less long op (export_finetune_pack or
+run_gold_eval). Progress ticks (update_job_progress mid-op) come when an op exposes a per-unit loop.
