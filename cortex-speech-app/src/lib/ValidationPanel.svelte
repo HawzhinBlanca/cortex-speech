@@ -419,7 +419,7 @@
                           <span>CTC Match: {segment.ctcScore.toFixed(2)}</span>
                         {/if}
                         {#if segment.oodScore !== undefined && segment.oodScore !== null}
-                          <span>OOD: {segment.oodScore.toFixed(2)}</span>
+                          <span>{$t('validation.ood.score')}: {segment.oodScore.toFixed(2)}</span>
                         {/if}
                       </div>
                     </div>
@@ -460,7 +460,7 @@
                   class="rounded border-cortex-800 bg-cortex-950 text-cortex-500 focus:ring-0"
                   bind:checked={showAllSegmentsForOod}
                 />
-                Show all segments (not just OOD flagged)
+                {$t('validation.ood.showAll')}
               </label>
             </div>
           </div>
