@@ -403,6 +403,19 @@ def _probe_rtf():
     return "OmniASR CTC-300M model missing - run fetch-models"
 
 
+def _probe_egress():
+    if not EXE.exists():
+        return "release exe missing - run `make build-app`"
+    if sys.platform != "win32":
+        return "egress probe samples Windows TCP (Get-NetTCPConnection); runs on the owner Windows rig"
+    # Require the CTC model the transcribe leg needs — the SAME location the app resolves it from and
+    # every other model gate checks (src-tauri/models). Without this the gate would run browse-only yet
+    # its charter advertises ASR-path coverage: SKIP-ENV honestly (INCOMPLETE) instead of a false GREEN.
+    if not (SRC_TAURI / "models" / "omniasr-ctc-300m" / "model.int8.onnx").exists():
+        return "OmniASR CTC-300M model missing (transcribe leg requires it) - run fetch-models"
+    return None
+
+
 def _probe_fuzz():
     if not shutil.which("cargo-fuzz"):
         return "cargo-fuzz not installed (cargo install cargo-fuzz + nightly toolchain)"
@@ -467,7 +480,7 @@ GATES = [
     ("exe-freshness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_exe_freshness.py"}"', REPO_ROOT, _probe_exe, "Truth-in-advertising: exe compiled from HEAD"),
     ("real-app-e2e", 2, "cmd", f'node "{APP / "e2e_real_app.cjs"}"', APP, _probe_real_e2e, "THE daily-use reliability gate: real exe, real audio, real transcript"),
     # Tier 3 — deep proof legs (env-gated; skipped honestly when absent)
-    ("egress-runtime", 3, "not-built", "WS3b: PARTIAL — `npm run test:egress` (scripts/egress_probe.cjs) runtime-proves ZERO external TCP from the backend PID on the default-offline STARTUP+browse path, with an in-run POSITIVE CONTROL that fails loud if the sampler is dead (no vacuous pass); the transcribe-path leg (cloud STT/LLM if consent leaked) + a kernel/ETW socket trace remain owner-gated. Static test_cloud_privacy_policy.py is belt-and-braces.", None, None, "Privacy: zero outbound sockets at runtime"),
+    ("egress-runtime", 3, "cmd", f'node "{APP / "scripts" / "egress_probe.cjs"}"', APP, _probe_egress, "Privacy: zero outbound sockets at runtime — egress_probe.cjs proves ZERO external TCP from the backend PID across startup + browse + a REAL offline transcription (import->VAD->CTC ASR, the path where cloud STT/LLM would fire if consent leaked), with an in-run POSITIVE CONTROL that fails loud if the sampler is dead (no vacuous pass). Poll-sampled (200ms) + TCP-only; an airtight kernel/ETW socket trace is a further stretch. SKIP-ENV off the Windows rig / without the exe. Static test_cloud_privacy_policy.py is belt-and-braces."),
     ("ignored-real-model", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored --skip live_transcribe_segments', REPO_ROOT, _probe_silero, "WS3a: the 37 #[ignore] real-model gates (cloud-key test excluded)"),
     ("fuzz-smoke", 3, "fn", _fn_fuzz_smoke, None, _probe_fuzz, "Engineering rigor: 5 fuzz targets, 0 crashes"),
     ("rtf-bench", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --test real_audio -- --ignored omniasr_rtf_on_committed_fleurs_ckb_fixture --nocapture', REPO_ROOT, _probe_rtf, "Latency: RTF on this rig (baseline-regression gate: WS4)"),

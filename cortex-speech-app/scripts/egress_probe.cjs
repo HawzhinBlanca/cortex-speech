@@ -21,9 +21,13 @@
  *     "no egress" OR "the sampler silently never ran". A POSITIVE CONTROL (validateSamplerApparatus) runs
  *     first each execution: it opens a known loopback connection owned by this node process and requires
  *     the SAME sampler invocation to observe it, so a broken monitor fails LOUD instead of vacuously green.
- *   - Exercises startup + get_settings + get_waveform (decode) + get_jobs. It does NOT by default run a
- *     transcription (the path where cloud STT/LLM would fire IF consent leaked) — that leg needs a local
- *     model + audio and is owner-machine-gated; run with CORTEX_EGRESS_TRANSCRIBE=1 once a fixture exists.
+ *   - Exercises startup + get_settings + get_waveform (decode) + get_jobs AND, when the offline CTC model
+ *     is resolvable, a REAL transcription (import -> VAD -> CTC ASR -> persist) — the path where cloud
+ *     STT/LLM would fire IF consent leaked. The transcribe leg auto-runs when the local model is present;
+ *     force with CORTEX_EGRESS_TRANSCRIBE=1, skip with =0. If enabled but ASR yields 0 segments the leg is
+ *     reported INCONCLUSIVE (not silently claimed) — the egress verdict then covers startup+browse only.
+ *   - The airtight non-poll version (a kernel/ETW socket trace) is still a further stretch; this poll-based
+ *     probe with a positive control is a strong runtime signal, not a formal proof.
  *   - TCP only. A UDP/DNS lookup with no TCP connect is not counted (no data egress without a connection).
  *
  * Isolation (same contract as heartbeat_probe.cjs / jobs_probe.cjs): a DISPOSABLE CORTEX_APP_DATA_DIR, a
@@ -48,6 +52,22 @@ const AUDIO =
 const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9335';
 const SAMPLE_MS = Number(process.env.CORTEX_EGRESS_SAMPLE_MS || 200);
 const WORKLOAD_MS = Number(process.env.CORTEX_EGRESS_WORKLOAD_MS || 6000);
+
+// Transcribe leg: run a REAL offline ASR under the monitor when the CTC-300M model is resolvable.
+// Detection MUST match the APP's own resolver (models.rs bundled/repo fallback), which finds the model
+// at EITHER target/release/models (next to the exe) OR src-tauri/models (the fetch_models.py
+// destination that every other model gate checks). Detecting only next-to-exe silently skipped the leg
+// on the canonical fetch-models layout while the app could still transcribe — a false "browse-only"
+// pass under a gate whose charter claims ASR coverage (adversarial review 2026-07-12). Auto-on when
+// present; CORTEX_EGRESS_TRANSCRIBE forces (1) or skips (0).
+const CTC_REL = path.join('omniasr-ctc-300m', 'model.int8.onnx');
+const CTC_CANDIDATES = [
+  path.join(path.dirname(APP_EXE), 'models', CTC_REL),
+  path.join(REPO, 'src-tauri', 'models', CTC_REL),
+];
+const CTC_PRESENT = CTC_CANDIDATES.some((p) => fs.existsSync(p));
+const TRANSCRIBE_ENV = process.env.CORTEX_EGRESS_TRANSCRIBE;
+const RUN_TRANSCRIBE = TRANSCRIBE_ENV === '1' || (TRANSCRIBE_ENV !== '0' && CTC_PRESENT);
 
 const die = (m) => {
   console.error('PRECONDITION FAILED: ' + m);
@@ -155,7 +175,10 @@ async function validateSamplerApparatus() {
     client.once('error', rej);
   });
   const control = startSampler(process.pid); // this node process owns the loopback socket above
-  await sleep(1500);
+  // Poll until the sampler observes the known socket, up to 4s — a fixed short window can be shorter
+  // than PowerShell/Get-NetTCPConnection cold start, which would FALSELY fail the control (a flaky
+  // gate). This passes the instant the apparatus works, and only fails after a genuine 4s of nothing.
+  for (let i = 0; i < 20 && control.lines.length === 0; i++) await sleep(200);
   const seen = stopSampler(control);
   client.destroy();
   server.close();
@@ -216,6 +239,43 @@ async function run() {
   const page = ctx.pages().find((p) => p.url().includes('localhost') || p.url().includes('1420')) || ctx.pages()[0];
   await page.waitForSelector('[data-testid="app-root"]', { timeout: 45000 });
 
+  // Transcribe leg (highest-value) runs FIRST — before the browse busy-loop below, which hammers
+  // get_settings, trips the backend's IPC rate limiter and would otherwise reject this leg's own
+  // get_settings and make it inconclusive. Run a REAL offline transcription while the SAME sampler
+  // (started at t0) watches, so any cloud STT/LLM connection on the ASR path would be caught. The CTC
+  // engine is provisioned in the disposable profile (default WSL7B fail-hards without its server);
+  // cloud opt-ins are asserted OFF below, so this stays the offline path.
+  let transcribeLeg = { ran: false, segments: 0, error: null };
+  if (RUN_TRANSCRIBE) {
+    console.log('==> transcribe leg: provisioning offline CTC engine + importing real audio under the monitor...');
+    transcribeLeg = await page.evaluate(
+      async ({ audio }) => {
+        const invoke = window.__TAURI_INTERNALS__.invoke;
+        try {
+          const s = await invoke('get_settings');
+          s.asr_model_size = 'CTC300M';
+          s.use_finetuned_asr = false;
+          // CPU CTC: egress is identical either way, and it can't contend for VRAM a warm 7B server
+          // may be holding on both cards — keeps the leg robust, not fast (speed is not this test).
+          s.enable_gpu = false;
+          await invoke('update_settings', { settings: s });
+          await invoke('import_audio_file', { path: audio });
+          // Poll the backend for segments — proof the ASR path actually ran (up to 120s).
+          let segs = [];
+          for (let i = 0; i < 120; i++) {
+            segs = await invoke('get_segments', { verified: null }).catch(() => []);
+            if (Array.isArray(segs) && segs.length >= 1) break;
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+          return { ran: true, segments: Array.isArray(segs) ? segs.length : 0, error: null };
+        } catch (e) {
+          return { ran: true, segments: 0, error: String((e && e.message) || e) };
+        }
+      },
+      { audio: AUDIO },
+    );
+  }
+
   const workload = await page.evaluate(
     async ({ audio, workloadMs }) => {
       const invoke = window.__TAURI_INTERNALS__.invoke;
@@ -229,7 +289,7 @@ async function run() {
           await invoke('get_jobs');
           await invoke('get_waveform', { path: audio, numPoints: 4000, alignmentJson: null });
         } catch (e) {
-          /* a missing fixture is fine — we only need the backend exercised, not a result */
+          /* a missing fixture / rate-limit is fine — we only need the backend exercised, not a result */
         }
         calls++;
       }
@@ -271,10 +331,29 @@ async function run() {
     );
   }
 
+  // If we DECIDED to run the transcribe leg (model present / forced) it MUST have proven the ASR path
+  // (>=1 segment). A 0-segment leg cannot back the ASR-coverage the gate advertises, so fail LOUD
+  // rather than pass claiming coverage we did not get — the whole reason this leg exists is to monitor
+  // the import->VAD->CTC path where a cloud-STT/LLM leak would fire. (Egress itself was clean for what
+  // ran; this is a leg-inconclusive failure, not an egress failure.)
+  if (transcribeLeg.ran && transcribeLeg.segments < 1) {
+    throw new Error(
+      `TRANSCRIBE LEG INCONCLUSIVE: the leg ran but produced 0 segments` +
+        `${transcribeLeg.error ? ` (err=${transcribeLeg.error})` : ''} — cannot prove the ASR path was ` +
+        `exercised, so refusing to pass a gate that advertises ASR-path egress coverage. ` +
+        `(Zero external connections were observed for what ran; re-run, or set CORTEX_EGRESS_TRANSCRIBE=0 ` +
+        `to intentionally cover startup+browse only.)`,
+    );
+  }
+  // Only two honest outcomes reach here: the leg ran AND proved ASR (segments>=1), or it was not run
+  // (no model / explicitly skipped → startup+browse only). Never a silent "ran but empty" pass.
+  const legDesc = transcribeLeg.ran
+    ? `+ a REAL offline transcription (${transcribeLeg.segments} segment(s) via CTC ASR)`
+    : `; transcribe leg skipped (no local CTC model) — verdict covers startup+browse only`;
   console.log(
     `\nEGRESS OK: the default offline path opened ZERO non-loopback connections from the backend PID ` +
-      `(covering startup + a ${(WORKLOAD_MS / 1000) | 0}s get_settings/get_jobs/get_waveform workload). ` +
-      `Scope: TCP, poll-sampled every ${SAMPLE_MS}ms; transcribe-leg owner-gated (see header).`,
+      `(covering startup + a ${(WORKLOAD_MS / 1000) | 0}s get_settings/get_jobs/get_waveform workload ${legDesc}). ` +
+      `Scope: TCP, poll-sampled every ${SAMPLE_MS}ms; airtight kernel/ETW trace still a stretch (see header).`,
   );
 }
 
