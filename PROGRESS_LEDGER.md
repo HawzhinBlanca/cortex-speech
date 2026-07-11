@@ -2785,9 +2785,16 @@ VERBATIM proof (Windows):
     unchanged, no sensitive data in job rows, no network. Found ONE low-sev false-negative on the
     success-path `?` (a failed success-stamp reported a real export as failed) → FIXED to best-effort.
 
-OWNER-OBSERVABLE proof PENDING (honest gap): exe rebuilt, but the end-to-end "run an export → get_jobs
-shows succeeded; kill mid-export → next start shows INTERRUPTED" is a runtime check on the owner's
-machine; the get_jobs FRONTEND surface is the next increment. The bracketing LOGIC is unit-proven here.
+RUNTIME-PROVEN (npm run test:jobs, scripts/jobs_probe.cjs, fresh release exe, disposable profile):
+  ==> get_jobs before=0 after=1  exportError=none
+  ==> recorded job: id=995d53d1-... kind=export_dataset state=succeeded errorCode=null
+  JOBS OK: a durable export_dataset job was recorded and reached "succeeded" at runtime.
+  So it is USER-OBSERVABLE via IPC, not just unit-tested: a real export persists a durable succeeded
+  job a UI can read via get_jobs. (Rebuild first hit os error 32 — 4 stray cortex-speech-app.exe
+  instances from prior probe/e2e runs held the exe; killed + relinked; get_jobs confirmed present in the
+  binary.) STILL owner-machine: the crash-recovery leg (kill mid-export → next start shows INTERRUPTED)
+  and a get_jobs FRONTEND surface — logic unit-proven (orphaned_running_jobs_are_reaped...), the live
+  kill-and-restart is an owner drill.
 
 NEXT increment: (a) small frontend activity surface polling get_jobs (running/succeeded/failed+
 INTERRUPTED pill or list), then (b) bracket a second durability-less long op (export_finetune_pack or
