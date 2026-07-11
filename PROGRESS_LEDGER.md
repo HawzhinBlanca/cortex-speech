@@ -3054,3 +3054,26 @@ retrain cycle, IAA kappa w/ ≥2 real Sorani annotators, CORDI dialect fairness,
 crash/restore/soak drills, real calibration split (+ the heuristic-fence design call), the egress transcribe-
 leg (needs a local model) + a kernel/ETW trace for the airtight version; verify_10 not-built legs:
 egress-runtime (full) + refinery-lift. => The next iteration should WRITE docs/OWNER_HANDOFF.md and STOP.
+
+## SESSION SUMMARY + OWNER HAND-OFF (2026-07-11) — autonomous loop honest stop
+
+The verifiable-here, non-Codex, crisp-real-value surface is now GENUINELY EXHAUSTED. Final scan confirmed:
+the three concrete UI/export honesty gaps are closed (#157 subtitles, #8 Parquet alignment marker, #7 OOD
+relabel); the T1 judge has no user-facing lexicon/perplexity overclaim to relabel; media.rs whole-file
+playback copy is a larger byte-range change with owner-gated proof; the rest is owner-gated or Codex-territory.
+
+Delivered this session (all on codex/newbranch, each gated + adversarially verified; ~13 real defects found
++ fixed, several in my own first drafts): P0 #2 main-thread (runtime-proven); P0 #3 Job Supervisor COMPLETE
+(runtime-proven + user-visible, 2 ops bracketed); P0 #4 supervision policy/driver (pure-tested; live glue
+owner-gated); P0 #5 backup/restore fencing (newer-refuse + older-remigrate + undo-clear fix); P0 #9 egress
+(scoped runtime harness + in-run positive control); P1 durability (audio SHA256SUMS + staging-exclusion root
+fix; multi-source SRT/VTT refusal #157); P1 truthful intelligence (conformal provenance disclosure; Parquet
+alignment_quality marker #8; OOD -> Signal-Anomaly honest relabel #7).
+
+Honest grade: NOT a declared 10/10. verify_10.py is not fully green (egress-runtime full + refinery-lift are
+not-built; several legs owner-gated). The full remaining-work checklist, tagged [owner-gated] /
+[design-decision] / [verifiable-here-later] with the exact command/data/hardware each needs, and how to run
+every local gate, is in docs/OWNER_HANDOFF.md. The committed exe/bundle is stale vs HEAD — rebuild before any
+live check (npm run build + cargo build --release; kill stray cortex-speech-app.exe first).
+
+Loop STOPPED here — an honest owner-gated stop is success, not failure. Restart with /loop to resume.
