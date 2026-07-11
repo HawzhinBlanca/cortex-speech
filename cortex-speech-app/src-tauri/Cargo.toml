@@ -10,7 +10,11 @@ repository = "https://github.com/HawzhinBlanca/cortex-speech"
 
 [lib]
 name = "cortex_speech_app_lib"
-crate-type = ["lib", "cdylib", "staticlib"]
+# "lib" (rlib) is all the desktop binary links. The Tauri-template "cdylib"/"staticlib" exist only
+# for iOS/Android targets this Windows-only app never builds — and the cdylib breaks every fuzz
+# build (cargo-fuzz links with /include:main on MSVC, which a cdylib cannot satisfy: LNK2001).
+# Re-add them if mobile targets ever land.
+crate-type = ["lib"]
 
 [package.metadata]
 resources = []

@@ -10,10 +10,19 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 cortex-speech-app = { path = ".." }
+# cache.rs builds a CacheEntry whose created_at is a chrono timestamp (same version as the lib).
+chrono = "0.4"
 
 [profile.release]
 opt-level = 3
 debug = 1
+
+# cargo-fuzz enables debug-assertions on the TARGET via RUSTFLAGS, which never reach host-side
+# proc-macros/build scripts — tauri-codegen then compiles with debug_assertions OFF and omits the
+# #[cfg(debug_assertions)] `referenced_by` field its generate_context! output must initialize,
+# breaking every fuzz build with E0063. Align the host-side cfg so codegen and the target agree.
+[profile.release.build-override]
+debug-assertions = true
 
 [[bin]]
 name = "normalizer"

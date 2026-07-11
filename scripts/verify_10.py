@@ -406,6 +406,15 @@ def _probe_rtf():
 def _probe_fuzz():
     if not shutil.which("cargo-fuzz"):
         return "cargo-fuzz not installed (cargo install cargo-fuzz + nightly toolchain)"
+    if sys.platform == "win32":
+        # Measured on the owner's rig (2026-07-11), not assumed: the fuzz harness now COMPILES
+        # (tauri cfg/build-override, chrono dep, cdylib/include:main all fixed) but cannot LINK on
+        # windows-msvc — ASAN's dynamic-CRT model multiply-defines std:: symbols against the
+        # static-MT sherpa-onnx prebuilt (LNK2005), and --sanitizer none strips the runtime that
+        # provides libFuzzer's sancov section symbols (LNK2001 __stop___sancov_pcs).
+        # sherpa-onnx-sys 1.13.4 ships no MD prebuilt. Run this leg on Linux (CI), where
+        # ASAN + the -fPIC static libs link fine.
+        return "cargo-fuzz cannot link on windows-msvc (ASAN CRT vs static-MT sherpa); run on Linux CI"
     return None
 
 
