@@ -2844,3 +2844,32 @@ NEXT increment: continue widening job coverage (export_dataset_bundle / export_f
 run_gold_eval), OR pivot to the next audit item (P0 #5 backup/restore fencing, or P0 #4 live supervision
 glue). Progress ticks (update_job_progress mid-op) come when an op exposes a per-unit loop. Owner-machine
 still: live kill-mid-export crash drill (logic unit-proven via orphaned_running_jobs_are_reaped...).
+
+## P0 #5 backup/restore fencing — restore refuses a newer-schema snapshot (2026-07-11)
+
+Pivot to P0 #5. The restore path already integrity-checks the SOURCE before overwriting (db.rs restore
+line ~1210) — that gap was already closed. The REAL remaining hole: restore copies the source's pages
+directly (SQLite online-backup), BYPASSING run_migrations' startup forward-compat guard. So restoring a
+snapshot from a NEWER build would page-copy a future schema into the live DB and the running app would
+operate it with stale semantics. Both db_restore and restore_db_from_snapshot route through db.rs
+restore(), so both are now fenced.
+- db.rs restore(): after the source integrity_check, read the source's MAX(schema_migrations.version);
+  if > migrations::max_supported_version(), refuse BEFORE any write (live library never clobbered).
+  Missing schema_migrations -> version 0 (old/fresh snapshot restores); genuine read error propagates.
+  `no such table` handling mirrors get_current_version.
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean
+  cargo test --lib -> 876 passed; 0 failed; 6 ignored. New regression gate:
+    db::tests::restore_refuses_a_snapshot_from_a_newer_schema_without_clobbering_the_live_db (max+1
+    refused, live segment survives the refusal, same-version snapshot still restores).
+  python scripts/run_python_policies.py -> all 23 regressions passed
+  Adversarial 2-lens Workflow (fence-correctness / regression-privacy): 0 defects. Fence runs before any
+    live write; strictly-greater comparison (equal/older still restore); `no such table` catch verified
+    against pinned rusqlite 0.31 + SQLite 3.45.0 source; no PII in the message; local read, no network.
+
+FOLLOW-UPS surfaced (not done, candidate next P0 #5 increments): (a) restoring an OLDER snapshot does not
+re-run migrations afterward (pre-existing) — the live conn would sit at the old schema until next startup
+initialize(); worth a post-restore migrate or a re-open. (b) A pre-restore SAFETY snapshot of the current
+live DB before the swap (the 10-min auto-snapshot partially covers this). (c) restore atomicity (a crash
+mid online-backup can leave the live DB half-overwritten — copy-to-temp-then-swap would harden it).
