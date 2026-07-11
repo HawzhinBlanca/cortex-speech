@@ -1471,6 +1471,46 @@ impl Database {
         Ok(n)
     }
 
+    /// The most recent jobs (newest first), for a UI activity surface.
+    pub fn list_recent_jobs(&self, limit: i64) -> AppResult<Vec<crate::jobs::Job>> {
+        let sql = format!("SELECT {} FROM jobs ORDER BY datetime(created_at) DESC, id DESC LIMIT ?1", Self::JOB_COLS);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows: Vec<JobRow> = stmt.query_map(params![limit], Self::read_job_row)?.collect::<Result<_, _>>()?;
+        rows.into_iter().map(Self::job_from_row).collect()
+    }
+
+    /// Bracket `work` as a durable job: record a queued→running lifecycle, run it, then mark
+    /// succeeded, or failed with the stable `error_code` on error (the original error still propagates).
+    /// A crash mid-`work` leaves a `running` row that `mark_orphaned_running_jobs_failed` reaps at the
+    /// next startup — that is the whole point of routing a long op through here. `job_id` is caller-
+    /// supplied (a fresh uuid) so the id is known before `work` starts and survives a crash.
+    pub fn run_tracked<T>(
+        &self,
+        job_id: &str,
+        kind: &str,
+        error_code: &str,
+        work: impl FnOnce(&Database) -> AppResult<T>,
+    ) -> AppResult<T> {
+        self.create_or_get_job(job_id, kind, None, None)?;
+        self.transition_job(job_id, crate::jobs::JobState::Running, None)?;
+        // Once `work` returns, the op's real outcome is DECIDED (the export file is on disk, or not).
+        // The terminal stamp is a best-effort RECORD of that — it must never change what the caller sees.
+        // If a stamp write fails, the row lingers `running` and is reaped as INTERRUPTED at the next
+        // startup: a cosmetic history wart, never a false result to the user or data loss.
+        match work(self) {
+            Ok(v) => {
+                if let Err(e) = self.transition_job(job_id, crate::jobs::JobState::Succeeded, None) {
+                    tracing::warn!("job {job_id} ({kind}) succeeded but recording success failed: {e}");
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.transition_job(job_id, crate::jobs::JobState::Failed, Some(error_code));
+                Err(e)
+            }
+        }
+    }
+
     pub fn insert_hypothesis(&self, hyp: &SegmentHypothesis) -> AppResult<()> {
         // NFC-canonicalize the vote at this single chokepoint so EVERY engine's hypothesis (local
         // 300M/1B/WSL-7B and cloud Scribe) is stored in the same normalization form. The jury scores
@@ -4260,5 +4300,54 @@ mod tests {
     fn get_job_returns_none_for_a_missing_id() {
         let db = make_db();
         assert!(db.get_job("does-not-exist").unwrap().is_none());
+    }
+
+    #[test]
+    fn run_tracked_marks_succeeded_and_returns_the_work_value() {
+        let db = make_db();
+        let out = db.run_tracked("t-ok", "export_dataset", "EXPORT_FAILED", |_d| Ok(42_i32)).unwrap();
+        assert_eq!(out, 42);
+        let job = db.get_job("t-ok").unwrap().unwrap();
+        assert_eq!(job.state, JobState::Succeeded);
+        assert!(job.error_code.is_none());
+    }
+
+    #[test]
+    fn run_tracked_marks_failed_with_code_and_propagates_the_original_error() {
+        let db = make_db();
+        let err = db
+            .run_tracked::<()>("t-err", "export_dataset", "EXPORT_FAILED", |_d| {
+                Err(AppError::Other("disk full while writing parquet".into()))
+            })
+            .unwrap_err();
+        // The ORIGINAL work error propagates, not a job-bookkeeping error.
+        assert!(format!("{err}").contains("disk full"), "must surface the work error: {err}");
+        let job = db.get_job("t-err").unwrap().unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.error_code.as_deref(), Some("EXPORT_FAILED"));
+    }
+
+    #[test]
+    fn run_tracked_gives_work_a_usable_db_handle() {
+        // The closure receives &Database so the bracketed op can actually touch the library.
+        let db = make_db();
+        db.insert_segment(&make_segment("seg-in-job", "/a.wav")).unwrap();
+        let n = db
+            .run_tracked("t-db", "count", "COUNT_FAILED", |d| Ok(d.get_segment_by_id("seg-in-job")?.is_some()))
+            .unwrap();
+        assert!(n, "work closure could read the DB it was handed");
+        assert_eq!(db.get_job("t-db").unwrap().unwrap().state, JobState::Succeeded);
+    }
+
+    #[test]
+    fn list_recent_jobs_returns_newest_first_and_respects_limit() {
+        let db = make_db();
+        for i in 0..3 {
+            db.create_or_get_job(&format!("lj{i}"), "export_dataset", None, None).unwrap();
+        }
+        let all = db.list_recent_jobs(10).unwrap();
+        assert_eq!(all.len(), 3);
+        let limited = db.list_recent_jobs(2).unwrap();
+        assert_eq!(limited.len(), 2, "limit honored");
     }
 }

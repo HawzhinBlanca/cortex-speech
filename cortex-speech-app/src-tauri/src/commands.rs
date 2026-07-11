@@ -1672,10 +1672,30 @@ pub async fn export_dataset(path: String, format: String, state: State<'_, AppSt
     };
     // Off the main thread: a full-library export (DB scan + serialize + hash + atomic write) would
     // otherwise freeze the UI. The DB guard is taken INSIDE the blocking task, never across an await.
+    // Bracketed as a durable job so a crash mid-export is reaped as INTERRUPTED at the next startup and
+    // the outcome shows up in get_jobs — the op's real work is unchanged.
+    let db = state.db_arc();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        db.run_tracked(&job_id, "export_dataset", "EXPORT_FAILED", |d| {
+            crate::export::export_dataset(d, Path::new(&validated_path), &fmt)
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Recent durable jobs (newest first) for a UI activity surface — a long op bracketed via
+/// `Database::run_tracked` shows here as running/succeeded/failed, and a crash residue reaped at
+/// startup shows as failed/INTERRUPTED. Cheap read; safe to poll.
+#[tauri::command]
+pub async fn get_jobs(state: State<'_, AppState>) -> Result<Vec<crate::jobs::Job>, String> {
+    RATE_LIMITER.check("get_jobs")?;
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::export::export_dataset(&db, Path::new(&validated_path), &fmt).map_err(|e| e.to_string())
+        db.list_recent_jobs(50).map_err(|e| e.to_string())
     })
     .await
 }

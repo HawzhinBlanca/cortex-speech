@@ -445,6 +445,15 @@ pub fn run() {
         tracing::warn!("champion pointer sync failed: {e}");
     }
 
+    // P0 #3 Job Supervisor: any durable job still `running` at startup is a crash residue (a clean run
+    // always reaches a terminal state) — reap it to failed/INTERRUPTED so the activity surface shows the
+    // honest "interrupted", never a ghost that spins forever. Best-effort: never blocks startup.
+    match db.mark_orphaned_running_jobs_failed() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("reaped {n} interrupted job(s) from a previous crash"),
+        Err(e) => tracing::warn!("startup job reaper failed: {e}"),
+    }
+
     // P3.1/M0.4b: rotating auto-snapshots of the DB + config state. One on startup (so a corruption is
     // recoverable from the moment the app runs), then every 10 minutes — protecting the marathon's
     // irreplaceable review labor without any user action. Skipped in headless test modes.
@@ -577,6 +586,7 @@ pub fn run() {
             commands::merge_dataset_json,
             commands::export_dataset,
             commands::export_transcript,
+            commands::get_jobs,
             commands::get_champion_engine_status,
             commands::start_champion_engine,
             commands::export_dataset_bundle,

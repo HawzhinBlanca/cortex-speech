@@ -5,6 +5,7 @@
 //! This module owns the PURE part — the state machine — so the transition rules are unit-tested
 //! without a database. The DB read/write glue and the actual op wiring come in a later increment.
 
+use serde::Serialize;
 use std::fmt;
 
 /// The lifecycle of a durable job. String forms match the `jobs.state` CHECK constraint in
@@ -77,8 +78,17 @@ impl fmt::Display for JobState {
     }
 }
 
+// Serialize as the same token the DB stores, so as_str stays the single source of truth (no drift to a
+// derive's own casing).
+impl Serialize for JobState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// A durable job as read back from the `jobs` table (the columns the UI/supervisor actually need).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Job {
     pub id: String,
     pub kind: String,
