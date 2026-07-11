@@ -3027,8 +3027,30 @@ VERBATIM proof (Windows):
   Adversarial 1-lens Workflow: Parquet code CORRECT (lockstep at index 6, positional type-check intact, no
     fixed-position consumer); caught my FALSE "CSV also carries it" premise -> comment + rationale corrected.
 
-NEXT: verifiable-here candidates are largely exhausted for this session's non-Codex surface. Remaining real
-value is OWNER-GATED: Gold Marathon ≥500 real decisions, retrain cycle, IAA kappa w/ real annotators, CORDI
-dialect fairness, live WSL/7B supervision + crash/restore drills, real calibration data (+ the heuristic-fence
-design call), the egress transcribe-leg (needs a local model). If the next scan finds no crisp verifiable-here
-item of real value, WRITE docs/OWNER_HANDOFF.md and STOP the loop (an honest owner-gated stop = success).
+## P1 truthful intelligence #7 — relabel "OOD detector" as the honest "Signal-Anomaly (heuristic)" screen (2026-07-11)
+
+Audit P1 #7 + honesty law. quality/ood.rs is a ZCR + frame-energy-variance HEURISTIC (its header records the
+fabricated WavLM "OOD" path was removed for violating the honesty law; no learned model exists). The UI still
+called it an "Out-of-Distribution Audio Detector" with "OOD Score" verdicts — overclaiming a trained detector.
+Fix: en/ckb validation.ood.* relabeled to "Signal Anomaly (heuristic)" (title/tab/run/score/verdict), the
+description now says plainly "NOT a trained out-of-distribution classifier"; and TWO hardcoded un-localized
+"OOD" strings in ValidationPanel.svelte (the per-segment `OOD: {score}` label + the "OOD flagged" checkbox,
+which stayed English even under Sorani) now route through $t.
+
+VERBATIM proof (Windows):
+  npm run typecheck -> 0 errors; npm run lint -> clean
+  npx vitest run -> 179 passed, 0 errors. New gates in tests/lib/i18n.test.ts: dictionary honesty checks
+    (title 'heuristic' not 'detector', tab 'anomaly', description 'not a trained', ckb parity/no 'OOD') PLUS
+    a SOURCE-SCAN of ValidationPanel.svelte (no 'OOD flagged', no `>OOD:`).
+  python scripts/run_python_policies.py -> all 23 regressions passed
+  Adversarial 1-lens Workflow: Sorani accuracy + consistency clean; CONFIRMED the two hardcoded strings my
+    first draft missed (medium-sev completeness) -> both FIXED + the gate strengthened (dictionary-only checks
+    could not see hardcoded component text — the exact hole that let them slip).
+
+NEXT: this session has now closed the three concrete UI/export honesty gaps found on the non-Codex surface
+(#157 subtitles, #8 Parquet alignment marker, #7 OOD relabel). Verifiable-here candidates of real value are
+now genuinely exhausted; remaining work to a true 10/10 is OWNER-GATED: Gold Marathon ≥500 real decisions,
+retrain cycle, IAA kappa w/ ≥2 real Sorani annotators, CORDI dialect fairness, live WSL/7B supervision +
+crash/restore/soak drills, real calibration split (+ the heuristic-fence design call), the egress transcribe-
+leg (needs a local model) + a kernel/ETW trace for the airtight version; verify_10 not-built legs:
+egress-runtime (full) + refinery-lift. => The next iteration should WRITE docs/OWNER_HANDOFF.md and STOP.
