@@ -179,5 +179,25 @@ describe('segmentStore', () => {
       expect(get(libraryTotal)).toBe(0);
       expect(get(libraryTruncated)).toBe(false);
     });
+
+    it('NEVER bakes the view filters into the backend query — the store is always the whole library', async () => {
+      // Background reloads (batch/import completion, wsl-status, ReviewMode.ensureWordTimings) fire
+      // while the verified chip / search box are active. A filtered server query silently replaced
+      // the store with a stale subset that every consumer (filteredSegments, segmentStats, export's
+      // verified filter) then treated as the whole library. Filtering is client-side, always.
+      filterVerified.set(true);
+      searchQuery.set('hello');
+      invokeMock.mockImplementation(fakeBackend(3) as typeof invoke);
+      await segments.load();
+
+      expect(get(segments)).toHaveLength(3); // the full library, not the filtered subset
+      const pageCalls = invokeMock.mock.calls.filter((c) => c[0] === 'get_segments_page');
+      expect(pageCalls.length).toBeGreaterThan(0);
+      for (const call of pageCalls) {
+        const args = call[1] as { verified: boolean | null; query: string | null };
+        expect(args.verified).toBeNull();
+        expect(args.query).toBeNull();
+      }
+    });
   });
 });

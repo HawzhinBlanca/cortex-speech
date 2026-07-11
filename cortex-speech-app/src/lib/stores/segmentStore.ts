@@ -22,10 +22,12 @@ function createSegmentsStore() {
     },
     async load() {
       const seq = ++loadSeq;
-      // Snapshot the filter params ONCE: a mid-load store change must not drift the query across
-      // pages. A real change bumps loadSeq elsewhere, and this run bails at the next stale-check.
-      const verified = get(filterVerified);
-      const query = get(searchQuery) || null;
+      // ALWAYS load the whole library — never bake the view filters (verified chip / search query)
+      // into the backend query. Every consumer treats this store AS the whole library and applies
+      // the filters client-side (filteredSegments, searchScopedSegments, segmentStats, export's
+      // verified filter), and background reloads fire while filters are active (batch/import
+      // completion, wsl-status, ReviewMode.ensureWordTimings) — a filtered reload silently
+      // replaced the library with a stale subset that every consumer then mis-derived from.
       const sort = get(sortOrder);
       try {
         const acc: SpeechSegment[] = [];
@@ -34,7 +36,7 @@ function createSegmentsStore() {
         // Walk EVERY page. The old code took only the first 300 rows, so any larger library silently
         // dropped everything past 300 from review, lists, and every store-derived stat.
         do {
-          const page = await api.getSegmentsPage({ verified, query, sort, limit: PAGE_SIZE, cursor });
+          const page = await api.getSegmentsPage({ verified: null, query: null, sort, limit: PAGE_SIZE, cursor });
           if (seq !== loadSeq) return; // a newer load or a write superseded this run
           total = page.total;
           acc.push(...page.items);
@@ -46,9 +48,11 @@ function createSegmentsStore() {
         const truncated = acc.length < total;
         libraryTruncated.set(truncated);
         if (truncated) {
+          // The store always holds an unfiltered prefix, so search/filter chips cannot pull in the
+          // dropped tail — say so honestly instead of advising a filter that won't change the load.
           console.warn(
             `Loaded ${acc.length} of ${total} segments (MAX_LOAD=${MAX_LOAD} reached). ` +
-              'Narrow with search/filter to review the rest.',
+              'Rows past the ceiling are not shown; libraryTruncated is set.',
           );
         }
         // Refresh threshold after loading segments
