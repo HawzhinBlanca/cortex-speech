@@ -115,6 +115,15 @@ pub fn export_audio_segments(
         files.push("metadata.csv".to_string());
     }
 
+    // Integrity manifest over every written clip (+ metadata), matching every sibling multi-file export
+    // (export_dataset / HF / bundle / gold-eval / finetune): a consumer runs `sha256sum -c SHA256SUMS`
+    // to detect a corrupted, truncated, or partially-copied WAV in a shared dataset. Written LAST so it
+    // covers all artifacts. Skipped when nothing was exported (all failed/held-out) — no files to cover.
+    if !files.is_empty() {
+        crate::export::write_sha256sums(output_dir)?;
+        files.push("SHA256SUMS".to_string());
+    }
+
     Ok(AudioExportResult {
         total: segment_ids.len(),
         succeeded,
@@ -577,7 +586,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files, vec!["test_exp1.wav"]);
+        assert_eq!(result.files, vec!["test_exp1.wav", "SHA256SUMS"]);
         assert!(!out_dir.join("metadata.csv").exists());
     }
 
@@ -642,7 +651,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.succeeded, 1);
-        assert_eq!(result.files, vec!["test_exp1.wav", "metadata.csv"]);
+        assert_eq!(result.files, vec!["test_exp1.wav", "metadata.csv", "SHA256SUMS"]);
         assert_ne!(fs::read(&output_path).unwrap(), b"stale partial export");
         let (sample_rate, sample_count) = output_wav_info(&output_path);
         assert_eq!(sample_rate, 16000);
@@ -652,6 +661,59 @@ mod tests {
             .flatten()
             .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"));
         assert!(!temp_left, "temporary export file should be promoted or removed");
+    }
+
+    #[test]
+    fn export_writes_a_sha256sums_manifest_that_covers_the_clips_and_detects_tampering() {
+        // Every multi-file export must ship an integrity manifest so a consumer can detect a corrupted,
+        // truncated, or partially-copied WAV via `sha256sum -c`. Audio export was the lone one missing it.
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("test.wav");
+        make_wav_file(&wav_path);
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        insert_test_segment(&db, "exp1", &wav_path);
+
+        let out_dir = tmp.path().join("out");
+        let result = export_audio_segments(
+            &db,
+            &["exp1".to_string()],
+            &AudioExportOptions {
+                output_dir: out_dir.to_string_lossy().to_string(),
+                format: AudioExportFormat::Wav,
+                sample_rate: 16000,
+                include_metadata: true,
+            },
+        )
+        .unwrap();
+        assert!(result.files.contains(&"SHA256SUMS".to_string()), "manifest must be listed in the result");
+
+        // The manifest lists the clip + metadata, sorted, and NEVER itself.
+        let sums = fs::read_to_string(out_dir.join("SHA256SUMS")).unwrap();
+        let entries: std::collections::HashMap<String, String> = sums
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let (hash, path) = l.split_once("  ").expect("each line is '<hex>  <path>'");
+                (path.to_string(), hash.to_string())
+            })
+            .collect();
+        assert!(entries.contains_key("test_exp1.wav"), "the exported clip must be in the manifest");
+        assert!(entries.contains_key("metadata.csv"), "metadata.csv must be in the manifest");
+        assert!(!entries.contains_key("SHA256SUMS"), "the manifest must not hash itself");
+
+        // The recorded hash MATCHES the file on disk — a correct manifest verifies.
+        use sha2::{Digest, Sha256};
+        let sha_of = |name: &str| -> String {
+            let bytes = fs::read(out_dir.join(name)).unwrap();
+            Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        assert_eq!(entries["test_exp1.wav"], sha_of("test_exp1.wav"), "manifest hash matches the real clip");
+
+        // Tampering is detectable: mutate the clip and the recorded hash no longer matches.
+        fs::write(out_dir.join("test_exp1.wav"), b"corrupted bytes not the real wav").unwrap();
+        assert_ne!(entries["test_exp1.wav"], sha_of("test_exp1.wav"), "a corrupted clip must fail verification");
     }
 
     #[test]

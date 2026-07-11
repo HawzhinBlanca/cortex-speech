@@ -599,7 +599,18 @@ pub(crate) fn write_sha256sums(dir: &std::path::Path) -> AppResult<()> {
                 collect(&path, root, out)?;
             } else if ft.is_file() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name == "SHA256SUMS" || name.ends_with(".tmp") {
+                // Skip the manifest itself and any in-flight or crash-leftover STAGING file. TWO temp
+                // shapes exist: `*.tmp` (atomic text writes) and `*.tmp-<pid>-<nonce>` (audio-clip
+                // staging, export_audio::temporary_output_path). Matching only `.tmp` would let a
+                // crashed-run clip fragment (`foo.wav.tmp-1234-567`) be hashed into the manifest as if it
+                // were a real dataset artifact. The `.tmp-` arm requires an all-digits/`-` tail so a real
+                // file coincidentally containing `.tmp-` (e.g. `foo.tmp-bar.wav`) is NOT excluded.
+                let is_staging = name.ends_with(".tmp")
+                    || name.rfind(".tmp-").is_some_and(|i| {
+                        let tail = &name[i + ".tmp-".len()..];
+                        !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+                    });
+                if name == "SHA256SUMS" || is_staging {
                     continue;
                 }
                 let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
@@ -1624,6 +1635,12 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("data/train")).unwrap();
         std::fs::write(dir.path().join("data/train/clip.wav"), b"hello world").unwrap();
         std::fs::write(dir.path().join("metadata.csv.tmp"), b"staging").unwrap();
+        // An audio-clip staging fragment left by a crashed/concurrent run: `<name>.tmp-<pid>-<nonce>`.
+        // The old `.ends_with(".tmp")` rule missed this shape, so it would have been hashed in as a real
+        // dataset artifact. It must be excluded.
+        std::fs::write(dir.path().join("clip.wav.tmp-1234-567890"), b"crash leftover").unwrap();
+        // A REAL file that merely contains ".tmp-" in its stem must NOT be excluded (the tail has letters).
+        std::fs::write(dir.path().join("foo.tmp-bar.wav"), b"a genuine clip").unwrap();
 
         write_sha256sums(dir.path()).unwrap();
         let sums = std::fs::read_to_string(dir.path().join("SHA256SUMS")).unwrap();
@@ -1632,9 +1649,12 @@ mod tests {
         assert!(sums.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  a.txt"));
         // Nested file present with a forward-slash relative path.
         assert!(sums.lines().any(|l| l.ends_with("  data/train/clip.wav")));
-        // .tmp staging files and the manifest itself are excluded.
-        assert!(!sums.contains(".tmp"));
+        // Both staging shapes and the manifest itself are excluded...
+        assert!(!sums.contains("metadata.csv.tmp"), ".csv.tmp staging excluded");
+        assert!(!sums.contains(".tmp-1234-567890"), ".tmp-<pid>-<nonce> clip staging excluded");
         assert!(!sums.contains("SHA256SUMS"));
+        // ...but a genuine file whose name merely contains `.tmp-` is kept.
+        assert!(sums.lines().any(|l| l.ends_with("  foo.tmp-bar.wav")), "a real .tmp-named clip stays");
         // Every listed hash matches an independent recompute.
         for line in sums.lines() {
             let (hash, rel) = line.split_once("  ").unwrap();
