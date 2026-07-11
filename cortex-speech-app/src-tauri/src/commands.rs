@@ -1478,10 +1478,14 @@ pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> 
 }
 
 #[tauri::command]
-pub fn get_segments(verified: Option<bool>, state: State<'_, AppState>) -> Result<Vec<SpeechSegment>, String> {
+pub async fn get_segments(verified: Option<bool>, state: State<'_, AppState>) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("get_segments")?;
-    let db = state.lock_db();
-    db.get_segments(verified).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        db.get_segments(verified).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1518,13 +1522,17 @@ pub fn get_segments_page(
 /// M2.5: Return segments ordered by suspect-first priority: escalated + low confidence first.
 /// Priority: 1) Jury escalated, 2) Low agent confidence, 3) Chronological.
 #[tauri::command]
-pub fn get_segments_suspect_first(
+pub async fn get_segments_suspect_first(
     verified: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("get_segments_suspect_first")?;
-    let db = state.lock_db();
-    db.get_segments_suspect_first(verified).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        db.get_segments_suspect_first(verified).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1616,18 +1624,22 @@ pub fn delete_segments_batch(ids: Vec<String>, state: State<'_, AppState>) -> Re
 }
 
 #[tauri::command]
-pub fn merge_dataset_json(json_content: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn merge_dataset_json(json_content: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("merge_dataset_json")?;
     // Sanity-bound the pasted payload (generous enough for a real multi-segment dataset) so a
     // pathological blob can't drive an unbounded parse — matching the size guard every other
     // JSON-accepting command applies.
     validate::validate_text(&json_content, 50_000_000, "Dataset JSON")?;
-    let db = state.lock_db();
-    let (created, updated) = db.merge_dataset_json(&json_content).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({
-        "created": created,
-        "updated": updated
-    }))
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let (created, updated) = db.merge_dataset_json(&json_content).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "created": created,
+            "updated": updated
+        }))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1952,10 +1964,14 @@ pub fn get_import_status(state: State<'_, AppState>) -> Result<crate::pipeline::
 }
 
 #[tauri::command]
-pub fn get_dataset_stats(state: State<'_, AppState>) -> Result<stats::DatasetStats, String> {
+pub async fn get_dataset_stats(state: State<'_, AppState>) -> Result<stats::DatasetStats, String> {
     RATE_LIMITER.check("get_dataset_stats")?;
-    let db = state.lock_db();
-    stats::compute_stats(&db).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        stats::compute_stats(&db).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// The complete speaker list (not the truncated top-10 dashboard summary) so the speaker-management
@@ -2601,9 +2617,13 @@ pub fn acknowledge_quarantine(state: State<'_, AppState>) -> Result<usize, Strin
 }
 
 #[tauri::command]
-pub fn db_vacuum(state: State<'_, AppState>) -> Result<(), String> {
-    let db = state.lock_db();
-    db.vacuum().map_err(|e| e.to_string())
+pub async fn db_vacuum(state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        db.vacuum().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// B2: report whether a past corruption event quarantined a database (files named
@@ -2634,10 +2654,14 @@ pub fn get_quarantine_notice(state: State<'_, AppState>) -> Result<serde_json::V
 /// Intelligence read-side: LOOP-0 shadow precision (the C5 go-live evidence) + auto-accept
 /// precision (C4) joined against subsequent human decisions.
 #[tauri::command]
-pub fn get_intelligence_report(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn get_intelligence_report(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("get_intelligence_report")?;
-    let db = state.lock_db();
-    db.intelligence_report().map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        db.intelligence_report().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// B2: list the rotating auto-snapshots (newest first) for the restore picker.
@@ -2699,21 +2723,29 @@ pub fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Res
 
 /// P3.3: report which distinct source audio files are missing on disk (moved/renamed/deleted).
 #[tauri::command]
-pub fn get_audio_health(state: State<'_, AppState>) -> Result<crate::db::AudioHealth, String> {
+pub async fn get_audio_health(state: State<'_, AppState>) -> Result<crate::db::AudioHealth, String> {
     RATE_LIMITER.check("get_audio_health")?;
-    let db = state.lock_db();
-    db.audio_health().map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        db.audio_health().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// P3.3: relink missing source audio by basename against a folder the owner picks.
 #[tauri::command]
-pub fn relink_audio(search_dir: String, state: State<'_, AppState>) -> Result<crate::db::RelinkResult, String> {
+pub async fn relink_audio(search_dir: String, state: State<'_, AppState>) -> Result<crate::db::RelinkResult, String> {
     STRICT_RATE_LIMITER.check("relink_audio")?;
     if search_dir.contains('\0') {
         return Err("Search directory contains null bytes".to_string());
     }
-    let db = state.lock_db();
-    db.relink_audio(std::path::Path::new(&search_dir)).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        db.relink_audio(std::path::Path::new(&search_dir)).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]

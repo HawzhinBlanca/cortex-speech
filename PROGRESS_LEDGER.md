@@ -2421,3 +2421,28 @@ NEXT: the heavier slow-command classes — ASR/alignment (transcribe_segment*, a
 hashing, backup/snapshot, model download, evaluation, jury/batch. These hold more state and some
 already spawn threads; audit each for the run_blocking pattern vs existing concurrency. Then the
 runtime heartbeat proof (needs the built exe/CDP harness — flag if unrunnable here).
+
+## P0 #2 cont. — 8 dataset-wide DB commands moved off the main thread (2026-07-11)
+
+Third async-migration batch. An Explore agent classified all remaining sync #[tauri::command]s into
+A (clean run_blocking conversions), B (risky — spawn threads / cancel tokens / AppHandle event
+emit / cloud egress: handle individually), C (instant reads — leave sync). This batch = the cleanest
+Bucket-A `lock db → one blocking call → return owned` shape:
+- get_segments, get_segments_suspect_first (full-table loads — froze the UI on a large library),
+  get_dataset_stats, get_intelligence_report (dataset-wide aggregates), get_audio_health,
+  relink_audio (source-dir scan + file I/O), db_vacuum (rewrites the whole DB file),
+  merge_dataset_json (parse up-to-50 MB + DB merge/insert). All now async + run_blocking + db_arc().
+- cargo check + cargo test compiling test cfg both pass → PROVES none had a sync internal caller.
+- Ratchet gate grown to 17 commands (9 exports/dialogs + these 8).
+
+VERBATIM proof:
+  cargo check --lib                 -> Finished (6.3s)
+  cargo clippy --lib -- -D warnings -> Finished, 0 warnings
+  cargo test --lib                  -> 842 passed; 0 failed; 6 ignored
+  python scripts/test_command_main_thread_policy.py -> command main-thread policy regression passed
+
+NEXT: continue Bucket A (get_dataset_certificate, get_active_learning_queue, the eval/scorecard
+commands, compute_acoustic/ood_scores, db_backup/restore, verify_finetuned_model_integrity/hashing,
+the pipeline-clone ASR commands transcribe_segment*/get_waveform/rediarize_segments). Then Bucket B
+individually (batch_*/import_* thread-spawners, cloud-egress jury/scribe/dpo, register_media_asset's
+guard-across-copy). Then the runtime heartbeat proof (needs built exe/CDP — flag if unrunnable here).

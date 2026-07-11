@@ -25,6 +25,15 @@ ASYNC_SLOW_COMMANDS = [
     "export_audio",
     "export_gold_eval_set",
     "export_finetune_pack",
+    # Dataset-wide DB scans / file-I/O reads + writes (whole-library work that froze the UI).
+    "get_segments",
+    "get_segments_suspect_first",
+    "get_dataset_stats",
+    "get_intelligence_report",
+    "get_audio_health",
+    "relink_audio",
+    "db_vacuum",
+    "merge_dataset_json",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).
@@ -36,6 +45,14 @@ RUN_BLOCKING_COMMANDS = [
     "export_audio",
     "export_gold_eval_set",
     "export_finetune_pack",
+    "get_segments",
+    "get_segments_suspect_first",
+    "get_dataset_stats",
+    "get_intelligence_report",
+    "get_audio_health",
+    "relink_audio",
+    "db_vacuum",
+    "merge_dataset_json",
 ]
 
 
