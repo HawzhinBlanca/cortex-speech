@@ -1003,8 +1003,8 @@ pub async fn transcribe_segment_constrained(
         // Slice only THIS segment's clip — every VAD chunk shares the whole-source audio_path (the range is
         // in alignment_json), so decoding `pcm` directly would re-transcribe the ENTIRE recording into one
         // segment. None alignment (single-segment file) = whole file. Mirrors the finetuned/Scribe paths.
-        let (clip, _suffix) =
-            crate::chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref()).map_err(|e| e.to_string())?;
+        let (clip, _suffix) = crate::chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref())
+            .map_err(|e| e.to_string())?;
         let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
         let text = crate::constrained_decode::run_constrained(&model, &tokens, &audio, true)?;
         Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
@@ -1117,7 +1117,7 @@ pub async fn verify_finetuned_model_integrity() -> Result<String, String> {
 /// `transcribe_segment` path is unchanged. Resolves the model from `CORTEX_FINETUNED_ONNX` +
 /// `CORTEX_FINETUNED_VOCAB` (dev/testing) or `<models>/finetuned-mms-ckb/{model.onnx,vocab.json}`.
 #[tauri::command]
-pub fn transcribe_segment_finetuned(
+pub async fn transcribe_segment_finetuned(
     audio_path: String,
     alignment_json: Option<String>,
     state: State<'_, AppState>,
@@ -1127,36 +1127,41 @@ pub fn transcribe_segment_finetuned(
     if let Some(ref aj) = alignment_json {
         validate::validate_alignment_json(aj)?;
     }
-    let (onnx, vocab) = resolve_finetuned_paths()?;
-    // Offset-less alignment is only whole-file-safe when this source has NO sibling chunks (see
-    // decode_finetuned_clip_16k): on a multi-segment source it would silently re-transcribe the
-    // entire recording into one segment (true-10 audit 2026-07-09).
-    let sibling_count: i64 = {
-        let db = state.lock_db();
-        db.connection()
-            .query_row(
-                "SELECT COUNT(*) FROM speech_segments WHERE audio_path = ?1",
-                rusqlite::params![audio_path],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?
-    };
-    // Decode ONLY this segment's clip window (16 kHz). Every VAD chunk shares the whole-source
-    // audio_path with its range in alignment_json; decoding the WHOLE source first (the old path) failed
-    // on long recordings ("audio too large to decode in one pass") even though the clip is a few
-    // seconds. The windowed decode reads just the clip, so re-transcribe works on any source length.
-    let clip = decode_finetuned_clip_16k(&audio_path, alignment_json.as_deref(), sibling_count <= 1)?;
-    // Route through the pipeline's shared windowed wrapper, NOT run_wav2vec2 directly: the model is
-    // trained on short utterances and a single unbounded pass over >15 s (a raised max-segment
-    // setting, or a whole-file/no-meta clip) duplicates text — the pipeline path sub-splits into
-    // ~15 s windows for exactly that reason (true-10 audit 2026-07-09: one engine, two call paths,
-    // two different qualities).
-    let text = crate::pipeline::ProcessingPipeline::transcribe_chunk_finetuned(&onnx, &vocab, &clip)?;
-    Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
+    let db = state.db_arc();
+    // Windowed decode + fine-tuned ONNX inference — off the main thread.
+    run_blocking(move || {
+        let (onnx, vocab) = resolve_finetuned_paths()?;
+        // Offset-less alignment is only whole-file-safe when this source has NO sibling chunks (see
+        // decode_finetuned_clip_16k): on a multi-segment source it would silently re-transcribe the
+        // entire recording into one segment (true-10 audit 2026-07-09).
+        let sibling_count: i64 = {
+            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM speech_segments WHERE audio_path = ?1",
+                    rusqlite::params![audio_path],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?
+        };
+        // Decode ONLY this segment's clip window (16 kHz). Every VAD chunk shares the whole-source
+        // audio_path with its range in alignment_json; decoding the WHOLE source first (the old path) failed
+        // on long recordings ("audio too large to decode in one pass") even though the clip is a few
+        // seconds. The windowed decode reads just the clip, so re-transcribe works on any source length.
+        let clip = decode_finetuned_clip_16k(&audio_path, alignment_json.as_deref(), sibling_count <= 1)?;
+        // Route through the pipeline's shared windowed wrapper, NOT run_wav2vec2 directly: the model is
+        // trained on short utterances and a single unbounded pass over >15 s (a raised max-segment
+        // setting, or a whole-file/no-meta clip) duplicates text — the pipeline path sub-splits into
+        // ~15 s windows for exactly that reason (true-10 audit 2026-07-09: one engine, two call paths,
+        // two different qualities).
+        let text = crate::pipeline::ProcessingPipeline::transcribe_chunk_finetuned(&onnx, &vocab, &clip)?;
+        Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn transcribe_segment(
+pub async fn transcribe_segment(
     segment_id: Option<String>,
     audio_path: String,
     alignment_json: Option<String>,
@@ -1171,19 +1176,22 @@ pub fn transcribe_segment(
         validate::validate_alignment_json(aj)?;
     }
     // Clone the pipeline (Arc-wrapped internals) so the global pipeline mutex is released before the
-    // possibly-long WSL/ONNX transcription — holding it would serialize every other pipeline command.
+    // possibly-long WSL/ONNX transcription, and run it OFF the main thread so the UI stays responsive.
     let pipeline = state.lock_pipeline().clone();
-    let draft = pipeline
-        .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref(), None)
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({
-        "text": draft.final_text,
-        "rawTranscript": draft.raw_text,
-        "confidence": draft.confidence,
-        "confidenceSource": draft.confidence_source,
-        "modelVersionId": draft.model_version_id,
-        "cloudCall": draft.cloud_call
-    }))
+    run_blocking(move || {
+        let draft = pipeline
+            .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref(), None)
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "text": draft.final_text,
+            "rawTranscript": draft.raw_text,
+            "confidence": draft.confidence,
+            "confidenceSource": draft.confidence_source,
+            "modelVersionId": draft.model_version_id,
+            "cloudCall": draft.cloud_call
+        }))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1389,7 +1397,7 @@ pub fn normalize_text(text: String, state: State<'_, AppState>) -> Result<String
 }
 
 #[tauri::command]
-pub fn align_segment(
+pub async fn align_segment(
     audio_path: String,
     text: String,
     alignment_json: Option<String>,
@@ -1408,30 +1416,32 @@ pub fn align_segment(
         return Err("Alignment text cannot be empty".to_string());
     }
     validate::validate_text(&text, 100000, "Alignment text")?;
-    let (timestamps, quality) = {
-        // Clone the pipeline OUT of the lock so the global mutex is released before the slow decode +
-        // ONNX forced alignment runs — holding it serializes every other pipeline command (the UI's
-        // get_import_status polling, transcribe, get_waveform) for the whole alignment. Matches the
-        // get_waveform / rediarize_segments pattern; ProcessingPipeline is Clone and align takes &self.
-        let pipeline = state.lock_pipeline().clone();
-        pipeline.align(&audio_path, &text, alignment_json.as_deref()).map_err(|e| e.to_string())?
-    };
-    // Persist the word timings INTO alignment_json (merged with the existing chunk metadata) AND
-    // stamp the honest alignment_quality, so the per-word review features (spoken-span playback,
-    // tap-a-word, karaoke highlight) survive a reload instead of vanishing every time. The quality
-    // distinguishes real CTC forced alignment from the linear/energy heuristic fallback — heuristic
-    // output is never labelled 'ctc_forced'.
-    if let Some(ref id) = segment_id {
-        if !timestamps.is_empty() {
-            let merged = crate::chunking::merge_word_timestamps(alignment_json.as_deref(), &timestamps);
-            let db = state.lock_db();
-            db.update_segment_alignment_json(id, &merged)
-                .map_err(|error| format!("Failed to persist word timings for {id}: {error}"))?;
-            db.update_alignment_quality(id, quality.as_db_str())
-                .map_err(|error| format!("Failed to stamp alignment quality for {id}: {error}"))?;
+    // Clone the pipeline OUT of the lock so the global mutex is released before the slow decode +
+    // ONNX forced alignment, and run the whole align + persist OFF the main thread — holding either
+    // lock (or blocking the UI thread) serializes every other pipeline command (get_import_status
+    // polling, transcribe, get_waveform) for the whole alignment. ProcessingPipeline is Clone; align
+    // takes &self.
+    let pipeline = state.lock_pipeline().clone();
+    let db = state.db_arc();
+    run_blocking(move || {
+        let (timestamps, quality) =
+            pipeline.align(&audio_path, &text, alignment_json.as_deref()).map_err(|e| e.to_string())?;
+        // Persist the word timings INTO alignment_json (merged with existing chunk metadata) AND stamp
+        // the honest alignment_quality, so per-word review features survive a reload. The quality
+        // distinguishes real CTC forced alignment from the linear/energy heuristic fallback.
+        if let Some(ref id) = segment_id {
+            if !timestamps.is_empty() {
+                let merged = crate::chunking::merge_word_timestamps(alignment_json.as_deref(), &timestamps);
+                let db = db.lock().unwrap_or_else(|p| p.into_inner());
+                db.update_segment_alignment_json(id, &merged)
+                    .map_err(|error| format!("Failed to persist word timings for {id}: {error}"))?;
+                db.update_alignment_quality(id, quality.as_db_str())
+                    .map_err(|error| format!("Failed to stamp alignment quality for {id}: {error}"))?;
+            }
         }
-    }
-    Ok(timestamps)
+        Ok(timestamps)
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -2536,15 +2546,18 @@ pub fn batch_normalize(
 }
 
 #[tauri::command]
-pub fn check_audio(path: String) -> Result<serde_json::Value, String> {
-    let validated = validate::validate_file_path(&path)?;
-    let info = audio::check_audio_file(&validated).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({
-        "duration_ms": info.duration_ms,
-        "sample_rate": info.sample_rate,
-        "channels": info.channels,
-        "format": info.format,
-    }))
+pub async fn check_audio(path: String) -> Result<serde_json::Value, String> {
+    run_blocking(move || {
+        let validated = validate::validate_file_path(&path)?;
+        let info = audio::check_audio_file(&validated).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "duration_ms": info.duration_ms,
+            "sample_rate": info.sample_rate,
+            "channels": info.channels,
+            "format": info.format,
+        }))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3647,7 +3660,10 @@ pub async fn compute_annotation_drift_scorecard(
 }
 
 #[tauri::command]
-pub async fn run_gold_eval_local(state: State<'_, AppState>, model_id: String) -> Result<crate::eval::EvalRunResult, String> {
+pub async fn run_gold_eval_local(
+    state: State<'_, AppState>,
+    model_id: String,
+) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval_local")?;
     // Clone the pipeline and let it open its own DB connection, so neither global mutex is held
     // across the multi-segment ASR eval loop, and run it OFF the main thread (was minutes of freeze).

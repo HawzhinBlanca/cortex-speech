@@ -2494,3 +2494,28 @@ import_verified_segments_as_gold, import_model_checkpoint, check_audio/check_ext
 db_backup/db_restore/restore_db_from_snapshot (audit multi-state ordering). Then Bucket B
 (thread-spawn batch_*/import_audio_file/resume_interrupted_import, cloud-egress jury/scribe/dpo,
 register_media_asset guard-across-copy) INDIVIDUALLY. Then the runtime heartbeat proof (built exe/CDP).
+
+## P0 #2 cont. — per-segment ASR + forced-alignment off the main thread (2026-07-11)
+
+Sixth async-migration batch — the interactive per-clip commands that ran ONNX/WSL inference on the
+UI thread:
+- transcribe_segment (pipeline-clone transcribe), transcribe_segment_finetuned (db sibling-count read
+  + windowed decode + fine-tuned ONNX — db_arc moved in), align_segment (pipeline-clone forced
+  alignment + the brief db persist of word timings/quality — BOTH pipeline clone AND db_arc in the
+  same task), check_audio (audio probe, no state). All now async + run_blocking.
+- Ratchet grown to 34 commands. cargo fmt normalized the loose finetuned-closure indentation (+ two
+  files it touched).
+
+VERBATIM proof:
+  cargo check --lib                 -> Finished (6.0s)
+  cargo fmt                         -> clean
+  cargo clippy --lib -- -D warnings -> Finished, 0 warnings
+  cargo test --lib                  -> 842 passed; 0 failed; 6 ignored
+  python scripts/test_command_main_thread_policy.py -> command main-thread policy regression passed
+
+NEXT Bucket-A remainder: compute_acoustic_scores/compute_ood_scores (per-seg re-lock db+settings+mm),
+run_consensus_refinery (db ×2 + normalizer Arc), run_t0_gate, import_gold_segments/create_gold_from_file/
+import_verified_segments_as_gold, import_model_checkpoint (hash then db), check_external_provider,
+db_backup/db_restore/restore_db_from_snapshot (sequential multi-state — audit ordering). Then Bucket B
+(thread-spawn batch_*/import_*, cloud-egress jury/scribe/dpo, register_media_asset) INDIVIDUALLY.
+Then the runtime heartbeat proof (built exe/CDP).

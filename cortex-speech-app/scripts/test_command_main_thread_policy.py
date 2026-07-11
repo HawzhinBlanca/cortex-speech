@@ -49,6 +49,11 @@ ASYNC_SLOW_COMMANDS = [
     "rediarize_segments",
     "run_gold_eval_asr",
     "run_gold_eval_local",
+    # Per-segment ASR/alignment (decode + ONNX/WSL inference, some with a brief db write).
+    "transcribe_segment",
+    "transcribe_segment_finetuned",
+    "align_segment",
+    "check_audio",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

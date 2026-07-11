@@ -146,10 +146,8 @@ fn to_txt(cues: &[Cue]) -> String {
     for c in cues {
         if multi && c.audio_path != current {
             current = c.audio_path.clone();
-            let name = std::path::Path::new(&c.audio_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&c.audio_path);
+            let name =
+                std::path::Path::new(&c.audio_path).file_name().and_then(|n| n.to_str()).unwrap_or(&c.audio_path);
             if !out.is_empty() {
                 out.push('\n');
             }
@@ -227,7 +225,8 @@ mod tests {
 
     #[test]
     fn missing_source_window_falls_back_to_cumulative_per_file() {
-        let mut s = SpeechSegment { id: "x".into(), audio_path: "f.wav".into(), duration_ms: 1500, ..Default::default() };
+        let mut s =
+            SpeechSegment { id: "x".into(), audio_path: "f.wav".into(), duration_ms: 1500, ..Default::default() };
         s.annotated_transcript = Some("A".into());
         let mut s2 = s.clone();
         s2.id = "y".into();
