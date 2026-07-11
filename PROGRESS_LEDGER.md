@@ -2542,3 +2542,25 @@ settings/model_manager clones), run_consensus_refinery (db ×2 + normalizer Arc)
 restore_db_from_snapshot (sequential multi-state file-copy — audit ordering; may keep some state ops
 outside the task). Then Bucket B (thread-spawn batch_*/import_*, cloud-egress jury/scribe/dpo,
 register_media_asset) INDIVIDUALLY. Then the runtime heartbeat proof (built exe/CDP).
+
+## P0 #2 cont. — per-segment scoring loops + consensus refinery off the main thread (2026-07-11)
+
+Eighth async-migration batch (the multi-lock Bucket-A commands):
+- compute_acoustic_scores / compute_ood_scores (whole dataset scan that decodes + ONNX-scores each
+  segment and RE-LOCKS the db per segment — snapshot enable_gpu + model_manager.models_dir up front,
+  build the aligner/detector INSIDE the task, run the whole loop in one run_blocking re-locking db_arc
+  per write). run_consensus_refinery (IRT fit over all hypotheses, db locked twice — normalizer is
+  Arc<SoraniNormalizer>, cloned in; both db reads/writes inside the task). All async + run_blocking.
+- Confirmed aligner::ForcedAligner + quality::ood::OodDetector (ONNX) are Send.
+- Ratchet grown to 42 commands.
+
+VERBATIM proof:
+  cargo check --lib                 -> Finished (6.0s)
+  cargo fmt                         -> clean
+  cargo clippy --lib -- -D warnings -> Finished, 0 warnings
+  cargo test --lib                  -> 842 passed; 0 failed; 6 ignored
+  python scripts/test_command_main_thread_policy.py -> command main-thread policy regression passed
+
+NEXT: db_backup/db_restore/restore_db_from_snapshot (sequential multi-state file-copy — audit which
+steps must stay outside the task). Then Bucket B (thread-spawn batch_*/import_*, cloud-egress
+jury/scribe/dpo, register_media_asset) INDIVIDUALLY. Then the runtime heartbeat proof (built exe/CDP).

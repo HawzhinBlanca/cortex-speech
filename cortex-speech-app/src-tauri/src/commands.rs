@@ -3333,126 +3333,131 @@ pub fn add_segment_hypothesis(state: State<'_, AppState>, hyp: crate::db::Segmen
 }
 
 #[tauri::command]
-pub fn run_consensus_refinery(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn run_consensus_refinery(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("run_consensus_refinery")?;
+    let normalizer = state.normalizer.clone(); // Arc<SoraniNormalizer> — cheap clone
+    let db = state.db_arc();
+    run_blocking(move || {
+        let hypotheses = {
+            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            db.get_all_hypotheses().map_err(|e| e.to_string())?
+        };
 
-    let hypotheses = {
-        let db = state.lock_db();
-        db.get_all_hypotheses().map_err(|e| e.to_string())?
-    };
+        if hypotheses.is_empty() {
+            return Ok(serde_json::json!({
+                "status": "ignored",
+                "message": "No segment hypotheses found in database"
+            }));
+        }
 
-    if hypotheses.is_empty() {
-        return Ok(serde_json::json!({
-            "status": "ignored",
-            "message": "No segment hypotheses found in database"
-        }));
-    }
+        let results = crate::quality::irt::fit_irt_consensus(&hypotheses);
 
-    let results = crate::quality::irt::fit_irt_consensus(&hypotheses);
+        let mut updates = Vec::new();
+        for (segment_id, consensus_text) in &results.consensus_transcripts {
+            // Missing IRT confidence ⇒ MINIMUM, not maximum: a no-signal segment must not be recorded
+            // as maximally confident (which would suppress its escalation downstream).
+            let confidence = *results.segment_confidences.get(segment_id).unwrap_or(&0.0);
+            let normalized_text = normalizer.normalize(consensus_text);
+            updates.push((segment_id.clone(), consensus_text.clone(), normalized_text, confidence));
+        }
 
-    let mut updates = Vec::new();
-    for (segment_id, consensus_text) in &results.consensus_transcripts {
-        // Missing IRT confidence ⇒ MINIMUM, not maximum: a no-signal segment must not be recorded as
-        // maximally confident (which would suppress its escalation downstream).
-        let confidence = *results.segment_confidences.get(segment_id).unwrap_or(&0.0);
-        let normalized_text = state.normalizer.normalize(consensus_text);
-        updates.push((segment_id.clone(), consensus_text.clone(), normalized_text, confidence));
-    }
+        let segments_updated = {
+            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            db.update_segment_consensus_batch(&updates).map_err(|e| e.to_string())?
+        };
 
-    let segments_updated = {
-        let db = state.lock_db();
-        db.update_segment_consensus_batch(&updates).map_err(|e| e.to_string())?
-    };
-
-    Ok(serde_json::json!({
-        "status": "success",
-        "segmentsUpdated": segments_updated,
-        "modelAbilities": results.model_abilities,
-    }))
+        Ok(serde_json::json!({
+            "status": "success",
+            "segmentsUpdated": segments_updated,
+            "modelAbilities": results.model_abilities,
+        }))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize, String> {
+pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize, String> {
     RATE_LIMITER.check("compute_acoustic_scores")?;
-
-    let segments = {
-        let db = state.lock_db();
-        db.get_segments(None).map_err(|e| e.to_string())?
+    let settings_gpu = {
+        let s = state.lock_settings();
+        s.enable_gpu
     };
-
-    let aligner = {
-        let settings_gpu = {
-            let s = state.lock_settings();
-            s.enable_gpu
+    let models_dir = state.lock_model_manager().models_dir.clone();
+    let db = state.db_arc();
+    run_blocking(move || {
+        let segments = {
+            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            db.get_segments(None).map_err(|e| e.to_string())?
         };
-        let mm = state.lock_model_manager();
-        aligner::ForcedAligner::new(&mm.models_dir, settings_gpu).map_err(|e| e.to_string())?
-    };
 
-    if !aligner.is_available() {
-        return Err("MMS Forced Aligner model (mms_aligner.onnx) is not available.".to_string());
-    }
+        let aligner = aligner::ForcedAligner::new(&models_dir, settings_gpu).map_err(|e| e.to_string())?;
 
-    let mut count = 0;
-    for seg in &segments {
-        if seg.ctc_score.is_some() {
-            continue;
+        if !aligner.is_available() {
+            return Err("MMS Forced Aligner model (mms_aligner.onnx) is not available.".to_string());
         }
 
-        let text = seg.raw_transcript.clone();
-        if text.trim().is_empty() {
-            continue;
+        let mut count = 0;
+        for seg in &segments {
+            if seg.ctc_score.is_some() {
+                continue;
+            }
+
+            let text = seg.raw_transcript.clone();
+            if text.trim().is_empty() {
+                continue;
+            }
+
+            let audio_path = seg.audio_path.clone();
+            if !std::path::Path::new(&audio_path).exists() {
+                tracing::warn!("Skipping acoustic score for {}: audio path not found: {}", seg.id, audio_path);
+                continue;
+            }
+
+            let (sample_rate, pcm) = match audio::decode_to_pcm_with_timeout(&audio_path, Duration::from_secs(30)) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    tracing::warn!("Skipping acoustic score for {}: decode failed: {error}", seg.id);
+                    continue;
+                }
+            };
+            let (_sr, pcm_16k) = match audio::ensure_pcm_16khz(sample_rate, pcm) {
+                Ok(resampled) => resampled,
+                Err(error) => {
+                    tracing::warn!("Skipping acoustic score for {}: 16 kHz conversion failed: {error}", seg.id);
+                    continue;
+                }
+            };
+            // Score only THIS segment's clip, not the whole source file. Segments share the source
+            // audio_path (the per-segment range lives in alignment_json), so without slicing the acoustic
+            // ctc_score — which feeds the conformal jury gate — would be computed over the ENTIRE recording
+            // for every segment, a systematically wrong quality signal on any multi-segment import.
+            let pcm_16k = match crate::chunking::slice_pcm_by_alignment(
+                &pcm_16k,
+                audio::TARGET_SAMPLE_RATE,
+                seg.alignment_json.as_deref(),
+            ) {
+                Ok((clip, _)) => clip,
+                Err(error) => {
+                    tracing::warn!("Skipping acoustic score for {}: clip slice failed: {error}", seg.id);
+                    continue;
+                }
+            };
+            let score = match aligner.score_consistency(&pcm_16k, audio::TARGET_SAMPLE_RATE, &text) {
+                Ok(score) => score,
+                Err(error) => {
+                    tracing::warn!("Skipping acoustic score for {}: scoring failed: {error}", seg.id);
+                    continue;
+                }
+            };
+
+            let guard = db.lock().unwrap_or_else(|p| p.into_inner());
+            guard.update_ctc_score(&seg.id, score).map_err(|e| e.to_string())?;
+            count += 1;
         }
 
-        let audio_path = seg.audio_path.clone();
-        if !std::path::Path::new(&audio_path).exists() {
-            tracing::warn!("Skipping acoustic score for {}: audio path not found: {}", seg.id, audio_path);
-            continue;
-        }
-
-        let (sample_rate, pcm) = match audio::decode_to_pcm_with_timeout(&audio_path, Duration::from_secs(30)) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                tracing::warn!("Skipping acoustic score for {}: decode failed: {error}", seg.id);
-                continue;
-            }
-        };
-        let (_sr, pcm_16k) = match audio::ensure_pcm_16khz(sample_rate, pcm) {
-            Ok(resampled) => resampled,
-            Err(error) => {
-                tracing::warn!("Skipping acoustic score for {}: 16 kHz conversion failed: {error}", seg.id);
-                continue;
-            }
-        };
-        // Score only THIS segment's clip, not the whole source file. Segments share the source
-        // audio_path (the per-segment range lives in alignment_json), so without slicing the acoustic
-        // ctc_score — which feeds the conformal jury gate — would be computed over the ENTIRE recording
-        // for every segment, a systematically wrong quality signal on any multi-segment import.
-        let pcm_16k = match crate::chunking::slice_pcm_by_alignment(
-            &pcm_16k,
-            audio::TARGET_SAMPLE_RATE,
-            seg.alignment_json.as_deref(),
-        ) {
-            Ok((clip, _)) => clip,
-            Err(error) => {
-                tracing::warn!("Skipping acoustic score for {}: clip slice failed: {error}", seg.id);
-                continue;
-            }
-        };
-        let score = match aligner.score_consistency(&pcm_16k, audio::TARGET_SAMPLE_RATE, &text) {
-            Ok(score) => score,
-            Err(error) => {
-                tracing::warn!("Skipping acoustic score for {}: scoring failed: {error}", seg.id);
-                continue;
-            }
-        };
-
-        let db = state.lock_db();
-        db.update_ctc_score(&seg.id, score).map_err(|e| e.to_string())?;
-        count += 1;
-    }
-
-    Ok(count)
+        Ok(count)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3474,70 +3479,72 @@ pub async fn get_dataset_certificate(
 }
 
 #[tauri::command]
-pub fn compute_ood_scores(state: State<'_, AppState>) -> Result<usize, String> {
+pub async fn compute_ood_scores(state: State<'_, AppState>) -> Result<usize, String> {
     RATE_LIMITER.check("compute_ood_scores")?;
+    let models_dir = state.lock_model_manager().models_dir.clone();
+    let db = state.db_arc();
+    run_blocking(move || {
+        let segments = {
+            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            db.get_segments(None).map_err(|e| e.to_string())?
+        };
 
-    let segments = {
-        let db = state.lock_db();
-        db.get_segments(None).map_err(|e| e.to_string())?
-    };
+        let detector = quality::ood::OodDetector::new(&models_dir, 0.35).map_err(|e| e.to_string())?;
 
-    let mm = state.lock_model_manager();
-    let detector = quality::ood::OodDetector::new(&mm.models_dir, 0.35).map_err(|e| e.to_string())?;
-    drop(mm);
+        let mut count = 0;
+        for seg in &segments {
+            if seg.ood_score.is_some() {
+                continue;
+            }
 
-    let mut count = 0;
-    for seg in &segments {
-        if seg.ood_score.is_some() {
-            continue;
+            let audio_path = seg.audio_path.clone();
+            if !std::path::Path::new(&audio_path).exists() {
+                continue;
+            }
+
+            let (sample_rate, pcm) = match audio::decode_to_pcm_with_timeout(&audio_path, Duration::from_secs(30)) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    tracing::warn!("Skipping OOD score for {}: decode failed: {error}", seg.id);
+                    continue;
+                }
+            };
+            let (_sr, pcm_16k) = match audio::ensure_pcm_16khz(sample_rate, pcm) {
+                Ok(resampled) => resampled,
+                Err(error) => {
+                    tracing::warn!("Skipping OOD score for {}: 16 kHz conversion failed: {error}", seg.id);
+                    continue;
+                }
+            };
+            // Score only THIS segment's clip, not the whole source file (same whole-file-vs-clip hazard as
+            // the acoustic-score loop): segments share the source audio_path, with the range in alignment_json.
+            let pcm_16k = match crate::chunking::slice_pcm_by_alignment(
+                &pcm_16k,
+                audio::TARGET_SAMPLE_RATE,
+                seg.alignment_json.as_deref(),
+            ) {
+                Ok((clip, _)) => clip,
+                Err(error) => {
+                    tracing::warn!("Skipping OOD score for {}: clip slice failed: {error}", seg.id);
+                    continue;
+                }
+            };
+            let score = match detector.compute_ood_score(&pcm_16k) {
+                Ok(score) => score,
+                Err(error) => {
+                    tracing::warn!("Skipping OOD score for {}: scoring failed: {error}", seg.id);
+                    continue;
+                }
+            };
+
+            let guard = db.lock().unwrap_or_else(|p| p.into_inner());
+            guard.update_ood_score(&seg.id, score).map_err(|e| e.to_string())?;
+            count += 1;
         }
 
-        let audio_path = seg.audio_path.clone();
-        if !std::path::Path::new(&audio_path).exists() {
-            continue;
-        }
-
-        let (sample_rate, pcm) = match audio::decode_to_pcm_with_timeout(&audio_path, Duration::from_secs(30)) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                tracing::warn!("Skipping OOD score for {}: decode failed: {error}", seg.id);
-                continue;
-            }
-        };
-        let (_sr, pcm_16k) = match audio::ensure_pcm_16khz(sample_rate, pcm) {
-            Ok(resampled) => resampled,
-            Err(error) => {
-                tracing::warn!("Skipping OOD score for {}: 16 kHz conversion failed: {error}", seg.id);
-                continue;
-            }
-        };
-        // Score only THIS segment's clip, not the whole source file (same whole-file-vs-clip hazard as
-        // the acoustic-score loop): segments share the source audio_path, with the range in alignment_json.
-        let pcm_16k = match crate::chunking::slice_pcm_by_alignment(
-            &pcm_16k,
-            audio::TARGET_SAMPLE_RATE,
-            seg.alignment_json.as_deref(),
-        ) {
-            Ok((clip, _)) => clip,
-            Err(error) => {
-                tracing::warn!("Skipping OOD score for {}: clip slice failed: {error}", seg.id);
-                continue;
-            }
-        };
-        let score = match detector.compute_ood_score(&pcm_16k) {
-            Ok(score) => score,
-            Err(error) => {
-                tracing::warn!("Skipping OOD score for {}: scoring failed: {error}", seg.id);
-                continue;
-            }
-        };
-
-        let db = state.lock_db();
-        db.update_ood_score(&seg.id, score).map_err(|e| e.to_string())?;
-        count += 1;
-    }
-
-    Ok(count)
+        Ok(count)
+    })
+    .await
 }
 
 #[tauri::command]

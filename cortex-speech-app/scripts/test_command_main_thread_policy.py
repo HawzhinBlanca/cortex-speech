@@ -60,6 +60,10 @@ ASYNC_SLOW_COMMANDS = [
     "create_gold_from_file",
     "import_verified_segments_as_gold",
     "import_model_checkpoint",
+    # Per-segment acoustic/OOD scoring loops + IRT consensus refinery (decode + ONNX per segment).
+    "compute_acoustic_scores",
+    "compute_ood_scores",
+    "run_consensus_refinery",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).
