@@ -2682,3 +2682,26 @@ VERBATIM proof:
 
 NOTE: engine_supervisor is not yet wired into a command, so the shipped exe behavior is unchanged
 (the heartbeat proof still stands). The exe needs a rebuild before ship (standard freshness gate).
+
+## P0 #4 cont. — supervision DRIVER (tick + warm-up + UI label), pure/testable (2026-07-11)
+
+Second increment of app-owned 7B supervision. engine_supervisor.rs now has the full loop DRIVER,
+still pure (no I/O — caller does the real probe/start between ticks):
+- SupervisionState::tick(healthy, now) sequences: healthy → Idle (clear); else if within a restart's
+  WARM-UP window (30s default; the ~30 GB server takes 1-5 min) → Wait (don't count a failure yet);
+  else warm-up elapsed + still down → on_failure (counted once) → decide() → Restart (arms warm-up) /
+  Wait / Cooldown / GaveUp. manual_start() resets + arms warm-up.
+- engine_state_label(breaker, healthy) → 'ready'|'starting'|'recovering'|'failed' for the status pill.
+- Added Decision::Idle (healthy, nothing to do).
+
+VERBATIM proof:
+  cargo test --lib engine_supervisor -> 15 passed; 0 failed (added: warm-up grace, failure-after-warmup
+    +backoff, drive-to-GaveUp on a never-up engine, manual_start reset, state-label mapping)
+  cargo fmt -> clean; cargo clippy --lib -D warnings -> clean
+  cargo test --lib -> 857 passed; 0 failed; 6 ignored
+
+STILL owner-machine (flagged): the thin live wiring — a tokio background task holding SupervisionState
+that ticks on an interval, calling probe_wsl_7b_server for `healthy` and start_champion_engine on
+Decision::Restart, plus surfacing engine_state_label via get_champion_engine_status and a
+process-tree kill on app shutdown. The live WSL restart loop can't be fully verified here (needs the
+7B server); the DECISION logic that drives it is now 100% unit-tested.

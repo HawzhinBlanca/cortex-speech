@@ -52,12 +52,14 @@ impl Default for SupervisorPolicy {
     }
 }
 
-/// What the supervisor wants the caller to do right now (engine is NOT currently healthy).
+/// What the supervisor wants the caller to do right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
+    /// Engine is healthy — nothing to do; poll again next interval.
+    Idle,
     /// (Re)start the engine now, then call `on_restart_attempt` followed by on_healthy/on_failure.
     Restart,
-    /// Not yet — wait this long (backoff between attempts), then decide again.
+    /// Not yet — wait this long (backoff between attempts, or a restart's warm-up), then decide again.
     Wait(Duration),
     /// Breaker is Open — cooling down for this long before a probe. Surface "Offline (recovering)".
     Cooldown(Duration),
@@ -185,6 +187,75 @@ impl EngineSupervisor {
                 }
             }
         }
+    }
+}
+
+/// A short state label for the UI status pill, derived from the breaker + current health.
+pub fn engine_state_label(breaker: Breaker, healthy: bool) -> &'static str {
+    if healthy {
+        return "ready";
+    }
+    match breaker {
+        Breaker::Closed => "starting", // trying / warming up (not yet given up)
+        Breaker::Open | Breaker::HalfOpen => "recovering", // breaker tripped, backing off / probing
+        Breaker::GaveUp => "failed",   // needs a manual start
+    }
+}
+
+/// The full supervision DRIVER wrapping the pure [`EngineSupervisor`] policy with the tick sequencing
+/// a live loop needs: a warm-up grace window after a restart (the ~30 GB server takes 1-5 min, so a
+/// still-not-healthy probe within the window is NOT counted as a failure), plus in-flight tracking so
+/// a restart's outcome is judged exactly once. Still PURE: `tick` takes the observed `healthy` sample
+/// and `now`; the caller does the real probe + real start (on [`Decision::Restart`]) between ticks.
+pub struct SupervisionState {
+    sup: EngineSupervisor,
+    /// While set, a restart is in its warm-up window — don't count failures until it elapses.
+    warmup_until: Option<Duration>,
+    warmup: Duration,
+}
+
+impl SupervisionState {
+    pub fn new(policy: SupervisorPolicy, warmup: Duration) -> Self {
+        Self { sup: EngineSupervisor::new(policy), warmup_until: None, warmup }
+    }
+
+    pub fn breaker(&self) -> Breaker {
+        self.sup.breaker()
+    }
+    pub fn supervisor(&self) -> &EngineSupervisor {
+        &self.sup
+    }
+
+    /// Manual/operator start — reset the policy and arm a fresh warm-up window (the caller starts it).
+    pub fn manual_start(&mut self, now: Duration) {
+        self.sup.reset();
+        self.sup.on_restart_attempt(now);
+        self.warmup_until = Some(now.saturating_add(self.warmup));
+    }
+
+    /// One supervision tick. `healthy` = did the health probe just succeed, observed at `now`.
+    /// Returns the action for the caller (Restart ⇒ start the engine now).
+    pub fn tick(&mut self, healthy: bool, now: Duration) -> Decision {
+        if healthy {
+            self.sup.on_healthy();
+            self.warmup_until = None;
+            return Decision::Idle;
+        }
+        // Not healthy. If a restart is still within its warm-up window, give it time.
+        if let Some(until) = self.warmup_until {
+            if now < until {
+                return Decision::Wait(until.saturating_sub(now));
+            }
+            // Warm-up elapsed and STILL not healthy ⇒ that restart failed. Count it once.
+            self.sup.on_failure(now);
+            self.warmup_until = None;
+        }
+        let decision = self.sup.decide(now);
+        if decision == Decision::Restart {
+            self.sup.on_restart_attempt(now);
+            self.warmup_until = Some(now.saturating_add(self.warmup));
+        }
+        decision
     }
 }
 
@@ -327,5 +398,79 @@ mod tests {
         s.on_healthy(); // engine came up
                         // Later it drops again — no stale backoff should delay the first retry.
         assert_eq!(s.decide(secs(500)), Decision::Restart);
+    }
+
+    // ── SupervisionState driver ──────────────────────────────────────────────
+
+    fn driver() -> SupervisionState {
+        SupervisionState::new(policy(), secs(30)) // 30s warm-up window
+    }
+
+    #[test]
+    fn tick_healthy_is_idle_and_clears_everything() {
+        let mut d = driver();
+        assert_eq!(d.tick(false, secs(0)), Decision::Restart); // arms warm-up
+        assert_eq!(d.tick(true, secs(5)), Decision::Idle); // came up during warm-up
+        assert_eq!(d.breaker(), Breaker::Closed);
+    }
+
+    #[test]
+    fn tick_respects_warmup_window_before_counting_a_failure() {
+        let mut d = driver();
+        assert_eq!(d.tick(false, secs(0)), Decision::Restart); // start; warm-up until 30s
+        assert_eq!(d.tick(false, secs(10)), Decision::Wait(secs(20))); // inside warm-up -> WAIT
+        assert_eq!(d.supervisor().consecutive_failures(), 0, "no failure counted during warm-up");
+    }
+
+    #[test]
+    fn tick_counts_a_failure_after_warmup_and_backs_off() {
+        let mut d = driver();
+        d.tick(false, secs(0)); // Restart; warm-up until 30
+        let dec = d.tick(false, secs(31)); // still down after warm-up -> failure #1, backoff 2s
+        assert_eq!(d.supervisor().consecutive_failures(), 1);
+        assert_eq!(dec, Decision::Wait(secs(2)));
+        assert_eq!(d.tick(false, secs(33)), Decision::Restart); // backoff elapsed
+    }
+
+    #[test]
+    fn tick_drives_all_the_way_to_gaveup_when_the_engine_never_comes_up() {
+        let mut d = driver();
+        let mut t = 0u64;
+        let mut last = Decision::Idle;
+        for _ in 0..40 {
+            last = d.tick(false, secs(t));
+            if last == Decision::GaveUp {
+                break;
+            }
+            t += 200; // jump past any warm-up/backoff/cooldown so progress is guaranteed
+        }
+        assert_eq!(last, Decision::GaveUp, "a permanently-down engine must eventually give up");
+        assert_eq!(d.breaker(), Breaker::GaveUp);
+    }
+
+    #[test]
+    fn manual_start_resets_a_gaveup_driver_and_arms_warmup() {
+        let mut d = driver();
+        let mut t = 0u64;
+        loop {
+            if d.tick(false, secs(t)) == Decision::GaveUp {
+                break;
+            }
+            t += 200;
+        }
+        assert_eq!(d.breaker(), Breaker::GaveUp);
+        d.manual_start(secs(t + 500));
+        assert_eq!(d.breaker(), Breaker::Closed);
+        assert_eq!(d.tick(false, secs(t + 505)), Decision::Wait(secs(25))); // fresh warm-up
+    }
+
+    #[test]
+    fn state_label_maps_breaker_and_health() {
+        assert_eq!(engine_state_label(Breaker::Closed, true), "ready");
+        assert_eq!(engine_state_label(Breaker::Open, true), "ready"); // health wins
+        assert_eq!(engine_state_label(Breaker::Closed, false), "starting");
+        assert_eq!(engine_state_label(Breaker::Open, false), "recovering");
+        assert_eq!(engine_state_label(Breaker::HalfOpen, false), "recovering");
+        assert_eq!(engine_state_label(Breaker::GaveUp, false), "failed");
     }
 }
