@@ -3164,3 +3164,65 @@ VERBATIM proof (Windows):
     refinery-lift, fairness-gender-age). Green cannot be claimed."
   Adversarial refutation workflow (9 lenses over the working tree) -> 8 clean, 1 real defect
     (settings 100 ms floor, above) -> fixed -> focused re-refutation VERDICT: CLEAN.
+
+## LAST PASS — batch B: runtime proofs, review-surface integrity, e2e root-cause, fuzz enablement (2026-07-11)
+
+COMMITS:
+- f1e530c fix(ui): segments.load() always fetches the WHOLE library (HIGH). View filters (verified
+  chip + search) were baked into the backend query while background reloads fire constantly
+  (batch/import completion, wsl-status, ReviewMode.ensureWordTimings) — any such reload silently
+  replaced the store with a stale filtered subset that header stats, the review queue, and export's
+  verified filter then treated as the full library. Filtering is client-side only now + regression
+  test (load() must pass verified:null/query:null on every page).
+- 66ed15b fix(ui): three review-surface gold-integrity holes + autosave guard contract:
+  (1) ReviewMode draft-persist (go() + unmount teardown) skipped submit()'s empty-edit guard —
+  clearing the textarea and navigating persisted annotatedTranscript='' (gold blanked, no undo);
+  (2) Review Inbox decisions never refreshed the segments store — closing the inbox left
+  pre-decision data live, letting a reviewer overwrite a just-recorded reject with an accept;
+  (3) the Ctrl+K command palette bypassed the keyboard manager's allowInReview suppression
+  (hidden-selection verify/transcribe/delete = unreviewed export-eligible gold) — palette now
+  filters to review-safe commands on review surfaces; (4) autosave.pendingId() (the guard 6 call
+  sites use to stop a debounced flush resurrecting a deleted row) had ZERO test coverage — contract
+  pinned.
+- bb426ba fix(e2e): "VAD produced 0 segments" ROOT-CAUSED (agent investigation): the disposable
+  profile (c39d340) boots default settings = WSL7B + no client script, so import fail-hards at the
+  engine gate BEFORE any decode; VAD never ran and the harness blame was false. Harness now
+  provisions CORTEX_ASR_ENGINE (default CTC300M, offline) via get_settings/update_settings before
+  import, surfaces import rejections immediately, and reports the timeout honestly.
+- 50864e2 fix(fuzz): fuzz harness made BUILDABLE (it had never compiled anywhere): tauri
+  host/target debug-assertions cfg mismatch (build-override), missing chrono dep in cache.rs's
+  crate, and the template cdylib/staticlib crate-types (mobile-only; break MSVC fuzz linking with
+  /include:main) removed — desktop release build re-proven clean after. HONEST LIMIT (measured):
+  windows-msvc still cannot LINK fuzz binaries — ASAN CRT vs static-MT sherpa prebuilt (LNK2005);
+  --sanitizer none lacks sancov runtime symbols (LNK2001). _probe_fuzz now returns exactly that as
+  the SKIP-ENV reason; the leg is runnable on Linux CI.
+
+RUNTIME PROOFS against the freshly rebuilt HEAD exe (all real, this rig, 2026-07-11):
+  npm run test:heartbeat -> "HEARTBEAT OK: main thread stayed responsive (p95 3.3ms <= 300ms)"
+    (1754 get_settings calls during 8 concurrent waveform decodes)
+  npm run test:jobs -> "JOBS OK: durable export_dataset + export_huggingface_dataset jobs recorded
+    and 'succeeded' at runtime" (get_jobs 0 -> 2)
+  npm run test:egress -> positive control OK (sampler saw 4 connections for the control PID), then
+    "EGRESS OK: the default offline path opened ZERO non-loopback connections from the backend PID"
+    (1622 loops, cloud opt-ins OFF; transcribe-leg owner-gated per probe header)
+  npm run test:e2e:real (fixed harness, FLEURS ckb fixture) -> "REAL-DATA RUN OK: 1 segments; first
+    transcript 77 chars" (real Sorani text, no-fabrication guard passed)
+  OmniASR-7B champion server started (WSL, cuda, base + Kurdish LoRA) -> port 8799 UP; the
+  wsl_7b_preflight ignored test passed against it.
+
+FULL AGGREGATE (python scripts/verify_10.py, CORTEX_AUDIO set, warm 7B server):
+  Run at bb426ba (exe fresh at that HEAD): "kept gates run: 23 - 20 PASS, 0 FAIL, 3 skipped
+  (env/not-built)"; "VERDICT: INCOMPLETE - 3 kept gate(s) could not run (egress-runtime,
+  fuzz-smoke, refinery-lift). Green cannot be claimed." exe-freshness, real-app-e2e,
+  ignored-real-model, rtf-bench ALL PASS — this morning's baseline was 17 PASS / 2 FAIL RED.
+  Closing re-run at 50864e2: same legs green EXCEPT python-policies RED — the anti-drift ledger
+  gate itself fired at 4 commits > 3 limit (this very entry is the cure; the gate caught its
+  author, working as designed).
+  Post-hoc note (see the report accompanying this commit): reproduction is one command —
+  make ship-check-local (rebuild + freshness proof + full gate).
+
+REMAINING (honest): egress-runtime (full charter leg incl. transcribe-under-monitor: not built —
+the partial startup+browse probe passed above but wiring it as the full leg would overclaim);
+refinery-lift (fixed-seed synthetic benchmark: not built); fuzz-smoke (msvc linkage, run on Linux
+CI); 5 owner-gated legs; 8 owner-descoped distribution legs. NOT a 10/10 claim: "CORTEX 10/10: ALL
+GATES GREEN" is only printable when nothing is descoped or owner-gated.

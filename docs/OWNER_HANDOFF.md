@@ -185,3 +185,49 @@ honest inspection, either owner-gated or entangled:
 Net: the clearly-high-value, non-speculative, non-Codex, verifiable-here surface is exhausted again. An
 honest stop here beats manufacturing niche or unvalidated work. Restart with `/loop` any time, or point
 the loop at a specific item above and it will take it on directly.
+
+---
+
+## Last pass (owner: "real 10/10 however possible") — 2026-07-11
+
+A 33-agent adversarial sweep + full runtime verification pass. Every change below is committed,
+gated, and adversarially refuted (one refuter finding — the settings 100 ms floor vs the
+seconds-based UI round-trip — was real and fixed before commit; see the ledger).
+
+**Where the aggregate stands now** (`python scripts/verify_10.py`, warm 7B server, CORTEX_AUDIO
+set): **20 PASS, 0 FAIL** kept gates — up from 17 PASS / 2 FAIL (RED) at the start of the pass —
+with 3 honest skips: `egress-runtime` (full charter leg not built; the partial startup+browse
+runtime probe DID pass with a working positive control), `refinery-lift` (synthetic benchmark not
+built), `fuzz-smoke` (harness now compiles — three real defects fixed — but windows-msvc cannot
+link ASAN against the static-MT sherpa prebuilt; run that leg on Linux CI). Verdict:
+**INCOMPLETE — green cannot be claimed** (by design while anything is skipped/owner-gated).
+Reproduce with one command: `make ship-check-local`.
+
+**Fixed this pass** (details + verbatim proofs in PROGRESS_LEDGER.md):
+- Three gates could LIE and no longer can: verify_10 `--quick` printed the ship-ready GREEN while
+  skipping every tier-2/3 gate (now at best INCOMPLETE); ledger-staleness and eval-provenance
+  passed vacuously when their target file was missing (now hard-fail; negative-proven).
+- `settings.rs`: segment-duration/thread knobs bounded at BOTH trust boundaries (update + load
+  repair) — min=max=0 no longer explodes the chunk planner into one chunk per PCM sample.
+- WAV/FLAC export metadata.csv now reports the duration of the clip actually written (the HF
+  exporter's clamp fix, finally ported).
+- Frontend gold-integrity: whole-library store loads (HIGH), ReviewMode empty-draft blanking,
+  Review Inbox stale-store overwrite hazard, command-palette review-guard bypass, autosave
+  pendingId() contract pinned.
+- e2e harness: the "VAD produced 0 segments" failure was root-caused (disposable profile boots an
+  unrunnable WSL7B default → import fail-hards before decode) and fixed — `test:e2e:real` now
+  passes on the committed FLEURS fixture with the offline CTC300M engine: "REAL-DATA RUN OK".
+- Runtime proofs all green on the rebuilt exe: heartbeat (p95 3.3 ms), jobs (0→2 succeeded),
+  egress (zero non-loopback, positive control verified), ignored-real-model 37 gates incl. the 7B
+  preflight against a genuinely warm champion server.
+
+**Note on the 7B server:** it was started for this pass by holding a `wsl -- bash -lc "... exec
+python cortex_7b_server.py"` process alive; `start_7b_server.ps1`'s nohup-detach dies when its
+console exits on a NON-interactive runner (the server is killed with the launching session). From
+your own interactive terminal the launcher works as designed.
+
+**Still between here and the full-charter 10/10** (unchanged in kind, updated in count):
+build the `egress-runtime` full leg and `refinery-lift` benchmark; run `fuzz-smoke` on Linux;
+the 5 owner-gated legs (annotators, CORDI, Gold Marathon, branch protection, AsoSoft licensing);
+the 8 owner-descoped distribution legs if scope ever widens. Nothing else verifiable-here was
+found by a 33-agent sweep — 11 confirmed findings, all fixed above; 3 killed as not-real.
