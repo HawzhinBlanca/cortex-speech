@@ -1712,7 +1712,7 @@ pub fn start_champion_engine() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn export_dataset_bundle(
+pub async fn export_dataset_bundle(
     path: String,
     production: bool,
     warning_threshold: Option<usize>,
@@ -1721,18 +1721,22 @@ pub fn export_dataset_bundle(
     STRICT_RATE_LIMITER.check("export_dataset_bundle")?;
     let validated_path = validate::validate_output_path(&path)?;
     let warning_threshold = warning_threshold.unwrap_or(0);
-    let db = state.lock_db();
     let settings = state.lock_settings().clone();
-    let model_manager = state.lock_model_manager();
-    crate::export_bundle::export_dataset_bundle(
-        &db,
-        &model_manager,
-        Path::new(&validated_path),
-        &settings,
-        production,
-        warning_threshold,
-    )
-    .map_err(|e| e.to_string())
+    let model_manager = state.lock_model_manager().clone(); // ModelManager is Clone (a PathBuf)
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::export_bundle::export_dataset_bundle(
+            &db,
+            &model_manager,
+            Path::new(&validated_path),
+            &settings,
+            production,
+            warning_threshold,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2128,7 +2132,7 @@ pub fn validate_dataset_cmd(state: State<'_, AppState>) -> Result<crate::validat
 }
 
 #[tauri::command]
-pub fn export_audio(
+pub async fn export_audio(
     segment_ids: Vec<String>,
     options: crate::export_audio::AudioExportOptions,
     state: State<'_, AppState>,
@@ -2139,8 +2143,12 @@ pub fn export_audio(
     for id in &segment_ids {
         validate::validate_identifier(id)?;
     }
-    let db = state.lock_db();
-    crate::export_audio::export_audio_segments(&db, &segment_ids, &options).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::export_audio::export_audio_segments(&db, &segment_ids, &options).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3647,7 +3655,7 @@ pub fn import_verified_segments_as_gold(state: State<'_, AppState>) -> Result<us
 /// M2.7 / P1.6: export the gold set as a portable eval set (manifest.jsonl + 16 kHz WAV clips) under
 /// `out_dir`. Returns the export summary (counts + manifest path).
 #[tauri::command]
-pub fn export_gold_eval_set(
+pub async fn export_gold_eval_set(
     out_dir: String,
     state: State<'_, AppState>,
 ) -> Result<crate::eval::GoldEvalExport, String> {
@@ -3655,14 +3663,18 @@ pub fn export_gold_eval_set(
     if out_dir.contains('\0') {
         return Err("Output path contains null bytes".to_string());
     }
-    let db = state.lock_db();
-    crate::eval::export_gold_eval_set(&db, std::path::Path::new(&out_dir)).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::eval::export_gold_eval_set(&db, std::path::Path::new(&out_dir)).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// M5.1 / P5.1: export a fine-tune training pack (trainer manifest + 16 kHz clips) from human-verified
 /// segments under `out_dir`, EXCLUDING holdout gold (the leak guard). Returns the pack summary.
 #[tauri::command]
-pub fn export_finetune_pack(
+pub async fn export_finetune_pack(
     out_dir: String,
     state: State<'_, AppState>,
 ) -> Result<crate::eval::FinetunePackResult, String> {
@@ -3672,8 +3684,13 @@ pub fn export_finetune_pack(
     }
     // P5.5: every pack export appends its provenance line to the durable corpus ledger.
     let ledger = state.lock_data_dir().clone().map(|d| d.join("corpus_ledger.jsonl"));
-    let db = state.lock_db();
-    crate::eval::export_finetune_pack(&db, std::path::Path::new(&out_dir), ledger.as_deref()).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::eval::export_finetune_pack(&db, std::path::Path::new(&out_dir), ledger.as_deref())
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Report which cloud providers have an API key configured (provider NAMES only — never the key

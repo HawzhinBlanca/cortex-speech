@@ -17,13 +17,26 @@ COMMANDS_RS = REPO_ROOT / "src-tauri" / "src" / "commands.rs"
 ASYNC_SLOW_COMMANDS = [
     "open_audio_file",  # non-blocking native picker (crash fix f01ab66)
     "import_directory",  # non-blocking native folder picker (crash fix f01ab66)
-    "export_dataset",  # DB scan + serialize + hash + atomic write via run_blocking
-    "export_transcript",  # TXT/SRT/VTT build via run_blocking
-    "export_huggingface_dataset",  # HF dataset build via run_blocking
+    # Export family — DB scan + serialize + hash + (re)encode + atomic write, all via run_blocking.
+    "export_dataset",
+    "export_transcript",
+    "export_huggingface_dataset",
+    "export_dataset_bundle",
+    "export_audio",
+    "export_gold_eval_set",
+    "export_finetune_pack",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).
-RUN_BLOCKING_COMMANDS = ["export_dataset", "export_transcript", "export_huggingface_dataset"]
+RUN_BLOCKING_COMMANDS = [
+    "export_dataset",
+    "export_transcript",
+    "export_huggingface_dataset",
+    "export_dataset_bundle",
+    "export_audio",
+    "export_gold_eval_set",
+    "export_finetune_pack",
+]
 
 
 def source() -> str:

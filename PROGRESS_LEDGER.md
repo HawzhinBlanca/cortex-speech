@@ -2400,3 +2400,24 @@ STILL TODO on P0 #2 (next iterations): migrate the remaining slow sync commands 
 backup/model-download/eval/jury/the other exports: dataset_bundle, audio, gold_eval, finetune) in
 batches, each added to the ratchet; then the RUNTIME heartbeat proof (drive the exe: a slow command
 running while get_settings stays responsive — needs the built exe / CDP harness).
+
+## P0 #2 cont. — export family fully migrated off the main thread (2026-07-11)
+
+Second async-migration batch, same run_blocking + state.db_arc() pattern as e755f9a:
+- export_dataset_bundle (db + settings + model_manager — ModelManager is Clone, a PathBuf, so it
+  moves cleanly into the task), export_audio (decode+re-encode per clip), export_gold_eval_set,
+  export_finetune_pack (ledger path extracted before the await). All now `pub async fn` + run_blocking.
+- Ratchet grown: scripts/test_command_main_thread_policy.py ASYNC_SLOW_COMMANDS + RUN_BLOCKING_COMMANDS
+  now cover all 7 exports (+ the 2 dialog commands). The whole export surface is off the UI thread.
+- Also tracked docs/GODMODE_LOOP.md (the autonomous-loop doctrine the ledger + wakeups reference).
+
+VERBATIM proof:
+  cargo check --lib                 -> Finished (5.6s)
+  cargo clippy --lib -- -D warnings -> Finished, 0 warnings
+  cargo test --lib                  -> 842 passed; 0 failed; 6 ignored
+  python scripts/test_command_main_thread_policy.py -> command main-thread policy regression passed
+
+NEXT: the heavier slow-command classes — ASR/alignment (transcribe_segment*, align_segment),
+hashing, backup/snapshot, model download, evaluation, jury/batch. These hold more state and some
+already spawn threads; audit each for the run_blocking pattern vs existing concurrency. Then the
+runtime heartbeat proof (needs the built exe/CDP harness — flag if unrunnable here).
