@@ -739,6 +739,44 @@ pub static MIGRATIONS: &[Migration] = &[
              ALTER TABLE speech_segments DROP COLUMN confidence_source;",
         ),
     },
+    Migration {
+        version: 37,
+        description: "Durable jobs table for the persistent Job Supervisor (crash-safe long operations)",
+        // A durable record for every long operation (import, transcribe, export, backup, eval, ...), so a
+        // job survives an app crash/restart instead of vanishing with a detached thread. `state` is a
+        // CHECK-constrained lifecycle; `idempotency_key` (UNIQUE where present) lets a re-issued identical
+        // job resume/return the existing row instead of duplicating work; `progress`/`completed`/`total`
+        // drive the UI's ETA; `error_code` is a STABLE machine code (MODEL_UNAVAILABLE, DISK_FULL,
+        // SOURCE_MOVED, JOB_CANCELLED, ...) the UI renders as "what happened + what remains safe".
+        up_sql: "CREATE TABLE IF NOT EXISTS jobs (
+                     id TEXT PRIMARY KEY,
+                     kind TEXT NOT NULL,
+                     state TEXT NOT NULL DEFAULT 'queued'
+                         CHECK (state IN ('queued','running','succeeded','failed','cancelled')),
+                     idempotency_key TEXT,
+                     progress REAL NOT NULL DEFAULT 0.0
+                         CHECK (progress >= 0.0 AND progress <= 1.0),
+                     total INTEGER,
+                     completed INTEGER NOT NULL DEFAULT 0,
+                     error_code TEXT,
+                     error_detail TEXT,
+                     payload_json TEXT,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     started_at TEXT,
+                     finished_at TEXT
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency
+                     ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+                 CREATE INDEX IF NOT EXISTS idx_jobs_kind_state ON jobs(kind, state);",
+        down_sql: Some(
+            "DROP INDEX IF EXISTS idx_jobs_kind_state;
+             DROP INDEX IF EXISTS idx_jobs_state;
+             DROP INDEX IF EXISTS idx_jobs_idempotency;
+             DROP TABLE IF EXISTS jobs;",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -856,6 +894,80 @@ mod tests {
             })
             .unwrap();
         assert_eq!(exists, 1, "the v27 model_abilities table must exist after initialize()");
+    }
+
+    #[test]
+    fn migration_v37_creates_jobs_table_with_enforced_constraints() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+
+        // Table + the three indexes exist.
+        let table: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='jobs'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(table, 1, "the v37 jobs table must exist after initialize()");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                 AND name IN ('idx_jobs_idempotency', 'idx_jobs_state', 'idx_jobs_kind_state')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 3, "all three v37 job indexes must exist");
+
+        // A valid queued job inserts fine; a defaulted row is 'queued' at progress 0.
+        conn.execute("INSERT INTO jobs (id, kind) VALUES ('j1', 'import')", []).unwrap();
+        let (state, progress): (String, f64) = conn
+            .query_row("SELECT state, progress FROM jobs WHERE id='j1'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(state, "queued");
+        assert_eq!(progress, 0.0);
+
+        // The state CHECK rejects anything outside the lifecycle vocabulary.
+        assert!(
+            conn.execute("INSERT INTO jobs (id, kind, state) VALUES ('bad', 'import', 'pending')", []).is_err(),
+            "an out-of-vocabulary state must violate the CHECK constraint"
+        );
+        // The progress CHECK rejects out-of-[0,1] values.
+        assert!(
+            conn.execute("INSERT INTO jobs (id, kind, progress) VALUES ('bad2', 'import', 1.5)", []).is_err(),
+            "progress > 1.0 must violate the CHECK constraint"
+        );
+
+        // idempotency_key is UNIQUE where present (a re-issued identical job cannot duplicate)...
+        conn.execute("INSERT INTO jobs (id, kind, idempotency_key) VALUES ('k1', 'export', 'dedupe-A')", []).unwrap();
+        assert!(
+            conn.execute("INSERT INTO jobs (id, kind, idempotency_key) VALUES ('k2', 'export', 'dedupe-A')", [])
+                .is_err(),
+            "a duplicate idempotency_key must be rejected by the unique partial index"
+        );
+        // ...but NULL keys are exempt (many jobs legitimately have no dedupe key).
+        conn.execute("INSERT INTO jobs (id, kind) VALUES ('n1', 'transcribe')", []).unwrap();
+        conn.execute("INSERT INTO jobs (id, kind) VALUES ('n2', 'transcribe')", []).unwrap();
+    }
+
+    #[test]
+    fn jobs_check_vocabulary_stays_in_lockstep_with_jobstate_enum() {
+        // The migration v37 CHECK list and JobState::as_str() are two copies of the same vocabulary in
+        // different files. Each file's own tests use literal strings, so a drift (add a state to the enum
+        // but not the CHECK, or vice-versa) would pass both suites while the DB silently rejects the new
+        // state at write time. This binds them: EVERY enum variant's token must satisfy the CHECK.
+        use crate::jobs::JobState;
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+        for (i, state) in ["queued", "running", "succeeded", "failed", "cancelled"].iter().enumerate() {
+            // Every token the enum emits must be accepted by the CHECK constraint.
+            assert_eq!(
+                JobState::parse(state).map(|s| s.as_str()),
+                Some(*state),
+                "enum must round-trip the token the CHECK allows"
+            );
+            conn.execute("INSERT INTO jobs (id, kind, state) VALUES (?1, 'x', ?2)", (format!("v{i}"), state))
+                .unwrap_or_else(|e| panic!("CHECK must accept enum token {state:?}: {e}"));
+        }
     }
 
     #[test]

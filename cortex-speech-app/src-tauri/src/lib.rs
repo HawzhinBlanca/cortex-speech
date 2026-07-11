@@ -37,6 +37,7 @@ pub mod history;
 pub mod http;
 pub mod inference;
 pub mod integration_runner;
+pub mod jobs;
 pub mod jury;
 pub mod llm_refiner;
 pub mod media;
