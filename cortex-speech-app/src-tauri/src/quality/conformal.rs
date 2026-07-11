@@ -12,6 +12,13 @@ pub struct ConformalCertificate {
     pub certified_segment_ids: Vec<String>,
     pub expected_error_bound: f64,
     pub is_calibrated: bool,
+    /// PROVENANCE of the calibration set's per-utterance confidences (honesty, not interpretation): how
+    /// many calibration segments carried a real model posterior vs the heuristic/unknown fallback. On the
+    /// default offline path (OmniASR CTC exposes no token posteriors) this is `real_posterior == 0` — the
+    /// readout must not imply a calibrated-posterior guarantee it does not have. This does NOT change the
+    /// threshold/certification (the score also uses the real ctc_score); it just surfaces the basis.
+    pub calibration_real_posterior: usize,
+    pub calibration_heuristic: usize,
 }
 
 /// The nonconformity score from a (confidence, ctc) pair: S = (1 - confidence) + 0.1·(-ctc).
@@ -127,6 +134,12 @@ pub fn calibrate_and_certify(
     // Build the (nonconformity, cer) calibration set from verified segments with a non-empty
     // reference, scored on the segment's own confidence (this is the seg.confidence-based DATASET
     // certificate; the IRT-based T0 gate calibrates separately via calibrate_threshold).
+    // Provenance of the calibration confidences — a fact surfaced for honesty, computed over the SAME
+    // membership rule as cal_scored (verified + non-empty reference). `real_posterior` requires the exact
+    // token stored by asr::ConfidenceSource; anything else (heuristic, legacy `unknown`, or missing) is
+    // the fallback.
+    let mut calibration_real_posterior = 0usize;
+    let mut calibration_heuristic = 0usize;
     let cal_scored: Vec<(f64, f64)> = all_segments
         .iter()
         .filter_map(|s| {
@@ -136,6 +149,11 @@ pub fn calibrate_and_certify(
             let ref_text = s.annotated_transcript.as_deref()?.trim();
             if ref_text.is_empty() {
                 return None;
+            }
+            if s.confidence_source.as_deref() == Some("real_posterior") {
+                calibration_real_posterior += 1;
+            } else {
+                calibration_heuristic += 1;
             }
             let cer = compute_cer(ref_text, &s.raw_transcript).min(1.0); // bound to [0,1] for Hoeffding
             Some((compute_nonconformity_score(s), cer))
@@ -168,6 +186,8 @@ pub fn calibrate_and_certify(
         certified_segment_ids,
         expected_error_bound,
         is_calibrated,
+        calibration_real_posterior,
+        calibration_heuristic,
     }
 }
 
@@ -197,6 +217,27 @@ mod tests {
             ood_score: None,
             ..SpeechSegment::default()
         }
+    }
+
+    #[test]
+    fn certificate_discloses_calibration_confidence_provenance() {
+        // Honesty/provenance: the certificate must surface whether its calibration confidences were real
+        // model posteriors or the heuristic/unknown fallback (the default offline CTC path has none), so
+        // the readout cannot imply a calibrated-posterior guarantee it does not have. This is a FACT over
+        // the calibration-set membership (verified + non-empty reference), not a behavior change.
+        let mut real = mock_segment("r", 0.9, -1.0, true, "text", "text");
+        real.confidence_source = Some("real_posterior".to_string());
+        let mut heur = mock_segment("h", 0.9, -1.0, true, "text", "text");
+        heur.confidence_source = Some("heuristic".to_string());
+        let unknown = mock_segment("u", 0.9, -1.0, true, "text", "text"); // confidence_source None (legacy)
+        let unverified = mock_segment("x", 0.9, -1.0, false, "text", "text"); // NOT in the calibration set
+
+        let cert = calibrate_and_certify(&[real, heur, unknown, unverified], 0.3, 0.90);
+        assert_eq!(cert.calibration_real_posterior, 1, "only the real_posterior segment counts as real");
+        assert_eq!(
+            cert.calibration_heuristic, 2,
+            "heuristic + legacy-unknown are the fallback; the unverified segment is excluded entirely"
+        );
     }
 
     #[test]

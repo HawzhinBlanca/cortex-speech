@@ -1074,6 +1074,11 @@ export interface ConformalCertificate {
   certifiedSegmentIds: string[];
   expectedErrorBound: number;
   isCalibrated: boolean;
+  /** Provenance of the calibration confidences: how many were real model posteriors vs the
+   * heuristic/unknown fallback. On the default offline path realPosterior is 0 — the readout must not
+   * imply a calibrated-posterior guarantee it does not have. */
+  calibrationRealPosterior: number;
+  calibrationHeuristic: number;
 }
 
 export async function runConsensusRefinery(): Promise<{

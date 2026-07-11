@@ -634,6 +634,8 @@ export const en: Record<string, string> = {
   'stats.conformalTitle': 'Conformal Quality Certification',
   'stats.calibrated': 'Calibrated',
   'stats.heuristic': 'Heuristic',
+  'stats.conformalHeuristicBasis':
+    'Confidence basis: heuristic. The local engine emits no token posteriors, so certification reflects the acoustic (CTC) score, not a calibrated confidence — treat as indicative.',
   'stats.certifiedSegments': 'Certified Segments',
   // Waveform
   'waveform.timelineZoom': 'Timeline Zoom',

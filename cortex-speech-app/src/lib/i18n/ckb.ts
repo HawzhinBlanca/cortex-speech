@@ -631,6 +631,8 @@ export const ckb: Record<string, string> = {
   'stats.conformalTitle': 'بڕوانامەی جۆری کۆنفۆرمەڵ',
   'stats.calibrated': 'کالیبرەکراو',
   'stats.heuristic': 'هیوریستیک',
+  'stats.conformalHeuristicBasis':
+    'بنەمای دڵنیایی: هیوریستیک. ئەنجنی ناوخۆیی هیچ ئەگەرێکی تۆکن دەرناهێنێت، بۆیە پشتڕاستکردنەوە پشت بە خاڵی دەنگی (CTC) دەبەستێت، نەک دڵنیاییەکی پێوانەکراو — وەک ئاماژە مامەڵەی لەگەڵ بکە.',
   'stats.certifiedSegments': 'بەشە بڕوانامەدارەکان',
   // Waveform
   'waveform.timelineZoom': 'زووم کردنی هێڵی کات',

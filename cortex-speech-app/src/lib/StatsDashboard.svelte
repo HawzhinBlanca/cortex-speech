@@ -669,6 +669,18 @@
               bounds.
             </p>
           {/if}
+
+          {#if cert.calibrationRealPosterior === 0 && cert.calibrationHeuristic > 0}
+            <!-- Honesty: even a statistically-calibrated cert can be built entirely on the heuristic
+                 confidence fallback (the default offline CTC engine emits no token posteriors). Disclose
+                 the provenance so the number is never over-trusted as a calibrated posterior. -->
+            <p
+              class="text-[9px] text-amber-400/90 leading-tight"
+              data-testid="conformal-heuristic-basis"
+            >
+              {$t('stats.conformalHeuristicBasis')}
+            </p>
+          {/if}
         </div>
       </div>
     {/if}
