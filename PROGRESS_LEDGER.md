@@ -2659,3 +2659,26 @@ exe mid-startup so WebView2 never initialized). node --check clean.
 
 P0 #2 STATUS: structural migration (46 commands) DONE + ratchet-gated; Bucket B assessed; runtime
 responsiveness PROVEN. NEXT execution-order item: P0 #3 Job Supervisor + #4 full 7B engine supervision.
+
+## P0 #4 START — engine supervision POLICY state machine (2026-07-11)
+
+First increment of full app-owned 7B supervision (audit P0 #4), building on the status pill +
+start/probe already shipped (c556517). src-tauri/src/engine_supervisor.rs — a PURE, deterministic
+state machine (no I/O; monotonic time passed in) that decides WHEN to (re)start the champion engine:
+- Bounded EXPONENTIAL backoff (base 2s, doubling, capped 60s) between attempts.
+- CIRCUIT BREAKER: Closed → Open (after N consecutive failures) → HalfOpen (after a cooldown, one
+  probe) → Closed (on success) / Open (on failure = a "trip") → GaveUp (after max_trips; manual
+  start required). Decision enum = Restart / Wait(d) / Cooldown(d) / GaveUp for the caller to act on.
+- reset() for a manual/operator start.
+The live loop (a background task calling decide() on a tick, invoking probe_wsl_7b_server +
+start_champion_engine, plus server/model/adapter hash-verify and process-tree kill on shutdown) is
+the next increment; the live WSL spawn/restart is owner-machine (flag honestly when wired).
+
+VERBATIM proof:
+  cargo test --lib engine_supervisor -> 9 passed; 0 failed (backoff grow+cap, breaker open/cooldown,
+    half-open close, half-open reopen+trip, give-up after max_trips, reset, healthy-clears-backoff)
+  cargo fmt -> clean; cargo clippy --lib -D warnings -> clean
+  cargo test --lib -> 851 passed; 0 failed; 6 ignored
+
+NOTE: engine_supervisor is not yet wired into a command, so the shipped exe behavior is unchanged
+(the heartbeat proof still stands). The exe needs a rebuild before ship (standard freshness gate).

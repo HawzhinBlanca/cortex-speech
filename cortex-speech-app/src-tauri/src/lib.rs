@@ -22,6 +22,7 @@ pub mod db;
 pub mod denoiser;
 pub mod diarization;
 pub mod diff;
+pub mod engine_supervisor;
 pub mod error;
 pub mod eval;
 pub mod export;
