@@ -3118,3 +3118,49 @@ per-source SRT/VTT export carries a UX/naming design decision; god-file decompos
 fs::copy / whole-file reads are small config or necessary cloud-send reads (not perf bugs). Per the doctrine
 (don't manufacture busywork), loop STOPPED. Full remaining checklist + how-to-run-gates: docs/OWNER_HANDOFF.md
 ("Resumed phase" section). Exe/bundle stale vs HEAD — rebuild before any live check. Restart with /loop anytime.
+
+## LAST PASS (owner: "real 10/10 however possible") — batch A: gates + Rust durability (2026-07-11)
+
+Owner asked for one last pass at the real 10/10. Ran a 33-agent, 5-lens adversarial sweep (Rust
+durability / frontend correctness / python-gate honesty / test gaps / docs honesty; every medium+
+finding verified by 2 independent skeptics): 14 findings verified, 11 CONFIRMED, 3 killed. Also
+rebuilt the stale exe/bundle and ran every runtime proof against it (batch B entry has those).
+
+COMMITS (this batch):
+- 3225795 fix(gates): no gate can pass vacuously or print a ship verdict it did not earn
+  verify_10 --quick could print "GREEN - PERSONAL-USE SHIP-READY" (exit 0) while skipping ALL
+  tier-2/3 kept gates -> now NOT-RUN-QUICK => INCOMPLETE exit 2 (proven: --quick now ends
+  "VERDICT: INCOMPLETE - 8 kept gate(s) could not run (...)" exit=2).
+  test_ledger_staleness.py + test_eval_provenance.py passed VACUOUSLY when their target file was
+  missing -> now hard AssertionError; NEGATIVE-PROVEN (renamed each target away -> gate FAILS with
+  "missing" message; restored -> passes).
+  run_python_policies.py now prints the real count. HONEST CORRECTION: earlier ledger entries
+  repeat "all 23 regressions passed" verbatim — that count was NEVER printed by the runner (it
+  printed no count at all) and 29 policy scripts run today. Those entries' pass/fail claims stand;
+  the "23" was a stale hand-written count, now impossible to repeat (the runner prints the number).
+- 4413ef4 fix(settings): bound segment-duration/thread knobs at BOTH trust boundaries
+  min=max=0 exploded the chunk planner to one chunk PER PCM SAMPLE (16k segments/sec of audio);
+  num_asr_threads=0 flowed into the ONNX config. validate(): min in [1000,600000], max in
+  [min,600000], threads in [1,128]; load(): repairs only the bad knobs (defaults would drop consent
+  flags). ADVERSARIAL CATCH THAT MATTERED: first draft floored at 100 ms; refuter proved the
+  seconds-based settings UI round-trip (round(ms/1000)*1000) would turn an accepted sub-second
+  value into 0 and brick EVERY later save incl. consent toggles. Floor raised to the UI unit
+  (1000 ms); re-refutation brute-forced all 599,001 in-range values + 2,166 repair boundary combos
+  -> zero rejectable results. 2 new tests.
+- b575d3d fix(export): WAV/FLAC metadata.csv reports the WRITTEN clip's duration
+  The stored duration_ms reached metadata.csv even when slice_for_export CLAMPED the window
+  (re-encoded/shortened source, relink_audio) — metadata claiming audio the file doesn't back up is
+  training-data corruption; the HF exporter's existing fix (clip_dur_ms) was never ported to this
+  sibling path. Now ExportedAudioFile carries clip_duration_ms (measured pre-resample). 1 new test
+  (stored 5000 ms over a 1 s source -> CSV says 1000, never 5000).
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean
+  cargo test --lib -> 885 passed; 0 failed; 6 ignored (was 882; +3 new regression tests)
+  python scripts/run_python_policies.py -> "Python policy regressions finished: 29 policy test
+    scripts passed." (the runner now prints this real count)
+  python scripts/verify_10.py --quick -> exit=2, "VERDICT: INCOMPLETE - 8 kept gate(s) could not
+    run (exe-freshness, real-app-e2e, egress-runtime, ignored-real-model, fuzz-smoke, rtf-bench,
+    refinery-lift, fairness-gender-age). Green cannot be claimed."
+  Adversarial refutation workflow (9 lenses over the working tree) -> 8 clean, 1 real defect
+    (settings 100 ms floor, above) -> fixed -> focused re-refutation VERDICT: CLEAN.
