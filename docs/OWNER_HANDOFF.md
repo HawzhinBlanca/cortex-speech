@@ -153,3 +153,35 @@ the link fail with `os error 32`.) The heartbeat/jobs/egress probes launch the e
 *This hand-off is the honest end of the autonomous loop: the verifiable-here surface (non-Codex,
 crisp, real-value) is exhausted; everything above is owner-gated, a design decision, or larger work that
 should be coordinated with the Codex agent. Restart with `/loop` any time to resume.*
+
+---
+
+## Resumed phase (post-hand-off, owner asked to continue) — 2026-07-11
+
+After the hand-off the owner asked to keep going, so the loop took on the LARGER
+`[verifiable-here-later]` items. Delivered (all gated + adversarially verified, on `codex/newbranch`):
+
+- **Git hygiene** — `1010PATH.md` (the private root audit) gitignored so it can't be committed by
+  accident and no longer clutters `git status`; working tree clean; all branch commit subjects verified
+  well-formed.
+- **P1 media playback hard-link** — `media.rs` no longer copies the whole source audio into the
+  asset-protocol cache on every playback grant; it **hard-links** (instant, zero extra disk,
+  byte-identical) with the original copy kept only as the cross-volume / linkless-FS fallback. Kills the
+  multi-GB-copy-per-grant problem for the common same-volume case. 0-defect 2-lens adversarial review;
+  new unit tests prove it links (not copies) and that pruning the cache never deletes the source.
+
+**Then genuinely re-scanned and stopped again** — the remaining `[verifiable-here-later]` items are, on
+honest inspection, either owner-gated or entangled:
+- **Chunking overlap/dedup** — the pure seam-dedup logic is *speculative dead code* until chunk-overlap
+  is wired into the ASR decode loop AND validated on real long recordings (owner-gated per the audit).
+  Writing it now would be unvalidated guesswork; deferred to the owner.
+- **Per-source SRT/VTT export** — turning the current multi-source *refusal* into per-source files is a
+  real feature but carries a UX/naming design decision (how to name N output files from one save path) —
+  an owner call.
+- **God-file decomposition** (`commands.rs`/`db.rs`/`pipeline.rs`) — Codex-owned; must be coordinated.
+- Other `fs::copy`/whole-file-read sites scanned are small config files or necessary cloud-send reads —
+  not perf bugs.
+
+Net: the clearly-high-value, non-speculative, non-Codex, verifiable-here surface is exhausted again. An
+honest stop here beats manufacturing niche or unvalidated work. Restart with `/loop` any time, or point
+the loop at a specific item above and it will take it on directly.

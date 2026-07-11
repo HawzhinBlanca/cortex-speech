@@ -3106,3 +3106,15 @@ VERBATIM proof (Windows):
 HONEST: same-volume only (cross-volume/FAT/exFAT/UNC fall back to copy); exe stale vs HEAD, rebuild to
 exercise live. NEXT larger item candidates: chunking overlap/dedup pure logic (long-recording A/B owner-
 gated), or a non-Codex architecture extraction. Owner-gated list unchanged (see docs/OWNER_HANDOFF.md).
+
+## RESUMED PHASE COMPLETE — honest stop (2026-07-11)
+
+Resumed phase (owner asked to continue past the hand-off) added, all gated + adversarially verified:
+git hygiene (1010PATH.md gitignored; tree clean; commit subjects well-formed) + P1 media playback
+HARD-LINK (no more whole-file copy into the asset cache; 0-defect 2-lens adversarial; unit-tested).
+Re-scanned for another concrete non-Codex win and found none of non-speculative real value: chunking
+overlap/dedup is owner-gated (pure dedup = dead code until overlap is wired + validated on real audio);
+per-source SRT/VTT export carries a UX/naming design decision; god-file decomposition is Codex-owned; other
+fs::copy / whole-file reads are small config or necessary cloud-send reads (not perf bugs). Per the doctrine
+(don't manufacture busywork), loop STOPPED. Full remaining checklist + how-to-run-gates: docs/OWNER_HANDOFF.md
+("Resumed phase" section). Exe/bundle stale vs HEAD — rebuild before any live check. Restart with /loop anytime.
