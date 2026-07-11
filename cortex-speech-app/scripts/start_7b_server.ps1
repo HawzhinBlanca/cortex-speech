@@ -9,6 +9,11 @@
 #   CORTEX_7B_MODEL_DIR   WSL path to the champion model dir (LoRA + tokenizer [+ base .pt])
 #   CORTEX_7B_PYTHON      WSL path to the python with torch/fairseq2/peft/omnilingual-asr
 #   CORTEX_7B_PORT        default 8799
+#   CORTEX_7B_DEVICES     e.g. "0,1" — one model replica per GPU (default: every visible GPU).
+#                         On this rig (2x 3090 Ti) the default loads both cards for ~2x throughput.
+# NOTE: run from an INTERACTIVE console. The nohup-detach dies with a non-interactive runner's
+# session (WSL kills the session's children when the launching wsl.exe exits) — a headless harness
+# must instead hold `wsl -- bash -lc "... exec python cortex_7b_server.py"` alive itself.
 $ErrorActionPreference = "Stop"
 
 $port = if ($env:CORTEX_7B_PORT) { $env:CORTEX_7B_PORT } else { "8799" }
@@ -35,10 +40,12 @@ Write-Host "  script:    $serverWsl"
 Write-Host "  model dir: $modelDir   python: $wslPython   port: $port"
 
 # nohup + detach so the server outlives this console; log to ~/cortex_7b_server.log in WSL.
-$launch = "CORTEX_7B_MODEL_DIR='$modelDir' CORTEX_7B_PORT=$port nohup '$wslPython' '$serverWsl' > ~/cortex_7b_server.log 2>&1 &"
+$devEnv = if ($env:CORTEX_7B_DEVICES) { "CORTEX_7B_DEVICES='$($env:CORTEX_7B_DEVICES)' " } else { "" }
+$launch = "${devEnv}CORTEX_7B_MODEL_DIR='$modelDir' CORTEX_7B_PORT=$port nohup '$wslPython' '$serverWsl' > ~/cortex_7b_server.log 2>&1 &"
 wsl -- bash -lc $launch
 
-$deadline = (Get-Date).AddMinutes(8)
+# Two replicas stream the ~30 GB checkpoint twice, so allow for the multi-GPU default.
+$deadline = (Get-Date).AddMinutes(15)
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 10
     if ((Test-ServerUp) -match "UP") {
@@ -48,6 +55,6 @@ while ((Get-Date) -lt $deadline) {
     Write-Host "  ...still loading (log: wsl -- tail -5 ~/cortex_7b_server.log)"
 }
 
-Write-Host "FAILED: server did not come up within 8 minutes. Last log lines:" -ForegroundColor Red
+Write-Host "FAILED: server did not come up within 15 minutes. Last log lines:" -ForegroundColor Red
 wsl -- bash -c "tail -15 ~/cortex_7b_server.log 2>/dev/null"
 exit 1

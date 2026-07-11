@@ -14,6 +14,14 @@ fine-tuned 21.00% and the stock 29.40%. Zero-reference clips drop out of the rat
 This is the reusable harness for the honest default-engine decision (deep-audit F1): point it at the
 gold corpus (build one with scripts/build_ckb_gold.py from CORTEX_CORPUS_ZIP + CORTEX_CORPUS_TSV) and
 it prints the real 7B micro CER + 95% CI at whatever N the manifest holds. No number is fabricated.
+
+Concurrency: CORTEX_7B_WORKERS=N (default 1) keeps N clips in flight — set it to the server's
+replica count (CORTEX_7B_DEVICES) so a multi-GPU server is actually saturated. For N <= replica
+count, results/CER/WER/output order are identical to the serial run; only wall-clock changes.
+HONEST LIMIT: pushing N beyond the replica count queues clips at the server, and a clip whose
+queue wait exceeds the 300 s socket timeout is SKIPped — changing n and the published number.
+Ctrl+C aborts cleanly: in-flight clips finish, queued clips are cancelled, no partial number is
+reported.
 """
 import json
 import os
@@ -22,6 +30,7 @@ import socket
 import sys
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 
 # P2.1: WER + timing telemetry (M1.3 needs CER + WER + RTF). CER stays inline/byte-identical below.
 from asr_metrics import bootstrap_ci as boot_ci
@@ -96,16 +105,46 @@ def main() -> int:
     per_clip = []  # (char_dist, char_ref_len)
     word_clip = []  # P2.1: (word_dist, word_ref_len) for WER, scored on the SAME normalized pairs
     pairs = []
-    total_proc_s = 0.0  # P2.1: cumulative transcription wall-clock for throughput/RTF
-    for i, row in enumerate(rows):
-        wav, ref = row[0], row[1]
+    total_proc_s = 0.0  # P2.1: cumulative per-clip decode time (sum of latencies, all workers)
+    workers = max(1, int(os.environ.get("CORTEX_7B_WORKERS", "1")))
+
+    def fetch(row):
+        """(hyp, elapsed_s, error) for one clip — runs on a worker thread; scoring stays in order below."""
+        t0 = time.perf_counter()
         try:
-            t0 = time.perf_counter()
-            hyp = transcribe_7b(wav)
-            total_proc_s += time.perf_counter() - t0
-        except Exception as e:
-            print(f"  SKIP {wav}: {e}")
+            return transcribe_7b(row[0]), time.perf_counter() - t0, None
+        except Exception as e:  # noqa: BLE001 — the main loop SKIPs and reports, same as before
+            return None, time.perf_counter() - t0, e
+
+    wall_t0 = time.perf_counter()
+    # Bounded-chunk submission, NOT one whole-manifest map: a full submit made Ctrl+C useless
+    # (shutdown drained every queued request — a 900-clip run kept hammering the warm server for
+    # hours after the interrupt) and silenced all progress output until the very end
+    # (adversarial review 2026-07-12). Chunks keep progress live and bound the abort latency to
+    # the clips already in flight. pool.map preserves order within each chunk and chunks are
+    # extended in order, so per_clip/word_clip/pairs stay aligned exactly as in the serial version.
+    results = []
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        chunk = max(workers * 4, 8)
+        for start in range(0, len(rows), chunk):
+            results.extend(pool.map(fetch, rows[start : start + chunk]))
+            done = min(start + chunk, len(rows))
+            if done < len(rows):
+                print(f"  ...{done}/{len(rows)}", flush=True)
+        pool.shutdown(wait=True)
+    except KeyboardInterrupt:
+        pool.shutdown(wait=False, cancel_futures=True)
+        print("\ninterrupted — queued clips cancelled; refusing to report a partial number.")
+        return 130
+    wall_s = time.perf_counter() - wall_t0
+
+    for i, (row, (hyp, elapsed, err)) in enumerate(zip(rows, results)):
+        wav, ref = row[0], row[1]
+        if err is not None:
+            print(f"  SKIP {wav}: {err}")
             continue
+        total_proc_s += elapsed
         r, h = _NORM(ref), _NORM(hyp)
         if not r:
             continue  # zero-reference clip drops out of the ratio-of-sums (matches eval.rs)
@@ -147,7 +186,10 @@ def main() -> int:
     wer = micro_rate(word_clip)
     wlo, whi = boot_ci(word_clip, n_boot, 42)
     mean_proc_s = total_proc_s / n if n else 0.0
-    throughput = n / total_proc_s if total_proc_s > 0 else 0.0
+    # Throughput is WALL-based: with CORTEX_7B_WORKERS>1 the per-clip latencies overlap, so
+    # n/total_proc_s would overstate nothing but describe no real clock. At workers=1,
+    # wall_s ~= total_proc_s and this matches the old n/total_proc_s definition.
+    throughput = n / wall_s if wall_s > 0 else 0.0
 
     out_tsv = os.path.join(os.path.dirname(os.path.abspath(manifest)), "omni7b_results.tsv")
     with open(out_tsv, "w", encoding="utf-8") as f:
@@ -167,6 +209,8 @@ def main() -> int:
                 "wer_ci_hi": whi,
                 "total_proc_s": total_proc_s,
                 "mean_proc_s": mean_proc_s,
+                "wall_clock_s": wall_s,
+                "workers": workers,
                 "throughput_clips_per_s": throughput,
                 "examples": pairs[:10],
             },
