@@ -157,6 +157,42 @@ describe('autosave controller', () => {
     vi.useRealTimers();
   });
 
+  // pendingId() is the guard SIX App.svelte call sites rely on to scope a cancel to one segment
+  // before delete/re-transcribe — so a debounced flush can't resurrect a deleted row (via
+  // update_segment's insert-on-conflict) or clobber a fresh machine transcript. A regression that
+  // returns null while an edit is queued (or a stale id after cancel/flush/save) silently disables
+  // every one of those guards while npm test stays green. Pin the whole contract.
+  it('pendingId() tracks the queued segment through schedule, cancel, flush, re-key, and save', async () => {
+    vi.useFakeTimers();
+    const h = setup([
+      { id: 's1', text: 'a' },
+      { id: 's2', text: 'b' },
+    ]);
+
+    expect(h.ctrl.pendingId()).toBeNull(); // nothing queued yet
+
+    h.ctrl.schedule({ text: 'edit-1' });
+    expect(h.ctrl.pendingId()).toBe('s1'); // a queued edit reports its segment
+
+    h.ctrl.cancel();
+    expect(h.ctrl.pendingId()).toBeNull(); // cancel drops the queue — no stale id
+
+    h.ctrl.schedule({ text: 'edit-2' });
+    await h.ctrl.flushAsync();
+    expect(h.ctrl.pendingId()).toBeNull(); // explicit flush clears the queue
+
+    // The re-key case the delete guard depends on: switching targets mid-debounce must report the
+    // NEW segment (the old edit was flushed, not still pending under the old id).
+    h.ctrl.schedule({ text: 'edit-3' });
+    h.setTarget('s2');
+    h.ctrl.schedule({ text: 'edit-4' });
+    expect(h.ctrl.pendingId()).toBe('s2');
+
+    await vi.runAllTimersAsync();
+    expect(h.ctrl.pendingId()).toBeNull(); // the debounced save landing clears the queue
+    vi.useRealTimers();
+  });
+
   it('reports an error and returns to idle when the save fails', async () => {
     vi.useFakeTimers();
     const rows = new Map<string, Row>([['A', { id: 'A', text: 'a' }]]);

@@ -443,7 +443,10 @@
     // Persist any unsaved edit as a DRAFT before navigating, so the load $effect can't silently discard
     // the reviewer's typed corrections when `current` changes. Navigation is not a verify, so the
     // segment's `verified` state is left untouched; the edit is recoverable and Reset still discards it.
-    if (dirty && current && !saving) {
+    // A CLEARED textarea is dirty too but must NOT be drafted: persisting annotatedTranscript=''
+    // blanks the gold transcript with no undo entry (submit() refuses the same state). The cleared
+    // text survives in editCache for this session, so nothing is lost by skipping the persist.
+    if (dirty && current && !saving && editText.trim()) {
       const seg = current;
       const draft: SpeechSegment = { ...seg, annotatedTranscript: editText.trim() };
       saving = true;
@@ -471,7 +474,9 @@
   $effect(() => {
     return () => {
       const seg = current;
-      if (!seg || !dirty || saving) return;
+      // The empty-edit guard mirrors go() and submit(): a cleared textarea on teardown must not
+      // persist annotatedTranscript='' and blank the gold transcript with no undo entry.
+      if (!seg || !dirty || saving || !editText.trim()) return;
       const draft: SpeechSegment = { ...seg, annotatedTranscript: editText.trim() };
       segments.update((list) => list.map((s) => (s.id === seg.id ? draft : s)));
       // Fire-and-forget: teardown cannot await. Surface a failure — the notification store outlives

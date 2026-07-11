@@ -15,10 +15,15 @@
     open = false,
     onClose = () => {},
     extraCommands = [],
+    reviewActive = false,
   }: {
     open?: boolean;
     onClose?: () => void;
     extraCommands?: Command[];
+    /** True while a review surface (Review & Correct / Review Inbox) owns the screen. The palette
+     *  then lists only allowInReview shortcuts — mirroring the keyboard manager's suppression, so
+     *  the palette can't run a non-review-safe global against the hidden curate selection. */
+    reviewActive?: boolean;
   } = $props();
 
   let query = $state('');
@@ -26,13 +31,15 @@
   let listEl: HTMLDivElement | undefined = $state();
 
   const commands = $derived.by<Command[]>(() => {
-    const fromShortcuts: Command[] = (globalKeyboardManager?.getAll() ?? []).map((s, i) => ({
-      id: `sc-${i}`,
-      label: s.description,
-      category: s.category,
-      hint: globalKeyboardManager?.formatShortcut(s),
-      run: s.action,
-    }));
+    const fromShortcuts: Command[] = (globalKeyboardManager?.getAll() ?? [])
+      .filter((s) => !reviewActive || s.allowInReview)
+      .map((s, i) => ({
+        id: `sc-${i}`,
+        label: s.description,
+        category: s.category,
+        hint: globalKeyboardManager?.formatShortcut(s),
+        run: s.action,
+      }));
     return [...extraCommands, ...fromShortcuts];
   });
 

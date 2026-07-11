@@ -3282,7 +3282,14 @@
 
 <KeyboardShortcuts />
 
-<CommandPalette open={showCommandPalette} onClose={() => (showCommandPalette = false)} />
+<!-- reviewActive filters the palette to allowInReview commands: without it, Ctrl+K re-opened the
+     exact hidden-selection hole the keyboard manager's review suppression closes (running e.g.
+     "Toggle verified" from the palette verifies the INVISIBLE curate selection — unreviewed gold). -->
+<CommandPalette
+  open={showCommandPalette}
+  reviewActive={viewMode === 'review' || $showReviewInbox}
+  onClose={() => (showCommandPalette = false)}
+/>
 
 <ConfirmDialog />
 
@@ -3297,7 +3304,12 @@
        the invisible background app and Enter activated top-bar buttons sight-unseen. -->
   <div class="fixed inset-0 z-[100] flex items-stretch justify-center p-6 glass" use:focusTrap>
     <ErrorBoundary>
-      <ReviewInbox onClose={() => showReviewInbox.set(false)} />
+      <!-- Reload on close: inbox decisions (accept/edit/reject/flag) write human_decision to the DB
+           but only mutate the inbox's LOCAL copy — without this, header stats and the Review &
+           Correct queue keep pre-decision data, and a reviewer could unknowingly overwrite a
+           just-recorded reject with an accept. loadSegments routes through the loadSeq-guarded
+           segments.load(), so the refresh is race-safe. -->
+      <ReviewInbox onClose={() => { showReviewInbox.set(false); void loadSegments(); }} />
     </ErrorBoundary>
   </div>
 {/if}
