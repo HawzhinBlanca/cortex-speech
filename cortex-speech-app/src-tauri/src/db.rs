@@ -1233,6 +1233,13 @@ impl Database {
         }
         let backup = backup::Backup::new(&src_conn, &mut self.conn)?;
         backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
+        drop(backup); // release the &mut self.conn borrow before re-migrating self
+                      // Bring the restored DB up to the current schema IN PLACE. The newer-schema case was refused
+                      // above, so the source is at an OLDER (or equal) version; without this, a restored old snapshot
+                      // would sit at a stale schema — missing columns/tables a later migration added — and the running
+                      // app (new code) would hit "no such column" errors until the next startup re-migrated it. Equal
+                      // is a no-op; each migration is CREATE/ALTER ... guarded and applied in its own transaction.
+        crate::migrations::run_migrations(self)?;
         Ok(())
     }
 
@@ -3996,6 +4003,64 @@ mod tests {
             same.initialize().unwrap();
         }
         live.restore(&same_path).expect("a current-schema snapshot must still restore");
+    }
+
+    #[test]
+    fn restore_of_an_older_snapshot_migrates_it_forward_to_head() {
+        // Restore copies pages directly, so an OLDER snapshot would leave the live DB behind HEAD and the
+        // running app would hit "no such column/table" until the next startup. restore() must re-migrate.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let head = crate::migrations::max_supported_version();
+
+        let live_path = tmp.path().join("live.db");
+        let mut live = Database::open(live_path.to_str().unwrap()).unwrap();
+        live.initialize().unwrap();
+
+        // Synthesize a genuinely OLD snapshot: a HEAD db with the newest migration (v37, the jobs table)
+        // rolled back — its version row deleted AND its table dropped — so it looks like it came from a
+        // build one schema behind and is missing a table a later migration adds.
+        let old_path = tmp.path().join("old.db");
+        {
+            let old = Database::open(old_path.to_str().unwrap()).unwrap();
+            old.initialize().unwrap();
+            old.connection()
+                .execute_batch(&format!(
+                    "DROP TABLE IF EXISTS jobs; DELETE FROM schema_migrations WHERE version = {head};"
+                ))
+                .unwrap();
+            let old_ver = crate::migrations::get_current_version(&old).unwrap();
+            assert!(old_ver < head, "the synthesized snapshot must be behind HEAD (got v{old_ver}, head v{head})");
+            let has_jobs: i64 = old
+                .connection()
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='jobs'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(has_jobs, 0, "the old snapshot must genuinely lack the v37 jobs table");
+        }
+
+        live.restore(&old_path).expect("an older snapshot restores");
+
+        // After restore the live DB is migrated forward to HEAD and the v37 table exists + is usable.
+        assert_eq!(
+            crate::migrations::get_current_version(&live).unwrap(),
+            head,
+            "a restored older snapshot must be migrated up to HEAD in place"
+        );
+        let has_jobs: i64 = live
+            .connection()
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='jobs'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(has_jobs, 1, "the post-restore migration must recreate the v37 jobs table");
+        live.create_or_get_job("after-restore", "export_dataset", None, None)
+            .expect("the migrated-in jobs table must be usable right after restore");
+
+        // Idempotent: restoring an already-HEAD snapshot re-migrates as a no-op and still succeeds.
+        let head_path = tmp.path().join("head.db");
+        {
+            let h = Database::open(head_path.to_str().unwrap()).unwrap();
+            h.initialize().unwrap();
+        }
+        live.restore(&head_path).expect("a HEAD snapshot restores idempotently");
+        assert_eq!(crate::migrations::get_current_version(&live).unwrap(), head);
     }
 
     #[test]

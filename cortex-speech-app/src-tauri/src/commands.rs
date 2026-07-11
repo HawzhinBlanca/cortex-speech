@@ -2677,16 +2677,20 @@ pub async fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), S
     // Heavy DB file-copy + reopen — off the main thread. The lock is taken INSIDE the task (never
     // across the await); prepare_restore already refused if writers are active.
     let db = state.db_arc();
-    run_blocking(move || {
+    let restore_result = run_blocking(move || {
         let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
         guard.restore(&validated).map_err(|e| e.to_string())
     })
-    .await?;
+    .await;
     // The in-memory undo/redo stack holds Commands (DeleteSegments, BatchTranscribe, ...) that
     // reference rows from the PRE-restore database. Replaying one via Undo after the restore would
-    // apply a stale mutation to a different dataset — resurrecting or corrupting rows. Clear it so
-    // undo can never cross the restore boundary.
+    // apply a stale mutation to a different dataset — resurrecting or corrupting rows. Clear it on ANY
+    // restore attempt that reached the swap: restore() can return Err AFTER the pages were already
+    // copied (e.g. a forward-migration failure post-copy), so clearing only on Ok would leave a stale
+    // Undo able to cross the restore boundary. Clearing on a pre-swap rejection (bad/newer snapshot)
+    // too is harmless — the library is unchanged, only the undo stack resets.
     state.lock_history().clear();
+    restore_result?;
     Ok(())
 }
 
@@ -2775,15 +2779,21 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
     }
     prepare_restore(&state)?;
     // Heavy DB file-copy + reopen — off the main thread; the lock is taken INSIDE the task.
-    {
+    let restore_result = {
         let db = state.db_arc();
         let restore_src = src.clone();
         run_blocking(move || {
             let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
             guard.restore(&restore_src).map_err(|e| e.to_string())
         })
-        .await?;
-    } // release the db lock before touching the settings/pipeline locks
+        .await
+    }; // release the db lock before touching the settings/pipeline locks
+       // Clear the undo/redo stack on ANY restore attempt that reached the swap: restore() can return Err
+       // AFTER the pages were copied (e.g. a forward-migration failure post-copy), and a stale Undo would
+       // then corrupt the restored dataset (see db_restore). Do it BEFORE propagating the error so it runs
+       // even on that post-swap-failure path.
+    state.lock_history().clear();
+    restore_result?;
 
     // Restore the snapshot's captured config (settings.json / champion.json) so the app returns to a
     // CONSISTENT known-good state — not a rolled-back library sitting beside post-disaster settings, or
@@ -2805,9 +2815,7 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
     let restored = crate::settings::AppSettings::load(&data_dir.join("settings.json"));
     *state.lock_settings() = restored.clone();
     state.update_pipeline_settings(restored);
-    // Clear the undo/redo stack: it references pre-restore rows and replaying it would corrupt the
-    // restored dataset (see db_restore).
-    state.lock_history().clear();
+    // (undo/redo history was already cleared above, right after the DB swap.)
     tracing::info!("database and config restored from auto-snapshot {name}");
     Ok(())
 }
