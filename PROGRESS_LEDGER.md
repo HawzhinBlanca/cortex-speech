@@ -2705,3 +2705,39 @@ that ticks on an interval, calling probe_wsl_7b_server for `healthy` and start_c
 Decision::Restart, plus surfacing engine_state_label via get_champion_engine_status and a
 process-tree kill on app shutdown. The live WSL restart loop can't be fully verified here (needs the
 7B server); the DECISION logic that drives it is now 100% unit-tested.
+
+## P0 #3 START — durable jobs table (migration v37) + pure JobState machine (2026-07-11)
+
+First increment of the persistent Job Supervisor. Lands the fully-verifiable-here core so a long op
+(import/transcribe/export/backup/eval) can survive a crash/restart instead of vanishing with a
+detached thread. Wiring a real op through it is the next increment (deliberately deferred).
+- migration v37: `jobs` table — id/kind/state/idempotency_key/progress/total/completed/error_code/
+  error_detail/payload_json/created_at/updated_at/started_at/finished_at. `state` CHECK-constrained to
+  {queued,running,succeeded,failed,cancelled}; UNIQUE partial index on idempotency_key WHERE NOT NULL
+  (re-issued identical job = no-op; null keys exempt); progress CHECK 0..1. Purely additive
+  (CREATE ... IF NOT EXISTS), atomic via existing apply_migration transaction.
+- jobs.rs: pure `JobState` enum with as_str/parse (single source of truth for the CHECK tokens),
+  is_terminal, can_transition_to encoding exactly 5 legal edges (Queued→Running|Cancelled,
+  Running→Succeeded|Failed|Cancelled) — terminals sealed, no self-loops, no resurrection.
+- Regression gate binding the two files: migrations::tests::jobs_check_vocabulary_stays_in_lockstep_
+  with_jobstate_enum — every JobState::as_str token must satisfy the SQL CHECK, so a future drift
+  between commands and schema fails the build.
+
+VERBATIM proof (Windows):
+  cargo fmt -> clean
+  cargo clippy --lib --all-targets -- -D warnings -> clean (renamed from_str→parse per should_implement_trait)
+  cargo test --lib -> 865 passed; 0 failed; 6 ignored
+    - jobs::tests (6): round-trip, unknown-token reject, terminals, exhaustive 5x5 edge legality,
+      sealed terminals, no self-loops
+    - migration_v37_creates_jobs_table_with_enforced_constraints: table+3 indexes; CHECK rejects bad
+      state + progress 1.5; idempotency dedupe (dup rejected, dual-NULL allowed)
+    - jobs_check_vocabulary_stays_in_lockstep_with_jobstate_enum (regression gate)
+    - rollback_then_reapply_restores_schema still green (down_sql reverses up_sql)
+  python scripts/run_python_policies.py -> all 23 regressions passed (windows repo hygiene included,
+    after genericizing a hardcoded profile path in docs/GODMODE_LOOP.md)
+  Adversarial 3-lens Workflow (correctness / privacy-offline / forward-compat) -> 0 defects; confirmed
+    no bare `jobs` table pre-exists (only the distinct import_jobs table in db.rs).
+
+NEXT increment: wire ONE long op (candidate: import_directory or a batch export) through a jobs row —
+insert queued → running with progress ticks → succeeded/failed with a stable error_code — and add a
+get_jobs / resume-on-startup path. That step is where durability becomes user-observable.
