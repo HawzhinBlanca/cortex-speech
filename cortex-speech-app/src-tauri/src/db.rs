@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
+/// One row of the `jobs` table as read: (id, kind, state, progress, completed, total, error_code).
+type JobRow = (String, String, String, f64, i64, Option<i64>, Option<String>);
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeechSegment {
@@ -1358,6 +1361,114 @@ impl Database {
         let mut stmt = self.conn.prepare("SELECT path FROM import_job_files WHERE job_id = ?1")?;
         let completed_paths: Vec<String> = stmt.query_map(params![id], |r| r.get(0))?.collect::<Result<_, _>>()?;
         Ok(Some(ImportJob { id, dir, total_files: total_files as usize, completed_paths, created_at }))
+    }
+
+    // ── Durable jobs (migration v37 + crate::jobs::JobState) — the persistent Job Supervisor. ──
+
+    /// Build a `Job` from a `(id, kind, state_str, progress, completed, total, error_code)` row tuple,
+    /// erroring if the persisted state is outside the lifecycle vocabulary (the CHECK constraint makes
+    /// that impossible, but a corrupt DB shouldn't silently coerce to a wrong state).
+    fn job_from_row(row: JobRow) -> AppResult<crate::jobs::Job> {
+        let (id, kind, state_str, progress, completed, total, error_code) = row;
+        let state = crate::jobs::JobState::parse(&state_str)
+            .ok_or_else(|| AppError::Other(format!("job {id} has an unknown state {state_str:?} in the database")))?;
+        Ok(crate::jobs::Job { id, kind, state, progress, completed, total, error_code })
+    }
+
+    const JOB_COLS: &str = "id, kind, state, progress, completed, total, error_code";
+
+    fn read_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+    }
+
+    /// Fetch a job by id, or `None` if it doesn't exist.
+    pub fn get_job(&self, id: &str) -> AppResult<Option<crate::jobs::Job>> {
+        let sql = format!("SELECT {} FROM jobs WHERE id = ?1", Self::JOB_COLS);
+        match self.conn.query_row(&sql, params![id], Self::read_job_row) {
+            Ok(row) => Ok(Some(Self::job_from_row(row)?)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn get_job_by_idempotency_key(&self, key: &str) -> AppResult<Option<crate::jobs::Job>> {
+        let sql = format!("SELECT {} FROM jobs WHERE idempotency_key = ?1", Self::JOB_COLS);
+        match self.conn.query_row(&sql, params![key], Self::read_job_row) {
+            Ok(row) => Ok(Some(Self::job_from_row(row)?)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Create a queued job, or return the existing one when `idempotency_key` is already present — so a
+    /// re-issued identical request (retry, double-click) resumes the same job instead of duplicating work.
+    pub fn create_or_get_job(
+        &self,
+        id: &str,
+        kind: &str,
+        idempotency_key: Option<&str>,
+        total: Option<i64>,
+    ) -> AppResult<crate::jobs::Job> {
+        if let Some(key) = idempotency_key {
+            if let Some(existing) = self.get_job_by_idempotency_key(key)? {
+                return Ok(existing);
+            }
+        }
+        self.conn.execute(
+            "INSERT INTO jobs (id, kind, idempotency_key, total, state) VALUES (?1, ?2, ?3, ?4, 'queued')",
+            params![id, kind, idempotency_key, total],
+        )?;
+        self.get_job(id)?.ok_or_else(|| AppError::Other(format!("job {id} vanished immediately after insert")))
+    }
+
+    /// Move a job to `to`, enforcing the `JobState` lifecycle (an illegal edge — e.g. completing twice,
+    /// or resurrecting a cancelled job — is rejected, not silently written). Stamps `started_at` on the
+    /// first entry to `running` and `finished_at` on any terminal state.
+    pub fn transition_job(&self, id: &str, to: crate::jobs::JobState, error_code: Option<&str>) -> AppResult<()> {
+        let current = self.get_job(id)?.ok_or_else(|| AppError::Other(format!("job {id} not found")))?;
+        if !current.state.can_transition_to(to) {
+            return Err(AppError::Validation(format!(
+                "illegal job transition {} -> {} for job {id}",
+                current.state, to
+            )));
+        }
+        let finished = to.is_terminal() as i64;
+        self.conn.execute(
+            "UPDATE jobs SET
+                 state = ?2,
+                 error_code = ?3,
+                 started_at = CASE WHEN ?2 = 'running' AND started_at IS NULL THEN datetime('now') ELSE started_at END,
+                 finished_at = CASE WHEN ?4 = 1 THEN datetime('now') ELSE finished_at END,
+                 updated_at = datetime('now')
+             WHERE id = ?1",
+            params![id, to.as_str(), error_code, finished],
+        )?;
+        Ok(())
+    }
+
+    /// Update a running job's progress. `progress` is clamped to 0.0..=1.0 to respect the CHECK constraint.
+    pub fn update_job_progress(&self, id: &str, completed: i64, progress: f64) -> AppResult<()> {
+        let progress = progress.clamp(0.0, 1.0);
+        self.conn.execute(
+            "UPDATE jobs SET completed = ?2, progress = ?3, updated_at = datetime('now') WHERE id = ?1",
+            params![id, completed, progress],
+        )?;
+        Ok(())
+    }
+
+    /// At STARTUP, any job still `running` is a crash residue (a clean run always reaches a terminal
+    /// state). Mark them failed with a stable `INTERRUPTED` code so the UI can honestly show "interrupted"
+    /// instead of a ghost that never finishes. Returns how many were reaped.
+    // ponytail: generic recovery = fail+INTERRUPTED; a resumable job kind can re-create from its own
+    // durable state on the next run. Add per-kind auto-resume only when a kind actually needs it.
+    pub fn mark_orphaned_running_jobs_failed(&self) -> AppResult<usize> {
+        let n = self.conn.execute(
+            "UPDATE jobs SET state = 'failed', error_code = COALESCE(error_code, 'INTERRUPTED'),
+                 finished_at = datetime('now'), updated_at = datetime('now')
+             WHERE state = 'running'",
+            [],
+        )?;
+        Ok(n)
     }
 
     pub fn insert_hypothesis(&self, hyp: &SegmentHypothesis) -> AppResult<()> {
@@ -4053,5 +4164,101 @@ mod tests {
         let after = db.intelligence_report().unwrap();
         assert_eq!(after["loop0Shadow"]["firedButHumanAcceptedOriginal"], 1);
         assert_eq!(after["loop0Shadow"]["totalObservations"], 1);
+    }
+
+    // ── Durable jobs accessors (migration v37 + crate::jobs) ──
+    use crate::jobs::JobState;
+
+    #[test]
+    fn create_or_get_job_is_idempotent_on_the_key() {
+        let db = make_db();
+        let a = db.create_or_get_job("job-a", "import", Some("dedupe-1"), Some(10)).unwrap();
+        assert_eq!(a.state, JobState::Queued);
+        assert_eq!(a.total, Some(10));
+        // Re-issuing the SAME key returns the ORIGINAL job (no duplicate row), even with a different id.
+        let again = db.create_or_get_job("job-b", "import", Some("dedupe-1"), Some(99)).unwrap();
+        assert_eq!(again.id, "job-a", "same key must return the first job, not create a second");
+        assert_eq!(again.total, Some(10), "original params preserved");
+        let count: i64 = db.conn.query_row("SELECT COUNT(*) FROM jobs WHERE kind='import'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "the idempotent re-issue must not have inserted a second row");
+    }
+
+    #[test]
+    fn null_key_jobs_are_never_deduped() {
+        let db = make_db();
+        db.create_or_get_job("n1", "export", None, None).unwrap();
+        db.create_or_get_job("n2", "export", None, None).unwrap();
+        let count: i64 = db.conn.query_row("SELECT COUNT(*) FROM jobs WHERE kind='export'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 2, "two null-key jobs must both persist");
+    }
+
+    #[test]
+    fn transition_job_enforces_the_lifecycle_and_stamps_times() {
+        let db = make_db();
+        db.create_or_get_job("j", "transcribe", None, None).unwrap();
+
+        // Legal: queued -> running stamps started_at; progress updates land.
+        db.transition_job("j", JobState::Running, None).unwrap();
+        db.update_job_progress("j", 3, 0.3).unwrap();
+        let mid = db.get_job("j").unwrap().unwrap();
+        assert_eq!(mid.state, JobState::Running);
+        assert_eq!(mid.completed, 3);
+        assert!((mid.progress - 0.3).abs() < 1e-9);
+        let started: Option<String> =
+            db.conn.query_row("SELECT started_at FROM jobs WHERE id='j'", [], |r| r.get(0)).unwrap();
+        assert!(started.is_some(), "started_at stamped on first running");
+
+        // Legal: running -> failed records the error_code and stamps finished_at.
+        db.transition_job("j", JobState::Failed, Some("MODEL_UNAVAILABLE")).unwrap();
+        let done = db.get_job("j").unwrap().unwrap();
+        assert_eq!(done.state, JobState::Failed);
+        assert_eq!(done.error_code.as_deref(), Some("MODEL_UNAVAILABLE"));
+        let finished: Option<String> =
+            db.conn.query_row("SELECT finished_at FROM jobs WHERE id='j'", [], |r| r.get(0)).unwrap();
+        assert!(finished.is_some(), "finished_at stamped on terminal");
+
+        // Illegal: a terminal job cannot transition again — rejected, not written.
+        let err = db.transition_job("j", JobState::Succeeded, None).unwrap_err();
+        assert!(format!("{err}").contains("illegal job transition"), "double-complete must be rejected: {err}");
+        assert_eq!(db.get_job("j").unwrap().unwrap().state, JobState::Failed, "state unchanged after illegal move");
+    }
+
+    #[test]
+    fn progress_is_clamped_to_the_check_range() {
+        let db = make_db();
+        db.create_or_get_job("p", "eval", None, None).unwrap();
+        db.transition_job("p", JobState::Running, None).unwrap();
+        // A caller passing 1.4 (e.g. off-by-one on the denominator) must not violate the CHECK constraint.
+        db.update_job_progress("p", 7, 1.4).unwrap();
+        assert!((db.get_job("p").unwrap().unwrap().progress - 1.0).abs() < 1e-9, "over-range progress clamps to 1.0");
+        db.update_job_progress("p", 0, -0.5).unwrap();
+        assert!((db.get_job("p").unwrap().unwrap().progress).abs() < 1e-9, "negative progress clamps to 0.0");
+    }
+
+    #[test]
+    fn orphaned_running_jobs_are_reaped_as_interrupted_on_startup() {
+        let db = make_db();
+        // Simulate a crash: one job left running, one already finished, one still queued.
+        db.create_or_get_job("crashed", "import", None, None).unwrap();
+        db.transition_job("crashed", JobState::Running, None).unwrap();
+        db.create_or_get_job("clean", "import", None, None).unwrap();
+        db.transition_job("clean", JobState::Running, None).unwrap();
+        db.transition_job("clean", JobState::Succeeded, None).unwrap();
+        db.create_or_get_job("waiting", "import", None, None).unwrap();
+
+        let reaped = db.mark_orphaned_running_jobs_failed().unwrap();
+        assert_eq!(reaped, 1, "only the still-running job is a crash residue");
+
+        let crashed = db.get_job("crashed").unwrap().unwrap();
+        assert_eq!(crashed.state, JobState::Failed);
+        assert_eq!(crashed.error_code.as_deref(), Some("INTERRUPTED"));
+        assert_eq!(db.get_job("clean").unwrap().unwrap().state, JobState::Succeeded, "finished job untouched");
+        assert_eq!(db.get_job("waiting").unwrap().unwrap().state, JobState::Queued, "queued job untouched");
+    }
+
+    #[test]
+    fn get_job_returns_none_for_a_missing_id() {
+        let db = make_db();
+        assert!(db.get_job("does-not-exist").unwrap().is_none());
     }
 }

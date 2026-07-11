@@ -77,6 +77,20 @@ impl fmt::Display for JobState {
     }
 }
 
+/// A durable job as read back from the `jobs` table (the columns the UI/supervisor actually need).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Job {
+    pub id: String,
+    pub kind: String,
+    pub state: JobState,
+    /// 0.0..=1.0 fraction complete.
+    pub progress: f64,
+    pub completed: i64,
+    pub total: Option<i64>,
+    /// Stable machine code on failure (e.g. `MODEL_UNAVAILABLE`), `None` while not failed.
+    pub error_code: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
