@@ -981,7 +981,7 @@ pub fn take_last_crash(state: State<'_, AppState>) -> Option<String> {
 /// decode. Additive — it does NOT touch the default `transcribe_segment` path. Loads a fresh ort
 /// session per call (fine for a user-initiated action; session caching is a perf follow-up).
 #[tauri::command]
-pub fn transcribe_segment_constrained(
+pub async fn transcribe_segment_constrained(
     audio_path: String,
     alignment_json: Option<String>,
 ) -> Result<serde_json::Value, String> {
@@ -990,22 +990,26 @@ pub fn transcribe_segment_constrained(
     if let Some(ref aj) = alignment_json {
         validate::validate_alignment_json(aj)?;
     }
-    let models = crate::models::active_models_dir();
-    let model = models.join(crate::models::OMNIASR_CTC_300M_MODEL);
-    let tokens = models.join(crate::models::OMNIASR_CTC_300M_TOKENS);
-    if !model.exists() || !tokens.exists() {
-        return Err("OmniASR model/tokens not found for constrained decode".to_string());
-    }
-    // decode_to_pcm returns 16 kHz mono PCM (the model's expected input rate).
-    let (rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
-    // Slice only THIS segment's clip — every VAD chunk shares the whole-source audio_path (the range is
-    // in alignment_json), so decoding `pcm` directly would re-transcribe the ENTIRE recording into one
-    // segment. None alignment (single-segment file) = whole file. Mirrors the finetuned/Scribe paths.
-    let (clip, _suffix) =
-        crate::chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref()).map_err(|e| e.to_string())?;
-    let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
-    let text = crate::constrained_decode::run_constrained(&model, &tokens, &audio, true)?;
-    Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
+    // Decode + constrained CTC beam search — off the main thread.
+    run_blocking(move || {
+        let models = crate::models::active_models_dir();
+        let model = models.join(crate::models::OMNIASR_CTC_300M_MODEL);
+        let tokens = models.join(crate::models::OMNIASR_CTC_300M_TOKENS);
+        if !model.exists() || !tokens.exists() {
+            return Err("OmniASR model/tokens not found for constrained decode".to_string());
+        }
+        // decode_to_pcm returns 16 kHz mono PCM (the model's expected input rate).
+        let (rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
+        // Slice only THIS segment's clip — every VAD chunk shares the whole-source audio_path (the range is
+        // in alignment_json), so decoding `pcm` directly would re-transcribe the ENTIRE recording into one
+        // segment. None alignment (single-segment file) = whole file. Mirrors the finetuned/Scribe paths.
+        let (clip, _suffix) =
+            crate::chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref()).map_err(|e| e.to_string())?;
+        let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
+        let text = crate::constrained_decode::run_constrained(&model, &tokens, &audio, true)?;
+        Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
+    })
+    .await
 }
 
 /// Decode ONLY a segment's clip window to 16 kHz mono PCM without loading the whole (possibly
@@ -1902,16 +1906,16 @@ pub fn check_agentic_readiness(state: State<'_, AppState>) -> Result<AgenticRead
 }
 
 #[tauri::command]
-pub fn rediarize_segments(ids: Vec<String>, state: State<'_, AppState>) -> Result<usize, String> {
+pub async fn rediarize_segments(ids: Vec<String>, state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("rediarize_segments")?;
     for id in &ids {
         validate::validate_identifier(id)?;
     }
     // Clone the pipeline and let it open its own DB connection, so neither the global pipeline nor
-    // db mutex is held across the per-file decode + diarization-inference loop (which would freeze
-    // every other db-touching command for the decode duration).
+    // db mutex is held across the per-file decode + diarization-inference loop, and run it OFF the
+    // main thread so the UI stays responsive for the decode duration.
     let pipeline = state.lock_pipeline().clone();
-    pipeline.rediarize_segments(&ids).map_err(|e| e.to_string())
+    run_blocking(move || pipeline.rediarize_segments(&ids).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]
@@ -1942,7 +1946,7 @@ pub fn get_audio_duration(path: String) -> Result<i64, String> {
 }
 
 #[tauri::command]
-pub fn get_waveform(
+pub async fn get_waveform(
     path: String,
     num_points: usize,
     alignment_json: Option<String>,
@@ -1955,9 +1959,12 @@ pub fn get_waveform(
     }
     // Clone the pipeline out of the global lock before the (up to 30 s) decode so a waveform
     // render never starves other pipeline-lock users (matches import_audio_file / rediarize /
-    // run_gold_eval_asr, which all clone for the same reason).
+    // run_gold_eval_asr, which all clone for the same reason), then decode OFF the main thread.
     let pipeline = state.lock_pipeline().clone();
-    pipeline.get_waveform(&validated, num_points, alignment_json.as_deref()).map_err(|e| e.to_string())
+    run_blocking(move || {
+        pipeline.get_waveform(&validated, num_points, alignment_json.as_deref()).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3508,37 +3515,38 @@ pub fn compute_ood_scores(state: State<'_, AppState>) -> Result<usize, String> {
 }
 
 #[tauri::command]
-pub fn get_active_learning_queue(
+pub async fn get_active_learning_queue(
     state: State<'_, AppState>,
     target_error: f64,
     confidence_level: f64,
     limit: usize,
 ) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("get_active_learning_queue")?;
+    let db = state.db_arc();
+    run_blocking(move || {
+        let segments = {
+            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            db.get_segments(None).map_err(|e| e.to_string())?
+        };
 
-    let segments = {
-        let db = state.lock_db();
-        db.get_segments(None).map_err(|e| e.to_string())?
-    };
+        let cert = quality::conformal::calibrate_and_certify(&segments, target_error, confidence_level);
+        let q_hat = cert.threshold;
 
-    let cert = quality::conformal::calibrate_and_certify(&segments, target_error, confidence_level);
-    let q_hat = cert.threshold;
+        let mut candidates: Vec<(SpeechSegment, f64)> = segments
+            .into_iter()
+            .filter(|s| !s.verified)
+            .map(|s| {
+                let score = quality::conformal::compute_nonconformity_score(&s);
+                let uncertainty = -(score - q_hat).abs();
+                (s, uncertainty)
+            })
+            .collect();
 
-    let mut candidates: Vec<(SpeechSegment, f64)> = segments
-        .into_iter()
-        .filter(|s| !s.verified)
-        .map(|s| {
-            let score = quality::conformal::compute_nonconformity_score(&s);
-            let uncertainty = -(score - q_hat).abs();
-            (s, uncertainty)
-        })
-        .collect();
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let results: Vec<SpeechSegment> = candidates.into_iter().take(limit).map(|(s, _)| s).collect();
-
-    Ok(results)
+        Ok(candidates.into_iter().take(limit).map(|(s, _)| s).collect())
+    })
+    .await
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3587,14 +3595,15 @@ pub async fn run_gold_eval(
 /// the produced hypotheses (no caller-supplied text). This is the honest-CER entrypoint.
 /// `model_id` defaults to the active local model when omitted.
 #[tauri::command]
-pub fn run_gold_eval_asr(
+pub async fn run_gold_eval_asr(
     state: State<'_, AppState>,
     model_id: Option<String>,
 ) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval_asr")?;
-    // Clone the Arc so the (potentially long) ASR loop does not hold the pipeline lock.
+    // Clone the pipeline so the (potentially long) ASR loop does not hold the pipeline lock, and run
+    // it OFF the main thread.
     let pipeline = state.lock_pipeline().clone();
-    pipeline.run_gold_eval_asr(model_id.as_deref()).map_err(|e| e.to_string())
+    run_blocking(move || pipeline.run_gold_eval_asr(model_id.as_deref()).map_err(|e| e.to_string())).await
 }
 
 /// Response for `build_scorecard`: the structured scorecard plus a ready-to-paste
@@ -3638,12 +3647,12 @@ pub async fn compute_annotation_drift_scorecard(
 }
 
 #[tauri::command]
-pub fn run_gold_eval_local(state: State<'_, AppState>, model_id: String) -> Result<crate::eval::EvalRunResult, String> {
+pub async fn run_gold_eval_local(state: State<'_, AppState>, model_id: String) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval_local")?;
     // Clone the pipeline and let it open its own DB connection, so neither global mutex is held
-    // across the multi-segment ASR eval loop (which would freeze the entire UI for minutes).
+    // across the multi-segment ASR eval loop, and run it OFF the main thread (was minutes of freeze).
     let pipeline = state.lock_pipeline().clone();
-    pipeline.run_gold_eval_local(&model_id).map_err(|e| e.to_string())
+    run_blocking(move || pipeline.run_gold_eval_local(&model_id).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]

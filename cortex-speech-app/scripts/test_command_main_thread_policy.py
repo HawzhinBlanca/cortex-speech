@@ -42,6 +42,13 @@ ASYNC_SLOW_COMMANDS = [
     "validate_dataset_cmd",
     "get_dataset_quality",
     "verify_finetuned_model_integrity",
+    # Active-learning compute + pipeline-clone ASR/decode reads (audio decode + ONNX inference).
+    "get_active_learning_queue",
+    "get_waveform",
+    "transcribe_segment_constrained",
+    "rediarize_segments",
+    "run_gold_eval_asr",
+    "run_gold_eval_local",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).
@@ -61,6 +68,7 @@ RUN_BLOCKING_COMMANDS = [
     "relink_audio",
     "db_vacuum",
     "merge_dataset_json",
+    "get_active_learning_queue",
 ]
 
 

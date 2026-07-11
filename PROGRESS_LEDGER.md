@@ -2469,3 +2469,28 @@ acoustic/OOD scan commands (compute_acoustic_scores/compute_ood_scores — per-s
 db_backup/db_restore/restore_db_from_snapshot (sequential multi-state — audit each). Then Bucket B
 (thread-spawn batch_*/import_*, cloud-egress jury/scribe/dpo, register_media_asset guard-across-copy)
 INDIVIDUALLY. Then the runtime heartbeat proof (needs built exe/CDP — flag if unrunnable here).
+
+## P0 #2 cont. — active-learning + pipeline-clone ASR reads off the main thread (2026-07-11)
+
+Fifth async-migration batch. Verified ProcessingPipeline is Send (#[derive(Clone)]) so the
+pipeline-clone commands move cleanly into spawn_blocking:
+- get_active_learning_queue (conformal cert + candidate scoring/sort over ALL segments — db_arc),
+  get_waveform (up-to-30 s decode — pipeline clone), transcribe_segment_constrained (decode +
+  constrained CTC beam search — no state), rediarize_segments / run_gold_eval_asr / run_gold_eval_local
+  (pipeline-clone ASR loops that ran minutes-long on the UI thread). All now async + run_blocking.
+- Ratchet grown to 30 commands (pipeline ones are async-only; get_active_learning_queue also in
+  RUN_BLOCKING_COMMANDS via db_arc).
+
+VERBATIM proof:
+  cargo check --lib                 -> Finished (5.5s)
+  cargo clippy --lib -- -D warnings -> Finished, 0 warnings
+  cargo test --lib                  -> 842 passed; 0 failed; 6 ignored
+  python scripts/test_command_main_thread_policy.py -> command main-thread policy regression passed
+
+NEXT Bucket A remainder: transcribe_segment (1151, pipeline), transcribe_segment_finetuned (1112),
+align_segment (1384, pipeline + brief db write), compute_acoustic_scores/compute_ood_scores (per-seg
+re-lock), run_consensus_refinery, run_t0_gate, import_gold_segments/create_gold_from_file/
+import_verified_segments_as_gold, import_model_checkpoint, check_audio/check_external_provider,
+db_backup/db_restore/restore_db_from_snapshot (audit multi-state ordering). Then Bucket B
+(thread-spawn batch_*/import_audio_file/resume_interrupted_import, cloud-egress jury/scribe/dpo,
+register_media_asset guard-across-copy) INDIVIDUALLY. Then the runtime heartbeat proof (built exe/CDP).
