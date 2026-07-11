@@ -2956,6 +2956,36 @@ OWNER DESIGN DECISION surfaced (not faked): whether the conformal DATASET certif
 ranking should FENCE OUT heuristic-confidence segments (making the default-path cert honestly uncertain) or
 keep the graceful ctc-based degradation. The autonomy gate is unaffected either way.
 
-NEXT: a fresh 1010PATH.md item — candidates: P0 #9 runtime egress proof (socket-interception harness;
-meaningful version exercises the transcribe path — larger/owner-model-gated), P1 architecture decomposition
-(pure extraction + tests, avoid Codex files), or another crisp verifiable-here item.
+## P0 #9 runtime egress proof — scoped harness, false-pass closed (2026-07-11)
+
+Built the socket-monitoring harness the audit's egress-runtime leg (verify_10.py:456) marked 'not-built'.
+scripts/egress_probe.cjs (npm run test:egress): launches the real exe with DEFAULT settings + disposable
+profile, records the MAIN exe PID (Rust backend — cloud reqwest/ureq originate there, not WebView2 children),
+streams Get-NetTCPConnection -OwningProcess <pid> through startup + a get_settings/get_jobs/get_waveform
+workload, asserts ZERO non-loopback connections. Verifies via get_settings that all 3 cloud opt-ins are OFF.
+
+Adversarial 2-lens Workflow found a CONFIRMED HIGH-sev FALSE-PASS -> FIXED: a Tauri backend owns ~0 TCP
+connections offline, so total==0 is BOTH the healthy result AND the signature of a silently-dead sampler; a
+broken monitor would have passed vacuously. Fix: an in-run POSITIVE CONTROL opens a known loopback connection
+owned by the node process and requires the SAME sampler invocation to observe it -> a dead monitor now fails
+LOUD before the app is measured. Low-sev honesty items (header caveat, verify_10 wording) folded in.
+
+VERBATIM run (fresh release exe):
+  ==> positive control OK: sampler saw 4 connection(s) for the control PID (apparatus works)
+  ==> default-offline workflow: 2218 loops · cloud opt-ins OFF · sampled 0 distinct backend TCP endpoints
+  EGRESS OK: the default offline path opened ZERO non-loopback connections from the backend PID.
+  (Sampler independently validated against a PID with real external connections: captured 34.149.66.137:443 +
+   160.79.104.10:443, filtered 0.0.0.0 — so a caught-nothing result is a TRUE zero.)
+  node --check clean; python policies -> 23 passed; verify_10.py parses.
+
+HONEST SCOPE (not overclaimed): TCP only; 200ms poll (sub-sample miss possible, but a real cloud HTTPS call
+outlasts one sample); covers the default STARTUP+browse path. OWNER-GATED remainder: the transcribe-path leg
+(cloud STT/LLM if consent leaked; needs local model + audio) and a kernel/ETW socket trace. verify_10
+egress-runtime stays 'not-built' — 10/10 criterion #11 is NOT fully met; its description now points at this
+PARTIAL harness. Adversarial scope lens otherwise clean (no updater plugin, no frontend telemetry;
+isLocalAddress does NOT mask private LAN ranges, so a LAN exfil would still be caught).
+
+NEXT: a fresh 1010PATH.md item — the transcribe-leg egress extension is owner-model-gated; remaining
+verifiable-here candidates: P1 architecture decomposition (pure extraction + tests, avoid Codex files),
+P1 chunking overlap/dedup, or another crisp item. Owner-gated: Gold Marathon, retrain, IAA kappa, CORDI,
+live WSL/7B supervision + crash/restore drills, the heuristic-confidence fence design call.
