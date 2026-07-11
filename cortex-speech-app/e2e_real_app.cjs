@@ -14,6 +14,12 @@
  *   CORTEX_OUT         (optional) output dir for debug log + run.jsonl; default: repo root
  *   CORTEX_DEBUG_PORT  (optional) WebView2 remote-debug port; default 9222
  *   CORTEX_LOCALE      (optional) 'en' | 'ckb'; default 'en'
+ *   CORTEX_ASR_ENGINE  (optional) engine to provision in the DISPOSABLE profile before import:
+ *                       'CTC300M' (default: fully offline, runnable on any dev box), 'CTC1B',
+ *                       'WSL7B' (needs the owner's warm 7B server + a seeded client script path —
+ *                       the fresh profile's WSL7B default otherwise fail-hards the import BEFORE
+ *                       any decode, and this harness would blame VAD), or 'keep' to leave the
+ *                       profile's settings untouched.
  *   CORTEX_SKIP_DB_CLEAR (optional) '1' to keep existing DB rows (default: clear for a clean run)
  *
  * Exit code 0 only when: the app launched, VAD produced >=1 segment, the first segment
@@ -160,8 +166,27 @@ async function run() {
   await page.evaluate((loc) => { localStorage.setItem('cortex-locale', loc); window.location.reload(); }, LOCALE);
   await page.waitForSelector('[data-testid="app-root"]', { timeout: 30000 });
 
+  // Provision a RUNNABLE engine in the disposable profile. A fresh profile boots with the
+  // WSL7B default + no client script, so import fail-hards at the engine-unresolved gate BEFORE
+  // any decode — and this harness would then poll get_segments for 12 minutes and misreport the
+  // failure as "VAD produced 0 segments" (2026-07-11 root-cause). Round-trip the real settings
+  // object so only the engine field changes.
+  const ENGINE = process.env.CORTEX_ASR_ENGINE || 'CTC300M';
+  if (ENGINE !== 'keep') {
+    console.log(`==> Provisioning ASR engine '${ENGINE}' in the disposable profile...`);
+    await page.evaluate(async (engine) => {
+      const s = await window.__TAURI_INTERNALS__.invoke('get_settings');
+      s.asr_model_size = engine;
+      await window.__TAURI_INTERNALS__.invoke('update_settings', { settings: s });
+    }, ENGINE).catch((e) => { throw new Error('Could not provision the ASR engine: ' + e.message); });
+  }
+
   console.log('==> Importing real audio:', AUDIO);
-  await page.evaluate((p) => window.__TAURI_INTERNALS__.invoke('import_audio_file', { path: p }), AUDIO);
+  // Surface an import rejection IMMEDIATELY (engine preflight, unreadable file) instead of letting
+  // the segment poll below time out and blame VAD for an import that never started.
+  await page
+    .evaluate((p) => window.__TAURI_INTERNALS__.invoke('import_audio_file', { path: p }), AUDIO)
+    .catch((e) => { throw new Error('import_audio_file failed: ' + (e && e.message ? e.message : e)); });
 
   // Poll the BACKEND for segments (ground truth) rather than relying on the UI auto-refreshing
   // via the Tauri event channel, which can be delivered unreliably under remote-debugging. Once
@@ -177,7 +202,13 @@ async function run() {
     await sleep(2000);
   }
   if (!Array.isArray(backendSegs) || backendSegs.length === 0) {
-    throw new Error('VAD produced 0 segments for the provided audio (backend get_segments empty).');
+    // Do NOT blame VAD: an import that failed asynchronously (engine unresolved/preflight, decode
+    // error) also leaves get_segments empty. Report what is actually known.
+    throw new Error(
+      'no segments appeared within the 12-min window (backend get_segments empty) — the import ' +
+        'failed or never persisted. Check the [App] log above for the import error; a fresh ' +
+        "profile needs a runnable engine (see CORTEX_ASR_ENGINE, default 'CTC300M').",
+    );
   }
   console.log(`==> VAD produced ${backendSegs.length} segment(s) (backend). Reloading UI to render from DB...`);
   await page.reload();
