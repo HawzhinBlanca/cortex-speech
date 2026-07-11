@@ -86,3 +86,8 @@ podcast_transcription.txt
 # skills) is intentionally NOT ignored — mirrors cortex-speech-app/.gitignore's convention.
 .claude/settings.local.json
 .claude/worktrees/
+
+# Fetched at build time by scripts/fetch_models.py (pinned MS onnxruntime release) into
+# models/onnxruntime.dll/ and bundled from there — these src-tauri-root copies are redundant.
+cortex-speech-app/src-tauri/onnxruntime.dll
+cortex-speech-app/src-tauri/onnxruntime_providers_shared.dll

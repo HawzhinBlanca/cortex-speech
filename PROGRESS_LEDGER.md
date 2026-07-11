@@ -2354,3 +2354,19 @@ audit (honest ≈7/10; ordered plan: test isolation & main-thread safety → job
 recovery/storage → decomposition → calibrated intelligence → quieter UX). NEXT UP: async/
 spawn_blocking migration of slow sync commands (audit: 120 commands, ~2 async) with a
 responsiveness heartbeat gate.
+
+## HOUSEKEEPING (2026-07-11): repo prune + reorg (owner-approved cleanup scan)
+
+- Un-tracked the two 15 MB src-tauri-root onnxruntime DLLs (git rm --cached + .gitignore). They
+  are redundant: scripts/fetch_models.py downloads them (pinned MS v1.24.4) into
+  models/onnxruntime.dll/ (bundled from there), every CI job runs fetch-models, and `ort` uses
+  features=["load-dynamic"] (runtime load, not compile). Local build byte-identical (files stay
+  on disk); `cargo check --lib` clean.
+- Moved 26 loose one-off dataset/experiment .py scripts from the repo root → research/ (git mv,
+  history preserved; none referenced by build/CI/each-other) + a research/README. Repo root now
+  holds only canonical files (LICENSE/README/charters/Makefile/ledger).
+- Moved docs to docs/: "Cortex research.md" → docs/cortex-research.md (fixed the space),
+  CORTEX_SKILL_utf8.md → docs/CORTEX_SKILL_utf8.md.
+- Left untouched by owner's choice: untracked 1010PATH.md at root. No .bak/.tmp/.DS_Store cruft
+  existed; .gitignore already covered node_modules/target/dist/db/logs/models/audio.
+- Gate: full python-policy suite green (gitignore + windows-repo-hygiene + real-data isolation).
