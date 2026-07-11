@@ -430,6 +430,12 @@ impl AppSettings {
                                 );
                             }
                         }
+                        // A hand-edited file bypasses update_settings' validate() gate, so degenerate
+                        // numeric knobs (min=max=0 → one chunk per PCM SAMPLE; num_asr_threads=0 → ONNX
+                        // config) must be repaired HERE. Repair only the bad knobs — hard-failing load
+                        // would brick startup, and falling back to full defaults would silently drop
+                        // consent flags and the output dir over one bad number.
+                        settings.repair_out_of_range_numeric_knobs();
                         settings
                     }
                     Err(e) => {
@@ -447,6 +453,45 @@ impl AppSettings {
                 tracing::warn!("Failed to read settings file at {}: {}; using defaults", path.display(), e);
                 Self::default()
             }
+        }
+    }
+
+    /// Reset any out-of-range segment-duration / thread knob to its default, warning per field.
+    /// Load-path counterpart of the same bounds validate() enforces at the update_settings trust
+    /// boundary — a hand-edited settings.json never passes through validate(), and a degenerate
+    /// value here explodes the chunk planner (min=max=0 → one chunk per PCM sample) or feeds 0
+    /// threads to the ONNX session config.
+    fn repair_out_of_range_numeric_knobs(&mut self) {
+        // 1000 ms floor = the UI's whole-second unit; see the matching bound in validate(). A
+        // sub-second value repaired-to-kept here would map to 0 in the seconds-based settings UI
+        // and brick every subsequent save.
+        const MIN_SEGMENT_MS: u32 = 1000;
+        const MAX_SEGMENT_MS: u32 = 600_000;
+        let defaults = Self::default();
+        if self.min_segment_duration_ms < MIN_SEGMENT_MS || self.min_segment_duration_ms > MAX_SEGMENT_MS {
+            tracing::warn!(
+                "settings: min_segment_duration_ms {} out of [{MIN_SEGMENT_MS}, {MAX_SEGMENT_MS}]; reset to {}",
+                self.min_segment_duration_ms,
+                defaults.min_segment_duration_ms
+            );
+            self.min_segment_duration_ms = defaults.min_segment_duration_ms;
+        }
+        if self.max_segment_duration_ms < self.min_segment_duration_ms || self.max_segment_duration_ms > MAX_SEGMENT_MS
+        {
+            tracing::warn!(
+                "settings: max_segment_duration_ms {} out of [min, {MAX_SEGMENT_MS}]; reset to {}",
+                self.max_segment_duration_ms,
+                defaults.max_segment_duration_ms.max(self.min_segment_duration_ms)
+            );
+            self.max_segment_duration_ms = defaults.max_segment_duration_ms.max(self.min_segment_duration_ms);
+        }
+        if self.num_asr_threads == 0 || self.num_asr_threads > 128 {
+            tracing::warn!(
+                "settings: num_asr_threads {} out of [1, 128]; reset to {}",
+                self.num_asr_threads,
+                defaults.num_asr_threads
+            );
+            self.num_asr_threads = defaults.num_asr_threads;
         }
     }
 
@@ -527,6 +572,31 @@ impl AppSettings {
             if !value.is_finite() || value < 0.0 {
                 return Err(AppError::Validation(format!("{name} must be a finite value >= 0")));
             }
+        }
+        // Segment-duration and thread knobs feed the chunk planner and sherpa config directly.
+        // With min=max=0 the planner's `.max(1)` floors both to ONE PCM SAMPLE, so every import
+        // explodes into 16,000 segments per second of audio; num_asr_threads=0 flows unchecked
+        // into the ONNX session config. Same trust boundary as the thresholds above: a webview
+        // payload or hand-edited settings.json must not be able to plant these.
+        // The 1000 ms floor is the UI's unit: settingsAdapter round-trips these as WHOLE SECONDS
+        // (Math.round(ms/1000) → sec*1000), so a stored sub-second value maps to 0 on the next UI
+        // save and would then be rejected here — bricking every settings save (adversarial review
+        // 2026-07-11). Accept only values the UI round-trip preserves.
+        const MIN_SEGMENT_MS: u32 = 1000;
+        const MAX_SEGMENT_MS: u32 = 600_000; // 10 minutes — far beyond any sane review segment
+        if self.min_segment_duration_ms < MIN_SEGMENT_MS || self.min_segment_duration_ms > MAX_SEGMENT_MS {
+            return Err(AppError::Validation(format!(
+                "min_segment_duration_ms must be in [{MIN_SEGMENT_MS}, {MAX_SEGMENT_MS}]"
+            )));
+        }
+        if self.max_segment_duration_ms < self.min_segment_duration_ms || self.max_segment_duration_ms > MAX_SEGMENT_MS
+        {
+            return Err(AppError::Validation(format!(
+                "max_segment_duration_ms must be in [min_segment_duration_ms, {MAX_SEGMENT_MS}]"
+            )));
+        }
+        if self.num_asr_threads == 0 || self.num_asr_threads > 128 {
+            return Err(AppError::Validation("num_asr_threads must be in [1, 128]".into()));
         }
         Ok(())
     }
@@ -956,6 +1026,63 @@ mod tests {
             let s = AppSettings { hf_train_ratio: bad, ..AppSettings::default() };
             assert!(matches!(s.validate(), Err(crate::error::AppError::Validation(_))), "hf_train_ratio {bad}");
         }
+    }
+
+    #[test]
+    fn validate_rejects_degenerate_segment_durations_and_thread_count() {
+        // min=max=0 floors the chunk planner to ONE PCM SAMPLE per chunk (chunking.rs `.max(1)`),
+        // exploding every import into 16k segments/second; num_asr_threads=0 flows into the ONNX
+        // session config. All three arrive from the same webview/hand-edited-json trust boundary
+        // as the thresholds above and must be bounded there.
+        assert!(AppSettings::default().validate().is_ok(), "defaults must validate");
+
+        // 999 covers the sub-second band the UI's whole-second round-trip turns into 0 (accepting
+        // it on write would brick every later save — adversarial review 2026-07-11).
+        for (min_ms, max_ms) in [(0, 0), (0, 15_000), (999, 15_000), (3_000, 0), (3_000, 2_999), (700_000, 700_000)] {
+            let s = AppSettings {
+                min_segment_duration_ms: min_ms,
+                max_segment_duration_ms: max_ms,
+                ..AppSettings::default()
+            };
+            assert!(
+                matches!(s.validate(), Err(crate::error::AppError::Validation(_))),
+                "segment durations min={min_ms} max={max_ms} must be rejected"
+            );
+        }
+
+        for bad_threads in [0u32, 129] {
+            let s = AppSettings { num_asr_threads: bad_threads, ..AppSettings::default() };
+            assert!(
+                matches!(s.validate(), Err(crate::error::AppError::Validation(_))),
+                "num_asr_threads {bad_threads} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn load_repairs_degenerate_numeric_knobs_from_hand_edited_file() {
+        // A hand-edited settings.json bypasses update_settings' validate() gate entirely, so the
+        // load path must repair degenerate knobs itself — while PRESERVING every other persisted
+        // value (repairing must not become a stealth reset of consent flags or the output dir).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        let hand_edited = AppSettings {
+            min_segment_duration_ms: 0,
+            max_segment_duration_ms: 0,
+            num_asr_threads: 0,
+            language: "ckb".to_string(),
+            ..AppSettings::default()
+        };
+        // save() persists as-is (it doesn't validate) — exactly the hand-edit analogue.
+        hand_edited.save(&path).expect("seed hand-edited settings");
+
+        let loaded = AppSettings::load(&path);
+        let defaults = AppSettings::default();
+        assert_eq!(loaded.min_segment_duration_ms, defaults.min_segment_duration_ms, "min repaired to default");
+        assert_eq!(loaded.max_segment_duration_ms, defaults.max_segment_duration_ms, "max repaired to default");
+        assert_eq!(loaded.num_asr_threads, defaults.num_asr_threads, "threads repaired to default");
+        assert_eq!(loaded.language, "ckb", "unrelated persisted values must survive the repair");
+        assert!(loaded.validate().is_ok(), "repaired settings must pass the update-path validator");
     }
 
     #[test]
