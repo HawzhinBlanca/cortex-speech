@@ -2580,34 +2580,37 @@ pub fn db_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> 
 }
 
 #[tauri::command]
-pub fn db_backup(dest: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn db_backup(dest: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let validated = validate::validate_output_path(&dest)?;
     // Dedicated connection (true-10 audit 2026-07-09): holding the global DB mutex for the whole
     // online backup froze every DB-touching command for the full copy duration on a slow external
-    // drive — the periodic snapshot path already uses its own connection; so does this now.
+    // drive. Grab the path under a brief lock, then do the whole copy + verify OFF the main thread.
     let db_path = {
         let db = state.lock_db();
         db.path().to_string()
     };
-    let backup_db = crate::db::Database::open(&db_path).map_err(|e| e.to_string())?;
-    backup_db.backup(&validated).map_err(|e| e.to_string())?;
-    // Verify the file we WROTE — an off-disk "disaster copy" that is itself bad (destination volume
-    // corruption) must fail the backup NOW, not at the disaster. Read-only open: never mutate it.
-    let conn = rusqlite::Connection::open_with_flags(
-        &validated,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| format!("backup written but could not be opened for verification: {e}"))?;
-    let integrity: String = conn
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .map_err(|e| format!("backup written but failed verification: {e}"))?;
-    if integrity != "ok" {
-        return Err(format!("backup written but FAILED integrity check: {integrity}"));
-    }
-    let segment_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM speech_segments", [], |row| row.get(0))
-        .map_err(|e| format!("backup written but could not count segments: {e}"))?;
-    Ok(serde_json::json!({ "integrityOk": true, "segmentCount": segment_count }))
+    run_blocking(move || {
+        let backup_db = crate::db::Database::open(&db_path).map_err(|e| e.to_string())?;
+        backup_db.backup(&validated).map_err(|e| e.to_string())?;
+        // Verify the file we WROTE — an off-disk "disaster copy" that is itself bad (destination volume
+        // corruption) must fail the backup NOW, not at the disaster. Read-only open: never mutate it.
+        let conn = rusqlite::Connection::open_with_flags(
+            &validated,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("backup written but could not be opened for verification: {e}"))?;
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|e| format!("backup written but failed verification: {e}"))?;
+        if integrity != "ok" {
+            return Err(format!("backup written but FAILED integrity check: {integrity}"));
+        }
+        let segment_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM speech_segments", [], |row| row.get(0))
+            .map_err(|e| format!("backup written but could not count segments: {e}"))?;
+        Ok(serde_json::json!({ "integrityOk": true, "segmentCount": segment_count }))
+    })
+    .await
 }
 
 /// Shared restore precondition (true-10 audit 2026-07-09): refuse while an import/batch worker may
@@ -2632,20 +2635,24 @@ fn prepare_restore(state: &State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), String> {
     // M0.4: Restore a previously backed-up database snapshot. The file must be a valid SQLite
     // database (PRAGMA integrity_check on open verifies this). This completes the backup/restore
     // pair so the app is never at risk of data loss mid-import or mid-review.
     let validated = validate::validate_file_path(&src)?;
     prepare_restore(&state)?;
-    {
-        let mut db = state.lock_db();
-        db.restore(&validated).map_err(|e| e.to_string())?;
-    } // release the db lock before taking the history lock (consistent ordering)
-      // The in-memory undo/redo stack holds Commands (DeleteSegments, BatchTranscribe, ...) that
-      // reference rows from the PRE-restore database. Replaying one via Undo after the restore would
-      // apply a stale mutation to a different dataset — resurrecting or corrupting rows. Clear it so
-      // undo can never cross the restore boundary.
+    // Heavy DB file-copy + reopen — off the main thread. The lock is taken INSIDE the task (never
+    // across the await); prepare_restore already refused if writers are active.
+    let db = state.db_arc();
+    run_blocking(move || {
+        let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
+        guard.restore(&validated).map_err(|e| e.to_string())
+    })
+    .await?;
+    // The in-memory undo/redo stack holds Commands (DeleteSegments, BatchTranscribe, ...) that
+    // reference rows from the PRE-restore database. Replaying one via Undo after the restore would
+    // apply a stale mutation to a different dataset — resurrecting or corrupting rows. Clear it so
+    // undo can never cross the restore boundary.
     state.lock_history().clear();
     Ok(())
 }
@@ -2721,7 +2728,7 @@ pub fn list_db_snapshots(state: State<'_, AppState>) -> Result<Vec<crate::snapsh
 /// `snapshot_<digits>` component (no separators — cannot traverse), and the snapshot must contain a
 /// DB file. Restore goes through the same SQLite online-backup path as `db_restore`.
 #[tauri::command]
-pub fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("restore_db_from_snapshot")?;
     let valid =
         name.strip_prefix("snapshot_").is_some_and(|ts| !ts.is_empty() && ts.bytes().all(|b| b.is_ascii_digit()));
@@ -2734,9 +2741,15 @@ pub fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Res
         return Err(format!("snapshot '{name}' has no database file"));
     }
     prepare_restore(&state)?;
+    // Heavy DB file-copy + reopen — off the main thread; the lock is taken INSIDE the task.
     {
-        let mut db = state.lock_db();
-        db.restore(&src).map_err(|e| e.to_string())?;
+        let db = state.db_arc();
+        let restore_src = src.clone();
+        run_blocking(move || {
+            let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
+            guard.restore(&restore_src).map_err(|e| e.to_string())
+        })
+        .await?;
     } // release the db lock before touching the settings/pipeline locks
 
     // Restore the snapshot's captured config (settings.json / champion.json) so the app returns to a

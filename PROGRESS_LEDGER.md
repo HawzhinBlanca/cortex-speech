@@ -2564,3 +2564,31 @@ VERBATIM proof:
 NEXT: db_backup/db_restore/restore_db_from_snapshot (sequential multi-state file-copy — audit which
 steps must stay outside the task). Then Bucket B (thread-spawn batch_*/import_*, cloud-egress
 jury/scribe/dpo, register_media_asset) INDIVIDUALLY. Then the runtime heartbeat proof (built exe/CDP).
+
+## P0 #2 — clean Bucket-A migration COMPLETE: backup/restore off the main thread (2026-07-11)
+
+Ninth async-migration batch closes Bucket A:
+- db_backup (grab db path under a brief lock, then dedicated-connection online-backup + integrity
+  verify + count all in run_blocking), db_restore (prepare_restore writers-check outside; heavy
+  restore file-copy+reopen in run_blocking via db_arc; history.clear after), restore_db_from_snapshot
+  (same, plus the config-file restore + settings/pipeline apply run on the async worker after the
+  await — off the main thread, no guard across await). All async fn.
+- prepare_restore is a quick writers-active check; update_pipeline_settings is a config update — both
+  fine outside the blocking task.
+- Ratchet grown to 45 commands. 45/125 commands now off the main thread — the ENTIRE freeze-causing
+  Bucket-A surface (exports, dataset scans, all ASR/align/eval/quality/scoring, imports, hashing,
+  backup/restore).
+
+VERBATIM proof:
+  cargo check --lib                 -> Finished (6.1s)
+  cargo fmt                         -> clean
+  cargo clippy --lib -- -D warnings -> Finished, 0 warnings
+  cargo test --lib                  -> 842 passed; 0 failed; 6 ignored
+  python scripts/test_command_main_thread_policy.py -> command main-thread policy regression passed
+
+REMAINING for P0 #2: (a) Bucket B — batch_*/import_audio_file/resume_interrupted_import/
+run_wsl_refinement already std::thread::spawn a DETACHED worker, so they do NOT freeze the main
+thread (an async wrapper would be churn — assess+document, likely leave as-is); cloud-egress
+(jury/scribe/dpo) + register_media_asset are the only remaining genuine offload candidates (handle
+individually). (b) The RUNTIME heartbeat proof (audit-point #2): drive the built exe/CDP — a slow
+command running while get_settings stays responsive. If the exe can't be driven here, owner-verify.

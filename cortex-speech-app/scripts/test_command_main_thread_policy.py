@@ -64,6 +64,10 @@ ASYNC_SLOW_COMMANDS = [
     "compute_acoustic_scores",
     "compute_ood_scores",
     "run_consensus_refinery",
+    # DB backup/restore — the heavy file-copy + integrity-check runs in run_blocking.
+    "db_backup",
+    "db_restore",
+    "restore_db_from_snapshot",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).
