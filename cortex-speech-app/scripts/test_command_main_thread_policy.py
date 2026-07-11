@@ -54,6 +54,12 @@ ASYNC_SLOW_COMMANDS = [
     "transcribe_segment_finetuned",
     "align_segment",
     "check_audio",
+    # Jury gate + gold imports + model-checkpoint hash (audio reads / DB writes / multi-GB SHA-256).
+    "run_t0_gate",
+    "import_gold_segments",
+    "create_gold_from_file",
+    "import_verified_segments_as_gold",
+    "import_model_checkpoint",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

@@ -1830,7 +1830,7 @@ pub fn get_champion_model(
 /// gated step (not exposed yet — it must run through the eval gate), so this can only ever add a
 /// candidate, never crown a champion.
 #[tauri::command]
-pub fn import_model_checkpoint(
+pub async fn import_model_checkpoint(
     id: String,
     family: String,
     checkpoint_path: String,
@@ -1848,12 +1848,25 @@ pub fn import_model_checkpoint(
         validate::validate_text(card, 256, "model_card_name")?;
     }
     let checkpoint_path = validate::validate_file_path(&checkpoint_path)?;
-    // Hash the (potentially multi-GB) checkpoint BEFORE taking the DB lock — holding the global db
-    // mutex across the full-file SHA-256 would starve every UI DB poll (get_segments, search, …).
-    let sha = crate::registry::hash_checkpoint(&checkpoint_path).map_err(|e| e.to_string())?;
-    let db = state.lock_db();
-    crate::registry::register_checkpoint(&db, &id, &family, &checkpoint_path, &source, &license, model_card_name, sha)
+    let db = state.db_arc();
+    run_blocking(move || {
+        // Hash the (potentially multi-GB) checkpoint off the main thread AND before taking the DB lock
+        // — holding the global db mutex across the full-file SHA-256 would starve every UI DB poll.
+        let sha = crate::registry::hash_checkpoint(&checkpoint_path).map_err(|e| e.to_string())?;
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::registry::register_checkpoint(
+            &db,
+            &id,
+            &family,
+            &checkpoint_path,
+            &source,
+            &license,
+            model_card_name,
+            sha,
+        )
         .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3567,7 +3580,7 @@ pub async fn get_active_learning_queue(
 // ════════════════════════════════════════════════════════════════════════════
 
 #[tauri::command]
-pub fn import_gold_segments(
+pub async fn import_gold_segments(
     state: State<'_, AppState>,
     inputs: Vec<crate::eval::GoldSegmentInput>,
 ) -> Result<usize, String> {
@@ -3585,8 +3598,12 @@ pub fn import_gold_segments(
             Ok::<_, String>(crate::eval::GoldSegmentInput { audio_path, ..inp })
         })
         .collect::<Result<_, _>>()?;
-    let db = state.lock_db();
-    crate::eval::import_gold_segments(&db, validated).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::eval::import_gold_segments(&db, validated).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3703,35 +3720,50 @@ pub fn list_gold_segments(state: State<'_, AppState>) -> Result<Vec<crate::eval:
 // ════════════════════════════════════════════════════════════════════════════
 
 #[tauri::command]
-pub fn run_t0_gate(state: State<'_, AppState>, segment_ids: Vec<String>) -> Result<crate::jury::T0GateReport, String> {
+pub async fn run_t0_gate(
+    state: State<'_, AppState>,
+    segment_ids: Vec<String>,
+) -> Result<crate::jury::T0GateReport, String> {
     RATE_LIMITER.check("run_t0_gate")?;
-    let db = state.lock_db();
     let (autonomy, learn) = {
         let s = state.lock_settings();
         (s.jury_autonomy_level.clone(), s.irt_ability_learning_enabled)
     };
-    crate::jury::run_t0_gate(&db, &segment_ids, &autonomy, learn).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::jury::run_t0_gate(&db, &segment_ids, &autonomy, learn).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Turn the human-corrected segments of one source file into a holdout GOLD benchmark entry. Run it
 /// after correcting a file in the Review inbox: it concatenates the corrected transcripts into the
 /// gold reference (excluded from all training). Returns the number of gold rows created.
 #[tauri::command]
-pub fn create_gold_from_file(audio_path: String, state: State<'_, AppState>) -> Result<usize, String> {
+pub async fn create_gold_from_file(audio_path: String, state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("create_gold_from_file")?;
     if audio_path.contains('\0') {
         return Err("Audio path contains null bytes".to_string());
     }
-    let db = state.lock_db();
-    crate::eval::create_gold_from_verified_file(&db, &audio_path).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::eval::create_gold_from_verified_file(&db, &audio_path).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// M2.7 / P1.6: bulk-promote every reviewed source file into the gold set. Returns rows created.
 #[tauri::command]
-pub fn import_verified_segments_as_gold(state: State<'_, AppState>) -> Result<usize, String> {
+pub async fn import_verified_segments_as_gold(state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("import_verified_segments_as_gold")?;
-    let db = state.lock_db();
-    crate::eval::import_verified_segments_as_gold(&db).map_err(|e| e.to_string())
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::eval::import_verified_segments_as_gold(&db).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// M2.7 / P1.6: export the gold set as a portable eval set (manifest.jsonl + 16 kHz WAV clips) under

@@ -2519,3 +2519,26 @@ import_verified_segments_as_gold, import_model_checkpoint (hash then db), check_
 db_backup/db_restore/restore_db_from_snapshot (sequential multi-state — audit ordering). Then Bucket B
 (thread-spawn batch_*/import_*, cloud-egress jury/scribe/dpo, register_media_asset) INDIVIDUALLY.
 Then the runtime heartbeat proof (built exe/CDP).
+
+## P0 #2 cont. — jury gate + gold imports + checkpoint hash off the main thread (2026-07-11)
+
+Seventh async-migration batch:
+- run_t0_gate (IRT gate over segment_ids; settings snapshotted before), import_gold_segments (per-input
+  path validation up front, then audio-identity read + insert), create_gold_from_file,
+  import_verified_segments_as_gold, import_model_checkpoint (multi-GB SHA-256 now inside the task, off
+  the main thread, before the db register). All async + run_blocking + db_arc.
+- check_external_provider left sync (instant settings-status read — Bucket C).
+- Ratchet grown to 39 commands.
+
+VERBATIM proof:
+  cargo check --lib                 -> Finished (8.8s)
+  cargo fmt                         -> clean
+  cargo clippy --lib -- -D warnings -> Finished, 0 warnings
+  cargo test --lib                  -> 842 passed; 0 failed; 6 ignored
+  python scripts/test_command_main_thread_policy.py -> command main-thread policy regression passed
+
+NEXT Bucket-A remainder: compute_acoustic_scores/compute_ood_scores (per-segment re-lock db +
+settings/model_manager clones), run_consensus_refinery (db ×2 + normalizer Arc), db_backup/db_restore/
+restore_db_from_snapshot (sequential multi-state file-copy — audit ordering; may keep some state ops
+outside the task). Then Bucket B (thread-spawn batch_*/import_*, cloud-egress jury/scribe/dpo,
+register_media_asset) INDIVIDUALLY. Then the runtime heartbeat proof (built exe/CDP).
