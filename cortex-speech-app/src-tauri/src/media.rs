@@ -109,12 +109,19 @@ impl MediaRegistry {
         std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Create media cache: {e}"))?;
         self.prune_orphaned_cache_files(&cache_dir);
         let cached_path = cache_dir.join(format!("{id}.{ext}"));
-        // Refuse a copy that would fill the disk BEFORE writing a partial file (which would then need
-        // pruning and could have already corrupted a co-located WAL). `source_bytes = 0` when the size
-        // can't be read → the check no-ops, same graceful-degrade as an unresolvable volume.
+        // Materialize the source INTO the asset-protocol scope so the WebView can play it — preferring a
+        // hard link (instant, zero extra disk) over a whole-file copy. A multi-GB audiobook otherwise
+        // copies in full into the temp cache on every grant (P1 durability). `source_bytes = 0` when the
+        // size can't be read → the copy-path room check no-ops (graceful-degrade).
         let source_bytes = std::fs::metadata(&source_path).map(|m| m.len()).unwrap_or(0);
-        ensure_cache_room(source_bytes, crate::health::free_disk_bytes_for(&cache_dir))?;
-        std::fs::copy(&source_path, &cached_path).map_err(|e| format!("Copy media into app cache: {e}"))?;
+        match link_or_copy_into_cache(&source_path, &cached_path, source_bytes, &cache_dir)? {
+            CacheMaterialization::HardLinked => {
+                tracing::debug!("media cache: hard-linked {} (no copy)", source_path.display());
+            }
+            CacheMaterialization::Copied => {
+                tracing::debug!("media cache: copied {} MB (cross-volume fallback)", source_bytes / 1_048_576);
+            }
+        }
 
         let expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
         self.grants.insert(id.clone(), GrantRecord { source_path, cached_path: cached_path.clone(), expires_at });
@@ -220,6 +227,38 @@ impl MediaRegistry {
             if let Err(e) = std::fs::remove_file(&path) {
                 tracing::warn!("Failed to remove stale media cache file {}: {e}", path.display());
             }
+        }
+    }
+}
+
+/// How a source was materialized into the media cache. A hard link shares the source's bytes (no copy,
+/// no extra disk); a copy is the cross-volume / linkless-filesystem fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheMaterialization {
+    HardLinked,
+    Copied,
+}
+
+/// Put `source` at `cached` inside the media cache for asset-scope playback WITHOUT a whole-file copy
+/// when possible. A hard link is instant and consumes zero extra disk (same volume), and removing the
+/// cached entry later never touches the source (a separate directory entry to the same inode). Falls
+/// back to a real `std::fs::copy` across volumes or on filesystems without hard-link support — and only
+/// THEN checks disk room, since only a copy can exhaust the volume. A hard link serves byte-identical
+/// audio (the same inode), so there is no offset/corruption risk versus the source.
+fn link_or_copy_into_cache(
+    source: &Path,
+    cached: &Path,
+    source_bytes: u64,
+    cache_dir: &Path,
+) -> Result<CacheMaterialization, String> {
+    match std::fs::hard_link(source, cached) {
+        Ok(()) => Ok(CacheMaterialization::HardLinked),
+        Err(_link_err) => {
+            // Cross-volume or unsupported FS: fall back to a full copy, but refuse it if it wouldn't fit
+            // (a partial copy could corrupt a co-located WAL when the disk hits zero).
+            ensure_cache_room(source_bytes, crate::health::free_disk_bytes_for(cache_dir))?;
+            std::fs::copy(source, cached).map_err(|e| format!("Copy media into app cache: {e}"))?;
+            Ok(CacheMaterialization::Copied)
         }
     }
 }
@@ -440,6 +479,49 @@ mod tests {
         assert!(ensure_cache_room(source, Some(free_just_over_file)).is_err());
         // Exactly file + margin is the boundary: allowed.
         assert!(ensure_cache_room(source, Some(source + MEDIA_CACHE_MARGIN_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn materializes_into_cache_via_hard_link_not_a_copy_on_the_same_volume() {
+        // The media cache and a source under the same TempDir share a volume, so materialization must be
+        // an instant hard link — no whole-file copy, no extra disk (the whole point of this change).
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("book.wav");
+        std::fs::write(&src, b"original-audio").unwrap();
+        let cache_dir = tmp.path().join("media-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cached = cache_dir.join("clip.wav");
+
+        let how = link_or_copy_into_cache(&src, &cached, 14, &cache_dir).unwrap();
+        assert_eq!(how, CacheMaterialization::HardLinked, "same-volume must hard-link, not copy");
+        assert_eq!(std::fs::read(&cached).unwrap(), b"original-audio", "linked clip serves the source bytes");
+
+        // A hard link shares the source inode: an in-place rewrite of the source is visible through the
+        // cached entry. A whole-file COPY would NOT reflect it — so this proves we linked, not copied.
+        std::fs::write(&src, b"changed").unwrap();
+        assert_eq!(
+            std::fs::read(&cached).unwrap(),
+            b"changed",
+            "the cached entry must share the source's bytes (hard link, not a copy)"
+        );
+    }
+
+    #[test]
+    fn removing_the_cached_hard_link_never_deletes_the_source() {
+        // Prune/expiry removes the cached entry; because it is a hard link (not the source itself), the
+        // owner's original audio file must survive untouched.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("book.wav");
+        std::fs::write(&src, b"keep me").unwrap();
+        let cache_dir = tmp.path().join("media-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cached = cache_dir.join("clip.wav");
+        link_or_copy_into_cache(&src, &cached, 7, &cache_dir).unwrap();
+
+        remove_cached_media_file(&cached, "test");
+        assert!(!cached.exists(), "cache entry removed");
+        assert!(src.exists(), "the source audio must survive removal of its cache hard link");
+        assert_eq!(std::fs::read(&src).unwrap(), b"keep me", "source content intact");
     }
 
     #[test]
