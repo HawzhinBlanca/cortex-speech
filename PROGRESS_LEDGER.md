@@ -2635,3 +2635,27 @@ will be recorded next. If the build/CDP drive can't complete in this environment
   1) cd cortex-speech-app && cargo build --release --manifest-path src-tauri/Cargo.toml --bin cortex-speech-app
   2) npm run test:heartbeat
   Expected: "HEARTBEAT OK: main thread stayed responsive (p95 <Xms <= 300ms)."
+
+## P0 #2 — AUDIT-POINT #2 RUNTIME-PROVEN: main thread stays responsive under load (2026-07-11)
+
+The async migration is now proven at RUNTIME on the freshly-built release exe, not just structurally.
+scripts/heartbeat_probe.cjs drove the real exe (disposable profile, isolated WebView2 data dir),
+fired 8 concurrent async get_waveform decodes of the committed CC-BY fixture, and hammered the instant
+get_settings command in-page while they ran.
+
+VERBATIM (npm run test:heartbeat, fresh cargo build --release exe at 04:58):
+  ==> get_settings during 8 concurrent get_waveform decodes: 2450 calls · median 1.5ms · p95 2.3ms · max 21.5ms
+  HEARTBEAT OK: main thread stayed responsive (p95 2.3ms <= 300ms).
+
+2450 get_settings calls at p95 2.3ms while slow ASR-decode commands ran concurrently = the main/UI
+thread is NOT blocked by slow work. Before the migration these were sync (on the main thread) and
+would have serialized behind the decodes. Audit-point #2 ("every slow operation keeps the UI
+responsive") is PROVEN for the migrated surface.
+
+Harness debugging that got it running (all committed): isolate WEBVIEW2_USER_DATA_FOLDER per run
+(shared dir → WebView2 0x8007139F, no window); use 127.0.0.1 not localhost (Node fetch/undici); and
+stdio:'ignore' on the spawned exe (an undrained pipe of the verbose ort startup logging blocked the
+exe mid-startup so WebView2 never initialized). node --check clean.
+
+P0 #2 STATUS: structural migration (46 commands) DONE + ratchet-gated; Bucket B assessed; runtime
+responsiveness PROVEN. NEXT execution-order item: P0 #3 Job Supervisor + #4 full 7B engine supervision.

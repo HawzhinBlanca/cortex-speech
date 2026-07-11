@@ -72,24 +72,32 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function run() {
   console.log(`==> Heartbeat probe. profile=${DATA_DIR}  audio=${path.basename(AUDIO)}  threshold=${MAX_MS}ms`);
-  if (await fetch(`http://localhost:${DEBUG_PORT}/json`).then((r) => r.ok, () => false)) {
+  if (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json`).then((r) => r.ok, () => false)) {
     die(`debug port ${DEBUG_PORT} already answering — another instance is running; close it or set CORTEX_DEBUG_PORT.`);
   }
 
+  // Isolate the WebView2 user-data folder per run — sharing the default one across concurrent /
+  // rapid launches (or with the owner's other WebView2 apps) yields WebView2 error 0x8007139F
+  // ("resource not in the correct state") and the window never opens.
+  const wvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-hb-wv-'));
   appProcess = spawn(APP_EXE, [], {
     env: {
       ...process.env,
       CORTEX_APP_DATA_DIR: DATA_DIR,
+      WEBVIEW2_USER_DATA_FOLDER: wvDir,
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${DEBUG_PORT}`,
     },
     cwd: path.dirname(APP_EXE),
     shell: false,
+    // Discard the exe's stdio: the app logs verbosely (ort init) at startup, and an undrained pipe
+    // buffer would fill and BLOCK the exe mid-startup so WebView2 never initializes.
+    stdio: 'ignore',
   });
 
   let pages = null;
   for (let i = 0; i < 90; i++) {
     try {
-      const res = await fetch(`http://localhost:${DEBUG_PORT}/json`);
+      const res = await fetch(`http://127.0.0.1:${DEBUG_PORT}/json`);
       if (res.ok) {
         pages = await res.json();
         break;
@@ -101,7 +109,7 @@ async function run() {
   }
   if (!pages) throw new Error(`WebView2 debug port ${DEBUG_PORT} did not come up within 90s.`);
 
-  const browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
+  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${DEBUG_PORT}`);
   const ctx = browser.contexts()[0];
   const page = ctx.pages().find((p) => p.url().includes('localhost') || p.url().includes('1420')) || ctx.pages()[0];
   await page.waitForSelector('[data-testid="app-root"]', { timeout: 45000 });
