@@ -2873,3 +2873,27 @@ re-run migrations afterward (pre-existing) — the live conn would sit at the ol
 initialize(); worth a post-restore migrate or a re-open. (b) A pre-restore SAFETY snapshot of the current
 live DB before the swap (the 10-min auto-snapshot partially covers this). (c) restore atomicity (a crash
 mid online-backup can leave the live DB half-overwritten — copy-to-temp-then-swap would harden it).
+
+## P0 #5 cont. — restore re-migrates an older snapshot to HEAD (+ undo-clear fix) (2026-07-11)
+
+Closed follow-up (a). db.rs restore() now calls run_migrations(self) after the page copy, so an older
+snapshot is brought forward to HEAD in place (equal = no-op; newer already refused by the fence). The
+adversarial panel confirmed migration safety (version-gated, no double-apply, HEAD no-op) AND caught a
+LOW-sev regression the change introduced — now FIXED: run_migrations(self)? made restore() able to return
+Err AFTER the pages were swapped (a forward-migration failure), and both restore commands cleared the
+undo/redo history only on Ok — so that path would leave a stale Undo able to corrupt the restored dataset.
+db_restore + restore_db_from_snapshot now clear history on ANY restore that reached the swap.
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean
+  cargo test --lib -> 877 passed; 0 failed; 6 ignored. New regression gate:
+    db::tests::restore_of_an_older_snapshot_migrates_it_forward_to_head (synthesized v36 snapshot restores
+    -> migrated to HEAD in place -> v37 jobs table recreated + usable; HEAD snapshot restores idempotently).
+  python scripts/run_python_policies.py -> all 23 regressions passed
+  Adversarial 2-lens Workflow (double-apply / failure-atomicity): double-apply clean; failure-atomicity
+    found the undo-clear window -> FIXED.
+OWNER-MACHINE (surfaced, not faked): a LIVE backup→restore drill + the rare mid-restore migration-failure
+path is an owner-machine check (exe needs rebuild); forward-migration LOGIC is unit-proven here.
+
+Remaining P0 #5 follow-ups: (b) pre-restore safety snapshot before the swap; (c) restore atomicity
+(copy-to-temp-then-swap). NEXT: (b) or (c), or pivot to P0 #4 verifiable-here glue / next 1010PATH.md item.
