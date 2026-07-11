@@ -2796,6 +2796,31 @@ RUNTIME-PROVEN (npm run test:jobs, scripts/jobs_probe.cjs, fresh release exe, di
   and a get_jobs FRONTEND surface — logic unit-proven (orphaned_running_jobs_are_reaped...), the live
   kill-and-restart is an owner drill.
 
-NEXT increment: (a) small frontend activity surface polling get_jobs (running/succeeded/failed+
-INTERRUPTED pill or list), then (b) bracket a second durability-less long op (export_finetune_pack or
-run_gold_eval). Progress ticks (update_job_progress mid-op) come when an op exposes a per-unit loop.
+## P0 #3 cont. — durable jobs are now USER-VISIBLE (JobsActivityPill) (2026-07-11)
+
+Fourth increment: a header pill surfaces the durable jobs so durability is user-visible, not just an
+IPC read. Quiet by design — renders nothing when idle; amber "N running" during work; red "A task
+failed"/"A task was interrupted" when the newest TERMINAL job failed (self-clears once a later job
+succeeds).
+- src/lib/JobsActivityPill.svelte (poll get_jobs 5s, cleared onDestroy) + commands.ts Job/getJobs +
+  i18n EN/CKB (jobs.running{count}/failed/interrupted/tooltip) + App.svelte header placement.
+- Two real defects found (test harness + adversarial review) and FIXED: (1) null-response crash —
+  a generic invoke→null mock made jobs.filter throw (caught by AppRuntimeGuard.test.ts); fixed with an
+  Array.isArray trust-boundary coercion. (2) sticky-failure UX (medium) — find(any-failed) painted a
+  permanent red pill because durable failed rows are never pruned (a one-time crash's INTERRUPTED row
+  would nag on every launch); fixed to flag only the newest terminal job's failure.
+
+VERBATIM proof (verifiable-here):
+  npx vitest run -> 176 passed, 0 errors (was "1 unhandled error" pre-null-fix). New JobsActivityPill
+    spec: 9 cases (running count, failed, interrupted, running-outranks-failed, old-failure-under-newer-
+    success=no pill, queued-over-older-failure=flags, empty/read-fails/null=no pill).
+  npm run typecheck -> 0 errors; npm run lint -> clean
+  python scripts/run_python_policies.py -> all 23 regressions passed (frontend audio incl.)
+  Adversarial 2-lens Workflow (robustness / i18n-privacy): i18n clean (EN/CKB parity, {count}, RTL, no
+    PII, no network); robustness found the sticky-failure defect → FIXED.
+OWNER-OBSERVABLE: a live visual check (run/fail an export → watch the pill) needs a FRONTEND rebuild on
+the owner's machine; logic is unit-proven here. (The exe/bundle now needs a rebuild to see the pill live.)
+
+NEXT increment: bracket a SECOND durability-less long op (export_finetune_pack or run_gold_eval) through
+run_tracked, extend scripts/jobs_probe.cjs to assert it. Progress ticks (update_job_progress mid-op)
+come when an op exposes a per-unit loop.
