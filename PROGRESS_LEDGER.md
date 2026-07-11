@@ -3008,8 +3008,27 @@ VERBATIM proof (Windows):
 Follow-up (surfaced): a per-source SRT/VTT export (one file per media) would let a multi-source library get
 subtitles; today TXT is the documented whole-library path.
 
-NEXT: remaining verifiable-here candidates thin out — P1 architecture decomposition (pure extraction, avoid
-Codex files, low daily-driver value), P1 chunking overlap/dedup (real proof owner-gated on long recordings),
-or another crisp bug on re-read. If none of real value remains, WRITE THE OWNER HAND-OFF and stop. Owner-gated:
-Gold Marathon ≥500 decisions, retrain, IAA kappa, CORDI, live WSL/7B supervision + crash/restore drills, real
-calibration data, the heuristic-confidence fence design call, the egress transcribe-leg (needs local model).
+## P1 truthful intelligence #8 — Parquet ships the alignment_quality precision marker (2026-07-11)
+
+Audit P1 #8 "approximate alignment must never silently become training timing; visibly mark it." The Parquet
+dataset export shipped alignment_json (per-word timestamps) but DROPPED alignment_quality — so a trainer could
+not tell ctc_forced (precise) from energy_heuristic (approximate) and would treat approximate timing as ground
+truth. Parquet was the ONLY format shipping the timestamps while dropping the marker. Fix: add the
+alignment_quality column (schema/array/batch in lockstep after alignment_json; values pass through unchanged).
+Format coverage (verified honestly — adversarial review corrected my first-draft premise): JSON+JSONL flatten
+SpeechSegment so they already carry it; CSV is hand-rolled and ships NO alignment fields (honest by omission,
+never at #8 risk). So the marker now travels with the timestamps in every format that ships them.
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean
+  cargo test --lib -> 880 passed; 0 failed; 6 ignored. export_parquet_writes_valid_file extended: a segment
+    with alignment_quality="energy_heuristic" round-trips (column exists + value(0) reads the marker).
+  python scripts/run_python_policies.py -> all 23 regressions passed (training-grade export policy incl.)
+  Adversarial 1-lens Workflow: Parquet code CORRECT (lockstep at index 6, positional type-check intact, no
+    fixed-position consumer); caught my FALSE "CSV also carries it" premise -> comment + rationale corrected.
+
+NEXT: verifiable-here candidates are largely exhausted for this session's non-Codex surface. Remaining real
+value is OWNER-GATED: Gold Marathon ≥500 real decisions, retrain cycle, IAA kappa w/ real annotators, CORDI
+dialect fairness, live WSL/7B supervision + crash/restore drills, real calibration data (+ the heuristic-fence
+design call), the egress transcribe-leg (needs a local model). If the next scan finds no crisp verifiable-here
+item of real value, WRITE docs/OWNER_HANDOFF.md and STOP the loop (an honest owner-gated stop = success).
