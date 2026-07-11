@@ -2985,7 +2985,31 @@ egress-runtime stays 'not-built' — 10/10 criterion #11 is NOT fully met; its d
 PARTIAL harness. Adversarial scope lens otherwise clean (no updater plugin, no frontend telemetry;
 isLocalAddress does NOT mask private LAN ranges, so a LAN exfil would still be caught).
 
-NEXT: a fresh 1010PATH.md item — the transcribe-leg egress extension is owner-model-gated; remaining
-verifiable-here candidates: P1 architecture decomposition (pure extraction + tests, avoid Codex files),
-P1 chunking overlap/dedup, or another crisp item. Owner-gated: Gold Marathon, retrain, IAA kappa, CORDI,
-live WSL/7B supervision + crash/restore drills, the heuristic-confidence fence design call.
+## P1 data durability #157 — refuse a multi-source SRT/VTT (resetting-timestamp bug) (2026-07-11)
+
+Audit P1 "Export SRT/VTT per source media file; never concatenate multiple source timelines into one
+subtitle file with timestamps resetting to zero." transcript_export.rs times each source's cues from that
+source's OWN window (per-file cursor reset), so exporting a multi-source library into ONE SRT/VTT produced
+timestamps that jump back to zero at each source boundary — a broken, non-monotonic subtitle track. Nothing
+enforced the "single-media" invariant the module doc claims (export_transcript exports the whole library).
+Fix: ensure_single_source_for_subtitles(cues, format) — a PURE guard that fails closed (AppError::Validation)
+BEFORE writing when Srt/Vtt cues span >1 source; TXT (whole-library, labels each source) + single-source
+subtitles unaffected.
+
+VERBATIM proof (Windows):
+  cargo fmt; cargo clippy --lib --all-targets -- -D warnings -> clean
+  cargo test --lib -> 880 passed; 0 failed; 6 ignored. New gate:
+    transcript_export::tests::subtitles_refuse_a_multi_source_library_but_txt_and_single_source_are_allowed
+  python scripts/run_python_policies.py -> all 23 regressions passed
+  Adversarial 1-lens Workflow: guard logically correct on every probe (no false refuse/pass; fail-closed is
+    strictly better than a broken file); caught a LOW-sev HONESTY defect in the error message (suggested a
+    "filter to a single source" UI that doesn't exist) -> FIXED to point only at the real TXT remedy.
+
+Follow-up (surfaced): a per-source SRT/VTT export (one file per media) would let a multi-source library get
+subtitles; today TXT is the documented whole-library path.
+
+NEXT: remaining verifiable-here candidates thin out — P1 architecture decomposition (pure extraction, avoid
+Codex files, low daily-driver value), P1 chunking overlap/dedup (real proof owner-gated on long recordings),
+or another crisp bug on re-read. If none of real value remains, WRITE THE OWNER HAND-OFF and stop. Owner-gated:
+Gold Marathon ≥500 decisions, retrain, IAA kappa, CORDI, live WSL/7B supervision + crash/restore drills, real
+calibration data, the heuristic-confidence fence design call, the egress transcribe-leg (needs local model).
