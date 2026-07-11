@@ -1794,10 +1794,16 @@ pub async fn export_huggingface_dataset(path: String, state: State<'_, AppState>
     STRICT_RATE_LIMITER.check("export_huggingface_dataset")?;
     let validated_path = validate::validate_output_path(&path)?;
     let settings = state.lock_settings().clone();
+    // Bracketed as a durable job (same as export_dataset): a crash mid-export is reaped as INTERRUPTED
+    // at the next startup and the outcome shows in get_jobs / the activity pill. Work is unchanged.
     let db = state.db_arc();
+    let job_id = uuid::Uuid::new_v4().to_string();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::export::export_huggingface_dataset(&db, Path::new(&validated_path), &settings).map_err(|e| e.to_string())
+        db.run_tracked(&job_id, "export_huggingface_dataset", "HF_EXPORT_FAILED", |d| {
+            crate::export::export_huggingface_dataset(d, Path::new(&validated_path), &settings)
+        })
+        .map_err(|e| e.to_string())
     })
     .await
 }

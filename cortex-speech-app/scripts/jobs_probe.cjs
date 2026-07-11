@@ -42,6 +42,7 @@ if (DATA_DIR) {
   DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-jobs-'));
 }
 const OUT = path.join(DATA_DIR, 'jobs_probe_export.jsonl');
+const HF_OUT = path.join(DATA_DIR, 'jobs_probe_hf'); // HF export writes a directory (parent must exist)
 
 let appProcess = null;
 function killApp() {
@@ -96,37 +97,45 @@ async function run() {
   await page.waitForSelector('[data-testid="app-root"]', { timeout: 45000 });
 
   const result = await page.evaluate(
-    async ({ out }) => {
+    async ({ out, hfDir }) => {
       const invoke = window.__TAURI_INTERNALS__.invoke;
       // No jobs before we run anything.
       const before = await invoke('get_jobs');
-      // Run a REAL export (an empty library exports an empty dataset — still a completed op = a job row).
-      let exportError = null;
+      // Run REAL exports (an empty library exports an empty dataset — still a completed op = a job row).
+      const errors = {};
       try {
         await invoke('export_dataset', { path: out, format: 'jsonl' });
       } catch (e) {
-        exportError = String(e);
+        errors.export_dataset = String(e);
+      }
+      try {
+        await invoke('export_huggingface_dataset', { path: hfDir });
+      } catch (e) {
+        errors.export_huggingface_dataset = String(e);
       }
       const after = await invoke('get_jobs');
-      return { before, after, exportError };
+      return { before, after, errors };
     },
-    { out: OUT },
+    { out: OUT, hfDir: HF_OUT },
   );
 
   await browser.close();
   killApp();
 
-  const { before, after, exportError } = result;
-  console.log(`==> get_jobs before=${before.length} after=${after.length}  exportError=${exportError || 'none'}`);
-  if (exportError) throw new Error(`export_dataset itself failed: ${exportError}`);
+  const { before, after, errors } = result;
+  console.log(`==> get_jobs before=${before.length} after=${after.length}  errors=${JSON.stringify(errors)}`);
 
-  const job = after.find((j) => j.kind === 'export_dataset');
-  if (!job) throw new Error(`no export_dataset job was recorded (get_jobs returned ${JSON.stringify(after)})`);
-  console.log(`==> recorded job: id=${job.id} kind=${job.kind} state=${job.state} errorCode=${job.errorCode}`);
-  if (job.state !== 'succeeded') {
-    throw new Error(`export job did not reach 'succeeded' (state=${job.state}, errorCode=${job.errorCode})`);
+  // Assert BOTH bracketed ops recorded a durable succeeded job of their kind.
+  for (const kind of ['export_dataset', 'export_huggingface_dataset']) {
+    if (errors[kind]) throw new Error(`${kind} itself failed: ${errors[kind]}`);
+    const job = after.find((j) => j.kind === kind);
+    if (!job) throw new Error(`no ${kind} job was recorded (get_jobs returned ${JSON.stringify(after)})`);
+    console.log(`==> recorded job: id=${job.id} kind=${job.kind} state=${job.state} errorCode=${job.errorCode}`);
+    if (job.state !== 'succeeded') {
+      throw new Error(`${kind} job did not reach 'succeeded' (state=${job.state}, errorCode=${job.errorCode})`);
+    }
   }
-  console.log(`\nJOBS OK: a durable export_dataset job was recorded and reached 'succeeded' at runtime.`);
+  console.log(`\nJOBS OK: durable export_dataset + export_huggingface_dataset jobs recorded and 'succeeded' at runtime.`);
 }
 
 run().catch((err) => {
