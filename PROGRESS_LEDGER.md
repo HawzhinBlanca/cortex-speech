@@ -3268,3 +3268,44 @@ engine), each with an un-lieable gate, GPU-budget profiles, and honest blockers.
 web sweep: Qwen3-ASR (the Jan-2026 open SOTA) does NOT support Sorani — the fine-tuned 7B champion
 stands. App-side chunk dispatch stays serial until the Codex-owned pipeline.rs change lands
 (spec: Track 5).
+
+## LOOP: egress transcribe-path gate BUILT — aggregate 21 PASS / 0 FAIL (2026-07-12)
+
+/loop "improve and harden and complete ship ready 1 user app" — increment 1. Picked the highest-value
+verifiable-here ship gate: egress-runtime was the single biggest privacy gate still NOT-BUILT, its
+charter deferring "the transcribe-path leg (cloud STT/LLM if consent leaked)" as owner-gated. The
+CTC-300M model is present, so that leg is verifiable here now.
+
+COMMIT 4f36fe2 feat(privacy): egress gate proves zero egress on the REAL transcribe path.
+  egress_probe.cjs gained a transcribe leg: provision offline CTC (enable_gpu=false so it never
+  contends for VRAM the warm 7B server holds), import the fixture, poll get_segments to >=1 — a REAL
+  import->VAD->CTC decode->persist — under the SAME positive-control-guarded sampler. Runs FIRST,
+  before the browse busy-loop trips the backend IPC rate limiter. verify_10.py egress-runtime flipped
+  from not-built placeholder to a real cmd gate (SKIP-ENV off-Windows / without exe or CTC model).
+  ADVERSARIAL REVIEW (3-lens) caught a real FALSE-GREEN before commit: probe detected the model only
+  next to the exe, but the app resolves it from src-tauri/models (CARGO_MANIFEST_DIR) — on the
+  canonical fetch-models layout the app could transcribe while the probe silently skipped the leg, yet
+  the gate rode GREEN claiming ASR coverage. Fixed: broadened detection to the app's resolver; a leg
+  that RUNS but yields 0 segments now HARD-FAILS (no silent inconclusive pass under a coverage-claiming
+  gate); _probe_egress requires the CTC model so it SKIP-ENVs honestly instead of false-greening.
+
+VERBATIM proof (this rig, 2026-07-12):
+  npm run test:egress -> positive control OK (4 conns); "EGRESS OK: ... ZERO non-loopback connections
+    ... + a REAL offline transcription (1 segment(s) via CTC ASR)"
+  EMPIRICAL false-green fix test: moved target/release/models aside so ONLY src-tauri/models has the
+    model (the flagged canonical layout) -> transcribe leg STILL ran, got 1 segment via CTC, exit 0.
+    Proves the app resolves from src-tauri/models AND the broadened detection matches it.
+  Full aggregate (CORTEX_AUDIO set, warm dual-GPU 7B server):
+    "kept gates run: 23 - 21 PASS, 0 FAIL, 2 skipped (env/not-built)"
+    "VERDICT: INCOMPLETE - 2 kept gate(s) could not run (fuzz-smoke, refinery-lift)."
+    egress-runtime: PASS (21.5s) — was NOT-BUILT. Aggregate moved 20->21 PASS, 3->2 not-built.
+  HONEST NOTE: the FIRST aggregate re-run went RED on test-e2e+a11y — proven a TRANSIENT contention
+    flake (Playwright browser launch under the heavy concurrent aggregate load), NOT a regression:
+    "npm run test:e2e" in isolation = "47 passed (11.6s)", and the clean re-run above is green. The
+    gate is occasionally load-sensitive at launch; not fixed here (passes in isolation and normally in
+    aggregate), flagged so a future RED from it is not mistaken for a code regression.
+
+REMAINING to full-charter 10/10: refinery-lift (synthetic injected-error benchmark, not built —
+next loop increment candidate); fuzz-smoke (compiles; MSVC linkage blocks it, runs on Linux CI); the
+airtight kernel/ETW egress trace (poll-sampled version now covers startup+browse+transcribe); 5
+owner-gated legs; 8 owner-descoped distribution legs. Still NOT a 10/10 claim.
