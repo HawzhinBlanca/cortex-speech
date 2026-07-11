@@ -264,6 +264,22 @@ export async function getChampionEngineStatus(): Promise<EngineStatus> {
   return invoke<EngineStatus>('get_champion_engine_status');
 }
 
+/** A durable background job (P0 #3 Job Supervisor). Mirrors crate::jobs::Job (camelCase). */
+export interface Job {
+  id: string;
+  kind: string;
+  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  progress: number;
+  completed: number;
+  total: number | null;
+  errorCode: string | null;
+}
+
+/** Recent durable jobs (newest first) for the activity surface. Cheap read; safe to poll. */
+export async function getJobs(): Promise<Job[]> {
+  return invoke<Job[]>('get_jobs');
+}
+
 /** Start the champion 7B server (WSL) from the app; returns immediately, then poll status. */
 export async function startChampionEngine(): Promise<void> {
   return invoke<void>('start_champion_engine');

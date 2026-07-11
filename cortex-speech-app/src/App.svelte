@@ -63,6 +63,7 @@
   import { isTauriRuntime } from './lib/runtime';
   import AudioPlayer from './lib/AudioPlayer.svelte';
   import EngineStatusPill from './lib/EngineStatusPill.svelte';
+  import JobsActivityPill from './lib/JobsActivityPill.svelte';
   import Waveform from './lib/Waveform.svelte';
   import ErrorBoundary from './lib/ErrorBoundary.svelte';
   import Toast from './lib/Toast.svelte';
@@ -1909,6 +1910,7 @@
       >
       {#if tauriAvailable}
         <EngineStatusPill />
+        <JobsActivityPill />
       {/if}
       {#if $isProcessing}
         <span class="flex items-center gap-1 text-xs text-cortex-400">
