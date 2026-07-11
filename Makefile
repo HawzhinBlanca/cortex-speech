@@ -71,7 +71,7 @@ build-app:
 
 ## measure-10: run the REAL accuracy scorecards on a gold manifest and record the numbers into
 ## docs/MEASUREMENTS.md (git SHA + manifest SHA-256 + exact command + full output). Owner-gated: run
-## inside WSL on the 4090 box with the warm 7B server up and CORTEX_FINETUNED_{MODEL,ONNX} set.
+## inside WSL on the GPU rig (2x 3090 Ti) with the warm 7B server up and CORTEX_FINETUNED_{MODEL,ONNX} set.
 ## Usage:  make measure-10 GOLD=/mnt/c/path/to/gold.tsv   [BOOTSTRAP=3000] [ENGINES=7b,finetuned]
 ## Build a gold manifest first if needed:  python cortex-speech-app/scripts/build_ckb_gold.py 900
 BOOTSTRAP ?= 3000

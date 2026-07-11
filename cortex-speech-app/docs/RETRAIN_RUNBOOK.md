@@ -9,7 +9,7 @@ The one law still holds: **the promotion gate decides on a real measured CER/WER
 scorecard run.** No estimated numbers. If the challenger does not actually beat the champion on the
 frozen gold set, it does not get promoted — that is the whole point of the gate.
 
-**Prerequisites:** a WSL environment with the 4090 (the training + ONNX export happen there), the
+**Prerequisites:** a WSL environment with the GPU rig (measured 2026-07-11: 2x RTX 3090 Ti 24 GB, NVLink; training + ONNX export happen there), the
 fine-tuned MMS-CTC-1B HF export as the training base, and enough verified segments to matter (M3 —
 keep reviewing in-app until you have a few hours of verified audio).
 
@@ -18,7 +18,7 @@ keep reviewing in-app until you have a few hours of verified audio).
 ## The cycle at a glance
 
 ```
-[in-app review]  ──▶  export_finetune_pack   ──▶  QLoRA train (WSL/4090)  ──▶  export ONNX
+[in-app review]  ──▶  export_finetune_pack   ──▶  QLoRA train (WSL/GPU rig)  ──▶  export ONNX
    (M3 data)          (leak-guarded pack)          (external trainer)          + verify
                                                                                    │
                                                                                    ▼
@@ -66,7 +66,7 @@ Convert the manifest to the TSV the scorecard scripts expect (`<clip_path>\t<ref
 if you have not already; `scripts/scorecard_finetuned.py` and `measure_finetuned_cer.py` both read a
 `gold_manifest.tsv`.
 
-## Step 3 — Train (WSL / 4090, external)
+## Step 3 — Train (WSL / GPU rig, external)
 
 Training runs in your WSL environment, **not** in the app — there is no in-repo trainer, by design
 (the app's job is to produce leak-clean data and to gate the result, not to own your training loop).

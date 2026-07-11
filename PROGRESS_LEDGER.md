@@ -3226,3 +3226,45 @@ the partial startup+browse probe passed above but wiring it as the full leg woul
 refinery-lift (fixed-seed synthetic benchmark: not built); fuzz-smoke (msvc linkage, run on Linux
 CI); 5 owner-gated legs; 8 owner-descoped distribution legs. NOT a 10/10 claim: "CORTEX 10/10: ALL
 GATES GREEN" is only printable when nothing is descoped or owner-gated.
+
+## HARDWARE PASS — dual-GPU exploitation, measured (2026-07-12)
+
+Owner: "commit everything green and get best git hygiene... i have a very strong pc, with 2 rtx
+3090ti linked via nvlink and 256gb ram, let the app use them wisely". Hygiene audit first: tree
+clean, fsck clean, all subjects well-formed, hygiene+gitignore policy gates green. Branch has NO
+upstream — pushing publishes to GitHub, so it is surfaced as an owner decision, not done.
+
+MEASURED RIG (nvidia-smi / Win32_Processor, 2026-07-11): 2x RTX 3090 Ti 24 GB, NVLink 4x14 GB/s
+per GPU, Threadripper 3990X 64C/128T, 256 GB RAM; both GPUs visible in WSL. NOTE: this is the
+SECOND PC (picked up 2026-07-10); dated docs referencing the first PC's RTX 4090 were correct for
+that machine — an uncommitted edit that rewrote FINAL_READINESS_10.md's dated record as "wrong"
+was itself caught by adversarial review and reverted to an appended dated note. Living guidance
+(RETRAIN_RUNBOOK, Makefile measure-10 comment) now references the current rig.
+
+COMMIT f27b9e7 perf(7b): one model replica per GPU (pre-forked worker processes).
+  The daily-driver 7B champion served on ONE GPU with a serial accept loop. Now: CUDA-free parent,
+  CORTEX_7B_DEVICES (default all GPUs), one pre-forked worker process per card, listen() deferred
+  to the loaded worker (READY/preflight only answers when a replica can actually serve), fleet
+  dies loudly if any worker dies. scorecard_7b.py gains CORTEX_7B_WORKERS (order-preserving,
+  Ctrl+C-abortable, honest queue-timeout limit documented); new bench_7b_throughput.py refuses to
+  report a speedup unless transcripts are non-empty and identical.
+  HONEST DETOUR (kept in the record): the first implementation used replica THREADS — measured
+  1.10x warm, because the autoregressive 7B decode serializes on the GIL. Processes: 2.10x.
+VERBATIM proof (this rig):
+  nvidia-smi during serve: GPU0 21,861 MiB used, GPU1 21,861 MiB used (one replica each)
+  cargo test --lib -- --ignored wsl_7b_preflight_passes_when_server_up -> ok (1 passed)
+  bench (fixture wav, 8 requests, warm steady state):
+    concurrency 1: 25.18s wall, 0.32 clips/s
+    concurrency 2: 11.98s wall, 0.67 clips/s -> speedup 2.10x (identical transcripts)
+  python scripts/run_python_policies.py -> 29 policy test scripts passed
+  Adversarial 3-lens review -> 3 real defects (cpu-branch silently grabbed GPU0 while logging
+  "cpu"; whole-manifest submit made Ctrl+C drain ~900 queued requests with zero progress output;
+  the FINAL_READINESS record falsification above) -> ALL fixed pre-commit.
+
+ALSO: docs/ACCURACY_PLAN_2026-07.md — owner-requested robust plan for the six July-2026
+improvement tracks (local GER corrector, Qwen3-ASR-1.7B LoRA jury engine, precise word alignment,
+task-arithmetic experiment, chunk-parallel dispatch spec for Codex, the Gold-Marathon data
+engine), each with an un-lieable gate, GPU-budget profiles, and honest blockers. Confirmed via
+web sweep: Qwen3-ASR (the Jan-2026 open SOTA) does NOT support Sorani — the fine-tuned 7B champion
+stands. App-side chunk dispatch stays serial until the Codex-owned pipeline.rs change lands
+(spec: Track 5).

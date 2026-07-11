@@ -28,6 +28,11 @@
 
 - **GPU**: RTX 4090 (24 GB) visible in WSL; torch 2.8.0+cu128, CUDA available. **Retraining is
   feasible on this machine today.**
+  *(Dated note, 2026-07-12: the bullet above is the 2026-07-02 session's record of the FIRST PC
+  and was correct for it — see docs/WSL_DR_RUNBOOK.md's 2026-07-04 probe. The CURRENT daily rig
+  is a second PC, measured 2026-07-11: 2x RTX 3090 Ti 24 GB with NVLink, Threadripper 3990X,
+  256 GB RAM. An earlier uncommitted edit here rewrote the historical bullet as "wrong" — it
+  wasn't; the machines differ.)*
 - **7B base weights (31 GB) verified present inside WSL's fairseq2 cache** (only the Windows-side
   export folder lacks them). `train_omni_7b.py` (QLoRA r=16 on q/v projections, DDP, thermal
   governor) + `eval_7b_gold.py` + the warm server all exist.
@@ -193,7 +198,7 @@ measured rate — not guessed).
 6. **Execute ONE full cycle** with a **pre-registered comparison** (one challenger vs champion on
    frozen app-gold, paired CI; no retry-until-win — repeated retrains against the same gold
    inflate false positives): accumulate ≥300 verified corrections → export pack (optionally +
-   CV22 as volume, contamination-annotated) → QLoRA retrain on the 4090 (~10–30 GPU-h) →
+   CV22 as volume, contamination-annotated) → QLoRA retrain on the GPU rig (~10–30 GPU-h) →
    challenger AND champion evaluated on identical gold → import → gate → promote (or the honest
    failure is logged as the cycle's completion — **either outcome closes C7's "executed once"**;
    the *win* remains the criterion for calling C7 fully green).
