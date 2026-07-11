@@ -13,7 +13,8 @@ Modes
              leg explicitly — skipped legs are REPORTED, never silently dropped.
   --static   exactly the historical four governance gates (CI contract:
              ci.yml `governance-gate` and release.yml call this).
-  --quick    Tiers 0-1 only.
+  --quick    Tiers 0-1 only. Tier-2/3 kept gates are counted NOT-RUN-QUICK, so
+             the verdict is at best INCOMPLETE (exit 2) — never a ship verdict.
 
 Verdict contract (exactly one final line):
   RED (exit 1)         — a kept gate failed.
@@ -364,6 +365,10 @@ def static_main():
 # ---------------------------------------------------------------------------
 
 PASS, FAIL, SKIP_ENV, NOT_BUILT = "PASS", "FAIL", "SKIP-ENV", "NOT-BUILT"
+# --quick deliberately does not run tier-2/3 kept gates; they are counted with this status so the
+# verdict is at best INCOMPLETE. Quick mode must never print the ship-ready GREEN line — that
+# verdict was previously reachable ONLY in the least-verified mode (true-10 sweep 2026-07-11).
+NOT_RUN_QUICK = "NOT-RUN-QUICK"
 
 
 def _probe_deny():
@@ -545,6 +550,7 @@ def aggregate_main(quick):
     results = []
     for name, tier, kind, payload, cwd, probe, charter in GATES:
         if quick and tier > 1:
+            results.append((name, NOT_RUN_QUICK, 0.0, ""))
             continue
         print(f"\n----- [tier {tier}] {name} :: {charter}")
         status, secs, detail = run_gate(name, kind, payload, cwd, probe)
@@ -561,7 +567,7 @@ def aggregate_main(quick):
         print(f" {'OWNER-GATED-PENDING':<26} {name:<28} ({why})")
 
     fails = [n for n, s, _, _ in results if s == FAIL]
-    skips = [n for n, s, _, _ in results if s in (SKIP_ENV, NOT_BUILT)]
+    skips = [n for n, s, _, _ in results if s in (SKIP_ENV, NOT_BUILT, NOT_RUN_QUICK)]
     passes = [n for n, s, _, _ in results if s == PASS]
     print("-" * 68)
     print(

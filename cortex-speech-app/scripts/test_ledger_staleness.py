@@ -23,8 +23,13 @@ def test_ledger_staleness(max_commits_lag=3):
     ledger = repo_root / "PROGRESS_LEDGER.md"
 
     if not ledger.exists():
-        print("SKIP: PROGRESS_LEDGER.md not found")
-        return
+        # The ledger is a committed artifact. A missing file must FAIL, not skip: a silent SKIP
+        # here disables the exact gate built to prevent ledger neglect (same rationale as the CI
+        # git-failure hard error below — a vacuous pass lands exactly where nobody is watching).
+        raise AssertionError(
+            "PROGRESS_LEDGER.md is missing — the anti-drift gate cannot run. Restore the ledger; "
+            "deleting or moving it must never silently disable this gate."
+        )
 
     def git(*args):
         return subprocess.check_output(["git", *args], cwd=repo_root, text=True).strip()

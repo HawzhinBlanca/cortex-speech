@@ -14,8 +14,13 @@ def test_eval_provenance():
     """Parse EVAL.md, extract all metric numbers, verify each has backing artifact."""
     eval_md = Path(__file__).parent.parent / "docs" / "EVAL.md"
     if not eval_md.exists():
-        print("SKIP: EVAL.md not found")
-        return
+        # EVAL.md is a committed doc that currently carries gated metrics. A missing file must
+        # FAIL, not skip: a vacuous green here would let every metric claim go unpoliced exactly
+        # when the doc holding them disappears (true-10 sweep 2026-07-11).
+        raise AssertionError(
+            "docs/EVAL.md is missing — the provenance gate cannot run. Restore the file; deleting "
+            "or moving it must never silently disable this gate."
+        )
 
     content = eval_md.read_text(encoding="utf-8")
 

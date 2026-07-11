@@ -115,7 +115,7 @@ and a naive fence could destroy a legitimate ctc-based calibration.
 python scripts/verify_10.py
 
 # Fast sandbox-runnable gates
-npm run test:python-policies      # 23 honesty/privacy/CI/dataset policy tests
+npm run test:python-policies      # honesty/privacy/CI/dataset policy tests (runner prints the real count)
 npm test                          # vitest (frontend)
 npm run typecheck                 # svelte-check + tsc
 npm run lint                      # eslint

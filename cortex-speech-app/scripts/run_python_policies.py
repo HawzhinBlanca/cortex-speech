@@ -48,7 +48,10 @@ def main() -> int:
     finally:
         remove_pycache()
 
-    print("\nPython policy regressions finished.", flush=True)
+    # The count is printed so ledger entries can quote a REAL number — a hardcoded "N regressions
+    # passed" claim drifts the moment a policy test is added (true-10 sweep 2026-07-11 found the
+    # ledger repeating a stale "23" while 29 test scripts actually run).
+    print(f"\nPython policy regressions finished: {len(test_files)} policy test scripts passed.", flush=True)
     return 0
 
 

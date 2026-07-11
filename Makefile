@@ -16,7 +16,8 @@ governance-proof:
 verify-10:
 	python scripts/verify_10.py
 
-## verify-10-quick: tiers 0-1 only (static governance + CI-equivalent code gates)
+## verify-10-quick: tiers 0-1 only (static governance + CI-equivalent code gates). Verdict is at
+## best INCOMPLETE (exit 2) — tier-2/3 gates are counted NOT-RUN; never a ship verdict.
 verify-10-quick:
 	python scripts/verify_10.py --quick
 
