@@ -3309,3 +3309,30 @@ REMAINING to full-charter 10/10: refinery-lift (synthetic injected-error benchma
 next loop increment candidate); fuzz-smoke (compiles; MSVC linkage blocks it, runs on Linux CI); the
 airtight kernel/ETW egress trace (poll-sampled version now covers startup+browse+transcribe); 5
 owner-gated legs; 8 owner-descoped distribution legs. Still NOT a 10/10 claim.
+
+## 2026-07-13 — premium dataset tier + annotation law (owner goal: absolute best training data)
+
+Commit a73ea1e (codex/newbranch). The owner set /goal "best datasets for AI training: clean
+audio, full sentences, no fillers, exact transcription". Landed the verbatim-in/clean-out
+architecture: docs/ANNOTATION_GUIDELINES.md (verbatim law + canonical filler spellings chosen
+to never collide with real words) + scripts/build_premium_dataset.py (premium tier by ROUTING
+segments, never rewriting text) + scripts/test_premium_dataset_policy.py (regression gate).
+
+Adversarial verification: 13-agent workflow (3 lenses -> per-finding refuters) + re-check
+agent. 10 findings -> 9 CONFIRMED, all fixed and pinned by tests, 1 refuted. Critical catch:
+normalizer's heh fold (ه U+0647 -> ھ U+06BE at export) made filler همم undetectable on the
+real path; Review-Inbox verdicts export verified=false so a verified-flag gate rejected real
+human decisions — both fixed against app semantics (transcriptSource=="human_verified").
+
+Verbatim proof (real runs, this machine):
+  $ python scripts/test_premium_dataset_policy.py
+  PASS: premium dataset builder policy
+  $ python scripts/run_python_policies.py
+  Python policy regressions finished: 31 policy test scripts passed.   (was 30)
+
+Real-data measurement (live library, read-only copy): 143 queued Sound_From_AP drafts, 143/143
+have stored snr/clipping/rms, 0 breach the audio gates (clean recording), 28 flagged for
+review attention (adjacent repeats/filler-like tokens) in the owner's review-priority report.
+
+Owner-gated remainder for the goal: reviewing the 143 drafts per the new guidelines (perfect
+exact transcription is human work by definition); premium tier fills as verifications land.
