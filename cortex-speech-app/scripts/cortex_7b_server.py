@@ -261,19 +261,32 @@ def main() -> None:
         children.append(pid)
     srv.close()  # only the workers accept
     print(f"parent: {len(children)} workers forked (pids {children}); serving once all load.", flush=True)
-    # If ANY worker dies, take the fleet down loudly — a silently halved server would misreport
-    # capacity forever (and the launcher's port probe would still say READY).
-    pid, status = os.wait()
-    print(f"parent: worker {pid} exited (status {status}) — stopping the rest.", flush=True)
-    import signal
+    supervise_workers(set(children), len(children))
 
-    for c in children:
-        if c != pid:
-            try:
-                os.kill(c, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-    sys.exit(1)
+
+def supervise_workers(live, total, reap=None, exit_fn=None):
+    """Reap workers as they exit, degrading gracefully. SCALE RESILIENCE: a single worker death (a
+    rare OOM / CUDA hiccup over a long session) must NOT take the whole server down — that turns a
+    transient blip into a ~10-min full reload. The surviving workers keep accept()ing on the shared
+    listen socket, so remaining replicas serve on (at reduced throughput); the parent logs LOUDLY so
+    the reduced capacity is never silent (the earlier build deliberately died here to avoid a silent
+    half-capacity server — loud logging keeps that honesty while staying ALIVE). Only exit once EVERY
+    worker is gone. `live` is the set of child pids; `total` the original count. `reap`/`exit_fn` are
+    injectable so the loop is unit-testable without real fork()/os.wait() (Linux-only)."""
+    reap = reap or os.wait
+    exit_fn = exit_fn or sys.exit
+    while live:
+        pid, status = reap()
+        live.discard(pid)
+        if live:
+            print(
+                f"parent: WORKER {pid} DIED (status {status}) — SERVING DEGRADED on {len(live)} of "
+                f"{total} replica(s). Restart the server when convenient to restore full capacity.",
+                flush=True,
+            )
+        else:
+            print(f"parent: last worker {pid} exited (status {status}); no replicas left — stopping.", flush=True)
+    exit_fn(1)
 
 
 if __name__ == "__main__":
