@@ -3514,3 +3514,29 @@ Answers to the owner's questions (grounded):
 
 Owner-gated 10/10 criteria unchanged. Not-installed-and-optional after this: WavLM OOD detector,
 finetuned MMS-1B ckb (both still absent; not required for the default path).
+
+## 2026-07-13 (cont.) — fine-tuned MMS-CTC-1B ckb champion re-exported + installed (real ort proof)
+
+Owner: "install all those we wanna complete setup." The fine-tuned Kurdish engine's int8 model.onnx
+(SHA-pinned, ~970MB) was NOT on disk — but the owner's full checkpoint was, at
+Desktop/Kurdish_ASR_Model_Export/MMS_CTC_1B_Champion/ (model.safetensors 1.93GB + config +
+vocab.json whose SHA MATCHES the existing pin 31dcd5c4.., confirming provenance).
+
+Re-exported the consolidated Wav2Vec2ForCTC -> int8 ONNX (transformers 4.46 legacy exporter — the
+installed transformers 5.8 + torch 2.13 default dynamo exporter both fail to trace wav2vec2's
+symbolic sample dim). Verified at every stage:
+- transformers checkpoint decode on fleurs_ckb_sample.wav: بوپێش هاتنی سوپە حایتی لە وتەی ساڵی ...
+- fp32 ONNX decode == transformers (match=True, max|logit diff| 3.97e-04)
+- int8 model.onnx: 970,236,520 bytes (within 15KB of the original pin's 970,251,415), sha 064d6ec2..
+- DEFINITIVE end-to-end via the REAL app ort path — cargo test --test gold_wer_eval
+  finetuned_gold_regression: hyp "وپێش هاتنی سوپا حایتی لە وتەی ساڵی 1هە0ەتەوە ..." measured
+  micro CER 0.1977 on the committed FLEURS ckb clip (published baseline 21.0%). test PASSED.
+
+- fix(finetuned) 43b79d2: installed models/finetuned-mms-ckb/{model.onnx,vocab.json} (gitignored);
+  refreshed FINETUNED_MODEL_SHA256 064d6ec2.. + FINETUNED_MODEL_BYTES 970_236_520; vocab pin
+  unchanged. 8 wav2vec2_asr unit tests pass, fmt/clippy clean.
+
+Setup now complete for every LOCAL model the app references: Silero VAD, OmniASR CTC-300M + CTC-1B,
+mms_aligner, CAM++ diarization, GTCRN denoiser, WSL 7B champion+LoRA, AND the fine-tuned MMS-CTC-1B
+ckb (~20% CER). NOT installed (by design, not a gap): WavLM OOD (vestigial dead code — OOD runs on
+an honest heuristic; no real model exists), cloud engines (opt-in off), Ollama (service).
