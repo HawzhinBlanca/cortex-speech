@@ -14,6 +14,7 @@
     agentPipelineStages,
     batchProgress,
     isProcessing,
+    type AgentPipelineStage,
   } from './stores/uiStore';
   import { computeProgress, formatDurationShort } from './progressStats';
 
@@ -68,7 +69,15 @@
     $pipelineCurrentFile ? ($pipelineCurrentFile.split(/[/\\]/).pop() ?? $pipelineCurrentFile) : '',
   );
 
-  const recentStages = $derived($agentPipelineStages.slice(-6));
+  // Dedupe by stage name (keep the latest entry per stage) so the keyed {#each} below always has
+  // UNIQUE keys. agentPipelineStages is populated two ways: upsertAgentPipelineStage (already unique)
+  // AND a raw .set() from DB history (App.svelte loadLatestAgentStageEvents) that does NOT dedupe —
+  // that path can repeat a stage name, and a keyed each with a duplicate key throws each_key_duplicate.
+  const recentStages = $derived.by(() => {
+    const byStage = new Map<string, AgentPipelineStage>();
+    for (const s of $agentPipelineStages) byStage.set(s.stage, s);
+    return Array.from(byStage.values()).slice(-6);
+  });
 
   function stageTone(status: string): string {
     if (status === 'completed') return 'border-emerald-700/40 text-emerald-300 bg-emerald-950/30';
