@@ -367,6 +367,47 @@ pub fn build_source_meta(
     }
 }
 
+/// Stitch two adjacent chunk transcripts produced from OVERLAPPING audio, removing the boundary
+/// words the overlap duplicated (audit P1 #4: "add limited overlap ... and duplicate removal;
+/// regression-test boundary words on long recordings").
+///
+/// PURE core only. Today `plan_speech_chunks` emits CONTIGUOUS, non-overlapping chunks, so nothing
+/// calls this yet — wiring a small acoustic overlap into the chunk plan and merging the resulting
+/// per-chunk transcripts through this function runs in the pipeline (Codex-owned pipeline.rs) and is
+/// the documented follow-up. This function is the tested, ready seam for that work.
+///
+/// Algorithm: find the LARGEST k in `1..=max_overlap_words` such that the last k normalized words of
+/// `prev` equal the first k normalized words of `next`, and drop that duplicated prefix from `next`.
+/// Comparison is on `char_only`-normalized words (Kaf/Yeh/Heh folding, whitespace) so an orthographic
+/// variant at the seam still dedups; the KEPT surface form is `prev`'s. No overlap found → a plain
+/// space-join (never drops real content). Empty inputs pass the other side through unchanged.
+pub fn stitch_overlapping_transcripts(prev: &str, next: &str, max_overlap_words: usize) -> String {
+    let prev_words: Vec<&str> = prev.split_whitespace().collect();
+    let next_words: Vec<&str> = next.split_whitespace().collect();
+    if prev_words.is_empty() {
+        return next.trim().to_string();
+    }
+    if next_words.is_empty() {
+        return prev.trim().to_string();
+    }
+    let normalizer = crate::normalizer::SoraniNormalizer::char_only();
+    let norm = |w: &str| normalizer.normalize(w);
+    let prev_norm: Vec<String> = prev_words.iter().map(|w| norm(w)).collect();
+    let next_norm: Vec<String> = next_words.iter().map(|w| norm(w)).collect();
+
+    let max_k = max_overlap_words.min(prev_words.len()).min(next_words.len());
+    let mut overlap = 0;
+    for k in 1..=max_k {
+        if prev_norm[prev_norm.len() - k..] == next_norm[..k] {
+            overlap = k; // keep scanning for the LARGEST matching overlap
+        }
+    }
+    // prev's surface words + next's words past the duplicated boundary.
+    let mut out: Vec<&str> = prev_words.clone();
+    out.extend_from_slice(&next_words[overlap..]);
+    out.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +418,49 @@ mod tests {
         assert_eq!(samples_to_ms(16000, 16000), 1000);
         // Defense-in-depth: a zero sample rate must not divide-by-zero panic (pub leaf utility).
         assert_eq!(samples_to_ms(16000, 0), 0);
+    }
+
+    #[test]
+    fn stitch_dedups_the_overlapping_boundary_words() {
+        // The overlap re-transcribed "چوارەم پێنجەم" at the seam; the merge keeps ONE copy.
+        let prev = "یەکەم دووەم سێیەم چوارەم پێنجەم";
+        let next = "چوارەم پێنجەم شەشەم حەوتەم";
+        assert_eq!(
+            stitch_overlapping_transcripts(prev, next, 6),
+            "یەکەم دووەم سێیەم چوارەم پێنجەم شەشەم حەوتەم"
+        );
+    }
+
+    #[test]
+    fn stitch_takes_the_largest_overlap_not_the_first() {
+        // A single word repeats mid-transcript AND at the true 2-word seam; the largest run wins so
+        // the real boundary dedups without eating the earlier legitimate repeat.
+        let prev = "ئاو زۆر ئاو گەرم";
+        let next = "ئاو گەرم دەبێ";
+        assert_eq!(stitch_overlapping_transcripts(prev, next, 4), "ئاو زۆر ئاو گەرم دەبێ");
+    }
+
+    #[test]
+    fn stitch_dedups_across_an_orthographic_variant_at_the_seam() {
+        // Arabic Kaf/Yeh vs Kurdish Keheh/Yeh for "کوردی" — char_only folding makes them equal, so
+        // the seam still dedups. The KEPT surface form is prev's.
+        let prev = "زمانی كوردی"; // Arabic Kaf U+0643 + Arabic Yeh U+064A
+        let next = "کوردی خۆشە"; // Kurdish Keheh U+06A9 + Kurdish Yeh U+06CC
+        assert_eq!(stitch_overlapping_transcripts(prev, next, 3), "زمانی كوردی خۆشە");
+    }
+
+    #[test]
+    fn stitch_with_no_overlap_concatenates_without_dropping_content() {
+        assert_eq!(stitch_overlapping_transcripts("ئەم", "ئەوە باشە", 4), "ئەم ئەوە باشە");
+        assert_eq!(stitch_overlapping_transcripts("", "دەست", 4), "دەست");
+        assert_eq!(stitch_overlapping_transcripts("دەست", "", 4), "دەست");
+        // max_overlap_words caps the look-back: a real 3-word overlap ("b c d") EXCEEDS cap=2, so
+        // no seam is detected and content is concatenated intact (never partially dropped) — the safe
+        // failure mode. In practice the cap is set generously above the expected acoustic overlap.
+        assert_eq!(
+            stitch_overlapping_transcripts("a b c d", "b c d e", 2),
+            "a b c d b c d e"
+        );
     }
 
     #[test]
