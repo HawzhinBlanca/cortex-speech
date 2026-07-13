@@ -3406,3 +3406,24 @@ Combined with the frontend (npm test 194 passed, lint clean, typecheck 0 errors)
 (31 passed), and clippy --lib --all-targets clean, EVERY automated gate is green on this build.
 Honest note: the earlier same-session "red cargo gate" was a self-inflicted cache artifact, not a
 regression — corrected here for the record.
+
+## 2026-07-13 (cont.) — precise word alignment enabled (owner: "words not aligned to the voice")
+
+Root cause: no mms_aligner.onnx shipped, so aligner.rs falls back to an ENERGY HEURISTIC that spaces
+words evenly and ignores the voice. Fix WITHOUT any download: reuse the bundled OmniASR-CTC-300M as
+the forced aligner. Measured (not assumed): its ONNX signature matches the aligner contract exactly
+(input [1,N] f32 PCM -> logits [1,frames,9812]); 36 s audio -> 1799 frames = 50.0 fps, matching the
+aligner's hardcoded 0.02 s stride; greedy-decoding the real Nawras clip returns correct Sorani; all
+34 Kurdish letters + <pad> blank present. Installed via scripts/setup_word_aligner.py (hardlink the
+model + reduce sherpa `SYMBOL ID` tokens to one-per-line) into %APPDATA%/cortex-speech/models — the
+RAW model_manager.models_dir the aligner reads at pipeline.rs:3146 (NOT the resolved bundled dir the
+ASR uses; that mismatch is pre-existing in Codex-owned pipeline.rs, worked around not edited).
+
+Proof the fix tracks the voice (replicated the exact CTC Viterbi forced alignment on segment 0):
+  دەزگای  CTC 0.00-1.12s (1.12s)   لە  1.50-1.74 (0.24s)   بۆ 4.86-4.94 (0.08s)   ساڵی 4.94-6.26 (1.32s)
+  CTC word-duration spread 0.08-1.32 s (stdev 0.36) vs energy heuristic's FLAT 0.50 s per word.
+
+Gates: scripts/test_word_aligner_policy.py PASS (pins the token conversion: strip id, index-order
+enforced, <pad> required — caught a space-token bug); run_python_policies.py -> 32 passed (was 31).
+NOTE: alignment is on-demand (the "Align" action, pipeline.rs:3124), NOT run at import — existing
+segments keep heuristic timings until re-aligned; new alignments use the CTC path.
