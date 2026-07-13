@@ -3390,3 +3390,19 @@ Verbatim proof (this machine, new build 12:07):
 
 Note: the earlier "interrupted-import DB corruption" attribution was WRONG (id is a PK, no persistent
 dups); the real cause was the in-memory transient above — now structurally impossible to crash on.
+
+## 2026-07-13 (cont.) — full gate suite VERIFIED GREEN (reliability check)
+
+Owner asked "is it reliable." Ran the real gates, not opinion. A first `cargo test` flapped with
+non-deterministic compile errors (151 in gold_wer_eval, then 4x "1 error" in other targets) — the
+signature of a corrupted incremental cache from overlapping/killed cargo builds this session, NOT
+code defects. Cleared target/debug/incremental and re-ran clean:
+
+  $ rm -rf target/debug/incremental && cargo test
+  31 test binaries, ALL ok: 981 passed; 0 failed; 37 ignored   (lib alone: 885 passed, incl.
+  62.46s run). Zero compile errors, zero FAILED.
+
+Combined with the frontend (npm test 194 passed, lint clean, typecheck 0 errors), python policies
+(31 passed), and clippy --lib --all-targets clean, EVERY automated gate is green on this build.
+Honest note: the earlier same-session "red cargo gate" was a self-inflicted cache artifact, not a
+regression — corrected here for the record.
