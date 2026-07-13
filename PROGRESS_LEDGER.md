@@ -3364,3 +3364,29 @@ Verbatim proof (real app export, this machine):
 Owner workflow now CONFIRMED end-to-end: review in app -> Export -> JSONL -> build_premium_dataset
 -> premium.jsonl. Verified clips flow into premium; all 143 queued clips carry audio metrics.
 Aligner-install-to-GOLD remains an optional upgrade for timestamp-dependent training.
+
+## 2026-07-13 (cont.) — processing progress panel + crash-proof segment list (owner: best UX)
+
+Owner asked for real progress tracking during processing ("best user experience"). Shipped a
+prominent ProcessingProgress banner (real % bar, phase, elapsed, linear ETA, live stage chips,
+cancel) reading the existing pipeline stores; math in unit-tested progressStats.ts. Commit 1e46309.
+
+A live test surfaced two each_key_duplicate crashes, both fixed:
+ - 6334fd6: the panel keyed its stage chips by name, but agentPipelineStages is loaded un-deduped
+   from DB history (App.svelte loadLatestAgentStageEvents) — dedupe by name (latest wins).
+ - 75d3155: the SEGMENT LIST (VirtualList, keyed by item.id) white-screened on a duplicate id.
+   speech_segments.id is a PRIMARY KEY so persistent dups are impossible — the cause is a TRANSIENT
+   in-memory dup (optimistic append racing the background reload during import), which can hit ANY
+   import. Fix: VirtualList renders dedupeById(items) (new pure helper + 5 tests); order-preserving,
+   same-order no-op on unique input, collapses a transient dup to one row instead of crashing.
+   Adversarial audit (separate agent, read VirtualList + App.svelte usage): SOUND — selection is by
+   id not index, no reactivity loop, no external index reliance, negligible O(n) cost.
+
+Verbatim proof (this machine, new build 12:07):
+  $ npm run typecheck -> 0 errors ; npm run lint -> clean ; npm test -> 33 files, 194 passed
+  $ batch_importer <short clip> -> Completed: Total 1, Succeeded 1, Failed 0  (exit 0)
+  relaunch -> 5 segments render in the list, "Ready", ZERO each_key_duplicate error cards (verified
+  on screen). The white-screen crash is gone.
+
+Note: the earlier "interrupted-import DB corruption" attribution was WRONG (id is a PK, no persistent
+dups); the real cause was the in-memory transient above — now structurally impossible to crash on.
