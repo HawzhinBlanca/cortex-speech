@@ -116,73 +116,130 @@ fn build_user_prompt(
     )
 }
 
-// ─── Gemini API call ─────────────────────────────────────────────────────────
+// ─── Audio judge API call (provider-agnostic) ────────────────────────────────
 
-fn call_gemini_audio(
+/// Where T2 sends the contested audio. OpenRouter lets the owner reach Gemini-class — and future,
+/// better — audio models through ONE OpenAI-compatible endpoint + key, sidestepping the direct-Gemini
+/// 429 quota and making the judge model swappable (`google/gemini-2.5-pro`, `qwen/qwen3-asr-flash`,
+/// `google/chirp-3`, …) with no code change. `GeminiDirect` preserves the original behavior exactly.
+#[derive(Debug, Clone)]
+pub enum T2Endpoint {
+    /// Google's direct `generativelanguage` REST surface (`x-goog-api-key` + `inlineData`).
+    GeminiDirect,
+    /// Any OpenAI-compatible `chat/completions` endpoint (`Bearer` + `input_audio`), e.g. OpenRouter's
+    /// `https://openrouter.ai/api/v1/chat/completions`.
+    OpenAiCompatible { url: String },
+}
+
+/// Parse a judge's raw JSON text (`{transcript, reason, confidence}`) into a sample, clamping the
+/// untrusted self-reported confidence to [0,1] (NaN/inf → 0.0) so a malformed value (a percentage
+/// like 92, or a negative) can never sail through the >= 0.85 training-promotion gate downstream.
+/// Shared by both providers so the trust rule is identical regardless of transport.
+fn sample_from_json(raw_text: &str) -> Result<GeminiSample, String> {
+    let raw_text = raw_text.trim();
+    if raw_text.is_empty() {
+        return Err("Missing text in judge response".to_string());
+    }
+    let mut sample = serde_json::from_str::<GeminiSample>(raw_text)
+        .map_err(|e| format!("Failed to parse judge JSON sample: {e}\nRaw: {raw_text}"))?;
+    sample.confidence = if sample.confidence.is_finite() { sample.confidence.clamp(0.0, 1.0) } else { 0.0 };
+    Ok(sample)
+}
+
+/// Build the Gemini-direct `generateContent` body (systemInstruction + inline audio + JSON mode).
+fn build_gemini_audio_payload(audio_b64: &str, system_prompt: &str, user_prompt: &str) -> serde_json::Value {
+    json!({
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "contents": [{
+            "parts": [
+                { "inlineData": { "mimeType": "audio/wav", "data": audio_b64 } },
+                { "text": user_prompt }
+            ]
+        }],
+        "generationConfig": { "temperature": 0.1, "responseMimeType": "application/json" }
+    })
+}
+
+/// Build the OpenAI-compatible `chat/completions` body with an `input_audio` (base64 WAV) part —
+/// the shape OpenRouter and gpt-audio expect. `response_format: json_object` mirrors Gemini's JSON mode.
+fn build_openai_audio_payload(
+    model: &str,
+    audio_b64: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> serde_json::Value {
+    json!({
+        "model": model,
+        "temperature": 0.1,
+        "response_format": { "type": "json_object" },
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": [
+                { "type": "input_audio", "input_audio": { "data": audio_b64, "format": "wav" } },
+                { "type": "text", "text": user_prompt }
+            ]}
+        ]
+    })
+}
+
+/// Extract the concatenated text of Gemini's response. Gemini can split one response across
+/// `content.parts[0..N]` (and a 2.5-class "thinking" model can emit a leading thought part), so
+/// indexing `parts[0]` alone would silently truncate or read the wrong part.
+fn gemini_text_from_body(body: &serde_json::Value) -> String {
+    body["candidates"][0]["content"]["parts"]
+        .as_array()
+        .map(|ps| {
+            ps.iter().filter_map(|p| p.get("text").and_then(serde_json::Value::as_str)).collect::<Vec<_>>().join("")
+        })
+        .unwrap_or_default()
+}
+
+/// Extract the assistant text from an OpenAI-compatible response (`choices[0].message.content`).
+fn openai_text_from_body(body: &serde_json::Value) -> String {
+    body["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string()
+}
+
+/// Send the contested audio to the configured judge endpoint and parse one structured sample.
+/// Dispatches on `endpoint`; the two providers differ only in URL, auth header, request body, and the
+/// response text location — the sample parse + confidence clamp are shared (`sample_from_json`).
+fn call_audio_judge(
+    endpoint: &T2Endpoint,
     audio_b64: &str,
     model: &str,
     api_key: &str,
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<GeminiSample, String> {
-    let url = gemini_api::generate_content_url(model);
-
-    let payload = json!({
-        "systemInstruction": {
-            "parts": [{ "text": system_prompt }]
-        },
-        "contents": [{
-            "parts": [
-                {
-                    "inlineData": {
-                        "mimeType": "audio/wav",
-                        "data": audio_b64
-                    }
-                },
-                { "text": user_prompt }
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 0.1,
-            "responseMimeType": "application/json"
+    // json_bounded, NOT into_json (true-10 audit 2026-07-09 — provider-body OOM guard): T2 is the
+    // highest-volume cloud endpoint (n_samples calls per contested segment, over a whole batch);
+    // into_json streams bounded only by the read TIMEOUT, so a trickled multi-GB body could allocate
+    // unbounded and OOM the process mid-review. The 64 MiB cap matches every sibling deserialization.
+    let raw_text = match endpoint {
+        T2Endpoint::GeminiDirect => {
+            let url = gemini_api::generate_content_url(model);
+            let payload = build_gemini_audio_payload(audio_b64, system_prompt, user_prompt);
+            let resp = gemini_api::with_api_key(crate::http::API_AGENT.post(&url), api_key)
+                .set("Content-Type", "application/json")
+                .send_json(payload)
+                .map_err(|e| format!("Gemini API request failed: {}", redact_api_key(&e.to_string(), api_key)))?;
+            let body: serde_json::Value =
+                crate::http::json_bounded(resp).map_err(|e| format!("Failed to parse Gemini response: {e}"))?;
+            gemini_text_from_body(&body)
         }
-    });
-
-    let resp = gemini_api::with_api_key(crate::http::API_AGENT.post(&url), api_key)
-        .set("Content-Type", "application/json")
-        .send_json(payload)
-        .map_err(|e| format!("Gemini API request failed: {}", redact_api_key(&e.to_string(), api_key)))?;
-
-    // json_bounded, NOT into_json (true-10 audit 2026-07-09 — regression of the provider-body OOM
-    // guard): T2 is the highest-volume cloud endpoint (n_samples Gemini calls per contested segment,
-    // per-segment over a whole batch); into_json streams bounded only by the read TIMEOUT, so a
-    // trickled multi-GB body could allocate unbounded and OOM the process mid-review. The 64 MiB cap
-    // matches every sibling provider deserialization (llm_refiner/scribe/agentic).
-    let body: serde_json::Value =
-        crate::http::json_bounded(resp).map_err(|e| format!("Failed to parse Gemini response: {e}"))?;
-
-    // Concatenate ALL text parts. Gemini can split one response across content.parts[0..N] (and a
-    // 2.5-class "thinking" model can emit a leading thought part), so indexing parts[0] alone would
-    // silently truncate the response or read the wrong part. For this JSON response-mode call,
-    // reassembling every text part reconstructs the full document before parsing.
-    let raw_text: String = body["candidates"][0]["content"]["parts"]
-        .as_array()
-        .map(|ps| {
-            ps.iter().filter_map(|p| p.get("text").and_then(serde_json::Value::as_str)).collect::<Vec<_>>().join("")
-        })
-        .unwrap_or_default();
-    let raw_text = raw_text.trim();
-    if raw_text.is_empty() {
-        return Err("Missing text in Gemini response".to_string());
-    }
-
-    let mut sample = serde_json::from_str::<GeminiSample>(raw_text)
-        .map_err(|e| format!("Failed to parse Gemini JSON sample: {e}\nRaw: {raw_text}"))?;
-    // The model's self-reported confidence is untrusted: clamp to [0,1] (NaN/inf → 0.0) so a malformed
-    // value (a percentage like 92, or a negative) can never sail through the >= 0.85 training-promotion
-    // gate downstream.
-    sample.confidence = if sample.confidence.is_finite() { sample.confidence.clamp(0.0, 1.0) } else { 0.0 };
-    Ok(sample)
+        T2Endpoint::OpenAiCompatible { url } => {
+            let payload = build_openai_audio_payload(model, audio_b64, system_prompt, user_prompt);
+            let resp = crate::http::API_AGENT
+                .post(url)
+                .set("Content-Type", "application/json")
+                .set("Authorization", &format!("Bearer {api_key}"))
+                .send_json(payload)
+                .map_err(|e| format!("OpenRouter audio request failed: {}", redact_api_key(&e.to_string(), api_key)))?;
+            let body: serde_json::Value =
+                crate::http::json_bounded(resp).map_err(|e| format!("Failed to parse OpenRouter response: {e}"))?;
+            openai_text_from_body(&body)
+        }
+    };
+    sample_from_json(&raw_text)
 }
 
 // ─── Self-consistency voting ─────────────────────────────────────────────────
@@ -269,8 +326,37 @@ pub fn listen_and_judge(
     model: &str,
     n_samples: usize,
 ) -> T2Result {
+    // Backwards-compatible entry point: the direct-Gemini transport (the original behavior). Callers
+    // that want the audio jury routed through OpenRouter (Gemini-via-OpenRouter, or a swappable audio
+    // model) call `listen_and_judge_via` with `T2Endpoint::OpenAiCompatible`.
+    listen_and_judge_via(
+        &T2Endpoint::GeminiDirect,
+        audio_b64,
+        hypotheses,
+        t1_evidence,
+        few_shots,
+        api_key,
+        model,
+        n_samples,
+    )
+}
+
+/// Run the T2 listening jury against a specific endpoint (direct Gemini or an OpenAI-compatible
+/// gateway such as OpenRouter). Identical self-consistency, grounding, and escalation logic — only the
+/// transport differs.
+#[allow(clippy::too_many_arguments)]
+pub fn listen_and_judge_via(
+    endpoint: &T2Endpoint,
+    audio_b64: &str,
+    hypotheses: &[SegmentHypothesis],
+    t1_evidence: &[Evidence],
+    few_shots: &[crate::jury::FewShotExample],
+    api_key: &str,
+    model: &str,
+    n_samples: usize,
+) -> T2Result {
     if api_key.trim().is_empty() {
-        return T2Result { verdict: None, must_escalate: true, error: Some("Gemini API key not configured.".into()) };
+        return T2Result { verdict: None, must_escalate: true, error: Some("Judge API key not configured.".into()) };
     }
 
     let sys = build_system_prompt();
@@ -278,7 +364,7 @@ pub fn listen_and_judge(
 
     for i in 0..n_samples {
         let prompt = build_user_prompt(hypotheses, t1_evidence, few_shots, i);
-        match call_gemini_audio(audio_b64, model, api_key, sys, &prompt) {
+        match call_audio_judge(endpoint, audio_b64, model, api_key, sys, &prompt) {
             Ok(s) => samples.push(s),
             Err(e) => {
                 tracing::warn!("T2 sample {i} failed: {e}");
@@ -608,5 +694,65 @@ mod tests {
         // A near-identical post-edit of the substantive hypothesis stays grounded.
         let edited = "دەزگای ڕوانگە لە ڕەسمێکی شایستەدا ئەنجامەکان ڕادەگەیەنرێت";
         assert!(is_grounded_post_edit(edited, &hyps), "a small edit of the substantive hypothesis is grounded");
+    }
+
+    #[test]
+    fn openai_audio_payload_carries_model_audio_and_prompts_in_openai_shape() {
+        let p = build_openai_audio_payload("google/gemini-2.5-pro", "AUDIOB64", "SYS", "USER");
+        assert_eq!(p["model"], "google/gemini-2.5-pro");
+        assert_eq!(p["response_format"]["type"], "json_object", "JSON mode mirrors Gemini's responseMimeType");
+        assert_eq!(p["messages"][0]["role"], "system");
+        assert_eq!(p["messages"][0]["content"], "SYS");
+        // The audio rides as an OpenAI-style input_audio part (base64 WAV), with the user text alongside.
+        let user_parts = p["messages"][1]["content"].as_array().expect("user content is a parts array");
+        assert_eq!(user_parts[0]["type"], "input_audio");
+        assert_eq!(user_parts[0]["input_audio"]["data"], "AUDIOB64");
+        assert_eq!(user_parts[0]["input_audio"]["format"], "wav");
+        assert_eq!(user_parts[1]["type"], "text");
+        assert_eq!(user_parts[1]["text"], "USER");
+    }
+
+    #[test]
+    fn gemini_audio_payload_uses_inline_data_and_json_mode() {
+        let p = build_gemini_audio_payload("AUDIOB64", "SYS", "USER");
+        assert_eq!(p["systemInstruction"]["parts"][0]["text"], "SYS");
+        assert_eq!(p["contents"][0]["parts"][0]["inlineData"]["mimeType"], "audio/wav");
+        assert_eq!(p["contents"][0]["parts"][0]["inlineData"]["data"], "AUDIOB64");
+        assert_eq!(p["contents"][0]["parts"][1]["text"], "USER");
+        assert_eq!(p["generationConfig"]["responseMimeType"], "application/json");
+    }
+
+    #[test]
+    fn text_extractors_read_each_providers_response_shape() {
+        // OpenAI-compatible: choices[0].message.content.
+        let openai = json!({ "choices": [{ "message": { "content": "{\"transcript\":\"x\"}" } }] });
+        assert_eq!(openai_text_from_body(&openai), "{\"transcript\":\"x\"}");
+        // Gemini: candidates[0].content.parts[*].text, concatenated (thought part + answer part).
+        let gemini = json!({ "candidates": [{ "content": { "parts": [{ "text": "{\"a\":" }, { "text": "1}" }] } }] });
+        assert_eq!(gemini_text_from_body(&gemini), "{\"a\":1}");
+        // Missing fields degrade to empty (never panic) so the caller escalates rather than crashing.
+        assert_eq!(openai_text_from_body(&json!({})), "");
+        assert_eq!(gemini_text_from_body(&json!({})), "");
+    }
+
+    #[test]
+    fn sample_from_json_parses_and_clamps_untrusted_confidence() {
+        // A well-formed sample parses as-is.
+        let s = sample_from_json("{\"transcript\":\"کوردستان\",\"reason\":\"r\",\"confidence\":0.9}").unwrap();
+        assert_eq!(s.transcript, "کوردستان");
+        assert!((s.confidence - 0.9).abs() < 1e-9);
+        // An out-of-range self-reported confidence (a percentage) is clamped to [0,1] — it must never
+        // clear the >= 0.85 promotion gate on a bogus value regardless of which provider produced it.
+        assert_eq!(
+            sample_from_json("{\"transcript\":\"t\",\"reason\":\"\",\"confidence\":92}").unwrap().confidence,
+            1.0
+        );
+        assert_eq!(
+            sample_from_json("{\"transcript\":\"t\",\"reason\":\"\",\"confidence\":-3}").unwrap().confidence,
+            0.0
+        );
+        // Empty / non-JSON text is a hard error (escalates), not a silent empty verdict.
+        assert!(sample_from_json("   ").is_err());
+        assert!(sample_from_json("not json").is_err());
     }
 }
