@@ -40,8 +40,12 @@ def _seg(**over):
         "id": f"seg-{len(str(over))}-{sorted(over) or 'base'}",
         "audioPath": "clip.wav",
         "trainingTranscript": "ئاوەکە بۆ ئاودان بەکاردێتەوە بۆ پیشەسازی",
-        "trainingReady": True,
-        "trainingGrade": "gold",
+        # A human-verified clip the aligner-less app grades REVIEW for energy_heuristic alignment —
+        # the REAL shape of every clip on this machine. It must be premium-eligible (owner decision):
+        # trainingReady=false and grade=review, but the only review-risks are alignment.
+        "trainingReady": False,
+        "trainingGrade": "review",
+        "trainingReasons": ["low_confidence_alignment", "energy_heuristic_alignment", "human_verified"],
         "transcriptSource": "human_verified",
         "verified": True,
         "durationMs": 4000,
@@ -112,9 +116,25 @@ def test_human_gate_is_transcript_source():
         assert any(r.startswith("not-human-verified") for r in reasons), (source, reasons)
 
 
+def test_alignment_only_review_risk_is_tolerated_but_audio_risk_is_not():
+    # THE owner-decision property (2026-07-13): a human-verified clip the aligner-less app graded
+    # REVIEW *only* for alignment is premium — trainingReady=false must NOT block it.
+    assert _eval(_seg()) == [], "human-verified + alignment-only REVIEW must be premium"
+    assert _eval(_seg(trainingReady=False, trainingGrade="review",
+                      trainingReasons=["energy_heuristic_alignment", "human_verified"])) == []
+    # ...but a REAL audio review-risk the app flagged still rejects, even human-verified...
+    for risk in ("clipping_warning", "low_rms_volume", "low_snr"):
+        reasons = _eval(_seg(trainingReasons=[risk, "energy_heuristic_alignment", "human_verified"]))
+        assert any(r.startswith("audio-review-risk") for r in reasons), (risk, reasons)
+    # ...and the app's hard REJECT grade (human-rejected / blank / placeholder / severe audio) rejects.
+    reasons = _eval(_seg(trainingGrade="reject", trainingReasons=["human_rejected"]))
+    assert any(r.startswith("app-rejected") for r in reasons), reasons
+
+
 def test_every_gate_rejects_with_a_reason():
     cases = {
-        "not-training-ready": _seg(trainingReady=False),
+        "app-rejected": _seg(trainingGrade="reject", trainingReasons=["human_rejected"]),
+        "audio-review-risk": _seg(trainingReasons=["low_snr", "energy_heuristic_alignment", "human_verified"]),
         "not-human-verified": _seg(transcriptSource="jury_verdict"),
         "empty-training-transcript": _seg(trainingTranscript="  "),
         "fillers": _seg(trainingTranscript=f"باشە {HEH_EXPORTED} ئەوە دەکەم"),

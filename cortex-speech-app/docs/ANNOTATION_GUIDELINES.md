@@ -60,6 +60,15 @@ JSONL export. It keeps only segments that are human-verified AND pass, among oth
 - duration, chars-per-second, clipping/SNR/RMS bounds (the app's own measured metrics);
 - optional owner-supplied blockword list.
 
+**Alignment note (important).** The app's own `trainingReady`/GOLD grade *also* requires
+MMS-precise word timestamps. That model (`mms_aligner.onnx`) is not installed, so every clip
+is graded `review` for `energy_heuristic_alignment` — including clips you verify. Because ASR
+audio→text training does **not** use word timestamps, the premium builder deliberately does
+**not** gate on `trainingReady`: a human-verified clip with clean audio and clean text is
+premium regardless of alignment source. It still excludes the app's hard `reject` grade and any
+real audio review-risk (clipping/low-RMS/low-SNR). If you later want precise word timings (for
+CTC/forced-alignment training), install the aligner and re-process — that lifts clips to GOLD.
+
 That script — not the annotator — is where "no fillers, clean audio, full sentences"
 happens. **Your job in review is only ever the truth of §1–§3.** A verbatim segment
 containing `ئەمم` is a *correct, valuable* segment; the premium builder simply routes it

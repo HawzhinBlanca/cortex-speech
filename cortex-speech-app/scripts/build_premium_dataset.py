@@ -8,8 +8,11 @@ never silently rewritten — rewriting text while the audio still contains the s
 recreate the exact audio/text mismatch that poisons ASR training.
 
 Gates (each rejection carries machine-readable reasons; nothing is dropped silently):
-  identity   — trainingReady == true AND transcriptSource == "human_verified" (covers both the
-               verify button AND Review-Inbox accept/edit verdicts, which export verified=false)
+  identity   — transcriptSource == "human_verified" (covers the verify button AND Review-Inbox
+               accept/edit verdicts, which export verified=false) AND trainingGrade != "reject"
+               AND no NON-alignment audio review-risk. NOT gated on trainingReady: that GOLD bar
+               also requires MMS-precise word timestamps, which ASR audio->text training ignores,
+               and which every clip fails while the aligner model is absent (energy_heuristic).
   text       — no canonical filler tokens, no elongated hesitations, no `X-` false-start
                fragments, optional owner blockword list, minimum word count (full sentences)
   timing     — duration within bounds; chars-per-second within bounds (garbage detector)
@@ -78,6 +81,14 @@ ELONGATION = re.compile(r"([^\W\d_])\1\1")
 # marker fragment_tokens_in must still see after stripping.
 PUNCT_STRIP = "،؟؛.!,?;:…«»()[]{}\"'‌"
 
+# App review-risk reasons (quality.rs) that flag a REAL AUDIO problem. These still reject a clip
+# even after human verification. The two ALIGNMENT risks — low_confidence_alignment and
+# energy_heuristic_alignment — are deliberately NOT here: they concern word-timestamp precision,
+# which ASR audio->text training does not use, so a human-verified clip that the app downgraded to
+# REVIEW *only* for alignment is still premium (owner decision 2026-07-13). Any audio risk below,
+# or the app's REJECT grade, still excludes the clip.
+NON_ALIGNMENT_AUDIO_RISK = frozenset(["clipping_warning", "low_rms_volume", "low_snr"])
+
 
 def tokens_of(text: str) -> list[str]:
     return text.split()
@@ -121,17 +132,28 @@ def evaluate_segment(seg: dict, cfg: argparse.Namespace, blockwords: frozenset[s
     reasons = []
     text = (seg.get("trainingTranscript") or "").strip()
 
-    # identity: only human-verified, training-ready truth may enter the best tier.
-    # The human signal is transcriptSource == "human_verified" (quality.rs
-    # training_transcript_with_source): it covers BOTH verification flows — the verify button
-    # (verified=true) AND a Review-Inbox accept/edit verdict, which the app records in
-    # human_decision while the verified flag stays false. Gating on the verified flag alone
-    # wrongly rejected every Review-Inbox decision (adversarial review finding). It also
-    # excludes SILVER rows (machine-evidence-only trainingReady) from the premium tier.
-    if not seg.get("trainingReady"):
-        reasons.append(f"not-training-ready:grade={seg.get('trainingGrade', '?')}")
+    # identity: human-verified truth the app did not REJECT, with no real audio review-risk.
+    #
+    # We deliberately DO NOT gate on trainingReady. That GOLD bar (quality.rs) also demands
+    # MMS-precise word timestamps, and with the aligner model absent EVERY clip is graded REVIEW
+    # for energy_heuristic_alignment — so trainingReady is false for every clip, even ones the
+    # human verified. ASR audio->text training does not use word timestamps, so alignment source
+    # must not block the premium tier (owner decision 2026-07-13). Instead we require the SUBSTANCE:
+    #   - transcriptSource == "human_verified": the human confirmed the text. Covers BOTH the verify
+    #     button (verified=true) AND Review-Inbox accept/edit verdicts (verified=false but
+    #     human_decision set) — gating on the verified flag alone wrongly rejected inbox verdicts.
+    #   - trainingGrade != "reject": excludes human-rejected / blank / placeholder / SEVERE-audio
+    #     clips (the app's hard REJECT, which overrides everything).
+    #   - no NON-alignment audio review-risk: a clip the app flagged for clipping/low-RMS/low-SNR is
+    #     still out, even if human-verified. Alignment-only review-risk is tolerated (see above).
+    # The explicit measured-metric audio gates below are kept too (defense in depth).
     if seg.get("transcriptSource") != "human_verified":
         reasons.append(f"not-human-verified:source={seg.get('transcriptSource', '?')}")
+    if seg.get("trainingGrade") == "reject":
+        reasons.append("app-rejected:" + "|".join((seg.get("trainingReasons") or [])[:5]))
+    audio_risk = [r for r in (seg.get("trainingReasons") or []) if r in NON_ALIGNMENT_AUDIO_RISK]
+    if audio_risk:
+        reasons.append("audio-review-risk:" + "|".join(audio_risk))
     if not text:
         reasons.append("empty-training-transcript")
         return reasons  # nothing further to measure on empty text
