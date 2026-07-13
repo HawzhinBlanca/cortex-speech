@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import type { Snippet } from 'svelte';
   import type { SpeechSegment } from './types';
+  import { dedupeById } from './dedupeById';
 
   interface Props {
     items: SpeechSegment[];
@@ -16,7 +17,13 @@
   let container: HTMLDivElement;
   let scrollTop = $state(0);
   let containerHeight = $state(600);
-  let totalHeight = $derived(items.length * itemHeight);
+
+  // Render a by-id-unique view of the incoming items. The keyed {#each} below crashes the whole list
+  // (Svelte each_key_duplicate) if two rows share an id, which can happen for one frame when an import
+  // optimistically appends a segment the background reload also re-fetches. Deduping here makes the
+  // list crash-proof regardless of what the parent passes; on unique input it is a same-order no-op.
+  let rows = $derived(dedupeById(items));
+  let totalHeight = $derived(rows.length * itemHeight);
 
   // Clamp scrollTop against the CURRENT content height. When `items` shrinks (e.g. a search filter
   // narrows the list) while scrolled down, the stale scrollTop is only reset by the browser's async
@@ -26,9 +33,9 @@
 
   let startIndex = $derived(Math.max(0, Math.floor(effScroll / itemHeight) - overscan));
   let endIndex = $derived(
-    Math.min(items.length, Math.ceil((effScroll + containerHeight) / itemHeight) + overscan),
+    Math.min(rows.length, Math.ceil((effScroll + containerHeight) / itemHeight) + overscan),
   );
-  let visibleItems = $derived(items.slice(startIndex, endIndex));
+  let visibleItems = $derived(rows.slice(startIndex, endIndex));
   let offsetY = $derived(startIndex * itemHeight);
 
   onMount(() => {
