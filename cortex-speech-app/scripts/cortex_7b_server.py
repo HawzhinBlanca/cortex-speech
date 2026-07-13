@@ -261,6 +261,24 @@ def main() -> None:
         children.append(pid)
     srv.close()  # only the workers accept
     print(f"parent: {len(children)} workers forked (pids {children}); serving once all load.", flush=True)
+
+    # Forward termination to the fleet: without this, killing the parent (pkill / a restart script)
+    # ORPHANS the GPU replicas — they keep the listen port and ~19 GB VRAM per card, and the
+    # "restart the server to restore capacity" advice fails because the new parent can't bind.
+    # SIGTERM every child, then let the normal supervise loop below reap them and exit.
+    import signal
+
+    def _forward_termination(signum, _frame):
+        print(f"parent: signal {signum} — terminating {len(children)} worker(s)", flush=True)
+        for pid in children:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass  # already gone
+
+    signal.signal(signal.SIGTERM, _forward_termination)
+    signal.signal(signal.SIGINT, _forward_termination)
+
     supervise_workers(set(children), len(children))
 
 

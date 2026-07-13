@@ -153,7 +153,9 @@
   let retranscribing = $state(false);
   async function retranscribe(engine: 'champion' | 'finetuned') {
     const seg = current;
-    if (!seg || retranscribing || saving) return;
+    // `aligning` too: the clip-load background align persists fresh CTC timings mid-flight; an
+    // upsert built from the pre-align snapshot would revert them (stale-spread clobber).
+    if (!seg || retranscribing || saving || aligning) return;
     retranscribing = true;
     try {
       const result =
@@ -162,7 +164,7 @@
           : await api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id);
       const text = result.text;
       const updated: SpeechSegment = {
-        ...seg,
+        ...freshRow(seg.id, seg),
         rawTranscript: result.rawTranscript,
         annotatedTranscript: text,
         verified: false,
@@ -209,16 +211,16 @@
   // Records a human 'reject' decision (verdict = human_reject) which the export path already honors.
   async function markBad() {
     const seg = current;
-    if (!seg || saving || retranscribing) return;
+    if (!seg || saving || retranscribing || aligning) return;
     // No blocking confirm (true-10 audit): 'x' is undoable via Backspace now, so a native
     // window.confirm per press only broke the keyboard flow.
     saving = true;
     try {
       undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
       // recordHumanDecision FIRST so a validation failure aborts before updateSegment commits (same
-      // ordering rationale as submit()).
+      // ordering rationale as submit()). freshRow AFTER it: same stale-spread rationale as submit().
       await api.recordHumanDecision(seg.id, 'reject', null);
-      const updated: SpeechSegment = { ...seg, verified: true };
+      const updated: SpeechSegment = { ...freshRow(seg.id, seg), verified: true };
       await api.updateSegment(updated);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       notifications.success($t('review.markedBad'));
@@ -331,6 +333,15 @@
     return seg.annotatedTranscript ?? seg.normalizedTranscript ?? seg.rawTranscript ?? '';
   }
 
+  // Rebuild an upsert payload from the FRESHEST store copy of the row. update_segment writes the
+  // WHOLE row (insert_segment ON CONFLICT — including alignment_json and alignment_quality), so
+  // spreading a segment captured before a multi-second await lets the background aligner's freshly
+  // persisted CTC timings be silently reverted by the stale copy. ensureWordTimings reloads the
+  // store right after it persists, so re-reading by id at persist time carries those columns.
+  function freshRow(id: string, fallback: SpeechSegment): SpeechSegment {
+    return get(segments).find((s) => s.id === id) ?? fallback;
+  }
+
   // Plain (non-reactive) cache of in-progress edits keyed by segment id, so switching clips — via
   // prev/next OR a queue reorder from a concurrent store reload — never silently discards an unsaved
   // correction. Cleared per id on a successful save.
@@ -386,7 +397,7 @@
     // several seconds, and accepting/saving mid-flight would record a human decision on the stale
     // pre-retranscribe draft that the in-flight run is about to overwrite — the human "accept" would
     // land on text the reviewer no longer sees.
-    if (!seg || saving || retranscribing) return;
+    if (!seg || saving || retranscribing || aligning) return;
     const original = originalText(seg).trim();
     const text = acceptAsIs ? original : editText.trim();
     // Never save an empty edit (mirrors the Save button's disabled guard — the Ctrl+Enter shortcut
@@ -404,7 +415,6 @@
     // Map to a real human decision: an actual change is an "edit" (the typed text becomes gold), a
     // no-change save is an "accept".
     const isEdit = !acceptAsIs && text !== original;
-    const updated: SpeechSegment = { ...seg, annotatedTranscript: text, verified: true };
     try {
       undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
       // BOTH calls are required, recordHumanDecision FIRST: it validates the decision (an empty edit
@@ -420,6 +430,10 @@
       // typed text is the label; for an accept the displayed original is. (Backend only captures a
       // LOOP-0 memory / ledger row on 'edit', so an accept with text stays a pure verdict overwrite.)
       await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', text);
+      // Build the upsert AFTER the slow decision call (whole-file hash on 'edit' takes hundreds of
+      // ms) from the freshest store row: update_segment writes the whole row, so a pre-await spread
+      // would revert timings the background aligner persisted inside that window.
+      const updated: SpeechSegment = { ...freshRow(seg.id, seg), annotatedTranscript: text, verified: true };
       await api.updateSegment(updated);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       editCache.delete(seg.id); // persisted — drop the in-progress copy

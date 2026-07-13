@@ -11,20 +11,27 @@
   type EngineState = 'checking' | 'ready' | 'offline' | 'starting';
   let state = $state<EngineState>('checking');
   let poll: ReturnType<typeof setInterval> | undefined;
+  // 'starting' must not be a one-way state: if the engine process dies during its multi-minute
+  // model load, polls kept 'starting' alive forever and the Start button (offline-only) never came
+  // back. Give the warmup a generous deadline, then honestly return to offline.
+  const WARMUP_DEADLINE_MS = 8 * 60 * 1000;
+  let startingSince = 0;
 
   async function refresh() {
+    const warmupExpired = state === 'starting' && Date.now() - startingSince > WARMUP_DEADLINE_MS;
     try {
       const s = await api.getChampionEngineStatus();
       if (s.ready) state = 'ready';
-      else if (state !== 'starting') state = 'offline'; // don't drop 'starting' back to offline mid-warmup
+      else if (state !== 'starting' || warmupExpired) state = 'offline';
     } catch {
-      if (state !== 'starting') state = 'offline';
+      if (state !== 'starting' || warmupExpired) state = 'offline';
     }
   }
 
   async function start() {
     try {
       state = 'starting';
+      startingSince = Date.now();
       await api.startChampionEngine();
     } catch (e) {
       state = 'offline';

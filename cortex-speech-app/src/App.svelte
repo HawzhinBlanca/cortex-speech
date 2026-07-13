@@ -1020,8 +1020,13 @@
       statusMessage.set($t('pipeline.importing'));
       await api.importDirectory();
     } catch (e) {
-      notifyActionableError(e, $t('importFailed'));
-      statusMessage.set($t('importFailed'));
+      // Cancelling the native folder picker rejects with "No directory selected" — a routine
+      // cancel, not a failure. Reset quietly instead of flashing a red "Import failed" toast.
+      const cancelled = String(e).includes('No directory selected');
+      if (!cancelled) {
+        notifyActionableError(e, $t('importFailed'));
+      }
+      statusMessage.set(cancelled ? $t('ready') : $t('importFailed'));
       isProcessing.set(false);
       pipelinePhase.set('idle');
       pipelineCurrentFile.set('');
@@ -1067,10 +1072,18 @@
       const annotatedTranscript = result.text;
       let normalizedTranscript = seg.normalizedTranscript;
       if ($settings.autoNormalize) {
-        normalizedTranscript = await api.normalizeText(result.text);
+        // Best-effort: a normalize failure (rate limit, validation) must never discard the
+        // just-succeeded multi-second GPU transcription — save the raw result and say what failed.
+        try {
+          normalizedTranscript = await api.normalizeText(result.text);
+        } catch (normalizeError) {
+          notifications.error($t('notifications.normalizeFailed'), { detail: String(normalizeError) });
+        }
       }
       const updatedSeg = {
-        ...seg,
+        // freshRow-by-id: the store row may have gained columns (speaker id autosave, background
+        // align stamps) during the multi-second ASR await — never upsert the stale pre-await copy.
+        ...($segments.find((s) => s.id === seg.id) ?? seg),
         rawTranscript,
         annotatedTranscript,
         normalizedTranscript,
@@ -1132,7 +1145,9 @@
     try {
       const result = await api.transcribeSegmentConstrained(seg.audioPath, seg.alignmentJson);
       const updatedSeg = {
-        ...seg,
+        // freshRow-by-id: never upsert the stale pre-await copy (it reverts columns persisted during
+        // the multi-second ASR await — speaker autosave, background align stamps).
+        ...($segments.find((s) => s.id === seg.id) ?? seg),
         rawTranscript: result.rawTranscript,
         annotatedTranscript: result.text,
         // A re-transcription is machine output — reset verified so it isn't kept as human-verified.
@@ -1170,7 +1185,8 @@
     try {
       const result = await api.transcribeSegmentFinetuned(seg.audioPath, seg.alignmentJson);
       const updatedSeg = {
-        ...seg,
+        // freshRow-by-id: same stale-spread guard as the other transcribe handlers.
+        ...($segments.find((s) => s.id === seg.id) ?? seg),
         rawTranscript: result.rawTranscript,
         annotatedTranscript: result.text,
         // A re-transcription is machine output — reset verified so it isn't kept as human-verified.
@@ -1210,7 +1226,13 @@
       const text = await api.transcribeWithScribe(seg.audioPath, seg.alignmentJson);
       // A fresh MACHINE re-transcription: reset verified=false so the new text is never presented as
       // human-verified (the honesty guardrail), and so the human re-reviews the replaced transcript.
-      await api.updateSegment({ ...seg, rawTranscript: text, annotatedTranscript: text, verified: false });
+      // freshRow-by-id: same stale-spread guard as the other transcribe handlers.
+      await api.updateSegment({
+        ...($segments.find((s) => s.id === seg.id) ?? seg),
+        rawTranscript: text,
+        annotatedTranscript: text,
+        verified: false,
+      });
       await loadSegments();
       // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
       // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
@@ -1358,6 +1380,10 @@
       segments.update((list) =>
         list.map((s) => (s.id === seg.id ? { ...s, verified: nextVerified } : s)),
       );
+      // The bump above may have cancelled a legitimate reload (e.g. a WSL batch completion refresh
+      // walking its pages) whose data would then never arrive — run a FRESH load, which reads
+      // post-write rows and so carries both the batch results and this verify.
+      void segments.load();
       await historyStore.refresh();
     } catch (e) {
       // Revert Svelte store state on error
@@ -2891,6 +2917,7 @@
                 class="input h-32 resize-none font-mono text-sm text-end"
                 value={$selectedSegment.annotatedTranscript ?? ''}
                 placeholder={$t('editTranscript')}
+                disabled={$isProcessing || $batchProgress.status === 'running'}
                 oninput={(e) => {
                   const seg = $selectedSegment;
                   if (seg) {
@@ -2912,6 +2939,7 @@
                   class="input !text-xs font-mono"
                   value={$selectedSegment.speakerId ?? ''}
                   placeholder={$t('batchAssignSpeaker.placeholder')}
+                  disabled={$isProcessing || $batchProgress.status === 'running'}
                   oninput={(e) => {
                     const seg = $selectedSegment;
                     if (seg) {

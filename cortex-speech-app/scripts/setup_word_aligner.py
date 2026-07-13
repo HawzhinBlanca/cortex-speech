@@ -25,7 +25,7 @@ tokens reduced to one SYMBOL per line, index-aligned, as aligner.rs expects). No
 
 USAGE
   python scripts/setup_word_aligner.py            # auto-detect bundled model + app-data dir
-  python scripts/setup_word_aligner.py --app-data "C:/Users/<you>/AppData/Roaming/cortex-speech"
+  python scripts/setup_word_aligner.py --app-data "%APPDATA%/cortex-speech"
   python scripts/setup_word_aligner.py --check    # verify only, exit 1 if not installed
 
 After install, click "Align" on a segment (or re-align) to get CTC word timings. Existing segments
@@ -98,6 +98,12 @@ def install(app_data: Path, bundled: Path) -> int:
         print(f"ERROR: bundled CTC model/tokens not found under {bundled}", file=sys.stderr)
         return 1
 
+    # Tokens FIRST (validate + write), model link second: an abort between the two steps must never
+    # leave a model without its vocab — the app treats that pair as "aligner installed" and every
+    # alignment would silently degrade. Tokens-without-model is harmless (aligner stays unavailable).
+    toks = tokens_stripped(ctc_tokens)
+    (models / "mms_aligner_tokens.txt").write_text("\n".join(toks) + "\n", encoding="utf-8")
+
     aligner_model = models / "mms_aligner.onnx"
     if aligner_model.exists():
         aligner_model.unlink()
@@ -109,9 +115,6 @@ def install(app_data: Path, bundled: Path) -> int:
 
         shutil.copy2(ctc_model, aligner_model)
         how = "copied"
-
-    toks = tokens_stripped(ctc_tokens)
-    (models / "mms_aligner_tokens.txt").write_text("\n".join(toks) + "\n", encoding="utf-8")
 
     print(f"OK: mms_aligner.onnx {how} + {len(toks)} tokens -> {models}")
     print('Click "Align" on a segment to use CTC word alignment.')

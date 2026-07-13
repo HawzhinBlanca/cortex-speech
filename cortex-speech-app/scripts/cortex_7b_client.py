@@ -98,27 +98,38 @@ def main():
     # so we see fresh segments. (audio_path + alignment never change once a segment exists.)
     import shutil
     import tempfile
+    import time
     row = None
     read_err = None
-    tmpdir = tempfile.mkdtemp(prefix="cortex7b_")
-    try:
-        tmp = os.path.join(tmpdir, "snap.db")
-        shutil.copyfile(db, tmp)
-        for ext in ("-wal", "-shm"):
-            if os.path.exists(db + ext):
+    # The app writes the WAL while we copy, so a single-shot copy can be torn (page copied mid-write)
+    # and the open fails — which previously escalated a transient blip into an EX_DB infra-failure.
+    # Retry the whole snapshot: a torn copy is momentary. Deliberately do NOT copy -shm — the shared-
+    # memory index is only valid for the live connections that created it; a copied one makes SQLite
+    # refuse the database outright ("unable to open database file", reproduced on this machine), while
+    # a fresh read of db + -wal rebuilds it automatically.
+    for attempt in range(3):
+        tmpdir = tempfile.mkdtemp(prefix="cortex7b_")
+        try:
+            tmp = os.path.join(tmpdir, "snap.db")
+            shutil.copyfile(db, tmp)
+            wal = db + "-wal"
+            if os.path.exists(wal):
                 try:
-                    shutil.copyfile(db + ext, tmp + ext)
+                    shutil.copyfile(wal, tmp + "-wal")
                 except Exception:
                     pass
-        con = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
-        row = con.execute(
-            "SELECT audio_path, alignment_json FROM speech_segments WHERE id=?", (a.segment_id,)
-        ).fetchone()
-        con.close()
-    except Exception as e:
-        read_err = e
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+            con = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+            row = con.execute(
+                "SELECT audio_path, alignment_json FROM speech_segments WHERE id=?", (a.segment_id,)
+            ).fetchone()
+            con.close()
+            read_err = None
+            break
+        except Exception as e:
+            read_err = e
+            time.sleep(0.2 * (attempt + 1))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     if read_err is not None:
         fail(EX_DB, f"7B client: could not read the app DB at {db}: {read_err}")

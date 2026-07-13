@@ -2,6 +2,7 @@ import { writable, derived, get } from 'svelte/store';
 import type { SpeechSegment, WordTimestamp } from '../types';
 import * as api from '../commands';
 import { isHumanRejected } from '../segmentQuality';
+import { dedupeById } from '../dedupeById';
 
 // Fetch the whole library by walking every backend page. Page size is the backend's max (fewest
 // round-trips). MAX_LOAD is a defensive ceiling so a pathological library can't exhaust memory or
@@ -43,7 +44,12 @@ function createSegmentsStore() {
           cursor = page.nextCursor;
           if (page.items.length === 0) break; // defensive: never spin on a non-null cursor + empty page
         } while (cursor && acc.length < MAX_LOAD);
-        set(acc);
+        // Cross-page dedupe: the backend "cursor" is a plain OFFSET, so a concurrent insert (e.g. the
+        // import worker writing rows between page fetches under the newest-first sort) shifts rows
+        // down and the next page re-serves ones already accumulated. Duplicate ids in this store crash
+        // keyed {#each} consumers (each_key_duplicate) and double-count stats — dedupe is the fix at
+        // the SOURCE (keep-first preserves page order); VirtualList's own dedupe stays as belt-and-braces.
+        set(dedupeById(acc));
         libraryTotal.set(total);
         const truncated = acc.length < total;
         libraryTruncated.set(truncated);

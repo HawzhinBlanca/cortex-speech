@@ -589,6 +589,7 @@ export const en: Record<string, string> = {
   'notifications.deleteFailed': 'Delete failed',
   'notifications.alignmentComplete': 'Alignment complete',
   'notifications.alignmentFailed': 'Alignment failed',
+  'notifications.normalizeFailed': 'Normalization failed — raw transcript saved unchanged',
   'batchDelete.filtered': 'Delete Filtered',
   'batchDelete.confirmTitle': 'Delete filtered segments',
   'batchDelete.confirmMessage':

@@ -587,6 +587,7 @@ export const ckb: Record<string, string> = {
   'notifications.deleteFailed': 'سڕینەوە سەرکەوتوو نەبوو',
   'notifications.alignmentComplete': 'هاوشێوەکردن تەواو بوو',
   'notifications.alignmentFailed': 'هاوشێوەکردن سەرکەوتوو نەبوو',
+  'notifications.normalizeFailed': 'ئاساییکردنەوە سەرکەوتوو نەبوو — دەقە خاوەکە بێ گۆڕان پاشەکەوت کرا',
   'batchDelete.filtered': 'سڕینەوەی فیلتەرکراو',
   'batchDelete.confirmTitle': 'سڕینەوەی بەشە فیلتەرکراوەکان',
   'batchDelete.confirmMessage': '{n} بەش لە فیلتەری ئێستا بسڕدرێتەوە؟ ناگەڕێتەوە.',
