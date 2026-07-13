@@ -1069,25 +1069,31 @@
       if ($settings.autoNormalize) {
         normalizedTranscript = await api.normalizeText(result.text);
       }
-      let alignmentJson = seg.alignmentJson;
-      if ($settings.autoAlign) {
-        const alignText = normalizedTranscript ?? result.text;
-        if (alignText?.trim()) {
-          const ts = await api.alignSegment(seg.audioPath, alignText, seg.alignmentJson);
-          wordTimestamps.set(ts);
-          alignmentJson = mergeWordTimestamps(seg.alignmentJson, ts);
-        }
-      }
       const updatedSeg = {
         ...seg,
         rawTranscript,
         annotatedTranscript,
         normalizedTranscript,
-        alignmentJson,
         // A re-transcription is machine output — reset verified so it isn't kept as human-verified.
         verified: false,
       };
       await api.updateSegment(updatedSeg);
+      // Align LAST, with the segment id: align_segment persists the merged word timings and stamps
+      // the honest alignment_quality in the backend. Order matters — updateSegment upserts the WHOLE
+      // row including alignment_quality (insert_segment ON CONFLICT), so aligning before it would let
+      // the stale quality from `seg` clobber a fresh ctc_forced stamp. Best-effort: a failed align
+      // keeps the successfully saved transcript.
+      if ($settings.autoAlign) {
+        const alignText = normalizedTranscript ?? result.text;
+        if (alignText?.trim()) {
+          try {
+            const ts = await api.alignSegment(seg.audioPath, alignText, seg.alignmentJson, seg.id);
+            wordTimestamps.set(ts);
+          } catch (alignError) {
+            notifications.error($t('notifications.alignmentFailed'), { detail: String(alignError) });
+          }
+        }
+      }
       await loadSegments();
       // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
       // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
@@ -1762,14 +1768,16 @@
     pipelinePhase.set('detecting');
     statusMessage.set($t('pipeline.detecting'));
     try {
-      const ts = await api.alignSegment(seg.audioPath, text, seg.alignmentJson);
-      const alignmentJson = mergeWordTimestamps(seg.alignmentJson, ts);
-      const updatedSeg = { ...seg, alignmentJson };
-      await api.updateSegment(updatedSeg);
-      // Update UI/store only AFTER the persist succeeds. Mutating first left an unsaved alignment in
-      // the UI on a failed save, which a later auto-save would then silently persist.
+      // Pass the segment id: align_segment persists the merged word timings AND stamps the honest
+      // alignment_quality (ctc_forced vs energy_heuristic) in one backend transaction. Without the id
+      // (the old call) the backend skipped persistence entirely — the client-side updateSegment saved
+      // the timings but the quality stayed stamped "energy_heuristic" even for a REAL CTC alignment,
+      // which wrongly kept the segment penalized as review-risk in the training grade.
+      const ts = await api.alignSegment(seg.audioPath, text, seg.alignmentJson, seg.id);
+      // Update UI only AFTER the backend persist succeeds; reload the store from the DB so the fresh
+      // alignmentJson AND alignmentQuality both arrive (same race-safe pattern as ReviewMode).
       wordTimestamps.set(ts);
-      segments.update((arr) => arr.map((s) => (s.id === seg.id ? { ...s, alignmentJson } : s)));
+      await loadSegments();
       notifications.success($t('notifications.alignmentComplete'));
     } catch (e) {
       notifications.error($t('notifications.alignmentFailed'), { detail: String(e) });

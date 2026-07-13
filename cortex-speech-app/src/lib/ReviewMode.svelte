@@ -305,7 +305,14 @@
   let aligning = $state(false);
   const alignAttempted = new Set<string>();
   async function ensureWordTimings(seg: SpeechSegment) {
-    if (parseWordTimestamps(seg.alignmentJson).length > 0 || alignAttempted.has(seg.id)) return;
+    // Re-align when timings are MISSING or still the energy heuristic (evenly spaced words that do
+    // not track the voice): imported clips always carry heuristic timings, so gating on "has
+    // timestamps" alone froze the entire backlog at heuristic quality even after a real CTC aligner
+    // was installed. Idempotent: without an aligner the backend re-persists the same heuristic, and
+    // alignAttempted stops per-session repeats either way.
+    const hasRealTimings =
+      parseWordTimestamps(seg.alignmentJson).length > 0 && seg.alignmentQuality !== 'energy_heuristic';
+    if (hasRealTimings || alignAttempted.has(seg.id)) return;
     const text = originalText(seg);
     if (!text.trim() || text.includes('[Pending') || text.includes('[ASR unavailable')) return;
     alignAttempted.add(seg.id);
