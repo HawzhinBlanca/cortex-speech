@@ -1,10 +1,10 @@
 export const ckb: Record<string, string> = {
-  import: 'هاوردەکردن',
+  import: 'زیادکردنی بوخچە',
   export: 'هەناردەکردن',
   settings: 'ڕێکخستنەکان',
   batchOps: 'کردارە کۆمەڵییەکان',
-  open: 'کردنەوە',
-  openFile: 'کردنەوەی فایل',
+  open: 'زیادکردنی فایل',
+  openFile: 'زیادکردنی فایل',
   transcribe: 'نووسینەوە',
   'scribe.transcribe': 'سکرایب (هەور)',
   'scribe.transcribeTitle': 'دووبارە نووسینەوەی ئەم بەشە بە ElevenLabs Scribe (STTی هەور)',

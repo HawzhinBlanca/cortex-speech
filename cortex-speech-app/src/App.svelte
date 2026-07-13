@@ -3057,6 +3057,22 @@
           </div>
         {:else}
           <EmptyState variant="mic" title={$t('selectSegment')}>
+            {#if $segmentStats.pending > 0}
+              <!-- Center empty but review work remains: surface the summary + the next recommended
+                   action instead of a mostly blank canvas (audit P2). -->
+              <div class="flex flex-col items-center gap-2 mb-4">
+                <p class="text-sm text-default">
+                  {$segmentStats.pending === 1
+                    ? $t('reviewCorrect.ctaOne')
+                    : $t('reviewCorrect.cta', { n: String($segmentStats.pending) })}
+                </p>
+                <button
+                  class="btn btn-primary"
+                  onclick={openReviewInbox}
+                  data-testid="empty-start-review">{$t('reviewCorrect.start')} →</button
+                >
+              </div>
+            {/if}
             <div class="flex flex-wrap justify-center gap-x-3 gap-y-1 text-xs text-subtle">
               <span><kbd>{modKey}+O</kbd> {$t('openFile')}</span>
               <span><kbd>{modKey}+I</kbd> {$t('import')}</span>

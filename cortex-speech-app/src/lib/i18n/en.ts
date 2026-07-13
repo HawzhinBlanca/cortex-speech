@@ -1,10 +1,10 @@
 export const en: Record<string, string> = {
-  import: 'Import',
+  import: 'Add folder',
   export: 'Export',
   settings: 'Settings',
   batchOps: 'Batch Ops',
-  open: 'Open',
-  openFile: 'Open File',
+  open: 'Add file',
+  openFile: 'Add file',
   transcribe: 'Transcribe',
   transcribeConstrained: 'Kurdish-only',
   transcribeConstrainedTitle: 'Transcribe with constrained Kurdish-script decode (guarantees Kurdish output)',
