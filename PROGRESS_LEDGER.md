@@ -3477,3 +3477,40 @@ fencing) are Codex-owned. Delivered the genuine non-Codex gaps with proof:
 
 Owner-gated 10/10 criteria unchanged (500 decisions, retrain cycle, frozen benchmarks, 30 daily
 sessions). Gates this batch: run_python_policies.py -> 32 passed.
+
+## 2026-07-13 (cont.) — installed + tested the 3 missing models; provider-agnostic cloud jury
+
+Owner: "download these models all and test them ... can we have gemini 2.5 pro via OpenRouter not
+directly ... are we using gemini 2.5 pro wisely". Downloaded + SHA-verified all three not-yet-
+installed models into src-tauri/models + target/release/models, and PROVED each runs on real
+Central Kurdish audio (src-tauri/tests/fixtures/fleurs_ckb_sample.wav, 8.2s) via sherpa-onnx 1.13.4:
+
+- CTC-1B  (786MB archive -> 1.03GB int8 onnx, sha f7b74c96.. MATCHES the existing pin):
+  decode "بو پێش هاتنی سوپا هایەتی لە وتەی ساڵی ٠ەوە تووشی کێشەی پێیوێست بە نەخۆشیەکەن نەبوو" RTF 0.285
+- CTC-300M (already installed): "بوو پێش هاتنی سوپا هایەتی لەوەتەی ساڵی ١ە ..." RTF 0.109 — the two
+  engines DISAGREE (لە وتەی vs لەوەتەی, ٠ vs ١, کێشەی vs کەشەی), i.e. real N-best error-localization signal
+- Denoiser gtcrn_simple.onnx (0.5MB, sha e77603ac..): ran, 131520->131328 samples, rms 0.107->0.103
+- CAM++ zh_en advanced (28MB, sha aa3cfc16..): 192-dim embedding, L2 6.73, all nonzero
+
+Real bugs found + fixed (models.rs is non-Codex):
+- fix(models) f0c726c: CAM++ and denoiser download URLs in models.rs 404'd (dead tar.bz2 links) —
+  switched to the real direct .onnx assets; filled CTC-1B archive pin (27c270df..) + CAM++/denoiser
+  pins; denoiser min-size floor 10MB->400KB (10MB rejected the real 0.5MB GTCRN). +regression test.
+  cargo test --lib models -> "21 passed; 0 failed"; clippy --lib clean.
+- feat(jury) 4915a20: T2 audio judge made provider-agnostic (T2Endpoint GeminiDirect |
+  OpenAiCompatible{url}) so the jury can run over OpenRouter (Gemini-2.5-Pro via OpenRouter, or a
+  swappable audio model: qwen3-asr-flash / chirp-3 / gpt-audio). listen_and_judge keeps its
+  signature (delegates to GeminiDirect) so Codex call sites compile unchanged. +4 pure tests.
+  cargo test --lib jury::t2_listener -> "17 passed; 0 failed"; clippy --lib clean.
+
+Answers to the owner's questions (grounded):
+- Gemini-2.5-Pro via OpenRouter for TEXT refine is ALREADY wired+tested (pipeline.rs build_refiner ->
+  llm_refiner for_openrouter). Enable: cloud LLM opt-in + Gemini mode + OpenRouter key in secrets.env.
+- For the AUDIO jury, the enabling half now exists (above); the call-site switch + jury_provider
+  setting is a Codex follow-up, specced in docs/CODEX_HANDOFF.md.
+- OpenRouter now has a real STT surface (whisper-large-v3, gpt-4o-transcribe, google/chirp-3,
+  qwen3-asr-flash) + audio-input LLMs incl. google/gemini-2.5-pro. NONE confirmed for Central Kurdish
+  yet — local OmniASR (1600 langs incl. ckb) stays primary; cloud is the guarded cross-check.
+
+Owner-gated 10/10 criteria unchanged. Not-installed-and-optional after this: WavLM OOD detector,
+finetuned MMS-1B ckb (both still absent; not required for the default path).

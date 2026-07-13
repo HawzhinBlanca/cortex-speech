@@ -109,3 +109,36 @@ written columns.
 the unresolved app-data dir, not the resolved bundled dir — the reason `setup_word_aligner.py` has to
 install into `%APPDATA%/cortex-speech/models`. Change to `resolved_dir()` for consistency (then the
 aligner could ship in the bundled models dir like every other model).
+
+## Route the T2 audio jury through OpenRouter (owner asked; enabling half is DONE)
+
+**Non-Codex piece shipped (`jury/t2_listener.rs`):** the audio judge is now provider-agnostic —
+`T2Endpoint { GeminiDirect, OpenAiCompatible { url } }`, `listen_and_judge_via(endpoint, …)`, with
+`listen_and_judge(…)` delegating to `GeminiDirect` so **existing call sites compile unchanged**. The
+OpenAI-compatible path builds the OpenRouter `chat/completions` body with an `input_audio` (base64
+WAV) part; the untrusted-confidence clamp is shared across providers. Unit-tested (payload shapes,
+response extractors, clamp).
+
+**Codex wiring to finish it (call sites are Codex-owned):**
+1. `commands.rs:4781` and `commands.rs:4943` — the two `listen_and_judge(&audio_b64, …, &jury_model,
+   n_samples)` calls. Switch to `listen_and_judge_via(&endpoint, …)` where `endpoint` is derived from
+   a new setting: when a `jury_provider == "openrouter"` (or an OpenRouter key is present and the
+   owner opted in), pass `T2Endpoint::OpenAiCompatible { url: "https://openrouter.ai/api/v1/chat/completions".into() }`
+   and use the **OpenRouter API key** (`crate::api_keys::ApiKeys::load(data_dir).openrouter`) as
+   `api_key`; otherwise `T2Endpoint::GeminiDirect` with the Gemini key (today's behavior).
+2. `settings.rs`/`db.rs` — add a `jury_provider` field (default `"gemini"`) and let `jury_model` hold
+   an OpenRouter slug (`google/gemini-2.5-pro`, `qwen/qwen3-asr-flash`, `google/chirp-3`,
+   `openai/gpt-audio`). The text refiner already resolves a Gemini-mode model to an OpenRouter id via
+   `pipeline.rs::openrouter_model_id`; reuse or mirror that so a bare `gemini-2.5-pro` maps to
+   `google/gemini-2.5-pro` for the jury too.
+3. Keep the privacy gate: only construct an `OpenAiCompatible` endpoint when `jury_cloud_opt_in` is
+   true (same gate the two call sites already read via `cloud_opt_in`).
+
+**Why (owner question "are we using Gemini wisely for Kurdish ASR?"):** local OmniASR (7B + CTC-1B,
+1600 languages incl. Kurdish) stays the primary/Kurdish-capable engine; the cloud judge is a guarded
+post-editor on contested segments only. OpenRouter's value here is (a) dodging the direct-Gemini 429
+quota, and (b) swapping the judge to a **dedicated multilingual ASR** (Qwen3-ASR / Chirp-3) that may
+beat Gemini on Sorani — and, bigger win later, adding a cloud ASR as an independent **N-best
+hypothesis** feeding the disagreement refinery (a `pipeline.rs` change), not just as the arbiter.
+NOTE: verify ckb/Sorani coverage per model before trusting any cloud ASR on Kurdish — none is
+confirmed for Central Kurdish yet; the honesty law applies.
