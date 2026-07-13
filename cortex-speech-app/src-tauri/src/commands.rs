@@ -775,7 +775,13 @@ pub fn import_audio_file(
                             let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&settings);
                             report_options.agent_run_id = Some(agent_run_id.clone());
                             report_options.agentic_readiness = Some(agentic_readiness);
-                            match run_jury_pipeline_core(&db, &settings, segment_ids.clone()) {
+                            let jury_data_dir = app_state.lock_data_dir().clone();
+                            match run_jury_pipeline_core_via(
+                                &db,
+                                &settings,
+                                segment_ids.clone(),
+                                jury_data_dir.as_deref(),
+                            ) {
                                 Ok(jury_report) => {
                                     let completion_detail = format!(
                                         "Reference commits: {}; review queue: {}",
@@ -1359,9 +1365,10 @@ pub fn batch_transcribe(
                 // get_segments while it runs. with_jury_db retries the dedicated open and only falls
                 // back to the shared handle on a hard failure (so a transient lock doesn't skip the
                 // jury entirely).
-                if let Err(error) =
-                    with_jury_db(&app_state, |db| run_jury_pipeline_core(db, &settings, transcribed_ids))
-                {
+                let jury_data_dir = app_state.lock_data_dir().clone();
+                if let Err(error) = with_jury_db(&app_state, |db| {
+                    run_jury_pipeline_core_via(db, &settings, transcribed_ids, jury_data_dir.as_deref())
+                }) {
                     log_jury_pipeline_failure("batch transcription", &error);
                 }
             }
@@ -4574,19 +4581,84 @@ fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) ->
     f(&db)
 }
 
+/// OpenRouter's OpenAI-compatible chat endpoint (reaches audio-capable models: google/gemini-2.5-pro,
+/// qwen/qwen3-asr-flash, google/chirp-3, openai/gpt-audio, ...).
+const OPENROUTER_CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+
+/// Map a jury model name to an OpenRouter slug. A bare Gemini id (the default `gemini-2.5-pro`) maps to
+/// `google/gemini-2.5-pro`; an id that already has a `provider/model` shape (or a non-Gemini name)
+/// passes through so a future/better audio model works with no code change.
+fn openrouter_jury_model_id(jury_model: &str) -> String {
+    let m = jury_model.trim();
+    if m.is_empty() {
+        "google/gemini-2.5-pro".to_string()
+    } else if m.contains('/') || !m.starts_with("gemini") {
+        m.to_string()
+    } else {
+        format!("google/{m}")
+    }
+}
+
+/// Pure branch logic for the T2 audio-judge transport (no filesystem): OpenRouter when the provider is
+/// opted into AND an OpenRouter key is present, otherwise direct Gemini. Never routes to keyless cloud.
+fn resolve_t2_endpoint_from_keys(
+    settings: &crate::settings::AppSettings,
+    gemini_key: &str,
+    openrouter_key: Option<&str>,
+) -> (crate::jury::t2_listener::T2Endpoint, String, String) {
+    use crate::jury::t2_listener::T2Endpoint;
+    if settings.jury_provider.eq_ignore_ascii_case("openrouter") {
+        if let Some(key) = openrouter_key.map(str::trim).filter(|k| !k.is_empty()) {
+            return (
+                T2Endpoint::OpenAiCompatible { url: OPENROUTER_CHAT_URL.to_string() },
+                key.to_string(),
+                openrouter_jury_model_id(&settings.jury_model),
+            );
+        }
+    }
+    (T2Endpoint::GeminiDirect, gemini_key.to_string(), settings.jury_model.clone())
+}
+
+/// Resolve the T2 transport/key/model, loading the OpenRouter key from `secrets.env` in `data_dir` when
+/// the jury provider is "openrouter". Falls back to direct Gemini when no OpenRouter key is present.
+fn resolve_t2_endpoint(
+    settings: &crate::settings::AppSettings,
+    gemini_key: &str,
+    data_dir: Option<&std::path::Path>,
+) -> (crate::jury::t2_listener::T2Endpoint, String, String) {
+    let openrouter_key = if settings.jury_provider.eq_ignore_ascii_case("openrouter") {
+        data_dir.and_then(|d| crate::api_keys::ApiKeys::load(d).openrouter)
+    } else {
+        None
+    };
+    resolve_t2_endpoint_from_keys(settings, gemini_key, openrouter_key.as_deref())
+}
+
+/// Direct-Gemini entry point (the default transport, used by tests and any caller without a data dir).
+/// Callers with a data dir use `run_jury_pipeline_core_via` to honor the OpenRouter jury setting.
 pub fn run_jury_pipeline_core(
     db: &crate::db::Database,
     settings: &crate::settings::AppSettings,
     segment_ids: Vec<String>,
 ) -> Result<serde_json::Value, String> {
+    run_jury_pipeline_core_via(db, settings, segment_ids, None)
+}
+
+pub fn run_jury_pipeline_core_via(
+    db: &crate::db::Database,
+    settings: &crate::settings::AppSettings,
+    segment_ids: Vec<String>,
+    data_dir: Option<&std::path::Path>,
+) -> Result<serde_json::Value, String> {
     let t1_threshold = settings.jury_t1_threshold;
     let cloud_opt_in = settings.jury_cloud_opt_in;
-    let jury_model = settings.jury_model.clone();
     // Floor at 3: self-consistency is meaningless below 3 samples, and a misconfigured 1 would let a
     // single Gemini sample masquerade as a "majority". majority_vote also requires >= 2 agreeing
     // samples, so this is defense in depth at the config boundary.
     let n_samples = (settings.jury_self_consistency_n as usize).max(3);
-    let api_key = settings.llm_api_key.clone();
+    // T2 transport: direct Gemini by default, or OpenRouter (with the OR key from secrets.env) when the
+    // jury provider is set to "openrouter".
+    let (t2_endpoint, api_key, jury_model) = resolve_t2_endpoint(settings, &settings.llm_api_key, data_dir);
 
     let initial_seg_map: std::collections::HashMap<String, crate::db::SpeechSegment> = db
         .get_segments_by_ids(&segment_ids)
@@ -4778,7 +4850,8 @@ pub fn run_jury_pipeline_core(
                     };
 
                     let few_shots = crate::jury::get_few_shot_examples(db, seg_id, 5).map_err(|e| e.to_string())?;
-                    let t2 = crate::jury::t2_listener::listen_and_judge(
+                    let t2 = crate::jury::t2_listener::listen_and_judge_via(
+                        &t2_endpoint,
                         &audio_b64,
                         &hypotheses,
                         &t1_evidence,
@@ -4870,7 +4943,8 @@ pub fn run_jury_pipeline(state: State<'_, AppState>, segment_ids: Vec<String>) -
     // Run on a dedicated connection so the global db Mutex is not held across the jury's blocking T2
     // cloud calls — holding it would freeze the UI's get_segments for the whole run. with_jury_db
     // retries the dedicated open and only falls back to the shared handle on a hard failure.
-    with_jury_db(&state, |db| run_jury_pipeline_core(db, &settings, segment_ids))
+    let jury_data_dir = state.lock_data_dir().clone();
+    with_jury_db(&state, |db| run_jury_pipeline_core_via(db, &settings, segment_ids, jury_data_dir.as_deref()))
 }
 
 /// `run_t2_for_segment` — run Gemini audio judge on a single segment directly.
@@ -4887,7 +4961,10 @@ pub fn run_t2_for_segment(
     validate::validate_identifier(&segment_id)?;
 
     let settings = state.lock_settings().clone();
-    let jury_model = settings.jury_model.clone();
+    let data_dir = state.lock_data_dir().clone();
+    // T2 transport: direct Gemini (the passed key) by default, or OpenRouter (its key from secrets.env)
+    // when the jury provider is "openrouter". `api_key`/`jury_model` are the resolved judge credentials.
+    let (t2_endpoint, api_key, jury_model) = resolve_t2_endpoint(&settings, &api_key, data_dir.as_deref());
     // Floor at 3: self-consistency is meaningless below 3 samples, and a misconfigured 1 would let a
     // single Gemini sample masquerade as a "majority". majority_vote also requires >= 2 agreeing
     // samples, so this is defense in depth at the config boundary.
@@ -4898,7 +4975,10 @@ pub fn run_t2_for_segment(
         return Err("Cloud opt-in is required for T2. Enable it in Settings → Listening Jury.".into());
     }
     if api_key.trim().is_empty() {
-        return Err("Gemini API key is required for T2.".into());
+        return Err(
+            "A judge API key is required for T2 (a Gemini key, or an OpenRouter key when the jury provider is OpenRouter)."
+                .into(),
+        );
     }
 
     // Gather every DB input under a BRIEF lock, then drop it before listen_and_judge. Holding the
@@ -4940,7 +5020,8 @@ pub fn run_t2_for_segment(
     // The gather block above released the global DB lock when it ended (all reads are done, few_shots
     // included), so the blocking T2 cloud call below (Gemini, n_samples retries — multiple seconds)
     // never starves other DB users like the UI's get_segments. The verdict write re-acquires briefly.
-    let result = crate::jury::t2_listener::listen_and_judge(
+    let result = crate::jury::t2_listener::listen_and_judge_via(
+        &t2_endpoint,
         &audio_b64,
         &hyps,
         &t2_evidence,
@@ -5132,6 +5213,42 @@ mod tests {
             source_reference_models: models.iter().map(|model| (*model).to_string()).collect(),
             ..crate::settings::AppSettings::default()
         }
+    }
+
+    #[test]
+    fn t2_endpoint_resolves_gemini_by_default_and_openrouter_only_with_a_key() {
+        use crate::jury::t2_listener::T2Endpoint;
+        let mut s = crate::settings::AppSettings::default();
+
+        // Default provider ("gemini") -> direct Gemini with the passed key + configured jury_model,
+        // even when an OpenRouter key happens to be available.
+        let (ep, key, model) = resolve_t2_endpoint_from_keys(&s, "gkey", Some("orkey"));
+        assert!(matches!(ep, T2Endpoint::GeminiDirect));
+        assert_eq!(key, "gkey");
+        assert_eq!(model, s.jury_model);
+
+        // Provider "openrouter" but NO OpenRouter key -> fall back to direct Gemini (never keyless cloud).
+        s.jury_provider = "openrouter".into();
+        let (ep, key, _) = resolve_t2_endpoint_from_keys(&s, "gkey", None);
+        assert!(matches!(ep, T2Endpoint::GeminiDirect), "no OR key must stay on Gemini");
+        assert_eq!(key, "gkey");
+        let (ep, _, _) = resolve_t2_endpoint_from_keys(&s, "gkey", Some("   "));
+        assert!(matches!(ep, T2Endpoint::GeminiDirect), "blank OR key must stay on Gemini");
+
+        // Provider "openrouter" WITH a key -> OpenRouter endpoint, the OR key, mapped model slug.
+        s.jury_model = "gemini-2.5-pro".into();
+        let (ep, key, model) = resolve_t2_endpoint_from_keys(&s, "gkey", Some("orkey"));
+        match ep {
+            T2Endpoint::OpenAiCompatible { url } => assert!(url.contains("openrouter.ai"), "{url}"),
+            _ => panic!("expected OpenRouter endpoint"),
+        }
+        assert_eq!(key, "orkey");
+        assert_eq!(model, "google/gemini-2.5-pro", "a bare Gemini id maps to the OpenRouter slug");
+
+        // An already-slugged / non-Gemini model passes through unchanged (future models work as-is).
+        s.jury_model = "qwen/qwen3-asr-flash".into();
+        let (_, _, model) = resolve_t2_endpoint_from_keys(&s, "gkey", Some("orkey"));
+        assert_eq!(model, "qwen/qwen3-asr-flash");
     }
 
     #[test]

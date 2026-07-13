@@ -88,6 +88,13 @@ pub struct AppSettings {
     pub jury_cloud_opt_in: bool,
     #[serde(default = "default_jury_model")]
     pub jury_model: String,
+    /// Transport for the T2 audio judge: "gemini" (default — Google's direct generativelanguage REST)
+    /// or "openrouter" (OpenAI-compatible endpoint, so `jury_model` may be a slug like
+    /// `google/gemini-2.5-pro`, `qwen/qwen3-asr-flash`, `google/chirp-3`). OpenRouter uses the
+    /// OpenRouter key from secrets.env and sidesteps the direct-Gemini 429 quota. Still gated by
+    /// `jury_cloud_opt_in`; falls back to direct Gemini if no OpenRouter key is present.
+    #[serde(default = "default_jury_provider")]
+    pub jury_provider: String,
     /// Whole-file source transcript models used before chunking for reference-aware adjudication.
     #[serde(default = "default_source_reference_models")]
     pub source_reference_models: Vec<String>,
@@ -267,6 +274,9 @@ pub enum AutonLevel {
 fn default_jury_model() -> String {
     "gemini-2.5-pro".to_string()
 }
+fn default_jury_provider() -> String {
+    "gemini".to_string()
+}
 fn default_source_reference_models() -> Vec<String> {
     vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()]
 }
@@ -326,6 +336,7 @@ impl Default for AppSettings {
             external_asr_script_path: "".to_string(),
             jury_cloud_opt_in: false,
             jury_model: default_jury_model(),
+            jury_provider: default_jury_provider(),
             source_reference_models: default_source_reference_models(),
             jury_self_consistency_n: default_jury_self_consistency_n(),
             jury_autonomy_level: AutonLevel::default(),

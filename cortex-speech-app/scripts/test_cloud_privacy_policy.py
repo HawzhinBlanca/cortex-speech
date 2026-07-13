@@ -51,7 +51,10 @@ def test_t2_audio_cloud_calls_require_jury_opt_in() -> None:
     assert_contains(commands, 'db.write_segment_verdict(seg_id, "escalated", None, Some(&reason)', COMMANDS_RS.name)
     assert_contains(commands, "if !cloud_opt_in", COMMANDS_RS.name)
     assert_contains(commands, "Cloud opt-in is required for T2", COMMANDS_RS.name)
-    assert_contains(commands, "Gemini API key is required for T2", COMMANDS_RS.name)
+    # A judge API key is required before any T2 cloud call. Substring (not the Gemini-specific wording)
+    # so the guard still holds after the jury gained an OpenRouter transport (Gemini key OR OpenRouter
+    # key) — the key check itself is unchanged; the message just names both providers now.
+    assert_contains(commands, "key is required for T2", COMMANDS_RS.name)
 
 
 def test_cloud_stt_scribe_egress_requires_opt_in() -> None:
