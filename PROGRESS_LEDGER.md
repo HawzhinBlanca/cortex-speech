@@ -3455,3 +3455,25 @@ Verbatim gates (this machine): cargo test --lib aligner -> "10 passed; 0 failed"
 cargo clippy --lib --all-targets -D warnings -> "Finished" clean; npm typecheck -> 0 errors;
 npm lint -> clean; npm test -> "194 passed"; run_python_policies.py -> "32 policy test scripts
 passed."
+
+## 2026-07-13 (cont.) — audit roadmap (DEBUG_cortex.md) worked one-by-one, non-Codex parts delivered
+
+Owner pointed at the 2026-07-11 external audit as the goal. Triaged the whole roadmap against
+CURRENT code (per no-unearned-completion-claims): most concrete non-Codex items were ALREADY done
+(test isolation, egress, media hard-link, per-source SRT/VTT, alignment honesty, OOD math). The
+audit's BIGGEST items (async commands, Job Supervisor, DB writer queue, STRICT schema, backup
+fencing) are Codex-owned. Delivered the genuine non-Codex gaps with proof:
+
+- feat(chunking) c2b1c31: stitch_overlapping_transcripts pure core + 4 tests (P1 #4). Wiring =
+  Codex handoff.
+- feat(ux) be5cbfc: Open/Import -> Add file/Add folder (EN+CKB); actionable empty-state (review
+  summary + Start reviewing instead of blank canvas) (P2). 194 FE tests, typecheck/lint green.
+- fix(jury) 569d51e: T1 judge demoted to proposal-only (default-off auto-commit gate) so a weak
+  lexicon/entropy signal can't skip human review (P1 #3). cargo t1_judge 6 passed, clippy clean.
+- docs: cortex-speech-app/docs/CODEX_HANDOFF.md — precise file:line specs for the Codex-owned
+  items (async migration, Job Supervisor, 7B supervision, backup fence, DB writer queue, STRICT
+  schema, OOD field rename, chunk-overlap wiring, F10 fresh-row IPC, aligner model_dir bug at
+  pipeline.rs:3146).
+
+Owner-gated 10/10 criteria unchanged (500 decisions, retrain cycle, frozen benchmarks, 30 daily
+sessions). Gates this batch: run_python_policies.py -> 32 passed.
