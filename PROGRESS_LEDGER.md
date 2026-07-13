@@ -3540,3 +3540,33 @@ Setup now complete for every LOCAL model the app references: Silero VAD, OmniASR
 mms_aligner, CAM++ diarization, GTCRN denoiser, WSL 7B champion+LoRA, AND the fine-tuned MMS-CTC-1B
 ckb (~20% CER). NOT installed (by design, not a gap): WavLM OOD (vestigial dead code — OOD runs on
 an honest heuristic; no real model exists), cloud engines (opt-in off), Ollama (service).
+
+## 2026-07-14 — Codex retired: finished the safe handoff items; removed CODEX_HANDOFF.md
+
+Owner: "codex no longer working on it ... remove codex handoff but finish the tasks." Removed
+docs/CODEX_HANDOFF.md (no code/gate referenced it) and finished the items that are genuinely
+completable WITH verification here, honestly leaving the rest as normal backlog (NOT faking rewrites):
+
+DONE this pass (verified):
+- fix(aligner) 19ce1ea: ForcedAligner uses resolved_dir() (bundled-dir fallback) like the ASR path,
+  not the raw models_dir. cargo test --lib green.
+- feat(jury) 799e495: T2 audio judge routed to OpenRouter — settings.jury_provider
+  ("gemini"|"openrouter") + resolve_t2_endpoint across both call paths (run_jury_pipeline_core_via +
+  run_t2_for_segment) via listen_and_judge_via. Bare gemini id -> google/gemini-2.5-pro; slugged/other
+  models pass through (qwen3-asr-flash, chirp-3, gpt-audio). Privacy gate intact (opt-in + key). Unit
+  test on the resolver. 898 lib tests, clippy, 32/32 policies green. Live OpenRouter call is
+  user-verifiable (needs an OR key); a Settings UI toggle for jury_provider is a small follow-up.
+
+REMAINING backlog (honest scope — NOT started, would be reckless to rush on a working app):
+- OOD -> signal_anomaly rename: 143 occurrences / 34 files incl. a DB column + schema MIGRATION +
+  committed manifests + TS/UI. A wide, staged change; do it deliberately with a migration test.
+- Chunk-overlap stitch WIRING: the pure stitch_overlapping_transcripts core + tests exist, but
+  plan_speech_chunks deliberately emits CONTIGUOUS chunks and overlaps would create duplicate/overlapping
+  WORD-TIMING segments the text-only stitch does not reconcile — needs timeline dedup too, and the
+  long-recording A/B is owner-gated. Not a clean 2-file change.
+- F10 fresh-row IPC: backend update_segment_fields(id, partial) + App.svelte autosave wiring (the
+  frontend mitigation — inputs disabled while processing — is already shipped).
+- P0 architecture (each a multi-week rewrite of a working app's core, verified-in-staging not here):
+  async migration of ~120 #[tauri::command]s, a durable Job Supervisor, app-owned 7B supervision,
+  backup/restore writer fence, global-DB-mutex -> serialized writer queue + read pool, STRICT schema +
+  migrate-from-every-version. These stay owner-scheduled; faking them would violate the honesty law.
