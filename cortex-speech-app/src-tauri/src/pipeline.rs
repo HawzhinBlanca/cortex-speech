@@ -3143,7 +3143,10 @@ impl ProcessingPipeline {
             timer.finish(true);
             return Ok((words, aligner::AlignmentQuality::CtcForced));
         }
-        let aligner = aligner::ForcedAligner::new(&self.model_manager.models_dir, self.settings.enable_gpu)
+        // Use resolved_dir() (bundled-dir fallback) like the ASR path — NOT the raw models_dir. The two
+        // were inconsistent: the aligner looked only in the unresolved app-data dir, so a bundled
+        // aligner was invisible to it. resolved_dir() is where inference actually loads models from.
+        let aligner = aligner::ForcedAligner::new(&self.model_manager.resolved_dir(), self.settings.enable_gpu)
             .map_err(AppError::Other)?;
         let result = aligner.align(&pcm, audio::TARGET_SAMPLE_RATE, text);
         timer.finish(result.is_ok());
