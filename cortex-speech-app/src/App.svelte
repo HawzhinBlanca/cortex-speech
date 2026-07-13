@@ -84,6 +84,7 @@
   import CommandPalette from './lib/CommandPalette.svelte';
   import EmptyState from './lib/EmptyState.svelte';
   import ActivityRail from './lib/ActivityRail.svelte';
+  import ProcessingProgress from './lib/ProcessingProgress.svelte';
   import ReviewMode from './lib/ReviewMode.svelte';
   import PanelSplitter from './lib/PanelSplitter.svelte';
   import HistoryPanel from './lib/HistoryPanel.svelte';
@@ -2257,6 +2258,9 @@
       {/if}
     </div>
   {/if}
+
+  <!-- Prominent processing indicator: real % bar + elapsed + ETA + stages, under the toolbar. -->
+  <ProcessingProgress />
 
   <div class="flex flex-1 overflow-hidden">
     <ActivityRail
