@@ -25,8 +25,11 @@ static SESSION_CACHE: LazyLock<Mutex<Option<(std::path::PathBuf, ort::session::S
 // swapped file would silently degrade transcripts (the exact thing the honesty law forbids). These
 // pins are for the CURRENT bundled model — UPDATE them when it is retrained/replaced (M5). Computed
 // from src-tauri/models/finetuned-mms-ckb/.
-pub const FINETUNED_MODEL_SHA256: &str = "6147ea5d986d38c85aadd4c5d8d05bd9bc982e48b119d24b51b375548e49396c";
-pub const FINETUNED_MODEL_BYTES: u64 = 970_251_415;
+// 2026-07-13: re-exported int8 ONNX from the owner's MMS_CTC_1B_Champion checkpoint (the original
+// model.onnx was not on disk; the checkpoint + matching vocab.json SHA were). fp32 ONNX decode
+// verified bit-for-bit against transformers; the vocab pin is unchanged (same vocab.json).
+pub const FINETUNED_MODEL_SHA256: &str = "064d6ec2225500cf7d47d267402f50c7c7da4d29f34d0fb6a9cb77272aef5ae0";
+pub const FINETUNED_MODEL_BYTES: u64 = 970_236_520;
 pub const FINETUNED_VOCAB_SHA256: &str = "31dcd5c4361451991bd8241eb99bdc822d2ef2d8a4906404884c2196aa8f3a41";
 
 /// True when `onnx_path` is the bundled fine-tuned model (`…/finetuned-mms-ckb/model.onnx`). A custom
