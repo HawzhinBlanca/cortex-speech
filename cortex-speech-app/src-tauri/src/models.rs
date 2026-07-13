@@ -35,20 +35,27 @@ pub const OMNIASR_CTC_1B_DIR: &str = "omniasr-ctc-1b";
 pub const OMNIASR_CTC_1B_MODEL: &str = "omniasr-ctc-1b/model.int8.onnx";
 pub const OMNIASR_CTC_1B_TOKENS: &str = "omniasr-ctc-1b/tokens.txt";
 pub const OMNIASR_CTC_1B_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-omnilingual-asr-1600-languages-1B-ctc-int8-2025-11-12.tar.bz2";
-pub const OMNIASR_CTC_1B_ARCHIVE_SHA256: &str = "";
+// Pinned from the real 786 MB archive (downloaded + extracted; the extracted model.int8.onnx/tokens
+// matched the pins below, authenticating the archive). Non-empty → the in-app CTC-1B download is
+// unblocked (model_download_supported) and the archive is hash-verified before extraction.
+pub const OMNIASR_CTC_1B_ARCHIVE_SHA256: &str = "27c270dfe9bc1abb35fef62c396b373577ffc55a272cb039d08487c27b0ecfaa";
 
-/// Subdirectory for CAM++ speaker embedding model.
+/// CAM++ speaker embedding model. The sherpa-onnx speaker-recognition assets are single `.onnx` files
+/// (NOT tar.bz2 bundles), so this is a direct-file download like Silero VAD — the 192-dim zh+en
+/// "advanced" CAM++ voiceprint. Speaker embeddings are language-agnostic, so it serves Kurdish
+/// diarization fine. (The previous tar.bz2 URL 404'd — dead link.)
 pub const CAMPP_DIR: &str = "campp";
 pub const CAMPP_MODEL: &str = "campp/model.onnx";
-pub const CAMPP_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/sherpa-onnx-3dspeaker-campp-zh-en-rdino-tiny-2023-12-05.tar.bz2";
-pub const CAMPP_ARCHIVE_SHA256: &str = "";
+pub const CAMPP_MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
+pub const CAMPP_MODEL_SHA256: &str = "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2";
 
-/// Subdirectory for the AI Audio Denoiser model.
+/// AI Audio Denoiser — sherpa-onnx GTCRN (the architecture denoiser.rs loads via `gtcrn.model`). A
+/// single ~0.5 MB `.onnx`, direct-file download. (The previous tar.bz2 URL 404'd — dead link.)
 pub const DENOISER_DIR: &str = "denoiser";
 pub const DENOISER_MODEL: &str = "denoiser/model.onnx";
-pub const DENOISER_ARCHIVE_URL: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-denoiser-v1-2025-11-12.tar.bz2";
-pub const DENOISER_ARCHIVE_SHA256: &str = "";
+pub const DENOISER_MODEL_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx";
+pub const DENOISER_MODEL_SHA256: &str = "e77603ac0c23dac3227dd2d7135b3a585cbee2679048aecfa886657d3ae1b534";
 
 /// Bundled models shipped with the app / used during development.
 pub fn bundled_models_dir() -> PathBuf {
@@ -180,17 +187,19 @@ pub const MODELS: &[ModelInfo] = &[
     ModelInfo {
         name: "CAM++ Speaker Embedding",
         filename: CAMPP_MODEL,
-        url: "",
-        sha256: "",
+        url: CAMPP_MODEL_URL,
+        sha256: CAMPP_MODEL_SHA256,
         min_size_bytes: 10_000_000,
         version: "1.0",
     },
     ModelInfo {
         name: "AI Audio Denoiser",
         filename: DENOISER_MODEL,
-        url: "",
-        sha256: "",
-        min_size_bytes: 10_000_000,
+        url: DENOISER_MODEL_URL,
+        sha256: DENOISER_MODEL_SHA256,
+        // GTCRN is ~0.5 MB — a 10 MB floor (the old value) rejected the correct model. Guard against a
+        // truncated download without excluding the real file.
+        min_size_bytes: 400_000,
         version: "1.0",
     },
     ModelInfo {
@@ -577,24 +586,26 @@ impl ModelManager {
         model_file_meets_min_size(&self.models_dir, CAMPP_MODEL, 10_000_000)
     }
 
-    /// Download and extract the CAM++ speaker embedding archive.
+    /// Download the CAM++ speaker-embedding ONNX (a single direct file, not an archive) and verify it
+    /// against its pinned SHA-256 before placing it as `campp/model.onnx`.
     pub fn download_campp(&self, progress_cb: impl Fn(f32)) -> Result<(), String> {
         if self.models_dir.join(CAMPP_MODEL).exists() {
             progress_cb(1.0);
             return Ok(());
         }
 
-        ensure_pinned_sha256("CAM++ archive", CAMPP_ARCHIVE_SHA256)?;
+        ensure_pinned_sha256("CAM++ model", CAMPP_MODEL_SHA256)?;
 
         self.ensure_dir()?;
         let dest_dir = self.models_dir.join(CAMPP_DIR);
         fs::create_dir_all(&dest_dir).map_err(|e| format!("Create CAM++ dir: {e}"))?;
 
-        let tmp_archive = self.models_dir.join("campp.downloading.tar.bz2");
-        tracing::info!("Downloading CAM++ from {}", CAMPP_ARCHIVE_URL);
+        let dest = self.models_dir.join(CAMPP_MODEL);
+        let tmp = dest.with_extension("downloading");
+        tracing::info!("Downloading CAM++ from {}", CAMPP_MODEL_URL);
 
         let response = crate::http::DOWNLOAD_AGENT
-            .get(CAMPP_ARCHIVE_URL)
+            .get(CAMPP_MODEL_URL)
             .call()
             .map_err(|e| format!("CAM++ download failed: {e}"))?;
 
@@ -602,22 +613,20 @@ impl ModelManager {
 
         write_reader_to_temp(
             response.into_reader(),
-            &tmp_archive,
+            &tmp,
             total_size,
-            0.9,
+            0.95,
             &progress_cb,
-            "Archive read error",
-            "Archive write error",
+            "CAM++ read error",
+            "CAM++ write error",
         )?;
 
-        verify_sha256(&tmp_archive, CAMPP_ARCHIVE_SHA256)?;
-        progress_cb(0.92);
-        self.extract_model_archive(&tmp_archive, &dest_dir, "model.onnx", false)?;
-        remove_model_temp_file(&tmp_archive, "completed CAM++ archive");
+        verify_sha256(&tmp, CAMPP_MODEL_SHA256)?;
+        replace_file(&tmp, &dest).map_err(|e| format!("Replace CAM++ model: {e}"))?;
         progress_cb(1.0);
 
         if !self.campp_present() {
-            return Err("CAM++ archive extracted but model.onnx is missing".into());
+            return Err("CAM++ downloaded but model.onnx is missing or undersized".into());
         }
 
         tracing::info!("CAM++ installed under {}", dest_dir.display());
@@ -630,27 +639,30 @@ impl ModelManager {
         // pipeline constructs DenoiserService from resolved_dir(), so the denoising-provenance flag must
         // be computed from the same place, or a denoiser present in the user dir but unreachable after
         // the bundled-dir fallback would still record denoising=true while audio passed through.
-        model_file_meets_min_size(&self.resolved_dir(), DENOISER_MODEL, 10_000_000)
+        // GTCRN is ~0.5 MB — see the MODELS entry: a 10 MB floor rejected the correct file.
+        model_file_meets_min_size(&self.resolved_dir(), DENOISER_MODEL, 400_000)
     }
 
-    /// Download and extract the AI Denoiser archive.
+    /// Download the GTCRN denoiser ONNX (a single direct file, not an archive) and verify it against
+    /// its pinned SHA-256 before placing it as `denoiser/model.onnx`.
     pub fn download_denoiser(&self, progress_cb: impl Fn(f32)) -> Result<(), String> {
         if self.models_dir.join(DENOISER_MODEL).exists() {
             progress_cb(1.0);
             return Ok(());
         }
 
-        ensure_pinned_sha256("AI Denoiser archive", DENOISER_ARCHIVE_SHA256)?;
+        ensure_pinned_sha256("AI Denoiser model", DENOISER_MODEL_SHA256)?;
 
         self.ensure_dir()?;
         let dest_dir = self.models_dir.join(DENOISER_DIR);
         fs::create_dir_all(&dest_dir).map_err(|e| format!("Create Denoiser dir: {e}"))?;
 
-        let tmp_archive = self.models_dir.join("denoiser.downloading.tar.bz2");
-        tracing::info!("Downloading AI Denoiser from {}", DENOISER_ARCHIVE_URL);
+        let dest = self.models_dir.join(DENOISER_MODEL);
+        let tmp = dest.with_extension("downloading");
+        tracing::info!("Downloading AI Denoiser from {}", DENOISER_MODEL_URL);
 
         let response = crate::http::DOWNLOAD_AGENT
-            .get(DENOISER_ARCHIVE_URL)
+            .get(DENOISER_MODEL_URL)
             .call()
             .map_err(|e| format!("Denoiser download failed: {e}"))?;
 
@@ -658,22 +670,20 @@ impl ModelManager {
 
         write_reader_to_temp(
             response.into_reader(),
-            &tmp_archive,
+            &tmp,
             total_size,
-            0.9,
+            0.95,
             &progress_cb,
-            "Archive read error",
-            "Archive write error",
+            "Denoiser read error",
+            "Denoiser write error",
         )?;
 
-        verify_sha256(&tmp_archive, DENOISER_ARCHIVE_SHA256)?;
-        progress_cb(0.92);
-        self.extract_model_archive(&tmp_archive, &dest_dir, "model.onnx", false)?;
-        remove_model_temp_file(&tmp_archive, "completed denoiser archive");
+        verify_sha256(&tmp, DENOISER_MODEL_SHA256)?;
+        replace_file(&tmp, &dest).map_err(|e| format!("Replace Denoiser model: {e}"))?;
         progress_cb(1.0);
 
         if !self.denoiser_present() {
-            return Err("Denoiser archive extracted but model.onnx is missing".into());
+            return Err("Denoiser downloaded but model.onnx is missing or undersized".into());
         }
 
         tracing::info!("AI Denoiser installed under {}", dest_dir.display());
@@ -822,10 +832,10 @@ fn model_download_supported(model: &ModelInfo) -> bool {
         return !OMNIASR_CTC_1B_ARCHIVE_SHA256.is_empty();
     }
     if model.filename.starts_with(CAMPP_DIR) {
-        return !CAMPP_ARCHIVE_SHA256.is_empty();
+        return !CAMPP_MODEL_SHA256.is_empty();
     }
     if model.filename.starts_with(DENOISER_DIR) {
-        return !DENOISER_ARCHIVE_SHA256.is_empty();
+        return !DENOISER_MODEL_SHA256.is_empty();
     }
     !model.url.is_empty() && !model.sha256.is_empty()
 }
@@ -1065,11 +1075,42 @@ mod tests {
 
     #[test]
     fn runtime_integrity_noop_for_unpinned_model() {
-        // CAM++ has an empty pin today -> verification is a documented no-op (cannot verify).
+        // The WavLM OOD detector has an empty pin today -> verification is a documented no-op (cannot
+        // verify). (CAM++ and the denoiser are now pinned, so they are NOT no-ops any more — see
+        // extra_model_pins_are_populated_and_urls_are_direct_files.)
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("whatever.onnx");
         std::fs::write(&path, b"unpinned content").unwrap();
-        assert!(verify_model_path_runtime(&path, CAMPP_MODEL).is_ok());
+        assert!(verify_model_path_runtime(&path, "wavlm_ood.onnx").is_ok());
+    }
+
+    #[test]
+    fn extra_model_pins_are_populated_and_urls_are_direct_files() {
+        // Regression for the 2026-07-13 fetch: CAM++ and the GTCRN denoiser were installed and their
+        // real bytes pinned; the previous tar.bz2 URLs were dead (404) and the extracted-file pins were
+        // blank (integrity check silently disabled). CTC-1B's archive pin was blank too, which blocked
+        // the in-app download. These invariants must not regress.
+        assert_eq!(OMNIASR_CTC_1B_ARCHIVE_SHA256.len(), 64, "CTC-1B archive pin must be populated");
+
+        for (dir, url, sha) in [
+            (CAMPP_DIR, CAMPP_MODEL_URL, CAMPP_MODEL_SHA256),
+            (DENOISER_DIR, DENOISER_MODEL_URL, DENOISER_MODEL_SHA256),
+        ] {
+            assert_eq!(sha.len(), 64, "{dir}: 64-hex SHA pin");
+            assert!(sha.chars().all(|c| c.is_ascii_hexdigit()), "{dir}: pin must be hex");
+            // Direct .onnx file, never a tar.bz2 (the old dead URLs) — the download path no longer extracts.
+            assert!(url.ends_with(".onnx"), "{dir}: URL must be a direct .onnx, got {url}");
+            assert!(!url.ends_with(".tar.bz2"), "{dir}: must not be an archive URL");
+            // MODELS entry mirrors the constants so status()/model_available_in agree with the downloader.
+            let m = MODELS.iter().find(|m| m.filename.starts_with(dir)).expect("MODELS entry present");
+            assert_eq!(m.sha256, sha, "{dir}: MODELS pin must match the constant");
+            assert_eq!(m.url, url, "{dir}: MODELS url must match the constant");
+            assert!(model_download_supported(m), "{dir}: must be auto-downloadable now");
+        }
+
+        // The GTCRN denoiser is ~535 KB; its floor must admit the real file (the old 10 MB floor rejected it).
+        let den = MODELS.iter().find(|m| m.filename.starts_with(DENOISER_DIR)).unwrap();
+        assert!(den.min_size_bytes < 535_638, "denoiser floor must be below the real GTCRN size");
     }
 
     #[test]
@@ -1103,17 +1144,20 @@ mod tests {
 
     #[test]
     fn routed_archive_download_refuses_unpinned_archive_before_side_effects() {
+        // Routed through download_model(): a model whose archive SHA is still blank (OmniASR CTC-300M —
+        // its archive was never hash-recorded) must refuse BEFORE any network/dir side effects. (CAM++
+        // and the denoiser are pinned now, so they no longer exercise this path.)
         let tmp = tempfile::tempdir().expect("tempdir");
         let models_dir = tmp.path().join("models");
         let manager = ModelManager::new(models_dir.clone());
         let progress_calls = Cell::new(0);
-        let model = MODELS.iter().find(|model| model.filename == CAMPP_MODEL).expect("CAM++ model entry");
+        let model = MODELS.iter().find(|model| model.filename == OMNIASR_CTC_300M_MODEL).expect("300M model entry");
 
         let err = manager
             .download_model(model, |_| progress_calls.set(progress_calls.get() + 1))
             .expect_err("unpinned archive must fail before download");
 
-        assert!(err.contains("Missing pinned SHA256 for CAM++ archive"));
+        assert!(err.contains("Missing pinned SHA256 for Meta OmniASR CTC300M archive"), "got: {err}");
         assert_eq!(progress_calls.get(), 0, "preflight failure must not emit progress");
         assert!(!models_dir.exists(), "preflight failure must not create model directories");
     }
@@ -1360,21 +1404,24 @@ mod tests {
 
     #[test]
     fn unpinned_optional_models_are_not_bulk_download_candidates() {
+        // Bulk-download candidacy follows PINNING, not presence (presence now varies with local install
+        // state — CAM++/denoiser may be in the bundled dir). CAM++ and the GTCRN denoiser became pinned
+        // direct-file downloads on 2026-07-13; WavLM OOD is still unpinned and must always be skipped.
+        let campp = MODELS.iter().find(|m| m.filename == CAMPP_MODEL).expect("CAM++ entry");
+        let denoiser = MODELS.iter().find(|m| m.filename == DENOISER_MODEL).expect("denoiser entry");
+        let wavlm = MODELS.iter().find(|m| m.filename == "wavlm_ood.onnx").expect("wavlm entry");
+        assert!(model_download_supported(campp), "CAM++ is pinned + has a URL -> a candidate");
+        assert!(model_download_supported(denoiser), "denoiser is pinned + has a URL -> a candidate");
+        assert!(!model_download_supported(wavlm), "WavLM OOD is unpinned -> never a candidate");
+
+        // The unpinned model must never appear in the bulk-download set regardless of what is installed.
         let tmp = tempfile::tempdir().expect("tempdir");
         let manager = ModelManager::new(tmp.path().join("models"));
-
-        let missing_names = manager.missing_models().into_iter().map(|model| model.name).collect::<Vec<_>>();
-        assert!(missing_names.contains(&"CAM++ Speaker Embedding"));
-        assert!(missing_names.contains(&"AI Audio Denoiser"));
-
-        let downloadable = manager.downloadable_missing_models();
-        assert!(downloadable.is_empty(), "bulk download must skip missing models without pinned checksums");
-
-        let status = manager.status();
-        let campp = status.iter().find(|model| model["filename"] == CAMPP_MODEL).expect("CAM++ status");
-        assert_eq!(campp["downloaded"], false);
-        assert_eq!(campp["downloadable"], false);
-        assert_eq!(campp["source"], "missing");
+        let downloadable: Vec<&str> = manager.downloadable_missing_models().into_iter().map(|m| m.name).collect();
+        assert!(
+            !downloadable.contains(&"WavLM Speech OOD Detector"),
+            "an unpinned model must never be a bulk-download candidate, got {downloadable:?}"
+        );
     }
 
     #[test]
