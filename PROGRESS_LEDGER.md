@@ -3427,3 +3427,31 @@ Gates: scripts/test_word_aligner_policy.py PASS (pins the token conversion: stri
 enforced, <pad> required — caught a space-token bug); run_python_policies.py -> 32 passed (was 31).
 NOTE: alignment is on-demand (the "Align" action, pipeline.rs:3124), NOT run at import — existing
 segments keep heuristic timings until re-aligned; new alignments use the CTC path.
+
+## 2026-07-13 (cont.) — align persistence proven in-app + 14-defect adversarial sweep
+
+Owner: "fix all other bugs and issues, make sure all works with proof not just brag."
+
+ALIGN, PROVEN: commit 9a4ea3c fixed handleAlign not passing the segment id (backend skipped the
+alignment_quality stamp), the re-transcribe flow clobbering fresh stamps via whole-row upsert
+ordering, and ReviewMode never upgrading heuristic-timed clips. On-screen proof in the rebuilt
+app: clicked Align -> "Alignment complete" -> DB row flipped to alignment_quality='ctc_forced'
+with voice-tracking durations [1.1, 0.5, 0.14, 0.6 ...] and confidences 0.73-0.99 (vs flat
+0.398 s / 0.5 heuristic rows). The review backlog self-upgrades on open (ensureWordTimings).
+
+SWEEP: commit caf8010 — a 19-agent workflow (4 lenses + per-finding adversarial refuters)
+confirmed 14 defects, 1 refuted. Highlights: CRITICAL unbounded Viterbi DP (~58 GB attempted
+allocation on a 30-min clip) capped with tests; the REAL each_key_duplicate source found and
+fixed at the source (OFFSET-cursor pagination re-serving rows during concurrent import inserts —
+no optimistic append exists); the stale-spread clobber class closed across ReviewMode + all four
+App transcribe handlers (freshRow-by-id at persist time); 7B parent now forwards SIGTERM/SIGINT
+(killing it orphaned GPU replicas holding the port + ~19 GB VRAM each); client DB snapshot no
+longer copies -shm (reproduced failure) + retries torn WAL copies; engine pill warmup deadline;
+picker-cancel + normalize-failure UX honesty. F10 (autosave merges vs the store during a minutes-
+long batch) is MITIGATED frontend-side (inputs disabled while processing); the full fix needs a
+Codex-owned fresh-row IPC — surfaced, not faked.
+
+Verbatim gates (this machine): cargo test --lib aligner -> "10 passed; 0 failed" (3 new);
+cargo clippy --lib --all-targets -D warnings -> "Finished" clean; npm typecheck -> 0 errors;
+npm lint -> clean; npm test -> "194 passed"; run_python_policies.py -> "32 policy test scripts
+passed."
