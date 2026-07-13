@@ -78,8 +78,11 @@ def test_unpinned_archive_models_are_not_downloadable() -> None:
     required_archive_guards = [
         ("OMNIASR_CTC_300M_DIR", "OMNIASR_CTC_300M_ARCHIVE_SHA256"),
         ("OMNIASR_CTC_1B_DIR", "OMNIASR_CTC_1B_ARCHIVE_SHA256"),
-        ("CAMPP_DIR", "CAMPP_ARCHIVE_SHA256"),
-        ("DENOISER_DIR", "DENOISER_ARCHIVE_SHA256"),
+        # CAM++ and the denoiser are now single-file .onnx direct downloads (the old tar.bz2 URLs 404'd),
+        # pinned by the model SHA (not an archive SHA). The unpinned-not-downloadable guarantee is
+        # unchanged — model_download_supported still gates them on a non-empty pinned digest.
+        ("CAMPP_DIR", "CAMPP_MODEL_SHA256"),
+        ("DENOISER_DIR", "DENOISER_MODEL_SHA256"),
     ]
 
     for dir_const, sha_const in required_archive_guards:
@@ -94,8 +97,9 @@ def test_archive_downloads_preflight_and_verify_sha256() -> None:
 
     expected_pairs = [
         ("Meta OmniASR", "archive_sha256"),
-        ("CAM++ archive", "CAMPP_ARCHIVE_SHA256"),
-        ("AI Denoiser archive", "DENOISER_ARCHIVE_SHA256"),
+        # Direct .onnx downloads: still preflight the pinned SHA -> network get -> verify SHA, in order.
+        ("CAM++ model", "CAMPP_MODEL_SHA256"),
+        ("AI Denoiser model", "DENOISER_MODEL_SHA256"),
     ]
 
     for label, sha_expr in expected_pairs:

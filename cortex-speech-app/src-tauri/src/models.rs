@@ -187,16 +187,19 @@ pub const MODELS: &[ModelInfo] = &[
     ModelInfo {
         name: "CAM++ Speaker Embedding",
         filename: CAMPP_MODEL,
-        url: CAMPP_MODEL_URL,
-        sha256: CAMPP_MODEL_SHA256,
+        // Literal url/sha256 (matches CAMPP_MODEL_URL/CAMPP_MODEL_SHA256) — the provenance policy audits
+        // the hex directly in the ModelInfo block, like Silero/OmniASR above.
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+        sha256: "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
         min_size_bytes: 10_000_000,
         version: "1.0",
     },
     ModelInfo {
         name: "AI Audio Denoiser",
         filename: DENOISER_MODEL,
-        url: DENOISER_MODEL_URL,
-        sha256: DENOISER_MODEL_SHA256,
+        // Literal url/sha256 (matches DENOISER_MODEL_URL/DENOISER_MODEL_SHA256).
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx",
+        sha256: "e77603ac0c23dac3227dd2d7135b3a585cbee2679048aecfa886657d3ae1b534",
         // GTCRN is ~0.5 MB — a 10 MB floor (the old value) rejected the correct model. Guard against a
         // truncated download without excluding the real file.
         min_size_bytes: 400_000,

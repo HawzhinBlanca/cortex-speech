@@ -937,8 +937,10 @@ def test_model_artifact_cleanup_reports_failures() -> None:
         'remove_model_temp_file(&tmp_archive, "completed OmniASR archive");',
         'remove_model_temp_file(&tmp, "failed model extraction temp");',
         'remove_model_temp_file(&tmp, "failed token extraction temp");',
-        'remove_model_temp_file(&tmp_archive, "completed CAM++ archive");',
-        'remove_model_temp_file(&tmp_archive, "completed denoiser archive");',
+        # CAM++/denoiser are direct .onnx downloads now (no tar.bz2 to clean after extraction); their
+        # temp is cleaned on failure by write_reader_to_temp (read error) and verify_sha256
+        # (mismatch/unpinned — see the "SHA256-mismatched"/"unpinned" entries above), promoted by
+        # replace_file on success. No dedicated archive-completion cleanup call remains for them.
         'remove_model_temp_file(&tmp, "undersized model download");',
         'remove_model_temp_file(tmp_path, "partial model download");',
         'remove_model_temp_file(tmp, "staged model extraction temp");',
