@@ -150,7 +150,15 @@ pub fn judge_t1(
         };
     };
 
-    if best_score >= commit_threshold {
+    // Audit P1 #3 — DEMOTED TO PROPOSAL-ONLY. T1's "lexicon" is Arabic-Unicode-block coverage
+    // (lexicon_lookup) and its "perplexity" is self-trigram entropy (ngram_perplexity): neither is a
+    // validated Sorani language signal, so T1 MUST NOT auto-commit labels (skipping human review on a
+    // weak heuristic) until a real Sorani lexicon/LM shows measured, ratified lift. Until then a
+    // would-be commit escalates for human/T2 review instead — the honest default. The scoring +
+    // threshold are preserved so the day this flips true, behavior is exactly the old path.
+    const T1_AUTOCOMMIT_ENABLED: bool = false;
+
+    if T1_AUTOCOMMIT_ENABLED && best_score >= commit_threshold {
         T1Decision::Commit {
             segment_id: segment_id.into(),
             transcript: winner.transcript.clone(),
@@ -218,11 +226,17 @@ mod tests {
     }
 
     #[test]
-    fn test_t1_judge_selects_best() {
+    fn test_t1_judge_demoted_escalates_even_over_threshold() {
+        // Audit P1 #3: T1 is demoted to proposal-only — even a hypothesis that clears the commit
+        // threshold (here threshold=0.0, best score always over it) must ESCALATE, not auto-commit,
+        // so a weak lexicon/entropy signal can never skip human/T2 review. Flip T1_AUTOCOMMIT_ENABLED
+        // true (only after measured lift) and this becomes a Commit again.
         let hyps = vec![make_hyp("s1", "good-model", "کوردستان", 0.9), make_hyp("s1", "bad-model", "xyzxyzxyz", 0.3)];
-        // With commit_threshold=0.0 it should always commit
         let decision = judge_t1("s1", &hyps, 0.0);
-        assert!(matches!(decision, T1Decision::Commit { .. }));
+        assert!(
+            matches!(decision, T1Decision::EscalateToT2 { .. }),
+            "demoted T1 must escalate, not commit"
+        );
     }
 
     #[test]
