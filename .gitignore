@@ -86,6 +86,11 @@ podcast_transcription.txt
 # skills) is intentionally NOT ignored — mirrors cortex-speech-app/.gitignore's convention.
 .claude/settings.local.json
 .claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/skills/**/*.md.txt
+
+# Local debug/rating scratch — contains machine-local profile paths; never publish.
+DEBUG_cortex.md
 
 # Fetched at build time by scripts/fetch_models.py (pinned MS onnxruntime release) into
 # models/onnxruntime.dll/ and bundled from there — these src-tauri-root copies are redundant.
