@@ -3336,3 +3336,31 @@ review attention (adjacent repeats/filler-like tokens) in the owner's review-pri
 
 Owner-gated remainder for the goal: reviewing the 143 drafts per the new guidelines (perfect
 exact transcription is human work by definition); premium tier fills as verifications land.
+
+## 2026-07-13 (cont.) — premium tier unblocked: proven end-to-end on a REAL app export
+
+Commit 92916cd. Drove the running app's Export->JSONL to produce a genuine 148-row export, ran
+the premium builder on it, and hit an EMPTY premium tier (0/148). Root cause (quality.rs:257):
+energy_heuristic_alignment is a review-risk and mms_aligner.onnx is absent, so EVERY clip is
+graded `review` and trainingReady is false for all — even human-verified ones. Reviewing 143
+clips would still have yielded nothing (and the app's own HF export is blocked identically).
+
+Owner decision: ASR audio->text training does not use word timestamps, so alignment source must
+not block premium. Builder identity gate changed from trainingReady to: transcriptSource==
+"human_verified" AND trainingGrade!="reject" AND no NON-alignment audio review-risk; measured
+audio/text/timing gates unchanged. Adversarial audit (separate agent, read quality.rs + export.rs
++ builder in full): SOUND, no holes — the human_verified branch separates GOLD/REVIEW solely on a
+closed 5-reason review-risk set, so tolerating the 2 alignment reasons admits exactly the intended
+clips; the change is strictly tighter on jury/machine rows; human-rejected still drop; holdout
+excluded upstream by export_dataset.
+
+Verbatim proof (real app export, this machine):
+  $ python scripts/build_premium_dataset.py <app-export.jsonl> --out-dir premium/
+  premium: 3 / 148 segments      (the 3 human-verified Nawras clips)
+  rejected: 145  (not-human-verified: 144; missing-audio-metric: 1)   EXIT 0
+  $ python scripts/run_python_policies.py
+  Python policy regressions finished: 31 policy test scripts passed.
+
+Owner workflow now CONFIRMED end-to-end: review in app -> Export -> JSONL -> build_premium_dataset
+-> premium.jsonl. Verified clips flow into premium; all 143 queued clips carry audio metrics.
+Aligner-install-to-GOLD remains an optional upgrade for timestamp-dependent training.
