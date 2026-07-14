@@ -11,6 +11,11 @@ Cortex Speech is an **offline-first desktop app** (Tauri v2 + Svelte 5 + Rust) f
 
 - Local ASR: **Meta OmniASR CTC** via **sherpa-onnx** + **Silero VAD** (no cloud needed).
 - Optional, **consent-gated** cloud: ElevenLabs Scribe (STT) and OpenRouter (LLM refine, reaches Gemini-class models).
+- **Cloud-ASR policy (owner, strict):** the ONLY approved cloud ASR/judge for Central Kurdish is
+  **Gemini 2.5 Pro** (`gemini-2.5-pro` direct or `google/gemini-2.5-pro` via OpenRouter); ElevenLabs
+  **Scribe** is the only other approved cloud STT. **Never use or suggest Qwen-family ASR for ckb** —
+  it has no Sorani support (measured). Any new cloud judge requires a measured ckb CER on the frozen
+  gold set before it may be configured.
 - Storage: SQLite + FTS5 search. ~102 Tauri IPC commands. EN/CKB (RTL) localized UI.
 - Workflow: import -> VAD chunk -> ASR -> (optional refine) -> review/annotate -> validate -> verify -> export (JSON/JSONL/CSV/Parquet/HuggingFace/WAV).
 

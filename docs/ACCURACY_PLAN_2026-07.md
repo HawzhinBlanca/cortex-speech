@@ -62,11 +62,15 @@ CI catches this; keep the placeholder/empty guards. Prompt language matters (Sor
 vs English) — A/B both.
 **Effort:** harness ~half a day; model pulls are bandwidth-bound; eval ~1 h per model at 2× speed.
 
-## Track 2 — Third jury engine: Qwen3-ASR-1.7B + ckb LoRA
+## Track 2 — Third jury engine: Qwen3-ASR-1.7B + ckb LoRA — **DROPPED (owner decision 2026-07-14)**
 
-**Goal:** a fast third opinion for the jury (diversity beats solo accuracy) with native timestamp
+**Owner ruling: Qwen is bad in Kurdish — do not build on it.** The approved cloud ASR/judge is
+strictly **Gemini 2.5 Pro** (+ ElevenLabs Scribe for cloud STT). This track is retired; a third jury
+engine, if ever, must start from a model with measured ckb competence.
+
+~~**Goal:** a fast third opinion for the jury (diversity beats solo accuracy) with native timestamp
 prediction. Verified: Qwen3-ASR does **not** ship Sorani — a LoRA is required, and the 7B champion
-stays champion until beaten on gold.
+stays champion until beaten on gold.~~
 
 **Steps:**
 1. **[agent] Data audit:** count holdout-excluded training pairs available via
