@@ -3570,3 +3570,31 @@ REMAINING backlog (honest scope — NOT started, would be reckless to rush on a 
   async migration of ~120 #[tauri::command]s, a durable Job Supervisor, app-owned 7B supervision,
   backup/restore writer fence, global-DB-mutex -> serialized writer queue + read pool, STRICT schema +
   migrate-from-every-version. These stay owner-scheduled; faking them would violate the honesty law.
+
+## 2026-07-14 (cont.) — Gemini-only policy hardened; F10 root-fixed; OpenRouter key box shipped
+
+Owner: "for cloud ASR only use gemini 2.5 pro - Make it strict in all docs, coz Qwen is bad in
+kurdish, only gemini and scribe 2 is good, also yes fix f10 and give me a box to paste my openrouter
+api safely." All three delivered with verbatim gates:
+
+- docs(policy) fa0e055: CLAUDE.md binding policy (cloud ASR judge for ckb = Gemini 2.5 Pro ONLY;
+  Scribe the only other cloud STT; never Qwen — matches the recorded sweep: Qwen3-ASR has no Sorani).
+  ACCURACY_PLAN Track 2 (Qwen3-ASR jury engine) DROPPED. Strictness also written into settings.rs /
+  commands.rs / t2_listener.rs doc comments.
+- feat(curation+settings) 716b9c8:
+  * F10 ROOT FIX — update_segment_fields IPC: whitelisted curation fields only, FRESH row read +
+    apply under the held lock, persists via the same HistoryManager path (undo intact); deleted row
+    is a no-op. Autosave sends ONLY the edited fields; the batch-running input-disable mitigation is
+    removed (root cause gone). Regression tests both sides (Rust apply_curation_fields whitelist/
+    null/unknown-key; vitest fields+id forwarding).
+  * OpenRouter key box (Settings -> Listening Jury): ApiKeys::save_key writes secrets.env atomically,
+    preserves other lines, REJECTS whitespace/control chars (env-injection guard), empty clears; the
+    key is never logged/echoed/stored elsewhere — UI shows only a set/unset badge. "Judge connection"
+    select (Google direct | OpenRouter) surfaces jury_provider with the strict Gemini-only note.
+
+Verbatim gates this batch: cargo test --lib -> "901 passed; 0 failed"; clippy --lib clean; vitest ->
+"196 passed (196)"; svelte-check/tsc -> 0 errors; eslint clean; run_python_policies.py -> "32 policy
+test scripts passed."
+
+To USE OpenRouter for the jury: Settings -> Listening Jury -> cloud opt-in -> Judge connection =
+OpenRouter -> paste key -> Save. Falls back to direct Gemini automatically if no key is present.
