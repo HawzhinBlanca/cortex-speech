@@ -8,6 +8,11 @@ DEFAULT_CAPABILITY = REPO_ROOT / "src-tauri" / "capabilities" / "default.json"
 
 EXPECTED_CAPABILITY_PERMISSIONS = [
     "core:default",
+    # 2026-07-14: the close-button fix needed these two. Without allow-destroy, window.destroy() in
+    # the close-request handler was silently DENIED by the permission system — every close click was
+    # intercepted (to flush the autosave) and then went nowhere, so the app could never actually quit.
+    "core:window:allow-close",
+    "core:window:allow-destroy",
     "dialog:default",
     "dialog:allow-open",
     "dialog:allow-save",
