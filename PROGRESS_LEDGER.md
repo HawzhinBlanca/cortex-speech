@@ -3598,3 +3598,16 @@ test scripts passed."
 
 To USE OpenRouter for the jury: Settings -> Listening Jury -> cloud opt-in -> Judge connection =
 OpenRouter -> paste key -> Save. Falls back to direct Gemini automatically if no key is present.
+
+## 2026-07-14 (cont.) — owner review-session feedback: undo button, Gemini watcher, verbatim repeats
+
+Owner (reviewing real transcriptions): repeated words dropped ("کە کە"->"کە"); cannot go back after
+Save & next; wants Gemini as a smart audio+text watcher. Delivered:
+- feat(review) <hash>: visible "Undo review" button (undo existed only as hidden Backspace; a saved
+  clip teleports to the done tail so Back landed elsewhere — undoLast clears the decision + restores
+  + re-lands the cursor). NEW "Gemini check" watcher button: per-clip audio+hypotheses to Gemini 2.5
+  Pro through the existing guarded T2 judge; inline verdict card with use-this-text fill; human
+  still decides. T2 + GER prompts now demand VERBATIM repeats (listen for repeats the local ASR
+  dropped). Normalizer verified clean of any word-dedup — repeat-dropping is model behavior; owner
+  corrections + the watcher are the honest countermeasures until the next fine-tune.
+Gates: typecheck 0; eslint clean; vitest 196/196; cargo jury 52 + refiner 3; clippy clean.
