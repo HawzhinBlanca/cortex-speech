@@ -1,6 +1,7 @@
 # Third-Party Licenses
 
-Cortex Speech is licensed under Apache-2.0. It builds on the open-source
+Cortex Speech's own source is licensed under PolyForm Noncommercial 1.0.0 (see the root
+`LICENSE`/`NOTICE`). It builds on the open-source
 components below. The license for each **direct** dependency was read from the
 resolved crate metadata on disk (`cargo metadata --format-version 1`, license
 field) and from `package.json`; it is not hand-asserted.

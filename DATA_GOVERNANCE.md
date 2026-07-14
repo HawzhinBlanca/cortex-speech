@@ -30,7 +30,8 @@ All ingested and benchmarked datasets must be audited against this provenance le
 * **Attribution**: "AsoSoft Kurdish Corpus, AsoSoft Team, licensed under CC BY-SA 4.0."
 * **Consent Basis**: Academic public dataset.
 * **Redistribution Rights**: Permitted under ShareAlike. 
-* **License Compatibility Warning**: **SHARE-ALIKE CONTAMINATING**. Any derivative dataset derived from AsoSoft text or audio must also be distributed under `CC-BY-SA-4.0`. The core app remains Apache-2.0, but the exported AsoSoft-derived data is isolated and gated.
+* **License Compatibility Warning**: **SHARE-ALIKE CONTAMINATING**. Any derivative dataset derived from AsoSoft text or audio must also be distributed under `CC-BY-SA-4.0`. The core app's own source is licensed separately (PolyForm Noncommercial 1.0.0 — see root
+`LICENSE`), but the exported AsoSoft-derived data is isolated and gated regardless.
 
 ### 3. CORDI (Central Kurdish Dialect Corpus)
 * **Source URL**: Academic release

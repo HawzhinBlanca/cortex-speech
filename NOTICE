@@ -1,9 +1,17 @@
 Cortex Speech
-Copyright 2026 Cortex Team
+Required Notice: Copyright 2026 Wareen (hawzhin88@gmail.com) — https://github.com/HawzhinBlanca/cortex-speech
 
-This product includes software developed by the Cortex Team.
+This original code (the Cortex Speech application, its Rust/Svelte source, and its
+Sorani-normalization logic) is licensed under the PolyForm Noncommercial License 1.0.0 — see
+LICENSE. Noncommercial use (personal, academic, research, evaluation) is freely permitted;
+commercial use (including embedding this code, in whole or in part, into another product or
+service) requires a separate commercial license from the copyright holder. To request one,
+contact hawzhin88@gmail.com.
 
-This product includes or makes use of the following third-party components:
+This product includes or makes use of the following third-party components. Their own
+licenses are unaffected by the license of this project's original code above — each remains
+governed by its own upstream license, and this project complies with those terms (attribution
+below) rather than claiming any broader right over them:
 
 1. Meta Omnilingual ASR (omniASR)
    Developed by Meta AI (Facebook Research)

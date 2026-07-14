@@ -4,8 +4,8 @@ version = "2.1.0"
 edition = "2021"
 default-run = "cortex-speech-app"
 description = "Production-grade Kurdish (Sorani) speech transcription, processing, and dataset curation app"
-authors = ["Cortex Team"]
-license = "Apache-2.0"
+authors = ["Wareen <hawzhin88@gmail.com>"]
+license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/HawzhinBlanca/cortex-speech"
 
 [lib]
@@ -74,6 +74,9 @@ bzip2 = "0.5"
 
 # HTTP client for model downloads and LLM API
 ureq = { version = "2", features = ["tls", "json"] }
+# Couch Review: minimal thread-per-request HTTP server for the LAN-only phone review page.
+# Sync (no tokio-net coupling), matching the codebase's Mutex<Database> patterns.
+tiny_http = "0.12"
 
 # SHA256 verification for downloaded models
 sha2 = "0.11"

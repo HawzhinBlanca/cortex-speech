@@ -136,23 +136,28 @@ def check_manifests():
     if changelog_ver != pkg_ver:
         print("  [ERR] Canonical CHANGELOG version does not byte-equal the manifests!")
         ok = False
-    if pkg_license != "Apache-2.0" or cargo_license != "Apache-2.0":
-        print("  [ERR] License mismatch or not Apache-2.0!")
+    # PolyForm Noncommercial 1.0.0 (2026-07-14 relicense, owner decision): the app's own source went
+    # from Apache-2.0 (freely commercially reusable, which is what let third parties embed it in their
+    # own products) to a noncommercial-use license. Bundled THIRD-PARTY deps (Meta OmniASR, sherpa-onnx,
+    # Silero VAD) keep their own Apache-2.0 terms unaffected — see NOTICE — this gate is only about the
+    # project's own declared license.
+    if pkg_license != "PolyForm-Noncommercial-1.0.0" or cargo_license != "PolyForm-Noncommercial-1.0.0":
+        print("  [ERR] License mismatch or not PolyForm-Noncommercial-1.0.0!")
         ok = False
     return ok
 
 
 def check_repo_integrity():
-    """LICENSE is Apache-2.0 text, NOTICE names the project, Cargo repository URL is the real remote."""
+    """LICENSE is PolyForm Noncommercial 1.0.0 text, NOTICE names the project, Cargo repository URL is the real remote."""
     print("==> Checking LICENSE/NOTICE content and repository URL...")
     ok = True
 
     license_head = "\n".join(rel("LICENSE").read_text(encoding="utf-8").splitlines()[:5])
-    if "Apache License" not in license_head:
-        print("  [ERR] LICENSE does not begin with the Apache License text.")
+    if "PolyForm Noncommercial License 1.0.0" not in license_head:
+        print("  [ERR] LICENSE does not begin with the PolyForm Noncommercial License text.")
         ok = False
     else:
-        print("  [OK]  LICENSE is the Apache License text.")
+        print("  [OK]  LICENSE is the PolyForm Noncommercial License text.")
 
     notice_head = rel("NOTICE").read_text(encoding="utf-8").splitlines()
     if not notice_head or "Cortex" not in notice_head[0]:

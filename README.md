@@ -41,4 +41,13 @@ make verify-10         # full charter gate; fails closed until eval/egress/relea
 
 ## License
 
-Apache-2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+**PolyForm Noncommercial 1.0.0** — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+The source is public for transparency and portfolio purposes. Noncommercial use (personal,
+academic, research, evaluation) is freely permitted. **Commercial use — including embedding
+this code, in whole or in part, into another product or service — is NOT permitted** without a
+separate commercial license from the copyright holder. To request one, contact
+hawzhin88@gmail.com.
+
+Bundled third-party components (Meta OmniASR, sherpa-onnx, Silero VAD, AsoSoft) retain their
+own upstream licenses — see [`NOTICE`](NOTICE) and [`THIRD_PARTY_LICENSES.md`](cortex-speech-app/THIRD_PARTY_LICENSES.md).
