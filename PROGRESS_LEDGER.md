@@ -3611,3 +3611,25 @@ Save & next; wants Gemini as a smart audio+text watcher. Delivered:
   dropped). Normalizer verified clean of any word-dedup — repeat-dropping is model behavior; owner
   corrections + the watcher are the honest countermeasures until the next fine-tune.
 Gates: typecheck 0; eslint clean; vitest 196/196; cargo jury 52 + refiner 3; clippy clean.
+
+## 2026-07-15 — Couch Review shipped: phone reviewing over Wi-Fi or Tailscale
+
+Owner: review from couch/phone; then "instead being on the same wifi" -> Tailscale (owner's tailnet
+already had hawapc01 + iPhone 15 Pro Max; verified via tailscale status). feat(couch) <hash>:
+token-gated tiny_http server + self-contained mobile page (audio player, RTL editor, accept/save/
+bad/undo) + Settings card showing Wi-Fi AND Tailscale URLs (CGNAT-range-verified detection).
+Website/public-internet exposure REFUSED on privacy grounds (biometric audio; server is LAN-grade
+by design) — Tailscale delivers from-anywhere with zero public exposure.
+
+HONESTY HIGHLIGHT — the live end-to-end test caught a real production deadlock pre-ship: stop()
+hung forever on join() because a bare TCP connect never wakes tiny_http's accept loop (only complete
+HTTP requests do). Root-caused via checkpoint instrumentation after two hung runs (the leftover
+hung process even blocked the next linker run — LNK1104 — confirming the diagnosis). Fix:
+Arc<Server>::unblock(); test asserts clean join. Also: two expect()s converted to graceful paths
+(panic-policy gate), and the earlier wedge was orphaned cargo processes deadlocking the global
+package-cache lock (killed; isolated CARGO_TARGET_DIR now the standing pattern for testing while
+the app runs).
+
+Verbatim gates: cargo test --lib -> "907 passed; 0 failed" (6 new couch tests incl. live HTTP
+roundtrip "6 passed; 0 failed ... finished in 0.10s"); clippy --lib clean; run_python_policies ->
+"32 policy test scripts passed"; vitest "196 passed"; svelte-check 0 errors; eslint clean.
