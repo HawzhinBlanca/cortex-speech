@@ -49,6 +49,11 @@ fn build_system_prompt() -> &'static str {
      You will receive an audio clip and multiple ASR transcription hypotheses. \
      Listen carefully to the audio and determine which hypothesis is most accurate, \
      or provide a corrected transcription if all hypotheses are wrong. \
+     Transcribe VERBATIM — exactly what is spoken: if the speaker repeats a word or part of a word \
+     (for example says 'کە کە' or 'لە لە'), the transcript MUST contain the repetition exactly as \
+     spoken. Local ASR systems often collapse such repetitions into a single word, so listen \
+     specifically for repeated words the hypotheses may have dropped, and for filler sounds. Never \
+     'clean up' the speech: no added punctuation the speaker did not voice, no dropped stutters. \
      Always respond in strict JSON format with exactly three keys: \
      'transcript' (the correct Sorani Kurdish text), \
      'reason' (a single sentence explaining your decision), \

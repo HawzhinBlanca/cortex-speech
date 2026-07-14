@@ -202,7 +202,8 @@ pub fn build_ger_user_prompt(primary: &str, hypotheses: &[String], few_shot: &[(
     out.push_str(
         "\n\nUsing the candidates and past corrections, output ONLY the corrected Sorani transcript, \
          with no explanation or quotes. Prefer what the candidates agree on; do not add content the \
-         candidates do not support.",
+         candidates do not support. The transcript is VERBATIM: if the speaker repeated a word (e.g. \
+         'کە کە'), keep the repetition — never collapse repeated words, stutters, or fillers into one.",
     );
     out
 }

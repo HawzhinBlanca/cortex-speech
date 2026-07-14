@@ -259,6 +259,27 @@
       saving = false;
     }
   }
+  // Cloud watcher: one Gemini-2.5-Pro listen on THIS clip (the T2 judge, on demand). Gemini hears the
+  // audio and checks the draft verbatim — including repeated words ("کە کە") the local ASR often
+  // collapses — and returns a corrected transcript + reason. The verdict renders inline; the reviewer
+  // stays the decider (a "use this text" click only fills the editor, never auto-verifies).
+  let cloudChecking = $state(false);
+  let cloudCheck = $state<{ id: string; result: import('./commands').T2Result } | null>(null);
+  async function runCloudCheck() {
+    const seg = current;
+    if (!seg || cloudChecking || saving || retranscribing) return;
+    cloudChecking = true;
+    cloudCheck = null;
+    try {
+      const result = await api.runT2ForSegment(seg.id, $settings.llmApiKey);
+      cloudCheck = { id: seg.id, result };
+    } catch (e) {
+      notifications.error($t('review.cloudCheckFailed'), { detail: String(e) });
+    } finally {
+      cloudChecking = false;
+    }
+  }
+
   // A word is "contested" (worth a second look) when under two-thirds weighted agreement.
   const CONTESTED = 0.67;
 
@@ -1031,6 +1052,17 @@
         >
           {$t('review.retranscribeFinetuned')}
         </button>
+        {#if $settings.juryCloudOptIn}
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs"
+            onclick={() => void runCloudCheck()}
+            disabled={cloudChecking || retranscribing || saving}
+            title={$t('review.cloudCheckTitle')}
+          >
+            {cloudChecking ? $t('review.cloudChecking') : $t('review.cloudCheck')}
+          </button>
+        {/if}
         <button
           type="button"
           class="btn btn-secondary ms-auto !text-xs !text-rose-300 hover:!text-rose-200"
@@ -1042,6 +1074,39 @@
         </button>
       </div>
 
+      <!-- Cloud watcher verdict: Gemini's audio-grounded reading of THIS clip. Advisory only — the
+           reviewer decides; "use this text" fills the editor and still requires Save & next. -->
+      {#if cloudCheck && current && cloudCheck.id === current.id}
+        {@const verdict = cloudCheck.result.verdict}
+        <div class="rounded-md border border-cortex-700/40 bg-cortex-900/40 p-3 space-y-2">
+          {#if verdict}
+            {#if verdict.transcript.trim() === editText.trim()}
+              <p class="text-xs text-emerald-300">
+                ✓ {$t('review.cloudCheckAgrees')} ({Math.round(verdict.confidence * 100)}%)
+              </p>
+            {:else}
+              <p dir="rtl" lang="ckb" class="font-mono text-sm text-end">{verdict.transcript}</p>
+              <p class="text-[11px] text-subtle">
+                {verdict.reason} · {Math.round(verdict.confidence * 100)}% · {verdict.votes}×
+              </p>
+              <button
+                type="button"
+                class="btn btn-secondary !text-xs"
+                onclick={() => (editText = verdict.transcript)}
+              >
+                {$t('review.cloudCheckUse')}
+              </button>
+            {/if}
+          {:else}
+            <p class="text-xs text-amber-300">
+              {$t('review.cloudCheckEscalated')}{cloudCheck.result.error
+                ? ` — ${cloudCheck.result.error}`
+                : ''}
+            </p>
+          {/if}
+        </div>
+      {/if}
+
       <!-- Actions -->
       <div class="flex flex-wrap items-center gap-2">
         <button
@@ -1052,6 +1117,15 @@
           aria-label={$t('prevSegment')}
         >
           {$t('review.prev')}
+        </button>
+        <button
+          type="button"
+          class="btn btn-secondary"
+          onclick={() => void undoLast()}
+          disabled={undoHistory.length === 0 || saving || retranscribing}
+          title={$t('review.undoLastTitle')}
+        >
+          ↩ {$t('review.undoLast')}
         </button>
         <div class="flex flex-1 flex-wrap justify-end gap-2">
           <button
