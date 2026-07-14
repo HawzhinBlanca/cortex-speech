@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Cortex Couch Review</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: system-ui, sans-serif; background: #0b1220; color: #e2e8f0;
+         min-height: 100dvh; display: flex; flex-direction: column; padding: 12px; gap: 12px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; }
+  h1 { font-size: 15px; color: #7dd3fc; }
+  #progress { font-size: 12px; color: #94a3b8; }
+  #card { background: #111a2e; border: 1px solid #1e293b; border-radius: 14px; padding: 14px;
+          display: flex; flex-direction: column; gap: 12px; flex: 1; }
+  audio { width: 100%; }
+  textarea { width: 100%; min-height: 34dvh; background: #0b1220; color: #f1f5f9;
+             border: 1px solid #334155; border-radius: 10px; padding: 12px;
+             font-size: 18px; line-height: 1.9; direction: rtl; }
+  .meta { font-size: 11px; color: #64748b; }
+  .row { display: flex; gap: 8px; }
+  button { flex: 1; padding: 14px 8px; border-radius: 12px; border: 1px solid #334155;
+           background: #1e293b; color: #e2e8f0; font-size: 15px; font-weight: 600; }
+  button:disabled { opacity: 0.45; }
+  #save   { background: #0369a1; border-color: #0284c7; }
+  #accept { background: #14532d; border-color: #166534; }
+  #bad    { color: #fda4af; }
+  #undo   { flex: 0 0 auto; padding: 14px 16px; }
+  #done, #err { text-align: center; padding: 40px 10px; font-size: 16px; }
+  #err { color: #fda4af; white-space: pre-wrap; }
+  .toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+           background: #1e293b; border: 1px solid #334155; padding: 8px 18px;
+           border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .2s; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header><h1>Cortex · Couch Review</h1><div id="progress"></div></header>
+<div id="card" hidden>
+  <audio id="player" controls preload="auto"></audio>
+  <textarea id="text" lang="ckb" spellcheck="false"></textarea>
+  <div class="meta" id="meta"></div>
+  <div class="row">
+    <button id="undo" title="Undo last review">↩</button>
+    <button id="bad">✗ Bad</button>
+    <button id="accept">✓ Looks good</button>
+    <button id="save">Save &amp; next</button>
+  </div>
+</div>
+<div id="done" hidden>🎉 Queue reviewed. New clips appear here automatically.</div>
+<div id="err" hidden></div>
+<div class="toast" id="toast"></div>
+<script>
+  const token = new URLSearchParams(location.search).get('t') || '';
+  const $ = (id) => document.getElementById(id);
+  let queue = [], i = 0, busy = false;
+
+  function toast(msg) {
+    $('toast').textContent = msg;
+    $('toast').classList.add('show');
+    setTimeout(() => $('toast').classList.remove('show'), 1400);
+  }
+  async function api(path, opts) {
+    const r = await fetch(path + (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(token), opts);
+    if (!r.ok) throw new Error(await r.text());
+    return r.headers.get('content-type')?.includes('json') ? r.json() : r;
+  }
+  function show() {
+    const seg = queue[i];
+    $('card').hidden = !seg; $('done').hidden = !!seg;
+    $('progress').textContent = queue.length ? (queue.length - i) + ' left' : '';
+    if (!seg) return;
+    $('player').src = '/api/audio/' + encodeURIComponent(seg.id) + '?t=' + encodeURIComponent(token);
+    $('text').value = seg.text;
+    $('meta').textContent = (seg.durationMs / 1000).toFixed(1) + 's' + (seg.speakerId ? ' · ' + seg.speakerId : '');
+  }
+  async function load() {
+    try {
+      queue = await api('/api/queue'); i = 0; show();
+    } catch (e) { $('err').hidden = false; $('err').textContent = 'Cannot load queue:\n' + e.message; }
+  }
+  async function decide(action) {
+    if (busy || !queue[i]) return;
+    busy = true;
+    const btns = ['save','accept','bad','undo'].map($); btns.forEach(b => b.disabled = true);
+    try {
+      await api('/api/decision', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: queue[i].id, action, text: $('text').value }),
+      });
+      toast(action === 'bad' ? 'Marked bad' : 'Saved');
+      i += 1; show();
+    } catch (e) { toast('Failed: ' + e.message); }
+    finally { busy = false; btns.forEach(b => b.disabled = false); }
+  }
+  $('save').onclick   = () => decide('edit');
+  $('accept').onclick = () => decide('accept');
+  $('bad').onclick    = () => decide('bad');
+  $('undo').onclick   = async () => {
+    if (busy) return; busy = true;
+    try {
+      const undone = await api('/api/undo', { method: 'POST' });
+      toast('Review undone');
+      await load();
+      const pos = queue.findIndex((s) => s.id === undone.id);
+      if (pos >= 0) i = pos;
+      show();
+    } catch (e) { toast('Undo failed: ' + e.message); }
+    finally { busy = false; }
+  };
+  load();
+</script>
+</body>
+</html>

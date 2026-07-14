@@ -50,6 +50,32 @@
     }
   });
 
+  // Couch Review (LAN phone review server): session state + start/stop. The URL (with its one-session
+  // token) is only ever displayed here for the owner to open on the phone.
+  let couchStatus = $state<import('./commands').CouchStatus | null>(null);
+  let couchBusy = $state(false);
+  async function toggleCouch() {
+    if (couchBusy || !tauriAvailable) return;
+    couchBusy = true;
+    try {
+      couchStatus = couchStatus?.running
+        ? await api.stopCouchReview()
+        : await api.startCouchReview();
+    } catch (e) {
+      notifications.error($t('settings.couchFailed'), { detail: String(e) });
+    } finally {
+      couchBusy = false;
+    }
+  }
+  onMount(async () => {
+    if (!tauriAvailable) return;
+    try {
+      couchStatus = await api.couchReviewStatus();
+    } catch (e) {
+      console.error('couch status load failed:', e);
+    }
+  });
+
   // OpenRouter key entry. The pasted value goes straight to the backend (secrets.env) and is cleared
   // from this input on success — it is never kept in the store, settings.json, or logs, and the UI
   // only ever reflects set/unset (configuredProviders holds provider NAMES, never values).
@@ -346,6 +372,37 @@
             />
             <span class="text-sm text-muted">{$t('settings.autoplaySegments')}</span>
           </label>
+
+          <!-- Couch Review: LAN-only, token-gated phone review server (off by default, per-session).
+               The URL carries a random session token; audio never leaves the local network. -->
+          <div class="rounded-md border border-cortex-700/40 bg-cortex-900/30 p-3 space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="text-sm text-default">📱 {$t('settings.couchTitle')}</span>
+              <button
+                type="button"
+                class="btn-secondary text-xs px-3"
+                disabled={couchBusy || !tauriAvailable}
+                onclick={() => void toggleCouch()}
+              >
+                {couchBusy
+                  ? '…'
+                  : couchStatus?.running
+                    ? $t('settings.couchStop')
+                    : $t('settings.couchStart')}
+              </button>
+            </div>
+            {#if couchStatus?.running && couchStatus.url}
+              <span class="text-[10px] text-subtle">{$t('settings.couchWifiUrl')}</span>
+              <input class="input w-full !text-xs font-mono" readonly value={couchStatus.url} onfocus={(e) => (e.target as HTMLInputElement).select()} />
+              {#if couchStatus.tailscaleUrl}
+                <span class="text-[10px] text-subtle">{$t('settings.couchTailscaleUrl')}</span>
+                <input class="input w-full !text-xs font-mono" readonly value={couchStatus.tailscaleUrl} onfocus={(e) => (e.target as HTMLInputElement).select()} />
+              {/if}
+              <p class="text-[10px] text-subtle">{$t('settings.couchRunningHint')}</p>
+            {:else}
+              <p class="text-[10px] text-subtle">{$t('settings.couchHint')}</p>
+            {/if}
+          </div>
         {:else if activeTab === 'asr'}
           <label class="flex items-center gap-3 cursor-pointer">
             <input

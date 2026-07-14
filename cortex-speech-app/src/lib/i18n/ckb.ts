@@ -674,6 +674,14 @@ export const ckb: Record<string, string> = {
   'wsl.stillRunning': 'باشترکردن هێشتا کار دەکات. تکایە هەڵیوەشێنەرەوە یان چاوەڕێ بکە تا تەواو دەبێت.',
   // Settings panel labels
   'settings.autoplaySegments': 'لێدانی خۆکاری بەشەکان لە کاتی هەڵبژاردن',
+  'settings.couchTitle': 'پێداچوونەوەی قەنەفە (مۆبایل لەسەر وایفای)',
+  'settings.couchStart': 'دەستپێکردن',
+  'settings.couchWifiUrl': 'هەمان وایفای:',
+  'settings.couchTailscaleUrl': 'لە هەر شوێنێکەوە (Tailscale — تەنیا ئامێرەکانی خۆت، کۆدکراو):',
+  'settings.couchStop': 'وەستاندن',
+  'settings.couchHint': 'پەڕەی پێداچوونەوە بۆ مۆبایلەکەت تەنیا لەسەر تۆڕی ماڵەوە. بە شێوەی بنەڕەتی کوژاوەیە؛ هەر دانیشتنێک تۆکنی نوێ؛ دەنگ هەرگیز تۆڕەکە بەجێناهێڵێت.',
+  'settings.couchRunningHint': 'ئەم بەستەرە لە مۆبایلەکەت بکەرەوە (هەمان وایفای). کە تەواو بوویت ڕایبگرە — بەستەرەکە دەستبەجێ لە کار دەکەوێت.',
+  'settings.couchFailed': 'پێداچوونەوەی قەنەفە سەرکەوتوو نەبوو',
   'settings.useFinetuned': 'مۆدێلی ڕاهێنراو بەکاربهێنە',
   'settings.useFinetunedHint':
     'باشترین وردی کوردیی ناوخۆیی (پێوانەکراو ٪٢١ هەڵەی پیت، N=900) — لەسەر CPU، بێ ڕێکخستن. سەروپۆشی ئەندازیارەکەی خوارەوە دەکات.',

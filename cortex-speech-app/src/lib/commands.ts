@@ -494,6 +494,30 @@ export async function setApiKey(
   return invoke<string[]>('set_api_key', { provider, key });
 }
 
+/** Couch Review: the token-gated phone review server (off by default, per-session). */
+export interface CouchStatus {
+  running: boolean;
+  /** Wi-Fi (LAN) URL with the session token to open on the phone; null when stopped. */
+  url: string | null;
+  /**
+   * Same page over the owner's Tailscale tailnet — works from ANY network (4G, elsewhere),
+   * end-to-end encrypted between the owner's own devices. Null when no tailnet is up.
+   */
+  tailscaleUrl: string | null;
+}
+
+export async function startCouchReview(): Promise<CouchStatus> {
+  return invoke<CouchStatus>('start_couch_review');
+}
+
+export async function stopCouchReview(): Promise<CouchStatus> {
+  return invoke<CouchStatus>('stop_couch_review');
+}
+
+export async function couchReviewStatus(): Promise<CouchStatus> {
+  return invoke<CouchStatus>('couch_review_status');
+}
+
 /** A row of the model-version registry (snake_case, as serialized by the backend). */
 export interface ModelVersion {
   id: string;

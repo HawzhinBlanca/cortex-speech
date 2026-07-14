@@ -17,6 +17,7 @@ pub mod chunking;
 pub mod commands;
 pub mod constrained_decode;
 pub mod corrections;
+pub mod couch;
 pub mod crash;
 pub mod db;
 pub mod denoiser;
@@ -603,6 +604,9 @@ pub fn run() {
             commands::export_finetune_pack,
             commands::get_configured_providers,
             commands::set_api_key,
+            commands::start_couch_review,
+            commands::stop_couch_review,
+            commands::couch_review_status,
             commands::transcribe_audio_with_scribe,
             commands::add_scribe_votes,
             commands::get_blocking_validation_issues,

@@ -3993,6 +3993,28 @@ pub fn set_api_key(provider: String, key: String, state: State<'_, AppState>) ->
     Ok(keys.configured_providers().into_iter().map(String::from).collect())
 }
 
+/// Start Couch Review — the LAN-only, token-gated phone review server (see couch.rs for the privacy
+/// stance). Explicit per-session start; returns the URL (with the session token) to open on the phone.
+#[tauri::command]
+pub fn start_couch_review(state: State<'_, AppState>) -> Result<crate::couch::CouchStatus, String> {
+    STRICT_RATE_LIMITER.check("start_couch_review")?;
+    let db_path = { state.lock_db().path().to_string() };
+    crate::couch::start(db_path)
+}
+
+/// Stop Couch Review and invalidate the session token.
+#[tauri::command]
+pub fn stop_couch_review() -> Result<crate::couch::CouchStatus, String> {
+    STRICT_RATE_LIMITER.check("stop_couch_review")?;
+    crate::couch::stop()
+}
+
+#[tauri::command]
+pub fn couch_review_status() -> Result<crate::couch::CouchStatus, String> {
+    RATE_LIMITER.check("couch_review_status")?;
+    Ok(crate::couch::status())
+}
+
 /// Consent gate for any ElevenLabs Scribe upload. Voice is biometric data (GDPR Art. 9), so audio
 /// must NEVER be sent to a provider without the user's explicit cloud-STT opt-in. The pipeline path
 /// enforces this; the direct Scribe IPC commands must too, or they silently bypass consent.

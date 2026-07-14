@@ -677,6 +677,14 @@ export const en: Record<string, string> = {
   'wsl.stillRunning': 'Refinement is still running. Please cancel or wait for it to complete.',
   // Settings panel labels
   'settings.autoplaySegments': 'Autoplay Segments on Selection',
+  'settings.couchTitle': 'Couch Review (phone on your Wi-Fi)',
+  'settings.couchStart': 'Start',
+  'settings.couchWifiUrl': 'Same Wi-Fi:',
+  'settings.couchTailscaleUrl': 'From anywhere (Tailscale — your devices only, encrypted):',
+  'settings.couchStop': 'Stop',
+  'settings.couchHint': 'Serve a review page to your phone over your home network only. Off by default; a new random access token every session; audio never leaves your network.',
+  'settings.couchRunningHint': 'Open this URL on your phone (same Wi-Fi). Stop the server when done — the link stops working immediately.',
+  'settings.couchFailed': 'Couch Review failed',
   'settings.useFinetuned': 'Use fine-tuned model',
   'settings.useFinetunedHint':
     'Best local Sorani accuracy (measured 21.0% CER, N=900) — runs on CPU, no setup. Overrides the engine below.',
