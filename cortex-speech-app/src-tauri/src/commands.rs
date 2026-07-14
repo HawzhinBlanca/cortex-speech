@@ -1609,6 +1609,95 @@ pub fn update_segment(segment: SpeechSegment, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
+/// Apply the whitelisted curation fields from an autosave `fields` object onto a segment row. Pure and
+/// unit-tested. Only the three fields the debounced curation autosave edits are accepted; an unknown
+/// key is a LOUD error (never silently dropped — a typo'd field must not look saved). Each value may
+/// be a string or `null` (all three columns are nullable).
+pub(crate) fn apply_curation_fields(
+    segment: &mut SpeechSegment,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    fn opt_string(key: &str, v: &serde_json::Value) -> Result<Option<String>, String> {
+        if v.is_null() {
+            Ok(None)
+        } else {
+            v.as_str().map(str::to_string).map(Some).ok_or_else(|| format!("{key} must be a string or null"))
+        }
+    }
+    for (key, value) in fields {
+        match key.as_str() {
+            "annotatedTranscript" => {
+                let v = opt_string(key, value)?;
+                if let Some(ref t) = v {
+                    validate::validate_text(t, 100000, "Annotated transcript")?;
+                }
+                segment.annotated_transcript = v;
+            }
+            "speakerId" => {
+                let v = opt_string(key, value)?;
+                if let Some(ref s) = v {
+                    if !s.is_empty() {
+                        validate::validate_text(s, 256, "Speaker ID")?;
+                    }
+                }
+                segment.speaker_id = v;
+            }
+            "alignmentJson" => {
+                let v = opt_string(key, value)?;
+                if let Some(ref aj) = v {
+                    validate::validate_alignment_json(aj)?;
+                }
+                segment.alignment_json = v;
+            }
+            other => {
+                return Err(format!(
+                    "update_segment_fields: unsupported field '{other}' — only curation fields \
+                     (annotatedTranscript, speakerId, alignmentJson) may be partially updated"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// F10 root fix — the partial-update IPC the debounced curation autosave calls instead of
+/// whole-row `update_segment`.
+///
+/// The old path merged the user's field edits into the FRONTEND STORE row and upserted the whole row;
+/// during a minutes-long batch the store is stale (it reloads only on batch completion), so that
+/// upsert could silently revert concurrently-written columns (verify stamps, alignment quality,
+/// confidence...). Here the FRESH row is read from the DB and the whitelisted fields applied under the
+/// SAME held lock with no await in between (this command is sync), then persisted through the same
+/// history path as `update_segment` — undo/redo still works, and nothing else in the row can be
+/// clobbered by construction. A row deleted mid-debounce returns `Ok(false)` (no-op) rather than being
+/// resurrected by the upsert.
+#[tauri::command]
+pub fn update_segment_fields(
+    segment_id: String,
+    fields: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    STRICT_RATE_LIMITER.check("update_segment_fields")?;
+    validate::validate_identifier(&segment_id)?;
+    let obj = fields.as_object().ok_or("update_segment_fields: fields must be a JSON object")?;
+    if obj.is_empty() {
+        return Ok(false); // nothing to apply
+    }
+
+    let db = state.lock_db();
+    let Some(mut segment) = db.get_segment_by_id(&segment_id).map_err(|e| e.to_string())? else {
+        return Ok(false); // deleted mid-debounce -> no-op, never resurrect
+    };
+    apply_curation_fields(&mut segment, obj)?;
+    let history = state.lock_history();
+    HistoryManager::persist_segment_update(&db, &history, &segment).map_err(|e| e.to_string())?;
+    drop(history);
+    drop(db);
+
+    state.session_auto_save();
+    Ok(true)
+}
+
 #[tauri::command]
 pub fn delete_segment(id: String, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("delete_segment")?;
@@ -3885,6 +3974,25 @@ pub fn get_configured_providers(state: State<'_, AppState>) -> Result<Vec<String
     Ok(keys.configured_providers().into_iter().map(String::from).collect())
 }
 
+/// Save one provider API key into `secrets.env` from the Settings UI (an empty key clears it).
+/// The key value goes straight to the local secrets file — it is never logged, never echoed back, and
+/// never stored in settings.json/DB. Returns the configured provider NAMES so the UI can refresh its
+/// set/unset badges without ever seeing the value again.
+#[tauri::command]
+pub fn set_api_key(provider: String, key: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    STRICT_RATE_LIMITER.check("set_api_key")?;
+    let name = match provider.as_str() {
+        "gemini" => "GEMINI_API_KEY",
+        "elevenlabs" => "ELEVENLABS_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        other => return Err(format!("unknown provider '{other}'")),
+    };
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    crate::api_keys::ApiKeys::save_key(&data_dir, name, &key)?;
+    let keys = crate::api_keys::ApiKeys::load(&data_dir);
+    Ok(keys.configured_providers().into_iter().map(String::from).collect())
+}
+
 /// Consent gate for any ElevenLabs Scribe upload. Voice is biometric data (GDPR Art. 9), so audio
 /// must NEVER be sent to a provider without the user's explicit cloud-STT opt-in. The pipeline path
 /// enforces this; the direct Scribe IPC commands must too, or they silently bypass consent.
@@ -4581,13 +4689,14 @@ fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) ->
     f(&db)
 }
 
-/// OpenRouter's OpenAI-compatible chat endpoint (reaches audio-capable models: google/gemini-2.5-pro,
-/// qwen/qwen3-asr-flash, google/chirp-3, openai/gpt-audio, ...).
+/// OpenRouter's OpenAI-compatible chat endpoint. POLICY (owner, 2026-07-14): the only approved cloud
+/// ASR judge for Central Kurdish is **google/gemini-2.5-pro** — Qwen-family ASR has no Sorani support
+/// (measured; PROGRESS_LEDGER 2026 sweep) and must not be configured as the judge.
 const OPENROUTER_CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 /// Map a jury model name to an OpenRouter slug. A bare Gemini id (the default `gemini-2.5-pro`) maps to
-/// `google/gemini-2.5-pro`; an id that already has a `provider/model` shape (or a non-Gemini name)
-/// passes through so a future/better audio model works with no code change.
+/// `google/gemini-2.5-pro`; an already-slugged id passes through (mechanism only — the approved ckb
+/// judge is strictly Gemini 2.5 Pro; any different model first needs a measured ckb CER on frozen gold).
 fn openrouter_jury_model_id(jury_model: &str) -> String {
     let m = jury_model.trim();
     if m.is_empty() {
@@ -5245,10 +5354,50 @@ mod tests {
         assert_eq!(key, "orkey");
         assert_eq!(model, "google/gemini-2.5-pro", "a bare Gemini id maps to the OpenRouter slug");
 
-        // An already-slugged / non-Gemini model passes through unchanged (future models work as-is).
-        s.jury_model = "qwen/qwen3-asr-flash".into();
+        // An already-slugged model passes through unchanged (mechanism only — policy is that the ckb
+        // judge is strictly google/gemini-2.5-pro until another model has a measured ckb CER).
+        s.jury_model = "example/future-approved-judge".into();
         let (_, _, model) = resolve_t2_endpoint_from_keys(&s, "gkey", Some("orkey"));
-        assert_eq!(model, "qwen/qwen3-asr-flash");
+        assert_eq!(model, "example/future-approved-judge");
+    }
+
+    #[test]
+    fn apply_curation_fields_touches_only_whitelisted_fields_and_rejects_unknown_keys() {
+        // F10 root fix: the partial autosave path must be able to change ONLY the three curation
+        // fields; everything else in the row must be bit-identical after the apply, and an unknown key
+        // must be a loud error (a typo'd field must never look saved).
+        let mut seg = test_segment("s1", "/audio/a.wav", "raw text");
+        seg.verified = true;
+        seg.confidence = Some(0.42);
+        let before = seg.clone();
+
+        let fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"annotatedTranscript": "دەق", "speakerId": "SPEAKER_01"}"#).unwrap();
+        apply_curation_fields(&mut seg, &fields).unwrap();
+        assert_eq!(seg.annotated_transcript.as_deref(), Some("دەق"));
+        assert_eq!(seg.speaker_id.as_deref(), Some("SPEAKER_01"));
+        // Every non-curation column is untouched — the stale-store clobber class is closed by construction.
+        assert_eq!(seg.verified, before.verified);
+        assert_eq!(seg.confidence, before.confidence);
+        assert_eq!(seg.raw_transcript, before.raw_transcript);
+        assert_eq!(seg.audio_path, before.audio_path);
+        assert_eq!(seg.alignment_json, before.alignment_json, "unprovided field stays untouched");
+
+        // null clears a nullable field.
+        let clear: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"speakerId": null}"#).unwrap();
+        apply_curation_fields(&mut seg, &clear).unwrap();
+        assert_eq!(seg.speaker_id, None);
+
+        // Unknown key -> loud error, row unchanged.
+        let bad: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"verified": true}"#).unwrap();
+        let err = apply_curation_fields(&mut seg, &bad).unwrap_err();
+        assert!(err.contains("unsupported field 'verified'"), "{err}");
+        assert!(!seg.verified || seg.verified == before.verified, "non-whitelisted field must not change");
+
+        // Wrong value type -> loud error.
+        let wrong: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"annotatedTranscript": 7}"#).unwrap();
+        assert!(apply_curation_fields(&mut seg, &wrong).is_err());
     }
 
     #[test]

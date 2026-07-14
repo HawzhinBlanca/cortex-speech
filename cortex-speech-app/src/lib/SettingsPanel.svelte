@@ -50,6 +50,29 @@
     }
   });
 
+  // OpenRouter key entry. The pasted value goes straight to the backend (secrets.env) and is cleared
+  // from this input on success — it is never kept in the store, settings.json, or logs, and the UI
+  // only ever reflects set/unset (configuredProviders holds provider NAMES, never values).
+  let openrouterKeyInput = $state('');
+  let savingOpenrouterKey = $state(false);
+  async function saveOpenrouterKey() {
+    if (!tauriAvailable || savingOpenrouterKey) return;
+    savingOpenrouterKey = true;
+    try {
+      configuredProviders = await api.setApiKey('openrouter', openrouterKeyInput.trim());
+      openrouterKeyInput = '';
+      notifications.success(
+        configuredProviders.includes('openrouter')
+          ? 'OpenRouter key saved to secrets.env'
+          : 'OpenRouter key cleared',
+      );
+    } catch (e) {
+      notifications.error('Failed to save OpenRouter key', { detail: String(e) });
+    } finally {
+      savingOpenrouterKey = false;
+    }
+  }
+
   onDestroy(() => {
     // Cancel must discard: don't persist unsaved edits when the user explicitly cancelled.
     if (cancelled) return;
@@ -865,6 +888,61 @@
                   >Shared with the AI Post-Processing tab. Not written to disk.</span
                 >
               </label>
+
+              <!-- T2 transport: direct Gemini REST, or the SAME Gemini 2.5 Pro via OpenRouter -->
+              <label class="flex flex-col gap-1">
+                <span class="text-sm text-muted">Judge connection</span>
+                <select
+                  class="input w-full"
+                  bind:value={localSettings.juryProvider}
+                  onchange={saveQuietly}
+                >
+                  <option value="gemini">Google direct (Gemini API key)</option>
+                  <option value="openrouter">OpenRouter (same Gemini 2.5 Pro; OpenRouter key)</option>
+                </select>
+                <span class="text-[10px] text-subtle">
+                  Cloud ASR judge policy: <strong>Gemini 2.5 Pro only</strong> — it is the only cloud
+                  model verified usable for Sorani (Qwen and similar are not). OpenRouter reaches the
+                  same model with its own key and quota.
+                </span>
+              </label>
+
+              {#if localSettings.juryProvider === 'openrouter'}
+                <div class="flex flex-col gap-1">
+                  <span class="text-sm text-muted">
+                    OpenRouter API key
+                    {#if configuredProviders.includes('openrouter')}
+                      <span class="ms-2 text-[10px] text-emerald-400">● key saved</span>
+                    {:else}
+                      <span class="ms-2 text-[10px] text-amber-400">○ no key yet</span>
+                    {/if}
+                  </span>
+                  <div class="flex gap-2">
+                    <input
+                      type="password"
+                      class="input flex-1"
+                      bind:value={openrouterKeyInput}
+                      placeholder="sk-or-…"
+                      autocomplete="off"
+                      onkeydown={(e) => {
+                        if (e.key === 'Enter') void saveOpenrouterKey();
+                      }}
+                    />
+                    <button
+                      type="button"
+                      class="btn-secondary text-xs px-3"
+                      disabled={savingOpenrouterKey}
+                      onclick={() => void saveOpenrouterKey()}
+                    >
+                      {savingOpenrouterKey ? 'Saving…' : 'Save key'}
+                    </button>
+                  </div>
+                  <span class="text-[10px] text-subtle">
+                    Stored locally in secrets.env (app data folder) — never logged, never shown again,
+                    sent only to OpenRouter. Save an empty box to remove the key.
+                  </span>
+                </div>
+              {/if}
             {/if}
           </div>
         {:else if activeTab === 'diagnostics'}

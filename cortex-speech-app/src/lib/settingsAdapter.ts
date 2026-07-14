@@ -44,6 +44,7 @@ export interface BackendSettings {
   // Listening Jury
   jury_cloud_opt_in?: boolean;
   jury_model?: string;
+  jury_provider?: string;
   source_reference_models?: string[];
   jury_self_consistency_n?: number;
   jury_autonomy_level?: string;
@@ -166,6 +167,7 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
     // Listening Jury
     juryCloudOptIn: raw.jury_cloud_opt_in ?? false,
     juryModel: raw.jury_model ?? 'gemini-2.5-pro',
+    juryProvider: raw.jury_provider === 'openrouter' ? 'openrouter' : 'gemini',
     sourceReferenceModels: raw.source_reference_models ?? ['gemini-2.5-pro', 'gemini-2.5-flash'],
     jurySelfConsistencyN: raw.jury_self_consistency_n ?? 3,
     juryAutonomyLevel: (raw.jury_autonomy_level as AppSettings['juryAutonomyLevel']) ?? 'propose',
@@ -224,6 +226,7 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
     // Listening Jury
     jury_cloud_opt_in: ui.juryCloudOptIn,
     jury_model: ui.juryModel,
+    jury_provider: ui.juryProvider,
     source_reference_models: ui.sourceReferenceModels,
     jury_self_consistency_n: num(ui.jurySelfConsistencyN, existing.jury_self_consistency_n ?? 3),
     jury_autonomy_level: ui.juryAutonomyLevel,

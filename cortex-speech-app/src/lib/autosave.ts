@@ -16,14 +16,19 @@ export interface AutosaveDeps<T extends object> {
   /** Freshest row for an id (from the store), or null if it no longer exists. */
   getRow: (id: string) => T | null;
   /**
-   * Persist a merged row. MUST be idempotent (a pure upsert): if the debounce timer's save is still
-   * in-flight when `flush`/`flushAsync` runs (e.g. the window closes the instant after the timer fired),
-   * `pending` is not cleared until that save's `.then`, so the SAME entry can be persisted a SECOND time.
-   * That is harmless for an idempotent field write (the app wires this to `updateSegment`), but a
-   * side-effectful save — recording a human decision, crediting LOOP-0 confidence, appending a ledger
-   * row — would DOUBLE-COUNT. Keep side effects out of this callback; do them on the explicit verify path.
+   * Persist the queued edit. MUST be idempotent: if the debounce timer's save is still in-flight when
+   * `flush`/`flushAsync` runs (e.g. the window closes the instant after the timer fired), `pending` is
+   * not cleared until that save's `.then`, so the SAME entry can be persisted a SECOND time. That is
+   * harmless for an idempotent field write, but a side-effectful save — recording a human decision,
+   * crediting LOOP-0 confidence, appending a ledger row — would DOUBLE-COUNT. Keep side effects out of
+   * this callback; do them on the explicit verify path.
+   *
+   * Receives the merged row (fresh store row + edits, for callers that persist whole rows), plus the
+   * raw edited `fields` and the segment `id` — the app wires these to the partial-update IPC
+   * (`updateSegmentFields`), so ONLY the user-edited fields are persisted and a stale store row can
+   * never clobber concurrently-written columns (F10 root fix).
    */
-  save: (row: T) => Promise<void>;
+  save: (row: T, fields: Record<string, unknown>, id: string) => Promise<unknown>;
   /** UI state transitions ('saving' on schedule, 'saved' on success, 'idle' on no-op/error). */
   onState?: (state: SaveState) => void;
   /** Save failure callback. */
@@ -62,13 +67,16 @@ export function createAutosaveController<T extends object>(
 
   // Re-read the FRESH row so a concurrent change to OTHER fields (a verify/normalize/background
   // reload during the debounce) is preserved, then re-apply the user's edited fields so their edit
-  // always wins. Returns the in-flight save promise, or null (no save issued) when the row no longer
-  // exists — callers that only need "was a save issued?" can still test truthiness (null is falsy).
+  // always wins. The save callback ALSO receives the raw fields + id so the app can persist only the
+  // edited fields (partial-update IPC — the store row itself may be stale during a long batch, so the
+  // merged row is advisory, never the persistence source of truth). Returns the in-flight save
+  // promise, or null (no save issued) when the row no longer exists — callers that only need "was a
+  // save issued?" can still test truthiness (null is falsy).
   function persist(entry: { id: string; fields: Record<string, unknown> }): Promise<void> | null {
     const fresh = deps.getRow(entry.id);
     if (!fresh) return null;
     const merged = { ...fresh, ...entry.fields } as T;
-    return deps.save(merged).then(
+    return deps.save(merged, entry.fields, entry.id).then(
       () => {
         if (pending === entry) pending = null;
         deps.onState?.('saved');

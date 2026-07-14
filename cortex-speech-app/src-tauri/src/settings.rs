@@ -89,10 +89,15 @@ pub struct AppSettings {
     #[serde(default = "default_jury_model")]
     pub jury_model: String,
     /// Transport for the T2 audio judge: "gemini" (default — Google's direct generativelanguage REST)
-    /// or "openrouter" (OpenAI-compatible endpoint, so `jury_model` may be a slug like
-    /// `google/gemini-2.5-pro`, `qwen/qwen3-asr-flash`, `google/chirp-3`). OpenRouter uses the
-    /// OpenRouter key from secrets.env and sidesteps the direct-Gemini 429 quota. Still gated by
-    /// `jury_cloud_opt_in`; falls back to direct Gemini if no OpenRouter key is present.
+    /// or "openrouter" (OpenAI-compatible endpoint reaching the same model as
+    /// `google/gemini-2.5-pro`, sidestepping the direct-Gemini 429 quota). Uses the OpenRouter key
+    /// from secrets.env; still gated by `jury_cloud_opt_in`; falls back to direct Gemini if no
+    /// OpenRouter key is present.
+    ///
+    /// POLICY (owner decision 2026-07-14): the ONLY approved cloud ASR judge for Central Kurdish is
+    /// **Gemini 2.5 Pro** (ElevenLabs Scribe is the only other approved cloud STT). Qwen-family ASR is
+    /// measured-bad on Sorani (no ckb support — see PROGRESS_LEDGER 2026 sweep) — do NOT point
+    /// `jury_model` at it. Any future judge model needs a measured ckb CER on the frozen gold set first.
     #[serde(default = "default_jury_provider")]
     pub jury_provider: String,
     /// Whole-file source transcript models used before chunking for reference-aware adjudication.

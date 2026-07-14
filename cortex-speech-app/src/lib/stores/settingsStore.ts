@@ -45,6 +45,8 @@ export interface AppSettings {
   // Listening Jury settings
   juryCloudOptIn: boolean;
   juryModel: string;
+  /** T2 judge transport: direct Gemini REST, or OpenRouter (same Gemini 2.5 Pro model, OR quota/key). */
+  juryProvider: 'gemini' | 'openrouter';
   sourceReferenceModels: string[];
   jurySelfConsistencyN: number;
   juryAutonomyLevel: 'observe' | 'propose' | 'act_confirm' | 'act_auto';
@@ -96,6 +98,7 @@ export const defaultSettings: AppSettings = {
   // Listening Jury defaults
   juryCloudOptIn: false,
   juryModel: 'gemini-2.5-pro',
+  juryProvider: 'gemini',
   sourceReferenceModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
   jurySelfConsistencyN: 3,
   juryAutonomyLevel: 'propose',

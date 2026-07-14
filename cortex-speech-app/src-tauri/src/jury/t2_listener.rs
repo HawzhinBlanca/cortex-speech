@@ -118,10 +118,11 @@ fn build_user_prompt(
 
 // ─── Audio judge API call (provider-agnostic) ────────────────────────────────
 
-/// Where T2 sends the contested audio. OpenRouter lets the owner reach Gemini-class — and future,
-/// better — audio models through ONE OpenAI-compatible endpoint + key, sidestepping the direct-Gemini
-/// 429 quota and making the judge model swappable (`google/gemini-2.5-pro`, `qwen/qwen3-asr-flash`,
-/// `google/chirp-3`, …) with no code change. `GeminiDirect` preserves the original behavior exactly.
+/// Where T2 sends the contested audio. OpenRouter reaches the judge through ONE OpenAI-compatible
+/// endpoint + key, sidestepping the direct-Gemini 429 quota. `GeminiDirect` preserves the original
+/// behavior exactly. POLICY (owner, 2026-07-14): the only approved cloud ASR judge for Central
+/// Kurdish is **Gemini 2.5 Pro** (`google/gemini-2.5-pro` on OpenRouter) — Qwen-family ASR has no
+/// Sorani support and must not be used; a future judge needs a measured ckb CER on frozen gold first.
 #[derive(Debug, Clone)]
 pub enum T2Endpoint {
     /// Google's direct `generativelanguage` REST surface (`x-goog-api-key` + `inlineData`).

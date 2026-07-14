@@ -100,4 +100,15 @@ describe('settingsAdapter', () => {
     expect(mapBackendToFrontend({ ...sampleBackend, autoplay_segments: true }).autoplaySegments).toBe(true);
     expect(mapBackendToFrontend({ ...sampleBackend, autoplay_segments: false }).autoplaySegments).toBe(false);
   });
+// juryProvider (T2 judge transport) must survive save -> reload, default safely to 'gemini' on old
+  // settings files, and reject junk values (never route cloud audio on a typo'd provider).
+  it('round-trips juryProvider and defaults unknown/missing values to gemini', () => {
+    const ui = { ...defaultSettings, juryProvider: 'openrouter' as const };
+    const backend = mapFrontendToBackend(ui, sampleBackend);
+    expect(backend.jury_provider).toBe('openrouter');
+    expect(mapBackendToFrontend(backend).juryProvider).toBe('openrouter');
+    // Missing (pre-upgrade settings.json) and junk values both resolve to the safe default.
+    expect(mapBackendToFrontend(sampleBackend).juryProvider).toBe('gemini');
+    expect(mapBackendToFrontend({ ...sampleBackend, jury_provider: 'qwen' }).juryProvider).toBe('gemini');
+  });
 });

@@ -50,6 +50,33 @@ describe('autosave controller', () => {
     vi.useRealTimers();
   });
 
+  // F10 root fix: the save callback receives the raw edited FIELDS and the segment id, so the app can
+  // persist ONLY the user's edits via the partial-update IPC (updateSegmentFields) — the merged store
+  // row may be stale during a long batch and must never be the persistence source of truth.
+  it('passes the accumulated raw fields and the segment id to the save callback', async () => {
+    vi.useFakeTimers();
+    const calls: Array<{ fields: Record<string, unknown>; id: string }> = [];
+    let target: string | null = 'A';
+    const ctrl = createAutosaveController<Row>({
+      targetId: () => target,
+      getRow: () => ({ id: 'A', text: 'stale-store-text', speaker: 'stale' }),
+      save: async (_row, fields, id) => {
+        calls.push({ fields: { ...fields }, id });
+      },
+      debounceMs: 1000,
+    });
+
+    ctrl.schedule({ text: 'edit-1' });
+    ctrl.schedule({ speaker: 'S2' }); // same segment: edits accumulate into ONE partial save
+    await vi.runAllTimersAsync();
+
+    expect(calls).toEqual([{ fields: { text: 'edit-1', speaker: 'S2' }, id: 'A' }]);
+    // Only the edited fields ride to the backend — nothing from the (stale) store row.
+    expect(Object.keys(calls[0].fields)).not.toContain('id');
+    void target;
+    vi.useRealTimers();
+  });
+
   // The close-flush contract: flushAsync issues the queued save immediately and resolves only after
   // it settles, so a window-close handler can AWAIT it and never lose the last edit to the debounce.
   it('flushAsync resolves only after the queued save settles', async () => {

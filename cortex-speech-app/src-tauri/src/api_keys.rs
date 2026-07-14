@@ -75,6 +75,41 @@ impl ApiKeys {
         providers
     }
 
+    /// Save (or clear, with an empty `value`) one API key in `{data_dir}/secrets.env`, preserving every
+    /// other line (comments, other keys). Written atomically (tmp + rename). The value is validated
+    /// against control characters/whitespace so a pasted value can never inject extra `KEY=` lines,
+    /// and it is NEVER logged or echoed back.
+    pub fn save_key(data_dir: &Path, name: &str, value: &str) -> Result<(), String> {
+        if !KEY_NAMES.contains(&name) {
+            return Err(format!("unknown API key name '{name}'"));
+        }
+        let value = value.trim();
+        if value.contains(|c: char| c.is_control() || c.is_whitespace()) {
+            // A newline would inject a second KEY= line; other whitespace/control chars are never part
+            // of a real provider key. Reject rather than "sanitize" (a silently altered key fails later
+            // in a far more confusing way).
+            return Err("API key contains whitespace or control characters — paste the key exactly".to_string());
+        }
+
+        let path = data_dir.join(SECRETS_FILE);
+        let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| Self::template());
+        let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+        let prefix = format!("{name}=");
+        let new_line = format!("{name}={value}"); // empty value -> "NAME=" (a cleared, unset key)
+        match lines.iter_mut().find(|l| l.trim_start().starts_with(&prefix)) {
+            Some(line) => *line = new_line,
+            None => lines.push(new_line),
+        }
+        let mut contents = lines.join("\n");
+        contents.push('\n');
+
+        std::fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
+        let tmp = data_dir.join(format!("{SECRETS_FILE}.tmp"));
+        std::fs::write(&tmp, &contents).map_err(|e| format!("write secrets temp: {e}"))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("replace secrets file: {e}"))?;
+        Ok(())
+    }
+
     /// The exact `secrets.env` template to drop next to the app's settings — empty placeholders the
     /// user fills in locally.
     pub fn template() -> String {
@@ -165,5 +200,43 @@ mod tests {
         for name in KEY_NAMES {
             assert!(t.contains(&format!("{name}=")), "template must include {name}");
         }
+    }
+
+    #[test]
+    fn save_key_creates_updates_clears_and_preserves_other_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // First save on a machine with no secrets.env: file is created from the template.
+        ApiKeys::save_key(dir, "OPENROUTER_API_KEY", "sk-or-abc123").unwrap();
+        let keys = ApiKeys::load(dir);
+        assert_eq!(keys.openrouter.as_deref(), Some("sk-or-abc123"));
+        let contents = std::fs::read_to_string(dir.join(SECRETS_FILE)).unwrap();
+        assert!(contents.contains("GEMINI_API_KEY="), "template placeholders preserved");
+        assert!(contents.starts_with('#'), "template comment preserved");
+
+        // Update in place — other keys/lines untouched.
+        ApiKeys::save_key(dir, "GEMINI_API_KEY", "g-key").unwrap();
+        ApiKeys::save_key(dir, "OPENROUTER_API_KEY", "sk-or-NEW").unwrap();
+        let keys = ApiKeys::load(dir);
+        assert_eq!(keys.openrouter.as_deref(), Some("sk-or-NEW"));
+        assert_eq!(keys.gemini.as_deref(), Some("g-key"));
+        let contents = std::fs::read_to_string(dir.join(SECRETS_FILE)).unwrap();
+        assert_eq!(contents.matches("OPENROUTER_API_KEY=").count(), 1, "one line per key, replaced not appended");
+
+        // Empty value clears the key (line stays as an unset placeholder).
+        ApiKeys::save_key(dir, "OPENROUTER_API_KEY", "").unwrap();
+        assert!(ApiKeys::load(dir).openrouter.is_none(), "cleared key must read back as unset");
+    }
+
+    #[test]
+    fn save_key_rejects_injection_and_unknown_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // A newline in the value would inject a second KEY= line into the env file.
+        assert!(ApiKeys::save_key(dir, "OPENROUTER_API_KEY", "abc\nGEMINI_API_KEY=stolen").is_err());
+        assert!(ApiKeys::save_key(dir, "OPENROUTER_API_KEY", "has space").is_err());
+        assert!(ApiKeys::save_key(dir, "NOT_A_KEY", "x").is_err());
+        assert!(!dir.join(SECRETS_FILE).exists(), "a rejected save must not create/alter the file");
     }
 }

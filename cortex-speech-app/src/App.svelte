@@ -142,7 +142,10 @@
   const autosave = createAutosaveController<SpeechSegment>({
     targetId: () => get(selectedSegment)?.id ?? null,
     getRow: (id) => get(segments).find((s) => s.id === id) ?? null,
-    save: (row) => api.updateSegment(row),
+    // F10 root fix: persist ONLY the edited fields via the partial-update IPC — the backend reads the
+    // FRESH row under its lock and applies just these fields, so a debounced save during a
+    // minutes-long batch can never merge a stale store row over concurrently-written columns.
+    save: (_row, fields, id) => api.updateSegmentFields(id, fields),
     onState: (s) => {
       saveState = s;
       if (s === 'saved') {
@@ -2917,7 +2920,7 @@
                 class="input h-32 resize-none font-mono text-sm text-end"
                 value={$selectedSegment.annotatedTranscript ?? ''}
                 placeholder={$t('editTranscript')}
-                disabled={$isProcessing || $batchProgress.status === 'running'}
+                disabled={$isProcessing}
                 oninput={(e) => {
                   const seg = $selectedSegment;
                   if (seg) {
@@ -2939,7 +2942,7 @@
                   class="input !text-xs font-mono"
                   value={$selectedSegment.speakerId ?? ''}
                   placeholder={$t('batchAssignSpeaker.placeholder')}
-                  disabled={$isProcessing || $batchProgress.status === 'running'}
+                  disabled={$isProcessing}
                   oninput={(e) => {
                     const seg = $selectedSegment;
                     if (seg) {

@@ -136,6 +136,12 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'get_configured_providers':
             // Names only, never key values — matches the real configured_providers() contract.
             return ['elevenlabs'];
+          case 'set_api_key':
+            // Echo the post-save provider-NAMES list (never a key value), like the real command.
+            return ['elevenlabs', args?.provider ?? 'openrouter'];
+          case 'update_segment_fields':
+            // F10 partial autosave: true = the fresh row existed and the fields were applied.
+            return true;
           case 'get_fingerprint_count':
             return 1;
           case 'get_tracing_stats':

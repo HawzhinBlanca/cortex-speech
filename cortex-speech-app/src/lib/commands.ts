@@ -225,6 +225,20 @@ export async function updateSegment(segment: SpeechSegment): Promise<void> {
   return invoke<void>('update_segment', { segment });
 }
 
+/**
+ * F10 root fix — partial autosave update. Sends ONLY the edited curation fields
+ * (annotatedTranscript / speakerId / alignmentJson); the backend reads the FRESH row and applies them
+ * under its lock, so a debounced save during a long batch can never merge against a stale store row
+ * and revert concurrently-written columns. Resolves false when the row no longer exists (deleted
+ * mid-debounce — a safe no-op, never a resurrecting upsert).
+ */
+export async function updateSegmentFields(
+  segmentId: string,
+  fields: Partial<Pick<SpeechSegment, 'annotatedTranscript' | 'speakerId' | 'alignmentJson'>>,
+): Promise<boolean> {
+  return invoke<boolean>('update_segment_fields', { segmentId, fields });
+}
+
 export async function updateSegmentBounds(
   id: string,
   startMs: number,
@@ -466,6 +480,18 @@ export async function checkExternalProvider(): Promise<{
  */
 export async function getConfiguredProviders(): Promise<string[]> {
   return invoke<string[]>('get_configured_providers');
+}
+
+/**
+ * Save one provider API key into the local `secrets.env` (empty key clears it). The value goes
+ * straight to the backend and is never logged or echoed back; the resolved list of configured
+ * provider NAMES is returned so the UI can refresh its set/unset badges.
+ */
+export async function setApiKey(
+  provider: 'gemini' | 'elevenlabs' | 'openrouter',
+  key: string,
+): Promise<string[]> {
+  return invoke<string[]>('set_api_key', { provider, key });
 }
 
 /** A row of the model-version registry (snake_case, as serialized by the backend). */
