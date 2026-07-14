@@ -587,15 +587,35 @@
       try {
         const { getCurrentWindow } = await import('@tauri-apps/api/window');
         const appWindow = getCurrentWindow();
+        // `closing` lets the SECOND close request pass through un-prevented: if destroy() is ever
+        // denied again (the original bug — core:default lacks window:allow-destroy, so preventDefault
+        // ran and then destroy() silently rejected, leaving a window that could never be closed), the
+        // fallback close() re-triggers this handler, which now steps aside instead of re-preventing.
+        let closing = false;
         closeUnlisten = await appWindow.onCloseRequested(async (event) => {
+          if (closing) return; // pass-through: let the OS complete the close
           event.preventDefault();
+          closing = true;
           try {
             await Promise.race([
               autosave.flushAsync(),
               new Promise<void>((resolve) => setTimeout(resolve, 3000)),
             ]);
           } finally {
-            await appWindow.destroy();
+            try {
+              await appWindow.destroy();
+            } catch (destroyErr) {
+              // Never trap the user in an uncloseable window: fall back to a plain close request,
+              // which the `closing` flag above lets through without interception.
+              console.error('window.destroy failed; falling back to close():', destroyErr);
+              appWindow.close().catch((closeErr) => {
+                closing = false; // both paths failed — restore interception and surface it
+                console.error('window.close fallback also failed:', closeErr);
+                notifications.error('Close failed — use the tray/task manager', {
+                  detail: String(closeErr),
+                });
+              });
+            }
           }
         });
       } catch (e) {
