@@ -3633,3 +3633,20 @@ the app runs).
 Verbatim gates: cargo test --lib -> "907 passed; 0 failed" (6 new couch tests incl. live HTTP
 roundtrip "6 passed; 0 failed ... finished in 0.10s"); clippy --lib clean; run_python_policies ->
 "32 policy test scripts passed"; vitest "196 passed"; svelte-check 0 errors; eslint clean.
+
+## 2026-07-15 (cont.) — hardening loop: reproduced + root-fixed the review data-loss class
+
+Loop iterations 2-3. Followed reproduce-before-fix strictly: wrote the failing test FIRST — it
+failed exactly where the live loss happened (undo restored transcript+verified but decision -> None,
+"left: None / right: Some(\"edit\")"). Root cause: insert_segment deliberately omits decision
+columns, so undoLast's clear+upsert pair could never restore a prior decision. Along the way,
+evidence ELIMINATED two suspects (paged SELECT carries all columns; write_segment_verdict is no-op
+on human-decided rows) and identified retranscribe() as the live test's gold-destroyer (by design).
+
+fix(review) <hash>: restore_segment_snapshot IPC (lossless full-column restore); undoLast one
+atomic restore; danger-confirm before re-transcribing a VERIFIED clip + undo snapshot (pushed
+post-ASR, retry-safe); review cursor never opens on verified gold. Repro test now gates BOTH the
+documented old-pair loss AND the lossless restore.
+
+Verbatim gates: cargo test --lib "908 passed; 0 failed"; clippy clean; vitest "196 passed";
+svelte-check 0 errors; eslint clean.
