@@ -3650,3 +3650,18 @@ documented old-pair loss AND the lossless restore.
 
 Verbatim gates: cargo test --lib "908 passed; 0 failed"; clippy clean; vitest "196 passed";
 svelte-check 0 errors; eslint clean.
+
+## 2026-07-15 (cont.) — Couch Review LIVE-VERIFIED in the shipped production app
+
+Loop iteration 4: rebuilt (all fixes incl. lossless undo + guards), relaunched, then drove the REAL
+app UI end-to-end: Settings -> Couch Review -> Start. Verbatim live results:
+- Panel showed BOTH URLs as designed: Wi-Fi http://192.168.100.75:8737/?t=... AND Tailscale
+  http://100.107.91.64:8737/?t=... (matches the owner's tailnet hawapc01 exactly).
+- netstat: TCP 0.0.0.0:8737 LISTENING. Token gate live: GET / and /api/queue WITHOUT token -> 401.
+- STOP button (the deadlock fix, in production): UI returned instantly (no freeze), card back to
+  Start, subsequent connections REFUSED, port fully released on recheck. The unblock() fix holds
+  under real conditions — pre-fix this click would have hung the app forever.
+- Windows Firewall consent dialog appeared on first Start (expected; elevated — owner must approve
+  once, "Private networks", for phones to reach it; loopback worked regardless).
+Remaining live check is owner-held: open the Tailscale URL on the iPhone (authenticated path is
+already gated by the couch test suite's real-HTTP roundtrip).
