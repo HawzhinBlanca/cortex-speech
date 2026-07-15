@@ -1,7 +1,7 @@
 # CLAUDE.md — Cortex Speech (Cowork project instructions)
 
 These are the standing instructions for any Claude/Cowork session in this repo. Read this
-first, every session. It governs **how to work here**; `AGENT_CHARTER.md` governs the
+first, every session. It governs **how to work here**; the repo-root `../AGENT_CHARTER.md` governs the
 deeper *why/when-to-stop*, and `docs/REAL_READINESS_PLAN.md` defines the honest bar.
 
 ## What this project is
@@ -75,12 +75,12 @@ Run the relevant gates and paste the real output. A fix without a regression gat
 
 - Backend: `src-tauri/src/` — `commands.rs` (IPC), `pipeline.rs`, `asr.rs`, `audio.rs`, `db.rs`, `normalizer.rs`, `eval.rs`, `models.rs`, `settings.rs`, `jury/`, `export*.rs`.
 - Frontend: `src/App.svelte` (shell) + `src/lib/*.svelte` (`AudioPlayer`, `ReviewMode`, `ReviewInbox`, `ValidationPanel`, `DiffView`, `StatsDashboard`, ...).
-- Docs: `AGENT_CHARTER.md`, `ROAD_TO_10.md`, `docs/REAL_READINESS_PLAN.md`, `docs/HARDENING_PLAN_10.md`, `docs/COWORK_PIPELINE_PROMPT.md`.
+- Docs: `../AGENT_CHARTER.md` (repo root), `ROAD_TO_10.md`, `docs/REAL_READINESS_PLAN.md`, `docs/HARDENING_PLAN_10.md`, `docs/COWORK_PIPELINE_PROMPT.md`.
 - Scripts: `scripts/*.py` (dataset build/review + policy gates), `e2e_real_app.cjs` (real-app driver).
 
 ## Definition of done (10/10)
 
-Per `AGENT_CHARTER.md`: on a clean checkout, a single `make verify-10` exits 0 and prints
+Per the repo-root `../AGENT_CHARTER.md`: on a clean checkout, a single `make verify-10` exits 0 and prints
 `CORTEX 10/10: ALL GATES GREEN`. Until that command exists and passes, you are not done —
 partial completion means keep going, and nothing is called "10/10" on tests alone.
 

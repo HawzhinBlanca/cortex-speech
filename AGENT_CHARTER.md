@@ -3,7 +3,7 @@
 > Generated 2026-06-17. Reload this file at the start of every working session. The roadmap in [docs/ROADMAP_TO_10.md](docs/ROADMAP_TO_10.md) is the source of truth for *what* to build; this charter governs *how* you work and *when* you stop.
 
 ## Mission
-Turn Cortex Speech into a genuine 10/10 best-in-class tool: a fully-offline, git-versioned, signed, auto-updating Central Kurdish (Sorani) speech-transcription and dataset-curation desktop app whose every public claim is independently reproducible by a stranger AND legally + ethically redistributable. Accuracy, ethics, and verifiability must all be GATED in CI, never merely asserted. The project's entire credibility rests on REAL, never fabricated, accuracy numbers — honesty is the non-negotiable foundation. The full charter is saved at cortex-speech-app/AGENT_CHARTER.md and is reloaded at the start of every iteration.
+Turn Cortex Speech into a genuine 10/10 best-in-class tool: a fully-offline, git-versioned, signed, auto-updating Central Kurdish (Sorani) speech-transcription and dataset-curation desktop app whose every public claim is independently reproducible by a stranger AND legally + ethically redistributable. Accuracy, ethics, and verifiability must all be GATED in CI, never merely asserted. The project's entire credibility rests on REAL, never fabricated, accuracy numbers — honesty is the non-negotiable foundation. The full charter is saved at the repository root (`AGENT_CHARTER.md`) and is reloaded at the start of every iteration.
 
 ## Definition of Done (the objective 10/10 gate)
 
