@@ -84,7 +84,11 @@
     const targetId = $selectedSegmentId;
     if (targetId) {
       const pos = queue.findIndex((s) => s.id === targetId);
-      if (pos >= 0) index = pos;
+      // Land on the restored cursor only when it still needs work. A VERIFIED cursor (the last clip
+      // the reviewer ACTED on) would reopen finished gold as the very first thing on screen — one
+      // accidental keypress from destroying it (the 2026-07-14 live-test incident). Verified cursor →
+      // start at the queue head (first pending) instead.
+      if (pos >= 0 && !queue[pos].verified) index = pos;
     }
     cursorRestored = true;
   });
@@ -151,7 +155,26 @@
   // 'finetuned' runs the embedded fine-tuned MMS-1B (CPU/ONNX, always available). A re-transcription is
   // machine output, so verified is reset (it must never be kept as if a human confirmed it).
   let retranscribing = $state(false);
-  async function retranscribe(engine: 'champion' | 'finetuned') {
+  function retranscribe(engine: 'champion' | 'finetuned') {
+    const seg = current;
+    if (!seg || retranscribing || saving || aligning) return;
+    // GUARD (2026-07-15, from the live-test incident): re-transcribing a VERIFIED clip replaces the
+    // human-reviewed gold with a machine draft and reopens it — destroying review work must never be
+    // one accidental click. The pre-save snapshot goes on the undo stack either way, so even a
+    // confirmed destructive re-transcribe is reversible via Undo review.
+    if (seg.verified) {
+      showConfirmDialog.set({
+        title: $t('review.retranscribeVerifiedTitle'),
+        message: $t('review.retranscribeVerifiedMessage'),
+        confirmLabel: $t('review.retranscribeVerifiedConfirm'),
+        danger: true,
+        onConfirm: () => void doRetranscribe(engine),
+      });
+      return;
+    }
+    void doRetranscribe(engine);
+  }
+  async function doRetranscribe(engine: 'champion' | 'finetuned') {
     const seg = current;
     // `aligning` too: the clip-load background align persists fresh CTC timings mid-flight; an
     // upsert built from the pre-align snapshot would revert them (stale-spread clobber).
@@ -169,6 +192,13 @@
         annotatedTranscript: text,
         verified: false,
       };
+      // Re-transcribing a reviewed clip is destructive (gold replaced, clip reopened): snapshot the
+      // pre-change row so Undo review restores the FULL pre-decision state (lossless, incl. decision
+      // columns). Pushed only here — after the ASR succeeded, immediately before the write — so a
+      // failed attempt + retry can never double-push.
+      if (seg.verified) {
+        undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
+      }
       await api.updateSegment(updated);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       editText = text;
@@ -195,8 +225,8 @@
           message: $t('asr.championUnavailableMessage'),
           confirmLabel: $t('asr.tryAgain'),
           danger: false,
-          onConfirm: () => retranscribe('champion'),
-          secondary: { label: $t('asr.useOfflineModel'), onClick: () => retranscribe('finetuned') },
+          onConfirm: () => void doRetranscribe('champion'),
+          secondary: { label: $t('asr.useOfflineModel'), onClick: () => void doRetranscribe('finetuned') },
         });
       } else {
         notifications.error($t('review.retranscribeFailed'), { detail: String(e) });
@@ -244,8 +274,12 @@
     saving = true;
     undoHistory = undoHistory.slice(0, -1);
     try {
-      await api.clearHumanDecision(last.id);
-      await api.updateSegment(last.prev);
+      // LOSSLESS restore (2026-07-15 fix, reproduced in db::tests::redecision_undo_...): the old
+      // clearHumanDecision + updateSegment pair NULLed a PRIOR decision when undoing a REdecision,
+      // because updateSegment deliberately omits the decision columns. restoreSegmentSnapshot writes
+      // the whole pre-save snapshot — prior decision, verdict fields, escalation state and all — so
+      // undo returns the row to its exact pre-decision state in one atomic upsert.
+      await api.restoreSegmentSnapshot(last.prev);
       segments.update((list) => list.map((s) => (s.id === last.id ? last.prev : s)));
       editCache.delete(last.id);
       const idx = queue.findIndex((s) => s.id === last.id);

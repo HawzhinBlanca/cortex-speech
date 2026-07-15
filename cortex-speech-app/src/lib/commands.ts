@@ -232,6 +232,15 @@ export async function updateSegment(segment: SpeechSegment): Promise<void> {
  * and revert concurrently-written columns. Resolves false when the row no longer exists (deleted
  * mid-debounce — a safe no-op, never a resurrecting upsert).
  */
+/**
+ * Lossless review-undo restore: writes the WHOLE pre-decision snapshot back, including the
+ * jury/decision columns that updateSegment deliberately omits — so undoing a re-decision can never
+ * erase the earlier human decision (the 2026-07-14 live-test data loss, reproduced + fixed).
+ */
+export async function restoreSegmentSnapshot(segment: SpeechSegment): Promise<void> {
+  return invoke<void>('restore_segment_snapshot', { segment });
+}
+
 export async function updateSegmentFields(
   segmentId: string,
   fields: Partial<Pick<SpeechSegment, 'annotatedTranscript' | 'speakerId' | 'alignmentJson'>>,

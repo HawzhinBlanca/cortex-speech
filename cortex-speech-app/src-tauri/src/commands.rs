@@ -1660,6 +1660,36 @@ pub(crate) fn apply_curation_fields(
     Ok(())
 }
 
+/// Lossless snapshot restore — the review-undo IPC. `update_segment` deliberately omits the
+/// jury/decision columns (anti-clobber for ordinary edits), so ReviewMode's undo — clear decision +
+/// re-upsert the pre-save snapshot — silently NULLed a PRIOR human_decision when undoing a
+/// REdecision (reproduced in db::tests::redecision_undo_...; observed live 2026-07-14 as the owner's
+/// morning review vanishing). This command writes the WHOLE snapshot through the same lossless path
+/// the delete-undo uses (`restore_segment` / `insert_segment_full`), so an undo returns the row to
+/// its exact pre-decision state — decision, verdict fields, escalation, gold flag and all.
+#[tauri::command]
+pub fn restore_segment_snapshot(segment: SpeechSegment, state: State<'_, AppState>) -> Result<(), String> {
+    STRICT_RATE_LIMITER.check("restore_segment_snapshot")?;
+    validate::validate_identifier(&segment.id)?;
+    validate::validate_text(&segment.raw_transcript, 100000, "Raw transcript")?;
+    if let Some(ref t) = segment.annotated_transcript {
+        validate::validate_text(t, 100000, "Annotated transcript")?;
+    }
+    if let Some(ref aj) = segment.alignment_json {
+        validate::validate_alignment_json(aj)?;
+    }
+    let db = state.lock_db();
+    // Restore only over an EXISTING row: this is an undo of an edit/decision, never a resurrection
+    // path (delete-undo has its own history command with its own guards).
+    if db.get_segment_by_id(&segment.id).map_err(|e| e.to_string())?.is_none() {
+        return Err(format!("Cannot restore snapshot of segment {}: it no longer exists", segment.id));
+    }
+    db.restore_segment(&segment).map_err(|e| e.to_string())?;
+    drop(db);
+    state.session_auto_save();
+    Ok(())
+}
+
 /// F10 root fix — the partial-update IPC the debounced curation autosave calls instead of
 /// whole-row `update_segment`.
 ///

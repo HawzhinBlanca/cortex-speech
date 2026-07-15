@@ -2600,6 +2600,87 @@ mod tests {
     }
 
     #[test]
+    fn redecision_undo_and_retranscribe_sequence_preserves_or_resets_exactly_as_designed() {
+        // Reproduction of the 2026-07-14 live-test data-loss sequence, mechanically, at the DB layer —
+        // written BEFORE any fix, per process. The UI flow on an ALREADY-VERIFIED clip was:
+        //   (1) save a new decision (recordHumanDecision + whole-row upsert),
+        //   (2) Undo review (clearHumanDecision + upsert of the pre-save snapshot),
+        //   (3) re-transcribe (upsert with a fresh machine draft + verified=false).
+        // This pins what each stage does to the owner's gold so the responsibilities are provable:
+        // the undo RESTORES everything (incl. the prior decision, via human_decision=excluded);
+        // the RE-TRANSCRIBE is the destructive step (fresh draft wipes annotated + verified by design).
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        // Owner's reviewed row: verified gold with an 'edit' decision.
+        let mut owner = make_segment("s1", "/a.wav");
+        owner.annotated_transcript = Some("owner gold کە کە".into());
+        owner.verified = true;
+        db.insert_segment(&owner).unwrap();
+        db.record_human_decision("s1", "edit", Some("owner gold کە کە"), None).unwrap();
+        // The frontend STORE row mirrors the full DB row (all columns selected) — snapshot it like
+        // ReviewMode's `{...seg}` undo entry does.
+        let prev_snapshot = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert_eq!(prev_snapshot.human_decision.as_deref(), Some("edit"), "precondition: decision in snapshot");
+
+        // (1) A NEW decision is saved over it (the live test's 'Use this text' + Save).
+        db.record_human_decision("s1", "edit", Some("gemini text خۆ"), None).unwrap();
+        let mut resaved = db.get_segment_by_id("s1").unwrap().unwrap();
+        resaved.annotated_transcript = Some("gemini text خۆ".into());
+        resaved.verified = true;
+        db.insert_segment(&resaved).unwrap();
+
+        // (2a) THE BUG, documented: the pre-fix undo pair (clearHumanDecision + plain updateSegment
+        // upsert) loses the PRIOR decision, because insert_segment deliberately omits the decision
+        // columns (anti-clobber for ordinary edits). This is exactly the 2026-07-14 live data loss.
+        db.clear_human_decision("s1").unwrap();
+        db.insert_segment(&prev_snapshot).unwrap();
+        let after_old_pair = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert_eq!(
+            after_old_pair.annotated_transcript.as_deref(),
+            Some("owner gold کە کە"),
+            "the old pair does restore the transcript (which is why the loss was so easy to miss)"
+        );
+        assert!(after_old_pair.verified, "the old pair does restore verified");
+        assert_eq!(
+            after_old_pair.human_decision, None,
+            "DOCUMENTED BUG: the old clear+upsert pair silently loses the prior decision — the reason \
+             undoLast now uses restore_segment_snapshot instead"
+        );
+
+        // (2b) THE FIX: the lossless snapshot restore (what undoLast calls now) brings back the FULL
+        // pre-save state — prior decision included.
+        db.restore_segment(&prev_snapshot).unwrap();
+        let after_undo = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert_eq!(after_undo.annotated_transcript.as_deref(), Some("owner gold کە کە"));
+        assert!(after_undo.verified);
+        assert_eq!(
+            after_undo.human_decision.as_deref(),
+            Some("edit"),
+            "restore_segment must restore the PRIOR decision losslessly"
+        );
+
+        // (3) Re-transcribe on the (restored, verified) clip: fresh draft + verified=false, exactly
+        // what ReviewMode.retranscribe upserts. THIS is the destructive-by-design step.
+        let mut retranscribed = db.get_segment_by_id("s1").unwrap().unwrap();
+        retranscribed.raw_transcript = "fresh machine draft".into();
+        retranscribed.annotated_transcript = Some("fresh machine draft".into());
+        retranscribed.verified = false;
+        db.insert_segment(&retranscribed).unwrap();
+        let after_rt = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert!(!after_rt.verified, "re-transcribe reopens the clip");
+        assert_eq!(after_rt.annotated_transcript.as_deref(), Some("fresh machine draft"));
+        // The decision column itself survives a re-transcribe upsert (it rides the row) — so the final
+        // NULL observed live can only have come from the UNDO's clear if stage (2) failed, or from the
+        // row having no decision at snapshot time. This assertion documents the mechanical truth.
+        assert_eq!(
+            after_rt.human_decision.as_deref(),
+            Some("edit"),
+            "a re-transcribe upsert does not itself clear human_decision"
+        );
+    }
+
+    #[test]
     fn intelligence_report_joins_shadow_and_verdicts_against_human_decisions() {
         // True-10 audit: the C5/C4 read side. Over-trigger = would-fire + human accepted the
         // ORIGINAL text unchanged (the memory would have corrupted a correct transcript). C4

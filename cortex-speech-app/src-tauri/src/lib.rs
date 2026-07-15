@@ -583,6 +583,7 @@ pub fn run() {
             commands::search_segments,
             commands::update_segment,
             commands::update_segment_fields,
+            commands::restore_segment_snapshot,
             commands::delete_segment,
             commands::delete_segments_batch,
             commands::merge_dataset_json,
