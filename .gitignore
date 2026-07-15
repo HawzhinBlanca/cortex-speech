@@ -100,3 +100,4 @@ cortex-speech-app/src-tauri/onnxruntime_providers_shared.dll
 # The owner's private external audit dropped at the repo root — intentionally NOT tracked (docs refer to
 # it as a local reference). Ignored so it can't be committed by accident and doesn't clutter git status.
 /1010PATH.md
+.month-loop.lock
