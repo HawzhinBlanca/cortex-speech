@@ -233,10 +233,7 @@ mod tests {
         // true (only after measured lift) and this becomes a Commit again.
         let hyps = vec![make_hyp("s1", "good-model", "کوردستان", 0.9), make_hyp("s1", "bad-model", "xyzxyzxyz", 0.3)];
         let decision = judge_t1("s1", &hyps, 0.0);
-        assert!(
-            matches!(decision, T1Decision::EscalateToT2 { .. }),
-            "demoted T1 must escalate, not commit"
-        );
+        assert!(matches!(decision, T1Decision::EscalateToT2 { .. }), "demoted T1 must escalate, not commit");
     }
 
     #[test]

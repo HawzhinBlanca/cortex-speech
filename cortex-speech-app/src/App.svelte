@@ -59,7 +59,6 @@
     showReviewInbox,
   } from './lib/stores/uiStore';
   import { cancelOperation } from './lib/commands';
-  import { PARQUET_EXPORT_SUPPORTED } from './lib/appFeatures';
   import { isTauriRuntime } from './lib/runtime';
   import AudioPlayer from './lib/AudioPlayer.svelte';
   import EngineStatusPill from './lib/EngineStatusPill.svelte';
@@ -1446,10 +1445,7 @@
     if (!requireDesktopRuntime()) return;
     try {
       const { save } = await import('@tauri-apps/plugin-dialog');
-      let format = $settings.exportFormat;
-      if (format === 'parquet' && !PARQUET_EXPORT_SUPPORTED) {
-        format = 'json';
-      }
+      const format = $settings.exportFormat;
       const ext =
         format === 'parquet'
           ? 'parquet'
@@ -1463,9 +1459,7 @@
         { name: 'JSONL', extensions: ['jsonl'] },
         { name: 'CSV', extensions: ['csv'] },
       ];
-      if (PARQUET_EXPORT_SUPPORTED) {
-        filters.push({ name: 'Parquet', extensions: ['parquet'] });
-      }
+      filters.push({ name: 'Parquet', extensions: ['parquet'] });
       const path = await save({
         filters,
         defaultPath: `cortex-dataset.${ext}`,

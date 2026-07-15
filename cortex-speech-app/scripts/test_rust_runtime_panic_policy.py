@@ -674,27 +674,6 @@ def test_commands_audio_duration_probe_send_failures_are_reported() -> None:
         raise AssertionError(f"commands.rs must keep observable audio duration probe send handling:\n{formatted}")
 
 
-def test_progress_observers_report_delivery_failures() -> None:
-    observer = (REPO_ROOT / "src-tauri/src/observer/mod.rs").read_text(encoding="utf-8")
-    forbidden = [
-        "let _ = self.app_handle.emit(event_name, event);",
-        "let _ = self.sender.send(event.clone());",
-    ]
-    present = [pattern for pattern in forbidden if pattern in observer]
-    if present:
-        formatted = "\n".join(f"- {entry}" for entry in present)
-        raise AssertionError(f"observer progress delivery failures are silently discarded:\n{formatted}")
-
-    required = [
-        'tracing::warn!("Failed to emit observer event {event_name}: {error}");',
-        'tracing::warn!("Failed to send progress observer event: {error}");',
-    ]
-    missing = [pattern for pattern in required if pattern not in observer]
-    if missing:
-        formatted = "\n".join(f"- {entry}" for entry in missing)
-        raise AssertionError(f"observer progress delivery failures must be logged:\n{formatted}")
-
-
 def test_commands_batch_normalize_reports_prefetch_and_update_failures() -> None:
     commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
     required = [
@@ -1451,7 +1430,6 @@ def main() -> None:
     test_pipeline_event_emits_report_failures()
     test_command_event_emits_are_not_silently_discarded()
     test_commands_audio_duration_probe_send_failures_are_reported()
-    test_progress_observers_report_delivery_failures()
     test_commands_batch_normalize_reports_prefetch_and_update_failures()
     test_commands_acoustic_scoring_reports_skipped_segments()
     test_commands_alignment_quality_stamp_reports_failures()

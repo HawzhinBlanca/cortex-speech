@@ -47,10 +47,10 @@ impl<K: Eq + Hash + Clone, V: Clone> Memoizer<K, V> {
     }
 }
 
-// Global memoizers
-pub static NORMALIZER_CACHE: LazyLock<Memoizer<String, String>> = LazyLock::new(|| Memoizer::new(10_000));
-pub static DIFF_CACHE: LazyLock<Memoizer<(String, String), crate::diff::TextDiff>> =
-    LazyLock::new(|| Memoizer::new(500));
+/// Process-wide normalizer memoizer: normalization is pure per (config, text), so identical
+/// transcripts across a batch normalize once. (Restored after the DIFF_CACHE removal clipped it —
+/// this one has a live caller in commands.rs.)
+pub static NORMALIZER_CACHE: LazyLock<Memoizer<String, String>> = LazyLock::new(|| Memoizer::new(2000));
 
 /// Parallel batch processor using rayon.
 /// Processes items in parallel and collects results.

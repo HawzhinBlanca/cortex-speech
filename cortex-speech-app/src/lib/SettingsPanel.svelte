@@ -7,7 +7,6 @@
   import { isVerifiedGood } from './segmentQuality';
   import { isProcessing, statusMessage, batchProgress } from './stores/uiStore';
   import { startOperation, endOperation } from './invoke';
-  import { PARQUET_EXPORT_SUPPORTED } from './appFeatures';
   import ModelDownload from './ModelDownload.svelte';
   import ModelRegistry from './ModelRegistry.svelte';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
@@ -113,9 +112,6 @@
   });
 
   function coerceSettingsForRuntime() {
-    if (localSettings.exportFormat === 'parquet' && !PARQUET_EXPORT_SUPPORTED) {
-      localSettings = { ...localSettings, exportFormat: 'json' };
-    }
     // A <input type="number"> binds NaN when the user clears the field to retype it. Shipping NaN to
     // updateSettings either fails backend deserialization (u32 fields — the setting silently doesn't
     // save) or, for a float threshold, defeats a gate. Revert any non-finite numeric field to its
@@ -594,9 +590,7 @@
               <option value="json">JSON (COCO-style manifest)</option>
               <option value="jsonl">JSONL (one segment per line)</option>
               <option value="csv">CSV</option>
-              {#if PARQUET_EXPORT_SUPPORTED}
                 <option value="parquet">Parquet</option>
-              {/if}
             </select>
           </label>
           <div class="pt-2 border-t border-cortex-800/50 space-y-2">

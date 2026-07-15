@@ -47,10 +47,6 @@ export interface ImportStatus {
   file: string;
 }
 
-export async function getImportStatus(): Promise<ImportStatus> {
-  return invoke<ImportStatus>('get_import_status');
-}
-
 export async function cancelOperation(): Promise<void> {
   return invoke<void>('cancel_operation');
 }
@@ -248,18 +244,6 @@ export async function updateSegmentFields(
   return invoke<boolean>('update_segment_fields', { segmentId, fields });
 }
 
-export async function updateSegmentBounds(
-  id: string,
-  startMs: number,
-  endMs: number,
-): Promise<void> {
-  return invoke<void>('update_segment_bounds', {
-    id,
-    startMs: Math.round(startMs),
-    endMs: Math.round(endMs),
-  });
-}
-
 export async function deleteSegment(id: string): Promise<void> {
   return invoke<void>('delete_segment', { id });
 }
@@ -437,18 +421,6 @@ export interface MediaGrant {
   expiresAt: string;
 }
 
-export async function exportDatasetBundle(
-  path: string,
-  production = false,
-  warningThreshold = 0,
-): Promise<BundleExportResult> {
-  return invoke<BundleExportResult>('export_dataset_bundle', {
-    path,
-    production,
-    warningThreshold,
-  });
-}
-
 export async function listAgentImportReports(limit = 25): Promise<AgentImportReport[]> {
   return invoke<AgentImportReport[]>('list_agent_import_reports', { limit });
 }
@@ -460,26 +432,12 @@ export async function listAgentStageEvents(
   return invoke<AgentStageEvent[]>('list_agent_stage_events', { runId: runId ?? null, limit });
 }
 
-export async function getBlockingValidationIssues(
-  warningThreshold = 0,
-): Promise<BlockingValidationIssues> {
-  return invoke<BlockingValidationIssues>('get_blocking_validation_issues', { warningThreshold });
-}
-
 export async function registerMediaAsset(audioPath: string): Promise<MediaGrant> {
   return invoke<MediaGrant>('register_media_asset', { audioPath });
 }
 
 export async function getMediaAssetUrl(id: string): Promise<string> {
   return invoke<string>('get_media_asset_url', { id });
-}
-
-export async function checkExternalProvider(): Promise<{
-  available: boolean;
-  script?: string;
-  message: string;
-}> {
-  return invoke('check_external_provider');
 }
 
 /**
@@ -648,10 +606,6 @@ export async function addScribeVotes(ids: string[]): Promise<number> {
   return invoke<number>('add_scribe_votes', { ids });
 }
 
-export async function getAudioDuration(path: string): Promise<number> {
-  return invoke<number>('get_audio_duration', { path });
-}
-
 export async function getWaveform(
   path: string,
   numPoints: number,
@@ -775,10 +729,6 @@ export interface AnnotationDriftScorecard {
   seed: number;
 }
 
-export async function computeAnnotationDriftScorecard(): Promise<AnnotationDriftScorecard> {
-  return invoke<AnnotationDriftScorecard>('compute_annotation_drift_scorecard');
-}
-
 export interface DatasetQuality {
   totalSegments: number;
   emptyTranscriptCount: number;
@@ -829,14 +779,6 @@ export async function updateSettings(
   const existing = existingBackend ?? (await invoke<BackendSettings>('get_settings'));
   const backend = mapFrontendToBackend(settings, existing);
   return invoke<void>('update_settings', { settings: backend });
-}
-
-export async function getCacheInfo(): Promise<{ entries: number; maxEntries: number }> {
-  return invoke('get_cache_info');
-}
-
-export async function clearCache(): Promise<void> {
-  return invoke<void>('clear_cache');
 }
 
 export const ValidationSeverity = {
@@ -972,31 +914,6 @@ export async function computeDiff(
   return invoke('compute_diff', { raw, annotated });
 }
 
-export async function checkAudio(path: string): Promise<{
-  duration_ms: number;
-  sample_rate: number;
-  channels: number;
-  format: string;
-}> {
-  return invoke('check_audio', { path });
-}
-
-export async function dbInfo(): Promise<{
-  page_count: number;
-  page_size: number;
-  size_bytes: number;
-  journal_mode: string;
-  segment_count: number;
-  free_pages: number;
-  free_bytes: number;
-  fragmentation_pct: number;
-  wal_size_bytes: number;
-  last_vacuum: string | null;
-  suggestions: string[];
-}> {
-  return invoke('db_info');
-}
-
 /** Back up the live library to `dest` on a DEDICATED connection (the UI stays responsive), then
  * verify the WRITTEN file (integrity check + segment count) — a disaster copy that is itself bad
  * must fail now, not at the disaster. */
@@ -1020,10 +937,6 @@ export async function dbVacuum(): Promise<void> {
   return invoke('db_vacuum');
 }
 
-export async function dbWalCheckpoint(): Promise<void> {
-  return invoke('db_wal_checkpoint');
-}
-
 export async function modelsStatus(): Promise<
   Array<{
     name: string;
@@ -1037,10 +950,6 @@ export async function modelsStatus(): Promise<
   }>
 > {
   return invoke('models_status');
-}
-
-export async function modelsDownload(filename: string): Promise<void> {
-  return invoke('models_download', { filename });
 }
 
 export async function modelsDownloadAll(): Promise<{
@@ -1140,18 +1049,6 @@ export interface ConformalCertificate {
   calibrationHeuristic: number;
 }
 
-export async function runConsensusRefinery(): Promise<{
-  status: string;
-  segmentsUpdated: number;
-  modelAbilities: Record<string, number>;
-}> {
-  return invoke('run_consensus_refinery');
-}
-
-export async function computeAcousticScores(): Promise<number> {
-  return invoke('compute_acoustic_scores');
-}
-
 export async function getDatasetCertificate(
   targetError: number,
   confidenceLevel: number,
@@ -1186,12 +1083,6 @@ import type {
   FewShotExample,
   T0GateReport,
 } from './types';
-
-export async function importGoldSegments(
-  inputs: { audioPath: string; reference: string; isHoldout?: boolean }[],
-): Promise<number> {
-  return invoke<number>('import_gold_segments', { inputs });
-}
 
 export async function runGoldEval(
   modelId: string,
@@ -1284,15 +1175,7 @@ export async function getLabelQualityLift(): Promise<LabelQualityLift> {
   return invoke<LabelQualityLift>('get_label_quality_lift');
 }
 
-export async function listGoldSegments(): Promise<GoldSegment[]> {
-  return invoke<GoldSegment[]>('list_gold_segments');
-}
-
 // ── Phase 2 — T0 Gate + Jury ───────────────────────────────────────────────
-
-export async function runT0Gate(segmentIds: string[]): Promise<T0GateReport> {
-  return invoke<T0GateReport>('run_t0_gate', { segmentIds });
-}
 
 export async function getEscalationQueue(limit: number): Promise<SpeechSegment[]> {
   return invoke<SpeechSegment[]>('get_escalation_queue', { limit });
@@ -1344,16 +1227,8 @@ export async function writeSegmentVerdict(
   });
 }
 
-export async function getFewShotExamples(segmentId: string, k: number): Promise<FewShotExample[]> {
-  return invoke<FewShotExample[]>('get_few_shot_examples', { segmentId, k });
-}
-
 export async function getEscalationRateTrend(): Promise<EscalationTrendPoint[]> {
   return invoke<EscalationTrendPoint[]>('get_escalation_rate_trend');
-}
-
-export async function runDpoUpdate(endpoint: string): Promise<string> {
-  return invoke<string>('run_dpo_update', { endpoint });
 }
 
 // ── Jury Pipeline (Items 1 & 2) ───────────────────────────────────────────────

@@ -1684,7 +1684,7 @@ pub fn restore_segment_snapshot(segment: SpeechSegment, state: State<'_, AppStat
     if db.get_segment_by_id(&segment.id).map_err(|e| e.to_string())?.is_none() {
         return Err(format!("Cannot restore snapshot of segment {}: it no longer exists", segment.id));
     }
-    db.restore_segment(&segment).map_err(|e| e.to_string())?;
+    db.insert_segment_full(&segment).map_err(|e| e.to_string())?;
     drop(db);
     state.session_auto_save();
     Ok(())
@@ -1961,20 +1961,6 @@ pub fn list_model_versions(state: State<'_, AppState>) -> Result<Vec<crate::regi
     RATE_LIMITER.check("list_model_versions")?;
     let db = state.lock_db();
     crate::registry::list_model_versions(&db).map_err(|e| e.to_string())
-}
-
-/// The current champion for a family, if one is crowned. Reserved programmatic accessor: the
-/// model-registry UI surfaces the champion via each row's `status` field, so this is intentionally
-/// not invoked from the frontend — it stays for CLI/scripted callers. (IPC-surface audit 2026-06-25.)
-#[tauri::command]
-pub fn get_champion_model(
-    family: String,
-    state: State<'_, AppState>,
-) -> Result<Option<crate::registry::ModelVersion>, String> {
-    RATE_LIMITER.check("get_champion_model")?;
-    validate::validate_identifier(&family)?;
-    let db = state.lock_db();
-    crate::registry::get_champion(&db, &family).map_err(|e| e.to_string())
 }
 
 /// Import an externally fine-tuned checkpoint into the registry as a gated candidate. The SHA is
@@ -3495,23 +3481,6 @@ pub fn cancel_wsl_refinement() -> Result<(), String> {
     Ok(())
 }
 
-/// Insert a single segment hypothesis. Reserved programmatic API: the jury/consensus pipeline
-/// produces hypotheses internally (ASR votes, Scribe votes), so there is no manual single-insert UI
-/// — this stays for CLI/scripted jury orchestration. (IPC-surface audit 2026-06-25.)
-#[tauri::command]
-pub fn add_segment_hypothesis(state: State<'_, AppState>, hyp: crate::db::SegmentHypothesis) -> Result<(), String> {
-    RATE_LIMITER.check("add_segment_hypothesis")?;
-    // This row feeds the IRT jury consensus, so apply the same validation discipline every other write
-    // command uses: shaped identifiers and a bounded transcript (round-22 #3) — never an unbounded blob
-    // or a malformed id straight from the renderer.
-    validate::validate_identifier(&hyp.segment_id)?;
-    validate::validate_identifier(&hyp.model_id)?;
-    validate::validate_text(&hyp.transcript, 100_000, "Hypothesis transcript")?;
-    let db = state.lock_db();
-    db.insert_hypothesis(&hyp).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn run_consensus_refinery(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("run_consensus_refinery")?;
@@ -3669,7 +3638,7 @@ pub async fn compute_ood_scores(state: State<'_, AppState>) -> Result<usize, Str
             db.get_segments(None).map_err(|e| e.to_string())?
         };
 
-        let detector = quality::ood::OodDetector::new(&models_dir, 0.35).map_err(|e| e.to_string())?;
+        let detector = quality::ood::OodDetector::new(&models_dir).map_err(|e| e.to_string())?;
 
         let mut count = 0;
         for seg in &segments {

@@ -73,16 +73,3 @@ function createHistoryStore() {
 }
 
 export const historyStore = createHistoryStore();
-
-// Derived: keyboard shortcut helpers
-export const undoShortcut = derived([], () => ({
-  key: 'z',
-  meta: true,
-  shift: false,
-}));
-
-export const redoShortcut = derived([], () => ({
-  key: 'z',
-  meta: true,
-  shift: true,
-}));

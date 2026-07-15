@@ -545,12 +545,6 @@ impl Database {
         Ok(())
     }
 
-    /// Alias for [`insert_segment_full`], kept so the undo path can read as "restore". Both names
-    /// write the FULL row (jury/review/gold columns + created_at) so an undone delete is lossless.
-    pub fn restore_segment(&self, seg: &SpeechSegment) -> AppResult<()> {
-        self.insert_segment_full(seg)
-    }
-
     /// Targeted single-column update: sets `verified` without touching any other field.
     /// Returns true if the row was found and updated.
     pub fn update_verified(&self, id: &str, verified: bool) -> AppResult<bool> {
@@ -2650,14 +2644,14 @@ mod tests {
 
         // (2b) THE FIX: the lossless snapshot restore (what undoLast calls now) brings back the FULL
         // pre-save state — prior decision included.
-        db.restore_segment(&prev_snapshot).unwrap();
+        db.insert_segment_full(&prev_snapshot).unwrap();
         let after_undo = db.get_segment_by_id("s1").unwrap().unwrap();
         assert_eq!(after_undo.annotated_transcript.as_deref(), Some("owner gold کە کە"));
         assert!(after_undo.verified);
         assert_eq!(
             after_undo.human_decision.as_deref(),
             Some("edit"),
-            "restore_segment must restore the PRIOR decision losslessly"
+            "insert_segment_full must restore the PRIOR decision losslessly"
         );
 
         // (3) Re-transcribe on the (restored, verified) clip: fresh draft + verified=false, exactly

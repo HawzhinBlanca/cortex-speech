@@ -1,8 +1,6 @@
 use std::path::Path;
 
-pub struct OodDetector {
-    threshold: f32,
-}
+pub struct OodDetector;
 
 impl OodDetector {
     /// Round-24 #1/#2/#3: the previous WavLM-ONNX path scored OOD as the cosine distance to a
@@ -13,8 +11,8 @@ impl OodDetector {
     /// distance-to-a-sine-wave as an OOD verdict in the UI and baking it into the exported dataset
     /// violated the project's honesty law. That path is removed until a real learned centroid exists;
     /// OOD scoring uses the honest signal-processing heuristic (ZCR + frame-energy variance) below.
-    pub fn new(_models_dir: &Path, threshold: f32) -> Result<Self, String> {
-        Ok(Self { threshold })
+    pub fn new(_models_dir: &Path) -> Result<Self, String> {
+        Ok(Self)
     }
 
     /// Measures the out-of-distribution distance (0.0 to 1.0) from a real signal-processing heuristic.
@@ -23,12 +21,6 @@ impl OodDetector {
             return Ok(1.0); // Empty audio is completely OOD
         }
         Ok(self.heuristic_ood_score(pcm))
-    }
-
-    /// Returns true if the audio is out-of-distribution.
-    pub fn is_ood(&self, pcm: &[i16]) -> Result<bool, String> {
-        let score = self.compute_ood_score(pcm)?;
-        Ok(score > self.threshold as f64)
     }
 
     /// Signal-processing OOD heuristic: an honest (if crude) distance in [0,1] derived from the
@@ -90,7 +82,7 @@ mod tests {
 
     #[test]
     fn test_heuristic_speech() {
-        let detector = OodDetector::new(Path::new(""), 0.5).unwrap();
+        let detector = OodDetector::new(Path::new("")).unwrap();
         // Generate a simulated speech signal (sine wave sweeps/modulated)
         let mut pcm = Vec::new();
         for i in 0..16000 {
@@ -105,7 +97,7 @@ mod tests {
 
     #[test]
     fn test_heuristic_noise() {
-        let detector = OodDetector::new(Path::new(""), 0.5).unwrap();
+        let detector = OodDetector::new(Path::new("")).unwrap();
         // Generate white noise (random high ZCR)
         let mut pcm = Vec::new();
         let mut seed = 12345u64;
@@ -123,7 +115,7 @@ mod tests {
     fn ood_score_is_always_finite_and_in_range() {
         // Round-24 #3: the OOD score must always be a finite value in [0,1] — never NaN (which the
         // gate's `score > threshold` would silently treat as in-distribution).
-        let detector = OodDetector::new(Path::new(""), 0.5).unwrap();
+        let detector = OodDetector::new(Path::new("")).unwrap();
         for pcm in [vec![], vec![0i16; 50], vec![0i16; 16000], vec![32767i16; 16000]] {
             let score = detector.compute_ood_score(&pcm).unwrap();
             assert!(score.is_finite() && (0.0..=1.0).contains(&score), "score out of range: {score}");

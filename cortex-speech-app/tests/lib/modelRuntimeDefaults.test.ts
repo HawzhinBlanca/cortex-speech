@@ -4,14 +4,10 @@ import { resolve } from 'node:path';
 import { defaultSettings } from '../../src/lib/stores/settingsStore';
 
 describe('model runtime defaults', () => {
-  it('forces the OmniASR-7B Champion as the app default, keeps bundled CTC300M for download/batch', () => {
+  it('forces the OmniASR-7B Champion as the app default, keeps bundled CTC300M for batch', () => {
     const settingsSource = readFileSync(resolve(process.cwd(), 'src-tauri', 'src', 'settings.rs'), 'utf-8');
     const batchProcessorSource = readFileSync(
       resolve(process.cwd(), 'src-tauri', 'src', 'bin', 'batch_processor.rs'),
-      'utf-8',
-    );
-    const downloadModelSource = readFileSync(
-      resolve(process.cwd(), 'src-tauri', 'src', 'bin', 'download_model.rs'),
       'utf-8',
     );
 
@@ -19,12 +15,11 @@ describe('model runtime defaults', () => {
     // user-facing default in BOTH the Rust AppSettings and the frontend store (kept in sync).
     expect(defaultSettings.asrModel).toBe('wsl-7b');
     expect(settingsSource).toContain('asr_model_size: AsrModelSize::WSL7B');
-    // ...but the BUNDLED/downloadable runtime model stays the base CTC-300M ONNX (the 7B is an external
-    // WSL/GPU engine, not a bundled ONNX), so the offline batch path + the model downloader still
-    // default to CTC300M rather than chasing a non-bundled 1B/7B.
+    // ...but the BUNDLED runtime model stays the base CTC-300M ONNX (the 7B is an external WSL/GPU
+    // engine, not a bundled ONNX), so the offline batch path defaults to CTC300M rather than chasing
+    // a non-bundled 1B/7B. (The old dev bin download_model.rs was deleted in the 2026-07-15 audit —
+    // in-app downloads go through the download_model IPC, whose CTC300M routing models.rs tests pin.)
     expect(batchProcessorSource).toContain('..AsrLoadConfig::default()');
     expect(batchProcessorSource).not.toContain('AsrModelSize::CTC1B');
-    expect(downloadModelSource).toContain('download_omniasr(AsrModelSize::CTC300M');
-    expect(downloadModelSource).not.toContain('download_omniasr(AsrModelSize::CTC1B');
   });
 });

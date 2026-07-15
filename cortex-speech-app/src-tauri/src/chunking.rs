@@ -425,10 +425,7 @@ mod tests {
         // The overlap re-transcribed "چوارەم پێنجەم" at the seam; the merge keeps ONE copy.
         let prev = "یەکەم دووەم سێیەم چوارەم پێنجەم";
         let next = "چوارەم پێنجەم شەشەم حەوتەم";
-        assert_eq!(
-            stitch_overlapping_transcripts(prev, next, 6),
-            "یەکەم دووەم سێیەم چوارەم پێنجەم شەشەم حەوتەم"
-        );
+        assert_eq!(stitch_overlapping_transcripts(prev, next, 6), "یەکەم دووەم سێیەم چوارەم پێنجەم شەشەم حەوتەم");
     }
 
     #[test]
@@ -457,10 +454,7 @@ mod tests {
         // max_overlap_words caps the look-back: a real 3-word overlap ("b c d") EXCEEDS cap=2, so
         // no seam is detected and content is concatenated intact (never partially dropped) — the safe
         // failure mode. In practice the cap is set generously above the expected acoustic overlap.
-        assert_eq!(
-            stitch_overlapping_transcripts("a b c d", "b c d e", 2),
-            "a b c d b c d e"
-        );
+        assert_eq!(stitch_overlapping_transcripts("a b c d", "b c d e", 2), "a b c d b c d e");
     }
 
     #[test]

@@ -205,14 +205,6 @@ pub const MODELS: &[ModelInfo] = &[
         min_size_bytes: 400_000,
         version: "1.0",
     },
-    ModelInfo {
-        name: "WavLM Speech OOD Detector",
-        filename: "wavlm_ood.onnx",
-        url: "",
-        sha256: "",
-        min_size_bytes: 5_000_000,
-        version: "1.0",
-    },
 ];
 
 fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
@@ -1078,13 +1070,12 @@ mod tests {
 
     #[test]
     fn runtime_integrity_noop_for_unpinned_model() {
-        // The WavLM OOD detector has an empty pin today -> verification is a documented no-op (cannot
-        // verify). (CAM++ and the denoiser are now pinned, so they are NOT no-ops any more — see
-        // extra_model_pins_are_populated_and_urls_are_direct_files.)
+        // A filename with no manifest pin -> verification is a documented no-op (cannot verify).
+        // Every SHIPPED model is pinned now; this guards the not-in-manifest path (custom/dev files).
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("whatever.onnx");
         std::fs::write(&path, b"unpinned content").unwrap();
-        assert!(verify_model_path_runtime(&path, "wavlm_ood.onnx").is_ok());
+        assert!(verify_model_path_runtime(&path, "not-in-manifest.onnx").is_ok());
     }
 
     #[test]
@@ -1407,24 +1398,26 @@ mod tests {
 
     #[test]
     fn unpinned_optional_models_are_not_bulk_download_candidates() {
-        // Bulk-download candidacy follows PINNING, not presence (presence now varies with local install
-        // state — CAM++/denoiser may be in the bundled dir). CAM++ and the GTCRN denoiser became pinned
-        // direct-file downloads on 2026-07-13; WavLM OOD is still unpinned and must always be skipped.
+        // Bulk-download candidacy follows PINNING, not presence. Every shipped entry is pinned now,
+        // so the unpinned-never-downloadable invariant is guarded with a synthetic entry.
         let campp = MODELS.iter().find(|m| m.filename == CAMPP_MODEL).expect("CAM++ entry");
         let denoiser = MODELS.iter().find(|m| m.filename == DENOISER_MODEL).expect("denoiser entry");
-        let wavlm = MODELS.iter().find(|m| m.filename == "wavlm_ood.onnx").expect("wavlm entry");
         assert!(model_download_supported(campp), "CAM++ is pinned + has a URL -> a candidate");
         assert!(model_download_supported(denoiser), "denoiser is pinned + has a URL -> a candidate");
-        assert!(!model_download_supported(wavlm), "WavLM OOD is unpinned -> never a candidate");
 
-        // The unpinned model must never appear in the bulk-download set regardless of what is installed.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let manager = ModelManager::new(tmp.path().join("models"));
-        let downloadable: Vec<&str> = manager.downloadable_missing_models().into_iter().map(|m| m.name).collect();
-        assert!(
-            !downloadable.contains(&"WavLM Speech OOD Detector"),
-            "an unpinned model must never be a bulk-download candidate, got {downloadable:?}"
-        );
+        // Field-shorthand on purpose: the provenance policy textually scans ModelInfo blocks for
+        // `url: "..."` manifest entries; this synthetic TEST value must not read as one.
+        let url = "https://example.invalid/model.onnx";
+        let sha256 = "";
+        let unpinned = ModelInfo {
+            name: "Synthetic Unpinned",
+            filename: "synthetic/unpinned.onnx",
+            url,
+            sha256,
+            min_size_bytes: 1,
+            version: "0",
+        };
+        assert!(!model_download_supported(&unpinned), "a model without a pinned SHA must never be auto-downloadable");
     }
 
     #[test]

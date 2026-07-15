@@ -160,7 +160,10 @@ impl ForcedAligner {
         let (output_shape, logits) = extract_res;
 
         if output_shape.len() < 3 {
-            tracing::warn!(?output_shape, "alignment fallback: aligner output is not [batch, frames, vocab] — energy heuristic");
+            tracing::warn!(
+                ?output_shape,
+                "alignment fallback: aligner output is not [batch, frames, vocab] — energy heuristic"
+            );
             return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
         }
 
@@ -169,7 +172,11 @@ impl ForcedAligner {
         // A corrupt-but-loadable model can report a zero frame/vocab dim, which would
         // divide-by-zero in ctc_align; degrade to the energy aligner instead of panicking.
         if num_frames == 0 || vocab_size == 0 {
-            tracing::warn!(num_frames, vocab_size, "alignment fallback: aligner emitted zero frames/vocab — energy heuristic");
+            tracing::warn!(
+                num_frames,
+                vocab_size,
+                "alignment fallback: aligner emitted zero frames/vocab — energy heuristic"
+            );
             return Ok((fallback_align(pcm, sample_rate, text), AlignmentQuality::EnergyHeuristic));
         }
         let blank_idx = self.tokens.iter().position(|t| t == "<pad>" || t == "_" || t == "<blank>").unwrap_or(0);

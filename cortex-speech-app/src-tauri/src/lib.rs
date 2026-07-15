@@ -45,7 +45,6 @@ pub mod media;
 pub mod migrations;
 pub mod models;
 pub mod normalizer;
-pub mod observer;
 pub mod perf;
 pub mod pipeline;
 pub mod quality;
@@ -597,7 +596,6 @@ pub fn run() {
             commands::list_agent_import_reports,
             commands::list_agent_stage_events,
             commands::list_model_versions,
-            commands::get_champion_model,
             commands::import_model_checkpoint,
             commands::create_gold_from_file,
             commands::import_verified_segments_as_gold,
@@ -663,7 +661,6 @@ pub fn run() {
             commands::get_inference_stats,
             commands::run_wsl_refinement,
             commands::cancel_wsl_refinement,
-            commands::add_segment_hypothesis,
             commands::run_consensus_refinery,
             commands::compute_acoustic_scores,
             commands::get_dataset_certificate,

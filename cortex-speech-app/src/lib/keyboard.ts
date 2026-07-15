@@ -118,9 +118,6 @@ export class KeyboardManager {
     return [...this.shortcuts];
   }
 
-  getByCategory(category: string): Shortcut[] {
-    return this.shortcuts.filter((s) => s.category === category);
-  }
 
   destroy() {
     if (typeof window !== 'undefined') {

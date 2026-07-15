@@ -90,37 +90,3 @@ export function toggleLeftPanel() {
 export function toggleRightPanel() {
   rightPanel.update((v) => (v === 'none' ? 'segments' : 'none'));
 }
-
-export function openConfirm(dialog: ConfirmDialog) {
-  showConfirmDialog.set(dialog);
-}
-
-export function closeConfirm() {
-  showConfirmDialog.set(null);
-}
-
-// Re-export as an object for components that use the old `uiStore` API
-export const uiStore = {
-  subscribe: (run: (v: Record<string, unknown>) => void) => {
-    const unsub1 = viewMode.subscribe((v) => run({ viewMode: v }));
-    const unsub2 = isProcessing.subscribe((v) => run({ processing: v }));
-    const unsub3 = showConfirmDialog.subscribe((v) => run({ confirm: v }));
-    const unsub4 = showKeyboardHelp.subscribe((v) => run({ showShortcuts: v }));
-    const unsub5 = leftPanel.subscribe((v) => run({ leftPanel: v }));
-    const unsub6 = rightPanel.subscribe((v) => run({ rightPanel: v }));
-    return () => {
-      unsub1();
-      unsub2();
-      unsub3();
-      unsub4();
-      unsub5();
-      unsub6();
-    };
-  },
-  openConfirm,
-  closeConfirm,
-  toggleSettings: () => {},
-  setViewMode: (mode: ViewMode) => viewMode.set(mode),
-  setProcessing: (v: boolean) => isProcessing.set(v),
-  toggleShortcuts: () => showKeyboardHelp.update((v) => !v),
-};

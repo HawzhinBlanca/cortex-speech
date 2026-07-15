@@ -347,7 +347,7 @@ mod tests {
         seg.is_gold = true;
         seg.agent_confidence = Some(0.9);
         seg.rationale = Some("reviewed".to_string());
-        db.restore_segment(&seg).unwrap();
+        db.insert_segment_full(&seg).unwrap();
 
         // Snapshot exactly what the delete command captures, delete, then undo.
         let snapshot = db.get_segment_by_id("g1").unwrap().unwrap();
