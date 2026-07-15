@@ -3665,3 +3665,15 @@ app UI end-to-end: Settings -> Couch Review -> Start. Verbatim live results:
   once, "Private networks", for phones to reach it; loopback worked regardless).
 Remaining live check is owner-held: open the Tailscale URL on the iPhone (authenticated path is
 already gated by the couch test suite's real-HTTP roundtrip).
+
+## 2026-07-15 (cont.) — ponytail repo audit applied: ~33,700 lines cut, all gated
+
+Three parallel audit scanners (Rust/frontend/scripts) -> 20 findings applied across 3 commits,
+3 findings REJECTED by my own caller-verification (runGoldEval live; conformalThreshold drives
+activeLearning sort; cache eviction is deliberate created_at semantics with a pinned test — not a
+hand-rolled LRU). Biggest cuts: 28.9k-line committed SBOM (zero refs), research/ (3.3k), duplicate
++ divergent doc copies (root charter canonical — it carries the newer SeamlessM4T-baseline honesty
+correction), dead observer/ module, 2 dead bins, 20 dead IPC wrappers, vestigial wavlm manifest
+entry. Gates caught 2 pieces of my own collateral damage (clipped NORMALIZER_CACHE; damaged
+segmentStore.ts) — repaired, which is exactly what the gates are for.
+Verbatim: cargo 905/0, clippy clean, vitest 196/196, typecheck 0, eslint clean, 32/32 policies.
