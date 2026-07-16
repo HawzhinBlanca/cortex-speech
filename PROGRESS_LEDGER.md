@@ -5111,3 +5111,38 @@ investigating the last substantial candidate and finding it low-value/risky/earl
   instrumented + live).
 exe freshness GREEN (unchanged this iter — doc-only). Loop stays alive to pick up owner-unblocked or
 Week-3 work.
+
+---
+
+## 2026-07-16T21:58Z — iter 31 — production panic-risk audit (clean + already-gated) → honest session hand-off
+
+**Increment attempted:** the panic-risk audit flagged last iter — hunt production `unwrap()`/`expect()`/
+indexing that could crash on untrusted input. **Findings (honest):**
+- Hot input-facing files (commands/pipeline/audio/asr/scribe_api) have **~0 `unwrap()` in their
+  production regions** — the 1895 total `unwrap()` are overwhelmingly in test modules.
+- **Zero** raw `.lock().unwrap()`/`.lock().expect()` in production (poison-recovery pattern is followed).
+- The two grep candidates were false positives: `couch.rs:404-405` is inside a `#[test]` fn;
+  `chunking.rs:157` `regions[0]` is guarded by an `is_empty()` check two lines above.
+- **Why it's this clean:** `scripts/test_rust_runtime_panic_policy.py` (1471 lines) ALREADY exhaustively
+  gates poison-recovery locks, no-silent-error-discard, and no-startup-panics across the whole tree.
+  A "no production lock-unwrap" gate would be **redundant** — deliberately NOT added (manufacturing).
+
+**Outcome:** nothing to fix, nothing non-redundant to add. Honest no-op (audit verified robustness).
+No code changed; no gate run needed beyond the audit itself.
+
+**Session hand-off — genuine exhaustion, confirmed 3×.** Across iters 24–31: Week 1 (responsiveness)
+COMPLETE with real timing telemetry live in the exe (freshness green); Week 2 (durability) done or
+owner-gated; the last three iters (STRICT defer, OOD defer, panic audit) each investigated a candidate
+and correctly found it low-value/risky/redundant. The codebase is mature, clean, and its robustness is
+maximally gated. **No low-risk, high-value, non-owner-gated increment remains right now.**
+
+Per the doctrine's stop condition ("all remaining work owner-gated → honest hand-off, cheap no-op"),
+STOPPING this interactive session's auto-loop to avoid churning no-op wakeups. **The durable MONTH
+LOOP continues** via the external scheduled task `cortex-month-loop` (nightly 02:00 local, MONTH_LOOP.md
+§ intro) — a fresh session each night. The owner can also re-run `/loop` manually anytime.
+
+**What unblocks the next high-value work (owner-gated, none faked):** speech_segments STRICT
+(supervised pass + real-DB snapshot; plan in docs/STRICT_SPEECH_SEGMENTS_PLAN.md); enable
+champion_supervision_enabled; set backup_second_dir; DPAPI key re-save; native-Sorani review; iPhone
+Tailscale; and the Week-3 measured-intelligence work (starts 2026-07-30, needs real gold data / long
+audio / cloud opt-in). Real RTF/export timings accrue automatically as the app is used.
