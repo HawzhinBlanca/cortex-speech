@@ -4728,3 +4728,21 @@ NEXT (Week 2 remaining): larger STRICT tables via the same pattern (each its own
 speech_segments needs the FTS-trigger recreate) · disk-full drill (design pass needed). Week-3 themes
 (measured intelligence) begin 2026-07-30.
 Python policy regressions finished: 33 policy test scripts passed.
+
+## 2026-07-16 — iteration 22 addendum: exe rebuilt (v38 STRICT pilot shipped)
+
+App not running. Verbatim: VITE_EXIT=0; CARGO_REL_EXIT=0 (0 errors);
+check_exe_freshness -> EXE FRESHNESS GATE: OK (exe at HEAD 98e7f26f8fdf…, newer than all sources).
+
+OWNER-VISIBLE NOTE (surfaced, not owner-GATED — it's automatic + adversarially-verified-safe): the
+NEXT app launch on the owner's real library will apply migration v38 (recreate decision_verdicts as
+STRICT) in-place, atomically. A pre-restore/pre-migration snapshot pin already guards it; both skeptic
+lenses cleared it as fail-closed with no data-loss path.
+
+SESSION TALLY (night 1, 22 iterations): Week 1 COMPLETE (blocking audit + 8 freezer migrations +
+nextest + durability drill + 7B supervision). Week 2 all-but-two: write-path audit, second-dir backup +
+drilled restore, atomicity trio + job CAS, 4 fault drills (kill-during-write / corruption-covered /
+mid-export / missing-media), DPAPI keys, STRICT pilot. OPEN: larger STRICT tables (speech_segments+FTS,
+each its own staged migration), disk-full drill (design pass). ~23 source commits, exe freshness-green
+throughout; every non-trivial change adversarially verified — the skeptic passes caught 8 genuine
+issues this session, each fixed before shipping.
