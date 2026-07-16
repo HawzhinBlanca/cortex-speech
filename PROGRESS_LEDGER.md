@@ -4160,3 +4160,14 @@ COMPLETE for user-observable freezes.
 
 NEXT (Week 1 remaining): cargo-nextest adoption, kill/restart durability drill, 7B engine supervision
 skeleton — plus the batched exe rebuild (this wind-down).
+
+## 2026-07-16 — iteration 9 addendum: milestone exe rebuilt (ALL wired freezers shipped)
+
+App not running; built into src-tauri/target/release (CARGO_TARGET_DIR unset). Verbatim:
+  $ (npm run build)                       -> VITE_EXIT=0
+  $ cargo build --release                 -> CARGO_REL_EXIT=0 (0 build/LNK errors)
+  $ python scripts/check_exe_freshness.py -> EXE FRESHNESS GATE: OK (exe at HEAD 9ea87f53fffc…, newer than all sources)
+The installed exe now carries every off-thread migration from tonight (10 commands async across 8
+increments) — no UI-reachable IPC command blocks the main thread with heavy work anymore. Owner-
+observable effect: search, model downloads, audio-duration probes, the Gemini T2 watcher, the jury
+chain, and Scribe votes can no longer freeze the window; status pills poll without micro-freezes.
