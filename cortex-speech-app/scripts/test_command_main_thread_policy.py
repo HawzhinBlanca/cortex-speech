@@ -95,6 +95,9 @@ ASYNC_SLOW_COMMANDS = [
     # Scribe vote batch: per-segment decode/slice + ElevenLabs POST loop on run_blocking; consent/key
     # gates + the to-vote gather stay eager; per-insert brief db_arc lock inside the task.
     "add_scribe_votes",
+    # DPO preference-pair upload: the ~120s blocking outbound HTTP POST moved to run_blocking on a
+    # separate WAL connection; the cloud-LLM consent gate stays EAGER (never offload before opt-in).
+    "run_dpo_update",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

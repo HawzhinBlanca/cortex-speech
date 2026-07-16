@@ -31,9 +31,10 @@ Count of the current split (updated as the migration lands): **57 async** (off t
 **7 sync-but-offloaded** (safe) · **3 sync-and-blocking** (below) · the remaining ~62 sync commands
 are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a freeze risk).
 
-**Milestone 2026-07-16: every UI-WIRED freezer from the original 13 is off the main thread.** The 3
-remaining rows are an unwired training hook (`run_dpo_update`) and a detached near-instant spawn
-(`start_champion_engine`, MED). (`check_external_provider` was deleted 2026-07-16 — it was dead code.)
+**Milestone 2026-07-16: every heavy freezer is off the main thread.** After migrating the unwired
+training hook `run_dpo_update` (the last ~120 s blocking cloud POST), the ONLY remaining freezer is
+`start_champion_engine` (MED) — a detached `powershell` spawn whose freeze is just process-creation
+latency. (`check_external_provider` was deleted 2026-07-16 — it was dead code.)
 
 **Migration progress (Week-1 item 2), all 2026-07-16:**
 - ✅ `search_segments` (#12) → `pub async fn` + `run_blocking` (mirrors `get_segments`).
@@ -60,16 +61,17 @@ remaining rows are an unwired training hook (`run_dpo_update`) and a detached ne
 - ✅ `add_scribe_votes` (#5) → `async` (App.svelte's batch Scribe-vote action); the per-segment
   decode/slice + POST loop moved into `run_blocking`, consent/key gates + the to-vote gather stay
   eager, and each vote's insert takes the same brief global-mutex lock as before (via `db_arc`).
-- ℹ️ `run_dpo_update` (#3) found **unwired** — registered + consent-gated + its core tested, but no
-  caller in `src/` (a DPO training hook awaiting UI). Left sync for now (its freeze is latent, not a
-  live UI freeze); migrate it when it's wired, or fold it into a cleanup pass.
+- ✅ `run_dpo_update` (#3) → `pub async fn` + `run_blocking`. Still **unwired** (no `src/` caller yet),
+  but it's a registered, consent-gated IPC command, so the ~120 s blocking cloud POST was a latent UI
+  freeze the moment anything invoked it. Migrated pre-emptively: consent gate stays eager, the POST
+  runs on the blocking pool via a separate WAL connection. This clears the last heavy freezer.
 Migrated rows below are struck through.
 
 | # | command | class | severity | heaviest op (traced) | consent/key gate |
 |---|---------|-------|----------|----------------------|------------------|
 | ~~1~~ | ~~`run_jury_pipeline`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~T0→T1→T2 chain~~ — now `async`; whole chain on `run_blocking` via owned `JuryDbSource` | cloud-LLM opt-in |
 | ~~2~~ | ~~`run_t2_for_segment`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~N≥3 Gemini audio calls~~ — now `async`; cloud call in `run_blocking`, DB gather/write bracket it | cloud-LLM opt-in |
-| 3 | `run_dpo_update` ℹ️ unwired | cloud-net | HIGH | outbound HTTP POST (~120 s cap) → `jury::learning::run_dpo_update` — **no `src/` caller** (latent, not a live freeze) | cloud-LLM opt-in |
+| ~~3~~ | ~~`run_dpo_update`~~ ✅ migrated (still unwired) | cloud-net | ~~HIGH~~ | ~~outbound HTTP POST (~120 s cap)~~ — now `async`; POST in `run_blocking` on a separate WAL connection, consent gate eager | cloud-LLM opt-in |
 | ~~4~~ | ~~`transcribe_audio_with_scribe`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~ElevenLabs Scribe POST~~ — now `async` + `run_blocking` (consent gate stays eager) | cloud-STT opt-in |
 | ~~5~~ | ~~`add_scribe_votes`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~decode+POST loop~~ — now `async`; loop on `run_blocking`, per-insert brief `db_arc` lock | cloud-STT opt-in |
 | ~~6~~ | ~~`models_download`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~multi-hundred-MB HTTP download~~ — now `async` + `run_blocking` | — |

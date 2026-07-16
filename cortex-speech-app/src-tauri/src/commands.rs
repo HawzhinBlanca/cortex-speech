@@ -4354,19 +4354,22 @@ pub fn get_escalation_rate_trend(state: State<'_, AppState>) -> Result<Vec<crate
 }
 
 #[tauri::command]
-pub fn run_dpo_update(state: State<'_, AppState>, endpoint: String) -> Result<String, String> {
+pub async fn run_dpo_update(state: State<'_, AppState>, endpoint: String) -> Result<String, String> {
     RATE_LIMITER.check("run_dpo_update")?;
     // DPO POSTs private, transcript-derived preference pairs outbound — a parallel cloud-LLM channel,
     // so it requires the same explicit cloud-LLM opt-in (the endpoint allow-list is a separate,
-    // non-consent control). Gate before building/serializing any of that private data.
+    // non-consent control). Gate before building/serializing any of that private data — the consent
+    // check runs EAGERLY here, so no request is ever offloaded without opt-in.
     require_cloud_llm_consent(&state)?;
     // Build + POST on a SEPARATE WAL connection (see open_jury_db_connection), never the global lock —
-    // run_dpo_update performs a blocking outbound HTTP POST (up to ~120s on a stalled endpoint), and
-    // holding lock_db() across it would freeze every other DB-touching IPC (get_segments, search, ...)
-    // and the whole UI. Mirrors run_jury_pipeline / run_t2_for_segment.
+    // run_dpo_update performs a blocking outbound HTTP POST (up to ~120s on a stalled endpoint).
+    // Open the connection eagerly, then move it into run_blocking so the POST runs on the blocking pool
+    // — off the UI thread AND without holding lock_db(), so it never freezes the window or starves
+    // other DB-touching IPCs (get_segments, search, ...). Database is Send (Connection + String).
+    // Mirrors run_jury_pipeline / run_t2_for_segment.
     let db = open_jury_db_connection(&state)
         .ok_or_else(|| "App data directory is unavailable for the DPO update.".to_string())?;
-    crate::jury::learning::run_dpo_update(&db, &endpoint).map_err(|e| e.to_string())
+    run_blocking(move || crate::jury::learning::run_dpo_update(&db, &endpoint).map_err(|e| e.to_string())).await
 }
 
 // ── Items 1 & 2: Full jury pipeline + T2 direct command ─────────────────────

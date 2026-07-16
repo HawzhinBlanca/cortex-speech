@@ -45,7 +45,11 @@ FREEZERS: dict[str, tuple[str, str]] = {
     # an owned JuryDbSource (with_jury_db extracted); in the ASYNC ratchet.
     # MIGRATED 2026-07-16: run_t2_for_segment — the N-sample Gemini cloud call moved to run_blocking
     # (consent/key gates + brief DB gather stay eager); in the ASYNC ratchet.
-    "run_dpo_update": ("cloud-net", "outbound HTTP POST, ~120s cap on a stalled endpoint (jury::learning::run_dpo_update)"),
+    # MIGRATED 2026-07-16: run_dpo_update — the ~120s blocking outbound HTTP POST moved to
+    # `pub async fn` + run_blocking on a separate WAL connection (cloud-LLM consent gate stays eager);
+    # now in test_command_main_thread_policy.py's ASYNC_SLOW_COMMANDS ratchet. With this, the only
+    # remaining freezer is start_champion_engine (a detached powershell spawn whose freeze is just
+    # process-creation latency).
     # MIGRATED 2026-07-16: transcribe_audio_with_scribe — blocking Scribe POST moved to run_blocking
     # (consent/key/DB gates stay eager); in the ASYNC ratchet.
     # MIGRATED 2026-07-16: add_scribe_votes — the decode+POST loop moved to run_blocking (consent/key
