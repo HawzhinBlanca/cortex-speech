@@ -3677,3 +3677,61 @@ correction), dead observer/ module, 2 dead bins, 20 dead IPC wrappers, vestigial
 entry. Gates caught 2 pieces of my own collateral damage (clipped NORMALIZER_CACHE; damaged
 segmentStore.ts) — repaired, which is exactly what the gates are for.
 Verbatim: cargo 905/0, clippy clean, vitest 196/196, typecheck 0, eslint clean, 32/32 policies.
+
+## 2026-07-16 — MONTH LOOP night 1 (Week 1, Responsiveness): UI-thread blocking audit + ratchet
+
+Theme by date = Week 1 (Jul 16–22, responsiveness & process reliability). Smallest unblocked
+increment = item 1 "measure first: identify which sync IPC commands block the UI thread." Preconditions
+clean: no lock, clean tree on codex/newbranch, cortex-speech-app.exe NOT running, no stray toolchain.
+Lock acquired + released this run. No Rust/frontend source touched — a docs + policy-script increment,
+zero blast radius on commands.rs/db.rs/pipeline.rs.
+
+WHAT SHIPPED (2 new files):
+- docs/UI_THREAD_BLOCKING_AUDIT.md — the ranked "measure first" deliverable. Of 129 #[tauri::command]s:
+  47 async (off-thread), 7 sync-but-offloaded (spawn-and-return, safe), 13 sync-and-blocking (the
+  UI-freeze worklist), remaining ~62 sync are trivial getters / single-row DB ops.
+  The 13 freezers (migrate-first), code-traced into their delegates:
+    cloud-net (7): run_jury_pipeline, run_t2_for_segment, run_dpo_update, transcribe_audio_with_scribe,
+      add_scribe_votes, models_download, models_download_all — all block the MAIN THREAD on a network
+      round-trip (they already drop the DB lock, but the sync fn still holds the UI thread across the
+      wait; run_dpo_update's own comment notes a ~120s POST cap).
+    subprocess (4): get_champion_engine_status (~5s WSL probe), check_external_provider /
+      check_agentic_readiness (~10s `wsl --status`), start_champion_engine (detached powershell — MED,
+      real freeze is just process-creation latency).
+    file-io (1): get_audio_duration — LOOKS offloaded (spawns a thread) but blocks on rx.recv_timeout(30s).
+    db-scan (1): search_segments — unbounded FTS5 MATCH, no LIMIT, all matching full rows (transcripts
+      + alignment_json) serialized sync on the UI thread.
+- scripts/test_ui_thread_blocking_audit.py — shrinking-ratchet gate (auto-discovered, policy #33): pins
+  each of the 13 freezers as still-sync (FAILS when one is migrated → forces adding it to the existing
+  test_command_main_thread_policy.py ASYNC ratchet, so the worklist honestly shrinks) and pins the 7
+  offloaded commands as still-spawning (regression guard against silently dropping a thread::spawn).
+
+METHOD + HONESTY:
+- The naive "sync == freezes" is false here (batch_* etc. self-offload) and "async == safe" misses the
+  spawn-then-block trap — so the list is code-verified, not marker-guessed. Static analysis can't see a
+  block behind a delegate or a recv, so the freezer set is hand-traced and pinned against source.
+- NO real wall-clock timings are claimed. Durations quoted (~120s POST, 5–10s WSL, 30s decode) are the
+  code's configured CEILINGS, not measured latencies. Real per-command timing is OWNER-GATED (needs a
+  real-audio / live-download / opted-in-cloud session on the owner's machine). The existing TRACER
+  (telemetry/mod.rs, get_recent_spans/get_tracing_stats) already captures real spans during use;
+  instrumenting the 13 freezers to each emit a span is the natural next increment.
+
+ADVERSARIAL VERIFY (doctrine step 5): two independent Explore readers. (1) full classification of all
+81 sync commands — agreed 12 HIGH freezers, and CAUGHT 4 my static scanner missed (the 3 WSL getters +
+get_audio_duration's spawn-then-recv). (2) a skeptic tasked ONLY with finding a false negative —
+REFUTED my first completeness claim by finding search_segments (unbounded FTS5 scan+serialize on the
+main thread; its siblings get_segments/get_segments_suspect_first use run_blocking and get_segments_page
+clamps to 500, but this one caps neither). I verified the db.rs SQL myself (db.rs:1092, no LIMIT) before
+promoting it from "secondary/bounded" into the worklist as freezer #12 — 12 → 13. Both the doc and the
+gate were corrected before commit. This is exactly the class of error the adversarial pass exists to
+catch: an under-rating that would have left a real freezer off the Week-1 migration list.
+
+VERBATIM GATE:
+  $ python scripts/run_python_policies.py
+  Python policy regressions finished: 33 policy test scripts passed.
+(was 32; +1 is the new auditor. No cargo/npm gate run — no Rust/frontend source changed.)
+
+NEXT (Week 1 item 2): migrate the cloud-net freezer cluster (#1–#7) to async off the main thread —
+they share the jury/scribe/download helper shape; each behavior-preserving, each with a test, each
+added to test_command_main_thread_policy.py's ASYNC_SLOW_COMMANDS ratchet (and removed from this
+audit's FREEZERS) as it lands.
