@@ -4746,3 +4746,33 @@ mid-export / missing-media), DPAPI keys, STRICT pilot. OPEN: larger STRICT table
 each its own staged migration), disk-full drill (design pass). ~23 source commits, exe freshness-green
 throughout; every non-trivial change adversarially verified — the skeptic passes caught 8 genuine
 issues this session, each fixed before shipping.
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 23 (cleanup): deleted the dead check_external_provider command
+
+Ponytail cleanup of the dead code the write-path/blocking audits surfaced (iter 3 flagged it + spawned
+an owner chip; done in-session instead). check_external_provider was a registered #[tauri::command] with
+NO caller anywhere — re-verified this iteration: `grep -rn check_external_provider src/` empty; only its
+own def + the invoke_handler registration referenced it. App NOT running; lock held + released.
+
+DELETED: the fn (commands.rs) + its lib.rs invoke_handler registration. KEPT external_provider_status
+(the helper) — still used by check_agentic_readiness (the live, already-migrated WSL-status path) and a
+background thread. Updated test_ui_thread_blocking_audit.py (removed from FREEZERS + the docstring) and
+docs/UI_THREAD_BLOCKING_AUDIT.md (row struck as DELETED). Dismissed the owner chip (task_a9d95cda).
+
+VERIFICATION: the COMPILER is the proof for a dead-code deletion — a real caller would fail to compile;
+the invoke_handler removal is compile-checked. No adversarial Workflow for a verified-dead deletion
+(dead-ness confirmed by 2 independent reader agents in iter 3 + re-grepped here) — said plainly.
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR; app not running):
+  $ cargo fmt --check  -> exit 0
+  $ cargo clippy --all-targets -- -D warnings -> CLIPPY_EXIT=0
+  $ cargo test --lib   -> test result: ok. 922 passed; 0 failed; 6 ignored
+  $ run_python_policies -> 33 policy test scripts passed.
+  $ test_ui_thread_blocking_audit -> #[tauri::command] total: 128 (was 129) / async 57
+IPC surface: 129 -> 128 commands. Freezer audit is down to 2 rows: run_dpo_update (unwired) +
+start_champion_engine (MED). Exe rebuild batched (1 source commit since 98e7f26; behavior-preserving —
+removing an unreachable command).
+
+NEXT: larger STRICT tables (each its own staged migration; speech_segments+FTS is the high-risk one
+needing a dedicated iteration) · disk-full drill (design pass) · Week-3 measured-intelligence themes
+begin 2026-07-30.

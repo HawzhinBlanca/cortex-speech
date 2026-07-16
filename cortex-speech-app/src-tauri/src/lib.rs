@@ -629,7 +629,6 @@ pub fn run() {
             commands::get_blocking_validation_issues,
             commands::register_media_asset,
             commands::get_media_asset_url,
-            commands::check_external_provider,
             commands::check_agentic_readiness,
             commands::rediarize_segments,
             commands::rename_speaker,

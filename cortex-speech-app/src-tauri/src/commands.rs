@@ -2070,13 +2070,6 @@ pub fn get_media_asset_url(id: String, state: State<'_, AppState>) -> Result<Str
 }
 
 #[tauri::command]
-pub fn check_external_provider(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("check_external_provider")?;
-    let settings = state.lock_settings().clone();
-    Ok(external_provider_status(&settings))
-}
-
-#[tauri::command]
 pub async fn check_agentic_readiness(state: State<'_, AppState>) -> Result<AgenticReadiness, String> {
     RATE_LIMITER.check("check_agentic_readiness")?;
     // Grab the two cheap, lock-guarded inputs on the caller thread (a settings clone + a bounded

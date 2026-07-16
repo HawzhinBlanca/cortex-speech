@@ -32,8 +32,8 @@ Count of the current split (updated as the migration lands): **57 async** (off t
 are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a freeze risk).
 
 **Milestone 2026-07-16: every UI-WIRED freezer from the original 13 is off the main thread.** The 3
-remaining rows are an unwired training hook (`run_dpo_update`), dead code (`check_external_provider`,
-delete-flagged), and a detached near-instant spawn (`start_champion_engine`, MED).
+remaining rows are an unwired training hook (`run_dpo_update`) and a detached near-instant spawn
+(`start_champion_engine`, MED). (`check_external_provider` was deleted 2026-07-16 — it was dead code.)
 
 **Migration progress (Week-1 item 2), all 2026-07-16:**
 - ✅ `search_segments` (#12) → `pub async fn` + `run_blocking` (mirrors `get_segments`).
@@ -63,8 +63,6 @@ delete-flagged), and a detached near-instant spawn (`start_champion_engine`, MED
 - ℹ️ `run_dpo_update` (#3) found **unwired** — registered + consent-gated + its core tested, but no
   caller in `src/` (a DPO training hook awaiting UI). Left sync for now (its freeze is latent, not a
   live UI freeze); migrate it when it's wired, or fold it into a cleanup pass.
-- 🗑️ `check_external_provider` (#9) is **dead** (registered, but no caller in `src/` or Rust) — left sync
-  and flagged for deletion rather than migrated (don't invest in code that should be deleted).
 Migrated rows below are struck through.
 
 | # | command | class | severity | heaviest op (traced) | consent/key gate |
@@ -77,7 +75,7 @@ Migrated rows below are struck through.
 | ~~6~~ | ~~`models_download`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~multi-hundred-MB HTTP download~~ — now `async` + `run_blocking` | — |
 | ~~7~~ | ~~`models_download_all`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~download loop~~ — now `async`; whole loop + emits in `run_blocking` | — |
 | ~~8~~ | ~~`get_champion_engine_status`~~ ✅ migrated | subprocess | ~~HIGH~~ | ~~WSL TCP probe~~ — now `async` + `run_blocking` | — |
-| 9 | `check_external_provider` 🗑️ dead | subprocess | HIGH | shells out to `wsl --status` up to 10 s → `external_provider_status` — **unused, delete candidate** | — |
+| ~~9~~ | ~~`check_external_provider`~~ 🗑️ DELETED | subprocess | ~~HIGH~~ | dead code, removed 2026-07-16 (no caller) | — |
 | ~~10~~ | ~~`check_agentic_readiness`~~ ✅ migrated | subprocess | ~~HIGH~~ | ~~`wsl --status` + model stat~~ — now `async`, probe on `run_blocking` | — |
 | ~~11~~ | ~~`get_audio_duration`~~ ✅ migrated | file-io | ~~HIGH~~ | ~~probe thread + `recv_timeout(30 s)`~~ — watchdog now inside `run_blocking` | — |
 | ~~12~~ | ~~`search_segments`~~ ✅ migrated | db-scan | ~~HIGH~~ | ~~unbounded FTS5 `MATCH`~~ — now `async` + `run_blocking` (off the main thread) | — |
@@ -126,7 +124,7 @@ ratchet as it lands:
    careful pass).
 2. ✅ **WSL status getters (#8–#10)** — DONE 2026-07-16 for the two live ones (`get_champion_engine_status`,
    `check_agentic_readiness`): the `wsl`/probe work runs on `run_blocking`, off the polled UI thread.
-   `check_external_provider` (#9) turned out **dead** (no caller) → flagged for deletion, not migrated.
+   `check_external_provider` (#9) turned out **dead** (no caller) → DELETED 2026-07-16.
 3. ✅ **`get_audio_duration` (#11)** — DONE 2026-07-16: the whole watchdog (probe thread + 30 s
    `recv_timeout`) moved inside `run_blocking`, so the bound is preserved but the wait is off the UI
    thread (kept the watchdog rather than dropping the timeout, which would be a behaviour change).

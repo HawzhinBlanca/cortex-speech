@@ -11,9 +11,10 @@ not marker-guessed:
      `run_wsl_refinement`) `std::thread::spawn` the heavy body and return immediately — they do NOT
      freeze the UI. These are tracked in OFFLOADED_HIGH so a future edit can't silently drop the spawn.
   2. Some commands LOOK offloaded or trivial but still block the caller: `get_audio_duration` spawns a
-     probe thread then blocks on `rx.recv_timeout(30s)`; the three WSL "status getters"
-     (`get_champion_engine_status`, `check_external_provider`, `check_agentic_readiness`) delegate into
-     a helper that shells out to `wsl` and blocks 5–10s. Static marker scanning cannot see either
+     probe thread then blocks on `rx.recv_timeout(30s)`; the WSL "status getters"
+     (`get_champion_engine_status`, `check_agentic_readiness`; the dead `check_external_provider` was
+     deleted) delegate into a helper that shells out to `wsl` and blocks 5–10s. Static marker scanning
+     cannot see either
      pattern (the block is behind a delegate / a recv), so the freezer set below is CODE-VERIFIED by
      hand (traced 2026-07-16, cross-checked by a reader agent) and pinned against the source.
 
@@ -53,9 +54,8 @@ FREEZERS: dict[str, tuple[str, str]] = {
     # MIGRATED 2026-07-16: models_download + models_download_all — blocking HTTP download moved to
     # run_blocking; in the ASYNC ratchet.
     # Subprocess spawns / WSL probes that block the caller.
-    # DEAD (no caller in src/ or Rust; registered only in the invoke_handler) — left sync on purpose,
-    # flagged for deletion rather than migration; ponytail: don't invest in code that should be deleted.
-    "check_external_provider": ("subprocess", "DEAD (unused) — shells out to `wsl --status` up to 10s (external_provider_status); delete candidate, not a migrate target"),
+    # (check_external_provider was DELETED 2026-07-16 — it was dead code, verified no caller; the
+    #  live WSL-status path lives in check_agentic_readiness, already migrated.)
     "start_champion_engine": ("subprocess", "powershell spawn — detached, so real freeze is just process-creation latency"),
     # MIGRATED 2026-07-16: get_audio_duration — the probe-thread + 30s recv_timeout watchdog now runs
     # inside run_blocking (bound preserved, off the UI thread); in the ASYNC ratchet.
