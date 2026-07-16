@@ -4565,3 +4565,42 @@ mid-export kill), DPAPI keys. Exe rebuild: NOW (3 source commits since 0c8afd2).
 App not running. Verbatim: VITE_EXIT=0; CARGO_REL_EXIT=0 (0 errors);
 check_exe_freshness -> EXE FRESHNESS GATE: OK (exe at HEAD fd93117d7256…, newer than all sources).
 Installed exe now carries all three atomicity fixes (verdict pair, jury verdict, import journal + CAS).
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 19 (Week 2): mid-export kill drill — SHIPPED + PASSED
+
+Week-2 fault drill #2 (of the disk-full / corruption / missing-media / mid-export set). Inventory
+first: corruption+quarantine already has real tests (open_with_retry_quarantines_db_when_integrity_
+check_fails_after_open, restore_rejects_a_corrupt_source, sidecar quarantine, transient-message
+classification) — NOT rebuilt; kill-during-write is the iteration-11 durability drill. Mid-export kill
+was uncovered. App NOT running; lock held + released.
+
+WHAT SHIPPED:
+- src-tauri/src/bin/export_writer.rs: seeds a disposable profile with 400 real segments (~1.5KB
+  transcripts), then loops the REAL production export path (export::export_dataset -> JSON) to
+  numbered files, journaling each path only AFTER the export returned (flushed single write — the
+  established drill protocol). Resume-safe across restarts (max existing export index + 1).
+- scripts/export_kill_drill.py: N cycles spawn -> wait for >=1 completed export -> random short delay ->
+  hard kill -> verify: every journaled export exists; EVERY final .json (journaled or not) parses
+  completely with the full 400-row count — a torn final file fails the drill; .tmp staging debris is
+  allowed by design (manifests exclude it), counted + reported.
+
+VERBATIM RUN (disposable TEMP profile):
+  $ python scripts/export_kill_drill.py --exe .../export_writer.exe --cycles 15
+  EXPORT KILL DRILL PASS: 15 mid-export kills, 20 journaled exports all complete, zero torn final
+  files (atomic temp+rename held)
+  (exit 0; tmp_debris=0 every cycle)
+
+HONEST CAVEATS: (1) tmp_debris=0 across all 15 kills suggests many kills landed BETWEEN export writes
+rather than inside them (400 rows ≈ fast writes) — the zero-torn-finals claim stands over 20 completed
+exports + 15 kills, but the in-write kill frequency is unmeasured; SEED_ROWS is the knob to widen the
+write window in future runs. (2) This drills the JSON table path (export_dataset); the bundle/HF/audio
+paths share atomic_file but are not separately drilled.
+
+VERBATIM GATES: cargo fmt --check exit 0; clippy --all-targets -D warnings CLIPPY_EXIT=0;
+cargo test --lib "915 passed; 0 failed"; run_python_policies "33 policy test scripts passed."
+VERIFICATION SCOPING: the drill reuses the iteration-11 instrument pattern whose protocol was
+adversarially hardened (journal-after-complete, adaptive kill, TEMP guard); the new surface (JSON
+parse + row-count verifier) is exercised by the real run itself. No fresh Workflow — said plainly.
+
+WEEK-2 FAULT-DRILL STATUS: kill-during-write DONE (iter 11) · corruption COVERED (existing tests) ·
+mid-export kill DONE (this) · REMAINING: disk-full, missing-media · then DPAPI keys.
