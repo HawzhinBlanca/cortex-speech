@@ -80,22 +80,32 @@ impl ApiKeys {
     /// against control characters/whitespace so a pasted value can never inject extra `KEY=` lines,
     /// and it is NEVER logged or echoed back.
     pub fn save_key(data_dir: &Path, name: &str, value: &str) -> Result<(), String> {
-        if !KEY_NAMES.contains(&name) {
-            return Err(format!("unknown API key name '{name}'"));
-        }
-        let value = value.trim();
-        if value.contains(|c: char| c.is_control() || c.is_whitespace()) {
-            // A newline would inject a second KEY= line; other whitespace/control chars are never part
-            // of a real provider key. Reject rather than "sanitize" (a silently altered key fails later
-            // in a far more confusing way).
-            return Err("API key contains whitespace or control characters — paste the key exactly".to_string());
-        }
+        let value = validate_key_value(name, value)?;
+        // Empty clears the key (write a bare "NAME=" placeholder). A non-empty key is stored AS-IS
+        // (plaintext); use save_key_protected for DPAPI at-rest protection.
+        Self::write_key_line(data_dir, name, value)
+    }
 
+    /// Like [`save_key`], but DPAPI-encrypts the value at rest (`NAME=dpapi:<base64>`), tying it to the
+    /// current Windows account. Empty value clears the key. Windows-only for a non-empty value; on
+    /// other platforms it errors rather than silently storing plaintext under a protected API.
+    pub fn save_key_protected(data_dir: &Path, name: &str, value: &str) -> Result<(), String> {
+        let value = validate_key_value(name, value)?;
+        if value.is_empty() {
+            return Self::write_key_line(data_dir, name, String::new());
+        }
+        let protected = crate::dpapi::protect(&value)?;
+        Self::write_key_line(data_dir, name, protected)
+    }
+
+    /// Shared writer: replace/insert `NAME=<stored>` in secrets.env atomically, preserving all other
+    /// lines. `stored` is written verbatim (already plaintext-validated or a dpapi blob).
+    fn write_key_line(data_dir: &Path, name: &str, stored: String) -> Result<(), String> {
         let path = data_dir.join(SECRETS_FILE);
         let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| Self::template());
         let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
         let prefix = format!("{name}=");
-        let new_line = format!("{name}={value}"); // empty value -> "NAME=" (a cleared, unset key)
+        let new_line = format!("{name}={stored}"); // empty -> "NAME=" (a cleared, unset key)
         match lines.iter_mut().find(|l| l.trim_start().starts_with(&prefix)) {
             Some(line) => *line = new_line,
             None => lines.push(new_line),
@@ -124,6 +134,21 @@ impl ApiKeys {
     }
 }
 
+/// Validate an API-key name + value before storing. Returns the trimmed value (possibly empty, which
+/// means "clear this key"). Rejects unknown names and whitespace/control chars (a newline would inject
+/// a second `KEY=` line; other whitespace/control chars are never part of a real provider key) — the
+/// same guard for both plaintext and pre-DPAPI values.
+fn validate_key_value(name: &str, value: &str) -> Result<String, String> {
+    if !KEY_NAMES.contains(&name) {
+        return Err(format!("unknown API key name '{name}'"));
+    }
+    let value = value.trim();
+    if value.contains(|c: char| c.is_control() || c.is_whitespace()) {
+        return Err("API key contains whitespace or control characters — paste the key exactly".to_string());
+    }
+    Ok(value.to_string())
+}
+
 /// Parse a minimal `.env` file: `KEY=VALUE` per line; `#` comments and blank lines ignored;
 /// surrounding whitespace and a matching pair of single/double quotes stripped; blank values dropped.
 fn parse_env_file(path: &Path) -> HashMap<String, String> {
@@ -149,7 +174,21 @@ fn parse_env_file(path: &Path) -> HashMap<String, String> {
             }
         }
         if !key.is_empty() && !value.is_empty() {
-            map.insert(key.to_string(), value.to_string());
+            // DPAPI-protected values (`dpapi:<base64>`) are transparently decrypted here so the rest of
+            // the app only ever sees plaintext. A blob that can't be decrypted (copied to another
+            // Windows account, or moved to a non-Windows box) is treated as UNSET — never surfaced as
+            // the literal ciphertext — and logged so the failure is visible, not silent.
+            if crate::dpapi::is_protected(value) {
+                match crate::dpapi::unprotect(value) {
+                    Ok(plain) if !plain.is_empty() => {
+                        map.insert(key.to_string(), plain);
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("could not decrypt DPAPI-protected {key} (treated as unset): {e}"),
+                }
+            } else {
+                map.insert(key.to_string(), value.to_string());
+            }
         }
     }
     map
@@ -227,6 +266,44 @@ mod tests {
         // Empty value clears the key (line stays as an unset placeholder).
         ApiKeys::save_key(dir, "OPENROUTER_API_KEY", "").unwrap();
         assert!(ApiKeys::load(dir).openrouter.is_none(), "cleared key must read back as unset");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_key_protected_encrypts_at_rest_and_loads_transparently() {
+        // Week-2 credentials-off-plaintext: a DPAPI-protected save must (1) store a dpapi:<base64> blob
+        // NOT the plaintext, and (2) load back transparently as plaintext. Plaintext keys still work.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let secret = "sk-or-super-secret-value";
+        ApiKeys::save_key_protected(dir, "OPENROUTER_API_KEY", secret).unwrap();
+
+        let on_disk = std::fs::read_to_string(dir.join(SECRETS_FILE)).unwrap();
+        assert!(!on_disk.contains(secret), "the plaintext key must never be on disk");
+        assert!(on_disk.contains("OPENROUTER_API_KEY=dpapi:"), "value stored as a DPAPI blob: {on_disk}");
+
+        assert_eq!(ApiKeys::load(dir).openrouter.as_deref(), Some(secret), "loads back transparently");
+
+        // A plaintext key alongside the protected one still loads (additive, not a replacement).
+        ApiKeys::save_key(dir, "GEMINI_API_KEY", "g-plain").unwrap();
+        let keys = ApiKeys::load(dir);
+        assert_eq!(keys.gemini.as_deref(), Some("g-plain"));
+        assert_eq!(keys.openrouter.as_deref(), Some(secret));
+
+        // Clearing a protected key works through the same path.
+        ApiKeys::save_key_protected(dir, "OPENROUTER_API_KEY", "").unwrap();
+        assert!(ApiKeys::load(dir).openrouter.is_none());
+    }
+
+    #[test]
+    fn a_corrupt_dpapi_blob_reads_as_unset_never_as_ciphertext() {
+        // A dpapi: value that can't be decrypted (wrong account / non-Windows) must be treated as unset,
+        // never surfaced as the literal ciphertext to the app.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join(SECRETS_FILE);
+        std::fs::write(&p, "OPENROUTER_API_KEY=dpapi:not-valid-base64-or-blob!!!\n").unwrap();
+        let keys = ApiKeys::load(tmp.path());
+        assert!(keys.openrouter.is_none(), "an undecryptable blob must read as unset, not as the raw string");
     }
 
     #[test]

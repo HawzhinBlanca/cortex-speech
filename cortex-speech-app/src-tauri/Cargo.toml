@@ -50,6 +50,9 @@ unicode-normalization = "0.1.23"
 # "time" for the champion-supervision tick (engine_runtime's tokio::time::sleep) — no net coupling.
 tokio = { version = "1", features = ["sync", "time"] }
 
+# DPAPI blob transport encoding for api_keys (0.22 already in the tree transitively — dedupes).
+base64 = "0.22"
+
 # Logging (structured tracing)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
@@ -117,6 +120,11 @@ harness = false
 name = "audio"
 path = "benches/audio_bench.rs"
 harness = false
+
+# DPAPI (CryptProtectData) for at-rest API-key protection in api_keys.rs. Windows-only by nature;
+# 0.61 already in the tree transitively — dedupes. Foundation carries LocalFree.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [features]
 default = ["custom-protocol"]

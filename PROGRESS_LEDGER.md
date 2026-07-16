@@ -4631,3 +4631,44 @@ WEEK-2 FAULT-DRILL STATUS: kill-during-write DONE · corruption COVERED · mid-e
 missing-media DONE · REMAINING: disk-full (genuinely hard to fault-inject portably — candidate
 approaches: tiny VHD/quota dir, or an injectable io::Write wrapper; needs its own design pass) · then
 DPAPI keys · then STRICT tables (staged).
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 21 (Week 2): DPAPI at-rest API-key protection
+
+Week-2 "credentials off plaintext." Additive, opt-in — plaintext secrets.env still works unchanged.
+App NOT running; lock held + released.
+
+CHANGE:
+- NEW src/dpapi.rs: protect()/unprotect() via Windows DPAPI CryptProtectData/CryptUnprotectData
+  (account-tied; CRYPTPROTECT_UI_FORBIDDEN so it never prompts in the batch/supervision contexts);
+  stored form is `dpapi:<base64>`. Non-Windows stubs Err (the Cowork sandbox). The unsafe FFI wraps the
+  DPAPI-allocated out-blob in an OutBlob RAII guard (copy-out + LocalFree on Drop).
+- api_keys.rs: parse_env_file transparently DECRYPTS `dpapi:` values on load — an undecryptable blob
+  (wrong Windows account / copied file) reads as UNSET + warn, NEVER as the literal ciphertext.
+  save_key unchanged (plaintext); NEW save_key_protected DPAPI-encrypts at rest; both share a validated
+  writer (the injection guard runs first on both paths). Cargo.toml: base64 0.22 +
+  [target.'cfg(windows)'] windows-sys 0.61 (Foundation + Security_Cryptography).
+- Tests: real-Windows roundtrip + ciphertext-differs; corrupt-blob-reads-unset; protected-save-encrypts-
+  at-rest-and-loads-transparently (plaintext key alongside still loads).
+
+ADVERSARIAL VERIFY (§3 — unsafe FFI + credential path, mandatory Workflow, 2 lenses): the security/
+backward-compat lens was CLEAN (refuted=FALSE: plaintext compat byte-identical, no plaintext on disk,
+undecryptable never surfaced, injection guard on both paths, honest account-tied scope). The
+unsafe-ffi-memory-safety lens found a REAL medium bug — CONFIRMED and FIXED before commit: the DPAPI
+out-param was passed as `&out.0 as *const _ as *mut _` from an IMMUTABLE binding; DPAPI WRITES through
+it, and writing through a shared-ref-derived pointer is UB (Stacked/Tree Borrows; Miri-flagged, the
+exact `&x as *const T as *mut T` anti-pattern). Fixed to `let mut out` + `&mut out.0` at both call
+sites. (The other 5 memory-safety points — null/zero guard, u32->usize, single LocalFree, read-only
+input cast, LocalFree(null) no-op — were verified sound.)
+
+HONEST GATE HISTORY: gate 1 tests PASSED (real Windows DPAPI roundtrip works) but clippy RED (2x
+unnecessary_mut_passed on the INPUT param — windows-sys 0.61 types pDataIn *const). The UB fix + the
+input `&mut input`->`&input` fix cleared it. Final:
+  $ cargo fmt --check  -> exit 0
+  $ cargo clippy --all-targets -- -D warnings -> CLIPPY_EXIT=0
+  $ cargo test --lib   -> test result: ok. 920 passed; 0 failed; 6 ignored
+  $ run_python_policies -> (below)
+
+OWNER ACTION (surfaced): to protect an EXISTING plaintext key, re-save it via save_key_protected (a UI
+toggle wiring it to the Settings key box is a small follow-up; the backend + tests are done). Keys tie
+to THIS Windows account — a restore onto a new account needs re-entry.
+Python policy regressions finished: 33 policy test scripts passed.

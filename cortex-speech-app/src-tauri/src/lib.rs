@@ -23,6 +23,7 @@ pub mod db;
 pub mod denoiser;
 pub mod diarization;
 pub mod diff;
+pub mod dpapi;
 pub mod engine_runtime;
 pub mod engine_supervisor;
 pub mod error;
