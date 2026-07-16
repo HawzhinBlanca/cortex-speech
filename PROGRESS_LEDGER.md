@@ -4804,3 +4804,43 @@ SESSION SCORE (every number from a real run, pasted above): Week 1 COMPLETE + We
 Adversarial Workflows caught 8 genuine issues, each fixed before shipping. The loop's cheap-no-op /
 longer-rest stance now holds until the next fresh iteration or the 02:00 nightly picks up the
 high-risk items.
+
+---
+
+## 2026-07-16T17:17Z — iter 24 — Week 2 — disk-full fault drill (SQLITE_FULL atomic rollback)
+
+**Theme:** Storage durability. **Increment:** the last outstanding Week-2 fault drill —
+disk-full — which night-1 explicitly deferred as "no portable fault-injection yet (needs a
+design pass)". Found the design: SQLite's `PRAGMA max_page_count` caps the file's page count
+and exceeding it returns **SQLITE_FULL**, the identical error a full disk raises. No VFS shim,
+tmpfs, or real full disk required — deterministic and portable.
+
+**Change (test-only, no production code):** `db.rs` test
+`disk_full_rolls_back_a_batch_insert_atomically`. Seeds a committed baseline row, caps
+`max_page_count` at current+4 pages, then attempts a 500-row batch of ~2 KB Sorani transcripts
+that overruns the cap **mid-batch**. Targets `insert_segments_batch` (SAVEPOINT batch_insert)
+to prove a mid-batch SQLITE_FULL rolls back the ENTIRE batch (incl. its FTS5 trigger writes),
+not a torn partial. Asserts, after lifting the cap (`max_page_count = 0`): the batch surfaced
+an error; 0 batch rows persisted; the pre-batch committed row survives; `integrity_check() ==
+"ok"`; and a fresh insert succeeds (writes resume once space frees).
+
+**Gate (verbatim, isolated CARGO_TARGET_DIR=…/cortex-monthloop-target):**
+```
+CLIPPY_EXIT=0
+test result: ok. 923 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 63.80s
+Python policy regressions finished: 33 policy test scripts passed.
+GATE_DONE
+```
+(923 = 922 + this test.) **Adversarial verification:** not run — pure test addition against a
+real, well-understood error injection; the test's own assertions plus the genuine SQLITE_FULL
+ARE the verification (no production logic changed).
+
+**Commit:** 4ee6aa3 `test(durability): disk-full drill — SQLITE_FULL mid-batch rolls back
+atomically`. Pushed; main fast-forwarded to 4ee6aa3.
+
+**Week-2 fault-drill status:** the disk-full drill was the last one outstanding — power-loss,
+kill-mid-import, kill-mid-export, and now disk-full all have real drills. **Remaining Week-2:**
+only the HIGH-risk speech_segments STRICT conversion (its own dedicated iteration; v38 is the
+pattern). **Owner-action queue unchanged** (champion_supervision_enabled, backup_second_dir,
+DPAPI key re-save, native-Sorani review, iPhone Tailscale). exe unchanged this iter (test-only),
+so freshness stays green at the night-1 rebuild.
