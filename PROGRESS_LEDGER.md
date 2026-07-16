@@ -4053,3 +4053,11 @@ EXE REBUILD: deferred/batched (1 new source change on top of exe at 2916a0d). Re
 WEEK-1 item 2 PROGRESS: 8 of the original 13 freezers migrated. REMAINING worklist = 5: run_jury_pipeline
 (wired, most complex — with_jury_db), add_scribe_votes (wired, a per-segment loop), run_dpo_update
 (unwired), check_external_provider (dead), start_champion_engine (MED).
+
+## 2026-07-16 — iteration 7 addendum: shipped exe rebuilt (burst-end, 8 freezers)
+
+App not running; built into src-tauri/target/release (CARGO_TARGET_DIR unset). Verbatim:
+  $ (npm run build)                       -> VITE_EXIT=0
+  $ cargo build --release                 -> CARGO_REL_EXIT=0 (0 build/LNK errors)
+  $ python scripts/check_exe_freshness.py -> EXE FRESHNESS GATE: OK (exe at HEAD d6ec64b80d53…, newer than all sources)
+Installed exe now carries all 8 off-thread migrations, baked at d6ec64b (incl. the T2 Gemini watcher fix).
