@@ -3830,3 +3830,13 @@ stale until then, surfaced honestly.
 
 NEXT: remaining freezers = cloud-net cluster (#1–7), get_audio_duration (#11), start_champion_engine (#13,
 low). Then the batched exe rebuild.
+
+## 2026-07-16 — iteration 3 addendum: shipped exe rebuilt (batched iters 2–3)
+
+Batched the 3 off-thread commits (search_segments + 2 WSL getters; all behavior-preserving) into ONE
+release rebuild rather than rebuild-per-commit. App confirmed not running before + after; built into the
+REAL src-tauri/target/release (CARGO_TARGET_DIR unset for this step). Verbatim:
+  $ (npm run build)                 -> VITE_EXIT=0
+  $ cargo build --release           -> CARGO_REL_EXIT=0   (0 build/LNK errors)
+  $ python scripts/check_exe_freshness.py -> EXE FRESHNESS GATE: OK (exe at HEAD 085e11dd149a…, newer than all sources)
+The installed exe now carries tonight's freeze fixes, baked at HEAD 085e11d. No longer stale.
