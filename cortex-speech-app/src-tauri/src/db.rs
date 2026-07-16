@@ -4152,16 +4152,20 @@ mod tests {
         let mut live = Database::open(live_path.to_str().unwrap()).unwrap();
         live.initialize().unwrap();
 
-        // Synthesize a genuinely OLD snapshot: a HEAD db with the newest migration (v37, the jobs table)
-        // rolled back — its version row deleted AND its table dropped — so it looks like it came from a
-        // build one schema behind and is missing a table a later migration adds.
+        // Synthesize a genuinely OLD snapshot: roll back to BEFORE the jobs migration (v37 created the
+        // `jobs` table) by deleting every migration record from v37 up AND dropping the table — so it
+        // looks like it came from a build behind v37, missing a table later migrations add. Keyed on the
+        // jobs-migration version (37), NOT HEAD, so adding newer migrations (e.g. the v38 STRICT pilot)
+        // can't decouple "rolled-back version" from "dropped table": re-migration on restore must re-run
+        // v37 (recreating jobs) and everything after.
+        const JOBS_MIGRATION: i64 = 37;
         let old_path = tmp.path().join("old.db");
         {
             let old = Database::open(old_path.to_str().unwrap()).unwrap();
             old.initialize().unwrap();
             old.connection()
                 .execute_batch(&format!(
-                    "DROP TABLE IF EXISTS jobs; DELETE FROM schema_migrations WHERE version = {head};"
+                    "DROP TABLE IF EXISTS jobs; DELETE FROM schema_migrations WHERE version >= {JOBS_MIGRATION};"
                 ))
                 .unwrap();
             let old_ver = crate::migrations::get_current_version(&old).unwrap();

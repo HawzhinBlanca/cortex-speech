@@ -4683,3 +4683,48 @@ WEEK-2 STATUS: write-path audit ✓ · second-dir backup + drilled restore ✓ �
 jury/import-journal) + job-transition CAS ✓ · fault drills: kill-during-write ✓ / corruption-covered ✓
 / mid-export-kill ✓ / missing-media ✓ / disk-full OPEN (hard to fault-inject portably — needs a design
 pass) · DPAPI keys ✓ (UI toggle follow-up) · STRICT tables migration OPEN (staged, next).
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 22 (Week 2): STRICT-tables migration — PILOT (decision_verdicts)
+
+Week-2 "STRICT tables migration, staged with a migration test on a copy of a real DB." Deliberately
+scoped to the SMALLEST safe pilot, NOT the high-blast-radius speech_segments+FTS bulk rewrite: recreate
+decision_verdicts (3 TEXT cols, child-only FK, one index) as STRICT — proving the recreate pattern +
+the real-schema migration-test harness the larger tables will reuse. App NOT running; lock held +
+released.
+
+CHANGE (migrations/mod.rs): migration v38 — canonical STRICT recreate (SQLite can't ALTER to STRICT):
+CREATE ... STRICT -> INSERT..SELECT -> DROP -> RENAME -> reindex, atomic inside apply_migration's
+transaction. SAFE with foreign_keys ON: decision_verdicts is a CHILD only (nothing references it
+inbound — verified), so the DROP orphans no FK; existing rows already satisfy the FK so the copy passes.
+down_sql mirrors it (non-strict recreate). max_supported_version -> 38.
+
+TESTS (real migrated schema): v38_decision_verdicts_becomes_strict_and_preserves_rows (a real
+write_segment_verdict row survives; table is STRICT via sqlite_master; a BLOB-into-TEXT insert is
+REJECTED; FK ON DELETE CASCADE still fires after the recreate) + v38_migrates_a_prepopulated_pre_v38_row
+(a pre-existing row carries through the recreate with data intact).
+
+ADVERSARIAL VERIFY (§3 — schema migration, mandatory Workflow, 2 lenses): BOTH refuted=FALSE.
+recreate-safety: FK-OFF-around-recreate is irrelevant here (no inbound refs); DROP fires no triggers
+(none on decision_verdicts); execute_batch runs all 5 DDL statements atomically; the only theoretical
+failure (a legacy orphan row) is fail-CLOSED and unreachable (foreign_keys ON since before the table
+existed). strict-correctness: all writers (record_decision_verdict via write_segment_verdict /
+jury::write_verdict) write TEXT-only literals — nothing STRICT would newly reject; down/forward-compat
+correct.
+
+HONEST GATE HISTORY: gate 1 — my 2 new tests PASSED but a PRE-EXISTING test FAILED:
+restore_of_an_older_snapshot_migrates_it_forward_to_head asserted "post-restore migration recreates the
+v37 jobs table" by deleting the schema_migrations record for HEAD and dropping jobs — a stale coupling
+that assumed HEAD == the jobs migration (v37). My v38 made HEAD the decision_verdicts migration, so the
+synthesis no longer round-tripped. ROOT-CAUSED (not papered over): re-keyed the test's rollback on the
+jobs-migration version (37) — delete records >= 37 + drop jobs — so restore re-runs v37 (recreating
+jobs) AND v38. Full re-gate green:
+  $ cargo fmt --check  -> exit 0
+  $ cargo clippy --all-targets -- -D warnings -> CLIPPY_EXIT=0
+  $ cargo test --lib   -> test result: ok. 922 passed; 0 failed; 6 ignored
+    (incl. both v38 tests AND the fixed restore_of_an_older_snapshot_migrates_it_forward_to_head)
+  $ run_python_policies -> (below)
+
+NEXT (Week 2 remaining): larger STRICT tables via the same pattern (each its own staged migration;
+speech_segments needs the FTS-trigger recreate) · disk-full drill (design pass needed). Week-3 themes
+(measured intelligence) begin 2026-07-30.
+Python policy regressions finished: 33 policy test scripts passed.

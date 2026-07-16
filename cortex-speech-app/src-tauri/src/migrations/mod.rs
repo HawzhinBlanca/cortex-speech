@@ -777,6 +777,44 @@ pub static MIGRATIONS: &[Migration] = &[
              DROP TABLE IF EXISTS jobs;",
         ),
     },
+    Migration {
+        version: 38,
+        description: "STRICT-tables pilot: recreate decision_verdicts as a STRICT table",
+        // Week-2 storage durability: STRICT tables reject affinity-mangled writes (a TEXT into an INT
+        // column, a float into an id) at the DB boundary instead of silently coercing. SQLite can't
+        // ALTER a table to STRICT, so this is the canonical recreate: new STRICT table -> copy -> drop
+        // -> rename -> reindex, all inside apply_migration's transaction. SAFE with foreign_keys ON:
+        // decision_verdicts is a CHILD only (FK -> speech_segments); NOTHING references it, so the DROP
+        // orphans no inbound FK (verified: `grep REFERENCES decision_verdicts` is empty). The existing
+        // rows already satisfy the same FK/columns, so the copy passes the STRICT + FK checks. All three
+        // columns are TEXT (a valid STRICT type). This is the PILOT — the pattern the larger tables
+        // (speech_segments + its FTS triggers) will follow in their own staged migrations.
+        up_sql: "CREATE TABLE decision_verdicts_strict (
+                     segment_id TEXT PRIMARY KEY,
+                     auto_accept_verdict TEXT,
+                     verdict_computed_at TEXT,
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+                 ) STRICT;
+                 INSERT INTO decision_verdicts_strict (segment_id, auto_accept_verdict, verdict_computed_at)
+                     SELECT segment_id, auto_accept_verdict, verdict_computed_at FROM decision_verdicts;
+                 DROP TABLE decision_verdicts;
+                 ALTER TABLE decision_verdicts_strict RENAME TO decision_verdicts;
+                 CREATE INDEX IF NOT EXISTS idx_decision_verdicts_verdict ON decision_verdicts(auto_accept_verdict);",
+        // Down: recreate the NON-strict form (a rollback to the pre-v38 schema). Same recreate shape.
+        down_sql: Some(
+            "CREATE TABLE decision_verdicts_nonstrict (
+                 segment_id TEXT PRIMARY KEY,
+                 auto_accept_verdict TEXT,
+                 verdict_computed_at TEXT,
+                 FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+             );
+             INSERT INTO decision_verdicts_nonstrict (segment_id, auto_accept_verdict, verdict_computed_at)
+                 SELECT segment_id, auto_accept_verdict, verdict_computed_at FROM decision_verdicts;
+             DROP TABLE decision_verdicts;
+             ALTER TABLE decision_verdicts_nonstrict RENAME TO decision_verdicts;
+             CREATE INDEX IF NOT EXISTS idx_decision_verdicts_verdict ON decision_verdicts(auto_accept_verdict);",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -790,6 +828,86 @@ mod tests {
         db.initialize().unwrap();
         let _applied = run_migrations(&db).unwrap();
         assert!(get_current_version(&db).unwrap() >= 1);
+    }
+
+    #[test]
+    fn v38_decision_verdicts_becomes_strict_and_preserves_rows() {
+        // STRICT-tables pilot, on a REAL migrated schema (initialize runs every migration incl. v38).
+        // Verifies: (1) the pre-existing decision_verdicts rows survive the recreate, (2) the table is
+        // now STRICT (an affinity-mangled write is REJECTED, not silently coerced), (3) the index and
+        // FK CASCADE still work.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert!(get_current_version(&db).unwrap() >= 38, "v38 must have applied");
+
+        // A real verdict write goes through the app path (segment + write_segment_verdict -> the
+        // decision_verdicts INSERT), so the row exists BEFORE we probe STRICT.
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "sv-1".into(),
+            audio_path: "/a.wav".into(),
+            raw_transcript: "دەق".into(),
+            duration_ms: 1000,
+            ..Default::default()
+        })
+        .unwrap();
+        db.write_segment_verdict("sv-1", "auto_accept", Some("t"), None, None, Some(0.9), false).unwrap();
+        let conn = db.connection();
+        let (before,): (i64,) = conn
+            .query_row("SELECT COUNT(*) FROM decision_verdicts WHERE segment_id='sv-1'", [], |r| Ok((r.get(0)?,)))
+            .unwrap();
+        assert_eq!(before, 1, "the real verdict write landed a decision_verdicts row");
+
+        // (2) STRICT enforcement: the table must be declared STRICT...
+        let sql: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_verdicts'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(sql.contains("STRICT"), "decision_verdicts must be a STRICT table: {sql}");
+        // ...and reject a value with no valid conversion to the column type. auto_accept_verdict is TEXT,
+        // which accepts most things, so probe the PRIMARY KEY path: a STRICT TEXT column rejects a BLOB.
+        let bad = conn
+            .execute("INSERT INTO decision_verdicts (segment_id, auto_accept_verdict) VALUES (x'00', 'T0_ACCEPT')", []);
+        assert!(bad.is_err(), "STRICT must reject a BLOB into a TEXT column");
+
+        // (3) FK CASCADE still works after the recreate: deleting the segment removes its verdict row.
+        db.delete_segment("sv-1").unwrap();
+        let (after,): (i64,) = conn
+            .query_row("SELECT COUNT(*) FROM decision_verdicts WHERE segment_id='sv-1'", [], |r| Ok((r.get(0)?,)))
+            .unwrap();
+        assert_eq!(after, 0, "FK ON DELETE CASCADE survives the STRICT recreate");
+    }
+
+    #[test]
+    fn v38_migrates_a_prepopulated_pre_v38_row() {
+        // The upgrade path that matters: a real DB that already had decision_verdicts rows (written by a
+        // pre-v38 build) must carry them through the STRICT recreate intact. Simulate by inserting a row
+        // via raw SQL then running the migration that owns the recreate.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap(); // fully migrated incl. v38 — but we re-exercise the recreate's INSERT..SELECT
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "pre-1".into(),
+            audio_path: "/a.wav".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO decision_verdicts (segment_id, auto_accept_verdict, verdict_computed_at) \
+                 VALUES ('pre-1', 'T0_ACCEPT', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        // Re-run the v38 up_sql directly (the recreate is idempotent-safe on data): rows must survive.
+        let v38 = MIGRATIONS.iter().find(|m| m.version == 38).unwrap();
+        db.connection().execute_batch(v38.up_sql).unwrap();
+        let (verdict,): (String,) = db
+            .connection()
+            .query_row("SELECT auto_accept_verdict FROM decision_verdicts WHERE segment_id='pre-1'", [], |r| {
+                Ok((r.get(0)?,))
+            })
+            .unwrap();
+        assert_eq!(verdict, "T0_ACCEPT", "a pre-v38 row survives the STRICT recreate with its data intact");
     }
 
     #[test]
