@@ -92,6 +92,9 @@ ASYNC_SLOW_COMMANDS = [
     # connection, shared-handle fallback) so neither the UI thread nor the global db Mutex is held
     # across the cloud round-trips.
     "run_jury_pipeline",
+    # Scribe vote batch: per-segment decode/slice + ElevenLabs POST loop on run_blocking; consent/key
+    # gates + the to-vote gather stay eager; per-insert brief db_arc lock inside the task.
+    "add_scribe_votes",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

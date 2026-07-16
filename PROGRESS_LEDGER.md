@@ -4112,3 +4112,51 @@ No CONFIRMED finding -> nothing to fix.
 EXE REBUILD: at this wind-down (next entry). WEEK-1 item 2 PROGRESS: 9 of 13 migrated. REMAINING = 4:
 add_scribe_votes (wired loop — last real freezer), run_dpo_update (unwired), check_external_provider
 (dead), start_champion_engine (MED, near-instant).
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 9 (Week 1 item 2): Scribe vote batch off the main thread — ALL WIRED FREEZERS DONE
+
+The last UI-wired freezer: add_scribe_votes (freezer #5) — App.svelte's batch Scribe-vote action
+(per-segment decode/slice + ElevenLabs POST loop). App NOT running; lock held + released.
+
+CHANGE (src-tauri/src/commands.rs): `pub fn` -> `pub async fn`. Eager gates unchanged (STRICT rate
+limit, require_cloud_stt_consent, per-id validation, key load) + the brief-locked to-vote gather stays
+on the caller thread (guard drops at block end). The ENTIRE decode+POST loop moved into run_blocking;
+each successful vote's insert takes a brief lock on the SAME global mutex as before (db_arc clone,
+lock_db-identical poison recovery). Loop body moved verbatim — same skip/warn/tally/upsert semantics.
+
+ADVERSARIAL FINDING FIXED BEFORE COMMIT (the pass earned its keep again): both skeptics returned
+refuted=FALSE but flagged a genuine severity-LOW delta — the async version opened a SELF-OVERLAP window
+the old main-thread execution physically serialized away: two rapid concurrent calls could both pass the
+gather-time existing-vote check and double-POST the same consented audio (duplicate Scribe COST only —
+data provably safe: segment_hypotheses PK (segment_id, model_id) + insert_hypothesis is ON CONFLICT DO
+UPDATE, so exactly one scribe-v1 row survives; and it's practically unreachable from the single awaited
+frontend call site). Fixed anyway (6 lines, stdlib): SCRIBE_VOTES_IN_FLIGHT AtomicBool — swap(true) set
+AFTER all fallible eager work (no early `?` can leak the flag), second caller gets a clean
+"already running" Err, flag reset on every path after the await including the JoinError one (result
+captured, not ?-propagated). Restores the old one-at-a-time behavior explicitly.
+
+RATCHETS: add_scribe_votes added to ASYNC_SLOW_COMMANDS; removed from FREEZERS (4 -> 3).
+docs/UI_THREAD_BLOCKING_AUDIT.md: 57 async / 3 freezers + milestone note.
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR; app not running; re-run in full AFTER the guard was added):
+  $ cargo fmt --check                              -> exit 0 (clean)
+  $ cargo clippy --all-targets -- -D warnings      -> exit 0, 0 warnings
+  $ cargo test --lib                               -> test result: ok. 905 passed; 0 failed; 6 ignored; 0 measured; finished in 61.18s
+  $ python scripts/run_python_policies.py          -> Python policy regressions finished: 33 policy test scripts passed.
+  $ python scripts/test_ui_thread_blocking_audit.py-> async 57 / offloaded 7 / freeze-worklist 3
+
+ADVERSARIAL VERIFY (§3, mandatory Workflow): 2 skeptics (privacy-and-equivalence +
+soundness-concurrency), both refuted=FALSE (booleans correct this time). Verified: consent/validation/
+key all eager before any offload; loop moved verbatim (git-diff-checked); same mutex + poison recovery;
+no guard across the await; SpeechSegment all-owned/Send; inter-command interleaving between inserts is
+NOT new (the sync version also released the lock per insert). The self-overlap cost window they found
+was fixed pre-commit as above.
+
+*** MILESTONE: every UI-WIRED freezer from the original 13-item audit is now off the main thread. ***
+Remaining worklist (3) contains NO live UI freezes: run_dpo_update (unwired training hook),
+check_external_provider (dead — deletion chip pending owner), start_champion_engine (MED — detached
+spawn, process-creation latency only). Week-1 item 2 ("migrate the worst offenders") is functionally
+COMPLETE for user-observable freezes.
+
+NEXT (Week 1 remaining): cargo-nextest adoption, kill/restart durability drill, 7B engine supervision
+skeleton — plus the batched exe rebuild (this wind-down).

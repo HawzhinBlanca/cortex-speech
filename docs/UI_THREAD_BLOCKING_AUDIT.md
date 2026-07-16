@@ -27,9 +27,13 @@ not keyword-guessed:
 
 ## Ranked worklist — sync commands that block the UI thread (migrate first)
 
-Count of the current split (updated as the migration lands): **56 async** (off the main thread) ·
-**7 sync-but-offloaded** (safe) · **4 sync-and-blocking** (below) · the remaining ~62 sync commands
+Count of the current split (updated as the migration lands): **57 async** (off the main thread) ·
+**7 sync-but-offloaded** (safe) · **3 sync-and-blocking** (below) · the remaining ~62 sync commands
 are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a freeze risk).
+
+**Milestone 2026-07-16: every UI-WIRED freezer from the original 13 is off the main thread.** The 3
+remaining rows are an unwired training hook (`run_dpo_update`), dead code (`check_external_provider`,
+delete-flagged), and a detached near-instant spawn (`start_champion_engine`, MED).
 
 **Migration progress (Week-1 item 2), all 2026-07-16:**
 - ✅ `search_segments` (#12) → `pub async fn` + `run_blocking` (mirrors `get_segments`).
@@ -53,6 +57,9 @@ are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a
   fallback with lock_db's poison recovery) so the whole T0→T1→T2 chain runs on `run_blocking` —
   neither the UI thread nor the global db mutex is held across the Gemini round-trips. The
   `batch_transcribe` caller of `with_jury_db` is untouched (thin wrapper preserved).
+- ✅ `add_scribe_votes` (#5) → `async` (App.svelte's batch Scribe-vote action); the per-segment
+  decode/slice + POST loop moved into `run_blocking`, consent/key gates + the to-vote gather stay
+  eager, and each vote's insert takes the same brief global-mutex lock as before (via `db_arc`).
 - ℹ️ `run_dpo_update` (#3) found **unwired** — registered + consent-gated + its core tested, but no
   caller in `src/` (a DPO training hook awaiting UI). Left sync for now (its freeze is latent, not a
   live UI freeze); migrate it when it's wired, or fold it into a cleanup pass.
@@ -66,7 +73,7 @@ Migrated rows below are struck through.
 | ~~2~~ | ~~`run_t2_for_segment`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~N≥3 Gemini audio calls~~ — now `async`; cloud call in `run_blocking`, DB gather/write bracket it | cloud-LLM opt-in |
 | 3 | `run_dpo_update` ℹ️ unwired | cloud-net | HIGH | outbound HTTP POST (~120 s cap) → `jury::learning::run_dpo_update` — **no `src/` caller** (latent, not a live freeze) | cloud-LLM opt-in |
 | ~~4~~ | ~~`transcribe_audio_with_scribe`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~ElevenLabs Scribe POST~~ — now `async` + `run_blocking` (consent gate stays eager) | cloud-STT opt-in |
-| 5 | `add_scribe_votes` | cloud-net | **HIGH** | per-segment decode/slice + ElevenLabs POST **loop** → `scribe_api::transcribe_wav_bytes` | cloud-STT opt-in |
+| ~~5~~ | ~~`add_scribe_votes`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~decode+POST loop~~ — now `async`; loop on `run_blocking`, per-insert brief `db_arc` lock | cloud-STT opt-in |
 | ~~6~~ | ~~`models_download`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~multi-hundred-MB HTTP download~~ — now `async` + `run_blocking` | — |
 | ~~7~~ | ~~`models_download_all`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~download loop~~ — now `async`; whole loop + emits in `run_blocking` | — |
 | ~~8~~ | ~~`get_champion_engine_status`~~ ✅ migrated | subprocess | ~~HIGH~~ | ~~WSL TCP probe~~ — now `async` + `run_blocking` | — |

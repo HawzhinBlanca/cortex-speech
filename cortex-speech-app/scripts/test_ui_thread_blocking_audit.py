@@ -47,7 +47,9 @@ FREEZERS: dict[str, tuple[str, str]] = {
     "run_dpo_update": ("cloud-net", "outbound HTTP POST, ~120s cap on a stalled endpoint (jury::learning::run_dpo_update)"),
     # MIGRATED 2026-07-16: transcribe_audio_with_scribe — blocking Scribe POST moved to run_blocking
     # (consent/key/DB gates stay eager); in the ASYNC ratchet.
-    "add_scribe_votes": ("cloud-net", "per-segment decode/slice + ElevenLabs POST loop (scribe_api::transcribe_wav_bytes)"),
+    # MIGRATED 2026-07-16: add_scribe_votes — the decode+POST loop moved to run_blocking (consent/key
+    # gates + gather stay eager; per-insert brief db_arc lock); in the ASYNC ratchet. With this, every
+    # UI-WIRED freezer from the original 13 is off the main thread — the 3 below are unwired/dead/MED.
     # MIGRATED 2026-07-16: models_download + models_download_all — blocking HTTP download moved to
     # run_blocking; in the ASYNC ratchet.
     # Subprocess spawns / WSL probes that block the caller.

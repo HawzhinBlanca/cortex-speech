@@ -4140,6 +4140,13 @@ pub async fn transcribe_audio_with_scribe(
 /// `scribe_vote_model_id_matches_the_model_actually_sent` test fails if the two ever drift.
 const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v1";
 
+/// Serializes `add_scribe_votes` batches. The old sync command was physically serialized by the main
+/// thread; the async version could self-overlap (two rapid calls both passing the gather-time
+/// existing-vote check and double-POSTing the same consented audio — duplicate Scribe COST, never
+/// duplicate data: the (segment_id, model_id) upsert keeps one scribe-v1 row). This flag restores the
+/// old one-at-a-time behavior explicitly.
+static SCRIBE_VOTES_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Add an independent ElevenLabs Scribe hypothesis for the given segments (typically the escalated,
 /// hard ones), so the IRT jury sees an architecturally-INDEPENDENT vote rather than only kin OmniASR
 /// models — closing the confidently-wrong-correlated-error hole. Opt-in and cost-bounded: it
@@ -4147,7 +4154,7 @@ const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v1";
 /// (idempotent). Scribe is a second opinion (~32% WER on Sorani), never auto-accepted as gold.
 /// Returns the number of votes added. Re-run the jury afterwards to fold the new votes into consensus.
 #[tauri::command]
-pub fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<usize, String> {
+pub async fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("add_scribe_votes")?;
     // Same cloud-STT privacy gate as transcribe_audio_with_scribe: no segment audio is uploaded to
     // ElevenLabs unless the user explicitly opted in, even if a key is present in secrets.env.
@@ -4181,44 +4188,65 @@ pub fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<
         out
     };
 
-    let mut added = 0usize;
-    for seg in to_vote {
-        // Send ONLY this segment's sliced audio window to Scribe — never the whole source file. The
-        // whole file would store a whole-recording transcript against one segment's `scribe-v1` vote
-        // (corrupting consensus) and cost ~N× more. `segment_audio_as_wav_bytes` decodes (cached) and
-        // slices by the segment alignment — the same window the T2 listener already sends.
-        let wav = match crate::agentic::segment_audio_as_wav_bytes(&seg) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!("Scribe vote skipped: could not slice segment audio: {e}");
-                continue;
-            }
-        };
-        match crate::scribe_api::transcribe_wav_bytes(
-            &wav,
-            "segment.wav",
-            &key,
-            crate::scribe_api::DEFAULT_MODEL,
-            crate::scribe_api::SORANI_LANGUAGE_CODE,
-        ) {
-            Ok(transcript) => {
-                let hyp = crate::db::SegmentHypothesis {
-                    segment_id: seg.id.clone(),
-                    model_id: SCRIBE_VOTE_MODEL_ID.to_string(),
-                    transcript,
-                    confidence: None,
-                };
-                let db = state.lock_db(); // brief lock for the local insert only
-                if let Err(e) = db.insert_hypothesis(&hyp) {
-                    tracing::warn!("Failed to store Scribe vote: {e}");
-                } else {
-                    added += 1;
-                }
-            }
-            Err(e) => tracing::warn!("Scribe vote failed for a segment: {e}"),
-        }
+    // The per-segment decode/slice + Scribe POST loop runs on the blocking pool so the UI thread stays
+    // responsive across the whole batch. Every privacy gate above (STT consent, id validation, key) ran
+    // EAGERLY, so nothing is offloaded without consent. The per-vote insert locks the SAME global db
+    // mutex as state.lock_db() (db_arc is Arc::clone of it), with the same poison recovery — still a
+    // brief per-insert lock, exactly as before, just taken from a pool thread.
+    let db_arc = state.db_arc();
+    // One batch at a time (restores the old main-thread serialization). Set AFTER all fallible eager
+    // work (gates + gather) so no early `?` return can leak the flag; reset on every path after the
+    // await, including run_blocking's JoinError path (result is captured, not `?`-propagated).
+    if SCRIBE_VOTES_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("A Scribe vote batch is already running — wait for it to finish.".to_string());
     }
-    Ok(added)
+    let result = run_blocking(move || {
+        let mut added = 0usize;
+        for seg in to_vote {
+            // Send ONLY this segment's sliced audio window to Scribe — never the whole source file. The
+            // whole file would store a whole-recording transcript against one segment's `scribe-v1` vote
+            // (corrupting consensus) and cost ~N× more. `segment_audio_as_wav_bytes` decodes (cached) and
+            // slices by the segment alignment — the same window the T2 listener already sends.
+            let wav = match crate::agentic::segment_audio_as_wav_bytes(&seg) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("Scribe vote skipped: could not slice segment audio: {e}");
+                    continue;
+                }
+            };
+            match crate::scribe_api::transcribe_wav_bytes(
+                &wav,
+                "segment.wav",
+                &key,
+                crate::scribe_api::DEFAULT_MODEL,
+                crate::scribe_api::SORANI_LANGUAGE_CODE,
+            ) {
+                Ok(transcript) => {
+                    let hyp = crate::db::SegmentHypothesis {
+                        segment_id: seg.id.clone(),
+                        model_id: SCRIBE_VOTE_MODEL_ID.to_string(),
+                        transcript,
+                        confidence: None,
+                    };
+                    // Brief lock for the local insert only (same mutex + poison recovery as lock_db).
+                    let db = db_arc.lock().unwrap_or_else(|poisoned| {
+                        tracing::warn!("Recovering poisoned database lock");
+                        poisoned.into_inner()
+                    });
+                    if let Err(e) = db.insert_hypothesis(&hyp) {
+                        tracing::warn!("Failed to store Scribe vote: {e}");
+                    } else {
+                        added += 1;
+                    }
+                }
+                Err(e) => tracing::warn!("Scribe vote failed for a segment: {e}"),
+            }
+        }
+        Ok(added)
+    })
+    .await;
+    SCRIBE_VOTES_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    result
 }
 
 #[tauri::command]
