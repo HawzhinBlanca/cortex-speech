@@ -4559,3 +4559,9 @@ for the third application of the same verified pattern — said plainly.
 WRITE-PATH AUDIT FOLLOW-UPS: all three invariant families now atomic (verdict pair, jury verdict,
 import journal + CAS). Remaining Week-2: fault drills (disk-full, corruption bit-flip, missing-media,
 mid-export kill), DPAPI keys. Exe rebuild: NOW (3 source commits since 0c8afd2).
+
+## 2026-07-16 — iteration 18 addendum: exe rebuilt (atomicity trio shipped)
+
+App not running. Verbatim: VITE_EXIT=0; CARGO_REL_EXIT=0 (0 errors);
+check_exe_freshness -> EXE FRESHNESS GATE: OK (exe at HEAD fd93117d7256…, newer than all sources).
+Installed exe now carries all three atomicity fixes (verdict pair, jury verdict, import journal + CAS).
