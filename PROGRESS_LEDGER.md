@@ -5037,3 +5037,44 @@ Rust change landed — a future exe rebuild will include it (freshness gate will
 until then; the added span is inert until a real transcribe runs). Owner-action queue unchanged
 (speech_segments STRICT owner-gated; champion_supervision, backup_second_dir, DPAPI key re-save,
 native-Sorani review, iPhone Tailscale).
+
+---
+
+## 2026-07-16T20:18Z — iter 29 — Week 1 — export telemetry spans + batched exe rebuild (freshness GREEN)
+
+**Theme:** Responsiveness / "measure first" (Week-1 item 1). **Two parts:**
+
+**(1) Export instrumentation.** `export.rs` had zero span coverage. Added SpanGuards at both heavy
+export entrypoints (mirroring asr.transcribe / decode / normalizer): `export.dataset` (JSON/JSONL/CSV/
+Parquet, metadata=format) and `export.huggingface` (audio copy + shard writes). One span per export
+call (low volume). Surfaces through the already-UI-wired get_recent_spans / get_tracing_stats.
+Commit 6f8fe3c. With ASR (ea526ec) + export + the pre-existing decode/import/diff/normalizer spans,
+item-1 instrumentation covers the meaningful heavy ops. **Note-and-skip:** the model-integrity SHA-256
+"hashing" span is marginal (a rarely-run diagnostic) — deliberately not ground out.
+
+**(2) Batched exe rebuild — the activation step.** The telemetry spans are INERT on the owner's
+machine until the exe is rebuilt, so this rebuild is what makes item-1's "real timings" actually
+accrue on a real run — not cosmetic. App confirmed NOT running (re-checked immediately before);
+built into the real target/release (NOT the isolated test target). Verbatim:
+```
+Finished `release` profile [optimized] target(s) in 6m 09s
+CARGO_BUILD_EXIT=0
+EXE FRESHNESS GATE: OK (exe at HEAD 6f8fe3c04dd9…, newer than all sources)
+FRESHNESS_EXIT=0
+```
+The exe now bakes HEAD 6f8fe3c and is newer than all sources — **freshness GREEN**, the ASR+export
+telemetry is live. (The exe is a gitignored artifact; nothing to commit — freshness is proven by the
+script's baked-SHA + mtime check above.)
+
+**Gate for the code change (isolated CARGO_TARGET_DIR, before the rebuild):** fmt 0; clippy -D
+warnings 0; cargo test --lib 924 passed / 0 failed / 6 ignored; 33/33 python policies.
+**Adversarial Workflow:** not run — the spans are trivial guards on a tested pattern, and the rebuild
+is verified by the clean build + the freshness gate; nothing non-trivial to refute (the session's
+substantive correctness/security changes — STRICT blocker, run_dpo_update migration — did get Workflows).
+
+**State:** Week-1 responsiveness theme COMPLETE and its telemetry live in the exe. Real RTF/export
+timings will accrue on the owner's next real transcription/export run (owner-gated data, honestly).
+High-value unblocked work for the current themes is now largely exhausted — remaining items are
+owner-gated (speech_segments STRICT; champion_supervision; backup_second_dir; DPAPI key re-save;
+native-Sorani review; iPhone Tailscale) or Week-3 measured-intelligence (starts 2026-07-30, needs real
+gold data / long audio / cloud opt-in).
