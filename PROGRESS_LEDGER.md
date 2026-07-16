@@ -4672,3 +4672,14 @@ OWNER ACTION (surfaced): to protect an EXISTING plaintext key, re-save it via sa
 toggle wiring it to the Settings key box is a small follow-up; the backend + tests are done). Keys tie
 to THIS Windows account — a restore onto a new account needs re-entry.
 Python policy regressions finished: 33 policy test scripts passed.
+
+## 2026-07-16 — iteration 21 addendum: exe rebuilt (missing-media drill + DPAPI shipped)
+
+App not running. Verbatim: VITE_EXIT=0; CARGO_REL_EXIT=0 (0 errors);
+check_exe_freshness -> EXE FRESHNESS GATE: OK (exe at HEAD fa420c421cef…, newer than all sources).
+Installed exe now carries the DPAPI FFI + all Week-2 storage-durability work to date.
+
+WEEK-2 STATUS: write-path audit ✓ · second-dir backup + drilled restore ✓ · atomicity trio (verdict/
+jury/import-journal) + job-transition CAS ✓ · fault drills: kill-during-write ✓ / corruption-covered ✓
+/ mid-export-kill ✓ / missing-media ✓ / disk-full OPEN (hard to fault-inject portably — needs a design
+pass) · DPAPI keys ✓ (UI toggle follow-up) · STRICT tables migration OPEN (staged, next).
