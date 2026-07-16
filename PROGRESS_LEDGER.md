@@ -4219,3 +4219,58 @@ evidence; any flake found gets root-caused per the standing doctrine item.
 
 NEXT (Week 1 remaining): kill/restart durability drill (scripted NX kill-during-write vs a disposable
 profile), then the 7B engine supervision skeleton.
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 11 (Week 1 item 4): kill/restart durability drill — SHIPPED + PASSED
+
+Built the repeatable crash-storm drill and ran it for real. Two components:
+- src-tauri/src/bin/durability_writer.rs — the REAL production stack under fire: CORTEX_APP_DATA_DIR
+  disposable profile, the app's InstanceLock, the EXACT boot sequence (open_with_retry + initialize()),
+  production insert_segment writes; each id journaled+flushed (ONE write_all syscall) only AFTER its
+  commit returned. Resume = max drill id in DB + 1 (insert_segment is an UPSERT, so resume-by-journal
+  would silently clobber — documented in-code).
+- scripts/durability_drill.py — N kill cycles; ADAPTIVE write-phase kills (wait for journal growth =
+  provably mid-write) + scheduled BOOT-phase kills every 5th cycle; verify on even cycles + final ONLY,
+  so deferred cycles leave the crashed WAL for the NEXT writer boot — putting rusqlite's own WAL replay
+  on the hook, not just python's. Invariants: integrity ok; journal ⊆ db (zero lost journaled edits);
+  CONTIGUOUS id space 0..max (holes = vanished/clobbered rows); unjournaled-tail growth ≤1 per kill;
+  count never decreases; missing-table legal only with an empty journal; TEMP-only profile guard.
+
+THE DRILL EARNED ITS BUILD — it caught real things on the way (all fixed, all honest):
+1. First run: 25/25 kills landed in the BOOT phase (debug-build boot > my fixed 0.6s delay) — zero
+   commits; the zero-progress guard FAILED the run correctly. -> adaptive kill timing.
+2. The writer itself found that open_with_retry does NOT create schema — the app boots via
+   open_with_retry + initialize(); the writer now mirrors that exactly.
+3. My own tightened tail-bound assertion was WRONG (compared the CUMULATIVE tail to per-interval
+   kills) — the drill FAILed at cycle 6 on healthy data; reality-checked, root-caused, fixed to bound
+   tail GROWTH per interval.
+
+ADVERSARIAL VERIFY (§3 durability = mandatory Workflow, 2 lenses): the proves-what-it-claims lens
+PARTIALLY REFUTED the first version (severity=medium) with high-quality findings, every one fixed
+before commit: "0 duplicates" was a schema TAUTOLOGY (id is PK + UPSERT — claim replaced with the
+meaningful contiguity invariant); python's verifier was doing ALL the WAL recovery (fixed via deferred
+verifies so rusqlite replays its own crashed WAL); boot-phase kills were structurally excluded (fixed
+via the every-5th-cycle schedule); "0 lost" now honestly scoped to JOURNALED edits; writeln!'s
+two-syscall torn-line window closed (single write_all); dead returncode filter -> stderr-keyed; wrong
+PK comment fixed. The soundness lens: refuted=FALSE (instrument sound; insert_segment is one autocommit
+statement so journal-after-return = journal-after-commit; resume collision-free; stale-lock recovery
+loud-fails if it ever blocks).
+
+VERBATIM FINAL RUN (disposable TEMP profile; app not running):
+  $ python scripts/durability_drill.py --exe .../durability_writer.exe --cycles 30
+  DURABILITY DRILL PASS: 30 hard-kill cycles (24 write-phase, 6 boot-phase), 15647 rows committed,
+  0 journaled edits lost, contiguous id space (no holes), integrity ok at every verify; rusqlite WAL
+  replay exercised on deferred-verify boundaries
+  (exit 0; earlier 25-cycle write-phase-only run also PASSED: 16124 rows, 0 lost)
+VERBATIM GATES: cargo fmt --check exit 0; cargo clippy --all-targets -D warnings exit 0 (re-verified
+with a clean non-piped exit code); cargo test --lib "905 passed; 0 failed" (run this iteration, before
+the final comment-only writer edits; the bin is clippy-covered); run_python_policies "33 policy test
+scripts passed".
+
+HONEST SCOPE: process-kill durability only (WAL survives process kill regardless of fsync) — power-loss
+is NOT simulated and is documented as out of scope in the script docstring. The ≤1-per-kill
+committed-but-unjournaled tail rows sit outside journal protection by construction (their loss would
+surface as an id-space hole, which IS asserted).
+
+WEEK-1 STATUS: items 1 (audit), 2 (all wired freezers async), 3 (nextest), 4 (durability drill) DONE.
+Remaining: item 5 — 7B engine supervision skeleton (warm-probe -> start -> restart-with-backoff ->
+tree-kill on shutdown, wrapping start_7b_server.ps1).
