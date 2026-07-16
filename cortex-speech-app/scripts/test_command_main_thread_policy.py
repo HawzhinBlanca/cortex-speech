@@ -85,6 +85,9 @@ ASYNC_SLOW_COMMANDS = [
     # Cloud STT: the blocking ElevenLabs Scribe upload+POST moved to run_blocking; the consent + key +
     # DB-membership gates stay EAGER on the caller thread (never offload before the privacy check).
     "transcribe_audio_with_scribe",
+    # T2 Gemini audio judge: eager consent/key checks + a brief-locked DB gather, then the N-sample
+    # cloud round-trip runs on run_blocking; the verdict write re-locks briefly after the await.
+    "run_t2_for_segment",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

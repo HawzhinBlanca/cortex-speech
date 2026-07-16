@@ -4009,3 +4009,47 @@ App not running; built into src-tauri/target/release (CARGO_TARGET_DIR unset). V
   $ cargo build --release                 -> CARGO_REL_EXIT=0 (0 build/LNK errors)
   $ python scripts/check_exe_freshness.py -> EXE FRESHNESS GATE: OK (exe at HEAD 2916a0d8effa…, newer than all sources)
 Installed exe now carries all 7 off-thread migrations, baked at 2916a0d.
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 7 (Week 1 item 2): T2 Gemini judge off the main thread
+
+Picked the highest-VALUE remaining cloud freezer rather than the smallest: run_t2_for_segment (freezer
+#2) — the Gemini "check" watcher the owner actually uses from ReviewMode. Established via grep that
+run_jury_pipeline (ReviewInbox), run_t2_for_segment (ReviewMode), add_scribe_votes (App.svelte) are all
+frontend-WIRED (real freezes), while run_dpo_update is UNWIRED (no src/ caller — a DPO training hook
+awaiting UI; its freeze is latent, so it stays sync for now, noted in the audit). App NOT running; lock
+held + released.
+
+CHANGE (src-tauri/src/commands.rs): run_t2_for_segment `pub fn` -> `pub async fn`. This one interleaves
+DB access with the cloud call, so the split is surgical: (1) eager consent (jury_cloud_opt_in) + key
+checks stay BEFORE everything; (2) the brief-locked GATHER block (audio_b64 + hyps + reference_report +
+t2_evidence + few_shots) stays on the caller thread and drops its lock at the block's end; (3) ONLY the
+N-sample cloud call — listen_and_judge_via — is wrapped in run_blocking(move || Ok(...)).await? (it
+returns T2Result, not Result, so Ok-wrap + JoinError->String + .await? unwrap); (4) the verdict write
+re-acquires lock_db() AFTER the await on the caller thread. No MutexGuard crosses the await. All 8 inputs
+are owned locals moved in; reference_report/segment_id/result are the only post-await uses.
+
+RATCHETS: added run_t2_for_segment to test_command_main_thread_policy.py ASYNC_SLOW_COMMANDS; removed from
+test_ui_thread_blocking_audit.py FREEZERS (6 -> 5). docs/UI_THREAD_BLOCKING_AUDIT.md updated (55 async /
+5 freezers; run_dpo_update marked unwired).
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR=%TEMP%\cortex-monthloop-target; app not running):
+  $ cargo fmt --check                              -> exit 0 (clean)
+  $ cargo clippy --all-targets -- -D warnings      -> exit 0, 0 warnings  (proves the Send+'static bounds on the moved T2Result/hyps/evidence/few_shots)
+  $ cargo test --lib                               -> test result: ok. 905 passed; 0 failed; 6 ignored; 0 measured; finished in 58.96s
+  $ python scripts/run_python_policies.py          -> Python policy regressions finished: 33 policy test scripts passed.
+  $ python scripts/test_ui_thread_blocking_audit.py-> async 55 / offloaded 7 / freeze-worklist 5
+
+ADVERSARIAL VERIFY (§3 — commands.rs + PRIVACY + DB-interleaved, mandatory Workflow): 2 skeptics.
+privacy-and-ordering: refuted=FALSE, none — consent+key gates eager, audio only encoded AFTER them,
+gather->cloud->write ordering intact, verdict conditioned on the awaited result; no bypass.
+soundness-locks-move: text says verbatim "sound; no soundness regression found" — no MutexGuard across
+the await (gather guard drops at block end before await; write lock fresh after), Send+'static satisfied,
+no move-after-use, no new panic path, contract unchanged; it again set the refuted BOOLEAN to true
+(recurring slip) AND usefully corrected my brief (t2_endpoint is a T2Endpoint enum, not String — still
+Send+'static, still sound). No CONFIRMED finding.
+
+EXE REBUILD: deferred/batched (1 new source change on top of exe at 2916a0d). Rebuild at next wind-down.
+
+WEEK-1 item 2 PROGRESS: 8 of the original 13 freezers migrated. REMAINING worklist = 5: run_jury_pipeline
+(wired, most complex — with_jury_db), add_scribe_votes (wired, a per-segment loop), run_dpo_update
+(unwired), check_external_provider (dead), start_champion_engine (MED).

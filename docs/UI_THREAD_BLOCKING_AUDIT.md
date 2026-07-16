@@ -27,8 +27,8 @@ not keyword-guessed:
 
 ## Ranked worklist — sync commands that block the UI thread (migrate first)
 
-Count of the current split (updated as the migration lands): **54 async** (off the main thread) ·
-**7 sync-but-offloaded** (safe) · **6 sync-and-blocking** (below) · the remaining ~62 sync commands
+Count of the current split (updated as the migration lands): **55 async** (off the main thread) ·
+**7 sync-but-offloaded** (safe) · **5 sync-and-blocking** (below) · the remaining ~62 sync commands
 are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a freeze risk).
 
 **Migration progress (Week-1 item 2), all 2026-07-16:**
@@ -44,6 +44,13 @@ are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a
 - ✅ `transcribe_audio_with_scribe` (#4) → `async`; the blocking ElevenLabs Scribe upload moved into
   `run_blocking` while **every privacy gate (STT consent, DB-membership, key) stays eager** on the
   caller thread — an un-opted-in request is still rejected before any audio is offloaded.
+- ✅ `run_t2_for_segment` (#2) → `async` (the Gemini "check" watcher used from ReviewMode); the
+  N-sample cloud round-trip moved into `run_blocking`. The two DB phases bracket it on the caller
+  thread — the brief-locked gather (audio + hyps + few-shots) drops its lock before the await, the
+  verdict write re-locks after — and the `jury_cloud_opt_in` + key checks stay eager.
+- ℹ️ `run_dpo_update` (#3) found **unwired** — registered + consent-gated + its core tested, but no
+  caller in `src/` (a DPO training hook awaiting UI). Left sync for now (its freeze is latent, not a
+  live UI freeze); migrate it when it's wired, or fold it into a cleanup pass.
 - 🗑️ `check_external_provider` (#9) is **dead** (registered, but no caller in `src/` or Rust) — left sync
   and flagged for deletion rather than migrated (don't invest in code that should be deleted).
 Migrated rows below are struck through.
@@ -51,8 +58,8 @@ Migrated rows below are struck through.
 | # | command | class | severity | heaviest op (traced) | consent/key gate |
 |---|---------|-------|----------|----------------------|------------------|
 | 1 | `run_jury_pipeline` | cloud-net | **HIGH** | T0→T1→T2 chain; T2 = Gemini audio round-trips → `run_jury_pipeline_core_via` | cloud-LLM opt-in |
-| 2 | `run_t2_for_segment` | cloud-net | **HIGH** | N≥3 Gemini audio calls → `jury::t2_listener::listen_and_judge_via` | cloud-LLM opt-in |
-| 3 | `run_dpo_update` | cloud-net | **HIGH** | outbound HTTP POST, **~120 s** cap on a stalled endpoint → `jury::learning::run_dpo_update` | cloud-LLM opt-in |
+| ~~2~~ | ~~`run_t2_for_segment`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~N≥3 Gemini audio calls~~ — now `async`; cloud call in `run_blocking`, DB gather/write bracket it | cloud-LLM opt-in |
+| 3 | `run_dpo_update` ℹ️ unwired | cloud-net | HIGH | outbound HTTP POST (~120 s cap) → `jury::learning::run_dpo_update` — **no `src/` caller** (latent, not a live freeze) | cloud-LLM opt-in |
 | ~~4~~ | ~~`transcribe_audio_with_scribe`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~ElevenLabs Scribe POST~~ — now `async` + `run_blocking` (consent gate stays eager) | cloud-STT opt-in |
 | 5 | `add_scribe_votes` | cloud-net | **HIGH** | per-segment decode/slice + ElevenLabs POST **loop** → `scribe_api::transcribe_wav_bytes` | cloud-STT opt-in |
 | ~~6~~ | ~~`models_download`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~multi-hundred-MB HTTP download~~ — now `async` + `run_blocking` | — |

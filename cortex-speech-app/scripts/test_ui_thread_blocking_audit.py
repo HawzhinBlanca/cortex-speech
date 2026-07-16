@@ -41,7 +41,8 @@ FREEZERS: dict[str, tuple[str, str]] = {
     # Cloud round-trips run synchronously on the UI thread (they correctly drop the DB lock first, but
     # the network wait itself still blocks the main thread). All consent/key-gated.
     "run_jury_pipeline": ("cloud-net", "T0/T1/T2 chain; T2 = Gemini audio round-trips (run_jury_pipeline_core_via)"),
-    "run_t2_for_segment": ("cloud-net", "N>=3 Gemini audio calls (jury::t2_listener::listen_and_judge_via)"),
+    # MIGRATED 2026-07-16: run_t2_for_segment — the N-sample Gemini cloud call moved to run_blocking
+    # (consent/key gates + brief DB gather stay eager); in the ASYNC ratchet.
     "run_dpo_update": ("cloud-net", "outbound HTTP POST, ~120s cap on a stalled endpoint (jury::learning::run_dpo_update)"),
     # MIGRATED 2026-07-16: transcribe_audio_with_scribe — blocking Scribe POST moved to run_blocking
     # (consent/key/DB gates stay eager); in the ASYNC ratchet.

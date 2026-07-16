@@ -5131,7 +5131,7 @@ pub fn run_jury_pipeline(state: State<'_, AppState>, segment_ids: Vec<String>) -
 /// Useful for re-running T2 from the Review Inbox or a manual trigger without
 /// going through the full pipeline again.
 #[tauri::command]
-pub fn run_t2_for_segment(
+pub async fn run_t2_for_segment(
     state: State<'_, AppState>,
     segment_id: String,
     api_key: String,
@@ -5198,17 +5198,24 @@ pub fn run_t2_for_segment(
 
     // The gather block above released the global DB lock when it ended (all reads are done, few_shots
     // included), so the blocking T2 cloud call below (Gemini, n_samples retries — multiple seconds)
-    // never starves other DB users like the UI's get_segments. The verdict write re-acquires briefly.
-    let result = crate::jury::t2_listener::listen_and_judge_via(
-        &t2_endpoint,
-        &audio_b64,
-        &hyps,
-        &t2_evidence,
-        &few_shots,
-        &api_key,
-        &jury_model,
-        n_samples,
-    );
+    // never starves other DB users like the UI's get_segments. It also runs on the blocking pool via
+    // run_blocking so it never blocks the UI thread itself — the cloud_opt_in + api_key gates above
+    // already ran eagerly, so no request is offloaded without consent. The verdict write re-acquires
+    // the DB lock briefly on the caller thread after the await. All inputs are owned + moved in; only
+    // reference_report/segment_id/result are used afterward.
+    let result = run_blocking(move || {
+        Ok(crate::jury::t2_listener::listen_and_judge_via(
+            &t2_endpoint,
+            &audio_b64,
+            &hyps,
+            &t2_evidence,
+            &few_shots,
+            &api_key,
+            &jury_model,
+            n_samples,
+        ))
+    })
+    .await?;
 
     // If T2 produced a verdict, write it to the DB automatically (re-acquire the lock briefly).
     if let Some(ref verdict) = result.verdict {
