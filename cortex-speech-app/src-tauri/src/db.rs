@@ -2638,6 +2638,48 @@ mod tests {
     }
 
     #[test]
+    fn dropping_speech_segments_cascade_deletes_children_so_strict_recreate_needs_fk_off() {
+        // Week-2's LAST open item is the STRICT conversion of speech_segments. SQLite cannot ALTER a
+        // table to STRICT, so the only path is the recreate: new STRICT table -> copy -> DROP old ->
+        // RENAME. This test proves WHY the naive recreate (the v38 decision_verdicts pattern) is
+        // DATA-DESTROYING for THIS table and must not be shipped inside a normal migration.
+        //
+        // speech_segments is an FK PARENT of seven child tables: FIVE are ON DELETE CASCADE
+        // (segment_hypotheses, agent_examples, decision_log, decision_verdicts, loop0_shadow_log) and
+        // two are ON DELETE SET NULL (correction_memory.source_segment, corrections.segment_id). This
+        // test probes decision_verdicts, a CASCADE child, whose rows are DELETED (not nulled). With
+        // foreign_keys=ON (the app default, Database::open db.rs:246), `DROP TABLE speech_segments`
+        // performs an implicit DELETE of every parent row, which FIRES ON DELETE CASCADE and wipes the
+        // child rows. apply_migration runs up_sql inside `unchecked_transaction()`, and
+        // `PRAGMA foreign_keys=OFF` is a NO-OP inside a transaction — so a v39 migration literally
+        // cannot turn the cascade off. The correct conversion must run with foreign_keys OFF *outside*
+        // a transaction (SQLite's 12-step recreate); see docs/STRICT_SPEECH_SEGMENTS_PLAN.md.
+        let db = make_db(); // foreign_keys=ON
+        db.insert_segment(&make_segment("seg-1", "/a.wav")).unwrap();
+        db.write_segment_verdict("seg-1", "auto_accept", Some("t"), None, None, Some(0.9), false).unwrap();
+        let child_before: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM decision_verdicts WHERE segment_id='seg-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(child_before, 1, "precondition: the child verdict row exists via the real write path");
+
+        // Faithfully reproduce a naive STRICT-recreate migration's DROP, inside a transaction exactly
+        // as apply_migration would run it.
+        let conn = db.connection();
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch("DROP TABLE speech_segments").unwrap();
+        tx.commit().unwrap();
+
+        let child_after: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM decision_verdicts", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            child_after, 0,
+            "DROP TABLE speech_segments with foreign_keys=ON cascade-deleted the child verdict rows: \
+             the naive STRICT recreate is DATA-DESTROYING and must run with foreign_keys OFF, outside a txn"
+        );
+    }
+
+    #[test]
     fn disk_full_rolls_back_a_batch_insert_atomically() {
         // Week-2 disk-full FAULT DRILL. `PRAGMA max_page_count` caps the DB file size; exceeding it
         // returns SQLITE_FULL — the exact error a full disk raises — so it's a PORTABLE, deterministic
