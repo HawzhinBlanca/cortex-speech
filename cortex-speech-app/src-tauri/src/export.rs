@@ -301,6 +301,11 @@ pub(crate) fn exclude_holdout_segments(db: &Database, segments: Vec<SpeechSegmen
 }
 
 pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportFormat) -> AppResult<()> {
+    // Telemetry (Week-1 "measure first"): real export wall-clock. The guard records on return; metadata
+    // carries the format so the owner can compare JSON/JSONL/CSV/Parquet costs via get_recent_spans /
+    // get_tracing_stats. Mirrors the asr.transcribe / decode / normalizer guards.
+    let _span = crate::telemetry::TRACER
+        .start_span("export.dataset", crate::telemetry::Tracer::metadata(vec![("format", format!("{format:?}"))]));
     // Drop held-out gold segments BEFORE counting or writing any format, so the training tables
     // (JSON/JSONL/CSV/Parquet) — including the production bundle that delegates through here — never
     // publish the eval set's reference transcripts; closes the eval-on-train leak the HF export
@@ -660,6 +665,8 @@ pub fn export_huggingface_dataset(
     dir: &std::path::Path,
     settings: &crate::settings::AppSettings,
 ) -> AppResult<()> {
+    // Telemetry (Week-1 "measure first"): real HuggingFace-export wall-clock (audio copy + shard writes).
+    let _span = crate::telemetry::TRACER.start_span("export.huggingface", crate::telemetry::Tracer::metadata(vec![]));
     std::fs::create_dir_all(dir)?;
     let data_dir = dir.join("data");
     let train_dir = data_dir.join("train");
