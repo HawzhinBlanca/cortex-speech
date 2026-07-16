@@ -28,6 +28,7 @@ ASYNC_SLOW_COMMANDS = [
     # Dataset-wide DB scans / file-I/O reads + writes (whole-library work that froze the UI).
     "get_segments",
     "get_segments_suspect_first",
+    "search_segments",  # unbounded FTS5 MATCH (no LIMIT) — off the main thread like its get_segments siblings
     "get_dataset_stats",
     "get_intelligence_report",
     "get_audio_health",
@@ -83,6 +84,7 @@ RUN_BLOCKING_COMMANDS = [
     "export_finetune_pack",
     "get_segments",
     "get_segments_suspect_first",
+    "search_segments",
     "get_dataset_stats",
     "get_intelligence_report",
     "get_audio_health",

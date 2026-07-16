@@ -54,10 +54,9 @@ FREEZERS: dict[str, tuple[str, str]] = {
     "start_champion_engine": ("subprocess", "powershell spawn — detached, so real freeze is just process-creation latency"),
     # Spawns a probe thread but then BLOCKS on recv_timeout(30s) — looks offloaded, is not.
     "get_audio_duration": ("file-io", "spawns a decode probe thread, then blocks on rx.recv_timeout(30s) (audio::get_duration_ms)"),
-    # Unbounded whole-library scan + serialize on the main thread — the odd one out among its siblings.
-    "search_segments": ("db-scan", "unbounded FTS5 MATCH: no LIMIT, all matching full rows (transcripts + alignment JSON) "
-                        "materialized + IPC-serialized sync on the UI thread (db::search_segments). Siblings get_segments / "
-                        "get_segments_suspect_first use run_blocking; get_segments_page clamps to 500 — this one caps neither."),
+    # MIGRATED 2026-07-16 (commit after 21ce99f): search_segments — unbounded FTS5 MATCH — moved to
+    # `pub async fn` + run_blocking (mirrors get_segments); now in test_command_main_thread_policy.py's
+    # ASYNC_SLOW_COMMANDS ratchet. Left here as a breadcrumb, not a live entry.
 }
 
 # Sync commands that DO offload (spawn a worker thread and return immediately) — safe today, but the

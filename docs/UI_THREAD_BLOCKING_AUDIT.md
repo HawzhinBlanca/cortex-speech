@@ -27,9 +27,13 @@ not keyword-guessed:
 
 ## Ranked worklist — sync commands that block the UI thread (migrate first)
 
-Count of the current split: **47 async** (off the main thread) · **7 sync-but-offloaded** (safe) ·
-**13 sync-and-blocking** (below) · the remaining ~62 sync commands are trivial in-memory
-getters/setters or single-row DB reads/writes (fast, not a freeze risk).
+Count of the current split (updated as the migration lands): **48 async** (off the main thread) ·
+**7 sync-but-offloaded** (safe) · **12 sync-and-blocking** (below) · the remaining ~62 sync commands
+are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a freeze risk).
+
+**Migration progress (Week-1 item 2):** ✅ `search_segments` — migrated 2026-07-16 to `pub async fn`
++ `run_blocking` (mirrors `get_segments`), now in the `test_command_main_thread_policy.py` ratchet.
+Row #12 below is kept for the record, struck through.
 
 | # | command | class | severity | heaviest op (traced) | consent/key gate |
 |---|---------|-------|----------|----------------------|------------------|
@@ -44,7 +48,7 @@ getters/setters or single-row DB reads/writes (fast, not a freeze risk).
 | 9 | `check_external_provider` | subprocess | **HIGH** | shells out to `wsl --status`, blocks up to 10 s → `external_provider_status` | — |
 | 10 | `check_agentic_readiness` | subprocess | **HIGH** | `wsl --status` (up to 10 s) + `model_manager.status()` | — |
 | 11 | `get_audio_duration` | file-io | **HIGH** | spawns a decode probe thread, then **blocks on `rx.recv_timeout(30 s)`** → `audio::get_duration_ms` | — |
-| 12 | `search_segments` | db-scan | **HIGH** | **unbounded** FTS5 `MATCH` (no `LIMIT`); all matching full rows — transcripts + `alignment_json` — materialized + IPC-serialized → `db::search_segments` | — |
+| ~~12~~ | ~~`search_segments`~~ ✅ migrated | db-scan | ~~HIGH~~ | ~~unbounded FTS5 `MATCH`~~ — now `async` + `run_blocking` (off the main thread) | — |
 | 13 | `start_champion_engine` | subprocess | MED | `powershell … spawn()` — **detached**, so the real freeze is only process-creation latency | — |
 
 **`search_segments` (#12) is the odd one out:** its siblings `get_segments` and
@@ -89,8 +93,9 @@ ratchet as it lands:
    removes recurring micro-freezes; good early wins.
 3. **`get_audio_duration` (#11)** — drop the synchronous `recv_timeout`; make the command async and
    await the probe.
-4. **`search_segments` (#12)** — mirror its already-migrated siblings: `async` + `run_blocking`, and
-   add a `LIMIT` (its bounded twin `get_segments_page` already clamps to 500).
+4. ✅ **`search_segments` (#12)** — DONE 2026-07-16: mirrored its already-migrated siblings (`async` +
+   `run_blocking`). A `LIMIT`/pagination bound is a separate follow-up (a behaviour change — it would
+   truncate large result sets — so it's deliberately not folded into the off-thread migration).
 5. **`start_champion_engine` (#13)** — lowest priority (already near-instant).
 
 ## Honesty

@@ -3735,3 +3735,49 @@ NEXT (Week 1 item 2): migrate the cloud-net freezer cluster (#1–#7) to async o
 they share the jury/scribe/download helper shape; each behavior-preserving, each with a test, each
 added to test_command_main_thread_policy.py's ASYNC_SLOW_COMMANDS ratchet (and removed from this
 audit's FREEZERS) as it lands.
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 2 (Week 1 item 2): search_segments off the main thread
+
+Item 2 = "migrate the worst offenders to async + spawn_blocking, a few per run, behavior-preserving,
+each with a test." Smallest unblocked increment: migrate search_segments — the freezer the previous
+iteration's adversarial pass caught (an unbounded FTS5 MATCH, no LIMIT, materializing + IPC-serializing
+all matching full rows synchronously on the UI thread). It is the cleanest first pick: an exact mirror
+of its already-migrated siblings get_segments / get_segments_suspect_first. App NOT running; lock held +
+released this run.
+
+CHANGE (src-tauri/src/commands.rs): search_segments `pub fn` -> `pub async fn`; body moved to
+`let db = state.db_arc(); run_blocking(move || { let db = db.lock()...; db.search_segments(&query) }).await`.
+RATE_LIMITER.check + validate::validate_text still run eagerly before the blocking task (identical early
+returns). db_arc() = Arc::clone of the SAME Mutex<Database> lock_db() locks (verified lib.rs:211/220), so
+locking semantics are byte-identical — only the thread changes (main -> spawn_blocking pool). Frontend
+unchanged: invoke('search_segments', {query}) already awaits a Promise; sync vs async commands both resolve
+one. A LIMIT/pagination bound is deliberately NOT folded in (it would truncate results = a behavior change;
+tracked as a separate follow-up).
+
+RATCHETS: added search_segments to test_command_main_thread_policy.py ASYNC_SLOW_COMMANDS + RUN_BLOCKING_COMMANDS;
+removed it from test_ui_thread_blocking_audit.py FREEZERS (13 -> 12). docs/UI_THREAD_BLOCKING_AUDIT.md updated
+(48 async / 12 freezers; row struck through, migration-progress note).
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR=%TEMP%\cortex-monthloop-target; app not running):
+  $ cargo fmt --check                              -> exit 0 (clean)
+  $ cargo clippy --all-targets -- -D warnings      -> exit 0, 0 warnings
+  $ cargo test --lib                               -> test result: ok. 905 passed; 0 failed; 6 ignored; 0 measured; finished in 61.01s
+  $ python scripts/run_python_policies.py          -> Python policy regressions finished: 33 policy test scripts passed.
+  $ python scripts/test_ui_thread_blocking_audit.py-> async 48 / offloaded 7 / freeze-worklist 12
+
+ADVERSARIAL VERIFY (§3 — commands.rs change, mandatory Workflow): 2 independent skeptics
+(behavior-equivalence + soundness/contract) both returned refuted=FALSE, severity=none. Confirmed:
+eager gate ordering preserved; same mutex/query/ORDER BY/error-mapping; no lock held across the await;
+closure Send+'static satisfied; invoke_handler + frontend contract unchanged; only delta is panic-in-task
+now surfaces as Err("background task failed: ...") instead of unwinding — equal-or-better and identical to
+the sibling pattern (and search_segments returns AppResult, never panics, so unreachable for real inputs).
+
+EXE REBUILD: DEFERRED (not "done"). Shipped behavior changed (a command moved off-thread) and the app is
+not running, so a rebuild is permitted — but it is being BATCHED to the end of this /loop session rather
+than run after each micro-commit (a full Tauri release rebuild is ~tens of minutes; more freezer migrations
+are queued this session). No NIGHTLY gate depends on it: test_exe_freshness.py only unit-tests the decision
+logic; the real exe inspection (check_exe_freshness.py main) runs only under `make ship-check-local`. The
+installed exe is therefore one commit stale until the batched rebuild — surfaced here honestly, not hidden.
+
+NEXT: continue the cloud-net freezer cluster or the WSL status-getter cluster (both unblocked); rebuild the
+exe once before winding down the session.

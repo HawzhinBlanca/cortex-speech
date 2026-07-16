@@ -1561,13 +1561,21 @@ pub async fn get_segments_suspect_first(
 }
 
 #[tauri::command]
-pub fn search_segments(query: String, state: State<'_, AppState>) -> Result<Vec<SpeechSegment>, String> {
+pub async fn search_segments(query: String, state: State<'_, AppState>) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("search_segments")?;
     // Bound the free-text query like every other text-accepting command (save_session caps its
     // search_query at 1000): an unbounded multi-MB string otherwise reaches the FTS5 MATCH parser.
     validate::validate_text(&query, 1000, "Search query")?;
-    let db = state.lock_db();
-    db.search_segments(&query).map_err(|e| e.to_string())
+    // Off the main thread: the FTS5 MATCH has no LIMIT, so a common token materializes + serializes a
+    // large slice of the library. Run it on the blocking pool exactly like the get_segments siblings so
+    // a keystroke in the search box can't freeze the UI. db_arc + lock INSIDE the task — never hold a
+    // lock_db() guard across the await.
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        db.search_segments(&query).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
