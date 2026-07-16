@@ -4363,3 +4363,14 @@ scoped honestly in the module doc.
 *** WEEK 1 COMPLETE: all 5 items (audit, async migration of every wired freezer, nextest, durability
 drill, 7B supervision) shipped in night 1, 13 iterations. *** Exe rebuild for iters 8-13 source
 changes: next entry.
+
+## 2026-07-16 — iteration 13 addendum: Week-1-complete exe rebuilt
+
+App not running; built into src-tauri/target/release. Verbatim: VITE_EXIT=0; CARGO_REL_EXIT=0
+(0 errors); check_exe_freshness -> EXE FRESHNESS GATE: OK (exe at HEAD 5a6713b0e03e…, newer than all
+sources). The installed exe now carries everything from night 1: 10 off-thread commands, the
+supervision wiring (dormant until the owner enables champion_supervision_enabled), and all fixes.
+
+OWNER ACTIONS QUEUED (nothing blocking): enable champion_supervision_enabled in settings.json to
+activate 7B supervision (then observe the live restart leg); the check_external_provider deletion
+chip; the pre-existing items (native Sorani review, iPhone Tailscale test, cloud opt-ins).
