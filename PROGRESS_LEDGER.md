@@ -4948,3 +4948,49 @@ iter can migrate it for ratchet-completeness or leave it as the documented MED t
 this iter (async signature only, no behavior change) — freshness stays green at the night-1 rebuild.
 Owner-action queue unchanged (speech_segments STRICT owner-gated per iter 25; champion_supervision,
 backup_second_dir, DPAPI key re-save, native-Sorani review, iPhone Tailscale).
+
+---
+
+## 2026-07-16T19:02Z — iter 27 — Week 1 — freezer worklist closed (start_champion_engine reviewed, not migrated)
+
+**Theme:** Responsiveness (Week 1). **Increment:** the last freezer worklist entry,
+`start_champion_engine`. **Decision after fully reading it: do NOT migrate — it's already
+spawn-and-return.** Its body is a rate-limit check + env read + `is_file()` stat + a DETACHED
+`Command::spawn()` (stdio null, CREATE_NO_WINDOW) that returns immediately and never waits for the
+child's ~8-min warm-up. UI-thread cost = process-creation latency (~ms), below perceptibility and
+≈ `spawn_blocking`'s own dispatch overhead — so `async` would add machinery for no measurable gain.
+Migrating it would be optimizing a non-problem (ponytail: don't add machinery for no benefit).
+
+**Change (test-gate reclassification + doc, NO production code):** moved start_champion_engine from
+the FREEZERS migration worklist to OFFLOADED_HIGH (spawn-and-return) in
+`scripts/test_ui_thread_blocking_audit.py`, and added a `.spawn()` marker to SPAWN_MARKERS so the gate
+PINS the invariant — a regression to a blocking `.output()`/`.status()`/`.wait()` (which would wait
+on the 8-min warm-up on the UI thread) now fails the audit. `.spawn()` matches Command::spawn()/Child
+spawn without matching the blocking finishers or `thread::spawn(<closure>)`. Audit doc records the
+review + rationale. **The freezer worklist is now 0.**
+
+**Gate (verbatim):**
+```
+=== git: only python scripts + md doc changed (no Rust) ===
+cortex-speech-app/scripts/test_ui_thread_blocking_audit.py
+docs/UI_THREAD_BLOCKING_AUDIT.md
+=== python policy suite (includes both ratchet scripts) ===
+Python policy regressions finished: 33 policy test scripts passed.
+GATE_DONE
+```
+Audit standalone (proves reclassification): `UI-freeze worklist — sync + heavy + blocks the main
+thread (0), migrate first` … `ui-thread blocking audit passed`. Rust untouched → cargo suite
+unaffected at 924 passing (iter 26). **Adversarial Workflow:** not run — trivial test-gate
+reclassification + doc, no production code, zero caller impact (no signature changed), verified by the
+passing audit gate + a full read of the 20-line function.
+
+**Commit:** 3a4e7ae. Pushed; main fast-forwarded to 3a4e7ae.
+
+**Week-1 responsiveness theme: COMPLETE.** Every command that did heavy work on the UI thread is
+async; the one near-instant subprocess launcher is pinned spawn-and-return. **Surfaced as the natural
+next Week-1 increment (not done):** instrument the migrated commands with telemetry spans (the TRACER
+already exists; get_recent_spans/get_tracing_stats surface them) so REAL per-command wall-clock timings
+accrue automatically during owner use — turning the audit's owner-gated timings into collected data.
+That's a bigger production-code change deserving its own focused iteration. Owner-action queue
+unchanged (speech_segments STRICT owner-gated; champion_supervision, backup_second_dir, DPAPI key
+re-save, native-Sorani review, iPhone Tailscale). exe unchanged (no Rust) — freshness green at night-1.
