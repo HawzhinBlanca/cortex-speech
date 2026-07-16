@@ -4455,3 +4455,10 @@ use the drilled fresh-profile flow). A picker/命令 for second-dir restore is a
 owner wants one-click.
 
 NEXT (Week 2): savepoint-wrap the 3 invariant families from the audit; then fault drills; then DPAPI.
+
+## 2026-07-16 — iteration 15 addendum: exe rebuilt (iters 14-15 batched)
+
+App not running. Verbatim: VITE_EXIT=0; CARGO_REL_EXIT=0 (0 errors);
+check_exe_freshness -> EXE FRESHNESS GATE: OK (exe at HEAD 0c8afd2cd2a6…, newer than all sources).
+Installed exe + bins now carry the batch_processor InstanceLock and the second-directory backup
+(dormant until the owner sets backup_second_dir in settings.json).
