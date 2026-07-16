@@ -31,10 +31,16 @@ Count of the current split (updated as the migration lands): **57 async** (off t
 **7 sync-but-offloaded** (safe) · **3 sync-and-blocking** (below) · the remaining ~62 sync commands
 are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a freeze risk).
 
-**Milestone 2026-07-16: every heavy freezer is off the main thread.** After migrating the unwired
-training hook `run_dpo_update` (the last ~120 s blocking cloud POST), the ONLY remaining freezer is
-`start_champion_engine` (MED) — a detached `powershell` spawn whose freeze is just process-creation
-latency. (`check_external_provider` was deleted 2026-07-16 — it was dead code.)
+**Milestone 2026-07-16: the migration worklist is COMPLETE — the freezer worklist is now 0.** After
+migrating the unwired training hook `run_dpo_update` (the last ~120 s blocking cloud POST), the one
+remaining candidate — `start_champion_engine` — was **reviewed and deliberately NOT migrated**: its
+body is a rate-limit check + env read + `is_file()` stat + a DETACHED `Command::spawn()` (stdio null,
+`CREATE_NO_WINDOW`) that returns immediately and never waits for the child's ~8-min warm-up. Its only
+UI-thread cost is process-creation latency (~ms) — below perceptibility and comparable to
+`spawn_blocking`'s own dispatch overhead, so `async` would add machinery for no measurable gain.
+It is reclassified as a spawn-and-return command (`OFFLOADED_HIGH` in the audit gate), where a
+`.spawn()` marker pins it so a regression to a blocking `.output()`/`.status()`/`.wait()` fails the
+gate. (`check_external_provider` was deleted 2026-07-16 — it was dead code.)
 
 **Migration progress (Week-1 item 2), all 2026-07-16:**
 - ✅ `search_segments` (#12) → `pub async fn` + `run_blocking` (mirrors `get_segments`).
@@ -81,7 +87,7 @@ Migrated rows below are struck through.
 | ~~10~~ | ~~`check_agentic_readiness`~~ ✅ migrated | subprocess | ~~HIGH~~ | ~~`wsl --status` + model stat~~ — now `async`, probe on `run_blocking` | — |
 | ~~11~~ | ~~`get_audio_duration`~~ ✅ migrated | file-io | ~~HIGH~~ | ~~probe thread + `recv_timeout(30 s)`~~ — watchdog now inside `run_blocking` | — |
 | ~~12~~ | ~~`search_segments`~~ ✅ migrated | db-scan | ~~HIGH~~ | ~~unbounded FTS5 `MATCH`~~ — now `async` + `run_blocking` (off the main thread) | — |
-| 13 | `start_champion_engine` | subprocess | MED | `powershell … spawn()` — **detached**, so the real freeze is only process-creation latency | — |
+| ~~13~~ | `start_champion_engine` ✅ reviewed — spawn-and-return, NOT migrated | subprocess | ~~MED~~ | detached `Command::spawn()` (stdio null, `CREATE_NO_WINDOW`), returns without waiting for warm-up — UI cost is only process-creation latency (~ms, ≈ `spawn_blocking` dispatch), so `async` buys nothing; pinned as spawn-and-return in the gate | — |
 
 **`search_segments` (#12) is the odd one out:** its siblings `get_segments` and
 `get_segments_suspect_first` were migrated to `async` + `run_blocking`, and `get_segments_page` clamps
@@ -133,7 +139,11 @@ ratchet as it lands:
 4. ✅ **`search_segments` (#12)** — DONE 2026-07-16: mirrored its already-migrated siblings (`async` +
    `run_blocking`). A `LIMIT`/pagination bound is a separate follow-up (a behaviour change — it would
    truncate large result sets — so it's deliberately not folded into the off-thread migration).
-5. **`start_champion_engine` (#13)** — lowest priority (already near-instant).
+5. ✅ **`start_champion_engine` (#13)** — REVIEWED 2026-07-16, deliberately NOT migrated. It already
+   returns immediately (detached `Command::spawn()`, no wait for warm-up); its UI-thread cost is
+   process-creation latency (~ms), which is below perceptibility and ≈ the `spawn_blocking` dispatch
+   overhead an `async` version would add — so migrating buys nothing measurable. Reclassified as a
+   spawn-and-return command and pinned by a `.spawn()` marker in the gate. **The worklist is now 0.**
 
 ## Honesty
 

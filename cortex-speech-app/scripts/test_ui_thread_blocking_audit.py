@@ -60,7 +60,14 @@ FREEZERS: dict[str, tuple[str, str]] = {
     # Subprocess spawns / WSL probes that block the caller.
     # (check_external_provider was DELETED 2026-07-16 — it was dead code, verified no caller; the
     #  live WSL-status path lives in check_agentic_readiness, already migrated.)
-    "start_champion_engine": ("subprocess", "powershell spawn — detached, so real freeze is just process-creation latency"),
+    # RECLASSIFIED 2026-07-16: start_champion_engine is NOT a migration target. Its body is a rate-limit
+    # check + env read + is_file() stat + a DETACHED Command::spawn() (stdio null, CREATE_NO_WINDOW)
+    # that returns immediately — it never waits for the child's ~8-min warm-up. Its only UI-thread cost
+    # is process-creation latency (~ms), which is below perceptibility AND ~= spawn_blocking's own
+    # dispatch overhead, so `async` + run_blocking would add machinery for no measurable gain. Moved to
+    # OFFLOADED_HIGH (spawn-and-return) below, where the gate pins the .spawn() so it can't silently
+    # regress into a blocking .output()/.status()/.wait(). With this, the migration worklist is EMPTY —
+    # every command that did heavy work on the UI thread is now async; see docs/UI_THREAD_BLOCKING_AUDIT.md.
     # MIGRATED 2026-07-16: get_audio_duration — the probe-thread + 30s recv_timeout watchdog now runs
     # inside run_blocking (bound preserved, off the UI thread); in the ASYNC ratchet.
     # MIGRATED 2026-07-16 (commit after 21ce99f): search_segments — unbounded FTS5 MATCH — moved to
@@ -68,8 +75,9 @@ FREEZERS: dict[str, tuple[str, str]] = {
     # ASYNC_SLOW_COMMANDS ratchet. Left here as a breadcrumb, not a live entry.
 }
 
-# Sync commands that DO offload (spawn a worker thread and return immediately) — safe today, but the
-# gate pins the spawn so an edit can't quietly turn them back into UI-thread blockers.
+# Sync commands that DO offload (spawn a worker thread — or a detached subprocess — and return
+# immediately) — safe today, but the gate pins the spawn so an edit can't quietly turn them back into
+# UI-thread blockers.
 OFFLOADED_HIGH = [
     "import_audio_file",
     "resume_interrupted_import",
@@ -78,8 +86,15 @@ OFFLOADED_HIGH = [
     "batch_assign_speaker",
     "batch_normalize",
     "run_wsl_refinement",
+    # Detached subprocess launcher: spawns powershell (CREATE_NO_WINDOW, stdio null) and returns without
+    # waiting for warm-up. The `.spawn()` marker below pins that — a regression to `.output()`/`.status()`
+    # (which BLOCK on the ~8-min warm-up) would fail this gate.
+    "start_champion_engine",
 ]
-SPAWN_MARKERS = ["thread::spawn", "Builder::new()", "spawn_blocking", "async_runtime::spawn", "parallel_batch"]
+# A body counts as "offloads and returns" if it spawns a worker thread OR a detached child process.
+# `.spawn()` (empty parens) matches Command::spawn()/Child spawn without matching the blocking
+# `.output()`/`.status()` finishers, and does not match `thread::spawn(<closure>)` (its own marker).
+SPAWN_MARKERS = ["thread::spawn", "Builder::new()", "spawn_blocking", "async_runtime::spawn", "parallel_batch", ".spawn()"]
 
 
 def source() -> str:
