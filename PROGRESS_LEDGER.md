@@ -5078,3 +5078,36 @@ High-value unblocked work for the current themes is now largely exhausted — re
 owner-gated (speech_segments STRICT; champion_supervision; backup_second_dir; DPAPI key re-save;
 native-Sorani review; iPhone Tailscale) or Week-3 measured-intelligence (starts 2026-07-30, needs real
 gold data / long audio / cloud opt-in).
+
+---
+
+## 2026-07-16T21:07Z — iter 30 — Week 1 exhausted → assessed + deferred Week-3 pull-forward (OOD rename)
+
+**Context:** Week 1 (responsiveness) COMPLETE + telemetry live; Week 2 done/owner-gated. Per the
+doctrine ("if the current week is exhausted, pull forward"), assessed the most-unblocked Week-3 item:
+the OOD → `signal_anomaly` rename (item 4). **Understood the full scope, then deliberately DEFERRED
+it** (evidence-based, like the iter-25 STRICT call), correcting three factual errors in the plan note:
+- **UX rename ALREADY DONE:** every `validation.ood.*` i18n VALUE in en.ts already reads "Signal
+  Anomaly". The remaining rename is purely INTERNAL identifiers (DB column `ood_score`,
+  `SpeechSegment.ood_score`+serde `oodScore`, `quality/ood.rs` OodDetector/compute_ood_score, i18n
+  KEYS). **Zero UX/functional benefit** — internal consistency only.
+- **The "migration test that already exists" does NOT exist** — must be built as part of the sweep.
+- Real scope ~88 precise-identifier occurrences / ~20 files (not 143/34); ATOMIC (DB column + Rust +
+  serde + frontend must land together — a partial sweep won't compile).
+Rationale: a large, cross-boundary, atomic sweep for ZERO user benefit is a poor trade to rush 2
+weeks early. Recorded accurate scope in docs/MONTH_LOOP.md item 4 so the future focused pass isn't
+misled. **Commit 3e1cab3** (doc-only; no gate needed — no code/policy touched).
+
+**Honest state — high-value unblocked work remains genuinely exhausted.** Confirmed this iteration by
+investigating the last substantial candidate and finding it low-value/risky/early. What's left:
+- **Owner-gated:** speech_segments STRICT (proven cascade trap, plan in docs/STRICT_SPEECH_SEGMENTS_PLAN.md);
+  enable champion_supervision_enabled; set backup_second_dir; DPAPI key re-save; native-Sorani review;
+  iPhone Tailscale.
+- **Week-3 (starts 2026-07-30):** measured-intelligence (real CTC-logit uncertainty needs per-token
+  log-probs the sherpa binding doesn't expose + gold data; chunk-overlap A/B needs real long audio;
+  batch Gemini watcher is cloud/consent-gated) + the deferred OOD rename.
+- **Deliberately NOT ground out:** the marginal hashing telemetry span (would need a 2nd 6-min exe
+  rebuild for a rarely-run diagnostic — not worth it; item-1's meaningful ops ASR/export/file-IO are
+  instrumented + live).
+exe freshness GREEN (unchanged this iter — doc-only). Loop stays alive to pick up owner-unblocked or
+Week-3 work.
