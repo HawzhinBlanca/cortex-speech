@@ -4524,3 +4524,38 @@ VERBATIM GATES (isolated CARGO_TARGET_DIR; app not running):
 
 NEXT (Week 2): import-journal invariant family (begin_import_job 3 stmts + non-atomic transition_job),
 then fault drills, then DPAPI. Exe rebuild batched (2 source commits since 0c8afd2).
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 18 (Week 2): import journal atomic + job-transition CAS — atomicity trio COMPLETE
+
+Third invariant family from the write-path audit. App NOT running; lock held + released.
+
+CHANGES (db.rs):
+- begin_import_job: reap + INSERT + retention wrapped in SAVEPOINT import_job_begin — a failure after
+  the reap used to leave prior crashes 'abandoned' WITHOUT the new running job that justified it (the
+  startup resume prompt would then find nothing to offer). FAULT-INJECTION TEST via a RAISE trigger on
+  the INSERT: begin fails AND the crashed job is still 'running'/resumable (reap rolled back).
+- transition_job: the state-machine UPDATE is now a COMPARE-AND-SWAP (WHERE id AND state = the
+  validated state) — a concurrent transition on another connection landing between the read and the
+  write becomes a 0-row miss surfaced as an honest error, never a silent double-write (e.g.
+  resurrecting a just-cancelled job). HONEST TEST SCOPE (in the test comment too): the CAS's own
+  window is not injectable single-threaded through the public fn — the regression test flips the state
+  before the call (caught by the validation branch) and pins the end-to-end contract; the CAS clause
+  itself is structural.
+
+HONEST GATE HISTORY: first gate RED — 2 compile errors in MY test (wrong create_or_get_job arity, a
+nonexistent JobState::Completed variant — the real terminal is Succeeded). Fixed against the real
+signatures, full re-gate green:
+  $ cargo fmt --check  -> exit 0
+  $ cargo clippy --all-targets -- -D warnings -> CLIPPY_EXIT=0
+  $ cargo test --lib   -> test result: ok. 915 passed; 0 failed; 6 ignored
+    (incl. begin_import_job_is_atomic_reap_never_survives_a_failed_insert + transition_job_rejects_a_concurrently_changed_state)
+  $ run_python_policies -> 33 policy test scripts passed. (from gate 1; no python changed after)
+
+VERIFICATION SCOPING: identical savepoint idiom to iters 16-17 (whose skeptics swept this connection's
+transaction holders); begin_import_job's only caller is the single-flight import path (guarded by
+try_start_import, per its own doc); the CAS is strictly-stronger defense-in-depth. No fresh Workflow
+for the third application of the same verified pattern — said plainly.
+
+WRITE-PATH AUDIT FOLLOW-UPS: all three invariant families now atomic (verdict pair, jury verdict,
+import journal + CAS). Remaining Week-2: fault drills (disk-full, corruption bit-flip, missing-media,
+mid-export kill), DPAPI keys. Exe rebuild: NOW (3 source commits since 0c8afd2).

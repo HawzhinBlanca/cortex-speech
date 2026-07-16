@@ -1313,31 +1313,47 @@ impl Database {
     /// small. Journal writes are best-effort at the call sites — a failure here never fails an import.
     pub fn begin_import_job(&self, dir: &str, total_files: usize) -> AppResult<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        // Reap stale crashes first. Imports are single-flight (try_start_import guards the only call
-        // site), so when a NEW import begins any lingering 'running' job is a PRIOR crash the user did
-        // not resume — the startup resume prompt already had its chance before this new import started.
-        // Marking them 'abandoned' keeps exactly one 'running' job (the active one), so:
-        //   * find_interrupted_import_job stays unambiguous — no spurious "resume?" for an old crash
-        //     after the user already resumed a newer one, and
-        //   * 'running' rows can't accumulate unboundedly across repeated crashes (abandoned rows are
-        //     status != 'running', so the retention prune below reaps them + CASCADE clears their files).
-        self.conn.execute(
-            "UPDATE import_jobs SET status = 'abandoned', updated_at = datetime('now') WHERE status = 'running'",
-            [],
-        )?;
-        self.conn.execute(
-            "INSERT INTO import_jobs (id, dir, total_files, status) VALUES (?1, ?2, ?3, 'running')",
-            params![id, dir, total_files as i64],
-        )?;
-        // Retention: keep the newest 50 FINISHED jobs (running jobs are always kept — they may be crashes).
-        self.conn.execute(
-            "DELETE FROM import_jobs WHERE status != 'running' AND id NOT IN (
-                 SELECT id FROM import_jobs WHERE status != 'running'
-                 ORDER BY datetime(created_at) DESC, id DESC LIMIT 50
-             )",
-            [],
-        )?;
-        Ok(id)
+        // SAVEPOINT (write-path audit, Week 2): reap + INSERT + retention are one invariant — a failure
+        // after the reap used to leave prior crashes marked 'abandoned' WITHOUT the new running job that
+        // justified abandoning them (the resume prompt would then find nothing to offer).
+        self.conn.execute("SAVEPOINT import_job_begin", [])?;
+        let result: AppResult<()> = (|| {
+            // Reap stale crashes first. Imports are single-flight (try_start_import guards the only call
+            // site), so when a NEW import begins any lingering 'running' job is a PRIOR crash the user did
+            // not resume — the startup resume prompt already had its chance before this new import started.
+            // Marking them 'abandoned' keeps exactly one 'running' job (the active one), so:
+            //   * find_interrupted_import_job stays unambiguous — no spurious "resume?" for an old crash
+            //     after the user already resumed a newer one, and
+            //   * 'running' rows can't accumulate unboundedly across repeated crashes (abandoned rows are
+            //     status != 'running', so the retention prune below reaps them + CASCADE clears their files).
+            self.conn.execute(
+                "UPDATE import_jobs SET status = 'abandoned', updated_at = datetime('now') WHERE status = 'running'",
+                [],
+            )?;
+            self.conn.execute(
+                "INSERT INTO import_jobs (id, dir, total_files, status) VALUES (?1, ?2, ?3, 'running')",
+                params![id, dir, total_files as i64],
+            )?;
+            // Retention: keep the newest 50 FINISHED jobs (running jobs are always kept — they may be crashes).
+            self.conn.execute(
+                "DELETE FROM import_jobs WHERE status != 'running' AND id NOT IN (
+                     SELECT id FROM import_jobs WHERE status != 'running'
+                     ORDER BY datetime(created_at) DESC, id DESC LIMIT 50
+                 )",
+                [],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("import_job_begin")?;
+                Ok(id)
+            }
+            Err(e) => {
+                self.cleanup_savepoint_after_error("import_job_begin");
+                Err(e)
+            }
+        }
     }
 
     /// Record that `path` finished processing in job `job_id` (idempotent).
@@ -1454,16 +1470,28 @@ impl Database {
             )));
         }
         let finished = to.is_terminal() as i64;
-        self.conn.execute(
+        // Compare-and-swap (write-path audit, Week 2): the lifecycle check above is read-then-write, and
+        // a concurrent transition on ANOTHER connection could land between the read and this UPDATE —
+        // the old unconditional WHERE would then apply an edge validated against a stale state (e.g.
+        // resurrecting a just-cancelled job). Conditioning on the state we validated makes the racing
+        // writer's edge a 0-row miss, surfaced as an honest error instead of a silent double-write.
+        let affected = self.conn.execute(
             "UPDATE jobs SET
                  state = ?2,
                  error_code = ?3,
                  started_at = CASE WHEN ?2 = 'running' AND started_at IS NULL THEN datetime('now') ELSE started_at END,
                  finished_at = CASE WHEN ?4 = 1 THEN datetime('now') ELSE finished_at END,
                  updated_at = datetime('now')
-             WHERE id = ?1",
-            params![id, to.as_str(), error_code, finished],
+             WHERE id = ?1 AND state = ?5",
+            params![id, to.as_str(), error_code, finished, current.state.as_str()],
         )?;
+        if affected == 0 {
+            let now_state = self.get_job(id)?.map(|j| j.state.to_string()).unwrap_or_else(|| "<gone>".to_string());
+            return Err(AppError::Validation(format!(
+                "job {id} was transitioned concurrently ({} -> {now_state}); {} -> {to} rejected",
+                current.state, current.state
+            )));
+        }
         Ok(())
     }
 
@@ -4260,6 +4288,50 @@ mod tests {
         // transcript-scoped, so a folder name never yields a false positive.
         let by_path_token = db.search_segments("سامپڵز").unwrap();
         assert!(!by_path_token.iter().any(|s| s.id == "sr-1"), "a path-only token does not match");
+    }
+
+    #[test]
+    fn begin_import_job_is_atomic_reap_never_survives_a_failed_insert() {
+        // Write-path audit (Week 2): reap + INSERT + retention are one invariant. Fault-inject the
+        // INSERT with a RAISE trigger: the reap must ROLL BACK — a prior crash must never be marked
+        // 'abandoned' without the new running job that justified abandoning it (the resume prompt
+        // would otherwise find nothing to offer).
+        let db = make_db();
+        let crashed = db.begin_import_job("C:/audio/crashed", 4).unwrap();
+        // Simulate the crash: the job stays 'running' (a real crash never completes it).
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_import_insert BEFORE INSERT ON import_jobs
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+
+        let result = db.begin_import_job("C:/audio/new", 2);
+        assert!(result.is_err(), "a failed job INSERT must fail the whole begin");
+
+        // The crashed job must still be 'running' — reap rolled back — so the resume prompt still works.
+        let found = db.find_interrupted_import_job().unwrap().expect("crashed job still resumable");
+        assert_eq!(found.id, crashed, "the prior crash must remain the resumable interruption");
+    }
+
+    #[test]
+    fn transition_job_rejects_a_concurrently_changed_state() {
+        // Write-path audit (Week 2): the UPDATE is now a compare-and-swap on the validated state.
+        // HONEST SCOPE: the CAS's own branch (a flip landing BETWEEN the fn's read and its UPDATE) is
+        // not injectable single-threaded through the public fn — this test flips the state BEFORE the
+        // call, which the fn's fresh read catches in the validation branch instead. It still pins the
+        // end-to-end contract the CAS also serves: a state changed out from under a caller is rejected
+        // with no silent write. The CAS WHERE-clause itself is structural (state = the validated value).
+        let db = make_db();
+        let job = db.create_or_get_job("drill-job", "import", None, Some(10)).unwrap();
+        db.transition_job(&job.id, crate::jobs::JobState::Running, None).unwrap();
+        // "The other connection" cancels it via raw SQL (bypassing the API, as a racer effectively would).
+        db.conn.execute("UPDATE jobs SET state = 'cancelled' WHERE id = ?1", params![job.id]).unwrap();
+        // A stale-validated edge (running -> succeeded) must now be rejected...
+        let err = db.transition_job(&job.id, crate::jobs::JobState::Succeeded, None).unwrap_err();
+        assert!(err.to_string().contains("cancelled") || err.to_string().contains("illegal"), "{err}");
+        // ...and the cancelled state must be untouched.
+        assert_eq!(db.get_job(&job.id).unwrap().unwrap().state, crate::jobs::JobState::Cancelled);
     }
 
     #[test]
