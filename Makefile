@@ -28,6 +28,12 @@ gate: governance-proof
 test-rust:
 	cargo test --manifest-path cortex-speech-app/src-tauri/Cargo.toml
 
+## nextest: backend tests under cargo-nextest — per-test process isolation + hang-killing timeouts
+## (config: cortex-speech-app/src-tauri/.config/nextest.toml). ADDITIVE to test-rust, not a replacement.
+## Flake hunt: cd cortex-speech-app/src-tauri && cargo nextest run --lib --profile flaky-hunt
+nextest:
+	cd cortex-speech-app/src-tauri && cargo nextest run --lib
+
 ## test-frontend: Svelte/TS unit tests
 test-frontend:
 	cd cortex-speech-app && npm test

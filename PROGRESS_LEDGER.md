@@ -4171,3 +4171,51 @@ The installed exe now carries every off-thread migration from tonight (10 comman
 increments) — no UI-reachable IPC command blocks the main thread with heavy work anymore. Owner-
 observable effect: search, model downloads, audio-duration probes, the Gemini T2 watcher, the jury
 chain, and Scribe votes can no longer freeze the window; status pills poll without micro-freezes.
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 10 (Week 1 item 3): cargo-nextest adopted
+
+With item 2 functionally complete, the next unblocked Week-1 item: adopt cargo-nextest (per-test
+process isolation + hang-killing timeouts + flaky detection), ADDITIVE — cargo test stays a mandatory
+gate. App NOT running; lock held + released.
+
+WHAT SHIPPED:
+- Installed cargo-nextest v0.9.140 (cargo install --locked, source-built from crates.io; exit 0).
+- cortex-speech-app/src-tauri/.config/nextest.toml:
+  * [profile.default] slow-timeout period=60s, terminate-after=3 (a single test past 180s is hung —
+    the couch join() deadlock class this repo hit LIVE would now be killed+reported instead of wedging
+    the run forever); retries=0 — STRICT per doctrine: a flake FAILS and gets root-caused, never
+    silently retried green.
+  * [profile.flaky-hunt] retries=2, fail-fast=false — the deliberate flake-DETECTION profile (nextest
+    marks pass-on-retry as FLAKY); documented as never a pass/fail gate.
+- Makefile `nextest` target (sibling of test-rust), with the flaky-hunt invocation documented.
+
+RISK INVESTIGATED FIRST (understand-before-adopt): nextest runs each test in its OWN PROCESS, undoing
+process-wide serialization. Audited the suite's shared statics: couch.rs's `static COUCH: Mutex<...>`
+serializes the fixed-port-8737 server within one process — but only ONE couch test binds the real port
+(the unblock assertion lives inside live_server_gates_every_route_on_the_token), so no cross-process
+collision exists. Other statics (TRACER, rate limiters, SCRIBE_VOTES_IN_FLIGHT) get FRESH state per
+test under nextest = strictly better isolation.
+
+VERBATIM RUN (isolated CARGO_TARGET_DIR=%TEMP%\cortex-monthloop-target; app not running):
+  $ cargo nextest run --lib
+  Starting 905 tests across 1 binary (6 tests skipped)
+  Summary [  39.375s] 905 tests run: 905 passed, 6 skipped
+  (exit 0; zero FAIL/FLAKY/TIMEOUT lines; ~1.5x faster than cargo test's ~60s — parallel processes
+  across the 3990X)
+  $ python scripts/run_python_policies.py -> Python policy regressions finished: 33 policy test scripts passed.
+  (cargo fmt/clippy/test not re-run: ZERO Rust source changed this iteration — 9ea87f5's green gates
+  stand; the new files are config+Makefile, hygiene-checked clean of private paths.)
+
+ADVERSARIAL VERIFY: consciously SKIPPED the Workflow this iteration and saying so plainly — the change
+is additive test infrastructure outside §5's non-trivial list (no byte math / durability / privacy /
+hot paths / commands.rs / db.rs / pipeline.rs), its one real risk class (per-process isolation breaking
+shared-state tests) was investigated by hand BEFORE adoption (above), and the authoritative gate is the
+real nextest run itself, which executed green. The config's failure-masking knobs are explicitly strict
+(retries=0 default; the retry profile documented as detection-only, never a gate).
+
+HONEST CAVEAT: one green run proves the suite passes under process isolation TODAY, not that no
+order-dependent test exists in principle. The flaky-hunt profile + nightly use will accumulate real
+evidence; any flake found gets root-caused per the standing doctrine item.
+
+NEXT (Week 1 remaining): kill/restart durability drill (scripted NX kill-during-write vs a disposable
+profile), then the 7B engine supervision skeleton.
