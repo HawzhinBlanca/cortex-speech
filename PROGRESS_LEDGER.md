@@ -4776,3 +4776,31 @@ removing an unreachable command).
 NEXT: larger STRICT tables (each its own staged migration; speech_segments+FTS is the high-risk one
 needing a dedicated iteration) · disk-full drill (design pass) · Week-3 measured-intelligence themes
 begin 2026-07-30.
+
+## 2026-07-16 — iteration 23 addendum: exe rebuilt (dead command removed) + NIGHT-1 WIND-DOWN
+
+App not running. Verbatim: VITE_EXIT=0; CARGO_REL_EXIT=0 (0 errors);
+check_exe_freshness -> EXE FRESHNESS GATE: OK (exe at HEAD 0ed54eaf2486…, newer than all sources).
+
+*** NIGHT-1 WIND-DOWN — HONEST HAND-OFF ***
+23 iterations this session; the small/safe/high-value increments are EXHAUSTED. What remains is
+deliberately NOT rushed at marathon's end — each needs fresh context or a design pass:
+- speech_segments STRICT conversion: HIGH-risk (BOOLEAN-declared columns are NOT valid STRICT types
+  and must become INTEGER; the FTS5 triggers segments_ai/ad/au must be dropped + recreated around the
+  table swap; ~30 columns). Its own dedicated, well-rested iteration — the v38 pilot is the pattern.
+- disk-full drill: no portable fault-injection yet (candidate: a tmpfs/quota dir or an injectable
+  io::Write wrapper) — needs a design pass, not a guess.
+- Week-3 measured-intelligence themes (real CTC-logit uncertainty + calibration, chunk-overlap A/B):
+  begin 2026-07-30 per the weekly schedule; big measurement work needing real gold data + fresh context.
+
+OWNER-ACTION QUEUE (surfaced, none blocking): enable champion_supervision_enabled to activate 7B
+supervision (+ observe the live restart leg); set backup_second_dir for off-drive backups; re-save
+plaintext keys via save_key_protected for DPAPI at rest; native-Sorani review + iPhone Tailscale test
+(pre-existing). The next app launch auto-applies migration v38 (STRICT decision_verdicts) — safe,
+verified, snapshot-guarded.
+
+SESSION SCORE (every number from a real run, pasted above): Week 1 COMPLETE + Week 2 all-but-two.
+~25 commits, exe freshness-green throughout, cargo test --lib 922 passing, 33/33 python policies.
+Adversarial Workflows caught 8 genuine issues, each fixed before shipping. The loop's cheap-no-op /
+longer-rest stance now holds until the next fresh iteration or the 02:00 nightly picks up the
+high-risk items.
