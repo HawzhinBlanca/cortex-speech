@@ -3886,3 +3886,15 @@ check_agentic_readiness, get_audio_duration); 1 dead (check_external_provider, d
 worklist = 9: the 7 cloud-net commands (jury/scribe/DPO/model-download — the biggest, network+consent, need
 their own careful iterations, some may need real async HTTP not just run_blocking), check_external_provider
 (dead), start_champion_engine (#13, MED — detached spawn, near-instant).
+
+## 2026-07-16 — iteration 4 addendum: shipped exe rebuilt (session checkpoint, 4 freezers)
+
+Wound down the active-building burst (iters 1–4) with a checkpoint rebuild. App confirmed not running;
+built into the real src-tauri/target/release (CARGO_TARGET_DIR unset). Verbatim:
+  $ (npm run build)                       -> VITE_EXIT=0
+  $ cargo build --release                 -> CARGO_REL_EXIT=0  (0 build/LNK errors)
+  $ python scripts/check_exe_freshness.py -> EXE FRESHNESS GATE: OK (exe at HEAD 538b6b6424f0…, newer than all sources)
+The installed exe now carries all 4 off-thread migrations, baked at 538b6b6. (As with the iter-3
+rebuild note: THIS ledger commit will sit one docs-only commit ahead of the baked SHA — no source delta,
+so the binary is functionally at-HEAD; next iteration should trust check_exe_freshness, not this prose,
+to decide if a rebuild is pending.)
