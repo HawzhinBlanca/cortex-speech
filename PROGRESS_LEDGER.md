@@ -4061,3 +4061,54 @@ App not running; built into src-tauri/target/release (CARGO_TARGET_DIR unset). V
   $ cargo build --release                 -> CARGO_REL_EXIT=0 (0 build/LNK errors)
   $ python scripts/check_exe_freshness.py -> EXE FRESHNESS GATE: OK (exe at HEAD d6ec64b80d53…, newer than all sources)
 Installed exe now carries all 8 off-thread migrations, baked at d6ec64b (incl. the T2 Gemini watcher fix).
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 8 (Week 1 item 2): full jury chain off the main thread
+
+The most complex remaining wired freezer: run_jury_pipeline (freezer #1) — ReviewInbox's "run jury"
+T0->T1->T2 chain. Its blocker was structural: with_jury_db takes &AppState (non-'static), so the body
+couldn't move into run_blocking as-is, and with_jury_db has a SECOND caller (batch_transcribe's worker
+thread). App NOT running; lock held + released.
+
+CHANGE (src-tauri/src/commands.rs), a root-cause extraction + the migration:
+- NEW JuryDbSource { db_path: String, shared: Arc<Mutex<Database>> } + jury_db_source(&AppState) —
+  the owned, Send+'static form of with_jury_db's logic. `with()` carries the EXACT old semantics:
+  dedicated Database::open per run (plain open, not open_with_retry — same comment preserved),
+  byte-identical warn on failure, shared-handle fallback with lock_db's poison recovery, :memory:
+  (tests) still routed to the shared handle. with_jury_db survives as a thin wrapper so
+  batch_transcribe's call site is UNTOUCHED.
+- run_jury_pipeline `pub fn` -> `pub async fn`: eager rate-limit + settings clone + jury_data_dir +
+  jury_db_source (all owned), then run_blocking(move || source.with(|db| run_jury_pipeline_core_via(...))).await.
+  Neither the UI thread NOR the global db mutex is held across the Gemini round-trips (the dedicated
+  connection was already the design; now the thread is right too). The rare fallback path holds the
+  global lock for the run exactly as the old sync version did — but on a pool thread, strictly better.
+
+RATCHETS: run_jury_pipeline added to ASYNC_SLOW_COMMANDS; removed from FREEZERS (5 -> 4).
+docs/UI_THREAD_BLOCKING_AUDIT.md: 56 async / 4 freezers.
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR=%TEMP%\cortex-monthloop-target; app not running):
+  $ cargo fmt --check                              -> exit 0 (clean)
+  $ cargo clippy --all-targets -- -D warnings      -> exit 0, 0 warnings
+  $ cargo test --lib                               -> test result: ok. 905 passed; 0 failed; 6 ignored; 0 measured; finished in 59.51s
+  $ python scripts/run_python_policies.py          -> Python policy regressions finished: 33 policy test scripts passed.
+  $ python scripts/test_ui_thread_blocking_audit.py-> async 56 / offloaded 7 / freeze-worklist 4
+
+ADVERSARIAL VERIFY (§3 — commands.rs + a shared-logic refactor + privacy, mandatory Workflow): THREE
+independent lenses (ultracode).
+- extraction-equivalence: refuted=FALSE — behavior-identical for BOTH callers; Arc clone is lock-free;
+  :memory: still routes to the shared handle; warn byte-identical; and it verified the shared Database
+  is never replaced in place (no *guard=/mem::replace/swap in production code), so the path snapshot
+  cannot go stale. Only log-metadata (tracing module target) differs on poison recovery.
+- async-soundness: text verbatim "Async command is sound; no unsoundness or regression found" —
+  Send composition holds (Connection is Send, !Sync never exercised: access only via the exclusive
+  guard), no MutexGuard across the await, contract unchanged, fallback identical-but-on-pool-thread.
+  It again set the refuted BOOLEAN to true (4th occurrence of the slip, always contradicted by its
+  own zero-defect text) — recorded as-is.
+- privacy-consent-location: refuted=FALSE — the T2 gate (`if cloud_opt_in && !api_key...`) is inside
+  the UNTOUCHED run_jury_pipeline_core_via (git-diff-verified); settings snapshot-at-call-time is
+  bit-identical to the sync version; JuryDbSource adds no network surface; resolve_t2_endpoint
+  untouched (OpenRouter only on explicit provider + key, else Gemini direct — policy intact).
+No CONFIRMED finding -> nothing to fix.
+
+EXE REBUILD: at this wind-down (next entry). WEEK-1 item 2 PROGRESS: 9 of 13 migrated. REMAINING = 4:
+add_scribe_votes (wired loop — last real freezer), run_dpo_update (unwired), check_external_provider
+(dead), start_champion_engine (MED, near-instant).

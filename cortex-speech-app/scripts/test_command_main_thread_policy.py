@@ -88,6 +88,10 @@ ASYNC_SLOW_COMMANDS = [
     # T2 Gemini audio judge: eager consent/key checks + a brief-locked DB gather, then the N-sample
     # cloud round-trip runs on run_blocking; the verdict write re-locks briefly after the await.
     "run_t2_for_segment",
+    # Full jury chain (T0→T1→T2): runs on run_blocking against an owned JuryDbSource (dedicated
+    # connection, shared-handle fallback) so neither the UI thread nor the global db Mutex is held
+    # across the cloud round-trips.
+    "run_jury_pipeline",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

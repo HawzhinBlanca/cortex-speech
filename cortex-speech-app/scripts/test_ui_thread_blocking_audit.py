@@ -40,7 +40,8 @@ COMMANDS_RS = REPO_ROOT / "src-tauri" / "src" / "commands.rs"
 FREEZERS: dict[str, tuple[str, str]] = {
     # Cloud round-trips run synchronously on the UI thread (they correctly drop the DB lock first, but
     # the network wait itself still blocks the main thread). All consent/key-gated.
-    "run_jury_pipeline": ("cloud-net", "T0/T1/T2 chain; T2 = Gemini audio round-trips (run_jury_pipeline_core_via)"),
+    # MIGRATED 2026-07-16: run_jury_pipeline — the whole T0→T1→T2 chain moved to run_blocking against
+    # an owned JuryDbSource (with_jury_db extracted); in the ASYNC ratchet.
     # MIGRATED 2026-07-16: run_t2_for_segment — the N-sample Gemini cloud call moved to run_blocking
     # (consent/key gates + brief DB gather stay eager); in the ASYNC ratchet.
     "run_dpo_update": ("cloud-net", "outbound HTTP POST, ~120s cap on a stalled endpoint (jury::learning::run_dpo_update)"),

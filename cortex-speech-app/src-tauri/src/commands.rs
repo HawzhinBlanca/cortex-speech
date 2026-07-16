@@ -4739,24 +4739,45 @@ fn has_final_machine_verdict(seg: &crate::db::SpeechSegment) -> bool {
 /// for an in-memory database (tests can't share `:memory:` across connections, and that path has cloud
 /// off so there is no network call to block on) or in the rare event the dedicated open fails.
 fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) -> R) -> R {
-    let db_path = { app_state.lock_db().path().to_string() };
-    if db_path != ":memory:" {
-        // Dedicated worker connection so we never hold the GLOBAL db Mutex across the jury's cloud T2
-        // Gemini round-trips (which would freeze every other DB command for minutes). Use plain `open`,
-        // NOT open_with_retry: the latter runs a full PRAGMA integrity_check (a per-review-session tax
-        // that grows with the library) AND reaches the boot-time-only DESTRUCTIVE quarantine decision
-        // from a live worker thread. The file was already integrity-checked at boot; `open` sets WAL +
-        // busy_timeout=10000, which is the actual transient-contention retry we want here.
-        match crate::db::Database::open(&db_path) {
-            Ok(db) => return f(&db),
-            Err(e) => tracing::warn!(
-                "Jury dedicated db connection open failed after retries ({e}); using the shared handle \
-                 (other DB commands may pause during adjudication)"
-            ),
+    jury_db_source(app_state).with(f)
+}
+
+/// Owned, `Send + 'static` form of the jury-DB access above, so an async command can move it into
+/// `run_blocking` (a `&AppState` borrow can't cross the await). Carries the db PATH (the dedicated
+/// connection is opened lazily inside `with`, on whichever thread runs it) plus the shared handle for
+/// the fallback. Same semantics as `with_jury_db` — it IS `with_jury_db`'s implementation.
+struct JuryDbSource {
+    db_path: String,
+    shared: Arc<std::sync::Mutex<crate::db::Database>>,
+}
+
+fn jury_db_source(app_state: &AppState) -> JuryDbSource {
+    JuryDbSource { db_path: app_state.lock_db().path().to_string(), shared: app_state.db_arc() }
+}
+
+impl JuryDbSource {
+    fn with<R>(&self, f: impl FnOnce(&crate::db::Database) -> R) -> R {
+        if self.db_path != ":memory:" {
+            // Dedicated worker connection so we never hold the GLOBAL db Mutex across the jury's cloud T2
+            // Gemini round-trips (which would freeze every other DB command for minutes). Use plain `open`,
+            // NOT open_with_retry: the latter runs a full PRAGMA integrity_check (a per-review-session tax
+            // that grows with the library) AND reaches the boot-time-only DESTRUCTIVE quarantine decision
+            // from a live worker thread. The file was already integrity-checked at boot; `open` sets WAL +
+            // busy_timeout=10000, which is the actual transient-contention retry we want here.
+            match crate::db::Database::open(&self.db_path) {
+                Ok(db) => return f(&db),
+                Err(e) => tracing::warn!(
+                    "Jury dedicated db connection open failed after retries ({e}); using the shared handle \
+                     (other DB commands may pause during adjudication)"
+                ),
+            }
         }
+        let db = self.shared.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned database lock");
+            poisoned.into_inner()
+        });
+        f(&db)
     }
-    let db = app_state.lock_db();
-    f(&db)
 }
 
 /// OpenRouter's OpenAI-compatible chat endpoint. POLICY (owner, 2026-07-14): the only approved cloud
@@ -5116,14 +5137,25 @@ pub(crate) fn open_jury_db_connection(app_state: &AppState) -> Option<crate::db:
 }
 
 #[tauri::command]
-pub fn run_jury_pipeline(state: State<'_, AppState>, segment_ids: Vec<String>) -> Result<serde_json::Value, String> {
+pub async fn run_jury_pipeline(
+    state: State<'_, AppState>,
+    segment_ids: Vec<String>,
+) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("run_jury_pipeline")?;
     let settings = state.lock_settings().clone();
     // Run on a dedicated connection so the global db Mutex is not held across the jury's blocking T2
-    // cloud calls — holding it would freeze the UI's get_segments for the whole run. with_jury_db
-    // retries the dedicated open and only falls back to the shared handle on a hard failure.
+    // cloud calls — holding it would freeze the UI's get_segments for the whole run (JuryDbSource
+    // retries the dedicated open and only falls back to the shared handle on a hard failure). The
+    // whole T0→T1→T2 chain also runs on the blocking pool via run_blocking so the UI THREAD itself
+    // stays responsive too (the T2 consent gate lives inside run_jury_pipeline_core_via, on settings
+    // cloned eagerly here — cloud is never reached without jury_cloud_opt_in). All captures are owned:
+    // settings clone, segment_ids, jury_data_dir, and the Send JuryDbSource (path + Arc handle).
     let jury_data_dir = state.lock_data_dir().clone();
-    with_jury_db(&state, |db| run_jury_pipeline_core_via(db, &settings, segment_ids, jury_data_dir.as_deref()))
+    let source = jury_db_source(&state);
+    run_blocking(move || {
+        source.with(|db| run_jury_pipeline_core_via(db, &settings, segment_ids, jury_data_dir.as_deref()))
+    })
+    .await
 }
 
 /// `run_t2_for_segment` — run Gemini audio judge on a single segment directly.
