@@ -369,7 +369,7 @@ impl Database {
         Ok(())
     }
 
-    fn cleanup_savepoint_after_error(&self, savepoint: &str) {
+    pub(crate) fn cleanup_savepoint_after_error(&self, savepoint: &str) {
         if let Err(error) = self.conn.execute(&format!("ROLLBACK TO {savepoint}"), []) {
             tracing::warn!("Failed to roll back savepoint {savepoint}: {error}");
         }
@@ -385,7 +385,7 @@ impl Database {
     /// NEXT command would run inside the stale transaction and a later ROLLBACK TO could silently
     /// discard writes already reported as committed. Roll it back + release on failure so a failed
     /// commit cannot poison the connection.
-    fn release_savepoint(&self, savepoint: &str) -> AppResult<()> {
+    pub(crate) fn release_savepoint(&self, savepoint: &str) -> AppResult<()> {
         if let Err(error) = self.conn.execute(&format!("RELEASE {savepoint}"), []) {
             self.cleanup_savepoint_after_error(savepoint);
             return Err(error.into());

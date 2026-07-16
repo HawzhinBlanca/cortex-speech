@@ -348,36 +348,54 @@ pub fn write_verdict(
     // in-memory "already has a verdict" skip reads the STALE snapshot. The same guard as db::
     // write_segment_verdict and the consensus/ASR write paths makes a verdict for an already-human-decided
     // segment a 0-row no-op, keeping the human's verdict/gold transcript authoritative.
-    let affected = db.connection().execute(
-        "UPDATE speech_segments
-         SET verdict           = ?2,
-             verdict_transcript = ?3,
-             rationale         = ?4,
-             evidence_json     = ?5,
-             agent_confidence  = ?6,
-             escalated         = ?7,
-             updated_at        = datetime('now')
-         WHERE id = ?1
-           AND (human_decision IS NULL OR human_decision = '')
-           AND (verdict IS NULL OR verdict NOT IN ('human_accept', 'human_edit', 'human_reject'))",
-        params![
-            segment_id,
-            verdict.to_string(),
-            transcript,
-            rationale,
-            evidence_json,
-            agent_confidence,
-            (verdict == Verdict::Escalated) as i32,
-        ],
-    )?;
+    // SAVEPOINT (write-path audit, Week 2): the verdict UPDATE and its decision_verdicts record are one
+    // invariant — a failure between them left a verdict with no C4 denominator row. Same idiom as
+    // db::write_segment_verdict / delete_segment. The best-effort flywheel capture below stays OUTSIDE
+    // the savepoint on purpose: its failure must not fail (or roll back) the verdict write.
+    db.connection().execute("SAVEPOINT jury_verdict", [])?;
+    let affected_result: AppResult<usize> = (|| {
+        let affected = db.connection().execute(
+            "UPDATE speech_segments
+             SET verdict           = ?2,
+                 verdict_transcript = ?3,
+                 rationale         = ?4,
+                 evidence_json     = ?5,
+                 agent_confidence  = ?6,
+                 escalated         = ?7,
+                 updated_at        = datetime('now')
+             WHERE id = ?1
+               AND (human_decision IS NULL OR human_decision = '')
+               AND (verdict IS NULL OR verdict NOT IN ('human_accept', 'human_edit', 'human_reject'))",
+            params![
+                segment_id,
+                verdict.to_string(),
+                transcript,
+                rationale,
+                evidence_json,
+                agent_confidence,
+                (verdict == Verdict::Escalated) as i32,
+            ],
+        )?;
 
-    // M2.2/P1.2: record the T0/T1 classification in decision_verdicts for the C4 auto-accept-precision
-    // denominator. This path (the IRT-consensus jury) previously recorded NOTHING, so auto-accepts from
-    // the main jury were invisible to C4. Gated on affected > 0 so a verdict the guard above did NOT
-    // write (human-decided segment) never plants a phantom machine verdict.
-    if affected > 0 {
-        db.record_decision_verdict(segment_id, &verdict.to_string(), verdict == Verdict::Escalated)?;
-    }
+        // M2.2/P1.2: record the T0/T1 classification in decision_verdicts for the C4 auto-accept-precision
+        // denominator. This path (the IRT-consensus jury) previously recorded NOTHING, so auto-accepts from
+        // the main jury were invisible to C4. Gated on affected > 0 so a verdict the guard above did NOT
+        // write (human-decided segment) never plants a phantom machine verdict.
+        if affected > 0 {
+            db.record_decision_verdict(segment_id, &verdict.to_string(), verdict == Verdict::Escalated)?;
+        }
+        Ok(affected)
+    })();
+    let affected = match affected_result {
+        Ok(n) => {
+            db.release_savepoint("jury_verdict")?;
+            n
+        }
+        Err(e) => {
+            db.cleanup_savepoint_after_error("jury_verdict");
+            return Err(e);
+        }
+    };
 
     // Flywheel capture: when the jury ACCEPTS a transcript that differs from the raw ASR, the model
     // corrected OmniASR — record it as a provenance-tagged PSEUDO example (never auto-trained; gated
@@ -689,6 +707,24 @@ mod tests {
             matches!(t0_gate_segment(&seg, &hyps, "کوردستان", 0.99, 0.60), T0Decision::EscalateToT1 { .. }),
             "an empty-transcript hypothesis must not count as a second voter"
         );
+    }
+
+    #[test]
+    fn jury_write_verdict_is_atomic_with_its_decision_log() {
+        // Write-path audit (Week 2), sibling of db::write_segment_verdict_is_atomic_...: fault-inject
+        // the decision_verdicts INSERT by dropping its table — the whole verdict write must FAIL and
+        // the UPDATE must ROLL BACK (never a verdict without its C4 denominator row).
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&make_seg("atom", "دەق")).unwrap();
+        db.connection().execute_batch("DROP TABLE decision_verdicts").unwrap();
+
+        let result = write_verdict(&db, "atom", Verdict::Escalated, None, None, None, Some(0.3));
+        assert!(result.is_err(), "a failed decision-log insert must fail the whole jury verdict write");
+
+        let seg = db.get_segment_by_id("atom").unwrap().expect("segment still present");
+        assert_eq!(seg.verdict, None, "the verdict UPDATE must roll back with the failed decision log");
+        assert!(!seg.escalated, "escalated must roll back too");
     }
 
     #[test]

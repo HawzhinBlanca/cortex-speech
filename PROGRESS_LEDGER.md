@@ -4495,3 +4495,32 @@ REMOVES the worse failure mode. No CONFIRMED finding.
 
 NEXT (Week 2): the remaining two invariant families (jury write_verdict 3-statement; import journal),
 then fault drills, then DPAPI. Exe rebuild batched (this is 1 source commit since 0c8afd2).
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 17 (Week 2): jury write_verdict made atomic
+
+Sibling of iteration 16 — the second invariant family from the write-path audit: jury::write_verdict
+(the T0 gate's per-segment writer) ran its guarded UPDATE + record_decision_verdict as separate
+autocommits. App NOT running; lock held + released.
+
+CHANGE: db.rs savepoint helpers widened to pub(crate) (2 words); jury/mod.rs write_verdict wraps the
+UPDATE + decision-log pair in SAVEPOINT jury_verdict (same idiom); the best-effort flywheel capture
+(record_model_correction) stays OUTSIDE the savepoint deliberately — its failure must not fail or roll
+back the verdict write (unchanged semantics). REGRESSION TEST (fault-injection):
+jury_write_verdict_is_atomic_with_its_decision_log — DROP decision_verdicts, assert Err + rollback.
+
+NESTING SELF-VERIFICATION (the one new adversarial question vs iter 16, checked by hand):
+write_verdict's only production callers are run_t0_gate's two sequential loop sites (jury/mod.rs:309,
+320) — no enclosing transaction; save_model_abilities' own tx is scoped and completes BEFORE the T0
+loop; T1/T2/escalation paths call the db.rs fn fixed in iter 16, whose Workflow skeptic already swept
+this connection's transaction holders. Identical mechanical pattern to the verified sibling — no fresh
+Workflow spawned for it, said plainly.
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR; app not running):
+  $ cargo fmt --check  -> exit 0
+  $ cargo clippy --all-targets -- -D warnings -> exit 0
+  $ cargo test --lib   -> test result: ok. 913 passed; 0 failed; 6 ignored
+    (incl. "test jury::tests::jury_write_verdict_is_atomic_with_its_decision_log ... ok")
+  $ run_python_policies -> 33 policy test scripts passed.
+
+NEXT (Week 2): import-journal invariant family (begin_import_job 3 stmts + non-atomic transition_job),
+then fault drills, then DPAPI. Exe rebuild batched (2 source commits since 0c8afd2).
