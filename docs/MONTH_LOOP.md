@@ -91,8 +91,20 @@ week. Checked boxes are maintained by the runs themselves (edit this file in the
       pre-screen the pending review queue (audio+text to `google/gemini-2.5-pro` via OpenRouter,
       never Qwen) and mark clips "watcher-flagged" with a reason. It may never auto-accept or
       auto-edit. Cap per-run spend; count and log every call.
-- [ ] Rename OOD → `signal_anomaly` (staged, with the migration test that already exists in
-      planning notes; ~143 occurrences / 34 files — do it in one mechanical, gated sweep).
+- [ ] Rename OOD → `signal_anomaly` (one mechanical, gated sweep). **Scope re-verified 2026-07-16
+      (iter 30), corrections to this note:** (a) the **user-facing** rename is ALREADY DONE — every
+      `validation.ood.*` i18n *value* in `src/lib/i18n/en.ts` already reads "Signal Anomaly"; what
+      remains is purely INTERNAL identifiers (DB column `ood_score`, `SpeechSegment.ood_score` +
+      serde-derived `oodScore`, the `quality/ood.rs` `OodDetector`/`compute_ood_score` module, the
+      `validation.ood.*` i18n *keys*, and their frontend refs). So this change has **zero UX/functional
+      benefit** — it's internal-consistency only. (b) The "migration test that already exists" does
+      NOT exist — none found in `migrations/` or planning notes; it must be BUILT as part of the sweep
+      (a `RENAME COLUMN ood_score → signal_anomaly_score` migration that preserves existing rows).
+      (c) Real scope is ~88 precise-identifier occurrences across ~20 files (not 143/34); atomic —
+      DB column + Rust field + serde + frontend must land together (a partial sweep won't compile).
+      **Deliberately deferred to its Week-3 slot** (iter 30): large + cross-boundary + risky for zero
+      user benefit is a poor trade to rush 2 weeks early. The type systems + 924 tests catch most
+      breakage; still worth its own focused, adversarially-verified pass.
 
 ### Week 4 · Aug 6–15 — Architecture, UX quiet-down, re-audit
 - [ ] Decompose the 3–4k-line files (`commands.rs` first) into slices — one slice per run,
