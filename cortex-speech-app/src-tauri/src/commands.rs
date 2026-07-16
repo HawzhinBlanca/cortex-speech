@@ -2117,22 +2117,31 @@ pub fn rename_speaker(old_id: String, new_id: String, state: State<'_, AppState>
 }
 
 #[tauri::command]
-pub fn get_audio_duration(path: String) -> Result<i64, String> {
+pub async fn get_audio_duration(path: String) -> Result<i64, String> {
     RATE_LIMITER.check("get_audio_duration")?;
     let validated = validate::validate_file_path(&path)?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = audio::get_duration_ms(&validated);
-        send_audio_duration_probe_result(tx, result);
-    });
-    match rx.recv_timeout(Duration::from_secs(30)) {
-        Ok(Ok(dur)) => Ok(dur),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("Audio duration probe timed out after 30s".to_string()),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err("Audio duration probe thread disconnected".to_string())
+    // The whole watchdog (probe thread + 30s recv_timeout that bounds a pathological decode) runs on
+    // the blocking pool, so the `recv_timeout` blocks a spawn_blocking thread instead of the UI thread.
+    // Behavior-preserving: same probe thread, same 30s bound, same four outcomes — only the thread the
+    // caller waits on changes (main -> blocking pool).
+    run_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = audio::get_duration_ms(&validated);
+            send_audio_duration_probe_result(tx, result);
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(dur)) => Ok(dur),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err("Audio duration probe timed out after 30s".to_string())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("Audio duration probe thread disconnected".to_string())
+            }
         }
-    }
+    })
+    .await
 }
 
 #[tauri::command]

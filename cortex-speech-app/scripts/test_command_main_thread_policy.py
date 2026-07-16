@@ -75,6 +75,9 @@ ASYNC_SLOW_COMMANDS = [
     # moved to run_blocking so polling the engine/agentic status pills can't freeze the UI.
     "get_champion_engine_status",
     "check_agentic_readiness",
+    # Audio-duration watchdog: probe thread + 30s recv_timeout — the whole watchdog now runs on the
+    # blocking pool so the recv no longer blocks the UI thread (bound preserved).
+    "get_audio_duration",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

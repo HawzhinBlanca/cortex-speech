@@ -27,8 +27,8 @@ not keyword-guessed:
 
 ## Ranked worklist — sync commands that block the UI thread (migrate first)
 
-Count of the current split (updated as the migration lands): **50 async** (off the main thread) ·
-**7 sync-but-offloaded** (safe) · **10 sync-and-blocking** (below) · the remaining ~62 sync commands
+Count of the current split (updated as the migration lands): **51 async** (off the main thread) ·
+**7 sync-but-offloaded** (safe) · **9 sync-and-blocking** (below) · the remaining ~62 sync commands
 are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a freeze risk).
 
 **Migration progress (Week-1 item 2), all 2026-07-16:**
@@ -37,6 +37,8 @@ are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a
   signature kept via `unwrap_or` on the unreachable JoinError).
 - ✅ `check_agentic_readiness` (#10) → `async`; settings clone + bounded model-stat taken on the caller
   thread, the slow `wsl --status` probe moved to `run_blocking`.
+- ✅ `get_audio_duration` (#11) → `async`; the probe-thread + 30 s `recv_timeout` watchdog now runs
+  inside `run_blocking` (bound preserved, off the UI thread).
 - 🗑️ `check_external_provider` (#9) is **dead** (registered, but no caller in `src/` or Rust) — left sync
   and flagged for deletion rather than migrated (don't invest in code that should be deleted).
 Migrated rows below are struck through.
@@ -53,7 +55,7 @@ Migrated rows below are struck through.
 | ~~8~~ | ~~`get_champion_engine_status`~~ ✅ migrated | subprocess | ~~HIGH~~ | ~~WSL TCP probe~~ — now `async` + `run_blocking` | — |
 | 9 | `check_external_provider` 🗑️ dead | subprocess | HIGH | shells out to `wsl --status` up to 10 s → `external_provider_status` — **unused, delete candidate** | — |
 | ~~10~~ | ~~`check_agentic_readiness`~~ ✅ migrated | subprocess | ~~HIGH~~ | ~~`wsl --status` + model stat~~ — now `async`, probe on `run_blocking` | — |
-| 11 | `get_audio_duration` | file-io | **HIGH** | spawns a decode probe thread, then **blocks on `rx.recv_timeout(30 s)`** → `audio::get_duration_ms` | — |
+| ~~11~~ | ~~`get_audio_duration`~~ ✅ migrated | file-io | ~~HIGH~~ | ~~probe thread + `recv_timeout(30 s)`~~ — watchdog now inside `run_blocking` | — |
 | ~~12~~ | ~~`search_segments`~~ ✅ migrated | db-scan | ~~HIGH~~ | ~~unbounded FTS5 `MATCH`~~ — now `async` + `run_blocking` (off the main thread) | — |
 | 13 | `start_champion_engine` | subprocess | MED | `powershell … spawn()` — **detached**, so the real freeze is only process-creation latency | — |
 
@@ -98,8 +100,9 @@ ratchet as it lands:
 2. ✅ **WSL status getters (#8–#10)** — DONE 2026-07-16 for the two live ones (`get_champion_engine_status`,
    `check_agentic_readiness`): the `wsl`/probe work runs on `run_blocking`, off the polled UI thread.
    `check_external_provider` (#9) turned out **dead** (no caller) → flagged for deletion, not migrated.
-3. **`get_audio_duration` (#11)** — drop the synchronous `recv_timeout`; make the command async and
-   await the probe.
+3. ✅ **`get_audio_duration` (#11)** — DONE 2026-07-16: the whole watchdog (probe thread + 30 s
+   `recv_timeout`) moved inside `run_blocking`, so the bound is preserved but the wait is off the UI
+   thread (kept the watchdog rather than dropping the timeout, which would be a behaviour change).
 4. ✅ **`search_segments` (#12)** — DONE 2026-07-16: mirrored its already-migrated siblings (`async` +
    `run_blocking`). A `LIMIT`/pagination bound is a separate follow-up (a behaviour change — it would
    truncate large result sets — so it's deliberately not folded into the off-thread migration).

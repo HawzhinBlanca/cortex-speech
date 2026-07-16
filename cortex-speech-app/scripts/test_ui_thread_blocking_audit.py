@@ -52,8 +52,8 @@ FREEZERS: dict[str, tuple[str, str]] = {
     # flagged for deletion rather than migration; ponytail: don't invest in code that should be deleted.
     "check_external_provider": ("subprocess", "DEAD (unused) — shells out to `wsl --status` up to 10s (external_provider_status); delete candidate, not a migrate target"),
     "start_champion_engine": ("subprocess", "powershell spawn — detached, so real freeze is just process-creation latency"),
-    # Spawns a probe thread but then BLOCKS on recv_timeout(30s) — looks offloaded, is not.
-    "get_audio_duration": ("file-io", "spawns a decode probe thread, then blocks on rx.recv_timeout(30s) (audio::get_duration_ms)"),
+    # MIGRATED 2026-07-16: get_audio_duration — the probe-thread + 30s recv_timeout watchdog now runs
+    # inside run_blocking (bound preserved, off the UI thread); in the ASYNC ratchet.
     # MIGRATED 2026-07-16 (commit after 21ce99f): search_segments — unbounded FTS5 MATCH — moved to
     # `pub async fn` + run_blocking (mirrors get_segments); now in test_command_main_thread_policy.py's
     # ASYNC_SLOW_COMMANDS ratchet. Left here as a breadcrumb, not a live entry.

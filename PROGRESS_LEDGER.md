@@ -3840,3 +3840,49 @@ REAL src-tauri/target/release (CARGO_TARGET_DIR unset for this step). Verbatim:
   $ cargo build --release           -> CARGO_REL_EXIT=0   (0 build/LNK errors)
   $ python scripts/check_exe_freshness.py -> EXE FRESHNESS GATE: OK (exe at HEAD 085e11dd149a…, newer than all sources)
 The installed exe now carries tonight's freeze fixes, baked at HEAD 085e11d. No longer stale.
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 4 (Week 1 item 2): get_audio_duration off the main thread
+
+Smallest unblocked freezer left: get_audio_duration (#11) — the "looks-offloaded-but-blocks" one. It
+spawns a probe thread then blocks the CALLER on rx.recv_timeout(30s) (a watchdog bounding a pathological
+decode); the caller was the UI thread. App NOT running; lock held + released.
+
+CHANGE (src-tauri/src/commands.rs): `pub fn` -> `pub async fn`. RATE_LIMITER.check + validate_file_path
+stay eager; the ENTIRE watchdog (channel + probe thread + 30s recv_timeout + the 4-arm match) is wrapped
+in run_blocking(move || {...}).await. Behavior-preserving: same probe thread, same 30s bound, same four
+outcomes/error strings, same detached-thread-on-timeout semantics — only the thread that WAITS on
+recv_timeout moves from the UI thread to a spawn_blocking pool thread. Kept the watchdog rather than
+dropping the timeout (dropping it would let a hung decode hang the promise forever = a behavior change).
+Confirmed get_audio_duration is LIVE (mockInvoke stub in src/main.ts:107 is only the browser-dev
+fallback; real calls go through Tauri IPC).
+
+RATCHETS: added get_audio_duration to test_command_main_thread_policy.py ASYNC_SLOW_COMMANDS; removed
+from test_ui_thread_blocking_audit.py FREEZERS (10 -> 9). docs/UI_THREAD_BLOCKING_AUDIT.md updated
+(51 async / 9 freezers, row struck through).
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR=%TEMP%\cortex-monthloop-target; app not running):
+  $ cargo fmt --check                              -> exit 0 (clean; ran `cargo fmt` to block-wrap the now-more-indented Timeout arm)
+  $ cargo clippy --all-targets -- -D warnings      -> exit 0, 0 warnings
+  $ cargo test --lib                               -> test result: ok. 905 passed; 0 failed; 6 ignored; 0 measured; finished in 59.79s
+  $ python scripts/run_python_policies.py          -> Python policy regressions finished: 33 policy test scripts passed.
+  $ python scripts/test_ui_thread_blocking_audit.py-> async 51 / offloaded 7 / freeze-worklist 9
+
+ADVERSARIAL VERIFY (§3 — commands.rs change, mandatory Workflow): 2 skeptics (behavior-equivalence +
+soundness/resource). behavior-equivalence: refuted=FALSE, none (identical 4 outcomes + 30s bound; only
+the waiter moves main->pool). HONEST NOTE (recurring): the soundness lens again set the refuted BOOLEAN
+to true while its finding text says verbatim "Behavior-preserving and sound; no regression" with ZERO
+defects (Send+'static OK; nothing non-Send across the await; the 30s-timeout thread detach is IDENTICAL
+to the prior sync version so no NEW leak; send_audio_duration_probe_result already tolerates a dropped
+receiver; blocking pool default 512, rate-limited + 30s-bounded so burst pressure is only theoretical;
+frontend i64 contract unchanged). Same boolean-vs-text slip as iteration 3 — recorded as-is. No CONFIRMED
+finding -> nothing to fix.
+
+EXE REBUILD: deferred/batched again. This is 1 new SOURCE change on top of the exe rebuilt last iteration
+(baked 085e11d), so the installed exe is now 1 source-commit stale. Same rationale (behavior-preserving;
+no nightly gate depends on exe freshness). Will rebuild at the next wind-down.
+
+WEEK-1 item 2 PROGRESS: 4 of the original 13 freezers migrated (search_segments, get_champion_engine_status,
+check_agentic_readiness, get_audio_duration); 1 dead (check_external_provider, delete-flagged). REMAINING
+worklist = 9: the 7 cloud-net commands (jury/scribe/DPO/model-download — the biggest, network+consent, need
+their own careful iterations, some may need real async HTTP not just run_blocking), check_external_provider
+(dead), start_champion_engine (#13, MED — detached spawn, near-instant).
