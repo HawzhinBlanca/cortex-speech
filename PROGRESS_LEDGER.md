@@ -4994,3 +4994,46 @@ accrue automatically during owner use — turning the audit's owner-gated timing
 That's a bigger production-code change deserving its own focused iteration. Owner-action queue
 unchanged (speech_segments STRICT owner-gated; champion_supervision, backup_second_dir, DPAPI key
 re-save, native-Sorani review, iPhone Tailscale). exe unchanged (no Rust) — freshness green at night-1.
+
+---
+
+## 2026-07-16T19:37Z — iter 28 — Week 1 — telemetry: span the ASR inference op (real RTF)
+
+**Theme:** Responsiveness / "measure first" (Week-1 item 1: instrument the heavy ops — ASR, hashing,
+export, file IO). **First, an honest scan for real work** (rather than manufacturing any): 0 TODO/
+FIXME markers in the Rust tree; the 6 `#[ignore]`d tests are all owner-gated (need real models / WSL /
+live ELEVENLABS key); the "blanket-instrument every command" idea was rejected as over-engineering —
+the existing 5 TRACER spans correctly sit at heavy-OP boundaries (audio.decode, diff, normalizer,
+pipeline.import_file), not per-command. **The genuine gap:** the item-1 heavy ops themselves —
+asr.rs, export*.rs, models.rs (hashing), eval.rs — had ZERO span coverage. So real timings for the
+heaviest local ops can never accrue. Closing that is chartered, not speculative.
+
+**Change:** `asr.rs` — a SpanGuard at the top of `AsrEngine::transcribe` ("asr.transcribe",
+metadata audio_s), mirroring the existing decode/normalizer/diff guards. Records real inference
+wall-clock on return; the owner derives RTF = duration_ms / (audio_s*1000) from get_recent_spans /
+get_tracing_stats (both already UI-wired). ASR is item-1's #1 op and the most valuable timing for a
+transcription app, so it goes first; one logical change (one op), not a blanket sweep.
+
+**Gate (verbatim, isolated CARGO_TARGET_DIR=…/cortex-monthloop-target):**
+```
+FMT_EXIT=0
+CLIPPY_EXIT=0
+test result: ok. 924 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 64.23s
+Python policy regressions finished: 33 policy test scripts passed.
+GATE_DONE
+```
+No new test (the guard/Tracer is already tested in telemetry/mod.rs; the 3 existing guard call-sites
+have no dedicated test either — testing via a real transcribe needs a loaded model, owner-gated).
+**Adversarial Workflow:** not run — trivial one-line span following a tested, established pattern; the
+compile+clippy+test gate is the verification.
+
+**Commit:** ea526ec. Pushed; main fast-forwarded to ea526ec.
+
+**Honest note on payoff:** the instrumentation is shipped + verified, but the REAL RTF numbers are
+owner-gated — they accrue only on a real transcription run on the owner's machine. **Next increments
+(same item-1 gap, each its own commit):** span the export ops (export_dataset family — per-export, low
+volume), the model-integrity SHA-256 hash (models.rs), and eval. exe unchanged behavior-wise but a
+Rust change landed — a future exe rebuild will include it (freshness gate will flag the exe as behind
+until then; the added span is inert until a real transcribe runs). Owner-action queue unchanged
+(speech_segments STRICT owner-gated; champion_supervision, backup_second_dir, DPAPI key re-save,
+native-Sorani review, iPhone Tailscale).
