@@ -355,6 +355,16 @@ impl KurdishAsrService {
         audio: &[f32],
         sample_rate: u32,
     ) -> Result<(String, Option<f64>, ConfidenceSource), String> {
+        // Telemetry (Week-1 "measure first"): ASR inference is the core per-segment heavy op and had no
+        // span. The guard records real wall-clock on return — divide duration_ms by (audio_s * 1000) for
+        // RTF. Mirrors the existing audio.decode_to_pcm / normalizer / diff guards; the ring self-limits.
+        let _span = crate::telemetry::TRACER.start_span(
+            "asr.transcribe",
+            crate::telemetry::Tracer::metadata(vec![(
+                "audio_s",
+                format!("{:.2}", audio.len() as f64 / SAMPLE_RATE as f64),
+            )]),
+        );
         let recognizer = self.recognizer.as_ref().ok_or("ASR model not loaded")?;
 
         if sample_rate != SAMPLE_RATE {
