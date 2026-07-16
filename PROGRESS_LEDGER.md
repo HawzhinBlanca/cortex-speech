@@ -4311,3 +4311,55 @@ IMPLEMENTATION PLAN (next iteration):
 
 Week-1 state: items 1-4 DONE tonight; item 5 scoped with the blocking constraint resolved on paper.
 Lock released; implementation is the next iteration's single increment.
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 13 (Week 1 item 5): app-owned 7B supervision SHIPPED
+
+Implemented from iteration 12's committed plan. Week-1 item 5 delivered:
+- NEW src-tauri/src/engine_runtime.rs: holds the champion WSL server as an OWNED child (the ps1's own
+  NOTE proves detach dies headless — the app holds wsl.exe itself, which also provides the tree-kill
+  handle). launch_bash_line mirrors the ps1 launch exactly minus nohup/& (exec, same env defaults,
+  same ~/cortex_7b_server.log; wslpath inline — pure, unit-tested). Supervision loop: 15s tick,
+  bounded probe on the blocking pool, SupervisionState::tick (the pre-existing tested policy: 6-min
+  warm-up windows, 2->60s backoff, breaker, GaveUp), Restart -> start held child, disable-edge kills
+  the owned server, GaveUp logged once.
+- settings.champion_supervision_enabled: serde(default)=false + Default entry. DEFAULT OFF — enabling
+  auto-loads a ~30GB server; OWNER-GATED (toggle in settings.json; re-read every tick, no restart
+  needed). Surfaced here as the owner action to activate.
+- lib.rs: loop spawned at setup (idles at one settings read/tick while off); runner converted
+  .run(ctx) -> .build(ctx).run(Exit handler) which calls engine_runtime::begin_shutdown().
+- Cargo.toml: tokio "time" feature added (caught by a RED clippy gate — E0433 tokio::time configured
+  out; fixed at the dependency, gate re-run).
+
+ADVERSARIAL VERIFY (§3 — lifecycle + lib.rs, mandatory Workflow, 2 lenses): BOTH lenses returned
+genuine findings (refuted=true, medium/low) — ALL FIXED BEFORE COMMIT:
+1. MEDIUM Exit-vs-tick race (a tick's Restart could spawn AFTER the Exit handler killed the child):
+   FIXED — SHUTTING_DOWN AtomicBool set by begin_shutdown() before the kill; start_child refuses
+   during shutdown. Regression test start_is_refused_after_begin_shutdown.
+2. MEDIUM over-claim ("must never outlive the app" is false on abnormal exit — no Job Object): FIXED
+   honestly — comments rewritten to best-effort-on-orderly-exit; the orphan/toggle asymmetry and the
+   adopt-on-next-launch mitigation documented in the module doc; Job Object (KILL_ON_JOB_CLOSE) named
+   as the ponytail upgrade path. (The skeptic also verified: no steady-state double server — the
+   server binds early, a second instance dies at listen(); and the manual-ps1-vs-supervision warm-up
+   VRAM race self-heals — now documented.)
+3. LOW sticky trips (after a GaveUp recovered manually, the NEXT independent outage jumped to GaveUp
+   on its first trip): FIXED — on_healthy() now clears trips (flapper-safe: intermittent healthy blips
+   already prevent the breaker from ever tripping); regression test
+   recovery_resets_trips_so_the_next_outage_gets_a_full_budget (first version of my test had wrong
+   loop math — caught it myself tracing the trip accounting, rewrote with a precise construction).
+The lens also confirmed the policy walk: a persistently-dead server costs ~7 bounded spawns over
+~50 min then GaveUp (no hammering); healthy = one 3s-bounded probe/15s; disabled = zero probes.
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR; app not running; FULL re-run after all fixes):
+  $ cargo fmt --check                              -> exit 0
+  $ cargo clippy --all-targets -- -D warnings      -> CLIPPY_EXIT=0  (first run was RED: E0433 tokio::time — fixed via Cargo.toml feature)
+  $ cargo test --lib                               -> test result: ok. 910 passed; 0 failed; 6 ignored (908 + 2 new regression tests)
+  $ python scripts/run_python_policies.py          -> Python policy regressions finished: 33 policy test scripts passed.
+
+OWNER-GATED (surfaced, not faked): the LIVE leg — enabling champion_supervision_enabled and observing
+a real restart-with-backoff of the actual ~30GB server — needs the owner's WSL model environment.
+Everything up to that human step is built and unit-tested; the wiring's real-world behavior claims are
+scoped honestly in the module doc.
+
+*** WEEK 1 COMPLETE: all 5 items (audit, async migration of every wired freezer, nextest, durability
+drill, 7B supervision) shipped in night 1, 13 iterations. *** Exe rebuild for iters 8-13 source
+changes: next entry.

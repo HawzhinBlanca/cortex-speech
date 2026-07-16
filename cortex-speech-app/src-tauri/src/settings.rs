@@ -75,6 +75,11 @@ pub struct AppSettings {
     /// ElevenLabs' API — off by default, like every other cloud gate.
     #[serde(default)]
     pub cloud_stt_opt_in: bool,
+    /// App-owned supervision of the champion 7B WSL server (engine_runtime): the app holds the server
+    /// as an owned child and auto-restarts it per engine_supervisor's backoff/breaker policy, killing
+    /// it on app exit. OFF by default — enabling auto-loads a ~30 GB model server (owner decision).
+    #[serde(default)]
+    pub champion_supervision_enabled: bool,
     #[serde(default = "default_llm_system_prompt")]
     pub llm_system_prompt: String,
     #[serde(default = "default_llm_model")]
@@ -336,6 +341,7 @@ impl Default for AppSettings {
             llm_api_key_configured: false,
             cloud_llm_opt_in: false,
             cloud_stt_opt_in: false,
+            champion_supervision_enabled: false,
             llm_system_prompt: default_llm_system_prompt(),
             llm_model: default_llm_model(),
             external_asr_script_path: "".to_string(),

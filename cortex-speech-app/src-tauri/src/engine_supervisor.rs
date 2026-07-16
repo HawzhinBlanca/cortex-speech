@@ -103,9 +103,13 @@ impl EngineSupervisor {
         self.trips
     }
 
-    /// The engine is confirmed healthy (a probe/start succeeded): clear all failure state.
+    /// The engine is confirmed healthy (a probe/start succeeded): clear all failure state — including
+    /// `trips`, so a recovered engine faces the NEXT outage with the full retry budget rather than a
+    /// history-pinned near-GaveUp state. (A flapping engine can't abuse this: intermittent healthy
+    /// blips already clear `consecutive_failures`, so a flapper never trips the breaker either way.)
     pub fn on_healthy(&mut self) {
         self.consecutive_failures = 0;
+        self.trips = 0;
         self.breaker = Breaker::Closed;
         self.open_until = None;
     }
@@ -275,6 +279,25 @@ mod tests {
             open_cooldown: secs(120),
             max_trips: 3,
         }
+    }
+
+    #[test]
+    fn recovery_resets_trips_so_the_next_outage_gets_a_full_budget() {
+        let mut sup = EngineSupervisor::new(policy());
+        // Trip 1: three consecutive failures open the breaker.
+        for i in 0..3 {
+            sup.on_failure(secs(i));
+        }
+        assert_eq!((sup.trips(), sup.breaker()), (1, Breaker::Open));
+        // Trip 2: the half-open probe fails — 2 of max 3 trips, one shy of GaveUp.
+        sup.on_restart_attempt(secs(500));
+        sup.on_failure(secs(600));
+        assert_eq!((sup.trips(), sup.breaker()), (2, Breaker::Open));
+        // The engine recovers. A later, INDEPENDENT outage must face a fresh trip budget —
+        // not a history-pinned state that jumps to GaveUp on its first trip.
+        sup.on_healthy();
+        assert_eq!(sup.trips(), 0, "confirmed health must clear the trip history");
+        assert_eq!(sup.breaker(), Breaker::Closed);
     }
 
     #[test]

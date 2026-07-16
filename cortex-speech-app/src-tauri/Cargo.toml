@@ -47,7 +47,8 @@ sysinfo = "0.39"
 unicode-normalization = "0.1.23"
 
 # Async runtime
-tokio = { version = "1", features = ["sync"] }
+# "time" for the champion-supervision tick (engine_runtime's tokio::time::sleep) — no net coupling.
+tokio = { version = "1", features = ["sync", "time"] }
 
 # Logging (structured tracing)
 tracing = "0.1"

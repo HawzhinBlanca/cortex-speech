@@ -23,6 +23,7 @@ pub mod db;
 pub mod denoiser;
 pub mod diarization;
 pub mod diff;
+pub mod engine_runtime;
 pub mod engine_supervisor;
 pub mod error;
 pub mod eval;
@@ -715,6 +716,10 @@ pub fn run() {
                 }
             }
 
+            // Champion 7B supervision loop (engine_runtime): idles until the owner enables
+            // champion_supervision_enabled; re-reads the setting every tick.
+            crate::engine_runtime::spawn_supervision_loop(app.handle().clone());
+
             for (label, _window) in app.webview_windows() {
                 tracing::info!("Found webview window: {label}");
                 // `open_devtools` only exists in debug builds, so in release the binding is
@@ -748,8 +753,16 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .unwrap_or_else(|e| fatal_app_error(format!("Tauri application runtime error: {e}")));
+        .build(tauri::generate_context!())
+        .unwrap_or_else(|e| fatal_app_error(format!("Tauri application runtime error: {e}")))
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Best-effort on ORDERLY exit: refuse further supervised starts, then tree-kill the
+                // held champion child. An abnormal app death never reaches this handler — that orphan
+                // case is documented (and adopted-on-next-launch) in engine_runtime's module doc.
+                crate::engine_runtime::begin_shutdown();
+            }
+        });
 }
 
 fn fatal_app_error(message: String) -> ! {
