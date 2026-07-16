@@ -4903,3 +4903,48 @@ full recipe + checklist in docs/STRICT_SPEECH_SEGMENTS_PLAN.md. **With this, eve
 either done or has an honest, proven hand-off.** Owner-action queue otherwise unchanged
 (champion_supervision_enabled, backup_second_dir, DPAPI key re-save, native-Sorani review, iPhone
 Tailscale). exe unchanged this iter (test + doc only) — freshness stays green at the night-1 rebuild.
+
+---
+
+## 2026-07-16T18:30Z — iter 26 — Week 1 — last heavy UI-thread freezer migrated (run_dpo_update)
+
+**Theme:** Responsiveness (Week 1). **Increment:** a fresh re-scan of the freezer worklist (rather
+than trusting the prior "exhausted" note) found two live entries in test_ui_thread_blocking_audit.py:
+`run_dpo_update` and `start_champion_engine`. Checked callers: run_dpo_update is UNWIRED (no `src/`
+invoke) but registered + tested + security-guarded, and its body is a **blocking ~120s outbound HTTP
+POST** on the main thread — the single worst remaining freezer. start_champion_engine IS UI-wired but
+only freezes for detached process-spawn latency (MED). Picked run_dpo_update.
+
+**Change:** `commands.rs` — `run_dpo_update` `pub fn` → `pub async fn` + run_blocking, mirroring
+run_t2_for_segment / run_jury_pipeline. The cloud-LLM consent gate + rate limiter stay EAGER on the
+caller thread (no offload before opt-in); the separate-WAL-connection Database + endpoint move into
+run_blocking so the POST runs on the blocking pool, off the UI thread and without holding lock_db().
+Database is Send (Connection + String). Behavior-preserving (identical error semantics + return
+values). Ratchet bookkeeping: removed from FREEZERS, added to ASYNC_SLOW_COMMANDS; audit doc updated.
+
+**Gate (verbatim, isolated CARGO_TARGET_DIR=…/cortex-monthloop-target):**
+```
+FMT_EXIT=0
+CLIPPY_EXIT=0
+test result: ok. 924 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 65.25s
+Python policy regressions finished: 33 policy test scripts passed.
+GATE_DONE
+```
+(test count unchanged — this migrates an existing command; the python ratchet gates enforce it.)
+
+**Adversarial verification (Workflow, 2 lenses, both NO_ISSUE):** behavior-preservation — error
+semantics identical, run_blocking return threading correct (no double-wrap/stray ?), Database Send +
+'static, endpoint moved in, State not captured across the await; security-ordering — consent +
+rate-limit run eagerly BEFORE any private-data serialize or POST, and the endpoint allow-list +
+build_dpo_dataset + POST live only INSIDE the offloaded jury::learning::run_dpo_update, strictly
+after consent, so the async offload cannot bypass opt-in.
+
+**Commit:** ce96287. Pushed; main fast-forwarded to ce96287.
+
+**Week-1 status:** every heavy freezer is now off the main thread. The ONLY remaining freezer is
+`start_champion_engine` — a detached powershell spawn whose freeze is just process-creation latency
+(MED, UI-wired). Migrating it yields little UX benefit (near-instant), so it's low priority; a future
+iter can migrate it for ratchet-completeness or leave it as the documented MED tail. exe unchanged
+this iter (async signature only, no behavior change) — freshness stays green at the night-1 rebuild.
+Owner-action queue unchanged (speech_segments STRICT owner-gated per iter 25; champion_supervision,
+backup_second_dir, DPAPI key re-save, native-Sorani review, iPhone Tailscale).
