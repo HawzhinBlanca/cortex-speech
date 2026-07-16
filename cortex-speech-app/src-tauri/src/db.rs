@@ -2638,6 +2638,50 @@ mod tests {
     }
 
     #[test]
+    fn disk_full_rolls_back_a_batch_insert_atomically() {
+        // Week-2 disk-full FAULT DRILL. `PRAGMA max_page_count` caps the DB file size; exceeding it
+        // returns SQLITE_FULL — the exact error a full disk raises — so it's a PORTABLE, deterministic
+        // disk-full injection (no VFS shim, no real full disk). The property under test: a batch insert
+        // that hits SQLITE_FULL MID-BATCH must roll back the WHOLE batch (SAVEPOINT batch_insert), never
+        // leave a torn partial batch, keep prior committed rows, and keep the DB consistent.
+        let db = make_db();
+        db.insert_segment(&make_segment("base-1", "/a.wav")).unwrap();
+
+        // Cap at the current size + a tiny headroom so a large batch blows past it after a few rows.
+        let cur_pages: i64 = db.connection().query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+        db.connection().execute_batch(&format!("PRAGMA max_page_count = {}", cur_pages + 4)).unwrap();
+
+        // 500 fat rows (each ~2 KB) — far more than 4 pages of headroom, so the insert (incl. its FTS
+        // trigger writes) hits SQLITE_FULL partway through the batch.
+        let big: Vec<SpeechSegment> = (0..500)
+            .map(|i| {
+                let mut s = make_segment(&format!("full-{i}"), "/a.wav");
+                s.raw_transcript = "پڕ".repeat(1000);
+                s
+            })
+            .collect();
+        let err = db.insert_segments_batch(&big).unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("full") || matches!(err, AppError::Database(_)),
+            "a disk-full mid-batch must surface as an error, not silent success: {err}"
+        );
+
+        // Lift the cap (0 = unlimited) and verify atomic rollback + consistency.
+        db.connection().execute_batch("PRAGMA max_page_count = 0").unwrap();
+        let leaked: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM speech_segments WHERE id LIKE 'full-%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(leaked, 0, "SQLITE_FULL mid-batch must roll back the ENTIRE batch — no torn partial insert");
+        assert!(db.get_segment_by_id("base-1").unwrap().is_some(), "the pre-batch committed row survives disk-full");
+        assert_eq!(db.integrity_check().unwrap(), "ok", "DB stays consistent after a disk-full rollback");
+        // The connection is usable again once space is available.
+        db.insert_segment(&make_segment("after-1", "/a.wav")).unwrap();
+        assert!(db.get_segment_by_id("after-1").unwrap().is_some(), "writes resume after the disk frees up");
+    }
+
+    #[test]
     fn redecision_undo_and_retranscribe_sequence_preserves_or_resets_exactly_as_designed() {
         // Reproduction of the 2026-07-14 live-test data-loss sequence, mechanically, at the DB layer —
         // written BEFORE any fix, per process. The UI flow on an ALREADY-VERIFIED clip was:
