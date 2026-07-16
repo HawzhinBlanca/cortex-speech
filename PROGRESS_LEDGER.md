@@ -3946,3 +3946,14 @@ check_agentic_readiness, get_audio_duration, models_download, models_download_al
 (check_external_provider). REMAINING worklist = 7: 5 cloud-net (run_jury_pipeline, run_t2_for_segment,
 run_dpo_update, transcribe_audio_with_scribe, add_scribe_votes — all consent/key-gated, each a careful
 run_blocking wrap of a blocking client call), check_external_provider (dead), start_champion_engine (MED).
+
+## 2026-07-16 — iteration 5 addendum: shipped exe rebuilt (session checkpoint, 6 freezers)
+
+Burst-end checkpoint rebuild. App confirmed not running; built into the real src-tauri/target/release
+(CARGO_TARGET_DIR unset). Verbatim:
+  $ (npm run build)                       -> VITE_EXIT=0
+  $ cargo build --release                 -> CARGO_REL_EXIT=0  (0 build/LNK errors)
+  $ python scripts/check_exe_freshness.py -> EXE FRESHNESS GATE: OK (exe at HEAD 62913fec247a…, newer than all sources)
+Installed exe now carries all 6 off-thread migrations, baked at 62913fe. (Confirmed earlier this session
+that check_exe_freshness narrows the SHA check to SOURCE changes — a following docs/ledger commit is
+treated HEAD-equivalent, so this note does not un-fresh the exe.)
