@@ -24,6 +24,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = app_data_dir.join("cortex-speech.db");
     info!("Using Database at: {}", db_path.display());
 
+    // Same single-instance lock as the app and batch_importer (the Week-2 write-path audit found this
+    // tool claimed parity but took no lock): never write the live DB concurrently with the running
+    // app — WAL would prevent corruption, but the repo's cross-process discipline is the InstanceLock.
+    let _lock = cortex_speech_app_lib::flock::InstanceLock::try_lock(&app_data_dir)
+        .map_err(|e| format!("another Cortex process holds the data dir: {e}"))?;
+
     // Use open_with_retry + initialize like batch_importer and the app: open() only sets PRAGMAs and
     // creates NO tables/FTS triggers/migrations, so reading or writing against a fresh or stale-schema
     // data dir would fail ("no such table: speech_segments") or silently skip FTS indexing.

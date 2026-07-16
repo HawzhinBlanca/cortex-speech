@@ -4374,3 +4374,46 @@ supervision wiring (dormant until the owner enables champion_supervision_enabled
 OWNER ACTIONS QUEUED (nothing blocking): enable champion_supervision_enabled in settings.json to
 activate 7B supervision (then observe the live restart leg); the check_external_provider deletion
 chip; the pre-existing items (native Sorani review, iPhone Tailscale test, cloud opt-ins).
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 14 (Week 2 pulled forward): write-path audit + 2 fixes
+
+Week 1 complete, so Week-2 item 1 pulled forward: "Audit the real write path: is there a single
+serialized writer? Document what exists." Method: 3 parallel code-mappers (connection inventory /
+write-site inventory / serialization+durability config), every claim file:line-cited; the mappers
+DISAGREED on one fact (task-3 said bin tools are InstanceLock-serialized; task-1 said batch_processor
+has NO lock) — resolved by my own grep: task-1 was right. Deliverable: docs/WRITE_PATH_AUDIT.md.
+
+THE HONEST VERDICT (full detail in the doc): there is NO single app-level serialized writer — BY
+DESIGN. ≥6 concurrent connection classes (global Mutex handle for most IPC writes; jury dedicated;
+pipeline per-op; WSL-7B worker; couch phone-review server thread; snapshot thread read-only; bin tools
+cross-process) all inherit WAL + synchronous=NORMAL + busy_timeout=10000 from the single factory
+(db.rs:241-251), and write serialization is delegated to SQLite's WAL single-writer lock. The
+jury-vs-human logical race is guarded in SQL WHERE clauses (late machine verdict = 0-row no-op), not
+locks. Week-2's "serialize if not" clause: NOT warranted as a quick change — a writer queue is the
+GODMODE-item-4 architecture decision; the drill (30 kills, 0 lost) already proves crash consistency.
+
+GAPS FOUND (concrete): (1) batch_processor took NO InstanceLock despite claiming parity with
+batch_importer — could write the live DB concurrently with the running app; (2) three multi-statement
+invariant families run as autocommit sequences outside transactions (write_segment_verdict 2 stmts;
+jury write_verdict 3; import journal 3 + non-atomic transition_job) — savepoint-wrap follow-ups, one
+gated change each; (3) no BEGIN IMMEDIATE anywhere (deferred-tx COMMIT can hit SQLITE_BUSY — error not
+corruption, low urgency); (4) stale comments claimed app-level open retries in the jury path; (5) no
+app-level SQLITE_BUSY retry (documented, acceptable single-user); (6) default auto-checkpoint only.
+
+FIXED IN THIS COMMIT (the small ones): batch_processor now takes the InstanceLock (3 lines, mirrors
+batch_importer); the misleading "after retries" comment+warn corrected. The savepoint-wrap items are
+follow-ups, each its own gated change.
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR; app not running):
+  $ cargo fmt --check     -> exit 0
+  $ cargo clippy --all-targets -- -D warnings -> CLIPPY_EXIT=0
+  $ cargo test --lib      -> test result: ok. 910 passed; 0 failed; 6 ignored
+  $ run_python_policies   -> 33 policy test scripts passed.
+
+VERIFICATION SCOPING (honest): the doc's contested facts were adversarially resolved by construction
+(3 independent mappers + my hand-verification of the disagreement + spot-checks of WAL config and
+couch's connection); the code fix is 3 lines mirroring an existing pattern, gated above. No separate
+refute-Workflow this iteration — the mapper-disagreement-plus-verification WAS the adversarial pass.
+
+NEXT (Week 2, from the doc's ordered list): scheduled second-directory backup + drilled restore; then
+savepoint-wrapping the invariant families; then the fault drills; then DPAPI keys.

@@ -4794,8 +4794,10 @@ impl JuryDbSource {
             // busy_timeout=10000, which is the actual transient-contention retry we want here.
             match crate::db::Database::open(&self.db_path) {
                 Ok(db) => return f(&db),
+                // One open attempt (SQLite's busy_timeout=10s inside open() is the only retry) —
+                // the write-path audit corrected an older comment that claimed app-level retries.
                 Err(e) => tracing::warn!(
-                    "Jury dedicated db connection open failed after retries ({e}); using the shared handle \
+                    "Jury dedicated db connection open failed ({e}); using the shared handle \
                      (other DB commands may pause during adjudication)"
                 ),
             }
