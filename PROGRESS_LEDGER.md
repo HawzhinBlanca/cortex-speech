@@ -4417,3 +4417,41 @@ refute-Workflow this iteration — the mapper-disagreement-plus-verification WAS
 
 NEXT (Week 2, from the doc's ordered list): scheduled second-directory backup + drilled restore; then
 savepoint-wrapping the invariant families; then the fault drills; then DPAPI keys.
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 15 (Week 2 item 2): second-directory backup + drilled restore
+
+The write-path audit's #1 follow-up: snapshots previously lived ONLY under <data_dir>/snapshots — a
+data-dir/disk loss took the backups with it. App NOT running; lock held + released.
+
+CHANGE:
+- settings.backup_second_dir (serde default "", Default entry) — when set to a directory (ideally
+  another drive), the periodic snapshot thread ALSO rotates snapshots into <second>/snapshots/.
+  OFF by default; OWNER ACTION to activate (set the path in settings.json — re-read every 10-min
+  interval, no restart needed).
+- lib.rs periodic snapshot thread: after the primary snapshot, re-reads settings.json and takes the
+  second-dir snapshot via the SAME take_snapshot machinery (rotation keep=10 + empty-DB guard free).
+  Warn-only, runs AFTER the primary, inside the existing catch_unwind — the primary safety net is
+  strictly unaffected by any second-dir failure (inline adversarial reasoning in the session log:
+  bad path -> warning; path inside data dir -> bounded harmless duplicates; panicking load -> caught
+  + counted by the pre-existing hardening).
+- THE DRILL (repeatable, runs in every gate + nightly nextest): snapshot.rs test
+  second_directory_snapshot_survives_primary_loss_and_restores — 25 real rows on a primary profile ->
+  take_snapshot_at into a SECOND dir -> primary profile DESTROYED -> recovery on a FRESH profile via
+  the PRODUCTION Database::restore (source integrity check + page copy + in-place migration re-run) ->
+  all 25 rows asserted back with content intact.
+
+HONEST GATE HISTORY: first gate run was RED — CLIPPY_EXIT=101 (needless_borrows_for_generic_args in my
+new test; the piped-to-null gate hid the error text, re-ran with output captured). Fixed (1 char),
+full gate re-run green:
+  $ cargo fmt --check   -> FMT_EXIT=0
+  $ cargo clippy --all-targets -- -D warnings -> CLIPPY_EXIT=0
+  $ cargo test --lib    -> test result: ok. 911 passed; 0 failed; 6 ignored
+    (incl. "test snapshot::tests::second_directory_snapshot_survives_primary_loss_and_restores ... ok")
+  $ run_python_policies -> 33 policy test scripts passed. (from the first gate run; no python changed after)
+
+RESTORE-FROM-SECOND-DIR UX note (honest): the in-app restore command (restore_db_from_snapshot) lists
+only <data_dir>/snapshots; recovering from the second dir today = copy the snapshot folder back (or
+use the drilled fresh-profile flow). A picker/命令 for second-dir restore is a small follow-up if the
+owner wants one-click.
+
+NEXT (Week 2): savepoint-wrap the 3 invariant families from the audit; then fault drills; then DPAPI.

@@ -476,10 +476,26 @@ pub fn run() {
             let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // A fresh read connection avoids holding the app's DB mutex for the backup's duration.
                 match Database::open(snap_db_path.to_string_lossy().as_ref()) {
-                    Ok(snap_db) => match crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("periodic DB snapshot failed: {e}"),
-                    },
+                    Ok(snap_db) => {
+                        match crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("periodic DB snapshot failed: {e}"),
+                        }
+                        // Second-directory backup (Week-2): re-read settings.json each interval so the
+                        // owner can point backups at another drive without a restart. Failure here is
+                        // warn-only — it must never break the primary snapshot safety net above.
+                        let second = AppSettings::load(&snap_data_dir.join("settings.json")).backup_second_dir;
+                        if !second.trim().is_empty() {
+                            match crate::snapshot::take_snapshot(
+                                &snap_db,
+                                std::path::Path::new(second.trim()),
+                                SNAPSHOT_KEEP,
+                            ) {
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!("second-directory snapshot failed ({second}): {e}"),
+                            }
+                        }
+                    }
                     Err(e) => tracing::warn!("periodic snapshot: could not open db: {e}"),
                 }
             }));

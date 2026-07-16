@@ -80,6 +80,12 @@ pub struct AppSettings {
     /// it on app exit. OFF by default — enabling auto-loads a ~30 GB model server (owner decision).
     #[serde(default)]
     pub champion_supervision_enabled: bool,
+    /// Second-directory backup (Week-2 storage durability): when set to an absolute directory (ideally
+    /// on ANOTHER drive), the periodic snapshot thread also rotates snapshots into
+    /// `<backup_second_dir>/snapshots/` — so losing the data dir/disk no longer loses the backups too.
+    /// Empty (default) = off. Re-read every snapshot interval; no restart needed.
+    #[serde(default)]
+    pub backup_second_dir: String,
     #[serde(default = "default_llm_system_prompt")]
     pub llm_system_prompt: String,
     #[serde(default = "default_llm_model")]
@@ -342,6 +348,7 @@ impl Default for AppSettings {
             cloud_llm_opt_in: false,
             cloud_stt_opt_in: false,
             champion_supervision_enabled: false,
+            backup_second_dir: String::new(),
             llm_system_prompt: default_llm_system_prompt(),
             llm_model: default_llm_model(),
             external_asr_script_path: "".to_string(),

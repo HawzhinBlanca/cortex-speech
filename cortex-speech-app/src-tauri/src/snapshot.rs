@@ -372,6 +372,52 @@ mod tests {
     }
 
     #[test]
+    fn second_directory_snapshot_survives_primary_loss_and_restores() {
+        // The Week-2 backup/restore DRILL, as a repeatable gate: rows written on a primary profile,
+        // snapshotted into a SECOND directory (another-drive stand-in), the primary destroyed, and the
+        // data recovered into a FRESH profile through the PRODUCTION restore path (integrity check +
+        // page copy + in-place migration re-run). Proves second-dir snapshots are restore-complete.
+        let primary = tempfile::TempDir::new().unwrap();
+        let second = tempfile::TempDir::new().unwrap();
+        let fresh = tempfile::TempDir::new().unwrap();
+
+        // 1. Real rows on the primary.
+        let db_path = primary.path().join(DB_FILE);
+        let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        for i in 0..25 {
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: format!("drill-{i:03}"),
+                audio_path: "/a.wav".to_string(),
+                raw_transcript: format!("ڕیزبەندی {i}"),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        // 2. Snapshot into the SECOND directory (exactly what the periodic thread does when
+        //    backup_second_dir is set): lands under <second>/snapshots/snapshot_<ts>/.
+        let snap = take_snapshot_at(&db, second.path(), 10, 7777).unwrap().expect("non-empty db snapshots");
+        assert!(snap.starts_with(second.path()), "snapshot must live in the second dir: {}", snap.display());
+        drop(db);
+
+        // 3. Destroy the primary profile entirely (disk-loss stand-in).
+        drop(primary);
+
+        // 4. Recover on a fresh profile via the production restore: open+initialize an empty DB, then
+        //    Database::restore from the second-dir snapshot file.
+        let fresh_db_path = fresh.path().join(DB_FILE);
+        let mut recovered = Database::open(fresh_db_path.to_string_lossy().as_ref()).unwrap();
+        recovered.initialize().unwrap();
+        recovered.restore(snap.join(DB_FILE)).expect("restore from the second-dir snapshot");
+
+        // 5. Every row is back, content intact.
+        let rows = recovered.get_segments(None).unwrap();
+        assert_eq!(rows.len(), 25, "all 25 rows must survive the round trip");
+        assert!(rows.iter().any(|s| s.id == "drill-013" && s.raw_transcript == "ڕیزبەندی 13"));
+    }
+
+    #[test]
     fn read_only_segment_count_does_not_mutate_the_frozen_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = seeded_db();
