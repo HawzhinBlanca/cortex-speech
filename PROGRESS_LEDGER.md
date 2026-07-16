@@ -4604,3 +4604,30 @@ parse + row-count verifier) is exercised by the real run itself. No fresh Workfl
 
 WEEK-2 FAULT-DRILL STATUS: kill-during-write DONE (iter 11) · corruption COVERED (existing tests) ·
 mid-export kill DONE (this) · REMAINING: disk-full, missing-media · then DPAPI keys.
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 20 (Week 2): missing-media fault drill — SHIPPED + PASSED
+
+Fault drill #3. Inventory-first (not rebuilt): audio_health detection, relink-by-basename (incl. the
+ambiguity refusal), edit-with-missing-audio, and get_duration_ms-errors-on-missing all have existing
+tests. The UNCOVERED journey was the EXPORT family under missing media — now pinned as a drill test
+(runs in every gate + nightly nextest). App NOT running; lock held + released.
+
+WHAT SHIPPED (export_audio/mod.rs test): missing_media_drill_exports_present_clips_and_reports_missing_
+per_file — a mixed library (2 segments with real WAVs, 2 pointing at deleted files):
+  * audio export DEGRADES, never aborts wholesale: succeeded=2 / failed=2, each missing source a clean
+    per-file "not found" error, exactly 2 clips on disk, metadata.csv + SHA256SUMS covering exactly the
+    exported artifacts;
+  * table export (export_dataset JSON) succeeds with ALL 4 rows — transcripts are audio-independent.
+The graceful design already existed (per-segment error collection, fail-closed manifests) — the drill
+pins it against regression.
+
+VERBATIM GATES: cargo fmt --check exit 0; clippy --all-targets -D warnings exit 0 (CLIPPY_PIPE=0);
+cargo test --lib "916 passed; 0 failed" (incl. the drill test verbatim above); run_python_policies
+"33 policy test scripts passed."
+VERIFICATION SCOPING: a pure test addition pinning existing behavior — no production code changed; the
+gates + the drill's own assertions are the verification. No Workflow — said plainly.
+
+WEEK-2 FAULT-DRILL STATUS: kill-during-write DONE · corruption COVERED · mid-export kill DONE ·
+missing-media DONE · REMAINING: disk-full (genuinely hard to fault-inject portably — candidate
+approaches: tiny VHD/quota dir, or an injectable io::Write wrapper; needs its own design pass) · then
+DPAPI keys · then STRICT tables (staged).

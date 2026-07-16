@@ -427,6 +427,59 @@ mod tests {
     }
 
     #[test]
+    fn missing_media_drill_exports_present_clips_and_reports_missing_per_file() {
+        // Week-2 missing-media FAULT DRILL: with half the library's source audio gone (moved drive,
+        // deleted files), the export family must DEGRADE, never corrupt or abort wholesale:
+        //   * audio export: present clips export; each missing one is a PER-FILE error (clean message,
+        //     no panic); metadata.csv + SHA256SUMS cover exactly the exported artifacts;
+        //   * table export (export_dataset): succeeds with ALL rows — transcripts don't need audio.
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        // Two segments with real WAVs, two pointing at files that do not exist.
+        let present1 = tmp.path().join("ok1.wav");
+        let present2 = tmp.path().join("ok2.wav");
+        make_wav_file(&present1);
+        make_wav_file(&present2);
+        insert_test_segment(&db, "ok-1", &present1);
+        insert_test_segment(&db, "ok-2", &present2);
+        insert_test_segment(&db, "gone-1", &tmp.path().join("deleted1.wav"));
+        insert_test_segment(&db, "gone-2", &tmp.path().join("deleted2.wav"));
+
+        let out = tmp.path().join("audio_out");
+        fs::create_dir_all(&out).unwrap();
+        let options = AudioExportOptions {
+            output_dir: out.to_string_lossy().to_string(),
+            format: AudioExportFormat::Wav,
+            sample_rate: 16000,
+            include_metadata: true,
+        };
+        let ids: Vec<String> = ["ok-1", "ok-2", "gone-1", "gone-2"].iter().map(|s| s.to_string()).collect();
+        let result = export_audio_segments(&db, &ids, &options).expect("mixed export must not abort wholesale");
+
+        assert_eq!(result.succeeded, 2, "both present clips export");
+        assert_eq!(result.failed, 2, "both missing sources are per-file failures");
+        assert_eq!(result.errors.len(), 2);
+        assert!(result.errors.iter().all(|e| e.contains("not found")), "{:?}", result.errors);
+        assert!(result.files.iter().any(|f| f == "metadata.csv"));
+        assert!(result.files.iter().any(|f| f == "SHA256SUMS"));
+        // Exactly the two exported clips exist on disk (plus metadata + manifest).
+        let wavs =
+            fs::read_dir(&out).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".wav"));
+        assert_eq!(wavs.count(), 2, "only the present clips land on disk");
+
+        // Table export is audio-independent: all four rows ship.
+        let table = tmp.path().join("dataset.json");
+        crate::export::export_dataset(&db, &table, &crate::settings::ExportFormat::Json)
+            .expect("table export must succeed with missing media");
+        let text = fs::read_to_string(&table).unwrap();
+        for id in ["ok-1", "ok-2", "gone-1", "gone-2"] {
+            assert!(text.contains(id), "table export must include {id} regardless of audio presence");
+        }
+    }
+
+    #[test]
     fn metadata_csv_reduces_source_path_to_basename_never_leaking_absolute_path() {
         // The shared metadata.csv must publish only the source BASENAME, never the curator's absolute
         // path (which leaks the OS username + directory layout), exactly like the JSON/JSONL/CSV/Parquet/HF
