@@ -71,6 +71,10 @@ ASYNC_SLOW_COMMANDS = [
     "restore_db_from_snapshot",
     # Media cache: multi-GB fs::copy moved off the main thread (async fn; see the ponytail note).
     "register_media_asset",
+    # WSL status probes: shell out to `wsl` (probe_wsl_7b_server TCP probe / `wsl --status`, ~3–10s) —
+    # moved to run_blocking so polling the engine/agentic status pills can't freeze the UI.
+    "get_champion_engine_status",
+    "check_agentic_readiness",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

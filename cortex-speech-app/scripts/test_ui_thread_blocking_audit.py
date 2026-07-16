@@ -48,9 +48,9 @@ FREEZERS: dict[str, tuple[str, str]] = {
     "models_download": ("cloud-net", "synchronous multi-hundred-MB HTTP download (models::ModelManager::download_model)"),
     "models_download_all": ("cloud-net", "synchronous loop of download_model over all missing models"),
     # Subprocess spawns / WSL probes that block the caller.
-    "get_champion_engine_status": ("subprocess", "spawns a WSL TCP probe, blocks ~5s (pipeline::probe_wsl_7b_server)"),
-    "check_external_provider": ("subprocess", "shells out to `wsl --status`, blocks up to 10s (external_provider_status)"),
-    "check_agentic_readiness": ("subprocess", "`wsl --status` (up to 10s) + model_manager.status()"),
+    # DEAD (no caller in src/ or Rust; registered only in the invoke_handler) — left sync on purpose,
+    # flagged for deletion rather than migration; ponytail: don't invest in code that should be deleted.
+    "check_external_provider": ("subprocess", "DEAD (unused) — shells out to `wsl --status` up to 10s (external_provider_status); delete candidate, not a migrate target"),
     "start_champion_engine": ("subprocess", "powershell spawn — detached, so real freeze is just process-creation latency"),
     # Spawns a probe thread but then BLOCKS on recv_timeout(30s) — looks offloaded, is not.
     "get_audio_duration": ("file-io", "spawns a decode probe thread, then blocks on rx.recv_timeout(30s) (audio::get_duration_ms)"),

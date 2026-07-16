@@ -1860,8 +1860,15 @@ pub struct EngineStatus {
 /// Bounded (~5s) health check of the champion 7B engine, for the UI status pill. Cheap + side-effect
 /// free (a TCP probe), so the frontend can poll it.
 #[tauri::command]
-pub fn get_champion_engine_status() -> EngineStatus {
-    EngineStatus { ready: crate::pipeline::probe_wsl_7b_server(3), port: crate::pipeline::WSL_7B_SERVER_PORT }
+pub async fn get_champion_engine_status() -> EngineStatus {
+    // The TCP probe blocks up to ~3s; run it on the blocking pool so the frontend's status-pill poll
+    // never freezes the UI. A JoinError (panic in the probe) is unreachable here — degrade to
+    // not-ready, which is the correct default for a health pill.
+    run_blocking(move || {
+        Ok(EngineStatus { ready: crate::pipeline::probe_wsl_7b_server(3), port: crate::pipeline::WSL_7B_SERVER_PORT })
+    })
+    .await
+    .unwrap_or(EngineStatus { ready: false, port: crate::pipeline::WSL_7B_SERVER_PORT })
 }
 
 /// Start the champion 7B server (WSL) FROM THE APP so the owner never hand-runs a terminal. Spawns
@@ -2070,15 +2077,22 @@ pub fn check_external_provider(state: State<'_, AppState>) -> Result<serde_json:
 }
 
 #[tauri::command]
-pub fn check_agentic_readiness(state: State<'_, AppState>) -> Result<AgenticReadiness, String> {
+pub async fn check_agentic_readiness(state: State<'_, AppState>) -> Result<AgenticReadiness, String> {
     RATE_LIMITER.check("check_agentic_readiness")?;
+    // Grab the two cheap, lock-guarded inputs on the caller thread (a settings clone + a bounded
+    // model-file stat), then run the SLOW part off the UI thread: external_provider_status shells out
+    // to `wsl --status` (bounded at ~10s but that still froze the readiness poll). No lock is held
+    // across the await — both guards are released before run_blocking.
     let settings = state.lock_settings().clone();
     let model_status = {
         let model_manager = state.lock_model_manager();
         model_manager.status()
     };
-    let external_provider = external_provider_status(&settings);
-    Ok(build_agentic_readiness(&settings, &model_status, &external_provider))
+    run_blocking(move || {
+        let external_provider = external_provider_status(&settings);
+        Ok(build_agentic_readiness(&settings, &model_status, &external_provider))
+    })
+    .await
 }
 
 #[tauri::command]

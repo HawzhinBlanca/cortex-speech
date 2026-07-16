@@ -27,13 +27,19 @@ not keyword-guessed:
 
 ## Ranked worklist — sync commands that block the UI thread (migrate first)
 
-Count of the current split (updated as the migration lands): **48 async** (off the main thread) ·
-**7 sync-but-offloaded** (safe) · **12 sync-and-blocking** (below) · the remaining ~62 sync commands
+Count of the current split (updated as the migration lands): **50 async** (off the main thread) ·
+**7 sync-but-offloaded** (safe) · **10 sync-and-blocking** (below) · the remaining ~62 sync commands
 are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a freeze risk).
 
-**Migration progress (Week-1 item 2):** ✅ `search_segments` — migrated 2026-07-16 to `pub async fn`
-+ `run_blocking` (mirrors `get_segments`), now in the `test_command_main_thread_policy.py` ratchet.
-Row #12 below is kept for the record, struck through.
+**Migration progress (Week-1 item 2), all 2026-07-16:**
+- ✅ `search_segments` (#12) → `pub async fn` + `run_blocking` (mirrors `get_segments`).
+- ✅ `get_champion_engine_status` (#8) → `async` + `run_blocking` (probe off the UI thread; infallible
+  signature kept via `unwrap_or` on the unreachable JoinError).
+- ✅ `check_agentic_readiness` (#10) → `async`; settings clone + bounded model-stat taken on the caller
+  thread, the slow `wsl --status` probe moved to `run_blocking`.
+- 🗑️ `check_external_provider` (#9) is **dead** (registered, but no caller in `src/` or Rust) — left sync
+  and flagged for deletion rather than migrated (don't invest in code that should be deleted).
+Migrated rows below are struck through.
 
 | # | command | class | severity | heaviest op (traced) | consent/key gate |
 |---|---------|-------|----------|----------------------|------------------|
@@ -44,9 +50,9 @@ Row #12 below is kept for the record, struck through.
 | 5 | `add_scribe_votes` | cloud-net | **HIGH** | per-segment decode/slice + ElevenLabs POST **loop** → `scribe_api::transcribe_wav_bytes` | cloud-STT opt-in |
 | 6 | `models_download` | cloud-net | **HIGH** | synchronous **multi-hundred-MB** HTTP download → `ModelManager::download_model` | — |
 | 7 | `models_download_all` | cloud-net | **HIGH** | synchronous loop of `download_model` over all missing models | — |
-| 8 | `get_champion_engine_status` | subprocess | **HIGH** | spawns a WSL TCP probe, blocks ~5 s → `pipeline::probe_wsl_7b_server` | — |
-| 9 | `check_external_provider` | subprocess | **HIGH** | shells out to `wsl --status`, blocks up to 10 s → `external_provider_status` | — |
-| 10 | `check_agentic_readiness` | subprocess | **HIGH** | `wsl --status` (up to 10 s) + `model_manager.status()` | — |
+| ~~8~~ | ~~`get_champion_engine_status`~~ ✅ migrated | subprocess | ~~HIGH~~ | ~~WSL TCP probe~~ — now `async` + `run_blocking` | — |
+| 9 | `check_external_provider` 🗑️ dead | subprocess | HIGH | shells out to `wsl --status` up to 10 s → `external_provider_status` — **unused, delete candidate** | — |
+| ~~10~~ | ~~`check_agentic_readiness`~~ ✅ migrated | subprocess | ~~HIGH~~ | ~~`wsl --status` + model stat~~ — now `async`, probe on `run_blocking` | — |
 | 11 | `get_audio_duration` | file-io | **HIGH** | spawns a decode probe thread, then **blocks on `rx.recv_timeout(30 s)`** → `audio::get_duration_ms` | — |
 | ~~12~~ | ~~`search_segments`~~ ✅ migrated | db-scan | ~~HIGH~~ | ~~unbounded FTS5 `MATCH`~~ — now `async` + `run_blocking` (off the main thread) | — |
 | 13 | `start_champion_engine` | subprocess | MED | `powershell … spawn()` — **detached**, so the real freeze is only process-creation latency | — |
@@ -89,8 +95,9 @@ ratchet as it lands:
 1. **Cloud-net cluster (#1–#7)** — highest user-visible freeze (up to ~120 s). These already drop the
    DB lock; the remaining fix is to stop holding the *main thread* across the network wait. Group them
    because they share the jury/scribe/download helper shape.
-2. **WSL status getters (#8–#10)** — small, self-contained, and polled from the UI, so migrating them
-   removes recurring micro-freezes; good early wins.
+2. ✅ **WSL status getters (#8–#10)** — DONE 2026-07-16 for the two live ones (`get_champion_engine_status`,
+   `check_agentic_readiness`): the `wsl`/probe work runs on `run_blocking`, off the polled UI thread.
+   `check_external_provider` (#9) turned out **dead** (no caller) → flagged for deletion, not migrated.
 3. **`get_audio_duration` (#11)** — drop the synchronous `recv_timeout`; make the command async and
    await the probe.
 4. ✅ **`search_segments` (#12)** — DONE 2026-07-16: mirrored its already-migrated siblings (`async` +

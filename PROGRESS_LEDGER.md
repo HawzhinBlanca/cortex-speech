@@ -3781,3 +3781,52 @@ installed exe is therefore one commit stale until the batched rebuild — surfac
 
 NEXT: continue the cloud-net freezer cluster or the WSL status-getter cluster (both unblocked); rebuild the
 exe once before winding down the session.
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 3 (Week 1 item 2): WSL status-getter cluster off the main thread
+
+Continued item 2 with the WSL status-getter cluster (freezers #8–#10 in the audit). These are polled
+status pills that each shell out to WSL and block the UI 3–10s. App NOT running; lock held + released.
+
+CHANGE (src-tauri/src/commands.rs) — the two LIVE ones migrated to `pub async fn` + run_blocking:
+- get_champion_engine_status: probe_wsl_7b_server(3) (a ~3s TCP probe) moved to run_blocking. Return
+  type kept EXACTLY as EngineStatus (infallible) via `.unwrap_or(EngineStatus{ready:false,..})` on the
+  unreachable JoinError — zero frontend change (invoke<EngineStatus> unchanged).
+- check_agentic_readiness: settings clone + the bounded model_manager.status() taken on the caller
+  thread (fast, lock-guarded), then the SLOW external_provider_status (`wsl --status`, ~10s) + build
+  moved to run_blocking. Effect order preserved; both MutexGuards drop before the await.
+
+DEAD-CODE FINDING (surfaced, not migrated): check_external_provider (#9) is registered in the
+invoke_handler (lib.rs:614) but has NO caller anywhere — `grep -rn check_external_provider src/` is
+empty and the only Rust refs are its own def + the registration. Ponytail: don't invest in migrating
+code that should be deleted. Left it sync, annotated it in the audit FREEZERS as a delete-candidate,
+and spawned an owner task (task_a9d95cda) to delete it + its registration. NOT deleted here (deleting a
+registered IPC command is its own scoped change; surfaced per doctrine, owner decides).
+
+RATCHETS: added get_champion_engine_status + check_agentic_readiness to test_command_main_thread_policy.py
+ASYNC_SLOW_COMMANDS (NOT RUN_BLOCKING_COMMANDS — that list's test requires state.db_arc(), which these
+WSL commands don't use). Removed both from test_ui_thread_blocking_audit.py FREEZERS (12 -> 10).
+docs/UI_THREAD_BLOCKING_AUDIT.md updated: 50 async / 10 freezers, rows struck through, dead #9 annotated.
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR=%TEMP%\cortex-monthloop-target; app not running):
+  $ cargo fmt --check                              -> exit 0 (clean)
+  $ cargo clippy --all-targets -- -D warnings      -> exit 0, 0 warnings
+  $ cargo test --lib                               -> test result: ok. 905 passed; 0 failed; 6 ignored; 0 measured; finished in 59.32s
+  $ python scripts/run_python_policies.py          -> Python policy regressions finished: 33 policy test scripts passed.
+  $ python scripts/test_ui_thread_blocking_audit.py-> async 50 / offloaded 7 / freeze-worklist 10
+
+ADVERSARIAL VERIFY (§3 — commands.rs change, mandatory Workflow): 2 skeptics (behavior-equivalence +
+soundness/contract). behavior-equivalence: refuted=FALSE, none. HONEST NOTE: the soundness lens set the
+refuted BOOLEAN to true but its finding text says verbatim "Migration is sound; no contract or soundness
+break" and lists ZERO defects (Send+'static satisfied; no MutexGuard held across the await — the
+model_manager guard is scoped in its own {} block that closes before .await; invoke_handler + frontend
+contract unchanged; and the green clippy compile-time-enforces exactly those constraints). So on
+SUBSTANCE both verdicts confirm no defect; the refuted=true was a mislabel contradicted by its own text.
+Recorded as-is rather than smoothed over. No CONFIRMED finding -> nothing to fix.
+
+EXE REBUILD: still DEFERRED/batched (now 3 committed shipped-behavior changes across iters 2–3: search
++ 2 WSL getters). Same rationale as iter 2 — no nightly gate depends on exe freshness (only
+make ship-check-local). Will rebuild ONCE before winding the session down; installed exe is N commits
+stale until then, surfaced honestly.
+
+NEXT: remaining freezers = cloud-net cluster (#1–7), get_audio_duration (#11), start_champion_engine (#13,
+low). Then the batched exe rebuild.
