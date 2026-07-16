@@ -82,6 +82,9 @@ ASYNC_SLOW_COMMANDS = [
     # run_blocking so the model panel doesn't freeze for the whole download.
     "models_download",
     "models_download_all",
+    # Cloud STT: the blocking ElevenLabs Scribe upload+POST moved to run_blocking; the consent + key +
+    # DB-membership gates stay EAGER on the caller thread (never offload before the privacy check).
+    "transcribe_audio_with_scribe",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

@@ -43,7 +43,8 @@ FREEZERS: dict[str, tuple[str, str]] = {
     "run_jury_pipeline": ("cloud-net", "T0/T1/T2 chain; T2 = Gemini audio round-trips (run_jury_pipeline_core_via)"),
     "run_t2_for_segment": ("cloud-net", "N>=3 Gemini audio calls (jury::t2_listener::listen_and_judge_via)"),
     "run_dpo_update": ("cloud-net", "outbound HTTP POST, ~120s cap on a stalled endpoint (jury::learning::run_dpo_update)"),
-    "transcribe_audio_with_scribe": ("cloud-net", "audio decode + ElevenLabs Scribe POST (scribe_transcribe_clip)"),
+    # MIGRATED 2026-07-16: transcribe_audio_with_scribe — blocking Scribe POST moved to run_blocking
+    # (consent/key/DB gates stay eager); in the ASYNC ratchet.
     "add_scribe_votes": ("cloud-net", "per-segment decode/slice + ElevenLabs POST loop (scribe_api::transcribe_wav_bytes)"),
     # MIGRATED 2026-07-16: models_download + models_download_all — blocking HTTP download moved to
     # run_blocking; in the ASYNC ratchet.

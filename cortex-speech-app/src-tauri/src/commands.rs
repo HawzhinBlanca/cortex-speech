@@ -4101,7 +4101,7 @@ fn scribe_transcribe_clip(audio_path: &str, alignment_json: Option<&str>, key: &
 /// Transcribe ONE imported segment's clip with ElevenLabs Scribe (verified working for Sorani). Uses the
 /// locally configured ELEVENLABS_API_KEY; errors clearly if it is absent. Returns the transcription text.
 #[tauri::command]
-pub fn transcribe_audio_with_scribe(
+pub async fn transcribe_audio_with_scribe(
     audio_path: String,
     alignment_json: Option<String>,
     state: State<'_, AppState>,
@@ -4123,7 +4123,11 @@ pub fn transcribe_audio_with_scribe(
     let key = crate::api_keys::ApiKeys::load(&data_dir)
         .elevenlabs
         .ok_or_else(|| "No ElevenLabs API key configured — add ELEVENLABS_API_KEY to secrets.env".to_string())?;
-    scribe_transcribe_clip(&audio_path, alignment_json.as_deref(), &key)
+    // The blocking ElevenLabs upload+POST runs on the blocking pool so the UI thread stays responsive.
+    // Every privacy/validation gate above (STT consent, DB-membership via ensure_imported, key present)
+    // already ran EAGERLY on the caller thread, so an un-opted-in or unvalidated request is rejected
+    // before any audio is offloaded or leaves the device.
+    run_blocking(move || scribe_transcribe_clip(&audio_path, alignment_json.as_deref(), &key)).await
 }
 
 /// Model id for the independent ElevenLabs Scribe vote. Scribe is architecturally INDEPENDENT of the

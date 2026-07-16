@@ -3957,3 +3957,47 @@ Burst-end checkpoint rebuild. App confirmed not running; built into the real src
 Installed exe now carries all 6 off-thread migrations, baked at 62913fe. (Confirmed earlier this session
 that check_exe_freshness narrows the SHA check to SOURCE changes — a following docs/ledger commit is
 treated HEAD-equivalent, so this note does not un-fresh the exe.)
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 6 (Week 1 item 2): Scribe cloud STT off the main thread
+
+First of the consent-gated cloud cluster: transcribe_audio_with_scribe (freezer #4) — the cleanest
+(single blocking Scribe upload+POST). PRIVACY-SENSITIVE (audio leaves the device), so the migration was
+done with the consent gate as the first-class concern. App NOT running; lock held + released.
+
+CHANGE (src-tauri/src/commands.rs): `pub fn` -> `pub async fn`. Body IDENTICAL through the key load —
+STRICT_RATE_LIMITER.check, require_cloud_stt_consent, ensure_imported (DB-membership: only
+already-imported audio may be uploaded, never an arbitrary webview path), data_dir, ElevenLabs key —
+ALL stay EAGER on the caller thread. Only the final blocking call is wrapped:
+`run_blocking(move || scribe_transcribe_clip(&audio_path, alignment_json.as_deref(), &key)).await`
+(audio_path/alignment_json/key are owned, move in). Because every gate precedes the single .await, an
+un-opted-in call returns Err BEFORE spawn_blocking is reached — no task, no network. ensure_imported
+shadows audio_path, so the DB-validated path (not the raw webview arg) is what's offloaded.
+
+RATCHETS: added transcribe_audio_with_scribe to test_command_main_thread_policy.py ASYNC_SLOW_COMMANDS;
+removed from test_ui_thread_blocking_audit.py FREEZERS (7 -> 6). docs/UI_THREAD_BLOCKING_AUDIT.md updated
+(54 async / 6 freezers, row struck).
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR=%TEMP%\cortex-monthloop-target; app not running):
+  $ cargo fmt --check                              -> exit 0 (clean)
+  $ cargo clippy --all-targets -- -D warnings      -> exit 0, 0 warnings
+  $ cargo test --lib                               -> test result: ok. 905 passed; 0 failed; 6 ignored; 0 measured; finished in 61.80s
+  $ python scripts/run_python_policies.py          -> Python policy regressions finished: 33 policy test scripts passed.
+  $ python scripts/test_ui_thread_blocking_audit.py-> async 54 / offloaded 7 / freeze-worklist 6
+
+ADVERSARIAL VERIFY (§3 — commands.rs change + PRIVACY path, mandatory Workflow): 2 skeptics, a dedicated
+privacy-gate-ordering lens + behavior/soundness. privacy-gate-ordering: refuted=FALSE, none — consent +
+DB-membership + key all run EAGERLY before the single .await; an un-opted-in call returns Err at the
+consent check without spawn_blocking ever being reached; ensure_imported shadows audio_path so only the
+DB-validated path is offloaded; gate preserved unweakened. behavior/soundness: text confirms
+"Behavior-equivalence and soundness hold; no regression" (all four cases identical; Send+'static; no lock
+across await; contract unchanged) though it again set the refuted BOOLEAN to true (recurring slip,
+contradicted by its own zero-defect finding). No CONFIRMED finding -> nothing to fix.
+
+EXE REBUILD: deferred/batched (1 new source change on top of the exe at 62913fe). Rebuild at next
+wind-down.
+
+WEEK-1 item 2 PROGRESS: 7 of the original 13 freezers migrated (search_segments, get_champion_engine_status,
+check_agentic_readiness, get_audio_duration, models_download, models_download_all,
+transcribe_audio_with_scribe); 1 dead (check_external_provider). REMAINING worklist = 6: 4 cloud-net
+(run_jury_pipeline, run_t2_for_segment, run_dpo_update, add_scribe_votes — all consent-gated), the dead
+check_external_provider, and start_champion_engine (MED).

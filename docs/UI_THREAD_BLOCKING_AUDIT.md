@@ -27,8 +27,8 @@ not keyword-guessed:
 
 ## Ranked worklist — sync commands that block the UI thread (migrate first)
 
-Count of the current split (updated as the migration lands): **53 async** (off the main thread) ·
-**7 sync-but-offloaded** (safe) · **7 sync-and-blocking** (below) · the remaining ~62 sync commands
+Count of the current split (updated as the migration lands): **54 async** (off the main thread) ·
+**7 sync-but-offloaded** (safe) · **6 sync-and-blocking** (below) · the remaining ~62 sync commands
 are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a freeze risk).
 
 **Migration progress (Week-1 item 2), all 2026-07-16:**
@@ -41,6 +41,9 @@ are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a
   inside `run_blocking` (bound preserved, off the UI thread).
 - ✅ `models_download` (#6) + `models_download_all` (#7) → `async`; the multi-hundred-MB blocking HTTP
   download (and, for `_all`, the whole missing-model loop + progress emits) moved into `run_blocking`.
+- ✅ `transcribe_audio_with_scribe` (#4) → `async`; the blocking ElevenLabs Scribe upload moved into
+  `run_blocking` while **every privacy gate (STT consent, DB-membership, key) stays eager** on the
+  caller thread — an un-opted-in request is still rejected before any audio is offloaded.
 - 🗑️ `check_external_provider` (#9) is **dead** (registered, but no caller in `src/` or Rust) — left sync
   and flagged for deletion rather than migrated (don't invest in code that should be deleted).
 Migrated rows below are struck through.
@@ -50,7 +53,7 @@ Migrated rows below are struck through.
 | 1 | `run_jury_pipeline` | cloud-net | **HIGH** | T0→T1→T2 chain; T2 = Gemini audio round-trips → `run_jury_pipeline_core_via` | cloud-LLM opt-in |
 | 2 | `run_t2_for_segment` | cloud-net | **HIGH** | N≥3 Gemini audio calls → `jury::t2_listener::listen_and_judge_via` | cloud-LLM opt-in |
 | 3 | `run_dpo_update` | cloud-net | **HIGH** | outbound HTTP POST, **~120 s** cap on a stalled endpoint → `jury::learning::run_dpo_update` | cloud-LLM opt-in |
-| 4 | `transcribe_audio_with_scribe` | cloud-net | **HIGH** | audio decode + ElevenLabs Scribe POST → `scribe_transcribe_clip` | cloud-STT opt-in |
+| ~~4~~ | ~~`transcribe_audio_with_scribe`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~ElevenLabs Scribe POST~~ — now `async` + `run_blocking` (consent gate stays eager) | cloud-STT opt-in |
 | 5 | `add_scribe_votes` | cloud-net | **HIGH** | per-segment decode/slice + ElevenLabs POST **loop** → `scribe_api::transcribe_wav_bytes` | cloud-STT opt-in |
 | ~~6~~ | ~~`models_download`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~multi-hundred-MB HTTP download~~ — now `async` + `run_blocking` | — |
 | ~~7~~ | ~~`models_download_all`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~download loop~~ — now `async`; whole loop + emits in `run_blocking` | — |
