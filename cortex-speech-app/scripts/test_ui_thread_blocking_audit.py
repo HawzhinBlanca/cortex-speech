@@ -45,8 +45,8 @@ FREEZERS: dict[str, tuple[str, str]] = {
     "run_dpo_update": ("cloud-net", "outbound HTTP POST, ~120s cap on a stalled endpoint (jury::learning::run_dpo_update)"),
     "transcribe_audio_with_scribe": ("cloud-net", "audio decode + ElevenLabs Scribe POST (scribe_transcribe_clip)"),
     "add_scribe_votes": ("cloud-net", "per-segment decode/slice + ElevenLabs POST loop (scribe_api::transcribe_wav_bytes)"),
-    "models_download": ("cloud-net", "synchronous multi-hundred-MB HTTP download (models::ModelManager::download_model)"),
-    "models_download_all": ("cloud-net", "synchronous loop of download_model over all missing models"),
+    # MIGRATED 2026-07-16: models_download + models_download_all — blocking HTTP download moved to
+    # run_blocking; in the ASYNC ratchet.
     # Subprocess spawns / WSL probes that block the caller.
     # DEAD (no caller in src/ or Rust; registered only in the invoke_handler) — left sync on purpose,
     # flagged for deletion rather than migration; ponytail: don't invest in code that should be deleted.

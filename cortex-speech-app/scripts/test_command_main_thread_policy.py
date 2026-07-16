@@ -78,6 +78,10 @@ ASYNC_SLOW_COMMANDS = [
     # Audio-duration watchdog: probe thread + 30s recv_timeout — the whole watchdog now runs on the
     # blocking pool so the recv no longer blocks the UI thread (bound preserved).
     "get_audio_duration",
+    # Model downloads: multi-hundred-MB blocking HTTP fetch (single + download-all loop) — moved to
+    # run_blocking so the model panel doesn't freeze for the whole download.
+    "models_download",
+    "models_download_all",
 ]
 
 # Commands whose blocking body must run on the spawn_blocking pool (not inline on a tokio worker).

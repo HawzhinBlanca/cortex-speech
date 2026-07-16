@@ -27,8 +27,8 @@ not keyword-guessed:
 
 ## Ranked worklist — sync commands that block the UI thread (migrate first)
 
-Count of the current split (updated as the migration lands): **51 async** (off the main thread) ·
-**7 sync-but-offloaded** (safe) · **9 sync-and-blocking** (below) · the remaining ~62 sync commands
+Count of the current split (updated as the migration lands): **53 async** (off the main thread) ·
+**7 sync-but-offloaded** (safe) · **7 sync-and-blocking** (below) · the remaining ~62 sync commands
 are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a freeze risk).
 
 **Migration progress (Week-1 item 2), all 2026-07-16:**
@@ -39,6 +39,8 @@ are trivial in-memory getters/setters or single-row DB reads/writes (fast, not a
   thread, the slow `wsl --status` probe moved to `run_blocking`.
 - ✅ `get_audio_duration` (#11) → `async`; the probe-thread + 30 s `recv_timeout` watchdog now runs
   inside `run_blocking` (bound preserved, off the UI thread).
+- ✅ `models_download` (#6) + `models_download_all` (#7) → `async`; the multi-hundred-MB blocking HTTP
+  download (and, for `_all`, the whole missing-model loop + progress emits) moved into `run_blocking`.
 - 🗑️ `check_external_provider` (#9) is **dead** (registered, but no caller in `src/` or Rust) — left sync
   and flagged for deletion rather than migrated (don't invest in code that should be deleted).
 Migrated rows below are struck through.
@@ -50,8 +52,8 @@ Migrated rows below are struck through.
 | 3 | `run_dpo_update` | cloud-net | **HIGH** | outbound HTTP POST, **~120 s** cap on a stalled endpoint → `jury::learning::run_dpo_update` | cloud-LLM opt-in |
 | 4 | `transcribe_audio_with_scribe` | cloud-net | **HIGH** | audio decode + ElevenLabs Scribe POST → `scribe_transcribe_clip` | cloud-STT opt-in |
 | 5 | `add_scribe_votes` | cloud-net | **HIGH** | per-segment decode/slice + ElevenLabs POST **loop** → `scribe_api::transcribe_wav_bytes` | cloud-STT opt-in |
-| 6 | `models_download` | cloud-net | **HIGH** | synchronous **multi-hundred-MB** HTTP download → `ModelManager::download_model` | — |
-| 7 | `models_download_all` | cloud-net | **HIGH** | synchronous loop of `download_model` over all missing models | — |
+| ~~6~~ | ~~`models_download`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~multi-hundred-MB HTTP download~~ — now `async` + `run_blocking` | — |
+| ~~7~~ | ~~`models_download_all`~~ ✅ migrated | cloud-net | ~~HIGH~~ | ~~download loop~~ — now `async`; whole loop + emits in `run_blocking` | — |
 | ~~8~~ | ~~`get_champion_engine_status`~~ ✅ migrated | subprocess | ~~HIGH~~ | ~~WSL TCP probe~~ — now `async` + `run_blocking` | — |
 | 9 | `check_external_provider` 🗑️ dead | subprocess | HIGH | shells out to `wsl --status` up to 10 s → `external_provider_status` — **unused, delete candidate** | — |
 | ~~10~~ | ~~`check_agentic_readiness`~~ ✅ migrated | subprocess | ~~HIGH~~ | ~~`wsl --status` + model stat~~ — now `async`, probe on `run_blocking` | — |
@@ -94,9 +96,12 @@ Behaviour-preserving `pub async fn` + `run_blocking` (or a real async HTTP clien
 ones), a few per run, each with a test, each added to the `test_command_main_thread_policy.py`
 ratchet as it lands:
 
-1. **Cloud-net cluster (#1–#7)** — highest user-visible freeze (up to ~120 s). These already drop the
-   DB lock; the remaining fix is to stop holding the *main thread* across the network wait. Group them
-   because they share the jury/scribe/download helper shape.
+1. **Cloud-net cluster (#1–#7)** — highest user-visible freeze (up to ~120 s). ✅ The model-download
+   pair (#6 `models_download`, #7 `models_download_all`) is DONE 2026-07-16 (no consent gate — just a
+   blocking HTTP fetch, wrapped in `run_blocking`). Remaining #1–#5 are the jury/scribe/DPO commands:
+   they already drop the DB lock; the fix is to stop holding the *main thread* across the network wait
+   (a `run_blocking` wrap of the blocking client call — they're consent/key-gated, so each needs its own
+   careful pass).
 2. ✅ **WSL status getters (#8–#10)** — DONE 2026-07-16 for the two live ones (`get_champion_engine_status`,
    `check_agentic_readiness`): the `wsl`/probe work runs on `run_blocking`, off the polled UI thread.
    `check_external_provider` (#9) turned out **dead** (no caller) → flagged for deletion, not migrated.

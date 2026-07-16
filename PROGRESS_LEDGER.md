@@ -3898,3 +3898,51 @@ The installed exe now carries all 4 off-thread migrations, baked at 538b6b6. (As
 rebuild note: THIS ledger commit will sit one docs-only commit ahead of the baked SHA — no source delta,
 so the binary is functionally at-HEAD; next iteration should trust check_exe_freshness, not this prose,
 to decide if a rebuild is pending.)
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 5 (Week 1 item 2): model downloads off the main thread
+
+Started the cloud-net cluster with the cleanest, consent-free pair: models_download + models_download_all
+(freezers #6/#7). These fetch multi-hundred-MB ASR models over blocking HTTP synchronously on the UI
+thread (the model panel froze for the whole download). NOT a privacy/consent path (downloading local ASR
+models from a model host, not sending user audio to a cloud judge) — so no consent-gate complexity. App
+NOT running; lock held + released.
+
+CHANGE (src-tauri/src/commands.rs), both `pub fn` -> `pub async fn`:
+- models_download: STRICT_RATE_LIMITER.check + the MODELS lookup + unknown-filename error stay eager;
+  the download call is wrapped in run_blocking. `model` is &'static ModelInfo (models::MODELS is a const
+  &'static slice) so it moves into the task freely.
+- models_download_all: clone mm on the caller thread (needs the lock), then the ENTIRE remaining body —
+  the mm.missing_models()/downloadable_missing_models() queries, total/skipped, the early 0-return, the
+  started/progress/completed emit_or_log events, and the download loop — runs inside run_blocking. Doing
+  the mm queries INSIDE the closure keeps `missing` (a Vec<&ModelInfo> whose elided lifetime ties to
+  &mm) borrowing the closure-local mm, so nothing borrowing mm escapes across the await. Behavior
+  identical: same event stream/fields/order, same summary json, same tally.
+
+RATCHETS: added models_download + models_download_all to test_command_main_thread_policy.py
+ASYNC_SLOW_COMMANDS; removed both from test_ui_thread_blocking_audit.py FREEZERS (9 -> 7).
+docs/UI_THREAD_BLOCKING_AUDIT.md updated (53 async / 7 freezers, rows struck through).
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR=%TEMP%\cortex-monthloop-target; app not running):
+  $ cargo fmt --check                              -> exit 0 (clean; ran `cargo fmt` to reindent the wrapped body)
+  $ cargo clippy --all-targets -- -D warnings      -> exit 0, 0 warnings
+  $ cargo test --lib                               -> test result: ok. 905 passed; 0 failed; 6 ignored; 0 measured; finished in 62.15s
+  $ python scripts/run_python_policies.py          -> Python policy regressions finished: 33 policy test scripts passed.
+  $ python scripts/test_ui_thread_blocking_audit.py-> async 53 / offloaded 7 / freeze-worklist 7
+
+ADVERSARIAL VERIFY (§3 — commands.rs change, mandatory Workflow): 2 skeptics (behavior-equivalence +
+soundness/lifetimes) BOTH refuted=FALSE, severity=none (both booleans correct this time — no slip).
+Confirmed: eager gate ordering; identical events/return/tally; the KEY lifetime point — `missing`
+borrows the closure-local mm, used+dropped before the closure returns an owned Value, nothing escapes
+the await; Send+'static holds (ModelInfo has only &'static str/u64 fields); no new panic path (JoinError
+only on closure panic; download_model returns Result, every failure tallied). No CONFIRMED finding.
+
+EXE REBUILD: deferred/batched. 2 new SOURCE changes on top of the exe rebuilt at 538b6b6, so the exe is
+now 1 source-commit stale (this iter's commit). Same rationale (behavior-preserving; no nightly gate
+depends on freshness — check_exe_freshness runs only under make ship-check-local, and it now correctly
+treats docs-only HEAD advances as HEAD-equivalent). Will rebuild at the next wind-down.
+
+WEEK-1 item 2 PROGRESS: 6 of the original 13 freezers migrated (search_segments, get_champion_engine_status,
+check_agentic_readiness, get_audio_duration, models_download, models_download_all); 1 dead
+(check_external_provider). REMAINING worklist = 7: 5 cloud-net (run_jury_pipeline, run_t2_for_segment,
+run_dpo_update, transcribe_audio_with_scribe, add_scribe_votes — all consent/key-gated, each a careful
+run_blocking wrap of a blocking client call), check_external_provider (dead), start_champion_engine (MED).
