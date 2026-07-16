@@ -4844,3 +4844,62 @@ only the HIGH-risk speech_segments STRICT conversion (its own dedicated iteratio
 pattern). **Owner-action queue unchanged** (champion_supervision_enabled, backup_second_dir,
 DPAPI key re-save, native-Sorani review, iPhone Tailscale). exe unchanged this iter (test-only),
 so freshness stays green at the night-1 rebuild.
+
+---
+
+## 2026-07-16T17:50Z — iter 25 — Week 2 — speech_segments STRICT is BLOCKED (proven) + correct plan
+
+**Theme:** Storage durability. **Target:** the last open Week-2 checkbox — convert speech_segments
+to a STRICT table (the v38 decision_verdicts pilot was meant to be the pattern). **Outcome: it is
+BLOCKED, not a small increment — and the block is a data-loss trap, now proven and guarded.**
+
+**The finding (deep code-read, then proven):** SQLite can't ALTER a table to STRICT, so the only
+path is the recreate (new STRICT twin → copy → DROP old → RENAME). But speech_segments is an FK
+PARENT of **seven** child tables (five `ON DELETE CASCADE`: segment_hypotheses, agent_examples,
+decision_log, decision_verdicts, loop0_shadow_log; two `ON DELETE SET NULL`: correction_memory,
+corrections). With foreign_keys=ON (app default, db.rs:246), `DROP TABLE speech_segments` does an
+implicit DELETE that **fires ON DELETE CASCADE and wipes the child rows**. apply_migration wraps
+up_sql in `unchecked_transaction()`, where `PRAGMA foreign_keys=OFF` is a **no-op** — so a normal
+migration cannot disable the cascade. The correct path is SQLite's 12-step recreate: foreign_keys
+OFF **outside** a txn, then BEGIN/recreate/COMMIT, then foreign_key_check, then foreign_keys ON —
+which needs a migration-framework change (an FK-off migration mode).
+
+**Shipped (test-only + doc, no production code):**
+- `db.rs` test `dropping_speech_segments_cascade_deletes_children_so_strict_recreate_needs_fk_off`
+  — inserts a segment + a real decision_verdicts child, runs the naive DROP inside a transaction
+  exactly as apply_migration would, asserts the child rows drop to 0. A permanent guard: if a future
+  edit ever makes the naive recreate "look safe", this fails loudly.
+- `docs/STRICT_SPEECH_SEGMENTS_PLAN.md` — the 12-step recipe, the exact 34-column live schema (all
+  already valid STRICT types; **NO BOOLEAN columns** — correcting the earlier ledger claim that
+  BOOLEAN cols needed remapping), and the owner-gated rationale.
+
+**Gate (verbatim, isolated CARGO_TARGET_DIR=…/cortex-monthloop-target):**
+```
+FMT_EXIT=0
+CLIPPY_EXIT=0
+test result: ok. 924 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 64.27s
+Python policy regressions finished: 33 policy test scripts passed.
+GATE_DONE
+```
+(924 = 923 + this test.)
+
+**Adversarial verification (Workflow, 5 skeptic lenses):** column-completeness NO_ISSUE (34-col list
+exact); read-path-order NO_ISSUE (no SELECT *, explicit SEGMENT_SELECT_COLUMNS, rowid only matters
+for FTS which the recipe preserves+rebuilds); fk-off-and-defer NO_ISSUE (blocker reasoning correct,
+defer_foreign_keys defers checks not cascade actions, no simpler safe path dismissed);
+**recipe-correctness CONFIRMED_ISSUE** — the recipe recreated only 3 of the 10 indexes the DROP
+removes (incl. v19's perf-critical `idx_segments_verified_created` composite) and under-enumerated
+FK children (3 of 7, wrongly all CASCADE). **Fixed** in the doc + test comment before commit.
+(boolean-audit lens hit the StructuredOutput retry cap and returned no verdict; re-verified by hand
+— the only BOOLEAN token is loop0_shadow_log.memory_fired, not in speech_segments; claim holds.)
+
+**Commit:** 22c4f99. Pushed; main fast-forwarded to 22c4f99.
+
+**OWNER-GATED (surfaced, not done):** the speech_segments STRICT conversion itself — highest-risk
+migration in the app (34-col recreate + FTS-rowid resync + FK-off framework change), runs unattended
+on the real DB at next launch (unverifiable from the loop), marginal value over the already-typed
+write path (SpeechSegment + validate_segment). Needs a supervised pass with a real-DB snapshot first;
+full recipe + checklist in docs/STRICT_SPEECH_SEGMENTS_PLAN.md. **With this, every Week-2 item is
+either done or has an honest, proven hand-off.** Owner-action queue otherwise unchanged
+(champion_supervision_enabled, backup_second_dir, DPAPI key re-save, native-Sorani review, iPhone
+Tailscale). exe unchanged this iter (test + doc only) — freshness stays green at the night-1 rebuild.
