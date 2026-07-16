@@ -4274,3 +4274,40 @@ surface as an id-space hole, which IS asserted).
 WEEK-1 STATUS: items 1 (audit), 2 (all wired freezers async), 3 (nextest), 4 (durability drill) DONE.
 Remaining: item 5 — 7B engine supervision skeleton (warm-probe -> start -> restart-with-backoff ->
 tree-kill on shutdown, wrapping start_7b_server.ps1).
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 12 (Week 1 item 5): 7B supervision — scoped, key constraint discovered
+
+Scoping iteration (design committed, implementation next — the discovered constraint changes the
+architecture, and this surface deserves a fresh full verify cycle rather than a tail-end rush).
+
+WHAT EXISTS (verified by reading, not assuming):
+- engine_supervisor.rs (476 lines): the PURE supervision policy — bounded exponential backoff,
+  Closed/Open/HalfOpen/GaveUp circuit breaker, Decision enum, fully unit-tested, deliberately no I/O.
+  Registered as a module; NO live caller yet.
+- start_champion_engine IPC: spawns start_7b_server.ps1 DETACHED (fire-and-forget, drops the child).
+- scripts/test_cortex_7b_supervise.py: the SERVER-side (WSL python) worker-fleet supervisor — orthogonal.
+
+KEY CONSTRAINT (from start_7b_server.ps1's own NOTE, verbatim): "The nohup-detach dies with a
+non-interactive runner's session (WSL kills the session's children when the launching wsl.exe exits) —
+a headless harness must instead hold `wsl -- bash -lc \"... exec python cortex_7b_server.py\"` alive
+itself." => An app-spawned ps1 wrap is NOT a reliable headless start path. The app must OWN the wsl
+child process directly. This conveniently solves tree-kill too: killing the app-held wsl.exe child
+tears down the WSL-side session children by the same semantics.
+
+IMPLEMENTATION PLAN (next iteration):
+1. engine_supervisor gets a small runtime module (or sibling): spawn + HOLD
+   `wsl -- bash -lc "exec python .../cortex_7b_server.py"` as an owned tokio child (no window),
+   env-passthrough for CORTEX_7B_MODEL_DIR/PYTHON/PORT/DEVICES.
+2. Supervision loop (tokio task, tick ~15s): probe_wsl_7b_server (bounded ~3s, on run_blocking) ->
+   drive SupervisorPolicy::decide -> Restart => kill+respawn the owned child per backoff; GaveUp =>
+   surface to the status pill; all transitions logged.
+3. Gated by a NEW setting champion_supervision_enabled, serde(default)=false — DEFAULT OFF; enabling
+   is OWNER-GATED (surfaced, never auto-on: supervision auto-loads a ~30GB model server).
+4. Shutdown: on app exit, tree-kill the owned child (taskkill /T /F on the wsl.exe pid; WSL session
+   semantics kill the server) BEFORE the DB shutdown sequence.
+5. start_champion_engine stays as the manual path; the supervisor takes precedence when enabled.
+6. Tests: wiring glue unit-tested with injected probe/spawn hooks (the policy core is already tested);
+   the LIVE leg (real 30GB server restart-with-backoff) is OWNER-GATED — surfaced, never faked.
+
+Week-1 state: items 1-4 DONE tonight; item 5 scoped with the blocking constraint resolved on paper.
+Lock released; implementation is the next iteration's single increment.
