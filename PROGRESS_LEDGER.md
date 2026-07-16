@@ -4001,3 +4001,11 @@ check_agentic_readiness, get_audio_duration, models_download, models_download_al
 transcribe_audio_with_scribe); 1 dead (check_external_provider). REMAINING worklist = 6: 4 cloud-net
 (run_jury_pipeline, run_t2_for_segment, run_dpo_update, add_scribe_votes — all consent-gated), the dead
 check_external_provider, and start_champion_engine (MED).
+
+## 2026-07-16 — iteration 6 addendum: shipped exe rebuilt (burst-end, 7 freezers)
+
+App not running; built into src-tauri/target/release (CARGO_TARGET_DIR unset). Verbatim:
+  $ (npm run build)                       -> VITE_EXIT=0
+  $ cargo build --release                 -> CARGO_REL_EXIT=0 (0 build/LNK errors)
+  $ python scripts/check_exe_freshness.py -> EXE FRESHNESS GATE: OK (exe at HEAD 2916a0d8effa…, newer than all sources)
+Installed exe now carries all 7 off-thread migrations, baked at 2916a0d.
