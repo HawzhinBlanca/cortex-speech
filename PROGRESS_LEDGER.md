@@ -4462,3 +4462,36 @@ App not running. Verbatim: VITE_EXIT=0; CARGO_REL_EXIT=0 (0 errors);
 check_exe_freshness -> EXE FRESHNESS GATE: OK (exe at HEAD 0c8afd2cd2a6…, newer than all sources).
 Installed exe + bins now carry the batch_processor InstanceLock and the second-directory backup
 (dormant until the owner sets backup_second_dir in settings.json).
+
+## 2026-07-16 — MONTH LOOP night 1, iteration 16 (Week 2): write_segment_verdict made atomic
+
+First savepoint-wrap from the write-path audit's gap #2: write_segment_verdict's two statements (the
+human-guard UPDATE + the decision_verdicts INSERT for the C4 denominator) ran as separate autocommits —
+a failure between them left a verdict with no decision-log row. App NOT running; lock held + released.
+
+CHANGE (db.rs): both statements wrapped in SAVEPOINT verdict_write using the repo's exact
+delete_segment idiom (closure + release_savepoint on Ok / cleanup_savepoint_after_error on Err). The
+0-affected no-op branch (human already decided) is unchanged. REGRESSION TEST (fault-injection):
+write_segment_verdict_is_atomic_with_its_decision_log — DROPs decision_verdicts so the second
+statement fails, asserts the whole write Errs AND the verdict UPDATE rolled back (verdict None,
+escalated false).
+
+VERBATIM GATES (isolated CARGO_TARGET_DIR; app not running):
+  $ cargo fmt --check  -> exit 0
+  $ cargo clippy --all-targets -- -D warnings -> exit 0
+  $ cargo test --lib   -> test result: ok. 912 passed; 0 failed; 6 ignored
+    (incl. "test db::tests::write_segment_verdict_is_atomic_with_its_decision_log ... ok")
+  $ run_python_policies -> 33 policy test scripts passed.
+
+ADVERSARIAL VERIFY (§3 — db.rs, mandatory Workflow): savepoint-nesting-and-callers skeptic, clear on
+all four fronts (text verbatim "refutation FAILED on all four fronts... sound across every caller";
+the recurring refuted-boolean slip again, severity=none): NO production caller holds an open
+transaction/savepoint on this connection (every call site checked: IPC, jury chain sites on the
+dedicated conn, run_t2, runs.rs, pipeline.rs:2232 runs after the batch savepoints close); nested
+RELEASE would be legal anyway; the no-op branch is byte-identical (git-diff-verified); the test
+genuinely exercises the rollback (escalated -> T1_ESCALATE bypasses the early return); the warn-only
+cleanup is a pre-existing property of all five prior users of the idiom — this change strictly
+REMOVES the worse failure mode. No CONFIRMED finding.
+
+NEXT (Week 2): the remaining two invariant families (jury write_verdict 3-statement; import journal),
+then fault drills, then DPAPI. Exe rebuild batched (this is 1 source commit since 0c8afd2).

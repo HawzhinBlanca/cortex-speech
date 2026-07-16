@@ -2081,32 +2081,48 @@ impl Database {
         // suspect-first orderings (COALESCE(agent_confidence, 0.5)) collapsed back to recency: the one
         // live review-speed feature was silently nominal (true-10 audit 2026-07-09). No caller has a
         // legitimate "clear the confidence" case; callers that HAVE a signal pass Some and still win.
-        let affected = self.conn.execute(
-            "UPDATE speech_segments
-             SET verdict              = ?2,
-                 verdict_transcript   = ?3,
-                 rationale            = ?4,
-                 evidence_json        = ?5,
-                 agent_confidence     = COALESCE(?6, agent_confidence),
-                 escalated            = ?7,
-                 updated_at           = datetime('now')
-             WHERE id = ?1
-               AND (human_decision IS NULL OR human_decision = '')
-               AND (verdict IS NULL OR verdict NOT IN ('human_accept', 'human_edit', 'human_reject'))",
-            params![segment_id, verdict, transcript, rationale, evidence_json, agent_confidence, escalated as i32],
-        )?;
-        if affected == 0 {
-            // Either the row is gone or a human already decided it — in both cases the machine verdict
-            // correctly does not apply. Logged (not an error) so the no-op is visible without masking it.
-            tracing::debug!(
-                "write_segment_verdict({segment_id}, {verdict}): no-op — segment is human-decided or missing"
-            );
-        } else {
-            // M2.2/P1.2: record the T0/T1 classification for the C4 denominator (no-op for human/unknown).
-            self.record_decision_verdict(segment_id, verdict, escalated)?;
+        // SAVEPOINT (write-path audit, Week 2): the verdict UPDATE and its decision-log INSERT are one
+        // invariant — a crash or SQLITE_BUSY between them used to leave a written verdict with no C4
+        // denominator record. Same idiom as delete_segment/del_seg.
+        self.conn.execute("SAVEPOINT verdict_write", [])?;
+        let result: AppResult<()> = (|| {
+            let affected = self.conn.execute(
+                "UPDATE speech_segments
+                 SET verdict              = ?2,
+                     verdict_transcript   = ?3,
+                     rationale            = ?4,
+                     evidence_json        = ?5,
+                     agent_confidence     = COALESCE(?6, agent_confidence),
+                     escalated            = ?7,
+                     updated_at           = datetime('now')
+                 WHERE id = ?1
+                   AND (human_decision IS NULL OR human_decision = '')
+                   AND (verdict IS NULL OR verdict NOT IN ('human_accept', 'human_edit', 'human_reject'))",
+                params![segment_id, verdict, transcript, rationale, evidence_json, agent_confidence, escalated as i32],
+            )?;
+            if affected == 0 {
+                // Either the row is gone or a human already decided it — in both cases the machine verdict
+                // correctly does not apply. Logged (not an error) so the no-op is visible without masking it.
+                tracing::debug!(
+                    "write_segment_verdict({segment_id}, {verdict}): no-op — segment is human-decided or missing"
+                );
+            } else {
+                // M2.2/P1.2: record the T0/T1 classification for the C4 denominator (no-op for human/unknown).
+                self.record_decision_verdict(segment_id, verdict, escalated)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("verdict_write")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(e) => {
+                self.cleanup_savepoint_after_error("verdict_write");
+                Err(e)
+            }
         }
-        self.track_write()?;
-        Ok(())
     }
 
     /// Fully RE-OPEN a segment whose human decision is being undone. record_human_decision OVERWRITES
@@ -2708,6 +2724,23 @@ mod tests {
         assert_eq!(c4["t1Escalations"], 1);
         assert_eq!(c4["t0HumanConfirmed"], 1);
         assert_eq!(c4["t0HumanContradicted"], 1);
+    }
+
+    #[test]
+    fn write_segment_verdict_is_atomic_with_its_decision_log() {
+        // Write-path audit (Week 2): the verdict UPDATE and the decision_verdicts INSERT are one
+        // invariant. Fault-inject the second statement by dropping its table: the whole write must
+        // FAIL and the verdict UPDATE must ROLL BACK — never a verdict without its C4 denominator row.
+        let db = make_db();
+        db.insert_segment(&make_segment("atom", "/audio/s.wav")).unwrap();
+        db.conn.execute_batch("DROP TABLE decision_verdicts").unwrap();
+
+        let result = db.write_segment_verdict("atom", "escalated", None, None, None, Some(0.4), true);
+        assert!(result.is_err(), "a failed decision-log insert must fail the whole verdict write");
+
+        let seg = db.get_segment_by_id("atom").unwrap().expect("segment still present");
+        assert_eq!(seg.verdict, None, "the verdict UPDATE must roll back with the failed decision log");
+        assert!(!seg.escalated, "escalated must roll back too");
     }
 
     #[test]
