@@ -5580,3 +5580,22 @@ commands.rs is in-target — see iter 45), (b) import commands (jury-coupled), (
 undo/redo, etc.). Further slicing is marginal. Week-4 item 1 (decomposition) goal is MET. The remaining
 "fully ready robust" work is owner-machine-gated (recoverable exe rebuild + real-audio e2e/RTF/
 calibration gates + Week-3 measurements). Headless high-value code work substantially complete.
+
+---
+
+## 2026-07-17T19:05Z — iter 47 — refreshed OWNER_HANDOFF with a current, actionable "finish from here" guide
+
+**Not more decomposition — a hand-off refresh, because that is the genuinely useful headless move now.**
+The clean commands.rs families are exhausted (iter 46) and the finish is owner-machine-gated, so the
+highest-value safe thing is to make finishing EASY for the owner. OWNER_HANDOFF.md was stale (dated
+2026-07-11, pre-dating this session's 24 iterations). Added a dated **UPDATE 2026-07-17** section at the
+top: a concise summary of Weeks 1–4 done this session + the **exact remaining owner legs with commands**
+(snapshot + `make build-app` to activate v39/v40/telemetry; `make verify-10`; real-audio
+`node e2e_real_app.cjs` + `make bench-rtf`/`make eval-ckb`; read real RTF from the new ASR telemetry;
+Week-3 measurements + retrain stay owner-gated). Commit cc02877. Doc-only; 33/33
+python policies still pass.
+
+**Honest state:** headless high-value work is complete (W1 ✅, W2 ✅ incl v40 STRICT, W3 item-4 ✅, W4
+decomposition ✅ in-target). The remaining "fully ready robust" legs are ALL owner-machine-gated and now
+written as a single executable checklist in OWNER_HANDOFF.md. The optional jury-subsystem consolidation
+(iter 45) remains the one big deferred code refactor. Nothing faked; no 10/10 claimed.
