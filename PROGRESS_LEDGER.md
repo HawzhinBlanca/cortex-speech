@@ -5476,3 +5476,18 @@ one in the COUNT only; no command was ever lost or missing. True app command cou
 Running total: commands.rs 5968→4571 (~23% off) over 8 slices. Remaining in commands.rs: the jury
 machinery bulk (shared w/ batch_transcribe), settings/registry/agentic commands, misc getters. exe
 owner-gated-behind (recoverable via auto-snapshot).
+
+---
+
+## 2026-07-17T17:43Z — iter 42 — commands.rs slice 9 (segment mutations); +count-verification in the gate
+
+**Week-4 item 1, slice 9 (commit 2b2d0a4).** Extracted 10 segment-write commands
+→ src/commands/segments_write.rs (write counterpart to slice 8). **commands.rs 4563→4295 (~28% off over
+9 slices), 55 commands relocated.** Compiler-surfaced dep handling: slice took history::{Command,
+HistoryManager}; removed the now-unused HistoryManager import from commands.rs (Command stays, used by
+batch_transcribe); apply_curation_fields stays shared via super::. **Added a hard count check to the
+gate: lib.rs registered (127) == surface attribute-commands (127), lost NONE** — definitively proves no
+command dropped. fmt/clippy 0, cargo test --lib 929, 33/33 policies, lib.rs untouched.
+
+Running total: commands.rs 5968→4295 (~28% off) over 9 slices. exe owner-gated-behind (recoverable via
+auto-snapshot).
