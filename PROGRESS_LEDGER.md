@@ -5618,3 +5618,18 @@ Commit 5fb3ebd. fmt/clippy 0, 33/33 policies.
 **This was a genuinely valuable safe win** (unlike the marginal commands.rs singletons): the biggest
 file dropped below the target with no production risk. pipeline.rs (4340) could get the same treatment
 next if its test module is large. Owner-gated finish legs unchanged (see OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-17T19:37Z — iter 49 — pipeline.rs test module split → pipeline_tests.rs (4340→3313, into target)
+
+**Week-4 item 1, test-split technique applied to pipeline.rs (now the biggest file).** Moved the
+1031-line `#[cfg(test)] mod tests` to pipeline_tests.rs via #[path]. **pipeline.rs 4340→3313 (into the
+3-4k band); ZERO production change**; cargo test --lib **929 passed / 0 failed (unchanged)**. Two
+policies (agentic + rust-panic) read pipeline.rs by path and assert test-name regressions → both routed
+through the pipeline surface (pipeline.rs + pipeline_tests.rs) with a pipeline_surface() helper +
+vacuous-pass guard. Commit 17d7d98. fmt/clippy 0, 33/33 policies.
+
+**File-size progress:** commands.rs 3937, db.rs 2622, pipeline.rs 3313 — all now in/under the 3-4k band.
+Remaining big-test files for the same safe split: export.rs (2765, ~1446 test lines) and export_bundle.rs
+(2309, ~1336 test lines) → next iterations. Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
