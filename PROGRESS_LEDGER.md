@@ -5599,3 +5599,22 @@ python policies still pass.
 decomposition ✅ in-target). The remaining "fully ready robust" legs are ALL owner-machine-gated and now
 written as a single executable checklist in OWNER_HANDOFF.md. The optional jury-subsystem consolidation
 (iter 45) remains the one big deferred code refactor. Nothing faked; no 10/10 claimed.
+
+---
+
+## 2026-07-17T19:22Z — iter 48 — db.rs test module split → db_tests.rs (db.rs 4776→2622, below 3k)
+
+**Week-4 item 1, applied to the next-biggest file (commands.rs is done + in-target).** db.rs was 4776
+lines (the largest after the commands.rs slices); 2158 were the `#[cfg(test)] mod tests` block. Moved
+it verbatim to src-tauri/src/db_tests.rs via `#[cfg(test)] #[path = "db_tests.rs"] mod tests;` (super::*
+still resolves to db). **db.rs 4776→2622 (below 3k); ZERO production change** — tests byte-identical,
+only relocated. Verified they still RUN: cargo test --lib **929 passed / 0 failed (unchanged)**.
+
+Gate coupling: test_rust_runtime_panic_policy.py reads db.rs by path for BOTH production patterns AND
+test-name regressions — the test names moved, so it went RED. Fixed with a db_surface() helper (db.rs +
+db_tests.rs) + vacuous-pass guard, routing the 3 direct reads + the forbidden-pattern key through it.
+Commit 5fb3ebd. fmt/clippy 0, 33/33 policies.
+
+**This was a genuinely valuable safe win** (unlike the marginal commands.rs singletons): the biggest
+file dropped below the target with no production risk. pipeline.rs (4340) could get the same treatment
+next if its test module is large. Owner-gated finish legs unchanged (see OWNER_HANDOFF.md).
