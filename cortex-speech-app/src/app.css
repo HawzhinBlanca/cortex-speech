@@ -29,7 +29,7 @@
   /* Text */
   --text: #e8eef6;
   --text-muted: #97a4b6;
-  --text-subtle: #6d7c8c;
+  --text-subtle: #7d8c9c;  /* WCAG 2.2 AA: >=4.5:1 on all dark surfaces (was #6d7c8c = 4.19, failed axe) */
   --text-on-accent: #04121d;
 
   /* Accent — vivid sky, used with restraint */
@@ -504,7 +504,7 @@
     --red-400-rgb: 248 113 113;
     --emerald-400-rgb: 52 211 153;
     --text-muted: #97a4b6;
-    --text-subtle: #6d7c8c;
+    --text-subtle: #7d8c9c;
   }
 
   /* Compact square icon button */
