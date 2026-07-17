@@ -5266,3 +5266,65 @@ zero FAILED binaries.
 
 **Weeks status:** W1 ✅ · **W2 ✅ (complete)** · W3 item 4 ✅, items 1–3 blocked on real data ·
 W4 next (commands.rs decomposition). exe behind (Rust changed) — rebuild batched.
+
+---
+
+## 2026-07-17T15:33Z — iter 34 — Week 4 opened: commands.rs slice 1 + verify_10 caught TWO real RED gates
+
+**Owner directive:** "complete all the weeks work and any improvement u can." Four commits, all
+verified; the two most valuable were found by actually RUNNING the charter aggregator.
+
+**1) Week-4 item 1 — commands.rs decomposition, slice 1 (commit 3883427).** Extracted the 7-command
+export family into `src/commands/export.rs`. commands.rs 5968→5831 lines, 128→121 commands. Behaviour
++ names UNCHANGED — **lib.rs untouched** (proof): `mod export; pub use export::*;` keeps
+`commands::export_dataset` resolving. The real care was gate coupling: SIX policies pin commands.rs by
+path; test_command_main_thread_policy DID fail on the move (the gate is real). Both it and the UI-audit
+now scan the whole command SURFACE (commands.rs + src/commands/*.rs) with a guard that raises if no
+#[tauri::command] is found — a slice can never make them pass VACUOUSLY. Audit still counts 128.
+
+**2) Week-4 item 4 — ran verify_10.py (the charter aggregator). It was RED. Fixed both kept-gate
+failures:**
+- **`deny` RED → GREEN (commit 4ccf26e).** cargo-deny was license-vetting the project's OWN crate
+  (Cargo.toml's owner-chosen PolyForm-Noncommercial, absent from the third-party allow-list). Fixed the
+  RIGHT way: `publish = false` + deny.toml `[licenses] private.ignore = true` — skips OUR crate only.
+  The 12-entry allow-list is byte-for-byte unchanged; PolyForm is NOT added (that would let any
+  dependency adopt a noncommercial license unnoticed). `cargo deny check` = all ok from both invocations.
+  (Also caught: the Makefile comment "mirrors CI" is accurate — both paths find deny.toml; my first
+  hypothesis of a config-path bug was WRONG, corrected by testing both.)
+- **`test-e2e+a11y` RED → GREEN (commit 0013d4f).** Two real pre-existing failures (not caused by this
+  session — my other changes don't touch the frontend):
+  (a) **WCAG 2.2 AA color-contrast**, 14 nodes app-root + 1 settings. Single root cause: `--text-subtle`
+  #6d7c8c = 4.19:1 on #111723 (below 4.5 for normal text), 3.78:1 on --surface-3. Computed #7d8c9c:
+  ≥4.5:1 on ALL dark surfaces (5.21/5.12/4.70), smallest bump that clears AA. Applied to the two DARK
+  defs (:root, .terminal-dark); .light #647085 left alone (dark-on-white; lightening would REDUCE it).
+  axe now zero violations on en, ckb/RTL, settings.
+  (b) **import-progress strict-mode**: getByText('2/5') matched both "2/5 files" AND the progress bar's
+  "2/5 chunks". Scoped the assertion to pipeline-import-status (the file counter) — more faithful to the
+  test's intent, not a gate weakening.
+
+**verify_10 --quick verdict moved: RED (13 PASS / 2 FAIL) → INCOMPLETE (15 PASS / 0 FAIL).** Verbatim:
+`kept gates run: 23 - 15 PASS, 0 FAIL, 8 skipped (env/not-built)`. INCOMPLETE (not GREEN) because 8
+tier-2/3 gates can't run in --quick — they need the built exe / real audio / live model / fairness
+corpus (exe-freshness, real-app-e2e, egress-runtime, ignored-real-model, fuzz-smoke, rtf-bench,
+refinery-lift, fairness-gender-age). Those are owner-machine-gated, not code defects; GREEN is
+un-claimable from --quick BY DESIGN.
+
+**Gate:** cargo test --lib 929; ALL integration binaries green (test_file_cli removed iter 33);
+npm typecheck 0; lint 0; vitest 196; npm run test:e2e 47 passed / 0 failed (was 44/3); 33/33 python
+policies; cargo deny ok; cargo clippy 0.
+
+**Found in passing (honest, not fixed — out of scope + untested):** the LIGHT theme's `--text-subtle`
+#647085 on the light hover surface --surface-3 #eef1f6 is 4.418:1 — also < 4.5. There is no
+light-theme axe test so it is not in any RED gate; darkening light-theme subtle text is a considered
+visual change better done with rendered-frame proof. Logged for a future UX pass.
+
+**⚠️ EXE REBUILD — OWNER GO/NO-GO.** The exe is now behind by v39 (rename) + **v40 (STRICT, rewrites the
+main table on first launch)** + the export slice + the a11y CSS. Rebuilding stages v40 to run on the
+owner's REAL database at the next app launch. It is atomic, fail-closed, adversarially verified, and
+proven on a populated schema — but it is the first migration to rewrite the main table, so I did NOT
+unilaterally rebuild. **Recommend: snapshot the real DB first (the restore path exists), then rebuild.**
+Owner's call.
+
+**Weeks:** W1 ✅ · W2 ✅ · W3 item 4 ✅ (1–3 blocked on real data) · **W4: item 1 slice-1 done, item 4
+done (RED→INCOMPLETE, 0 failing kept gates)**; items 2 (e2e expansion) + 3 (quiet-UX, needs
+rendered-frame proof) remain, plus more commands.rs slices.
