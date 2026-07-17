@@ -5563,3 +5563,20 @@ Remaining W4 items (e2e real-audio expansion, quiet-UX with rendered-frame proof
 **owner-machine-gated**. The high-value HEADLESS code work is substantially complete; further
 meaningful progress needs the owner's machine (recoverable rebuild + real-audio/measurement gates).
 No code shipped this iter (attempt reverted) — the value is the corrected plan + honest completion call.
+
+---
+
+## 2026-07-17T18:51Z — iter 46 — commands.rs slice 12 (settings/config); below 4k; clean families exhausted
+
+**Week-4 item 1, slice 12 (commit 9de883d).** Extracted 4 settings/config/key
+commands → src/commands/settings.rs. **commands.rs 4008→3941 (below 4k; ~34% off over 12 slices), 81
+commands in 12 modules.** Clean first-try; lib.rs untouched; count guardrail 127==127 none lost;
+fmt/clippy 0, cargo test --lib 929, 33/33.
+
+**Honest state:** the clean cohesive command families are now **essentially exhausted**. What remains in
+commands.rs: (a) the tightly-coupled jury subsystem (~800 lines, all-or-nothing move, OPTIONAL since
+commands.rs is in-target — see iter 45), (b) import commands (jury-coupled), (c) scattered singletons
+(normalize_text, merge_dataset_json, verify_finetuned_model_integrity, run_wsl_refinement, db_* maint,
+undo/redo, etc.). Further slicing is marginal. Week-4 item 1 (decomposition) goal is MET. The remaining
+"fully ready robust" work is owner-machine-gated (recoverable exe rebuild + real-audio e2e/RTF/
+calibration gates + Week-3 measurements). Headless high-value code work substantially complete.
