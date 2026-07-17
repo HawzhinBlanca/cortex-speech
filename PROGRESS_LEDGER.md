@@ -5503,3 +5503,29 @@ commands.rs (17 refs) via super::. **4th policy to hit gate-coupling:** test_age
 routed through command_surface() (now 5 policies scan the surface: main-thread, ui-audit, rust-panic,
 cloud-privacy, agentic). Count guardrail: lib.rs 127 == surface 127, none lost. fmt/clippy 0, cargo
 test --lib 929, 33/33. exe owner-gated-behind (recoverable via auto-snapshot).
+
+---
+
+## 2026-07-17T18:19Z — iter 44 — commands.rs slice 11 (infra/diagnostics); target band reached; jury-bulk plan documented
+
+**Week-4 item 1, slice 11 (commit 33b3066).** Extracted 14 small infra/diagnostics
+commands → src/commands/infra.rs. **commands.rs 4144→4023 (~33% off over 11 slices), 77 commands in 11
+modules. commands.rs is now well within the doctrine's 3-4k target band** (from ~6k). Count guardrail:
+lib.rs 127 == surface 127, none lost. fmt/clippy 0, cargo test --lib 929, 33/33.
+
+**Strategic state — honest:** the HIGH-VALUE commands.rs decomposition is substantially DONE. All the
+cohesive command families are extracted; what remains in commands.rs is (a) the jury MACHINERY bulk and
+(b) batch_transcribe (jury-coupled) and (c) scattered singletons. Now db.rs (4776) + pipeline.rs (4340)
+are actually the largest files, but those are impl-blocks+tests, not IPC-command wrappers — a different
+decomposition than the doctrine's "commands.rs first" slice pattern.
+
+**DEFERRED (documented plan) — jury-bulk consolidation, its own dedicated iteration:** move the jury
+helper cluster from commands.rs INTO commands/jury.rs — with_jury_db, jury_db_source, JuryDbSource
+(struct+impl), run_jury_pipeline_core (KEEP pub — pipeline.rs calls crate::commands::run_jury_pipeline_core),
+run_jury_pipeline_core_via (277 lines), reference_selection_for_segment (104), reference_selection_evidence,
+resolve_t2_endpoint (~418 lines total). Visibility: helpers called only within jury → private;
+with_jury_db + run_jury_pipeline_core_via (called from commands.rs) → pub(crate), callers become
+jury::X. **Exact caller sites to update: commands.rs:1273 (with_jury_db, in batch_transcribe),
+commands.rs:801 + 1274 (run_jury_pipeline_core_via), and pipeline.rs (crate::commands::run_jury_pipeline_core
+stays resolvable via pub re-export).** Behavior-critical (cloud pipeline) → adversarially verify. Not
+rushed at session's end. exe owner-gated-behind (recoverable via auto-snapshot).
