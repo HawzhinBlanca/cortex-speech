@@ -5390,3 +5390,19 @@ No adversarial Workflow — third application of the mechanical slice pattern, c
 each slice is small/safe/verified. Remaining big cohesive groups: the jury/T-pipeline family (with the
 with_jury_db + JuryDbSource helpers), the get_*/stats family, the db-maintenance family (interleaved
 with helpers). exe still behind (owner-gated rebuild, recoverable via the confirmed auto-snapshot).
+
+---
+
+## 2026-07-17T16:20Z — iter 37 — commands.rs slice 4 (dataset analytics)
+
+**Week-4 item 1, slice 4 (commit 073857d).** Extracted 7 whole-dataset analytics
+getters → src/commands/dataset_analytics.rs. **commands.rs 5381→5292 lines, 115→108 commands.** Chose
+this over the jury family (too coupled — with_jury_db / run_jury_pipeline_core_via are called by
+batch_transcribe and other commands, so not a clean slice) and over tiny telemetry getters (low
+impact). Self-contained: super::{run_blocking, RATE_LIMITER} + crate::{quality, stats} only. lib.rs
+untouched; surface 128; no policy update needed. Gate: fmt 0, clippy 0, cargo test --lib 929, 33/33.
+
+**Decomposition running total: commands.rs 5968→5292 (~11% off) over 4 slices** (export 7,
+model_download 3, batch 3, dataset_analytics 7 = 20 commands relocated). Remaining big group is the
+jury/T-pipeline family (needs its coupled helpers moved together — a dedicated careful slice).
+exe still owner-gated-behind (recoverable via confirmed auto-snapshot).
