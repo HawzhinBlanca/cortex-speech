@@ -5457,3 +5457,22 @@ provably preserved (no separate Workflow needed for a proven byte-identical relo
 family's remaining bulk (run_jury_pipeline_core, JuryDbSource impl ~hundreds of lines) stays in
 commands.rs for now (shared with batch_transcribe); a later pass could move it + update the 2 callers.
 exe owner-gated-behind (recoverable via auto-snapshot).
+
+---
+
+## 2026-07-17T17:27Z — iter 41 — commands.rs slice 8 (segment/audio read); verified true command count = 127
+
+**Week-4 item 1, slice 8 (commit 0bc9433).** Extracted 8 whole-library
+read/retrieval commands → src/commands/segments_read.rs. **commands.rs 4718→4571 (~23% off over 8
+slices), 45 commands relocated.** Self-contained (super:: + crate::{audio, quality, db, validation}).
+lib.rs untouched; gate fmt/clippy 0, cargo test --lib 929, 33/33 policies.
+
+**Count reconciliation (honest correction):** surface has exactly **127** attribute-#[tauri::command]s,
+matching lib.rs's 127 registered commands, with every registered name resolving to a fn (proven — else
+lib.rs would not compile). My earlier ledgers said "128" — that was the substring counter also matching
+the legitimate  mention in commands.rs's run_blocking doc comment (line 99). Off by
+one in the COUNT only; no command was ever lost or missing. True app command count: **127**.
+
+Running total: commands.rs 5968→4571 (~23% off) over 8 slices. Remaining in commands.rs: the jury
+machinery bulk (shared w/ batch_transcribe), settings/registry/agentic commands, misc getters. exe
+owner-gated-behind (recoverable via auto-snapshot).
