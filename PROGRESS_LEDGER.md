@@ -5406,3 +5406,13 @@ untouched; surface 128; no policy update needed. Gate: fmt 0, clippy 0, cargo te
 model_download 3, batch 3, dataset_analytics 7 = 20 commands relocated). Remaining big group is the
 jury/T-pipeline family (needs its coupled helpers moved together — a dedicated careful slice).
 exe still owner-gated-behind (recoverable via confirmed auto-snapshot).
+
+---
+
+## 2026-07-17T16:34Z — iter 38 — commands.rs slice 5 (gold-set + gold-eval)
+
+**Week-4 item 1, slice 5 (commit bfeb3c1).** Extracted 6 gold/eval commands →
+src/commands/gold_eval.rs. **commands.rs 5285→5195, 108→102 commands.** Self-contained (super +
+validation::input); compiled clean first try; lib.rs untouched; surface 128; gate fmt/clippy 0, cargo
+test --lib 929, 33/33 policies. **Running total: commands.rs 5968→5195 (~13% off) over 5 slices (26
+commands relocated).** exe still owner-gated-behind (recoverable via confirmed auto-snapshot).
