@@ -5146,3 +5146,60 @@ LOOP continues** via the external scheduled task `cortex-month-loop` (nightly 02
 champion_supervision_enabled; set backup_second_dir; DPAPI key re-save; native-Sorani review; iPhone
 Tailscale; and the Week-3 measured-intelligence work (starts 2026-07-30, needs real gold data / long
 audio / cloud opt-in). Real RTF/export timings accrue automatically as the app is used.
+
+---
+
+## 2026-07-17T03:40Z — iter 32 — Week 3 item 4 DONE: OOD jargon retired end-to-end (signal_anomaly)
+
+**Owner directive:** "complete all the weeks work and any improvement u can" — this reverses the
+iter-30 deferral of the OOD rename. Done, in full, verified.
+
+**Change (Week-3 item 4):** every layer now agrees with what the UI always said ("Signal Anomaly").
+- **DB:** migration **v39** `ALTER TABLE speech_segments RENAME COLUMN ood_score TO
+  signal_anomaly_score`. SAFE unlike a table recreate — RENAME COLUMN never drops/recreates the table,
+  so it cannot fire the ON DELETE CASCADE trap proven in iter 25. The historical "ADD COLUMN ood_score"
+  migration is deliberately LEFT INTACT so replay-from-scratch and upgrade-in-place both converge.
+- **Rust:** SpeechSegment.signal_anomaly_score (serde camelCase → signalAnomalyScore); quality/ood.rs →
+  quality/signal_anomaly.rs; OodDetector → SignalAnomalyDetector; IPC compute_ood_scores →
+  compute_signal_anomaly_scores. **Frontend:** types, the computeSignalAnomalyScores entry point,
+  ValidationPanel state + 'signalAnomaly' tab literal, i18n keys in BOTH en + ckb.
+- **Left intact on purpose:** jury/mod.rs's "rare/OOD Sorani tail" (a real out-of-distribution concept,
+  not this feature) + historical notes on the deleted WavLM OOD path.
+
+**New migration tests (the plan said these must be BUILT — they didn't exist):**
+`v39_renames_ood_score_to_signal_anomaly_score` and `v39_preserves_existing_values_through_the_rename`
+(a real pre-v39 value survives the RENAME). v39's up_sql is **not idempotent**, so the two tests that
+rewind migration records and re-run (`restore_of_an_older_snapshot_migrates_it_forward_to_head`,
+`v35_repairs_divergent_segments_fts…`) now revert the rename first — faithful pre-v39 snapshots instead
+of records-only fakes, mirroring how they already undo non-idempotent v36.
+
+**Gate (verbatim):**
+```
+FMT_EXIT=0
+CLIPPY_EXIT=0
+test result: ok. 926 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 74.43s
+TYPECHECK_EXIT=0
+LINT_EXIT=0
+ Test Files  33 passed (33)
+      Tests  196 passed (196)
+Python policy regressions finished: 33 policy test scripts passed.
+```
+(all integration binaries also ok; 926 = 924 + the two v39 tests)
+
+**Adversarial verification (Workflow, 4 lenses) — earned its keep.** serde-boundary NO_ISSUE (contract
+intact, no dynamic/string-keyed survivor). **completeness CONFIRMED_ISSUE:** the first sweep renamed
+values + i18n keys but left the frontend **component-state layer** stale AND internally consistent, so
+typecheck passed clean — a half-renamed feature would have shipped (computeOodScores entry point,
+oodRunning/oodSegments/runOodDetection/wasOod, the 'ood' tab literal), plus 2 comments describing
+CURRENT code and 2 dangling quality/ood.rs paths. All fixed before commit; re-gated green. **No type
+system could have caught this** — only an adversarial read.
+
+**Commit:** 4371689. Pushed; main fast-forwarded.
+
+**Remaining weeks — honest status:** Week 1 COMPLETE. Week 2: all but speech_segments STRICT (next).
+Week 3: item 4 DONE; **items 1–3 are genuinely blocked on real data** — CTC-logit uncertainty needs
+per-token log-probs the sherpa binding does not expose + a frozen gold set to calibrate (ECE/Brier);
+chunk-overlap A/B needs real long audio with measured CER; the batch Gemini watcher is cloud/consent/
+cost-gated. Those items' deliverable IS a measured number, and a number will not be fabricated.
+Week 4: commands.rs decomposition — doable, next after STRICT. exe is now behind (Rust changed) —
+rebuild batched for after the next Rust landing.
