@@ -29,7 +29,12 @@ def main() -> None:
     learning = read("src-tauri/src/jury/learning.rs")
     integration = read("src-tauri/src/integration_runner.rs")
     runs = read("src-tauri/src/runs.rs")
+    # pipeline.rs's test module was split into pipeline_tests.rs (#[path]); scan both so a moved
+    # regression-test assertion still resolves (else this gate reads it as "missing").
     pipeline = read("src-tauri/src/pipeline.rs")
+    _pt = ROOT / "src-tauri" / "src" / "pipeline_tests.rs"
+    if _pt.is_file():
+        pipeline += "\n" + _pt.read_text(encoding="utf-8")
     export_bundle = read("src-tauri/src/export_bundle.rs")
     settings = read("src-tauri/src/settings.rs")
     migrations = read("src-tauri/src/migrations/mod.rs")

@@ -34,6 +34,19 @@ def db_surface() -> str:
     return text
 
 
+def pipeline_surface() -> str:
+    """pipeline.rs PLUS pipeline_tests.rs — the test module was split out via #[path], so both the
+    production checks AND the test-name assertions below must scan the whole pipeline module."""
+    parts = [(REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")]
+    pt = REPO_ROOT / "src-tauri" / "src" / "pipeline_tests.rs"
+    if pt.is_file():
+        parts.append(pt.read_text(encoding="utf-8"))
+    text = "\n".join(parts)
+    if "ProcessingPipeline" not in text:
+        raise AssertionError("pipeline.rs surface missing `ProcessingPipeline` — this gate would pass vacuously")
+    return text
+
+
 FORBIDDEN_RUNTIME_PATTERNS = {
     "src-tauri/src/jury/t2_listener.rs": [
         "samples.iter().find(|s| s.transcript.trim() == winning_transcript).unwrap()",
@@ -225,6 +238,8 @@ def test_known_runtime_panic_patterns_do_not_return() -> None:
             text = command_surface()
         elif relative_path == "src-tauri/src/db.rs":
             text = db_surface()
+        elif relative_path == "src-tauri/src/pipeline.rs":
+            text = pipeline_surface()
         else:
             text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
         for pattern in patterns:
@@ -438,7 +453,7 @@ def test_commands_use_recovered_app_state_batch_api() -> None:
 
 def test_app_state_pipeline_settings_update_recovers_poisoned_lock() -> None:
     lib = (REPO_ROOT / "src-tauri/src/lib.rs").read_text(encoding="utf-8")
-    pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface()
     commands = command_surface()
     if "pub(crate) fn lock_pipeline(&self) -> MutexGuard<'_, ProcessingPipeline>" not in lib:
         raise AssertionError("AppState must centralize processing pipeline locking behind lock_pipeline()")
@@ -620,7 +635,7 @@ def test_commands_jury_evidence_serialization_is_not_silent() -> None:
 
 def test_jury_background_runs_report_failures() -> None:
     commands = command_surface()
-    pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface()
     required_commands = [
         'fn log_jury_pipeline_failure(context: &str, error: &str)',
         'tracing::error!("Jury pipeline failed after {context}: {error}");',
@@ -1023,7 +1038,7 @@ def test_audio_decode_worker_send_failures_are_reported() -> None:
 
 
 def test_pipeline_wsl_subprocess_send_failures_are_reported() -> None:
-    pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface()
     forbidden = [
         "let _ = tx.send(cmd.output());",
         "let _ = child.kill();",
@@ -1050,7 +1065,7 @@ def test_pipeline_wsl_subprocess_send_failures_are_reported() -> None:
 
 
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
-    pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface()
     forbidden = [
         "audio::get_duration_ms(path).unwrap_or(0)",
         "let duration_ms = audio::get_duration_ms(path).unwrap_or(0);",
@@ -1134,7 +1149,7 @@ def test_eval_read_paths_do_not_silently_drop_rows() -> None:
 
 
 def test_pipeline_rediarize_reports_db_update_failures() -> None:
-    pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface()
     required = [
         "pub fn rediarize_segments(&self, ids: &[String]) -> AppResult<usize>",
         "let db = self.open_db()?;",
@@ -1197,7 +1212,7 @@ def test_batch_processor_asr_errors_are_not_blank_transcripts() -> None:
 
 
 def test_pipeline_hypothesis_population_reports_failures() -> None:
-    pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface()
     required = [
         "fn log_hypothesis_population_failure(segment_id: &str, error: &AppError)",
         "fn insert_hypothesis_checked(",
@@ -1379,7 +1394,7 @@ def test_health_system_recovers_poisoned_lock() -> None:
 
 
 def test_pipeline_import_status_recovers_poisoned_lock() -> None:
-    pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface()
     if "fn lock_import_status(&self) -> MutexGuard<'_, ImportStatus>" not in pipeline:
         raise AssertionError("ProcessingPipeline must centralize import status locking behind lock_import_status()")
     if "Recovering poisoned import status lock" not in pipeline:
@@ -1394,7 +1409,7 @@ def test_pipeline_import_status_recovers_poisoned_lock() -> None:
 
 
 def test_pipeline_cached_services_recover_poisoned_locks() -> None:
-    pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface()
     if "fn lock_diarization_service(" not in pipeline:
         raise AssertionError("ProcessingPipeline must centralize diarization service locking")
     if "fn lock_denoiser_service(&self) -> MutexGuard<'_, Option<crate::denoiser::DenoiserService>>" not in pipeline:
@@ -1412,7 +1427,7 @@ def test_pipeline_cached_services_recover_poisoned_locks() -> None:
 
 
 def test_pipeline_decoded_window_accumulator_recovers_poisoned_lock() -> None:
-    pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface()
     if "fn lock_decoded_windows(windows: &Mutex<Vec<audio::PcmWindow>>) -> MutexGuard<'_, Vec<audio::PcmWindow>>" not in pipeline:
         raise AssertionError("pipeline.rs must centralize decoded-window accumulator locking")
     if "Recovering poisoned decoded PCM window accumulator" not in pipeline:
