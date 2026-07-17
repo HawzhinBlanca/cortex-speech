@@ -5633,3 +5633,26 @@ vacuous-pass guard. Commit 17d7d98. fmt/clippy 0, 33/33 policies.
 **File-size progress:** commands.rs 3937, db.rs 2622, pipeline.rs 3313 — all now in/under the 3-4k band.
 Remaining big-test files for the same safe split: export.rs (2765, ~1446 test lines) and export_bundle.rs
 (2309, ~1336 test lines) → next iterations. Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-17T20:00Z — iter 50 — export.rs test module split → export_tests.rs (2764→1322, into target)
+
+**Week-4 item 1, test-split technique applied to export.rs.** Moved the 1445-line `#[cfg(test)] mod
+tests` to export_tests.rs via #[path]. **export.rs 2764→1322 (into the 3-4k band)**; cargo test --lib
+**929 passed / 0 failed (unchanged)**, 38 #[test] fns preserved (0 left in production export.rs).
+
+**Semantic-equivalence proof** (the dedent triggered rustfmt canonicalization — reflow, dropped trailing
+commas, one `|s| { e }`→`|s| e` closure unwrap): after stripping whitespace+commas+braces the original
+module body and the new file are **byte-identical (sha256 match)**. Adversarially checked the real risk of
+a blind `sed 's/^    //'` dedent (corrupting an indented multi-line string) — the sole raw string doesn't
+span indented lines and the byte-identical proof rules out any non-format change. Commit 3d59da5.
+
+**Gate coupling:** test_training_grade_export_policy.py pins 6 #[test] fn NAMES that moved →
+export_surface() helper (export.rs + export_tests.rs) + vacuous-pass guard, mirroring
+db_surface()/pipeline_surface(). rust-panic policy's export.rs read is production-only patterns
+(all still present) — unchanged. fmt/clippy 0, 33/33 policies.
+
+**File-size progress:** commands.rs 3937, export.rs 1322, db.rs 2622, pipeline.rs 3313 — all in/under the
+3-4k band. Last big-test file for the same safe split: **export_bundle.rs (2308, ~1334 test lines from
+line 974)** → next iteration. Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
