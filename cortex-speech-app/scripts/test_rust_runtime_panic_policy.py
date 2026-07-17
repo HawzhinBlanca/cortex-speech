@@ -19,6 +19,21 @@ def command_surface() -> str:
     return text
 
 
+def db_surface() -> str:
+    """db.rs PLUS db_tests.rs — the db module's tests were split into db_tests.rs (via #[path]) to keep
+    db.rs under the size target, so both the production checks AND the test-name assertions below must
+    scan the whole db module, or a moved test would read as "missing" and a forbidden pattern could hide
+    in the test file."""
+    parts = [(REPO_ROOT / "src-tauri" / "src" / "db.rs").read_text(encoding="utf-8")]
+    db_tests = REPO_ROOT / "src-tauri" / "src" / "db_tests.rs"
+    if db_tests.is_file():
+        parts.append(db_tests.read_text(encoding="utf-8"))
+    text = "\n".join(parts)
+    if "impl Database" not in text:
+        raise AssertionError("db.rs surface missing `impl Database` — this gate would pass vacuously")
+    return text
+
+
 FORBIDDEN_RUNTIME_PATTERNS = {
     "src-tauri/src/jury/t2_listener.rs": [
         "samples.iter().find(|s| s.transcript.trim() == winning_transcript).unwrap()",
@@ -208,6 +223,8 @@ def test_known_runtime_panic_patterns_do_not_return() -> None:
         # so a bad pattern cannot slip past by being extracted into src/commands/.
         if relative_path == "src-tauri/src/commands.rs":
             text = command_surface()
+        elif relative_path == "src-tauri/src/db.rs":
+            text = db_surface()
         else:
             text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
         for pattern in patterns:
@@ -816,7 +833,7 @@ def test_jury_db_and_export_paths_do_not_silently_drop_errors() -> None:
 
 
 def test_database_read_paths_do_not_silently_drop_rows() -> None:
-    db = (REPO_ROOT / "src-tauri/src/db.rs").read_text(encoding="utf-8")
+    db = db_surface()
     required = [
         "pub fn get_segments_by_ids(&self, ids: &[String]) -> AppResult<Vec<SpeechSegment>>",
         "pub fn get_escalation_queue(&self, limit: usize) -> AppResult<Vec<SpeechSegment>>",
@@ -840,7 +857,7 @@ def test_database_read_paths_do_not_silently_drop_rows() -> None:
 
 
 def test_database_fts_maintenance_does_not_silently_discard_errors() -> None:
-    db = (REPO_ROOT / "src-tauri/src/db.rs").read_text(encoding="utf-8")
+    db = db_surface()
     forbidden = [
         'self.conn.execute_batch("INSERT INTO segments_fts(segments_fts) VALUES(\'rebuild\');").ok();',
         'self.conn.execute("INSERT INTO segments_fts(segments_fts) VALUES(\'optimize\')", []).ok();',
@@ -862,7 +879,7 @@ def test_database_fts_maintenance_does_not_silently_discard_errors() -> None:
 
 
 def test_database_savepoint_cleanup_reports_failures() -> None:
-    db = (REPO_ROOT / "src-tauri/src/db.rs").read_text(encoding="utf-8")
+    db = db_surface()
     forbidden = [
         'let _ = self.conn.execute("ROLLBACK TO batch_insert", []);',
         'let _ = self.conn.execute("RELEASE batch_insert", []);',
