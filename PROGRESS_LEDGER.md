@@ -5365,3 +5365,28 @@ tier-2/3 gates that need the real exe + real audio + a live model (real-app-e2e,
 fuzz, fairness); (c) Week-3 items 1–3 measurements (real gold data / long audio). I'll keep doing the
 safe headless work (more slices, any found bugs), but the finish line genuinely needs the owner's
 machine for the real-audio/measurement legs.
+
+---
+
+## 2026-07-17T16:04Z — iter 36 — commands.rs slice 3 (batch review actions)
+
+**Week-4 item 1, slice 3 (commit 01003e8).** Extracted the 3 thread-spawning batch commands
+(batch_verify, batch_assign_speaker, batch_normalize) → src/commands/batch.rs. **commands.rs
+5728→5384 lines, 118→115 commands** (5968→5384 = ~10% off the original across slices 1-3). Surface
+total stays 128; lib.rs untouched. batch_transcribe deliberately left in commands.rs — it is coupled
+to the jury with_jury_db helper and belongs with a future jury slice.
+
+Compiler surfaced the extra imports (crate::db::SpeechSegment, validation::input as validate,
+std::sync::Arc, tauri::Manager for AppHandle::try_state). **No policy update was needed this time** —
+the command_surface() helper (iters 34-35) means the panic policy's required patterns for these
+commands are found automatically now that they live in a slice. That gate-coupling design holds.
+
+**Gate:** fmt 0; clippy 0; cargo test --lib 929; 33/33 python policies; lib.rs untouched; surface 128.
+No adversarial Workflow — third application of the mechanical slice pattern, compiler-verified (clippy
++ 929 tests) with the surface-scanning gates; consistent with slices 1-2.
+
+**Decomposition progress:** commands.rs 5968→5384 over 3 slices (export 7, model_download 3, batch 3 =
+13 commands relocated). The doctrine targets 3-4k-line files, so this is a multi-iteration grind;
+each slice is small/safe/verified. Remaining big cohesive groups: the jury/T-pipeline family (with the
+with_jury_db + JuryDbSource helpers), the get_*/stats family, the db-maintenance family (interleaved
+with helpers). exe still behind (owner-gated rebuild, recoverable via the confirmed auto-snapshot).
