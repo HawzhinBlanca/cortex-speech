@@ -15,6 +15,23 @@ def read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+# Week-4 decomposes commands.rs into slices under src/commands/. The cloud-consent gates for the jury
+# T2 + Scribe egress commands moved with them, so these privacy checks must scan the whole command
+# SURFACE (commands.rs + every slice) — otherwise a consent gate could "vanish" from a by-path read and
+# the gate would pass vacuously while audio/text egress silently lost its opt-in guard.
+COMMANDS_DIR = REPO_ROOT / "src-tauri" / "src" / "commands"
+
+
+def command_surface() -> str:
+    parts = [read(COMMANDS_RS)]
+    if COMMANDS_DIR.is_dir():
+        parts += [read(path) for path in sorted(COMMANDS_DIR.rglob("*.rs"))]
+    text = "\n".join(parts)
+    if "#[tauri::command]" not in text:
+        raise AssertionError("no #[tauri::command] in the command surface — this cloud-privacy gate would pass vacuously")
+    return text
+
+
 def assert_contains(text: str, expected: str, context: str) -> None:
     if expected not in text:
         raise AssertionError(f"{context} is missing: {expected}")
@@ -43,7 +60,7 @@ def test_gemini_refinement_requires_effective_opt_in_mode() -> None:
 
 
 def test_t2_audio_cloud_calls_require_jury_opt_in() -> None:
-    commands = read(COMMANDS_RS)
+    commands = command_surface()
 
     assert_contains(commands, "let cloud_opt_in = settings.jury_cloud_opt_in;", COMMANDS_RS.name)
     assert_contains(commands, "if cloud_opt_in && !api_key.trim().is_empty()", COMMANDS_RS.name)
@@ -62,7 +79,7 @@ def test_cloud_stt_scribe_egress_requires_opt_in() -> None:
     # paths upload SEGMENT AUDIO — a stricter privacy surface. Every Scribe egress must be gated behind
     # cloud_stt_opt_in, or a refactor could silently ship audio off-device with no consent.
     settings = read(SETTINGS_RS)
-    commands = read(COMMANDS_RS)
+    commands = command_surface()
     pipeline = read(PIPELINE_RS)
 
     # Opt-out by default.
