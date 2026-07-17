@@ -5429,3 +5429,31 @@ fmt/clippy 0, cargo test --lib 929, 33/33. **Running total: commands.rs 5968→5
 slices, 32 commands relocated.** Biggest remaining group is the coupled jury/T-pipeline family (needs a
 dedicated iteration to move its shared helpers with visibility care). exe owner-gated-behind
 (recoverable via auto-snapshot).
+
+---
+
+## 2026-07-17T17:11Z — iter 40 — commands.rs slice 7 (jury/cloud-judge wrappers) — the security-sensitive one
+
+**Week-4 item 1, slice 7 (commit b575ac9).** Extracted the 5 jury/cloud-judge
+command wrappers → src/commands/jury.rs. **commands.rs 4997→4723 (~21% off the original over 7 slices),
+96→91 commands.** Only the thin wrappers moved; the shared jury machinery (JuryDbSource,
+run_jury_pipeline_core_via, reference_selection_*, consent gates, resolve_t2_endpoint) STAYS in
+commands.rs (also used by batch_transcribe) via super::. **PURE MOVE, proven: commands.rs diff = 281
+deletions + 2 wiring lines, no logic edits** — every cloud consent/key gate byte-identical.
+
+**Two things I caught + fixed:** (1) my doc-comment contained the literal "#[tauri::command]" string,
+inflating the audit's command count to 129 — rephrased, back to 128. (2) test_cloud_privacy_policy.py
+(a PRIVACY gate) read commands.rs by path and went RED ("require_cloud_stt_consent found 1 call site")
+because add_scribe_votes + run_t2_for_segment moved — routed it through a command_surface() helper +
+vacuous-pass guard so a consent gate can never silently vanish from a by-path read. Right fix: a
+privacy gate must follow its command into the slice.
+
+**Gate:** fmt 0; clippy 0; cargo test --lib 929; 33/33 python policies (incl. surface-scanning
+cloud-privacy); lib.rs untouched; surface 128. Verification: the git-diff-proves-pure-move + 7
+consent-gate markers present in the slice + the surface-scanning privacy policy = the consent gates are
+provably preserved (no separate Workflow needed for a proven byte-identical relocation).
+
+**Running total: commands.rs 5968→4723 (~21% off) over 7 slices, 37 commands relocated.** The jury
+family's remaining bulk (run_jury_pipeline_core, JuryDbSource impl ~hundreds of lines) stays in
+commands.rs for now (shared with batch_transcribe); a later pass could move it + update the 2 callers.
+exe owner-gated-behind (recoverable via auto-snapshot).
