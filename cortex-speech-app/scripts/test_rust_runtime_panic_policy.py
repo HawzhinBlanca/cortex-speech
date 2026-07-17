@@ -2,6 +2,22 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Week-4 decomposes commands.rs into slices under src/commands/. Every command-CONTENT check here
+# must follow a command wherever it moves, or extracting it to a slice would make the check pass
+# VACUOUSLY (a forbidden pattern could escape; a required pattern would read as "missing").
+COMMANDS_DIR = REPO_ROOT / "src-tauri" / "src" / "commands"
+
+
+def command_surface() -> str:
+    """commands.rs + every extracted slice under src/commands/, concatenated."""
+    parts = [(REPO_ROOT / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")]
+    if COMMANDS_DIR.is_dir():
+        parts += [path.read_text(encoding="utf-8") for path in sorted(COMMANDS_DIR.rglob("*.rs"))]
+    text = "\n".join(parts)
+    if "#[tauri::command]" not in text:
+        raise AssertionError("no #[tauri::command] in the command surface — this gate would pass vacuously")
+    return text
+
 
 FORBIDDEN_RUNTIME_PATTERNS = {
     "src-tauri/src/jury/t2_listener.rs": [
@@ -188,7 +204,12 @@ FORBIDDEN_RUNTIME_PATTERNS = {
 def test_known_runtime_panic_patterns_do_not_return() -> None:
     offenders: list[str] = []
     for relative_path, patterns in FORBIDDEN_RUNTIME_PATTERNS.items():
-        text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        # commands.rs forbidden patterns are checked across the whole command surface (incl. slices)
+        # so a bad pattern cannot slip past by being extracted into src/commands/.
+        if relative_path == "src-tauri/src/commands.rs":
+            text = command_surface()
+        else:
+            text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
         for pattern in patterns:
             if pattern in text:
                 offenders.append(f"{relative_path}: {pattern}")
@@ -198,7 +219,7 @@ def test_known_runtime_panic_patterns_do_not_return() -> None:
 
 
 def test_wsl_refinement_batch_is_panic_safe_and_cancellable() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     # The batch 7B refinement no longer spawns the configured script once with batch flags the
     # per-segment warm client cannot parse; it drives the shared per-segment helper in a loop. These
     # invariants keep that loop process-safe, cancellable, and non-destructive.
@@ -239,7 +260,7 @@ def test_wsl_refinement_batch_is_panic_safe_and_cancellable() -> None:
 
 
 def test_wsl_refinement_lifecycle_failures_are_reported() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     forbidden = [
         "child.wait().ok()",
         "let _ = child.kill();",
@@ -331,7 +352,7 @@ def test_app_state_cancel_token_recovers_poisoned_lock() -> None:
 
 
 def test_commands_use_recovered_app_state_cancellation_api() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     if "state.start_cancel_token()" not in commands:
         raise AssertionError("commands.rs must start operations through AppState::start_cancel_token()")
     if "state.cancel_current_operation()" not in commands:
@@ -358,7 +379,7 @@ def test_app_state_import_state_recovers_poisoned_lock() -> None:
 
 
 def test_commands_use_recovered_app_state_import_api() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     if "state.try_start_import()?" not in commands:
         raise AssertionError("commands.rs must start imports through AppState::try_start_import()")
     if "finish_import()" not in commands:
@@ -387,7 +408,7 @@ def test_app_state_batch_state_recovers_poisoned_lock() -> None:
 
 
 def test_commands_use_recovered_app_state_batch_api() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     if "state.try_start_batch()?" not in commands:
         raise AssertionError("commands.rs must start batches through AppState::try_start_batch()")
     if "finish_batch()" not in commands:
@@ -401,7 +422,7 @@ def test_commands_use_recovered_app_state_batch_api() -> None:
 def test_app_state_pipeline_settings_update_recovers_poisoned_lock() -> None:
     lib = (REPO_ROOT / "src-tauri/src/lib.rs").read_text(encoding="utf-8")
     pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     if "pub(crate) fn lock_pipeline(&self) -> MutexGuard<'_, ProcessingPipeline>" not in lib:
         raise AssertionError("AppState must centralize processing pipeline locking behind lock_pipeline()")
     if "Recovering poisoned processing pipeline lock" not in lib:
@@ -532,7 +553,7 @@ def test_instance_lock_cleanup_reports_failures() -> None:
 
 
 def test_commands_do_not_silently_default_critical_db_failures() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     required = [
         'tracing::error!("Batch transcribe DB prefetch failed: {error}")',
         'let segments = db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?;',
@@ -550,7 +571,7 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
 
 
 def test_commands_batch_transcribe_reports_insert_failures() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     # Batch transcribe writes results through a GUARDED targeted update
     # (update_batch_transcription_if_unreviewed) rather than a full insert_segment of the prefetched
     # (now-stale) snapshot, so a concurrent human verify/edit is never clobbered. It must STILL snapshot
@@ -568,7 +589,7 @@ def test_commands_batch_transcribe_reports_insert_failures() -> None:
 
 
 def test_commands_jury_evidence_serialization_is_not_silent() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     required = [
         'format!("Failed to serialize T1 evidence for {seg_id}: {e}")',
         'format!("Failed to serialize T2 evidence for {seg_id}: {e}")',
@@ -581,7 +602,7 @@ def test_commands_jury_evidence_serialization_is_not_silent() -> None:
 
 
 def test_jury_background_runs_report_failures() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     pipeline = (REPO_ROOT / "src-tauri/src/pipeline.rs").read_text(encoding="utf-8")
     required_commands = [
         'fn log_jury_pipeline_failure(context: &str, error: &str)',
@@ -607,7 +628,7 @@ def test_jury_background_runs_report_failures() -> None:
 
 
 def test_pipeline_event_emits_report_failures() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     required = [
         "fn emit_or_log<T>(app: &tauri::AppHandle, event: &str, payload: T)",
         'tracing::warn!("Failed to emit {event}: {error}");',
@@ -625,7 +646,7 @@ def test_pipeline_event_emits_report_failures() -> None:
 
 
 def test_command_event_emits_are_not_silently_discarded() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     forbidden = [
         "let _ = app.emit(",
         "let _ = app_clone.emit(",
@@ -654,7 +675,7 @@ def test_command_event_emits_are_not_silently_discarded() -> None:
 
 
 def test_commands_audio_duration_probe_send_failures_are_reported() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     forbidden = [
         "let _ = tx.send(result);",
     ]
@@ -675,7 +696,7 @@ def test_commands_audio_duration_probe_send_failures_are_reported() -> None:
 
 
 def test_commands_batch_normalize_reports_prefetch_and_update_failures() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     required = [
         'tracing::warn!("Batch normalize segment not found during prefetch: {id}")',
         'tracing::error!("Batch normalize DB prefetch failed for {id}: {error}")',
@@ -694,7 +715,7 @@ def test_commands_batch_normalize_reports_prefetch_and_update_failures() -> None
 
 
 def test_commands_acoustic_scoring_reports_skipped_segments() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     required = [
         '"Skipping acoustic score for {}: audio path not found: {}"',
         'tracing::warn!("Skipping acoustic score for {}: decode failed: {error}", seg.id);',
@@ -711,7 +732,7 @@ def test_commands_acoustic_scoring_reports_skipped_segments() -> None:
 
 
 def test_commands_alignment_quality_stamp_reports_failures() -> None:
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
     forbidden = [
         'let _ = db.update_alignment_quality(id, "ctc_forced");',
     ]
@@ -1116,7 +1137,7 @@ def test_file_dialog_commands_do_not_block_the_main_thread() -> None:
     command hung the full timeout while the dialog was up). Both MUST stay `async fn` and use the
     non-blocking pick_file/pick_folder callback form so the dialog never blocks the event loop.
     """
-    commands = (REPO_ROOT / "src-tauri/src/commands.rs").read_text(encoding="utf-8")
+    commands = command_surface()
 
     def body_of(sig: str) -> str:
         start = commands.index(sig)
