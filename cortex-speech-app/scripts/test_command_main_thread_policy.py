@@ -11,6 +11,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMMANDS_RS = REPO_ROOT / "src-tauri" / "src" / "commands.rs"
+# Week-4 decomposes commands.rs into slices under src/commands/ (one slice per run). The command
+# SURFACE is therefore commands.rs PLUS its slices — this gate must follow a command wherever it
+# lives, or it would silently stop checking it the moment it moved, which is a vacuous pass.
+COMMANDS_DIR = REPO_ROOT / "src-tauri" / "src" / "commands"
 
 # Slow commands proven moved OFF the main thread. GROW this list as the migration continues; never
 # shrink it (that would be a UI-freeze regression).
@@ -123,7 +127,17 @@ RUN_BLOCKING_COMMANDS = [
 
 
 def source() -> str:
-    return COMMANDS_RS.read_text(encoding="utf-8")
+    """The whole command surface: commands.rs + every extracted slice under src/commands/."""
+    if not COMMANDS_RS.is_file():
+        raise AssertionError(f"{COMMANDS_RS} is missing — the command surface cannot be checked")
+    parts = [COMMANDS_RS.read_text(encoding="utf-8")]
+    if COMMANDS_DIR.is_dir():
+        parts += [path.read_text(encoding="utf-8") for path in sorted(COMMANDS_DIR.rglob("*.rs"))]
+    text = "\n".join(parts)
+    # Fail loudly rather than pass vacuously if the surface ever reads empty.
+    if "#[tauri::command]" not in text:
+        raise AssertionError("no #[tauri::command] found in the command surface — this gate would pass vacuously")
+    return text
 
 
 def test_listed_slow_commands_are_async() -> None:

@@ -34,6 +34,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMMANDS_RS = REPO_ROOT / "src-tauri" / "src" / "commands.rs"
+# Week-4 decomposes commands.rs into slices under src/commands/ (one slice per run). The audit must
+# see the WHOLE command surface — otherwise a migrated command would vanish from the counts and a
+# listed freezer could "disappear" (passing vacuously) simply by being moved to a slice.
+COMMANDS_DIR = REPO_ROOT / "src-tauri" / "src" / "commands"
 
 # Sync `#[tauri::command]`s that do heavy work inline on the main thread and freeze the UI. Traced by
 # hand into the helper they delegate to. class ∈ {cloud-net, subprocess, file-io}. When one is migrated
@@ -98,7 +102,16 @@ SPAWN_MARKERS = ["thread::spawn", "Builder::new()", "spawn_blocking", "async_run
 
 
 def source() -> str:
-    return COMMANDS_RS.read_text(encoding="utf-8")
+    """The whole command surface: commands.rs + every extracted slice under src/commands/."""
+    if not COMMANDS_RS.is_file():
+        raise AssertionError(f"{COMMANDS_RS} is missing — the command surface cannot be audited")
+    parts = [COMMANDS_RS.read_text(encoding="utf-8")]
+    if COMMANDS_DIR.is_dir():
+        parts += [path.read_text(encoding="utf-8") for path in sorted(COMMANDS_DIR.rglob("*.rs"))]
+    text = "\n".join(parts)
+    if "#[tauri::command]" not in text:
+        raise AssertionError("no #[tauri::command] in the command surface — this audit would pass vacuously")
+    return text
 
 
 def _body(src: str, name: str) -> str:
