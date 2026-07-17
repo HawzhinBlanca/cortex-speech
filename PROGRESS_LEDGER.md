@@ -5203,3 +5203,66 @@ chunk-overlap A/B needs real long audio with measured CER; the batch Gemini watc
 cost-gated. Those items' deliverable IS a measured number, and a number will not be fabricated.
 Week 4: commands.rs decomposition — doable, next after STRICT. exe is now behind (Rust changed) —
 rebuild batched for after the next Rust landing.
+
+---
+
+## 2026-07-17T04:46Z — iter 33 — **WEEK 2 COMPLETE**: STRICT speech_segments (v40) via a new FK-off migration mode
+
+**Owner directive:** "complete all the weeks work" — so the iter-25 owner-gated deferral is lifted and
+the riskiest migration in the app is now done, test-first and adversarially verified.
+
+**Framework capability (the plan's prerequisite, now built):** `FK_OFF_MIGRATIONS` +
+`run_with_foreign_keys_off` + `reject_foreign_key_violations`. SQLite's canonical 12-step recreate:
+foreign_keys OFF in autocommit → ONE transaction for the schema work → foreign_key_check → commit →
+restore. Keyed by version so the 39 existing migration literals stay untouched. `rollback()` gets the
+same window AND the same transaction.
+
+**v40:** recreate speech_segments as STRICT. Exact live schema dumped from SQLite first (not
+hand-derived): **34 columns, all already TEXT/INTEGER/REAL → ZERO type remapping**; **10 indexes**
+(confirming the iter-25 adversarial finding). Copy PRESERVES rowid (segments_fts is external-content on
+content_rowid); all 10 indexes + all 3 FTS triggers recreated; FTS rebuilt last.
+
+**Gate (verbatim):**
+```
+FMT_EXIT=0
+CLIPPY_EXIT=0
+test result: ok. 929 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 77.43s
+TYPECHECK_EXIT=0
+      Tests  196 passed (196)
+Python policy regressions finished: 33 policy test scripts passed.
+```
+
+**Adversarial verification (Workflow, 4 lenses) — found REAL data-loss defects in my own code.**
+schema-fidelity NO_ISSUE (34/34 exact, verified by mechanically replaying migrations; the only diff,
+`id` notnull 0→1, is STRICT's own tightening — fail-closed). recreate-completeness NO_ISSUE (rowid
+preservation, 10 indexes, 3 triggers verbatim — proven by EXECUTING the up_sql on a populated replica).
+blast-radius NO_ISSUE. **fk-off-framework CONFIRMED_ISSUE ×3, all fixed before commit:**
+1. **My fk_check backstop was structurally BLIND to the very thing it guarded.** A cascade deletes
+   children *cleanly* → **ZERO violations** → an FK-still-ON recreate would PASS the check and commit
+   total child-row loss silently. The lens *measured* this. Real guard is now a **read-back** asserting
+   the pragma took effect (SQLite silently ignores it inside a txn and still reports success) — fails
+   CLOSED. reject_foreign_key_violations' doc now honestly states it catches orphans, NOT cascades.
+2. A failed restore was **silently swallowed** when the body also failed (`result?` dropped it) →
+   foreign_keys left OFF for the connection's life; `Database::restore()` runs migrations at RUNTIME on
+   the live AppState connection where failure is non-fatal. Both errors now reported.
+3. rollback's FK-off path was **non-atomic** (execute_batch in autocommit) — a failure between DROP and
+   RENAME would leave NO speech_segments table. Now mirrors apply exactly.
+**No test could have caught #1** — the tests passed while the guard was blind. Only an adversarial read did.
+
+**Tests added:** `v40_speech_segments_is_strict_and_the_recreate_preserved_everything` (real recreate on
+a POPULATED schema: STRICT rejects a type violation, rows/values survive, **rowids preserved**, the
+**CASCADE child survives**, 10 indexes present, FTS search works, integrity + foreign_key_check clean,
+writes resume); `fk_off_window_refuses_when_the_pragma_silently_did_not_take_effect` (the body must
+NEVER run on the data-loss path); `fk_off_window_restores_foreign_keys_even_when_the_body_fails`.
+
+**Commits:** b17feb5 (v40 + framework), aefc2b9 (see below). Pushed; main fast-forwarded.
+
+**Improvement found while gating:** `tests/test_file_cli.rs` was the ONLY red integration binary —
+failing instantly with "CARGO_BIN_EXE_test_file is unset". **Not a regression:** commit 1167504
+("dead-code cuts") deliberately deleted the dead dev bin `src/bin/test_file.rs` but LEFT its test
+behind, orphaned and permanently red since. Completed that deletion (assert_cmd still used by
+shell_smoke + tauri_integration, so no orphaned dep). **The whole integration suite is now green** —
+zero FAILED binaries.
+
+**Weeks status:** W1 ✅ · **W2 ✅ (complete)** · W3 item 4 ✅, items 1–3 blocked on real data ·
+W4 next (commands.rs decomposition). exe behind (Rust changed) — rebuild batched.
