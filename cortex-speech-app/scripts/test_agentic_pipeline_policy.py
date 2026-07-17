@@ -8,9 +8,23 @@ def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
+def command_surface() -> str:
+    # Week-4 decomposes commands.rs into slices under src/commands/. The agentic command patterns
+    # asserted below (agent stage events, consensus refinery, engine status/readiness) may live in a
+    # slice, so scan the whole command surface — else the check passes vacuously when a command moves.
+    parts = [read("src-tauri/src/commands.rs")]
+    commands_dir = ROOT / "src-tauri" / "src" / "commands"
+    if commands_dir.is_dir():
+        parts += [p.read_text(encoding="utf-8") for p in sorted(commands_dir.rglob("*.rs"))]
+    text = "\n".join(parts)
+    if "#[tauri::command]" not in text:
+        raise AssertionError("no #[tauri::command] in the command surface — this agentic gate would pass vacuously")
+    return text
+
+
 def main() -> None:
     agentic = read("src-tauri/src/agentic.rs")
-    commands = read("src-tauri/src/commands.rs")
+    commands = command_surface()
     db = read("src-tauri/src/db.rs")
     learning = read("src-tauri/src/jury/learning.rs")
     integration = read("src-tauri/src/integration_runner.rs")
