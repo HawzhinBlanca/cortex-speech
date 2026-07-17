@@ -39,6 +39,8 @@ mod model_download;
 pub use model_download::*;
 mod batch;
 pub use batch::*;
+mod dataset_analytics;
+pub use dataset_analytics::*;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2087,17 +2089,6 @@ pub fn get_import_status(state: State<'_, AppState>) -> Result<crate::pipeline::
     Ok(pipeline.import_status())
 }
 
-#[tauri::command]
-pub async fn get_dataset_stats(state: State<'_, AppState>) -> Result<stats::DatasetStats, String> {
-    RATE_LIMITER.check("get_dataset_stats")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        stats::compute_stats(&db).map_err(|e| e.to_string())
-    })
-    .await
-}
-
 /// The complete speaker list (not the truncated top-10 dashboard summary) so the speaker-management
 /// panel can rename every speaker, including low-frequency ones.
 #[tauri::command]
@@ -2105,18 +2096,6 @@ pub fn get_speakers(state: State<'_, AppState>) -> Result<Vec<stats::SpeakerStat
     RATE_LIMITER.check("get_speakers")?;
     let db = state.lock_db();
     stats::list_speakers(&db).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn get_dataset_quality(state: State<'_, AppState>) -> Result<quality::DatasetQuality, String> {
-    RATE_LIMITER.check("get_dataset_quality")?;
-    let settings = state.lock_settings().clone(); // snapshot before moving into the blocking task
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        quality::compute_quality_with_settings(&db, &settings).map_err(|e| e.to_string())
-    })
-    .await
 }
 
 #[tauri::command]
@@ -2266,20 +2245,6 @@ pub fn restore_session(state: State<'_, AppState>) -> Result<Option<crate::sessi
 }
 
 #[tauri::command]
-pub async fn validate_dataset_cmd(state: State<'_, AppState>) -> Result<crate::validation::ValidationReport, String> {
-    // Rate-limited like its read siblings: this runs a full-dataset validation scan under the db lock,
-    // so an unthrottled webview loop would starve every other DB command.
-    RATE_LIMITER.check("validate_dataset_cmd")?;
-    let settings = state.lock_settings().clone(); // snapshot before moving into the blocking task
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::validation::validate_dataset_with_settings(&db, &settings).map_err(|e| e.to_string())
-    })
-    .await
-}
-
-#[tauri::command]
 pub async fn check_audio(path: String) -> Result<serde_json::Value, String> {
     run_blocking(move || {
         let validated = validate::validate_file_path(&path)?;
@@ -2426,19 +2391,6 @@ pub fn get_quarantine_notice(state: State<'_, AppState>) -> Result<serde_json::V
         "snapshotCount": snapshots.len(),
         "newestSnapshotSegments": snapshots.first().and_then(|s| s.segment_count),
     }))
-}
-
-/// Intelligence read-side: LOOP-0 shadow precision (the C5 go-live evidence) + auto-accept
-/// precision (C4) joined against subsequent human decisions.
-#[tauri::command]
-pub async fn get_intelligence_report(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("get_intelligence_report")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.intelligence_report().map_err(|e| e.to_string())
-    })
-    .await
 }
 
 /// B2: list the rotating auto-snapshots (newest first) for the restore picker.
@@ -3102,24 +3054,6 @@ pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize
 }
 
 #[tauri::command]
-pub async fn get_dataset_certificate(
-    state: State<'_, AppState>,
-    target_error: f64,
-    confidence_level: f64,
-) -> Result<crate::quality::conformal::ConformalCertificate, String> {
-    RATE_LIMITER.check("get_dataset_certificate")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let segments = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.get_segments(None).map_err(|e| e.to_string())?
-        };
-        Ok(crate::quality::conformal::calibrate_and_certify(&segments, target_error, confidence_level))
-    })
-    .await
-}
-
-#[tauri::command]
 pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result<usize, String> {
     RATE_LIMITER.check("compute_signal_anomaly_scores")?;
     let models_dir = state.lock_model_manager().models_dir.clone();
@@ -3307,23 +3241,6 @@ pub fn build_scorecard(
     Ok(ScorecardResponse { scorecard, markdown })
 }
 
-/// Compute the annotation-drift scorecard for the current dataset: how much human
-/// reviewers had to change the raw ASR output (micro WER/CER with bootstrap CIs). Reads
-/// the live segments directly — unlike `build_scorecard` it needs no held-out eval run.
-#[tauri::command]
-pub async fn compute_annotation_drift_scorecard(
-    state: State<'_, AppState>,
-) -> Result<crate::scorecard::AnnotationDriftScorecard, String> {
-    RATE_LIMITER.check("compute_annotation_drift_scorecard")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        let segments = db.get_segments(None).map_err(|e| e.to_string())?;
-        Ok(crate::scorecard::annotation_drift_scorecard(&segments, Default::default()))
-    })
-    .await
-}
-
 #[tauri::command]
 pub async fn run_gold_eval_local(
     state: State<'_, AppState>,
@@ -3341,19 +3258,6 @@ pub fn list_eval_runs(state: State<'_, AppState>) -> Result<Vec<crate::eval::Eva
     RATE_LIMITER.check("list_eval_runs")?;
     let db = state.lock_db();
     crate::eval::list_eval_runs(&db).map_err(|e| e.to_string())
-}
-
-/// Measured raw-ASR vs post-jury label-quality lift (M3.1) over human-verified segments.
-#[tauri::command]
-pub async fn get_label_quality_lift(state: State<'_, AppState>) -> Result<crate::eval::LabelQualityLift, String> {
-    RATE_LIMITER.check("get_label_quality_lift")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        let triples = crate::eval::load_lift_triples(&db).map_err(|e| e.to_string())?;
-        Ok(crate::eval::compute_label_quality_lift(&triples, 2000, 1234))
-    })
-    .await
 }
 
 #[tauri::command]

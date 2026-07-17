@@ -1,0 +1,111 @@
+//! Dataset-analytics IPC commands — slice 4 of the Week-4 `commands.rs` decomposition.
+//!
+//! Behaviour and command NAMES unchanged: `commands.rs` re-exports this module (`pub use
+//! dataset_analytics::*;`), so `lib.rs`'s invoke_handler still names `commands::get_dataset_stats`
+//! and the frontend invokes are untouched. Same functions, only relocated.
+//!
+//! Each is a whole-dataset read/compute (stats, quality, validation, the intelligence report, the
+//! conformal certificate, annotation-drift, label-quality lift) run via `run_blocking` so a large
+//! library never freezes the UI thread.
+
+use super::{run_blocking, RATE_LIMITER};
+use crate::{quality, stats, AppState};
+use tauri::State;
+
+#[tauri::command]
+pub async fn get_dataset_stats(state: State<'_, AppState>) -> Result<stats::DatasetStats, String> {
+    RATE_LIMITER.check("get_dataset_stats")?;
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        stats::compute_stats(&db).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_dataset_quality(state: State<'_, AppState>) -> Result<quality::DatasetQuality, String> {
+    RATE_LIMITER.check("get_dataset_quality")?;
+    let settings = state.lock_settings().clone(); // snapshot before moving into the blocking task
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        quality::compute_quality_with_settings(&db, &settings).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn validate_dataset_cmd(state: State<'_, AppState>) -> Result<crate::validation::ValidationReport, String> {
+    // Rate-limited like its read siblings: this runs a full-dataset validation scan under the db lock,
+    // so an unthrottled webview loop would starve every other DB command.
+    RATE_LIMITER.check("validate_dataset_cmd")?;
+    let settings = state.lock_settings().clone(); // snapshot before moving into the blocking task
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::validation::validate_dataset_with_settings(&db, &settings).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Intelligence read-side: LOOP-0 shadow precision (the C5 go-live evidence) + auto-accept
+/// precision (C4) joined against subsequent human decisions.
+#[tauri::command]
+pub async fn get_intelligence_report(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    RATE_LIMITER.check("get_intelligence_report")?;
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        db.intelligence_report().map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_dataset_certificate(
+    state: State<'_, AppState>,
+    target_error: f64,
+    confidence_level: f64,
+) -> Result<crate::quality::conformal::ConformalCertificate, String> {
+    RATE_LIMITER.check("get_dataset_certificate")?;
+    let db = state.db_arc();
+    run_blocking(move || {
+        let segments = {
+            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            db.get_segments(None).map_err(|e| e.to_string())?
+        };
+        Ok(crate::quality::conformal::calibrate_and_certify(&segments, target_error, confidence_level))
+    })
+    .await
+}
+
+/// Compute the annotation-drift scorecard for the current dataset: how much human
+/// reviewers had to change the raw ASR output (micro WER/CER with bootstrap CIs). Reads
+/// the live segments directly — unlike `build_scorecard` it needs no held-out eval run.
+#[tauri::command]
+pub async fn compute_annotation_drift_scorecard(
+    state: State<'_, AppState>,
+) -> Result<crate::scorecard::AnnotationDriftScorecard, String> {
+    RATE_LIMITER.check("compute_annotation_drift_scorecard")?;
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let segments = db.get_segments(None).map_err(|e| e.to_string())?;
+        Ok(crate::scorecard::annotation_drift_scorecard(&segments, Default::default()))
+    })
+    .await
+}
+
+/// Measured raw-ASR vs post-jury label-quality lift (M3.1) over human-verified segments.
+#[tauri::command]
+pub async fn get_label_quality_lift(state: State<'_, AppState>) -> Result<crate::eval::LabelQualityLift, String> {
+    RATE_LIMITER.check("get_label_quality_lift")?;
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let triples = crate::eval::load_lift_triples(&db).map_err(|e| e.to_string())?;
+        Ok(crate::eval::compute_label_quality_lift(&triples, 2000, 1234))
+    })
+    .await
+}
