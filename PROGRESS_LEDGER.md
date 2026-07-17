@@ -5416,3 +5416,16 @@ src/commands/gold_eval.rs. **commands.rs 5285→5195, 108→102 commands.** Self
 validation::input); compiled clean first try; lib.rs untouched; surface 128; gate fmt/clippy 0, cargo
 test --lib 929, 33/33 policies. **Running total: commands.rs 5968→5195 (~13% off) over 5 slices (26
 commands relocated).** exe still owner-gated-behind (recoverable via confirmed auto-snapshot).
+
+---
+
+## 2026-07-17T16:50Z — iter 39 — commands.rs slice 6 (per-segment transcribe/align); now below 5k lines
+
+**Week-4 item 1, slice 6 (commit 5589bd6).** Extracted 6 per-segment
+ASR/alignment/audio commands → src/commands/transcribe.rs. **commands.rs 5189→5003 (below 5k for the
+first time), 102→96 commands.** Compiler surfaced deps: crate::{aligner, audio, validation} + two
+finetuned-decode helpers via super:: (they stay in commands.rs). lib.rs untouched; surface 128; gate
+fmt/clippy 0, cargo test --lib 929, 33/33. **Running total: commands.rs 5968→5003 (~16% off) over 6
+slices, 32 commands relocated.** Biggest remaining group is the coupled jury/T-pipeline family (needs a
+dedicated iteration to move its shared helpers with visibility care). exe owner-gated-behind
+(recoverable via auto-snapshot).
