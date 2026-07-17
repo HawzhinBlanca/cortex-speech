@@ -1,5 +1,55 @@
 # Cortex Speech — Owner Hand-off
 
+> ## ▶ UPDATE 2026-07-17 — MONTH-LOOP session (Weeks 1–4). Read this first; the 2026-07-11 status below is the older baseline.
+>
+> This autonomous session (24 iterations, every change gated + most adversarially verified — see the
+> tail of `PROGRESS_LEDGER.md` for the verbatim per-iteration record) completed the high-value work that
+> can be done **without your machine**:
+>
+> - **Week 1 — responsiveness:** every heavy command is off the UI thread; the last freezer
+>   (`run_dpo_update`) migrated; `start_champion_engine` reviewed + kept sync (spawn-and-return).
+>   **Real timing telemetry is now instrumented** (ASR + export spans) — it records real RTF/export
+>   durations during use, surfaced by `get_recent_spans` / `get_tracing_stats`.
+> - **Week 2 — durability:** disk-full / power-loss / corruption / mid-export fault drills; DPAPI key
+>   protection; and **`speech_segments` is now a STRICT table (migration v40)** via a new FK-off
+>   migration mode. The adversarial review of v40 caught a real data-loss hole in the guard *before* it
+>   shipped; the recreate is proven on a populated schema.
+> - **Week 3 — item 4 done:** the "OOD" jargon was retired end-to-end → `signal_anomaly` (migration v39,
+>   Rust + serde + frontend + i18n). Items 1–3 (real CTC-logit uncertainty/calibration, chunk-overlap
+>   A/B CER, batch Gemini watcher) are **owner-gated** — their deliverable is a *measured number* on real
+>   gold data / long audio, which was not fabricated.
+> - **Week 4 — decomposition:** `commands.rs` went 5968 → 3941 lines (~34% off, into the 3–4k target) via
+>   12 clean slices under `src/commands/`, command names + IPC surface unchanged (`lib.rs` untouched), a
+>   count guardrail proving no command was lost, and 5 policy gates hardened to follow commands into
+>   slices. The tightly-coupled jury subsystem is the one remaining (optional) consolidation.
+>
+> ### ▶ To finish "fully ready robust" — the remaining legs are all on YOUR machine:
+>
+> 1. **(Recommended) Snapshot the DB, then rebuild the exe.** The app *auto-pins* a
+>    `premigration_v39_to_v40` snapshot before v40 runs (verified: `lib.rs` pre-migration snapshot),
+>    and v40 is atomic + adversarially verified, so this is recoverable — but a manual copy costs
+>    nothing. Then: `make build-app` (frontend-first, then the release exe). This activates v39/v40 +
+>    the telemetry. **v40 rewrites `speech_segments` on the first launch after the rebuild** — expected
+>    and safe, just know it happens.
+> 2. **Run the full charter gate:** `make verify-10`. As of this session it is **INCOMPLETE with ZERO
+>    failing kept gates** (the two that were RED — a cargo-deny license misconfig and a WCAG contrast
+>    bug — were fixed). The remaining legs it reports NOT-RUN are Tier-2/3: they need the real exe +
+>    real audio + a live model.
+> 3. **Real-audio reliability + measurement (the honest accuracy/perf numbers):**
+>    - `CORTEX_AUDIO=<abs path to a real .wav> node cortex-speech-app/e2e_real_app.cjs` — real import →
+>      transcribe → review → export on the real exe (fails on a blank transcript).
+>    - `make bench-rtf` — real-time-factor benchmark; `make eval-ckb` — CKB accuracy proof (needs the
+>      FLEURS/AsoSoft artifacts).
+>    - After a real transcription run, open the telemetry panel (`get_recent_spans`) to read the real
+>      RTF now that the ASR op is instrumented.
+> 4. **Week-3 measurements + retrain** stay owner-gated (real gold set, ≥500 review decisions, live
+>    7B/WSL). Nothing here was faked.
+>
+> Nothing above is a declared 10/10 — that bar still needs the owner-gated legs. The engineering the
+> agent *could* do is done and green; the finish line is the real-data / real-hardware legs.
+
+---
+
 **Date:** 2026-07-11 · **Branch:** `codex/newbranch` · **Author:** autonomous GODMODE loop (Claude)
 
 ## Honest status — NOT a declared 10/10
