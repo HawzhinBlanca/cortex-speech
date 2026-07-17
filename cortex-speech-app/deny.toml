@@ -23,6 +23,11 @@ ignore = [
 [licenses]
 version = 2
 confidence-threshold = 0.8
+# Skip license-vetting crates marked `publish = false` — i.e. cortex-speech-app ITSELF, whose
+# PolyForm-Noncommercial-1.0.0 is the owner's deliberate choice, not a dependency risk. This gate
+# exists to vet THIRD-PARTY licenses, and allow-listing PolyForm here would have let any dependency
+# adopt a noncommercial license unnoticed. The allow-list below stays exactly as strict as before.
+private = { ignore = true }
 allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
