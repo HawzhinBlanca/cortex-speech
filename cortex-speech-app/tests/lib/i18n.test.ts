@@ -33,22 +33,22 @@ describe('i18n English fallback', () => {
 });
 
 describe('signal-anomaly screen is honestly labeled (audit P1 #7 / honesty law)', () => {
-  // Backend ood.rs is a ZCR/energy-variance HEURISTIC — the fabricated WavLM "OOD" path was removed for
+  // Backend signal_anomaly.rs is a ZCR/energy-variance HEURISTIC — the fabricated WavLM "OOD" path was removed for
   // overclaiming. The UI must not present it as a trained out-of-distribution DETECTOR.
   it('English labels call it a heuristic anomaly screen, not an OOD detector', () => {
-    expect(en['validation.ood.title'].toLowerCase()).toContain('heuristic');
-    expect(en['validation.ood.title'].toLowerCase()).not.toContain('detector');
-    expect(en['validation.tab.ood'].toLowerCase()).toContain('anomaly');
-    expect(en['validation.ood.description'].toLowerCase()).toContain('not a trained');
+    expect(en['validation.signalAnomaly.title'].toLowerCase()).toContain('heuristic');
+    expect(en['validation.signalAnomaly.title'].toLowerCase()).not.toContain('detector');
+    expect(en['validation.tab.signalAnomaly'].toLowerCase()).toContain('anomaly');
+    expect(en['validation.signalAnomaly.description'].toLowerCase()).toContain('not a trained');
     // The per-segment verdict/score no longer assert "out of distribution".
-    expect(en['validation.ood.isOod'].toLowerCase()).not.toContain('distribution');
-    expect(en['validation.ood.score'].toLowerCase()).not.toContain('ood');
+    expect(en['validation.signalAnomaly.isSignalAnomaly'].toLowerCase()).not.toContain('distribution');
+    expect(en['validation.signalAnomaly.score'].toLowerCase()).not.toContain('ood');
   });
 
   it('the ckb dictionary carries every ood label (no silent English fallback for this surface)', () => {
-    const oodKeys = Object.keys(en).filter((k) => k.startsWith('validation.ood.') || k === 'validation.tab.ood');
-    expect(oodKeys.length).toBeGreaterThan(4);
-    for (const key of oodKeys) {
+    const signalAnomalyKeys = Object.keys(en).filter((k) => k.startsWith('validation.signalAnomaly.') || k === 'validation.tab.signalAnomaly');
+    expect(signalAnomalyKeys.length).toBeGreaterThan(4);
+    for (const key of signalAnomalyKeys) {
       expect(ckb[key], `ckb missing ${key}`).toBeTruthy();
       // ckb must not fall back to advertising a learned "OOD" detector either.
       expect(ckb[key]).not.toContain('OOD');

@@ -681,7 +681,7 @@ pub fn run() {
             commands::run_consensus_refinery,
             commands::compute_acoustic_scores,
             commands::get_dataset_certificate,
-            commands::compute_ood_scores,
+            commands::compute_signal_anomaly_scores,
             commands::get_active_learning_queue,
             // Phase 1 — Gold-Set Eval Harness
             commands::import_gold_segments,

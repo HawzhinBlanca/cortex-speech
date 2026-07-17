@@ -1906,7 +1906,7 @@ impl ProcessingPipeline {
                 // quality/jury gates skip the SNR check instead of reading 0.0 as the worst SNR.
                 snr_db: quality.snr_db,
                 split: None,
-                ood_score: None,
+                signal_anomaly_score: None,
                 verdict: None,
                 verdict_transcript: None,
                 rationale: None,
@@ -3692,7 +3692,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".to_string()),
-            ood_score: None,
+            signal_anomaly_score: None,
             verdict: None,
             verdict_transcript: None,
             rationale: None,

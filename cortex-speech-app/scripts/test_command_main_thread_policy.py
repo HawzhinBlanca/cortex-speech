@@ -63,7 +63,7 @@ ASYNC_SLOW_COMMANDS = [
     "import_model_checkpoint",
     # Per-segment acoustic/OOD scoring loops + IRT consensus refinery (decode + ONNX per segment).
     "compute_acoustic_scores",
-    "compute_ood_scores",
+    "compute_signal_anomaly_scores",
     "run_consensus_refinery",
     # DB backup/restore — the heavy file-copy + integrity-check runs in run_blocking.
     "db_backup",

@@ -18,8 +18,8 @@
   let showErrors = $state(true);
   let showWarnings = $state(true);
 
-  // Tabs: 'dataset' | 'active' | 'ood'
-  let activeTab = $state<'dataset' | 'active' | 'ood'>('dataset');
+  // Tabs: 'dataset' | 'active' | 'signalAnomaly'
+  let activeTab = $state<'dataset' | 'active' | 'signalAnomaly'>('dataset');
 
   // Active learning parameters & queue
   let targetError = $state(0.05);
@@ -28,16 +28,16 @@
   let activeQueueLoading = $state(false);
   let activeQueue = $state<SpeechSegment[]>([]);
 
-  // OOD status, running status, and flagged segments list
-  let oodRunning = $state(false);
-  let oodSegments = $state<SpeechSegment[]>([]);
-  let showAllSegmentsForOod = $state(false);
+  // Signal-anomaly status, running status, and flagged segments list
+  let signalAnomalyRunning = $state(false);
+  let signalAnomalySegments = $state<SpeechSegment[]>([]);
+  let showAllSegmentsForSignalAnomaly = $state(false);
 
-  let displayedOodSegments = $derived.by(() => {
-    if (showAllSegmentsForOod) {
-      return oodSegments;
+  let displayedSignalAnomalySegments = $derived.by(() => {
+    if (showAllSegmentsForSignalAnomaly) {
+      return signalAnomalySegments;
     } else {
-      return oodSegments.filter((s) => (s.oodScore || 0) > 0.35);
+      return signalAnomalySegments.filter((s) => (s.signalAnomalyScore || 0) > 0.35);
     }
   });
 
@@ -79,27 +79,27 @@
     }
   }
 
-  async function runOodDetection() {
-    oodRunning = true;
+  async function runSignalAnomalyDetection() {
+    signalAnomalyRunning = true;
     try {
-      const count = await api.computeOodScores();
-      notifications.success($t('validation.ood.success').replace('{n}', String(count)));
-      await reloadOodSegments();
+      const count = await api.computeSignalAnomalyScores();
+      notifications.success($t('validation.signalAnomaly.success').replace('{n}', String(count)));
+      await reloadSignalAnomalySegments();
     } catch (e) {
       notifications.error($t('validation.failed'), { detail: String(e) });
     } finally {
-      oodRunning = false;
+      signalAnomalyRunning = false;
     }
   }
 
-  async function reloadOodSegments() {
+  async function reloadSignalAnomalySegments() {
     try {
       const allSegments = await api.getSegments();
-      oodSegments = allSegments
-        .filter((s) => s.oodScore !== undefined && s.oodScore !== null)
-        .sort((a, b) => (b.oodScore || 0) - (a.oodScore || 0));
+      signalAnomalySegments = allSegments
+        .filter((s) => s.signalAnomalyScore !== undefined && s.signalAnomalyScore !== null)
+        .sort((a, b) => (b.signalAnomalyScore || 0) - (a.signalAnomalyScore || 0));
     } catch (e) {
-      console.error('Failed to load OOD segments', e);
+      console.error('Failed to load signal-anomaly segments', e);
       notifications.error($t('validation.failed'), { detail: String(e) });
     }
   }
@@ -193,16 +193,16 @@
       <button
         type="button"
         class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-all duration-200 border-0 cursor-pointer
-          {activeTab === 'ood'
+          {activeTab === 'signalAnomaly'
           ? 'bg-cortex-700 text-default shadow-sm font-bold'
           : 'bg-transparent text-cortex-400 hover:text-cortex-200 hover:bg-cortex-800/30'}"
         onclick={() => {
-          const wasOod = activeTab === 'ood';
-          activeTab = 'ood';
-          if (!wasOod) reloadOodSegments();
+          const wasSignalAnomaly = activeTab === 'signalAnomaly';
+          activeTab = 'signalAnomaly';
+          if (!wasSignalAnomaly) reloadSignalAnomalySegments();
         }}
       >
-        {$t('validation.tab.ood')}
+        {$t('validation.tab.signalAnomaly')}
       </button>
     </div>
 
@@ -418,8 +418,8 @@
                         {#if segment.ctcScore != null}
                           <span>CTC Match: {segment.ctcScore.toFixed(2)}</span>
                         {/if}
-                        {#if segment.oodScore !== undefined && segment.oodScore !== null}
-                          <span>{$t('validation.ood.score')}: {segment.oodScore.toFixed(2)}</span>
+                        {#if segment.signalAnomalyScore !== undefined && segment.signalAnomalyScore !== null}
+                          <span>{$t('validation.signalAnomaly.score')}: {segment.signalAnomalyScore.toFixed(2)}</span>
                         {/if}
                       </div>
                     </div>
@@ -442,13 +442,13 @@
         </div>
       {/if}
 
-      <!-- OOD Audio Quality Tab -->
-      {#if activeTab === 'ood'}
+      <!-- Signal-Anomaly Audio Quality Tab -->
+      {#if activeTab === 'signalAnomaly'}
         <div class="space-y-4">
           <div class="bg-cortex-900/30 p-3 rounded-lg border border-cortex-800/50 space-y-2">
-            <h3 class="text-xs font-semibold text-cortex-200">{$t('validation.ood.title')}</h3>
+            <h3 class="text-xs font-semibold text-cortex-200">{$t('validation.signalAnomaly.title')}</h3>
             <p class="text-xs text-cortex-400 leading-relaxed">
-              {$t('validation.ood.description')}
+              {$t('validation.signalAnomaly.description')}
             </p>
 
             <div class="flex items-center justify-between pt-1">
@@ -458,23 +458,23 @@
                 <input
                   type="checkbox"
                   class="rounded border-cortex-800 bg-cortex-950 text-cortex-500 focus:ring-0"
-                  bind:checked={showAllSegmentsForOod}
+                  bind:checked={showAllSegmentsForSignalAnomaly}
                 />
-                {$t('validation.ood.showAll')}
+                {$t('validation.signalAnomaly.showAll')}
               </label>
             </div>
           </div>
 
-          {#if oodRunning}
+          {#if signalAnomalyRunning}
             <div class="space-y-3">
               {#each [1, 2, 3] as _}
                 <div class="h-12 bg-cortex-800/30 rounded-lg animate-pulse"></div>
               {/each}
             </div>
-          {:else if displayedOodSegments.length > 0}
+          {:else if displayedSignalAnomalySegments.length > 0}
             <ul class="space-y-2 p-0 list-none m-0">
-              {#each displayedOodSegments as segment}
-                {@const isFlagged = (segment.oodScore || 0) > 0.35}
+              {#each displayedSignalAnomalySegments as segment}
+                {@const isFlagged = (segment.signalAnomalyScore || 0) > 0.35}
                 <li
                   class="rounded-lg border p-3 text-xs {isFlagged
                     ? 'border-red-500/40 bg-red-950/20 text-red-200'
@@ -491,7 +491,7 @@
                         {#if isFlagged}
                           <span
                             class="px-1.5 py-0.5 rounded bg-red-500/20 text-red-300 text-[9px] font-bold border border-red-500/30 uppercase shrink-0"
-                            >{$t('validation.ood.isOod')}</span
+                            >{$t('validation.signalAnomaly.isSignalAnomaly')}</span
                           >
                         {/if}
                       </div>
@@ -500,7 +500,7 @@
                       </p>
                       <div class="flex items-center gap-4 text-[10px] opacity-70 pt-1">
                         <span class="font-semibold text-amber-400"
-                          >{$t('validation.ood.score')}: {segment.oodScore?.toFixed(3)}</span
+                          >{$t('validation.signalAnomaly.score')}: {segment.signalAnomalyScore?.toFixed(3)}</span
                         >
                         <span>{$t('duration')}: {(segment.durationMs / 1000).toFixed(2)}s</span>
                       </div>
@@ -518,7 +518,7 @@
             </ul>
           {:else}
             <div class="text-center py-8 text-cortex-500 text-xs italic">
-              {$t('validation.ood.noOod')}
+              {$t('validation.signalAnomaly.noSignalAnomaly')}
             </div>
           {/if}
         </div>
@@ -538,12 +538,12 @@
         >
           {$t('validation.activeLearning.run')}
         </button>
-      {:else if activeTab === 'ood'}
-        <button class="btn-secondary !text-xs" onclick={runOodDetection} disabled={oodRunning}>
-          {#if oodRunning}
-            {$t('validation.ood.running')}
+      {:else if activeTab === 'signalAnomaly'}
+        <button class="btn-secondary !text-xs" onclick={runSignalAnomalyDetection} disabled={signalAnomalyRunning}>
+          {#if signalAnomalyRunning}
+            {$t('validation.signalAnomaly.running')}
           {:else}
-            {$t('validation.ood.run')}
+            {$t('validation.signalAnomaly.run')}
           {/if}
         </button>
       {/if}

@@ -3666,8 +3666,8 @@ pub async fn get_dataset_certificate(
 }
 
 #[tauri::command]
-pub async fn compute_ood_scores(state: State<'_, AppState>) -> Result<usize, String> {
-    RATE_LIMITER.check("compute_ood_scores")?;
+pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result<usize, String> {
+    RATE_LIMITER.check("compute_signal_anomaly_scores")?;
     let models_dir = state.lock_model_manager().models_dir.clone();
     let db = state.db_arc();
     run_blocking(move || {
@@ -3676,11 +3676,11 @@ pub async fn compute_ood_scores(state: State<'_, AppState>) -> Result<usize, Str
             db.get_segments(None).map_err(|e| e.to_string())?
         };
 
-        let detector = quality::ood::OodDetector::new(&models_dir).map_err(|e| e.to_string())?;
+        let detector = quality::signal_anomaly::SignalAnomalyDetector::new(&models_dir).map_err(|e| e.to_string())?;
 
         let mut count = 0;
         for seg in &segments {
-            if seg.ood_score.is_some() {
+            if seg.signal_anomaly_score.is_some() {
                 continue;
             }
 
@@ -3692,14 +3692,14 @@ pub async fn compute_ood_scores(state: State<'_, AppState>) -> Result<usize, Str
             let (sample_rate, pcm) = match audio::decode_to_pcm_with_timeout(&audio_path, Duration::from_secs(30)) {
                 Ok(decoded) => decoded,
                 Err(error) => {
-                    tracing::warn!("Skipping OOD score for {}: decode failed: {error}", seg.id);
+                    tracing::warn!("Skipping signal-anomaly score for {}: decode failed: {error}", seg.id);
                     continue;
                 }
             };
             let (_sr, pcm_16k) = match audio::ensure_pcm_16khz(sample_rate, pcm) {
                 Ok(resampled) => resampled,
                 Err(error) => {
-                    tracing::warn!("Skipping OOD score for {}: 16 kHz conversion failed: {error}", seg.id);
+                    tracing::warn!("Skipping signal-anomaly score for {}: 16 kHz conversion failed: {error}", seg.id);
                     continue;
                 }
             };
@@ -3712,20 +3712,20 @@ pub async fn compute_ood_scores(state: State<'_, AppState>) -> Result<usize, Str
             ) {
                 Ok((clip, _)) => clip,
                 Err(error) => {
-                    tracing::warn!("Skipping OOD score for {}: clip slice failed: {error}", seg.id);
+                    tracing::warn!("Skipping signal-anomaly score for {}: clip slice failed: {error}", seg.id);
                     continue;
                 }
             };
-            let score = match detector.compute_ood_score(&pcm_16k) {
+            let score = match detector.compute_signal_anomaly_score(&pcm_16k) {
                 Ok(score) => score,
                 Err(error) => {
-                    tracing::warn!("Skipping OOD score for {}: scoring failed: {error}", seg.id);
+                    tracing::warn!("Skipping signal-anomaly score for {}: scoring failed: {error}", seg.id);
                     continue;
                 }
             };
 
             let guard = db.lock().unwrap_or_else(|p| p.into_inner());
-            guard.update_ood_score(&seg.id, score).map_err(|e| e.to_string())?;
+            guard.update_signal_anomaly_score(&seg.id, score).map_err(|e| e.to_string())?;
             count += 1;
         }
 
@@ -5407,7 +5407,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(25.0),
             split: None,
-            ood_score: None,
+            signal_anomaly_score: None,
             ..crate::db::SpeechSegment::default()
         }
     }

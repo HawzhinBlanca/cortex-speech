@@ -19,7 +19,7 @@ export interface SpeechSegment {
   rmsDb?: number | null;
   snrDb?: number | null;
   split?: string | null;
-  oodScore?: number | null;
+  signalAnomalyScore?: number | null;
   // Jury fields (Migration v11)
   verdict?: string | null;
   verdictTranscript?: string | null;

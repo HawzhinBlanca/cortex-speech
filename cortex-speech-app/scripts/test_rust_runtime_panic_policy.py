@@ -10,7 +10,7 @@ FORBIDDEN_RUNTIME_PATTERNS = {
     "src-tauri/src/quality/conformal.rs": [
         "annotated_transcript.as_ref().unwrap()",
     ],
-    "src-tauri/src/quality/ood.rs": [
+    "src-tauri/src/quality/signal_anomaly.rs": [
         "session_mutex.lock().map_err",
         "OOD lock:",
     ],
@@ -1192,7 +1192,7 @@ def test_asr_pool_recovers_poisoned_state_lock() -> None:
 # NOTE: test_ood_session_recovers_poisoned_lock was intentionally removed. The OOD detector no longer
 # holds an ONNX session to lock: the fabricated WavLM / sine-wave-centroid OOD path was deleted for
 # honesty (Round-24 — it scored OOD as distance to a synthetic sine wave) and replaced with a
-# session-free signal-processing heuristic (ZCR + frame-energy variance) in quality/ood.rs. There is no
+# session-free signal-processing heuristic (ZCR + frame-energy variance) in quality/signal_anomaly.rs. There is no
 # session lock left to poison-recover; re-asserting one here would force re-introducing the dishonest path.
 
 

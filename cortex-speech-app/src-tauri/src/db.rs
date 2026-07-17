@@ -26,7 +26,7 @@ pub struct SpeechSegment {
     pub rms_db: Option<f64>,
     pub snr_db: Option<f64>,
     pub split: Option<String>,
-    pub ood_score: Option<f64>,
+    pub signal_anomaly_score: Option<f64>,
     // ── Jury fields (Migration v11) ────────────────────────────────
     /// NULL = unprocessed; "auto_accept" | "jury_accept" | "jury_edit"
     /// | "escalated" | "human_accept" | "human_edit" | "human_reject"
@@ -192,7 +192,7 @@ const VALID_SPLITS: &[&str] = &["train", "validation", "test"];
 
 const SEGMENT_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript, normalized_transcript,
                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
-                    confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
+                    confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
                     verdict, verdict_transcript, rationale, evidence_json,
                     agent_confidence, escalated, human_decision, corrected_at, is_gold,
                     alignment_quality, model_version_id, confidence_source, cloud_call,
@@ -399,7 +399,7 @@ impl Database {
         self.conn.execute(
             "INSERT INTO speech_segments
                 (id, audio_path, raw_transcript, normalized_transcript,
-                 annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score, alignment_quality,
+                 annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score, alignment_quality,
                  model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(?18, 'unknown@pre-registry'), COALESCE(?19, 'unknown'), ?20, ?21, ?22)
              ON CONFLICT(id) DO UPDATE SET
@@ -417,7 +417,7 @@ impl Database {
                 rms_db=excluded.rms_db,
                 snr_db=excluded.snr_db,
                 split=excluded.split,
-                ood_score=excluded.ood_score,
+                signal_anomaly_score=excluded.signal_anomaly_score,
                 alignment_quality=excluded.alignment_quality,
                 model_version_id=excluded.model_version_id,
                 confidence_source=excluded.confidence_source,
@@ -431,7 +431,7 @@ impl Database {
                 seg.alignment_json, seg.duration_ms, seg.speaker_id,
                 seg.verified as i32, seg.confidence, seg.ctc_score,
                 seg.clipping_ratio, seg.rms_db, seg.snr_db, seg.split,
-                seg.ood_score, seg.alignment_quality,
+                seg.signal_anomaly_score, seg.alignment_quality,
                 seg.model_version_id,
                 seg.confidence_source,
                 seg.cloud_call as i32,
@@ -466,7 +466,7 @@ impl Database {
             "INSERT INTO speech_segments
                 (id, created_at, audio_path, raw_transcript, normalized_transcript,
                  annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence,
-                 ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
+                 ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
                  verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
                  human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
                  confidence_source, cloud_call, decoder_config_hash, normalizer_version, updated_at)
@@ -489,7 +489,7 @@ impl Database {
                 rms_db=excluded.rms_db,
                 snr_db=excluded.snr_db,
                 split=excluded.split,
-                ood_score=excluded.ood_score,
+                signal_anomaly_score=excluded.signal_anomaly_score,
                 verdict=excluded.verdict,
                 verdict_transcript=excluded.verdict_transcript,
                 rationale=excluded.rationale,
@@ -523,7 +523,7 @@ impl Database {
                 seg.rms_db,
                 seg.snr_db,
                 seg.split,
-                seg.ood_score,
+                seg.signal_anomaly_score,
                 seg.verdict,
                 verdict_transcript_nfc,
                 seg.rationale,
@@ -574,7 +574,7 @@ impl Database {
             let mut stmt = self.conn.prepare(
                 "INSERT INTO speech_segments
                     (id, audio_path, raw_transcript, normalized_transcript,
-                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
+                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
                      model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'), ?19, ?20, ?21)
                  ON CONFLICT(id) DO UPDATE SET
@@ -592,7 +592,7 @@ impl Database {
                     rms_db=excluded.rms_db,
                     snr_db=excluded.snr_db,
                     split=excluded.split,
-                    ood_score=excluded.ood_score,
+                    signal_anomaly_score=excluded.signal_anomaly_score,
                     model_version_id=excluded.model_version_id,
                     confidence_source=excluded.confidence_source,
                     cloud_call=excluded.cloud_call,
@@ -619,7 +619,7 @@ impl Database {
                     seg.rms_db,
                     seg.snr_db,
                     seg.split,
-                    seg.ood_score,
+                    seg.signal_anomaly_score,
                     seg.model_version_id,
                     seg.confidence_source,
                     seg.cloud_call as i32,
@@ -653,7 +653,7 @@ impl Database {
             let mut insert_stmt = self.conn.prepare(
                 "INSERT INTO speech_segments
                     (id, audio_path, raw_transcript, normalized_transcript,
-                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, ood_score,
+                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
                      model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'), ?19, ?20, ?21)"
             )?;
@@ -663,7 +663,7 @@ impl Database {
                     audio_path=?2, raw_transcript=?3, normalized_transcript=?4, 
                     annotated_transcript=?5, alignment_json=?6, duration_ms=?7, 
                     speaker_id=?8, verified=?9, confidence=?10, ctc_score=?11,
-                    clipping_ratio=?12, rms_db=?13, snr_db=?14, split=?15, ood_score=?16,
+                    clipping_ratio=?12, rms_db=?13, snr_db=?14, split=?15, signal_anomaly_score=?16,
                     model_version_id=COALESCE(?17, 'unknown@pre-registry'),
                     confidence_source=COALESCE(?18, 'unknown'),
                     cloud_call=?19,
@@ -698,7 +698,7 @@ impl Database {
                         seg.rms_db,
                         seg.snr_db,
                         seg.split,
-                        seg.ood_score,
+                        seg.signal_anomaly_score,
                         seg.model_version_id,
                         seg.confidence_source,
                         seg.cloud_call as i32,
@@ -725,7 +725,7 @@ impl Database {
                         seg.rms_db,
                         seg.snr_db,
                         seg.split,
-                        seg.ood_score,
+                        seg.signal_anomaly_score,
                         seg.model_version_id,
                         seg.confidence_source,
                         seg.cloud_call as i32,
@@ -1811,9 +1811,9 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_ood_score(&self, id: &str, score: f64) -> AppResult<()> {
+    pub fn update_signal_anomaly_score(&self, id: &str, score: f64) -> AppResult<()> {
         self.conn.execute(
-            "UPDATE speech_segments SET ood_score = ?2, updated_at = datetime('now') WHERE id = ?1",
+            "UPDATE speech_segments SET signal_anomaly_score = ?2, updated_at = datetime('now') WHERE id = ?1",
             params![id, score],
         )?;
         self.track_write()?;
@@ -1907,7 +1907,7 @@ impl Database {
             rms_db: row.get(13)?,
             snr_db: row.get(14)?,
             split: row.get(15)?,
-            ood_score: row.get(16)?,
+            signal_anomaly_score: row.get(16)?,
             // Jury fields — added by Migration v11. Default ONLY when the column is genuinely absent
             // (old schema) or NULL; a decode error propagates so it can't silently strip provenance.
             verdict: Self::optional_col(row, 17)?,
@@ -2997,7 +2997,8 @@ mod tests {
 
         // Re-apply the repair migration (rewind past v35 so run_migrations re-runs it). v36's
         // proof-metadata ALTERs are not idempotent, so undo them first (its down_sql) or the
-        // re-run fails on "duplicate column name".
+        // re-run fails on "duplicate column name". Same for v39's RENAME COLUMN — re-running it on an
+        // already-renamed schema fails with "no such column: ood_score" — so undo it too.
         db.connection()
             .execute_batch(
                 "DROP INDEX IF EXISTS idx_segments_confidence_source;
@@ -3005,7 +3006,8 @@ mod tests {
                  ALTER TABLE speech_segments DROP COLUMN normalizer_version;
                  ALTER TABLE speech_segments DROP COLUMN decoder_config_hash;
                  ALTER TABLE speech_segments DROP COLUMN cloud_call;
-                 ALTER TABLE speech_segments DROP COLUMN confidence_source;",
+                 ALTER TABLE speech_segments DROP COLUMN confidence_source;
+                 ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score;",
             )
             .unwrap();
         db.connection().execute("DELETE FROM schema_migrations WHERE version >= 35", []).unwrap();
@@ -4239,11 +4241,18 @@ mod tests {
         live.initialize().unwrap();
 
         // Synthesize a genuinely OLD snapshot: roll back to BEFORE the jobs migration (v37 created the
-        // `jobs` table) by deleting every migration record from v37 up AND dropping the table — so it
-        // looks like it came from a build behind v37, missing a table later migrations add. Keyed on the
+        // `jobs` table) by deleting every migration record from v37 up AND reverting the SCHEMA those
+        // migrations produced — so it looks like it came from a build behind v37. Keyed on the
         // jobs-migration version (37), NOT HEAD, so adding newer migrations (e.g. the v38 STRICT pilot)
         // can't decouple "rolled-back version" from "dropped table": re-migration on restore must re-run
         // v37 (recreating jobs) and everything after.
+        //
+        // The schema revert must cover EVERY un-recorded migration whose up_sql is not re-runnable
+        // against an already-migrated schema. v37 (jobs) and v38 (STRICT recreate: CREATE->copy->drop->
+        // rename) both re-run fine, but v39's `RENAME COLUMN ood_score -> signal_anomaly_score` does NOT:
+        // re-running it on a schema that already renamed the column fails with "no such column:
+        // ood_score". So the synthesis renames it back, making this a faithful pre-v39 snapshot rather
+        // than a records-only fake.
         const JOBS_MIGRATION: i64 = 37;
         let old_path = tmp.path().join("old.db");
         {
@@ -4251,7 +4260,9 @@ mod tests {
             old.initialize().unwrap();
             old.connection()
                 .execute_batch(&format!(
-                    "DROP TABLE IF EXISTS jobs; DELETE FROM schema_migrations WHERE version >= {JOBS_MIGRATION};"
+                    "DROP TABLE IF EXISTS jobs; \
+                     ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score; \
+                     DELETE FROM schema_migrations WHERE version >= {JOBS_MIGRATION};"
                 ))
                 .unwrap();
             let old_ver = crate::migrations::get_current_version(&old).unwrap();
@@ -4261,6 +4272,15 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='jobs'", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(has_jobs, 0, "the old snapshot must genuinely lack the v37 jobs table");
+            let pre_v39_col: i64 = old
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('speech_segments') WHERE name='ood_score'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(pre_v39_col, 1, "the old snapshot must genuinely carry the pre-v39 ood_score column");
         }
 
         live.restore(&old_path).expect("an older snapshot restores");

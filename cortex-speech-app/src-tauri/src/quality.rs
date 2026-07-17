@@ -1,7 +1,7 @@
 pub mod calibration;
 pub mod conformal;
 pub mod irt;
-pub mod ood;
+pub mod signal_anomaly;
 
 use crate::chunking;
 use crate::db::{Database, SegmentHypothesis, SpeechSegment};
@@ -806,7 +806,7 @@ mod tests {
             rms_db: None,
             snr_db: None,
             split: None,
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         }
     }

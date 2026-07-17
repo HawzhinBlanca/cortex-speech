@@ -1018,7 +1018,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".into()),
-            ood_score: None,
+            signal_anomaly_score: None,
             verdict: Some("jury_accept".into()),
             verdict_transcript: Some("reference candidate".into()),
             rationale: Some("multi-reference consensus committed agent text".into()),
@@ -1126,7 +1126,7 @@ mod tests {
             rms_db: None,
             snr_db: None,
             split: None,
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         })
         .unwrap();
@@ -1161,7 +1161,7 @@ mod tests {
             rms_db: None,
             snr_db: None,
             split: None,
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         })
         .unwrap();
@@ -1198,7 +1198,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: None,
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         })
         .unwrap();
@@ -1236,7 +1236,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".into()),
-            ood_score: None,
+            signal_anomaly_score: None,
             verdict: Some("jury_accept".into()),
             verdict_transcript: Some("reference candidate".into()),
             rationale: Some("legacy source-reference commit".into()),
@@ -1316,7 +1316,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".into()),
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         })
         .unwrap();
@@ -1468,7 +1468,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".into()),
-            ood_score: None,
+            signal_anomaly_score: None,
             verdict: None,
             verdict_transcript: None,
             rationale: None,
@@ -1615,7 +1615,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".into()),
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         })
         .unwrap();
@@ -1730,7 +1730,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".into()),
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).unwrap();
@@ -1792,7 +1792,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".into()),
-            ood_score: None,
+            signal_anomaly_score: None,
             verdict: Some("jury_accept".into()),
             verdict_transcript: Some("reference candidate".into()),
             rationale: Some("multi-reference consensus committed agent text".into()),
@@ -2138,7 +2138,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".into()),
-            ood_score: None,
+            signal_anomaly_score: None,
             verdict: Some("jury_accept".into()),
             verdict_transcript: Some("agent wrong text".into()),
             rationale: Some("reference-aware agent selected a weak candidate".into()),
@@ -2241,7 +2241,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".into()),
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         })
         .unwrap();
@@ -2286,7 +2286,7 @@ mod tests {
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
             split: Some("train".into()),
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         })
         .unwrap();

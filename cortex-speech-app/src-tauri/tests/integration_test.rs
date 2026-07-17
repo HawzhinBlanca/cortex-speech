@@ -22,7 +22,7 @@ fn make_segment(id: &str, text: &str) -> cortex_speech_app_lib::db::SpeechSegmen
         rms_db: None,
         snr_db: None,
         split: None,
-        ood_score: None,
+        signal_anomaly_score: None,
         ..cortex_speech_app_lib::db::SpeechSegment::default()
     }
 }

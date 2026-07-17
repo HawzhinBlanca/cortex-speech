@@ -65,7 +65,7 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
       rmsDb: -18 - i,
       snrDb: i === 5 ? 6.2 : 22 - i,
       split: i % 4 === 0 ? 'test' : 'train',
-      oodScore: null,
+      signalAnomalyScore: null,
       verdict: conf < 0.7 ? 'escalate' : 'accept',
       escalated: conf < 0.7,
       isGold: i === 0,

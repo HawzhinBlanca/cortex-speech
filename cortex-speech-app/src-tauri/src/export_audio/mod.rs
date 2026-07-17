@@ -282,7 +282,7 @@ fn write_metadata_csv(
                 "rms_db",
                 "snr_db",
                 "split",
-                "ood_score",
+                "signal_anomaly_score",
                 "verdict",
                 "alignment_quality",
                 "export_sample_rate",
@@ -297,7 +297,7 @@ fn write_metadata_csv(
                 let clipping_ratio = optional_f64(seg.clipping_ratio);
                 let rms_db = optional_f64(seg.rms_db);
                 let snr_db = optional_f64(seg.snr_db);
-                let ood_score = optional_f64(seg.ood_score);
+                let signal_anomaly_score = optional_f64(seg.signal_anomaly_score);
                 let export_sample_rate = options.sample_rate.to_string();
                 let export_format = match options.format {
                     AudioExportFormat::Wav => "wav",
@@ -335,7 +335,7 @@ fn write_metadata_csv(
                     rms_db.as_str(),
                     snr_db.as_str(),
                     seg.split.as_deref().unwrap_or(""),
-                    ood_score.as_str(),
+                    signal_anomaly_score.as_str(),
                     verdict_t.as_ref(),
                     seg.alignment_quality.as_deref().unwrap_or(""),
                     export_sample_rate.as_str(),
@@ -414,7 +414,7 @@ mod tests {
             rms_db: None,
             snr_db: None,
             split: None,
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();

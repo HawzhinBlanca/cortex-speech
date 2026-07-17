@@ -1494,7 +1494,7 @@ mod tests {
             rms_db: None,
             snr_db: None,
             split: None,
-            ood_score: None,
+            signal_anomaly_score: None,
             ..SpeechSegment::default()
         }
     }

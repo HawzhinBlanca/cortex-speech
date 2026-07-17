@@ -29,7 +29,7 @@ fn annotated_seg(dir: &Path, id: &str, reference: &str, hypothesis: &str) -> Spe
         rms_db: None,
         snr_db: None,
         split: None,
-        ood_score: None,
+        signal_anomaly_score: None,
         ..SpeechSegment::default()
     }
 }

@@ -815,6 +815,23 @@ pub static MIGRATIONS: &[Migration] = &[
              CREATE INDEX IF NOT EXISTS idx_decision_verdicts_verdict ON decision_verdicts(auto_accept_verdict);",
         ),
     },
+    Migration {
+        version: 39,
+        description: "Rename ood_score -> signal_anomaly_score (OOD jargon retired; UI already said 'Signal Anomaly')",
+        // The internal half of the OOD -> signal_anomaly rename (Week-3 item 4). The USER-FACING text
+        // already read "Signal Anomaly"; this retires the jargon from the schema + code so the stored
+        // column matches what the app has always shown.
+        //
+        // SAFE, unlike the STRICT recreate (see docs/STRICT_SPEECH_SEGMENTS_PLAN.md): RENAME COLUMN does
+        // NOT drop/recreate speech_segments, so it never fires the ON DELETE CASCADE that a DROP would
+        // (the trap proven by dropping_speech_segments_cascade_deletes_children_...). Existing values are
+        // preserved in place; SQLite also auto-rewrites references in dependent objects. The historical
+        // "ADD COLUMN ood_score" migration is deliberately LEFT INTACT above — a fresh DB creates
+        // ood_score there, then this migration renames it, so replay-from-scratch and upgrade-in-place
+        // both converge on signal_anomaly_score.
+        up_sql: "ALTER TABLE speech_segments RENAME COLUMN ood_score TO signal_anomaly_score;",
+        down_sql: Some("ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score;"),
+    },
 ];
 
 #[cfg(test)]
@@ -828,6 +845,61 @@ mod tests {
         db.initialize().unwrap();
         let _applied = run_migrations(&db).unwrap();
         assert!(get_current_version(&db).unwrap() >= 1);
+    }
+
+    #[test]
+    fn v39_renames_ood_score_to_signal_anomaly_score() {
+        // The internal half of the OOD -> signal_anomaly rename. On a fully-migrated schema the column
+        // must carry the new name and the jargon name must be GONE, and a real write/read must
+        // round-trip through the renamed column (proving the Rust field + SQL agree).
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert!(get_current_version(&db).unwrap() >= 39, "v39 must have applied");
+
+        let conn = db.connection();
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('speech_segments')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "signal_anomaly_score"), "renamed column must exist: {cols:?}");
+        assert!(!cols.iter().any(|c| c == "ood_score"), "the ood_score jargon column must be gone: {cols:?}");
+
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "sa-1".into(),
+            audio_path: "/a.wav".into(),
+            signal_anomaly_score: Some(0.42),
+            ..Default::default()
+        })
+        .unwrap();
+        let got = db.get_segment_by_id("sa-1").unwrap().expect("segment");
+        assert_eq!(got.signal_anomaly_score, Some(0.42), "value round-trips through the renamed column");
+    }
+
+    #[test]
+    fn v39_preserves_existing_values_through_the_rename() {
+        // The UPGRADE path that matters: a real pre-v39 DB already holds ood_score values written by an
+        // older build. RENAME COLUMN must carry them across in place (unlike a table recreate, which on
+        // this FK-parent table would fire ON DELETE CASCADE — see
+        // dropping_speech_segments_cascade_deletes_children_so_strict_recreate_needs_fk_off).
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+
+        // Reconstruct a pre-v39 shape, seed a row under the OLD column name, then re-apply v39's up_sql.
+        conn.execute_batch("ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score;").unwrap();
+        conn.execute("INSERT INTO speech_segments (id, audio_path, ood_score) VALUES ('pre39', '/a.wav', 0.77)", [])
+            .unwrap();
+
+        let v39 = MIGRATIONS.iter().find(|m| m.version == 39).expect("v39 exists");
+        conn.execute_batch(v39.up_sql).unwrap();
+
+        let got: f64 = conn
+            .query_row("SELECT signal_anomaly_score FROM speech_segments WHERE id='pre39'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(got, 0.77, "a pre-v39 ood_score value must survive the RENAME COLUMN intact");
     }
 
     #[test]

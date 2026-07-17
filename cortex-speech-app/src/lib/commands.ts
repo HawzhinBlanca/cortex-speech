@@ -1056,8 +1056,8 @@ export async function getDatasetCertificate(
   return invoke<ConformalCertificate>('get_dataset_certificate', { targetError, confidenceLevel });
 }
 
-export async function computeOodScores(): Promise<number> {
-  return invoke<number>('compute_ood_scores');
+export async function computeSignalAnomalyScores(): Promise<number> {
+  return invoke<number>('compute_signal_anomaly_scores');
 }
 
 export async function getActiveLearningQueue(
