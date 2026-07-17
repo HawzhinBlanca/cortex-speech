@@ -83,8 +83,92 @@ fn ensure_migrations_table(db: &Database) -> AppResult<()> {
 /// the version INSERT leaves a half-applied schema that `open_with_retry` quarantines as
 /// corrupt — silently starting the user from an empty database. SQLite DDL is
 /// transactional, so any error rolls the whole migration back.
+/// Migrations whose SQL rebuilds an FK **parent** table, and therefore MUST run with `foreign_keys` OFF.
+///
+/// `DROP TABLE` on an FK parent performs an implicit DELETE that FIRES `ON DELETE CASCADE`, wiping every
+/// child row — proven, not assumed, by
+/// `db::tests::dropping_speech_segments_cascade_deletes_children_so_strict_recreate_needs_fk_off`.
+/// `PRAGMA foreign_keys` is a NO-OP inside a transaction, so the normal transaction-wrapped path
+/// literally cannot express such a migration; these go through `run_with_foreign_keys_off` instead
+/// (SQLite's canonical 12-step recreate). Keyed by version so the pre-existing migration literals stay
+/// untouched. See docs/STRICT_SPEECH_SEGMENTS_PLAN.md.
+const FK_OFF_MIGRATIONS: &[i64] = &[40];
+
+/// Run `body` with `foreign_keys` OFF, VERIFYING it actually took effect and restoring it on every path.
+///
+/// **The read-back below is load-bearing, not paranoia.** SQLite silently IGNORES
+/// `PRAGMA foreign_keys` inside a transaction and still reports success, so executing the statement
+/// proves nothing. And `PRAGMA foreign_key_check` canNOT be used as the backstop: a cascade DELETES the
+/// children *cleanly*, leaving ZERO violations behind — so an FK-still-ON recreate would pass the check
+/// and commit total child-row loss silently. This read-back is therefore the only thing standing between
+/// a mis-sequenced caller and irreversible data loss, which is why it fails closed.
+///
+/// A leaked `foreign_keys=OFF` is its own hazard: `Database::restore()` runs migrations at RUNTIME on the
+/// live `AppState` connection, where a failure is non-fatal — so a swallowed restore error would leave the
+/// app serving the whole session with FK enforcement silently disabled. Both failures are reported.
+fn run_with_foreign_keys_off<T>(conn: &rusqlite::Connection, body: impl FnOnce() -> AppResult<T>) -> AppResult<T> {
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let effective: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    if effective != 0 {
+        // It never went off, so the original state is intact — nothing to restore, just refuse.
+        return Err(crate::error::AppError::Other(
+            "refusing to run an FK-off migration: `PRAGMA foreign_keys=OFF` did not take effect (SQLite \
+             ignores it inside a transaction). Proceeding would let DROP TABLE cascade and silently \
+             delete every child row — and foreign_key_check cannot detect that, because a cascade leaves \
+             no violations behind."
+                .into(),
+        ));
+    }
+    let result = body();
+    let restored = conn.execute_batch("PRAGMA foreign_keys=ON;");
+    match (result, restored) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(body_err), Ok(())) => Err(body_err),
+        (Ok(_), Err(restore_err)) => Err(crate::error::AppError::Other(format!(
+            "migration body succeeded but restoring `PRAGMA foreign_keys=ON` failed: {restore_err} — \
+             foreign keys are left DISABLED on this connection"
+        ))),
+        // Never let the body's error hide a failed restore: the leaked pragma outlives the migration.
+        (Err(body_err), Err(restore_err)) => Err(crate::error::AppError::Other(format!(
+            "migration failed ({body_err}) AND restoring `PRAGMA foreign_keys=ON` failed ({restore_err}) \
+             — foreign keys are left DISABLED on this connection"
+        ))),
+    }
+}
+
+/// Reject a recreate that ORPHANED a child (a child row whose parent key no longer exists) before it can
+/// commit.
+///
+/// Scope, honestly: this catches orphans — e.g. a copy that lost parent rows. It does **not** and cannot
+/// catch a *cascade*, because a cascade deletes children cleanly and leaves zero violations to find.
+/// Guarding against the cascade is `run_with_foreign_keys_off`'s read-back, not this check.
+fn reject_foreign_key_violations(tx: &rusqlite::Transaction<'_>, version: i64) -> AppResult<()> {
+    let mut stmt = tx.prepare("PRAGMA foreign_key_check")?;
+    let violations = stmt.query_map([], |_| Ok(()))?.count();
+    if violations > 0 {
+        return Err(crate::error::AppError::Other(format!(
+            "migration v{version} left {violations} foreign-key violation(s) — rolling back instead of \
+             committing a broken schema"
+        )));
+    }
+    Ok(())
+}
+
 fn apply_migration(db: &Database, migration: &Migration) -> AppResult<()> {
     let conn = db.connection();
+    if FK_OFF_MIGRATIONS.contains(&migration.version) {
+        return run_with_foreign_keys_off(conn, || {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(migration.up_sql)?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version, description) VALUES (?1, ?2)",
+                rusqlite::params![migration.version, migration.description],
+            )?;
+            reject_foreign_key_violations(&tx, migration.version)?;
+            tx.commit()?;
+            Ok(())
+        });
+    }
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(migration.up_sql)?;
     tx.execute(
@@ -104,11 +188,33 @@ pub fn rollback(db: &Database, count: usize) -> AppResult<Vec<i64>> {
         if migration.version <= current && reverted.len() < count {
             if let Some(down_sql) = migration.down_sql {
                 tracing::info!("Rolling back v{}: {}", migration.version, migration.description);
-                db.connection().execute_batch(down_sql)?;
-                db.connection().execute(
-                    "DELETE FROM schema_migrations WHERE version = ?1",
-                    rusqlite::params![migration.version],
-                )?;
+                let conn = db.connection();
+                // A parent-table recreate cascades on the way DOWN exactly as it does on the way up, so
+                // the down_sql needs the same foreign_keys=OFF window — otherwise rolling back v40 would
+                // wipe every child row it was written to protect.
+                if FK_OFF_MIGRATIONS.contains(&migration.version) {
+                    // Mirror apply_migration exactly: ONE transaction + the orphan check. A bare
+                    // execute_batch here would auto-commit statement-by-statement, so a failure between
+                    // `DROP TABLE speech_segments` and the RENAME would leave the database with NO
+                    // speech_segments table at all — unrecoverable, and worse than the failed rollback.
+                    run_with_foreign_keys_off(conn, || {
+                        let tx = conn.unchecked_transaction()?;
+                        tx.execute_batch(down_sql)?;
+                        tx.execute(
+                            "DELETE FROM schema_migrations WHERE version = ?1",
+                            rusqlite::params![migration.version],
+                        )?;
+                        reject_foreign_key_violations(&tx, migration.version)?;
+                        tx.commit()?;
+                        Ok(())
+                    })?;
+                } else {
+                    conn.execute_batch(down_sql)?;
+                    conn.execute(
+                        "DELETE FROM schema_migrations WHERE version = ?1",
+                        rusqlite::params![migration.version],
+                    )?;
+                }
                 reverted.push(migration.version);
             }
         }
@@ -832,6 +938,184 @@ pub static MIGRATIONS: &[Migration] = &[
         up_sql: "ALTER TABLE speech_segments RENAME COLUMN ood_score TO signal_anomaly_score;",
         down_sql: Some("ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score;"),
     },
+    Migration {
+        version: 40,
+        description: "STRICT speech_segments: recreate the main table as STRICT (runs with foreign_keys OFF)",
+        // Week-2's last item. SQLite cannot ALTER a table to STRICT, so this is the canonical recreate —
+        // and speech_segments is an FK PARENT of seven children (five ON DELETE CASCADE:
+        // segment_hypotheses, agent_examples, decision_log, decision_verdicts, loop0_shadow_log; two
+        // ON DELETE SET NULL: correction_memory.source_segment, corrections.segment_id). A plain DROP
+        // here fires those cascades and wipes them (proven by
+        // db::tests::dropping_speech_segments_cascade_deletes_children_so_strict_recreate_needs_fk_off),
+        // which is why v40 is listed in FK_OFF_MIGRATIONS and runs inside a foreign_keys=OFF window with
+        // a PRAGMA foreign_key_check before commit. Full rationale: docs/STRICT_SPEECH_SEGMENTS_PLAN.md.
+        //
+        // Every one of the 34 columns is already TEXT/INTEGER/REAL (a valid STRICT type), so this needs
+        // ZERO type remapping — the shape below is a verbatim copy of the live schema, only + STRICT.
+        // The copy PRESERVES rowid because segments_fts is an external-content FTS5 table keyed on
+        // content_rowid=rowid; the index is rebuilt at the end regardless. All TEN indexes and all THREE
+        // FTS triggers are recreated (DROP TABLE takes them with it — missing any one silently turns a
+        // hot path into a full scan or desyncs search).
+        up_sql: "CREATE TABLE speech_segments_strict (
+                     id TEXT PRIMARY KEY,
+                     audio_path TEXT NOT NULL,
+                     raw_transcript TEXT NOT NULL DEFAULT '',
+                     normalized_transcript TEXT,
+                     annotated_transcript TEXT,
+                     alignment_json TEXT,
+                     duration_ms INTEGER NOT NULL DEFAULT 0,
+                     speaker_id TEXT,
+                     verified INTEGER NOT NULL DEFAULT 0,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     session_id TEXT,
+                     confidence REAL,
+                     ctc_score REAL,
+                     clipping_ratio REAL,
+                     rms_db REAL,
+                     snr_db REAL,
+                     split TEXT,
+                     signal_anomaly_score REAL,
+                     verdict TEXT,
+                     verdict_transcript TEXT,
+                     rationale TEXT,
+                     evidence_json TEXT,
+                     agent_confidence REAL,
+                     escalated INTEGER NOT NULL DEFAULT 0,
+                     human_decision TEXT,
+                     corrected_at TEXT,
+                     is_gold INTEGER NOT NULL DEFAULT 0,
+                     alignment_quality TEXT,
+                     model_version_id TEXT NOT NULL DEFAULT 'unknown@pre-registry',
+                     confidence_source TEXT NOT NULL DEFAULT 'unknown',
+                     cloud_call INTEGER NOT NULL DEFAULT 0,
+                     decoder_config_hash TEXT,
+                     normalizer_version TEXT
+                 ) STRICT;
+                 INSERT INTO speech_segments_strict (
+                     rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript,
+                     alignment_json, duration_ms, speaker_id, verified, created_at, updated_at, session_id,
+                     confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
+                     verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
+                     human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
+                     confidence_source, cloud_call, decoder_config_hash, normalizer_version)
+                 SELECT
+                     rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript,
+                     alignment_json, duration_ms, speaker_id, verified, created_at, updated_at, session_id,
+                     confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
+                     verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
+                     human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
+                     confidence_source, cloud_call, decoder_config_hash, normalizer_version
+                 FROM speech_segments;
+                 DROP TABLE speech_segments;
+                 ALTER TABLE speech_segments_strict RENAME TO speech_segments;
+                 CREATE INDEX IF NOT EXISTS idx_segments_verified ON speech_segments(verified);
+                 CREATE INDEX IF NOT EXISTS idx_segments_speaker ON speech_segments(speaker_id);
+                 CREATE INDEX IF NOT EXISTS idx_segments_created ON speech_segments(created_at);
+                 CREATE INDEX IF NOT EXISTS idx_segments_verdict ON speech_segments(verdict);
+                 CREATE INDEX IF NOT EXISTS idx_segments_escalated ON speech_segments(escalated);
+                 CREATE INDEX IF NOT EXISTS idx_segments_audio_path ON speech_segments(audio_path);
+                 CREATE INDEX IF NOT EXISTS idx_segments_verified_created ON speech_segments(verified, created_at);
+                 CREATE INDEX IF NOT EXISTS idx_segments_human_decision ON speech_segments(human_decision);
+                 CREATE INDEX IF NOT EXISTS idx_segments_cloud_call ON speech_segments(cloud_call);
+                 CREATE INDEX IF NOT EXISTS idx_segments_confidence_source ON speech_segments(confidence_source);
+                 CREATE TRIGGER IF NOT EXISTS segments_ai AFTER INSERT ON speech_segments BEGIN
+                     INSERT INTO segments_fts(rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                     VALUES (new.rowid, new.id, new.audio_path, new.raw_transcript, new.normalized_transcript, new.annotated_transcript);
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS segments_ad AFTER DELETE ON speech_segments BEGIN
+                     INSERT INTO segments_fts(segments_fts, rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                     VALUES ('delete', old.rowid, old.id, old.audio_path, old.raw_transcript, old.normalized_transcript, old.annotated_transcript);
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON speech_segments BEGIN
+                     INSERT INTO segments_fts(segments_fts, rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                     VALUES ('delete', old.rowid, old.id, old.audio_path, old.raw_transcript, old.normalized_transcript, old.annotated_transcript);
+                     INSERT INTO segments_fts(rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                     VALUES (new.rowid, new.id, new.audio_path, new.raw_transcript, new.normalized_transcript, new.annotated_transcript);
+                 END;
+                 INSERT INTO segments_fts(segments_fts) VALUES('rebuild');",
+        // Down: the same recreate without STRICT. Also runs in the FK-off window (see rollback()).
+        down_sql: Some(
+            "CREATE TABLE speech_segments_nonstrict (
+                 id TEXT PRIMARY KEY,
+                 audio_path TEXT NOT NULL,
+                 raw_transcript TEXT NOT NULL DEFAULT '',
+                 normalized_transcript TEXT,
+                 annotated_transcript TEXT,
+                 alignment_json TEXT,
+                 duration_ms INTEGER NOT NULL DEFAULT 0,
+                 speaker_id TEXT,
+                 verified INTEGER NOT NULL DEFAULT 0,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 session_id TEXT,
+                 confidence REAL,
+                 ctc_score REAL,
+                 clipping_ratio REAL,
+                 rms_db REAL,
+                 snr_db REAL,
+                 split TEXT,
+                 signal_anomaly_score REAL,
+                 verdict TEXT,
+                 verdict_transcript TEXT,
+                 rationale TEXT,
+                 evidence_json TEXT,
+                 agent_confidence REAL,
+                 escalated INTEGER NOT NULL DEFAULT 0,
+                 human_decision TEXT,
+                 corrected_at TEXT,
+                 is_gold INTEGER NOT NULL DEFAULT 0,
+                 alignment_quality TEXT,
+                 model_version_id TEXT NOT NULL DEFAULT 'unknown@pre-registry',
+                 confidence_source TEXT NOT NULL DEFAULT 'unknown',
+                 cloud_call INTEGER NOT NULL DEFAULT 0,
+                 decoder_config_hash TEXT,
+                 normalizer_version TEXT
+             );
+             INSERT INTO speech_segments_nonstrict (
+                 rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript,
+                 alignment_json, duration_ms, speaker_id, verified, created_at, updated_at, session_id,
+                 confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
+                 verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
+                 human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
+                 confidence_source, cloud_call, decoder_config_hash, normalizer_version)
+             SELECT
+                 rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript,
+                 alignment_json, duration_ms, speaker_id, verified, created_at, updated_at, session_id,
+                 confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
+                 verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
+                 human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
+                 confidence_source, cloud_call, decoder_config_hash, normalizer_version
+             FROM speech_segments;
+             DROP TABLE speech_segments;
+             ALTER TABLE speech_segments_nonstrict RENAME TO speech_segments;
+             CREATE INDEX IF NOT EXISTS idx_segments_verified ON speech_segments(verified);
+             CREATE INDEX IF NOT EXISTS idx_segments_speaker ON speech_segments(speaker_id);
+             CREATE INDEX IF NOT EXISTS idx_segments_created ON speech_segments(created_at);
+             CREATE INDEX IF NOT EXISTS idx_segments_verdict ON speech_segments(verdict);
+             CREATE INDEX IF NOT EXISTS idx_segments_escalated ON speech_segments(escalated);
+             CREATE INDEX IF NOT EXISTS idx_segments_audio_path ON speech_segments(audio_path);
+             CREATE INDEX IF NOT EXISTS idx_segments_verified_created ON speech_segments(verified, created_at);
+             CREATE INDEX IF NOT EXISTS idx_segments_human_decision ON speech_segments(human_decision);
+             CREATE INDEX IF NOT EXISTS idx_segments_cloud_call ON speech_segments(cloud_call);
+             CREATE INDEX IF NOT EXISTS idx_segments_confidence_source ON speech_segments(confidence_source);
+             CREATE TRIGGER IF NOT EXISTS segments_ai AFTER INSERT ON speech_segments BEGIN
+                 INSERT INTO segments_fts(rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                 VALUES (new.rowid, new.id, new.audio_path, new.raw_transcript, new.normalized_transcript, new.annotated_transcript);
+             END;
+             CREATE TRIGGER IF NOT EXISTS segments_ad AFTER DELETE ON speech_segments BEGIN
+                 INSERT INTO segments_fts(segments_fts, rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                 VALUES ('delete', old.rowid, old.id, old.audio_path, old.raw_transcript, old.normalized_transcript, old.annotated_transcript);
+             END;
+             CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON speech_segments BEGIN
+                 INSERT INTO segments_fts(segments_fts, rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                 VALUES ('delete', old.rowid, old.id, old.audio_path, old.raw_transcript, old.normalized_transcript, old.annotated_transcript);
+                 INSERT INTO segments_fts(rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                 VALUES (new.rowid, new.id, new.audio_path, new.raw_transcript, new.normalized_transcript, new.annotated_transcript);
+             END;
+             INSERT INTO segments_fts(segments_fts) VALUES('rebuild');",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -845,6 +1129,148 @@ mod tests {
         db.initialize().unwrap();
         let _applied = run_migrations(&db).unwrap();
         assert!(get_current_version(&db).unwrap() >= 1);
+    }
+
+    #[test]
+    fn v40_speech_segments_is_strict_and_the_recreate_preserved_everything() {
+        // The riskiest migration in the app, on a POPULATED schema. initialize() runs v40 on an empty
+        // table, so this test re-exercises the real recreate against real rows + a real FK child, and
+        // pins every invariant the recreate could silently break.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert!(get_current_version(&db).unwrap() >= 40, "v40 must have applied");
+
+        // Real rows through the real write path, plus a CASCADE child — the thing a naive DROP wipes.
+        for i in 0..3 {
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: format!("s-{i}"),
+                audio_path: format!("/a{i}.wav"),
+                raw_transcript: "کوردی".into(),
+                duration_ms: 1000,
+                signal_anomaly_score: Some(0.5),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        db.write_segment_verdict("s-1", "auto_accept", Some("t"), None, None, Some(0.9), false).unwrap();
+        let rowids_before: Vec<i64> = db
+            .connection()
+            .prepare("SELECT rowid FROM speech_segments ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        // Re-run the real recreate through the real FK-off path (what a live upgrade does).
+        let v40 = MIGRATIONS.iter().find(|m| m.version == 40).expect("v40 exists");
+        {
+            let conn = db.connection();
+            run_with_foreign_keys_off(conn, || {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(v40.up_sql)?;
+                reject_foreign_key_violations(&tx, 40)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .expect("the FK-off recreate must succeed");
+        }
+
+        let conn = db.connection();
+        // (1) STRICT is actually declared, and now REJECTS a type-violating raw write.
+        let sql: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='speech_segments'", [], |r| r.get(0))
+            .unwrap();
+        assert!(sql.contains("STRICT"), "speech_segments must be STRICT: {sql}");
+        assert!(
+            conn.execute(
+                "INSERT INTO speech_segments (id, audio_path, duration_ms) VALUES ('bad', '/x.wav', 'not-an-int')",
+                []
+            )
+            .is_err(),
+            "STRICT must reject a TEXT into the INTEGER duration_ms"
+        );
+
+        // (2) Rows survived, values intact, rowids PRESERVED (segments_fts keys on content_rowid=rowid).
+        assert_eq!(db.segment_count().unwrap(), 3, "every row survived the recreate");
+        assert_eq!(db.get_segment_by_id("s-1").unwrap().unwrap().signal_anomaly_score, Some(0.5));
+        let rowids_after: Vec<i64> = conn
+            .prepare("SELECT rowid FROM speech_segments ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rowids_before, rowids_after, "rowids must be preserved for the external-content FTS index");
+
+        // (3) The CASCADE child SURVIVED — the whole reason v40 runs with foreign_keys OFF.
+        let child: i64 =
+            conn.query_row("SELECT COUNT(*) FROM decision_verdicts WHERE segment_id='s-1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(child, 1, "the FK child must survive the parent recreate (no cascade)");
+
+        // (4) All TEN indexes are back (a missed one silently becomes a full table scan).
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='speech_segments' AND sql IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 10, "all 10 indexes must be recreated");
+
+        // (5) FTS still finds a segment by transcript (triggers recreated + index rebuilt).
+        let hits = db.search_segments("کوردی").unwrap();
+        assert!(!hits.is_empty(), "FTS search must still work after the recreate");
+
+        // (6) The DB is consistent and FK-clean, and normal writes resume (triggers alive).
+        assert_eq!(db.integrity_check().unwrap().trim(), "ok");
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check").unwrap();
+        assert_eq!(stmt.query_map([], |_| Ok(())).unwrap().count(), 0, "no FK violations after the recreate");
+        drop(stmt);
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "after".into(),
+            audio_path: "/z.wav".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn fk_off_window_refuses_when_the_pragma_silently_did_not_take_effect() {
+        // THE guard that prevents silent data loss. SQLite IGNORES `PRAGMA foreign_keys=OFF` inside a
+        // transaction and still reports success — and foreign_key_check cannot save us, because a cascade
+        // deletes children CLEANLY (zero violations). So if the pragma doesn't take, an FK-parent recreate
+        // would commit total child-row loss with every check passing. The window must fail CLOSED.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+
+        // Simulate the hazard: already inside a transaction, so the pragma silently no-ops.
+        let tx = conn.unchecked_transaction().unwrap();
+        let err = run_with_foreign_keys_off(conn, || -> AppResult<()> {
+            panic!("the body must NEVER run when foreign_keys is still ON — that is the data-loss path");
+        })
+        .expect_err("must refuse when the pragma did not take effect");
+        assert!(format!("{err}").contains("did not take effect"), "the refusal must name the real cause: {err}");
+        drop(tx);
+
+        // And the connection is untouched: FK enforcement was never actually disabled.
+        let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+        assert_eq!(fk, 1, "refusing must leave foreign_keys ON");
+    }
+
+    #[test]
+    fn fk_off_window_restores_foreign_keys_even_when_the_body_fails() {
+        // A leaked foreign_keys=OFF would silently disable FK enforcement for the rest of the
+        // connection's life — far worse than the failed migration itself. The restore must be unconditional.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let conn = db.connection();
+        let err =
+            run_with_foreign_keys_off(conn, || -> AppResult<()> { Err(crate::error::AppError::Other("boom".into())) });
+        assert!(err.is_err(), "the body's error must propagate");
+        let fk_on: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+        assert_eq!(fk_on, 1, "foreign_keys must be restored to ON even when the body fails");
     }
 
     #[test]
