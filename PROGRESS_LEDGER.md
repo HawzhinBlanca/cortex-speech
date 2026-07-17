@@ -5491,3 +5491,15 @@ command dropped. fmt/clippy 0, cargo test --lib 929, 33/33 policies, lib.rs unto
 
 Running total: commands.rs 5968→4295 (~28% off) over 9 slices. exe owner-gated-behind (recoverable via
 auto-snapshot).
+
+---
+
+## 2026-07-17T17:59Z — iter 43 — commands.rs slice 10 (agentic-ops + engine-control); ~30% off
+
+**Week-4 item 1, slice 10 (commit 6bea017).** Extracted 8 agentic/engine commands
+→ src/commands/agentic.rs. **commands.rs 4284→4152 (~30% off over 10 slices), 63 commands relocated
+into 10 focused modules.** Shared engine types (EngineStatus, AgenticReadiness) + helpers stay in
+commands.rs (17 refs) via super::. **4th policy to hit gate-coupling:** test_agentic_pipeline_policy.py
+routed through command_surface() (now 5 policies scan the surface: main-thread, ui-audit, rust-panic,
+cloud-privacy, agentic). Count guardrail: lib.rs 127 == surface 127, none lost. fmt/clippy 0, cargo
+test --lib 929, 33/33. exe owner-gated-behind (recoverable via auto-snapshot).
