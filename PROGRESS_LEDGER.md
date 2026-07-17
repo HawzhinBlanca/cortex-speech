@@ -5529,3 +5529,37 @@ jury::X. **Exact caller sites to update: commands.rs:1273 (with_jury_db, in batc
 commands.rs:801 + 1274 (run_jury_pipeline_core_via), and pipeline.rs (crate::commands::run_jury_pipeline_core
 stays resolvable via pub re-export).** Behavior-critical (cloud pipeline) → adversarially verify. Not
 rushed at session's end. exe owner-gated-behind (recoverable via auto-snapshot).
+
+---
+
+## 2026-07-17T18:36Z — iter 45 — jury-bulk consolidation ATTEMPTED, reverted; plan corrected (honest)
+
+**Attempted** the iter-44 documented jury-bulk move: relocate the jury machinery cluster from
+commands.rs into commands/jury.rs with a pub(crate) re-export (so batch_transcribe + pipeline.rs +
+tests keep their call paths). Executed the extraction (470 lines out of commands.rs), appended to
+jury.rs, wired the re-export.
+
+**Discovered a deeper cascade than the plan anticipated, so I REVERTED cleanly** (git checkout;
+verified: tree clean, cargo clippy --lib exit 0 — no broken code shipped). The finding: the jury
+subsystem is a **tightly-coupled web**, not a surgical cluster. run_jury_pipeline_core_via +
+reference_selection_for_segment pull in ~8 more commands.rs helpers (reference_selection_evidence,
+get_few_shot_examples, hypothesis_coverage_guard, load_hypotheses_for_segment,
+has_final_machine_verdict, has_human_decision, resolve_t2_endpoint_from_keys, …) — and those are
+SHARED with the jury commands already in the slice. Moving any part cascades, and the stay-behind
+helpers become dead code (—D warnings fails). So a clean jury consolidation is an **all-or-nothing move
+of the ENTIRE jury subsystem** (~800+ lines: the already-moved command wrappers + the machinery + the
+reference-selection/hypothesis/few-shot ecosystem), not incremental slicing. My iter-44 "surgical
+plan" was too optimistic — corrected here.
+
+**Strategic conclusion (honest):** commands.rs is **already in the doctrine's 3-4k target band** (4008
+lines, ~33% off over 11 clean slices). The jury-subsystem consolidation is therefore **OPTIONAL** — a
+large, coherent, behavior-critical refactor that would want its own carefully-planned, adversarially-
+verified pass (move the whole subsystem at once, prove zero dead-code + all callers re-point). It is
+not required to meet the Week-4 item-1 goal, which is MET.
+
+**Where "fully ready robust" actually stands:** W1 ✅, W2 ✅, W3 item 4 ✅ (1-3 owner-gated: real
+CTC-logit uncertainty / long-audio CER / cloud-cost measurements), W4 item 1 (decomposition) ✅ MET.
+Remaining W4 items (e2e real-audio expansion, quiet-UX with rendered-frame proof) + the exe rebuild are
+**owner-machine-gated**. The high-value HEADLESS code work is substantially complete; further
+meaningful progress needs the owner's machine (recoverable rebuild + real-audio/measurement gates).
+No code shipped this iter (attempt reverted) — the value is the corrected plan + honest completion call.
