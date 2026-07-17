@@ -5328,3 +5328,40 @@ Owner's call.
 **Weeks:** W1 ✅ · W2 ✅ · W3 item 4 ✅ (1–3 blocked on real data) · **W4: item 1 slice-1 done, item 4
 done (RED→INCOMPLETE, 0 failing kept gates)**; items 2 (e2e expansion) + 3 (quiet-UX, needs
 rendered-frame proof) remain, plus more commands.rs slices.
+
+---
+
+## 2026-07-17T15:47Z — iter 35 — commands.rs slice 2 (model-download) + confirmed v40's pre-migration safety net
+
+**Directive:** "continue and finish the app fully ready robust."
+
+**1) Verified a robustness safety net (no change needed — it already exists).** Before doing more
+decomposition, checked whether the app backs up before a schema migration. It DOES: lib.rs:418 pins a
+rotation-exempt snapshot under snapshots/pinned/ whenever `current > 0 && current < max_known`, BEFORE
+initialize()/run_migrations. For the owner's DB (v39) upgrading to v40, that condition is 39 < 40 →
+**a `premigration_v39_to_v40` snapshot is pinned automatically before v40 runs.** So v40 is protected by
+THREE independent layers: atomic transaction (rolls back SQL errors), the automatic pre-migration
+pinned snapshot (recovers a semantically-buggy migration), and the adversarial verification + populated-
+schema test done in iter 33. The exe rebuild is therefore RECOVERABLE, not just "careful".
+
+**2) Week-4 item 1 — decomposition slice 2 (commit e62ba3e).** Extracted the 3 model-download commands
+into src/commands/model_download.rs. commands.rs 5824→5731 lines, 121→118; surface total stays 128;
+lib.rs untouched. Named `model_download` (not `models`) to avoid shadowing `crate::models` — a naive
+`mod models;` broke `models::OMNIASR_CTC_300M_MODEL`, caught by the compiler and fixed. Gate coupling:
+test_rust_runtime_panic_policy.py pins commands.rs by path and asserts the "model-download-progress"
+event logging — which moved with the slice → RED. Fixed like iter-34: a `command_surface()` helper
+(commands.rs + every src/commands/*.rs) now backs all 17 direct reads + the forbidden-pattern dict's
+commands.rs key, each guarded against a vacuous pass. STRICTLY MORE coverage than before.
+
+**Gate:** fmt 0; clippy 0; cargo test --lib 929; 33/33 python policies; lib.rs untouched; surface 128.
+No adversarial Workflow — a second application of the iter-34 mechanical pattern, compiler-verified
+(clippy + 929 tests) with a strictly-stronger gate; consistent with how slice 1 was handled.
+
+**Honest state toward "fully ready robust":** the app is in very strong shape — W1/W2 complete, W3
+item 4 done, W4 decomposition underway (2 slices), verify_10 INCOMPLETE with **0 failing kept gates**.
+What now stands between here and "fully ready" is increasingly **owner-gated**: (a) the exe REBUILD to
+activate v39/v40/telemetry/a11y (recoverable — auto-snapshot confirmed above); (b) the verify_10
+tier-2/3 gates that need the real exe + real audio + a live model (real-app-e2e, rtf-bench, egress,
+fuzz, fairness); (c) Week-3 items 1–3 measurements (real gold data / long audio). I'll keep doing the
+safe headless work (more slices, any found bugs), but the finish line genuinely needs the owner's
+machine for the real-audio/measurement legs.
