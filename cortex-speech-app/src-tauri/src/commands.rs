@@ -43,6 +43,8 @@ mod dataset_analytics;
 pub use dataset_analytics::*;
 mod gold_eval;
 pub use gold_eval::*;
+mod transcribe;
+pub use transcribe::*;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -995,42 +997,6 @@ pub fn take_last_crash(state: State<'_, AppState>) -> Option<String> {
     crate::crash::take_latest_crash_summary(&data_dir)
 }
 
-/// Opt-in: transcribe a segment with the CONSTRAINED Kurdish-token CTC decode (guarantees
-/// Kurdish-script output) via the `ort` raw-logits path, instead of the default sherpa-onnx
-/// decode. Additive — it does NOT touch the default `transcribe_segment` path. Loads a fresh ort
-/// session per call (fine for a user-initiated action; session caching is a perf follow-up).
-#[tauri::command]
-pub async fn transcribe_segment_constrained(
-    audio_path: String,
-    alignment_json: Option<String>,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("transcribe_segment_constrained")?;
-    validate::validate_file_path(&audio_path)?;
-    if let Some(ref aj) = alignment_json {
-        validate::validate_alignment_json(aj)?;
-    }
-    // Decode + constrained CTC beam search — off the main thread.
-    run_blocking(move || {
-        let models = crate::models::active_models_dir();
-        let model = models.join(crate::models::OMNIASR_CTC_300M_MODEL);
-        let tokens = models.join(crate::models::OMNIASR_CTC_300M_TOKENS);
-        if !model.exists() || !tokens.exists() {
-            return Err("OmniASR model/tokens not found for constrained decode".to_string());
-        }
-        // decode_to_pcm returns 16 kHz mono PCM (the model's expected input rate).
-        let (rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
-        // Slice only THIS segment's clip — every VAD chunk shares the whole-source audio_path (the range is
-        // in alignment_json), so decoding `pcm` directly would re-transcribe the ENTIRE recording into one
-        // segment. None alignment (single-segment file) = whole file. Mirrors the finetuned/Scribe paths.
-        let (clip, _suffix) = crate::chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref())
-            .map_err(|e| e.to_string())?;
-        let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
-        let text = crate::constrained_decode::run_constrained(&model, &tokens, &audio, true)?;
-        Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
-    })
-    .await
-}
-
 /// Decode ONLY a segment's clip window to 16 kHz mono PCM without loading the whole (possibly
 /// multi-hour) source file. Reads just the [source_start_ms, source_end_ms] span via the incremental
 /// window decoder, early-stopping once past the window. Falls back to a whole-file decode when there is
@@ -1127,88 +1093,6 @@ pub async fn verify_finetuned_model_integrity() -> Result<String, String> {
         let (onnx, vocab) = resolve_finetuned_paths()?;
         crate::wav2vec2_asr::verify_finetuned_full(&onnx, &vocab)?;
         Ok(format!("verified: {}", onnx.display()))
-    })
-    .await
-}
-
-/// Opt-in: transcribe a segment with the fine-tuned Kurdish Wav2Vec2-CTC model (ONNX via `ort`),
-/// which roughly halves CER vs the stock OmniASR path (see docs/EVAL.md). Additive — the default
-/// `transcribe_segment` path is unchanged. Resolves the model from `CORTEX_FINETUNED_ONNX` +
-/// `CORTEX_FINETUNED_VOCAB` (dev/testing) or `<models>/finetuned-mms-ckb/{model.onnx,vocab.json}`.
-#[tauri::command]
-pub async fn transcribe_segment_finetuned(
-    audio_path: String,
-    alignment_json: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("transcribe_segment_finetuned")?;
-    validate::validate_file_path(&audio_path)?;
-    if let Some(ref aj) = alignment_json {
-        validate::validate_alignment_json(aj)?;
-    }
-    let db = state.db_arc();
-    // Windowed decode + fine-tuned ONNX inference — off the main thread.
-    run_blocking(move || {
-        let (onnx, vocab) = resolve_finetuned_paths()?;
-        // Offset-less alignment is only whole-file-safe when this source has NO sibling chunks (see
-        // decode_finetuned_clip_16k): on a multi-segment source it would silently re-transcribe the
-        // entire recording into one segment (true-10 audit 2026-07-09).
-        let sibling_count: i64 = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.connection()
-                .query_row(
-                    "SELECT COUNT(*) FROM speech_segments WHERE audio_path = ?1",
-                    rusqlite::params![audio_path],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?
-        };
-        // Decode ONLY this segment's clip window (16 kHz). Every VAD chunk shares the whole-source
-        // audio_path with its range in alignment_json; decoding the WHOLE source first (the old path) failed
-        // on long recordings ("audio too large to decode in one pass") even though the clip is a few
-        // seconds. The windowed decode reads just the clip, so re-transcribe works on any source length.
-        let clip = decode_finetuned_clip_16k(&audio_path, alignment_json.as_deref(), sibling_count <= 1)?;
-        // Route through the pipeline's shared windowed wrapper, NOT run_wav2vec2 directly: the model is
-        // trained on short utterances and a single unbounded pass over >15 s (a raised max-segment
-        // setting, or a whole-file/no-meta clip) duplicates text — the pipeline path sub-splits into
-        // ~15 s windows for exactly that reason (true-10 audit 2026-07-09: one engine, two call paths,
-        // two different qualities).
-        let text = crate::pipeline::ProcessingPipeline::transcribe_chunk_finetuned(&onnx, &vocab, &clip)?;
-        Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn transcribe_segment(
-    segment_id: Option<String>,
-    audio_path: String,
-    alignment_json: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("transcribe_segment")?;
-    if let Some(ref id) = segment_id {
-        validate::validate_identifier(id)?;
-    }
-    validate::validate_file_path(&audio_path)?;
-    if let Some(ref aj) = alignment_json {
-        validate::validate_alignment_json(aj)?;
-    }
-    // Clone the pipeline (Arc-wrapped internals) so the global pipeline mutex is released before the
-    // possibly-long WSL/ONNX transcription, and run it OFF the main thread so the UI stays responsive.
-    let pipeline = state.lock_pipeline().clone();
-    run_blocking(move || {
-        let draft = pipeline
-            .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref(), None)
-            .map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({
-            "text": draft.final_text,
-            "rawTranscript": draft.raw_text,
-            "confidence": draft.confidence,
-            "confidenceSource": draft.confidence_source,
-            "modelVersionId": draft.model_version_id,
-            "cloudCall": draft.cloud_call
-        }))
     })
     .await
 }
@@ -1414,54 +1298,6 @@ pub fn normalize_text(text: String, state: State<'_, AppState>) -> Result<String
     };
     let normalizer = crate::normalizer::SoraniNormalizer::with_config(config);
     Ok(normalizer.normalize(&text))
-}
-
-#[tauri::command]
-pub async fn align_segment(
-    audio_path: String,
-    text: String,
-    alignment_json: Option<String>,
-    segment_id: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<Vec<aligner::WordTimestamp>, String> {
-    RATE_LIMITER.check("align_segment")?;
-    validate::validate_file_path(&audio_path)?;
-    if let Some(ref aj) = alignment_json {
-        validate::validate_alignment_json(aj)?;
-    }
-    if let Some(ref id) = segment_id {
-        validate::validate_identifier(id)?;
-    }
-    if text.trim().is_empty() {
-        return Err("Alignment text cannot be empty".to_string());
-    }
-    validate::validate_text(&text, 100000, "Alignment text")?;
-    // Clone the pipeline OUT of the lock so the global mutex is released before the slow decode +
-    // ONNX forced alignment, and run the whole align + persist OFF the main thread — holding either
-    // lock (or blocking the UI thread) serializes every other pipeline command (get_import_status
-    // polling, transcribe, get_waveform) for the whole alignment. ProcessingPipeline is Clone; align
-    // takes &self.
-    let pipeline = state.lock_pipeline().clone();
-    let db = state.db_arc();
-    run_blocking(move || {
-        let (timestamps, quality) =
-            pipeline.align(&audio_path, &text, alignment_json.as_deref()).map_err(|e| e.to_string())?;
-        // Persist the word timings INTO alignment_json (merged with existing chunk metadata) AND stamp
-        // the honest alignment_quality, so per-word review features survive a reload. The quality
-        // distinguishes real CTC forced alignment from the linear/energy heuristic fallback.
-        if let Some(ref id) = segment_id {
-            if !timestamps.is_empty() {
-                let merged = crate::chunking::merge_word_timestamps(alignment_json.as_deref(), &timestamps);
-                let db = db.lock().unwrap_or_else(|p| p.into_inner());
-                db.update_segment_alignment_json(id, &merged)
-                    .map_err(|error| format!("Failed to persist word timings for {id}: {error}"))?;
-                db.update_alignment_quality(id, quality.as_db_str())
-                    .map_err(|error| format!("Failed to stamp alignment quality for {id}: {error}"))?;
-            }
-        }
-        Ok(timestamps)
-    })
-    .await
 }
 
 #[derive(serde::Serialize)]
@@ -2014,19 +1850,6 @@ pub async fn check_agentic_readiness(state: State<'_, AppState>) -> Result<Agent
 }
 
 #[tauri::command]
-pub async fn rediarize_segments(ids: Vec<String>, state: State<'_, AppState>) -> Result<usize, String> {
-    STRICT_RATE_LIMITER.check("rediarize_segments")?;
-    for id in &ids {
-        validate::validate_identifier(id)?;
-    }
-    // Clone the pipeline and let it open its own DB connection, so neither the global pipeline nor
-    // db mutex is held across the per-file decode + diarization-inference loop, and run it OFF the
-    // main thread so the UI stays responsive for the decode duration.
-    let pipeline = state.lock_pipeline().clone();
-    run_blocking(move || pipeline.rediarize_segments(&ids).map_err(|e| e.to_string())).await
-}
-
-#[tauri::command]
 pub fn rename_speaker(old_id: String, new_id: String, state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("rename_speaker")?;
     validate::validate_identifier(&new_id)?;
@@ -2244,21 +2067,6 @@ pub fn restore_session(state: State<'_, AppState>) -> Result<Option<crate::sessi
     RATE_LIMITER.check("restore_session")?;
     let mut session = state.lock_session();
     session.restore().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn check_audio(path: String) -> Result<serde_json::Value, String> {
-    run_blocking(move || {
-        let validated = validate::validate_file_path(&path)?;
-        let info = audio::check_audio_file(&validated).map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({
-            "duration_ms": info.duration_ms,
-            "sample_rate": info.sample_rate,
-            "channels": info.channels,
-            "format": info.format,
-        }))
-    })
-    .await
 }
 
 #[tauri::command]
