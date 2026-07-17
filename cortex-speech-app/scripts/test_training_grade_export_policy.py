@@ -8,9 +8,26 @@ def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
+def export_surface() -> str:
+    # export.rs's #[cfg(test)] module was split into export_tests.rs via #[path] (Week-4 decomposition).
+    # Several assertions below pin #[test] fn NAMES (the HuggingFace skip/write regressions) that now
+    # live in export_tests.rs — so the gate must scan the whole export SURFACE. Reading only export.rs
+    # would let a moved regression vanish and this policy pass vacuously.
+    parts = [read("src-tauri/src/export.rs")]
+    tests = ROOT / "src-tauri/src/export_tests.rs"
+    if tests.is_file():
+        parts.append(tests.read_text(encoding="utf-8"))
+    text = "\n".join(parts)
+    if "#[test]" not in text or "ExportSegmentRecord::new" not in text:
+        raise AssertionError(
+            "export surface is missing production or test code — this training-grade gate would pass vacuously"
+        )
+    return text
+
+
 def main() -> None:
     quality = read("src-tauri/src/quality.rs")
-    export = read("src-tauri/src/export.rs")
+    export = export_surface()
     export_bundle = read("src-tauri/src/export_bundle.rs")
 
     required_quality = [
