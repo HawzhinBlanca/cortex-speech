@@ -1091,11 +1091,24 @@ def test_pipeline_duration_probe_failures_are_not_silent() -> None:
 
 
 def test_export_bundle_model_metadata_load_errors_are_visible() -> None:
-    export_bundle = (REPO_ROOT / "src-tauri/src/export_bundle.rs").read_text(encoding="utf-8")
+    # export_bundle.rs's #[cfg(test)] module was split into export_bundle_tests.rs via #[path]
+    # (Week-4 decomposition). The FORBIDDEN check stays scoped to the PRODUCTION file only — a test may
+    # legitimately mention the silent-discard pattern, and we must not false-positive on that. The
+    # REQUIRED check pins two #[test]-side needles (the regression fn name + its assertion) that now live
+    # in the tests file, so it scans the whole SURFACE, else the moved regression vanishes vacuously.
+    export_bundle_prod = (REPO_ROOT / "src-tauri/src/export_bundle.rs").read_text(encoding="utf-8")
+    surface_parts = [export_bundle_prod]
+    bundle_tests = REPO_ROOT / "src-tauri/src/export_bundle_tests.rs"
+    if bundle_tests.is_file():
+        surface_parts.append(bundle_tests.read_text(encoding="utf-8"))
+    export_bundle_surface = "\n".join(surface_parts)
+    if "#[test]" not in export_bundle_surface or "fn draft_export" not in export_bundle_surface:
+        raise AssertionError("export_bundle surface is missing test code — this panic gate would pass vacuously")
+
     forbidden = [
         "model_manager.load_meta().unwrap_or_default()",
     ]
-    present = [pattern for pattern in forbidden if pattern in export_bundle]
+    present = [pattern for pattern in forbidden if pattern in export_bundle_prod]
     if present:
         formatted = "\n".join(f"- {entry}" for entry in present)
         raise AssertionError(f"export_bundle.rs silently hides model metadata load failures:\n{formatted}")
@@ -1108,10 +1121,10 @@ def test_export_bundle_model_metadata_load_errors_are_visible() -> None:
         "fn draft_export_records_model_metadata_load_errors()",
         'model_manifest["installedMetadataLoadError"].as_str().unwrap().contains("Parse meta")',
     ]
-    missing = [pattern for pattern in required if pattern not in export_bundle]
+    missing = [pattern for pattern in required if pattern not in export_bundle_surface]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
-        raise AssertionError(f"export_bundle.rs must keep model metadata load failures visible:\n{formatted}")
+        raise AssertionError(f"export_bundle surface must keep model metadata load failures visible:\n{formatted}")
 
 
 def test_eval_read_paths_do_not_silently_drop_rows() -> None:

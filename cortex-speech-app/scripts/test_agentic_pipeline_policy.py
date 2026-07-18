@@ -35,7 +35,12 @@ def main() -> None:
     _pt = ROOT / "src-tauri" / "src" / "pipeline_tests.rs"
     if _pt.is_file():
         pipeline += "\n" + _pt.read_text(encoding="utf-8")
+    # export_bundle.rs's test module was split into export_bundle_tests.rs (#[path]); scan both so a
+    # moved regression-test name/helper still resolves (else this gate reads it as "missing").
     export_bundle = read("src-tauri/src/export_bundle.rs")
+    _ebt = ROOT / "src-tauri" / "src" / "export_bundle_tests.rs"
+    if _ebt.is_file():
+        export_bundle += "\n" + _ebt.read_text(encoding="utf-8")
     settings = read("src-tauri/src/settings.rs")
     migrations = read("src-tauri/src/migrations/mod.rs")
     lib_rs = read("src-tauri/src/lib.rs")

@@ -25,10 +25,27 @@ def export_surface() -> str:
     return text
 
 
+def export_bundle_surface() -> str:
+    # export_bundle.rs's #[cfg(test)] module was split into export_bundle_tests.rs via #[path] (Week-4
+    # decomposition). Many assertions below pin #[test] fn NAMES (the production-export block/allow
+    # regressions) plus grade-details JSON field checks that now live in export_bundle_tests.rs — so the
+    # gate must scan the whole SURFACE, else a moved regression vanishes and this policy passes vacuously.
+    parts = [read("src-tauri/src/export_bundle.rs")]
+    tests = ROOT / "src-tauri/src/export_bundle_tests.rs"
+    if tests.is_file():
+        parts.append(tests.read_text(encoding="utf-8"))
+    text = "\n".join(parts)
+    if "#[test]" not in text or "build_training_grade_details" not in text:
+        raise AssertionError(
+            "export_bundle surface is missing production or test code — this training-grade gate would pass vacuously"
+        )
+    return text
+
+
 def main() -> None:
     quality = read("src-tauri/src/quality.rs")
     export = export_surface()
-    export_bundle = read("src-tauri/src/export_bundle.rs")
+    export_bundle = export_bundle_surface()
 
     required_quality = [
         "TrainingGradeReport",
