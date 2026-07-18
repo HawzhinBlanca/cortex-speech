@@ -5779,3 +5779,34 @@ atomic export). Remaining:
 - **pipeline.rs and db.rs STILL UNSCANNED** — their finders died on the session limit. The audit is
   PARTIAL; re-run those two when the limit resets before claiming any codebase-wide clean bill.
 Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-18T11:21Z — iter 55 — migration rollback made atomic (commit 8cb509f); ALL 4 hunt candidates now fixed
+
+Candidate #4 (last of the iter-52 list), hand-verified and fixed. `rollback()`'s FK-off branch already ran
+down_sql in ONE transaction and its comment spelled out the hazard verbatim; the sibling **non-FK-off
+branch did the exact bare execute_batch that comment warns about**, then a separate version delete.
+`apply_migration()`'s non-FK-off path already used a transaction — rollback was the lone asymmetry.
+(Same shape as iter 53: the guard existed, it just was not applied consistently.)
+
+**Impact:** several down_sql bodies are multi-statement (v6/v9/v17/v22/v25/v31/v36/v37); a mid-batch
+failure left the schema half-reverted while schema_migrations still recorded the version applied →
+run_migrations skips it forever, **no self-heal path**.
+**Proof — real migration data, no synthetic fixture** (rollback walks the global MIGRATIONS so a synthetic
+Migration cannot be injected): pin current at v6, pre-drop snr_db so v6's THIRD down statement fails after
+two succeeded. A first-statement failure would prove nothing (identical with/without a tx).
+**Fail-before observed:** rollback errored AND clipping_ratio stayed dropped — real partial apply.
+Pass-after; `rollback_then_reapply_restores_schema` unchanged.
+**Honest scope:** rollback() has no command caller today (test-only reachability), so this is a LATENT
+defect in a public durability API, not a live user-facing bug — fixed because a half-applied schema change
+is exactly the unrecoverable case.
+Gate: fmt 0, clippy 0, **cargo test --lib 934 passed / 0 failed**, 33/33 policies.
+
+**Hunt list: 4/4 fixed** (52 wipe-guard · 53 CWE-1236 ×2 sites · 54 atomic export · 55 atomic rollback).
+
+**pipeline.rs + db.rs hunt RUNNING** (wabwlmnq0, 8 lenses). This rerun fixes last run's reporting flaw: a
+dead verifier is now reported as **UNVERIFIED** rather than silently counted as "not confirmed" — that
+swallow is what produced the bogus "0 confirmed / 4 refuted" clean-bill last time. Until it lands and its
+findings are hand-checked, **the backend audit remains PARTIAL** and no clean bill is claimed.
+Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
