@@ -209,11 +209,19 @@ pub fn rollback(db: &Database, count: usize) -> AppResult<Vec<i64>> {
                         Ok(())
                     })?;
                 } else {
-                    conn.execute_batch(down_sql)?;
-                    conn.execute(
+                    // Mirror apply_migration's non-FK-off path: ONE transaction. A bare execute_batch
+                    // auto-commits statement-by-statement, and several down_sql bodies are multi-statement
+                    // (v6/v9/v17/v22/v25/v31/v36/v37), so a failure partway left the schema half-reverted
+                    // while schema_migrations still recorded the version as applied — run_migrations would
+                    // then skip it forever, with no self-heal path. Same hazard the FK-off branch above
+                    // already guards against; it just was not applied here.
+                    let tx = conn.unchecked_transaction()?;
+                    tx.execute_batch(down_sql)?;
+                    tx.execute(
                         "DELETE FROM schema_migrations WHERE version = ?1",
                         rusqlite::params![migration.version],
                     )?;
+                    tx.commit()?;
                 }
                 reverted.push(migration.version);
             }
@@ -1986,5 +1994,42 @@ mod tests {
         let reapplied = run_migrations(&db).unwrap();
         assert_eq!(reapplied, vec![max_version], "the rolled-back migration must re-apply");
         assert_eq!(get_current_version(&db).unwrap(), max_version);
+    }
+
+    #[test]
+    fn a_failed_multi_statement_rollback_leaves_the_schema_unchanged() {
+        // The FK-off rollback branch already runs down_sql in ONE transaction, and its comment spells out
+        // why: a bare execute_batch auto-commits statement-by-statement, so a mid-batch failure leaves the
+        // schema half-reverted. The sibling non-FK-off branch did exactly that bare execute_batch. Several
+        // down_sql bodies are multi-statement (v6/v9/v17/v22/v25/v31/v36/v37), so a failure partway left
+        // the schema mutated while schema_migrations still recorded the version as applied -- run_migrations
+        // then skips it forever, with no self-heal path.
+        //
+        // Deterministic injection using REAL migration data: v6's down_sql drops clipping_ratio, rms_db and
+        // snr_db (no IF EXISTS). Dropping snr_db up front makes the THIRD statement fail after the first two
+        // have already succeeded -- the exact partial-apply window.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        run_migrations(&db).unwrap();
+
+        let has_column = |name: &str| -> bool {
+            let conn = db.connection();
+            let mut stmt = conn.prepare("SELECT 1 FROM pragma_table_info('speech_segments') WHERE name = ?1").unwrap();
+            stmt.exists(rusqlite::params![name]).unwrap()
+        };
+
+        // Pin current version at 6 so rollback(1) targets v6, then poison its final down statement.
+        db.connection().execute("DELETE FROM schema_migrations WHERE version > 6", []).unwrap();
+        db.connection().execute_batch("ALTER TABLE speech_segments DROP COLUMN snr_db;").unwrap();
+        assert_eq!(get_current_version(&db).unwrap(), 6, "test must target v6");
+        assert!(has_column("clipping_ratio") && has_column("rms_db"), "fixture columns must exist up front");
+
+        let result = rollback(&db, 1);
+
+        assert!(result.is_err(), "the poisoned third down statement must fail the rollback, got {result:?}");
+        // The whole down_sql must roll back as one unit: the first two DROP COLUMNs must NOT have stuck.
+        assert!(has_column("clipping_ratio"), "a failed rollback must not leave clipping_ratio dropped");
+        assert!(has_column("rms_db"), "a failed rollback must not leave rms_db dropped");
+        assert_eq!(get_current_version(&db).unwrap(), 6, "schema and recorded version must stay consistent");
     }
 }
