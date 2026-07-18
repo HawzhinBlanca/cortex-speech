@@ -1096,6 +1096,15 @@ fn export_huggingface_skips_machine_ready_rows_without_hypothesis_coverage() {
     })
     .unwrap();
 
+    // A fully-eligible human-gold companion so the export actually RUNS. With ONLY the weak row this is
+    // a legitimate no-op export (it must not wipe a prior dataset), and the skip assertions below would
+    // then pass vacuously. The companion proves the skip is SELECTIVE, not a blanket empty export.
+    let companion_wav = tmp_dir.path().join("hf-good-companion.wav");
+    write_silent_wav(&companion_wav);
+    let mut good = sample_segment("hf-good-companion");
+    good.audio_path = companion_wav.to_string_lossy().to_string();
+    db.insert_segment(&good).unwrap();
+
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
         crate::settings::AppSettings { hf_speaker_disjoint: false, ..crate::settings::AppSettings::default() };
@@ -1107,6 +1116,10 @@ fn export_huggingface_skips_machine_ready_rows_without_hypothesis_coverage() {
     let test_metadata = std::fs::read_to_string(out_dir.path().join("data/test/metadata.csv")).unwrap_or_default();
     let all_metadata = format!("{train_metadata}\n{validation_metadata}\n{test_metadata}");
 
+    assert!(
+        all_metadata.contains("hf-good-companion"),
+        "the eligible companion must export — otherwise the skip assertions below are vacuous"
+    );
     assert!(!all_metadata.contains("hf-weak-machine"));
     assert!(!out_dir.path().join("data/train/hf-weak-machine_hf-weak-machine.wav").exists());
 }
@@ -1122,6 +1135,15 @@ fn export_huggingface_skips_machine_ready_rows_without_ready_agentic_report() {
     write_silent_wav(&wav_path);
     insert_machine_silver_segment_with_hf_coverage(&db, &wav_path, "hf-no-agent-report");
 
+    // A fully-eligible human-gold companion so the export actually RUNS. With ONLY the ineligible row
+    // this is a legitimate no-op export (it must not wipe a prior dataset), and the skip assertions
+    // below would then pass vacuously. The companion proves the skip is SELECTIVE.
+    let companion_wav = tmp_dir.path().join("hf-good-companion.wav");
+    write_silent_wav(&companion_wav);
+    let mut good = sample_segment("hf-good-companion");
+    good.audio_path = companion_wav.to_string_lossy().to_string();
+    db.insert_segment(&good).unwrap();
+
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
         crate::settings::AppSettings { hf_speaker_disjoint: false, ..crate::settings::AppSettings::default() };
@@ -1133,6 +1155,10 @@ fn export_huggingface_skips_machine_ready_rows_without_ready_agentic_report() {
     let test_metadata = std::fs::read_to_string(out_dir.path().join("data/test/metadata.csv")).unwrap_or_default();
     let all_metadata = format!("{train_metadata}\n{validation_metadata}\n{test_metadata}");
 
+    assert!(
+        all_metadata.contains("hf-good-companion"),
+        "the eligible companion must export — otherwise the skip assertions below are vacuous"
+    );
     assert!(!all_metadata.contains("hf-no-agent-report"));
     assert!(!out_dir.path().join("data/train/hf-no-agent-report_hf-no-agent-report.wav").exists());
 }
@@ -1405,4 +1431,53 @@ fn assert_no_tmp_exports(dir: &std::path::Path) {
     let tmp_left =
         std::fs::read_dir(dir).unwrap().flatten().any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"));
     assert!(!tmp_left, "temporary export files should be promoted or removed");
+}
+
+#[test]
+fn hf_reexport_with_zero_training_ready_segments_preserves_the_prior_export() {
+    // DATA-LOSS regression: the no-op guard tested `segments.is_empty()` (the RAW segment count) while
+    // the write loop skips every non-training-ready row. A library with segments but ZERO exportable
+    // rows therefore fell through the guard, remove_dir_all()'d the prior good dataset, wrote nothing,
+    // and returned Ok(()) — silently replacing a previously-good export with an empty one. That is
+    // exactly the state a missing word-aligner produces (every clip grades REVIEW => not training_ready),
+    // so this fired on a real, documented configuration. The guard must test whether any row would
+    // ACTUALLY be written.
+    let db_tmp = NamedTempFile::new().unwrap();
+    let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let wav_path = tmp_dir.path().join("not-ready.wav");
+    write_silent_wav(&wav_path);
+
+    // An unverified machine draft with no jury/multi-agent evidence: grades REVIEW, not training-ready.
+    let mut seg = sample_segment("not-ready-seg");
+    seg.audio_path = wav_path.to_string_lossy().to_string();
+    seg.verified = false;
+    db.insert_segment(&seg).unwrap();
+    let stored = db.get_segment_by_id("not-ready-seg").unwrap().unwrap();
+    assert!(
+        !quality::training_grade_for_segment(&stored).training_ready,
+        "fixture must be NON-training-ready for this regression to mean anything"
+    );
+
+    // A prior GOOD export already sitting on disk.
+    let out_dir = tempfile::tempdir().unwrap();
+    let train_dir = out_dir.path().join("data").join("train");
+    std::fs::create_dir_all(&train_dir).unwrap();
+    let prior_csv = train_dir.join("metadata.csv");
+    std::fs::write(&prior_csv, "file_name,transcription\nprior.wav,prior transcript\n").unwrap();
+    let prior_wav = train_dir.join("prior.wav");
+    std::fs::write(&prior_wav, b"__prior_payload__").unwrap();
+
+    export_huggingface_dataset(&db, out_dir.path(), &crate::settings::AppSettings::default()).unwrap();
+
+    // Nothing was exportable, so this must be a true NO-OP that leaves the prior dataset intact.
+    assert!(prior_csv.exists(), "a re-export with zero exportable rows must NOT delete the prior dataset");
+    assert!(prior_wav.exists(), "prior clips must survive — a no-op re-export must not remove_dir_all() them");
+    assert_eq!(std::fs::read(&prior_wav).unwrap(), b"__prior_payload__", "prior clips must survive byte-for-byte");
+    assert!(
+        std::fs::read_to_string(&prior_csv).unwrap().contains("prior.wav"),
+        "the prior metadata.csv must be untouched, not replaced by a header-only file"
+    );
 }

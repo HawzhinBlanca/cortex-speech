@@ -678,7 +678,34 @@ pub fn export_huggingface_dataset(
     // (for WER/CER eval) that ALSO exists as a normal training-ready segment leaks into data/train,
     // contaminating the very eval set the promotion gate measures against.
     let segments = exclude_holdout_segments(db, db.get_segments(None)?)?;
-    if segments.is_empty() {
+
+    let ready_agentic_segment_ids = ready_agentic_huggingface_segment_ids(db)?;
+    let required_source_reference_models = settings.source_reference_models();
+
+    // The no-op guard must test whether any row would ACTUALLY be written — NOT merely whether the
+    // library holds segments. The write loop below skips every row that is not training_ready, and every
+    // machine row without HF coverage, so a library with segments but zero EXPORTABLE rows used to fall
+    // straight through this guard, remove_dir_all() the prior good dataset, write nothing, and return
+    // Ok(()) — silently replacing a previously-good export with an empty one. That is exactly the state
+    // a missing word-aligner produces (every clip grades REVIEW => training_ready=false), so the raw
+    // `segments.is_empty()` test destroyed real datasets on a real, documented configuration.
+    let mut has_exportable_row = false;
+    for seg in &segments {
+        let grade = quality::training_grade_for_segment(seg);
+        if grade.training_ready
+            && is_training_ready_for_huggingface_export(
+                db,
+                seg,
+                &grade,
+                &ready_agentic_segment_ids,
+                &required_source_reference_models,
+            )?
+        {
+            has_exportable_row = true;
+            break;
+        }
+    }
+    if !has_exportable_row {
         // Nothing to export — a true NO-OP that PRESERVES any prior export rather than wiping it
         // (re-exporting with zero training-ready segments must not destroy a previous good dataset).
         return Ok(());
@@ -694,9 +721,6 @@ pub fn export_huggingface_dataset(
     std::fs::create_dir_all(&train_dir)?;
     std::fs::create_dir_all(&val_dir)?;
     std::fs::create_dir_all(&test_dir)?;
-
-    let ready_agentic_segment_ids = ready_agentic_huggingface_segment_ids(db)?;
-    let required_source_reference_models = settings.source_reference_models();
 
     // Assign each segment to a split — deterministic (seed-reproducible) and without
     // splitting a source recording across train/val/test. See assign_splits().
