@@ -5656,3 +5656,24 @@ db_surface()/pipeline_surface(). rust-panic policy's export.rs read is productio
 **File-size progress:** commands.rs 3937, export.rs 1322, db.rs 2622, pipeline.rs 3313 — all in/under the
 3-4k band. Last big-test file for the same safe split: **export_bundle.rs (2308, ~1334 test lines from
 line 974)** → next iteration. Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-18T02:57Z — iter 51 — export_bundle.rs test split (2308→976); test-decomposition vein COMPLETE; bug-hunt launched
+
+**Last file in the test-module #[path] split vein.** export_bundle.rs 2308→976; 17 #[test] fns moved to
+export_bundle_tests.rs; **byte-identical after ws+commas+braces normalization (sha256 match)**; cargo test
+--lib **929 passed / 0 failed (unchanged)**. THREE policies read export_bundle.rs by path and pin moved
+#[test] names → training_grade (export_bundle_surface() helper), rust-panic (required→surface, FORBIDDEN
+silent-discard check kept production-scoped so a test mention can't false-positive), agentic (dual-read).
+Commit 9e63e55. fmt/clippy 0, 33/33 policies.
+
+**Milestone: all previously-oversized backend files now in/under the 3-4k target** — commands.rs 3937,
+pipeline.rs 3313, db.rs 2622, export.rs 1322, export_bundle.rs 976. The decomposition vein is done.
+
+**Pivot (honest):** file-size refactors are maintainability, not robustness — they don't move the
+"fully ready robust" needle. Launched an adversarial bug-hunt Workflow (10 finders × failure-lens over
+production Rust → per-finding refutation verify → ranked confirmed defects) to seed REAL defect-fix work
+for the coming iterations. Any fix will land with a fail-before/pass-after regression test; findings that
+survive refutation get fixed, refuted ones logged and dropped (no fabricated "bugs"). Owner-gated finish
+legs unchanged (OWNER_HANDOFF.md): exe rebuild + real-audio e2e/RTF/eval still require the owner's machine.
