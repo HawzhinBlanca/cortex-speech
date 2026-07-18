@@ -896,14 +896,18 @@ pub fn export_huggingface_dataset(
                         let reasons = grade.reasons.join("; ");
                         // Canonical Sorani orthography for the shipped transcription (ك/ک, ي/ی, ه/ھ
                         // unified — mixed codepoint variants inflate the CTC label space downstream),
-                        // then the formula-injection guard on the free-text columns only.
+                        // then the formula-injection guard on every caller-influenced column. The clip
+                        // name is included: sanitized_clip_filename() maps '=', '+' and '@' to '_' but
+                        // PRESERVES '-', which csv_safe_cell() itself treats as a formula lead, so a
+                        // source stem beginning with '-' otherwise reached metadata.csv unguarded.
                         let canonical_transcript = crate::normalizer::canonical_training_text(&grade.transcript);
+                        let hf_filename = csv_safe_cell(filename.as_str());
                         let hf_transcript = csv_safe_cell(&canonical_transcript);
                         let hf_speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                         let hf_reasons = csv_safe_cell(reasons.as_str());
 
                         csv_wtr.write_record([
-                            filename.as_str(),
+                            hf_filename.as_ref(),
                             hf_transcript.as_ref(),
                             hf_speaker.as_ref(),
                             dur_str.as_str(),
@@ -1173,7 +1177,14 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
             for seg in segments {
                 let grade = quality::training_grade_for_segment(seg);
                 let reasons = grade.reasons.join("; ");
-                // Formula-injection guard on the free-text columns only.
+                // Formula-injection guard on EVERY column that can carry attacker-influenced text.
+                // audio_path is the imported file's basename and id can come from an imported dataset —
+                // both are caller-controlled, and `=SUM(1+1).wav` is a valid filename on Windows and
+                // Linux, so leaving them raw let a crafted name execute when the exported dataset.csv is
+                // opened in Excel/LibreOffice/Sheets (CWE-1236). The remaining columns are app-generated
+                // numerics/enums ("1"/"0", duration, grade), which cannot carry a formula lead.
+                let id_cell = csv_safe_cell(seg.id.as_str());
+                let audio_ref = csv_safe_cell(export_audio_ref(&seg.audio_path));
                 let raw = csv_safe_cell(seg.raw_transcript.as_str());
                 let normalized = csv_safe_cell(seg.normalized_transcript.as_deref().unwrap_or(""));
                 let annotated = csv_safe_cell(seg.annotated_transcript.as_deref().unwrap_or(""));
@@ -1183,8 +1194,8 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 let speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                 let reasons_cell = csv_safe_cell(reasons.as_str());
                 wtr.write_record([
-                    seg.id.as_str(),
-                    export_audio_ref(&seg.audio_path),
+                    id_cell.as_ref(),
+                    audio_ref.as_ref(),
                     raw.as_ref(),
                     normalized.as_ref(),
                     annotated.as_ref(),

@@ -1481,3 +1481,61 @@ fn hf_reexport_with_zero_training_ready_segments_preserves_the_prior_export() {
         "the prior metadata.csv must be untouched, not replaced by a header-only file"
     );
 }
+
+#[test]
+fn export_csv_neutralizes_formula_injection_in_audio_path_and_id() {
+    // CWE-1236 completeness: the formula-injection guard was applied to the free-text columns ONLY,
+    // leaving audio_path and id raw. audio_path is derived from an imported file's NAME — user- and
+    // dataset-controlled, and `=HYPERLINK(...).wav` is a perfectly valid filename on both Windows and
+    // Linux — so opening the exported dataset.csv in Excel/LibreOffice/Sheets evaluated it as a live
+    // formula. Every column that can carry attacker-influenced text must go through csv_safe_cell.
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let path = tmp_dir.path().join("inject-path.csv");
+    let mut seg = sample_segment("=cmd|' /c calc'!A1");
+    // NOTE: export_audio_ref() takes the basename after the last `/` or `\`, so a payload containing a
+    // URL would have its formula lead stripped incidentally. That is NOT a mitigation — a plain filename
+    // with no separators (valid on Windows and Linux) reaches the CSV cell with its lead char intact.
+    seg.audio_path = r"C:\corpus\=SUM(1+1)+cmd.wav".to_string();
+    export_csv(&path, &[seg]).unwrap();
+
+    let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_path(&path).unwrap();
+    let rec = rdr.records().next().unwrap().unwrap();
+    // Header order: 0 id, 1 audio_path.
+    assert!(rec[1].starts_with("'="), "audio_path formula lead must be neutralized, got {:?}", &rec[1]);
+    assert!(rec[0].starts_with("'="), "id formula lead must be neutralized, got {:?}", &rec[0]);
+    // The guard PREFIXES a quote; it must not mangle or drop the underlying value.
+    assert!(rec[1].contains("SUM(1+1)"), "the guard must prefix, not mangle, the value: {:?}", &rec[1]);
+}
+
+#[test]
+fn hf_metadata_csv_neutralizes_a_formula_lead_in_the_file_name_column() {
+    // Same CWE-1236 class as the dataset.csv columns, in the HuggingFace metadata.csv. The clip name
+    // comes from sanitized_clip_filename(), which maps '=', '+' and '@' to '_' — but it PRESERVES '-',
+    // and csv_safe_cell() itself classifies a leading '-' as a formula lead. So a source file whose
+    // stem begins with '-' produced a raw formula-lead cell in the shipped metadata.csv.
+    let db_tmp = NamedTempFile::new().unwrap();
+    let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let wav_path = tmp_dir.path().join("-2+3.wav");
+    write_silent_wav(&wav_path);
+    let mut seg = sample_segment("hfdash");
+    seg.audio_path = wav_path.to_string_lossy().to_string();
+    db.insert_segment(&seg).unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    export_huggingface_dataset(&db, out_dir.path(), &crate::settings::AppSettings::default()).unwrap();
+
+    let all_metadata = all_huggingface_metadata(out_dir.path());
+    let cell = all_metadata
+        .lines()
+        .find(|l| l.contains("hfdash"))
+        .unwrap_or_else(|| panic!("the exported row must be present:\n{all_metadata}"))
+        .split(',')
+        .next()
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    assert!(cell.starts_with("'-"), "a '-'-leading clip name must be quote-prefixed in metadata.csv, got {cell:?}");
+}
