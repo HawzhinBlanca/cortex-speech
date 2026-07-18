@@ -5677,3 +5677,47 @@ production Rust → per-finding refutation verify → ranked confirmed defects) 
 for the coming iterations. Any fix will land with a fail-before/pass-after regression test; findings that
 survive refutation get fixed, refuted ones logged and dropped (no fabricated "bugs"). Owner-gated finish
 legs unchanged (OWNER_HANDOFF.md): exe rebuild + real-audio e2e/RTF/eval still require the owner's machine.
+
+---
+
+## 2026-07-18T10:26Z — iter 52 — REAL DATA-LOSS BUG FIXED: HF re-export wiped the prior dataset (commit cbc3789)
+
+**First real defect fix of the bug-hunt pivot.** `export_huggingface_dataset()`'s no-op guard tested
+`segments.is_empty()` (raw segment count) while its own comment specified the invariant "re-exporting
+with **zero training-ready** segments must not destroy a previous good dataset". Different predicates.
+The write loop skips every non-training-ready row, so a library **with** segments but **zero exportable**
+rows fell through the guard, hit `remove_dir_all(&data_dir)`, wrote nothing, and returned Ok(()) —
+**silently replacing a good export with an empty one, no error surfaced.**
+
+**Not hypothetical — it fires on this rig's documented state:** mms_aligner.onnx absent => every clip
+grades REVIEW => training_ready=false => full library, zero exportable rows = exactly the wipe condition.
+
+**Fix:** hoist the eligibility inputs above the delete; guard now tests whether any row would ACTUALLY be
+written (both gates). Nothing exportable => return before touching data_dir. No-op-returns-Ok semantic
+unchanged — only the predicate corrected to what the comment always said.
+**Proof:** new test `hf_reexport_with_zero_training_ready_segments_preserves_the_prior_export` FAILS on
+unfixed code (prior WAV NotFound — dataset deleted) and passes after. Verified both directions.
+Two existing tests then no-op'd; each gained an **eligible companion row + positive assertion** so they
+prove SELECTIVE skipping instead of passing vacuously — strictly stronger, not weakened.
+Gate: fmt 0, clippy 0, **cargo test --lib 930 passed / 0 failed**, 33/33 policies.
+
+**Workflow honesty note:** the bug-hunt Workflow was **INCONCLUSIVE as a workflow** — 6/14 agents died on
+an account session limit. Two finders (pipeline.rs, db.rs — high-value targets) never ran, and **all four
+verifier agents died**, so the returned `{confirmed: [], refuted_count: 4}` was **meaningless**: those 4
+were never adjudicated, not refuted. The finders' raw output survived in journal.jsonl and yielded 4 real
+candidates, which I hand-verified against source instead of trusting the dead verifiers. **No agent
+verdict was used as evidence.**
+
+**Remaining candidates (hand-verify before any fix — not yet confirmed):**
+1. export.rs ~1163 (medium) — export_csv writes `audio_path`/`id` WITHOUT csv_safe_cell, bypassing its
+   own CWE-1236 formula-injection guard applied to transcript/speaker/reason. A filename leading with
+   `=`/`@`/`+` would evaluate in Excel/Sheets.
+2. export.rs ~692 (medium) — HF export deletes data_dir up front, so a mid-write failure (disk full,
+   rename fail) leaves a partial dataset with the prior good one already gone. Real fix = write to a temp
+   dir and swap on success (also subsumes this iteration's class of hazard).
+3. migrations/mod.rs ~212 (low) — rollback()'s non-FK-off branch runs down_sql and the version-delete as
+   two auto-commit statements; a crash between them leaves schema/version inconsistent. Low reachability
+   (rollback is test-only today) but it is a public durability API.
+
+**pipeline.rs and db.rs were never scanned** — re-run those two finders when the session limit resets.
+Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
