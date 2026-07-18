@@ -5721,3 +5721,30 @@ verdict was used as evidence.**
 
 **pipeline.rs and db.rs were never scanned** — re-run those two finders when the session limit resets.
 Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-18T10:46Z — iter 53 — CSV formula-injection (CWE-1236) closed at BOTH sites (commit 4411c22)
+
+Candidate #1 from the iter-52 hunt list, hand-verified and fixed. `csv_safe_cell()` already existed and
+both call sites explicitly said "the formula-injection guard on the free-text columns **only**" — that
+scoping left caller-controlled identifiers raw in two shipped CSVs:
+1. **dataset.csv** — `id` + `audio_path` unguarded. audio_path is the imported file's basename and
+   `=SUM(1+1).wav` is a valid filename on Windows/Linux. Fail-before cell: `=SUM(1+1)+cmd.wav`.
+2. **data/<split>/metadata.csv (HF)** — clip `file_name` unguarded. Found by chasing the ROOT CAUSE
+   rather than only the reported site: sanitized_clip_filename() maps `=`/`+`/`@` to `_` but
+   **preserves `-`**, which csv_safe_cell itself treats as a formula lead. Fail-before: `-2_3_hfdash.wav`.
+
+Both fixed; **2 regression tests, each verified fail-before AND pass-after**. The audio_path test also
+documents that export_audio_ref()'s basename split is NOT a mitigation (a separator-free filename keeps
+its lead char) — my first fixture was wrong about this and the test caught it, so the note is recorded to
+stop a future reader re-deriving it. csv_safe_cell only prefixes when the lead byte is dangerous
+(Cow::Borrowed otherwise), so **existing datasets export byte-identically**.
+Gate: fmt 0, clippy 0, **cargo test --lib 932 passed / 0 failed**, 33/33 policies.
+
+**Remaining from the hunt list (still unverified — do NOT treat as confirmed):**
+- export.rs ~692 (medium) — HF export deletes data_dir up front; a mid-write failure leaves a partial
+  dataset with the prior good one gone. Real fix = write to temp dir + swap on success.
+- migrations/mod.rs ~212 (low) — rollback()'s non-FK-off branch is non-atomic (test-only reachability).
+- **pipeline.rs and db.rs were never scanned** (their finders died on the session limit) — re-run when
+  the limit resets. Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
