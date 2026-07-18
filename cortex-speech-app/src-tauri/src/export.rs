@@ -669,9 +669,14 @@ pub fn export_huggingface_dataset(
     let _span = crate::telemetry::TRACER.start_span("export.huggingface", crate::telemetry::Tracer::metadata(vec![]));
     std::fs::create_dir_all(dir)?;
     let data_dir = dir.join("data");
-    let train_dir = data_dir.join("train");
-    let val_dir = data_dir.join("validation");
-    let test_dir = data_dir.join("test");
+    // Splits are STAGED in a sibling directory and swapped in only once every split has written
+    // successfully. Rebuilding in place (remove_dir_all(data) up front, then write) meant ANY mid-export
+    // failure — a full disk, a failed rename, an unwritable clip name — destroyed the prior good dataset
+    // and left the replacement partial, with nothing to recover.
+    let staging_dir = dir.join(".data-staging");
+    let train_dir = staging_dir.join("train");
+    let val_dir = staging_dir.join("validation");
+    let test_dir = staging_dir.join("test");
 
     // Exclude held-out gold audio from the TRAINING export — the same fail-closed content-hash guard
     // the plain export, DPO, and LM-corpus exports use. Without it, a clip registered as a holdout
@@ -711,12 +716,13 @@ pub fn export_huggingface_dataset(
         return Ok(());
     }
 
-    // There IS something to export: clear any prior export's split artifacts before re-writing, so a
-    // re-export into the same directory never leaves orphan WAVs (a segment that no longer exports) or a
-    // stale metadata.csv for a now-empty split — both would be hashed into SHA256SUMS and disagree with
-    // the freshly written metadata.csv / dataset_infos.json (round-12 audit).
-    if data_dir.exists() {
-        std::fs::remove_dir_all(&data_dir)?;
+    // There IS something to export. Stage into a FRESH tree: a leftover staging dir from a crashed run
+    // is discarded first, and because every clip lands in an empty tree there are no orphan WAVs and no
+    // stale metadata.csv for a now-empty split to prune — the round-12 hazard (an orphan getting hashed
+    // into SHA256SUMS and disagreeing with metadata.csv / dataset_infos.json) is now structurally
+    // impossible rather than cleaned up after the fact. data/ is left untouched until the swap below.
+    if staging_dir.exists() {
+        std::fs::remove_dir_all(&staging_dir)?;
     }
     std::fs::create_dir_all(&train_dir)?;
     std::fs::create_dir_all(&val_dir)?;
@@ -948,9 +954,36 @@ pub fn export_huggingface_dataset(
         )
     };
 
-    let (train_count, train_secs, train_dropped, train_ids) = process_split(&train_segs, "train", &train_dir)?;
-    let (val_count, val_secs, val_dropped, val_ids) = process_split(&val_segs, "validation", &val_dir)?;
-    let (test_count, test_secs, test_dropped, test_ids) = process_split(&test_segs, "test", &test_dir)?;
+    // Write every split into the staging tree first. If ANY split fails, discard the staging tree and
+    // propagate — data/ has not been touched, so the prior dataset survives a failed re-export intact.
+    let staged_splits = (|| -> AppResult<_> {
+        let train = process_split(&train_segs, "train", &train_dir)?;
+        let val = process_split(&val_segs, "validation", &val_dir)?;
+        let test = process_split(&test_segs, "test", &test_dir)?;
+        Ok((train, val, test))
+    })();
+    let (
+        (train_count, train_secs, train_dropped, train_ids),
+        (val_count, val_secs, val_dropped, val_ids),
+        (test_count, test_secs, test_dropped, test_ids),
+    ) = match staged_splits {
+        Ok(splits) => splits,
+        Err(error) => {
+            if let Err(cleanup) = std::fs::remove_dir_all(&staging_dir) {
+                tracing::warn!("HF export: failed to remove staging dir after an export error: {cleanup}");
+            }
+            return Err(error);
+        }
+    };
+
+    // COMMIT: every split wrote successfully, so replace the previous dataset now. The rename is atomic
+    // within the directory; if the remove succeeds but the rename fails, the fully-written new dataset
+    // is still on disk at .data-staging and is recoverable by hand (the prior in-place rebuild left
+    // nothing at all).
+    if data_dir.exists() {
+        std::fs::remove_dir_all(&data_dir)?;
+    }
+    std::fs::rename(&staging_dir, &data_dir)?;
 
     let total_count = train_count + val_count + test_count;
     let total_secs = train_secs + val_secs + test_secs;

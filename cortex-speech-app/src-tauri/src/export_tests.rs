@@ -580,6 +580,12 @@ fn hf_export_persists_splits_only_after_a_successful_write() {
         matches!(split.as_deref(), Some("train" | "validation" | "test")),
         "split persisted after a successful export, got {split:?}"
     );
+    // Splits are staged then swapped in; a SUCCESSFUL export must consume the staging tree (rename),
+    // never leave it beside data/ where it would be shipped and hashed into SHA256SUMS.
+    assert!(
+        !out_dir.path().join(".data-staging").exists(),
+        "a successful export must not leave a staging dir beside data/"
+    );
 }
 
 #[test]
@@ -1538,4 +1544,39 @@ fn hf_metadata_csv_neutralizes_a_formula_lead_in_the_file_name_column() {
         .trim_matches('"')
         .to_string();
     assert!(cell.starts_with("'-"), "a '-'-leading clip name must be quote-prefixed in metadata.csv, got {cell:?}");
+}
+
+#[test]
+fn hf_export_failure_midway_preserves_the_prior_dataset() {
+    // The HF export removed data/ BEFORE writing anything, so ANY error during the rebuild left the
+    // prior good dataset destroyed and the replacement partial — unrecoverable. Deterministic failure
+    // injection: a segment id long enough that the derived clip filename exceeds the OS filename-
+    // component limit, so the clip write fails part-way through the export.
+    let db_tmp = NamedTempFile::new().unwrap();
+    let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let wav_path = tmp_dir.path().join("src.wav");
+    write_silent_wav(&wav_path);
+    let mut seg = sample_segment(&"x".repeat(300));
+    seg.audio_path = wav_path.to_string_lossy().to_string();
+    db.insert_segment(&seg).unwrap();
+
+    // A prior GOOD export already on disk.
+    let out_dir = tempfile::tempdir().unwrap();
+    let train_dir = out_dir.path().join("data").join("train");
+    std::fs::create_dir_all(&train_dir).unwrap();
+    let prior_wav = train_dir.join("prior.wav");
+    std::fs::write(&prior_wav, b"__prior_payload__").unwrap();
+
+    let result = export_huggingface_dataset(&db, out_dir.path(), &crate::settings::AppSettings::default());
+
+    assert!(result.is_err(), "an oversized clip filename must fail the export, got {result:?}");
+    assert!(prior_wav.exists(), "a FAILED export must leave the prior dataset intact, not destroy it");
+    assert_eq!(std::fs::read(&prior_wav).unwrap(), b"__prior_payload__", "prior clips must be byte-identical");
+    assert!(
+        !out_dir.path().join(".data-staging").exists(),
+        "a failed export must clean up its staging tree, not litter the user's export directory"
+    );
 }
