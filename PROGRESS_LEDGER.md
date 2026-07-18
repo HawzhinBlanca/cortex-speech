@@ -5748,3 +5748,34 @@ Gate: fmt 0, clippy 0, **cargo test --lib 932 passed / 0 failed**, 33/33 policie
 - migrations/mod.rs ~212 (low) — rollback()'s non-FK-off branch is non-atomic (test-only reachability).
 - **pipeline.rs and db.rs were never scanned** (their finders died on the session limit) — re-run when
   the limit resets. Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-18T11:04Z — iter 54 — HF export made atomic: stage + swap (commit 41641a9)
+
+Candidate #2 from the iter-52 hunt list, hand-verified and fixed. The HF export rebuilt **in place** —
+`remove_dir_all(data/)` up front, then write — so any mid-export error destroyed the prior good dataset
+AND left the replacement partial, unrecoverable.
+
+**Fix:** splits are written into a sibling `.data-staging` tree and swapped in only after all three
+succeed; `data/` is untouched until the commit point. On failure the staging tree is discarded and the
+prior dataset survives intact.
+**Proof — deterministic failure injection, no mocking:** a segment id long enough that the derived clip
+filename exceeds the OS filename-component limit, so the clip write fails part-way. **Fail-before**
+(export returned Err and the prior dataset was gone) **and pass-after**, both observed.
+
+**Secondary wins:** the round-12 orphan hazard is now *structurally impossible* (fresh tree every time)
+rather than pruned after the fact — the existing `hf_reexport_removes_orphan_wav_for_a_dropped_segment`
+regression still passes unchanged; and a leftover staging tree from a crashed run is discarded next run.
+**Honest limitation (documented in code):** a small window remains between remove(data) and
+rename(staging→data); if the rename fails there the fully-written dataset is still at `.data-staging`
+and recoverable by hand — strictly better than before, which left nothing. Hygiene assertions added both
+directions (no staging litter on failure; staging consumed on success, else it'd be hashed into SHA256SUMS).
+Gate: fmt 0, clippy 0, **cargo test --lib 933 passed / 0 failed**, 33/33 policies.
+
+**Hunt list status:** 3 of 4 candidates now fixed (iter 52 wipe-guard, iter 53 CWE-1236 ×2 sites, iter 54
+atomic export). Remaining:
+- migrations/mod.rs ~212 (low) — rollback()'s non-FK-off branch is non-atomic; test-only reachability today.
+- **pipeline.rs and db.rs STILL UNSCANNED** — their finders died on the session limit. The audit is
+  PARTIAL; re-run those two when the limit resets before claiming any codebase-wide clean bill.
+Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
