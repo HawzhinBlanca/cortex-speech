@@ -5918,3 +5918,24 @@ Gate: fmt 0, clippy 0, **937 passed / 0 failed**, 33/33 policies.
 **Score: 9 defects fixed, 3 refuted-with-audit, 11 findings unverified** (next: pipeline.rs:2063
 alignment_quality NULL; pipeline.rs:2145 rollback swallow; db.rs:1287 relink ambiguity).
 Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-19T17:43Z — iter 60 — alignment timings+quality made atomic (commit b536d54); 10 findings left
+
+**pipeline.rs:2063 (#1, HIGH) hand-verified and FIXED at the root.** quality.rs raises the
+energy-heuristic review-risk reason only when the marker is PRESENT — so the background aligner's
+swallowed `let _ = update_alignment_quality(...)` after a successful timings write left **unmarked
+heuristic word timings** that read as trustworthy alignment (plausible failure: SQLITE_BUSY — the
+background thread runs its own connection beside the app's). The align_segment command had the same
+two-statement window with the error merely surfaced. **This exact swallow was fixed once before in
+commands.rs (old policy pinned it) — the background sibling kept it.**
+**Fix:** replaced both single-column methods with ONE `update_segment_alignment(id, json, quality)` —
+a single UPDATE is atomic; both call sites converted; old methods deleted (no other callers).
+**Gates:** Rust regression (both columns land together) + policy rewritten in place (intent preserved,
+now FORBIDS the split pair on both surfaces) — **fail-before/pass-after verified**.
+fmt 0, clippy 0, **938 passed / 0 failed**, 33/33 policies.
+
+**Score: 10 defects fixed, 3 refuted-with-audit, 10 findings unverified** (next: pipeline.rs:2145
+rollback swallow; db.rs:1287 relink ambiguity; db.rs:1379 discard_import_job non-txn).
+Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
