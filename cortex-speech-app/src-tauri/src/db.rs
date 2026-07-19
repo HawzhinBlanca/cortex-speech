@@ -1284,6 +1284,25 @@ impl Database {
             let candidate = search_dir.join(name);
             if candidate.is_file() {
                 let new_path = candidate.to_string_lossy().to_string();
+                // Second ambiguity guard: the collision check above only covers basenames shared among
+                // MISSING paths. If the candidate file is already OWNED by another library entry (a
+                // still-present segment whose recording happens to share the name), repointing would
+                // alias this missing recording onto THAT recording's audio — transcript/audio
+                // mispairing, the exact wrong-audio hazard this function refuses to guess about.
+                let owned: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM speech_segments WHERE audio_path = ?1",
+                    params![new_path],
+                    |r| r.get(0),
+                )?;
+                if owned > 0 {
+                    tracing::warn!(
+                        "relink: '{}' matches '{}', which another library recording already owns — skipped \
+                         (ambiguous, would serve the wrong audio)",
+                        old,
+                        new_path
+                    );
+                    continue;
+                }
                 let n = self.conn.execute(
                     "UPDATE speech_segments SET audio_path = ?2, updated_at = datetime('now') WHERE audio_path = ?1",
                     params![old, new_path],

@@ -2220,3 +2220,35 @@ fn update_segment_alignment_writes_timings_and_quality_together() {
         "the quality marker must land with the timings it describes"
     );
 }
+
+#[test]
+fn relink_refuses_a_candidate_already_owned_by_a_present_segment() {
+    // The ambiguity guard counted basename collisions only among the MISSING paths. A missing
+    // recording whose basename matches a file that a STILL-PRESENT segment already owns (a different
+    // recording that happens to share the name) was silently repointed onto that other recording's
+    // audio — transcript/audio mispairing, the exact wrong-audio hazard the guard exists to prevent.
+    // A candidate file already owned by another library entry must be refused, not guessed.
+    let db = make_db();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Present segment B owns <dir>/interview.wav.
+    let present_path = dir.path().join("interview.wav");
+    std::fs::write(&present_path, b"present recording bytes").unwrap();
+    let mut present = make_segment("seg-present", present_path.to_str().unwrap());
+    present.raw_transcript = "recording B".to_string();
+    db.insert_segment(&present).expect("insert present");
+
+    // Missing segment A points at a DIFFERENT recording that shares the basename.
+    let missing = make_segment("seg-missing", "/moved/away/interview.wav");
+    db.insert_segment(&missing).expect("insert missing");
+
+    let result = db.relink_audio(dir.path()).unwrap();
+
+    assert_eq!(result.relinked, 0, "a candidate owned by a present segment must be refused");
+    let a = db.get_segment_by_id("seg-missing").unwrap().unwrap();
+    assert_eq!(
+        a.audio_path, "/moved/away/interview.wav",
+        "the missing segment must NOT be repointed onto another recording's audio"
+    );
+    assert_eq!(result.still_missing, 1, "the refused path stays honestly missing");
+}
