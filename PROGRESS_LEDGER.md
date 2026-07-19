@@ -5872,3 +5872,27 @@ Gate: fmt 0, clippy 0, **935 passed / 0 failed**, 33/33 policies.
 db.rs:405 (upsert class root) · db.rs:655 (merge drops jury/gold cols) · db.rs:1777 (confidence_source
 stale) · pipeline.rs:1130 (import job stuck 'running' on cancel) · pipeline.rs:2063 (alignment_quality
 NULL). Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-19T17:10Z — iter 58 — merge provenance loss fixed (commit 592bac6); #14 adjudicated REFUTED; 14 findings left
+
+**db.rs:655 (#16, HIGH) hand-verified and FIXED.** merge_dataset_json's INSERT path dropped every jury/
+human-review/gold column + alignment_quality + created_at for NEW ids — merging a reviewed dataset
+stripped the human work product (rows re-graded as unreviewed drafts; created_at=now() reordered every
+view/export). Fix: INSERT path now routes through the existing lossless `insert_segment_full` (the
+delete-undo restore path). UPDATE path deliberately unchanged (unreviewed-only, ASR-columns-only —
+external jury state must not overwrite local). **Fail-before observed** (human_decision NULL after merge)
+**and pass-after**; existing guard test unchanged.
+
+**db.rs:405 (#14) adjudicated: REFUTED as stated.** insert_segment's upsert deliberately omits every
+jury/human/gold column (history tests pin it; separate insert_segment_full exists for full restores).
+The hazard is CALL-SITE discipline. Full production-caller audit: rediarize was the one live violation
+(fixed iter 56); batch normalize + couch submit re-read fresh; history/couch undo restore BY DESIGN;
+imports build fresh rows; batch_processor CLI holds snapshots but is single-writer by procedure (app
+closed). Contract now documented on insert_segment itself so future hunts don't re-flag it.
+
+Gate: fmt 0, clippy 0, **936 passed / 0 failed**, 33/33 policies.
+**Score: 8 defects fixed, 1 refuted-with-audit, 14 findings still unverified** (next: db.rs:1777
+confidence_source; pipeline.rs:1130 stuck import job; pipeline.rs:2063 alignment_quality NULL).
+Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
