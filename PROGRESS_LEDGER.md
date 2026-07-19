@@ -5810,3 +5810,44 @@ dead verifier is now reported as **UNVERIFIED** rather than silently counted as 
 swallow is what produced the bogus "0 confirmed / 4 refuted" clean-bill last time. Until it lands and its
 findings are hand-checked, **the backend audit remains PARTIAL** and no clean bill is claimed.
 Owner-gated finish legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-19T02:31Z — iter 56 — rediarize anti-clobber fix (commit c34e7c1); hunt #2 returned 18 UNVERIFIED findings
+
+### The hunt's "refuted: 18" is MEANINGLESS — read this before trusting it
+The pipeline.rs/db.rs hunt (wabwlmnq0) returned `{confirmed: [], unverified: [], refuted: 18}`.
+**All 18 verifier agents died on a session limit** (8 finders completed; 18/26 agents errored). My
+"honest unverified reporting" fix **did not work**: `agent()` **returns null on death, it does not
+throw**, so the `.catch()` branch never fired and `v?.real === true` scored every dead verifier as
+*refuted*. Same false clean-bill as last run, by a different mechanism. **Nothing was adjudicated.**
+Lesson saved to memory (`workflow-agent-returns-null-not-throws`): branch on `v == null` explicitly and
+cross-check `agents_error` before believing any empty finding list.
+
+### Fixed this iteration: pipeline.rs:3298 stale whole-row upsert (HIGH, hand-verified)
+`rediarize_segments()` snapshots segments, then does a per-file decode (timeout clamps to **3600s**) +
+ONNX embedding pass, then wrote the speaker back via `db.insert_segment(&seg)` — a **21-column whole-row
+upsert of the stale snapshot**. The method deliberately holds **no AppState lock** across that work (its
+own comment says so), so concurrent edits are expected BY DESIGN → **any human correction/verify/jury
+decision made during a multi-minute rediarize was silently reverted**, and a segment deleted mid-pass was
+**resurrected** (insert_segment is an upsert).
+db.rs already ships `update_speaker_id` — documented "*without touching any other field*" — and
+commands/batch.rs already uses it. **rediarize was the lone site still doing the whole-row write.**
+Matches the known clobber class ([[update-segment-whole-row-upsert]]).
+**Gate:** no unit test possible (needs ONNX models + real audio). The existing anti-clobber source policy
+`test_pipeline_rediarize_reports_db_update_failures` **pinned the OLD buggy call shape**, so it was
+updated in place — original intent (never swallow the write outcome) preserved and still asserted — plus
+a negative assertion that the stale-snapshot mutation cannot return. **Verified fail-before**
+(reverting only pipeline.rs fails with the 3 missing patterns) **and pass-after**.
+fmt 0, clippy 0, **934 passed / 0 failed**, 33/33 policies.
+
+### Remaining: 17 UNVERIFIED findings — hand-verify each before any fix, do NOT bulk-trust
+Highest-value by my read (all still UNVERIFIED):
+- pipeline.rs:2498 (high) — Scribe cloud-STT rows persisted via `..Default::default()` → `cloud_call`
+  written **false** for audio that WAS uploaded to a third party. **Provenance/privacy — check next.**
+- db.rs:405 (high) — insert_segment upsert rewrites 21 columns from caller snapshot (the class ROOT).
+- db.rs:655 (high) — merge_dataset_json hardcoded 21-col INSERT omits jury/human-review/gold columns.
+- db.rs:1777 (high) — consensus batch writes confidence but not confidence_source (provenance lie).
+- pipeline.rs:1130 (high) — cancel path skips complete_import_job → import row stuck 'running'.
+- pipeline.rs:2063 (high) — alignment_quality left NULL while heuristic timings persist.
+- Plus 11 medium/low. **Backend audit remains PARTIAL.** Owner-gated legs unchanged (OWNER_HANDOFF.md).
