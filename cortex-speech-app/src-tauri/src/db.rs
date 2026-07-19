@@ -393,6 +393,17 @@ impl Database {
         Ok(())
     }
 
+    /// ASR-side insert/upsert. On id conflict it rewrites the ASR-owned columns (transcripts, audio,
+    /// acoustic metrics, provenance) and DELIBERATELY omits every jury / human-decision / gold column
+    /// (verdict*, human_decision, corrected_at, is_gold, ...) and `created_at` — those survive an upsert
+    /// (pinned by the history-restore tests; full-row restore is [`Self::resurrect_segment_snapshot`]).
+    ///
+    /// CALLER CONTRACT (anti-clobber): `annotated_transcript`, `verified` and `speaker_id` ARE in the
+    /// update list, so never call this with a row snapshot held across long/await-able work — a
+    /// concurrent human edit to those columns would be silently reverted (the rediarize bug). Re-read
+    /// the row at persist time, or use a targeted update (`update_speaker_id`,
+    /// `update_asr_transcript_if_unreviewed`, ...). Audited call sites: batch normalize + couch submit
+    /// re-read fresh; history/couch undo restore a snapshot BY DESIGN; imports build fresh rows.
     pub fn insert_segment(&self, seg: &SpeechSegment) -> AppResult<()> {
         validate_segment(seg)?;
         let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
@@ -650,13 +661,6 @@ impl Database {
         self.conn.execute("SAVEPOINT merge_json", [])?;
         let result: AppResult<()> = (|| {
             let mut check_stmt = self.conn.prepare("SELECT id FROM speech_segments WHERE id = ?1")?;
-            let mut insert_stmt = self.conn.prepare(
-                "INSERT INTO speech_segments
-                    (id, audio_path, raw_transcript, normalized_transcript,
-                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
-                     model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'), ?19, ?20, ?21)"
-            )?;
             // Guard: never overwrite human decisions; only update unreviewed rows.
             let mut update_stmt = self.conn.prepare(
                 "UPDATE speech_segments SET
@@ -709,29 +713,15 @@ impl Database {
                         updated += 1;
                     }
                 } else {
-                    insert_stmt.execute(params![
-                        seg.id,
-                        seg.audio_path,
-                        raw_nfc,
-                        normalized_nfc,
-                        annotated_nfc,
-                        seg.alignment_json,
-                        seg.duration_ms,
-                        seg.speaker_id,
-                        seg.verified as i32,
-                        seg.confidence,
-                        seg.ctc_score,
-                        seg.clipping_ratio,
-                        seg.rms_db,
-                        seg.snr_db,
-                        seg.split,
-                        seg.signal_anomaly_score,
-                        seg.model_version_id,
-                        seg.confidence_source,
-                        seg.cloud_call as i32,
-                        seg.decoder_config_hash,
-                        seg.normalizer_version,
-                    ])?;
+                    // Lossless full-column insert for NEW ids. SpeechSegment deserializes every jury /
+                    // human-review / gold column, and a merged dataset can carry reviewed rows — the old
+                    // ASR-column-only INSERT silently dropped verdict/human_decision/is_gold/
+                    // corrected_at/alignment_quality/created_at, stripping the human work product so the
+                    // merged rows graded as unreviewed machine drafts. A new id has no local state to
+                    // protect, so persisting the whole snapshot is unconditionally correct (the guarded
+                    // UPDATE above keeps its unreviewed-only, ASR-columns-only semantics for EXISTING
+                    // rows — external jury state must not overwrite local jury state).
+                    self.insert_segment_full(seg)?;
                     created += 1;
                 }
             }

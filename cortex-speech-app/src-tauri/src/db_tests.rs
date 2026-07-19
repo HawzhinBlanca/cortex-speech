@@ -2123,3 +2123,48 @@ fn list_recent_jobs_returns_newest_first_and_respects_limit() {
     let limited = db.list_recent_jobs(2).unwrap();
     assert_eq!(limited.len(), 2, "limit honored");
 }
+
+#[test]
+fn merge_dataset_json_preserves_review_provenance_on_newly_created_rows() {
+    // DATA-LOSS regression: SpeechSegment deserializes every jury / human-review / gold column, but the
+    // merge's INSERT path used its own 21-column statement that silently DROPPED verdict,
+    // verdict_transcript, rationale, evidence_json, agent_confidence, escalated, human_decision,
+    // corrected_at, is_gold, alignment_quality and created_at for NEW ids. Merging a reviewed dataset
+    // into another library therefore stripped the human work product — the merged rows then graded as
+    // unreviewed machine drafts. The INSERT path must be the lossless full-column insert
+    // (insert_segment_full), exactly like the delete-undo restore.
+    let db = make_db();
+
+    let incoming = vec![SpeechSegment {
+        id: "merge-new-gold".to_string(),
+        created_at: Some("2026-01-02 03:04:05".to_string()),
+        audio_path: "/gold.wav".to_string(),
+        raw_transcript: "دەقی زێڕین".to_string(),
+        annotated_transcript: Some("دەقی زێڕینی ڕاستکراوە".to_string()),
+        duration_ms: 1500,
+        verified: true,
+        verdict: Some("human_edit".to_string()),
+        verdict_transcript: Some("دەقی زێڕینی ڕاستکراوە".to_string()),
+        rationale: Some("reviewer corrected one word".to_string()),
+        human_decision: Some("edit".to_string()),
+        corrected_at: Some("2026-01-02 03:05:00".to_string()),
+        is_gold: true,
+        alignment_quality: Some("word_aligner".to_string()),
+        ..SpeechSegment::default()
+    }];
+    let json = serde_json::to_string(&incoming).expect("serialize");
+    let (created, updated) = db.merge_dataset_json(&json).expect("merge");
+    assert_eq!((created, updated), (1, 0), "a new id must take the INSERT path");
+
+    let row = db.get_segment_by_id("merge-new-gold").unwrap().expect("row created");
+    assert_eq!(row.human_decision.as_deref(), Some("edit"), "human_decision must survive the merge");
+    assert!(row.is_gold, "is_gold must survive the merge");
+    assert_eq!(row.verdict.as_deref(), Some("human_edit"), "verdict must survive the merge");
+    assert_eq!(row.corrected_at.as_deref(), Some("2026-01-02 03:05:00"), "corrected_at must survive");
+    assert_eq!(row.alignment_quality.as_deref(), Some("word_aligner"), "alignment_quality must survive");
+    assert_eq!(
+        row.created_at.as_deref(),
+        Some("2026-01-02 03:04:05"),
+        "created_at must survive, or the merged row reorders every ORDER BY created_at view/export"
+    );
+}
