@@ -1385,9 +1385,24 @@ impl Database {
     /// Discard an interrupted job (the user chose not to resume). Deletes both tables explicitly so it
     /// works whether or not the foreign-keys pragma is enabling CASCADE.
     pub fn discard_import_job(&self, job_id: &str) -> AppResult<()> {
-        self.conn.execute("DELETE FROM import_job_files WHERE job_id = ?1", params![job_id])?;
-        self.conn.execute("DELETE FROM import_jobs WHERE id = ?1", params![job_id])?;
-        Ok(())
+        // SAVEPOINT: the two deletes are one invariant (same pattern as begin_import_job). As two
+        // auto-commit statements, a failure between them deleted the job's per-file progress journal
+        // while leaving the job row alive and 'running' — the startup resume prompt would then offer a
+        // job with an EMPTY completed-files list, and resuming would re-import files whose segments
+        // already exist, duplicating them.
+        self.conn.execute("SAVEPOINT discard_import_job", [])?;
+        let result: AppResult<()> = (|| {
+            self.conn.execute("DELETE FROM import_job_files WHERE job_id = ?1", params![job_id])?;
+            self.conn.execute("DELETE FROM import_jobs WHERE id = ?1", params![job_id])?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.release_savepoint("discard_import_job"),
+            Err(e) => {
+                self.cleanup_savepoint_after_error("discard_import_job");
+                Err(e)
+            }
+        }
     }
 
     /// The most recent still-'running' job — a crash never calls `complete_import_job`, so it stays
