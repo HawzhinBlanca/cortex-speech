@@ -5961,3 +5961,30 @@ Gate: fmt 0, clippy 0, **939 passed / 0 failed**, 33/33 policies.
 discard_import_job non-txn; db.rs:1244 vacuum/FTS pair; pipeline.rs:2678 GER unwrap_or_default;
 pipeline.rs:1453/300, db.rs:1047 perf, pipeline.rs:2591 .ok()).
 Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-19T18:18Z — iter 62 — discard atomic + GER observability (commit fb91f94); #18 deferred pending measurement; 5 findings left
+
+**Two findings FIXED:**
+1. **db.rs:1379 (#6).** discard_import_job's two deletes now run in a SAVEPOINT (begin_import_job's own
+   pattern) — a failure between them used to orphan a 'running' job with an empty progress journal,
+   making a later resume re-import already-imported files (duplicates). Structural fix; honest note in
+   the commit that fault-injection between two DELETEs isn't testable without mocking rusqlite.
+2. **pipeline.rs:2678 (#3).** GER context loads no longer fold DB read FAILURES into "no context" —
+   unwrap_or_default() made a persistent DB problem produce silently-unprimed refinement forever. Now
+   logged (refining unprimed stays legitimate); both warn strings are required policy patterns.
+   **Fail-before/pass-after verified.**
+
+**db.rs:1047 (#18) adjudicated: CONFIRMED-MECHANICAL, DEFERRED pending measurement.** Every sort arm
+wraps created_at in datetime(), which does defeat the created-at indexes (ORDER BY needs a temp b-tree).
+But this is a PERF claim and the project law is measure-first: the fix is not free (a new expression-index
+migration, DESC/ASC tiebreak subtleties per sort arm, and datetime() is load-bearing for non-canonical
+created_at formats that merge can now import). On a personal-library scale SQLite sorts tens of
+thousands of rows in ms. **Decision: measure get_segments_page on the real library during the owner's
+verify-10 pass; fix only if user-feelable.** Not silently dropped — recorded here.
+
+Gate: fmt 0, clippy 0, **939 passed / 0 failed**, 33/33 policies.
+**Score: 14 defects fixed, 3 refuted, 1 measure-deferred, 5 findings unverified** (pipeline.rs:1453
+resume-journal gap; pipeline.rs:2591 .ok(); pipeline.rs:300 child reap; db.rs:1244 vacuum/FTS;
+db.rs:2427 correction-ledger snapshot). Owner-gated legs unchanged (OWNER_HANDOFF.md).
