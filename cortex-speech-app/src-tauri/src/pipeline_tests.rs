@@ -162,7 +162,14 @@ fn build_scribe_segments_maps_timing_text_and_meta() {
         ScribeSegment { text: "ئەمە یەکەمە".into(), source_start_ms: 0, source_end_ms: 1500 },
         ScribeSegment { text: "دووەم".into(), source_start_ms: 2000, source_end_ms: 3000 },
     ];
-    let out = super::ProcessingPipeline::build_scribe_speech_segments(&segs, "/a/b.wav", 5000, false, false);
+    let out = super::ProcessingPipeline::build_scribe_speech_segments(
+        &segs,
+        "/a/b.wav",
+        5000,
+        false,
+        false,
+        crate::scribe_api::DEFAULT_MODEL,
+    );
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].raw_transcript, "ئەمە یەکەمە");
     assert_eq!(out[0].audio_path, "/a/b.wav");
@@ -182,7 +189,14 @@ fn build_scribe_segments_fills_open_end_and_normalizes() {
     use crate::scribe_api::ScribeSegment;
     // An open end (0) extends to the file duration; auto-normalize folds the Arabic Kaf.
     let segs = vec![ScribeSegment { text: "كوردی".into(), source_start_ms: 1000, source_end_ms: 0 }];
-    let out = super::ProcessingPipeline::build_scribe_speech_segments(&segs, "/x.wav", 4000, true, false);
+    let out = super::ProcessingPipeline::build_scribe_speech_segments(
+        &segs,
+        "/x.wav",
+        4000,
+        true,
+        false,
+        crate::scribe_api::DEFAULT_MODEL,
+    );
     assert_eq!(out.len(), 1);
     let m = crate::chunking::SegmentSourceMeta::from_alignment_json(out[0].alignment_json.as_deref().unwrap()).unwrap();
     assert_eq!((m.source_start_ms, m.source_end_ms), (1000, 4000), "open end clamps to duration");
@@ -193,7 +207,15 @@ fn build_scribe_segments_fills_open_end_and_normalizes() {
 
 #[test]
 fn build_scribe_segments_empty_input() {
-    assert!(super::ProcessingPipeline::build_scribe_speech_segments(&[], "/x.wav", 1000, false, false).is_empty());
+    assert!(super::ProcessingPipeline::build_scribe_speech_segments(
+        &[],
+        "/x.wav",
+        1000,
+        false,
+        false,
+        crate::scribe_api::DEFAULT_MODEL
+    )
+    .is_empty());
 }
 
 #[test]
@@ -201,7 +223,14 @@ fn build_scribe_segments_no_overflow_on_extreme_timestamps() {
     use crate::scribe_api::ScribeSegment;
     // Untrusted timestamps (saturated i64) must not overflow-panic the duration math.
     let segs = vec![ScribeSegment { text: "x".into(), source_start_ms: i64::MIN, source_end_ms: i64::MAX }];
-    let out = super::ProcessingPipeline::build_scribe_speech_segments(&segs, "/x.wav", 1000, false, false);
+    let out = super::ProcessingPipeline::build_scribe_speech_segments(
+        &segs,
+        "/x.wav",
+        1000,
+        false,
+        false,
+        crate::scribe_api::DEFAULT_MODEL,
+    );
     assert_eq!(out.len(), 1);
     assert!(out[0].duration_ms >= 0, "duration is never negative and never overflows");
 }
@@ -218,7 +247,14 @@ fn scribe_segments_round_trip_through_the_database() {
         ScribeSegment { text: "ئەمە یەکەمە".into(), source_start_ms: 0, source_end_ms: 1500 },
         ScribeSegment { text: "دووەمین پارچە".into(), source_start_ms: 2000, source_end_ms: 5000 },
     ];
-    let built = super::ProcessingPipeline::build_scribe_speech_segments(&scribe, "/audio/x.wav", 6000, false, false);
+    let built = super::ProcessingPipeline::build_scribe_speech_segments(
+        &scribe,
+        "/audio/x.wav",
+        6000,
+        false,
+        false,
+        crate::scribe_api::DEFAULT_MODEL,
+    );
     db.insert_segments_batch(&built).expect("insert batch");
 
     let mut back = db.get_segments(None).expect("read back");
@@ -1019,4 +1055,31 @@ fn win_path_to_wsl_translates_drive_paths() {
     assert_eq!(super::win_path_to_wsl(r"\\?\C:\a"), "/mnt/c/a");
     // Already-POSIX / non-drive path: backslashes normalised, returned as-is.
     assert_eq!(super::win_path_to_wsl("/mnt/c/already"), "/mnt/c/already");
+}
+
+#[test]
+fn scribe_segments_carry_cloud_call_provenance() {
+    // PROVENANCE (the project's one law): Scribe is the ONE path that uploads raw audio to a cloud
+    // provider, yet its rows were built via `..Default::default()` — persisting cloud_call=false and
+    // model_version_id=NULL for exactly the segments whose audio left the machine. The local-ASR draft
+    // path stamps cloud_call honestly (llm_refinement_uses_cloud()); this path must too.
+    use crate::scribe_api::ScribeSegment;
+
+    let segs = vec![ScribeSegment {
+        text: "ئەمە تاقیکردنەوەیە".into(), source_start_ms: 0, source_end_ms: 1500
+    }];
+    let out = super::ProcessingPipeline::build_scribe_speech_segments(
+        &segs,
+        "/a/b.wav",
+        5000,
+        false,
+        false,
+        crate::scribe_api::DEFAULT_MODEL,
+    );
+    assert!(out[0].cloud_call, "a Scribe row's audio WAS uploaded — cloud_call must be true");
+    assert_eq!(
+        out[0].model_version_id.as_deref(),
+        Some(crate::scribe_api::DEFAULT_MODEL),
+        "the Scribe model must be recorded as the row's model_version_id"
+    );
 }

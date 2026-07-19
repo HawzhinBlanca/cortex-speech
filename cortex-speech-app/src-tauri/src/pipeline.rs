@@ -2432,10 +2432,11 @@ impl ProcessingPipeline {
             return Err(AppError::Validation("Empty audio file".into()));
         }
         let audio_path = path.to_string_lossy().to_string();
+        let model_id = crate::scribe_api::DEFAULT_MODEL;
         let scribe_segs = crate::scribe_api::transcribe_segments(
             &audio_path,
             api_key,
-            crate::scribe_api::DEFAULT_MODEL,
+            model_id,
             crate::scribe_api::SORANI_LANGUAGE_CODE,
         )?;
         let segments = Self::build_scribe_speech_segments(
@@ -2444,6 +2445,7 @@ impl ProcessingPipeline {
             duration_ms,
             self.settings.auto_normalize,
             self.settings.verbalize_numbers,
+            model_id,
         );
         if segments.is_empty() {
             return Err(AppError::Other("Scribe returned no segments".into()));
@@ -2463,6 +2465,7 @@ impl ProcessingPipeline {
         total_duration_ms: i64,
         auto_normalize: bool,
         verbalize_numbers: bool,
+        model_id: &str,
     ) -> Vec<SpeechSegment> {
         let chunk_count = scribe_segs.len() as u32;
         scribe_segs
@@ -2495,6 +2498,13 @@ impl ProcessingPipeline {
                     normalized_transcript: normalized,
                     alignment_json: Some(meta.to_alignment_json()),
                     duration_ms: end.saturating_sub(start).max(0),
+                    // PROVENANCE: Scribe is the one path that uploads raw audio to a cloud provider, so
+                    // these rows must say so durably. `..Default::default()` here persisted
+                    // cloud_call=false and model_version_id=NULL for exactly the segments whose audio
+                    // left the machine. Scribe returns no per-segment confidence, so `confidence` stays
+                    // None and `confidence_source` honestly stays None with it.
+                    cloud_call: true,
+                    model_version_id: Some(model_id.to_string()),
                     ..Default::default()
                 }
             })
