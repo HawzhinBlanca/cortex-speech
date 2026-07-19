@@ -1272,6 +1272,11 @@ def test_pipeline_hypothesis_population_reports_failures() -> None:
         "hypothesis transcription failed for {segment_id}: {error}",
         "hypothesis model unavailable for {segment_id}",
         "Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE))",
+        # GER context loads are best-effort (refining unprimed is legitimate) but a DB READ FAILURE must
+        # be logged — the old unwrap_or_default() made a persistent DB problem silently produce unprimed
+        # GER forever with no trace.
+        "GER: could not load N-best hypotheses for {id}: {e}; refining unprimed",
+        "GER: could not load few-shot corrections for {id}: {e}; refining unprimed",
     ]
     missing = [pattern for pattern in required if pattern not in pipeline]
     if missing:

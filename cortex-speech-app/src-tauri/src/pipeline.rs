@@ -2702,17 +2702,28 @@ impl ProcessingPipeline {
                     let refine_result = if self.settings.ger_refinement_enabled {
                         // Generative error correction: prime the refiner with the N-best (populated
                         // just above) + relevant past corrections (relevance-ranked few-shot).
-                        let hyps: Vec<String> = db
-                            .get_hypotheses_for_segment(&id)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|h| h.transcript)
-                            .collect();
-                        let few_shot: Vec<(String, String)> = crate::jury::get_few_shot_examples(&db, &id, 3)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|e| (e.wrong_transcript, e.human_fix))
-                            .collect();
+                        // Context loads are best-effort — refinement legitimately proceeds unprimed
+                        // (no hypotheses recorded is a normal state) — but a DB READ FAILURE must be
+                        // logged, not folded into "no context": the old unwrap_or_default() made a
+                        // persistent DB problem silently produce unprimed GER forever with no trace.
+                        let hyps: Vec<String> = match db.get_hypotheses_for_segment(&id) {
+                            Ok(hyps) => hyps.into_iter().map(|h| h.transcript).collect(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "GER: could not load N-best hypotheses for {id}: {e}; refining unprimed"
+                                );
+                                Vec::new()
+                            }
+                        };
+                        let few_shot: Vec<(String, String)> = match crate::jury::get_few_shot_examples(&db, &id, 3) {
+                            Ok(examples) => examples.into_iter().map(|e| (e.wrong_transcript, e.human_fix)).collect(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "GER: could not load few-shot corrections for {id}: {e}; refining unprimed"
+                                );
+                                Vec::new()
+                            }
+                        };
                         refiner.refine_with_context(&raw_transcript, &hyps, &few_shot)
                     } else {
                         refiner.refine_text(&raw_transcript)
