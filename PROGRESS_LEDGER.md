@@ -5851,3 +5851,24 @@ Highest-value by my read (all still UNVERIFIED):
 - pipeline.rs:1130 (high) — cancel path skips complete_import_job → import row stuck 'running'.
 - pipeline.rs:2063 (high) — alignment_quality left NULL while heuristic timings persist.
 - Plus 11 medium/low. **Backend audit remains PARTIAL.** Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-19T16:50Z — iter 57 — Scribe cloud provenance fixed (commit 8cb37d4); 7th defect; 16 findings left
+
+**pipeline.rs:2498 (HIGH) hand-verified and fixed.** Scribe — the ONE path uploading raw audio to a
+cloud — built its rows via `..Default::default()`, durably persisting **cloud_call=false +
+model_version_id=NULL** for exactly the segments whose audio left the machine. Every other engine stamps
+provenance honestly (draft path uses llm_refinement_uses_cloud(); model ids like "omniasr-wsl-7b").
+The Scribe import bypasses the draft path entirely, so nothing corrected the default.
+**Fix:** cloud_call: true; builder takes the model id so the recorded model = the model actually sent
+(same discipline as the existing scribe_vote_model_id test for jury votes). confidence_source honestly
+stays None (Scribe returns no per-segment confidence). **Fail-before/pass-after verified**
+(`scribe_segments_carry_cloud_call_provenance`). Honest scope: rows already imported keep their false
+value (historical, like v34's backfill) — only new imports are stamped.
+Gate: fmt 0, clippy 0, **935 passed / 0 failed**, 33/33 policies.
+
+**Hunt findings: 2 fixed (rediarize clobber, Scribe provenance), 16 UNVERIFIED remain.** Next by value:
+db.rs:405 (upsert class root) · db.rs:655 (merge drops jury/gold cols) · db.rs:1777 (confidence_source
+stale) · pipeline.rs:1130 (import job stuck 'running' on cancel) · pipeline.rs:2063 (alignment_quality
+NULL). Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
