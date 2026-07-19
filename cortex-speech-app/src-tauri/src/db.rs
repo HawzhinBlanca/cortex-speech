@@ -1761,10 +1761,15 @@ impl Database {
                 // Guard: never overwrite a human-reviewed/edited segment with machine consensus —
                 // mirrors update_asr_transcript_if_unreviewed and merge_dataset_json. Without this,
                 // running the consensus refinery silently discards human corrections.
+                // `confidence_source` is restamped WITH the confidence it now describes: the stored
+                // number becomes an IRT-consensus score, and leaving the decoder's tag (e.g.
+                // "real_posterior") on it is a provenance lie — conformal.rs branches on that exact
+                // token when counting real-posterior calibration coverage.
                 "UPDATE speech_segments
                  SET raw_transcript = ?2,
                      normalized_transcript = ?3,
                      confidence = ?4,
+                     confidence_source = 'irt_consensus',
                      updated_at = datetime('now')
                  WHERE id = ?1
                    AND (human_decision IS NULL OR human_decision = '')

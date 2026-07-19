@@ -2168,3 +2168,35 @@ fn merge_dataset_json_preserves_review_provenance_on_newly_created_rows() {
         "created_at must survive, or the merged row reorders every ORDER BY created_at view/export"
     );
 }
+
+#[test]
+fn consensus_batch_restamps_confidence_source_for_the_score_it_writes() {
+    // PROVENANCE: update_segment_consensus_batch overwrites `confidence` with an IRT-consensus score,
+    // but its SET list omitted `confidence_source` — so a row whose decoder wrote "real_posterior" kept
+    // that tag on a number that is no longer a decoder posterior. conformal.rs branches on the exact
+    // "real_posterior" token when counting calibration coverage, so the stale tag actively inflated the
+    // real-posterior calibration count with IRT scores. The batch must stamp the source it wrote.
+    let db = make_db();
+    let mut seg = make_segment("cons-prov", "/a.wav");
+    seg.confidence = Some(0.42);
+    seg.confidence_source = Some("real_posterior".to_string());
+    db.insert_segment(&seg).expect("insert");
+
+    let changed = db
+        .update_segment_consensus_batch(&[(
+            "cons-prov".to_string(),
+            "دەقی کۆدەنگی".to_string(),
+            "دەقی کۆدەنگی".to_string(),
+            0.87,
+        )])
+        .expect("consensus batch");
+    assert_eq!(changed, 1);
+
+    let row = db.get_segment_by_id("cons-prov").unwrap().unwrap();
+    assert_eq!(row.confidence, Some(0.87), "the consensus confidence was written");
+    assert_eq!(
+        row.confidence_source.as_deref(),
+        Some("irt_consensus"),
+        "confidence_source must describe the number actually stored, not the pre-consensus decoder"
+    );
+}
