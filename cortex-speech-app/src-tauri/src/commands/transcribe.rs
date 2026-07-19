@@ -162,16 +162,16 @@ pub async fn align_segment(
         let (timestamps, quality) =
             pipeline.align(&audio_path, &text, alignment_json.as_deref()).map_err(|e| e.to_string())?;
         // Persist the word timings INTO alignment_json (merged with existing chunk metadata) AND stamp
-        // the honest alignment_quality, so per-word review features survive a reload. The quality
+        // the honest alignment_quality in ONE atomic statement, so per-word review features survive a
+        // reload and the timings can never land without their quality marker (quality.rs raises the
+        // energy-heuristic review-risk reason only when the marker is present). The quality
         // distinguishes real CTC forced alignment from the linear/energy heuristic fallback.
         if let Some(ref id) = segment_id {
             if !timestamps.is_empty() {
                 let merged = crate::chunking::merge_word_timestamps(alignment_json.as_deref(), &timestamps);
                 let db = db.lock().unwrap_or_else(|p| p.into_inner());
-                db.update_segment_alignment_json(id, &merged)
-                    .map_err(|error| format!("Failed to persist word timings for {id}: {error}"))?;
-                db.update_alignment_quality(id, quality.as_db_str())
-                    .map_err(|error| format!("Failed to stamp alignment quality for {id}: {error}"))?;
+                db.update_segment_alignment(id, &merged, quality.as_db_str())
+                    .map_err(|error| format!("Failed to persist word timings + quality for {id}: {error}"))?;
             }
         }
         Ok(timestamps)

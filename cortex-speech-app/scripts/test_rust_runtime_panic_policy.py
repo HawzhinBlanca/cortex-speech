@@ -763,24 +763,43 @@ def test_commands_acoustic_scoring_reports_skipped_segments() -> None:
         raise AssertionError(f"commands.rs is missing explicit acoustic scoring skip handling:\n{formatted}")
 
 
-def test_commands_alignment_quality_stamp_reports_failures() -> None:
+def test_alignment_json_and_quality_are_written_as_one_atomic_statement() -> None:
+    # Word timings and their quality marker must land TOGETHER: quality.rs raises the
+    # energy_heuristic_alignment review-risk reason only when the marker is PRESENT, so timings written
+    # without their marker read as trustworthy alignment. The old two-statement pair
+    # (update_segment_alignment_json then update_alignment_quality) had that window at both call sites —
+    # and the background aligner swallowed the second write outright (`let _ =`), silently laundering
+    # heuristic timestamps whenever the stamp failed. Both sites must use the combined atomic
+    # db.update_segment_alignment(...) and report its failure (this gate's original intent: the stamp
+    # outcome is never swallowed).
     commands = command_surface()
-    forbidden = [
-        'let _ = db.update_alignment_quality(id, "ctc_forced");',
-    ]
-    present = [pattern for pattern in forbidden if pattern in commands]
-    if present:
-        formatted = "\n".join(f"- {entry}" for entry in present)
-        raise AssertionError(f"commands.rs silently discards alignment-quality stamp failures:\n{formatted}")
+    pipeline = pipeline_surface()
 
-    required = [
-        "db.update_alignment_quality(id, quality.as_db_str())",
-        'map_err(|error| format!("Failed to stamp alignment quality for {id}: {error}"))?;',
+    for name, text in (("commands", commands), ("pipeline.rs", pipeline)):
+        for stale in ("update_segment_alignment_json(", "update_alignment_quality("):
+            if stale in text:
+                raise AssertionError(
+                    f"{name} writes alignment via the split two-statement pair ({stale}) — timings and "
+                    "their quality marker must be one atomic db.update_segment_alignment(...) write"
+                )
+
+    required_commands = [
+        "db.update_segment_alignment(id, &merged, quality.as_db_str())",
+        'map_err(|error| format!("Failed to persist word timings + quality for {id}: {error}"))?;',
     ]
-    missing = [pattern for pattern in required if pattern not in commands]
+    missing = [pattern for pattern in required_commands if pattern not in commands]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
-        raise AssertionError(f"commands.rs must keep observable alignment-quality stamp handling:\n{formatted}")
+        raise AssertionError(f"commands.rs must keep observable atomic alignment persistence:\n{formatted}")
+
+    required_pipeline = [
+        "if let Err(error) = db.update_segment_alignment(",
+        'tracing::warn!("background alignment: persist failed for {seg_id}: {error}");',
+    ]
+    missing = [pattern for pattern in required_pipeline if pattern not in pipeline]
+    if missing:
+        formatted = "\n".join(f"- {entry}" for entry in missing)
+        raise AssertionError(f"pipeline.rs background aligner must report atomic alignment persist failures:\n{formatted}")
 
 
 def test_media_cache_cleanup_reports_failures() -> None:
@@ -1514,7 +1533,7 @@ def main() -> None:
     test_commands_audio_duration_probe_send_failures_are_reported()
     test_commands_batch_normalize_reports_prefetch_and_update_failures()
     test_commands_acoustic_scoring_reports_skipped_segments()
-    test_commands_alignment_quality_stamp_reports_failures()
+    test_alignment_json_and_quality_are_written_as_one_atomic_statement()
     test_media_cache_cleanup_reports_failures()
     test_jury_db_and_export_paths_do_not_silently_drop_errors()
     test_database_read_paths_do_not_silently_drop_rows()

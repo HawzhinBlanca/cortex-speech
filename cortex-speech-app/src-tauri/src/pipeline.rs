@@ -2053,17 +2053,21 @@ impl ProcessingPipeline {
                     };
                     match crate::aligner::align(&sliced, 16000, &text) {
                         Ok(words) if !words.is_empty() => {
-                            // MERGE under `words`, preserving source_start_ms/source_end_ms.
+                            // MERGE under `words`, preserving source_start_ms/source_end_ms. One
+                            // atomic write for timings + quality marker: persisting the timings while
+                            // the quality stamp failed (the old swallowed `let _ =`) left heuristic
+                            // word timings unmarked, and quality.rs only raises the review-risk
+                            // reason when the marker is present.
                             let merged = crate::chunking::merge_word_timestamps(source_alignment.as_deref(), &words);
-                            if let Err(error) = db.update_segment_alignment_json(&seg_id, &merged) {
+                            if let Err(error) = db.update_segment_alignment(
+                                &seg_id,
+                                &merged,
+                                crate::aligner::AlignmentQuality::EnergyHeuristic.as_db_str(),
+                            ) {
                                 tracing::warn!("background alignment: persist failed for {seg_id}: {error}");
                                 failed += 1;
                                 continue;
                             }
-                            let _ = db.update_alignment_quality(
-                                &seg_id,
-                                crate::aligner::AlignmentQuality::EnergyHeuristic.as_db_str(),
-                            );
                             aligned += 1;
                         }
                         // Empty word list or error: leave the source offsets INTACT (never overwrite).

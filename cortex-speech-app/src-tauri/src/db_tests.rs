@@ -2200,3 +2200,23 @@ fn consensus_batch_restamps_confidence_source_for_the_score_it_writes() {
         "confidence_source must describe the number actually stored, not the pre-consensus decoder"
     );
 }
+
+#[test]
+fn update_segment_alignment_writes_timings_and_quality_together() {
+    // Timings + quality marker are one atomic UPDATE (single statement). Written separately, the
+    // marker could fail after the timings committed — and quality.rs raises the review-risk reason
+    // only when the marker is present, so unmarked heuristic timings read as trustworthy alignment.
+    let db = make_db();
+    let seg = make_segment("align-atomic", "/a.wav");
+    db.insert_segment(&seg).expect("insert");
+
+    db.update_segment_alignment("align-atomic", r#"{"words":[]}"#, "energy_heuristic").expect("update");
+
+    let row = db.get_segment_by_id("align-atomic").unwrap().unwrap();
+    assert_eq!(row.alignment_json.as_deref(), Some(r#"{"words":[]}"#));
+    assert_eq!(
+        row.alignment_quality.as_deref(),
+        Some("energy_heuristic"),
+        "the quality marker must land with the timings it describes"
+    );
+}

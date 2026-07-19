@@ -1838,30 +1838,21 @@ impl Database {
         Ok(())
     }
 
-    /// Stamp the alignment precision tier on a segment.
-    /// Called by `align_segment` after a successful CTC forced alignment run.
-    /// `quality`: "ctc_forced" | "energy_heuristic"
-    pub fn update_alignment_quality(&self, segment_id: &str, quality: &str) -> AppResult<()> {
+    /// Persist word timings AND their honest quality marker in ONE atomic statement.
+    /// `alignment_json` is metadata (chunk window + per-word timings), NOT FTS-indexed transcript
+    /// text, so no NFC canonicalization is needed. `quality`: "ctc_forced" | "energy_heuristic".
+    ///
+    /// These two columns must never be written as separate statements: quality.rs raises the
+    /// `energy_heuristic_alignment` review-risk reason only when the marker is PRESENT, so timings
+    /// that land without their marker read as trustworthy alignment. The old two-statement pair had
+    /// exactly that window — and the background aligner swallowed the second write's error outright
+    /// (`let _ =`), silently laundering heuristic timestamps whenever the quality stamp failed.
+    pub fn update_segment_alignment(&self, segment_id: &str, alignment_json: &str, quality: &str) -> AppResult<()> {
         self.conn.execute(
             "UPDATE speech_segments
-             SET alignment_quality = ?2, updated_at = datetime('now')
+             SET alignment_json = ?2, alignment_quality = ?3, updated_at = datetime('now')
              WHERE id = ?1",
-            params![segment_id, quality],
-        )?;
-        self.track_write()?;
-        Ok(())
-    }
-
-    /// Persist the chunk metadata + word timestamps JSON for a segment. `alignment_json` is metadata
-    /// (chunk window + per-word timings), NOT FTS-indexed transcript text, so no NFC canonicalization
-    /// is needed. Used by `align_segment` so forced-alignment word timings survive a reload instead of
-    /// being recomputed every time the clip is opened in review.
-    pub fn update_segment_alignment_json(&self, segment_id: &str, alignment_json: &str) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE speech_segments
-             SET alignment_json = ?2, updated_at = datetime('now')
-             WHERE id = ?1",
-            params![segment_id, alignment_json],
+            params![segment_id, alignment_json, quality],
         )?;
         self.track_write()?;
         Ok(())
