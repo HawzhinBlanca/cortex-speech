@@ -5896,3 +5896,25 @@ Gate: fmt 0, clippy 0, **936 passed / 0 failed**, 33/33 policies.
 **Score: 8 defects fixed, 1 refuted-with-audit, 14 findings still unverified** (next: db.rs:1777
 confidence_source; pipeline.rs:1130 stuck import job; pipeline.rs:2063 alignment_quality NULL).
 Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-19T17:27Z — iter 59 — consensus confidence_source restamped (commit 98dbb29); #8/#9 adjudicated; 11 findings left
+
+**db.rs:1777 (#17, HIGH) hand-verified and FIXED.** The consensus refinery overwrote `confidence` with an
+IRT score while `confidence_source` kept the decoder's tag — and conformal.rs branches on the exact
+"real_posterior" token for calibration coverage, so post-refinery rows **inflated the real-posterior
+count with IRT scores**. Fix: the batch UPDATE stamps `confidence_source='irt_consensus'` with the
+number it writes (lands in conformal's heuristic/unknown bucket — correct). **Fail-before/pass-after
+verified**; human-review guard unchanged.
+
+**pipeline.rs:1130 (#8, was HIGH) adjudicated: REFUTED.** Cancel leaving the job 'running' is the resume
+feature working: find_interrupted_import_job surfaces it at startup (2 IPC commands, resume/discard),
+the per-file journal makes resume coherent, and begin_import_job marks stale jobs 'abandoned'. No stuck
+state, no loss. **#9 likewise conservative-direction** (unadjudicated → REVIEW grade → never exported).
+Polish idea only: a distinct 'cancelled' status for prompt copy.
+
+Gate: fmt 0, clippy 0, **937 passed / 0 failed**, 33/33 policies.
+**Score: 9 defects fixed, 3 refuted-with-audit, 11 findings unverified** (next: pipeline.rs:2063
+alignment_quality NULL; pipeline.rs:2145 rollback swallow; db.rs:1287 relink ambiguity).
+Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
