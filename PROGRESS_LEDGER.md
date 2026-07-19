@@ -5939,3 +5939,25 @@ fmt 0, clippy 0, **938 passed / 0 failed**, 33/33 policies.
 **Score: 10 defects fixed, 3 refuted-with-audit, 10 findings unverified** (next: pipeline.rs:2145
 rollback swallow; db.rs:1287 relink ambiguity; db.rs:1379 discard_import_job non-txn).
 Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-19T18:00Z — iter 61 — WSL rollback swallow + relink wrong-audio guard (commit 6bb9892); 8 findings left
+
+**Two findings hand-verified and FIXED this iteration:**
+1. **pipeline.rs:2145/2217 (#2).** Two of four WSL-import rollback sites discarded the rollback delete's
+   result with `let _ =` right after logging "rolling back N segment(s)" — a failed rollback claimed
+   success, placeholders survived, re-import duplicated them. Both sites now match their loud siblings;
+   `let _ = db.delete_segments_batch(` is FORBIDDEN on the pipeline surface. Fail-before/pass-after via
+   policy stash-revert.
+2. **db.rs:1287 (#5).** relink's ambiguity guard only covered collisions among MISSING paths — a missing
+   recording sharing a basename with a file a PRESENT segment owns was repointed onto that other
+   recording's audio (**transcript/audio mispairing**). New guard: candidate owned by any library entry →
+   refuse + warn. Happy-path relinks unaffected (a moved file's new path is unowned until repointed).
+   Fail-before observed (segment WAS repointed) and pass-after; all 3 existing relink tests unchanged.
+
+Gate: fmt 0, clippy 0, **939 passed / 0 failed**, 33/33 policies.
+**Score: 12 defects fixed, 3 refuted-with-audit, 8 findings unverified** (next: db.rs:1379
+discard_import_job non-txn; db.rs:1244 vacuum/FTS pair; pipeline.rs:2678 GER unwrap_or_default;
+pipeline.rs:1453/300, db.rs:1047 perf, pipeline.rs:2591 .ok()).
+Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
