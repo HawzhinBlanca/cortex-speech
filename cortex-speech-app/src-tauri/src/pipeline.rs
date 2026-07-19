@@ -2146,7 +2146,15 @@ impl ProcessingPipeline {
                                 "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
                                 import_ids.len()
                             );
-                            let _ = db.delete_segments_batch(&import_ids);
+                            // A failed rollback must be LOUD (matches the cancel/infra siblings above):
+                            // the log just promised a rollback, and if the delete also fails the
+                            // placeholders survive — re-importing the file then duplicates them.
+                            if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
+                                tracing::error!(
+                                    "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
+                                    import_ids.len()
+                                );
+                            }
                             return Err(e);
                         }
                         let usable = !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
@@ -2218,7 +2226,14 @@ impl ProcessingPipeline {
                         "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
                         import_ids.len()
                     );
-                    let _ = db.delete_segments_batch(&import_ids);
+                    // Same loud-rollback contract as the sibling sites: a swallowed delete failure
+                    // here leaves placeholder rows the promised rollback never removed.
+                    if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
+                        tracing::error!(
+                            "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
+                            import_ids.len()
+                        );
+                    }
                     return Err(e);
                 }
             }

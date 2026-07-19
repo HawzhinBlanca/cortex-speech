@@ -201,6 +201,10 @@ FORBIDDEN_RUNTIME_PATTERNS = {
         "self.inner.lock().ok",
     ],
     "src-tauri/src/pipeline.rs": [
+        # The WSL-import rollback sites log "rolling back N segment(s)" and then delete — a swallowed
+        # delete failure means the log promised a rollback that never happened, leaving placeholder rows
+        # that duplicate on re-import. Every rollback delete must report its own failure.
+        "let _ = db.delete_segments_batch(",
         "if let Ok(mut status) = self.import_status.lock()",
         "self.import_status.lock().map",
         "self.import_status.lock().ok",
