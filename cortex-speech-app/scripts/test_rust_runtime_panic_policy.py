@@ -1162,17 +1162,33 @@ def test_eval_read_paths_do_not_silently_drop_rows() -> None:
 
 
 def test_pipeline_rediarize_reports_db_update_failures() -> None:
+    # rediarize_segments() snapshots its segments up front, then spends a per-file decode + ONNX speaker
+    # embedding pass (the decode timeout alone clamps up to 3600s) DELIBERATELY holding no AppState lock,
+    # so concurrent human edits are expected BY DESIGN. It must therefore write the speaker back with the
+    # TARGETED single-column update_speaker_id (db.rs documents it as "without touching any other field").
+    # The previous whole-row insert_segment upsert of the stale snapshot silently reverted every column a
+    # human changed during the pass and — since insert_segment is an UPSERT — resurrected segments deleted
+    # mid-pass. Same anti-clobber discipline as batch transcribe above. The write outcome must still never
+    # be swallowed, which is what this gate originally existed to enforce.
     pipeline = pipeline_surface()
     required = [
         "pub fn rediarize_segments(&self, ids: &[String]) -> AppResult<usize>",
         "let db = self.open_db()?;",
-        "match db.insert_segment(&seg)",
-        'tracing::error!("Rediarize speaker update failed for {}: {error}", seg.id);',
+        "match db.update_speaker_id(seg_id, Some(label.as_str()))",
+        'tracing::error!("Rediarize speaker update failed for {seg_id}: {error}")',
+        # A row deleted during the long pass is a no-op, never a revival.
+        'tracing::warn!("Rediarize speaker update skipped: segment {seg_id} no longer exists")',
     ]
     missing = [pattern for pattern in required if pattern not in pipeline]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"pipeline.rs is missing explicit rediarization DB update handling:\n{formatted}")
+    # And the stale whole-row upsert must not come back at this site.
+    if "seg.speaker_id = Some(label);" in pipeline:
+        raise AssertionError(
+            "pipeline.rs rediarize is mutating a stale segment snapshot again — that is the whole-row "
+            "clobber this gate exists to prevent; use db.update_speaker_id(id, ...) instead"
+        )
 
 
 def test_file_dialog_commands_do_not_block_the_main_thread() -> None:

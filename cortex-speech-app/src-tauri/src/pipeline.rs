@@ -3291,14 +3291,21 @@ impl ProcessingPipeline {
                 let Some(label) = labels.get(idx).and_then(|l| l.clone()) else {
                     continue;
                 };
-                let Some(mut seg) = segs.iter().find(|s| &s.id == seg_id).cloned() else {
-                    continue;
-                };
-                seg.speaker_id = Some(label);
-                match db.insert_segment(&seg) {
-                    Ok(()) => updated += 1,
+                // TARGETED single-column write, never a whole-row insert_segment upsert. `segs` is a
+                // snapshot taken before the per-file decode + ONNX embedding pass above, and this method
+                // deliberately holds no AppState lock across that work (see the comment at the top) so
+                // other db-touching commands keep running — concurrent edits are expected BY DESIGN.
+                // Upserting the stale snapshot silently reverted every column a human changed during a
+                // multi-minute rediarize. This is the same anti-clobber discipline the batch speaker
+                // command already follows via update_speaker_id. It also stops a segment DELETED during
+                // the pass from being resurrected by the upsert: that is now a no-op, not a revival.
+                match db.update_speaker_id(seg_id, Some(label.as_str())) {
+                    Ok(true) => updated += 1,
+                    Ok(false) => {
+                        tracing::warn!("Rediarize speaker update skipped: segment {seg_id} no longer exists");
+                    }
                     Err(error) => {
-                        tracing::error!("Rediarize speaker update failed for {}: {error}", seg.id);
+                        tracing::error!("Rediarize speaker update failed for {seg_id}: {error}");
                     }
                 }
             }
