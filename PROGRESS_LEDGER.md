@@ -6047,3 +6047,30 @@ Gate: fmt 0, clippy 0, **941 passed / 0 failed / 6 ignored**, 33/33 policies.
 probe_wsl_7b_server skips kill_and_reap_wsl_child on try_wait error; db.rs:1244 vacuum/FTS rebuild as
 two independent statements; db.rs:2427 record_human_decision builds correction ledger from a
 pre-transaction snapshot). Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T13:30Z — iter 65 — probe_wsl_7b_server reaps child on try_wait error (commit e8e538d); 2 findings left
+
+**One finding FIXED — pipeline.rs:300 (probe child reap), low.** The engine-status probe polls
+child.try_wait() in a loop; its Err arm was a bare `return false` that did NOT reap the spawned wsl
+child. std::process::Child does not kill/reap on drop (documented, all platforms), so a wait-status
+error left the WSL process running/orphaned — and this probe runs on a poll, so a persistent
+try_wait failure leaks one process per poll. Both sibling try_wait loops
+(run_wsl_segment_transcript at ~404, the 7B preflight probe at ~735) already reap on their Err arm
+via kill_and_reap_wsl_child; the probe was the odd one out (recurring theme).
+
+Fix: reap via kill_and_reap_wsl_child("engine-status probe") before returning false, matching the
+deadline branch above it and the two siblings.
+
+**Gate is a scoped source policy** (honest note): this path spawns a real `wsl` process and forcing
+a try_wait error is not feasible in a unit test. test_probe_wsl_7b_server_reaps_child_on_wait_error
+extracts the probe's function body and (a) forbids `Err(_) => return false` and (b) requires the
+reap call on BOTH the timeout and Err branches (count >= 2). **Fail-before/pass-after verified** via
+`git stash push -- pipeline.rs` → policy raises the exact AssertionError → `git stash pop`.
+
+Gate: fmt 0, clippy 0, **941 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 17 defects fixed, 3 refuted, 1 measure-deferred, 2 findings unverified** (db.rs:1244
+vacuum/FTS rebuild as two independent statements; db.rs:2427 record_human_decision builds correction
+ledger from a pre-transaction snapshot). Backend audit remains PARTIAL. Owner-gated legs unchanged
+(OWNER_HANDOFF.md).
