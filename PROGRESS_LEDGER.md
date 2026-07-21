@@ -6168,3 +6168,30 @@ audit coverage now: pipeline.rs, db.rs, export.rs, export_bundle.rs (hunts 1) + 
 audio, quality, models, runs, corrections (hunt 2, single-pass). Remaining un-audited: commands.rs
 (+slices), normalizer.rs, asr.rs, aligner.rs, agentic.rs, jury/, scorecard.rs, registry.rs,
 snapshot.rs, lib.rs. Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T17:55Z — iter 69 — normalizer.rs hand-audited: no defect; proptest alphabet hardened (commit c92a4f8)
+
+**normalizer.rs (the module whose hunt-2 finder died) hand-audited inline — NO actionable defect.**
+Traced: NFC-first ordering (composed hamza ا+ٔ folds to أ BEFORE the hamza rule — correct);
+ZWNJ→space and zero-width/bidi strips run BEFORE the heh-finality test (boundary decisions see real
+boundaries — correct); U+066B/U+066C separator folding + thousands-group stripping consistent across
+metric and verbalize paths; leading-zero IDs and >u64 runs read digit-by-digit; num_to_kurdish
+spot-checked on 0/21/110/123/1950/1000/2000 — all correct. g2p.rs pattern-scanned (311 lines): zero
+unwrap/expect/panic/indexing. Two marginal NON-actionable observations: (1) heh+harakat+tatweel loses
+the tatweel final-heh intent (vanishing-rare, and contradicts the pinned harakat rule anyway);
+(2) "3." verbalizes with a space before the orphan period (cosmetic).
+
+**Real gap found + closed: the idempotency proptest's alphabet was blind to every recent bug class.**
+It had no digits, separators, punctuation, ة, hamza forms, harakat, or zero-width/bidi controls — the
+exact input families where the last four normalizer bugs lived. Widened the generator to a hostile
+alphabet covering all of them and added a generative NFC-stability assertion (previously one pinned
+case). 256 generated cases per property PASS — an honest negative result that leaves a permanently
+stronger gate.
+
+Gate: fmt 0, clippy 0, **942 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 17 defects fixed, 5 refuted-with-audit, 2 measure-deferred.** Backend audit coverage:
++normalizer.rs (hand), +g2p.rs (pattern-scan only). Remaining un-audited: commands.rs (+slices),
+asr.rs, aligner.rs, agentic.rs, jury/, scorecard.rs, registry.rs, snapshot.rs, lib.rs. Owner-gated
+legs unchanged (OWNER_HANDOFF.md).
