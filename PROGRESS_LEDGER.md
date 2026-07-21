@@ -6247,3 +6247,35 @@ No code change this iteration (hunt + triage). Gate not re-run (no source touche
 69: 942/0/6 + 33/33). **Score: 17 fixed, 5 refuted, 2 measure-deferred, 18 NEW confirmed findings
 queued.** Un-audited remainder: commands.rs core + most slices, lib.rs, eval.rs was round-2-clean.
 Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T19:20Z — iter 71 — HIGH fixed: Autonomy Dial now governs every machine-commit stage (commit 4e27ebb); 17 findings left
+
+**Hunt-3 #1 (HIGH) hand-verified and FIXED — jury pipeline auto-commit leak.** Every link confirmed
+against source: apply_autonomy staged AutoAccepts under Observe/Propose (jury/mod.rs:147), but the
+SAME run_jury_pipeline_core_via run pushed every escalated segment into review_ids with no autonomy
+check (commands.rs) and machine-committed 'jury_accept' via reference-selection or T2;
+write_segment_verdict's guard only protects human decisions, so the staged 'escalated' verdict was
+freely overwritten and the segment silently left the human queue. Under Observe, the T2-disabled
+fallback also REWROTE pre-staged verdicts (rationale clobbered, IRT confidence NULLed → riskiest-
+first ordering degraded).
+
+**Aggravating discovery: the SHIPPED DEFAULT dial is Propose** (settings.rs `#[default]`), not
+ActConfirm as jury/mod.rs's stale comment claimed — so default-settings agentic imports were
+machine-committing in violation of the dial the whole time. Comment corrected.
+
+Fix at the single chokepoint: `machine_commits_allowed = matches!(dial, ActConfirm|ActAuto)`;
+reference commits gated (both sites); review loop under Observe writes nothing, under Propose stages
+'escalated' (carrying the guard's rationale) and preserves already-staged verdicts + confidence.
+
+**Fail-before verified:** gate forced to old ungated behavior → new test fails with
+referenceCommitted=1 under Propose. **8 pre-existing reference-machinery tests were passing ONLY
+because of the bug** (they ran on default settings = Propose); they now opt into ActConfirm via
+settings_act_confirm() with intent documented — no assertion weakened, and the new
+autonomy_dial_governs_every_machine_commit_stage_not_just_t0 pins all three dial legs.
+
+Gate: fmt 0, clippy 0, **943 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 18 fixed, 5 refuted, 2 measure-deferred, 17 findings left** (next: asr.rs:579
+unavailable-cache; models.rs:485 SHA-after-install; models.rs:425 .exists() vs min_size).
+Owner-gated legs unchanged (OWNER_HANDOFF.md).
