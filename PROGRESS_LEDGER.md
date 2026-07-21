@@ -6279,3 +6279,26 @@ Gate: fmt 0, clippy 0, **943 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 18 fixed, 5 refuted, 2 measure-deferred, 17 findings left** (next: asr.rs:579
 unavailable-cache; models.rs:485 SHA-after-install; models.rs:425 .exists() vs min_size).
 Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T19:45Z — iter 72 — ASR pool unavailable-cache fixed (commit 664a395); 16 findings left
+
+**Hunt-3 #2 (medium) hand-verified and FIXED — asr.rs:579 permanent unavailable-cache.** Confirmed at
+source: ensure_loaded short-circuited on bare contains_key, pinning the unavailable placeholder
+cached by a model-less first call (startup warmup fires before the user can act) until app restart.
+Fresh-install download-then-transcribe stayed "ASR model not loaded" — resolved dir + config key are
+identical before/after an in-app download, so no invalidation ever fired, and nothing touches the
+pool post-download. Fix: reuse only an AVAILABLE cached service; retry an unavailable placeholder on
+every ensure_loaded (cheap existence probe while absent; recovers the moment files appear, incl.
+after a re-download fixes a failed integrity pin). ensure_loaded now returns load-attempted (private,
+ignored by callers) purely to make the retry unit-testable without a real ONNX model.
+
+**Fail-before/pass-after verified:** with the old contains_key short-circuit the new test fails at
+the retry assertion; with the fix it passes. Honest coverage note: the available-service reuse path
+needs a real model and is covered by the ignored ort_omniasr_smoke on the owner's machine.
+
+Gate: fmt 0, clippy 0, **944 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 19 fixed, 5 refuted, 2 measure-deferred, 16 findings left** (next: models.rs:485
+SHA-verified-after-install no-rollback; models.rs:425 bare .exists() early-return; snapshot trio).
+Owner-gated legs unchanged (OWNER_HANDOFF.md).
