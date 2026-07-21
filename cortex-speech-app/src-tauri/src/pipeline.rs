@@ -193,6 +193,29 @@ fn resume_should_skip_file(resuming: bool, journaled: bool, has_persisted_segmen
     journaled || (resuming && has_persisted_segments)
 }
 
+/// Resolve the segment id for a `(audio_path, alignment_json)` pair when `transcribe` was called
+/// without an explicit `segment_id`. A missing row is a legitimate `Ok(None)` — the caller falls
+/// through to the "segment not found, import first" error. A REAL DB error (locked / IO / corrupt /
+/// no-such-table) PROPAGATES as `Err` instead of masquerading as "no such row": the old `.ok()`
+/// collapsed both into `None`, so a transient read failure wrongly told the user to re-import an
+/// already-imported file and hid the real fault. Matches the sibling bare-`audio_path` branch, which
+/// already propagates DB errors.
+fn resolve_segment_id_by_alignment(
+    conn: &rusqlite::Connection,
+    audio_path: &str,
+    alignment_json: &str,
+) -> AppResult<Option<String>> {
+    match conn.query_row(
+        "SELECT id FROM speech_segments WHERE audio_path = ? AND alignment_json = ?",
+        [audio_path, alignment_json],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(AppError::Other(format!("transcribe: segment lookup by alignment failed: {e}"))),
+    }
+}
+
 fn insert_hypothesis_checked(
     db: &Database,
     segment_id: &str,
@@ -2633,13 +2656,7 @@ impl ProcessingPipeline {
             let segment_id: Option<String> = if let Some(id) = segment_id {
                 Some(id.to_string())
             } else if let Some(aj) = alignment_json {
-                db.connection()
-                    .query_row(
-                        "SELECT id FROM speech_segments WHERE audio_path = ? AND alignment_json = ?",
-                        [&audio_path_str, aj],
-                        |row| row.get(0),
-                    )
-                    .ok()
+                resolve_segment_id_by_alignment(db.connection(), &audio_path_str, aj)?
             } else {
                 // Round-22 #10: with neither an explicit segment_id NOR an alignment_json to
                 // disambiguate, a bare `WHERE audio_path = ?` returns an ARBITRARY row when a file was

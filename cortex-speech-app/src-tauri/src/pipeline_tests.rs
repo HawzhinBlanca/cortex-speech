@@ -71,6 +71,39 @@ fn resume_skips_persisted_but_unjournaled_file_to_avoid_duplicates() {
 }
 
 #[test]
+fn segment_id_by_alignment_distinguishes_no_row_from_db_error() {
+    use super::resolve_segment_id_by_alignment;
+    // With the schema present: a matching (audio_path, alignment_json) resolves to its id.
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let seg = SpeechSegment {
+        id: "seg-a".into(),
+        audio_path: "/audio/a.wav".into(),
+        alignment_json: Some(r#"{"source_start_ms":0}"#.into()),
+        ..Default::default()
+    };
+    db.insert_segment(&seg).unwrap();
+    assert_eq!(
+        resolve_segment_id_by_alignment(db.connection(), "/audio/a.wav", r#"{"source_start_ms":0}"#).unwrap(),
+        Some("seg-a".to_string())
+    );
+    // No matching row is a legitimate None (caller falls through to "segment not found"), NOT an error.
+    assert_eq!(
+        resolve_segment_id_by_alignment(db.connection(), "/audio/a.wav", r#"{"nope":1}"#).unwrap(),
+        None,
+        "no matching row must be Ok(None), not an error"
+    );
+    // A REAL DB error (query against a connection with no speech_segments table) must PROPAGATE.
+    // Before the fix, .ok() collapsed it to None, so a locked/IO/corrupt read told the user to
+    // re-import an already-imported file and hid the fault. This is the regression assertion.
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    assert!(
+        resolve_segment_id_by_alignment(&bare, "/audio/a.wav", "{}").is_err(),
+        "a real DB error must surface as Err, not masquerade as no-such-row None"
+    );
+}
+
+#[test]
 fn loop0_firing_respects_opt_in_and_fires_when_enabled() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
