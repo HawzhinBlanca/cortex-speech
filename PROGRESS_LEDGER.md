@@ -6144,3 +6144,27 @@ candidate for a lock-out-of-hash refactor IF the owner's verify-10 measurement s
 iteration: either launch a fresh adversarial hunt on an un-audited module, or pivot to the owner-gated
 legs (exe rebuild to activate all source fixes since ~iter 30; real-audio e2e/RTF/CER). Backend audit
 remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T15:10Z — iter 68 — hunt round 2: 7 modules audited, 0 findings; normalizer.rs NOT audited (finder died)
+
+**Fresh adversarial hunt (Workflow wf_f1c51add-05a, 8 finders, high effort, one module+lens each):**
+settings.rs (privacy/consent), eval.rs (metric honesty), audio.rs (panic-safety on untrusted audio),
+quality.rs (grading false-accepts), models.rs (model integrity), runs.rs (report provenance),
+corrections.rs (LOOP-0 correctness) — **all 7 returned ZERO line-anchored defects.** Journal-verified
+per the workflow-agent-returns-null lesson: journal.jsonl shows seven genuine `{"findings": []}`
+returns (agents_done=7, agents_empty_result=7) — real empty results, NOT dead agents scored clean.
+Finders were instructed empty-is-correct and every claim needed a concrete failure scenario, so this
+is a real negative result, with the honest caveat that ONE finder pass per module is not an
+exhaustive proof of soundness.
+
+**normalizer.rs finder DIED (session limit, resets 17:40 AST) — that module is NOT audited.** No
+clean bill claimed for it. Next iteration: hand-audit normalizer.rs inline (no subagents needed).
+
+No code change this iteration. Gate not re-run (no source touched; last green: iter 66, 942/0/6 +
+33/33). **Score unchanged: 17 defects fixed, 5 refuted-with-audit, 2 measure-deferred.** Backend
+audit coverage now: pipeline.rs, db.rs, export.rs, export_bundle.rs (hunts 1) + settings, eval,
+audio, quality, models, runs, corrections (hunt 2, single-pass). Remaining un-audited: commands.rs
+(+slices), normalizer.rs, asr.rs, aligner.rs, agentic.rs, jury/, scorecard.rs, registry.rs,
+snapshot.rs, lib.rs. Owner-gated legs unchanged (OWNER_HANDOFF.md).
