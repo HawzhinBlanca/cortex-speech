@@ -331,7 +331,15 @@ pub(crate) fn probe_wsl_7b_server(timeout_secs: u64) -> bool {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => return false,
+            Err(_) => {
+                // A wait-status error may leave the probe child running; reap it before bailing,
+                // exactly like the sibling try_wait loops (run_wsl_segment_transcript, the 7B
+                // preflight probe). std::process::Child does NOT kill/reap on drop, so a bare
+                // `return false` here leaks a WSL process on every failed status poll — and this
+                // probe is called on a poll.
+                kill_and_reap_wsl_child(&mut child, "engine-status probe");
+                return false;
+            }
         }
     }
 }

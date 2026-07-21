@@ -1087,6 +1087,42 @@ def test_pipeline_wsl_subprocess_send_failures_are_reported() -> None:
         raise AssertionError(f"pipeline.rs must keep observable WSL subprocess send handling:\n{formatted}")
 
 
+def test_probe_wsl_7b_server_reaps_child_on_wait_error() -> None:
+    """probe_wsl_7b_server polls child.try_wait() in a loop; on a wait-status error its Err arm must
+    reap the child (kill_and_reap_wsl_child) before returning false — exactly like the sibling
+    try_wait loops (run_wsl_segment_transcript and the 7B preflight probe both reap on their Err
+    arm). std::process::Child does NOT kill/reap on drop, so a bare `return false` on the Err arm
+    leaks a WSL process on every failed status poll, and this probe is called on a poll.
+    Regression guard: iter-65."""
+    pipeline = (REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")
+    marker = "fn probe_wsl_7b_server(timeout_secs: u64) -> bool {"
+    start = pipeline.find(marker)
+    if start == -1:
+        raise AssertionError("probe_wsl_7b_server not found — this gate would pass vacuously")
+    # Scope the check to this function body: slice to the start of the next free function.
+    rest = pipeline[start + len(marker):]
+    end = rest.find("\nfn ")
+    next_pub = rest.find("\npub(crate) fn ")
+    if next_pub != -1 and (end == -1 or next_pub < end):
+        end = next_pub
+    body = rest if end == -1 else rest[:end]
+
+    # Forbidden: a try_wait Err arm that returns without reaping.
+    if "Err(_) => return false" in body:
+        raise AssertionError(
+            "probe_wsl_7b_server's try_wait Err arm returns false without reaping the child — it "
+            "leaks a WSL process on every failed status poll. Reap via kill_and_reap_wsl_child like "
+            "the sibling loops."
+        )
+    # Required: reap on BOTH the deadline branch AND the try_wait Err branch.
+    reaps = body.count('kill_and_reap_wsl_child(&mut child, "engine-status probe");')
+    if reaps < 2:
+        raise AssertionError(
+            "probe_wsl_7b_server must reap the child on both the timeout branch and the try_wait Err "
+            f"branch (found {reaps} reap call(s); expected >= 2)"
+        )
+
+
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
     pipeline = pipeline_surface()
     forbidden = [
@@ -1553,6 +1589,7 @@ def main() -> None:
     test_model_metadata_updates_do_not_silently_default()
     test_audio_decode_worker_send_failures_are_reported()
     test_pipeline_wsl_subprocess_send_failures_are_reported()
+    test_probe_wsl_7b_server_reaps_child_on_wait_error()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()
