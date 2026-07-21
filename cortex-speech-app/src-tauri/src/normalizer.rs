@@ -785,6 +785,20 @@ mod proptests {
             '\u{0640}', // Tatweel
             '\u{200C}', // ZWNJ
             ' ',
+            // ── Hostile-alphabet extension (iter-69 audit): every recent normalizer bug class
+            // (separator folding, glued digits, harakat-heh finality, zero-width strips) lived
+            // OUTSIDE the alphabet above, so the idempotence property was never exercised on the
+            // inputs where it matters. These generate those interactions:
+            '\u{0661}', '\u{0669}', // Arabic-Indic digits ١ ٩
+            '\u{06F2}', '\u{06F0}', // Extended (Persian) digits ۲ ۰
+            '1', '0', '7', // ASCII digits (incl. 0 for leading-zero/ID paths)
+            '\u{066B}', '\u{066C}', // Arabic decimal ٫ / thousands ٬ separators
+            ',', '.', '?', ';',        // ASCII punctuation the pipeline unifies
+            '\u{0629}', // ة teh marbuta (heh-contextual path)
+            '\u{0623}', '\u{0625}', '\u{0621}', '\u{0622}', // hamza forms أ إ ء آ
+            '\u{064E}', '\u{0651}', // harakat: fatha, shadda (combining, alphabetic)
+            '\u{200B}', '\u{200D}', '\u{FEFF}', // ZWSP / ZWJ / BOM (deleted, not spaced)
+            '\u{202B}', '\u{2066}', // RLE bidi embed + LRI isolate (deleted)
         ])
     }
 
@@ -801,6 +815,11 @@ mod proptests {
             let twice = n.normalize(&once);
             prop_assert_eq!(&once, &twice,
                 "normalize(normalize(s)) must equal normalize(s) — idempotency violated");
+            // The output must already be NFC over the whole hostile alphabet (harakat reordering,
+            // composed hamza forms) — pinned on one concrete case in test_nfc_canonical_composition,
+            // enforced generatively here.
+            prop_assert_eq!(once.clone(), once.nfc().collect::<String>(),
+                "normalizer output must be NFC-stable");
         }
 
         #[test]
