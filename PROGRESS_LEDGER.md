@@ -6302,3 +6302,32 @@ Gate: fmt 0, clippy 0, **944 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 19 fixed, 5 refuted, 2 measure-deferred, 16 findings left** (next: models.rs:485
 SHA-verified-after-install no-rollback; models.rs:425 bare .exists() early-return; snapshot trio).
 Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T20:15Z — iter 73 — model-download integrity pair fixed (commit df1836e); 14 findings left
+
+**Hunt-3 #3 + #4 (both medium) hand-verified and FIXED as one logical change — download integrity.**
+Two compounding defects confirmed at source: (1) download_omniasr verified extracted files' pinned
+SHA-256 only AFTER extract_model_archive promoted them to final paths, no rollback — a pin mismatch
+left the failed-integrity model installed; (2) all three download entry points early-returned Ok on
+bare .exists() (omniasr pair, campp, denoiser) while missing-model detection uses min-size floors —
+a truncated file (or defect #1's leftovers) made every later download report success without
+downloading. Together: a bad model became permanently "successfully installed". Recurring theme
+again: download_campp already verified its temp BEFORE replace_file — the correct pattern existed
+one function over.
+
+Fix: extract_model_archive takes staged_pins and verifies STAGED temps before the promote loop
+(mismatch → all temps cleaned, "Nothing was installed." error); post-install verification stays as
+defense in depth. Early-returns now size-aware (omniasr_ctc_*_present_in; campp_present; denoiser
+via the download-target dir with the 400KB floor — denoiser_present checks resolved_dir, the wrong
+dir for a download decision).
+
+**Fail-before/pass-after verified:** with staged verification skipped (old semantics) the tampered-
+archive test installs successfully and fails; with the fix, nothing installs and it passes
+(extract_model_archive_pin_mismatch_installs_nothing, plus a matching-pin positive leg).
+
+Gate: fmt 0, clippy 0, **945 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 21 fixed, 5 refuted, 2 measure-deferred, 14 findings left** (next: snapshot trio —
+snapshot.rs:158 partial-backup counted real; snapshot.rs:262 off-drive tree unpinned during
+quarantine; snapshot.rs:83 same-second pin collision). Owner-gated legs unchanged (OWNER_HANDOFF.md).
