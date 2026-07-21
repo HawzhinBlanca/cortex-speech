@@ -6195,3 +6195,55 @@ Gate: fmt 0, clippy 0, **942 passed / 0 failed / 6 ignored**, 33/33 policies.
 +normalizer.rs (hand), +g2p.rs (pattern-scan only). Remaining un-audited: commands.rs (+slices),
 asr.rs, aligner.rs, agentic.rs, jury/, scorecard.rs, registry.rs, snapshot.rs, lib.rs. Owner-gated
 legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T18:35Z — iter 70 — hunt round 3: 18 confirmed findings across 9 modules; fix queue opened
+
+**Hunt round 3 (Workflow wf_975f1536-1c2): 26/26 agents completed, ZERO dead agents** — unlike rounds
+1-2, every finding got a real adversarial verification pass (verifier default = refute, high effort).
+Result: 18 candidates, 18 CONFIRMED (0 refuted, 0 unverified). jury/t2_listener.rs: clean (0 findings).
+Agent verdicts are NOT evidence — each finding will be hand-verified against source at fix time, one
+per iteration, fail-before/pass-after gated, same as rounds 1-2.
+
+**The queue (verifier-corrected severity, priority order):**
+1. **jury/mod.rs:147 HIGH** — Observe/Propose "never auto-commit" enforced only at T0: a segment
+   apply_autonomy stages for the human (verdict='escalated') is immediately re-consumed as T2 input.
+2. asr.rs:579 med — ensure_loaded permanently caches new_unavailable() under the config key; fresh-
+   install download-then-transcribe stays "ASR model not loaded" until app restart.
+3. models.rs:485 med — download_omniasr verifies pinned SHA-256 AFTER promoting files to final paths,
+   no rollback: a pin-mismatch model stays installed.
+4. models.rs:425 med — download entry points early-return Ok on bare .exists() while detection uses
+   min_size_bytes: truncated model reported as successfully downloaded.
+5. snapshot.rs:158 med — failed db.backup leaves a partial snapshot dir that retention/quarantine
+   count as a real snapshot.
+6. snapshot.rs:262 med — quarantine prune-pin only checks primary root; off-drive snapshot tree
+   rotates out pre-corruption history during unacknowledged quarantine.
+7. snapshot.rs:83 low — same-label same-second pinned snapshots collide; db.backup overwrites the
+   previous pin.
+8. registry.rs:523 med — gate_and_promote never checks the scorecard's vs_baseline is the CURRENT
+   champion (or that the scorecard belongs to challenger_id): stale-baseline promotion.
+9. registry.rs:109 low — promote_to_champion maps EVERY family-lookup error to "unknown model
+   version", masking real DB failures.
+10. scorecard.rs:270 med — compare_to_baseline feeds empty-reference segments into mapsswe(): p-value
+    earned by segments the WER figures exclude.
+11. scorecard.rs:279 med — slice gate counts empty-reference segments toward MIN_SLICE_SEGS,
+    converting fail-closed UNVERIFIED into "Slice gate ok".
+12. jury/learning.rs:219 med — export_lm_corpus COALESCE omits annotated_transcript: accepted segment
+    with the human fix in annotated exports the pre-correction draft as human-confirmed.
+13. jury/learning.rs:87 med — build_dpo_dataset exports agent_examples with verified_by_human=1
+    without checking current human_decision (undone/rejected edits still train).
+14. agentic.rs:387 med — extract_gemini_text ignores finishReason: MAX_TOKENS/SAFETY-truncated Gemini
+    response treated as the COMPLETE reference transcript.
+15. agentic.rs:559 med — reference_window_tokens silently substitutes the ENTIRE reference for the
+    segment window when source meta is missing, still gated as a real window.
+16. aligner.rs:497 med — unalignable words get fabricated end=start+0.25s with no clamp to clip
+    duration; out-of-range timestamps stamped ctc_forced and exported.
+17. aligner.rs:190 med — score_consistency lacks align()'s 600s cap and MAX_VITERBI_CELLS cap:
+    whole-recording segment + long transcript → multi-GB alloc → OOM abort.
+18. aligner.rs:517 med — degenerate-alignment guard needs only aligned_chars>=1 to stamp CtcForced.
+
+No code change this iteration (hunt + triage). Gate not re-run (no source touched; last green iter
+69: 942/0/6 + 33/33). **Score: 17 fixed, 5 refuted, 2 measure-deferred, 18 NEW confirmed findings
+queued.** Un-audited remainder: commands.rs core + most slices, lib.rs, eval.rs was round-2-clean.
+Owner-gated legs unchanged (OWNER_HANDOFF.md).
