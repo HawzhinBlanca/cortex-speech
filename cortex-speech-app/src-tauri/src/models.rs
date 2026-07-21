@@ -422,7 +422,15 @@ impl ModelManager {
             }
         };
 
-        if self.models_dir.join(model_file).exists() && self.models_dir.join(tokens_file).exists() {
+        // Size-aware presence, not bare .exists(): a truncated model file (crashed extract, partial
+        // copy) must trigger a re-download, not an early "already installed" success — the same
+        // min-size floors the missing-model detection uses (round-24 hunt #4).
+        let already_present = match size {
+            AsrModelSize::CTC300M => omniasr_ctc_300m_present_in(&self.models_dir),
+            // WSL7B returned an Err above, so the only other size here is CTC1B.
+            _ => omniasr_ctc_1b_present_in(&self.models_dir),
+        };
+        if already_present {
             progress_cb(1.0);
             return Ok(());
         }
@@ -462,7 +470,20 @@ impl ModelManager {
 
         verify_sha256(&tmp_archive, archive_sha256)?;
         progress_cb(0.92);
-        self.extract_model_archive(&tmp_archive, &dest_dir, "model.int8.onnx", true)?;
+        // Verify the extracted artifacts against their pins BEFORE they are promoted to their final
+        // paths (round-24 hunt #3): verification used to run only in the metadata loop below, AFTER
+        // extract_model_archive had already installed the files — a pin mismatch errored but left the
+        // failed-integrity model in place, and the presence early-return above then reported it as
+        // successfully installed forever. The pins are keyed by the archive output names.
+        let staged_pins: Vec<(&str, &str)> = MODELS
+            .iter()
+            .filter(|m| m.filename == model_file || m.filename == tokens_file)
+            .filter_map(|m| {
+                let name = Path::new(m.filename).file_name()?.to_str()?;
+                Some((name, m.sha256))
+            })
+            .collect();
+        self.extract_model_archive(&tmp_archive, &dest_dir, "model.int8.onnx", true, &staged_pins)?;
         remove_model_temp_file(&tmp_archive, "completed OmniASR archive");
         progress_cb(1.0);
 
@@ -504,12 +525,16 @@ impl ModelManager {
         Ok(())
     }
 
+    /// `staged_pins`: (archive output file name -> pinned SHA-256) pairs verified on the STAGED
+    /// temp files before anything is promoted to its final path — a pin mismatch must leave the
+    /// models dir untouched, never a failed-integrity model installed at its final location.
     fn extract_model_archive(
         &self,
         archive_path: &Path,
         dest_dir: &Path,
         model_output_name: &str,
         require_tokens: bool,
+        staged_pins: &[(&str, &str)],
     ) -> Result<(), String> {
         let file = fs::File::open(archive_path).map_err(|e| format!("Open archive: {e}"))?;
         let decoder = bzip2::read::BzDecoder::new(file);
@@ -564,6 +589,24 @@ impl ModelManager {
             });
         }
 
+        // Integrity gate on the STAGED temps, before promotion (round-24 hunt #3). Empty pins are
+        // "not yet pinned" no-ops, matching verify_extracted_against_pin.
+        for (tmp, dest) in &staged_files {
+            let Some(name) = dest.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some((_, pin)) = staged_pins.iter().find(|(pin_name, _)| *pin_name == name) else { continue };
+            if pin.is_empty() {
+                continue;
+            }
+            let computed = compute_file_sha256(tmp)?;
+            if computed != *pin {
+                cleanup_staged_files(&staged_files);
+                return Err(format!(
+                    "Extracted model {name} failed integrity check before install: expected SHA256 {pin}, got \
+                     {computed}. Nothing was installed."
+                ));
+            }
+        }
+
         for i in 0..staged_files.len() {
             let (tmp, dest) = &staged_files[i];
             if let Err(e) = replace_file(tmp, dest) {
@@ -584,7 +627,9 @@ impl ModelManager {
     /// Download the CAM++ speaker-embedding ONNX (a single direct file, not an archive) and verify it
     /// against its pinned SHA-256 before placing it as `campp/model.onnx`.
     pub fn download_campp(&self, progress_cb: impl Fn(f32)) -> Result<(), String> {
-        if self.models_dir.join(CAMPP_MODEL).exists() {
+        // Size-aware presence (campp_present's own floor), not bare .exists() — a truncated file
+        // must re-download, not early-return success (round-24 hunt #4).
+        if self.campp_present() {
             progress_cb(1.0);
             return Ok(());
         }
@@ -641,7 +686,11 @@ impl ModelManager {
     /// Download the GTCRN denoiser ONNX (a single direct file, not an archive) and verify it against
     /// its pinned SHA-256 before placing it as `denoiser/model.onnx`.
     pub fn download_denoiser(&self, progress_cb: impl Fn(f32)) -> Result<(), String> {
-        if self.models_dir.join(DENOISER_MODEL).exists() {
+        // Size-aware presence in the DOWNLOAD-TARGET dir (denoiser_present checks resolved_dir,
+        // which may be the bundled fallback), not bare .exists() — a truncated file must
+        // re-download, not early-return success (round-24 hunt #4). Same 400 KB floor as
+        // denoiser_present: GTCRN is ~0.5 MB.
+        if model_file_meets_min_size(&self.models_dir, DENOISER_MODEL, 400_000) {
             progress_cb(1.0);
             return Ok(());
         }
@@ -1301,7 +1350,7 @@ mod tests {
         std::fs::create_dir_all(&dest_dir).expect("dest dir");
 
         let err = manager
-            .extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true)
+            .extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true, &[])
             .expect_err("missing tokens should fail");
 
         assert!(err.contains("tokens.txt"));
@@ -1318,7 +1367,7 @@ mod tests {
         let dest_dir = tmp.path().join("extract");
         std::fs::create_dir_all(&dest_dir).expect("dest dir");
 
-        manager.extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true).expect("extract");
+        manager.extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true, &[]).expect("extract");
 
         assert_eq!(std::fs::read(dest_dir.join("model.int8.onnx")).expect("model"), b"model bytes");
         assert_eq!(std::fs::read(dest_dir.join("tokens.txt")).expect("tokens"), b"tokens");
@@ -1344,11 +1393,54 @@ mod tests {
         std::fs::write(blocking.join("sentinel"), b"x").expect("sentinel");
 
         let err = manager
-            .extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true)
+            .extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true, &[])
             .expect_err("promotion should fail on the first artifact");
         assert!(err.contains("Promote extracted model artifact"), "got: {err}");
         // BEFORE the fix this fails: tokens.txt.extracting-* is orphaned. AFTER: it is cleaned up.
         assert_no_extracting_files(&dest_dir);
+    }
+
+    #[test]
+    fn extract_model_archive_pin_mismatch_installs_nothing() {
+        // Round-24 hunt #3: pin verification used to run only AFTER extraction had promoted the
+        // files to their final paths — a mismatch errored but left the failed-integrity model
+        // installed, and the presence early-return then reported it as successfully downloaded
+        // forever. Verification now happens on the STAGED temps: a mismatch must leave the dest
+        // dir with NO final artifacts and NO temps.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+        let archive_path = tmp.path().join("tampered.tar.bz2");
+        write_bzip2_tar(&archive_path, &[("nested/model.int8.onnx", b"model bytes"), ("nested/tokens.txt", b"tokens")]);
+        let dest_dir = tmp.path().join("extract");
+        std::fs::create_dir_all(&dest_dir).expect("dest dir");
+
+        let wrong_pin = "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = manager
+            .extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true, &[("model.int8.onnx", wrong_pin)])
+            .expect_err("a pin mismatch must fail the install");
+
+        assert!(err.contains("failed integrity check before install"), "got: {err}");
+        assert!(!dest_dir.join("model.int8.onnx").exists(), "the failed-integrity model must NOT be installed");
+        assert!(!dest_dir.join("tokens.txt").exists(), "no partial install: tokens must not land either");
+        assert_no_extracting_files(&dest_dir);
+
+        // A CORRECT pin (the real sha of b"model bytes") extracts normally.
+        let right_pin = compute_file_sha256(&{
+            let probe = tmp.path().join("probe");
+            std::fs::write(&probe, b"model bytes").unwrap();
+            probe
+        })
+        .unwrap();
+        manager
+            .extract_model_archive(
+                &archive_path,
+                &dest_dir,
+                "model.int8.onnx",
+                true,
+                &[("model.int8.onnx", &right_pin)],
+            )
+            .expect("a matching pin must install");
+        assert!(dest_dir.join("model.int8.onnx").exists());
     }
 
     #[test]
