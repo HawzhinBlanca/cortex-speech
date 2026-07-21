@@ -6105,3 +6105,42 @@ Gate: fmt 0, clippy 0, **942 passed / 0 failed / 6 ignored**, 33/33 policies.
 (db.rs:2427 record_human_decision builds the corrections ledger + LOOP-0 correction_memory rows from
 values read ~one audio-hash before the writing transaction opens). Backend audit remains PARTIAL.
 Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T14:20Z — iter 67 — record_human_decision snapshot REFUTED (intentional + writes atomic); hunt queue drained
+
+**db.rs:2427 (record_human_decision reads the segment snapshot ~100 lines / one audio-hash before the
+writing transaction opens) — REFUTED as a defect.** Audit:
+1. **No intra-connection race.** The command layer (commands/segments_write.rs:187) holds
+   `state.lock_db()` across the ENTIRE call, so every main-connection DB op is serialized; nothing
+   interleaves between the snapshot read and the tx on that connection.
+2. **Cross-connection safety is by design.** The jury runs on a SEPARATE WAL connection
+   (jury/mod.rs:345) and never clobbers a human decision — it guards with conditional 0-row-no-op
+   writes (WHERE excludes human-decided rows), NOT read-inside-tx isolation. The human path is the
+   authoritative writer.
+3. **The snapshot BEFORE the tx is intentional and correct** (documented at db.rs:2348-2351, 2377):
+   the corrections ledger's "wrong side" and the LOOP-0 memory evidence must be the transcript the
+   HUMAN REVIEWED, not a later background update the human never saw. Re-reading inside the tx (the
+   finding's implied fix) would (a) record a transcript the human never corrected, (b) let a memory
+   born from this edit confirm itself, and (c) reintroduce file I/O under an open write lock — all
+   regressions.
+4. **The atomicity that matters already exists:** the verdict UPDATE + agent_examples + corrections
+   ledger + correction_memory upserts + confidence updates + decision_log all commit in ONE tx
+   (db.rs:2412-2534). Existing tests pin the committed ledger content
+   (record_human_decision_appends_to_corrections_ledger, edit_populates_correction_memory_with_substitution).
+   No new test added — the behavior is already covered; adding one would be redundant.
+
+**Newly-surfaced while auditing (NOT the queued finding), measure-deferred:** source_audio_identity
+(pipeline.rs:40) blake3-hashes the ENTIRE source audio file, and record_human_decision calls it while
+holding the db mutex — so an "edit" decision on a large source recording holds the lock for the hash
+duration, briefly blocking other DB ops (UI polling). Same category as #18: a latency concern that
+the measure-first law says to MEASURE on the real library before fixing (blake3 ~GB/s, so a typical
+clip is sub-100ms; only large audiobook sources would be feelable). Recorded, not silently dropped;
+candidate for a lock-out-of-hash refactor IF the owner's verify-10 measurement shows it is feelable.
+
+**Hunt queue DRAINED.** No code change this iteration (honest refute).
+**Score: 17 defects fixed, 5 refuted-with-audit, 2 measure-deferred, 0 findings unverified.** Next
+iteration: either launch a fresh adversarial hunt on an un-audited module, or pivot to the owner-gated
+legs (exe rebuild to activate all source fixes since ~iter 30; real-audio e2e/RTF/CER). Backend audit
+remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
