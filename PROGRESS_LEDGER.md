@@ -5988,3 +5988,36 @@ Gate: fmt 0, clippy 0, **939 passed / 0 failed**, 33/33 policies.
 **Score: 14 defects fixed, 3 refuted, 1 measure-deferred, 5 findings unverified** (pipeline.rs:1453
 resume-journal gap; pipeline.rs:2591 .ok(); pipeline.rs:300 child reap; db.rs:1244 vacuum/FTS;
 db.rs:2427 correction-ledger snapshot). Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T00:00Z — iter 63 — resume adopts persisted-but-unjournaled files, no duplicates (commit dbf2352); 4 findings left
+
+**One finding FIXED — pipeline.rs:1453 (resume-journal gap), medium.** An import commits each
+file's segments (persist_segments, atomic batch) BEFORE the slow primary 7B pass, and the resume
+journal (mark_import_file_done) is written only after the file returns Ok. A crash in that window —
+WIDE, since the 7B pass dominates per-file time — leaves the file's rows in the DB with no journal
+entry. On resume, resume_completed did not contain it, so it was re-processed and persist_segments
+committed a SECOND full set: every segment of the in-flight file duplicated. (This is the same
+duplicate class iter-62's discard fix touched from the journal side; this closes the persist side.)
+
+Fix: on resume, look up existing segment ids per file's audio_path (one query via
+idx_segments_audio_path) and skip+adopt any file that already has rows, not just journaled ones.
+Decision extracted into a pure helper resume_should_skip_file(resuming, journaled,
+has_persisted_segments) = journaled || (resuming && has_persisted_segments). Non-destructive: rows
+are folded into the end-of-run jury batch, never deleted — the in-memory fingerprint guard resets on
+restart and allows same-path re-import, so an earlier reviewed import can legitimately share this
+audio_path and delete-by-audio_path would risk wiping reviewed data. Fresh import (resuming=false)
+unchanged.
+
+**Fail-before/pass-after verified** on a real pure-logic test: with old logic
+(journaled only) resume_skips_persisted_but_unjournaled_file_to_avoid_duplicates FAILS at the
+orphaned-file assertion; with the fix it passes. Test covers all four quadrants
+(fresh/journaled/orphaned/unprocessed).
+
+Gate: fmt 0, clippy 0, **940 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 15 defects fixed, 3 refuted, 1 measure-deferred, 4 findings unverified** (pipeline.rs:2591
+.ok() collapses DB error to no-such-row; pipeline.rs:300 probe_wsl_7b_server skips
+kill_and_reap_wsl_child on try_wait error; db.rs:1244 vacuum/FTS rebuild as two independent
+statements; db.rs:2427 record_human_decision builds correction ledger from a pre-transaction
+snapshot). Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
