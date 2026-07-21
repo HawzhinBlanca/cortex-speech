@@ -130,10 +130,16 @@ pub fn t0_gate_segment(
 
 /// Modulate a base T0 routing decision by the curator's Autonomy Dial. This is what makes the dial
 /// REAL (it was previously read by no backend logic): the SAME segment routes differently per level.
-///   - Observe / Propose: never auto-commit — a would-be AutoAccept is staged (EscalateToT1) for the
-///     human. (Observe additionally writes NO verdict at all — handled in run_t0_gate.)
-///   - ActConfirm (default): the base decision — auto-accept agreements, escalate the rest.
+///   - Observe / Propose (Propose is the shipped default — see settings::AutonLevel): never
+///     auto-commit — a would-be AutoAccept is staged (EscalateToT1) for the human. (Observe
+///     additionally writes NO verdict at all — handled in run_t0_gate.)
+///   - ActConfirm: the base decision — auto-accept agreements, escalate the rest.
 ///   - ActAuto: fully unattended — a would-be EscalateToT1 is committed (AutoAccept).
+///
+/// NOTE: this modulates only the T0 stage's routing. The reference-selection and T1/T2 commit
+/// stages enforce the same contract at the pipeline chokepoint (`machine_commits_allowed` in
+/// commands::run_jury_pipeline_core_via) — the dial was previously enforced ONLY here, which let
+/// the same run machine-commit the very segments it had just staged (round-24 hunt #1).
 pub fn apply_autonomy(
     decision: T0Decision,
     autonomy: &crate::settings::AutonLevel,

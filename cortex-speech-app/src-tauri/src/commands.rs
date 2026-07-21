@@ -3048,6 +3048,21 @@ pub fn run_jury_pipeline_core_via(
     // jury provider is set to "openrouter".
     let (t2_endpoint, api_key, jury_model) = resolve_t2_endpoint(settings, &settings.llm_api_key, data_dir);
 
+    // The Autonomy Dial governs EVERY machine-commit stage of this pipeline, not just T0
+    // (round-24 hunt #1, HIGH). Observe/Propose previously gated only run_t0_gate; the SAME run then
+    // re-consumed the staged ('escalated') segments as T1/T2 input and machine-committed them as
+    // 'jury_accept' — silently removing from the human queue the very segments the dial had just
+    // promised to stage (and, under Observe, the T2-disabled fallback still REWROTE verdicts the dial
+    // said it would never touch). Enforced once here, at the single pipeline chokepoint:
+    //   - Observe: the pipeline commits NOTHING beyond T0's own no-write contract — no reference
+    //     commits, no T1/T2, no re-staging writes.
+    //   - Propose: the machine stages ('escalated') but never commits; an already-staged segment
+    //     keeps its T0 verdict + IRT confidence (riskiest-first ordering) untouched.
+    let machine_commits_allowed = matches!(
+        settings.jury_autonomy_level,
+        crate::settings::AutonLevel::ActConfirm | crate::settings::AutonLevel::ActAuto
+    );
+
     let initial_seg_map: std::collections::HashMap<String, crate::db::SpeechSegment> = db
         .get_segments_by_ids(&segment_ids)
         .map_err(|e| e.to_string())?
@@ -3094,7 +3109,7 @@ pub fn run_jury_pipeline_core_via(
             &mut source_duration_cache,
             &mut source_identity_cache,
         )? {
-            Some(report) if report.should_commit => {
+            Some(report) if report.should_commit && machine_commits_allowed => {
                 let ev_json = serde_json::to_string(&report)
                     .map_err(|e| format!("Failed to serialize reference selection evidence for {seg_id}: {e}"))?;
                 db.write_segment_verdict(
@@ -3159,6 +3174,30 @@ pub fn run_jury_pipeline_core_via(
             Some(s) => s.clone(),
             None => continue,
         };
+
+        // Observe/Propose: the machine may not commit (or, under Observe, write anything at all) —
+        // stage-or-skip instead of running T1/T2. See machine_commits_allowed above.
+        if !machine_commits_allowed {
+            if matches!(settings.jury_autonomy_level, crate::settings::AutonLevel::Observe) {
+                continue; // Observe: pure observation — this run writes nothing.
+            }
+            // Propose: an already-staged segment keeps its verdict + IRT confidence (rewriting it
+            // would NULL the confidence that drives the queue's riskiest-first ordering).
+            if seg.escalated {
+                still_escalated += 1;
+                continue;
+            }
+            // Carry the guard's rationale into the staged verdict when one exists — under the
+            // shipped default (Propose) this is the reviewer's context in the inbox.
+            let staged_rationale = match reference_reports.remove(seg_id) {
+                Some(report) => format!("{} Staged for human review (autonomy dial: Propose).", report.rationale),
+                None => "Staged for human review: autonomy dial 'Propose' disables machine commits".to_string(),
+            };
+            db.write_segment_verdict(seg_id, "escalated", None, Some(&staged_rationale), None, None, true)
+                .map_err(|e| e.to_string())?;
+            still_escalated += 1;
+            continue;
+        }
 
         // Load hypotheses from database
         let hyps = load_hypotheses_for_segment(db, seg_id, &seg)?;
@@ -3421,10 +3460,22 @@ mod tests {
         audio.to_string_lossy().to_string()
     }
 
+    /// The jury tests below exercise the reference/guard/commit MACHINERY, which only runs when the
+    /// Autonomy Dial permits machine commits. The shipped default (AutonLevel::Propose) stages
+    /// instead of committing — that contract is pinned separately by
+    /// autonomy_dial_governs_every_machine_commit_stage_not_just_t0 — so these tests opt into
+    /// ActConfirm, the level whose semantics they were written against.
+    fn settings_act_confirm() -> crate::settings::AppSettings {
+        crate::settings::AppSettings {
+            jury_autonomy_level: crate::settings::AutonLevel::ActConfirm,
+            ..crate::settings::AppSettings::default()
+        }
+    }
+
     fn settings_with_source_reference_models(models: &[&str]) -> crate::settings::AppSettings {
         crate::settings::AppSettings {
             source_reference_models: models.iter().map(|model| (*model).to_string()).collect(),
-            ..crate::settings::AppSettings::default()
+            ..settings_act_confirm()
         }
     }
 
@@ -3728,6 +3779,75 @@ mod tests {
     }
 
     #[test]
+    fn autonomy_dial_governs_every_machine_commit_stage_not_just_t0() {
+        // Round-24 hunt #1 (HIGH): under Observe/Propose the dial was enforced only inside
+        // run_t0_gate — the SAME pipeline run then machine-committed 'jury_accept' via the
+        // reference-selection stage (and T2), silently removing from the human queue the very
+        // segments the dial promised to stage.
+
+        // ── Propose: a committable reference selection must STAGE, never commit. ──
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio_path = test_source_audio(&dir, "propose.wav");
+        let segment = test_segment("seg-propose", &audio_path, "wrong local consensus");
+        db.insert_segment(&segment).unwrap();
+        insert_hypothesis(&db, &segment.id, "omniasr-wsl-7b", "wrong local consensus", 0.99);
+        insert_hypothesis(&db, &segment.id, "omniasr-ctc-300m", "wrong local consensus", 0.95);
+        insert_hypothesis(&db, &segment.id, "omniasr-ctc-1b", "correct reference phrase", 0.90);
+        insert_source_reference(&db, &audio_path, "correct reference phrase");
+
+        let mut settings = settings_with_source_reference_models(&["gemini-2.5-pro"]);
+        settings.jury_autonomy_level = crate::settings::AutonLevel::Propose;
+        let report = run_jury_pipeline_core(&db, &settings, vec![segment.id.clone()]).unwrap();
+        let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+
+        assert_eq!(report["referenceCommitted"].as_u64(), Some(0), "Propose must never machine-commit: {report}");
+        assert_eq!(
+            fresh.verdict.as_deref(),
+            Some("escalated"),
+            "Propose stages the segment for the human, not 'jury_accept'"
+        );
+        assert!(fresh.escalated, "the staged segment must sit in the human escalation queue");
+        assert_eq!(report["humanInbox"].as_u64(), Some(1), "the staged segment is reported in humanInbox: {report}");
+
+        // ── Observe: the pipeline writes NOTHING — a pre-staged verdict survives untouched. ──
+        // (Before the fix, the T2-disabled fallback REWROTE the verdict rationale and NULLed the
+        // IRT confidence of every escalated segment fed back through the review loop.)
+        let db2 = crate::db::Database::open(":memory:").unwrap();
+        db2.initialize().unwrap();
+        let seg2 = test_segment("seg-observe", "/audio/observe.wav", "draft");
+        db2.insert_segment(&seg2).unwrap();
+        insert_hypothesis(&db2, &seg2.id, "omniasr-wsl-7b", "draft", 0.9);
+        insert_hypothesis(&db2, &seg2.id, "omniasr-ctc-300m", "other draft", 0.5);
+        db2.write_segment_verdict(&seg2.id, "escalated", None, Some("original rationale"), None, Some(0.42), true)
+            .unwrap();
+
+        let observe = crate::settings::AppSettings {
+            jury_autonomy_level: crate::settings::AutonLevel::Observe,
+            ..crate::settings::AppSettings::default()
+        };
+        run_jury_pipeline_core(&db2, &observe, vec![seg2.id.clone()]).unwrap();
+        let fresh2 = db2.get_segment_by_id(&seg2.id).unwrap().unwrap();
+        assert_eq!(fresh2.rationale.as_deref(), Some("original rationale"), "Observe must not rewrite verdicts");
+        assert_eq!(fresh2.agent_confidence, Some(0.42), "Observe must not NULL the staged IRT confidence");
+
+        // ── Propose: an already-staged segment keeps its confidence (riskiest-first ordering). ──
+        let propose = crate::settings::AppSettings {
+            jury_autonomy_level: crate::settings::AutonLevel::Propose,
+            ..crate::settings::AppSettings::default()
+        };
+        run_jury_pipeline_core(&db2, &propose, vec![seg2.id.clone()]).unwrap();
+        let fresh3 = db2.get_segment_by_id(&seg2.id).unwrap().unwrap();
+        assert_eq!(
+            fresh3.agent_confidence,
+            Some(0.42),
+            "Propose must not clobber an already-staged segment's IRT confidence"
+        );
+        assert!(fresh3.escalated, "the segment stays in the human queue");
+    }
+
+    #[test]
     fn agreeing_source_references_preserve_per_model_evidence() {
         let db = crate::db::Database::open(":memory:").unwrap();
         db.initialize().unwrap();
@@ -3740,8 +3860,7 @@ mod tests {
         insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-pro", "correct reference phrase");
         insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-flash", "correct reference phrase");
 
-        let report =
-            run_jury_pipeline_core(&db, &crate::settings::AppSettings::default(), vec![segment.id.clone()]).unwrap();
+        let report = run_jury_pipeline_core(&db, &settings_act_confirm(), vec![segment.id.clone()]).unwrap();
         let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
 
         assert_eq!(report["referenceCommitted"].as_u64(), Some(1));
@@ -3772,8 +3891,7 @@ mod tests {
         insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-pro", "unrelated source context");
         insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-flash", "unrelated source context");
 
-        let report =
-            run_jury_pipeline_core(&db, &crate::settings::AppSettings::default(), vec![segment.id.clone()]).unwrap();
+        let report = run_jury_pipeline_core(&db, &settings_act_confirm(), vec![segment.id.clone()]).unwrap();
         let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
 
         assert_eq!(report["referenceGuarded"].as_u64(), Some(1));
@@ -3796,8 +3914,7 @@ mod tests {
         insert_hypothesis(&db, &segment.id, "omniasr-ctc-1b", "wrong local consensus", 0.98);
         insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-pro", "correct reference phrase");
 
-        let report =
-            run_jury_pipeline_core(&db, &crate::settings::AppSettings::default(), vec![segment.id.clone()]).unwrap();
+        let report = run_jury_pipeline_core(&db, &settings_act_confirm(), vec![segment.id.clone()]).unwrap();
         let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
 
         assert_eq!(report["referenceCommitted"].as_u64(), Some(0));
@@ -3893,8 +4010,7 @@ mod tests {
         db.insert_segment(&segment).unwrap();
         insert_hypothesis(&db, &segment.id, "omniasr-ctc-300m", "fluent single model phrase", 0.99);
 
-        let report =
-            run_jury_pipeline_core(&db, &crate::settings::AppSettings::default(), vec![segment.id.clone()]).unwrap();
+        let report = run_jury_pipeline_core(&db, &settings_act_confirm(), vec![segment.id.clone()]).unwrap();
         let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
 
         assert_eq!(report["hypothesisGuarded"].as_u64(), Some(1));
@@ -3922,8 +4038,7 @@ mod tests {
         insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-pro", "first correct phrase");
         insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-flash", "second correct phrase");
 
-        let report =
-            run_jury_pipeline_core(&db, &crate::settings::AppSettings::default(), vec![segment.id.clone()]).unwrap();
+        let report = run_jury_pipeline_core(&db, &settings_act_confirm(), vec![segment.id.clone()]).unwrap();
         let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
 
         assert_eq!(report["referenceCommitted"].as_u64(), Some(0));
