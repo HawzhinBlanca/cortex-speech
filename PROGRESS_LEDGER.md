@@ -6021,3 +6021,29 @@ Gate: fmt 0, clippy 0, **940 passed / 0 failed / 6 ignored**, 33/33 policies.
 kill_and_reap_wsl_child on try_wait error; db.rs:1244 vacuum/FTS rebuild as two independent
 statements; db.rs:2427 record_human_decision builds correction ledger from a pre-transaction
 snapshot). Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T13:10Z — iter 64 — transcribe surfaces DB read errors instead of "import first" (commit d3d40a2); 3 findings left
+
+**One finding FIXED — pipeline.rs:2591 (.ok() collapses DB error), low.** In transcribe()'s
+WSL-primary path, resolving the segment id from (audio_path, alignment_json) when no explicit
+segment_id was passed used `query_row(...).ok()`, collapsing BOTH QueryReturnedNoRows (no matching
+segment — legitimate) AND a real DB fault (locked/IO/corrupt/no-such-table) into None. A None then
+returns "Segment not found in database. Please import the audio file first" — so a transient read
+failure on an already-imported file told the user to re-import and buried the real fault. The sibling
+bare-audio_path branch already propagates DB errors via map_err(..)?; this branch was the odd one out
+(same recurring theme: the correct handling existed one branch over, just not applied here).
+
+Fix: extracted resolve_segment_id_by_alignment(conn, audio_path, alignment_json) ->
+AppResult<Option<String>>, mapping QueryReturnedNoRows -> Ok(None) and any other error -> Err; call
+site uses `?`. **Fail-before/pass-after verified** on a real in-memory DB:
+segment_id_by_alignment_distinguishes_no_row_from_db_error asserts (a) a matching row resolves, (b) a
+non-matching row is Ok(None), (c) a query against a connection with no speech_segments table returns
+Err — with old .ok() case (c) FAILS (returned None), with the fix it passes.
+
+Gate: fmt 0, clippy 0, **941 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 16 defects fixed, 3 refuted, 1 measure-deferred, 3 findings unverified** (pipeline.rs:300
+probe_wsl_7b_server skips kill_and_reap_wsl_child on try_wait error; db.rs:1244 vacuum/FTS rebuild as
+two independent statements; db.rs:2427 record_human_decision builds correction ledger from a
+pre-transaction snapshot). Backend audit remains PARTIAL. Owner-gated legs unchanged (OWNER_HANDOFF.md).
