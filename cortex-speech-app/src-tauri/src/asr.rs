@@ -568,7 +568,9 @@ impl AsrPool {
         })
     }
 
-    fn ensure_loaded(&self, model_dir: &Path, config: &AsrLoadConfig) {
+    /// Returns whether a (re)load was attempted this call — callers don't need it, but it makes the
+    /// unavailable-retry contract below unit-testable without a real ONNX model on disk.
+    fn ensure_loaded(&self, model_dir: &Path, config: &AsrLoadConfig) -> bool {
         let mut state = self.lock_state();
 
         if state.loaded_dir.as_ref() != Some(&model_dir.to_path_buf()) {
@@ -576,8 +578,15 @@ impl AsrPool {
             state.loaded_dir = Some(model_dir.to_path_buf());
         }
 
-        if state.services.contains_key(config) {
-            return;
+        // Reuse only an AVAILABLE cached service. A cached UNAVAILABLE placeholder is retried
+        // instead: it used to be cached forever (bare contains_key), so the fresh-install flow —
+        // download the model in-app, then transcribe — stayed "ASR model not loaded" until app
+        // restart, because the resolved model dir and the config key are both identical before and
+        // after the download, so neither invalidation path ever fired (round-24 hunt #2). The retry
+        // is a cheap existence probe while the model is still absent, and recovers the moment the
+        // files appear (or a re-download fixes a failed integrity pin).
+        if state.services.get(config).is_some_and(|svc| svc.is_available()) {
+            return false;
         }
 
         tracing::info!(
@@ -594,6 +603,7 @@ impl AsrPool {
             }
         };
         state.services.insert(config.clone(), service);
+        true
     }
 
     pub fn warmup(&self, model_dir: &Path, config: &AsrLoadConfig) -> Result<(), String> {
@@ -624,6 +634,36 @@ impl AsrPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asr_pool_retries_an_unavailable_cached_service_instead_of_pinning_it() {
+        // Round-24 hunt #2: ensure_loaded used to short-circuit on bare contains_key, so the
+        // unavailable placeholder cached on a model-less first call was pinned for the process
+        // lifetime — the fresh-install "download the model in-app, then transcribe" flow stayed
+        // "ASR model not loaded" until app restart (same resolved dir + same config key before and
+        // after the download, so no invalidation path ever fired). The pool must RETRY a cached
+        // unavailable service on every ensure_loaded, so the load succeeds the moment the model
+        // files appear on disk.
+        let dir = tempfile::TempDir::new().unwrap();
+        let pool = AsrPool::new();
+        let config = AsrLoadConfig::default();
+
+        // First call: no model files -> load attempted, unavailable placeholder cached.
+        assert!(pool.ensure_loaded(dir.path(), &config), "first call must attempt the load");
+        assert!(!pool.is_available(dir.path(), &config), "no model on disk -> unavailable");
+
+        // Second call, model still absent: the cached UNAVAILABLE placeholder must be retried —
+        // this is the regression. (Before the fix, contains_key short-circuited and returned
+        // without attempting a load, which is exactly why an in-app download never recovered.)
+        assert!(
+            pool.ensure_loaded(dir.path(), &config),
+            "a cached unavailable service must be retried, not pinned for the process lifetime"
+        );
+
+        // The available-service fast path (reuse without reload) cannot be unit-covered here —
+        // constructing an available service needs a real ONNX model on disk; the ignored
+        // ort_omniasr_smoke test covers real loading on machines that have the model.
+    }
 
     /// Feasibility gate for the constrained-decode port: can we load the OmniASR ONNX via `ort`
     /// (dynamic onnxruntime) and run one inference to get the [1, T, 9812] CTC logits? Gated on the
