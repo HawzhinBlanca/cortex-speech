@@ -857,6 +857,29 @@ fn fts_index_searches_inserted_segments_and_tracks_batch_delete() {
 }
 
 #[test]
+fn vacuum_rebuilds_fts_and_leaves_search_working() {
+    // VACUUM cannot be wrapped in a transaction with its compensating FTS rebuild, and in practice
+    // this SQLite build PRESERVES speech_segments' rowids across VACUUM (verified: delete row 1 of
+    // [1,2,3,4] then VACUUM leaves [2,3,4], not [1,2,3]), so the external-content FTS does not
+    // actually desync — the rebuild inside vacuum() is defensive. This guards the observable
+    // contract that matters: vacuum() succeeds and search still returns the right rows afterward.
+    let db = make_db();
+    let mut first = make_segment("vac-1", "/data/audio/vac-1.wav");
+    first.raw_transcript = "hawzhin vacuumable transcript".to_string();
+    let mut second = make_segment("vac-2", "/data/audio/vac-2.wav");
+    second.raw_transcript = "hawzhin surviving transcript".to_string();
+    db.insert_segment(&first).expect("insert first");
+    db.insert_segment(&second).expect("insert second");
+    db.delete_segments_batch(&["vac-1".to_string()]).expect("batch delete");
+
+    db.vacuum().expect("vacuum must succeed");
+
+    let hits = db.search_segments("hawzhin").expect("search after vacuum");
+    assert_eq!(hits.len(), 1, "search must still work after VACUUM + FTS rebuild");
+    assert_eq!(hits[0].id, "vac-2");
+}
+
+#[test]
 fn search_treats_fts5_metacharacters_as_literal_text_not_query_syntax() {
     // Regression for the hardening-audit HIGH finding: FTS5 parses the bound value as a query,
     // so ordinary punctuation used to raise a hard error (unterminated string / no such column /

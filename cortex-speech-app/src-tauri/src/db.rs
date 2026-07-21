@@ -1228,10 +1228,20 @@ impl Database {
     }
 
     pub fn vacuum(&self) -> AppResult<()> {
+        // SQLite VACUUM cannot run inside a transaction — it commits any pending work and runs
+        // standalone — so the VACUUM and its compensating FTS rebuild below CANNOT be wrapped in one
+        // atomic statement. VACUUM renumbers speech_segments' implicit rowids, desyncing the
+        // external-content FTS index (search would return unrelated rows). Rebuild it immediately.
         self.conn.execute("VACUUM", [])?;
-        // VACUUM can renumber speech_segments' implicit rowids, silently desyncing the external-content
-        // FTS index (search would return unrelated rows until the next restart). Rebuild it immediately.
-        self.conn.execute("INSERT INTO segments_fts(segments_fts) VALUES('rebuild')", [])?;
+        // If the rebuild fails the index is left stale, but only until the next launch: initialize()
+        // unconditionally rebuilds segments_fts on every startup. Surface that so a rebuild failure is
+        // an actionable "restart repairs search", not a cryptic error over a silently-wrong index.
+        self.conn.execute("INSERT INTO segments_fts(segments_fts) VALUES('rebuild')", []).map_err(|e| {
+            AppError::Other(format!(
+                "VACUUM completed but rebuilding the search index failed: {e}. Search may return stale \
+                 results until you restart the app, which rebuilds the index automatically."
+            ))
+        })?;
         Ok(())
     }
 

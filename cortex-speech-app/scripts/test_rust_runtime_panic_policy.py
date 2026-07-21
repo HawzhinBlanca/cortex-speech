@@ -899,6 +899,10 @@ def test_database_fts_maintenance_does_not_silently_discard_errors() -> None:
     forbidden = [
         'self.conn.execute_batch("INSERT INTO segments_fts(segments_fts) VALUES(\'rebuild\');").ok();',
         'self.conn.execute("INSERT INTO segments_fts(segments_fts) VALUES(\'optimize\')", []).ok();',
+        # vacuum()'s rebuild must NOT bail with the bare rusqlite error — VACUUM already committed and
+        # renumbering desync (if any) self-heals on restart, so the failure must say so, not surface a
+        # cryptic message over a possibly-stale search index.
+        'self.conn.execute("INSERT INTO segments_fts(segments_fts) VALUES(\'rebuild\')", [])?;',
     ]
     present = [pattern for pattern in forbidden if pattern in db]
     if present:
@@ -909,6 +913,9 @@ def test_database_fts_maintenance_does_not_silently_discard_errors() -> None:
         'self.conn.execute_batch("INSERT INTO segments_fts(segments_fts) VALUES(\'rebuild\');")?;',
         'tracing::warn!("Failed to optimize segments FTS index after batch delete: {error}");',
         "fn fts_index_searches_inserted_segments_and_tracks_batch_delete()",
+        # vacuum() surfaces an actionable rebuild-failure message (restart repairs the index).
+        "VACUUM completed but rebuilding the search index failed:",
+        "fn vacuum_rebuilds_fts_and_leaves_search_working()",
     ]
     missing = [pattern for pattern in required if pattern not in db]
     if missing:
