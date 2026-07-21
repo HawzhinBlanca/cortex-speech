@@ -6074,3 +6074,34 @@ Gate: fmt 0, clippy 0, **941 passed / 0 failed / 6 ignored**, 33/33 policies.
 vacuum/FTS rebuild as two independent statements; db.rs:2427 record_human_decision builds correction
 ledger from a pre-transaction snapshot). Backend audit remains PARTIAL. Owner-gated legs unchanged
 (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T13:55Z — iter 66 — vacuum/FTS finding REFUTED (VACUUM preserves rowids) + observability polish (commit bd24199); 1 finding left
+
+**db.rs:1244 (vacuum/FTS two statements) — REFUTED as a defect, with a small observability fix.**
+The finding implied "make VACUUM + FTS rebuild atomic". Three reasons it is not a real defect:
+1. **Atomicity is impossible** — SQLite VACUUM cannot run inside a transaction (commits pending work,
+   runs standalone). A "wrap it in a txn" fix would ERROR at runtime.
+2. **The desync does not manifest** — a diagnostic proved this SQLite build PRESERVES
+   speech_segments' rowids across VACUUM: inserting [1,2,3,4], deleting row 1, then VACUUM leaves
+   rowids [2,3,4] (NOT [1,2,3]), and search returned every surviving row correctly WITHOUT any
+   rebuild. The external-content FTS never desyncs; the rebuild is defensive. (I nearly shipped a
+   behavioral "rebuild is load-bearing" test — the diagnostic showed it could never fail, so I did
+   not ship it. Honesty law held.)
+3. **Self-heals** — initialize() unconditionally rebuilds segments_fts on every startup.
+
+Kept improvement: the rebuild's failure was a bare `?` returning the raw rusqlite error over a
+possibly-stale index. Now mapped to an actionable message ("VACUUM completed but rebuilding the
+search index failed … restart the app, which rebuilds the index automatically") and the doc comment
+records the VACUUM-can't-be-transactional fact + startup self-heal, so nobody "fixes" it into a
+runtime error later. **Fail-before/pass-after verified**: git stash of db.rs → FTS-maintenance policy
+raised on the bare cryptic-`?` form; restored → passes. Behavioral test
+vacuum_rebuilds_fts_and_leaves_search_working guards the observable contract (vacuum() succeeds,
+search still works).
+
+Gate: fmt 0, clippy 0, **942 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 17 defects fixed, 4 refuted-with-audit, 1 measure-deferred, 1 finding unverified**
+(db.rs:2427 record_human_decision builds the corrections ledger + LOOP-0 correction_memory rows from
+values read ~one audio-hash before the writing transaction opens). Backend audit remains PARTIAL.
+Owner-gated legs unchanged (OWNER_HANDOFF.md).
