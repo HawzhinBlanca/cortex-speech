@@ -182,6 +182,17 @@ fn log_hypothesis_population_failure(segment_id: &str, error: &AppError) {
     tracing::error!("Failed to populate ASR hypotheses for {segment_id}: {error}");
 }
 
+/// Resume decision: should this file be SKIPPED (its already-persisted segments adopted into the
+/// jury batch rather than re-processed)? A file is already done when EITHER the resume journal
+/// recorded it (`journaled`) OR — while resuming — its segments are already in the DB
+/// (`has_persisted_segments`). The second case closes the crash window between `persist_segments`
+/// (an atomic batch commit) and `mark_import_file_done`: the rows exist but the journal never saw
+/// them, so without it resume would re-persist and DUPLICATE every segment of the in-flight file.
+/// Only fires while resuming — a fresh import (`resuming == false`) must never skip.
+fn resume_should_skip_file(resuming: bool, journaled: bool, has_persisted_segments: bool) -> bool {
+    journaled || (resuming && has_persisted_segments)
+}
+
 fn insert_hypothesis_checked(
     db: &Database,
     segment_id: &str,
@@ -1133,23 +1144,34 @@ impl ProcessingPipeline {
             let fname = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
             let file_path_str = file.to_string_lossy().to_string();
 
-            // P3.2: when resuming, a file already imported in the interrupted run is skipped — its
-            // segments were persisted per-file, so re-processing would only create duplicates.
-            if resume_completed.is_some_and(|done| done.contains(&file_path_str)) {
+            // P3.2 + resume-journal-gap fix: on resume, skip (adopt, never re-persist) any file whose
+            // segments are already in the DB. A file is "already done" two ways: (1) the resume journal
+            // recorded it, or (2) it is NOT journaled yet its rows exist — the crash landed in the window
+            // between persist_segments (an atomic batch commit) and mark_import_file_done, so the journal
+            // never saw it. Without case (2), resume reprocesses the in-flight file and DUPLICATES every
+            // segment. Query the existing ids once (resume only), then let resume_should_skip_file decide.
+            let resume_existing_ids: Vec<String> = if resume_completed.is_some() {
+                db.segment_ids_for_audio_path(&file_path_str).unwrap_or_else(|e| {
+                    tracing::warn!("resume: could not fetch segment ids for {file_path_str}: {e}");
+                    Vec::new()
+                })
+            } else {
+                Vec::new()
+            };
+            let journaled = resume_completed.is_some_and(|done| done.contains(&file_path_str));
+            if resume_should_skip_file(resume_completed.is_some(), journaled, !resume_existing_ids.is_empty()) {
                 succeeded += 1;
                 if let Some(ref jid) = job_id {
                     let _ = db.mark_import_file_done(jid, &file_path_str);
                 }
-                // Resume-correctness fix: fold this already-imported file's segments back into the
-                // jury batch. The post-import jury (below) runs once at the end keyed on
-                // `imported_ids`; a crash interrupts BEFORE that jury ever runs, so segments
-                // persisted pre-crash were never adjudicated. Skipping them silently would leave
-                // them persisted-but-un-adjudicated (no reference commit, no review routing). Pull
-                // their ids in so the end-of-run jury covers the whole resumed import.
-                match db.segment_ids_for_audio_path(&file_path_str) {
-                    Ok(ids) => imported_ids.extend(ids),
-                    Err(e) => tracing::warn!("resume: could not fetch segment ids for {file_path_str}: {e}"),
-                }
+                // Fold the already-imported file's segments back into the jury batch. The post-import
+                // jury (below) runs once at the end keyed on `imported_ids`; a crash interrupts BEFORE
+                // that jury ever runs, so segments persisted pre-crash were never adjudicated. Skipping
+                // them silently would leave them persisted-but-un-adjudicated (no reference commit, no
+                // review routing). Adopt the ids fetched above so the end-of-run jury covers the whole
+                // resumed import. Non-destructive: existing rows are adopted, never deleted (a reviewed
+                // earlier import may legitimately share this audio_path).
+                imported_ids.extend(resume_existing_ids);
                 callback(PipelineEvent::Progress {
                     current: idx + 1,
                     total,

@@ -44,6 +44,33 @@ fn primary_7b_failures_carry_the_ui_sentinel_and_never_leak_a_small_model() {
 }
 
 #[test]
+fn resume_skips_persisted_but_unjournaled_file_to_avoid_duplicates() {
+    use super::resume_should_skip_file;
+    // A crash can land in the window between persist_segments (an atomic batch commit) and
+    // mark_import_file_done: the file's segments are already in the DB, but the resume journal never
+    // recorded it. On resume, that file MUST be skipped (its rows adopted) or it gets reprocessed and
+    // every segment is DUPLICATED. This is the regression the resume-journal-gap fix closes.
+
+    // Fresh import (not resuming): never skip, even if the path somehow already has rows — a fresh
+    // import of a previously-imported directory is a legitimate (separate) re-import, not a resume.
+    assert!(!resume_should_skip_file(false, false, false));
+    assert!(!resume_should_skip_file(false, false, true), "a fresh import must never skip on pre-existing rows");
+
+    // Resuming, journal recorded the file: skip (pre-existing P3.2 behavior, preserved).
+    assert!(resume_should_skip_file(true, true, false));
+
+    // Resuming, NOT journaled but segments already persisted: MUST skip. Before the fix this branch
+    // returned false and the in-flight file was reprocessed into duplicate segments.
+    assert!(
+        resume_should_skip_file(true, false, true),
+        "resume must skip a persisted-but-unjournaled file, else duplicate segments on re-import"
+    );
+
+    // Resuming, not journaled, no rows yet (a genuinely unprocessed file past the crash point): process it.
+    assert!(!resume_should_skip_file(true, false, false));
+}
+
+#[test]
 fn loop0_firing_respects_opt_in_and_fires_when_enabled() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
