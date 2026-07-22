@@ -252,6 +252,20 @@ fn compare_to_baseline(system: &EvalRunResult, baseline: &EvalRunResult) -> Base
     for s in &system.segments {
         if let Some(b) = base_by_id.get(s.audio_path.as_str()) {
             let se = word_error(&s.reference, &s.hypothesis);
+            // Exclude unscoreable (empty-normalized-reference) segments from EVERY paired array,
+            // matching micro_rate / word_breakdown_aggregate / bootstrap_ci, which all filter
+            // ref_len > 0. The paired loop was the one path that didn't (round-24 hunt #10/#11): a
+            // silence/tatweel-only gold reference (ref_len == 0) leaked into mapsswe (which does NOT
+            // filter — manufacturing or blocking significance from hallucination diffs the WER metric
+            // itself ignores), inflated paired_segments, and padded the per-slice counts toward
+            // MIN_SLICE_SEGS — flipping the deliberate fail-closed "Slice gate UNVERIFIED" into a
+            // phantom "Slice gate ok". The gold reference is shared per audio_path, so the system-side
+            // ref_len is the clip's scoreability (its empty CER reference is empty too).
+            // ref_len is a non-negative word count, so `<= 0.0` == "empty reference" (the exact
+            // complement of micro_rate's `ref_len > 0.0` keep-filter).
+            if se.ref_len <= 0.0 {
+                continue;
+            }
             let be = word_error(&b.reference, &b.hypothesis);
             sys_errs.push(se);
             base_errs.push(be);
@@ -600,6 +614,41 @@ mod tests {
         assert!(sc.system.wer_ci.point < 0.01, "wer CI point pegged by empty-ref: {}", sc.system.wer_ci.point);
         assert!(sc.system.cer_ci.point < 0.01, "cer CI point pegged by empty-ref: {}", sc.system.cer_ci.point);
         assert!(sc.system.macro_wer < 0.01, "macro_wer pegged by empty-ref: {}", sc.system.macro_wer);
+    }
+
+    #[test]
+    fn empty_reference_segments_do_not_inflate_the_paired_comparison_or_slice_counts() {
+        // Round-24 hunt #10/#11: the paired loop in compare_to_baseline pushed EVERY paired segment
+        // into the mapsswe / paired_segments / per-slice arrays with no ref_len>0 filter — unlike
+        // micro_rate and every other aggregate. Unscoreable (empty-normalized-reference) clips then
+        // (a) fed mapsswe (manufacturing/blocking significance from hallucination diffs the WER metric
+        // itself ignores), (b) inflated paired_segments, and (c) padded per-slice counts toward
+        // MIN_SLICE_SEGS, flipping the fail-closed "Slice gate UNVERIFIED" into a phantom "ok".
+        //
+        // Gold: 4 reference-bearing short clips + 3 tatweel-only (empty-ref) clips. All 7 file under
+        // the "short (<=4 words)" slice, but only the 4 real clips are scoreable.
+        let pairs: Vec<(&str, &str)> = vec![
+            ("/r1.wav", "کورد"),
+            ("/r2.wav", "ئاو"),
+            ("/r3.wav", "نان"),
+            ("/r4.wav", "ماڵ"),
+            ("/e1.wav", "\u{0640}\u{0640}"), // tatweel-only -> normalizes to ""
+            ("/e2.wav", "\u{0640}\u{0640}"),
+            ("/e3.wav", "\u{0640}\u{0640}"),
+        ];
+        // Both systems are correct on the real clips and hallucinate DIFFERENTLY on the empty-ref
+        // clips — exactly where the finding says significance / slice padding is manufactured.
+        let sys_hyps = ["کورد", "ئاو", "نان", "ماڵ", "one two", "one two", "one two"];
+        let base_hyps = ["کورد", "ئاو", "نان", "ماڵ", "three", "three", "three"];
+        let (sys, base) = eval_pair(&pairs, &sys_hyps, &base_hyps, "sys", "base");
+        let sc = build_scorecard(&sys, Some(&base), ScorecardOptions::default());
+        let cmp = sc.vs_baseline.expect("paired comparison");
+
+        assert_eq!(cmp.paired_segments, 4, "only the 4 reference-bearing clips are paired (empty-ref excluded)");
+        // Only 4 scoreable rows in the "short" slice, below MIN_SLICE_SEGS(5), so NO slice is
+        // evaluated — the gate stays fail-closed (evaluated_slices==0), not padded to "ok" by the 3
+        // empty-ref rows.
+        assert_eq!(cmp.evaluated_slices, 0, "empty-ref rows must not pad a slice to the MIN_SLICE_SEGS threshold");
     }
 
     #[test]
