@@ -6938,3 +6938,38 @@ jury/learning redecision leak (medium — the retraction tests prove undo/reject
 
 Gate: fmt 0, clippy 0, **cargo test --lib 969 passed / 0 failed / 6 ignored**, **34/34 python policies**.
 **Score: 47 fixed, ~15 refuted, 2 measure-deferred.** Owner-gated finish line unchanged (exe rebuild + real-audio pass).
+
+---
+
+## 2026-07-22T22:10Z — iter 95 — TARGETED sweep for the "rejected/empty counted as real" pattern: 3 fixes (09fd74a, 944ca63, b07d7ed)
+
+**Hypothesis-driven iteration: after finding the same honesty bug 3× (iters 92-94), ran a TARGETED
+ultracode workflow (12 finders, one per count/coverage/tally site, × 3 refuters) hunting ONLY this class —
+counts that include empty/placeholder/human-rejected rows the authoritative data/export/gate path excludes.
+It CONFIRMED 3 more instances (5 candidates, 2 refuted). The pattern is systemic; a count/tally guarding
+gold/verified/coverage that skips is_human_rejected/is_effective_placeholder is a recurring trap.**
+
+**#1 stats.rs (medium, honesty; 3/3 CONFIRMED — also hand-found → 09fd74a).** compute_stats.verified_count =
+SUM(verified), no reject guard. A "mark bad" clip is verified=true (to leave the review queue), so the
+dashboard counted every rejected clip as VERIFIED — inflating verified_count/verification_rate and
+disagreeing with export_dataset (drops rejected before counting), quality::is_human_rejected, AND the
+dashboard's OWN frontend buildLocalStats (which uses isVerifiedGood). Fixed backend (three-way: verified /
+pending / rejected-neither, COALESCE-guarded against NULL-propagation) AND frontend buildLocalStats to match.
+
+**#2 eval.rs (medium; 3/3 CONFIRMED → 944ca63).** load_lift_triples required human_decision present but
+never excluded REJECT — so a rejected clip (annotation never confirmed, the reviewer discarded it) entered
+the MEASURED label-quality lift, inflating n and folding a fake raw→jury CER drop into the displayed
+micro-CER + lift + CI. Added the reject exclusion.
+
+**#3 db.rs (medium; 2/3 CONFIRMED → b07d7ed).** intelligence_report's C3 conformal-calibration count
+(verifiedWithReference per SNR bucket) had no reject guard — a mark-bad clip (verified=1, annotated intact)
+counted as a calibration sample, overstating progress toward T0 auto-accept. Added the exclusion.
+
+Each hand-verified against source; behavioral tests; fail-before verified (each: 2 without guard, 1 with).
+**Refuted (corroborating audits):** scorecard annotation_drift num_segments (already excludes empty-ref via
+scored count), jury/mod consensus empty-voter list.
+
+Gate: fmt 0, clippy 0, **cargo test --lib 972 passed / 0 failed / 6 ignored**, **34/34 python policies**,
+frontend typecheck 0 + vitest 201. **Score: 50 fixed, ~17 refuted, 2 measure-deferred.** Six total instances
+of this class fixed (runs/export_bundle/quality/stats/eval/db) — worth a standing coverage note. Owner-gated
+finish line unchanged (exe rebuild + real-audio pass).
