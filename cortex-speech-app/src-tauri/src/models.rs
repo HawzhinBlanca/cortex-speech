@@ -1386,11 +1386,23 @@ mod tests {
         write_bzip2_tar(&archive_path, &[("nested/model.int8.onnx", b"model bytes"), ("nested/tokens.txt", b"tokens")]);
         let dest_dir = tmp.path().join("extract");
         std::fs::create_dir_all(&dest_dir).expect("dest dir");
-        // Force the FIRST promotion (model.int8.onnx) to fail by occupying its destination with a
-        // NON-EMPTY directory — replace_file errors on this on both Unix and Windows.
+        // Force the FIRST promotion (model.int8.onnx) to fail so the SECOND artifact's staged temp must
+        // be cleaned up. A non-empty directory at the destination makes the Unix rename(tmp, final) fail
+        // outright. On Windows, replace_file moves the destination aside to a `.replace-bak-<pid>` sibling
+        // and promotes the tmp — so a dir at `dest` alone now SUCCEEDS (the promotion really happens); we
+        // ALSO occupy that exact backup path with a non-empty directory so the PRE-swap cleanup fails and
+        // the promotion errors before any swap. That is a genuine promotion failure, independent of the
+        // (best-effort) POST-swap backup cleanup — a durable write must never be reported as failed just
+        // because the throwaway backup could not be deleted.
         let blocking = dest_dir.join("model.int8.onnx");
         std::fs::create_dir_all(&blocking).expect("blocking dir");
         std::fs::write(blocking.join("sentinel"), b"x").expect("sentinel");
+        #[cfg(target_os = "windows")]
+        {
+            let backup = crate::atomic_file::replacement_backup_path(&blocking);
+            std::fs::create_dir_all(&backup).expect("blocking backup dir");
+            std::fs::write(backup.join("sentinel"), b"x").expect("backup sentinel");
+        }
 
         let err = manager
             .extract_model_archive(&archive_path, &dest_dir, "model.int8.onnx", true, &[])

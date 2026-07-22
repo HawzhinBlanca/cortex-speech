@@ -1233,6 +1233,39 @@ def test_save_session_is_rate_limited() -> None:
         )
 
 
+def test_atomic_replace_post_swap_backup_cleanup_is_best_effort() -> None:
+    """On Windows, atomic_file::replace_file moves the current file aside to a `.replace-bak`, promotes
+    the tmp file (the durable swap), fsyncs the dir, THEN deletes the backup. Deleting that throwaway
+    backup is non-load-bearing (recover_interrupted_replace only promotes a backup when the target is
+    MISSING; the next replace_file removes any leftover). A transient Windows scanner lock (Defender /
+    Search Indexer holding the fresh .replace-bak without FILE_SHARE_DELETE) makes remove_file fail with
+    ERROR_SHARING_VIOLATION — and if that error is PROPAGATED it reports a SUCCEEDED, durable write as
+    FAILED (a dishonest 'save failed' surfaced to the user). The post-swap cleanup must therefore be
+    best-effort (log + Ok), like the fsync_parent_dir above it. This can't be unit-injected (the backup
+    path is internal + pid-based), so it is pinned here. Scoped to the tail of the Windows replace_file
+    (after the last fsync_parent_dir call), NOT the pre-swap cleanup at 39-43 which correctly propagates
+    (there the swap never started and the file is unchanged)."""
+    atomic = (REPO_ROOT / "src-tauri" / "src" / "atomic_file.rs").read_text(encoding="utf-8")
+    marker = "fsync_parent_dir(final_path);"
+    idx = atomic.rfind(marker)
+    if idx == -1:
+        raise AssertionError("atomic_file.rs: fsync_parent_dir call not found — this gate would pass vacuously")
+    # Bound to the Windows replace_file tail: everything from the last fsync_parent_dir call up to the
+    # next `#[cfg(target_os = "windows")]` (the fsync_parent_dir fn's own attribute).
+    end = atomic.find('#[cfg(target_os = "windows")]', idx)
+    tail = atomic[idx:] if end == -1 else atomic[idx:end]
+    if "remove_file(&backup_path)" not in tail:
+        raise AssertionError("atomic_file.rs post-swap tail no longer removes the backup — gate would pass vacuously")
+    if "Err(e) => Err(e)" in tail:
+        raise AssertionError(
+            "atomic_file::replace_file propagates a POST-SWAP backup-cleanup error — a transient Windows "
+            "lock on the throwaway .replace-bak then reports a SUCCEEDED, durable write as failed. Make the "
+            "post-swap cleanup best-effort (log + Ok), like fsync_parent_dir."
+        )
+    if "tracing::warn!" not in tail:
+        raise AssertionError("atomic_file::replace_file post-swap backup cleanup must log its failure best-effort")
+
+
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
     pipeline = pipeline_surface()
     forbidden = [
@@ -1704,6 +1737,7 @@ def main() -> None:
     test_finish_import_clears_cancel_token_before_opening_the_gate()
     test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert()
     test_save_session_is_rate_limited()
+    test_atomic_replace_post_swap_backup_cleanup_is_best_effort()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()

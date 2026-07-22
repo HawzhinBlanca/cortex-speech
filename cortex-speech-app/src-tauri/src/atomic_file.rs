@@ -63,11 +63,25 @@ pub fn replace_file(tmp_path: &Path, final_path: &Path) -> io::Result<()> {
     // is rarely needed.
     fsync_parent_dir(final_path);
 
-    match fs::remove_file(&backup_path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    // The swap is already COMPLETE and DURABLE (the tmp -> final rename above succeeded and the parent
+    // dir was fsync'd), so the new bytes are on disk at `final_path`. Deleting the throwaway backup is
+    // NON-load-bearing cleanup: recover_interrupted_replace only promotes a backup when `final_path` is
+    // MISSING, and the next replace_file removes any leftover (lines 39-43). On Windows a transient
+    // scanner lock (Defender / Search Indexer opening the just-created `.replace-bak` file without
+    // FILE_SHARE_DELETE) makes remove_file fail with ERROR_SHARING_VIOLATION; propagating it would report
+    // a SUCCEEDED, durable write as FAILED — a dishonest "save failed" the caller surfaces to the user.
+    // Best-effort, exactly like fsync_parent_dir above (and unlike the pre-swap cleanup at 39-43, whose
+    // failure honestly means the swap never started and the file is unchanged).
+    if let Err(e) = fs::remove_file(&backup_path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            tracing::warn!(
+                "Atomic replace of {} succeeded; leftover backup {} could not be removed (transient lock?): {e}",
+                final_path.display(),
+                backup_path.display()
+            );
+        }
     }
+    Ok(())
 }
 
 /// Best-effort fsync of `final_path`'s containing directory so a rename's directory-entry metadata
@@ -86,7 +100,7 @@ fn fsync_parent_dir(final_path: &Path) {
 }
 
 #[cfg(target_os = "windows")]
-fn replacement_backup_path(final_path: &Path) -> PathBuf {
+pub(crate) fn replacement_backup_path(final_path: &Path) -> PathBuf {
     let file_name = final_path.file_name().and_then(|name| name.to_str()).unwrap_or("target");
     final_path.with_file_name(format!("{file_name}.replace-bak-{}", std::process::id()))
 }
