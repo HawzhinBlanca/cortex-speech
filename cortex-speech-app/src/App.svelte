@@ -1325,7 +1325,13 @@
     if (!seg) return;
     if (!requireDesktopRuntime()) return;
     try {
-      await api.updateSegment(seg);
+      // Field-level update, NOT a whole-row updateSegment. The Save button is reachable while a background
+      // batch-verify has written verified=true to the DB but the store row is still stale (verified=false);
+      // a whole-row upsert of $selectedSegment would revert that concurrent verify — and freshRow-by-id
+      // wouldn't help because the store itself is the stale source. update_segment_fields reads the FRESH
+      // row under the DB lock, applies ONLY annotatedTranscript, and still records undo history — the same
+      // safe path the oninput autosave already uses (scheduleAutoSave({ annotatedTranscript })).
+      await api.updateSegmentFields(seg.id, { annotatedTranscript: seg.annotatedTranscript });
       await historyStore.refresh();
       if (historyPanel) {
         historyPanel.recordAction(
@@ -1441,7 +1447,10 @@
     if (!seg) return;
     if (!requireDesktopRuntime()) return;
     try {
-      await api.updateSegment(seg);
+      // Field-level update, same reason as handleSaveAnnotation: a whole-row updateSegment of the stale
+      // $selectedSegment would revert a concurrent batch-verify's verified=true. update_segment_fields
+      // writes only speakerId onto the fresh row (and records undo history), like the oninput autosave.
+      await api.updateSegmentFields(seg.id, { speakerId: seg.speakerId });
       notifications.success($t('speaker.saved'));
     } catch (e) {
       notifications.error($t('notifications.saveFailed'), { detail: String(e) });

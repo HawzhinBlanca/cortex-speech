@@ -142,6 +142,25 @@ def test_waveform_stretches_peaks_across_the_canvas() -> None:
         raise AssertionError("Waveform still uses the 1-sample:1-bar samplesPerBar clamp; peaks won't fill the width")
 
 
+def test_app_save_handlers_use_field_level_updates() -> None:
+    """App.svelte handleSaveAnnotation and handleSaveSpeaker each persist ONE edited field (annotatedTranscript
+    / speakerId). Both must use api.updateSegmentFields (reads the fresh row under the DB lock, writes only the
+    named field, records undo history), NEVER a whole-row api.updateSegment($selectedSegment): the Save buttons
+    are reachable while a background batch-verify has written verified=true to the DB but the store row is still
+    stale (verified=false), so a whole-row upsert would revert that concurrent human verify (freshRow can't
+    help — the store itself is the stale source)."""
+    src = _read("src/App.svelte")
+    for fn, field in (("handleSaveAnnotation", "annotatedTranscript"), ("handleSaveSpeaker", "speakerId")):
+        body = _function_body(src, f"async function {fn}(")
+        if "api.updateSegment(seg)" in body:
+            raise AssertionError(
+                f"{fn} still whole-row-upserts the stale $selectedSegment via api.updateSegment(seg) — it can "
+                f"revert a concurrent batch-verify. Use api.updateSegmentFields(seg.id, {{ {field} }})."
+            )
+        if "api.updateSegmentFields(seg.id" not in body:
+            raise AssertionError(f"{fn} must persist via api.updateSegmentFields(seg.id, ...) (field-level, lock-safe)")
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -149,6 +168,7 @@ def main() -> None:
     test_app_normalize_uses_freshrow_not_a_stale_spread()
     test_app_export_audio_excludes_human_rejected()
     test_waveform_stretches_peaks_across_the_canvas()
+    test_app_save_handlers_use_field_level_updates()
     print("frontend review-guard source policy passed")
 
 
