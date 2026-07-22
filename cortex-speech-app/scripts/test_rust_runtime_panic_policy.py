@@ -1158,6 +1158,35 @@ def test_aligner_score_consistency_caps_clip_and_dp() -> None:
         raise AssertionError(f"score_consistency must cap clip duration AND DP size before running:\n{formatted}")
 
 
+def test_finish_import_clears_cancel_token_before_opening_the_gate() -> None:
+    """finish_import and finish_batch both share a round-15 TOCTOU: if the state gate flips to Idle
+    BEFORE the (possibly-cancelled) cancel token is cleared, a new operation can start in that window,
+    arm its own token, and then have finish's second statement wipe that fresh token — leaving the new
+    run uncancellable. finish_batch clears the token first; finish_import must too. This is a
+    concurrency-ordering invariant (single-threaded both orders behave identically, so it is not
+    unit-testable) — enforce the order at the source, scoped to each function body."""
+    lib = (REPO_ROOT / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
+    for fn_name, token_line, gate_line in (
+        ("pub fn finish_import(", "lock_import_cancel_token() = None", "ImportState::Idle"),
+        ("pub fn finish_batch(", "lock_batch_cancel_token() = None", "BatchState::Idle"),
+    ):
+        start = lib.find(fn_name)
+        if start == -1:
+            raise AssertionError(f"{fn_name} not found — this gate would pass vacuously")
+        rest = lib[start + len(fn_name):]
+        end = rest.find("\n    }")
+        body = rest if end == -1 else rest[:end]
+        token_at = body.find(token_line)
+        gate_at = body.find(gate_line)
+        if token_at == -1 or gate_at == -1:
+            raise AssertionError(f"{fn_name} no longer clears the token and/or opens the gate as expected")
+        if token_at > gate_at:
+            raise AssertionError(
+                f"{fn_name} opens the state gate BEFORE clearing the cancel token — a new operation can "
+                f"start in the window and lose its token (round-15 TOCTOU). Clear the token first."
+            )
+
+
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
     pipeline = pipeline_surface()
     forbidden = [
@@ -1626,6 +1655,7 @@ def main() -> None:
     test_pipeline_wsl_subprocess_send_failures_are_reported()
     test_probe_wsl_7b_server_reaps_child_on_wait_error()
     test_aligner_score_consistency_caps_clip_and_dp()
+    test_finish_import_clears_cancel_token_before_opening_the_gate()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()

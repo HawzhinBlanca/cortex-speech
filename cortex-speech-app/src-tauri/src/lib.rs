@@ -293,9 +293,15 @@ impl AppState {
     }
 
     pub fn finish_import(&self) {
-        *self.lock_import_state() = ImportState::Idle;
-        // Drop the (possibly-cancelled) token so the next import never inherits a stale one.
+        // Clear the (possibly-cancelled) token BEFORE opening the gate — the same round-15 TOCTOU
+        // ordering finish_batch documents. The OLD order (Idle first, then clear) let a new import
+        // start the instant this call flipped the state to Idle, arm its OWN token via
+        // start_cancel_token, and then have THIS call's second statement wipe that fresh token from
+        // the slot — leaving the new import running but with an empty cancel slot, so
+        // cancel_current_operation could never stop it. Opening the gate LAST means a new import can
+        // only begin after this call has fully finished, so it can never lose its token to us.
         *self.lock_import_cancel_token() = None;
+        *self.lock_import_state() = ImportState::Idle;
     }
 
     pub fn try_start_batch(&self) -> Result<(), String> {
