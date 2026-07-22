@@ -305,27 +305,22 @@ pub fn batch_normalize(
             }
 
             let update_ok = if let Some(app_state) = app_clone.try_state::<AppState>() {
+                // Targeted single-column update — writes ONLY normalized_transcript, never the whole
+                // row. The old read-modify-write (get_segment_by_id -> set -> insert_segment whole-row
+                // upsert) could clobber a concurrent write to this segment (e.g. a background aligner /
+                // 7B pass on the pipeline's own connection) that landed between the re-read and the
+                // upsert. annotated_transcript / verdict are untouched, matching the CRITICAL note this
+                // replaces. Sibling batch commands (verify, assign_speaker) already use this pattern.
                 let db = app_state.lock_db();
-                match db.get_segment_by_id(id) {
-                    Ok(Some(mut seg)) => {
-                        seg.normalized_transcript = Some(normalized.clone());
-                        // CRITICAL: Do NOT overwrite annotated_transcript here.
-                        // annotated_transcript is the human-corrected or LLM-refined
-                        // ground truth. Normalization only affects the normalized field.
-                        match db.insert_segment(&seg) {
-                            Ok(()) => true,
-                            Err(error) => {
-                                tracing::error!("Batch normalize DB update failed for {id}: {error}");
-                                false
-                            }
-                        }
-                    }
-                    Ok(None) => {
+                match db.update_normalized_transcript(id, normalized) {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        // The row no longer exists (deleted between prefetch and persist).
                         tracing::warn!("Batch normalize segment disappeared before update: {id}");
                         false
                     }
                     Err(error) => {
-                        tracing::error!("Batch normalize DB lookup failed before update for {id}: {error}");
+                        tracing::error!("Batch normalize DB update failed for {id}: {error}");
                         false
                     }
                 }

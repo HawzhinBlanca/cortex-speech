@@ -741,7 +741,6 @@ def test_commands_batch_normalize_reports_prefetch_and_update_failures() -> None
         '"file": id, "status": "failed", "operation": "normalize"',
         'tracing::error!("Batch normalize DB update failed for {id}: {error}")',
         'tracing::warn!("Batch normalize segment disappeared before update: {id}")',
-        'tracing::error!("Batch normalize DB lookup failed before update for {id}: {error}")',
         'tracing::error!("Batch normalize app state unavailable before update for {id}")',
     ]
     missing = [pattern for pattern in required if pattern not in commands]
@@ -1185,6 +1184,27 @@ def test_finish_import_clears_cancel_token_before_opening_the_gate() -> None:
                 f"{fn_name} opens the state gate BEFORE clearing the cancel token — a new operation can "
                 f"start in the window and lose its token (round-15 TOCTOU). Clear the token first."
             )
+
+
+def test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert() -> None:
+    """batch_normalize must persist normalized_transcript with the targeted single-column
+    update_normalized_transcript, NOT a read-modify-write + whole-row insert_segment upsert of a
+    re-read segment — the latter clobbers a concurrent write to the same segment that lands between
+    the re-read and the upsert (iter-88; the sibling batch commands verify/assign_speaker already use
+    targeted updates). Scoped to the batch_normalize function body."""
+    batch = (REPO_ROOT / "src-tauri" / "src" / "commands" / "batch.rs").read_text(encoding="utf-8")
+    marker = "pub fn batch_normalize("
+    start = batch.find(marker)
+    if start == -1:
+        raise AssertionError("batch_normalize not found — this gate would pass vacuously")
+    body = batch[start:]
+    if "insert_segment(" in body:
+        raise AssertionError(
+            "batch_normalize uses a whole-row insert_segment upsert — a concurrent write to the segment "
+            "can be clobbered; use the targeted db.update_normalized_transcript instead."
+        )
+    if "update_normalized_transcript(" not in body:
+        raise AssertionError("batch_normalize must persist via the targeted db.update_normalized_transcript")
 
 
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
@@ -1656,6 +1676,7 @@ def main() -> None:
     test_probe_wsl_7b_server_reaps_child_on_wait_error()
     test_aligner_score_consistency_caps_clip_and_dp()
     test_finish_import_clears_cancel_token_before_opening_the_gate()
+    test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()

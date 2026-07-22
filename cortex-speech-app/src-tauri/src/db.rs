@@ -577,6 +577,19 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Targeted single-column update: sets `normalized_transcript` (the normalized ASR draft) without
+    /// touching the human's answer (annotated_transcript / verdict) or any other field. Returns true
+    /// if the row was found and updated. Used by batch_normalize instead of a read-modify-write +
+    /// whole-row insert_segment upsert, which could clobber a concurrent write between the re-read and
+    /// the write (the anti-clobber discipline the sibling batch updates already follow).
+    pub fn update_normalized_transcript(&self, id: &str, normalized: &str) -> AppResult<bool> {
+        let rows = self.conn.execute(
+            "UPDATE speech_segments SET normalized_transcript = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![id, normalized],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn insert_segments_batch(&self, segments: &[SpeechSegment]) -> AppResult<()> {
         // Use a SAVEPOINT on the shared connection — avoids opening a second
         // file handle that could race with other writers under WAL mode.

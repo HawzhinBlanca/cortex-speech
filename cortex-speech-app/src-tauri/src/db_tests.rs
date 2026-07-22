@@ -21,6 +21,49 @@ fn make_segment(id: &str, audio_path: &str) -> SpeechSegment {
 }
 
 #[test]
+fn update_normalized_transcript_is_targeted_and_avoids_the_whole_row_clobber() {
+    // iter-88: batch_normalize used a read-modify-write + whole-row insert_segment upsert. A concurrent
+    // write to the SAME segment (e.g. a background aligner / 7B pass on the pipeline's own connection)
+    // landing between the re-read and the upsert was silently CLOBBERED. The targeted update writes
+    // ONLY normalized_transcript, so a concurrent edit to any other column survives.
+    let db = make_db();
+    let seg = make_segment("n1", "/a.wav");
+    db.insert_segment(&seg).unwrap();
+
+    // Snapshot the row as the OLD batch_normalize re-read it (annotated is None here).
+    let stale = db.get_segment_by_id("n1").unwrap().unwrap();
+    assert_eq!(stale.annotated_transcript, None);
+
+    // A concurrent human edit lands AFTER that snapshot (targeted write to a different column).
+    db.connection()
+        .execute("UPDATE speech_segments SET annotated_transcript = 'human fix' WHERE id = 'n1'", [])
+        .unwrap();
+
+    // NEW targeted path: writes ONLY normalized_transcript -> the concurrent edit SURVIVES.
+    assert!(db.update_normalized_transcript("n1", "NORMALIZED").unwrap(), "row found and updated");
+    let after = db.get_segment_by_id("n1").unwrap().unwrap();
+    assert_eq!(after.normalized_transcript.as_deref(), Some("NORMALIZED"));
+    assert_eq!(
+        after.annotated_transcript.as_deref(),
+        Some("human fix"),
+        "targeted update must not clobber a concurrent edit to another column"
+    );
+    // A missing row reports false, not an error.
+    assert!(!db.update_normalized_transcript("ghost", "x").unwrap());
+
+    // Contrast — the BUG the fix removes: the old whole-row upsert of the STALE snapshot wipes the
+    // concurrent edit back to None.
+    let mut whole_row = stale.clone();
+    whole_row.normalized_transcript = Some("NORMALIZED".to_string());
+    db.insert_segment(&whole_row).unwrap();
+    let clobbered = db.get_segment_by_id("n1").unwrap().unwrap();
+    assert_eq!(
+        clobbered.annotated_transcript, None,
+        "the whole-row upsert of the stale snapshot CLOBBERS the concurrent edit — what the targeted update avoids"
+    );
+}
+
+#[test]
 fn dropping_speech_segments_cascade_deletes_children_so_strict_recreate_needs_fk_off() {
     // Week-2's LAST open item is the STRICT conversion of speech_segments. SQLite cannot ALTER a
     // table to STRICT, so the only path is the recreate: new STRICT table -> copy -> DROP old ->
