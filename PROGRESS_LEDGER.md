@@ -7109,3 +7109,43 @@ Gate: fmt 0, clippy 0, **cargo test --lib 976 passed / 0 failed / 6 ignored**, *
 (incl. the new one; caught + fixed a bug in my own policy where a prose mention of the method name in the
 guard's comment shadowed the real call-site search). **Score: 59 fixed, ~22 refuted, 2 measure-deferred.**
 Owner-gated finish line unchanged.
+
+---
+
+## 2026-07-23T01:47Z — iter 100 — FRONTEND hunt (curation UI): 3 fixes (a7c23fe, 7d6dcc7, 33b4ea1), 2 refuted
+
+**Milestone iter 100. Pivoted off the well-drained backend (6 rounds) to the under-hunted frontend. 5 finders
+(ReviewMode / ReviewInbox / ValidationPanel / IPC layer / segment store), each hit by 3 diverse-lens
+refuters. IPC layer came back CLEAN. 5 findings: 3 confirmed, 2 refuted. Hand-verified each survivor against
+source myself.**
+
+**#1 ReviewMode.doRetranscribe (HIGH, wrong-segment gold corruption / THE ONE LAW; a7c23fe).** Captures
+seg=current, awaits the multi-second champion/finetuned ASR, then wrote editText/lastLoadedOriginal/draftModels
+unconditionally. Navigation is NOT blocked (go() + n/p/Arrow handlers lack a retranscribing guard), so a
+reviewer who presses `n` mid-flight is on clip B when A's call resolves — the editor for B is overwritten with
+A's MACHINE text, and Save & next persists it as B's human-verified gold. The DB/store write targets seg by id
+(correct, kept); guarded the CURRENT-editor writes with `if (current?.id !== seg.id) return;`.
+
+**#2 ReviewMode.go (MEDIUM, whole-row-clobber; 7d6dcc7).** The navigate-time draft persist guarded only
+!saving and spread `{...seg}` (pre-align row) into a WHOLE-ROW updateSegment incl. alignment_json. Editing +
+navigating while a clip's background CTC alignment is in flight can revert freshly-persisted CTC timings to
+heuristic. Every sibling mutator already bails on `aligning` + uses freshRow; go() now matches. (Latent on
+this machine — aligner currently missing → heuristic→heuristic — but real once a CTC aligner lands.)
+
+**#3 ReviewInbox.undo (MEDIUM, in-flight race; 33b4ea1).** undo() had no isSubmitting guard; Backspace during
+an in-flight accept/reject/edit/flag pops that action's just-pushed history entry and fires clearHumanDecision
+against the same id concurrently — losing the undo, and on a rejection double-popping the stack (drops a prior
+segment's entry). Added `if (isSubmitting) return;` matching the four mutators.
+
+New source-policy file scripts/test_frontend_review_guards.py (3 checks — the async races are not
+meaningfully unit-testable without a component-mount harness the project doesn't use); each fail-before
+verified. Refuted: ValidationPanel cross-tab teardown (3/3 — needs a delayed rejection that can't occur).
+
+**QUEUED for independent hand-verification next iter:** App.svelte handleNormalize (finding mis-filed as
+segmentStore.ts, refuted 2/3) — but the refutations leaned on that file-path red herring while the correctness
+refuter CONFIRMED a pre-await `{...seg}` whole-row spread into updateSegment — the known
+update-segment-whole-row-upsert clobber class. Worth checking myself, not trusting the shaky refutation.
+
+Gate (each fix, isolated): typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies**
+(incl. the new frontend one). **Score: 62 fixed, ~23 refuted, 2 measure-deferred, 1 queued.** Owner-gated
+finish line unchanged (exe rebuild activates all source-only fixes; real-audio e2e).
