@@ -124,12 +124,31 @@ def test_app_export_audio_excludes_human_rejected() -> None:
         raise AssertionError("handleExportAudio still filters raw s.verified; rejected clips leak into the export")
 
 
+def test_waveform_stretches_peaks_across_the_canvas() -> None:
+    """Waveform.draw() maps each bar to a FRACTIONAL slice of the fixed-length peak array so the peaks fill
+    the full canvas width. The old `samplesPerBar = max(1, floor(len/numBars))` with `startIdx =
+    i*samplesPerBar` mapped 1 sample:1 bar whenever numBars>len (any zoom>1 / a card wider than
+    ~len*barWidth px), cramming all peaks into the left strip while the ruler ticks, word-grid labels and
+    the amber playhead span the full width via (t/duration)*w — a playhead-vs-waveform misalignment that
+    misleads the reviewer inspecting word alignment (the exact purpose of the zoom slider)."""
+    src = _read("src/lib/Waveform.svelte")
+    if "Math.floor((i * waveform.length) / numBars)" not in src:
+        raise AssertionError(
+            "Waveform.draw() does not map bars fractionally across the peak array — a 1-sample:1-bar map "
+            "crams the waveform into the left while the playhead/labels span the full width. Use "
+            "`startIdx = Math.floor((i * waveform.length) / numBars)`."
+        )
+    if "const samplesPerBar = Math.max(1, Math.floor(waveform.length / numBars));" in src:
+        raise AssertionError("Waveform still uses the 1-sample:1-bar samplesPerBar clamp; peaks won't fill the width")
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
     test_inbox_undo_bails_while_a_decision_is_in_flight()
     test_app_normalize_uses_freshrow_not_a_stale_spread()
     test_app_export_audio_excludes_human_rejected()
+    test_waveform_stretches_peaks_across_the_canvas()
     print("frontend review-guard source policy passed")
 
 

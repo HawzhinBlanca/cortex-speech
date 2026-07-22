@@ -160,16 +160,21 @@
 
     // Waveform bars
     const numBars = Math.floor(w / (barWidth + barGap));
-    const samplesPerBar = Math.max(1, Math.floor(waveform.length / numBars));
     const midY = rulerHeight + (h - rulerHeight - labelHeight) / 2;
     const maxBarH = (h - rulerHeight - labelHeight) / 2 - 4;
 
     ctx.fillStyle = color;
     for (let i = 0; i < numBars; i++) {
-      const startIdx = i * samplesPerBar;
-      const endIdx = Math.min(startIdx + samplesPerBar, waveform.length);
+      // Map bar i to a FRACTIONAL slice of the fixed-length peak array so the peaks stretch across the
+      // FULL canvas width (upsampling when numBars > waveform.length — any zoom>1, or a card wider than
+      // ~waveform.length*barWidth px). The old `samplesPerBar = max(1, floor(len/numBars))` clamped to 1
+      // in that case, so bar i read sample i and all peaks crammed into the leftmost strip while the
+      // ruler ticks, word-grid labels, and the playhead all span the full width via (t/duration)*w —
+      // putting the waveform visibly out of registration with the playhead the reviewer reads.
+      const startIdx = Math.floor((i * waveform.length) / numBars);
+      const endIdx = Math.max(startIdx + 1, Math.floor(((i + 1) * waveform.length) / numBars));
       let peak = 0;
-      for (let j = startIdx; j < endIdx; j++) {
+      for (let j = startIdx; j < Math.min(endIdx, waveform.length); j++) {
         peak = Math.max(peak, Math.abs(waveform[j]));
       }
       peak = Math.min(peak, 1.0);
