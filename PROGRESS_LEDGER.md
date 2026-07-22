@@ -6621,3 +6621,30 @@ Gate: none needed (read-only audit; no code changed). **Score: 36 fixed, 5 refut
 (all hunt-3 modules + lib, chunking, cache, corrections, validation, significance, wer). The metric
 core being provably correct is the key confirmation for the project's honesty law. Owner-gated finish
 line unchanged — rebuild + real-audio pass.
+
+---
+
+## 2026-07-22T10:10Z — iter 85 — eval.rs orchestration hand-audited CLEAN; full measurement stack verified
+
+**Hand-audit of eval.rs (the metrics harness + gold-set construction). CLEAN, no defect — completes
+verification of the entire honesty-critical measurement pipeline.**
+- **run_gold_eval:** per-segment clamped WER/CER, macro = mean per-utterance rate over n, micro =
+  ratio-of-sums EXCLUDING empty-ref from both numerator and denominator (matches significance::rate and
+  the documented convention); a hypothesis for an unknown gold_id warns+skips. Correct.
+- **create_gold_from_verified_file:** reject-guard (a rejected chunk's audio is in the WAV but its text
+  is wrong) AND completeness-guard (an unreviewed chunk's speech is present but missing from the
+  reference → spurious insertions) both REFUSE the file — so no half-valid whole-file gold reference is
+  ever built. Reference = COALESCE(verdict ▸ annotated ▸ raw), deliberately NEVER normalized_transcript
+  (verbalized numbers would create an unbeatable WER penalty vs digit-emitting hypotheses). Order
+  created_at ASC, rowid ASC (documented same-second-batch tiebreaker). Correct.
+- **Consistency check verified:** METRICS_NORMALIZER has verbalize_numbers=false (keeps digits) +
+  remove_diacritics=true applied to BOTH ref and hyp — so the digit-form gold reference matches the
+  digit-emitting hypothesis with no asymmetric penalty. Internally consistent.
+
+**The full measurement stack is now hand-verified correct:** eval.rs (orchestration) + significance.rs
+(stats) + wer.rs (edit distance). This is the foundation the project's "one law: honesty" rests on.
+
+Gate: none needed (read-only audit). **Score: 36 fixed, 5 refuted, 2 measure-deferred; measurement
+stack (eval+significance+wer) verified clean.** In-sandbox high-value surface is now essentially
+exhausted — remaining un-audited surface is either workflow-scale (commands.rs core) or owner-gated
+(rebuild + real-audio). Owner-gated finish line unchanged.
