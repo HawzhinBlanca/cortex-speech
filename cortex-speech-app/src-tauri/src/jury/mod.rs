@@ -197,8 +197,13 @@ pub fn run_t0_gate(
 
     let all_hyps = db.get_all_hypotheses()?;
 
-    // We still need all verified segments to calibrate the conformal threshold.
-    let all_verified = db.get_segments(Some(true))?;
+    // We still need all verified segments to calibrate the conformal threshold. EXCLUDE human-rejected
+    // clips: a "mark bad" clip is verified=true (to leave the review queue) with its annotated_transcript
+    // intact, but the reviewer DISAVOWED it — calibrating the T0 auto-accept threshold against its
+    // (nonconformity score, committed-CER) contaminates the conformal coverage guarantee for the gate that
+    // decides auto-accept WITHOUT human review. Every export/gate path drops these via is_human_rejected.
+    let all_verified: Vec<_> =
+        db.get_segments(Some(true))?.into_iter().filter(|s| !crate::quality::is_human_rejected(s)).collect();
 
     // 2. Run IRT over all hypotheses. When ability-learning is enabled (opt-in, F7), warm-start the
     //    consensus from the persisted per-model abilities and persist the freshly-fit ones so the jury

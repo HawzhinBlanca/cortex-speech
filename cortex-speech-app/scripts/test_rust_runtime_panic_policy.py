@@ -1266,6 +1266,26 @@ def test_atomic_replace_post_swap_backup_cleanup_is_best_effort() -> None:
         raise AssertionError("atomic_file::replace_file post-swap backup cleanup must log its failure best-effort")
 
 
+def test_t0_calibration_excludes_human_rejected_from_the_conformal_set() -> None:
+    """The T0 auto-accept conformal threshold is calibrated over `all_verified` (jury/mod.rs). A human-
+    REJECTED clip is verified=true (set only to leave the review queue) with its annotated_transcript
+    intact, so without an is_human_rejected filter its (nonconformity score, committed-CER) contaminates
+    the per-SNR-bucket threshold that gates auto-accept WITHOUT human review — voiding the conformal
+    coverage guarantee. Every export/gate path drops these rows via is_human_rejected; the calibration set
+    must too. This is the 7th instance of the "rejected/empty counted as real" class and can't be
+    unit-injected cheaply (a full jury run), so it is source-pinned. Scoped to the all_verified statement."""
+    jury = (REPO_ROOT / "src-tauri" / "src" / "jury" / "mod.rs").read_text(encoding="utf-8")
+    idx = jury.find("let all_verified")
+    if idx == -1:
+        raise AssertionError("jury/mod.rs `all_verified` not found — this gate would pass vacuously")
+    stmt = jury[idx : jury.index(";", idx)]
+    if "is_human_rejected" not in stmt:
+        raise AssertionError(
+            "jury/mod.rs `all_verified` (the T0 conformal calibration set) must exclude is_human_rejected "
+            "clips — a mark-bad clip is verified=true and would contaminate the auto-accept threshold."
+        )
+
+
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
     pipeline = pipeline_surface()
     forbidden = [
@@ -1738,6 +1758,7 @@ def main() -> None:
     test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert()
     test_save_session_is_rate_limited()
     test_atomic_replace_post_swap_backup_cleanup_is_best_effort()
+    test_t0_calibration_excludes_human_rejected_from_the_conformal_set()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()
