@@ -1332,6 +1332,35 @@ def test_optin_transcribe_commands_reject_a_blank_decode() -> None:
             )
 
 
+def test_pipeline_wsl_retranscribe_rejects_an_empty_result() -> None:
+    """The in-pipeline WSL-7B branch of transcribe() is the twin of the opt-in transcribe commands guarded
+    above: run_wsl_segment_transcript returns Ok("") on a TRANSIENT empty result (server up but under load
+    — documented in-code, observed 1-of-3 under stress), so map_err(tag_7b_unavailable) does NOT catch it.
+    Without an explicit empty guard, update_asr_transcript_if_unreviewed(&id, "", ...) overwrites a good,
+    unverified stored transcript with "" — silent data loss on both re-transcribe entry points (per-segment
+    IPC + batch_transcribe), unlike the import path which retries/escalates. The branch must reject an empty
+    raw_transcript (return a tagged 7B-unavailable Err) BEFORE the DB write. transcribe() needs the WSL
+    server + audio + DB, so it is not unit-injectable — source-pinned."""
+    pipeline = pipeline_surface()
+    anchor = "self.run_wsl_segment_transcript(&id, cancel).map_err(tag_7b_unavailable)?;"
+    start = pipeline.find(anchor)
+    if start == -1:
+        raise AssertionError("run_wsl_segment_transcript call not found — this gate would pass vacuously")
+    # Match the METHOD CALL (`.update_asr_transcript_if_unreviewed(`), not a prose mention of the name in
+    # the guard's own comment — otherwise the search lands on the comment and excludes the guard below it.
+    write = pipeline.find(".update_asr_transcript_if_unreviewed(", start)
+    if write == -1:
+        raise AssertionError("update_asr_transcript_if_unreviewed call not found after the WSL call — gate vacuous")
+    between = pipeline[start:write]
+    if "raw_transcript.trim().is_empty()" not in between or "return Err(tag_7b_unavailable(" not in between:
+        raise AssertionError(
+            "transcribe()'s WSL-7B branch writes raw_transcript without an empty guard between the "
+            "run_wsl_segment_transcript call and update_asr_transcript_if_unreviewed — a transient empty 7B "
+            "result (Ok(\"\")) would overwrite a good stored transcript with a blank. Reject an empty "
+            "raw_transcript with a tagged 7B-unavailable Err before the write."
+        )
+
+
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
     pipeline = pipeline_surface()
     forbidden = [
@@ -1807,6 +1836,7 @@ def main() -> None:
     test_t0_calibration_excludes_human_rejected_from_the_conformal_set()
     test_run_t2_for_segment_respects_the_autonomy_dial()
     test_optin_transcribe_commands_reject_a_blank_decode()
+    test_pipeline_wsl_retranscribe_rejects_an_empty_result()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()

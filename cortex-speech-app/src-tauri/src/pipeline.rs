@@ -2699,6 +2699,19 @@ impl ProcessingPipeline {
                 let (raw_transcript, confidence) =
                     self.run_wsl_segment_transcript(&id, cancel).map_err(tag_7b_unavailable)?;
 
+                // A TRANSIENT empty 7B result (server up but under load) comes back as Ok("") — NOT an Err
+                // — so the map_err(tag_7b_unavailable) above does not catch it. Do not let it fall through
+                // to the write below: update_asr_transcript_if_unreviewed would replace a good, unverified
+                // stored transcript with "" (silent data loss). Both re-transcribe entry points route
+                // through here (batch_transcribe + the per-segment transcribe IPC) with no retry, unlike
+                // the import path which retries/escalates for exactly this transient. Surface it as the
+                // retry-or-offline 7B failure the tag above promises, leaving the existing transcript intact.
+                if raw_transcript.trim().is_empty() {
+                    return Err(tag_7b_unavailable(AppError::Other(
+                        "WSL 7B returned an empty transcript (the server is likely under load); the existing transcript is left unchanged".into(),
+                    )));
+                }
+
                 let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
 
                 let normalized_transcript = if self.settings.auto_normalize && !raw_transcript.is_empty() {
