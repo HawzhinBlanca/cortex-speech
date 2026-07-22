@@ -6331,3 +6331,34 @@ Gate: fmt 0, clippy 0, **945 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 21 fixed, 5 refuted, 2 measure-deferred, 14 findings left** (next: snapshot trio —
 snapshot.rs:158 partial-backup counted real; snapshot.rs:262 off-drive tree unpinned during
 quarantine; snapshot.rs:83 same-second pin collision). Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-21T21:05Z — iter 74 — snapshot durability trio fixed (commit 3160add); 11 findings left
+
+**Hunt-3 #5 + #6 + #7 (all medium) hand-verified and FIXED as one logical change — snapshot
+durability.** All three confirmed against source:
+- **#5 partial-snapshot-counted-real:** a failed db.backup left a `snapshot_<ts>` dir with a partial
+  DB that counted as real in has_any_snapshot (arming the empty-DB guard against a legit first
+  snapshot), the prune keep-set (evicting a good older snapshot), and the quarantine cap. Now built
+  in a `.staging_` dir + atomic rename: a `snapshot_<ts>`/`<label>_<ts>` name only ever refers to a
+  fully-built dir; failures clean up staging; crash residue is swept next run.
+- **#7 same-second pinned collision:** two same-label pins in one wall-clock second → create_dir_all
+  succeeded on the existing dir and db.backup OVERWROTE the previous pin's database. Now promotes
+  under the first FREE timestamped name.
+- **#6 off-drive tree unpinned:** the prune-pin/cap inspected the tree's OWN parent for *.corrupt.*;
+  the off-drive second-dir backup's parent never holds them, so its pre-corruption history rotated
+  out during quarantine. Quarantine dir now threaded from lib.rs (primary data dir) to both trees.
+
+Signatures preserved (take_snapshot, prune_snapshots infer parent); new
+take_snapshot_with_quarantine_source / prune_snapshots_from take it explicitly. take_snapshot_at
+gated #[cfg(test)] (production routes through _from).
+
+**Fail-before/pass-after verified for all three** by reverting ONLY that leg (free-name loop →
+fixed; quarantine source → own-parent; staging build → direct in-place write) — each turns its test
+red, restore turns it green.
+
+Gate: fmt 0, clippy 0, **948 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 24 fixed, 5 refuted, 2 measure-deferred, 11 findings left** (next: registry.rs:523
+stale-baseline promotion; registry.rs:109 error-masking; scorecard.rs:270/279 empty-ref gate holes).
+Owner-gated legs unchanged (OWNER_HANDOFF.md).
