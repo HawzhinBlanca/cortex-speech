@@ -2065,8 +2065,14 @@ impl Database {
         let mut bucket_counts = [0i64; crate::quality::conformal::N_SNR_BUCKETS];
         {
             let mut stmt = self.conn.prepare(
+                // Exclude human-REJECTED clips: "mark bad" sets verified=1 (to leave the review queue) with
+                // human_decision='reject'/verdict='human_reject' while keeping annotated_transcript, so
+                // without this guard a discarded clip counts as a "verified-with-reference" calibration
+                // sample — overstating C3 progress toward T0 auto-accept. Matches quality::is_human_rejected,
+                // which every export/gate path uses to drop these rows.
                 "SELECT snr_db FROM speech_segments
-                 WHERE verified = 1 AND annotated_transcript IS NOT NULL AND TRIM(annotated_transcript) != ''",
+                 WHERE verified = 1 AND annotated_transcript IS NOT NULL AND TRIM(annotated_transcript) != ''
+                   AND NOT (COALESCE(human_decision,'') IN ('reject','human_reject') OR COALESCE(verdict,'') = 'human_reject')",
             )?;
             let rows = stmt.query_map([], |row| row.get::<_, Option<f64>>(0))?;
             for snr in rows {

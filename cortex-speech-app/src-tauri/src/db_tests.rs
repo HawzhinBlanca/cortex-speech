@@ -2072,6 +2072,38 @@ fn shadow_metrics_count_distinct_segments_not_observations() {
     assert_eq!(after["loop0Shadow"]["totalObservations"], 1);
 }
 
+#[test]
+fn c3_calibration_count_excludes_human_rejected_verified_clips() {
+    // A "mark bad" clip is verified=1 with human_decision='reject'/verdict='human_reject' and its
+    // annotated_transcript intact. The C3 conformal-calibration progress count (verifiedWithReference)
+    // must EXCLUDE it — matching is_human_rejected / export_dataset — or it overstates how close the user
+    // is to the T0 auto-accept threshold by counting discarded bad-audio clips as calibration samples.
+    let db = make_db();
+    let mut good = make_segment("cal-good", "/audio/cg.wav");
+    good.verified = true;
+    good.annotated_transcript = Some("دەقی باش".to_string());
+    good.snr_db = Some(20.0);
+    db.insert_segment(&good).unwrap();
+    let mut bad = make_segment("cal-bad", "/audio/cb.wav");
+    bad.verified = true;
+    bad.annotated_transcript = Some("دەقی خراپ".to_string());
+    bad.snr_db = Some(20.0);
+    db.insert_segment(&bad).unwrap();
+    // markBad keeps verified=true and sets the reject decision.
+    db.conn
+        .execute("UPDATE speech_segments SET human_decision='reject', verdict='human_reject' WHERE id='cal-bad'", [])
+        .unwrap();
+
+    let report = db.intelligence_report().unwrap();
+    let total: i64 = report["conformalCalibration"]["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["verifiedWithReference"].as_i64().unwrap())
+        .sum();
+    assert_eq!(total, 1, "only the accepted verified-with-reference clip counts; the rejected one is excluded");
+}
+
 // ── Durable jobs accessors (migration v37 + crate::jobs) ──
 use crate::jobs::JobState;
 
