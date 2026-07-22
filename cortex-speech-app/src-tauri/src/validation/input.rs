@@ -54,10 +54,16 @@ pub fn validate_identifier(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate that a string is a safe text value with reasonable length.
+/// Validate that a string is a safe text value with a reasonable length, measured in CHARACTERS.
 pub fn validate_text(s: &str, max_len: usize, field_name: &str) -> Result<(), String> {
-    if s.len() > max_len {
-        return Err(format!("{field_name} too long (max {max_len} chars, got {})", s.len()));
+    // Count characters, not bytes: the limit is stated in chars, and Sorani (the app's primary
+    // language) is ~2 bytes/char in UTF-8, so a byte check rejected valid Kurdish text at roughly half
+    // the advertised budget AND the error mislabeled the byte count as "chars". chars().count() is
+    // O(n), fine for a one-shot boundary check; the effective byte ceiling stays bounded (max_len × 4
+    // for the widest codepoints).
+    let chars = s.chars().count();
+    if chars > max_len {
+        return Err(format!("{field_name} too long (max {max_len} chars, got {chars})"));
     }
     Ok(())
 }
@@ -113,6 +119,19 @@ mod tests {
     fn test_validate_text() {
         assert!(validate_text("hello", 100, "test").is_ok());
         assert!(validate_text("hello", 3, "test").is_err());
+    }
+
+    #[test]
+    fn validate_text_counts_characters_not_bytes() {
+        // Sorani letters are multi-byte in UTF-8; the limit is stated in CHARS, so a Kurdish string AT
+        // the char limit must pass even though its byte length exceeds it, and the error must report
+        // the char count (not the byte count it used to leak).
+        let three_sorani = "ککک"; // 3 chars, 6 bytes
+        assert_eq!(three_sorani.chars().count(), 3);
+        assert!(three_sorani.len() > 3, "precondition: byte length exceeds the char count");
+        assert!(validate_text(three_sorani, 3, "t").is_ok(), "3 chars must pass a 3-char limit");
+        let err = validate_text(three_sorani, 2, "t").expect_err("3 chars must fail a 2-char limit");
+        assert!(err.contains("got 3"), "error must report the CHAR count, not bytes: {err}");
     }
 
     #[test]
