@@ -6530,3 +6530,27 @@ start_cancel_token overwrites so it needs no reuse-guard); no production unwrap/
 Gate: fmt 0, clippy 0, **957 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 35 fixed, 5 refuted, 2 measure-deferred.** Backend audit coverage now +lib.rs. Owner-gated
 legs unchanged (OWNER_HANDOFF.md) — the finish line still needs the exe rebuild + real-audio pass.
+
+---
+
+## 2026-07-22T08:30Z — iter 81 — chunking.rs + cache.rs hand-audited CLEAN; invalidate coverage gap closed (commit e666aac)
+
+**Inline hand-audit of two never-hunt-covered modules — both sound, NO production defect (honest
+negative).**
+- **chunking.rs:** slice_pcm_by_alignment guards `end <= start` before the slice (out-of-range
+  start_ms errors, never panics; u32-overflow rejected); split_oversized/silence_aware/absorb_short
+  and find_quietest_cut all clamp to pcm.len()/total_len; boundary-stitch
+  `prev_norm[len-k..]==next_norm[..k]` bounds-safe (max_k <= both lens). No defect.
+- **cache.rs:** eviction fires only on a genuinely-new key, drops oldest-by-created_at; poison
+  recovery present; invalidate's 64-char-hash prefix match is collision-free (fixed-length blake3).
+  No defect — but invalidate() had NO test.
+
+Closed that coverage gap: invalidate_removes_every_entry_for_one_audio_and_keeps_others pins that
+invalidate drops EVERY key for one audio hash (all models + chunk suffixes) and leaves unrelated
+audio intact. **Fail-before verified** (no-op invalidate reds it). Not framed as a fix — it's a
+coverage test on already-correct behavior.
+
+Gate: fmt 0, clippy 0, **958 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 35 fixed, 5 refuted, 2 measure-deferred; +2 modules hand-audited clean (chunking, cache).**
+The heavily pre-hardened utility modules (Round-22/23/true-10 audited) show low residual defect
+density. Owner-gated legs unchanged — the finish line still needs the exe rebuild + real-audio pass.
