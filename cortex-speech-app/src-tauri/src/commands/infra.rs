@@ -120,6 +120,12 @@ pub fn save_session(
     filter_verified: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // Throttle like every other infra.rs command: save_session is a webview-reachable DB write taken
+    // under the GLOBAL db lock, and it was the lone one here without a limiter. The frontend debounces
+    // it to ~1/800ms, so this never rejects a legitimate save — it only stops a webview loop that
+    // bypasses the debounce from pinning the db lock and starving get_segments et al. (same class as
+    // export_audio round-22 #5 / register_media_asset round-25 #7).
+    RATE_LIMITER.check("save_session")?;
     validate::validate_text(&search_query, 1000, "search_query")?;
     validate::validate_text(&sort_order, 64, "sort_order")?;
     let db = state.lock_db();

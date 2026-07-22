@@ -1207,6 +1207,32 @@ def test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert() -> None
         raise AssertionError("batch_normalize must persist via the targeted db.update_normalized_transcript")
 
 
+def test_save_session_is_rate_limited() -> None:
+    """save_session is a webview-reachable WRITE — a DB session upsert taken under the GLOBAL db lock —
+    so, like every other IPC command in infra.rs, it must throttle through the rate limiter. The
+    frontend debounces it to ~1/800ms (so this never rejects a legitimate save), but without a limiter a
+    webview loop that bypasses that debounce can pin the db lock and starve get_segments et al. (same
+    'lone command missing a rate-limiter, a local DoS gap' class as export_audio round-22 #5 /
+    register_media_asset round-25 #7). Scoped to the save_session function body — the next command
+    (restore_session) has its OWN check that would otherwise satisfy this gate vacuously."""
+    infra = (REPO_ROOT / "src-tauri" / "src" / "commands" / "infra.rs").read_text(encoding="utf-8")
+    marker = "pub fn save_session("
+    start = infra.find(marker)
+    if start == -1:
+        raise AssertionError("save_session not found — this gate would pass vacuously")
+    rest = infra[start:]
+    nxt = rest.find("#[tauri::command]")
+    body = rest if nxt == -1 else rest[:nxt]
+    # A STRICT_RATE_LIMITER.check("save_session") superstring would satisfy this too (either limiter is
+    # acceptable throttling); the substring match accepts both.
+    if 'RATE_LIMITER.check("save_session")' not in body:
+        raise AssertionError(
+            'save_session must throttle through RATE_LIMITER.check("save_session") — it is a '
+            "webview-reachable DB write under the global db lock and was the lone infra.rs command "
+            "without a rate limiter (local DoS gap)."
+        )
+
+
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
     pipeline = pipeline_surface()
     forbidden = [
@@ -1677,6 +1703,7 @@ def main() -> None:
     test_aligner_score_consistency_caps_clip_and_dp()
     test_finish_import_clears_cancel_token_before_opening_the_gate()
     test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert()
+    test_save_session_is_rate_limited()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()
