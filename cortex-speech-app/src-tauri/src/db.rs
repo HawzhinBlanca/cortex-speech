@@ -2496,7 +2496,18 @@ impl Database {
         // independently confirmed correction bumps hit_count instead of inserting a duplicate.
         if is_gold == 0 {
             if let (Some(wrong), Some(fix)) = (wrong_side.as_deref(), corrected_transcript) {
+                // Dedup within THIS one correction by natural key. hit_count tracks INDEPENDENT
+                // (cross-segment) confirmations — the anti-one-off guard (min_hits). A single edit that
+                // repeats the SAME confusion in one sentence (e.g. a doubled phrase) yields duplicate
+                // memories; without deduping, the first occurrence INSERTs the row and the second UPDATEs
+                // the row just inserted, so ONE edit on ONE segment fakes a second confirmation
+                // (hit_count 1). Count each distinct confusion in a correction exactly once.
+                let mut seen_keys: std::collections::HashSet<(String, String, String)> =
+                    std::collections::HashSet::new();
                 for mem in crate::corrections::extract_substitution_memories(wrong, fix) {
+                    if !seen_keys.insert((mem.slot_key.clone(), mem.wrong_token.clone(), mem.human_token.clone())) {
+                        continue;
+                    }
                     let bumped = tx.execute(
                         "UPDATE correction_memory SET hit_count = hit_count + 1
                          WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3",

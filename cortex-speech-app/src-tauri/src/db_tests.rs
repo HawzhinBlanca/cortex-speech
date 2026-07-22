@@ -1393,6 +1393,32 @@ fn repeated_correction_bumps_hit_count_not_duplicates() {
 }
 
 #[test]
+fn a_single_edit_repeating_one_confusion_counts_as_one_capture_not_a_confirmation() {
+    // hit_count tracks INDEPENDENT (cross-segment) confirmations — the anti-one-off guard. A SINGLE edit
+    // on a SINGLE segment whose sentence repeats the same confusion ("باش"→"خراپ" twice) must capture ONE
+    // memory at hit_count 0 (a fresh capture), NOT hit_count 1 — otherwise a lone self-repeating edit fakes
+    // a second confirmation and can clear min_hits on its own. (Regression for the within-correction
+    // duplicate double-count.)
+    let db = make_db();
+    let mut seg = make_segment("mem-rep", "/data/audio/mem-rep.wav");
+    seg.raw_transcript = "ئەو باش بوو ئەو باش بوو".to_string();
+    db.insert_segment(&seg).expect("insert");
+    db.record_human_decision("mem-rep", "edit", Some("ئەو خراپ بوو ئەو خراپ بوو"), None).expect("edit");
+
+    let (rows, max_hits): (i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MAX(hit_count), 0) FROM correction_memory
+                 WHERE wrong_token = 'باش' AND human_token = 'خراپ'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("query");
+    assert_eq!(rows, 1, "a repeated confusion in ONE edit must capture a single memory, not duplicate");
+    assert_eq!(max_hits, 0, "one edit is one capture (hit_count 0), never a self-made 'independent' confirmation");
+}
+
+#[test]
 fn gold_edit_does_not_populate_correction_memory() {
     let db = make_db();
     let mut seg = make_segment("mem-gold", "/data/audio/mem-gold.wav");
