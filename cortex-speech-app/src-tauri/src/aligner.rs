@@ -2,6 +2,14 @@ use ort::value::Tensor;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Max clip length (seconds) fed through the ONNX aligner forward pass. Activations scale with
+/// length; above this we degrade to the energy heuristic (align) or the neutral score
+/// (score_consistency) instead of risking an OOM abort. 10 min is far above any real segment.
+const MAX_ALIGN_SECS: usize = 600;
+/// Max cells (frames × states) for the CTC forward/Viterbi DP — bounds the multi-GB matrix
+/// allocation a whole-recording clip against a long transcript would otherwise attempt.
+const MAX_VITERBI_CELLS: usize = 50_000_000;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WordTimestamp {
     pub word: String,
@@ -113,9 +121,8 @@ impl ForcedAligner {
         }
         // Duration guard: the whole clip goes through one ONNX forward pass (activations scale with
         // length) and then the Viterbi DP. The fine-tuned path caps at 15 s; this bundled path had NO
-        // cap, so aligning a whole recording (alignment_json=None) could exhaust memory. 10 minutes is
-        // far above any real segment while keeping the worst-case forward pass + DP bounded.
-        const MAX_ALIGN_SECS: usize = 600;
+        // cap, so aligning a whole recording (alignment_json=None) could exhaust memory. See
+        // MAX_ALIGN_SECS (module const, shared with score_consistency).
         if pcm.len() > MAX_ALIGN_SECS * sample_rate as usize {
             tracing::warn!(
                 pcm_seconds = pcm.len() / sample_rate.max(1) as usize,
@@ -187,8 +194,22 @@ impl ForcedAligner {
         }
     }
 
-    pub fn score_consistency(&self, pcm: &[i16], _sample_rate: u32, text: &str) -> Result<f64, String> {
+    pub fn score_consistency(&self, pcm: &[i16], sample_rate: u32, text: &str) -> Result<f64, String> {
         if self.session.is_none() || text.trim().is_empty() || pcm.is_empty() {
+            return Ok(-5.0);
+        }
+
+        // Duration cap (round-24 hunt #17): mirror align()'s MAX_ALIGN_SECS. Without it, a
+        // whole-recording segment (alignment_json=None → slice_pcm_by_alignment returns the ENTIRE
+        // file) runs an uncapped ONNX forward pass and then a num_frames × num_states forward-backward
+        // allocation (multi-GB), OOM-aborting the acoustic-scoring worker. align() degrades to the
+        // energy heuristic above the cap; the scoring path returns the neutral low score it already
+        // uses for every other degenerate input, so a too-long clip is scored conservatively, not fatal.
+        if pcm.len() > MAX_ALIGN_SECS * sample_rate.max(1) as usize {
+            tracing::warn!(
+                pcm_seconds = pcm.len() / sample_rate.max(1) as usize,
+                "score_consistency: clip longer than {MAX_ALIGN_SECS}s cap — neutral low score"
+            );
             return Ok(-5.0);
         }
 
@@ -258,6 +279,20 @@ impl ForcedAligner {
         }
 
         if target_tokens.is_empty() {
+            return Ok(-5.0);
+        }
+
+        // Cells cap (round-24 hunt #17): the forward-backward allocates num_frames × num_states f32
+        // matrices. Even under the duration cap, a very long transcript inflates num_states; bound the
+        // product exactly like ctc_logits_to_word_timestamps' Viterbi DP and score conservatively past it.
+        let num_frames = output_shape[1] as usize;
+        let num_states = 2 * target_tokens.len() + 1;
+        if num_frames.saturating_mul(num_states) > MAX_VITERBI_CELLS {
+            tracing::warn!(
+                num_frames,
+                num_states,
+                "score_consistency: DP too large (> {MAX_VITERBI_CELLS} cells) — neutral low score"
+            );
             return Ok(-5.0);
         }
 
@@ -430,9 +465,8 @@ pub fn ctc_logits_to_word_timestamps(
     // Memory guard: the Viterbi DP below allocates num_frames x (2*targets+1) cells at 12 bytes each
     // (f32 dp + usize backtrack). Nothing upstream bounds the clip (the align IPC accepts a whole
     // file with alignment_json=None and up to 100k chars of text), so a 30-minute clip against a long
-    // transcript would attempt a ~58 GB allocation and abort the process. Cap the DP at ~600 MB and
-    // degrade honestly to the energy heuristic instead of dying.
-    const MAX_VITERBI_CELLS: usize = 50_000_000;
+    // transcript would attempt a ~58 GB allocation and abort the process. Cap the DP (MAX_VITERBI_CELLS,
+    // module const) and degrade honestly to the energy heuristic instead of dying.
     let num_states = 2 * target_tokens.len() + 1;
     if num_frames.saturating_mul(num_states) > MAX_VITERBI_CELLS {
         tracing::warn!(
@@ -471,8 +505,13 @@ pub fn ctc_logits_to_word_timestamps(
         }
     }
 
+    // The clip's own duration in seconds — the hard upper bound for EVERY word boundary. Fabricated
+    // timings for unalignable words (below) must never exceed it.
+    let clip_duration = num_frames as f64 * frame_sec;
+
     let mut word_timestamps = Vec::new();
     let mut aligned_chars = 0usize;
+    let mut aligned_words = 0usize;
     for (word_idx, &word) in words.iter().enumerate() {
         let char_indices = &word_char_to_token_idx[word_idx];
         let mut word_start_frame = usize::MAX;
@@ -489,13 +528,21 @@ pub fn ctc_logits_to_word_timestamps(
                 }
             }
         }
+        let word_really_aligned = word_start_frame != usize::MAX && word_end_frame > word_start_frame;
+        if word_really_aligned {
+            aligned_words += 1;
+        }
         // Enforce monotonicity: a word never starts before the previous one ended (mis-aligned chars
-        // could otherwise jump backwards and break the karaoke highlight / word-tap seeks).
+        // could otherwise jump backwards and break the karaoke highlight / word-tap seeks). Clamp BOTH
+        // ends to the clip duration (round-24 hunt #16): an unalignable word gets a fabricated
+        // `start + 0.25`, and a run of trailing unalignable words (Latin/numeric tokens) chained past
+        // the clip end, producing out-of-range ctc_forced timestamps exported into the dataset and
+        // driving word-tap seeks beyond the audio.
         let prev_end = word_timestamps.last().map(|w: &WordTimestamp| w.end).unwrap_or(0.0);
         let raw_start = if word_start_frame != usize::MAX { word_start_frame as f64 * frame_sec } else { prev_end };
-        let start_time = raw_start.max(prev_end);
+        let start_time = raw_start.max(prev_end).min(clip_duration);
         let raw_end = if word_end_frame > 0 { word_end_frame as f64 * frame_sec } else { start_time + 0.25 };
-        let end_time = raw_end.max(start_time + frame_sec);
+        let end_time = raw_end.max(start_time + frame_sec).min(clip_duration).max(start_time);
         // REAL per-word confidence = mean of the model's frame certainty (max softmax prob) over the
         // word's aligned frames, NOT a hardcoded constant — so the review UI's low-confidence highlight
         // actually fires on doubtful words. A word that never aligned gets a low default.
@@ -510,11 +557,13 @@ pub fn ctc_logits_to_word_timestamps(
         };
         word_timestamps.push(WordTimestamp { word: word.to_string(), start: start_time, end: end_time, confidence });
     }
-    // If NOT A SINGLE character aligned to a real frame range, the forced path is degenerate (e.g. the
-    // transcript has more characters than the model emitted frames) — return None so the caller falls
-    // back to the honest energy heuristic instead of stamping fabricated even-spaced timings as
-    // ctc_forced at high confidence.
-    if aligned_chars == 0 {
+    // Degenerate-alignment guard (round-24 hunt #16): CtcForced is a provenance promise that the
+    // timings came from real CTC forced alignment. If fewer than HALF the words got a real frame
+    // boundary — a heavily mixed-script/numeric transcript where one Kurdish word aligns and the rest
+    // are fabricated prev_end+0.25 chained timings — the output is mostly invented, so return None and
+    // let the caller record the honest EnergyHeuristic provenance (which at least distributes ALL words
+    // by audio energy) instead of stamping ~majority-fabricated timings as ctc_forced.
+    if aligned_chars == 0 || aligned_words * 2 < words.len() {
         return None;
     }
     Some(word_timestamps)
@@ -806,6 +855,57 @@ mod tests {
         assert!(
             ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 0, "abcabc", 0.02).is_none(),
             "transcript longer than frames"
+        );
+    }
+
+    #[test]
+    fn fabricated_word_timestamps_are_clamped_to_the_clip_duration() {
+        // Round-24 hunt #16: an unalignable trailing word (a char outside the vocab) gets a fabricated
+        // `start + 0.25`. With the last aligned word ending at the clip's final frame, that fabricated
+        // end used to run PAST the audio (out-of-range ctc_forced timestamps exported + word-tap seeks
+        // beyond the clip). It must be clamped to the clip duration.
+        let tokens: Vec<String> = ["<pad>", "a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        #[rustfmt::skip]
+        let logits = vec![
+            10.0, 0.0, 0.0, 0.0, // f0 blank
+            10.0, 0.0, 0.0, 0.0, // f1 blank
+            10.0, 0.0, 0.0, 0.0, // f2 blank
+            0.0, 10.0, 0.0, 0.0, // f3 -> a (aligns at the very end of the clip)
+        ];
+        let clip = 4.0 * 0.02; // num_frames * frame_sec = 0.08 s
+                               // "a z": "a" aligns near the clip end; "z" is unalignable -> fabricated start+0.25 (~0.33 s).
+        let out = ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 0, "a z", 0.02).expect("alignment");
+        assert_eq!(out.len(), 2);
+        for w in &out {
+            assert!(w.start <= clip + 1e-9, "word '{}' start {} exceeds clip duration {}", w.word, w.start, clip);
+            assert!(w.end <= clip + 1e-9, "word '{}' end {} exceeds clip duration {}", w.word, w.end, clip);
+            assert!(w.end >= w.start, "word '{}' end before start", w.word);
+        }
+    }
+
+    #[test]
+    fn majority_fabricated_alignment_degrades_instead_of_stamping_ctc_forced() {
+        // Round-24 hunt #16: CtcForced promises real CTC timings. One aligned word among many
+        // unalignable ones (mixed-script/numeric transcript) is mostly fabricated prev_end+0.25 chained
+        // timings; fewer than half the words really aligned must return None so the caller records the
+        // honest EnergyHeuristic provenance instead of ctc_forced.
+        let tokens: Vec<String> = ["<pad>", "a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        #[rustfmt::skip]
+        let logits = vec![
+            0.0, 10.0, 0.0, 0.0, // f0 -> a
+            10.0, 0.0, 0.0, 0.0, // f1 blank
+            10.0, 0.0, 0.0, 0.0, // f2 blank
+            10.0, 0.0, 0.0, 0.0, // f3 blank
+        ];
+        // "a" aligns; four "z" words do not -> 1/5 words real -> below the half threshold -> None.
+        assert!(
+            ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 0, "a z z z z", 0.02).is_none(),
+            "majority-fabricated alignment must degrade to the energy heuristic, not stamp ctc_forced"
+        );
+        // Exactly half aligned ("a z") is still accepted as CtcForced.
+        assert!(
+            ctc_logits_to_word_timestamps(&logits, 4, 4, &tokens, 0, "a z", 0.02).is_some(),
+            "half the words aligned -> still a real CTC alignment"
         );
     }
 

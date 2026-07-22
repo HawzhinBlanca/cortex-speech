@@ -1130,6 +1130,34 @@ def test_probe_wsl_7b_server_reaps_child_on_wait_error() -> None:
         )
 
 
+def test_aligner_score_consistency_caps_clip_and_dp() -> None:
+    """score_consistency runs the ONNX forward pass + a num_frames×num_states forward-backward on the
+    WHOLE clip (a whole-recording segment reaches it via slice_pcm_by_alignment's None fallback).
+    Without align()'s MAX_ALIGN_SECS duration cap AND a MAX_VITERBI_CELLS DP cap it OOM-aborts the
+    scoring worker (round-24 hunt #17). This path needs the real ONNX model so it is not
+    unit-testable; guard the two caps at the source. Scoped to the score_consistency function body."""
+    aligner = (REPO_ROOT / "src-tauri" / "src" / "aligner.rs").read_text(encoding="utf-8")
+    marker = "pub fn score_consistency("
+    start = aligner.find(marker)
+    if start == -1:
+        raise AssertionError("score_consistency not found — this gate would pass vacuously")
+    rest = aligner[start + len(marker):]
+    # score_consistency is the last method in the impl, so scope to its OWN closing brace: the first
+    # 4-space-indented `}` (inner blocks close at deeper indentation), not the next fn (the fns that
+    # follow are module-level `fn`, which a `\n    fn ` marker would miss — the body would then bleed
+    # into ctc_logits_to_word_timestamps and inherit its MAX_VITERBI_CELLS).
+    end = rest.find("\n    }")
+    body = rest if end == -1 else rest[:end]
+    required = [
+        "MAX_ALIGN_SECS",  # duration cap before the ONNX forward pass
+        "MAX_VITERBI_CELLS",  # DP cell cap before forward_backward_ctc_score
+    ]
+    missing = [pattern for pattern in required if pattern not in body]
+    if missing:
+        formatted = "\n".join(f"- {entry}" for entry in missing)
+        raise AssertionError(f"score_consistency must cap clip duration AND DP size before running:\n{formatted}")
+
+
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
     pipeline = pipeline_surface()
     forbidden = [
@@ -1597,6 +1625,7 @@ def main() -> None:
     test_audio_decode_worker_send_failures_are_reported()
     test_pipeline_wsl_subprocess_send_failures_are_reported()
     test_probe_wsl_7b_server_reaps_child_on_wait_error()
+    test_aligner_score_consistency_caps_clip_and_dp()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()
