@@ -6973,3 +6973,42 @@ Gate: fmt 0, clippy 0, **cargo test --lib 972 passed / 0 failed / 6 ignored**, *
 frontend typecheck 0 + vitest 201. **Score: 50 fixed, ~17 refuted, 2 measure-deferred.** Six total instances
 of this class fixed (runs/export_bundle/quality/stats/eval/db) — worth a standing coverage note. Owner-gated
 finish line unchanged (exe rebuild + real-audio pass).
+
+---
+
+## 2026-07-22T22:58Z — iter 96 — ultracode round 4 (jury sub-judges + IPC slices): 4 fixes (ec654c7, 8c91fa8, d60e72e)
+
+**General adversarial hunt over 12 un-hunted modules (jury sub-judges, command IPC slices, 2nd-look
+targets); 10 candidates → 4 CONFIRMED. In parallel I hand-audited corrections firing/outcome + audio_quality
+(both clean).**
+
+**#1 jury/t2_listener.rs (MEDIUM→honesty; hand-found → ec654c7).** sample_from_json CLAMPED the judge's
+self-reported confidence to [0,1], so a percentage-scale value (92) became 1.0 (MAX) and sailed through the
+>= 0.85 SILVER training-promotion gate — the exact failure the guard's own comment claims it prevents; the
+existing test even asserted the buggy 92->1.0. Map out-of-[0,1]/non-finite to 0.0 (untrusted). Corrected the
+self-contradictory test. Fail-before verified.
+
+**#2 jury/mod.rs (HIGH, honesty; workflow 3/3 on sibling → 8c91fa8).** The T0 auto-accept conformal
+calibration set (all_verified = get_segments(true)) included human-REJECTED clips (verified=true), feeding
+their disavowed-draft CER as ground truth — a fabricated (often CER=0) calibration point that loosens the
+auto-accept threshold beyond its certified coverage. 7th instance of the count-honesty class. Filter
+!is_human_rejected; source-pinned; fail-before verified.
+
+**#3 commands/jury.rs (HIGH, safety; workflow 3/3 → d60e72e).** run_t2_for_segment auto-committed a machine
+jury_accept verdict WITHOUT checking the Autonomy Dial — under Observe/Propose (the default) it silently
+accepted a machine transcript the dial forbids, routing around the pipeline chokepoint's machine_commits_
+allowed gate (round-24 hunt #1 named T2). Gated it; source-pinned; fail-before verified.
+
+**#4 commands/transcribe.rs (HIGH, honesty+data-loss; workflow 2/3 → d60e72e).** transcribe_segment_
+constrained/finetuned returned a BLANK decode ("") as success; the frontend overwrites the transcript with
+it — destroying an existing good transcript and persisting a blank. Reject a blank decode with an Err (the
+in-pipeline path already guards this). Source-pinned; fail-before verified.
+
+**QUEUED (confirmed HIGH, deferred to next iter for a careful bound + crafted-rate test):** audio.rs resample
+new_len = src.len() * (to/from) with no lower bound on from_rate — a corrupt/crafted WAV declaring
+sample_rate=1 (survives the >0 guard) turns a ~20MB file into a ~640GB Vec::with_capacity -> alloc abort
+(process crash). Fix at the decode boundary or bound new_len. **Refuted:** transcribe check_audio rate (low),
+settings doc-only claim (low), integration_runner audiobook-OK, + others.
+
+Gate: fmt 0, clippy 0, **cargo test --lib 972 passed / 0 failed / 6 ignored**, **34/34 python policies**.
+**Score: 54 fixed, ~19 refuted, 2 measure-deferred, 1 confirmed-queued.** Owner-gated finish line unchanged.
