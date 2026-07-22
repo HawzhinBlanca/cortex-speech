@@ -92,10 +92,27 @@ def test_inbox_undo_bails_while_a_decision_is_in_flight() -> None:
         )
 
 
+def test_app_normalize_uses_freshrow_not_a_stale_spread() -> None:
+    """App.svelte handleNormalize persists a whole-row updateSegment AFTER `await api.normalizeText`. Like
+    every sibling transcribe handler, it must build the row from the FRESH store row by id, never spread the
+    pre-await `{ ...seg }` snapshot — which reverts any verify/edit/align stamp that landed on the segment
+    during the normalize await (the update-segment-whole-row-upsert clobber class)."""
+    body = _function_body(_read("src/App.svelte"), "async function handleNormalize(")
+    if "$segments.find((s) => s.id === seg.id)" not in body:
+        raise AssertionError(
+            "handleNormalize spreads a pre-await snapshot into updateSegment instead of the fresh store row "
+            "— a concurrent write during the normalize await is silently reverted (whole-row clobber class). "
+            "Use `...($segments.find((s) => s.id === seg.id) ?? seg)` like the transcribe handlers."
+        )
+    if "{ ...seg, normalizedTranscript }" in body:
+        raise AssertionError("handleNormalize still spreads the stale `{ ...seg }` whole row; use freshRow-by-id")
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
     test_inbox_undo_bails_while_a_decision_is_in_flight()
+    test_app_normalize_uses_freshrow_not_a_stale_spread()
     print("frontend review-guard source policy passed")
 
 

@@ -1300,7 +1300,13 @@
     if (!requireDesktopRuntime()) return;
     try {
       const normalizedTranscript = await api.normalizeText(seg.rawTranscript);
-      const updatedSeg = { ...seg, normalizedTranscript };
+      const updatedSeg = {
+        // freshRow-by-id: a concurrent verify/edit/align stamp may have updated the row during the
+        // normalize await — never upsert the stale pre-await copy (the whole-row clobber class), same
+        // guard as the transcribe handlers above.
+        ...($segments.find((s) => s.id === seg.id) ?? seg),
+        normalizedTranscript,
+      };
       await api.updateSegment(updatedSeg);
       // Update the store only AFTER the persist succeeds. Mutating it first left unsaved state in the
       // UI on a failed save — which a later unrelated auto-save would then silently persist.
