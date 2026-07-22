@@ -6389,3 +6389,32 @@ Gate: fmt 0, clippy 0, **950 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 26 fixed, 5 refuted, 2 measure-deferred, 9 findings left** (next: scorecard.rs:270/279
 empty-reference segments earning the p-value / flipping the slice gate; then jury/learning.rs:219/87
 training-data integrity; agentic.rs:387/559; aligner.rs:497/190/517). Owner-gated legs unchanged.
+
+---
+
+## 2026-07-22T06:00Z — iter 76 — scorecard empty-ref paired-comparison hole fixed (commit 562067b); 7 findings left
+
+**Hunt-3 #10 + #11 (both medium, ONE root cause) hand-verified and FIXED — scorecard paired
+comparison.** compare_to_baseline's paired loop pushed every paired segment into the mapsswe /
+paired_segments / per-slice arrays with no ref_len>0 filter — the one aggregate path that didn't
+(micro_rate, word_breakdown_aggregate, bootstrap_ci, scored_segments all exclude empty-ref; the
+file's own convention says exclude "everywhere"). A silence/tatweel-only gold reference (ref_len==0):
+- #10 fed mapsswe (which does NOT filter), so significance/beats_baseline could be manufactured (or a
+  better model blocked) from empty-ref hallucination diffs the WER figures in the same comparison
+  exclude; paired_segments inflated too.
+- #11 padded per-slice counts toward MIN_SLICE_SEGS, incrementing evaluated_slices and scoring
+  0.0-vs-0.0 clean — flipping decide_promotion's fail-closed "Slice gate UNVERIFIED"
+  (evaluated_slices==0) into a phantom "ok". Such refs reach the gold set (import_gold_segments does
+  no non-empty check).
+
+One-line-class fix: skip ref_len==0 pairs at the push, so mapsswe/paired/CER/slice all see the same
+scoreable population micro_rate does. **Fail-before/pass-after verified**:
+empty_reference_segments_do_not_inflate_the_paired_comparison_or_slice_counts (4 real + 3 tatweel)
+asserts paired_segments==4 & evaluated_slices==0; with the filter disabled it reads 7 and pads a
+slice.
+
+Gate: fmt 0, clippy 0, **951 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 27 fixed, 5 refuted, 2 measure-deferred, 7 findings left** (next: jury/learning.rs:219
+export_lm_corpus omits annotated_transcript; jury/learning.rs:87 build_dpo_dataset ignores current
+human_decision; agentic.rs:387/559 Gemini finishReason + window substitution; aligner.rs:497/190/517).
+Owner-gated legs unchanged (OWNER_HANDOFF.md).
