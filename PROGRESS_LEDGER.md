@@ -7176,3 +7176,42 @@ as the evidence, never the agents' verdicts.
 
 Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies**. **Score: 63 fixed,
 ~23 refuted, 2 measure-deferred, 0 queued.** Owner-gated finish line unchanged.
+
+---
+
+## 2026-07-23T02:19Z — iter 102 — frontend hunt round 2: 2 fixes (0beb7c0, 84c7c7c); 2 queued, 3 refuted
+
+**First iteration on the 10-min cron cadence. 5 finders (App.svelte writes / App.svelte flow / SettingsPanel
+consent / events.ts / AudioPlayer+Waveform), each hit by 3 refuters. events.ts came back CLEAN. 7 findings,
+4 confirmed. Fixed the 2 clean+high-value ones; queued the 2 that need care.**
+
+**#1 App.svelte handleExportAudio (HIGH, export-honesty; 0beb7c0).** Filtered raw `s.verified`, but markBad
+finalizes a REJECTED clip with verified=true + humanDecision='reject'. So the toolbar Export Audio shipped
+human-rejected clips' audio + bad transcripts into the "verified audio" dataset as human-gold (THE ONE LAW;
+7th+ instance of the count-must-exclude-rejected class [[count-sites-must-exclude-rejected-placeholder]]).
+The sibling SettingsPanel export + Rust export_dataset already exclude rejected. Fixed to isVerifiedGood;
+surveyed all other raw-verified filters (all !verified/pending or review-progress or demo — none are export
+gates). 3/3 confirmed.
+
+**#2 Waveform.svelte draw (MEDIUM, playhead misalignment; 84c7c7c).** samplesPerBar=max(1,floor(len/numBars))
+clamped to 1 when numBars>len (any zoom>1 / wide card), so bar i read sample i and all peaks crammed into the
+left strip while the ruler/word-grid/playhead spanned the full width — waveform out of registration with the
+playhead the reviewer reads for word alignment (the zoom slider's purpose). Fixed to a fractional bar->sample
+map so peaks fill the width. 3/3 confirmed.
+
+**QUEUED (confirmed, need careful design next iters):**
+- App.svelte handleSaveAnnotation + handleSaveSpeaker (HIGH, whole-row clobber). Both do
+  api.updateSegment($selectedSegment) — a whole-row upsert that reverts a concurrent batch-verify's
+  verified=true (the always-enabled Save button is reachable during a batch). Fix is field-level
+  api.updateSegmentFields (as the autosave already uses), NOT freshRow (the store itself is stale) — needs the
+  textarea-binding + exact-fields design. handleSaveAnnotation confirmed 2/3; handleSaveSpeaker refuted 2/3 but
+  is the SAME anti-pattern, so verify+fix both together.
+- SettingsPanel onDestroy (LOW). ✕/Escape close path fire-and-forgets api.updateSettings(...).catch(console.error)
+  — no rollback/notification on backend rejection (disk error). Consent toggles are safe (saveQuietly rolls back);
+  only non-auto-saved prefs (theme/sliders) silently revert next launch. LOW.
+
+**Refuted:** handleBatchVerify/AssignSpeaker overlap (3/3), save() no-rollback (3/3).
+
+Gate (each fix, isolated): typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies**
+(6 checks now in test_frontend_review_guards.py). **Score: 65 fixed, ~25 refuted, 2 measure-deferred, 2 queued.**
+Owner-gated finish line unchanged.
