@@ -7039,3 +7039,41 @@ restored -> passes.
 Gate: fmt 0, clippy 0, **cargo test --lib 973 passed / 0 failed / 6 ignored** (+1 new test), **34/34 python
 policies**. **Score: 55 fixed, ~19 refuted, 2 measure-deferred, 0 queued.** Owner-gated finish line unchanged
 (exe rebuild to activate source-only fixes; real-audio e2e/RTF/CER eval).
+
+---
+
+## 2026-07-23T00:25Z — iter 98 — ultracode hunt over 5 under-hunted modules: 3 fixes (02c726b, 3f8ab27, 0547985)
+
+**5 skeptical finders (normalizer / chunking / consent-gating / validators / secret-redaction), each
+finding then hit by 3 diverse-lens refuters (reachability/correctness/repro), majority-refute kills. 3
+findings, all 3/3-confirmed; chunking + secret-redaction came back clean (no defect). Each hand-verified
+against source by me before fixing.**
+
+**#1 validation/input.rs (HIGH, security; 02c726b).** validate_file_path canonicalized the RAW
+caller-supplied path FIRST and only inspected the UNC/VerbatimUNC prefix on the already-canonicalized
+result. On Windows std::fs::canonicalize opens a handle to the target, so canonicalizing a
+`\attacker.com\share\x.wav` from the (untrusted) webview itself drives the SMB redirector — an
+outbound TCP/445 session leaking the user's NTLM credentials — BEFORE the prefix guard runs (and if the
+host is unreachable canonicalize errors first, so the guard never runs at all). The guard's own comment
+documents this exact NTLM-relay threat but sat on the wrong side of the leaking call. Added a syntactic
+UNC pre-check on the raw input (zero I/O) before canonicalize; kept the post-canonicalize check as
+defense-in-depth for a symlink-to-share. **Fail-before:** with the pre-check disabled the test saw
+canonicalize actually reach the network (os error 53) and return "Invalid path" not the UNC rejection.
+
+**#2 normalizer.rs (MEDIUM, data-corruption; 3f8ab27).** A ZWNJ right after Arabic heh (U+0647) is the
+on-keyboard encoding of the Sorani ە (U+06D5) vowel when a letter follows (کۆمه‌ڵ = کۆمەڵ). The blanket
+Step-4 ZWNJ→space turned that in-word ZWNJ into a space and Step 4.5 then folded the now-word-final heh
+to ە — splitting one word into two tokens with a stray lone consonant ("کۆمە ڵ"), corrupting shipped
+training text and inflating CER/WER one-sidedly. Fold heh+ZWNJ→ە before the blanket rule (AsoSoft's ه‌→ە);
+a non-heh separator ZWNJ (ئەو‌کەسە) is untouched. **Fail-before:** neutered fold produced "کۆمە ڵ".
+
+**#3 settings.rs (LOW, silent-gate-bypass; 0547985).** load()'s repair_out_of_range_numeric_knobs
+repaired the integer segment/thread knobs but never the float gate thresholds; validate() bounds them to
+[0,1] only on the update path. A hand-edited "max_wer_threshold": 30 survived load, making `wer > 30.0`
+always false — silently disabling the export quality gate. Extended the load-path repair to reset any
+non-finite/out-of-[0,1] threshold (wer/cer/jury_t1/vad) to default. **Fail-before:** neutered repair left
+max_wer_threshold at 30.0 vs the 0.35 default.
+
+Gate (each fix, isolated): fmt 0, clippy 0, **cargo test --lib 976 passed / 0 failed / 6 ignored** (+3
+new tests), **34/34 python policies**. **Score: 58 fixed, ~21 refuted, 2 measure-deferred.** Owner-gated
+finish line unchanged (exe rebuild to activate source-only fixes; real-audio e2e/RTF/CER eval).
