@@ -6574,3 +6574,25 @@ Gate: python policies 33/33 (docs-only; no Rust change, no cargo run needed).
 in-sandbox engineering is largely exhausted (backend broadly audited; utility modules low residual
 defect density); the remaining value is on the owner's machine. Next iterations: continue opportunistic
 residual audits, OR (owner's call) pause the loop until the rebuild+measure legs are run.
+
+---
+
+## 2026-07-22T09:20Z — iter 83 — corrections.rs clean; validate_text char-vs-byte fixed (commit c4281e5)
+
+**Hand-audit of corrections.rs + validation/input.rs.**
+- **corrections.rs (LOOP-0 flywheel): CLEAN and FULLY COVERED.** beta_confidence is a correct
+  Beta(1,1) posterior; classify_memory_outcome disables eligibility gates on purpose (documented, so a
+  fresh memory can escape the prior); firing_winner_indices mirrors apply_memories (winner-take-all);
+  the known-limitation (isolated-eval mis-credit on a pathological repeated-context homophone) is
+  documented with sound rationale; align_words is a correct Levenshtein DP + backtrace. Every public fn
+  has 3-10 test refs. No defect, no gap.
+- **validation/input.rs:** path validators sound for the desktop/user-file-picker model (canonicalize
+  + reject UNC/network paths; no path built from a raw identifier). **One real honesty bug FIXED:**
+  validate_text counted BYTES while its limit + error said "chars" — for Sorani (~2 B/char) that halved
+  the advertised budget and mislabeled the byte count as chars. Now counts chars; byte ceiling stays
+  bounded (max_len × 4). Fail-before verified (3-char/6-byte Sorani string passes a 3-char limit).
+
+Gate: fmt 0, clippy 0, **959 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 36 fixed, 5 refuted, 2 measure-deferred.** Hardened-module saturation continues (chunking,
+cache, corrections all clean); the remaining wins are small honesty/UX fixes at the edges. Owner-gated
+finish line unchanged — rebuild + real-audio pass.
