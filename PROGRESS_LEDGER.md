@@ -7077,3 +7077,35 @@ max_wer_threshold at 30.0 vs the 0.35 default.
 Gate (each fix, isolated): fmt 0, clippy 0, **cargo test --lib 976 passed / 0 failed / 6 ignored** (+3
 new tests), **34/34 python policies**. **Score: 58 fixed, ~21 refuted, 2 measure-deferred.** Owner-gated
 finish line unchanged (exe rebuild to activate source-only fixes; real-audio e2e/RTF/CER eval).
+
+---
+
+## 2026-07-23T01:05Z — iter 99 — ultracode hunt over data-integrity/honesty core: 1 fix (031be26), 1 refuted
+
+**5 finders (export / aligner / significance+calibration / db / pipeline), each hit by 3 diverse-lens
+refuters. export, aligner, db came back CLEAN (no defect). 2 findings: 1 confirmed 3/3, 1 refuted 3/3.
+Hand-verified the survivor against source myself before fixing.**
+
+**pipeline.rs (MEDIUM, silent-data-loss; 031be26).** The in-pipeline WSL-7B branch of transcribe() — twin
+of the iter-96 opt-in commands — accepted a transient empty 7B result as success. run_wsl_segment_transcript
+returns Ok("") (server up but under load; documented in-code, observed 1-of-3 in stress), NOT an Err, so
+map_err(tag_7b_unavailable) misses it; the branch then wrote update_asr_transcript_if_unreviewed(&id, "",…),
+overwriting a good, unverified stored transcript with "" (and normalized=NULL). Reachable from BOTH
+re-transcribe entry points (per-segment transcribe IPC + batch_transcribe, which re-writes the blank), and
+neither retries (unlike the import path). Guarded raw_transcript.trim().is_empty() -> tagged 7B-unavailable
+Err before the write, leaving the existing transcript intact + UI offers retry-or-offline. Added source
+policy test_pipeline_wsl_retranscribe_rejects_an_empty_result (transcribe() needs WSL server+audio+DB, not
+unit-injectable). Fail-before verified (guard removed AND guard weakened both fire the policy). This is the
+2nd instance of the "blank transcript overwrites a good one" class -> new project memory
+[[blank-transcript-never-overwrites-good]].
+
+**Refuted 3/3 (significance.rs).** "MAPSSWE emits a normal-approximation p at tiny n, fabricating
+significance that gates auto-promotion." The arithmetic IS optimistic (z-test not Student-t; p≈0.0455 vs
+t-test ≈0.30 at n=2), but the claimed HARM is false: decide_promotion has a THIRD fail-closed slice gate
+(registry.rs:480-505) requiring a minimum of length-stratified slices, so a 2-clip challenger does NOT
+auto-promote. The p is a DISPLAYED scorecard stat, not the promotion gate. Left as-is (honestly labeled).
+
+Gate: fmt 0, clippy 0, **cargo test --lib 976 passed / 0 failed / 6 ignored**, **34/34 python policies**
+(incl. the new one; caught + fixed a bug in my own policy where a prose mention of the method name in the
+guard's comment shadowed the real call-site search). **Score: 59 fixed, ~22 refuted, 2 measure-deferred.**
+Owner-gated finish line unchanged.
