@@ -140,6 +140,16 @@ impl SoraniNormalizer {
         // Step 3: Remove Tatweel
         result = TATWEEL.replace_all(&result, "").to_string();
 
+        // Step 3.5: Fold Arabic heh + ZWNJ to the Sorani ە vowel BEFORE the blanket ZWNJ→space below.
+        // A ZWNJ right after heh (U+0647) is the on-keyboard encoding of the ە (U+06D5) vowel when a
+        // letter follows: the ZWNJ forces heh into its non-joining final form so it reads as ە rather
+        // than joining the next letter (e.g. کۆمه‌ڵ = the single word کۆمەڵ). Without this, Step 4 turns
+        // that in-word ZWNJ into a space and Step 4.5 then sees the heh as word-final, splitting one word
+        // into two tokens with a stray lone consonant ("کۆمە ڵ") — corrupting the exported training text
+        // and inflating CER/WER one-sidedly against an ASR hypothesis that emits ە directly. A ZWNJ NOT
+        // preceded by heh (a genuine word/morpheme separator, e.g. ئەو‌کەسە) is left for Step 4.
+        result = result.replace("\u{0647}\u{200C}", "\u{06D5}");
+
         // Step 4: Replace ZWNJ with space
         result = ZWNJ.replace_all(&result, " ").to_string();
 
@@ -441,6 +451,22 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(n.normalize(input), expected, "Failed for: {input}");
         }
+    }
+
+    #[test]
+    fn heh_zwnj_folds_to_the_ae_vowel_not_a_word_split() {
+        let n = SoraniNormalizer::new();
+        // کۆمه‌ڵ ("group/society") typed with Arabic heh (U+0647) + ZWNJ (U+200C) — the on-keyboard way to
+        // write the ە vowel when a letter follows (the ZWNJ forces heh's non-joining final form). It must
+        // fold to the SINGLE word کۆمەڵ, NOT split into two tokens with a stray lone ڵ ("کۆمە ڵ").
+        assert_eq!(
+            n.normalize("کۆمه\u{200C}ڵ"),
+            "کۆمەڵ",
+            "heh+ZWNJ must fold to the ە vowel as one word, not split with an orphaned consonant"
+        );
+        // Regression guard: a ZWNJ that is a genuine word/morpheme separator (after waw ۆ, not heh) still
+        // becomes a space — the case test_kurdish_normalization already pins (ئەو‌کەسە -> ئەو کەسە).
+        assert_eq!(n.normalize("ئەو\u{200C}کەسە"), "ئەو کەسە", "a non-heh ZWNJ separator still becomes a space");
     }
 
     #[test]
