@@ -108,11 +108,28 @@ def test_app_normalize_uses_freshrow_not_a_stale_spread() -> None:
         raise AssertionError("handleNormalize still spreads the stale `{ ...seg }` whole row; use freshRow-by-id")
 
 
+def test_app_export_audio_excludes_human_rejected() -> None:
+    """App.svelte handleExportAudio must filter the exported clip ids with isVerifiedGood (verified AND NOT
+    human-rejected), never raw s.verified: markBad finalizes a REJECTED clip with verified=true (to pull it
+    out of the review queue), so a plain s.verified filter ships human-rejected clips + their bad transcripts
+    into the 'verified audio' dataset as if human-gold — the export-honesty / count-must-exclude-rejected
+    class. The SettingsPanel export and the Rust export_dataset (!is_human_rejected) already exclude them."""
+    body = _function_body(_read("src/App.svelte"), "async function handleExportAudio(")
+    if "isVerifiedGood(s)" not in body:
+        raise AssertionError(
+            "handleExportAudio does not filter with isVerifiedGood — a raw s.verified filter exports "
+            "human-rejected ('mark bad') clips as verified audio. Use `.filter((s) => isVerifiedGood(s))`."
+        )
+    if ".filter((s) => s.verified)" in body:
+        raise AssertionError("handleExportAudio still filters raw s.verified; rejected clips leak into the export")
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
     test_inbox_undo_bails_while_a_decision_is_in_flight()
     test_app_normalize_uses_freshrow_not_a_stale_spread()
+    test_app_export_audio_excludes_human_rejected()
     print("frontend review-guard source policy passed")
 
 

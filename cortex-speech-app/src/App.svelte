@@ -30,6 +30,7 @@
     statusMessage,
   } from './lib/stores/uiStore';
   import { notifications } from './lib/stores/notificationStore';
+  import { isVerifiedGood } from './lib/segmentQuality';
   import { historyStore } from './lib/stores/historyStore';
   import { initKeyboardManager, globalKeyboardManager, modKeyLabel } from './lib/keyboard';
   import { focusTrap } from './lib/actions/focusTrap';
@@ -1542,7 +1543,11 @@
 
   async function handleExportAudio() {
     if (!requireDesktopRuntime()) return;
-    const verifiedIds = $segments.filter((s) => s.verified).map((s) => s.id);
+    // isVerifiedGood, NOT raw s.verified: markBad finalizes a REJECTED clip with verified=true (to pull
+    // it out of the review queue) + humanDecision='reject', so a plain s.verified filter would ship
+    // human-rejected clips and their bad transcripts into the "verified audio" dataset as if human-gold.
+    // Mirrors the SettingsPanel export and the Rust export_dataset (!is_human_rejected) so counts match.
+    const verifiedIds = $segments.filter((s) => isVerifiedGood(s)).map((s) => s.id);
     if (verifiedIds.length === 0) {
       notifications.warning($t('exportAudio.noVerified'));
       return;
