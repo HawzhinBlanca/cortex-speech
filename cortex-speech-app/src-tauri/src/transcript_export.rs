@@ -109,6 +109,17 @@ fn labelled(speaker: &Option<String>, text: &str) -> String {
     }
 }
 
+/// Collapse a cue body into subtitle-safe lines. SRT and VTT delimit cues with a BLANK line, so an
+/// interior blank line in a transcript (a human paragraph break — `\n\n`, or Windows `\r\n\r\n`) would
+/// terminate the cue early: a parser then reads the remaining text as the NEXT cue's numeric index,
+/// silently dropping transcript from the exported subtitle (and throwing off every following cue). Drop
+/// blank / whitespace-only lines and trim each surviving one, rejoined with a single `\n` — a multi-line
+/// cue is valid, a blank line is not. `.lines()` also strips the `\r` of a CRLF, so no stray carriage
+/// return survives either. Applied only to SRT/VTT; TXT is freeform and keeps the text as-is.
+fn subtitle_safe_text(text: &str) -> String {
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
+}
+
 fn to_srt(cues: &[Cue]) -> String {
     let mut out = String::new();
     for (i, c) in cues.iter().enumerate() {
@@ -116,7 +127,7 @@ fn to_srt(cues: &[Cue]) -> String {
         let end = c.end_ms.max(c.start_ms + 1);
         out.push_str(&format!("{}\n", i + 1));
         out.push_str(&format!("{} --> {}\n", fmt_ts(c.start_ms, ','), fmt_ts(end, ',')));
-        out.push_str(&labelled(&c.speaker, &c.text));
+        out.push_str(&labelled(&c.speaker, &subtitle_safe_text(&c.text)));
         out.push_str("\n\n");
     }
     out
@@ -128,9 +139,10 @@ fn to_vtt(cues: &[Cue]) -> String {
         let end = c.end_ms.max(c.start_ms + 1);
         out.push_str(&format!("{} --> {}\n", fmt_ts(c.start_ms, '.'), fmt_ts(end, '.')));
         // VTT voice span carries the speaker without polluting the caption text.
+        let safe = subtitle_safe_text(&c.text);
         let line = match &c.speaker {
-            Some(sp) => format!("<v {sp}>{}", c.text),
-            None => c.text.clone(),
+            Some(sp) => format!("<v {sp}>{safe}"),
+            None => safe,
         };
         out.push_str(&line);
         out.push_str("\n\n");
@@ -293,6 +305,25 @@ mod tests {
         let cues = build_cues(&[seg("a", "f.wav", "x", 5000, 5000)]); // end == start
         let srt = to_srt(&cues);
         assert!(srt.contains("00:00:05,000 --> 00:00:05,001"));
+    }
+
+    #[test]
+    fn subtitle_cue_body_drops_interior_blank_lines_that_would_split_the_cue() {
+        // A human paragraph break in the transcript ("سڵاو\n\nدنیا") must NOT terminate the cue early — a
+        // blank line is the SRT/VTT cue delimiter, so leaving it in makes a parser read "دنیا" as the next
+        // cue's numeric index and silently drop it. The blank line is removed; a plain multi-line cue is kept.
+        let cues = build_cues(&[seg("a", "f.wav", "سڵاو\n\nدنیا", 0, 1000)]);
+        let srt = to_srt(&cues);
+        assert!(
+            srt.contains("00:00:00,000 --> 00:00:01,000\nسڵاو\nدنیا\n\n"),
+            "srt cue body has no blank line: {srt:?}"
+        );
+        assert!(!srt.contains("سڵاو\n\nدنیا"), "no interior blank line may survive inside a cue");
+        // A Windows CRLF paragraph break is handled too: no stray \r and no blank line.
+        let cues_crlf = build_cues(&[seg("b", "f.wav", "one\r\n\r\ntwo", 0, 1000)]);
+        let vtt = to_vtt(&cues_crlf);
+        assert!(vtt.contains("one\ntwo\n\n"), "vtt cue body collapses the CRLF blank line: {vtt:?}");
+        assert!(!vtt.contains('\r'), "no stray carriage return survives in a cue");
     }
 
     #[test]
