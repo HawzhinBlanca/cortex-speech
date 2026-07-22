@@ -936,10 +936,18 @@ pub fn load_lift_triples(db: &Database) -> AppResult<Vec<(String, String, String
     let conn = db.connection();
     let mut stmt = conn.prepare(
         // Require human_decision so the reference is HUMAN-confirmed ground truth, not just an
-        // LLM-refined annotated_transcript (commands.rs notes annotated can be human OR LLM).
+        // LLM-refined annotated_transcript (commands.rs notes annotated can be human OR LLM). EXCLUDE
+        // human-REJECTED clips: a reject is a human decision that means the OPPOSITE of ground truth — the
+        // reviewer discarded the clip, so its (possibly LLM-refined) annotated_transcript was never
+        // confirmed. record_human_decision leaves the transcripts populated on a reject, so without this
+        // guard a rejected clip inflates LabelQualityLift.n and folds its char distances into the MEASURED
+        // raw/jury micro-CER + lift + CI, crediting the jury for "improving" a label on a clip that never
+        // ships (export_dataset drops it via is_human_rejected).
         "SELECT annotated_transcript, raw_transcript, verdict_transcript \
          FROM speech_segments \
          WHERE human_decision IS NOT NULL AND TRIM(human_decision) <> '' \
+           AND human_decision NOT IN ('reject', 'human_reject') \
+           AND COALESCE(verdict, '') <> 'human_reject' \
            AND annotated_transcript IS NOT NULL AND TRIM(annotated_transcript) <> '' \
            AND verdict_transcript IS NOT NULL AND TRIM(verdict_transcript) <> '' \
            AND raw_transcript IS NOT NULL AND TRIM(raw_transcript) <> ''",
@@ -990,6 +998,36 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         db
+    }
+
+    #[test]
+    fn load_lift_triples_excludes_human_rejected_clips() {
+        // The label-quality lift uses the human's annotated_transcript as GROUND TRUTH. A human-REJECTED
+        // clip's annotation was never confirmed (the reviewer discarded the clip), and record_human_decision
+        // leaves its transcripts populated — so without a reject guard it inflates the MEASURED lift (n +
+        // micro-CER + CI) over a row that never ships (export_dataset drops it via is_human_rejected).
+        let db = open_mem_db();
+        for (id, decision, verdict) in [("acc", "edit", "jury_edit"), ("rej", "reject", "human_reject")] {
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: id.to_string(),
+                audio_path: format!("/clips/{id}.wav"),
+                raw_transcript: "خاو".to_string(),
+                annotated_transcript: Some("دەقی ڕاست".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+            // verdict / verdict_transcript / human_decision are jury/decision columns that insert_segment
+            // omits by design, so set them here — including verdict_transcript (the post-jury label).
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET human_decision=?2, verdict=?3, verdict_transcript='دەقی ڕاست' WHERE id=?1",
+                    params![id, decision, verdict],
+                )
+                .unwrap();
+        }
+        let triples = load_lift_triples(&db).unwrap();
+        assert_eq!(triples.len(), 1, "only the accepted clip is a lift triple; the rejected one is excluded");
+        assert_eq!(triples[0].0, "دەقی ڕاست", "the surviving triple is the accepted clip's human reference");
     }
 
     #[test]
