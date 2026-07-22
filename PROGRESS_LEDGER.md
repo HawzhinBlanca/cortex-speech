@@ -6473,3 +6473,35 @@ Gate: fmt 0, clippy 0, **955 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 31 fixed, 5 refuted, 2 measure-deferred, 3 findings left** (the aligner cluster: aligner.rs:497
 unclamped fabricated word end; aligner.rs:190 score_consistency uncapped OOM; aligner.rs:517
 degenerate-alignment guard). Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-22T07:35Z — iter 79 — aligner cluster fixed (commit ce7f638); HUNT-3 QUEUE DRAINED
+
+**Hunt-3 #16 (two aligner defects, was #497/#517) + #17 (was #190) hand-verified and FIXED — the last
+three findings.**
+- **#16a clamp:** an unalignable word gets a fabricated start+0.25; with the last aligned word at the
+  clip's final frame, that end ran PAST the audio (out-of-range ctc_forced timestamps exported +
+  word-tap seeks beyond the clip). Now both boundaries clamp to num_frames*frame_sec.
+- **#16b provenance:** the degenerate guard was aligned_chars==0, so one-word-aligned + N-fabricated
+  was still stamped CtcForced. Now requires >=half the words really aligned, else None → honest
+  EnergyHeuristic.
+- **#17 OOM:** score_consistency ran the ONNX forward + num_frames×num_states forward-backward on the
+  whole clip with NEITHER of align()'s guards → multi-GB alloc → OOM. Now applies MAX_ALIGN_SECS +
+  MAX_VITERBI_CELLS (module consts now shared), returning the neutral low score for degenerate inputs.
+
+**Fail-before/pass-after verified:** #16a/#16b via unit tests ('z' end 0.33 > clip 0.08; 1-of-5
+stamped ctc_forced); #17 via a scoped source policy (needs the real ONNX model — not unit-testable),
+git-stash fail-before flags both missing caps.
+
+Gate: fmt 0, clippy 0, **957 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 34 fixed, 5 refuted, 2 measure-deferred, 0 findings left.**
+
+**★ HUNT-3 QUEUE FULLY DRAINED (all 18 confirmed findings adjudicated).** Cumulative across all
+rounds: 34 defects fixed with fail-before/pass-after, 5 refuted-with-audit, 2 measure-deferred. Backend
+audit coverage is now broad (pipeline, db, export, export_bundle, settings, eval, audio, quality,
+models, runs, corrections, normalizer, asr, aligner, agentic, jury/, scorecard, registry, snapshot,
+commands slices). Next iteration: either a fresh hunt on residual surface (commands.rs core, lib.rs,
+jury/t1/debate deeper) or pivot to surfacing the owner-gated finish line. The "fully ready robust"
+bar STILL needs the owner's machine (exe rebuild to activate ~all source fixes since iter 30;
+real-audio e2e/RTF/CER) — see OWNER_HANDOFF.md. Nothing here is a declared 10/10.
