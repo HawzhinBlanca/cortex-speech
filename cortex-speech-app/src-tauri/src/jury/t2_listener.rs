@@ -148,7 +148,12 @@ fn sample_from_json(raw_text: &str) -> Result<GeminiSample, String> {
     }
     let mut sample = serde_json::from_str::<GeminiSample>(raw_text)
         .map_err(|e| format!("Failed to parse judge JSON sample: {e}\nRaw: {raw_text}"))?;
-    sample.confidence = if sample.confidence.is_finite() { sample.confidence.clamp(0.0, 1.0) } else { 0.0 };
+    // A self-reported confidence OUTSIDE [0,1] is malformed and untrusted — map it to 0.0, NOT clamp it.
+    // Clamping a percentage-scale value (92 -> 1.0) or any >1.0 to the [0,1] ceiling would make a BOGUS
+    // value the MAXIMUM confidence and sail straight through the >= 0.85 training-promotion gate — the exact
+    // failure this guard exists to prevent. `contains` also rejects NaN/±inf (a huge JSON number parses to
+    // inf), so a non-finite confidence is untrusted too. An in-range value passes unchanged.
+    sample.confidence = if (0.0..=1.0).contains(&sample.confidence) { sample.confidence } else { 0.0 };
     Ok(sample)
 }
 
@@ -747,15 +752,26 @@ mod tests {
         let s = sample_from_json("{\"transcript\":\"کوردستان\",\"reason\":\"r\",\"confidence\":0.9}").unwrap();
         assert_eq!(s.transcript, "کوردستان");
         assert!((s.confidence - 0.9).abs() < 1e-9);
-        // An out-of-range self-reported confidence (a percentage) is clamped to [0,1] — it must never
-        // clear the >= 0.85 promotion gate on a bogus value regardless of which provider produced it.
+        // An out-of-range self-reported confidence is UNTRUSTED -> 0.0, so it can NEVER clear the >= 0.85
+        // promotion gate on a bogus value. A percentage-scale 92 must map to 0.0 (NOT clamp to 1.0, which
+        // would sail through the gate as maximum confidence); a negative and a non-finite (overflow) map
+        // to 0.0 too.
         assert_eq!(
             sample_from_json("{\"transcript\":\"t\",\"reason\":\"\",\"confidence\":92}").unwrap().confidence,
-            1.0
+            0.0,
+            "a percentage-scale 92 must be untrusted (0.0), not clamped to 1.0 and pass the >= 0.85 gate"
         );
         assert_eq!(
             sample_from_json("{\"transcript\":\"t\",\"reason\":\"\",\"confidence\":-3}").unwrap().confidence,
             0.0
+        );
+        // An overflowing confidence number is rejected at parse time -> a hard error that ESCALATES,
+        // never a fabricated confidence (serde_json refuses an out-of-f64-range literal).
+        assert!(sample_from_json("{\"transcript\":\"t\",\"reason\":\"\",\"confidence\":1e400}").is_err());
+        // A valid in-range value is preserved (including the exact boundary 1.0).
+        assert_eq!(
+            sample_from_json("{\"transcript\":\"t\",\"reason\":\"\",\"confidence\":1.0}").unwrap().confidence,
+            1.0
         );
         // Empty / non-JSON text is a hard error (escalates), not a silent empty verdict.
         assert!(sample_from_json("   ").is_err());
