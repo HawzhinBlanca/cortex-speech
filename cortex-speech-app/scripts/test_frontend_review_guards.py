@@ -54,8 +54,32 @@ def test_retranscribe_guards_editor_writes_against_navigation() -> None:
         )
 
 
+def test_go_draft_persist_bails_on_aligning_and_uses_freshrow() -> None:
+    """ReviewMode.go(): navigating with a dirty edit persists it as a draft via a WHOLE-ROW updateSegment.
+    That row includes alignment_json/alignment_quality, so (a) it must not run while a background CTC
+    alignment is in flight (`!aligning`) — else a draft built from the pre-align row reverts freshly
+    persisted CTC timings to heuristic (the whole-row-clobber class) — and (b) the draft must be built from
+    freshRow(seg.id, seg), NOT a stale `{...seg}` spread. Every sibling mutator (submit/markBad/
+    doRetranscribe) already guards `aligning` + uses freshRow; go() must match."""
+    body = _function_body(_read("src/lib/ReviewMode.svelte"), "async function go(")
+    if "!saving && !aligning" not in body:
+        raise AssertionError(
+            "go()'s draft-persist condition does not bail on `aligning` — a navigate during a background "
+            "CTC alignment can revert freshly-persisted CTC timings via the whole-row updateSegment. "
+            "Add `!aligning` to the `if (dirty && current && !saving && ... )` condition."
+        )
+    if "freshRow(seg.id, seg)" not in body:
+        raise AssertionError("go() must build its draft from freshRow(seg.id, seg), not a stale snapshot")
+    if "{ ...seg, annotatedTranscript" in body:
+        raise AssertionError(
+            "go() is spreading a stale `{ ...seg }` whole row into the draft (the clobber class the "
+            "update-segment-whole-row-upsert discipline forbids); use freshRow(seg.id, seg) instead"
+        )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
+    test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
     print("frontend review-guard source policy passed")
 
 

@@ -529,9 +529,15 @@
     // A CLEARED textarea is dirty too but must NOT be drafted: persisting annotatedTranscript=''
     // blanks the gold transcript with no undo entry (submit() refuses the same state). The cleared
     // text survives in editCache for this session, so nothing is lost by skipping the persist.
-    if (dirty && current && !saving && editText.trim()) {
+    // `!aligning` too: while a clip's background CTC alignment is in flight, a whole-row draft built from
+    // the pre-align store row carries the STALE (heuristic) alignmentJson/quality; if it lands after the
+    // aligner persisted real CTC timings it reverts them (the whole-row-clobber class — every sibling
+    // mutator submit/markBad/doRetranscribe already bails on `aligning`). Skipping the persist here loses
+    // nothing: the load $effect stashes the dirty edit in editCache before switching, and the unmount
+    // flush persists it. freshRow (not `{...seg}`) re-reads the current row so we never spread a stale one.
+    if (dirty && current && !saving && !aligning && editText.trim()) {
       const seg = current;
-      const draft: SpeechSegment = { ...seg, annotatedTranscript: editText.trim() };
+      const draft: SpeechSegment = { ...freshRow(seg.id, seg), annotatedTranscript: editText.trim() };
       saving = true;
       try {
         await api.updateSegment(draft);
