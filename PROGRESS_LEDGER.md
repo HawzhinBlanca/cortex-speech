@@ -7215,3 +7215,30 @@ map so peaks fill the width. 3/3 confirmed.
 Gate (each fix, isolated): typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies**
 (6 checks now in test_frontend_review_guards.py). **Score: 65 fixed, ~25 refuted, 2 measure-deferred, 2 queued.**
 Owner-gated finish line unchanged.
+
+---
+
+## 2026-07-23T02:24Z — iter 103 — queued save-clobber pair fixed (942515e)
+
+**Fixed the HIGH whole-row-clobber pair queued from iter 102 (both handlers, one logical change).**
+
+**App.svelte handleSaveAnnotation + handleSaveSpeaker (HIGH, whole-row clobber; 942515e).** Both explicit
+Save buttons whole-row-upserted $selectedSegment via api.updateSegment(seg). They are reachable while a
+background batch-verify has already written verified=true to the DB but the store row is still stale
+(verified=false, refreshed only on batch-complete); a whole-row upsert of the stale row reverts the human's
+batch-verify decision — and freshRow-by-id can't help because the store ITSELF is the stale source. Verified
+the fix layer against source: update_segment_fields (segments_write.rs:100-124) reads the FRESH row under the
+DB lock, applies only the named curation field (annotatedTranscript/speakerId), and STILL records undo history
+via persist_segment_update — so switching preserves undo behavior AND closes the clobber. Both Save buttons now
+mirror the oninput autosave's field-level path (scheduleAutoSave -> updateSegmentFields, App.svelte:148).
+handleSaveAnnotation was confirmed 2/3 in the iter-102 hunt; handleSaveSpeaker was refuted 2/3 there but is the
+identical anti-pattern, so I verified + fixed both together (the refutation was narrower-scope, not a real
+distinction). Source policy added; fail-before verified.
+
+Note: the verify toggle (App.svelte:1401 `{...seg, verified}` whole-row) is a SEPARATE case left as-is —
+`verified` is not a field update_segment_fields accepts, it is the deliberate verify action, and it already
+guards its own in-flight-load race.
+
+Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies** (7 checks now in
+test_frontend_review_guards.py). **Score: 66 fixed, ~25 refuted, 2 measure-deferred, 1 queued** (SettingsPanel
+onDestroy fire-and-forget save, LOW). Owner-gated finish line unchanged.
