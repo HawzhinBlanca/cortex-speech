@@ -6554,3 +6554,23 @@ Gate: fmt 0, clippy 0, **958 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 35 fixed, 5 refuted, 2 measure-deferred; +2 modules hand-audited clean (chunking, cache).**
 The heavily pre-hardened utility modules (Round-22/23/true-10 audited) show low residual defect
 density. Owner-gated legs unchanged — the finish line still needs the exe rebuild + real-audio pass.
+
+---
+
+## 2026-07-22T08:55Z — iter 82 — OWNER_HANDOFF.md refreshed to the current state (commit 48d9673)
+
+**Owner-facing doc refresh (no code; high-value, doesn't need the exe).** The handoff was stale
+(2026-07-17, pre-hunt). Added a dated 2026-07-22 block consolidating the adversarial campaign: the
+honest tally (35 fixed / 5 refuted / 2 measure-deferred), the highest-impact fixes grouped by theme
+(jury autonomy-dial HIGH, fresh-install ASR, model+download integrity, data-integrity/provenance,
+snapshot durability, promotion-gate honesty, cloud-reference honesty, aligner, finish_import TOCTOU),
+and the real green gate (958/0/6, fmt+clippy clean, 33/33). Restated — clearly — that this does NOT
+move the finish line: the running exe predates the fixes, so the three owner-machine legs
+(snapshot+rebuild → verify-10 → one real-audio pass) are unchanged and remain the only path to
+"fully ready robust". Nothing declared 10/10. Facts cross-checked vs ledger + git log + last gate run.
+
+Gate: python policies 33/33 (docs-only; no Rust change, no cargo run needed).
+**Score unchanged: 35 fixed, 5 refuted, 2 measure-deferred.** The loop has reached the point where
+in-sandbox engineering is largely exhausted (backend broadly audited; utility modules low residual
+defect density); the remaining value is on the owner's machine. Next iterations: continue opportunistic
+residual audits, OR (owner's call) pause the loop until the rebuild+measure legs are run.
