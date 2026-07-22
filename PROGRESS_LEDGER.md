@@ -7012,3 +7012,30 @@ settings doc-only claim (low), integration_runner audiobook-OK, + others.
 
 Gate: fmt 0, clippy 0, **cargo test --lib 972 passed / 0 failed / 6 ignored**, **34/34 python policies**.
 **Score: 54 fixed, ~19 refuted, 2 measure-deferred, 1 confirmed-queued.** Owner-gated finish line unchanged.
+
+---
+
+## 2026-07-22T23:30Z — iter 97 — queued audio.rs resample OOM fixed + whole with_capacity class audited (ff702bd)
+
+**Fixed the finding queued from iter 96, then swept its whole bug-class.**
+
+**audio.rs resample (HIGH, safety; ff702bd).** resample() computed new_len = src.len() * (to_rate/from_rate)
+and Vec::with_capacity(new_len) with NO lower bound on from_rate. A corrupt/crafted WAV declaring
+sample_rate=1 (it survives decode_to_pcm's `> 0` guard) upsampled to 16 kHz is ratio 16000, so a ~20 MB
+clip requests a ~640 GB allocation -> handle_alloc_error ABORTS the whole process (not a catchable panic):
+one broken import takes the app down. Capped new_len at src.len()*16 (a real resample to 16 kHz upsamples
+at most ~2x from an 8 kHz source; downsampling stays far under the cap), so no legitimate file changes and a
+malformed header now yields a bounded, harmless result. **Fail-before:** with the cap removed the new test
+saw new_len = 16,000,000 (the exact unbounded vector, tiny input so no real abort) and the assert fired;
+restored -> passes.
+
+**Sibling audit (the amplifying-allocation class, clean).** Swept every `with_capacity` in src-tauri:
+- downmix_to_mono frame_count = samples.len()/channels — DE-amplifying (<= input); channels==0 packets are
+  skipped (audio.rs:260) and channels falls back to >=1 (283), so no divide-by-zero either.
+- aligner target_states (tokens*2+1), features num_frames*mel_bins, scribe audio.len()+512, models bytes*2,
+  eval total=gold.len(), t2_listener n_samples (operator config 3-5) — all bounded by input length, DB row
+  count, or config. **resample was the only untrusted-amplifying allocation.** No new defect.
+
+Gate: fmt 0, clippy 0, **cargo test --lib 973 passed / 0 failed / 6 ignored** (+1 new test), **34/34 python
+policies**. **Score: 55 fixed, ~19 refuted, 2 measure-deferred, 0 queued.** Owner-gated finish line unchanged
+(exe rebuild to activate source-only fixes; real-audio e2e/RTF/CER eval).
