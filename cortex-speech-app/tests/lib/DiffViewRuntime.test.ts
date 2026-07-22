@@ -26,7 +26,11 @@ describe('DiffView runtime behavior', () => {
       },
     });
 
-    expect(await screen.findByText('world \u2192 beautiful')).toBeInTheDocument();
+    // "hello world" -> "hello beautiful world" is a pure INSERTION of "beautiful". It must render as an
+    // inserted word, NOT the misleading "world \u2192 beautiful" substitution the old LCS reconstruction
+    // emitted (it consumed the unchanged "world" into a bogus replace).
+    expect(await screen.findByText('beautiful')).toBeInTheDocument();
+    expect(screen.queryByText('world \u2192 beautiful')).not.toBeInTheDocument();
     await waitFor(() => expect(invokeMock).not.toHaveBeenCalled());
   });
 

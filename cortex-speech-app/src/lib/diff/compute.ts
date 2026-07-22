@@ -108,13 +108,18 @@ export function computeLocalDiff(raw: string, annotated: string): DiffResult {
   let lcsIndex = 0;
 
   while (rawIndex < rawWords.length || annotatedIndex < annotatedWords.length) {
-    if (
-      rawIndex < rawWords.length &&
+    // A side "is at the LCS" when its current word equals the next common word. That word MUST be
+    // emitted as Equal and never consumed into a Replace/Delete/Insert, or the remainder misaligns.
+    // (Mirrors the Rust `diff::compute_diff`.)
+    const rawIsLcs =
+      rawIndex < rawWords.length && lcsIndex < lcs.length && rawWords[rawIndex] === lcs[lcsIndex];
+    const annIsLcs =
       annotatedIndex < annotatedWords.length &&
       lcsIndex < lcs.length &&
-      rawWords[rawIndex] === lcs[lcsIndex] &&
-      annotatedWords[annotatedIndex] === lcs[lcsIndex]
-    ) {
+      annotatedWords[annotatedIndex] === lcs[lcsIndex];
+
+    // Both sides sit on the next common word \u2192 Equal.
+    if (rawIsLcs && annIsLcs) {
       changes.push({ op: 'Equal', value: lcs[lcsIndex] });
       rawIndex += 1;
       annotatedIndex += 1;
@@ -122,7 +127,11 @@ export function computeLocalDiff(raw: string, annotated: string): DiffResult {
       continue;
     }
 
-    if (rawIndex < rawWords.length && annotatedIndex < annotatedWords.length) {
+    // Replace ONLY when BOTH words diverge from the LCS (a genuine substitution). Replacing while one
+    // side is still on its common word would consume that common word and cascade wrong ops \u2014 the bug
+    // where an insert/delete next to an unchanged word rendered a spurious "x \u2192 y" and undercounted
+    // similarity (e.g. "a c" \u2192 "a b c" scored 33% with a bogus c\u2192b replace instead of 67%).
+    if (rawIndex < rawWords.length && annotatedIndex < annotatedWords.length && !rawIsLcs && !annIsLcs) {
       changes.push({
         op: 'Replace',
         value: `${rawWords[rawIndex]} \u2192 ${annotatedWords[annotatedIndex]}`,
@@ -132,15 +141,25 @@ export function computeLocalDiff(raw: string, annotated: string): DiffResult {
       continue;
     }
 
-    if (rawIndex < rawWords.length) {
+    // A raw word that is not the next common word \u2192 Delete; the annotated side waits at its common word.
+    if (rawIndex < rawWords.length && !rawIsLcs) {
       changes.push({ op: 'Delete', value: rawWords[rawIndex] });
       rawIndex += 1;
       continue;
     }
 
+    // An annotated word that is not the next common word \u2192 Insert (raw waits); also drains the
+    // annotated tail once raw is exhausted.
     if (annotatedIndex < annotatedWords.length) {
       changes.push({ op: 'Insert', value: annotatedWords[annotatedIndex] });
       annotatedIndex += 1;
+      continue;
+    }
+
+    // Only raw remains, on a common word with no annotated partner left \u2192 Delete it (loop backstop).
+    if (rawIndex < rawWords.length) {
+      changes.push({ op: 'Delete', value: rawWords[rawIndex] });
+      rawIndex += 1;
     }
   }
 

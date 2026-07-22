@@ -72,13 +72,13 @@ pub fn compute_diff(raw: &str, annotated: &str) -> TextDiff {
     let mut lcs_idx = 0usize;
 
     while ri < raw_words.len() || ai < ann_words.len() {
-        // Both have content matching LCS → Equal
-        if ri < raw_words.len()
-            && ai < ann_words.len()
-            && lcs_idx < lcs.len()
-            && raw_words[ri] == lcs[lcs_idx]
-            && ann_words[ai] == lcs[lcs_idx]
-        {
+        // A side "is at the LCS" when its current word equals the next common word. That word MUST be
+        // emitted as Equal and never consumed into a Replace/Delete/Insert, or the remainder misaligns.
+        let raw_is_lcs = ri < raw_words.len() && lcs_idx < lcs.len() && raw_words[ri] == lcs[lcs_idx];
+        let ann_is_lcs = ai < ann_words.len() && lcs_idx < lcs.len() && ann_words[ai] == lcs[lcs_idx];
+
+        // Both sides sit on the next common word → Equal.
+        if raw_is_lcs && ann_is_lcs {
             changes.push(DiffChange { op: DiffOp::Equal, value: lcs[lcs_idx].to_string() });
             ri += 1;
             ai += 1;
@@ -86,26 +86,39 @@ pub fn compute_diff(raw: &str, annotated: &str) -> TextDiff {
             continue;
         }
 
-        // Both have content but neither matches LCS → Replace
-        if ri < raw_words.len() && ai < ann_words.len() {
+        // Replace ONLY when BOTH words diverge from the LCS (a genuine substitution). Replacing while
+        // one side is still on its common word would consume that common word — dropping it from the
+        // alignment and cascading wrong ops. That was the bug: an insert/delete next to an unchanged
+        // word rendered a spurious "x → y" and undercounted similarity (e.g. "a c" → "a b c" scored
+        // 33% with a bogus c→b replace instead of 67% with a clean insert of b).
+        if ri < raw_words.len() && ai < ann_words.len() && !raw_is_lcs && !ann_is_lcs {
             changes.push(DiffChange { op: DiffOp::Replace, value: format!("{} → {}", raw_words[ri], ann_words[ai]) });
             ri += 1;
             ai += 1;
             continue;
         }
 
-        // Only raw has content → Delete
-        if ri < raw_words.len() {
+        // A raw word that is not the next common word → Delete; the annotated side waits at its common
+        // word so it aligns as Equal next.
+        if ri < raw_words.len() && !raw_is_lcs {
             changes.push(DiffChange { op: DiffOp::Delete, value: raw_words[ri].to_string() });
             ri += 1;
             continue;
         }
 
-        // Only annotated has content → Insert
+        // An annotated word that is not the next common word → Insert (the raw side waits at its common
+        // word). Also drains the annotated tail once raw is exhausted.
         if ai < ann_words.len() {
             changes.push(DiffChange { op: DiffOp::Insert, value: ann_words[ai].to_string() });
             ai += 1;
             continue;
+        }
+
+        // Only raw remains, sitting on a common word with no annotated partner left → Delete it. (Keeps
+        // the loop provably progressing; unreachable for a well-formed LCS but a safe backstop.)
+        if ri < raw_words.len() {
+            changes.push(DiffChange { op: DiffOp::Delete, value: raw_words[ri].to_string() });
+            ri += 1;
         }
     }
 
@@ -252,6 +265,31 @@ mod tests {
         let diff = compute_diff("hello", "world");
         assert_eq!(diff.stats.changed_words, 1);
         assert_eq!(diff.stats.similarity, 0.0);
+    }
+
+    #[test]
+    fn insert_next_to_common_word_is_an_insert_not_a_replace() {
+        // Regression: the reconstruction used to Replace whenever both sides had content, even when one
+        // word was still the next common word. "a c" → "a b c" is a pure insertion of b, so the only
+        // change must be one Insert and the two common words stay Equal (similarity 2/3). The old code
+        // emitted [Equal a, Replace(c→b), Insert c] — a bogus substitution that scored 1/3.
+        let diff = compute_diff("a c", "a b c");
+        assert_eq!(diff.stats.unchanged_words, 2, "a and c are unchanged: {:?}", diff.changes);
+        assert_eq!(diff.stats.added_words, 1, "exactly b is inserted: {:?}", diff.changes);
+        assert_eq!(diff.stats.changed_words, 0, "no word is replaced: {:?}", diff.changes);
+        assert_eq!(diff.stats.removed_words, 0, "no word is deleted: {:?}", diff.changes);
+        assert!((diff.stats.similarity - 200.0 / 3.0).abs() < 0.01, "got {}", diff.stats.similarity);
+    }
+
+    #[test]
+    fn delete_next_to_common_word_is_a_delete_not_a_replace() {
+        // The mirror case: "a b c" → "a c" is a pure deletion of b. The old code emitted
+        // [Equal a, Replace(b→c), Delete c], again undercounting the unchanged words.
+        let diff = compute_diff("a b c", "a c");
+        assert_eq!(diff.stats.unchanged_words, 2, "a and c are unchanged: {:?}", diff.changes);
+        assert_eq!(diff.stats.removed_words, 1, "exactly b is deleted: {:?}", diff.changes);
+        assert_eq!(diff.stats.changed_words, 0, "no word is replaced: {:?}", diff.changes);
+        assert_eq!(diff.stats.added_words, 0, "no word is inserted: {:?}", diff.changes);
     }
 }
 
