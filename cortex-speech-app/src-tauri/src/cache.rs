@@ -201,6 +201,30 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_removes_every_entry_for_one_audio_and_keeps_others() {
+        // Coverage gap (iter-81 hand-audit): invalidate() prefix-matches the audio content hash to
+        // drop EVERY cache key for that file — all models AND all chunk suffixes — while leaving
+        // unrelated audio untouched. Pin that contract (a stale cache entry surviving a re-import of
+        // edited-in-place audio would replay the wrong transcript).
+        let cache = TranscriptCache::new(8);
+        let a = audio_file(b"aaa");
+        let b = audio_file(b"bbb");
+        cache.set(a.path(), cache_entry("m1", "a-m1"));
+        cache.set(a.path(), cache_entry("m2", "a-m2"));
+        cache.set_chunk(a.path(), Some("chunk_0_1000"), cache_entry("m1", "a-chunk"));
+        cache.set(b.path(), cache_entry("m1", "b-m1"));
+        assert_eq!(cache.size(), 4);
+
+        cache.invalidate(a.path());
+
+        assert!(cache.get(a.path(), "m1").is_none(), "audio A / model m1 must be invalidated");
+        assert!(cache.get(a.path(), "m2").is_none(), "audio A / model m2 must be invalidated");
+        assert!(cache.get_chunk(a.path(), "m1", Some("chunk_0_1000")).is_none(), "audio A chunk must be invalidated");
+        assert!(cache.get(b.path(), "m1").is_some(), "an unrelated audio must survive invalidate");
+        assert_eq!(cache.size(), 1);
+    }
+
+    #[test]
     fn zero_capacity_cache_keeps_one_entry() {
         let cache = TranscriptCache::new(0);
         let first = audio_file(b"first");
