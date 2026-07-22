@@ -6726,3 +6726,37 @@ Gate: fmt 0, clippy 0, **961 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 38 fixed, 5 refuted, 2 measure-deferred.** Lesson: randomized proptests + auditing
 lower-hardened slices still find real bugs — "saturation" was premature. Owner-gated finish line
 unchanged (rebuild + real-audio pass).
+
+---
+
+## 2026-07-22T12:18Z — iter 89 — save_session rate-limiter (63ca5df); word-drop lead refuted with code evidence
+
+**One real fix + a broad hand-audit of the network/IPC surface; one flagged lead resolved as correct.**
+
+**Fix (local-DoS gap, LOW-MED — hand-audit of commands/infra.rs).** `save_session` was the lone IPC
+write command in infra.rs with NO rate-limiter (its read sibling `restore_session` has one). It's a
+webview-reachable DB upsert taken under the GLOBAL db lock; the frontend debounces it to ~1/800ms so a
+limiter never rejects a legitimate save, but a webview loop bypassing that debounce could pin the db lock
+and starve get_segments et al. Same "lone command missing a rate-limiter" class already closed for
+export_audio (round-22 #5) and register_media_asset (round-25 #7). Added
+`RATE_LIMITER.check("save_session")` + fail-before source policy `test_save_session_is_rate_limited`
+(body-scoped so restore_session's own check can't satisfy it vacuously). Fail-before verified by
+reverting the line → policy raises.
+
+**Refuted with code evidence — update_segment_bounds "word-drop".** `update_segment_bounds` rebuilds
+alignment_json via SegmentSourceMeta round-trip, which structurally DROPS any `words[]` array on every
+bounds edit. Looked like silent data loss, but pipeline.rs:2098-2107 slices the clip out of the source
+by its offsets BEFORE aligning (`aligner::align(&sliced, …)`) — so word timestamps are WINDOW-relative
+(0..clip-dur). Changing source_start/end_ms changes the window, so the old words are stale and MUST be
+dropped; preserving them (the tempting "fix") would render word highlights at wrong positions. Correct
+as-is. NOT a defect.
+
+**Audited robust this pass (no defect):** commands/{segments_write, export, batch, dataset_analytics,
+model_download, infra, gold_eval}.rs + couch.rs (LAN token-gated phone-review server) + assets/couch.html
+(no XSS — all dynamic content via .value/.textContent, no external sub-resources → no Referer token leak,
+CSRF-safe). Noted non-defects: couch `!=` token compare is non-constant-time but not exploitable (LAN,
+244-bit per-session token, network jitter dominates) — logged, not "fixed" (no security theater).
+
+Gate: fmt 0, clippy 0, **961 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 39 fixed, 6 refuted, 2 measure-deferred.** Owner-gated finish line unchanged (exe rebuild to
+activate all source-only fixes since ~iter 30; real-audio e2e/RTF/CER pass).
