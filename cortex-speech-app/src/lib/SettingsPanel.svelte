@@ -102,12 +102,14 @@
     // Cancel must discard: don't persist unsaved edits when the user explicitly cancelled.
     if (cancelled) return;
     applySourceReferenceModelsInput();
-    const currentStore = get(settings);
-    if (JSON.stringify(localSettings) !== JSON.stringify(currentStore)) {
-      settings.set(localSettings);
-      if (tauriAvailable) {
-        api.updateSettings(localSettings).catch(console.error);
-      }
+    // Close-to-save for theme/sliders (they have no per-field auto-save). Route through saveQuietly so
+    // this path gets the SAME NaN coercion + rollback-on-failure + error toast as every other persist.
+    // The old bare fire-and-forget updateSettings here skipped coerceSettingsForRuntime: clearing a
+    // type=number field (min/max segment sec, maxSpeakers, jurySelfConsistencyN) to NaN then closing via
+    // ✕/Escape sent NaN->null and failed the WHOLE backend write, silently discarding every edit the user
+    // did make (theme included) and leaving NaN in the store.
+    if (JSON.stringify(localSettings) !== JSON.stringify(get(settings))) {
+      void saveQuietly();
     }
   });
 

@@ -161,6 +161,28 @@ def test_app_save_handlers_use_field_level_updates() -> None:
             raise AssertionError(f"{fn} must persist via api.updateSegmentFields(seg.id, ...) (field-level, lock-safe)")
 
 
+def test_settings_close_persist_routes_through_savequietly() -> None:
+    """SettingsPanel onDestroy is the close-to-save path for theme/sliders (no per-field auto-save). It
+    must persist via saveQuietly (which coerces NaN numeric fields, rolls back on backend failure, and
+    surfaces an error toast), NEVER a bare fire-and-forget api.updateSettings(localSettings).catch: that
+    path skipped coerceSettingsForRuntime, so clearing a type=number field (min/max segment sec,
+    maxSpeakers, jurySelfConsistencyN) then closing via the ✕/Escape gesture sent NaN->null and failed the
+    ENTIRE backend write, silently discarding every settings edit the user did make (a settings-loss bug)
+    while leaving NaN in the reactive store. save() and saveQuietly() both coerce first; onDestroy didn't."""
+    body = _function_body(_read("src/lib/SettingsPanel.svelte"), "onDestroy(() => {")
+    if "saveQuietly()" not in body:
+        raise AssertionError(
+            "SettingsPanel onDestroy does not persist via saveQuietly() — the close-to-save path must reuse "
+            "it for NaN coercion + rollback + error toast. A bare api.updateSettings here silently discards "
+            "all edits when a numeric field was cleared to NaN before the ✕/Escape close."
+        )
+    if "api.updateSettings(localSettings).catch" in body:
+        raise AssertionError(
+            "SettingsPanel onDestroy still fire-and-forgets api.updateSettings(localSettings).catch, which "
+            "skips coerceSettingsForRuntime — route the close-to-save through saveQuietly() instead."
+        )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -169,6 +191,7 @@ def main() -> None:
     test_app_export_audio_excludes_human_rejected()
     test_waveform_stretches_peaks_across_the_canvas()
     test_app_save_handlers_use_field_level_updates()
+    test_settings_close_persist_routes_through_savequietly()
     print("frontend review-guard source policy passed")
 
 
