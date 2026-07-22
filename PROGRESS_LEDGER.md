@@ -6362,3 +6362,30 @@ Gate: fmt 0, clippy 0, **948 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 24 fixed, 5 refuted, 2 measure-deferred, 11 findings left** (next: registry.rs:523
 stale-baseline promotion; registry.rs:109 error-masking; scorecard.rs:270/279 empty-ref gate holes).
 Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-22T05:35Z — iter 75 — promotion gate identity checks (commit b5c6398); 9 findings left
+
+**Hunt-3 #12 (medium) + #13 (low) hand-verified and FIXED — registry promotion gate.** gate_and_promote
+is the designated promotion safety gate (manual runbook step today; zero non-test callers, IPC exposure
+planned) and it trusted the caller's scorecard blindly.
+- **#12 stale-baseline / wrong-scorecard:** the docstring makes "compare against the CURRENT champion" a
+  hard precondition, but get_champion was used only as a presence check — neither vs_baseline.baseline_
+  model_id nor system.model_id was ever read. Batch fan-out B/C both scored vs champion A: gating B
+  rolls A back, then C's stale-A scorecard passes every gate and crowns C (never compared to B). Fix:
+  two fail-closed checks — system.model_id == challenger_id, and (when a champion exists) vs_baseline.
+  baseline_model_id == current champion id.
+- **#13 error-masking:** promote_to_champion mapped EVERY family-lookup error to "unknown model version",
+  masking real DB faults. Now only QueryReturnedNoRows → Validation; other errors propagate as DB errors
+  (matches champion_gold_cer's existing idiom in the same file).
+
+**Fail-before/pass-after verified** for both #12 checks (disabled each independently → its test fails).
+The 4 pre-existing gate integration tests now stamp matching identities via a new `ided()` helper — no
+assertion weakened; decide_promotion unit tests untouched (they never read identity). #13's real-DB-error
+propagation isn't separately unit-testable without mocking rusqlite; the unknown-id path stays covered.
+
+Gate: fmt 0, clippy 0, **950 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 26 fixed, 5 refuted, 2 measure-deferred, 9 findings left** (next: scorecard.rs:270/279
+empty-reference segments earning the p-value / flipping the slice gate; then jury/learning.rs:219/87
+training-data integrity; agentic.rs:387/559; aligner.rs:497/190/517). Owner-gated legs unchanged.
