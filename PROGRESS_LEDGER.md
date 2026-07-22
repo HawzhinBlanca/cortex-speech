@@ -6505,3 +6505,28 @@ commands slices). Next iteration: either a fresh hunt on residual surface (comma
 jury/t1/debate deeper) or pivot to surfacing the owner-gated finish line. The "fully ready robust"
 bar STILL needs the owner's machine (exe rebuild to activate ~all source fixes since iter 30;
 real-audio e2e/RTF/CER) — see OWNER_HANDOFF.md. Nothing here is a declared 10/10.
+
+---
+
+## 2026-07-22T08:05Z — iter 80 — lib.rs hand-audit: finish_import TOCTOU fixed (commit c685807)
+
+**Fresh inline hand-audit of lib.rs (app startup/state — never covered by a hunt). One real defect
+found + FIXED.** finish_import had the exact round-15 TOCTOU that finish_batch documents and avoids,
+in the OPPOSITE (buggy) order: it set import_state=Idle FIRST, then cleared the cancel token (two
+separate locks, gap between). All 3 import commands run try_start_import → start_cancel_token →
+spawn(ImportGuard→finish_import). So if import B starts in the window between A's finish_import
+opening the gate and clearing the token, B arms its own token (start_cancel_token overwrites the
+slot) and A's finish_import then WIPES B's fresh token to None — B keeps running but
+cancel_current_operation reads None and can never stop it (a long audiobook import becomes
+uncancellable). Fix: clear token before opening the gate, mirroring finish_batch — a new import can
+only begin after finish_import fully completes.
+
+Concurrency-ordering invariant (single-threaded both orders are identical → not unit-testable);
+gated by a source-order policy checking BOTH finish_import and finish_batch clear-before-gate.
+**Fail-before verified** via git stash (old order → policy red). Also scanned the rest of lib.rs:
+all AppState locks recover from poison; startup ordering sound (pre-migration pin before initialize;
+start_cancel_token overwrites so it needs no reuse-guard); no production unwrap/panic.
+
+Gate: fmt 0, clippy 0, **957 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 35 fixed, 5 refuted, 2 measure-deferred.** Backend audit coverage now +lib.rs. Owner-gated
+legs unchanged (OWNER_HANDOFF.md) — the finish line still needs the exe rebuild + real-audio pass.
