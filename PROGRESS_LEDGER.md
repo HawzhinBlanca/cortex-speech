@@ -6906,3 +6906,35 @@ engine_supervisor, scribe_api, constrained_decode, features.
 
 Gate: fmt 0, clippy 0, **cargo test --lib 968 passed / 0 failed / 6 ignored**, **34/34 python policies**.
 **Score: 46 fixed (1 latent-hardening), ~13 refuted, 2 measure-deferred.** Owner-gated finish line unchanged.
+
+---
+
+## 2026-07-22T21:27Z — iter 94 — ultracode workflow round 3: 1 fix (quality hypothesis-coverage empty-count)
+
+**Third adversarial workflow (12 finders × 3 refuters, 21 agents, 3 candidates → 1 CONFIRMED). In
+parallel I independently hand-audited FIVE honesty/privacy-critical cores — ALL clean — corroborating the
+10 empty finders.**
+
+**Fix (quality.rs, HIGH, honesty; workflow 3/3 CONFIRMED → this commit).** hypothesis_coverage_for_model_
+outputs counted an EMPTY-transcript hypothesis as a "non-empty model": the only exclusions were
+model_id=="asr" and is_placeholder_transcript(text), but is_placeholder_transcript("") is false. So a
+near-silent clip where the CTC voters (300m/1b) decoded "" while WSL-7B produced real committed text
+reported nonEmptyModelCount inflated (a fabricated coverage number in the bundle report + UI) AND passed
+the >=2-real-model corroboration gate that guards a SILVER machine row into the HF/training export — on a
+SINGLE genuinely-corroborating model. Guarded with trim().is_empty(). Behavioral test; fail-before verified.
+This is the THIRD instance of the same "empty/placeholder counted as real" honesty pattern (iter-92
+runs.rs, iter-93 export_bundle, now quality.rs) — a recurring class worth a future coverage sweep.
+
+**Independently hand-audited CLEAN (5 cores):** quality.rs training-grade classifier (reject-first
+ordering; SILVER needs multi-agent evidence MATCHING the transcript), registry.rs promotion gate (paired
+CER/WER, fail-closed on missing baseline + stale-baseline + NULL-gold_cer + scorecard-belongs-to-challenger,
+slice fail-closed), dpapi.rs (RAII LocalFree, correct FFI provenance, no plaintext/ciphertext leak),
+session/mod.rs (atomic replace + recover-interrupted + saturating clock), jury/learning.rs (fail-closed
+holdout by hash AND path, human-only training, annotated-fix COALESCE, undo/reject retraction, path sanit,
+outbound-endpoint validation).
+
+**Refuted by the workflow (corroborating my audits):** quality clip_cer_tier empty-ref-as-Gold (low),
+jury/learning redecision leak (medium — the retraction tests prove undo/reject retract the pair).
+
+Gate: fmt 0, clippy 0, **cargo test --lib 969 passed / 0 failed / 6 ignored**, **34/34 python policies**.
+**Score: 47 fixed, ~15 refuted, 2 measure-deferred.** Owner-gated finish line unchanged (exe rebuild + real-audio pass).
