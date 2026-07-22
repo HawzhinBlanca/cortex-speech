@@ -6865,3 +6865,44 @@ with the dossier. Guarded the top-level tally with the same non-empty check; beh
 Gate: fmt 0, clippy 0, **cargo test --lib 965 passed / 0 failed / 6 ignored**, **34/34 python policies**.
 **Score: 43 fixed, 7 refuted, 2 measure-deferred.** Ultracode workflow paid off — 3 real bugs in modules
 5 solo hand-audits had found clean, all honesty-relevant. Owner-gated finish line unchanged (exe rebuild + real-audio pass).
+
+---
+
+## 2026-07-22T20:48Z — iter 93 — ultracode workflow round 2: 3 fixes (18b710d, 95aa587, 193d6e0)
+
+**Second adversarial workflow (12 finders × 3 refuters, 39 agents, 9 candidates → 2 CONFIRMED); each
+fix hand-verified against source. In parallel I independently hand-audited 5 modules (all clean),
+corroborating the empty finders.**
+
+**#1 export_bundle.rs (HIGH, honesty; workflow 3/3 CONFIRMED → 95aa587).** The bundle's segment list
+filtered holdout + human-rejected but OMITTED the is_effective_placeholder filter that export::export_dataset
+applies to the tabular data files. So manifest.json segmentCount/totalDurationMs/trainingGradeSummary and
+dataset_card.md counted not-yet-transcribed "[Pending WSL 7B ASR]" rows the shipped dataset.{json,jsonl,csv,
+parquet} exclude — an inflated count disagreeing with the bundle's own data (and dataset.json's embedded
+total). Added the placeholder filter for parity. Behavioral test; fail-before verified.
+
+**#2 corrections.rs / db.rs (MEDIUM, training-signal honesty; workflow 3/3 CONFIRMED → 193d6e0).** LOOP-0
+capture upserts one memory per substituted word with NO dedup, so a single edit repeating the same confusion
+in one sentence ("باش"→"خراپ" twice) INSERTs then bumps the just-inserted row → hit_count 1 from ONE segment.
+hit_count is the anti-one-off guard (independent cross-segment confirmations); one edit faking a confirmation
+corrupts it (n occurrences → hit_count n-1, can self-clear min_hits). Dedup by natural key within a
+correction. Behavioral test; fail-before verified.
+
+**#3 scorecard.rs (honesty hardening; workflow REFUTED 3/3 on reachability — kept, see below → 18b710d).**
+check_gold_regression (the documented, not-yet-wired PR gold-regression gate) never checked scored_segments,
+so an unscoreable candidate (all gold refs normalize to empty → micro_wer 0.0, CI [0,0]) returns passed=true
+with a fabricated "WER ok: 0.0000 ... -0.1500 improvement" — the exact case render_markdown already refuses
+to render. The workflow's verifiers REFUTED it 3/3 on the grounds that the gate has no LIVE caller yet (no
+current production harm). I kept the fix as PRE-WIRING hardening: the behavioral defect is real and
+reproduced by a fail-before test, and it makes the intended gate consistent with render_markdown's existing
+scored_segments==0 guard so it can't fabricate when wired. Honest framing: latent, not currently exploited.
+
+**Refuted by the workflow (not fixed), corroborating my hand-audits:** engine_supervisor exit race (it's a
+pure state machine — the spawner is elsewhere), scribe_api dedupe_repeated (documented conservative
+tradeoff), api_keys write_key_line read-error clobber (I'd independently rated it a minor nit; 2/3 refuted),
+wav2vec2 logits panic (trusted model, not untrusted input), scorecard render '0.00% vs 0.00%' (empty paired
+intersection), snapshot off-drive EXTRA_STATE (low). Independently hand-audited CLEAN: api_keys,
+engine_supervisor, scribe_api, constrained_decode, features.
+
+Gate: fmt 0, clippy 0, **cargo test --lib 968 passed / 0 failed / 6 ignored**, **34/34 python policies**.
+**Score: 46 fixed (1 latent-hardening), ~13 refuted, 2 measure-deferred.** Owner-gated finish line unchanged.
