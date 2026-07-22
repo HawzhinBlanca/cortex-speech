@@ -681,7 +681,14 @@ pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
     let ratio = to_rate as f64 / from_rate as f64;
     // Length is derived from `src` (the prefiltered signal), not the raw `samples`, so the
     // downsample pre-filter above is not silently dropped. `src == samples` on the upsample path.
-    let new_len = (src.len() as f64 * ratio).ceil() as usize;
+    //
+    // Bound the output length so a corrupt/crafted `from_rate` can't request an astronomical allocation.
+    // A real resample to 16 kHz upsamples at most ~2x (an 8 kHz source); 16x is a very generous ceiling no
+    // legitimate file reaches, but it caps the alloc a malformed header can demand: a WAV declaring
+    // sample_rate=1 (it survives the `> 0` decode guard) would otherwise want src.len() * 16000 samples — a
+    // hundreds-of-GB Vec::with_capacity that ABORTS the process (handle_alloc_error, not a catchable panic).
+    // Downsampling (ratio < 1) always stays well under the cap.
+    let new_len = ((src.len() as f64 * ratio).ceil() as usize).min(src.len().saturating_mul(16));
 
     // Anti-aliased windowed-sinc resampling. Each output sample is a Hamming-windowed-sinc-weighted sum
     // of the nearby SOURCE samples, with the sinc cutoff at the lower of the two Nyquist limits. When
@@ -1246,6 +1253,20 @@ mod tests {
         for &from in &[8000u32, 11025, 12000, 22050, 44100, 48000] {
             let _ = resample(&vec![0.1f32; 147], from, 16000);
         }
+    }
+
+    #[test]
+    fn resample_bounds_output_length_against_a_corrupt_low_sample_rate() {
+        // A corrupt/crafted WAV can declare sample_rate=1 (it survives decode's `> 0` guard). Upsampling
+        // it to 16 kHz is ratio 16000, so an unbounded new_len = src.len() * 16000 would be a
+        // hundreds-of-GB Vec::with_capacity that ABORTS the whole process. The output length must be
+        // capped to a sane upsample factor. Tiny input keeps the (bounded) allocation trivial.
+        let out = resample(&vec![0.1f32; 1000], 1, 16000);
+        assert!(out.len() <= 1000 * 16, "a corrupt low from_rate must not upsample past the cap: got {}", out.len());
+        // The cap never clips a LEGITIMATE resample: 8 kHz -> 16 kHz still doubles (ratio 2, far under 16x)...
+        assert_eq!(resample(&vec![0.2f32; 1000], 8000, 16000).len(), 2000, "8k->16k doubles length");
+        // ...and a downsample shrinks, nowhere near the cap.
+        assert_eq!(resample(&vec![0.3f32; 3000], 48000, 16000).len(), 1000, "48k->16k thirds the length");
     }
 
     #[test]
