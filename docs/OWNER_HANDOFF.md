@@ -1,5 +1,58 @@
 # Cortex Speech — Owner Hand-off
 
+> ## ▶ UPDATE 2026-07-22 — Adversarial bug-hunt campaign. Read this first; everything below is the older baseline.
+>
+> Since the 2026-07-17 note, the nightly loop ran a sustained **adversarial defect hunt** across the
+> whole Rust backend (multi-agent finders + per-finding adversarial verification, then every candidate
+> hand-verified against source before any fix). Verbatim per-iteration record: the tail of
+> `PROGRESS_LEDGER.md` (iters ~56–81).
+>
+> **Tally: 35 defects FIXED, 5 refuted-with-audit, 2 measure-deferred.** Every fix shipped with a
+> real fail-before/pass-after gate (the failing test/policy was shown red before the fix, green after)
+> — no fix was claimed on "tests pass" alone. Green gate as of this note:
+> `cargo test --lib` **958 passed / 0 failed / 6 ignored**, `cargo fmt --check` clean,
+> `cargo clippy --all-targets -D warnings` clean, **33/33** python policy scripts.
+>
+> ### The highest-impact fixes (what your rebuild activates)
+> - **HIGH — jury Autonomy Dial leaked machine-commits.** The dial was enforced only at T0; the same
+>   run then machine-committed `jury_accept` via reference-selection/T2. Because the SHIPPED DEFAULT
+>   dial is **Propose**, default-settings agentic imports were auto-committing verdicts the dial
+>   promised to stage for you. Now gated at every commit stage.
+> - **Fresh-install ASR was broken until restart.** The pool pinned a "model not loaded" placeholder
+>   for the whole process, so *download-the-model-in-app → transcribe* stayed dead until you restarted.
+>   Now it retries.
+> - **Model-download integrity.** Truncated downloads were reported "installed"; a failed SHA pin left
+>   the bad model in place. Now: verify-before-install + size-aware presence checks.
+> - **Data-integrity / provenance.** Crash-resume no longer duplicates segments; undo/reject now
+>   retract the DPO training pair; the LM corpus uses your annotated fix (not the stale ASR draft);
+>   relink refuses a file another recording owns; Scribe rows record honest cloud provenance.
+> - **Snapshot durability.** Snapshots are built in a staging dir + atomic rename (a failed backup can
+>   no longer leave a partial that counts as real); same-second pins no longer overwrite each other;
+>   the off-drive backup is pinned during a corruption quarantine.
+> - **Promotion gate honesty.** The gate now verifies the scorecard belongs to the challenger and was
+>   scored against the CURRENT champion (a stale-baseline batch could otherwise crown the wrong model);
+>   empty-reference clips no longer manufacture WER significance or pad the slice gate.
+> - **Cloud-reference honesty.** A truncated Gemini response (MAX_TOKENS/SAFETY) is refused instead of
+>   cached forever as a "complete" reference; a reference with no positional window can't fake a
+>   source-window match to auto-commit.
+> - **Aligner.** Fabricated word timestamps clamp to the clip; a mostly-fabricated alignment is no
+>   longer stamped `ctc_forced`; `score_consistency` caps clip/DP size so a whole-recording segment
+>   can't OOM the worker.
+> - **Concurrency.** A finishing import could wipe a just-started import's cancel token, making the new
+>   import uncancellable — fixed to the same clear-before-gate order as batch.
+>
+> ### ▶ This does NOT move the finish line — that is still on YOUR machine
+> **The running `.exe` predates essentially all of the above (source-only until rebuilt).** The three
+> legs below are unchanged from the 2026-07-17 note and remain the ONLY path to "fully ready robust":
+> 1. **Snapshot the DB, then `make build-app`** — activates every fix in this note + v39/v40 + telemetry.
+> 2. **`make verify-10`** — still INCOMPLETE with ZERO failing kept gates; the not-run legs need the
+>    real exe + real audio + a live model.
+> 3. **One real-audio pass you personally review** — `CORTEX_AUDIO=<abs .wav> node cortex-speech-app/e2e_real_app.cjs`,
+>    then `make bench-rtf` (RTF) and `make eval-ckb` (CKB CER). No number here is measured or faked.
+>
+> Nothing in this note is a declared 10/10. The engineering the agent could do without your hardware
+> is done and green; the finish line is the rebuild + the real-data legs.
+
 > ## ▶ UPDATE 2026-07-17 — MONTH-LOOP session (Weeks 1–4). Read this first; the 2026-07-11 status below is the older baseline.
 >
 > This autonomous session (24 iterations, every change gated + most adversarially verified — see the
