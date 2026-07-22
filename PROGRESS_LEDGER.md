@@ -6760,3 +6760,37 @@ CSRF-safe). Noted non-defects: couch `!=` token compare is non-constant-time but
 Gate: fmt 0, clippy 0, **961 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 39 fixed, 6 refuted, 2 measure-deferred.** Owner-gated finish line unchanged (exe rebuild to
 activate all source-only fixes since ~iter 30; real-audio e2e/RTF/CER pass).
+
+---
+
+## 2026-07-22T12:57Z — iter 90 — REAL frontend bug: LCS word-diff mis-rendered inserts/deletes as bogus Replaces (7530548)
+
+**First frontend defect of the campaign — the un-hunted Svelte/TS surface yielded a genuine user-visible bug.**
+
+**Bug (word-diff reconstruction, MEDIUM — hand-audit of src/lib/diff/compute.ts + its Rust mirror).** The
+LCS-diff shown in DiffView (and its similarity stat) emitted a Replace whenever both sides had content,
+WITHOUT checking that both words diverged from the LCS. When only one side diverged (an insert/delete
+next to an unchanged word), it consumed the other side's common word into a spurious "x → y" and
+cascaded wrong ops. The code literally contradicted its own comment ("neither matches LCS → Replace" —
+a guard the implementation omitted). Effect: "a c" → "a b c" (pure insertion) rendered
+[Equal a, Replace(c→b), Insert c] scoring 33% similar instead of [Equal a, Insert b, Equal c] at 67%.
+EVERY real transcript edit that adds/removes a word beside unchanged text was mis-rendered + under-scored
+on similarity (a metric the reviewer sees).
+
+**Present in BOTH mirrors** — Rust `diff::compute_diff` (the IPC path) AND TS `computeLocalDiff`
+(DiffView's browser-mode / backend-unavailable fallback). Fixed both to Replace only when both words
+diverge, else Delete/Insert so the side on a common word waits to align as Equal. One logical change,
+both mirrors moved together (DiffView falls back between them — divergence would confuse the reviewer).
+
+**Why it went uncaught:** the existing Rust unit tests (test_insertion/test_deletion) only asserted an
+op's PRESENCE, and the proptests asserted VALIDITY (all words accounted, similarity∈[0,100]) — never
+OPTIMALITY. The buggy output was a valid-but-suboptimal edit script, so every test passed. A
+DiffViewRuntime.test even PINNED the buggy "world → beautiful" replace for a pure insertion; corrected
+it to assert the inserted word + absence of the bogus substitution.
+
+Fail-before verified on both mirrors (reverted each → the 2 regression tests fail; Rust panic printed the
+exact bogus `[Equal a, Replace(c → b), Insert c]`). Gate: fmt 0, clippy 0, **cargo test --lib 963
+passed / 0 failed / 6 ignored**, **vitest 201 passed**, typecheck 0, lint 0, 33/33 python policies.
+**Score: 40 fixed, 6 refuted, 2 measure-deferred.** Lesson: the frontend pure-logic surface (mostly
+untested — 2 test files for ~31 components) is a fresh vein; autosave.ts / segmentQuality.ts /
+alignment.ts / wordEdit.ts audited correct this pass but under-tested. Owner-gated finish line unchanged.
