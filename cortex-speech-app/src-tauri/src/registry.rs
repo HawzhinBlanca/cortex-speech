@@ -104,9 +104,17 @@ pub fn promote_to_champion(db: &Database, id: &str) -> AppResult<()> {
     let conn = db.connection();
     let tx = conn.unchecked_transaction()?;
 
-    let family: String = tx
-        .query_row("SELECT family FROM model_versions WHERE id = ?1", params![id], |r| r.get(0))
-        .map_err(|_| AppError::Validation(format!("cannot promote unknown model version '{id}'")))?;
+    // Only a genuinely-absent row is a "validation" problem (unknown id); a real DB error (locked /
+    // IO / corrupt) must surface AS a DB error, not be mislabeled as an unknown model version
+    // (round-24 hunt #13) — otherwise a transient fault reads as "you promoted a nonexistent model".
+    let family: String =
+        match tx.query_row("SELECT family FROM model_versions WHERE id = ?1", params![id], |r| r.get(0)) {
+            Ok(family) => family,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(AppError::Validation(format!("cannot promote unknown model version '{id}'")));
+            }
+            Err(e) => return Err(e.into()),
+        };
 
     // Demote the incumbent champion of this family (if any other row holds it).
     tx.execute(
@@ -515,21 +523,48 @@ pub fn gate_and_promote(
     let challenger = get_model_version(db, challenger_id)?
         .ok_or_else(|| AppError::Validation(format!("cannot gate unknown model version '{challenger_id}'")))?;
 
+    // Safety-gate precondition #1 (round-24 hunt #12): the scorecard must BELONG to the challenger
+    // being gated. A scorecard whose system.model_id names a different model would gate the wrong
+    // model's metrics onto this promotion — silently crowning `challenger_id` on another model's
+    // numbers. The harness stamps system.model_id (scorecard.rs), so this is a caller-contract check.
+    if challenger_scorecard.system.model_id != challenger_id {
+        return Err(AppError::Validation(format!(
+            "promotion gate: scorecard is for model '{}', not the challenger '{}' being gated",
+            challenger_scorecard.system.model_id, challenger_id
+        )));
+    }
+
     // Distinguish "no champion exists" from "a champion exists" by the CHAMPION ROW itself — NOT by
     // whether its gold_cer is non-NULL. Keying on gold_cer would read a champion with a NULL gold_cer
     // as "no champion", letting the next challenger bypass the ENTIRE gate (a free promotion). The gate
     // uses the PAIRED champion CER carried in the challenger scorecard's vs_baseline, so the champion's
     // stored gold_cer value is not needed here at all.
-    let decision = if get_champion(db, &challenger.family)?.is_none() {
-        PromotionDecision {
+    let decision = match get_champion(db, &challenger.family)? {
+        None => PromotionDecision {
             promote: true,
             reasons: vec![format!(
                 "no incumbent champion for family '{}' — promoted as the first champion",
                 challenger.family
             )],
+        },
+        Some(champion) => {
+            // Safety-gate precondition #2 (round-24 hunt #12, the stale-baseline hole): the scorecard's
+            // paired baseline MUST be the CURRENT champion. In a batch fan-out, two challengers B and C
+            // are both scored against champion A; gating B promotes it and rolls A back. C's scorecard
+            // still pairs against A — every gate would pass against the now-STALE baseline and crown C
+            // even though it was never compared to B, the model it displaces. Fail-closed on mismatch.
+            if let Some(cmp) = &challenger_scorecard.vs_baseline {
+                if cmp.baseline_model_id != champion.id {
+                    return Err(AppError::Validation(format!(
+                        "promotion gate: scorecard for '{challenger_id}' was compared against baseline '{}', \
+                         but the current champion of family '{}' is '{}' — re-run the gold eval against the \
+                         current champion before gating",
+                        cmp.baseline_model_id, challenger.family, champion.id
+                    )));
+                }
+            }
+            decide_promotion(challenger_scorecard, policy)
         }
-    } else {
-        decide_promotion(challenger_scorecard, policy)
     };
 
     if decision.promote {
@@ -771,6 +806,17 @@ mod tests {
     }
 
     /// A challenger scorecard with a paired WER + CER comparison against the champion.
+    /// Stamp a card's identity fields so it satisfies gate_and_promote's precondition checks (the
+    /// scorecard belongs to `challenger_id` and is paired against `baseline_id`). The decide_promotion
+    /// unit tests don't need this — they never read identity — so `challenger_card` keeps its literals.
+    fn ided(mut card: Scorecard, challenger_id: &str, baseline_id: &str) -> Scorecard {
+        card.system.model_id = challenger_id.into();
+        if let Some(cmp) = card.vs_baseline.as_mut() {
+            cmp.baseline_model_id = baseline_id.into();
+        }
+        card
+    }
+
     fn challenger_card(
         system_wer: f64,
         system_cer: f64,
@@ -921,7 +967,7 @@ mod tests {
         let db = open();
         register_candidate(&db, &candidate("v1", "omniasr-7b", "user-finetuned", "sha")).unwrap();
         // Even a weak scorecard with no baseline promotes when there is no incumbent to beat.
-        let mut card = challenger_card(0.5, 0.5, 0.5, 0.5, false, 0.9);
+        let mut card = ided(challenger_card(0.5, 0.5, 0.5, 0.5, false, 0.9), "v1", "");
         card.vs_baseline = None;
         let decision = gate_and_promote(&db, "v1", &card, &PromotionPolicy::default()).unwrap();
         assert!(decision.promote, "the first model must become champion: {:?}", decision.reasons);
@@ -937,7 +983,7 @@ mod tests {
         promote_to_champion(&db, "champ").unwrap();
         // Challenger that significantly beats WER and lowers CER (0.06 < 0.10).
         register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
-        let card = challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01);
+        let card = ided(challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01), "chall", "champ");
         let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
         assert!(decision.promote, "a qualified challenger must promote: {:?}", decision.reasons);
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "chall");
@@ -952,7 +998,7 @@ mod tests {
         promote_to_champion(&db, "champ").unwrap();
         register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
         // Beats WER but regresses CER (0.15 > 0.10) -> blocked; the champion is untouched.
-        let card = challenger_card(0.10, 0.15, 0.20, 0.10, true, 0.01);
+        let card = ided(challenger_card(0.10, 0.15, 0.20, 0.10, true, 0.01), "chall", "champ");
         let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
         assert!(!decision.promote, "a CER-regressing challenger must be blocked");
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "champ", "champion is unchanged");
@@ -975,7 +1021,7 @@ mod tests {
 
         register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
         // A CER-regressing challenger (paired 0.15 > 0.10) must be BLOCKED, not free-promoted.
-        let card = challenger_card(0.10, 0.15, 0.20, 0.10, true, 0.01);
+        let card = ided(challenger_card(0.10, 0.15, 0.20, 0.10, true, 0.01), "chall", "champ");
         let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
         assert!(
             !decision.promote,
@@ -990,5 +1036,53 @@ mod tests {
         let db = open();
         let card = challenger_card(0.1, 0.05, 0.2, 0.08, true, 0.01);
         assert!(gate_and_promote(&db, "ghost", &card, &PromotionPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn gate_and_promote_rejects_a_scorecard_paired_against_a_stale_baseline() {
+        // Round-24 hunt #12 (the stale-baseline hole): a batch fan-out scores challengers B and C
+        // both against champion A. Gating B promotes it and rolls A back. C's scorecard STILL pairs
+        // against A — every WER/CER/slice gate would pass against the now-stale baseline and crown C,
+        // though it was never compared to B, the champion it would displace. The gate must refuse a
+        // scorecard whose baseline is not the CURRENT champion.
+        let db = open();
+        register_candidate(&db, &candidate("A", "omniasr-7b", "meta-stock", "shaA")).unwrap();
+        record_eval_result(&db, "A", 0.20, 0.10, 0.08, 0.12, None, "{}", None).unwrap();
+        promote_to_champion(&db, "A").unwrap();
+
+        // B beats A and is promoted; A is rolled back, B is champion.
+        register_candidate(&db, &candidate("B", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
+        let card_b = ided(challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01), "B", "A");
+        assert!(gate_and_promote(&db, "B", &card_b, &PromotionPolicy::default()).unwrap().promote);
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "B");
+
+        // C's scorecard is still paired against the now-STALE baseline A — must be REFUSED, and B stays.
+        register_candidate(&db, &candidate("C", "omniasr-7b", "user-finetuned", "shaC")).unwrap();
+        let card_c = ided(challenger_card(0.09, 0.05, 0.20, 0.10, true, 0.01), "C", "A");
+        let err = gate_and_promote(&db, "C", &card_c, &PromotionPolicy::default());
+        assert!(err.is_err(), "a scorecard paired against a rolled-back baseline must be refused, not gated");
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "B", "the real champion is unchanged");
+
+        // Re-scored against the CURRENT champion B, C promotes normally.
+        let card_c_fresh = ided(challenger_card(0.09, 0.05, 0.10, 0.06, true, 0.01), "C", "B");
+        assert!(gate_and_promote(&db, "C", &card_c_fresh, &PromotionPolicy::default()).unwrap().promote);
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "C");
+    }
+
+    #[test]
+    fn gate_and_promote_rejects_a_scorecard_for_a_different_model() {
+        // The scorecard must belong to the challenger being gated — a card whose system.model_id names
+        // another model would crown `challenger_id` on someone else's numbers.
+        let db = open();
+        register_candidate(&db, &candidate("champ", "omniasr-7b", "meta-stock", "shaA")).unwrap();
+        record_eval_result(&db, "champ", 0.20, 0.10, 0.08, 0.12, None, "{}", None).unwrap();
+        promote_to_champion(&db, "champ").unwrap();
+        register_candidate(&db, &candidate("chall", "omniasr-7b", "user-finetuned", "shaB")).unwrap();
+
+        // Card's system.model_id is "someone-else", not "chall".
+        let card = ided(challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01), "someone-else", "champ");
+        let err = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default());
+        assert!(err.is_err(), "a scorecard for a different model must be refused");
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "champ", "champion unchanged");
     }
 }
