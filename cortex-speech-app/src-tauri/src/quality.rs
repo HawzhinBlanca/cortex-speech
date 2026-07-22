@@ -108,7 +108,17 @@ pub fn hypothesis_coverage_for_model_outputs(hypotheses: &[SegmentHypothesis]) -
         if model_id.is_empty() {
             continue;
         }
-        if model_id.eq_ignore_ascii_case("asr") || is_placeholder_transcript(&hypothesis.transcript) {
+        // An EMPTY/whitespace transcript is not real model output — a CTC voter that decoded blank on a
+        // near-silent clip stores "" (parse_wsl_segment_result treats an empty result as a legitimate
+        // silent-clip outcome). It must NOT count toward `non_empty_models`: is_placeholder_transcript("")
+        // is false (it only matches the [ASR…/[Pending/n/a/null sentinels), so without this guard a blank
+        // hypothesis inflated the displayed nonEmptyModelCount AND defeated the >=2-real-model corroboration
+        // gate that lets a SILVER machine row into the training export — passing "3 models corroborate" when
+        // only one produced text. Ignore it, like a placeholder.
+        if model_id.eq_ignore_ascii_case("asr")
+            || hypothesis.transcript.trim().is_empty()
+            || is_placeholder_transcript(&hypothesis.transcript)
+        {
             ignored_models.insert(model_id.to_string());
         } else {
             non_empty_models.insert(model_id.to_string());
@@ -787,6 +797,39 @@ impl Default for DatasetQuality {
 mod tests {
     use super::*;
     use crate::db::SpeechSegment;
+
+    #[test]
+    fn hypothesis_coverage_ignores_empty_transcripts_so_the_corroboration_gate_is_not_faked() {
+        // A near-silent clip: two CTC voters decoded BLANK ("" / whitespace) and only one model produced
+        // real text. An empty transcript is not real model output — it must be IGNORED, never counted as a
+        // "non-empty model", or the displayed nonEmptyModelCount is fabricated AND the >=2-real-model
+        // corroboration gate that lets a SILVER row into the training export passes on a single genuinely-
+        // corroborating model (is_placeholder_transcript("") is false, so blanks slipped through).
+        let hyp = |model: &str, text: &str| SegmentHypothesis {
+            segment_id: "s1".to_string(),
+            model_id: model.to_string(),
+            transcript: text.to_string(),
+            confidence: Some(0.9),
+        };
+        let report = hypothesis_coverage_for_model_outputs(&[
+            hyp("omniasr-ctc-300m", ""),        // blank decode
+            hyp("omniasr-ctc-1b", "   "),       // whitespace-only decode
+            hyp("omniasr-wsl-7b", "دەقی ڕاست"), // the one real hypothesis
+        ]);
+        assert_eq!(
+            report.non_empty_models,
+            vec!["omniasr-wsl-7b".to_string()],
+            "only the model with real text counts as non-empty"
+        );
+        assert_eq!(report.non_empty_model_count, 1);
+        assert!(!report.passes_minimum, "one real model must NOT pass the >=2-model corroboration gate");
+        assert!(
+            report.ignored_models.contains(&"omniasr-ctc-300m".to_string())
+                && report.ignored_models.contains(&"omniasr-ctc-1b".to_string()),
+            "the blank-decode models are ignored, not counted: {:?}",
+            report.ignored_models
+        );
+    }
 
     fn seg(id: &str, text: &str, duration_ms: i64) -> SpeechSegment {
         SpeechSegment {
