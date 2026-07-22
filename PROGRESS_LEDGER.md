@@ -6672,3 +6672,30 @@ clean audits (corrections, significance, wer, eval, audio). Every hand-audited m
 well-hardened backend + the full honesty-critical measurement/decode stack are verified sound. Only
 substantial un-hand-audited surface left is commands.rs core (~3900 lines of IPC bodies — realistically
 workflow-scale). Owner-gated finish line unchanged (rebuild + real-audio pass).
+
+---
+
+## 2026-07-22T10:56Z — iter 87 — privacy/consent enforcement hand-audited CLEAN (the #1 guardrail)
+
+**Hand-audit of the cloud-consent guardrail — the project's most important security property. Verified
+COMPLETE and CORRECT at every egress path; CLEAN, no defect.**
+- **effective_llm_mode (settings.rs):** downgrades to None for Gemini without cloud_llm_opt_in AND for
+  "Local" mode pointed at a non-loopback endpoint (Round-22 #6 — a Local+remote LLM is effectively
+  cloud and would POST every transcript + bearer key without consent).
+- **endpoint_host_is_loopback:** robust, fail-closed loopback parser — requires http(s) scheme, strips
+  path/query/fragment, drops userinfo via rsplit('@') (last-@ = host, matching lenient clients), handles
+  bracketed IPv6 (rejects `[::1].evil.com`), and gates on `host=="localhost" || IpAddr::is_loopback()`
+  (covers 127/8 + ::1, not 0.0.0.0). I could construct NO input that returns loopback=true while a client
+  would route remotely. Traced localhost.evil.com / 127.0.0.1.evil.com / user@evil.com / [::1].evil.com /
+  fragment-@ tricks — all blocked.
+- **Every cloud-egress IPC command calls its consent gate FIRST:** transcribe_audio_with_scribe +
+  add_scribe_votes → require_cloud_stt_consent; DPO/cloud-LLM path → require_cloud_llm_consent. Gates run
+  EAGERLY on the caller thread before any offload. Audio egress ALSO requires ensure_imported
+  (DB-membership) so no arbitrary webview path is uploadable. Dedicated tests exist
+  (scribe_commands_require_cloud_stt_consent, cloud_llm consent).
+
+Gate: none needed (read-only audit). **Score: 36 fixed, 5 refuted, 2 measure-deferred; privacy guardrail
+verified sound.** With the measurement stack (iters 84-85), the untrusted-audio surface (86), and now the
+privacy guardrail all hand-verified, the highest-consequence properties are confirmed correct. Remaining
+un-hand-audited surface is the rest of commands.rs core (routine IPC bodies). Owner-gated finish line
+unchanged — rebuild + real-audio pass.
