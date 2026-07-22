@@ -6446,3 +6446,30 @@ Gate: fmt 0, clippy 0, **953 passed / 0 failed / 6 ignored**, 33/33 policies.
 finishReason ignored → truncated response as complete reference; agentic.rs:559 window substitution;
 aligner.rs:497/190/517 timestamp clamp / OOM cap / degenerate-alignment guard). Owner-gated legs
 unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-22T06:55Z — iter 78 — Gemini reference honesty pair fixed (commit 308f46a); 3 findings left
+
+**Hunt-3 #14 (medium) + #15 (low) hand-verified and FIXED — Gemini whole-file reference honesty.**
+- **#14 extract_gemini_text ignored finishReason:** a MAX_TOKENS/SAFETY/RECITATION-truncated response
+  was returned as complete, then cached (keyed by audio hash → reused forever), mis-scoring every
+  segment past the cut. Fix: a PRESENT non-STOP finishReason is a hard Err; missing is tolerated.
+  Covers all Gemini callers (reference + T2).
+- **#15 reference_window_tokens silent whole-file fallback:** with no source duration or segment
+  offsets it returned the WHOLE reference, but the caller still gated auto-commit on the >=0.45
+  "window" overlap and wrote a rationale claiming positional "source-window overlap" that never
+  happened. Fix: the fn now reports positional-ness; CandidateSelectionReport carries
+  positional_window; the single-ref commit gate AND the multi-reference agreement boost require it;
+  rationale is honest ("whole-file overlap … not a source-window match") on fallback.
+
+**Fail-before/pass-after verified** for both (extract_gemini_text_rejects_a_truncated_response;
+reference_selection_refuses_to_commit_without_a_positional_window). Two end-to-end reference-commit
+tests were exploiting the fake-audio degenerate path (no duration → whole-file commit — the bug);
+updated to the production state (real WAV + whole-file offsets), and the margin-gate test now
+supplies a real window so it tests margin, not the positional gate — no assertion weakened.
+
+Gate: fmt 0, clippy 0, **955 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 31 fixed, 5 refuted, 2 measure-deferred, 3 findings left** (the aligner cluster: aligner.rs:497
+unclamped fabricated word end; aligner.rs:190 score_consistency uncapped OOM; aligner.rs:517
+degenerate-alignment guard). Owner-gated legs unchanged (OWNER_HANDOFF.md).
