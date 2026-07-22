@@ -57,7 +57,22 @@ pub fn snapshot_health() -> SnapshotHealth {
 /// Take a rotating snapshot into `<data_dir>/snapshots/snapshot_<ts>/`, then prune to newest `keep`.
 /// Returns `Ok(None)` when the EMPTY-DB GUARD refuses the snapshot (see below) — a skip, not an error.
 pub fn take_snapshot(db: &Database, data_dir: &Path, keep: usize) -> AppResult<Option<PathBuf>> {
-    let result = take_snapshot_at(db, data_dir, keep, now_secs());
+    take_snapshot_with_quarantine_source(db, data_dir, data_dir, keep)
+}
+
+/// `take_snapshot` for a snapshot tree that does NOT live in the primary data dir (the
+/// second-directory backup): `quarantine_dir` is where `*.corrupt.*` quarantine files actually
+/// appear — the PRIMARY data dir. The quarantine prune-pin and the accumulation cap used to inspect
+/// the snapshot tree's own parent, so during an unacknowledged corruption the OFF-DRIVE tree — the
+/// copy that matters most in a corruption — kept pruning its pre-corruption history (round-24 hunt
+/// #6). Health counters cover both trees, as before.
+pub fn take_snapshot_with_quarantine_source(
+    db: &Database,
+    data_dir: &Path,
+    quarantine_dir: &Path,
+    keep: usize,
+) -> AppResult<Option<PathBuf>> {
+    let result = take_snapshot_at_from(db, data_dir, quarantine_dir, keep, now_secs());
     match &result {
         Ok(Some(_)) => {
             LAST_SUCCESS_EPOCH.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
@@ -79,17 +94,49 @@ pub fn take_snapshot(db: &Database, data_dir: &Path, keep: usize) -> AppResult<O
 /// BEFORE a restore overwrites the live DB — a mis-restore of the wrong snapshot was otherwise
 /// recoverable only from a ≤10-min-old rolling snapshot that itself rotates out.
 pub fn take_pinned_snapshot(db: &Database, data_dir: &Path, label: &str, keep_pinned: usize) -> AppResult<PathBuf> {
+    take_pinned_snapshot_at(db, data_dir, label, keep_pinned, now_secs())
+}
+
+/// `take_pinned_snapshot` with an explicit timestamp (testable without wall-clock sleeps).
+pub(crate) fn take_pinned_snapshot_at(
+    db: &Database,
+    data_dir: &Path,
+    label: &str,
+    keep_pinned: usize,
+    ts: u64,
+) -> AppResult<PathBuf> {
     let pinned_root = data_dir.join("snapshots").join(PINNED_DIR);
-    let snap_dir = pinned_root.join(format!("{label}_{:010}", now_secs()));
-    fs::create_dir_all(&snap_dir).map_err(AppError::Io)?;
-    db.backup(snap_dir.join(DB_FILE))?;
+    // Build in a STAGING dir (the '.' prefix keeps it out of every `{label}_` scan), then promote by
+    // rename — a failed backup must never leave a partial dir that counts as a real pin, and a
+    // second same-label pin in the same wall-clock second must never silently OVERWRITE the previous
+    // pin's database (round-24 hunt #5/#7: create_dir_all succeeded on the existing dir and
+    // db.backup clobbered it — destroying the very state the pin existed to preserve).
+    sweep_stale_staging_dirs(&pinned_root);
+    let staging = pinned_root.join(format!("{STAGING_PREFIX}{label}_{ts:010}"));
+    fs::create_dir_all(&staging).map_err(AppError::Io)?;
+    if let Err(e) = db.backup(staging.join(DB_FILE)) {
+        remove_staging_dir(&staging);
+        return Err(e);
+    }
     for name in EXTRA_STATE {
         let src = data_dir.join(name);
         if src.is_file() {
-            if let Err(e) = fs::copy(&src, snap_dir.join(name)) {
+            if let Err(e) = fs::copy(&src, staging.join(name)) {
                 tracing::warn!("pinned snapshot: could not copy {name}: {e}");
             }
         }
+    }
+    // Promote under the first FREE timestamped name — a same-second sibling bumps forward instead of
+    // being overwritten.
+    let mut final_ts = ts;
+    let mut snap_dir = pinned_root.join(format!("{label}_{final_ts:010}"));
+    while snap_dir.exists() {
+        final_ts += 1;
+        snap_dir = pinned_root.join(format!("{label}_{final_ts:010}"));
+    }
+    if let Err(e) = fs::rename(&staging, &snap_dir) {
+        remove_staging_dir(&staging);
+        return Err(AppError::Io(e));
     }
     // Bound same-label accumulation (newest keep_pinned survive) so repeated upgrades/restores
     // can't grow without limit; different labels never evict each other.
@@ -111,8 +158,20 @@ pub fn take_pinned_snapshot(db: &Database, data_dir: &Path, label: &str, keep_pi
     Ok(snap_dir)
 }
 
-/// `take_snapshot` with an explicit timestamp (testable without same-second collisions).
+/// `take_snapshot` with an explicit timestamp (testable without same-second collisions). Test-only
+/// convenience: production routes through `take_snapshot_at_from` so the quarantine dir is explicit.
+#[cfg(test)]
 pub(crate) fn take_snapshot_at(db: &Database, data_dir: &Path, keep: usize, ts: u64) -> AppResult<Option<PathBuf>> {
+    take_snapshot_at_from(db, data_dir, data_dir, keep, ts)
+}
+
+pub(crate) fn take_snapshot_at_from(
+    db: &Database,
+    data_dir: &Path,
+    quarantine_dir: &Path,
+    keep: usize,
+    ts: u64,
+) -> AppResult<Option<PathBuf>> {
     let root = data_dir.join("snapshots");
 
     // THE EMPTY-DB GUARD (B2, true-10 audit blocker): after a corruption quarantine the app opens a
@@ -133,7 +192,7 @@ pub(crate) fn take_snapshot_at(db: &Database, data_dir: &Path, keep: usize, ts: 
     // below is correct, but with snapshots resuming after a re-import (segment_count > 0) it meant a
     // full DB copy every cycle, unbounded (~144/day), until disk pressure. History is already frozen
     // by the pin — additional copies beyond 2×keep add no protection, so stop taking new ones.
-    if has_unacknowledged_quarantine(data_dir) {
+    if has_unacknowledged_quarantine(quarantine_dir) {
         let existing = fs::read_dir(&root)
             .ok()
             .into_iter()
@@ -150,25 +209,60 @@ pub(crate) fn take_snapshot_at(db: &Database, data_dir: &Path, keep: usize, ts: 
         }
     }
 
-    let snap_dir = root.join(format!("{SNAPSHOT_PREFIX}{ts:010}"));
-    fs::create_dir_all(&snap_dir).map_err(AppError::Io)?;
+    // Build in a STAGING dir, promote by rename (round-24 hunt #5): a failed db.backup used to leave
+    // a `snapshot_<ts>` dir holding a partial database, and that garbage dir then counted as a REAL
+    // snapshot everywhere — has_any_snapshot (arming the empty-DB guard against a legitimate first
+    // snapshot), the prune keep-set (occupying a slot and evicting a good older snapshot), and the
+    // quarantine accumulation cap. The '.' prefix keeps staging out of every SNAPSHOT_PREFIX scan.
+    sweep_stale_staging_dirs(&root);
+    let staging = root.join(format!("{STAGING_PREFIX}{SNAPSHOT_PREFIX}{ts:010}"));
+    fs::create_dir_all(&staging).map_err(AppError::Io)?;
 
-    // The DB is the critical artifact — its failure fails the snapshot. Online backup (page copy) is
-    // safe while the app reads/writes the source.
-    db.backup(snap_dir.join(DB_FILE))?;
+    // The DB is the critical artifact — its failure fails the snapshot (and removes the staging dir).
+    if let Err(e) = db.backup(staging.join(DB_FILE)) {
+        remove_staging_dir(&staging);
+        return Err(e);
+    }
 
     // Config/state files are best-effort — a missing or unreadable one must not lose the DB snapshot.
     for name in EXTRA_STATE {
         let src = data_dir.join(name);
         if src.is_file() {
-            if let Err(e) = fs::copy(&src, snap_dir.join(name)) {
+            if let Err(e) = fs::copy(&src, staging.join(name)) {
                 tracing::warn!("snapshot: could not copy {name}: {e}");
             }
         }
     }
 
-    prune_snapshots(&root, keep)?;
+    let snap_dir = root.join(format!("{SNAPSHOT_PREFIX}{ts:010}"));
+    if let Err(e) = fs::rename(&staging, &snap_dir) {
+        remove_staging_dir(&staging);
+        return Err(AppError::Io(e));
+    }
+
+    prune_snapshots_from(&root, quarantine_dir, keep)?;
     Ok(Some(snap_dir))
+}
+
+/// Staging dirs start with '.', so no `snapshot_`/`<label>_` scan ever counts one.
+const STAGING_PREFIX: &str = ".staging_";
+
+/// Best-effort removal of a staging dir after a failed build (warn, never fail the caller further).
+fn remove_staging_dir(staging: &Path) {
+    if let Err(e) = fs::remove_dir_all(staging) {
+        tracing::warn!("snapshot: could not remove staging dir {}: {e}", staging.display());
+    }
+}
+
+/// Best-effort sweep of stale staging dirs left by a crash mid-snapshot (warn, never fail).
+fn sweep_stale_staging_dirs(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && entry.file_name().to_str().is_some_and(|n| n.starts_with(STAGING_PREFIX)) {
+            remove_staging_dir(&path);
+        }
+    }
 }
 
 /// True when at least one `snapshot_<ts>` dir already exists under the snapshots root.
@@ -248,24 +342,32 @@ fn has_unacknowledged_quarantine(data_dir: &Path) -> bool {
 }
 
 /// Keep the newest `keep` snapshot dirs (ordered by the timestamp embedded in the name), delete older.
+/// Quarantine files are assumed to live in the tree's own parent — for a snapshot tree OUTSIDE the
+/// primary data dir (second-directory backup), use `prune_snapshots_from` with the primary dir.
 pub fn prune_snapshots(snapshots_root: &Path, keep: usize) -> AppResult<()> {
+    let parent = snapshots_root.parent().map(Path::to_path_buf).unwrap_or_else(|| snapshots_root.to_path_buf());
+    prune_snapshots_from(snapshots_root, &parent, keep)
+}
+
+pub(crate) fn prune_snapshots_from(snapshots_root: &Path, quarantine_dir: &Path, keep: usize) -> AppResult<()> {
     if !snapshots_root.is_dir() {
         return Ok(());
     }
     // #4.5 data-safety: while an UNACKNOWLEDGED corruption quarantine exists (a `*.corrupt.*` file in the
-    // data dir the user has not cleared), refuse to prune — pin ALL pre-quarantine history so a
+    // PRIMARY data dir the user has not cleared), refuse to prune — pin ALL pre-quarantine history so a
     // post-quarantine re-import can't rotate out the only good copies of weeks of review labor. The
     // empty-DB guard in `take_snapshot_at` only holds until the first re-import (segment_count > 0 lets it
     // snapshot + prune again); this holds the line until the user acknowledges by clearing the quarantine
     // files. Snapshots may accumulate meanwhile — the correct trade for an active, unresolved corruption.
-    if let Some(data_dir) = snapshots_root.parent() {
-        if has_unacknowledged_quarantine(data_dir) {
-            tracing::warn!(
-                "snapshot: unacknowledged corruption quarantine present — refusing to prune so pre-quarantine \
-                 history is pinned until the *.corrupt.* files are cleared"
-            );
-            return Ok(());
-        }
+    // `quarantine_dir` is threaded from the caller so the SECOND-DIRECTORY tree pins on the primary
+    // data dir's quarantine too (round-24 hunt #6 — it used to inspect its own parent, where
+    // *.corrupt.* files never appear, and kept pruning the off-drive history during a corruption).
+    if has_unacknowledged_quarantine(quarantine_dir) {
+        tracing::warn!(
+            "snapshot: unacknowledged corruption quarantine present — refusing to prune so pre-quarantine \
+             history is pinned until the *.corrupt.* files are cleared"
+        );
+        return Ok(());
     }
     let snaps: Vec<(u64, PathBuf)> = fs::read_dir(snapshots_root)
         .map_err(AppError::Io)?
@@ -665,6 +767,82 @@ mod tests {
         }
         // 4 == 2×keep held: the next take is refused (skip), not an error.
         assert!(take_snapshot_at(&db, data_dir, 2, 500).unwrap().is_none(), "cap reached — no new copies");
+    }
+
+    #[test]
+    fn failed_snapshot_is_built_atomically_and_cleans_up_its_staging() {
+        // Round-24 hunt #5: a snapshot that fails mid-build used to leave a `snapshot_<ts>` dir
+        // holding a PARTIAL database, and that garbage dir then counted as a REAL snapshot in
+        // has_any_snapshot (arming the empty-DB guard against a legitimate first snapshot), the prune
+        // keep-set (evicting a good older snapshot), and the quarantine cap. The snapshot is now
+        // built in a `.staging_` dir and promoted by a single atomic rename, so a `snapshot_<ts>`
+        // name only ever refers to a fully-built dir. A failure must leave NO `.staging_` residue and
+        // create NO new `snapshot_<ts>` dir.
+        //
+        // Deterministic + portable injection: occupy the promote TARGET with a non-empty dir so
+        // `fs::rename(staging, target)` fails on both platforms. (The db.backup-failure leg shares
+        // the identical remove_staging_dir + Err cleanup path.) The pre-existing target is NOT a
+        // partial from this run — the guarantee under test is that the FAILED run adds no garbage.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let db = seeded_db();
+        let root = data_dir.join("snapshots");
+        let target = root.join(format!("{SNAPSHOT_PREFIX}{:010}", 1000));
+        std::fs::create_dir_all(target.join("occupied")).unwrap();
+        std::fs::write(target.join("occupied").join("x"), b"x").unwrap();
+
+        let result = take_snapshot_at(&db, data_dir, 5, 1000);
+        assert!(result.is_err(), "promotion onto a non-empty target must fail the snapshot");
+
+        // The failed run leaked NO staging dir...
+        let leaked_staging = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(STAGING_PREFIX)));
+        assert!(!leaked_staging, "a failed snapshot must clean up its .staging_ dir");
+        // ...and a later snapshot (distinct ts, free target) still succeeds normally.
+        let ok = take_snapshot_at(&db, data_dir, 5, 2000).unwrap();
+        assert!(ok.is_some(), "a later snapshot succeeds after the failed attempt");
+        assert!(root.join(format!("{SNAPSHOT_PREFIX}{:010}", 2000)).join(DB_FILE).is_file());
+    }
+
+    #[test]
+    fn same_second_pinned_snapshots_do_not_overwrite_each_other() {
+        // Round-24 hunt #7: <label>_<seconds> collided for two pins in the same wall-clock second —
+        // create_dir_all succeeded on the existing dir and db.backup silently OVERWROTE the previous
+        // pin's database. Both pins must survive as distinct dirs.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let db = seeded_db();
+
+        let first = take_pinned_snapshot_at(&db, data_dir, "prerestore", 5, 4242).unwrap();
+        let second = take_pinned_snapshot_at(&db, data_dir, "prerestore", 5, 4242).unwrap();
+
+        assert_ne!(first, second, "a same-second pin must get a distinct dir, not overwrite");
+        assert!(first.join(DB_FILE).is_file(), "the first pin's database survives");
+        assert!(second.join(DB_FILE).is_file(), "the second pin has its own database");
+    }
+
+    #[test]
+    fn second_directory_tree_is_pinned_during_primary_quarantine() {
+        // Round-24 hunt #6: the prune-pin inspected the snapshot tree's OWN parent for *.corrupt.*
+        // files — for the second-directory (off-drive) tree that parent never holds them, so the
+        // off-drive pre-corruption history kept rotating out during an unacknowledged quarantine.
+        // With the quarantine source threaded from the primary dir, the off-drive tree pins too.
+        let primary = tempfile::TempDir::new().unwrap();
+        let second = tempfile::TempDir::new().unwrap();
+        let db = seeded_db();
+        std::fs::write(primary.path().join("cortex-speech.corrupt.1781500000"), b"bad db").unwrap();
+
+        for ts in [100u64, 200, 300, 400] {
+            take_snapshot_at_from(&db, second.path(), primary.path(), 2, ts).unwrap().expect("non-empty db snapshots");
+        }
+        let kept = std::fs::read_dir(second.path().join("snapshots"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir() && e.file_name().to_str().is_some_and(|n| n.starts_with(SNAPSHOT_PREFIX)))
+            .count();
+        assert_eq!(kept, 4, "the off-drive tree must pin ALL history while the PRIMARY quarantine is unacknowledged");
     }
 
     #[test]

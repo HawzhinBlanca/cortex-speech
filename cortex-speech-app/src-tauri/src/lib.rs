@@ -487,9 +487,13 @@ pub fn run() {
                         // warn-only — it must never break the primary snapshot safety net above.
                         let second = AppSettings::load(&snap_data_dir.join("settings.json")).backup_second_dir;
                         if !second.trim().is_empty() {
-                            match crate::snapshot::take_snapshot(
+                            // Quarantine files live in the PRIMARY data dir — thread it in so the
+                            // off-drive tree's prune-pin and accumulation cap see the corruption too
+                            // (its own parent never holds *.corrupt.* files).
+                            match crate::snapshot::take_snapshot_with_quarantine_source(
                                 &snap_db,
                                 std::path::Path::new(second.trim()),
+                                &snap_data_dir,
                                 SNAPSHOT_KEEP,
                             ) {
                                 Ok(_) => {}
