@@ -6648,3 +6648,27 @@ Gate: none needed (read-only audit). **Score: 36 fixed, 5 refuted, 2 measure-def
 stack (eval+significance+wer) verified clean.** In-sandbox high-value surface is now essentially
 exhausted — remaining un-audited surface is either workflow-scale (commands.rs core) or owner-gated
 (rebuild + real-audio). Owner-gated finish line unchanged.
+
+---
+
+## 2026-07-22T10:35Z — iter 86 — audio.rs (decode/resample/VAD) hand-audited CLEAN
+
+**Hand-audit of audio.rs — the untrusted-input panic surface (decode / downmix / resample / VAD).
+Panic-safe throughout, CLEAN, no defect.**
+- downmix_to_mono's `samples.len() / channels` is guarded (only called when channels > 1); floored
+  frame_count keeps every interleave slice in bounds.
+- resample + lowpass_fir: early-return on empty; src is always non-empty (prefiltered has samples.len);
+  every source index is edge-clamped to [0, n-1] (documented panic-free), so no rate can overshoot.
+- vad_energy_fallback percentile: num_frames is always >= 1 (the `+1`), so `sorted` is never empty and
+  `sorted[..]` can't panic (the num_frames==0 guard is harmless dead code); the amplitude cutoff is
+  derived ADAPTIVELY from the signal's own energy distribution (Round-24 #7 fix, not the mismatched
+  Silero-probability scale).
+- Silero VAD region mapping caps every (start,end) to [0, pcm.len()] with start <= end, so downstream
+  pcm[start..end] slicing is safe.
+
+Gate: none needed (read-only audit). **Score: 36 fixed, 5 refuted, 2 measure-deferred; audio.rs
+verified clean.** SATURATION: iters 81-86 = 1 coverage test + 1 doc + 1 edge fix (validate_text) + 5
+clean audits (corrections, significance, wer, eval, audio). Every hand-audited module is clean; the
+well-hardened backend + the full honesty-critical measurement/decode stack are verified sound. Only
+substantial un-hand-audited surface left is commands.rs core (~3900 lines of IPC bodies — realistically
+workflow-scale). Owner-gated finish line unchanged (rebuild + real-audio pass).
