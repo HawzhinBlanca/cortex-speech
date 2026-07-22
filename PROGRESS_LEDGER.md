@@ -6596,3 +6596,28 @@ Gate: fmt 0, clippy 0, **959 passed / 0 failed / 6 ignored**, 33/33 policies.
 **Score: 36 fixed, 5 refuted, 2 measure-deferred.** Hardened-module saturation continues (chunking,
 cache, corrections all clean); the remaining wins are small honesty/UX fixes at the edges. Owner-gated
 finish line unchanged — rebuild + real-audio pass.
+
+---
+
+## 2026-07-22T09:50Z — iter 84 — significance.rs + wer.rs (the metric/stats core) hand-audited CLEAN
+
+**Hand-audit of the honesty-critical foundation — the numbers the whole project's credibility rests
+on. Both CLEAN, mathematically correct, well-tested. NO defect, no fabricated fix.**
+- **significance.rs:** rate() applies the documented zero-reference convention (1.0 on nonzero errors,
+  else 0.0) consistently across the point estimate AND every bootstrap replica, so each CI brackets its
+  own point; micro_rate is the ratio-of-sums excluding empty-ref (Bisani & Ney); bootstrap_ci filters
+  empty-ref, resamples deterministically (seeded xorshift64*, all-zero-state-guarded, n=0 safe),
+  percentile-interpolates with equal-endpoint handling; mapsswe pairs by index, uses sample variance
+  (÷ n-1), and on degenerate variance falls back to a two-sided SIGN test (2·0.5ⁿ) instead of a false
+  infinite-significance — a genuinely subtle correct choice; erf is A&S 7.1.26. Proptests cover
+  unit-interval, ordering, reproducibility, self-comparison-never-significant.
+- **wer.rs:** normalize_for_metrics (metrics normalizer → NFC → lowercase → whitespace-collapse) is
+  applied uniformly to ref AND hyp; levenshtein (two-row) and levenshtein_breakdown (full DP + correct
+  S/D/I backtrace) are standard-correct; empty-reference returns the honest insertion count for micro
+  aggregation while compute_wer/cer clamp the per-utterance display rate to [0,1].
+
+Gate: none needed (read-only audit; no code changed). **Score: 36 fixed, 5 refuted, 2 measure-deferred;
++ significance.rs + wer.rs verified clean.** Coverage now spans essentially the entire backend
+(all hunt-3 modules + lib, chunking, cache, corrections, validation, significance, wer). The metric
+core being provably correct is the key confirmation for the project's honesty law. Owner-gated finish
+line unchanged — rebuild + real-audio pass.
