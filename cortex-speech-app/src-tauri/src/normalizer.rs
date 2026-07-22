@@ -169,7 +169,15 @@ impl SoraniNormalizer {
         // Step 9: Collapse whitespace
         result = MULTI_SPACE.replace_all(&result, " ").to_string();
 
-        // Step 10: Trim
+        // Step 10: FINAL NFC. Step 0 canonically orders combining marks, but steps that DELETE a
+        // ccc-0 character SITTING BETWEEN two runs of combining marks — tatweel removal (Step 3), the
+        // ZWNJ→space / zero-width strips (Steps 4/4b) — then merge those runs into a single run that is
+        // no longer canonically ordered (e.g. `ّ ـ َ` → tatweel removed → `ّ َ`, shadda-before-fatha).
+        // Without re-NFC the output is non-NFC and NON-IDEMPOTENT: re-normalizing reorders the marks,
+        // so the same text yields two byte strings and defeats dedup / FTS / WER-CER equality.
+        let result: String = result.nfc().collect();
+
+        // Step 11: Trim
         result.trim().to_string()
     }
 }
@@ -490,6 +498,25 @@ mod tests {
         assert!(!out.contains('ك') && !out.contains('ي'), "no Arabic variants remain: {out}");
         assert!(out.contains("١٤") || out.contains("14"), "digits preserved, never verbalized: {out}");
         assert!(!out.contains("چوارد"), "no number verbalization in shipped text: {out}");
+    }
+
+    #[test]
+    fn removing_a_separator_between_combining_marks_keeps_output_canonical_and_idempotent() {
+        // Regression for the non-idempotence the hostile-alphabet proptest surfaced: a ccc-0 char
+        // (tatweel here; ZWNJ/zero-width behave the same) BETWEEN two combining marks keeps NFC from
+        // ordering them together at Step 0; deleting that separator later merged them into a
+        // non-canonical run (shadda U+0651 ccc33 before fatha U+064E ccc30), so re-normalizing
+        // reordered it. The final NFC pass fixes it.
+        let n = SoraniNormalizer::new();
+        // ماڵ + shadda + TATWEEL + fatha: after tatweel removal the marks are ّ then َ (non-canonical).
+        let input = "ماڵ\u{0651}\u{0640}\u{064E}";
+        let once = n.normalize(input);
+        let twice = n.normalize(&once);
+        assert_eq!(once, twice, "normalize must be idempotent after a between-marks separator is removed");
+        assert_eq!(once, once.nfc().collect::<String>(), "output must be NFC (marks in canonical ccc order)");
+        // The tatweel is gone and the two marks are canonically ordered: fatha (ccc30) before shadda (ccc33).
+        assert!(!once.contains('\u{0640}'), "tatweel removed");
+        assert!(once.contains('\u{064E}') && once.contains('\u{0651}'), "both marks preserved");
     }
 
     #[test]
