@@ -453,6 +453,32 @@ pub struct RegressionGateResult {
 /// gold set + a checked-in baseline scorecard exist, makes a worse pipeline change un-mergeable:
 /// wire it into the de-`#[ignore]`'d gold_wer_eval test as a PR-blocking assertion.
 pub fn check_gold_regression(candidate: &Scorecard, baseline: &Scorecard) -> RegressionGateResult {
+    // An unscoreable scorecard has micro_wer/micro_cer stored as a bare 0.0 with a degenerate [0,0] CI —
+    // NOT a real measurement. render_markdown refuses to print those as 0% (they read as a flawless model
+    // from nothing); this PR-blocking gate must likewise FAIL CLOSED rather than greenlight a fabricated
+    // "-0.15 improvement" that was never scored (the honesty law: no fabricated metric). Gate on the
+    // SCOREABLE count, not num_segments — a corpus whose references all normalize to empty has
+    // num_segments > 0 yet scored_segments == 0.
+    if candidate.system.scored_segments == 0 {
+        return RegressionGateResult {
+            passed: false,
+            reasons: vec![format!(
+                "CANNOT EVALUATE: candidate scored 0 of {} gold segment(s) — WER/CER are undefined, not 0. \
+                 Add gold segments with non-empty references and re-run.",
+                candidate.system.num_segments
+            )],
+        };
+    }
+    if baseline.system.scored_segments == 0 {
+        return RegressionGateResult {
+            passed: false,
+            reasons: vec![
+                "CANNOT EVALUATE: the frozen baseline scored 0 segments — it is not a valid baseline to gate against."
+                    .to_string(),
+            ],
+        };
+    }
+
     let mut reasons = Vec::new();
     let mut passed = true;
 
@@ -547,6 +573,45 @@ mod tests {
         let verdict = check_gold_regression(&worse, &baseline);
         assert!(!verdict.passed, "a clearly worse change must be blocked: {:?}", verdict.reasons);
         assert!(verdict.reasons.iter().any(|r| r.contains("REGRESSED")), "{:?}", verdict.reasons);
+    }
+
+    #[test]
+    fn gold_regression_gate_fails_closed_on_an_unscoreable_candidate_instead_of_a_fabricated_zero() {
+        // A candidate whose gold references ALL normalize to empty has scored_segments == 0, so micro_wer/
+        // micro_cer are stored as a bare 0.0 with a degenerate [0,0] CI — NOT a real measurement
+        // (render_markdown refuses to print those as 0%). The PR-blocking gate must FAIL CLOSED, never
+        // greenlight a fabricated "-0.15 improvement" against a real baseline (the honesty law).
+        let base_pairs = [("/a/1.wav", "ساڵی نوێ پیرۆز بێت"), ("/a/2.wav", "ئەو لە کوردستان دەژی")];
+        let perfect: Vec<&str> = base_pairs.iter().map(|(_, r)| *r).collect();
+        let baseline =
+            build_scorecard(&eval_with(&base_pairs, &perfect, "baseline"), None, ScorecardOptions::default());
+        assert!(baseline.system.scored_segments > 0, "precondition: the baseline is really scored");
+
+        // Candidate: every gold reference is tatweel-only -> normalizes to empty -> nothing scoreable.
+        let unscoreable = build_scorecard(
+            &eval_with(
+                &[("/a.wav", "\u{0640}\u{0640}\u{0640}"), ("/b.wav", "\u{0640}\u{0640}")],
+                &["one two", "three"],
+                "cand-empty",
+            ),
+            None,
+            ScorecardOptions::default(),
+        );
+        assert_eq!(unscoreable.system.scored_segments, 0, "precondition: candidate scored nothing");
+        assert_eq!(unscoreable.system.micro_wer, 0.0, "precondition: micro_wer is stored as a bare 0.0");
+
+        let verdict = check_gold_regression(&unscoreable, &baseline);
+        assert!(!verdict.passed, "an unscoreable candidate must NOT pass the gate: {:?}", verdict.reasons);
+        assert!(
+            verdict.reasons.iter().any(|r| r.contains("CANNOT EVALUATE")),
+            "the reason must be honest about being unscoreable, not a fabricated 0.0000 WER: {:?}",
+            verdict.reasons
+        );
+        assert!(
+            !verdict.reasons.iter().any(|r| r.contains("WER ok")),
+            "must NOT emit a fabricated within-band pass for an unscored candidate: {:?}",
+            verdict.reasons
+        );
     }
 
     /// Evaluate two hypothesis sets against the SAME gold set, so the `gold_id`s align
