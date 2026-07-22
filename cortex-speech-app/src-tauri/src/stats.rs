@@ -121,20 +121,31 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
     //     str::len() (Sorani text is multi-byte, so character LENGTH() would differ).
     //   * The histogram uses BETWEEN ranges + an explicit over/negative bucket so a stray
     //     negative duration lands in over_30s exactly as the old `_` match arm did.
-    let (total, total_duration_ms, verified_count, total_chars, u5, u10, u15, u30, o30) = conn.query_row(
+    // A human-REJECTED clip ("mark bad") carries verified=true ONLY to leave the review queue — it is
+    // discarded bad data, not confirmed-good. Exclude it from `verified` (matching quality::is_human_
+    // rejected, export::export_dataset, and the frontend isVerifiedGood) so the dashboard never counts a
+    // rejected clip as verified; exclude it from `pending` too (it HAS been reviewed), so a rejected clip
+    // is NEITHER bucket, exactly like segmentStore's segmentStats. COALESCE guards the NULL-propagation
+    // trap: without it, `verified AND NOT (NULL IN ... OR NULL = ...)` collapses to NULL and a normal
+    // verified clip (NULL human_decision/verdict) would drop OUT of the verified count.
+    const REJECTED: &str =
+        "(COALESCE(human_decision,'') IN ('reject','human_reject') OR COALESCE(verdict,'') = 'human_reject')";
+    let sql = format!(
         "SELECT
             COUNT(*),
             COALESCE(SUM(duration_ms), 0),
-            COALESCE(SUM(CASE WHEN verified THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN verified AND NOT {REJECTED} THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN NOT verified AND NOT {REJECTED} THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(LENGTH(CAST(COALESCE(annotated_transcript, normalized_transcript, raw_transcript) AS BLOB))), 0),
             COALESCE(SUM(CASE WHEN duration_ms BETWEEN 0 AND 4999 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN duration_ms BETWEEN 5000 AND 9999 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN duration_ms BETWEEN 10000 AND 14999 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN duration_ms BETWEEN 15000 AND 29999 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN duration_ms < 0 OR duration_ms >= 30000 THEN 1 ELSE 0 END), 0)
-         FROM speech_segments",
-        [],
-        |r| {
+         FROM speech_segments"
+    );
+    let (total, total_duration_ms, verified_count, pending_count, total_chars, u5, u10, u15, u30, o30) = conn
+        .query_row(&sql, [], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
@@ -145,9 +156,9 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
                 r.get::<_, i64>(6)?,
                 r.get::<_, i64>(7)?,
                 r.get::<_, i64>(8)?,
+                r.get::<_, i64>(9)?,
             ))
-        },
-    )?;
+        })?;
 
     if total == 0 {
         return Ok(DatasetStats { db_size_bytes: size_bytes, ..Default::default() });
@@ -155,6 +166,7 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
 
     let total = total as usize;
     let verified_count = verified_count as usize;
+    let pending_count = pending_count as usize;
     let total_chars = total_chars as usize;
     let total_duration_seconds = total_duration_ms as f64 / 1000.0;
 
@@ -183,7 +195,9 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
         total_duration_seconds,
         avg_duration_seconds: total_duration_seconds / total as f64,
         verified_count,
-        pending_count: total - verified_count,
+        // From SQL (NOT total - verified): a human-rejected clip is neither verified nor pending, so
+        // total - verified_count would wrongly bucket rejected clips into pending.
+        pending_count,
         verification_rate: verified_count as f64 / total as f64 * 100.0,
         unique_speakers,
         total_chars,
@@ -329,6 +343,27 @@ mod tests {
         assert_eq!(st.total_chars, 11);
         assert_eq!(st.top_speakers[0].speaker_id, "A");
         assert_eq!(st.top_speakers[0].segment_count, 2);
+    }
+
+    #[test]
+    fn a_human_rejected_clip_counts_as_neither_verified_nor_pending() {
+        // markBad sets verified=true only to leave the review queue — a rejected clip is discarded bad
+        // data, NOT confirmed-good. It must count as NEITHER verified nor pending (matching
+        // quality::is_human_rejected / export_dataset / the frontend isVerifiedGood), so the dashboard
+        // never overstates the verified count by folding rejected clips into it.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&seg("good", 1000, true, Some("A"), "ڕاست")).unwrap(); // verified-good
+        db.insert_segment(&seg("pend", 1000, false, Some("A"), "چاوەڕوان")).unwrap(); // pending
+        db.insert_segment(&seg("bad", 1000, true, Some("A"), "خراپ")).unwrap(); // verified=true but rejected
+        db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='bad'", []).unwrap();
+
+        let st = compute_stats(&db).unwrap();
+        assert_eq!(st.total_segments, 3);
+        assert_eq!(st.verified_count, 1, "a rejected clip (verified=true) must NOT count as verified");
+        assert_eq!(st.pending_count, 1, "a rejected clip must NOT count as pending either");
+        assert_eq!(st.verified_count + st.pending_count, 2, "rejected is excluded from BOTH buckets");
+        assert!((st.verification_rate - 100.0 / 3.0).abs() < 1e-9, "1 of 3 segments verified-good");
     }
 
     #[test]

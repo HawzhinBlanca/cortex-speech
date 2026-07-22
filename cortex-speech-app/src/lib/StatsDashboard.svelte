@@ -4,7 +4,7 @@
   import type { DatasetStats, SpeechSegment } from './types';
   import { segments } from './stores/segmentStore';
   import { notifications } from './stores/notificationStore';
-  import { isVerifiedGood } from './segmentQuality';
+  import { isVerifiedGood, isHumanRejected } from './segmentQuality';
   import { t } from './i18n';
   import { isTauriRuntime } from './runtime';
 
@@ -71,7 +71,10 @@
       totalDurationSeconds,
       avgDurationSeconds: items.length ? totalDurationSeconds / items.length : 0,
       verifiedCount,
-      pendingCount: items.length - verifiedCount,
+      // Pending = awaiting review. A human-rejected clip has ALREADY been reviewed (and discarded), so it
+      // is neither verified nor pending — mirror the backend compute_stats so `items.length - verifiedCount`
+      // does not silently bucket rejected clips into pending.
+      pendingCount: items.filter((segment) => !isVerifiedGood(segment) && !isHumanRejected(segment)).length,
       verificationRate: items.length ? (verifiedCount / items.length) * 100 : 0,
       uniqueSpeakers: speakerDurations.size,
       totalChars,
