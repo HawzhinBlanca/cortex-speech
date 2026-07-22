@@ -77,9 +77,25 @@ def test_go_draft_persist_bails_on_aligning_and_uses_freshrow() -> None:
         )
 
 
+def test_inbox_undo_bails_while_a_decision_is_in_flight() -> None:
+    """ReviewInbox.undo(): a Backspace during an in-flight accept/reject/commitEdit/flag would pop that
+    action's just-pushed history entry and fire the inverse op (clearHumanDecision) against the SAME id
+    while its record is still in flight — losing the undo; and if the in-flight action then rejects, its
+    catch does a second history.slice(0,-1), dropping a PREVIOUS segment's entry. The four persisting
+    actions all guard isSubmitting; undo must too."""
+    body = _function_body(_read("src/lib/ReviewInbox.svelte"), "async function undo(")
+    if "if (isSubmitting) return;" not in body:
+        raise AssertionError(
+            "undo() has no `if (isSubmitting) return;` guard — a Backspace during an in-flight decision "
+            "races clearHumanDecision against the record still in flight and can corrupt the history stack. "
+            "Add the guard at the top of undo(), matching the four persisting actions."
+        )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
+    test_inbox_undo_bails_while_a_decision_is_in_flight()
     print("frontend review-guard source policy passed")
 
 

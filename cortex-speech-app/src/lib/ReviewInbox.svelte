@@ -298,6 +298,13 @@
   }
 
   async function undo() {
+    // Guard against racing an in-flight decision. Every persisting action (accept/reject/commitEdit/flag)
+    // sets isSubmitting and pushes its history entry BEFORE its await; a Backspace during that await would
+    // pop that just-pushed entry and fire the inverse op (clearHumanDecision) against the SAME id while its
+    // record is still in flight — and if the in-flight action then rejects, its catch does another
+    // history.slice(0,-1), dropping a PREVIOUS segment's entry (permanent undo loss). The four mutators all
+    // guard isSubmitting; undo must too.
+    if (isSubmitting) return;
     const last = history[history.length - 1];
     if (!last) return;
     history = history.slice(0, -1); // reassignment: keeps the Undo button's disabled binding live
