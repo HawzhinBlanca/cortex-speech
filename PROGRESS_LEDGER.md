@@ -6699,3 +6699,30 @@ verified sound.** With the measurement stack (iters 84-85), the untrusted-audio 
 privacy guardrail all hand-verified, the highest-consequence properties are confirmed correct. Remaining
 un-hand-audited surface is the rest of commands.rs core (routine IPC bodies). Owner-gated finish line
 unchanged — rebuild + real-audio pass.
+
+---
+
+## 2026-07-22T11:25Z — iter 88 — TWO real fixes: normalizer idempotence (4891ee7) + batch anti-clobber (3702245)
+
+**Two genuine defects fixed this iteration — the residual-audit surface is NOT fully saturated after all.**
+
+**#1 (normalizer non-idempotence, MEDIUM — surfaced by iter-69's OWN hostile-alphabet proptest).** The
+proptest hit a failing seed during the gate: normalize is not idempotent when a ccc-0 char (tatweel;
+ZWNJ/zero-width same) sits BETWEEN two combining-mark runs. Step-0 NFC orders the marks in their
+separate runs; a later delete step (tatweel removal / zero-width strip) merges them into a
+non-canonical run (shadda ccc33 before fatha ccc30) that is never re-NFC'd → the SAME text yields two
+byte strings, defeating dedup / FTS / WER-CER equality (normalize_for_metrics builds on this). Fix:
+final NFC pass at the end of normalize(). Deterministic regression + the generative proptest;
+fail-before verified. This validates the iter-69 test-hardening investment — it caught a real bug.
+
+**#2 (batch anti-clobber, MEDIUM — iter-88 hand-audit of commands/batch.rs).** batch_normalize persisted
+via read-modify-write + whole-row insert_segment upsert; a concurrent write on the pipeline connection
+landing in the re-read→upsert window is clobbered. Sibling batch commands already use targeted updates.
+Fix: new targeted db.update_normalized_transcript; batch uses it. Behavioral test (a concurrent annotated
+edit survives the targeted update; the whole-row upsert of the stale snapshot clobbers it) + a scoped
+policy forbidding insert_segment in batch_normalize. Fail-before verified.
+
+Gate: fmt 0, clippy 0, **961 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 38 fixed, 5 refuted, 2 measure-deferred.** Lesson: randomized proptests + auditing
+lower-hardened slices still find real bugs — "saturation" was premature. Owner-gated finish line
+unchanged (rebuild + real-audio pass).
