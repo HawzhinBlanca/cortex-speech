@@ -6828,3 +6828,40 @@ i18n coverage.
 Gate: python policy suite **34/34** (was 33; new policy auto-discovered). No Rust/frontend runtime code
 changed. **Score: 40 fixed, 7 refuted, 2 measure-deferred.** The frontend pure-logic surface is now
 largely audited (diff bug fixed iter 90; rest solid). Owner-gated finish line unchanged.
+
+---
+
+## 2026-07-22T20:05Z — iter 92 — THREE fixes via ultracode adversarial workflow (bec8d54, 0c6b40c, 8d48d11)
+
+**Ultracode multi-agent defect hunt over 11 un-hand-audited backend modules → 3 real bugs, each
+hand-verified against source before fixing (workflow verdicts are corroboration, not evidence).**
+
+Workflow: 12 finders (module × lens) → 3 adversarial refuters per finding (majority-refute kills it).
+21 agents, 9 finders empty, 3 candidates — ALL 3 adversarially confirmed, 0 spurious. In parallel I
+independently hand-audited chunking / transcript_export / media / diarization / stats and found them
+clean, corroborating the empty finders.
+
+**#1 atomic_file.rs (MEDIUM, honesty; 2/3 → bec8d54).** Windows replace_file, AFTER a durable swap
+(rename tmp→final succeeded, dir fsync'd), propagated the error from deleting the throwaway
+`.replace-bak` backup. A transient scanner lock (Defender/Search Indexer, no FILE_SHARE_DELETE →
+ERROR_SHARING_VIOLATION) then made a SUCCEEDED, durable write report "save failed" to the user
+(settings/session/export). Made the POST-swap cleanup best-effort (log+Ok), like fsync_parent_dir; the
+PRE-swap cleanup still propagates honestly. Source policy (OS-specific, can't unit-inject) + updated the
+models.rs promotion-failure test, which had been coupled to the old propagation (its blocking-dir induced
+a post-swap dir-remove error) — it now induces a genuine PRE-swap failure, preserving the temp-cleanup
+guarantee. Fail-before verified.
+
+**#2 transcript_export.rs (MEDIUM, honesty; 3/3 → 0c6b40c).** SRT/VTT delimit cues with a BLANK line;
+build_cues only trims the whole transcript, so a human paragraph break (`\n\n` / CRLF) inside an
+annotated_transcript was written verbatim into the cue — a parser reads the rest as the next cue's index
+and SILENTLY DROPS transcript from the exported subtitle. Added subtitle_safe_text (drop blank lines,
+strip CRLF), applied in to_srt/to_vtt only. Behavioral test (Kurdish \n\n + Windows CRLF); fail-before verified.
+
+**#3 runs.rs (LOW, honesty; 2/3 → 8d48d11).** The import summary's top-level per-model hypothesis counts
+tallied EVERY hypothesis while the dossier + coverage count only non-empty — so an empty hypothesis (a 7B
+pass that returned no text) was counted at the top level, OVERSTATING multi-model coverage and disagreeing
+with the dossier. Guarded the top-level tally with the same non-empty check; behavioral test; fail-before verified.
+
+Gate: fmt 0, clippy 0, **cargo test --lib 965 passed / 0 failed / 6 ignored**, **34/34 python policies**.
+**Score: 43 fixed, 7 refuted, 2 measure-deferred.** Ultracode workflow paid off — 3 real bugs in modules
+5 solo hand-audits had found clean, all honesty-relevant. Owner-gated finish line unchanged (exe rebuild + real-audio pass).
