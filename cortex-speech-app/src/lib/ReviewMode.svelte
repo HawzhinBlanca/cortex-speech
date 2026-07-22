@@ -201,13 +201,20 @@
       }
       await api.updateSegment(updated);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
+      notifications.success($t('review.retranscribed'));
+      // The DB/store write above targets seg by id and is correct even if the reviewer navigated away
+      // during the multi-second ASR await. But everything below mutates the CURRENTLY shown editor
+      // (editText/lastLoadedOriginal/draftModels/consensus/alignment) — if navigation changed `current`
+      // mid-flight, applying seg's draft here would put seg's MACHINE text into another clip's editor,
+      // and a subsequent Save would persist it as THAT clip's human-verified gold: a wrong-segment gold
+      // corruption (THE ONE LAW). Bail; seg's clip reloads its fresh draft + re-aligns when reopened.
+      if (current?.id !== seg.id) return;
       editText = text;
       editedChips = {}; // a fresh draft replaces the transcript wholesale — drop stale chip fixes
       // The re-transcribed draft is the new baseline (not a "dirty" edit). Do NOT reset lastLoadedId —
       // the clip id is unchanged, so the load effect must stay a no-op; resetting it would re-run
       // loadConsensus and wipe the provenance badge we set just below.
       lastLoadedOriginal = text;
-      notifications.success($t('review.retranscribed'));
       // The owner just produced this draft with the chosen engine, so name it on the provenance badge
       // immediately (honest — it's exactly what was used). A single-engine re-transcribe has no
       // multi-model consensus, so hide that card. The fine-tuned button always runs the MMS-1B; the
