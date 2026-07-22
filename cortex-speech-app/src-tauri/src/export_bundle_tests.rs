@@ -555,6 +555,52 @@ fn bundle_excludes_holdout_gold_from_all_artifacts() {
 }
 
 #[test]
+fn bundle_manifest_count_excludes_placeholders_matching_the_shipped_data_files() {
+    // A not-yet-transcribed PLACEHOLDER row ("[Pending WSL 7B ASR]") is dropped from the tabular data
+    // files by export::export_dataset, so the bundle manifest/card counts must exclude it too — otherwise
+    // segmentCount claims more rows than dataset.{json,jsonl,csv,parquet} actually ship (a dishonest,
+    // inflated number that also disagrees with dataset.json's own embedded total).
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+
+    let mk = |id: &str, path: &str, raw: &str, verified: bool| SpeechSegment {
+        id: id.into(),
+        audio_path: path.into(),
+        raw_transcript: raw.into(),
+        duration_ms: 1000,
+        verified,
+        ..SpeechSegment::default()
+    };
+    db.insert_segment(&mk("real", "/data/real.wav", "دەقی ڕاست", true)).unwrap();
+    db.insert_segment(&mk("pending", "/data/pending.wav", "[Pending WSL 7B ASR]", false)).unwrap();
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+    export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["segmentCount"].as_u64(),
+        Some(1),
+        "manifest must count only the 1 real segment, not the placeholder: {manifest}"
+    );
+
+    // The shipped data files ship exactly the real row and never the placeholder string.
+    let jsonl = std::fs::read_to_string(out.join("dataset.jsonl")).unwrap();
+    assert!(jsonl.contains("دەقی ڕاست"), "the real segment ships in the data files");
+    assert!(!jsonl.contains("[Pending WSL 7B ASR]"), "the placeholder must never ship in the data files");
+
+    // The human-readable card's Segments line agrees with the manifest (both exclude the placeholder).
+    let card = std::fs::read_to_string(out.join("dataset_card.md")).unwrap();
+    assert!(
+        card.contains("Segments: 1"),
+        "the card count must match the shipped rows, not include the placeholder: {card}"
+    );
+}
+
+#[test]
 fn production_export_blocks_source_reference_without_audio_identity() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
