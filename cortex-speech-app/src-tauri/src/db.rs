@@ -2190,7 +2190,14 @@ impl Database {
     /// verdict = 'human_*' so the "undone" segment still looked decided on reload AND the machine
     /// verdict-write guard (write_segment_verdict / jury::write_verdict) would refuse to re-adjudicate it.
     pub fn clear_human_decision(&self, segment_id: &str) -> AppResult<()> {
-        self.conn.execute(
+        // Undo also retracts the DPO/few-shot learning pair the edit produced (round-24 hunt #9): the
+        // agent_examples row is the ONLY provenance of a human edit, and build_dpo_dataset /
+        // get_few_shot_examples filter solely on verified_by_human=1 (never on the segment's current
+        // decision). Left behind, a retracted edit would permanently train the model to prefer a fix
+        // the human took back. Delete it in the SAME transaction as the re-open so the two can never
+        // diverge (a decision cleared with its learning pair still live, or vice versa).
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE speech_segments
              SET human_decision     = NULL,
                  corrected_at       = NULL,
@@ -2204,6 +2211,8 @@ impl Database {
              WHERE id = ?1",
             params![segment_id],
         )?;
+        tx.execute("DELETE FROM agent_examples WHERE segment_id = ?1", params![segment_id])?;
+        tx.commit()?;
         self.track_write()?;
         Ok(())
     }
@@ -2421,6 +2430,15 @@ impl Database {
              WHERE id = ?1",
             params![segment_id, decision, human_verdict, corrected_transcript],
         )?;
+
+        // Rejecting a clip retracts any prior EDIT's learning pair (round-24 hunt #9): a human who
+        // edited a segment and then rejects it as garbage audio must not keep training the model to
+        // prefer that edit. build_dpo_dataset / get_few_shot_examples key only on verified_by_human=1,
+        // never on the current decision, so the stale pair would survive; delete it here, in the same
+        // transaction as the reject verdict. (Undo is handled the same way in clear_human_decision.)
+        if decision == "reject" {
+            tx.execute("DELETE FROM agent_examples WHERE segment_id = ?1", params![segment_id])?;
+        }
 
         // Insert into agent_examples when it is an edit on a non-gold segment.
         // The rejected side must be the actual agent proposal when available,

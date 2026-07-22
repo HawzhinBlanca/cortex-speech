@@ -215,8 +215,16 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
         remove_diacritics: false,
     });
 
+    // Priority mirrors the codebase's canonical "text the human confirmed": the committed
+    // verdict_transcript first, then the human's typed annotation, then the normalized/raw ASR draft.
+    // annotated_transcript was OMITTED (round-24 hunt #8) — a segment whose fix lives only in
+    // annotated_transcript (inbox-accept and legacy accepts leave verdict_transcript NULL) exported
+    // the SUPERSEDED ASR draft as human-confirmed LM text, exactly the text the human replaced.
+    // Matches record_human_decision's loop0_draft_text (annotated ▸ normalized ▸ raw) and quality.rs's
+    // effective_transcript (annotated over normalized).
     let mut stmt = db.connection().prepare(
-        "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(normalized_transcript, ''), raw_transcript),
+        "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(annotated_transcript, ''),
+                         NULLIF(normalized_transcript, ''), raw_transcript),
                 audio_path
          FROM speech_segments
          WHERE is_gold = 0 AND human_decision IN ('accept', 'edit')
@@ -1128,5 +1136,60 @@ mod tests {
 
         let corpus = export_lm_corpus(&db).expect("export lm");
         assert!(corpus.is_empty(), "missing file must not leak held-out text into the LM corpus");
+    }
+
+    #[test]
+    fn export_lm_corpus_uses_the_annotated_fix_not_the_superseded_draft() {
+        // Round-24 hunt #8: the inbox-accept / legacy-accept path leaves the human's fix in
+        // annotated_transcript with verdict_transcript NULL. The corpus COALESCE omitted annotated,
+        // so it exported the stale ASR draft (normalized_transcript) as human-confirmed LM text.
+        let db = open_mem_db();
+        let seg = SpeechSegment {
+            id: "c-anno".to_string(),
+            audio_path: "/anno.wav".to_string(), // absent -> no holdout hashing, included
+            raw_transcript: "کوردی غەڵەت".to_string(),
+            normalized_transcript: Some("کوردی غەڵەت".to_string()),
+            annotated_transcript: Some("کوردی ڕاست".to_string()), // the human's typed fix
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&seg).expect("insert");
+        db.connection()
+            .execute("UPDATE speech_segments SET human_decision='accept' WHERE id='c-anno'", [])
+            .expect("accept");
+
+        let corpus = export_lm_corpus(&db).expect("export");
+        assert_eq!(corpus.len(), 1, "the accepted segment exports one line: {corpus:?}");
+        assert!(corpus[0].contains("ڕاست"), "must export the human's annotated fix: {corpus:?}");
+        assert!(!corpus[0].contains("غەڵەت"), "must NOT export the superseded ASR draft: {corpus:?}");
+    }
+
+    #[test]
+    fn undo_and_reject_retract_the_dpo_learning_pair() {
+        // Round-24 hunt #9: build_dpo_dataset / few-shot key only on verified_by_human=1, never on the
+        // segment's CURRENT decision, so a human edit later UNDONE or whose clip is later REJECTED used
+        // to keep training the model to prefer a retracted fix. clear_human_decision and the reject
+        // path now delete the agent_examples pair in the same transaction as the decision change.
+        let db = open_mem_db();
+        let seg = SpeechSegment {
+            id: "s-retract".to_string(),
+            audio_path: "/r.wav".to_string(), // absent -> not holdout, DPO-eligible
+            raw_transcript: "ئەو غەڵەتە".to_string(),
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&seg).expect("insert");
+
+        // A human edit creates the learning pair -> one DPO pair.
+        db.record_human_decision("s-retract", "edit", Some("ئەو ڕاستە"), None).expect("edit");
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "an edit produces a DPO pair");
+
+        // Undo retracts it.
+        db.clear_human_decision("s-retract").expect("undo");
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "undo must retract the learning pair");
+
+        // Re-edit, then REJECT the clip -> retracted again.
+        db.record_human_decision("s-retract", "edit", Some("ئەو ڕاستە"), None).expect("re-edit");
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "re-edit re-creates the pair");
+        db.record_human_decision("s-retract", "reject", None, None).expect("reject");
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "reject must retract the learning pair");
     }
 }
