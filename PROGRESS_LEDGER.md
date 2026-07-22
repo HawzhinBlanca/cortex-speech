@@ -6794,3 +6794,37 @@ passed / 0 failed / 6 ignored**, **vitest 201 passed**, typecheck 0, lint 0, 33/
 **Score: 40 fixed, 6 refuted, 2 measure-deferred.** Lesson: the frontend pure-logic surface (mostly
 untested — 2 test files for ~31 components) is a fresh vein; autosave.ts / segmentQuality.ts /
 alignment.ts / wordEdit.ts audited correct this pass but under-tested. Owner-gated finish line unchanged.
+
+---
+
+## 2026-07-22T13:28Z — iter 91 — i18n consistency gate added (54fac32); settingsAdapter autonomy-enum lead refuted
+
+**No new defect this pass — a strong lead refuted with evidence, and a mission-critical invariant gated.**
+
+**Refuted with evidence — settingsAdapter juryAutonomyLevel enum.** The frontend uses lowercase/snake
+autonomy values (type 'observe'|'propose'|'act_confirm'|'act_auto', default 'propose', SettingsPanel
+dropdown emits 'act_auto' etc.) and mapFrontendToBackend passes them straight to update_settings, which
+deserializes into the Rust `AutonLevel` enum. Looked like a whole-settings-save-rejected bug (round-23
+class: one bad enum → serde discards the ENTIRE save). BUT settings.rs:273 has
+`#[serde(rename_all = "snake_case")]` on AutonLevel — canonical form IS snake_case ("act_auto"), with
+PascalCase `alias`es only for legacy files; there's even a pinning test
+(update_settings_payload_with_snake_case_autonomy_deserializes). The frontend matches exactly. NOT a bug
+— and "fixing" it would have broken the correct round-trip. (LlmMode has no rename_all → PascalCase
+variants, which the frontend also matches.) My earlier grep started AT the enum line and missed the
+attribute above it; verifying against the real source prevented a false-positive fix.
+
+**Guard added (Kurdish-first invariant, previously ungated).** i18n is a real user-visible surface here:
+a locale gap falls a Kurdish user back to English, or shows every user a raw dotted key. en.ts/ckb.ts
+(~660 keys each) had NO automated guard, and the app was bitten once already (events.ts notifications
+were hardcoded English until a prior audit). Added scripts/test_i18n_consistency.py (auto-discovered):
+(1) no duplicate key within a locale, (2) en/ckb parity, (3) every literal t()/tr()/$t() reference
+defined. Currently perfect (660 keys exact parity, 0 dups, 590 literal refs all defined). Fail-before
+verified on all three checks (inject dup / drop key / reference undefined → each raises).
+
+**Audited clean this pass (no defect):** settingsAdapter.ts, keyboard.ts, events.ts, VirtualList.svelte,
+segmentStore.ts (load-gen guard + cross-page dedup + honest truncation + review-queue scope contract),
+i18n coverage.
+
+Gate: python policy suite **34/34** (was 33; new policy auto-discovered). No Rust/frontend runtime code
+changed. **Score: 40 fixed, 7 refuted, 2 measure-deferred.** The frontend pure-logic surface is now
+largely audited (diff bug fixed iter 90; rest solid). Owner-gated finish line unchanged.
