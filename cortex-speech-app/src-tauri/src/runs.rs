@@ -335,8 +335,15 @@ fn build_agent_import_summary(
     for segment_id in segment_ids {
         let hypotheses = db.get_hypotheses_for_segment(segment_id)?;
         for hypothesis in &hypotheses {
-            hypothesis_models.insert(hypothesis.model_id.clone());
-            *hypothesis_model_counts.entry(hypothesis.model_id.clone()).or_insert(0) += 1;
+            // Count only NON-EMPTY hypotheses, matching the per-file dossier (build_long_file_dossiers)
+            // and the coverage report's non_empty_models. An empty/whitespace hypothesis (e.g. a WSL 7B
+            // pass that returned no text, still written as a SegmentHypothesis) is not real model output;
+            // counting it here overstated multi-model coverage and DISAGREED with the dossier's own
+            // per-model counts for the exact same data.
+            if !hypothesis.transcript.trim().is_empty() {
+                hypothesis_models.insert(hypothesis.model_id.clone());
+                *hypothesis_model_counts.entry(hypothesis.model_id.clone()).or_insert(0) += 1;
+            }
         }
         hypotheses_by_segment.insert(segment_id.clone(), hypotheses);
     }
@@ -1078,6 +1085,70 @@ mod tests {
         let listed = list_agent_import_reports(&db, Some(10)).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, report.id);
+    }
+
+    #[test]
+    fn empty_hypothesis_is_excluded_from_both_the_summary_and_dossier_model_counts() {
+        // An empty/whitespace hypothesis (e.g. a WSL 7B pass that returned no text but was still written
+        // as a SegmentHypothesis) is not real model output. The top-level summary once counted it while
+        // the per-file dossier (and coverage) did not — two displayed per-model counts disagreeing, with
+        // the top-level one overstating multi-model coverage. Both must now exclude it and agree.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let audio_path = "C:\\audio\\empty-hyp.wav".to_string();
+        let segment = SpeechSegment {
+            id: "seg-empty-hyp".to_string(),
+            audio_path: audio_path.clone(),
+            raw_transcript: "real candidate".to_string(),
+            duration_ms: 1500,
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&segment).unwrap();
+        // One REAL hypothesis and one EMPTY-transcript hypothesis for the same segment.
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: segment.id.clone(),
+            model_id: "omniasr-ctc-300m".to_string(),
+            transcript: "real candidate".to_string(),
+            confidence: Some(0.8),
+        })
+        .unwrap();
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: segment.id.clone(),
+            model_id: "omniasr-wsl-7b".to_string(),
+            transcript: "   ".to_string(), // empty / whitespace-only: not real output
+            confidence: None,
+        })
+        .unwrap();
+
+        let report = record_agent_import_report(
+            &db,
+            "file",
+            std::slice::from_ref(&audio_path),
+            std::slice::from_ref(&segment.id),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The real model is counted; the empty-hypothesis model is excluded — at BOTH levels, in agreement.
+        assert_eq!(report.summary.hypothesis_model_counts.get("omniasr-ctc-300m"), Some(&1));
+        assert_eq!(
+            report.summary.hypothesis_model_counts.get("omniasr-wsl-7b"),
+            None,
+            "an empty hypothesis must NOT be counted at the top level (it overstates coverage)"
+        );
+        assert_eq!(
+            report.summary.hypothesis_models,
+            vec!["omniasr-ctc-300m".to_string()],
+            "the empty-hypothesis model must not appear as a contributing model"
+        );
+        let dossier = &report.summary.long_file_dossiers[0];
+        assert_eq!(dossier.hypothesis_model_counts.get("omniasr-ctc-300m"), Some(&1));
+        assert_eq!(dossier.hypothesis_model_counts.get("omniasr-wsl-7b"), None);
+        assert_eq!(
+            report.summary.hypothesis_model_counts, dossier.hypothesis_model_counts,
+            "the summary and dossier per-model counts must agree"
+        );
     }
 
     #[test]
