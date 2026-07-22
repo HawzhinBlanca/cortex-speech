@@ -7242,3 +7242,33 @@ guards its own in-flight-load race.
 Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies** (7 checks now in
 test_frontend_review_guards.py). **Score: 66 fixed, ~25 refuted, 2 measure-deferred, 1 queued** (SettingsPanel
 onDestroy fire-and-forget save, LOW). Owner-gated finish line unchanged.
+
+---
+
+## 2026-07-23T02:31Z — iter 104 — SettingsPanel close-to-save NaN loss fixed (a1d8a83)
+
+**Drained the last queued item — and it was worse than the LOW it was filed as (re-classified LOW→MEDIUM).**
+
+**SettingsPanel.svelte onDestroy (settings-loss; a1d8a83).** onDestroy is the close-to-save path for
+theme/sliders — they have no per-field auto-save, so closing via ✕/Escape/click-away (NOT Cancel, NOT Save)
+persists through it. Hand-verified against source: it was the ONLY one of the three persist paths (save(),
+saveQuietly(), onDestroy) that skipped coerceSettingsForRuntime(). A `<input type="number">` binds NaN when
+the user clears it to retype, and minSegmentSec/maxSegmentSec/maxSpeakers/jurySelfConsistencyN are all
+type=number bound directly to localSettings. Clear one, then close via ✕/Escape: onDestroy fired with NaN in
+localSettings → JSON.stringify(NaN)="null" → backend rejects null for a non-optional u32/f64 field → the
+ENTIRE updateSettings rejected → `.catch(console.error)` swallowed it → every settings edit the user did make
+(theme included) silently discarded, and the reactive store left holding NaN. Not the cosmetic LOW the queue framed.
+
+Root-cause/lazy fix (reuse, rung 2): routed onDestroy's persist through the existing saveQuietly(), which
+already coerces NaN + rolls back on backend failure + shows an error toast — fixing BOTH the NaN
+total-save-failure AND the originally-queued fire-and-forget silent-divergence in LESS code than the
+hand-rolled set+fire-and-forget block it replaced. Kept the JSON-diff guard so an unchanged close still writes nothing.
+
+Fail-before verified (both policy assertions fired pre-fix). Re-hit the iter-99 comment-shadows-grep trap: my
+explanatory comment embedded the exact `api.updateSettings(...).catch` string the policy greps for — reworded
+the comment (lesson re-applied). Source policy check #8 added to test_frontend_review_guards.py.
+
+Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies** (8 checks now in
+test_frontend_review_guards.py). **Score: 67 fixed, ~25 refuted, 2 measure-deferred, 0 queued** — queue
+drained; next iters resume the frontend/backend adversarial hunt. Owner-gated finish line unchanged (exe
+rebuild to activate source-only fixes; real-audio e2e/RTF/CER eval).
