@@ -7149,3 +7149,30 @@ update-segment-whole-row-upsert clobber class. Worth checking myself, not trusti
 Gate (each fix, isolated): typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies**
 (incl. the new frontend one). **Score: 62 fixed, ~23 refuted, 2 measure-deferred, 1 queued.** Owner-gated
 finish line unchanged (exe rebuild activates all source-only fixes; real-audio e2e).
+
+---
+
+## 2026-07-23T01:56Z — iter 101 — queued handleNormalize whole-row clobber verified + fixed (6ee5704)
+
+**Switched the loop to a 10-min cron cadence (owner request; job 40a870dc, cron 4,14,24,34,44,54). Then
+hand-verified the lead queued from iter 100 — which the frontend hunt had refuted 2/3.**
+
+**App.svelte handleNormalize (MEDIUM, whole-row clobber; 6ee5704).** handleNormalize captured
+seg=$selectedSegment, awaited api.normalizeText, then spread the STALE `{ ...seg }` whole row into
+api.updateSegment. My independent read found it is the LONE outlier: every sibling transcribe handler
+(handleTranscribe 1108, constrained 1172, finetuned 1211, scribe 1253) already uses
+`...($segments.find((s) => s.id === seg.id) ?? seg)` with explicit "never upsert the stale pre-await copy"
+comments — the freshRow-by-id guard the [[update-segment-whole-row-upsert]] memory mandates. A verify/edit/
+align stamp landing on the segment during the normalize await is reverted by the whole-row upsert of the
+pre-normalize snapshot. The iter-100 hunt's 2/3 refutation leaned on a file-path mis-attribution
+(segmentStore.ts vs App.svelte) + repro-probability, but the correctness refuter confirmed the mechanism and
+every sibling already guards it — so it is a genuine regression, not a false positive. Fixed to freshRow-by-id
+matching the siblings; added source policy (4th check in test_frontend_review_guards.py). Fail-before verified.
+
+**Lesson (honesty discipline):** a majority-refute is a strong signal but NOT proof — when a refutation rests
+on a red herring (wrong file path) and the pattern is a documented recurring class with the correct guard on
+every sibling, hand-verify before trusting the kill. This is why the loop protocol requires MY hand-verification
+as the evidence, never the agents' verdicts.
+
+Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies**. **Score: 63 fixed,
+~23 refuted, 2 measure-deferred, 0 queued.** Owner-gated finish line unchanged.
