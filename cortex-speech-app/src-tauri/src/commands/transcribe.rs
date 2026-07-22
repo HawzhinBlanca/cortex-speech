@@ -44,6 +44,15 @@ pub async fn transcribe_segment_constrained(
             .map_err(|e| e.to_string())?;
         let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
         let text = crate::constrained_decode::run_constrained(&model, &tokens, &audio, true)?;
+        // A blank decode is NOT a transcript. Returning it would let the frontend overwrite an existing
+        // good transcript with "" (a real result destroyed + a blank persisted, violating the no-blank
+        // honesty rule). Fail instead — the caller keeps the current transcript (opt-in path: no fallback).
+        if text.trim().is_empty() {
+            return Err(
+                "Constrained transcription produced no text (silent clip or no Kurdish speech) — the existing transcript is unchanged."
+                    .to_string(),
+            );
+        }
         Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
     })
     .await
@@ -92,6 +101,16 @@ pub async fn transcribe_segment_finetuned(
         // ~15 s windows for exactly that reason (true-10 audit 2026-07-09: one engine, two call paths,
         // two different qualities).
         let text = crate::pipeline::ProcessingPipeline::transcribe_chunk_finetuned(&onnx, &vocab, &clip)?;
+        // transcribe_chunk_finetuned returns Ok("") on a silent/blank-decoding clip. Returning it would let
+        // the frontend overwrite an existing good transcript with "" (data loss + a blank persisted as a
+        // real result). Fail instead — the in-pipeline finetuned path guards this exact case (pipeline.rs);
+        // this standalone opt-in command must too (no fallback engine here).
+        if text.trim().is_empty() {
+            return Err(
+                "Fine-tuned transcription produced no text (the clip may be silent) — the existing transcript is unchanged."
+                    .to_string(),
+            );
+        }
         Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
     })
     .await

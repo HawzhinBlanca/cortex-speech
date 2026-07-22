@@ -1286,6 +1286,52 @@ def test_t0_calibration_excludes_human_rejected_from_the_conformal_set() -> None
         )
 
 
+def test_run_t2_for_segment_respects_the_autonomy_dial() -> None:
+    """run_t2_for_segment (the direct "re-run T2 from the Review Inbox" IPC command) writes a machine
+    jury_accept verdict to the DB. Like the pipeline chokepoint run_jury_pipeline_core_via, that machine
+    commit MUST be gated behind the Autonomy Dial (machine_commits_allowed = ActConfirm | ActAuto) — under
+    Observe/Propose (the shipped default) a machine verdict is staged for the human, never auto-committed.
+    The command previously routed around the dial and silently accepted a machine transcript. Cloud-calling
+    command (can't be unit-injected), so source-pinned. Scoped to the run_t2_for_segment function body."""
+    jury = (REPO_ROOT / "src-tauri" / "src" / "commands" / "jury.rs").read_text(encoding="utf-8")
+    start = jury.find("pub async fn run_t2_for_segment")
+    if start == -1:
+        raise AssertionError("run_t2_for_segment not found — this gate would pass vacuously")
+    rest = jury[start:]
+    nxt = rest.find("\n#[tauri::command]", 1)
+    body = rest if nxt == -1 else rest[:nxt]
+    if "write_segment_verdict" not in body:
+        raise AssertionError("run_t2_for_segment no longer writes a verdict — gate would pass vacuously")
+    if "machine_commits_allowed" not in body or "jury_autonomy_level" not in body:
+        raise AssertionError(
+            "run_t2_for_segment writes a machine jury_accept verdict WITHOUT gating on the Autonomy Dial "
+            "(machine_commits_allowed / jury_autonomy_level) — under Observe/Propose it would auto-commit a "
+            "machine transcript the dial forbids. Gate the write like run_jury_pipeline_core_via."
+        )
+
+
+def test_optin_transcribe_commands_reject_a_blank_decode() -> None:
+    """transcribe_segment_constrained and transcribe_segment_finetuned run an opt-in engine and return its
+    text to the frontend, which OVERWRITES the segment's transcript with it. Both callees return an empty
+    string on a silent/blank-decoding clip (run_constrained -> ""; transcribe_chunk_finetuned -> Ok("")),
+    so shipping it destroys an existing good transcript and persists a blank as a real result — the
+    no-blank-transcript honesty rule + data loss. Each must reject a blank decode (return Err) before
+    returning the text. Cloud/ONNX commands (can't be unit-injected without the model), so source-pinned."""
+    src = (REPO_ROOT / "src-tauri" / "src" / "commands" / "transcribe.rs").read_text(encoding="utf-8")
+    for fn in ("transcribe_segment_constrained", "transcribe_segment_finetuned"):
+        start = src.find(f"pub async fn {fn}")
+        if start == -1:
+            raise AssertionError(f"{fn} not found — this gate would pass vacuously")
+        rest = src[start:]
+        nxt = rest.find("\n#[tauri::command]", 1)
+        body = rest if nxt == -1 else rest[:nxt]
+        if "text.trim().is_empty()" not in body:
+            raise AssertionError(
+                f"{fn} returns its decode text without a blank guard — a silent clip's empty decode would "
+                "overwrite the existing transcript with a blank. Reject a blank decode with an Err first."
+            )
+
+
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
     pipeline = pipeline_surface()
     forbidden = [
@@ -1759,6 +1805,8 @@ def main() -> None:
     test_save_session_is_rate_limited()
     test_atomic_replace_post_swap_backup_cleanup_is_best_effort()
     test_t0_calibration_excludes_human_rejected_from_the_conformal_set()
+    test_run_t2_for_segment_respects_the_autonomy_dial()
+    test_optin_transcribe_commands_reject_a_blank_decode()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()

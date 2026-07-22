@@ -272,30 +272,42 @@ pub async fn run_t2_for_segment(
     })
     .await?;
 
-    // If T2 produced a verdict, write it to the DB automatically (re-acquire the lock briefly).
-    if let Some(ref verdict) = result.verdict {
-        let evidence_payload = match &reference_report {
-            Some(report) => serde_json::json!({
-                "t2Evidence": verdict.evidence.clone(),
-                "referenceSelection": report,
-            }),
-            None => serde_json::json!(verdict.evidence.clone()),
-        };
-        let ev_json = serde_json::to_string(&evidence_payload)
-            .map_err(|e| format!("Failed to serialize T2 evidence for {segment_id}: {e}"))?;
-        // Re-acquire the lock only to persist the verdict.
-        state
-            .lock_db()
-            .write_segment_verdict(
-                &segment_id,
-                "jury_accept",
-                Some(&verdict.transcript),
-                Some(&verdict.reason),
-                Some(ev_json.as_str()),
-                Some(verdict.confidence),
-                false,
-            )
-            .map_err(|e| e.to_string())?;
+    // If T2 produced a verdict, write it to the DB — but ONLY when the Autonomy Dial permits a MACHINE
+    // commit (ActConfirm / ActAuto). Under Observe or Propose (the shipped default: "agent stages
+    // verdicts; human confirms each one") a machine verdict must NOT be auto-committed — it is returned in
+    // the T2Result for the human to confirm. This mirrors the pipeline chokepoint run_jury_pipeline_core_via,
+    // which gates EVERY machine commit behind the same check; this direct IPC command (re-run T2 from the
+    // Review Inbox) previously routed AROUND that gate and silently accepted a machine transcript under a
+    // dial level that forbids any machine commit (round-24 hunt #1 fixed the pipeline path but named T2).
+    let machine_commits_allowed = matches!(
+        settings.jury_autonomy_level,
+        crate::settings::AutonLevel::ActConfirm | crate::settings::AutonLevel::ActAuto
+    );
+    if machine_commits_allowed {
+        if let Some(ref verdict) = result.verdict {
+            let evidence_payload = match &reference_report {
+                Some(report) => serde_json::json!({
+                    "t2Evidence": verdict.evidence.clone(),
+                    "referenceSelection": report,
+                }),
+                None => serde_json::json!(verdict.evidence.clone()),
+            };
+            let ev_json = serde_json::to_string(&evidence_payload)
+                .map_err(|e| format!("Failed to serialize T2 evidence for {segment_id}: {e}"))?;
+            // Re-acquire the lock only to persist the verdict.
+            state
+                .lock_db()
+                .write_segment_verdict(
+                    &segment_id,
+                    "jury_accept",
+                    Some(&verdict.transcript),
+                    Some(&verdict.reason),
+                    Some(ev_json.as_str()),
+                    Some(verdict.confidence),
+                    false,
+                )
+                .map_err(|e| e.to_string())?;
+        }
     }
 
     Ok(result)
