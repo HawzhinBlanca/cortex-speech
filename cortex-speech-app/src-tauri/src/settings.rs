@@ -522,6 +522,31 @@ impl AppSettings {
             );
             self.num_asr_threads = defaults.num_asr_threads;
         }
+
+        // The [0,1] gate/threshold knobs get the SAME load-path repair. validate() enforces these bounds
+        // only on the update_settings trust boundary, so a hand-edited/legacy settings.json could carry a
+        // threshold as a percentage ("max_wer_threshold": 30), a NaN, or a negative — and `wer > 30.0` is
+        // then always false, SILENTLY disabling the export quality gate (exactly the honesty-rule
+        // violation validate()'s own comment warns about). Reset any non-finite / out-of-[0,1] value to
+        // its default; a valid threshold is left untouched.
+        let repair_rate = |name: &str, cur: &mut f64, def: f64| {
+            if !cur.is_finite() || !(0.0..=1.0).contains(&*cur) {
+                tracing::warn!("settings: {name} {} out of [0, 1]; reset to {def}", *cur);
+                *cur = def;
+            }
+        };
+        repair_rate("max_wer_threshold", &mut self.max_wer_threshold, defaults.max_wer_threshold);
+        repair_rate("max_cer_threshold", &mut self.max_cer_threshold, defaults.max_cer_threshold);
+        repair_rate("jury_t1_threshold", &mut self.jury_t1_threshold, defaults.jury_t1_threshold);
+        // vad_threshold carries the same [0, 1] contract but is an f32, so it gets its own check.
+        if !self.vad_threshold.is_finite() || !(0.0..=1.0).contains(&self.vad_threshold) {
+            tracing::warn!(
+                "settings: vad_threshold {} out of [0, 1]; reset to {}",
+                self.vad_threshold,
+                defaults.vad_threshold
+            );
+            self.vad_threshold = defaults.vad_threshold;
+        }
     }
 
     /// Rename an unparseable settings file to `settings.json.corrupt-<epoch>` so a subsequent save of
@@ -1112,6 +1137,35 @@ mod tests {
         assert_eq!(loaded.num_asr_threads, defaults.num_asr_threads, "threads repaired to default");
         assert_eq!(loaded.language, "ckb", "unrelated persisted values must survive the repair");
         assert!(loaded.validate().is_ok(), "repaired settings must pass the update-path validator");
+    }
+
+    #[test]
+    fn repair_resets_out_of_range_quality_gate_thresholds() {
+        // The [0,1] gate/threshold knobs get the same load-path repair as the segment/thread knobs above.
+        // A hand-edited/legacy settings.json bypasses validate(), so a threshold written as a percentage
+        // (30), a NaN, or a negative would otherwise survive load and make `wer > threshold` always false
+        // — silently disabling the export quality gate (the honesty rule). Tested on repair() directly
+        // because NaN does not round-trip through JSON (serde emits null).
+        let mut s = AppSettings {
+            max_wer_threshold: 30.0,     // a percentage, not the [0,1] fraction the gate needs
+            max_cer_threshold: f64::NAN, // non-finite
+            jury_t1_threshold: -1.0,     // below range
+            vad_threshold: 2.0,          // above range
+            language: "ckb".to_string(),
+            ..AppSettings::default()
+        };
+        s.repair_out_of_range_numeric_knobs();
+        let d = AppSettings::default();
+        assert_eq!(s.max_wer_threshold, d.max_wer_threshold, "percentage wer threshold repaired");
+        assert_eq!(s.max_cer_threshold, d.max_cer_threshold, "NaN cer threshold repaired");
+        assert_eq!(s.jury_t1_threshold, d.jury_t1_threshold, "negative jury threshold repaired");
+        assert_eq!(s.vad_threshold, d.vad_threshold, "above-range vad threshold repaired");
+        assert_eq!(s.language, "ckb", "unrelated values untouched");
+        assert!(s.validate().is_ok(), "repaired settings pass the update-path validator");
+        // A valid in-range threshold must NOT be touched.
+        let mut ok = AppSettings { max_wer_threshold: 0.15, ..AppSettings::default() };
+        ok.repair_out_of_range_numeric_knobs();
+        assert_eq!(ok.max_wer_threshold, 0.15, "a valid threshold is left as-is");
     }
 
     #[test]
