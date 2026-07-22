@@ -56,6 +56,12 @@ pub struct CandidateSelectionReport {
     pub confidence: f64,
     pub margin: f64,
     pub should_commit: bool,
+    /// True only when `reference_window_overlap` was scored against a real per-segment time window
+    /// (source duration + segment offsets present), not the whole-file fallback. Auto-commit paths
+    /// (here and the multi-reference agreement boost) require it — a whole-file overlap is not a
+    /// positional verification. `serde(default)` so older persisted evidence deserializes to false.
+    #[serde(default)]
+    pub positional_window: bool,
     pub rationale: String,
     pub reference_window_preview: String,
     pub scores: Vec<CandidateSelectionScore>,
@@ -113,7 +119,7 @@ pub fn select_best_candidate_against_reference(
         return None;
     }
 
-    let window_tokens = reference_window_tokens(segment, &reference_tokens, source_duration_ms);
+    let (window_tokens, positional_window) = reference_window_tokens(segment, &reference_tokens, source_duration_ms);
     let scoring_window = if window_tokens.is_empty() { &reference_tokens } else { &window_tokens };
 
     let mut scores: Vec<CandidateSelectionScore> = candidates
@@ -162,7 +168,13 @@ pub fn select_best_candidate_against_reference(
     let winner = scores[0].clone();
     let runner_up_score = scores.get(1).map(|score| score.final_score).unwrap_or(0.0);
     let margin = (winner.final_score - runner_up_score).max(0.0);
-    let should_commit = winner.final_score >= 0.72 && margin >= 0.08 && winner.reference_window_overlap >= 0.45;
+    // Auto-commit REQUIRES a positional window (round-24 hunt #15): without the source duration +
+    // segment offsets, `reference_window_overlap` is computed against the WHOLE reference, so the
+    // >=0.45 "window" gate is not a positional check and a common-word candidate matches somewhere in
+    // a long file. Such a segment stays in jury review; its rationale never claims source-window
+    // verification that did not happen.
+    let should_commit =
+        positional_window && winner.final_score >= 0.72 && margin >= 0.08 && winner.reference_window_overlap >= 0.45;
     let confidence =
         if should_commit { (winner.final_score + margin.min(0.2)).clamp(0.0, 1.0) } else { winner.final_score };
 
@@ -174,14 +186,20 @@ pub fn select_best_candidate_against_reference(
         confidence,
         margin,
         should_commit,
+        positional_window,
         rationale: if should_commit {
             format!(
                 "Reference-aware agent selected '{}' using source-window overlap {:.2}, global overlap {:.2}, and margin {:.2}.",
                 winner.model_id, winner.reference_window_overlap, winner.reference_global_overlap, margin
             )
+        } else if !positional_window {
+            format!(
+                "Reference-aware agent preferred '{}' (whole-file overlap {:.2}) but kept the segment in jury review: the reference could not be positionally aligned to this segment (no source duration/offsets), so its overlap is NOT a source-window match.",
+                winner.model_id, winner.reference_window_overlap
+            )
         } else {
             format!(
-                "Reference-aware agent preferred '{}' but kept the segment in jury review because score {:.2}, overlap {:.2}, or margin {:.2} was below the commit gate.",
+                "Reference-aware agent preferred '{}' but kept the segment in jury review because score {:.2}, source-window overlap {:.2}, or margin {:.2} was below the commit gate.",
                 winner.model_id, winner.final_score, winner.reference_window_overlap, margin
             )
         },
@@ -380,11 +398,27 @@ fn delete_gemini_file(name: &str, api_key: &str) -> Result<(), String> {
 }
 
 fn extract_gemini_text(body: &Value) -> Result<String, String> {
+    let candidate = &body["candidates"][0];
+    // Refuse a TRUNCATED / blocked response instead of returning partial text as if it were complete
+    // (round-24 hunt #14). Gemini stamps `finishReason` on the candidate: "STOP" is a clean
+    // completion; "MAX_TOKENS" (the output cap hit on a long/multi-hour source), "SAFETY",
+    // "RECITATION", "OTHER", etc. mean the text is CUT SHORT. Returning it would cache a truncated
+    // whole-file reference (keyed by the audio content hash → reused on every later run) and
+    // mis-score every segment past the cut against the wrong part of the transcript. A missing
+    // finishReason is tolerated (some responses omit it); only a PRESENT non-STOP reason is fatal.
+    if let Some(reason) = candidate["finishReason"].as_str() {
+        if !reason.eq_ignore_ascii_case("STOP") {
+            return Err(format!(
+                "Gemini response is incomplete (finishReason = {reason}); refusing to use a truncated \
+                 transcript as a reference"
+            ));
+        }
+    }
     // Concatenate ALL text parts, not just parts[0]. Gemini can split one transcript across
     // content.parts[0..N] (and a 2.5-class "thinking" model can emit a leading thought part), so
     // reading parts[0] alone silently truncates the reference transcript — which then mis-scores every
     // local candidate downstream. Join every part's text to reconstruct the full response.
-    let joined = body["candidates"][0]["content"]["parts"]
+    let joined = candidate["content"]["parts"]
         .as_array()
         .map(|ps| ps.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(""))
         .unwrap_or_default();
@@ -551,22 +585,28 @@ fn tokenize_for_reference(text: &str) -> Vec<String> {
     normalized.split_whitespace().map(ToOwned::to_owned).collect()
 }
 
+/// Returns `(window_tokens, positional)`. `positional` is true ONLY when a real per-segment time
+/// window was carved from the reference (source duration known AND the segment carries source
+/// offsets). When either is missing the caller still gets the WHOLE reference for a coarse overlap
+/// signal, but with `positional = false` so it cannot be reported/gated as a source-window match
+/// (round-24 hunt #15): the overlap of a short common-word candidate against an hour of reference
+/// text is near 1.0 and says nothing about whether the candidate belongs to THIS segment.
 fn reference_window_tokens(
     segment: &SpeechSegment,
     reference_tokens: &[String],
     source_duration_ms: Option<i64>,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     let Some(duration_ms) = source_duration_ms.filter(|duration| *duration > 0) else {
-        return reference_tokens.to_vec();
+        return (reference_tokens.to_vec(), false);
     };
     let Some(meta) = segment.alignment_json.as_deref().and_then(chunking::SegmentSourceMeta::from_alignment_json)
     else {
-        return reference_tokens.to_vec();
+        return (reference_tokens.to_vec(), false);
     };
 
     let token_count = reference_tokens.len();
     if token_count == 0 {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let start_ratio = (meta.source_start_ms.max(0) as f64 / duration_ms as f64).clamp(0.0, 1.0);
@@ -581,7 +621,7 @@ fn reference_window_tokens(
     let pad = expected_len.max(8);
     start = start.saturating_sub(pad);
     end = (end + pad).min(token_count);
-    reference_tokens[start..end].to_vec()
+    (reference_tokens[start..end].to_vec(), true)
 }
 
 fn token_overlap_ratio(candidate_tokens: &[String], reference_tokens: &[String]) -> f64 {
@@ -811,13 +851,70 @@ mod tests {
 
     #[test]
     fn reference_selection_does_not_commit_when_margin_is_weak() {
-        let segment =
-            SpeechSegment { id: "seg".to_string(), audio_path: "source.wav".to_string(), ..Default::default() };
+        // Give this segment a REAL positional window so it exercises the MARGIN gate, not the
+        // positional gate (round-24 hunt #15) — otherwise the assertion would pass vacuously.
+        let meta =
+            chunking::SegmentSourceMeta { source_start_ms: 0, source_end_ms: 2000, chunk_index: 0, chunk_count: 1 };
+        let segment = SpeechSegment {
+            id: "seg".to_string(),
+            audio_path: "source.wav".to_string(),
+            alignment_json: Some(meta.to_alignment_json()),
+            ..Default::default()
+        };
         let candidates = vec![hyp("a", "navenda peyam", 0.70), hyp("b", "navenda peyam", 0.69)];
 
-        let report =
-            select_best_candidate_against_reference(&segment, "navenda peyam", None, &candidates).expect("report");
+        let report = select_best_candidate_against_reference(&segment, "navenda peyam", Some(2000), &candidates)
+            .expect("report");
 
-        assert!(!report.should_commit);
+        assert!(report.positional_window, "this test must exercise the margin gate with a real window");
+        assert!(!report.should_commit, "identical-text candidates -> weak margin -> no commit");
+    }
+
+    #[test]
+    fn reference_selection_refuses_to_commit_without_a_positional_window() {
+        // Round-24 hunt #15: with no source offsets (or no duration) the overlap is whole-file, not a
+        // source-window match — a strong candidate that WOULD commit with a real window must instead
+        // stay in jury review, and the rationale must not claim positional verification.
+        let reference = "w01 w02 w03 navenda sarata peyam rast drust w09 w10 w11 w12 w13 w14 w15 w16";
+        let candidates = vec![hyp("strong", "navenda sarata peyam rast drust", 0.95), hyp("weak", "zzz qqq xxx", 0.50)];
+        // No alignment_json meta -> no positional window even though a duration is supplied.
+        let segment =
+            SpeechSegment { id: "seg".to_string(), audio_path: "source.wav".to_string(), ..Default::default() };
+
+        let report =
+            select_best_candidate_against_reference(&segment, reference, Some(8000), &candidates).expect("report");
+
+        assert_eq!(report.selected_model_id, "strong");
+        assert!(!report.positional_window, "no source offsets -> not a positional window");
+        assert!(!report.should_commit, "a whole-file overlap must not auto-commit");
+        assert!(
+            report.rationale.contains("positionally aligned"),
+            "rationale must name the missing positional window, not fake a source-window match: {}",
+            report.rationale
+        );
+    }
+
+    #[test]
+    fn extract_gemini_text_rejects_a_truncated_response() {
+        // Round-24 hunt #14: a MAX_TOKENS / SAFETY / RECITATION finishReason means the transcript is
+        // CUT SHORT; returning it would cache a truncated whole-file reference forever.
+        let complete = serde_json::json!({
+            "candidates": [{ "finishReason": "STOP", "content": { "parts": [{ "text": "temam بوو" }] } }]
+        });
+        assert_eq!(extract_gemini_text(&complete).unwrap(), "temam بوو");
+
+        for reason in ["MAX_TOKENS", "SAFETY", "RECITATION", "OTHER"] {
+            let truncated = serde_json::json!({
+                "candidates": [{ "finishReason": reason, "content": { "parts": [{ "text": "partial تر" }] } }]
+            });
+            let err = extract_gemini_text(&truncated).expect_err("a non-STOP finishReason must be rejected");
+            assert!(err.contains("incomplete") && err.contains(reason), "err must name the reason: {err}");
+        }
+
+        // A MISSING finishReason is tolerated (some responses omit it) — text is still returned.
+        let no_reason = serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "no reason field" }] } }]
+        });
+        assert_eq!(extract_gemini_text(&no_reason).unwrap(), "no reason field");
     }
 }

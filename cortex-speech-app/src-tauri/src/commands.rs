@@ -2612,6 +2612,7 @@ fn hypothesis_coverage_guard(
         confidence: 0.0,
         margin: 0.0,
         should_commit: false,
+        positional_window: false,
         rationale: format!(
             "Multi-model hypothesis coverage guard blocked automatic adjudication because fewer than 2 non-empty model hypotheses were available before jury (required {}). Present non-empty model hypotheses: {present_display}.",
             coverage.minimum_non_empty_model_count
@@ -2717,6 +2718,7 @@ fn source_reference_coverage_guard(
             confidence: 0.0,
             margin: 0.0,
             should_commit: false,
+            positional_window: false,
             rationale: format!(
                 "Source-reference audio identity guard blocked automatic adjudication because stored whole-file references are missing audio identity or no longer match the current source audio bytes: {}. Recreate source references before jury.",
                 stale_required_models.join(", ")
@@ -2755,6 +2757,7 @@ fn source_reference_coverage_guard(
         confidence: 0.0,
         margin: 0.0,
         should_commit: false,
+        positional_window: false,
         rationale: format!(
             "Source-reference coverage guard blocked automatic adjudication because configured whole-file reference models are missing or empty: {}. Required source reference models: {}. Present non-empty source reference models: {}.",
             missing_models.join(", "),
@@ -2844,7 +2847,10 @@ fn reference_selection_for_segment(
         .iter()
         .filter(|report| !best_key.is_empty() && reference_selection_text_key(report) == best_key)
         .count();
-    if agreeing_on_best >= 2 && best.selected_score >= 0.55 && !best.scores.is_empty() {
+    // Require a positional window even for the agreement boost (round-24 hunt #15): a whole-file
+    // fallback overlap makes the 0.55 bar much easier for common-word candidates and would auto-commit
+    // on evidence that never positionally located the candidate in the source.
+    if agreeing_on_best >= 2 && best.selected_score >= 0.55 && !best.scores.is_empty() && best.positional_window {
         let model_ids = reports.iter().filter_map(|report| report.reference_model_id.as_deref()).collect::<Vec<_>>();
         let confidence_boost = 0.08 * (agreeing_on_best as f64 - 1.0).min(2.0);
         best.reference_model_id = Some(format!("multi-reference-agreement-boost:{}", model_ids.join("+")));
@@ -3460,6 +3466,38 @@ mod tests {
         audio.to_string_lossy().to_string()
     }
 
+    /// A real, decodable silence WAV of `duration_ms` so `get_duration_ms` returns a true duration —
+    /// required for the source-reference POSITIONAL window (round-24 hunt #15). A source-reference
+    /// auto-commit needs the source duration AND the segment's offsets; production always has both
+    /// (real audio + chunked segments), so the reference-commit tests must supply both too.
+    fn real_source_audio(dir: &tempfile::TempDir, name: &str, duration_ms: u32) -> String {
+        let audio = dir.path().join(name);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&audio, spec).expect("create wav");
+        for _ in 0..(16_000u32 * duration_ms / 1000) {
+            writer.write_sample(0i16).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+        audio.to_string_lossy().to_string()
+    }
+
+    /// Whole-file source-offset meta (chunk 0 of 1) so a single-segment source spans the whole
+    /// reference — a real positional window covering the entire transcript.
+    fn whole_file_alignment(duration_ms: i64) -> String {
+        crate::chunking::SegmentSourceMeta {
+            source_start_ms: 0,
+            source_end_ms: duration_ms,
+            chunk_index: 0,
+            chunk_count: 1,
+        }
+        .to_alignment_json()
+    }
+
     /// The jury tests below exercise the reference/guard/commit MACHINERY, which only runs when the
     /// Autonomy Dial permits machine commits. The shipped default (AutonLevel::Propose) stages
     /// instead of committing — that contract is pinned separately by
@@ -3757,8 +3795,9 @@ mod tests {
         let db = crate::db::Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
-        let audio_path = test_source_audio(&dir, "source.wav");
-        let segment = test_segment("seg-reference-first", &audio_path, "wrong local consensus");
+        let audio_path = real_source_audio(&dir, "source.wav", 4000);
+        let mut segment = test_segment("seg-reference-first", &audio_path, "wrong local consensus");
+        segment.alignment_json = Some(whole_file_alignment(4000)); // real positional window
         db.insert_segment(&segment).unwrap();
         insert_hypothesis(&db, &segment.id, "omniasr-wsl-7b", "wrong local consensus", 0.99);
         insert_hypothesis(&db, &segment.id, "omniasr-ctc-300m", "wrong local consensus", 0.95);
@@ -3852,8 +3891,9 @@ mod tests {
         let db = crate::db::Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
-        let audio_path = test_source_audio(&dir, "agreeing-references.wav");
-        let segment = test_segment("seg-reference-agreement", &audio_path, "wrong local consensus");
+        let audio_path = real_source_audio(&dir, "agreeing-references.wav", 4000);
+        let mut segment = test_segment("seg-reference-agreement", &audio_path, "wrong local consensus");
+        segment.alignment_json = Some(whole_file_alignment(4000)); // real positional window
         db.insert_segment(&segment).unwrap();
         insert_hypothesis(&db, &segment.id, "omniasr-wsl-7b", "correct reference phrase", 0.99);
         insert_hypothesis(&db, &segment.id, "omniasr-ctc-1b", "wrong local consensus", 0.98);
