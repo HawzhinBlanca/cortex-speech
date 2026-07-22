@@ -6418,3 +6418,31 @@ Gate: fmt 0, clippy 0, **951 passed / 0 failed / 6 ignored**, 33/33 policies.
 export_lm_corpus omits annotated_transcript; jury/learning.rs:87 build_dpo_dataset ignores current
 human_decision; agentic.rs:387/559 Gemini finishReason + window substitution; aligner.rs:497/190/517).
 Owner-gated legs unchanged (OWNER_HANDOFF.md).
+
+---
+
+## 2026-07-22T06:25Z — iter 77 — training-data integrity pair fixed (commit b98f293); 5 findings left
+
+**Hunt-3 #8 + #9 (both medium) hand-verified and FIXED — training data derived from human decisions.**
+- **#8 export_lm_corpus omitted annotated_transcript:** COALESCE was verdict▸normalized▸raw, but the
+  canonical human-confirmed text is verdict▸annotated▸normalized▸raw (record_human_decision's
+  loop0_draft_text + quality.rs effective_transcript both prefer annotated). Inbox/legacy accepts leave
+  the fix in annotated with verdict_transcript NULL, so the KenLM corpus trained on the SUPERSEDED ASR
+  draft. Fix: add NULLIF(annotated_transcript,'') after the verdict term.
+- **#9 undone/rejected edits trained as preferred DPO pairs:** build_dpo_dataset AND few-shot key only
+  on agent_examples.verified_by_human=1, never the current decision. Undo (clear_human_decision) and a
+  later reject left the pair intact → a retracted fix (or an edit on a later-rejected clip) permanently
+  trained the model to prefer it. Fixed at the SOURCE (one fix, covers both consumers):
+  clear_human_decision deletes the segment's agent_examples in the same tx as the re-open (now
+  transactional), and record_human_decision deletes them on 'reject'.
+
+**Fail-before/pass-after verified** for both: reverting the COALESCE term reds
+export_lm_corpus_uses_the_annotated_fix_not_the_superseded_draft; disabling the two DELETEs reds
+undo_and_reject_retract_the_dpo_learning_pair (edit→1, undo→0, re-edit→1, reject→0) — both driven
+through the real record_human_decision path.
+
+Gate: fmt 0, clippy 0, **953 passed / 0 failed / 6 ignored**, 33/33 policies.
+**Score: 29 fixed, 5 refuted, 2 measure-deferred, 5 findings left** (next: agentic.rs:387 Gemini
+finishReason ignored → truncated response as complete reference; agentic.rs:559 window substitution;
+aligner.rs:497/190/517 timestamp clamp / OOM cap / degenerate-alignment guard). Owner-gated legs
+unchanged (OWNER_HANDOFF.md).
