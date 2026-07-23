@@ -1434,10 +1434,20 @@ pub(crate) fn apply_curation_fields(
                 }
                 segment.alignment_json = v;
             }
+            "verified" => {
+                // Verifying is a single-field curation action. Routing it through this field-level path
+                // (update_segment_fields reads the FRESH row by id, applies only this field, persists) —
+                // instead of the whole-row api.updateSegment upsert handleToggleVerify used to send — means a
+                // concurrent writer that holds NO $isProcessing lock, notably the WSL-7B refinement loop
+                // (it emits wsl-log events, not batch-progress, so the Verify button stays live), cannot have
+                // its raw_transcript write reverted by a stale whole-row spread. Matches the sibling
+                // handleSaveAnnotation / handleSaveSpeaker conversions to field-level updates.
+                segment.verified = value.as_bool().ok_or_else(|| format!("{key} must be a boolean"))?;
+            }
             other => {
                 return Err(format!(
                     "update_segment_fields: unsupported field '{other}' — only curation fields \
-                     (annotatedTranscript, speakerId, alignmentJson) may be partially updated"
+                     (annotatedTranscript, speakerId, alignmentJson, verified) may be partially updated"
                 ));
             }
         }
@@ -3603,9 +3613,10 @@ mod tests {
 
     #[test]
     fn apply_curation_fields_touches_only_whitelisted_fields_and_rejects_unknown_keys() {
-        // F10 root fix: the partial autosave path must be able to change ONLY the three curation
-        // fields; everything else in the row must be bit-identical after the apply, and an unknown key
-        // must be a loud error (a typo'd field must never look saved).
+        // F10 root fix: the partial autosave path must be able to change ONLY the whitelisted curation
+        // fields (annotatedTranscript, speakerId, alignmentJson, verified); everything else in the row must
+        // be bit-identical after the apply, and an unknown key must be a loud error (a typo'd field must
+        // never look saved).
         let mut seg = test_segment("s1", "/audio/a.wav", "raw text");
         seg.verified = true;
         seg.confidence = Some(0.42);
@@ -3628,11 +3639,22 @@ mod tests {
         apply_curation_fields(&mut seg, &clear).unwrap();
         assert_eq!(seg.speaker_id, None);
 
-        // Unknown key -> loud error, row unchanged.
-        let bad: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"verified": true}"#).unwrap();
+        // `verified` IS a whitelisted curation field now — handleToggleVerify routes through this field-level
+        // path (not a whole-row upsert) so a concurrent WSL-7B refinement write is never reverted. It applies
+        // as a bool, and a non-bool is a loud error.
+        let ver: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"verified": false}"#).unwrap();
+        apply_curation_fields(&mut seg, &ver).unwrap();
+        assert!(!seg.verified, "verified applies as a bool");
+        assert_eq!(seg.raw_transcript, before.raw_transcript, "verifying must not touch raw_transcript");
+        let ver_bad: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"verified": "yes"}"#).unwrap();
+        assert!(apply_curation_fields(&mut seg, &ver_bad).is_err(), "a non-bool verified must be a loud error");
+
+        // A genuinely non-whitelisted key -> loud error, row unchanged.
+        let bad: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"confidence": 0.9}"#).unwrap();
         let err = apply_curation_fields(&mut seg, &bad).unwrap_err();
-        assert!(err.contains("unsupported field 'verified'"), "{err}");
-        assert!(!seg.verified || seg.verified == before.verified, "non-whitelisted field must not change");
+        assert!(err.contains("unsupported field 'confidence'"), "{err}");
+        assert_eq!(seg.confidence, before.confidence, "non-whitelisted field must not change");
 
         // Wrong value type -> loud error.
         let wrong: serde_json::Map<String, serde_json::Value> =

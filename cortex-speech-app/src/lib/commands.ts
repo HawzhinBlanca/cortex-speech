@@ -239,7 +239,7 @@ export async function restoreSegmentSnapshot(segment: SpeechSegment): Promise<vo
 
 export async function updateSegmentFields(
   segmentId: string,
-  fields: Partial<Pick<SpeechSegment, 'annotatedTranscript' | 'speakerId' | 'alignmentJson'>>,
+  fields: Partial<Pick<SpeechSegment, 'annotatedTranscript' | 'speakerId' | 'alignmentJson' | 'verified'>>,
 ): Promise<boolean> {
   return invoke<boolean>('update_segment_fields', { segmentId, fields });
 }

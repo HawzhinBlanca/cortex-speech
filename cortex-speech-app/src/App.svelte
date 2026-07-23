@@ -1419,8 +1419,11 @@
     }
 
     try {
-      const updatedSeg = { ...seg, verified: nextVerified };
-      await api.updateSegment(updatedSeg);
+      // Field-level (fresh-read-by-id, verified only) — NOT a whole-row updateSegment upsert. A whole-row
+      // spread of the stale `seg` would revert any column a concurrent NO-$isProcessing writer changed on
+      // that row — notably the WSL-7B refinement loop's raw_transcript write (it runs on wsl-log events, so
+      // the Verify button stays live). Same fix the sibling save handlers already got.
+      await api.updateSegmentFields(seg.id, { verified: nextVerified });
       // Invalidate any in-flight load so its stale pre-write data won't clobber the verified write.
       // This closes the race window: a background load dispatched before this write will check its
       // generation and return early rather than applying pre-write data.

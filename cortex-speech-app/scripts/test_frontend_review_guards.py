@@ -143,19 +143,26 @@ def test_waveform_stretches_peaks_across_the_canvas() -> None:
 
 
 def test_app_save_handlers_use_field_level_updates() -> None:
-    """App.svelte handleSaveAnnotation and handleSaveSpeaker each persist ONE edited field (annotatedTranscript
-    / speakerId). Both must use api.updateSegmentFields (reads the fresh row under the DB lock, writes only the
-    named field, records undo history), NEVER a whole-row api.updateSegment($selectedSegment): the Save buttons
-    are reachable while a background batch-verify has written verified=true to the DB but the store row is still
-    stale (verified=false), so a whole-row upsert would revert that concurrent human verify (freshRow can't
-    help — the store itself is the stale source)."""
+    """App.svelte's single-field mutations — handleSaveAnnotation (annotatedTranscript), handleSaveSpeaker
+    (speakerId), and handleToggleVerify (verified) — must each persist via api.updateSegmentFields (reads the
+    fresh row under the DB lock, writes only the named field, records undo history), NEVER a whole-row
+    api.updateSegment(...): a whole-row upsert of the STALE store row reverts any column a concurrent writer
+    changed. The Verify button in particular is reachable while the WSL-7B refinement loop is writing
+    raw_transcript in the background (it runs on wsl-log events, so it holds NO $isProcessing lock and never
+    disables Verify), so a whole-row upsert would silently revert the 7B's fresh transcript. freshRow can't
+    help — the store itself is the stale source (hunt-6 / iter 162)."""
     src = _read("src/App.svelte")
-    for fn, field in (("handleSaveAnnotation", "annotatedTranscript"), ("handleSaveSpeaker", "speakerId")):
+    for fn, field in (
+        ("handleSaveAnnotation", "annotatedTranscript"),
+        ("handleSaveSpeaker", "speakerId"),
+        ("handleToggleVerify", "verified"),
+    ):
         body = _function_body(src, f"async function {fn}(")
-        if "api.updateSegment(seg)" in body:
+        if "api.updateSegment(" in body:  # any whole-row upsert; updateSegmentFields( does NOT match this
             raise AssertionError(
-                f"{fn} still whole-row-upserts the stale $selectedSegment via api.updateSegment(seg) — it can "
-                f"revert a concurrent batch-verify. Use api.updateSegmentFields(seg.id, {{ {field} }})."
+                f"{fn} whole-row-upserts a stale segment via api.updateSegment(...) — it can revert a "
+                f"concurrent writer (a batch op, or the WSL-7B refinement which holds no $isProcessing lock). "
+                f"Use api.updateSegmentFields(seg.id, {{ {field} }})."
             )
         if "api.updateSegmentFields(seg.id" not in body:
             raise AssertionError(f"{fn} must persist via api.updateSegmentFields(seg.id, ...) (field-level, lock-safe)")
