@@ -8795,3 +8795,45 @@ QUEUE (hunt-135 drained; accuracy-machinery backlog continuing):
   gold-CER/WER PR-gating test; CV-ckb + SoraniTTS importers; one-click gate_and_promote IPC+button;
   homophone-replacer FST (verify Omnilingual-path support). Gold-trust pair now complete (kappa + ECE).
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+### Iteration 144 — 2026-07-23 — REFUTE: KenLM n-gram fusion is NOT feasible on our CTC path (verified before building)
+
+**Judgment call (owner feedback: "do the only best, don't just simply agree"; memory
+`do-the-best-not-just-agree`).** Instead of building a 4th owner-gated harness, I asked which remaining
+machinery item could actually lower the SHIPPING offline CER without the owner's rig/marathon — only KenLM
+n-gram fusion could (text-only, decode-time, no retrain), the scan's "cheapest win". So I verified its
+feasibility FIRST rather than build blindly.
+
+**Verified against the sherpa-onnx 1.13.2 crate source (`offline_asr.rs`):** `OfflineLMConfig` is
+`{ model: Option<String>, scale: f32 }` where `model` is a path to a NEURAL RNN-LM **ONNX** file
+(offline_asr.rs:200-204). A KenLM is an ARPA/binary **n-gram**, not ONNX → it **mechanically cannot be
+wired to sherpa's offline LM at all**; and sherpa's offline LM + hotwords are transducer/beam-search
+features that do not apply to the OmniASR **CTC greedy** path (app sets `decoding_method="greedy_search"`,
+asr.rs:315). So the "cheapest win" is a **dead end** on our path. A real n-gram fusion would need a CUSTOM
+CTC prefix-beam-search + KenLM decoder in the app's own `ort` path — a large, opt-in-only build, not cheap.
+
+Residual honest finding: the ONE offline CTC-applicable decode knob is `OfflineRecognizerConfig.blank_penalty`
+(default 0.0, app unset — asr.rs sets it to none); a positive value biases against blank and cuts
+deletions, but the value must be **tuned on the gold set** (owner-gated; a blind non-zero default would be
+an unmeasured change → one-law violation). Recorded in the scan (§3.3 + §5 backlog #3 → refuted + gaps).
+
+Docs-only correction; no code, **no metric change**. Gate: **python policies 39 scripts passed**. Reality
+check pre-work: exe not running, git clean, HEAD ecb7a5d, lock free.
+
+**Score: 105 fixed + 1 cleanup, ~34 refuted, 2 measure-deferred, 0 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+**Direction call (honest):** the accuracy-machinery backlog is now mostly built-but-unrunnable-for-weeks
+(int8-quant, κ, ECE — all owner-gated on marathon data / annotators / real posteriors that don't exist yet)
+and the one near-term-accuracy hope (KenLM) is refuted. Per the doctrine ("where the loop CAN help users
+today is usefulness") the highest-value IN-LOOP work now is **reliability/usefulness that ships NOW** (a
+fresh adversarial defect hunt, or a concrete UX/reliability improvement) — NOT another owner-gated harness.
+Pivoting there next.
+
+QUEUE:
+- NEXT: fresh adversarial defect hunt (untouched subsystems) OR a concrete usefulness/reliability item.
+- Machinery remaining is owner-gated to RUN (1B benchmark, pseudo-labeling, gold-CER PR-gate, importers,
+  gate_and_promote IPC, homophone FST); blank_penalty tuning is an owner work order.
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
