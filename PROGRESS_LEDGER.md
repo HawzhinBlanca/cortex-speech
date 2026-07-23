@@ -9448,6 +9448,53 @@ scripts passed). Reality check pre-work: exe not running, git clean, HEAD ee8018
 closed, others refuted) + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 162 — 2026-07-23 — HUNT-6 processed: 2 fixes (#122, #123) + 1 close; 3 finders clean
+
+**Hunt-6** (Workflow, 6 fresh finders — IPC write-clobber, jury verdict math, python eval-stats, media/atomic,
+agentic orchestration, normalizer numbers — 3-lens refute, 1.5M tokens, 15 agents, 0 errors). jury-math,
+media-atomic, normalizer-numbers reported clean. 3 candidates, all AUTO-marked "refuted" — I hand-verified
+each and OVERRODE two:
+
+**FIX #122 — toggle-verify whole-row upsert clobbers a concurrent write (recurring whole-row-clobber class).**
+`handleToggleVerify` persisted via a whole-row `api.updateSegment({ ...seg (STALE), verified })`; its siblings
+handleSaveAnnotation/handleSaveSpeaker were already converted to field-level `updateSegmentFields` for this
+exact class — toggle-verify was the last holdout. All 3 lenses refuted, but ONLY vs the finder's chosen
+trigger (batch_assign_speaker, which DOES set $isProcessing). I found the reachable trigger they missed: the
+WSL-7B refinement loop runs on `wsl-log` events (NOT batch-progress), so it holds NO $isProcessing lock and
+never disables Verify — verifying a segment the 7B just refined (store still stale) reverts the 7B's fresh
+raw_transcript AND verifies it (stranding, per #120). Routed through `update_segment_fields` (fresh-read-by-id
+under the DB lock, apply only the field); added `verified` to the apply_curation_fields whitelist (bool) +
+the updateSegmentFields TS type. Guard: `test_app_save_handlers_use_field_level_updates` now covers
+handleToggleVerify; Rust test gains verified pos/neg coverage. Fail-before verified.
+
+**FIX #123 — MAPSSWE prints a FABRICATED p=0.0 "SIGNIFICANT" on a zero-variance (constant-gap) set (honesty).**
+`mapsswe_compare.py`'s var==0 branch returned `(mean, inf, 0.0)` for a constant non-zero per-clip gap → main()
+prints "p = 0.000e+00 (SIGNIFICANT p<0.05)". The statistic is UNDEFINED there, not infinitely significant; the
+correct fallback (two-sided sign test, p = 2·0.5^n; n=3 → 0.25) says a uniform gap over a handful of segments
+is NOT significant. The tool's output is pasted into the ledger as a real result, so this is a fabricated
+significance claim (honesty law). 2/3 refuted ("manual tool, N=922 never degenerate") — OVERRIDDEN: the p
+reaches the ledger via the operator, the finder reproduced it live on a small set, AND the repo's own
+canonical Rust ref significance.rs:182-193 already fixed this exact case (test
+mapsswe_constant_nonzero_gap_is_not_falsely_significant) — the Python was the unfixed sibling. Mirrored the
+Rust fix + an n<2 guard (the /(n-1) crash the finder noted). New unit test
+`test_mapsswe_compare_policy.py`. **Policy scripts now 41.** Fail-before verified.
+
+**CLOSED (refutation SOUND):** runs.rs:455 — the agent-import report's source-reference coverage counts
+presence by text_chars>0 and never re-verifies the stored audio_content_hash against the current file. Narrow
+code fact is real, but the report is an INFORMATIONAL orchestration dossier (no shipped WER/CER/F1), and every
+load-bearing promotion/export gate independently verifies audio identity (export_bundle's
+source_reference_export_identity_blockers, HF export's source_reference_identity_verified). Adding an identity
+check to an informational count is over-engineering with no reachable harm.
+
+Gate per fix: #122 full (cargo test 998, typecheck/lint clean, vitest 207, 40 policies); #123 python (41
+policy scripts). Reality check pre-work: exe not running, git clean, HEAD 1da7202, lock free.
+
+**Score: 123 fixed + 1 cleanup, ~41 refuted, 2 measure-deferred, 0 hunt-queued (hunt-6 drained: 2 fixed, 1
+closed, 3 finders clean) + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
