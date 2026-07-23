@@ -9114,6 +9114,40 @@ HEAD b059ed9, lock free.
 commands.rs:638 spawn-panic, i18n/index.ts:32) + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 154 — 2026-07-23 — FIX #115: repeated i18n placeholder rendered literally in a destructive dialog
+
+**Class: frontend correctness (first-vs-all substitution).** This was queued as a "reality-check-then-
+LIKELY-close" item (I suspected no real string repeats a placeholder). The reality check REFUTED my
+suspicion: a scan of both locale files found `speaker.mergeConfirm` (en.ts:646 + ckb.ts:643) uses `{target}`
+TWICE — "Rename '{source}' to '{target}'? '{target}' already exists ({n} segments) — this MERGES both
+speakers into one and cannot be undone." The `t()` interpolation (index.ts:31) used
+`String.replace(\`{k}\`, v)`, which substitutes only the FIRST occurrence, so the second `{target}`
+rendered as the literal text "{target}" in the `window.confirm()` dialog for an IRREVERSIBLE speaker merge
+(SpeakerPanel.svelte:39 passes source/target/n). Confirmed reachable + user-visible in BOTH languages.
+
+**Root fix (not the symptom):** switch the interpolation loop to `replaceAll` (already the codebase idiom —
+App.svelte/AudioPlayer.svelte/ProcessingProgress.svelte; tsconfig target ESNext), fixing this string AND any
+future repeated placeholder — rather than editing the one string to not repeat.
+
+**Fail-before (neutralize-then-restore):** reverted `replaceAll`→`replace` → the new vitest
+`i18n/interpolate.test.ts` FAILED (literal "{target}" survived); restored → PASS. The test renders
+speaker.mergeConfirm and asserts no literal `{…}` remains and the repeated value appears twice.
+
+Gate (frontend change): `svelte-check && tsc --noEmit` 0 errors; `eslint` 0 errors (4 pre-existing warnings,
+none in touched files); **vitest 37 files / 207 tests passed** (+1); **python policies 39 scripts passed**.
+Reality check pre-work: exe not running, git clean, HEAD aab268a, lock free.
+
+**Discipline note (owner "do the best, don't just agree" + "beware over-engineering"):** neither reflexively
+fixed nor reflexively closed — verified reachability first, found it real, then fixed at the root. Two
+reality-check items remain (denoiser SHA, spawn-panic); both still look like over-engineering to fix and
+will be closed with reasoned notes unless a reachable harm surfaces.
+
+**Score: 115 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 2 to reality-check (denoiser.rs:14 SHA,
+commands.rs:638 spawn-panic) + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
@@ -9128,10 +9162,11 @@ QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - ~~export_bundle.rs:499 — stale learning_preferences.jsonl orphan~~ FIXED iter 151 (#112).
 - ~~audio.rs:404 — decode ResetRequired silent truncation~~ FIXED iter 152 (#113, both decode loops).
 - ~~export.rs:859 — dropped_unavailable over-counts~~ FIXED iter 153 (#114, 9th count-exclusion instance).
+- ~~i18n/index.ts:32 repeated-placeholder~~ FIXED iter 154 (#115) — reality-check found it REAL
+  (speaker.mergeConfirm repeats {target}, reachable via SpeakerPanel), so fixed not closed.
 - REALITY-CHECK-BEFORE-FIXING (likely over-engineering per owner "beware over-engineering" — CLOSE with a
   reasoned note unless a real reachable harm is confirmed): denoiser.rs:14 SHA-verify (denoiser is
   best-effort preprocessing, not transcript-load-bearing), commands.rs:638 spawn-panic (only on OS
-  thread-creation failure — astronomically rare), i18n/index.ts:32 (only if a real translation string
-  repeats a placeholder — grep the locales first).
+  thread-creation failure — astronomically rare).
 - ~~aligner + campp orphan~~ FIXED in iter 148 (#109).
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
