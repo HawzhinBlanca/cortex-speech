@@ -7963,3 +7963,34 @@ enhancement.** Owner-gated finish line unchanged.
 QUEUE (hunt-117; hand-verify against source BEFORE fixing):
 - [LOW] ProcessingProgress.svelte:49 — ETA extrapolated from whole-pipeline elapsed vs chunk-scope done/total (wildly wrong early). ← next (last hunt-117 survivor)
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+## 2026-07-23T09:32Z — iter 122 — progress ETA inflated by the reference phase (LOW) fixed; hunt-117 drained (587d0b7)
+
+**Fixed the last hunt-117 survivor. Hand-verified the phase ordering + the ETA math.**
+
+**ProcessingProgress.svelte — the ETA was extrapolated from whole-pipeline elapsed against chunk-scope
+done/total, so it was wildly inflated early (LOW, UX; 587d0b7).** Hand-verified: elapsedMs (:44) = now -
+startedAt, where startedAt is set when the pipeline first becomes active (import start). current/total (:47-48)
+are the per-file CHUNK counts, which only become meaningful in the chunk `transcribing` phase — AFTER the slow
+whole-file `reference_transcribing` pass has already accrued into elapsedMs. computeProgress's ETA is
+elapsed/done*(total-done), so when the first chunk completes (done=1), ETA ≈ (reference-phase seconds) ×
+remaining chunks — grossly overstated, then collapsing toward reality as chunks finish. Reachable on every long
+single-file import (handleOpenFile → importAudioFile emits reference_transcribing before any chunk Progress).
+
+Fix: added a chunk-scoped ETA baseline (etaBaselineMs) that resets when the counted scope (total>0) begins, and
+feed `etaElapsedMs = now - etaBaselineMs` to computeProgress — so the ETA measures ONLY the chunk phase. The
+DISPLAYED elapsed (row 3) still shows whole-run time. Batch-verify is unaffected (its total is known from the
+start, so the baseline == start). computeProgress itself (pure, unit-tested) is unchanged. Source policy check
+#14; fail-before verified.
+
+Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies** (14 checks now in
+test_frontend_review_guards.py).
+
+**Score: 84 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 0 hunt-queued + 1 deferred-large + 1 enhancement.**
+hunt-117 queue DRAINED — the next iteration resumes the adversarial hunt. Owner-gated finish line unchanged.
+
+CARRIED (owner-facing, not from a hunt queue):
+- DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (Command-snapshot of child tables + archive-delta reversal; focused session).
+- ENHANCEMENT: undo-able speaker rename (RenameSpeaker command); re-run FTS (not just substring) on reload.
