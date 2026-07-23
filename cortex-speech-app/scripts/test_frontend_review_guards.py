@@ -334,6 +334,23 @@ def test_segment_stats_verified_excludes_placeholder_only_rows() -> None:
         )
 
 
+def test_verify_all_pending_excludes_placeholder_and_empty_rows() -> None:
+    """The ROOT of the class test_segment_stats_verified_excludes_placeholder_only_rows only band-aided at the
+    COUNT: handleBatchVerify('pending') builds its id list as $segments.filter(s => !s.verified) with no
+    content filter, so "Verify All Pending" marks placeholder ('[Pending WSL 7B ASR]') / empty rows verified.
+    They never ship (export drops placeholders) but they STRAND — the WSL-7B refinement loop skips verified
+    rows (update_asr_transcript_if_unreviewed's `AND verified=0`), so the placeholder can never be filled — and
+    they dishonestly read as verified. The bulk list must exclude no-content rows via hasRealTranscript (hunt-5
+    / iter 161)."""
+    body = _function_body(_read("src/App.svelte"), "async function handleBatchVerify(")
+    if "!s.verified && hasRealTranscript(s)" not in body:
+        raise AssertionError(
+            "handleBatchVerify('pending') selects `s => !s.verified` with no content filter — 'Verify All "
+            "Pending' marks placeholder/empty rows verified (stranding them from 7B refinement). Filter the "
+            "pending id list with `!s.verified && hasRealTranscript(s)`."
+        )
+
+
 def test_keyboard_shortcuts_help_each_uses_a_unique_key() -> None:
     """The Keyboard Shortcuts help modal renders {#each shortcuts.filter(...) as s (KEY)}. Keying on
     s.description throws Svelte's each_key_duplicate (crash / dropped row) when two shortcuts share a
@@ -403,6 +420,7 @@ def main() -> None:
     test_segment_stats_verified_excludes_placeholder_only_rows()
     test_keyboard_shortcuts_help_each_uses_a_unique_key()
     test_selection_reseats_playback_centrally_for_store_only_selections()
+    test_verify_all_pending_excludes_placeholder_and_empty_rows()
     print("frontend review-guard source policy passed")
 
 

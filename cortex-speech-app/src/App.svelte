@@ -30,7 +30,7 @@
     statusMessage,
   } from './lib/stores/uiStore';
   import { notifications } from './lib/stores/notificationStore';
-  import { isVerifiedGood } from './lib/segmentQuality';
+  import { isVerifiedGood, hasRealTranscript } from './lib/segmentQuality';
   import { historyStore } from './lib/stores/historyStore';
   import { initKeyboardManager, globalKeyboardManager, modKeyLabel } from './lib/keyboard';
   import { focusTrap } from './lib/actions/focusTrap';
@@ -1656,7 +1656,13 @@
 
     const ids =
       mode === 'pending'
-        ? $segments.filter((s) => !s.verified).map((s) => s.id)
+        ? // Exclude no-content rows (placeholder "[Pending WSL 7B ASR]" / "[ASR unavailable…]" or empty):
+          // "Verify All Pending" must never mark a placeholder verified. It wouldn't ship (export excludes
+          // placeholders) but it would STRAND the row — the WSL-7B refinement loop skips verified rows
+          // (update_asr_transcript_if_unreviewed's verified=0 guard), so the placeholder could never be
+          // filled — and it dishonestly counts as verified. Root of the recurring class iter 127 only
+          // band-aided at the count. Same hasRealTranscript gate the verified tally uses.
+          $segments.filter((s) => !s.verified && hasRealTranscript(s)).map((s) => s.id)
         : $selectedSegmentId
           ? [$selectedSegmentId]
           : [];
