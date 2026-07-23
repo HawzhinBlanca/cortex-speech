@@ -9495,6 +9495,56 @@ policy scripts). Reality check pre-work: exe not running, git clean, HEAD 1da720
 closed, 3 finders clean) + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 163 — 2026-07-23 — HUNT-7 processed: 3 fixes (#124, #125, #126) + 2 closes; richest hunt yet
+
+**Hunt-7** (Workflow, 6 finders over the last unswept surfaces — delete-cascade, dataset builders,
+conformal/calibration, merge/HF, review-inbox/mode, FTS/diff — 3-lens refute, but returning ALL candidates
+for human review since the auto-refute had been over-dismissing subtle bugs; 1.65M tokens, 21 agents). That
+change paid off: 4 survivors (two 0-refute HIGH) + 1 refuted. fts-search-diff clean.
+
+**FIX #124 (HIGH) — merge_dataset_json overwrites a human-VERIFIED row.** Its guard checked
+human_decision/verdict but NOT `verified` — the THIRD writer of the #118 family (the other two already carry
+`AND verified = 0`). "Verify"/"Verify selected" sets only verified=1, so a same-id paste-import
+(DatasetMerge.svelte → merge_dataset_json IPC) overwrote the row's transcript + verified flag with imported
+data: verified=true ships unapproved text as human GOLD; verified=false silently un-verifies. Added
+`AND verified = 0`. All 3 lenses confirmed (cited #118). Regression + fail-before.
+
+**FIX #125 (HIGH) — ReviewMode.submit() writes seg's text into another clip's editor after navigation.**
+Same wrong-segment-gold class the sibling doRetranscribe already guards with `if (current?.id !== seg.id)
+return;`. submit() set editText/lastLoadedOriginal/editedChips unconditionally after the decision await; if
+the reviewer navigated (accept-as-is via keyboard, then n/→) mid-await, seg A's text landed in clip B's
+editor (and submit never resets lastLoadedId, so B's load effect no-ops) → a later Save persists A's text as
+B's gold (THE ONE LAW). Added the guard between the id-targeted store write and the editor writes. All 3
+lenses confirmed. Regression + fail-before.
+
+**FIX #126 (LOW) — ECE silently understated on an invalid confidence.** `expected_calibration_error` weighted
+bins by len(members)/n but n counted every confidence; a NaN/>1/<0 value falls in no bin yet inflates n,
+scaling ECE DOWN — a fabricated better-looking number (honesty-consistent with #123). Real posteriors are
+[0,1] so the trigger is an upstream bug, but the honest response is to REFUSE it. Added a finite-[0,1]
+validation. Regression + fail-before.
+
+**CLOSED (refutations SOUND):**
+- build_halwest_dataset.py:553 — `general_ai_training/manifest.jsonl` writes empty-text rows for untranscribed
+  audio. Confirmed written, but `general_ai_training` is intentionally a COMPREHENSIVE full-audio manifest
+  (it converts full audio for every item; the `if not transcript: continue` only skips the chunked-ASR
+  allocation), and each empty row is self-labeled `transcript_status` + documented in the README. A different
+  artifact from export_dataset (ASR pairs, drops empty) — dropping these would remove a designed
+  audio-inclusive capability. Not silent corruption.
+- history/mod.rs:183 — delete-undo restores only the parent segment, not the cascade-deleted
+  agent_examples/segment_hypotheses. Mechanically true, but undo restores the segment's OWN review columns
+  (human_decision/verdict/annotated), and the human-edit DPO signal is persisted in a durable learning ledger
+  that survives the cascade delete; the lost child rows are regenerable provenance. No permanent loss of the
+  human's work.
+
+Gate per fix: #124 Rust (cargo test 999); #125 frontend (typecheck/vitest 207, 41 policies); #126 python (41
+policies). Reality check pre-work: exe not running, git clean, HEAD b890185, lock free.
+
+**Score: 126 fixed + 1 cleanup, ~42 refuted, 2 measure-deferred, 0 hunt-queued (hunt-7 drained: 3 fixed, 2
+closed, 1 finder clean) + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
