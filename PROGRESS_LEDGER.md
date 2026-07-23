@@ -8935,15 +8935,46 @@ Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib
 Owner-gated finish line unchanged. **The all-or-nothing model-resolution orphan class is now fully closed
 (VAD, denoiser, aligner, campp) and guarded by a source policy.**
 
+---
+
+### Iteration 149 — 2026-07-23 — FIX #110: WSL-7B refinement blank-overwrite (blank-overwrite class fully closed) + chunking DEFERRED
+
+**FIX #110 — blank-overwrite data-loss (4th/final sibling).** Hand-verified: `run_wsl_refinement_loop`
+(commands.rs:2136-2200) persisted the 7B result via `update_asr_transcript_if_unreviewed`, which writes
+`raw_transcript` unconditionally (guards only human-reviewed rows). `parse_wsl_segment_result` returns
+`Ok("")` for a silent/music/noise clip (verified iter 136), so a blank result overwrote a good transcript
+with "" — silent data loss. Fix: a match-guard arm `Ok((raw_transcript, _)) if raw_transcript.trim()
+.is_empty()` skips the persist (logs, counts neither transcribed nor failed, like the human-reviewed skip).
+Source-policy fail-before (`test_wsl_refinement_loop_refuses_blank_draft`; WSL runtime not unit-testable).
+**The blank-transcript-never-overwrites-good class is now fully closed across all 4 persist paths:
+transcribe_segment (#97), batch_transcribe (#99), batch_processor (#100), refinement loop (#110).**
+
+**DEFER — chunking.rs:373 (do-the-best judgment, not a rushed regression).** Hand-verified the whole-file
+slice bug is real BUT the obvious slice-level fix (error on Some-offset-less alignment) regresses every
+aligned single-segment file (a whole-file segment aligned via align_segment has a words-only, offset-less
+alignment_json and legitimately needs the whole file). A correct fix needs caller-level sibling-count
+context (the finetuned path already has it). Deferred with the analysis in the queue — I refused to ship a
+fix that trades one data bug for a regression.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 994 passed / 0 failed**;
+**python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD bb8ef8e, lock free.
+
+**Score: 110 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 7 hunt-queued + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
-- [MED] chunking.rs:373 — slice_pcm_by_alignment returns the WHOLE file for a chunk when alignment_json is
-  present but offset-less (words-only/legacy/clobbered blob) → whole recording paired with one segment.
+- [MED] chunking.rs:373 — **DEFERRED (iter 149, needs caller-level fix, NOT a slice-level patch):**
+  slice_pcm_by_alignment returns the WHOLE file when alignment_json is Some-but-offset-less. Hand-verified
+  the obvious fix (error on Some-offset-less) REGRESSES every ALIGNED SINGLE-SEGMENT file — a whole-file
+  segment that was aligned has a words-only (offset-less) alignment_json and legitimately needs the whole
+  file. Distinguishing an offset-LOST chunk from a whole-file segment needs caller-level sibling-count
+  context (the finetuned path already has it via sibling_count); apply that pattern to the transcribe
+  callers (pipeline.rs:2633, commands.rs:2300/2369) in a focused change. Reachability is also uncertain
+  (chunks retain offsets normally; only legacy/clobber loses them — 1/3 refuters doubted it).
 - [MED] lib.rs:335 — writers_active() misses the WSL-7B refinement batch writer → prepare_restore can run
   during an active refinement write.
-- [LOW] commands.rs:2148 — WSL-7B refinement loop persists without a trim().is_empty() guard (blank-overwrite,
-  4th sibling of the class).
 - [LOW] denoiser.rs:14 — denoiser model loads with NO SHA-256 verify (ASR/VAD siblings verify at load).
 - [LOW] audio.rs:404 — decode_pcm_windows silently truncates on a symphonia ResetRequired (returns Ok after partial).
 - [LOW] export.rs:859 — dropped_unavailable over-counts (counts non-training-ready REVIEW rows the write loop skips).
