@@ -8657,3 +8657,32 @@ QUEUE (hunt-135 survivors remaining):
 - [MED] constrained_decode.rs:157 — run_constrained skips the SHA-256 pin the default path enforces. ← next
 - [LOW] audio.rs:163 — check_audio duration_ms=0 for a valid VBR MP3 without a Xing header.
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+### Iteration 140 — 2026-07-23 — FIX #102: constrained decode bypassed the model+tokens SHA-256 integrity pin
+
+**Class: integrity-gate-bypass (a swapped vocab decodes to wrong graphemes, persisted as trustworthy).**
+Hand-verified: the opt-in constrained decode loads model.int8.onnx (`commit_from_file`,
+constrained_decode.rs:159) + tokens.txt (`load_tokens`, :184) via ort with NO SHA check, bypassing the
+runtime pin the default ASR path enforces (asr.rs:288-311, which verifies BOTH model and tokens via
+`verify_model_path_runtime` and refuses on mismatch). Same OmniASR-CTC-300M files; a tampered/swapped
+same-line-count tokens.txt (wrong id→grapheme map) still loads on the constrained path and decodes every
+clip to the WRONG Kurdish graphemes, persisted as a trustworthy transcript.
+
+Fix: verify both the model and tokens against `OMNIASR_CTC_300M_MODEL/_TOKENS` pins in the constrained
+command right after the exists() check, mirroring asr.rs (`verify_model_path_runtime` is a no-op for an
+unpinned file, so the direct-call parity tests are unaffected). Fail-before: source policy
+`test_constrained_transcribe_verifies_model_and_tokens_pin` asserts ≥2 verify CALLS (call-form count so a
+comment mention doesn't satisfy it — caught + fixed a false-pass in my own first policy draft); removing
+either verify fails it.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 990 passed / 0 failed**;
+**python policies 38 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD d9ca2f4, lock free.
+
+**Score: 102 fixed + 1 cleanup, ~33 refuted, 2 measure-deferred, 1 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-135 survivors remaining):
+- [LOW] audio.rs:163 — check_audio reports duration_ms=0 for a valid VBR MP3 without a Xing header. ← last
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
