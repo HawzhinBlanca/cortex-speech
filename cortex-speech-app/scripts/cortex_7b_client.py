@@ -81,6 +81,33 @@ def fail(code, msg):
     sys.exit(code)
 
 
+class ClobberedAlignment(Exception):
+    """A segment's alignment_json is PRESENT but has no usable source offsets — a clobbered chunk."""
+
+
+def resolve_clip_offsets(alignment):
+    """Resolve the (start_ms, end_ms) source slice for a segment from its stored alignment_json.
+
+    Returns (None, None) for a genuine WHOLE-FILE segment (no alignment metadata at all) — the server then
+    transcribes the whole file, which IS the clip. Raises ClobberedAlignment when alignment is PRESENT but
+    lacks usable source_start_ms/source_end_ms offsets (a bare {"words": ...} array, unparseable JSON, or only
+    one of the two offsets): sending null offsets in that case would make the server transcribe the ENTIRE
+    source file and store it as THIS one clip's transcript — the whole-file-vs-clip training-data corruption
+    that the Rust readers slice_for_export and slice_pcm_by_alignment already REFUSE. The caller must refuse,
+    not whole-file. (Import always writes source offsets, even for a chunk_count==1 single-file segment, so a
+    legitimate whole-file segment carries alignment=None here, never a present-but-offset-less blob.)
+    """
+    if not alignment:
+        return None, None
+    try:
+        m = json.loads(alignment)
+    except Exception:
+        raise ClobberedAlignment("alignment metadata is present but is not valid JSON")
+    if isinstance(m, dict) and m.get("source_start_ms") is not None and m.get("source_end_ms") is not None:
+        return m.get("source_start_ms"), m.get("source_end_ms")
+    raise ClobberedAlignment("alignment metadata is present but has no source_start_ms/source_end_ms offsets")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--segment-id", required=True)
@@ -137,13 +164,14 @@ def main():
         fail(EX_NOSEG, f"7B client: segment {a.segment_id} not found in the app DB")
 
     audio_path, alignment = row
-    start_ms = end_ms = None
-    if alignment:
-        try:
-            m = json.loads(alignment)
-            start_ms, end_ms = m.get("source_start_ms"), m.get("source_end_ms")
-        except Exception:
-            pass
+    try:
+        start_ms, end_ms = resolve_clip_offsets(alignment)
+    except ClobberedAlignment as e:
+        fail(
+            EX_DB,
+            f"7B client: segment {a.segment_id}: {e} (clobbered chunk metadata); refusing to transcribe it "
+            f"against the whole source file rather than storing a whole-file transcript for one clip",
+        )
 
     req = {"audio_path": win_to_wsl(audio_path), "start_ms": start_ms, "end_ms": end_ms}
     # 280 s: below the app's own 300 s per-attempt budget (pipeline.rs) but no longer 120 s shorter —
