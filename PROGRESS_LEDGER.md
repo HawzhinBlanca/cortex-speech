@@ -7465,3 +7465,42 @@ QUEUE (hand-verify each against source BEFORE fixing):
   when the audioPath prop VALUE changes, so consecutive same-source review clips don't reload → autoplay dies
   after the first clip.
 - [partial/LOW] export.rs written_clips keep-set dead post-staging-refactor (partial-availability clip drop).
+
+---
+
+## 2026-07-23T04:12Z — iter 109 — review autoplay died after the first same-source clip (MEDIUM) fixed (0d6aad4)
+
+**Fixed the queued MEDIUM AudioPlayer autoplay bug. Hand-verification NARROWED the scope: ReviewMode-only.**
+
+**AudioPlayer.svelte — autoplay fired only on a source-file reload, not per clip (MEDIUM; 0d6aad4).** Autoplay
+lived ONLY in handleLoaded (the onloadedmetadata handler), which fires only when the <audio> element's src
+actually changes (audioEl.load() in resolveAudioUrl, driven by the audioPath $effect). In ReviewMode a SINGLE
+AudioPlayer instance is reused across segment navigation (props change, no remount), and consecutive segments
+from one recording share audioPath (segments are grouped by source recording), so advancing to the next
+same-source clip left audioPath unchanged → the effect didn't re-run → no reload → onloadedmetadata never
+re-fired → autoplay never triggered for clips 2..N. The "True-10 audit" comments (ReviewMode:905, ReviewInbox:564)
+show autoplay-per-clip was the INTENT ("advancing to the next clip auto-plays … removing one keypress per clip").
+
+Scope correction (hand-verified, not from the finder): ReviewInbox does NOT have the bug — it wraps AudioPlayer
+in `{#key current.id}` (ReviewInbox:563), so it REMOUNTS per segment and onloadedmetadata fires each time.
+ReviewMode has no such {#key}. So the fix is ReviewMode-only; clipKey on ReviewInbox is defensive consistency.
+
+Fix: added a clipKey (segment id) prop to AudioPlayer + an $effect that autoplays when clipKey changes, guarded
+on !loading (a DIFFERENT-source advance sets loading=true in the audioPath effect, which runs first, so this
+skips and handleLoaded owns that autoplay — no double play) and keyed on clip IDENTITY, not startTime, so a
+tap-a-word (which narrows startTime only) never re-autoplays. handleLoaded stamps autoplayedClip so the effect
+doesn't double-fire when loading flips false. Passed clipKey={current.id} from ReviewMode + ReviewInbox.
+
+Fail-before verified (source policy check #11). No component-test harness exists (project uses pure-function
+unit tests + source policies), so the guard is pinned at the source like the sibling review-race guards.
+
+Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies** (11 checks now in
+test_frontend_review_guards.py).
+
+**Score: 72 fixed, ~27 refuted, 2 measure-deferred, 1 queued.** Owner-gated finish line unchanged.
+
+QUEUE (hand-verify against source BEFORE fixing):
+- [partial/LOW] export.rs written_clips keep-set dead post-staging-refactor — a PARTIAL-availability HF re-export
+  still drops the transiently-unavailable sources' prior clips from the new snapshot (the keep-set prunes the
+  fresh empty staging dir, never data/). Needs a carry-forward-into-staging design that keeps metadata.csv/SHA
+  consistent (no orphan WAVs unlisted in the manifest).
