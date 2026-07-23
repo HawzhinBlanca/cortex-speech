@@ -642,6 +642,71 @@ fn hf_export_excludes_holdout_gold_audio_from_training() {
 }
 
 #[test]
+fn exclude_holdout_excludes_a_missing_audio_segment_fail_closed() {
+    // Round-26 hunt: a training segment whose audio is MISSING at export can't be re-hashed to prove it is
+    // NOT the same content as a holdout gold clip re-imported at a DIFFERENT path (the exact-path check
+    // would miss that), so it must be excluded FAIL-CLOSED — like the present-but-unhashable sibling — or
+    // its transcript (possibly the holdout gold reference) leaks into the plain export (eval-on-train
+    // contamination). Only when a content-hash holdout is actually registered.
+    let db_tmp = NamedTempFile::new().unwrap();
+    let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+    let tmp_dir = tempfile::tempdir().unwrap();
+
+    // Register a holdout gold WITH a content hash (imported from an existing file).
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let gold_path = tmp_dir.path().join("gold.wav");
+    {
+        let mut w = hound::WavWriter::create(&gold_path, spec).unwrap();
+        for _ in 0..16000 {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+    // Settle a Windows write-then-read timing artifact: import_gold_segments HASHES this file to register
+    // its content hash; if the write hasn't landed, the hash is null and the holdout set is empty — which
+    // short-circuits the very branch under test. Confirm the file is readable (via the same identity call
+    // import uses) before importing.
+    for _ in 0..500 {
+        if crate::pipeline::source_audio_identity(&gold_path).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    crate::eval::import_gold_segments(
+        &db,
+        vec![crate::eval::GoldSegmentInput {
+            audio_path: gold_path.to_string_lossy().to_string(),
+            reference: "gold ref".into(),
+            is_holdout: true,
+        }],
+    )
+    .unwrap();
+    // Precondition: a content-hash holdout must actually be registered, or the fail-closed branch is
+    // unreachable and the test proves nothing.
+    assert!(
+        !crate::jury::learning::holdout_content_hashes(&db).unwrap().is_empty(),
+        "precondition: the gold clip's content hash must be registered"
+    );
+
+    // A training segment at a DIFFERENT path whose audio file does NOT exist.
+    let mut seg = sample_segment("missing-1");
+    seg.audio_path = tmp_dir.path().join("moved_away.wav").to_string_lossy().to_string();
+    db.insert_segment(&seg).unwrap();
+
+    let kept = exclude_holdout_segments(&db, vec![seg]).unwrap();
+    assert!(
+        kept.is_empty(),
+        "a missing-audio segment must be excluded fail-closed when a content-hash holdout is registered"
+    );
+}
+
+#[test]
 fn dataset_export_excludes_holdout_gold_audio_from_training_tables() {
     // The bundle/tabular export (JSON/JSONL/CSV/Parquet) must apply the SAME holdout exclusion as the
     // HF export — otherwise a clip registered as an eval holdout that also exists as a normal segment

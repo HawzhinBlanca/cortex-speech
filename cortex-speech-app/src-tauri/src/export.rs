@@ -270,7 +270,15 @@ pub(crate) fn exclude_holdout_segments(db: &Database, segments: Vec<SpeechSegmen
                 *path_cache.entry(seg.audio_path.clone()).or_insert_with(|| {
                     let path = std::path::Path::new(&seg.audio_path);
                     if !path.exists() {
-                        return false;
+                        // Fail CLOSED, exactly like the present-but-unhashable Err case below: a MISSING
+                        // file cannot be re-hashed to prove it is NOT the same content as a holdout gold
+                        // clip re-imported at a DIFFERENT path (the exact-path check above would miss
+                        // that), so keeping it would leak the eval reference into the training export
+                        // (eval-on-train contamination). Only reached when a content-hash holdout is
+                        // registered (holdout.is_empty() short-circuits above). Mirrors the fail-closed
+                        // DPO / LM-corpus missing-file guards in jury/learning.rs.
+                        tracing::warn!("Holdout check: {} is missing — excluding it fail-closed", path.display());
+                        return true;
                     }
                     match crate::pipeline::source_audio_identity(path) {
                         Ok(id) => holdout.contains(&id.content_hash),
