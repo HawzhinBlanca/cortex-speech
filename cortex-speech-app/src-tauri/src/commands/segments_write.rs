@@ -263,28 +263,12 @@ pub fn update_segment_bounds(id: String, start_ms: i64, end_ms: i64, state: Stat
     let mut segment =
         db.get_segment_by_id(&id).map_err(|e| e.to_string())?.ok_or_else(|| format!("Segment not found: {id}"))?;
 
-    let mut meta = if let Some(ref alignment_str) = segment.alignment_json {
-        crate::chunking::SegmentSourceMeta::from_alignment_json(alignment_str).unwrap_or(
-            crate::chunking::SegmentSourceMeta {
-                source_start_ms: start_ms,
-                source_end_ms: end_ms,
-                chunk_index: 0,
-                chunk_count: 1,
-            },
-        )
-    } else {
-        crate::chunking::SegmentSourceMeta {
-            source_start_ms: start_ms,
-            source_end_ms: end_ms,
-            chunk_index: 0,
-            chunk_count: 1,
-        }
-    };
-
-    meta.source_start_ms = start_ms;
-    meta.source_end_ms = end_ms;
-
-    segment.alignment_json = Some(meta.to_alignment_json());
+    // Preserve the forced-alignment word array on a bounds edit: rebound_alignment_json re-merges the
+    // existing `words` back under the `words` key. Round-tripping through SegmentSourceMeta alone (4 meta
+    // fields) would DROP the word timestamps — the flat-overwrite pipeline.rs:2068 forbids — permanently, and
+    // can flip the segment's alignment-based training grade.
+    segment.alignment_json =
+        Some(crate::chunking::rebound_alignment_json(segment.alignment_json.as_deref(), start_ms, end_ms));
     segment.duration_ms = end_ms - start_ms;
 
     let history = state.lock_history();

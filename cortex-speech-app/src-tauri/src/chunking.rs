@@ -46,6 +46,28 @@ pub fn merge_word_timestamps(existing: Option<&str>, words: &[crate::aligner::Wo
     }
 }
 
+/// Rebuild a segment's alignment JSON with NEW source bounds while PRESERVING the merged word-timestamp
+/// array (and chunk_index/chunk_count). SegmentSourceMeta::to_alignment_json carries only the 4 source-meta
+/// fields, so a bounds edit that round-trips through it alone DROPS the `words` array — the exact
+/// flat-overwrite pipeline.rs:2068 forbids ("MERGE its word array back under a `words` key via
+/// merge_word_timestamps"). Word timestamps are absolute source-time positions and stay valid across a
+/// bounds change (a reviewer can re-run alignment to refresh them).
+pub fn rebound_alignment_json(existing: Option<&str>, start_ms: i64, end_ms: i64) -> String {
+    let mut meta = existing.and_then(SegmentSourceMeta::from_alignment_json).unwrap_or(SegmentSourceMeta {
+        source_start_ms: start_ms,
+        source_end_ms: end_ms,
+        chunk_index: 0,
+        chunk_count: 1,
+    });
+    meta.source_start_ms = start_ms;
+    meta.source_end_ms = end_ms;
+    let meta_json = meta.to_alignment_json();
+    match existing.and_then(word_timestamps_from_alignment) {
+        Some(words) if !words.is_empty() => merge_word_timestamps(Some(&meta_json), &words),
+        _ => meta_json,
+    }
+}
+
 /// Extract word-level timestamps from alignment JSON (object with `words` or legacy array).
 pub fn word_timestamps_from_alignment(s: &str) -> Option<Vec<crate::aligner::WordTimestamp>> {
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
@@ -411,6 +433,33 @@ pub fn stitch_overlapping_transcripts(prev: &str, next: &str, max_overlap_words:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebound_alignment_json_preserves_word_timestamps_on_a_bounds_edit() {
+        // Editing a segment's source bounds must NOT drop the forced-alignment word array. Start from an
+        // aligned clip's JSON (meta + words), rebound it to a new window, and assert both the words survive
+        // and the source bounds updated (chunk_index/chunk_count preserved). Round-tripping through
+        // SegmentSourceMeta alone strips words — the flat-overwrite pipeline.rs:2068 forbids.
+        let meta = SegmentSourceMeta { source_start_ms: 1000, source_end_ms: 2000, chunk_index: 1, chunk_count: 3 };
+        let words = vec![
+            crate::aligner::WordTimestamp { word: "سڵاو".into(), start: 0.1, end: 0.4, confidence: 0.9 },
+            crate::aligner::WordTimestamp { word: "دنیا".into(), start: 0.5, end: 0.8, confidence: 0.8 },
+        ];
+        let aligned = merge_word_timestamps(Some(&meta.to_alignment_json()), &words);
+
+        let rebounded = rebound_alignment_json(Some(&aligned), 1500, 2500);
+
+        let new_meta = SegmentSourceMeta::from_alignment_json(&rebounded).expect("rebounded json parses as meta");
+        assert_eq!(new_meta.source_start_ms, 1500, "source_start_ms must update");
+        assert_eq!(new_meta.source_end_ms, 2500, "source_end_ms must update");
+        assert_eq!(new_meta.chunk_index, 1, "chunk_index must be preserved");
+        assert_eq!(new_meta.chunk_count, 3, "chunk_count must be preserved");
+
+        let kept = word_timestamps_from_alignment(&rebounded).expect("words must survive the rebound");
+        assert_eq!(kept.len(), 2, "both word timestamps must survive a bounds edit, not be dropped");
+        assert_eq!(kept[0].word, "سڵاو");
+        assert_eq!(kept[1].word, "دنیا");
+    }
 
     #[test]
     fn ms_to_samples_roundtrip() {
