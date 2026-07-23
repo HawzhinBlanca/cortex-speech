@@ -53,8 +53,9 @@ correctness, honesty, privacy, UX) — so that half of the mission is real, ship
 
 ## 2. Per-fire protocol (identical discipline to the month loop)
 
-1. **Acquire the lock** `.month-loop.lock` by **absolute repo-root path** (`C:/Users/Wareen/Desktop/
-   cortex-speech/.month-loop.lock`). If held, stop. See memory `month-loop-lock-absolute-path`.
+1. **Acquire the lock** — write to `.month-loop.lock` at the **repo root, addressed by its absolute
+   path** (the cwd drifts to the app subdir, so a relative `rm` leaves a stale lock). If held, stop.
+   See memory `month-loop-lock-absolute-path`.
 2. **Reality check:** `tasklist` shows `cortex-speech-app.exe` NOT running; `git status` clean; record
    HEAD; lock was free. If the exe is running: do not kill it, do not touch the live DB, do not rebuild
    into `src-tauri/target/release`.
@@ -65,8 +66,8 @@ correctness, honesty, privacy, UX) — so that half of the mission is real, ship
    then-restore if needed). A fix without a regression gate is incomplete.
 6. **Root-cause fix** — shortest correct diff, at the shared choke point (ponytail). Deletion over
    addition. One logical change.
-7. **Full gate** — for Rust: isolated `CARGO_TARGET_DIR=/c/Users/Wareen/AppData/Local/Temp/
-   cortex-monthloop-target`, then `cargo fmt --check` · `cargo clippy --all-targets -- -D warnings` ·
+7. **Full gate** — for Rust: an isolated `CARGO_TARGET_DIR` under the session temp dir (never
+   `%APPDATA%\cortex-speech`), then `cargo fmt --check` · `cargo clippy --all-targets -- -D warnings` ·
    `cargo test --lib` · `python scripts/run_python_policies.py`. For frontend: `npm run typecheck` ·
    `npm test` · `npm run lint` · policies. Never weaken/skip/delete a gate. Paste real output.
 8. **Commit** — Conventional Commit, one logical change, end with
