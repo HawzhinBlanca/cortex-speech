@@ -590,6 +590,17 @@ fn write_source_reference_artifacts(
     records: Vec<SourceReferenceBundleRecord>,
 ) -> AppResult<(SourceReferenceBundleManifest, Vec<String>)> {
     let source_dir = output_dir.join("source_transcripts");
+    // Re-exporting into a REUSED directory must not leave ORPHANS. Source-reference files use
+    // content-hashed variable names, so a (audio_path, model) pair present in an EARLIER export but dropped
+    // from THIS one — e.g. its clip became a gold holdout or was human-rejected and is now filtered out of
+    // `segments` upstream — would keep its old .txt on disk, get re-hashed into SHA256SUMS by the whole-tree
+    // walk, and (worst case) leave a holdout clip's HUMAN reference transcript (the WER/CER answer key)
+    // inside the "holdout-free" bundle. Clear the dir first — even when `records` is empty — so ONLY this
+    // run's records survive. (Fixed-name artifacts like metadata.csv and the manifests are overwritten each
+    // run; source_transcripts is the sole variable-named dir and thus the only orphan vector.)
+    if source_dir.exists() {
+        std::fs::remove_dir_all(&source_dir)?;
+    }
     let mut bundled_references = Vec::with_capacity(records.len());
     let mut files = Vec::with_capacity(records.len());
     if !records.is_empty() {

@@ -468,6 +468,53 @@ fn production_export_allows_machine_ready_rows_with_ready_agentic_promotion_repo
 }
 
 #[test]
+fn bundle_reexport_removes_orphan_source_reference_of_a_dropped_clip() {
+    // HOLDOUT-CONTAMINATION / manifest-vs-disk (hunt-117): source_transcripts/*.txt use content-hashed
+    // variable names, and export_dataset_bundle writes into a REUSED output_dir without clearing it. A clip
+    // present in an earlier export but DROPPED from a later one (its segment now human-rejected, or
+    // registered as a gold holdout — both filtered out of `segments`) would otherwise leave its old
+    // reference .txt on disk: re-hashed into SHA256SUMS by the whole-tree walk, absent from
+    // source_reference_manifest.json, and (worst case) its HUMAN reference transcript — the WER/CER answer
+    // key — left inside the "holdout-free" bundle. A re-export must not leave that orphan.
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let (_audio_keep, _id_keep) = insert_machine_silver_segment_with_coverage(&db, &tmp, "keep-seg");
+    let (audio_drop, id_drop) = insert_machine_silver_segment_with_coverage(&db, &tmp, "drop-seg");
+    insert_current_identity_source_reference(&db, &audio_drop, "gemini-2.5-pro");
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+    let source_dir = out.join("source_transcripts");
+
+    // Export 1: the clip is present, so its source-reference .txt is written.
+    export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+    let orphans_before: Vec<std::path::PathBuf> =
+        std::fs::read_dir(&source_dir).unwrap().flatten().map(|e| e.path()).collect();
+    assert_eq!(orphans_before.len(), 1, "run 1 must write the clip's source-reference txt, got {orphans_before:?}");
+
+    // The clip is dropped from the next bundle (human-rejected -> filtered out of `segments`).
+    db.record_human_decision(&id_drop, "reject", None, None).unwrap();
+
+    // Export 2 into the SAME dir.
+    export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+
+    // The orphan .txt must be gone — not left behind to be re-hashed into SHA256SUMS.
+    let orphans_after: Vec<std::path::PathBuf> =
+        std::fs::read_dir(&source_dir).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    assert!(
+        orphans_after.is_empty(),
+        "re-export must remove the dropped clip's orphan source-reference txt, found {orphans_after:?}"
+    );
+    for p in &orphans_before {
+        assert!(!p.exists(), "orphan source-reference file must be deleted on re-export: {p:?}");
+    }
+    // SHA256SUMS must not list a source_transcripts orphan (manifest-vs-disk consistency).
+    let sums = std::fs::read_to_string(out.join("SHA256SUMS")).unwrap();
+    assert!(!sums.contains("source_transcripts"), "no orphan source-reference file in the integrity manifest:\n{sums}");
+}
+
+#[test]
 fn bundle_excludes_holdout_gold_from_all_artifacts() {
     // Round-22 #1 (bundle completion): the holdout gold clip's HUMAN REFERENCE transcript and its
     // per-segment detail must NOT ship in the bundle SIDECARS (source_transcripts/*.txt,
