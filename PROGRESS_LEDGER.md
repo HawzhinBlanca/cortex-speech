@@ -9545,6 +9545,55 @@ policies). Reality check pre-work: exe not running, git clean, HEAD b890185, loc
 closed, 1 finder clean) + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 164 — 2026-07-23 — HUNT-8 processed: FIX #127 (new HIGH class) + 1 close; 5/6 finders clean
+
+**Hunt-8** (Workflow, 6 finders — export/job IPC, pipeline import-flow, asr model-loading, scorecard python,
+db.rs stats, StatsDashboard — 3-lens refute, all candidates returned; 1.13M tokens). 5 of 6 finders reported
+clean (export-job, asr-loading, scorecard-python, db-stats had no reachable defect; StatsDashboard refuted).
+1 HIGH survivor — and it's a NEW class, not a sibling, so the codebase is NOT fully saturated.
+
+**FIX #127 (HIGH) — a benign empty 7B clip rolls back the WHOLE import file (owner's primary engine).**
+`run_primary_wsl_pass_for_import` calls `self.transcribe()`, which converts a legit-but-EMPTY 7B result
+(a silent/music/noise chunk; parse_wsl_segment_result returns Ok("")) into an Err so the RE-TRANSCRIBE IPCs
+don't blank-overwrite a stored transcript. The IMPORT pass also routes through transcribe(), and its Ok-arm
+already handles empty correctly (usable=false → escalate only that segment, "NOT an infrastructure failure").
+But the empty arrived as an Err, so the Err arm set infra_failure=true and, after 3 retries,
+delete_segments_batch rolled back EVERY segment of the file — discarding the good transcripts already
+computed for its other chunks — and returned a false "OmniASR 7B server is not running". One non-speech
+chunk made the file permanently unimportable via the 7B, on the owner's stated primary engine. Two in-code
+contracts (parse_wsl_segment_result + the Ok-arm comment) forbid exactly this; transcribe()'s own comment
+shows the author assumed the import path handled empties itself (it doesn't — it routes through transcribe()).
+Fix: tag the empty-result Err with a stable `WSL_7B_EMPTY_RESULT_MARKER` and route it, in the import Err arm,
+to the same non-infra escalate path the Ok-arm uses (infra_failure=false); the file-rollback is reserved for
+a real server-down / client-exited-non-zero error. transcribe() unchanged → re-transcribe callers still
+preserve their existing transcript. Source-pinned guard (needs a full pipeline + WSL + non-speech clip).
+Fail-before verified.
+
+**CLOSED (refutation SOUND):** StatsDashboard.svelte:47 — `buildLocalStats` verifiedCount uses isVerifiedGood
+(omits hasRealTranscript), unlike its two production siblings (segmentStore.ts, App.svelte). Real code fact,
+but its ONLY caller is behind `if (!tauriAvailable)` — a non-Tauri browser-preview fallback. In the shipped
+desktop app the verified count comes from the BACKEND (api.getDatasetStats → compute_stats, which hunt-8's
+db-stats finder confirmed clean). No reachable dishonest number in the real product. Per beware-over-
+engineering (like the flock/spawn-panic closes); the 1-line hasRealTranscript consistency fix is available if
+it ever becomes reachable.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 999 passed / 0 failed**;
+**python policies 41 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD 1f01c2e,
+lock free.
+
+**Hunt-phase status:** 6 adversarial hunts (hunt-3..hunt-8) → 17 fixes (#111-#127, minus the earlier
+non-hunt ones: hunts specifically produced #117-#127). The per-hunt real-fix rate ran ~2-3 then dropped to 1
+(hunt-8: 5/6 finders clean), and the major recurring classes are closed across all their siblings — a
+strong (not absolute) saturation signal. hunt-8 proved a NEW class can still appear, so the loop should keep
+running occasional hunts on future fires, but the reliability frontier is now thin; the higher-value frontier
+is the OWNER-GATED accuracy levers (which need real measurement runs).
+
+**Score: 127 fixed + 1 cleanup, ~43 refuted, 2 measure-deferred, 0 hunt-queued (hunt-8 drained: 1 fixed, 1
+closed, 5 finders clean) + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
