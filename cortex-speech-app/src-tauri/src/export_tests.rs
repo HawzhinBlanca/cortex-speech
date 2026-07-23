@@ -1031,6 +1031,59 @@ fn export_huggingface_counts_dropped_missing_audio() {
 }
 
 #[test]
+fn export_huggingface_dropped_unavailable_counts_only_exportable_rows() {
+    // dropped_unavailable must count only rows that WOULD have exported (training-ready + HF-exportable),
+    // NOT the non-training-ready REVIEW rows the write loop skips regardless of source availability.
+    // Otherwise droppedUnavailableAudio in dataset_infos.json (and the operator warnings) over-count and
+    // mislabel REVIEW rows as lost "training-ready" segments. (Recurring "count must exclude what the
+    // export drops" class.)
+    let db_tmp = NamedTempFile::new().unwrap();
+    let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    // One AVAILABLE training-ready source so total_count > 0 and dataset_infos.json is actually written.
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let wav_path = tmp_dir.path().join("hf-present.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+    for _ in 0..16000 {
+        writer.write_sample(0i16).unwrap();
+    }
+    writer.finalize().unwrap();
+    let mut present = sample_segment("hf-present");
+    present.audio_path = wav_path.to_string_lossy().to_string();
+    db.insert_segment(&present).unwrap();
+
+    // One UNAVAILABLE source carrying BOTH a training-ready seg and a non-training-ready REVIEW seg.
+    let missing_path = "/nonexistent/does_not_exist.wav".to_string();
+    let mut missing_ready = sample_segment("missing-ready");
+    missing_ready.audio_path = missing_path.clone();
+    db.insert_segment(&missing_ready).unwrap();
+    let mut missing_review = sample_segment("missing-review");
+    missing_review.audio_path = missing_path.clone();
+    missing_review.raw_transcript.clear();
+    missing_review.normalized_transcript = None;
+    missing_review.annotated_transcript = None;
+    missing_review.verified = false;
+    db.insert_segment(&missing_review).unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let settings =
+        crate::settings::AppSettings { hf_speaker_disjoint: false, ..crate::settings::AppSettings::default() };
+    export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+
+    // Only the training-ready missing seg counts — NOT the REVIEW row the export drops anyway (would be 2
+    // if dropped_unavailable naively counted every seg for the unavailable source).
+    let info = std::fs::read_to_string(out_dir.path().join("dataset_infos.json")).unwrap();
+    assert!(info.contains("\"droppedUnavailableAudio\": 1"), "expected count 1 (only the exportable row): {info}");
+}
+
+#[test]
 fn export_huggingface_skips_rows_not_ready_for_training() {
     let db_tmp = NamedTempFile::new().unwrap();
     let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();

@@ -848,6 +848,29 @@ pub fn export_huggingface_dataset(
                     segs_by_source.entry(seg.audio_path.as_str()).or_default().push(seg);
                 }
 
+                // Count toward dropped_unavailable ONLY the rows that WOULD have been written — i.e. that
+                // pass the same training-ready + HF-export gate the write loop applies below. A source's
+                // non-training-ready REVIEW rows are skipped regardless of availability, so counting them
+                // here inflated droppedUnavailableAudio (dataset_infos.json) and mislabeled REVIEW rows as
+                // lost "training-ready" segments in the operator warnings. is_training_ready_for_huggingface_export
+                // reads only the grade + DB records, never the audio, so it is valid for an unavailable source.
+                let count_exportable = |segs: &[&SpeechSegment]| -> AppResult<usize> {
+                    let mut n = 0usize;
+                    for &seg in segs {
+                        let grade = quality::training_grade_for_segment(seg);
+                        if is_training_ready_for_huggingface_export(
+                            db,
+                            seg,
+                            &grade,
+                            &ready_agentic_segment_ids,
+                            &required_source_reference_models,
+                        )? {
+                            n += 1;
+                        }
+                    }
+                    Ok(n)
+                };
+
                 for (source_path_str, segs) in segs_by_source {
                     let source_path = std::path::Path::new(source_path_str);
                     // A source unavailable this run (unmounted/network drive, or an undecodable file) is
@@ -864,7 +887,7 @@ pub fn export_huggingface_dataset(
                         for seg in &segs {
                             tracing::warn!("Skipping segment {} in HF export: audio not found", seg.id);
                         }
-                        dropped_unavailable += segs.len();
+                        dropped_unavailable += count_exportable(&segs)?;
                         continue;
                     }
 
@@ -873,7 +896,7 @@ pub fn export_huggingface_dataset(
                         Ok(res) => res,
                         Err(e) => {
                             tracing::error!("Failed to decode {source_path_str} in HF export: {e}");
-                            dropped_unavailable += segs.len();
+                            dropped_unavailable += count_exportable(&segs)?;
                             continue;
                         }
                     };
