@@ -8962,6 +8962,37 @@ Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib
 **Score: 110 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 7 hunt-queued + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 150 — 2026-07-23 — FIX #111: a DB restore could tear the DB mid-WSL-refinement-write
+
+**Class: data-safety / concurrent-writer (missed writer in the restore gate).** Hand-verified:
+`prepare_restore` (commands.rs:1638) refuses a snapshot restore only while `AppState::writers_active()`
+(lib.rs:335), which checked import_state + batch_state but NOT the WSL-7B refinement loop — a THIRD
+background DB writer (`update_asr_transcript_if_unreviewed`) tracked by its own RAII-guarded
+`WSL_REFINE_RUNNING` atomic (set commands.rs:1972, cleared by `WslRefineRunningGuard::drop`). So a restore
+launched WHILE a refinement batch writes transcripts tore the live DB (lost writes / a restore partially
+re-overwritten by the still-running loop). Fix: `writers_active()` now also returns true when
+`WSL_REFINE_RUNNING` is set (made pub(crate)) — one-line predicate change; restore waits for all three
+writers. Source policy `test_writers_active_includes_the_wsl_refinement_writer` guards the invariant
+(runtime concurrency isn't unit-testable). Fail-before: removing the flag from writers_active fails it.
+
+**Owner feedback applied (memory `no-fancy-features-reliability-first`, sharpened):** "brutal reality
+checks, don't add unneeded stuff, beware over-engineering." Triaged the rest of the hunt-2 queue instead of
+reflexively fixing all of it — see the queue: 3 real (export_bundle orphan, audio truncation, export
+count-honesty) + 3 to REALITY-CHECK-then-likely-close (denoiser SHA on a best-effort model, spawn-panic on
+an astronomically-rare OS failure, i18n repeated-placeholder that may hit no real string). Stopping the
+per-fix bespoke-source-policy habit — those are for recurring classes + data-safety invariants only.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 994 passed / 0 failed**;
+**python policies 39 SCRIPTS passed** (a test FUNCTION was added to an existing script — the commit
+`7a2e960` message's "40" miscounted; honest count is 39 scripts). Reality check pre-work: exe not running,
+git clean, HEAD 39873c0, lock free.
+
+**Score: 111 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 5-ish hunt-queued (3 to fix, 3 to
+reality-check) + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
@@ -8973,12 +9004,13 @@ QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
   context (the finetuned path already has it via sibling_count); apply that pattern to the transcribe
   callers (pipeline.rs:2633, commands.rs:2300/2369) in a focused change. Reachability is also uncertain
   (chunks retain offsets normally; only legacy/clobber loses them — 1/3 refuters doubted it).
-- [MED] lib.rs:335 — writers_active() misses the WSL-7B refinement batch writer → prepare_restore can run
-  during an active refinement write.
-- [LOW] denoiser.rs:14 — denoiser model loads with NO SHA-256 verify (ASR/VAD siblings verify at load).
-- [LOW] audio.rs:404 — decode_pcm_windows silently truncates on a symphonia ResetRequired (returns Ok after partial).
-- [LOW] export.rs:859 — dropped_unavailable over-counts (counts non-training-ready REVIEW rows the write loop skips).
-- [LOW] commands.rs:638 — import worker thread::spawn panic skips ImportGuard Drop → shared-state wedge.
-- [LOW] src/lib/i18n/index.ts:32 — translator replace() substitutes only the FIRST occurrence of a repeated placeholder.
+- [MED] export_bundle.rs:499 — stale learning_preferences.jsonl orphan re-shipped + vouched by SHA256SUMS. ← next
+- [LOW] audio.rs:404 — decode_pcm_windows silently truncates on a symphonia ResetRequired (verify reachability).
+- [LOW] export.rs:859 — dropped_unavailable over-counts (honesty; verify harm isn't purely cosmetic).
+- REALITY-CHECK-BEFORE-FIXING (likely over-engineering per owner "beware over-engineering" — CLOSE with a
+  reasoned note unless a real reachable harm is confirmed): denoiser.rs:14 SHA-verify (denoiser is
+  best-effort preprocessing, not transcript-load-bearing), commands.rs:638 spawn-panic (only on OS
+  thread-creation failure — astronomically rare), i18n/index.ts:32 (only if a real translation string
+  repeats a placeholder — grep the locales first).
 - ~~aligner + campp orphan~~ FIXED in iter 148 (#109).
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
