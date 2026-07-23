@@ -9310,6 +9310,49 @@ transcript" affordance would be the right fix — not a blanket refuse.) No code
 refuted) + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 159 — 2026-07-23 — HUNT-4 + FIX #118: WSL-7B refinement silently overwrote a human-VERIFIED transcript
+
+**Hunt-4** (Workflow, 6 FRESH finders — audio/VAD-quality, aligner, normalizer, IPC-ratelimit-WSL,
+migrations, review-UI — each → 3-lens refute, 1.3M subagent tokens, 12 agents, 0 errors). 4 finders reported
+their surface already-hardened; 2 survivors (0 refutes each): this db.rs WSL-write gap (fixed here) and a
+ValidationPanel wrong-audio bug (iter 160 next).
+
+**FIX #118 — class: silent data loss + honesty (a human-VERIFIED transcript overwritten, still exported as
+GOLD).** Hand-verified: `update_asr_transcript_if_unreviewed` (db.rs:760) guarded only `human_decision` +
+`verdict` (db.rs:784-786), NOT `verified`. But "Verify"/"Verify selected" (batch_verify → `update_verified`,
+db.rs:561) sets ONLY the `verified` column (its docstring: "without touching any other field") — leaving
+human_decision/verdict NULL. So: the WSL-7B refinement loop snapshots empty-transcript targets at start
+(commands.rs:2101); the user re-transcribes one still-pending clip to real text and clicks Verify; the loop
+later reaches that segment and — because the row still matches the verified-blind WHERE — overwrites its
+raw/normalized transcript with unapproved 7B output (commands.rs:2173). The row stays verified=1 →
+quality.rs:292 grades it GOLD/training_ready → the export (`WHERE verified=1`) ships machine text the human
+never approved.
+
+**Corroboration I verified myself:** the SIBLING `update_batch_transcription_if_unreviewed` (db.rs:814) has
+the IDENTICAL human_decision/verdict guards PLUS `AND verified = 0`, and its docstring (db.rs:801-812)
+documents this exact "human verifies mid-batch → silent lost update" race. `update_asr_transcript_if_
+unreviewed` simply missed that clause. Both callers (commands.rs:2173, pipeline.rs:2755) use it AS the
+"safe, never overwrite human work" method and already treat a skipped `Ok(false)` as a benign log; the
+provenance `insert_hypothesis` runs only on `Ok(true)`. So adding the guard is the correct root fix with no
+caller breakage.
+
+**Root fix:** add `AND verified = 0` to the WHERE clause, mirroring the sibling.
+
+**Fail-before (neutralize-then-restore):** made the guard a no-op (`AND verified IN (0,1)`) →
+`wsl_refinement_must_not_overwrite_a_verified_transcript` FAILED ("a verified row must be SKIPPED, not
+overwritten"); restored → PASS. The test verifies a row via update_verified (verified only), asserts the WSL
+write skips it (Ok(false), transcript intact), and that an unverified row is still updated.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 998 passed / 0 failed**
+(+1 test); **python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean,
+HEAD 98d5351, lock free.
+
+**Score: 118 fixed + 1 cleanup, ~38 refuted, 2 measure-deferred, 1 hunt-4-survivor-queued
+(ValidationPanel.svelte:113 wrong-audio, MED, hand-verify next) + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
