@@ -8395,3 +8395,44 @@ changed. Reality check pre-work: exe not running, git clean, HEAD f2e206b, lock 
 **Score: 94 fixed + 1 cleanup, ~29 refuted, 2 measure-deferred, 2 hunt-queued + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged. (FIX #94 is accuracy MACHINERY — builds the gold-ceiling measurement;
 it does not itself change any CER.)
+
+---
+
+### Iteration 133 — 2026-07-23 — FIX #95: off-drive backup success masked a failing primary snapshot tree (data-safety, hunt-123)
+
+**Class: reliability / silent-safety-net-failure (false-green health).** Hand-verified against source
+(`snapshot.rs:76-87`, `lib.rs:465-518`): the periodic snapshot thread runs two trees per 600 s cycle —
+the PRIMARY (`take_snapshot`, live data dir) then the off-drive SECOND-DIRECTORY backup — and BOTH routed
+through `take_snapshot_with_quarantine_source`, which writes the shared health statics `CONSECUTIVE_FAILURES`
+/ `LAST_SUCCESS_EPOCH`. So in one cycle a PRIMARY failure (counter += 1) immediately followed by an
+off-drive SUCCESS reset the streak to 0 and stamped `last_success`. `snapshot_health()` / `health_check`
+then read a **false GREEN** while the primary safety net — the first line of recovery, protecting the
+marathon's irreplaceable review labor — silently failed for as long as the off-drive kept working. The
+comment already said the off-drive "must never break the primary safety net"; masking its *health* was the
+missed half.
+
+Fix (root-cause, smallest correct diff): add `take_offsite_snapshot` — the same snapshot + prune via the
+existing `take_snapshot_at_from` core but WITHOUT touching the health counters — and route the off-drive
+call (`lib.rs`) through it. Health now reflects the PRIMARY tree only; this also removes the inverse
+false-ALARM (an unplugged second drive inflating the streak to a false red). The off-drive's own failure
+stays warn-logged, as before.
+
+Fail-before: extended `snapshot_health_tracks_success_and_consecutive_failures` — force a primary failure,
+then a good off-drive snapshot, assert the streak SURVIVES and `last_success` is not re-stamped. Pointing
+`take_offsite_snapshot` back at the health-tracking function fails it exactly on "must not reset the
+primary's failure streak (no masking)".
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 987 passed / 0 failed**;
+**python policies 38/38**. Reality check pre-work: exe not running, git clean, HEAD d832cd0, lock free.
+
+**Score: 95 fixed + 1 cleanup, ~29 refuted, 2 measure-deferred, 1 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-123 remaining):
+- [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits. ← next
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+- IN-LOOP ACCURACY-MACHINERY (owner-surfaced): gold-CER/WER PR-gating test; OmniASR-CTC-1B benchmark
+  harness; KenLM n-gram fusion (verify sherpa CTC support first); pseudo-labeling harness; ECE/reliability
+  (pairs with the κ harness); active-learning queue ranking; CV-ckb + SoraniTTS importers; one-click
+  gate_and_promote IPC+button; homophone-replacer FST (verify Omnilingual-path support); reconcile stale
+  ledger measured-numbers table. (None move the CER number — all owner-gated to RUN.)
