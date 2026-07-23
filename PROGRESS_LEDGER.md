@@ -8993,6 +8993,49 @@ git clean, HEAD 39873c0, lock free.
 reality-check) + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 151 — 2026-07-23 — FIX #112: a stale DPO-preference file re-shipped + vouched on re-export
+
+**Class: bundle-integrity / stale-orphan on reused output dir (a false SHA256SUMS integrity claim).**
+Hand-verified against source: `export_dataset_bundle` output dir is the user's chosen `path`
+(commands/export.rs:74) and `create_dir_all` (export_bundle.rs:286) never cleans it, so re-exporting to
+the same folder is ordinary. `write_learning_artifacts` (export_bundle.rs:496) writes
+`learning_preferences.jsonl` ONLY when `build_dpo_dataset` yields `pair_count > 0`; every other fixed-name
+artifact is rewritten unconditionally, and the variable-named `source_transcripts` dir already clears
+itself (with a comment claiming it was "the only orphan vector"). GAP: `learning_preferences.jsonl` is
+fixed-name but CONDITIONALLY written — so a first export with pairs writes it, and a later export to the
+same dir with ZERO pairs (human edits rescinded / clips became gold holdout) left the old file on disk,
+where `write_sha256sums`'s whole-tree walk (export_bundle.rs:439) re-hashed it into SHA256SUMS — shipping
+WITHDRAWN preference pairs vouched as current. A downstream trainer reading SHA256SUMS + the raw dir would
+consume rescinded DPO pairs.
+
+**Root fix (mirror the sibling remedy, don't invent a new one):** clear the file first in
+`write_learning_artifacts` — same shape as `source_transcripts`'s clear-then-write. Also corrected the
+`source_transcripts` comment that wrongly generalized "fixed-name artifacts are overwritten each run"
+(true only for UNCONDITIONALLY-written ones — the reasoning gap that let this slip). No SHA-strategy change:
+keeping the whole-tree walk + an orphan-free tree is the codebase's established design and is robust to any
+future un-tracked write, whereas switching to a declared-files-only sum would silently under-cover a real
+file if `files` ever went incomplete.
+
+**Fail-before (neutralize-then-restore):** commented out the `remove_file` block →
+`re_export_into_reused_dir_removes_stale_learning_preferences_orphan` FAILED at the "stale ... orphan
+re-shipped" assert; restored → PASS. The test exports one pair, deletes the `agent_examples` row, re-exports
+to the same dir, and asserts the file is gone, absent from `result.files`/manifest, `pairCount=0`, and
+unlisted in SHA256SUMS.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 995 passed / 0 failed**
+(+1 new test); **python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean,
+HEAD 8ce58d2, lock free.
+
+**Brutal-reality-check note:** this survivor was tagged MED and confirmed a real reachable integrity bug
+(SHA256SUMS is a trust artifact vouching a file the manifest disclaims) — not over-engineering. The fix is
+a 3-line clear mirroring existing code + one honest regression test, not a new abstraction.
+
+**Score: 112 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 4-ish hunt-queued (2 to fix:
+audio.rs:404, export.rs:859; 3 to reality-check) + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
@@ -9004,8 +9047,8 @@ QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
   context (the finetuned path already has it via sibling_count); apply that pattern to the transcribe
   callers (pipeline.rs:2633, commands.rs:2300/2369) in a focused change. Reachability is also uncertain
   (chunks retain offsets normally; only legacy/clobber loses them — 1/3 refuters doubted it).
-- [MED] export_bundle.rs:499 — stale learning_preferences.jsonl orphan re-shipped + vouched by SHA256SUMS. ← next
-- [LOW] audio.rs:404 — decode_pcm_windows silently truncates on a symphonia ResetRequired (verify reachability).
+- ~~export_bundle.rs:499 — stale learning_preferences.jsonl orphan~~ FIXED iter 151 (#112).
+- [LOW] audio.rs:404 — decode_pcm_windows silently truncates on a symphonia ResetRequired (verify reachability). ← next
 - [LOW] export.rs:859 — dropped_unavailable over-counts (honesty; verify harm isn't purely cosmetic).
 - REALITY-CHECK-BEFORE-FIXING (likely over-engineering per owner "beware over-engineering" — CLOSE with a
   reasoned note unless a real reachable harm is confirmed): denoiser.rs:14 SHA-verify (denoiser is
