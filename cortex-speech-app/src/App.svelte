@@ -338,8 +338,22 @@
     if (!isAudioPlaying) clearWordOverride();
   });
   $effect(() => {
-    void $selectedSegmentId; // any selection change ends word-playback mode
+    const id = $selectedSegmentId; // any selection change ends word-playback mode AND reseats the view
     clearWordOverride();
+    // Per-selection VIEW setup for EVERY selection path. selectSegment() used to set these inline, but
+    // store-only selections from OTHER components — ValidationPanel "Go to segment" (jumpToSegment) and the
+    // active-learning / signal-anomaly jumps — only set the selectedSegmentId store and bypassed it. When
+    // chunks share ONE source audioPath (single-file import), the AudioPlayer then kept playing from the OLD
+    // position straight through the new clip's endTime (the reviewer HEARD the wrong clip while the UI showed
+    // the new one), and the waveform bars / tap-a-word data stayed on the previous chunk. Centralizing it
+    // here fixes every path. `get(selectedSegment)` reads WITHOUT subscribing, so this fires once per
+    // selection IDENTITY, not on unrelated segment-data updates (e.g. a mid-review re-alignment).
+    const seg = id ? get(selectedSegment) : null;
+    if (seg) {
+      currentTime = chunkPlaybackRange(parseSourceMeta(seg.alignmentJson)).startTime;
+      wordTimestamps.set(parseWordTimestamps(seg.alignmentJson));
+      loadWaveform(seg.audioPath, seg.alignmentJson);
+    }
   });
   // Tap a word → play EXACTLY that word; with an index (double-tap / F2), also open its inline editor
   // so the fix is typed right where the ear just confirmed the error.
@@ -1866,12 +1880,11 @@
 
   function selectSegment(seg: SpeechSegment) {
     // Persist any edit queued for the segment we're LEAVING before switching, so its debounced save
-    // is never dropped by the switch (round-16 data-loss fix).
+    // is never dropped by the switch (round-16 data-loss fix). The per-selection VIEW setup (playhead
+    // reset, word timestamps, waveform) is centralized in the $selectedSegmentId effect above so store-only
+    // selections (ValidationPanel "Go to segment", the active-learning / signal-anomaly jumps) get it too.
     autosave.flush();
     selectedSegmentId.set(seg.id);
-    wordTimestamps.set(parseWordTimestamps(seg.alignmentJson));
-    currentTime = chunkPlaybackRange(parseSourceMeta(seg.alignmentJson)).startTime;
-    loadWaveform(seg.audioPath, seg.alignmentJson);
   }
 
   function onSeek(time: number) {

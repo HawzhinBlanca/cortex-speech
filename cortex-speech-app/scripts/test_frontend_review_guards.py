@@ -349,6 +349,42 @@ def test_keyboard_shortcuts_help_each_uses_a_unique_key() -> None:
         )
 
 
+def test_selection_reseats_playback_centrally_for_store_only_selections() -> None:
+    """A selection made from ANOTHER component — ValidationPanel "Go to segment" (jumpToSegment), the
+    active-learning / signal-anomaly jumps — can only set the selectedSegmentId store; it cannot reach App's
+    currentTime / waveform. If the per-selection view setup (playhead reset + waveform + word timestamps)
+    lived ONLY inline in selectSegment(), such store-only selections would leave the AudioPlayer playing the
+    PREVIOUS chunk's audio (chunks of one recording share a source audioPath) straight through the new clip's
+    endTime while the UI shows the new clip — the reviewer verifies one clip while HEARING another. The reset
+    MUST live in a $selectedSegmentId-keyed effect so EVERY selection path gets it. Runtime is Svelte reactive
+    glue + an <audio> element, not unit-testable; source-pinned (hunt-4 / iter 160)."""
+    src = _read("src/App.svelte")
+    marker = "const id = $selectedSegmentId;"
+    start = src.find(marker)
+    if start == -1:
+        raise AssertionError(
+            "the $selectedSegmentId-keyed selection effect is gone — a store-only selection (ValidationPanel "
+            "'Go to segment') would leave the AudioPlayer on the previous chunk. This gate would pass vacuously."
+        )
+    rest = src[start:]
+    end = len(rest)
+    for m in ("\n  $effect(", "\n  function ", "\n  async function ", "\n  let "):
+        i = rest.find(m, 1)
+        if i != -1:
+            end = min(end, i)
+    body = rest[:end]
+    for needle, why in (
+        ("currentTime = chunkPlaybackRange(", "reseat the playhead at the new chunk start"),
+        ("loadWaveform(", "refresh the waveform bars for the new chunk"),
+    ):
+        if needle not in body:
+            raise AssertionError(
+                f"the $selectedSegmentId effect no longer reseats the view ({why}: {needle!r}). Keep the "
+                "per-selection reset in this central effect — inline-only-in-selectSegment leaves store-only "
+                "cross-component selections (ValidationPanel 'Go to segment') playing the wrong clip's audio."
+            )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -366,6 +402,7 @@ def main() -> None:
     test_processing_progress_eta_uses_chunk_scoped_elapsed_not_whole_pipeline()
     test_segment_stats_verified_excludes_placeholder_only_rows()
     test_keyboard_shortcuts_help_each_uses_a_unique_key()
+    test_selection_reseats_playback_centrally_for_store_only_selections()
     print("frontend review-guard source policy passed")
 
 
