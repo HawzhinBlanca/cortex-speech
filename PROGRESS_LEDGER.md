@@ -8114,3 +8114,40 @@ QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
 - [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree.
 - [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+## 2026-07-23T11:25Z — iter 126 — scorecard fabricated "no significant difference" at 0 paired segments (MEDIUM honesty) fixed (8f38a24)
+
+**Fixed the queued MEDIUM honesty defect. Hand-verified render_markdown + compare_to_baseline.**
+
+**scorecard.rs render_markdown — printed a fabricated measured-equivalence verdict at 0 paired segments (MEDIUM,
+honesty; 8f38a24).** Hand-verified: render_markdown early-returns the honest "WER/CER undefined (not 0%)" notice
+when s.scored_segments==0 (:344), guarding the SYSTEM's own table. The vs_baseline block (:369) had NO analogous
+paired_segments==0 guard. compare_to_baseline pairs the two runs on audio_path (:349); if the baseline shares no
+audio with the system — reachable when the gold SET is replaced between the baseline and challenger runs — the
+intersection is empty → paired_segments = sys_errs.len() = 0, system_micro_wer = baseline_micro_wer =
+micro_rate(empty) = 0.0, mapsswe(empty) short-circuits to p=1.0 → beats_baseline=false, significant_at_05=false.
+So it rendered "(0 paired segments): system WER 0.00% vs baseline 0.00% — MAPSSWE p = 1.0000 → no significant
+difference" — a measured-equivalence verdict + two 0.00% rates conjured from zero comparison data, the exact
+fabricated-clean-from-nothing the scored_segments guard forbids.
+
+Fix: guard the vs_baseline render on b.paired_segments==0 — emit "⚠️ no overlapping gold segments — the
+comparison is UNDEFINED (not an equivalence); re-run both on the SAME gold set" instead. Fail-before verified:
+the new test panicked with the EXACT fabricated string ("(0 paired segments): system WER 0.00% vs baseline
+0.00% — MAPSSWE p = 1.0000 → no significant difference") before the fix; passes after. Existing scorecard/registry
+gate tests (stale-baseline reject, gold-reimport survival, empty-ref exclusion) all still green.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 987 passed / 0 failed / 6 ignored** (was 986, +1),
+**35/35 python policies**.
+
+**Score: 88 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 5 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
+- [MED] stores/segmentStore.ts:216 — segmentStats.verified counts placeholder/empty verified rows every export drops (count-must-exclude-placeholder class; see memory). ← next
+- [MED] KeyboardShortcuts.svelte:55 — duplicate {#each} key when two shortcuts share a description → each_key_duplicate crash.
+- [MED] export_bundle.rs:394 — runConfig.denoising reports true when the denoiser model fails to load (provenance lie).
+- [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree.
+- [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
