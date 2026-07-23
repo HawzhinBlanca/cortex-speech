@@ -9394,6 +9394,60 @@ Reality check pre-work: exe not running, git clean, HEAD 9283093, lock free.
 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 161 — 2026-07-23 — HUNT-5 processed: 2 fixes (#120, #121) + 2 closes; 4 finders clean
+
+**Hunt-5** (Workflow, 6 finders over the last under-swept surfaces — secrets/api-keys, run tracking,
+flock/engine lifecycle, batch import, WSL-7B Python, remaining frontend panels — 3-lens refute, 1.58M
+subagent tokens, 18 agents, 0 errors). secrets + runs finders reported clean. 4 candidates, all auto-marked
+"refuted" (refutes ≥ 2) — but per discipline I HAND-VERIFIED each, and OVERRODE the auto-verdict on two that
+sit in recurring classes:
+
+**FIX #120 — batch-verify marks placeholder/empty rows verified (recurring "verified-excludes-placeholder"
+class).** `handleBatchVerify('pending')` (App.svelte) selected `s => !s.verified` with NO content filter, so
+"Verify All Pending" marked placeholder ("[Pending WSL 7B ASR]") / empty rows verified=1. The verify-lenses
+refuted on "export drops placeholders so no GOLD ships" — but I confirmed against source the harm they missed:
+post-#118 the WSL-7B refinement loop SKIPS verified rows, so a verified placeholder is now STRANDED (can never
+be filled), and it's the unfixed ROOT of the class iter 127 only band-aided at the dashboard count
+(segmentStats.verified). Fixed: filter the bulk list with `hasRealTranscript(s)`. Guard
+`test_verify_all_pending_excludes_placeholder_and_empty_rows`, fail-before verified.
+
+**FIX #121 — WSL-7B client whole-files a clobbered (offset-less) alignment (whole-file-vs-clip, DEFAULT engine
+path).** `cortex_7b_client.py` IS `external_asr_script_path` (the champion 7B path, pipeline.rs:3244 /
+pipeline_tests.rs:687). It reads a segment's alignment_json and, on a present-but-offset-less blob, sent null
+offsets → the server transcribes the WHOLE source file and stores it as one clip's transcript. This is the
+SAME corruption class as #116 — my #116 fix guarded the Rust `slice_pcm_by_alignment`, but this THIRD reader
+(the primary engine path) was the lone holdout. The finder's lenses refuted on the same "offset-less isn't
+reachable" argument I'd already OVERRIDDEN in #116 for defensive consistency with `slice_for_export`. Fixed:
+extracted `resolve_clip_offsets()` — (None,None) only for a genuine whole-file segment (no alignment), raises
+`ClobberedAlignment` for present-but-offset-less (bare word array / unparseable / partial), requiring BOTH
+offsets like the server gate. Unit test `test_cortex_7b_client_policy.py` (5 shapes), fail-before verified.
+**Policy scripts now 40** (new test file).
+
+**CLOSED (refutations SOUND after hand-verify):**
+- flock.rs:51 — Unix instance-lock unlinks the lockfile on a REJECTED acquisition (a textbook flock
+  antipattern: flock binds to the inode, so unlinking the name lets a later opener rendezvous on a fresh inode
+  and double-acquire). Real Unix-branch bug, BUT the owner ships WINDOWS-ONLY; the `#[cfg(windows)]` branch
+  (create_new + share_mode(0)) is immune, and the double-instance-DB-corruption harm needs two real Unix GUI
+  instances on a shared prod DB — which never happens (CI runs only `cargo test` on tempdirs; macOS out of
+  scope). No reachable harm on the shipped platform. Same category as the spawn-panic/denoiser closes; a
+  future cross-platform effort should delete the failure-path unlink (Drop already handles cleanup, and Unix
+  flock auto-releases on process death).
+- SettingsPanel.svelte:199 — `save()` optimistically `settings.set(localSettings)` then persists; on a
+  backend failure it shows an error TOAST but doesn't roll back the store. Refuted-sound: the user IS notified,
+  the divergence self-corrects on next launch (disk unchanged), and there is NO session consent leak — a
+  toggled opt-in reflects the user's explicit intent (consent is the action), and the safe direction (revoke)
+  is honored in-session. Unlike #117 (a SILENT restore re-grant), nothing here is silent. Minor smell: the
+  sibling `saveQuietly` (close-to-save) already rolls back; not worth the divergence given no reachable harm.
+
+Gate per fix: #120 frontend (typecheck/lint clean, vitest 207 passed, 39 policies); #121 python (40 policy
+scripts passed). Reality check pre-work: exe not running, git clean, HEAD ee8018f→a17322c, lock free.
+
+**Score: 121 fixed + 1 cleanup, ~40 refuted, 2 measure-deferred, 0 hunt-queued (hunt-5 drained: 2 fixed, 2
+closed, others refuted) + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
