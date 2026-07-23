@@ -8075,3 +8075,42 @@ QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
 - [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree.
 - [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits (audio export has no staging).
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+## 2026-07-23T10:58Z — iter 125 — snapshot restore silently re-granted revoked cloud consent (MEDIUM privacy) fixed (1fd5d41)
+
+**Fixed the queued MEDIUM privacy defect. Hand-verified the restore flow + the consent fields.**
+
+**commands.rs restore_db_from_snapshot — restoring a DB snapshot silently re-enabled cloud consent the user had
+revoked (MEDIUM, privacy; 1fd5d41).** Hand-verified: restore_db_from_snapshot restores the DB, copies the
+snapshot's captured settings.json over the live one (EXTRA_STATE loop), then `restored =
+AppSettings::load(settings.json)` → `*state.lock_settings() = restored` + `update_pipeline_settings(restored)`
+(the code comment even says "consent flags take effect immediately"). So if the snapshot was captured while
+cloud_llm_opt_in / cloud_stt_opt_in / jury_cloud_opt_in (settings.rs:72/77/99, the only 3 consent flags) were
+TRUE and the user has since turned them OFF, the restore flips them back ON in the LIVE pipeline with no fresh
+acknowledgment — subsequent transcribe/refine/jury could transmit audio/transcript to a cloud provider, violating
+the hard guardrail "never send audio/transcript to a provider without acknowledged consent". The restore picker
+is a routine recovery action (recover deleted/edited segments); nothing preserved the current consent posture.
+
+Fix: carry the CURRENT live opt-ins across the restore — capture state.lock_settings()'s 3 consent flags before
+applying and override the snapshot's, so a restore can only NARROW consent, never escalate it (consent is a live
+per-session privacy decision, not dataset state a rollback should change). Fail-before verified via source policy
+(the command needs AppState + DB + files, so source-pinned in test_rust_runtime_panic_policy.py): with the block
+reverted, the policy fired on the missing cloud_llm_opt_in preservation; passes after. All restore/snapshot/session
+tests still green (no regression).
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 986 passed / 0 failed / 6 ignored**, **35/35 python
+policies**.
+
+**Score: 87 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 6 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
+- [MED] scorecard.rs:369 — render_markdown prints a fabricated "no significant difference" verdict at 0 paired segments (honesty). ← next
+- [MED] stores/segmentStore.ts:216 — segmentStats.verified counts placeholder/empty verified rows every export drops (count-must-exclude-placeholder class).
+- [MED] KeyboardShortcuts.svelte:55 — duplicate {#each} key when two shortcuts share a description → each_key_duplicate crash.
+- [MED] export_bundle.rs:394 — runConfig.denoising reports true when the denoiser model fails to load (provenance lie).
+- [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree.
+- [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
