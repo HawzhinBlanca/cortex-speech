@@ -171,6 +171,18 @@ pub fn create_gold_from_verified_file(db: &Database, audio_path: &str) -> AppRes
     for row in rows {
         if let Some(text) = row? {
             let trimmed = text.trim();
+            // A placeholder is NON-empty, so the !is_empty() push below would join it verbatim into the
+            // PERMANENT holdout reference (accepting a chunk BEFORE its ASR finishes leaves verdict/annotated
+            // empty, so the COALESCE falls to raw_transcript='[Pending WSL 7B ASR]'). Its speech is in the
+            // WAV but it has no real text — the same hazard the reject/unreviewed guards refuse. Refuse the
+            // file until the chunk is transcribed/corrected, rather than poisoning every future benchmark.
+            if crate::quality::is_placeholder_transcript(trimmed) {
+                return Err(crate::error::AppError::Validation(format!(
+                    "'{audio_path}' has a reviewed chunk whose only reference text is a placeholder \
+                     ('{trimmed}') — its speech is in the holdout WAV but it has no real transcript (ASR \
+                     unfinished, or accepted before transcription); transcribe/correct it before marking it gold"
+                )));
+            }
             if !trimmed.is_empty() {
                 parts.push(trimmed.to_string());
             }
@@ -1123,6 +1135,34 @@ mod tests {
 
         // A file with no reviewed segments errors (correct it in the app first).
         assert!(create_gold_from_verified_file(&db, "/clips/missing.wav").is_err());
+    }
+
+    #[test]
+    fn create_gold_refuses_a_chunk_whose_only_text_is_a_placeholder() {
+        // Round-25 hunt: accepting a chunk BEFORE its ASR finishes leaves verdict/annotated empty, so the
+        // gold reference COALESCEs to raw_transcript='[Pending WSL 7B ASR]' — a placeholder that would be
+        // joined verbatim into the PERMANENT holdout reference, corrupting every future engine benchmark.
+        // It must be refused, like the reject/unreviewed guards.
+        let db = open_mem_db();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "p1".to_string(),
+            audio_path: "/clips/pending.wav".to_string(),
+            raw_transcript: "[Pending WSL 7B ASR]".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET human_decision='accept', verdict_transcript='', \
+                 annotated_transcript='' WHERE id='p1'",
+                [],
+            )
+            .unwrap();
+        let err = create_gold_from_verified_file(&db, "/clips/pending.wav").unwrap_err();
+        assert!(
+            format!("{err}").contains("placeholder"),
+            "a placeholder-only chunk must be refused, not joined into gold: {err}"
+        );
     }
 
     #[test]
