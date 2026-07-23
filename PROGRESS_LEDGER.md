@@ -7272,3 +7272,61 @@ Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python p
 test_frontend_review_guards.py). **Score: 67 fixed, ~25 refuted, 2 measure-deferred, 0 queued** — queue
 drained; next iters resume the frontend/backend adversarial hunt. Owner-gated finish line unchanged (exe
 rebuild to activate source-only fixes; real-audio e2e/RTF/CER eval).
+
+---
+
+## 2026-07-23T02:52Z — iter 105 — HF export all-sources-unavailable dataset-wipe fixed (556f75b)
+
+**Queue was drained → resumed the adversarial hunt. 6 finders × 3-lens refuter verify surfaced 6 distinct
+survivors; fixed the top HIGH (data-loss), queued the other 5 + a partial-availability sibling.**
+(Loop hygiene: iter opened on a STALE lock — iter 104's end-of-run `rm .month-loop.lock` ran from the app
+subdir and missed the repo-root lock. Cleared it, re-acquired by ABSOLUTE path, and recorded memory
+month-loop-lock-absolute-path so it can't silently stall a future fire.)
+
+**export.rs export_huggingface_dataset — a zero-clip re-export WIPED the prior good dataset to empty (HIGH,
+data-loss; 556f75b).** Hand-verified against source: the has_exportable_row no-op guard (export.rs:697-712)
+grades on the DB row only — training_grade_for_segment + is_training_ready_for_huggingface_export read
+transcript/verified/metrics/coverage and NEVER test seg.audio_path existence. So a library whose rows are all
+training-ready but whose source files vanished (drive unmounted / recordings folder moved or deleted after a
+prior export) sails PAST the guard; process_split (816-844) drops every source as unavailable (count=0, returns
+Ok — not Err, so no rollback); and the UNCONDITIONAL commit (983-986: remove_dir_all(data_dir) then
+rename(staging→data)) swapped in the empty staging tree — destroying a previously-good published dataset.
+total_count was computed AFTER the commit, so nothing gated it. This is the EXACT "replace a good export with
+an empty one" failure the guard was added to prevent, in the audio-availability dimension it can't see — and
+reachable under the autonomous nightly month-loop (re-export while a drive is unmounted). Verified by all 3
+refuter lenses AND independently by hand.
+
+Fail-before verified: new test hf_reexport_that_writes_zero_clips_because_all_sources_vanished_preserves_the_prior_export
+FAILED with left=0/right=1 (data/ wiped to empty) before the fix. Root-cause fix: hoisted
+total_count/total_secs/dropped_unavailable ABOVE the commit and added a `total_count==0 && data_dir.exists()`
+preserve-guard — discard staging + return Ok() without touching data/. The `data_dir.exists()` clause keeps a
+FIRST-ever all-unavailable export writing an empty, honestly-documented dataset (droppedUnavailableAudio in
+dataset_infos.json) — caught a regression in export_huggingface_counts_dropped_missing_audio during the gate and
+narrowed the guard rather than weaken the existing behavior.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 977 passed / 0 failed / 6 ignored** (was 976, +1),
+**35/35 python policies**.
+
+**Score: 68 fixed, ~25 refuted, 2 measure-deferred, 6 queued.** Owner-gated finish line unchanged (exe rebuild
+to activate source-only fixes; real-audio e2e/RTF/CER eval).
+
+QUEUE (hand-verify each against source BEFORE fixing — agent verdicts are leads, not evidence):
+- [HIGH] couch.rs:369 — api_undo restores the pre-decision snapshot via db.insert_segment(&prev), which omits
+  the jury/human-decision columns (verdict, human_decision, is_gold, escalated, corrected_at); after
+  clear_human_decision, a couch phone-review undo silently drops a prior human decision (whole-row-clobber family).
+- [HIGH] eval.rs:822 — run_gold_eval_with_transcriber pushes a hypothesis only when the transcriber returns Ok;
+  an engine failure silently drops the clip, and an all-fail run persists WER/CER 0.0 as "perfect" — an HONESTY
+  violation (the one law). Needs: a failed clip must NOT count as a perfect match / the metric must reflect it.
+- [MED] jury/mod.rs:331 — run_t0_gate writes agent_confidence=irt_confidence on EVERY Escalated verdict incl.
+  hard-veto escalations (single recognizer, or SNR<5 / clipping>0.1), so a veto escalation inherits IRT
+  agreement confidence and defeats riskiest-first review ordering.
+- [MED] ValidationPanel.svelte:519 — Signal-Anomaly tab shows "no anomalies" as an all-clear before any screen
+  has run (null signal_anomaly_score conflated with a screened-clean 0); the import/transcribe pipeline never
+  sets the score (only the manual "Run Signal-Anomaly Screen" button does).
+- [MED] AudioPlayer.svelte:259 — autoplay fires only inside handleLoaded (onloadedmetadata); the element reloads
+  only when the audioPath prop VALUE changes, so consecutive same-source review clips don't reload → autoplay
+  dies after the first clip.
+- [partial/LOW] export.rs written_clips keep-set is DEAD post-staging-refactor — it prunes the fresh empty
+  staging dir, never data/, so a PARTIAL-availability re-export still drops the transiently-unavailable sources'
+  prior clips from the new snapshot. Needs a carry-forward-into-staging design that keeps metadata.csv/SHA
+  consistent (don't leave orphan WAVs unlisted in the manifest).
