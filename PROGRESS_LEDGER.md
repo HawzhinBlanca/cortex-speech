@@ -7330,3 +7330,53 @@ QUEUE (hand-verify each against source BEFORE fixing — agent verdicts are lead
   staging dir, never data/, so a PARTIAL-availability re-export still drops the transiently-unavailable sources'
   prior clips from the new snapshot. Needs a carry-forward-into-staging design that keeps metadata.csv/SHA
   consistent (don't leave orphan WAVs unlisted in the manifest).
+
+---
+
+## 2026-07-23T03:20Z — iter 106 — eval-zero-segment honesty: backend HIGH REFUTED, frontend MEDIUM fixed (900c106)
+
+**Worked the queued HIGH "eval.rs:822 all-fail persists WER/CER 0.0 as perfect". Hand-verification + the gate
+turned it into: backend claim REFUTED (already handled), one real MEDIUM frontend display fixed.**
+
+Confirmed the raw mechanism by hand: run_gold_eval with zero scored hypotheses returns Ok with
+num_segs=0 / wer=cer=0.0 (macro & micro both 0.0), and run_gold_eval_with_transcriber + both pipeline
+closed-loop paths drop every engine-failed clip — so an all-engine-fail run reaches run_gold_eval empty.
+
+I first wrote a backend HONESTY GUARD (run_gold_eval → Err when n==0) with two fail-before-verified tests
+(both FAILED with the guard disabled; the partial-fail test stayed green). But the FULL gate caught that this
+guard breaks scorecard::tests::render_markdown_on_zero_segments_says_undefined_not_zero_percent — because the
+codebase ALREADY handles zero-scored evals honestly at the DECISION/DISPLAY layer, and intentionally lets
+run_gold_eval produce a zero-seg result for the scorecard to render:
+  • build_scorecard: scored_segments==0 ⇒ metrics UNDEFINED (not 0%).
+  • render_markdown (scorecard.rs:344): prints "⚠️ No segments were scored — WER/CER are undefined (not 0%)"
+    and omits the metric table.
+  • promotion gate (scorecard.rs:462): scored_segments==0 ⇒ "CANNOT EVALUATE … undefined, not 0" — the exact
+    "champion-selection misled" the finder feared is already refused.
+So the backend HIGH is REFUTED: erroring in run_gold_eval fights an intentional design and its test. Reverted
+the backend guard + tests (git checkout eval.rs).
+
+The ONE genuinely unguarded surface was the frontend: **RefineryPanel.svelte rendered pct(run.wer)/pct(run.cer)
+for every eval run** (Last-eval line, the eval-runs table, and both success notifications), so a zero-segment
+run displays a perfect "0.0%" — the precise "render a 0.00% rate from zero data" the scorecard forbids. Fixed
+(MEDIUM): added a numSegs-guarded `metric(x, numSegs) => numSegs>0 ? pct(x) : '—'` and routed all six WER/CER
+displays through it. Source policy check #9 (test_refinery_panel_renders_undefined_metric_for_a_zero_segment_eval)
+— fail-before verified.
+
+Lesson (recorded): the gate is an evidence source, not a nuisance — it surfaced that a plausible HIGH backend
+finding was already handled and my fix was over-reaching. Hand-verify the WHOLE decision path (incl. existing
+honesty handling), not just the mechanism the finder cites.
+
+Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies** (9 checks now in
+test_frontend_review_guards.py). Backend untouched (reverted) — no cargo change to land.
+
+**Score: 69 fixed, ~26 refuted (eval backend HIGH), 2 measure-deferred, 5 queued.** Owner-gated finish line
+unchanged.
+
+QUEUE (hand-verify each against source BEFORE fixing):
+- [HIGH] couch.rs:369 — api_undo restores via db.insert_segment(&prev), which omits jury/human-decision columns
+  (verdict, human_decision, is_gold, escalated, corrected_at); a couch phone-review undo can silently drop a
+  prior human decision (whole-row-clobber family). ← next
+- [MED] jury/mod.rs:331 — hard-veto escalations inherit IRT agreement confidence, defeating riskiest-first order.
+- [MED] ValidationPanel.svelte:519 — Signal-Anomaly tab shows "no anomalies" all-clear before any screen has run.
+- [MED] AudioPlayer.svelte:259 — autoplay fires only on element reload; dies after the first same-source clip.
+- [partial/LOW] export.rs written_clips keep-set dead post-staging-refactor (partial-availability clip drop).
