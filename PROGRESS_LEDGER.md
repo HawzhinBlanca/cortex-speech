@@ -7504,3 +7504,41 @@ QUEUE (hand-verify against source BEFORE fixing):
   still drops the transiently-unavailable sources' prior clips from the new snapshot (the keep-set prunes the
   fresh empty staging dir, never data/). Needs a carry-forward-into-staging design that keeps metadata.csv/SHA
   consistent (no orphan WAVs unlisted in the manifest).
+
+---
+
+## 2026-07-23T04:32Z — iter 110 — export dead orphan-prune/keep-set removed; queue drained (cd79dd5)
+
+**Resolved the last queued item (the export partial-availability clip-drop). Hand-verification reclassified it
+LOW→cleanup: the flagged behavior is defensible; the real defect was DEAD CODE + a FALSE comment.**
+
+**export.rs — removed the dead written_clips keep-set + per-split orphan-prune and corrected the stale
+"preserve transiently-unavailable clips" comment (cleanup/refactor; cd79dd5).** Verified against source: the
+export stages into `.data-staging` (export.rs:676) whose split dirs (train/val/test) are wiped + recreated
+FRESH every run (724-729), then commits via an atomic `remove_dir_all(data)` + `rename(staging→data)` swap. So
+the per-split orphan-prune (read_dir(dest_dir) → remove WAVs not in written_clips) ran on a fresh staging dir
+that only ever contains this run's clips — it could never find a prior clip to prune (dead), and old clips are
+removed wholesale by the swap. The staging comment (719-723) already stated orphans are "structurally
+impossible", confirming the prune was vestigial from the pre-staging in-place model. The keep-set's
+unavailable-source insertions (818-844) were likewise dead — and their comment FALSELY promised those clips are
+preserved. They are not: a transiently-unavailable source is DROPPED from the snapshot (counted in
+droppedUnavailableAudio, not silent) and reappears on the next re-export once readable. That behavior is
+DEFENSIBLE (a consistent, self-healing smaller snapshot; the prior dataset survives an all-unavailable run via
+the iter-105 total_count==0 guard), so the finding's "data-loss" framing is refuted for behavior — the defect
+was the dead code + false comment.
+
+Removed: written_clips HashSet + all insertions, the unused source_stem, the orphan-prune loop; rewrote the
+missing-source, no-early-return, and prune comments to state the actual staging-swap behavior. No behavior
+change — proven by hf_reexport_removes_orphan_wav_for_a_dropped_segment still passing (the swap, not the prune,
+removes old clips). Added a characterization test
+hf_partial_reexport_keeps_a_consistent_snapshot_of_the_available_source pinning the partial-availability
+contract (available source kept, unavailable dropped, on-disk == metadata.csv == SHA256SUMS, no orphan).
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 979 passed / 0 failed / 6 ignored** (was 978, +1
+characterization), **35/35 python policies**.
+
+**Score: 72 fixed + 1 cleanup, ~27 refuted, 2 measure-deferred, 0 queued.** QUEUE DRAINED — the next iteration
+resumes the frontend/backend adversarial hunt. Deferred enhancement (not a bug): carry a transiently-unavailable
+source's prior clips + rows forward into staging to keep a larger interim snapshot (must preserve
+metadata.csv/SHA consistency) — logged for the owner. Owner-gated finish line unchanged (exe rebuild to activate
+source-only fixes; real-audio e2e/RTF/CER eval).
