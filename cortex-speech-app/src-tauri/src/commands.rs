@@ -1773,7 +1773,18 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
     }
     // Apply the restored settings to memory AND the running pipeline (mirrors update_settings) so the
     // engine / thresholds / consent flags take effect immediately, not only on the next launch.
-    let restored = crate::settings::AppSettings::load(&data_dir.join("settings.json"));
+    let mut restored = crate::settings::AppSettings::load(&data_dir.join("settings.json"));
+    // PRIVACY: a DB snapshot restore must NEVER silently re-grant cloud consent the user has since revoked.
+    // Consent (cloud_llm / cloud_stt / jury_cloud opt-in) is a LIVE per-session privacy decision, not dataset
+    // state a rollback should change — carry the CURRENT opt-ins across instead of adopting the snapshot's, so
+    // a restore can only NARROW consent, never escalate it. (Guardrail: never send audio/transcript to a
+    // provider without acknowledged consent — a snapshot captured in a cloud-ON era must not flip it back on.)
+    {
+        let live = state.lock_settings();
+        restored.cloud_llm_opt_in = live.cloud_llm_opt_in;
+        restored.cloud_stt_opt_in = live.cloud_stt_opt_in;
+        restored.jury_cloud_opt_in = live.jury_cloud_opt_in;
+    }
     *state.lock_settings() = restored.clone();
     state.update_pipeline_settings(restored);
     // (undo/redo history was already cleared above, right after the DB swap.)

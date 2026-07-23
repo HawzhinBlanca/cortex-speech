@@ -1850,6 +1850,34 @@ def test_asr_load_gate_verifies_the_tokens_vocab_not_only_the_model() -> None:
         )
 
 
+def test_snapshot_restore_preserves_live_cloud_consent() -> None:
+    """restore_db_from_snapshot copies the SNAPSHOT's settings.json over the live one and applies it to memory
+    AND the running pipeline. A snapshot captured while the cloud opt-ins were ON would then silently re-grant
+    consent the user has since revoked — subsequent transcribe/refine/jury could transmit audio/transcript to a
+    cloud provider with no fresh acknowledgment, violating the hard guardrail 'never send without acknowledged
+    consent'. Consent is a LIVE per-session privacy decision, not dataset state a rollback should change, so the
+    restore must carry the CURRENT opt-ins across (a restore may narrow consent, never escalate it). Needs
+    AppState + DB + files, so source-pinned."""
+    surface = command_surface()
+    start = surface.find("fn restore_db_from_snapshot(")
+    if start == -1:
+        raise AssertionError("restore_db_from_snapshot not found — this gate would pass vacuously")
+    rest = surface[start:]
+    end = len(rest)
+    for marker in ("\n#[tauri::command]", "\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "):
+        idx = rest.find(marker, 1)
+        if idx != -1:
+            end = min(end, idx)
+    body = rest[:end]
+    for flag in ("cloud_llm_opt_in", "cloud_stt_opt_in", "jury_cloud_opt_in"):
+        if flag not in body:
+            raise AssertionError(
+                f"restore_db_from_snapshot does not preserve the live consent flag {flag} — restoring a "
+                "cloud-ON-era snapshot silently re-enables cloud consent the user revoked. Carry the current "
+                "state.lock_settings() opt-ins across the restore instead of adopting the snapshot's."
+            )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -1896,6 +1924,7 @@ def main() -> None:
     test_pipeline_wsl_retranscribe_rejects_an_empty_result()
     test_finetuned_fallback_counter_excludes_the_wsl_7b_primary_path()
     test_asr_load_gate_verifies_the_tokens_vocab_not_only_the_model()
+    test_snapshot_restore_preserves_live_cloud_consent()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()
