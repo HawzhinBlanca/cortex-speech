@@ -33,3 +33,21 @@ export function isPlaceholderTranscript(text: string | null | undefined): boolea
   const lower = t.toLowerCase();
   return t.startsWith('[ASR unavailable') || t.startsWith('[Pending') || lower === 'n/a' || lower === 'null';
 }
+
+/**
+ * True when a segment carries at least one REAL transcript — a non-empty, non-placeholder string in any of
+ * its transcript fields — i.e. actual content that could ship, not just an ASR placeholder or blanks. Used
+ * to keep "verified" COUNTS honest: batch_verify sets verified=true with NO content guard, so "Verify all
+ * pending" marks a still-pending placeholder clip (awaiting the 7B) as verified — yet export_dataset drops
+ * every placeholder/empty row via the training grade, so a plain `verified` tally over-counts what the
+ * dataset can actually contain. Correct-direction by design: a clip with ANY real transcript is real, so this
+ * never under-counts a genuinely-good clip; it excludes only clips that are placeholder/empty EVERYWHERE.
+ */
+export function hasRealTranscript(
+  seg: Pick<SpeechSegment, 'rawTranscript' | 'normalizedTranscript' | 'annotatedTranscript' | 'verdictTranscript'>,
+): boolean {
+  return [seg.annotatedTranscript, seg.verdictTranscript, seg.normalizedTranscript, seg.rawTranscript].some((t) => {
+    const s = (t ?? '').trim();
+    return s.length > 0 && !isPlaceholderTranscript(s);
+  });
+}

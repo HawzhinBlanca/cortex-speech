@@ -318,6 +318,22 @@ def test_processing_progress_eta_uses_chunk_scoped_elapsed_not_whole_pipeline() 
         )
 
 
+def test_segment_stats_verified_excludes_placeholder_only_rows() -> None:
+    """segmentStats.verified is the dashboard 'verified clips' count. batch_verify (commands/batch.rs) sets
+    verified=true with NO content guard, so 'Verify all pending' marks a still-pending placeholder clip
+    ('[Pending WSL 7B ASR]', awaiting the 7B) as verified — yet export_dataset drops every placeholder/empty row
+    via the training grade. A plain `s.verified` tally therefore OVER-counts what the exported dataset can
+    actually contain (the recurring count-must-exclude-placeholder honesty class). The verified bucket must
+    require real content (hasRealTranscript), counting a verified-but-contentless clip toward neither — like a
+    rejected clip."""
+    src = _read("src/lib/stores/segmentStore.ts")
+    if "s.verified && hasRealTranscript(s)" not in src:
+        raise AssertionError(
+            "segmentStats.verified counts bare `s.verified` rows, including batch-verified placeholders/empties "
+            "the export drops. Gate the verified bucket on `s.verified && hasRealTranscript(s)`."
+        )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -333,6 +349,7 @@ def main() -> None:
     test_speaker_rename_confirms_before_merging_into_an_existing_speaker()
     test_segment_reload_invalidates_the_frozen_search_scope()
     test_processing_progress_eta_uses_chunk_scoped_elapsed_not_whole_pipeline()
+    test_segment_stats_verified_excludes_placeholder_only_rows()
     print("frontend review-guard source policy passed")
 
 

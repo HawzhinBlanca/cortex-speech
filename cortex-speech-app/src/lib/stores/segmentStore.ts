@@ -1,7 +1,7 @@
 import { writable, derived, get } from 'svelte/store';
 import type { SpeechSegment, WordTimestamp } from '../types';
 import * as api from '../commands';
-import { isHumanRejected } from '../segmentQuality';
+import { isHumanRejected, hasRealTranscript } from '../segmentQuality';
 import { dedupeById } from '../dedupeById';
 
 // Fetch the whole library by walking every backend page. Page size is the backend's max (fewest
@@ -213,8 +213,14 @@ export const segmentStats = derived(segments, ($segments) => {
     // neither confirmed-good (verified) nor still-pending, so it counts toward neither bucket.
     if (isHumanRejected(s)) {
       // rejected: excluded from both verified and pending, still part of total
-    } else if (s.verified) {
+    } else if (s.verified && hasRealTranscript(s)) {
       verified++;
+    } else if (s.verified) {
+      // verified=true but NO real transcript — e.g. a placeholder clip ("[Pending WSL 7B ASR]") caught by
+      // "Verify all pending" (batch_verify has no content guard). It can't ship (export_dataset drops every
+      // placeholder/empty row via the training grade), and it is not pending-review (already marked verified),
+      // so — like a rejected clip — it counts toward NEITHER bucket, keeping the "verified" tally aligned with
+      // what the exported dataset can actually contain.
     } else {
       pending++;
     }
