@@ -1492,7 +1492,9 @@ impl ProcessingPipeline {
 
         let mut denoiser_guard = self.lock_denoiser_service();
         if denoiser_guard.is_none() {
-            let model_dir = self.model_manager.resolved_dir();
+            // Per-file (round-26): resolved_dir() is all-or-nothing, so a bundled-only or user-downloaded
+            // denoiser is orphaned once OmniASR flips the root. resolve_root_for loads it from wherever it is.
+            let model_dir = self.model_manager.resolve_root_for(crate::models::DENOISER_MODEL);
             *denoiser_guard = Some(crate::denoiser::DenoiserService::new(&model_dir));
         }
         let denoiser_service =
@@ -1647,7 +1649,8 @@ impl ProcessingPipeline {
 
             let mut denoiser_guard = self.lock_denoiser_service();
             if denoiser_guard.is_none() {
-                let model_dir = self.model_manager.resolved_dir();
+                // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
+                let model_dir = self.model_manager.resolve_root_for(crate::models::DENOISER_MODEL);
                 *denoiser_guard = Some(crate::denoiser::DenoiserService::new(&model_dir));
             }
             let denoiser_service = denoiser_guard

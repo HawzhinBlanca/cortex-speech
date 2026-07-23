@@ -151,6 +151,19 @@ fn resolve_file_in(user_dir: Option<&Path>, bundled_dir: &Path, relative: &str) 
     user_dir.map(|d| d.join(relative)).unwrap_or(bundled)
 }
 
+/// Companion to `resolve_file_in` that returns the ROOT dir (models_dir preferred, else bundled) which
+/// contains `relative`, for callers that pass a models root rather than a file (DenoiserService::new,
+/// denoiser_present). Falls back to `models_dir` when neither has it.
+fn resolve_root_in(models_dir: &Path, bundled_dir: &Path, relative: &str) -> PathBuf {
+    if models_dir.join(relative).exists() {
+        return models_dir.to_path_buf();
+    }
+    if bundled_dir.join(relative).exists() {
+        return bundled_dir.to_path_buf();
+    }
+    models_dir.to_path_buf()
+}
+
 pub struct ModelInfo {
     pub name: &'static str,
     pub filename: &'static str,
@@ -376,6 +389,15 @@ impl ModelManager {
     /// Resolved directory where inference loads ONNX files from.
     pub fn resolved_dir(&self) -> PathBuf {
         resolve_models_dir(&self.models_dir)
+    }
+
+    /// The models ROOT (self.models_dir preferred, else bundled) that actually CONTAINS `relative` —
+    /// PER FILE, so a bundled-only or user-only model isn't orphaned by `resolved_dir()`'s all-or-nothing
+    /// flip (round-26: downloading an OmniASR model into the user dir made the denoiser/aligner/campp,
+    /// which live only in the bundled dir, unreachable via `resolved_dir()`). Falls back to
+    /// `self.models_dir` when neither has it (the writable download target + a sensible not-found path).
+    pub fn resolve_root_for(&self, relative: &str) -> PathBuf {
+        resolve_root_in(&self.models_dir, &bundled_models_dir(), relative)
     }
 
     fn meta_path(&self) -> PathBuf {
@@ -700,13 +722,12 @@ impl ModelManager {
     }
 
     pub fn denoiser_present(&self) -> bool {
-        // Round-23 #3 (review): check the RESOLVED dir — the directory inference actually loads from
-        // (resolve_models_dir falls back to the bundled dir when the user dir lacks OmniASR CTC). The
-        // pipeline constructs DenoiserService from resolved_dir(), so the denoising-provenance flag must
-        // be computed from the same place, or a denoiser present in the user dir but unreachable after
-        // the bundled-dir fallback would still record denoising=true while audio passed through.
-        // GTCRN is ~0.5 MB — see the MODELS entry: a 10 MB floor rejected the correct file.
-        model_file_meets_min_size(&self.resolved_dir(), DENOISER_MODEL, 400_000)
+        // PER-FILE resolve (round-26): the pipeline constructs DenoiserService from the SAME
+        // resolve_root_for(DENOISER_MODEL), so the denoising-provenance flag is computed from exactly the
+        // dir inference loads from — a denoiser in the user dir but not the OmniASR-flipped resolved_dir,
+        // OR a bundled denoiser orphaned once the user downloads OmniASR, is now found (or honestly absent)
+        // rather than mis-flagged. GTCRN is ~0.5 MB — see the MODELS entry: a 10 MB floor rejected it.
+        model_file_meets_min_size(&self.resolve_root_for(DENOISER_MODEL), DENOISER_MODEL, 400_000)
     }
 
     /// Whether the denoiser model can ACTUALLY load, not merely exist on disk. This — not
@@ -717,7 +738,7 @@ impl ModelManager {
     /// presence would be exactly the provenance lie `is_active`'s contract forbids. Constructs the service
     /// once from the same resolved dir + GPU→CPU fallback the pipeline uses, and reports whether it loaded.
     pub fn denoiser_loadable(&self) -> bool {
-        crate::denoiser::DenoiserService::new(&self.resolved_dir()).is_active()
+        crate::denoiser::DenoiserService::new(&self.resolve_root_for(DENOISER_MODEL)).is_active()
     }
 
     /// Download the GTCRN denoiser ONNX (a single direct file, not an archive) and verify it against
@@ -1626,6 +1647,40 @@ mod tests {
         );
         // No user dir set -> the bundled path.
         assert_eq!(resolve_file_in(None, bundled.path(), "missing.onnx"), bundled.path().join("missing.onnx"));
+    }
+
+    #[test]
+    fn resolve_root_in_prefers_models_then_falls_back_to_bundled() {
+        // Round-26: a user who downloaded OmniASR (flipping resolved_dir to the user dir) must still reach a
+        // bundled-only model root (denoiser/aligner/campp); and a model downloaded into the user dir must be
+        // found there so the post-download check passes AND the pipeline loads it. resolve_root_in's logic is
+        // path-agnostic, so a root-level marker exercises the same branches (a subdir file hits a Windows
+        // write-then-exists() timing artifact unrelated to the logic).
+        fn write_and_confirm(path: &Path, bytes: &[u8]) {
+            std::fs::write(path, bytes).unwrap();
+            for _ in 0..500 {
+                if path.exists() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            panic!("file not visible after write: {}", path.display());
+        }
+        let models = tempfile::tempdir().expect("models tmp");
+        let bundled = tempfile::tempdir().expect("bundled tmp");
+        write_and_confirm(&bundled.path().join("marker.onnx"), b"bundled");
+
+        // Only in bundled (the orphan case) -> resolves to the bundled root, not lost.
+        assert_eq!(
+            resolve_root_in(models.path(), bundled.path(), "marker.onnx"),
+            bundled.path().to_path_buf(),
+            "a bundled-only model root must NOT be orphaned"
+        );
+        // Present in the models (user) dir -> that root wins.
+        write_and_confirm(&models.path().join("marker.onnx"), b"user");
+        assert_eq!(resolve_root_in(models.path(), bundled.path(), "marker.onnx"), models.path().to_path_buf());
+        // Absent in both -> the writable models dir (download target + not-found path).
+        assert_eq!(resolve_root_in(models.path(), bundled.path(), "missing.onnx"), models.path().to_path_buf());
     }
 
     fn create_minimal_300m_model_pair(model_dir: &Path) {
