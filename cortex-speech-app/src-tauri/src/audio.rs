@@ -1000,7 +1000,10 @@ pub fn voice_activity_detection(pcm: &[i16], sample_rate: u32, threshold: f32) -
     }
 
     crate::models::init_ort_dylib_path();
-    let model_path = crate::models::active_models_dir().join("silero_vad_v4.onnx");
+    // Per-file resolve (user dir, else bundled) — NOT active_models_dir().join: the latter is
+    // all-or-nothing, so once the user downloads any OmniASR model into the user dir, the bundled-only
+    // Silero VAD is orphaned and VAD silently drops to the energy fallback (round-26 hunt).
+    let model_path = crate::models::resolve_model_file("silero_vad_v4.onnx");
 
     if model_path.exists() {
         // Use a cached ONNX session AND state_dims across `voice_activity_detection`

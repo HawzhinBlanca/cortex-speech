@@ -125,6 +125,32 @@ pub fn resolve_models_dir(user_dir: &Path) -> PathBuf {
     user_dir.to_path_buf()
 }
 
+/// Resolve a single model file PER FILE, preferring the user models dir but falling back to the bundled
+/// dir when the file is absent there. `resolve_models_dir`/`active_models_dir` are ALL-OR-NOTHING — the
+/// presence of ANY OmniASR model in the user dir flips the WHOLE model root to it, so a bundled-only
+/// sibling that a user download never places in the user dir (Silero VAD, denoiser, campp, aligner) is
+/// silently orphaned — e.g. downloading OmniASR-CTC-1B makes the neural VAD unreachable and segmentation
+/// drops to the energy fallback with no error. Per-file resolution fixes that: a user's copy wins if
+/// present, else the bundled copy. Falls back to the user path when neither exists (so a caller's
+/// not-found error points at the writable dir).
+pub fn resolve_model_file(relative: &str) -> PathBuf {
+    resolve_file_in(USER_MODELS_DIR.get().map(|d| d.as_path()), &bundled_models_dir(), relative)
+}
+
+fn resolve_file_in(user_dir: Option<&Path>, bundled_dir: &Path, relative: &str) -> PathBuf {
+    if let Some(user_dir) = user_dir {
+        let candidate = user_dir.join(relative);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    let bundled = bundled_dir.join(relative);
+    if bundled.exists() {
+        return bundled;
+    }
+    user_dir.map(|d| d.join(relative)).unwrap_or(bundled)
+}
+
 pub struct ModelInfo {
     pub name: &'static str,
     pub filename: &'static str,
@@ -1557,6 +1583,49 @@ mod tests {
         std::fs::write(user_dir.join(OMNIASR_CTC_300M_TOKENS), b"tokens").expect("truncated tokens");
 
         assert_ne!(resolve_models_dir(&user_dir), user_dir);
+    }
+
+    #[test]
+    fn resolve_file_in_prefers_user_then_falls_back_to_bundled_per_file() {
+        // Round-26 hunt: a bundled-only sibling (Silero VAD) must NOT be orphaned just because the user
+        // downloaded an OmniASR model into the user dir. Per-file resolution: user copy wins if present,
+        // else the bundled copy, else the user path (so a not-found error points at the writable dir).
+        // write_and_confirm settles a Windows write-then-exists() timing artifact (exists() can read
+        // false immediately after fs::write under AV/temp load) so the code-under-test sees the file; in
+        // production the model files are written long before resolution, so this is a test-only concern.
+        fn write_and_confirm(path: &Path, bytes: &[u8]) {
+            std::fs::write(path, bytes).unwrap();
+            for _ in 0..500 {
+                if path.exists() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            panic!("file not visible after write: {}", path.display());
+        }
+        let user = tempfile::tempdir().expect("user tmp");
+        let bundled = tempfile::tempdir().expect("bundled tmp");
+        write_and_confirm(&bundled.path().join("silero_vad_v4.onnx"), b"vad");
+
+        // Only in bundled (the exact orphan case) -> resolves to bundled, NOT lost.
+        assert_eq!(
+            resolve_file_in(Some(user.path()), bundled.path(), "silero_vad_v4.onnx"),
+            bundled.path().join("silero_vad_v4.onnx"),
+            "a bundled-only file must fall back to the bundled dir"
+        );
+        // Present in the user dir -> user copy wins.
+        write_and_confirm(&user.path().join("silero_vad_v4.onnx"), b"user-vad");
+        assert_eq!(
+            resolve_file_in(Some(user.path()), bundled.path(), "silero_vad_v4.onnx"),
+            user.path().join("silero_vad_v4.onnx")
+        );
+        // Absent in both -> the user path (for a writable-dir error message).
+        assert_eq!(
+            resolve_file_in(Some(user.path()), bundled.path(), "missing.onnx"),
+            user.path().join("missing.onnx")
+        );
+        // No user dir set -> the bundled path.
+        assert_eq!(resolve_file_in(None, bundled.path(), "missing.onnx"), bundled.path().join("missing.onnx"));
     }
 
     fn create_minimal_300m_model_pair(model_dir: &Path) {
