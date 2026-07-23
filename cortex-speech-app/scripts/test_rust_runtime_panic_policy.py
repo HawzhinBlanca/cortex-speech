@@ -1115,6 +1115,28 @@ def test_pipeline_wsl_subprocess_send_failures_are_reported() -> None:
         raise AssertionError(f"pipeline.rs must keep observable WSL subprocess send handling:\n{formatted}")
 
 
+def test_wsl_import_pass_does_not_roll_back_the_file_on_a_benign_empty_result() -> None:
+    """run_primary_wsl_pass_for_import calls self.transcribe(), which converts a legit-but-EMPTY 7B result
+    (a silent/music/noise chunk — parse_wsl_segment_result returns Ok("")) into an Err so the re-transcribe
+    IPCs never blank-overwrite a stored transcript. But the IMPORT pass also routes through transcribe(), and
+    for it an empty result is NOT an infra failure — the Ok-arm usable=false path already escalates only that
+    one segment. If the Err arm can't tell the empty-result Err from a real "server down" Err, it sets
+    infra_failure=true and delete_segments_batch rolls back the ENTIRE file (discarding the good transcripts of
+    its other chunks) on the owner's PRIMARY import engine, and reports a false "server is not running". The
+    Err arm MUST route the WSL_7B_EMPTY_RESULT_MARKER error to the non-infra escalate path. Runtime needs a
+    full pipeline + WSL server + a non-speech clip, so source-pinned (found by adversarial hunt-8)."""
+    pipeline = pipeline_surface()
+    if 'WSL_7B_EMPTY_RESULT_MARKER: &str = "WSL 7B returned an empty transcript"' not in pipeline:
+        raise AssertionError("the WSL_7B_EMPTY_RESULT_MARKER constant (produced by transcribe's empty-result Err) is gone")
+    if "contains(WSL_7B_EMPTY_RESULT_MARKER)" not in pipeline:
+        raise AssertionError(
+            "the WSL-7B import pass no longer distinguishes a benign EMPTY 7B result from an infra failure — "
+            "one silent/music/noise chunk would set infra_failure=true and roll back the WHOLE file (discarding "
+            "its other chunks' good transcripts). The Err arm must check `msg.contains(WSL_7B_EMPTY_RESULT_MARKER)`"
+            " and route an empty result to the non-infra escalate path (infra_failure=false)."
+        )
+
+
 def test_probe_wsl_7b_server_reaps_child_on_wait_error() -> None:
     """probe_wsl_7b_server polls child.try_wait() in a loop; on a wait-status error its Err arm must
     reap the child (kill_and_reap_wsl_child) before returning false — exactly like the sibling
@@ -2129,6 +2151,7 @@ def main() -> None:
     test_audio_decode_worker_send_failures_are_reported()
     test_audio_decode_reset_required_fails_loud_not_silent_truncation()
     test_pipeline_wsl_subprocess_send_failures_are_reported()
+    test_wsl_import_pass_does_not_roll_back_the_file_on_a_benign_empty_result()
     test_probe_wsl_7b_server_reaps_child_on_wait_error()
     test_aligner_score_consistency_caps_clip_and_dp()
     test_finish_import_clears_cancel_token_before_opening_the_gate()

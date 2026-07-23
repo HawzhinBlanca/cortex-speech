@@ -288,6 +288,14 @@ static WSL_7B_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// drift (a mismatch would even green-light the preflight against the wrong service).
 pub(crate) const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.py
 
+/// Stable marker in the Err that `transcribe()` returns for a legit-but-EMPTY 7B result — a REACHABLE
+/// server that produced no words (a silent/music/noise clip), which parse_wsl_segment_result surfaces as
+/// Ok(""). transcribe() converts that to an Err so the re-transcribe IPCs never blank-overwrite a stored
+/// transcript; but the IMPORT pass also routes through transcribe(), and for it an empty result is NOT an
+/// infra failure — it must escalate only that one segment, never roll back the whole file. The import pass
+/// matches this marker to tell a benign empty apart from a real "server down / client exited non-zero" error.
+pub(crate) const WSL_7B_EMPTY_RESULT_MARKER: &str = "WSL 7B returned an empty transcript";
+
 /// Machine-readable sentinel embedded in every "the OmniASR-7B champion is the selected primary
 /// engine but it is unavailable / failed" error. The frontend matches on this token to offer the
 /// user an EXPLICIT choice — retry the champion once its server is up, or transcribe this one clip
@@ -2259,17 +2267,30 @@ impl ProcessingPipeline {
                         infra_failure = false;
                     }
                     Err(error) => {
-                        // The client exited non-zero: server not running / unreachable / hung / errored.
-                        // Fatal for a force-7B import. A 5-minute per-attempt timeout means the server is
-                        // HUNG, not transiently flaky — another full-timeout attempt only triples the
-                        // stall, so stop fast. Quick failures (connection refused) still retry briefly in
-                        // case the server is mid-launch.
                         let msg = error.to_string();
-                        let hung = msg.contains("timed out");
-                        last_problem = Some(msg);
-                        infra_failure = true;
-                        if hung {
-                            break;
+                        if msg.contains(WSL_7B_EMPTY_RESULT_MARKER) {
+                            // A legit-but-EMPTY 7B result reaches here as an Err ONLY because transcribe()
+                            // converts Ok("") -> Err to stop the re-transcribe IPCs from blank-overwriting a
+                            // stored transcript. For the IMPORT pass that is NOT an infrastructure failure —
+                            // the server is reachable and simply produced no words for a silent/music/noise
+                            // chunk. Treat it EXACTLY like the Ok-arm usable=false path: escalate only THIS
+                            // segment after retries, never roll the whole file back (which would discard the
+                            // good transcripts already computed for the file's other chunks). Two in-code
+                            // contracts (parse_wsl_segment_result + the Ok-arm comment) require this.
+                            last_problem = Some("7B returned an empty transcript".to_string());
+                            infra_failure = false;
+                        } else {
+                            // The client exited non-zero: server not running / unreachable / hung / errored.
+                            // Fatal for a force-7B import. A 5-minute per-attempt timeout means the server is
+                            // HUNG, not transiently flaky — another full-timeout attempt only triples the
+                            // stall, so stop fast. Quick failures (connection refused) still retry briefly in
+                            // case the server is mid-launch.
+                            let hung = msg.contains("timed out");
+                            last_problem = Some(msg);
+                            infra_failure = true;
+                            if hung {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2730,9 +2751,9 @@ impl ProcessingPipeline {
                 // the import path which retries/escalates for exactly this transient. Surface it as the
                 // retry-or-offline 7B failure the tag above promises, leaving the existing transcript intact.
                 if raw_transcript.trim().is_empty() {
-                    return Err(tag_7b_unavailable(AppError::Other(
-                        "WSL 7B returned an empty transcript (the server is likely under load); the existing transcript is left unchanged".into(),
-                    )));
+                    return Err(tag_7b_unavailable(AppError::Other(format!(
+                        "{WSL_7B_EMPTY_RESULT_MARKER} (the server is likely under load); the existing transcript is left unchanged"
+                    ))));
                 }
 
                 let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
