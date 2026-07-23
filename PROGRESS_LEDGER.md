@@ -7929,3 +7929,37 @@ QUEUE (hunt-117; hand-verify each against source BEFORE fixing):
 - [LOW] eval.rs:885 — label-quality lift micro-CER folds empty-normalized-ref rows into the numerator only. ← next
 - [LOW] ProcessingProgress.svelte:49 — ETA extrapolated from whole-pipeline elapsed vs chunk-scope done/total (wildly wrong early).
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+## 2026-07-23T09:05Z — iter 121 — label-quality lift micro-CER empty-ref inflation (LOW honesty) fixed (5bf1665)
+
+**Fixed the queued LOW metric-inflation. Hand-verified against char_edit_distance + every sibling micro site.**
+
+**eval.rs compute_label_quality_lift — an empty-normalizing reference pegged both engines' micro-CER + CI to a
+fabricated 1.0 (LOW, honesty; 5bf1665).** Hand-verified: the inner `micro` closure sums each segment's
+(ref_len, raw_dist, jury_dist) into ref_chars / raw_d / jury_d and guards ONLY the grand total
+(`if ref_chars == 0`). char_edit_distance (wer.rs) normalizes both sides via normalize_for_metrics and, for a
+reference that reduces to empty, returns ref_len=0 with distance = the hypothesis char count ("honest insertion
+count for micro aggregation" — the caller MUST exclude it). So a row whose reference normalizes to empty (a
+diacritics-only / invisible-only annotation that passes load_lift_triples' TRIM<>'' filter) contributes its
+raw/jury insertions to the numerators while adding 0 to the denominator — one such row over the zero denominator
+pegs raw_micro_cer = jury_micro_cer = 1.0 and the bootstrap CI to match, even when the only SCOREABLE reference
+matched perfectly (fabricated 100% CER on both engines). This was the LONE unguarded micro site: run_gold_eval
+(eval.rs:613-620), load_eval_run_and_recompute (:765-772), scorecard::word_breakdown_aggregate, and
+significance::micro_rate all filter ref_len>0 per-segment.
+
+Fix: skip per[i] where ref_len==0 in the micro closure (both numerator and denominator), matching the siblings.
+Fail-before verified: with the guard neutralized, the new test (one perfect "hello" row + one diacritics-only-ref
+row) reported raw_micro_cer=1; passes after (0). Fixture asserts the diacritics-only reference actually
+normalizes to an empty metric reference (precondition). Existing lift tests all still green.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 985 passed / 0 failed / 6 ignored** (was 984, +1),
+**35/35 python policies**.
+
+**Score: 83 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 1 hunt-queued (LOW) + 1 deferred-large + 1
+enhancement.** Owner-gated finish line unchanged.
+
+QUEUE (hunt-117; hand-verify against source BEFORE fixing):
+- [LOW] ProcessingProgress.svelte:49 — ETA extrapolated from whole-pipeline elapsed vs chunk-scope done/total (wildly wrong early). ← next (last hunt-117 survivor)
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
