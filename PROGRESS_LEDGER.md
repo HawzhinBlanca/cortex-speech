@@ -7673,3 +7673,37 @@ QUEUE (hand-verify each against source BEFORE fixing):
 - [MED] SearchBar.svelte:74 — active FTS search freezes the match id-set; a refine/import reload silently drops or keeps the wrong rows.
 - DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (Command-snapshot of child tables + archive-delta reversal; focused session).
 - ENHANCEMENT (not a bug): undo-able speaker rename (RenameSpeaker command).
+
+---
+
+## 2026-07-23T06:05Z — iter 114 — energy-VAD fallback dropped short words (MEDIUM) fixed (4d07087)
+
+**Fixed the queued MEDIUM audio.rs VAD floor mismatch. Hand-verified the frame math + the Silero baseline.**
+
+**audio.rs vad_energy_fallback — the fallback silently dropped 96-300ms utterances Silero keeps (MEDIUM,
+data-loss; 4d07087).** Hand-verified: vad_energy_fallback (audio.rs:1091) uses hop_size=160 (10ms/hop at 16 kHz)
+and min_speech_frames=30 (~300ms), discarding any contiguous speech run shorter than that (the mid-file push at
+1140 and the tail push at 1150 are both skipped). But the primary SILERO path was deliberately lowered to
+min_speech_frames=3 (~96ms) in Round-24 #6 ("the old 480ms floor silently DROPPED any real short word e.g.
+بەڵێ/yes"). The fallback was never updated to match, so whenever it runs — silero_vad_v4.onnx absent (fresh
+install before model download, deleted model, or a transient Silero/ONNX error falling through to the
+line-~1088 fallback) — a 96-300ms interjection is classified as a <30-frame run and dropped: the audio span
+never becomes a segment and is absent from the produced/exported dataset. The identical file with Silero present
+keeps it. Live path, reachable.
+
+Fix: lowered the fallback floor to min_speech_frames=9 (~90ms, ≤ Silero's ~96ms) so the fallback never drops a
+run the primary VAD would retain. Fail-before verified: the new test (a ~150ms burst flanked by silence) FAILED
+with the 300ms floor — the burst was dropped and the fallback collapsed to the whole buffer — and passes with
+the corrected floor (the burst is kept as its own sub-segment).
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 981 passed / 0 failed / 6 ignored** (was 980, +1),
+**35/35 python policies**.
+
+**Score: 76 fixed + 1 cleanup, ~27 refuted, 2 measure-deferred, 3 queued + 1 deferred-large.** Owner-gated finish
+line unchanged.
+
+QUEUE (hand-verify each against source BEFORE fixing):
+- [MED] pipeline.rs:112 — loop0_would_fire counts whitespace-only normalization as a memory firing, inflating a metric. ← next
+- [MED] SearchBar.svelte:74 — active FTS search freezes the match id-set; a refine/import reload silently drops or keeps the wrong rows.
+- DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (Command-snapshot of child tables + archive-delta reversal; focused session).
+- ENHANCEMENT (not a bug): undo-able speaker rename (RenameSpeaker command).
