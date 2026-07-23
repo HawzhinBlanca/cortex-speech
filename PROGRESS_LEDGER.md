@@ -8887,14 +8887,34 @@ stable 3× standalone + in the full suite before shipping).
 Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 993 passed / 0 failed**;
 **python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD 922f87c, lock free.
 
-**Score: 107 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 10 hunt-queued + 1 deferred-large + 1 enhancement.**
+---
+
+### Iteration 147 — 2026-07-23 — FIX #108: missing-audio segment leaked a holdout gold reference into the export (fail-open → fail-closed)
+
+**Class: holdout-leak / eval-on-train contamination (honesty).** Hand-verified: `exclude_holdout_segments`
+(export.rs:264-300) filters holdout gold clips out of the plain JSON/JSONL/CSV/Parquet export. In the
+content-hash branch (reached only when a content-hash holdout is registered), a candidate whose audio file
+is MISSING hit `if !path.exists() { return false; }` — fail-OPEN, keeping it. A missing file can't be
+re-hashed to prove it isn't the same content as a holdout gold clip re-imported at a DIFFERENT path (the
+exact-path check would miss that), so its transcript — possibly the holdout gold reference — leaked into the
+training export: silent contamination inflating the WER/CER the promotion gate measures against. The sibling
+present-but-unhashable `Err` case just below already failed CLOSED for this exact risk; the missing-file case
+was the inconsistent gap.
+
+Fix: fail CLOSED (exclude) on a missing file too, mirroring the Err case + the fail-closed DPO/LM-corpus
+guards in jury/learning.rs. Fail-before: `exclude_holdout_excludes_a_missing_audio_segment_fail_closed` —
+reverting to return false keeps the leaked segment. (Setup settles a Windows write-then-read timing artifact
++ asserts the holdout-hash precondition; confirmed stable 4× standalone + full suite before shipping.)
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 994 passed / 0 failed**;
+**python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD f080306, lock free.
+
+**Score: 108 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 9 hunt-queued + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged. NOTE: the **aligner (pipeline.rs:3266) + campp/SpeakerEmbedding
 (pipeline.rs:3398)** share the same all-or-nothing `resolved_dir()` orphaning — now a one-liner each via
 `resolve_root_for`; queued below.
 
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
-- [MED] export.rs:272 — exclude_holdout_segments fails OPEN for a missing-audio segment → holdout gold
-  reference leaks into the plain export (eval-on-train contamination; sibling Err-case at :285 fails closed).
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
 - [MED] chunking.rs:373 — slice_pcm_by_alignment returns the WHOLE file for a chunk when alignment_json is
