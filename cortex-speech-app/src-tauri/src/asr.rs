@@ -285,18 +285,28 @@ impl KurdishAsrService {
             return Ok(Self::new_unavailable());
         }
 
-        // Runtime integrity gate (M2.3): recompute the on-disk model SHA-256 and refuse to build
-        // a recognizer if it does not match the pinned digest. A missing model degrades gracefully
-        // (handled above); a TAMPERED/wrong model is a hard error, not silent acceptance.
-        let model_pin = match config.model_size {
-            AsrModelSize::CTC300M => Some(crate::models::OMNIASR_CTC_300M_MODEL),
-            AsrModelSize::CTC1B => Some(crate::models::OMNIASR_CTC_1B_MODEL),
-            AsrModelSize::WSL7B => None, // no pinned digest for this size -> cannot verify
+        // Runtime integrity gate (M2.3): recompute the on-disk SHA-256 and refuse to build a recognizer if
+        // it does not match the pinned digest. A missing file degrades gracefully (handled above); a
+        // TAMPERED/wrong file is a hard error, not silent acceptance. Verify BOTH the model weights AND the
+        // tokens.txt vocab — the CTC index->grapheme map is equally load-bearing for output correctness and
+        // equally pinned (OMNIASR_CTC_*_TOKENS). A tampered/swapped same-line-count tokens file still builds
+        // a recognizer but decodes every clip to the WRONG graphemes, persisted as trustworthy, so it must
+        // fail the same gate as a tampered ONNX.
+        let (model_pin, tokens_pin) = match config.model_size {
+            AsrModelSize::CTC300M => {
+                (Some(crate::models::OMNIASR_CTC_300M_MODEL), Some(crate::models::OMNIASR_CTC_300M_TOKENS))
+            }
+            AsrModelSize::CTC1B => {
+                (Some(crate::models::OMNIASR_CTC_1B_MODEL), Some(crate::models::OMNIASR_CTC_1B_TOKENS))
+            }
+            AsrModelSize::WSL7B => (None, None), // no pinned digest for this size -> cannot verify
         };
-        if let Some(pin) = model_pin {
-            if let Err(e) = crate::models::verify_model_path_runtime(&model_path, pin) {
-                tracing::error!("ASR model integrity check failed: {e}");
-                return Err(e);
+        for (path, pin) in [(&model_path, model_pin), (&tokens_path, tokens_pin)] {
+            if let Some(pin) = pin {
+                if let Err(e) = crate::models::verify_model_path_runtime(path, pin) {
+                    tracing::error!("ASR model integrity check failed: {e}");
+                    return Err(e);
+                }
             }
         }
 

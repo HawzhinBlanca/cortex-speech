@@ -1820,6 +1820,36 @@ def test_finetuned_fallback_counter_excludes_the_wsl_7b_primary_path() -> None:
         )
 
 
+def test_asr_load_gate_verifies_the_tokens_vocab_not_only_the_model() -> None:
+    """KurdishAsrService::new_with_config runtime-verifies the model.int8.onnx SHA-256 (M2.3 charter: "a
+    tampered ONNX fails the runtime manifest check") but the CTC tokens.txt — the index->grapheme map, equally
+    load-bearing for output correctness and equally pinned (OMNIASR_CTC_*_TOKENS carry real SHAs in MODELS) —
+    was set straight into the recognizer WITHOUT verification. A tampered/swapped same-line-count tokens.txt
+    still builds a recognizer (OfflineRecognizer::create succeeds) but decodes every clip to the WRONG Kurdish
+    graphemes, persisted at the fixed heuristic confidence and exported as trustworthy, with no gate flagging
+    it. The load gate must verify_model_path_runtime the tokens path too. Exercising it end-to-end needs the
+    real ~50MB ONNX (and must not tamper the real install), so it is source-pinned."""
+    asr = (REPO_ROOT / "src-tauri" / "src" / "asr.rs").read_text(encoding="utf-8")
+    start = asr.find("pub fn new_with_config(")
+    if start == -1:
+        raise AssertionError("new_with_config not found in asr.rs — this gate would pass vacuously")
+    rest = asr[start + 10 :]
+    end = len(rest)
+    for marker in ("\n    pub fn ", "\n    fn "):
+        idx = rest.find(marker)
+        if idx != -1:
+            end = min(end, idx)
+    body = rest[:end]
+    if "verify_model_path_runtime" not in body:
+        raise AssertionError("new_with_config no longer runtime-verifies any model file — gate vacuous")
+    if "OMNIASR_CTC_300M_TOKENS" not in body or "OMNIASR_CTC_1B_TOKENS" not in body:
+        raise AssertionError(
+            "new_with_config verifies the model weights but NOT tokens.txt — a tampered/swapped tokens vocab "
+            "(same line count) builds a recognizer that decodes to the wrong graphemes with no integrity gate. "
+            "verify_model_path_runtime the tokens path against OMNIASR_CTC_300M_TOKENS / OMNIASR_CTC_1B_TOKENS too."
+        )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -1865,6 +1895,7 @@ def main() -> None:
     test_optin_transcribe_commands_reject_a_blank_decode()
     test_pipeline_wsl_retranscribe_rejects_an_empty_result()
     test_finetuned_fallback_counter_excludes_the_wsl_7b_primary_path()
+    test_asr_load_gate_verifies_the_tokens_vocab_not_only_the_model()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()
