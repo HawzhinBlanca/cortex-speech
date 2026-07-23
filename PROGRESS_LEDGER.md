@@ -7858,3 +7858,40 @@ QUEUE (hunt-117; hand-verify each against source BEFORE fixing):
 - [LOW] eval.rs:885 — label-quality lift micro-CER folds empty-normalized-ref rows into the numerator only.
 - [LOW] ProcessingProgress.svelte:49 — ETA extrapolated from whole-pipeline elapsed vs chunk-scope done/total (wildly wrong early).
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+## 2026-07-23T08:15Z — iter 119 — ASR load gate didn't verify tokens.txt (MEDIUM integrity) fixed (a94687d)
+
+**Fixed the queued MEDIUM model-integrity gap. Hand-verified the gate + the pins.**
+
+**asr.rs KurdishAsrService::new_with_config — the runtime integrity gate verified model.int8.onnx but NEVER
+tokens.txt (MEDIUM, integrity/honesty; a94687d).** Hand-verified: new_with_config computes model_pin
+(OMNIASR_CTC_300M_MODEL / _1B_MODEL) and calls verify_model_path_runtime on the MODEL file (asr.rs:296-301),
+but the tokens_path (:276) is set into rec_config.model_config.tokens (:308) with NO verification. tokens.txt
+has its OWN pinned SHA-256 in MODELS (real, non-empty: a7a044…, entries at models.rs:163-186) checked only at
+download/extract, never at load — and it is the CTC index→grapheme map, as load-bearing for output correctness
+as the weights. verify_model_path_runtime returns Ok on an empty pin (safe) and really compares a pinned file,
+so it works for tokens. A tampered/swapped SAME-LINE-COUNT tokens.txt still builds a recognizer
+(OfflineRecognizer::create succeeds) but decodes every clip to the WRONG Kurdish graphemes, persisted at the
+fixed heuristic confidence and exported as trustworthy — the exact tampered-model class M2.3 defends the .onnx
+against, but not its vocab. (check_model_integrity at :232 is a separate SIZE-only diagnostic over the DEV
+models dir, not the load gate.)
+
+Fix: compute (model_pin, tokens_pin) together and loop verify_model_path_runtime over BOTH model_path and
+tokens_path (WSL7B → both None, unchanged). Fail-before verified via source policy (the load path needs the real
+~50MB ONNX and must not tamper the owner's install, so source-pinned in test_rust_runtime_panic_policy.py — same
+rationale the finetuned/F2 gates use). All existing asr load-path tests (model present/absent/truncated
+fallback) still green — the tokens gate doesn't disturb them.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 983 passed / 0 failed / 6 ignored**, **35/35 python
+policies**.
+
+**Score: 81 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 3 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-117; hand-verify each against source BEFORE fixing):
+- [LOW] jury/learning.rs:238 — export_lm_corpus can emit an ASR placeholder as human-confirmed LM training text (honesty/poisoning). ← next
+- [LOW] eval.rs:885 — label-quality lift micro-CER folds empty-normalized-ref rows into the numerator only.
+- [LOW] ProcessingProgress.svelte:49 — ETA extrapolated from whole-pipeline elapsed vs chunk-scope done/total (wildly wrong early).
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
