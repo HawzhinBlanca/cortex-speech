@@ -8597,3 +8597,34 @@ QUEUE (hunt-135 survivors remaining):
 - [MED] constrained_decode.rs:157 — run_constrained skips the SHA-256 pin the default path enforces.
 - [LOW] audio.rs:163 — check_audio duration_ms=0 for a valid VBR MP3 without a Xing header.
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+### Iteration 138 — 2026-07-23 — FIX #100: batch_processor deleted segments with a good existing transcript on an empty re-transcription
+
+**Class: blank-overwrite data-loss (DELETE variant; 3rd sibling of the class this hunt).** Hand-verified:
+the headless `batch_processor` selects ALL unverified segments (`get_segments(Some(false))`, line 40) and
+prunes any it can't transcribe — four `to_delete.push` sites: unsliceable window (114), silent clip (119),
+empty ASR text (146), empty normalized (153). Correct for FRESH placeholders (VAD false-positives), but a
+segment already holding a good UNVERIFIED draft (e.g. a stronger WSL-7B `jury_accept` draft) is ALSO in the
+set, so a legitimate `Ok("")` from the weaker offline CTC engine on a quiet clip DELETED it + its
+transcript. The authors guarded ASR runtime ERRORS (fail-loudly, 125-142) but not a valid empty result.
+
+Fix (root-cause, all four sites): compute `has_existing_transcript` once (raw OR human annotation,
+non-empty AND non-placeholder via `is_placeholder_transcript`) and guard every `to_delete.push` — a
+segment with a real transcript is KEPT; fresh placeholders still get pruned. Fail-before: source policy
+`test_batch_processor_never_deletes_a_segment_with_an_existing_transcript` asserts guards ≥ delete sites;
+unguarding one fails it (4 deletes vs 3 guards).
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean (all-targets incl. the bin); **`cargo test
+--lib` 989 passed / 0 failed**; **python policies 38 scripts passed**. Reality check pre-work: exe not
+running, git clean, HEAD 7e66b84, lock free.
+
+**Score: 100 fixed + 1 cleanup, ~33 refuted, 2 measure-deferred, 3 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged. **Milestone: 100 hand-verified, fail-before-gated defects fixed this month-loop.**
+
+QUEUE (hunt-135 survivors remaining):
+- [MED] eval.rs:174 — create_gold_from_verified_file joins a placeholder draft into the permanent gold reference. ← next
+- [MED] constrained_decode.rs:157 — run_constrained skips the SHA-256 pin the default path enforces.
+- [LOW] audio.rs:163 — check_audio duration_ms=0 for a valid VBR MP3 without a Xing header.
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
