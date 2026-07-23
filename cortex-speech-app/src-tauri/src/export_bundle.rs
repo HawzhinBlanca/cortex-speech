@@ -391,7 +391,10 @@ pub fn export_dataset_bundle(
         "agentStageEventCount": agent_stage_event_count,
         "longFileDossierCount": long_file_dossier_count,
         "totalDurationMs": total_duration_ms,
-        "runConfig": crate::runs::config_from_settings(settings, model_manager.denoiser_present()),
+        // Provenance: pass the ACTUAL denoiser loadability (is_active), NOT mere on-disk presence — a
+        // present-but-unloadable model leaves audio un-denoised, so denoiser_present() would record a false
+        // denoising=true (see ModelManager::denoiser_loadable + DenoiserService::is_active's contract).
+        "runConfig": crate::runs::config_from_settings(settings, model_manager.denoiser_loadable()),
         "validation": {
             "blocked": validation_gate.blocked,
             "errors": validation_gate.error_count,

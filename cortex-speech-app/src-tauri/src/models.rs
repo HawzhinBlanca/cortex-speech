@@ -683,6 +683,17 @@ impl ModelManager {
         model_file_meets_min_size(&self.resolved_dir(), DENOISER_MODEL, 400_000)
     }
 
+    /// Whether the denoiser model can ACTUALLY load, not merely exist on disk. This — not
+    /// `denoiser_present()` — is the honest input to the `denoising` run-config provenance flag: a
+    /// present-but-unloadable GTCRN model (onnxruntime opset/EP incompatibility, provider init failure on
+    /// both GPU and CPU) leaves audio un-denoised (`DenoiserService::is_active()==false`, a silent
+    /// pass-through the pipeline warns about at pipeline.rs:1780), so recording `denoising=true` from mere
+    /// presence would be exactly the provenance lie `is_active`'s contract forbids. Constructs the service
+    /// once from the same resolved dir + GPU→CPU fallback the pipeline uses, and reports whether it loaded.
+    pub fn denoiser_loadable(&self) -> bool {
+        crate::denoiser::DenoiserService::new(&self.resolved_dir()).is_active()
+    }
+
     /// Download the GTCRN denoiser ONNX (a single direct file, not an archive) and verify it against
     /// its pinned SHA-256 before placing it as `denoiser/model.onnx`.
     pub fn download_denoiser(&self, progress_cb: impl Fn(f32)) -> Result<(), String> {
