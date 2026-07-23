@@ -50,6 +50,13 @@ function createSegmentsStore() {
         // keyed {#each} consumers (each_key_duplicate) and double-count stats — dedupe is the fix at
         // the SOURCE (keep-first preserves page order); VirtualList's own dedupe stays as belt-and-braces.
         set(dedupeById(acc));
+        // A reload replaces every row, so an ACTIVE FTS search's frozen match-id set (computed against the
+        // PRE-reload library) is now stale: applySearchScope would keep filtering the fresh rows by it —
+        // hiding clips whose refined transcript newly matches the query and keeping ones that no longer do,
+        // in BOTH the curate filter and the review queue, until the user retypes. Drop the snapshot so the
+        // scope falls back to applySearchScope's LIVE substring predicate until the next keystroke re-runs
+        // FTS (this is the "reloads fire while filters are active" case documented above).
+        if (get(searchResults) !== null) searchResults.set(null);
         libraryTotal.set(total);
         const truncated = acc.length < total;
         libraryTruncated.set(truncated);

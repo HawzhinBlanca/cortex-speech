@@ -273,6 +273,29 @@ def test_speaker_rename_confirms_before_merging_into_an_existing_speaker() -> No
         )
 
 
+def test_segment_reload_invalidates_the_frozen_search_scope() -> None:
+    """applySearchScope filters the LIVE segments by the FROZEN id-set of the last FTS searchResults. A full
+    segments reload (segments.load(), fired on import/batch/refine completion — the store's own comment notes
+    "reloads fire while filters are active") replaces every row, so that frozen set is stale: a clip whose
+    refined transcript now matches the query has an id absent from the set (never shown), while one that no
+    longer matches stays in it (still shown) — in BOTH the curate filter and the review queue, until the user
+    retypes. load() must invalidate searchResults on reload so the scope falls back to applySearchScope's LIVE
+    substring predicate (the searchResults===null branch) instead of a stale FTS snapshot."""
+    src = _read("src/lib/stores/segmentStore.ts")
+    anchor = "set(dedupeById(acc));"
+    idx = src.find(anchor)
+    if idx == -1:
+        raise AssertionError("segments load() commit point set(dedupeById(acc)) not found — this gate would pass vacuously")
+    # Widish window: the invalidation sits right after the reload commit, but its explanatory comment is long.
+    window = src[idx : idx + 1200]
+    if "searchResults.set(null)" not in window:
+        raise AssertionError(
+            "segments.load() does not invalidate searchResults after the reload commit — applySearchScope keeps "
+            "filtering the fresh rows by the STALE frozen FTS id-set (new matches hidden, gone-stale matches "
+            "kept) in the curate filter and review queue. Add `searchResults.set(null)` after set(dedupeById(acc))."
+        )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -286,6 +309,7 @@ def main() -> None:
     test_validation_signal_anomaly_distinguishes_not_screened_from_clean()
     test_audioplayer_autoplays_each_clip_not_only_on_source_reload()
     test_speaker_rename_confirms_before_merging_into_an_existing_speaker()
+    test_segment_reload_invalidates_the_frozen_search_scope()
     print("frontend review-guard source policy passed")
 
 
