@@ -2003,6 +2003,28 @@ def test_check_audio_and_get_duration_share_the_decode_fallback() -> None:
         )
 
 
+def test_bundled_only_models_resolve_per_file_not_all_or_nothing() -> None:
+    """The denoiser/aligner/campp speaker model live ONLY in the bundled (exe-adjacent) dir on a fresh
+    install. Loading them via `resolved_dir()` — which is all-or-nothing: any OmniASR in the user dir flips
+    the whole root — orphans them once the user downloads an OmniASR model (silent VAD→energy /
+    no-denoise / no-diarization degradation). They must resolve PER FILE via `resolve_root_for`. Recurring
+    class (VAD, denoiser, aligner+campp). Runtime path needs real models, so source-pinned."""
+    src = (REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")
+    for bad in (
+        "SpeakerEmbeddingService::new(&self.model_manager.resolved_dir()",
+        "ForcedAligner::new(&self.model_manager.resolved_dir()",
+    ):
+        if bad in src:
+            raise AssertionError(
+                f"a bundled-only model is loaded via all-or-nothing resolved_dir() ({bad}) — it will be "
+                "orphaned when the user downloads OmniASR. Use model_manager.resolve_root_for(<file>)."
+            )
+    if "resolve_root_for(crate::models::CAMPP_MODEL)" not in src or 'resolve_root_for("mms_aligner.onnx")' not in src:
+        raise AssertionError(
+            "the campp speaker model and mms_aligner must resolve per-file via resolve_root_for."
+        )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -2061,6 +2083,7 @@ def main() -> None:
     test_batch_processor_never_deletes_a_segment_with_an_existing_transcript()
     test_constrained_transcribe_verifies_model_and_tokens_pin()
     test_check_audio_and_get_duration_share_the_decode_fallback()
+    test_bundled_only_models_resolve_per_file_not_all_or_nothing()
     test_pipeline_hypothesis_population_reports_failures()
     test_asr_pool_recovers_poisoned_state_lock()
     test_global_rate_limiter_recovers_poisoned_lock()

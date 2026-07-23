@@ -1483,7 +1483,9 @@ impl ProcessingPipeline {
 
         let mut diarization_guard = self.lock_diarization_service();
         if diarization_guard.is_none() {
-            let model_dir = self.model_manager.resolved_dir();
+            // Per-file (round-26): resolve_root_for avoids resolved_dir()'s all-or-nothing orphan of the
+            // bundled-only campp speaker model once the user downloads OmniASR into the user dir.
+            let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
             *diarization_guard = Some(crate::diarization::SpeakerEmbeddingService::new(&model_dir));
         }
         let embedding_service = diarization_guard
@@ -1640,7 +1642,8 @@ impl ProcessingPipeline {
 
             let mut diarization_guard = self.lock_diarization_service();
             if diarization_guard.is_none() {
-                let model_dir = self.model_manager.resolved_dir();
+                // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
+                let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
                 *diarization_guard = Some(crate::diarization::SpeakerEmbeddingService::new(&model_dir));
             }
             let embedding_service = diarization_guard
@@ -3263,11 +3266,14 @@ impl ProcessingPipeline {
             timer.finish(true);
             return Ok((words, aligner::AlignmentQuality::CtcForced));
         }
-        // Use resolved_dir() (bundled-dir fallback) like the ASR path — NOT the raw models_dir. The two
-        // were inconsistent: the aligner looked only in the unresolved app-data dir, so a bundled
-        // aligner was invisible to it. resolved_dir() is where inference actually loads models from.
-        let aligner = aligner::ForcedAligner::new(&self.model_manager.resolved_dir(), self.settings.enable_gpu)
-            .map_err(AppError::Other)?;
+        // Per-file resolve (round-26): resolve_root_for finds the mms_aligner.onnx wherever it lives (user
+        // dir OR bundled), NOT via resolved_dir() — which is all-or-nothing and orphans a bundled aligner
+        // once the user downloads OmniASR into the user dir (the same class as the VAD/denoiser orphans).
+        let aligner = aligner::ForcedAligner::new(
+            &self.model_manager.resolve_root_for("mms_aligner.onnx"),
+            self.settings.enable_gpu,
+        )
+        .map_err(AppError::Other)?;
         let result = aligner.align(&pcm, audio::TARGET_SAMPLE_RATE, text);
         timer.finish(result.is_ok());
         Ok(result?)
@@ -3397,8 +3403,9 @@ impl ProcessingPipeline {
                 continue;
             }
 
-            let embedding_service =
-                crate::diarization::SpeakerEmbeddingService::new(&self.model_manager.resolved_dir());
+            let embedding_service = crate::diarization::SpeakerEmbeddingService::new(
+                &self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL),
+            );
             let labels = crate::diarization::label_chunk_speakers(
                 &pcm,
                 sample_rate,
