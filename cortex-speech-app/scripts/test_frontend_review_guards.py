@@ -296,6 +296,28 @@ def test_segment_reload_invalidates_the_frozen_search_scope() -> None:
         )
 
 
+def test_processing_progress_eta_uses_chunk_scoped_elapsed_not_whole_pipeline() -> None:
+    """ProcessingProgress's ETA extrapolates elapsed/done*(remaining). Its `elapsed` must measure ONLY the
+    counted (done/total) scope — NOT the whole pipeline, whose elapsed includes the slow whole-file
+    reference_transcribing phase that runs BEFORE any per-chunk Progress starts. Feeding the raw whole-pipeline
+    elapsedMs to computeProgress made the first chunk's ETA ≈ (reference-phase seconds) × remaining chunks —
+    wildly inflated early (then collapsing toward reality). The ETA baseline must RESET when the counted scope
+    (total>0) begins, and computeProgress must be called with that chunk-scoped elapsed, while the DISPLAYED
+    elapsed stays whole-run."""
+    src = _read("src/lib/ProcessingProgress.svelte")
+    if "computeProgress(current, total, elapsedMs)" in src:
+        raise AssertionError(
+            "ProcessingProgress feeds the WHOLE-pipeline elapsedMs to computeProgress, so the ETA is inflated "
+            "by the pre-chunk reference_transcribing phase. Compute the ETA from a chunk-scoped elapsed that "
+            "resets when total>0 begins."
+        )
+    if "etaBaselineMs" not in src or "etaElapsedMs" not in src:
+        raise AssertionError(
+            "ProcessingProgress has no chunk-scoped ETA baseline (etaBaselineMs/etaElapsedMs) — the ETA still "
+            "extrapolates from whole-pipeline elapsed including the reference phase."
+        )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -310,6 +332,7 @@ def main() -> None:
     test_audioplayer_autoplays_each_clip_not_only_on_source_reload()
     test_speaker_rename_confirms_before_merging_into_an_existing_speaker()
     test_segment_reload_invalidates_the_frozen_search_scope()
+    test_processing_progress_eta_uses_chunk_scoped_elapsed_not_whole_pipeline()
     print("frontend review-guard source policy passed")
 
 

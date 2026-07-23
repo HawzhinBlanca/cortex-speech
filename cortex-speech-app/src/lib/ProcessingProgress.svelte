@@ -46,7 +46,23 @@
   // Prefer the pipeline counters; fall back to the batch-verify counters.
   const current = $derived($filesProcessed || $batchProgress.completed || 0);
   const total = $derived($pipelineTotal || $batchProgress.total || 0);
-  const stats = $derived(computeProgress(current, total, elapsedMs));
+
+  // ETA baseline: the ETA extrapolates elapsed/done*(remaining), so its `elapsed` must measure ONLY the
+  // counted (done/total) scope — NOT any earlier phase. For a single-file import the slow whole-file
+  // `reference_transcribing` pass runs (and accrues into elapsedMs) BEFORE per-chunk Progress starts, so
+  // feeding the whole elapsed made the first chunk's ETA ≈ (reference seconds) × remaining chunks — wildly
+  // inflated. Reset the baseline when the counted scope (total>0) begins so the ETA is chunk-scoped; the
+  // DISPLAYED elapsed (row 3) stays whole-run.
+  let etaBaselineMs = $state<number | null>(null);
+  $effect(() => {
+    if (!active || total <= 0) {
+      if (etaBaselineMs !== null) etaBaselineMs = null;
+    } else if (etaBaselineMs === null) {
+      etaBaselineMs = Date.now();
+    }
+  });
+  const etaElapsedMs = $derived(etaBaselineMs !== null ? Math.max(0, nowMs - etaBaselineMs) : 0);
+  const stats = $derived(computeProgress(current, total, etaElapsedMs));
 
   const phaseLabel = $derived.by(() => {
     switch ($pipelinePhase) {
