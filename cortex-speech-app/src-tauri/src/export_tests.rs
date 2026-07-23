@@ -1489,6 +1489,73 @@ fn hf_reexport_with_zero_training_ready_segments_preserves_the_prior_export() {
 }
 
 #[test]
+fn hf_reexport_that_writes_zero_clips_because_all_sources_vanished_preserves_the_prior_export() {
+    // DATA-LOSS regression (iter 105): the has_exportable_row no-op guard (export.rs:697) grades on the
+    // DB row only (transcript/verified/metrics) and NEVER checks whether the source audio still exists.
+    // So a library whose rows are all training-ready but whose source files have vanished (drive
+    // unmounted / recordings folder moved or deleted after a prior export) sails PAST the guard;
+    // process_split drops every row as unavailable (count=0, Ok — not Err), and the UNCONDITIONAL commit
+    // (export.rs:983) remove_dir_all()'d the prior good dataset and swapped in an empty staging tree —
+    // wiping a previously-good published dataset to empty. That is the exact "replace a good export with
+    // an empty one" failure the guard targets, in the audio-availability dimension it cannot see. A run
+    // that writes ZERO clips must PRESERVE the prior dataset, never replace it. Especially dangerous
+    // under the autonomous nightly month-loop, which can re-export while a drive is unmounted.
+    let db_tmp = NamedTempFile::new().unwrap();
+    let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let wav_path = tmp_dir.path().join("vanishing.wav");
+    write_silent_wav(&wav_path);
+
+    let mut seg = sample_segment("vanish-seg");
+    seg.audio_path = wav_path.to_string_lossy().to_string();
+    db.insert_segment(&seg).unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let settings = crate::settings::AppSettings::default();
+
+    let find_wavs = |root: &std::path::Path| -> Vec<std::path::PathBuf> {
+        ["train", "validation", "test"]
+            .iter()
+            .flat_map(|s| std::fs::read_dir(root.join("data").join(s)).ok().into_iter().flatten().flatten())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
+            .collect()
+    };
+
+    // Run 1: a real, good export lands on disk.
+    export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+    assert_eq!(find_wavs(out_dir.path()).len(), 1, "run 1 must export the one training-ready clip");
+    assert!(
+        all_huggingface_metadata(out_dir.path()).contains("vanish-seg"),
+        "run 1 metadata must contain the exported row"
+    );
+
+    // The source audio vanishes (unmounted drive / moved folder). The DB row stays training-ready.
+    std::fs::remove_file(&wav_path).unwrap();
+    let stored = db.get_segment_by_id("vanish-seg").unwrap().unwrap();
+    assert!(
+        quality::training_grade_for_segment(&stored).training_ready,
+        "the row must still grade training-ready after its audio vanishes (grade is on DB fields, not the file)"
+    );
+
+    // Re-export with EVERY source now unavailable: zero clips are written.
+    export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+
+    // The prior good dataset must survive — NOT be wiped to an empty tree.
+    assert_eq!(
+        find_wavs(out_dir.path()).len(),
+        1,
+        "a zero-clip re-export must PRESERVE the prior clips, not remove_dir_all() data/ into an empty tree"
+    );
+    assert!(
+        all_huggingface_metadata(out_dir.path()).contains("vanish-seg"),
+        "the prior metadata rows must survive a zero-clip re-export, not be replaced by header-only files"
+    );
+}
+
+#[test]
 fn export_csv_neutralizes_formula_injection_in_audio_path_and_id() {
     // CWE-1236 completeness: the formula-injection guard was applied to the free-text columns ONLY,
     // leaving audio_path and id raw. audio_path is derived from an imported file's NAME — user- and

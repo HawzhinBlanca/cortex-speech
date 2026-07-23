@@ -976,18 +976,41 @@ pub fn export_huggingface_dataset(
         }
     };
 
-    // COMMIT: every split wrote successfully, so replace the previous dataset now. The rename is atomic
-    // within the directory; if the remove succeeds but the rename fails, the fully-written new dataset
-    // is still on disk at .data-staging and is recoverable by hand (the prior in-place rebuild left
-    // nothing at all).
+    let total_count = train_count + val_count + test_count;
+    let total_secs = train_secs + val_secs + test_secs;
+    let dropped_unavailable = train_dropped + val_dropped + test_dropped;
+
+    // A staged export that wrote ZERO clips must NOT replace an EXISTING prior dataset. has_exportable_row
+    // (above) only proves the DB holds a training-ready row — it grades on transcript/verified/metrics and
+    // can't see whether the source audio still exists. When every training-ready source is unavailable this
+    // run (drive unmounted, recordings folder moved/deleted) or its alignment window is out of range, every
+    // row is dropped and total_count is 0. Committing here would remove_dir_all(data_dir) then swap in the
+    // empty staging tree — the exact "replace a previously-good export with an empty one" data-loss the
+    // no-op guard exists to prevent, in the audio-availability dimension it cannot see. Discard staging and
+    // PRESERVE the prior dataset (a later run, once the sources are back, re-exports it normally).
+    // Gated on data_dir.exists() so a FIRST-ever export with all sources unavailable still writes an empty,
+    // honestly-documented dataset (droppedUnavailableAudio in dataset_infos.json) — there is nothing to lose.
+    if total_count == 0 && data_dir.exists() {
+        if let Err(cleanup) = std::fs::remove_dir_all(&staging_dir) {
+            tracing::warn!("HF export: failed to remove staging dir after a zero-clip run: {cleanup}");
+        }
+        tracing::warn!(
+            "HF export: 0 clips written ({dropped_unavailable} training-ready segment(s) had \
+             unavailable/undecodable source audio or an out-of-range alignment window) — preserving \
+             the prior dataset rather than replacing it with an empty one."
+        );
+        return Ok(());
+    }
+
+    // COMMIT: every split wrote successfully and at least one clip exists, so replace the previous dataset
+    // now. The rename is atomic within the directory; if the remove succeeds but the rename fails, the
+    // fully-written new dataset is still on disk at .data-staging and is recoverable by hand (the prior
+    // in-place rebuild left nothing at all).
     if data_dir.exists() {
         std::fs::remove_dir_all(&data_dir)?;
     }
     std::fs::rename(&staging_dir, &data_dir)?;
 
-    let total_count = train_count + val_count + test_count;
-    let total_secs = train_secs + val_secs + test_secs;
-    let dropped_unavailable = train_dropped + val_dropped + test_dropped;
     if dropped_unavailable > 0 {
         tracing::warn!(
             "HF export: {dropped_unavailable} segment(s) dropped — source audio unavailable \
