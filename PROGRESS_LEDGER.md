@@ -8034,3 +8034,44 @@ QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
 - [MED] snapshot.rs:78 — off-drive backup success resets the SHARED health counters, masking a FAILING primary (restore-picker) snapshot tree (false-green safety net).
 - [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits (sibling of the bundle orphan fix; audio export has no staging).
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+## 2026-07-23T10:30Z — iter 124 — global shortcuts fired over open modals → verified flip (HIGH) fixed (a8544d8)
+
+**Fixed the queued HIGH modal-shortcut leak. Hand-verified the manager gating + every modal's aria-modal.**
+
+**keyboard.ts KeyboardManager — global shortcuts fired while a modal was open, silently flipping `verified` on
+the hidden selection (HIGH, honesty; a8544d8).** Hand-verified: handleKeydown (:83) suppresses shortcuts only on
+`inEditable` (isFromEditable) and `inReview` (reviewSurfaceActive) — there was NO modal-open gate. Modal.svelte
+(:35) and the panel dialogs only stopPropagation for Escape; all other keydowns bubble to the window-level
+manager. With a Settings/ConfirmDialog/Keyboard-help/Speaker/Validation/DatasetMerge/WSL modal open, focus is
+trapped on a non-editable button, so inEditable=false and inReview=false → every global chord matches. Ctrl+D
+and Ctrl+Enter both call handleToggleVerify (App.svelte), which optimistically flips AND PERSISTS `verified` on
+$selectedSegment via updateSegment — so a stray chord marks an unreviewed segment as human-verified (or
+un-verifies a real approval) behind an unrelated dialog: export-eligible gold nobody reviewed, the same
+silent-label class the allowInReview gate closes for the review surfaces.
+
+Fix: suppress every global shortcut while any aria-modal dialog is open — `document.querySelector('[aria-modal=
+"true"]')` at the top of handleKeydown. Verified EVERY modal sets aria-modal (Modal.svelte, SettingsPanel,
+SpeakerPanel, ValidationPanel, DatasetMerge, WslConsolePanel), so one attribute check auto-covers current +
+future dialogs — no store to enumerate. No regression: the command palette's open shortcut only sets
+showCommandPalette=true and fires when NO modal is yet open; the modal's own Escape/local keys still work.
+Fail-before verified: with the gate neutralized, the new jsdom unit test showed Ctrl+D firing under an open
+aria-modal element (called once when it must be zero); passes after, and re-fires once the modal closes.
+
+Gate: typecheck 0 errors (418 files), **vitest 203 passed** (35 files, +2), lint 0 errors, **35/35 python
+policies**.
+
+**Score: 86 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 7 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
+- [MED] commands.rs:1776 — restore_db_from_snapshot silently re-enables snapshot-era cloud consent opt-ins (privacy). ← next
+- [MED] scorecard.rs:369 — render_markdown prints a fabricated "no significant difference" verdict at 0 paired segments (honesty).
+- [MED] stores/segmentStore.ts:216 — segmentStats.verified counts placeholder/empty verified rows every export drops (count-must-exclude-placeholder class).
+- [MED] KeyboardShortcuts.svelte:55 — duplicate {#each} key when two shortcuts share a description → each_key_duplicate crash.
+- [MED] export_bundle.rs:394 — runConfig.denoising reports true when the denoiser model fails to load (provenance lie).
+- [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree.
+- [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits (audio export has no staging).
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
