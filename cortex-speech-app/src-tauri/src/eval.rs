@@ -878,6 +878,15 @@ pub fn compute_label_quality_lift(
         let mut jury_d = 0usize;
         for &i in indices {
             let (rl, rd, jd) = per[i];
+            // A reference that normalizes to EMPTY (ref_len == 0) has no unit to score against — its raw/jury
+            // char distances are pure insertions (char_edit_distance returns them as an "honest insertion
+            // count for micro aggregation"). Exclude such a row from BOTH numerator and denominator, matching
+            // every other micro site (run_gold_eval, load_eval_run_and_recompute, scorecard, significance).
+            // Guarding only the grand-total ref_chars==0 let a single empty-ref row's insertions over a zero
+            // denominator peg both engines' micro-CER (and the bootstrap CI) to a fabricated 1.0.
+            if rl == 0 {
+                continue;
+            }
             ref_chars += rl;
             raw_d += rd;
             jury_d += jd;
@@ -992,6 +1001,34 @@ mod tests {
         let lift = compute_label_quality_lift(&[], 100, 7);
         assert_eq!(lift.n, 0);
         assert_eq!(lift.cer_lift, 0.0);
+    }
+
+    #[test]
+    fn label_quality_lift_excludes_an_empty_normalizing_reference_from_micro_cer() {
+        // A reference that normalizes to EMPTY (ref_len == 0) must be excluded from BOTH the numerator and
+        // denominator of the micro-CER — otherwise its raw/jury insertions over a zero denominator peg both
+        // engines' micro-CER (and the CI) to a fabricated 1.0, even though the only scoreable reference
+        // matched perfectly. Same per-segment ref_len>0 guard used at every other micro-aggregation site.
+        let diacritics_only = "\u{064B}\u{064C}\u{064E}"; // fathatan/dammatan/fatha -> normalizes to ""
+        assert_eq!(
+            char_edit_distance(diacritics_only, "x").ref_len,
+            0,
+            "fixture precondition: the diacritics-only reference must normalize to an empty metric reference"
+        );
+        let good = ("hello".to_string(), "hello".to_string(), "hello".to_string()); // CER 0 for both
+        let empty_ref = (diacritics_only.to_string(), "x y z".to_string(), "a b c".to_string());
+        let lift = compute_label_quality_lift(&[good, empty_ref], 0, 1);
+
+        assert!(
+            lift.raw_micro_cer < 1e-9,
+            "empty-ref insertions must not inflate raw micro-CER: {}",
+            lift.raw_micro_cer
+        );
+        assert!(
+            lift.jury_micro_cer < 1e-9,
+            "empty-ref insertions must not inflate jury micro-CER: {}",
+            lift.jury_micro_cer
+        );
     }
 
     fn open_mem_db() -> Database {
