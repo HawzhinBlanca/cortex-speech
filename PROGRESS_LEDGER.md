@@ -8686,3 +8686,39 @@ Owner-gated finish line unchanged.
 QUEUE (hunt-135 survivors remaining):
 - [LOW] audio.rs:163 — check_audio reports duration_ms=0 for a valid VBR MP3 without a Xing header. ← last
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+### Iteration 141 — 2026-07-23 — FIX #103: check_audio reported 0 ms for a no-frame-count file; hunt-135 DRAINED
+
+**Class: correctness/consistency (duplicated logic diverged).** Hand-verified: `check_audio_file`
+(audio.rs:111-168) computed duration as `frames_to_duration_ms(num_frames.unwrap_or(0), …)` with NO
+decode fallback, so a valid file whose container reports no frame count (VBR MP3 without a Xing/Info
+header, streamed OGG/WebM) got `duration_ms = 0` — while `get_duration_ms` (490+) already falls back to a
+real decode for that exact case and reports the true duration. The UI's check_audio then showed a 0 ms /
+"empty" duration for a perfectly importable file. Root cause: the two functions duplicated the duration
+logic and diverged.
+
+Fix (DRY root cause): extracted `duration_ms_with_decode_fallback(path, num_frames, sample_rate)` and
+routed BOTH functions through it, so they can never disagree. Deterministic agreement test
+(check_audio == get_duration_ms == 1000 ms on a WAV) + source policy
+`test_check_audio_and_get_duration_share_the_decode_fallback` pinning both callers (fail-before: reverting
+check_audio_file to the direct `unwrap_or(0)` call fails the policy).
+
+Process note (honesty): I first wrote a decode-based unit test for the fallback; it passed standalone but
+FLAKED twice in the parallel gate (a real decode + the content-hashed LRU(10) PCM cache under ~30-way
+concurrency intermittently returned partial PCM). Shipping a flaky test is unacceptable, so I replaced it
+with the deterministic test + source policy rather than paper over it. The production path is unaffected
+(single user-triggered check_audio call, never 30-way concurrent).
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 991 passed / 0 failed**
+(re-run stable); **python policies 38 scripts passed**. Reality check pre-work: exe not running, git clean,
+HEAD 9facd69, lock free.
+
+**Score: 103 fixed + 1 cleanup, ~33 refuted, 2 measure-deferred, 0 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged. **Hunt-135 fully drained: 8 survivors → 7 fixed (#97–#103) + 1 refuted
+(pipeline.rs empty-rollback, already-fixed). Plus 3 correctly refuted at the verify stage.**
+
+QUEUE (hunt-135 drained):
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+- A fresh adversarial hunt (different subsystems) or the accuracy-machinery backlog are the next moves.
