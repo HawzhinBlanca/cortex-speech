@@ -1129,7 +1129,12 @@ fn vad_energy_fallback(pcm: &[i16], _sample_rate: u32, threshold: f32) -> AppRes
     let mut segments = Vec::new();
     let mut in_speech = false;
     let mut seg_start = 0;
-    let min_speech_frames = 30;
+    // ~90ms floor (9 hops × 10ms at 16 kHz) — matched to the Silero path's ~96ms floor (min_speech_frames=3;
+    // Round-24 #6). The old 30-hop (~300ms) floor was never lowered when the primary VAD's was, so whenever
+    // this fallback ran (silero_vad_v4.onnx absent), it silently DROPPED any 96-300ms utterance Silero would
+    // keep — the exact real-short-word loss (e.g. بەڵێ / "yes") the primary-VAD floor was lowered to prevent.
+    // Kept at or below Silero's floor so the fallback never drops a run the primary VAD would retain.
+    let min_speech_frames = 9;
 
     for (i, &is_speech) in speech_frames.iter().enumerate() {
         if is_speech && !in_speech {
@@ -1166,6 +1171,28 @@ mod tests {
     #[test]
     fn test_compute_waveform_empty() {
         assert!(compute_waveform(&[], 100).is_empty());
+    }
+
+    #[test]
+    fn energy_vad_fallback_keeps_a_short_word_like_silero_does() {
+        // Round-24 #6 lowered the SILERO floor to ~96ms (min_speech_frames=3) so real short words
+        // (بەڵێ / "yes") survive, but the energy FALLBACK — used when silero_vad_v4.onnx is absent — kept a
+        // 30-hop (~300ms) floor and silently DROPPED any 96-300ms utterance Silero would retain. Build a
+        // ~150ms loud burst flanked by silence: the fallback must keep it as its own sub-segment, not drop
+        // it (which collapses to the whole-buffer default and loses the word's boundary).
+        let sr = 16_000u32;
+        let ms = |m: usize| m * sr as usize / 1000;
+        let mut pcm = vec![0i16; ms(400)]; // leading silence
+        pcm.extend(std::iter::repeat(8000i16).take(ms(150))); // ~150ms burst, well above the noise floor
+        pcm.extend(std::iter::repeat(0i16).take(ms(400))); // trailing silence
+
+        let segs = vad_energy_fallback(&pcm, sr, 0.5).unwrap();
+        assert_eq!(segs.len(), 1, "the single short burst must be exactly one segment, got {segs:?}");
+        let (start, end) = segs[0];
+        // Fail-before discriminator: the old 300ms floor drops the 150ms burst and the fallback collapses
+        // to the whole buffer (0, len); the corrected floor keeps it as a proper sub-segment.
+        assert!(end - start < pcm.len(), "fallback dropped the ~150ms burst (collapsed to whole buffer): {segs:?}");
+        assert!(start >= ms(300), "the kept segment must bound the burst region, not start at 0: {segs:?}");
     }
 
     #[test]
