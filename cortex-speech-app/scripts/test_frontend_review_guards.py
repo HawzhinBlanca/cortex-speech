@@ -227,6 +227,31 @@ def test_validation_signal_anomaly_distinguishes_not_screened_from_clean() -> No
         )
 
 
+def test_audioplayer_autoplays_each_clip_not_only_on_source_reload() -> None:
+    """AudioPlayer autoplay lived ONLY in handleLoaded (the onloadedmetadata handler), which fires only when
+    the <audio> src actually changes. Consecutive review segments from the SAME recording share audioPath, so
+    the element never reloads and onloadedmetadata never re-fires — autoplay died after the FIRST clip, exactly
+    the per-clip keypress the autoplay setting was meant to remove (see the True-10 audit comments in
+    ReviewMode/ReviewInbox). AudioPlayer must also autoplay when the CLIP IDENTITY changes: a clipKey prop plus
+    an $effect that plays on a clipKey change (guarded on !loading so a same-source advance plays while a
+    different-source reload is left to handleLoaded, avoiding a double play), keyed on identity so a word-tap
+    (which only narrows startTime) does not re-autoplay. Both review consumers must pass clipKey."""
+    ap = _read("src/lib/AudioPlayer.svelte")
+    if "clipKey" not in ap:
+        raise AssertionError(
+            "AudioPlayer has no clipKey prop — same-source consecutive clips never re-autoplay (autoplay dies "
+            "after the first clip). Add a clipKey prop and an $effect that plays on clip-identity change."
+        )
+    if "autoplayedClip" not in ap:
+        raise AssertionError(
+            "AudioPlayer has no clip-identity autoplay effect (no autoplayedClip tracking) — a same-source clip "
+            "advance won't autoplay because onloadedmetadata only fires on a src change."
+        )
+    for consumer in ("src/lib/ReviewMode.svelte", "src/lib/ReviewInbox.svelte"):
+        if "clipKey=" not in _read(consumer):
+            raise AssertionError(f"{consumer} does not pass clipKey to AudioPlayer — autoplay won't advance per clip")
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -238,6 +263,7 @@ def main() -> None:
     test_settings_close_persist_routes_through_savequietly()
     test_refinery_panel_renders_undefined_metric_for_a_zero_segment_eval()
     test_validation_signal_anomaly_distinguishes_not_screened_from_clean()
+    test_audioplayer_autoplays_each_clip_not_only_on_source_reload()
     print("frontend review-guard source policy passed")
 
 

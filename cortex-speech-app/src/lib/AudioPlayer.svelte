@@ -7,6 +7,10 @@
 
   interface Props {
     audioPath: string;
+    // Identity of the CLIP currently loaded (the segment id). Consecutive review clips from one
+    // recording share audioPath but are distinct clips; autoplay keys on this so a same-source advance
+    // re-plays even though the <audio> element never reloads. A transient tap-a-word does NOT change it.
+    clipKey?: string | number;
     startTime?: number;
     endTime?: number;
     // Transport display bounds. Default to the playback window, but a caller can pass the FULL span
@@ -21,6 +25,7 @@
   }
   let {
     audioPath,
+    clipKey,
     startTime = 0,
     endTime = 0,
     displayStart,
@@ -116,6 +121,21 @@
       error = null;
       currentTime = 0;
       resolveAudioUrl(audioPath);
+    }
+  });
+
+  // Autoplay each newly-selected CLIP. handleLoaded covers a fresh SOURCE load (onloadedmetadata), but
+  // consecutive review segments from the SAME recording share audioPath, so the element never reloads and
+  // onloadedmetadata never re-fires — without this, autoplay dies after the first clip. Key on clipKey (the
+  // segment identity), not startTime, so a tap-a-word (which only narrows startTime) never re-autoplays.
+  // Guarded on !loading: a DIFFERENT-source advance sets loading=true in the audioPath effect above (which
+  // runs first), so this skips and handleLoaded owns that autoplay — no double play. `autoplayedClip` is a
+  // plain (non-reactive) marker so setting it here never re-triggers the effect.
+  let autoplayedClip: string | number | undefined = undefined;
+  $effect(() => {
+    if (autoplay && audioEl && !loading && clipKey !== undefined && clipKey !== autoplayedClip) {
+      autoplayedClip = clipKey;
+      play();
     }
   });
 
@@ -257,6 +277,9 @@
       duration = audioEl.duration;
       loading = false;
       if (autoplay) {
+        // Mark this clip as autoplayed so the clip-identity effect (which re-runs when loading flips
+        // false) doesn't fire a second play() for the same clip.
+        autoplayedClip = clipKey;
         play();
       }
     }

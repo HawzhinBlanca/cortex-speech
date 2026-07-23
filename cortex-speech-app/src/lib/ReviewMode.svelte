@@ -909,6 +909,7 @@
            exactly itself; otherwise the full spoken span. -->
       <AudioPlayer
         audioPath={current.audioPath}
+        clipKey={current.id}
         startTime={wordStartOverride ?? playStart}
         endTime={wordEndOverride ?? playEnd}
         displayStart={playStart}

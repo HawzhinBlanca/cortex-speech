@@ -565,6 +565,7 @@
                      queue auto-plays the clip so adjudication needs zero play clicks. -->
                 <AudioPlayer
                   audioPath={current.audioPath}
+                  clipKey={current.id}
                   startTime={inboxRange.startTime}
                   endTime={inboxRange.endTime}
                   autoplay={settings?.autoplaySegments ?? false}
