@@ -8436,3 +8436,40 @@ QUEUE (hunt-123 remaining):
   (pairs with the κ harness); active-learning queue ranking; CV-ckb + SoraniTTS importers; one-click
   gate_and_promote IPC+button; homophone-replacer FST (verify Omnilingual-path support); reconcile stale
   ledger measured-numbers table. (None move the CER number — all owner-gated to RUN.)
+
+---
+
+### Iteration 134 — 2026-07-23 — FIX #96: audio-export SHA256SUMS vouched for orphan clips metadata.csv omits (integrity, hunt-123 drained)
+
+**Class: integrity / provenance (manifest asserts unlisted files).** Hand-verified: `export_audio`
+(mod.rs:73) writes into a caller-chosen dir it only `create_dir_all`s when missing — no staging, no clean —
+then called `write_sha256sums(output_dir)` (export.rs:597), a WHOLE-DIR recursive scan. So a re-export of a
+SMALLER segment selection to the same dir left orphan clips from the prior run, and the whole-dir manifest
+vouched for them (`sha256sum -c SHA256SUMS` passes) while `metadata.csv` — written from the current
+`exported` set only (mod.rs:120) — omitted them. An integrity manifest asserting a file the dataset's own
+metadata does not list is the bundle-orphan bug class, one exporter over.
+
+Fix (root-cause, scoped not destructive): add `export::write_sha256sums_for(dir, rel_files)` covering only
+the named files, and pass the audio export's own `files` list. The shared whole-dir `write_sha256sums`
+stays correct for the siblings that stage into a clean dir (export_dataset/HF/bundle/gold-eval/finetune) —
+only the unstaged audio path needed scoping. Orphans are left on disk (never delete the user's files) but
+no longer vouched-for; metadata.csv and SHA256SUMS now describe the same set.
+
+Fail-before: new `sha256sums_covers_only_this_export_not_orphan_clips` exports one clip into a dir holding
+a pre-existing orphan .wav and asserts the manifest omits the orphan + covers the clip + metadata.csv.
+Delegating `write_sha256sums_for` back to the whole-dir scan fails it (the orphan hash appears).
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 988 passed / 0 failed**;
+**python policies 38/38**. Reality check pre-work: exe not running, git clean, HEAD 95ac62b, lock free.
+
+**Score: 96 fixed + 1 cleanup, ~29 refuted, 2 measure-deferred, 0 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged. **Hunt-123 queue fully drained.**
+
+QUEUE (hunt-123 drained; remaining backlog is IN-LOOP ACCURACY-MACHINERY + carried owner items):
+- IN-LOOP ACCURACY-MACHINERY (owner-surfaced, none move the CER number — all owner-gated to RUN):
+  gold-CER/WER PR-gating test; OmniASR-CTC-1B benchmark harness; KenLM n-gram fusion (verify sherpa CTC
+  support first); pseudo-labeling harness; ECE/reliability (pairs with the κ harness); active-learning
+  queue ranking; CV-ckb + SoraniTTS importers; one-click gate_and_promote IPC+button; homophone-replacer
+  FST (verify Omnilingual-path support); reconcile stale ledger measured-numbers table.
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+- A fresh adversarial defect hunt is warranted now the prior queue is drained.
