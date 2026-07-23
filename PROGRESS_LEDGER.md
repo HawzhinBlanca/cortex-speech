@@ -8218,3 +8218,43 @@ QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
 - [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree.
 - [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+### Iteration 129 — 2026-07-23 — FIX #91: bundle runConfig.denoising records mere model PRESENCE, not actual loadability (provenance lie)
+
+**Class: honesty / provenance (fabricated-capability-from-disk-presence).** `export_bundle.rs` builds the release
+bundle's `manifest.json` `runConfig`, whose `denoising` flag is the provenance record of whether the exported audio
+was actually denoised. It was computed as `config_from_settings(settings, model_manager.denoiser_present())`.
+`denoiser_present()` is a pure disk check — `model_file_meets_min_size(resolved_dir, DENOISER_MODEL, 400_000)` — it
+proves the GTCRN file exists on disk, NOT that it loads. A present-but-unloadable model (opset/EP incompatibility,
+provider init failure, corrupt file ≥400KB) leaves the pipeline's audio **un-denoised**: `pipeline.rs:1780` builds
+the real `DenoiserService`, sees `!is_active()`, warns, and passes audio through untouched. Yet the bundle would
+stamp `denoising=true`. `DenoiserService::is_active`'s own doc contract (denoiser.rs:53-55) forbids exactly this:
+"claiming denoising that did not run is a provenance lie."
+
+Reachable whenever a bundle is exported with `enable_denoising` on and the model file present but not loadable —
+a real failure mode on a machine whose ORT/EP can't init the GTCRN graph. Downstream consumers of the manifest
+(and any training/audit that trusts runConfig) would believe the corpus was denoised when it was raw.
+
+Fix (root-cause, one signal): add `ModelManager::denoiser_loadable()` — constructs
+`DenoiserService::new(&self.resolved_dir()).is_active()`, the SAME GPU→CPU fallback construction the pipeline uses,
+so it reports genuine loadability — and pass it to `config_from_settings` in place of `denoiser_present()`. The
+manifest now records `denoising=true` only when the denoiser actually loaded. The pipeline already used `is_active()`
+honestly; this closes the one export path that diverged from it.
+
+Fail-before: added source policy `test_bundle_runconfig_denoising_reflects_loadability_not_mere_presence` to
+`test_rust_runtime_panic_policy.py` (source-pinned — exercising the load path needs the real GTCRN ONNX). Reverted
+the bundle line to `denoiser_present()`, ran the policy → **FAILED** with the exact provenance-lie assertion;
+restored the fix → passes. Policy also requires `denoiser_loadable` to appear (guards against silent regression).
+
+Gate: `cargo fmt --check` clean; `cargo clippy --all-targets -D warnings` clean; **`cargo test --lib` 987 passed /
+0 failed / 6 ignored**; **python policies 35/35** (test_rust_runtime_panic_policy.py now carries this check).
+
+**Score: 91 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 2 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
+- [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree. ← next
+- [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
