@@ -108,8 +108,23 @@ pub fn validate_output_path(path: &str) -> Result<String, String> {
         return Err("Path contains null bytes".into());
     }
     let p = Path::new(path);
+    // SAME UNC guard as validate_file_path (this is its export/backup sibling). std::fs::canonicalize opens
+    // a handle to the target and on Windows drives the SMB redirector, so canonicalizing a webview-supplied
+    // UNC destination (\\attacker\share\out) would transmit the logged-in user's NTLM credentials to the
+    // attacker host BEFORE any post-check could reject it (and canonicalize errors if unreachable, so a
+    // post-check never runs — yet the creds are already on the wire). Block it SYNTACTICALLY on the raw
+    // input (zero I/O), and again after canonicalizing the parent (a local symlink parent resolving to a
+    // share — the indirect case). Both `\\server\share` and `//server/share` parse to a UNC prefix.
+    #[cfg(windows)]
+    if is_unc_path(p) {
+        return Err("Network (UNC) paths are not allowed".to_string());
+    }
     let parent = p.parent().ok_or_else(|| "No parent directory".to_string())?;
     let canonical_parent = std::fs::canonicalize(parent).map_err(|e| format!("Invalid output directory: {e}"))?;
+    #[cfg(windows)]
+    if is_unc_path(&canonical_parent) {
+        return Err("Network (UNC) paths are not allowed".to_string());
+    }
     let filename = p.file_name().ok_or_else(|| "No filename".to_string())?;
     Ok(canonical_parent.join(filename).to_string_lossy().to_string())
 }
@@ -136,6 +151,20 @@ mod tests {
     fn test_validate_text() {
         assert!(validate_text("hello", 100, "test").is_ok());
         assert!(validate_text("hello", 3, "test").is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn validate_output_path_rejects_unc_before_canonicalize() {
+        // Twin of validate_file_path's UNC guard: canonicalizing a UNC output/backup destination drives the
+        // SMB redirector and leaks the user's NTLM credentials to the attacker host. The syntactic pre-check
+        // must reject it — returning the UNC error, NOT "Invalid output directory" (which would mean
+        // canonicalize ran and the leak already fired). The ".invalid" TLD never resolves, so no real host is
+        // contacted even by the pre-fix path.
+        for p in ["\\\\nonexistent.invalid\\share\\out.wav", "//nonexistent.invalid/share/out.wav"] {
+            let err = validate_output_path(p).expect_err("a UNC output path must be rejected");
+            assert!(err.contains("UNC"), "must reject UNC syntactically, not via canonicalize: {err}");
+        }
     }
 
     #[test]
