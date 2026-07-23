@@ -8837,3 +8837,49 @@ QUEUE:
 - Machinery remaining is owner-gated to RUN (1B benchmark, pseudo-labeling, gold-CER PR-gate, importers,
   gate_and_promote IPC, homophone FST); blank_penalty tuning is an owner work order.
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+### Iteration 145 — 2026-07-23 — 2nd adversarial hunt (51 agents) + FIX #106: downloading OmniASR orphaned the neural VAD
+
+**Pivot to reliability (owner feedback: do the best).** Ran a 2nd 6-finder × 3-lens hunt (Workflow, 51
+agents, 4.7M subagent tokens) over the subsystems the 1st hunt didn't touch (frontend, export/dataset,
+models/download, audio/chunking, migrations, concurrency). **12 survivors, 3 correctly refuted** (App.svelte
+handleToggleVerify + handleNormalize both 2/3 — freshRow-by-id already guards them; couch.rs writer 2/3).
+
+**FIX #106 (survivor: models.rs:118 resolve-wrong-dir, highest-impact) — VAD silently degraded.**
+Hand-verified: `resolve_models_dir`/`active_models_dir` are ALL-OR-NOTHING — any OmniASR in the user models
+dir flips the WHOLE model root there, orphaning bundled-only siblings (Silero VAD, denoiser, campp,
+aligner) a user download never places in the user dir. So after downloading OmniASR-CTC-1B (or "Download
+All"), `audio.rs:1003` (`active_models_dir().join("silero_vad_v4.onnx")`) misses → VAD drops to the ENERGY
+fallback (worse segmentation) on every clip, no error. The fine-tuned MMS path already dodged this with a
+two-dir search; VAD didn't. Fix: `resolve_model_file(relative)` per-file resolver (user copy wins, else
+bundled, else user path for the error) + route VAD through it. **Fail-before:** a bundled-only file must
+resolve to bundled; removing the fallback fails the test. (Test settles a Windows write-then-exists() timing
+artifact — the resolve logic was correct, a debug run showed file_exists=true.)
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 992 passed / 0 failed**;
+**python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD d818ed2, lock free.
+
+**Score: 106 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 11 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
+- [MED] models.rs:740 — download_denoiser reports FAILURE after a verified-success download (post-check reads
+  resolved_dir, not the models_dir it wrote to). ← next (sibling of #106, use resolve_model_file)
+- [MED] export.rs:272 — exclude_holdout_segments fails OPEN for a missing-audio segment → holdout gold
+  reference leaks into the plain export (eval-on-train contamination; sibling Err-case at :285 fails closed).
+- [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
+  survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
+- [MED] chunking.rs:373 — slice_pcm_by_alignment returns the WHOLE file for a chunk when alignment_json is
+  present but offset-less (words-only/legacy/clobbered blob) → whole recording paired with one segment.
+- [MED] lib.rs:335 — writers_active() misses the WSL-7B refinement batch writer → prepare_restore can run
+  during an active refinement write.
+- [LOW] commands.rs:2148 — WSL-7B refinement loop persists without a trim().is_empty() guard (blank-overwrite,
+  4th sibling of the class).
+- [LOW] denoiser.rs:14 — denoiser model loads with NO SHA-256 verify (ASR/VAD siblings verify at load).
+- [LOW] audio.rs:404 — decode_pcm_windows silently truncates on a symphonia ResetRequired (returns Ok after partial).
+- [LOW] export.rs:859 — dropped_unavailable over-counts (counts non-training-ready REVIEW rows the write loop skips).
+- [LOW] commands.rs:638 — import worker thread::spawn panic skips ImportGuard Drop → shared-state wedge.
+- [LOW] src/lib/i18n/index.ts:32 — translator replace() substitutes only the FIRST occurrence of a repeated placeholder.
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
