@@ -81,6 +81,17 @@ export class KeyboardManager {
   }
 
   private handleKeydown(e: KeyboardEvent) {
+    // A blocking modal dialog (Settings, ConfirmDialog, Keyboard help, Speaker/Validation/DatasetMerge/WSL
+    // panels, command palette — EVERY one sets aria-modal="true") OWNS the keyboard: its own component
+    // handles Escape and its local keys. NO global shortcut may fire underneath it, or a stray Ctrl+Enter/
+    // Ctrl+D would toggle `verified` (or Delete/transcribe) on the HIDDEN curate selection behind the dialog
+    // — export-eligible gold nobody reviewed, the same silent-label-corruption class the allowInReview gate
+    // closes for the review surfaces. Detect any open modal via the shared aria-modal attribute so this
+    // auto-covers current AND future dialogs with no store to enumerate. (The command palette's open shortcut
+    // isn't affected: no modal is open at the moment it fires.)
+    if (typeof document !== 'undefined' && document.querySelector('[aria-modal="true"]')) {
+      return;
+    }
     const mod = e.metaKey || e.ctrlKey;
     const inEditable = this.isFromEditable(e);
     const inReview = this.reviewSurfaceActive();
