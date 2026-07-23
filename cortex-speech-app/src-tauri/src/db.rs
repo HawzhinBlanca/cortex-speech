@@ -674,11 +674,19 @@ impl Database {
         self.conn.execute("SAVEPOINT merge_json", [])?;
         let result: AppResult<()> = (|| {
             let mut check_stmt = self.conn.prepare("SELECT id FROM speech_segments WHERE id = ?1")?;
-            // Guard: never overwrite human decisions; only update unreviewed rows.
+            // Guard: never overwrite a human's reviewed row; only update unreviewed ones. verified = 0 is
+            // load-bearing alongside the human_decision/verdict checks: "Verify"/"Verify selected"
+            // (batch_verify -> update_verified) sets ONLY verified=1 and leaves human_decision/verdict NULL,
+            // so without this clause a pasted-dataset merge would overwrite a human-VERIFIED row's transcript
+            // (and its verified flag) with imported machine text — silently destroying reviewed work and, if
+            // the imported row carries verified=true, shipping unapproved text as human-verified GOLD. Mirrors
+            // the sibling update_asr_transcript_if_unreviewed / update_batch_transcription_if_unreviewed
+            // guards (the merge path was simply never given the clause). Importing a NEW verified row (an id
+            // not present locally) still works — this only refuses to OVERWRITE an existing reviewed row.
             let mut update_stmt = self.conn.prepare(
                 "UPDATE speech_segments SET
-                    audio_path=?2, raw_transcript=?3, normalized_transcript=?4, 
-                    annotated_transcript=?5, alignment_json=?6, duration_ms=?7, 
+                    audio_path=?2, raw_transcript=?3, normalized_transcript=?4,
+                    annotated_transcript=?5, alignment_json=?6, duration_ms=?7,
                     speaker_id=?8, verified=?9, confidence=?10, ctc_score=?11,
                     clipping_ratio=?12, rms_db=?13, snr_db=?14, split=?15, signal_anomaly_score=?16,
                     model_version_id=COALESCE(?17, 'unknown@pre-registry'),
@@ -688,6 +696,7 @@ impl Database {
                     normalizer_version=?21,
                     updated_at=datetime('now')
                  WHERE id=?1
+                   AND verified = 0
                    AND (human_decision IS NULL OR human_decision = '')
                    AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
             )?;

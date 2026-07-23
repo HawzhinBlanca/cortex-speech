@@ -1225,6 +1225,50 @@ fn merge_dataset_json_does_not_count_human_protected_rows_as_updated() {
 }
 
 #[test]
+fn merge_dataset_json_does_not_overwrite_a_verified_only_row() {
+    // A human who clicked "Verify"/"Verify selected" (batch_verify -> update_verified) sets ONLY verified=1,
+    // leaving human_decision/verdict NULL. A pasted-dataset merge must NOT overwrite such a row — otherwise it
+    // silently replaces the human's reviewed transcript with imported machine text (and, if the import carries
+    // verified=true, ships unapproved text as human-verified GOLD). Sibling of
+    // wsl_refinement_must_not_overwrite_a_verified_transcript; the verified=0 hole the merge guard missed
+    // (found by adversarial hunt-7). update_asr_transcript_if_unreviewed / update_batch_transcription_if_
+    // unreviewed already carry this clause.
+    let db = make_db();
+    let mut seg = make_segment("merge-ver", "/v.wav");
+    seg.raw_transcript = "human verified original".to_string();
+    db.insert_segment(&seg).expect("insert");
+    assert!(db.update_verified("merge-ver", true).unwrap());
+    let locked = db.get_segment_by_id("merge-ver").unwrap().unwrap();
+    assert!(locked.verified && locked.human_decision.is_none(), "verify leaves decision NULL (the precondition)");
+
+    let incoming = vec![SpeechSegment {
+        id: "merge-ver".to_string(),
+        audio_path: "/v.wav".to_string(),
+        raw_transcript: "incoming machine text".to_string(),
+        verified: false, // an import that would silently UN-verify + replace the human's work
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    }];
+    let (created, updated) = db.merge_dataset_json(&serde_json::to_string(&incoming).unwrap()).expect("merge");
+    assert_eq!((created, updated), (0, 0), "a verified row must be skipped, not overwritten");
+    let after = db.get_segment_by_id("merge-ver").unwrap().unwrap();
+    assert_eq!(after.raw_transcript, "human verified original", "verified transcript must be intact");
+    assert!(after.verified, "verified flag must stay set");
+
+    // A NEW verified row (id not present locally) is still importable — the guard only refuses OVERWRITES.
+    let fresh = vec![SpeechSegment {
+        id: "merge-new".to_string(),
+        audio_path: "/n.wav".to_string(),
+        raw_transcript: "brand new".to_string(),
+        verified: true,
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    }];
+    let (created2, _u2) = db.merge_dataset_json(&serde_json::to_string(&fresh).unwrap()).expect("merge new");
+    assert_eq!(created2, 1, "a new verified row (not a local overwrite) still imports");
+}
+
+#[test]
 fn consensus_batch_counts_only_rows_actually_changed() {
     // Round-2 audit LOW: the refinery reported updates.len() (attempted), not rows changed, so a
     // guard-skipped human-locked segment was over-counted. The method now returns rows-affected.
