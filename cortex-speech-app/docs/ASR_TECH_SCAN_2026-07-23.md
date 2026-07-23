@@ -39,9 +39,10 @@ config-swap and a self-trained checkpoint, not a new architecture.**
 
 ## 2. Offline accuracy levers that fit sherpa-onnx / Windows (facet 4, repo-grounded)
 
-The app runs `sherpa-onnx = "1.13.2"` (Rust), OmniASR-CTC-300M `model.int8.onnx`, **already GPU**
-(DirectML on Windows, CUDA elsewhere, CPU fallback — `asr.rs:27-60`), **already int8**. So "add GPU/int8"
-is done. The real, narrower findings:
+The app's **offline-fallback** path runs `sherpa-onnx = "1.13.2"` (Rust) + OmniASR-CTC-300M
+`model.int8.onnx` (the DEFAULT engine is the WSL-served 7B champion, `settings.rs` asr_model_size=WSL7B;
+CTC-300M is only the user-chosen fallback), **already GPU** (DirectML on Windows, CUDA elsewhere, CPU
+fallback — `asr.rs:27-60`), **already int8**. So "add GPU/int8" is done. The real, narrower findings:
 
 - **Hard ceiling — no CTC hotwords.** sherpa-onnx supports hotwords/context-biasing for **transducer
   only, not CTC**, and no 2026 release changed that. For a Kurdish names/places app on a CTC model this

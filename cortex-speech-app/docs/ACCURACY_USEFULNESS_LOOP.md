@@ -44,10 +44,11 @@ Everything below serves that. Where the loop CAN directly help users today is **
 correctness, honesty, privacy, UX) — so that half of the mission is real, shippable, and compounding.
 
 ### The current honest state (verify, don't trust this snapshot)
-- Champion (GPU-served fine-tuned OmniASR-7B): **7.03% CER on FLEURS-ckb** read speech — at/above
-  verifiable Sorani SOTA as of 2026-07-23, but **not reproduced under a documented normalizer** and
-  **not measured on conversational Sorani or the owner's own audio**.
-- Offline default (bundled OmniASR-CTC-300M int8): **11.34% CER**.
+- **Default engine** (GPU/WSL-served OmniASR-7B champion; AppSettings default asr_model_size=WSL7B):
+  **7.03% CER on FLEURS-ckb** read speech — at/above verifiable Sorani SOTA as of 2026-07-23, but
+  not reproduced under a documented normalizer and not measured on conversational/owner audio.
+- Offline **fallback** (bundled OmniASR-CTC-300M int8): **11.34% CER** — used only on a deliberate
+  user choice when the 7B server is down; the app fails LOUD, never silently downgrades (F2 contract).
 - Owner's own verified data: **~3 segments**; marathon **3/500**; verified audio **< 5 h**.
 - The label ceiling (gold-set noise), not the model, currently caps every number you could report.
 
