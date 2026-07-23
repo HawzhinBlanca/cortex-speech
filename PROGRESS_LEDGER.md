@@ -8473,3 +8473,55 @@ QUEUE (hunt-123 drained; remaining backlog is IN-LOOP ACCURACY-MACHINERY + carri
   FST (verify Omnilingual-path support); reconcile stale ledger measured-numbers table.
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
 - A fresh adversarial defect hunt is warranted now the prior queue is drained.
+
+---
+
+### Iteration 135 — 2026-07-23 — Fresh adversarial hunt (39 agents) + FIX #97: default transcribe_segment overwrote a good transcript with a blank
+
+**Hunt:** ran a 6-finder × 3-lens-refuter adversarial hunt (Workflow, 39 agents, 3.8M subagent tokens)
+across untouched subsystems (db/migrations/FTS, pipeline/audio, asr/decode, commands/consent, jury/eval,
+history/batch). **8 survivors** (`refutes < 2`), **3 correctly refuted** (db.rs:2169 write_segment_verdict
+3/3, pipeline.rs:2236 confidence-overwrite 2/3, constrained_decode.rs:137 special-token-skip 3/3). Every
+survivor is a LEAD to hand-verify, not a verdict to trust.
+
+**FIX #97 (survivor 1 of 8) — blank-overwrite data-loss, `commands/transcribe.rs`.** Hand-verified:
+`transcribe_segment` (the DEFAULT command behind the Transcribe button) returned the pipeline draft
+verbatim, including `""` for a silent clip. App.svelte `handleTranscribe` (line 1093, inside a `try`) then
+upserts it — `annotatedTranscript = result.text`, `rawTranscript`, `verified=false` — destroying an
+existing good transcript and persisting a blank. Its two opt-in siblings
+`transcribe_segment_constrained` (line 50) and `_finetuned` (line 108) already refuse this exact case with
+an Err; the default path was the lone omission. (Corrected the hunt's claim that the sibling guard "at
+line 169" was missing — that line is `align_segment`, a different command.) Fix: return Err when
+`draft.final_text.trim().is_empty()`, matching the siblings — the frontend try/catch then keeps the
+current transcript. Recurring class (memory `blank-transcript-never-overwrites-good`).
+
+Fail-before: source policy `test_default_transcribe_segment_refuses_blank_draft` in
+test_rust_runtime_panic_policy.py (runtime path needs real WSL/ONNX, so source-pinned) — asserts the
+default `transcribe_segment` body carries the empty guard; neutralizing the guard fails it with the exact
+data-loss message.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 988 passed / 0 failed**;
+**python policies 38 scripts passed** (the new check is a test FUNCTION added to an existing script, not a
+new script — the commit message `09b01a6`'s "39/39" miscounted; the honest count is 38 scripts). Reality
+check pre-work: exe not running, git clean, HEAD 5b50927, lock free.
+
+**Score: 97 fixed + 1 cleanup, ~32 refuted, 2 measure-deferred, 7 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-135 survivors — hand-verify EACH against source before fixing):
+- [HIGH] pipeline.rs:2264 — an empty 7B transcript for a non-speech segment is misclassified as an infra
+  failure and rolls back the ENTIRE file import with a false "server not running". ← next
+- [HIGH] commands.rs:1206 — batch_transcribe persists ASR output with no empty guard (blank overwrites a
+  good stored transcript). (sibling of #97, different command)
+- [HIGH] conformal.rs:146 — calibrate_and_certify builds its calibration + certified set from verified +
+  non-empty-annotated WITHOUT excluding is_human_rejected → 'mark bad' clips pollute the dataset-quality
+  certificate (count-must-exclude-rejected, 8th instance; db.rs:2073 has the identical predicate + guard).
+- [MED] batch_processor.rs:146 — headless re-transcribe DELETES an unverified segment on a legit empty
+  bundled-engine result (blank-overwrite / data-loss).
+- [MED] eval.rs:174 — create_gold_from_verified_file joins a placeholder draft ("[Pending WSL 7B ASR]")
+  into the permanent gold reference (placeholder-leak-into-gate).
+- [MED] constrained_decode.rs:157 — run_constrained loads model+tokens with no SHA-256 pin the default
+  path enforces (integrity-gate-bypass).
+- [LOW] audio.rs:163 — check_audio reports duration_ms=0 for a valid VBR MP3 without a Xing header
+  (contradicts get_duration_ms).
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
