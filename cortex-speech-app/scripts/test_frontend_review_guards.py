@@ -54,6 +54,29 @@ def test_retranscribe_guards_editor_writes_against_navigation() -> None:
         )
 
 
+def test_submit_guards_editor_writes_against_navigation() -> None:
+    """ReviewMode.submit() (accept/edit): after the recordHumanDecision + updateSegment awaits, the store
+    write targets seg by id (correct even if the reviewer navigated away — an 'edit' hashes the whole file,
+    hundreds of ms), but editText/lastLoadedOriginal/editedChips belong to the CURRENT clip. Without a
+    current-vs-seg recheck, navigating mid-await puts seg's text into another clip's editor (and submit never
+    resets lastLoadedId, so that clip's load effect no-ops and never reloads its own text); a subsequent Save
+    persists it as that clip's human-verified gold — wrong-segment gold corruption (THE ONE LAW). The guard
+    `if (current?.id !== seg.id) return;` must sit between the store write and the editor write. Sibling of
+    doRetranscribe's identical guard (found by adversarial hunt-7 / iter 163)."""
+    body = _function_body(_read("src/lib/ReviewMode.svelte"), "async function submit(")
+    store_write = body.find("await api.updateSegment(updated);")
+    editor_write = body.find("editText = text;")
+    guard = body.find("if (current?.id !== seg.id) return;")
+    if store_write == -1 or editor_write == -1:
+        raise AssertionError("submit structure changed (store/editor write markers missing) — gate vacuous")
+    if guard == -1 or not (store_write < guard < editor_write):
+        raise AssertionError(
+            "submit() writes editText without a current-vs-seg guard between the store write and the editor "
+            "write: navigating during the decision await would put seg's text into another clip's editor and "
+            "Save it as that clip's human gold. Add `if (current?.id !== seg.id) return;`."
+        )
+
+
 def test_go_draft_persist_bails_on_aligning_and_uses_freshrow() -> None:
     """ReviewMode.go(): navigating with a dirty edit persists it as a draft via a WHOLE-ROW updateSegment.
     That row includes alignment_json/alignment_quality, so (a) it must not run while a background CTC
@@ -411,6 +434,7 @@ def test_selection_reseats_playback_centrally_for_store_only_selections() -> Non
 
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
+    test_submit_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
     test_inbox_undo_bails_while_a_decision_is_in_flight()
     test_app_normalize_uses_freshrow_not_a_stale_spread()

@@ -499,10 +499,19 @@
       await api.updateSegment(updated);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       editCache.delete(seg.id); // persisted — drop the in-progress copy
+      notifications.success($t('saved'));
+      // The DB/store write above targets seg by id and is correct even if the reviewer navigated away during
+      // the decision await (an 'edit' hashes the whole file — hundreds of ms). But everything below mutates
+      // the CURRENTLY shown editor (editText/lastLoadedOriginal/editedChips) — if navigation changed `current`
+      // mid-flight, applying seg's text here would put it into ANOTHER clip's editor (and submit never resets
+      // lastLoadedId, so the coalesced load effect no-ops that clip and never reloads its own text), and a
+      // subsequent Save would persist seg's text as THAT clip's human-verified gold: a wrong-segment gold
+      // corruption (THE ONE LAW). Bail without advancing; seg is already saved and the current clip keeps its
+      // own draft. Mirrors doRetranscribe's identical guard.
+      if (current?.id !== seg.id) return;
       lastLoadedOriginal = text; // the saved text is now the baseline for dirty-tracking
       editText = text;
       editedChips = {}; // the fixes are now baked into the saved transcript; drop the overlay
-      notifications.success($t('saved'));
       advance();
     } catch (e) {
       undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
