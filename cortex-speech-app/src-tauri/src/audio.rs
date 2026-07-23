@@ -262,8 +262,15 @@ pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
                 break;
             }
             Err(symphonia::core::errors::Error::ResetRequired) => {
-                tracing::warn!("audio decode: stream reset required mid-file; stopping decode early");
-                break;
+                // A mid-stream reset (chained/multi-stream file, e.g. chained OGG) means there is MORE audio
+                // after this point we can't decode in one pass. Keeping only the decoded prefix is the same
+                // silent-truncation data-loss trap the corrupt-source arm below guards — fail LOUDLY so a
+                // curation import never quietly drops the tail of a legitimate file.
+                return Err(AppError::Audio(AudioError::Decode(
+                    "decode stopped at a mid-stream reset (chained or multi-stream file). Re-encode to a \
+                     single continuous stream (e.g. `ffmpeg -i INPUT -ar 16000 -ac 1 out.wav`) and re-import."
+                        .to_string(),
+                )));
             }
             Err(e) => {
                 // Non-EOF error mid-file = corrupt/truncated source. Fail loudly rather than silently
@@ -402,10 +409,15 @@ where
                 break;
             }
             Err(symphonia::core::errors::Error::ResetRequired) => {
-                // A legitimate mid-stream parameter change (e.g. chained OGG). Re-init is out of scope
-                // here; stop decoding but say so, rather than silently pretending it was EOF.
-                tracing::warn!("audio decode: stream reset required mid-file; stopping decode early");
-                break;
+                // A mid-stream reset (chained/multi-stream file, e.g. chained OGG) means there is MORE audio
+                // after this point we can't decode in one pass. Keeping only the decoded prefix is the same
+                // silent-truncation data-loss trap the corrupt-source arm below guards — fail LOUDLY so a
+                // curation import never quietly drops the tail of a legitimate file.
+                return Err(AppError::Audio(AudioError::Decode(
+                    "decode stopped at a mid-stream reset (chained or multi-stream file). Re-encode to a \
+                     single continuous stream (e.g. `ffmpeg -i INPUT -ar 16000 -ac 1 out.wav`) and re-import."
+                        .to_string(),
+                )));
             }
             Err(e) => {
                 // A non-EOF decode error mid-file means the source is corrupt/truncated. Treating it as a

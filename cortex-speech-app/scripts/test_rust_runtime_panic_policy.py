@@ -1066,6 +1066,28 @@ def test_audio_decode_worker_send_failures_are_reported() -> None:
         raise AssertionError(f"audio.rs must keep observable decode worker send handling:\n{formatted}")
 
 
+def test_audio_decode_reset_required_fails_loud_not_silent_truncation() -> None:
+    """Both decode loops (decode_to_pcm, decode_pcm_windows) can hit next_packet()'s ResetRequired on a
+    chained/multi-stream file MID-stream — by definition there is more audio after that point. The old arm
+    logged a tracing::warn! and `break`, keeping only the decoded PREFIX and returning Ok: a silent-
+    truncation data-loss trap (same class as the fixed `Err(_) => break`) that a GUI import never surfaces.
+    Both arms must fail LOUDLY, matching the corrupt-source arm right beside them. Regression guard: iter-152."""
+    audio = (REPO_ROOT / "src-tauri/src/audio.rs").read_text(encoding="utf-8")
+    forbidden = "stream reset required mid-file; stopping decode early"
+    if forbidden in audio:
+        raise AssertionError(
+            "audio.rs still silently breaks on a mid-stream ResetRequired (drops the tail of a legitimate "
+            f"chained/multi-stream file):\n- {forbidden}"
+        )
+    loud = "decode stopped at a mid-stream reset (chained or multi-stream file)."
+    count = audio.count(loud)
+    if count != 2:
+        raise AssertionError(
+            "audio.rs must fail loudly on ResetRequired in BOTH decode loops (decode_to_pcm + "
+            f"decode_pcm_windows); found {count} of 2 loud handlers."
+        )
+
+
 def test_pipeline_wsl_subprocess_send_failures_are_reported() -> None:
     pipeline = pipeline_surface()
     forbidden = [
@@ -2091,6 +2113,7 @@ def main() -> None:
     test_model_artifact_cleanup_reports_failures()
     test_model_metadata_updates_do_not_silently_default()
     test_audio_decode_worker_send_failures_are_reported()
+    test_audio_decode_reset_required_fails_loud_not_silent_truncation()
     test_pipeline_wsl_subprocess_send_failures_are_reported()
     test_probe_wsl_7b_server_reaps_child_on_wait_error()
     test_aligner_score_consistency_caps_clip_and_dp()
