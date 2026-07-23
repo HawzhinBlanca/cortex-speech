@@ -9594,6 +9594,50 @@ is the OWNER-GATED accuracy levers (which need real measurement runs).
 closed, 5 finders clean) + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 165 — 2026-07-23 — HUNT-9 processed: 3 fixes (#128, #129, #130); hit rate back UP to 3
+
+**Hunt-9** (Workflow, 6 deepest-surface finders — jury internals, settings/model/snapshot IPC, refine loop,
+measurement scripts, DiffView, less-common db methods — all candidates returned; 1.59M tokens, 21 agents, 1
+verify agent died mid-response so I hand-verified that survivor especially carefully). 3 survivors (all MED,
+0 refutes) + 3 finders clean (refine-loop, diffview, db-methods). Saturation DISPROVEN — hunt-8 found 1,
+hunt-9 found 3.
+
+**FIX #128 — DPO preference prompt leaks its own gold label.** record_human_decision("edit", fix) sets
+speech_segments.verdict_transcript = fix AND makes that same fix the pair's `chosen` (agent_examples.human_fix).
+Every DPO-eligible pair is edit-born, so verdict_transcript == chosen for 100% of pairs — and
+build_learning_prompt emitted `jury_transcript: <verdict_transcript>`, embedding the answer in the shared
+prompt. Fine-tuning that JSONL trains a copy-the-jury_transcript shortcut instead of ASR correction, defeating
+the flywheel. The existing prompt tests missed it: their fixtures hand-build verdict_transcript to the
+REJECTED text, decoupling from the real write. Removed the field (+ its now-dead LearningRow column). Test
+uses the PRODUCTION path and asserts the prompt lacks the chosen fix.
+
+**FIX #129 (privacy) — harden the #117 restore consent fix.** #117 fs::copies the snapshot's settings.json
+(cloud-ON opt-ins) to disk then best-effort re-saves a narrowed version. If that re-save fails/interrupts
+(disk full during disaster recovery — when restores run — or a kill in the window), the cloud-ON file stays
+and the next launch silently re-grants revoked consent. Fix: SKIP settings.json in the copy loop; load the
+snapshot's settings, narrow, and write ONLY the narrowed struct — so the snapshot's cloud-ON value never
+touches disk and a failed write leaves the pre-restore (revoked) consent (fails SAFE). Policy extended.
+
+**FIX #130 (honesty) — MAPSSWE mispaired clips silently.** The scorecards wrote compacted per-clip TSVs with
+no clip id and dropped skipped clips; mapsswe paired by row position (zip) guarded only by len-equality. Two
+engines skipping DIFFERENT clips → equal counts, mismatched pairs → a fabricated significance to the ledger
+(same tool as #123). Emit clip_index in both scorecards; pair by it in mapsswe (inner join, report drops);
+refuse/warn on legacy id-less TSVs. Testable helper + test.
+
+Gate per fix: #128 Rust (cargo test 1000); #129 Rust (cargo test 1000, 41 policies); #130 python (41
+policies). Reality check pre-work: exe not running, git clean, HEAD 25132a6, lock free.
+
+**Session hunt tally (hunt-3..hunt-9, 7 hunts): 14 hunt-found fixes (#117-#130) + the 6 earlier non-hunt
+fixes (#111-#116) = 20 this session.** Severity trend: the HIGH privacy/data-loss defects appear mined; the
+sustained tail is MED honesty/data-quality/data-safety bugs (~2-3/hunt, still real). Hunts remain productive
+— the loop should keep running occasional hunts on future fires.
+
+**Score: 130 fixed + 1 cleanup, ~43 refuted, 2 measure-deferred, 0 hunt-queued (hunt-9 drained: 3 fixed, 3
+finders clean) + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
