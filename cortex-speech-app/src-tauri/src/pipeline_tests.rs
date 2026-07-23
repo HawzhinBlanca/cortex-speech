@@ -166,6 +166,16 @@ fn loop0_would_fire_is_the_shadow_signal_independent_of_the_toggle() {
     assert!(!super::loop0_would_fire(&mems, "شتێکی جیاواز"), "unrelated text would not fire");
     assert!(!super::loop0_would_fire(&mems, "   "), "blank text never fires");
     assert!(!super::loop0_would_fire(&[], "ئەو ساڵە باش بوو"), "no memories -> never fires");
+
+    // Whitespace normalization is NOT a memory firing. apply_memories rebuilds the text via
+    // split_whitespace()+join(" "), so a draft with non-canonical whitespace (double space, leading/
+    // trailing, tab) but NO matching memory would otherwise differ from its input and flip the shadow
+    // signal true — inflating the C5 over-trigger honesty metric with pure whitespace edits.
+    assert!(!super::loop0_would_fire(&mems, "شتێکی  جیاواز"), "a double space alone is not a firing");
+    assert!(!super::loop0_would_fire(&mems, " شتێکی جیاواز "), "leading/trailing space alone is not a firing");
+    assert!(!super::loop0_would_fire(&mems, "شتێکی\tجیاواز"), "a tab alone is not a firing");
+    // A genuine memory match still fires even when the draft carries irregular whitespace around it.
+    assert!(super::loop0_would_fire(&mems, "  ئەو ساڵە باش بوو  "), "a real match still fires despite padding");
 }
 
 #[test]

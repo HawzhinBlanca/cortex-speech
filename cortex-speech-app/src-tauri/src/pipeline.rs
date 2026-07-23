@@ -109,8 +109,15 @@ fn openrouter_model_id(configured: &str) -> String {
 pub(crate) fn loop0_would_fire(memories: &[crate::corrections::MemoryEntry], text: &str) -> bool {
     !memories.is_empty()
         && !text.trim().is_empty()
-        && crate::corrections::apply_memories(text, memories, &crate::corrections::FiringConfig::default()).as_str()
-            != text
+        // Detect an ACTUAL memory firing (a winner-take-all slot replacement), NOT whitespace normalization.
+        // apply_memories rebuilds the text via split_whitespace()+join(" "), so it differs from a
+        // non-whitespace-canonical input (double space, leading/trailing, tab, newline) even when ZERO
+        // memories match — using `apply_memories(...) != text` here counted pure whitespace edits as
+        // firings and inflated the C5 over-trigger honesty metric (wouldFire / firedButHumanAcceptedOriginal,
+        // which must be 0 to let firing go live). fired_memories_summary applies the SAME eligibility gates +
+        // winner-take-all as apply_memories (it is the real firing path's provenance), minus that artifact.
+        && !crate::corrections::fired_memories_summary(text, memories, &crate::corrections::FiringConfig::default())
+            .is_empty()
 }
 
 /// F7 — the LLM-refinement diff guard. Max CER an LLM refinement may sit from the raw ASR text
