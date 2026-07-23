@@ -237,6 +237,15 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
         let (text, audio_path) = row_res?;
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { continue };
 
+        // Never emit an ASR PLACEHOLDER ("[Pending WSL 7B ASR]", "[ASR unavailable: …]", "n/a") as
+        // human-confirmed LM training text. The COALESCE can fall through to a raw placeholder on an
+        // accept/edit row (an export taken mid-import or after a stuck-placeholder incident), poisoning the
+        // corpus with a non-speech marker — the exact case is_effective_placeholder catches on the dataset
+        // paths, which this LM path bypasses (it never routes through the training-grade gate).
+        if crate::quality::is_placeholder_transcript(&text) {
+            continue;
+        }
+
         // Fail-closed holdout exclusion: path match drops a held-out clip even if its file is gone.
         if holdout_paths.contains(&audio_path) {
             continue;
@@ -1161,6 +1170,40 @@ mod tests {
         assert_eq!(corpus.len(), 1, "the accepted segment exports one line: {corpus:?}");
         assert!(corpus[0].contains("ڕاست"), "must export the human's annotated fix: {corpus:?}");
         assert!(!corpus[0].contains("غەڵەت"), "must NOT export the superseded ASR draft: {corpus:?}");
+    }
+
+    #[test]
+    fn export_lm_corpus_skips_an_asr_placeholder_draft() {
+        // A placeholder ("[Pending WSL 7B ASR]" / "[ASR unavailable …]") must NEVER be emitted as
+        // human-confirmed LM training text. A segment can carry human_decision='accept' while its COALESCE'd
+        // draft is still a bracket-placeholder (an export taken mid-import or after a stuck-placeholder
+        // incident); this LM path bypasses the training-grade gate that catches it elsewhere, so it must skip
+        // placeholders itself. A real accepted Kurdish draft is the control that MUST appear.
+        let db = open_mem_db();
+        let good = SpeechSegment {
+            id: "lm-good".to_string(),
+            audio_path: "/good.wav".to_string(), // absent -> no holdout hashing, included
+            raw_transcript: "کوردی".to_string(),
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&good).expect("insert good");
+        let placeholder = SpeechSegment {
+            id: "lm-ph".to_string(),
+            audio_path: "/ph.wav".to_string(),
+            raw_transcript: "[Pending WSL 7B ASR]".to_string(),
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&placeholder).expect("insert placeholder");
+        db.connection()
+            .execute("UPDATE speech_segments SET human_decision='accept' WHERE id IN ('lm-good','lm-ph')", [])
+            .expect("accept both");
+
+        let corpus = export_lm_corpus(&db).expect("export");
+        assert!(corpus.iter().any(|t| t.contains("کوردی")), "a real accepted draft must be in the corpus: {corpus:?}");
+        assert!(
+            !corpus.iter().any(|t| t.contains("Pending") || t.contains('[')),
+            "an ASR placeholder must not be emitted as human-confirmed LM text: {corpus:?}"
+        );
     }
 
     #[test]
