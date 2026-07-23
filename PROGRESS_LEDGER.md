@@ -8151,3 +8151,39 @@ QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
 - [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree.
 - [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+## 2026-07-23T11:55Z — iter 127 — segmentStats.verified counted batch-verified placeholders (MEDIUM honesty) fixed (211dc23)
+
+**Fixed the queued MEDIUM count-must-exclude-placeholder recurrence (7th of this class). Hand-verified reachability.**
+
+**stores/segmentStore.ts segmentStats.verified — over-counted verified clips vs the export (MEDIUM, honesty;
+211dc23).** Hand-verified: segmentStats counted a clip as `verified` on bare `s.verified && !isHumanRejected(s)`
+— NO content check. batch_verify (commands/batch.rs) sets verified=true via a blanket update_verified with NO
+placeholder/empty guard, so "Verify all pending" marks a still-pending placeholder clip ("[Pending WSL 7B ASR]",
+awaiting the 7B) as verified. export_dataset drops every placeholder/empty row via the training grade, so the
+dashboard "verified" number exceeded what the dataset can actually contain — the exact recurring class the
+memory count-sites-must-exclude-rejected-placeholder tracks (isPlaceholderTranscript's own doc says it exists to
+"keep the review counts honest"). REACHABLE via the "Verify all pending" button.
+
+Fix: added hasRealTranscript(seg) to segmentQuality.ts (true iff ANY of verdict/annotated/normalized/raw is
+non-empty AND non-placeholder) and gated the verified bucket on `s.verified && hasRealTranscript(s)`; a
+verified-but-contentless clip counts toward NEITHER, like a rejected one. Correct-DIRECTION by construction: a
+clip with any real transcript stays counted, so it never under-counts a genuinely-good clip; it excludes only
+clips that are placeholder/empty everywhere. Fail-before verified: source policy fired with the wiring
+neutralized; 3 hasRealTranscript unit tests added (placeholder-only false, any-real-field true, batch-verified
+placeholder is verified+not-rejected yet has no real content).
+
+Gate: typecheck 0 errors (419 files), **vitest 206 passed** (36 files, +3), lint 0 errors, **35/35 python
+policies** (15 checks now in test_frontend_review_guards.py).
+
+**Score: 89 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 4 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
+- [MED] KeyboardShortcuts.svelte:55 — duplicate {#each} key when two shortcuts share a description → each_key_duplicate crash. ← next
+- [MED] export_bundle.rs:394 — runConfig.denoising reports true when the denoiser model fails to load (provenance lie).
+- [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree.
+- [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
