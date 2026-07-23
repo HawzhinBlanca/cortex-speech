@@ -350,27 +350,43 @@ pub fn slice_pcm_by_alignment(
     sample_rate: u32,
     alignment_json: Option<&str>,
 ) -> AppResult<(Vec<i16>, Option<String>)> {
-    if let Some(meta) = alignment_json.and_then(SegmentSourceMeta::from_alignment_json) {
-        let (start_ms, end_ms) = (meta.source_start_ms.max(0), meta.source_end_ms.max(0));
-        // Reject an absurd offset rather than truncating via `as u32` (i64 -> u32 wraps mod 2^32, which
-        // would silently slice an UNRELATED in-bounds window with no error). The app never emits an
-        // offset > u32::MAX ms (~49.7 days); a value this large is a malformed or crafted alignment blob.
-        if start_ms > u32::MAX as i64 || end_ms > u32::MAX as i64 {
-            return Err(AppError::Validation("Chunk time range out of bounds".into()));
-        }
-        let start = ms_to_samples(start_ms as u32, sample_rate);
-        let end = ms_to_samples(end_ms as u32, sample_rate).min(pcm.len());
-        if end <= start {
-            return Err(AppError::Validation("Invalid chunk time range".into()));
-        }
-        // Round-22 #12: key the per-chunk cache on the STORED ms range, not the sample indices. The
-        // import write-side derives its key from the same source_start_ms/source_end_ms, so the keys
-        // match exactly; a sample-index key never matched here because `start`/`end` round-trip
-        // sample -> ms -> sample, so the cache missed on every re-transcribe.
-        let suffix = format!("chunk_{}_{}", meta.source_start_ms, meta.source_end_ms);
-        Ok((pcm[start..end].to_vec(), Some(suffix)))
-    } else {
-        Ok((pcm.to_vec(), None))
+    match alignment_json {
+        // Truly no alignment metadata -> a single-file segment; the whole file IS the clip.
+        None => Ok((pcm.to_vec(), None)),
+        Some(json) => match SegmentSourceMeta::from_alignment_json(json) {
+            Some(meta) => {
+                let (start_ms, end_ms) = (meta.source_start_ms.max(0), meta.source_end_ms.max(0));
+                // Reject an absurd offset rather than truncating via `as u32` (i64 -> u32 wraps mod 2^32,
+                // which would silently slice an UNRELATED in-bounds window with no error). The app never
+                // emits an offset > u32::MAX ms (~49.7 days); a value this large is a malformed/crafted blob.
+                if start_ms > u32::MAX as i64 || end_ms > u32::MAX as i64 {
+                    return Err(AppError::Validation("Chunk time range out of bounds".into()));
+                }
+                let start = ms_to_samples(start_ms as u32, sample_rate);
+                let end = ms_to_samples(end_ms as u32, sample_rate).min(pcm.len());
+                if end <= start {
+                    return Err(AppError::Validation("Invalid chunk time range".into()));
+                }
+                // Round-22 #12: key the per-chunk cache on the STORED ms range, not the sample indices. The
+                // import write-side derives its key from the same source_start_ms/source_end_ms, so the keys
+                // match exactly; a sample-index key never matched here because `start`/`end` round-trip
+                // sample -> ms -> sample, so the cache missed on every re-transcribe.
+                let suffix = format!("chunk_{}_{}", meta.source_start_ms, meta.source_end_ms);
+                Ok((pcm[start..end].to_vec(), Some(suffix)))
+            }
+            // Present but no source offsets (a clobbered chunk: a broken/legacy aligner overwrote the
+            // SegmentSourceMeta with a bare word array). Do NOT fall back to the whole file — re-transcribing
+            // a chunk against the ENTIRE recording pairs the chunk's transcript with whole-file audio, the
+            // whole-file-vs-clip training-data corruption that slice_for_export already SKIPS on the export
+            // side. Import always writes a SegmentSourceMeta (with source_start_ms, even for a chunk_count=1
+            // single-file segment), so a genuine whole-file segment has alignment_json = None (handled
+            // above), never a present-but-offset-less blob. Refuse loudly instead of silently mis-slicing.
+            None => Err(AppError::Validation(
+                "Alignment metadata is present but missing source offsets (clobbered chunk metadata); \
+                 refusing to transcribe this chunk against the whole file"
+                    .into(),
+            )),
+        },
     }
 }
 
@@ -605,6 +621,29 @@ mod tests {
             chunk_count: 1,
         };
         assert!(slice_pcm_by_alignment(&pcm, 16000, Some(&bad.to_alignment_json())).is_err());
+    }
+
+    #[test]
+    fn slice_pcm_by_alignment_refuses_present_but_offsetless_alignment() {
+        // A clobbered chunk (alignment present but no source offsets — a bare word array, or a
+        // {"words":...} object with no source_start_ms) must NOT fall back to the whole file: that would
+        // re-transcribe the chunk against the ENTIRE recording (whole-file-vs-clip training-data
+        // corruption). Mirrors slice_for_export's export-side guard. Import always writes a
+        // SegmentSourceMeta, so a genuine whole-file segment has alignment_json = None (still allowed).
+        let pcm = vec![0i16; 16000];
+        let bare_array = r#"[{"word":"x","start":0.0,"end":1.0,"confidence":0.5}]"#;
+        assert!(slice_pcm_by_alignment(&pcm, 16000, Some(bare_array)).is_err(), "bare word array must refuse");
+        let words_obj = r#"{"words":[]}"#;
+        assert!(slice_pcm_by_alignment(&pcm, 16000, Some(words_obj)).is_err(), "offset-less object must refuse");
+        // None -> whole file (a genuine single-file segment) is still allowed.
+        let (whole, suffix) = slice_pcm_by_alignment(&pcm, 16000, None).unwrap();
+        assert_eq!(whole.len(), pcm.len());
+        assert!(suffix.is_none());
+        // A valid offset still slices to its window.
+        let meta = SegmentSourceMeta { source_start_ms: 100, source_end_ms: 500, chunk_index: 0, chunk_count: 2 };
+        let (sliced, suffix) = slice_pcm_by_alignment(&pcm, 16000, Some(&meta.to_alignment_json())).unwrap();
+        assert_eq!(sliced.len(), ms_to_samples(400, 16000));
+        assert!(suffix.is_some());
     }
 
     #[test]
