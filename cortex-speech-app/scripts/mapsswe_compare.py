@@ -15,16 +15,22 @@ import sys
 
 
 def load(path):
+    """Each row -> (clip_index, char_dist, char_ref_len, word_dist, word_ref_len). clip_index is the manifest
+    row index the scorecards now emit so two engines' TSVs can be paired by CLIP; it is None for a legacy TSV
+    that predates the column."""
     rows = []
     with open(path, encoding="utf-8") as f:
         header = f.readline().rstrip("\n").split("\t")
         idx = {c: i for i, c in enumerate(header)}
+        has_id = "clip_index" in idx
         for line in f:
             p = line.rstrip("\n").split("\t")
             if len(p) < len(header):
                 continue
+            clip = int(p[idx["clip_index"]]) if has_id else None
             rows.append(
-                (int(p[idx["char_dist"]]), int(p[idx["char_ref_len"]]), int(p[idx["word_dist"]]), int(p[idx["word_ref_len"]]))
+                (clip, int(p[idx["char_dist"]]), int(p[idx["char_ref_len"]]),
+                 int(p[idx["word_dist"]]), int(p[idx["word_ref_len"]]))
             )
     return rows
 
@@ -53,6 +59,15 @@ def mapsswe(diffs):
     return mean, z, p
 
 
+def pair_by_clip_index(a, b):
+    """Join two per-clip row lists on clip_index (row[0]) so the matched-pairs test compares the SAME clip on
+    each side even when the two engines skipped different clips. Returns (common_indices, paired_a, paired_b)
+    in ascending clip_index order."""
+    amap, bmap = {r[0]: r for r in a}, {r[0]: r for r in b}
+    common = sorted(set(amap) & set(bmap))
+    return common, [amap[i] for i in common], [bmap[i] for i in common]
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
@@ -60,18 +75,43 @@ def main():
     a, b = load(sys.argv[1]), load(sys.argv[2])
     la = sys.argv[3] if len(sys.argv) > 3 else "A"
     lb = sys.argv[4] if len(sys.argv) > 4 else "B"
-    if len(a) != len(b):
-        print(f"ROW MISMATCH: {la}={len(a)} rows vs {lb}={len(b)} rows — segments must pair 1:1; refusing.")
-        return 1
+
+    a_has_id = bool(a) and all(r[0] is not None for r in a)
+    b_has_id = bool(b) and all(r[0] is not None for r in b)
+    if a_has_id and b_has_id:
+        # Pair by clip_index — the matched-pairs test REQUIRES row i of A and row i of B to be the SAME clip.
+        # Each scorecard drops the clips it skipped (decode error / empty ref / timeout), so if the two
+        # engines skipped DIFFERENT clips a plain row-position zip pairs mismatched clips (equal row counts,
+        # wrong pairs) and prints a fabricated significance. Join on the shared manifest index instead.
+        orig_a, orig_b = len(a), len(b)
+        common, a, b = pair_by_clip_index(a, b)
+        a_only, b_only = orig_a - len(common), orig_b - len(common)
+        if a_only or b_only:
+            print(f"NOTE: paired {len(common)} clips by clip_index; dropped {a_only} {la}-only + {b_only} {lb}-only clip(s).")
+    else:
+        # Legacy id-less TSV(s): pairing can only be by ROW POSITION, valid ONLY if both engines scored the
+        # identical clip set in the same order (no clip skipped on either side) — which is NOT verifiable
+        # here. Refuse an unequal count, and warn loudly even on an equal count rather than risk a silently
+        # mispaired (fabricated) significance.
+        if len(a) != len(b):
+            print(f"ROW MISMATCH: {la}={len(a)} rows vs {lb}={len(b)} rows — segments must pair 1:1; refusing.")
+            return 1
+        print("WARNING: TSV(s) have no clip_index column — pairing by ROW POSITION, which is only valid if BOTH "
+              "engines scored the identical clip set in the same order (no clip skipped on either side). "
+              "Re-run the scorecards to emit clip_index for a clip-verified comparison.")
+
     n = len(a)
-    for name, ei, ri in (("word", 2, 3), ("char", 0, 1)):
+    if n == 0:
+        print("no paired clips to compare.")
+        return 1
+    for name, ei, ri in (("word", 3, 4), ("char", 1, 2)):
         diffs = [ra[ei] - rb[ei] for ra, rb in zip(a, b)]
         mean, z, p = mapsswe(diffs)
-        ra = sum(r[ei] for r in a) / max(sum(r[ri] for r in a), 1)
-        rb_ = sum(r[ei] for r in b) / max(sum(r[ri] for r in b), 1)
+        ra_rate = sum(r[ei] for r in a) / max(sum(r[ri] for r in a), 1)
+        rb_rate = sum(r[ei] for r in b) / max(sum(r[ri] for r in b), 1)
         verdict = f"{la} better" if mean < 0 else f"{lb} better" if mean > 0 else "tied"
         print(
-            f"MAPSSWE {name}: {la} {ra * 100:.2f}% vs {lb} {rb_ * 100:.2f}%  "
+            f"MAPSSWE {name}: {la} {ra_rate * 100:.2f}% vs {lb} {rb_rate * 100:.2f}%  "
             f"mean diff/seg = {mean:+.3f}  z = {z:+.2f}  p = {p:.3e}  N={n}  -> {verdict}"
             + ("  (SIGNIFICANT p<0.05)" if p < 0.05 else "  (not significant)")
         )

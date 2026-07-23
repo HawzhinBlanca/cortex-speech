@@ -58,7 +58,12 @@ def main() -> int:
     per_clip, word_clip = [], []
     t0 = time.perf_counter()
     with open(out_tsv, "w", encoding="utf-8") as f:
-        f.write("char_dist\tchar_ref_len\tword_dist\tword_ref_len\n")
+        # clip_index (the manifest row index) is the FIRST column so mapsswe_compare.py can pair two
+        # engines' TSVs by CLIP, not by row position. Skipped clips (decode error / empty ref below) drop
+        # their row entirely, so without a clip id a comparison silently misaligns when the two engines skip
+        # DIFFERENT clips (equal row counts, mismatched clips). Both scorecards iterate the same manifest, so
+        # the manifest index is the shared, tab-safe key.
+        f.write("clip_index\tchar_dist\tchar_ref_len\tword_dist\tword_ref_len\n")
         for i, row in enumerate(rows):
             wav, ref = row[0], row[1]
             try:
@@ -77,7 +82,7 @@ def main() -> int:
             wd, wr = word_pair(r, h)
             per_clip.append((cd, cr))
             word_clip.append((wd, wr))
-            f.write(f"{cd}\t{cr}\t{wd}\t{wr}\n")
+            f.write(f"{i}\t{cd}\t{cr}\t{wd}\t{wr}\n")
             if (i + 1) % 25 == 0:
                 print(f"  ...{i + 1}/{len(rows)}", flush=True)
 

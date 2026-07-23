@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mapsswe_compare import mapsswe  # noqa: E402
+from mapsswe_compare import mapsswe, pair_by_clip_index  # noqa: E402
 
 
 def test_mapsswe_significance() -> None:
@@ -39,8 +39,25 @@ def test_mapsswe_significance() -> None:
     assert mapsswe([1, -1, 1, -1])[2] > 0.05
 
 
+def test_pair_by_clip_index_matches_clips_not_row_positions() -> None:
+    # A scored clips 0,1,2,3; engine B skipped clip 1 (decode error / timeout) so its TSV holds only 0,2,3.
+    # A plain row-position zip would pair A's clip 1 with B's clip 2, A's clip 2 with B's clip 3, ... — a
+    # matched-pairs test over MISMATCHED clips (equal-ish counts, fabricated significance). Pairing by
+    # clip_index must instead join on the shared clips {0,2,3}, aligned. Row tuple: (clip_index,cd,cr,wd,wr).
+    a = [(0, 1, 10, 0, 3), (1, 2, 10, 1, 3), (2, 3, 10, 1, 3), (3, 4, 10, 2, 3)]
+    b = [(0, 1, 10, 0, 3), (2, 9, 10, 5, 3), (3, 4, 10, 2, 3)]
+    assert a[1][0] != b[1][0], "fixture: row-position pairing WOULD mismatch clips (that's the bug)"
+    common, pa, pb = pair_by_clip_index(a, b)
+    assert common == [0, 2, 3], f"must join on shared clip_index, got {common}"
+    assert [r[0] for r in pa] == [0, 2, 3]
+    assert [r[0] for r in pb] == [0, 2, 3]
+    # clip 2 is now correctly compared with clip 2 on both sides (char_dist 3 vs 9), not a cross-clip artifact.
+    assert pa[1][1] - pb[1][1] == 3 - 9
+
+
 def main() -> None:
     test_mapsswe_significance()
+    test_pair_by_clip_index_matches_clips_not_row_positions()
     print("mapsswe significance policy passed")
 
 

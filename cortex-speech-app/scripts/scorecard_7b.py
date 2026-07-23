@@ -105,6 +105,7 @@ def main() -> int:
     per_clip = []  # (char_dist, char_ref_len)
     word_clip = []  # P2.1: (word_dist, word_ref_len) for WER, scored on the SAME normalized pairs
     pairs = []
+    scored_indices = []  # manifest row index of each SCORED clip, so the TSV pairs by clip, not row position
     total_proc_s = 0.0  # P2.1: cumulative per-clip decode time (sum of latencies, all workers)
     workers = max(1, int(os.environ.get("CORTEX_7B_WORKERS", "1")))
 
@@ -157,6 +158,7 @@ def main() -> int:
         per_clip.append((edit_distance(list(r), list(h)), len(r)))
         word_clip.append(word_pair(r, h))
         pairs.append({"ref": ref, "hyp": hyp})
+        scored_indices.append(i)
         if (i + 1) % 25 == 0:
             print(f"  ...{i+1}/{len(rows)}")
 
@@ -193,9 +195,12 @@ def main() -> int:
 
     out_tsv = os.path.join(os.path.dirname(os.path.abspath(manifest)), "omni7b_results.tsv")
     with open(out_tsv, "w", encoding="utf-8") as f:
-        f.write("char_dist\tchar_ref_len\tword_dist\tword_ref_len\n")
-        for (d, r), (wd, wr) in zip(per_clip, word_clip):
-            f.write(f"{d}\t{r}\t{wd}\t{wr}\n")
+        # clip_index (manifest row index) first, so mapsswe_compare.py pairs two engines' TSVs by CLIP, not
+        # by row position — skipped clips drop their row, so without an id a comparison silently misaligns
+        # when the two engines skip DIFFERENT clips. Both scorecards key on the same manifest index.
+        f.write("clip_index\tchar_dist\tchar_ref_len\tword_dist\tword_ref_len\n")
+        for idx, ((d, r), (wd, wr)) in zip(scored_indices, zip(per_clip, word_clip)):
+            f.write(f"{idx}\t{d}\t{r}\t{wd}\t{wr}\n")
     out_json = os.path.join(os.path.dirname(os.path.abspath(manifest)), "omni7b_eval_summary.json")
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(
