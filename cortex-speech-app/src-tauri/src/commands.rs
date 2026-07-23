@@ -1796,6 +1796,15 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
         restored.cloud_stt_opt_in = live.cloud_stt_opt_in;
         restored.jury_cloud_opt_in = live.jury_cloud_opt_in;
     }
+    // Persist the consent-narrowed settings to disk. The fs::copy above overwrote data_dir/settings.json with
+    // the SNAPSHOT's file, which may carry a cloud opt-in from a cloud-ON era; narrowing only the in-memory
+    // struct leaves that stale value on disk, so the NEXT launch's AppSettings::load (which does NOT reset
+    // opt-ins) would silently re-grant the revoked consent — defeating the "a restore may narrow consent,
+    // never escalate it" guarantee across a restart. Write the narrowed struct back so disk matches the
+    // consent-safe in-memory state. Best-effort, matching the per-file copy above.
+    if let Err(e) = restored.save(&data_dir.join("settings.json")) {
+        tracing::warn!("snapshot restore: could not persist consent-narrowed settings to disk: {e}");
+    }
     *state.lock_settings() = restored.clone();
     state.update_pipeline_settings(restored);
     // (undo/redo history was already cleared above, right after the DB swap.)

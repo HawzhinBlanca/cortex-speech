@@ -1891,13 +1891,27 @@ def test_snapshot_restore_preserves_live_cloud_consent() -> None:
         if idx != -1:
             end = min(end, idx)
     body = rest[:end]
+    # Strip comment-only lines so a commented-out call can't satisfy the substring checks below (a
+    # commented `// restored.save(...)` must NOT count as persisting).
+    code_body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("//"))
     for flag in ("cloud_llm_opt_in", "cloud_stt_opt_in", "jury_cloud_opt_in"):
-        if flag not in body:
+        if flag not in code_body:
             raise AssertionError(
                 f"restore_db_from_snapshot does not preserve the live consent flag {flag} — restoring a "
                 "cloud-ON-era snapshot silently re-enables cloud consent the user revoked. Carry the current "
                 "state.lock_settings() opt-ins across the restore instead of adopting the snapshot's."
             )
+    # The in-memory narrowing above is NOT enough: the fs::copy of the snapshot's settings.json already
+    # overwrote the on-disk file with the snapshot's (possibly cloud-ON) opt-ins, and AppSettings::load does
+    # not reset opt-ins — so without persisting the narrowed struct back to disk, the NEXT launch silently
+    # re-grants the revoked consent. The restore MUST save the narrowed settings to disk (hunt-3 / iter 157).
+    if "restored.save(" not in code_body:
+        raise AssertionError(
+            "restore_db_from_snapshot narrows consent IN MEMORY but never persists the narrowed settings to "
+            "disk. The snapshot's settings.json was already copied over the live one, so the next launch's "
+            "AppSettings::load re-grants the revoked cloud consent. Call restored.save(&data_dir.join("
+            "\"settings.json\")) after narrowing the opt-ins."
+        )
 
 
 def test_bundle_runconfig_denoising_reflects_loadability_not_mere_presence() -> None:
