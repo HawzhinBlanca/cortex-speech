@@ -8864,9 +8864,35 @@ Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib
 **Score: 106 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 11 hunt-queued + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 146 — 2026-07-23 — FIX #107: denoiser download reported failure + was orphaned (per-file resolution)
+
+**Class: resolve-wrong-dir (same all-or-nothing root as #106).** Hand-verified: `download_denoiser` writes
+GTCRN to `self.models_dir` (models.rs:763), but its post-download check (766) used `denoiser_present()` which
+reads `resolved_dir()` — the OmniASR-flipped root. On a fresh install (user dir lacks OmniASR) resolved_dir
+is the bundled dir, so a fully-successful SHA-verified download reported "model.onnx is missing or
+undersized". The narrow "check models_dir" fix would be MISLEADING — `denoiser_present`/`denoiser_loadable`
+and the pipeline's `DenoiserService` (pipeline.rs:1495,1650) also read `resolved_dir()`, so the downloaded
+denoiser would report OK yet never load at inference.
+
+Fix (complete + consistent): `ModelManager::resolve_root_for(relative)` (models_dir preferred, else bundled
+— the root that actually contains the file, via the pure `resolve_root_in`), routed through denoiser_present,
+denoiser_loadable, and BOTH pipeline DenoiserService sites. Post-download check now passes (file is in
+models_dir) AND the pipeline loads the denoiser wherever it is; provenance flag + load site stay consistent
+by construction. Fail-before: `resolve_root_in_prefers_models_then_falls_back_to_bundled` (root-level marker
+to avoid a Windows subdir write-then-exists() timing flake; the resolve logic is path-agnostic; confirmed
+stable 3× standalone + in the full suite before shipping).
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 993 passed / 0 failed**;
+**python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD 922f87c, lock free.
+
+**Score: 107 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 10 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged. NOTE: the **aligner (pipeline.rs:3266) + campp/SpeakerEmbedding
+(pipeline.rs:3398)** share the same all-or-nothing `resolved_dir()` orphaning — now a one-liner each via
+`resolve_root_for`; queued below.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
-- [MED] models.rs:740 — download_denoiser reports FAILURE after a verified-success download (post-check reads
-  resolved_dir, not the models_dir it wrote to). ← next (sibling of #106, use resolve_model_file)
 - [MED] export.rs:272 — exclude_holdout_segments fails OPEN for a missing-audio segment → holdout gold
   reference leaks into the plain export (eval-on-train contamination; sibling Err-case at :285 fails closed).
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
@@ -8882,4 +8908,6 @@ QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [LOW] export.rs:859 — dropped_unavailable over-counts (counts non-training-ready REVIEW rows the write loop skips).
 - [LOW] commands.rs:638 — import worker thread::spawn panic skips ImportGuard Drop → shared-state wedge.
 - [LOW] src/lib/i18n/index.ts:32 — translator replace() substitutes only the FIRST occurrence of a repeated placeholder.
+- [MED] aligner (pipeline.rs:3266) + campp/SpeakerEmbedding (pipeline.rs:3398) orphaned by the same
+  all-or-nothing resolved_dir() — one-liner each via resolve_root_for (found while fixing #107).
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
