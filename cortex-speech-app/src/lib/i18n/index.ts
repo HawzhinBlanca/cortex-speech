@@ -28,7 +28,10 @@ export const t = derived(locale, ($locale) => {
     let text = dict[key] || en[key] || key;
     if (params) {
       for (const [k, v] of Object.entries(params)) {
-        text = text.replace(`{${k}}`, v);
+        // replaceAll, not replace: a string that repeats a placeholder (e.g. speaker.mergeConfirm uses
+        // {target} twice) must substitute EVERY occurrence — replace() left the second one as literal
+        // "{target}" in a destructive-merge confirmation dialog.
+        text = text.replaceAll(`{${k}}`, v);
       }
     }
     return text;
