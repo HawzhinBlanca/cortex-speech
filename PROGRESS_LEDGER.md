@@ -7587,3 +7587,50 @@ QUEUE (from hunt-111; hand-verify each against source BEFORE fixing):
 - [MED] audio.rs:1140 — Energy-VAD fallback drops <~300ms utterances that Silero (96ms floor) keeps — short words lost.
 - [MED] pipeline.rs:112 — loop0_would_fire counts whitespace-only normalization as a memory firing, inflating a metric.
 - [MED] SearchBar.svelte:74 — active FTS search freezes the match id-set; a refine/import reload silently drops or keeps the wrong rows.
+
+---
+
+## 2026-07-23T05:20Z — iter 112 — normalizer strips U+2060 WORD JOINER; history undo-loses-children DEFERRED (bb8dd98)
+
+**Hand-verified the top-queued HIGH-value history finding — it is REAL but its correct fix is large/risky, so
+DEFERRED with precise documentation; landed a clean bounded fix on the normalizer instead.**
+
+**DEFERRED (real, needs a focused session) — history/mod.rs apply_undo loses cascade children on undo-of-delete
+(MEDIUM, data-loss).** Hand-verified: delete_segment (db.rs:913) folds the segment's loop0/C4 evidence into the
+PERMANENT archive counters (archive_loop0/c4_evidence_for) then DELETEs, firing ON DELETE CASCADE on the
+segment's children (segment_hypotheses, decision_verdicts, loop0_shadow_log — "five ON DELETE CASCADE" per
+migrations:953). The delete is UNDOABLE: delete_segment/delete_segments_batch commands push
+Command::DeleteSegments{segments: Vec<SpeechSegment>} (segments_write.rs:137/158), and apply_undo (history:174)
+restores ONLY the parent row via insert_segment_full — the Command captures no child rows and no folded deltas.
+So undo-of-delete returns a bare segment stripped of its hypotheses/verdicts/shadow-log provenance, and the
+archive stays folded (a non-undoable side effect of an undoable op; a later re-process + re-delete can then
+over-count the C5 over-trigger metric). REAL and reachable. But the CORRECT fix — snapshotting every cascade
+child table into the Command at delete time, restoring them on undo, AND capturing+reversing the archive deltas —
+is a substantial multi-table change on a CRITICAL data path (delete/undo). Rushing it in one loop iteration risks
+a worse bug than it fixes (ponytail: a small diff in the wrong place is a second bug). Surfaced for the owner as
+a focused task, like the iter-110 export carry-forward. NOT counted as fixed or refuted — it is a documented,
+verified, deferred defect.
+
+**FIXED — normalizer.rs ZERO_WIDTH_FORMAT omitted U+2060 WORD JOINER + U+2061-2064 (MEDIUM, label integrity;
+bb8dd98).** The strip set deletes ZWSP/ZWJ/BOM/ALM/bidi-controls precisely to stop two visually identical strings
+from normalizing differently (its own doc: "breaking dedup/exact-match and inflating WER/CER"), but omitted
+U+2060 WORD JOINER — the modern replacement for U+FEFF-as-word-joiner, common in text pasted from Word/PDF/web —
+and the invisible math operators U+2061-2064. All are Cf, zero-width, carry no word boundary, and are neither
+ZWNJ (U+200C, handled specially for Sorani) nor White_Space, so no other step removed them: an invisible U+2060
+in a transcript normalized to a DIFFERENT byte string than the clean text, silently breaking dedup and inflating
+CER on the very labels that feed retraining. Fix: added ⁠-⁤ to the char class (deleted, not spaced —
+the letters stay joined; U+2060 has no Sorani orthographic meaning). Fail-before verified (the new test panicked
+on the surviving U+2060 before the fix). Existing zwj/bidi strip tests still pass.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 980 passed / 0 failed / 6 ignored** (was 979, +1),
+**35/35 python policies**.
+
+**Score: 74 fixed + 1 cleanup, ~27 refuted, 2 measure-deferred, 5 queued + 1 deferred-large.** Owner-gated finish
+line unchanged.
+
+QUEUE (hand-verify each against source BEFORE fixing):
+- [MED] SpeakerPanel.svelte:33 — speaker rename silently & irreversibly merges into an existing speaker (no confirm, no undo). ← next
+- [MED] audio.rs:1140 — Energy-VAD fallback drops <~300ms utterances that Silero (96ms floor) keeps — short words lost.
+- [MED] pipeline.rs:112 — loop0_would_fire counts whitespace-only normalization as a memory firing, inflating a metric.
+- [MED] SearchBar.svelte:74 — active FTS search freezes the match id-set; a refine/import reload silently drops or keeps the wrong rows.
+- DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (needs a Command-snapshot of child tables + archive-delta reversal; focused session).
