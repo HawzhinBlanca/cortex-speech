@@ -138,6 +138,18 @@ pub async fn transcribe_segment(
         let draft = pipeline
             .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref(), None)
             .map_err(|e| e.to_string())?;
+        // A blank draft is NOT a transcript. Returning Ok("") lets the frontend upsert "" over an
+        // existing good transcript (App.svelte handleTranscribe: annotatedTranscript = result.text, then
+        // updateSegment), destroying it and persisting a blank. The two opt-in siblings
+        // (transcribe_segment_constrained/_finetuned) already refuse this exact case; the DEFAULT path
+        // must too — the frontend's try/catch then keeps the current transcript. (Memory:
+        // blank-transcript-never-overwrites-good; recurring data-loss class.)
+        if draft.final_text.trim().is_empty() {
+            return Err(
+                "Transcription produced no text (silent clip or no speech) — the existing transcript is unchanged."
+                    .to_string(),
+            );
+        }
         Ok(serde_json::json!({
             "text": draft.final_text,
             "rawTranscript": draft.raw_text,

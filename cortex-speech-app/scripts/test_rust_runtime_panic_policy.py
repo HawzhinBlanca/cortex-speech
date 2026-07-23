@@ -1899,6 +1899,29 @@ def test_bundle_runconfig_denoising_reflects_loadability_not_mere_presence() -> 
         )
 
 
+def test_default_transcribe_segment_refuses_blank_draft() -> None:
+    """The DEFAULT `transcribe_segment` command must refuse a blank draft (return Err before the Ok
+    json), exactly as its two opt-in siblings transcribe_segment_constrained/_finetuned already do.
+    Otherwise App.svelte's handleTranscribe upserts "" over an existing good transcript
+    (annotatedTranscript = result.text, then updateSegment) — silent, irreversible data loss (the
+    recurring blank-transcript-never-overwrites-good class). Exercising it needs a real pipeline + models
+    (WSL/ONNX), so it is source-pinned. `transcribe_segment(` matches only the default (the siblings are
+    `transcribe_segment_constrained(` / `_finetuned(`)."""
+    src = (COMMANDS_DIR / "transcribe.rs").read_text(encoding="utf-8")
+    start = src.find("pub async fn transcribe_segment(")
+    if start == -1:
+        raise AssertionError("default transcribe_segment command not found in commands/transcribe.rs")
+    # The command body runs up to the NEXT #[tauri::command] (align_segment), which bounds it.
+    end = src.find("#[tauri::command]", start)
+    body = src[start:end] if end != -1 else src[start:]
+    if ".trim().is_empty()" not in body or "return Err" not in body:
+        raise AssertionError(
+            "default transcribe_segment does not guard a blank draft — an empty ASR result would upsert "
+            '"" over a good transcript (data loss). Return Err when draft.final_text.trim().is_empty(), '
+            "matching transcribe_segment_constrained/_finetuned."
+        )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -1952,6 +1975,7 @@ def main() -> None:
     test_eval_read_paths_do_not_silently_drop_rows()
     test_pipeline_rediarize_reports_db_update_failures()
     test_batch_processor_asr_errors_are_not_blank_transcripts()
+    test_default_transcribe_segment_refuses_blank_draft()
     test_pipeline_hypothesis_population_reports_failures()
     test_asr_pool_recovers_poisoned_state_lock()
     test_global_rate_limiter_recovers_poisoned_lock()
