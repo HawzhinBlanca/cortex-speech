@@ -9353,6 +9353,47 @@ HEAD 98d5351, lock free.
 (ValidationPanel.svelte:113 wrong-audio, MED, hand-verify next) + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 160 — 2026-07-23 — FIX #119: "Go to segment" played the WRONG clip's audio (hunt-4 survivor 2)
+
+**Class: frontend data-integrity (reviewer verifies one clip while HEARING another).** Hand-verified the
+full reactive path: `jumpToSegment` (ValidationPanel.svelte:111) and the active-learning / signal-anomaly
+"Go to segment" buttons only `selectedSegmentId.set(...)`. `selectSegment` (App.svelte) additionally reset
+`currentTime`, `wordTimestamps`, and the waveform inline — but those cross-component buttons live in
+ValidationPanel and CANNOT reach App's `currentTime`/waveform, so they bypassed all of it. AudioPlayer runs
+in ABSOLUTE source time (`startTime`/`endTime`/`audioEl.currentTime`; `bind:currentTime` is App's absolute
+position) and gets NO `clipKey`. When chunks of one recording share a source audioPath (single-file import):
+after a jump, `audioPath` is unchanged (no reload), the seek effect doesn't fire (`|audioEl.currentTime −
+currentTime| < 0.05` since currentTime wasn't reset), and only the `endTime` effect runs → `scheduleClipStop`
+reschedules the stop for `endTime − audioEl.currentTime` (e.g. 185 − 3 = 182 s). So the element keeps playing
+from the OLD position through the NEW clip's endTime — the reviewer selected chunk 20 but hears chunks 1→20,
+and the waveform bars / tap-a-word data stay on the old chunk. Verified the frame myself in App.svelte
+(currentTime is absolute, chunkClipPosition feeds the Waveform not AudioPlayer, no clipKey passed) and
+AudioPlayer (play/seek/scheduleClipStop all absolute).
+
+**Root fix (fix once where all paths route through):** ValidationPanel can only set the store, so the reset
+must be central. Moved the per-selection view setup (playhead reset + word timestamps + waveform) into the
+existing `$selectedSegmentId`-keyed effect (App.svelte:340) — `get(selectedSegment)` reads WITHOUT
+subscribing, so it fires once per selection IDENTITY (not on segment-data updates). selectSegment keeps only
+`autosave.flush()` (the leaving-segment data-loss guard, which must stay per-path) + the store set. This
+fixes ALL selection paths (inline + store-only) and the stale-waveform/words symptoms too. Scope note: I
+discovered the waveform/words also went stale (same root cause) and fixed them in the same effect — not
+scope creep, it's completing the fix for one reachable action.
+
+**Guard:** `test_selection_reseats_playback_centrally_for_store_only_selections` (test_frontend_review_
+guards.py) asserts the reset lives in the selectedSegmentId effect (not inline-only). Runtime = Svelte
+reactive glue + an <audio> element, not unit-testable; source-pinned. **Fail-before:** removed the
+`currentTime = chunkPlaybackRange(...)` line → policy FAILED; restored → PASS.
+
+Gate (frontend change): `svelte-check && tsc --noEmit` 0 errors; `eslint` 0 errors (4 pre-existing warnings,
+none in touched files); **vitest 37 files / 207 tests passed**; **python policies 39 scripts passed**.
+Reality check pre-work: exe not running, git clean, HEAD 9283093, lock free.
+
+**Score: 119 fixed + 1 cleanup, ~38 refuted, 2 measure-deferred, 0 hunt-queued (hunt-4 drained: 2 fixed) +
+1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
