@@ -86,6 +86,22 @@ pub fn take_snapshot_with_quarantine_source(
     result
 }
 
+/// Second-directory (off-drive) backup: the SAME snapshot + prune as the primary, but it MUST NOT touch
+/// the shared health counters. The off-drive tree is a BONUS copy; letting its success reset the failure
+/// streak — or its failure inflate it — would MASK the PRIMARY snapshot tree, the exact surface
+/// `health_check` exists to protect. Round-25 hunt: a primary failure followed by an off-drive success
+/// reset `consecutive_failures` to 0 and stamped `last_success`, so a silently-failing primary safety net
+/// read as healthy for as long as the off-drive kept working. The off-drive's own failure is warn-logged
+/// by the caller; health reflects the primary tree only.
+pub fn take_offsite_snapshot(
+    db: &Database,
+    data_dir: &Path,
+    quarantine_dir: &Path,
+    keep: usize,
+) -> AppResult<Option<PathBuf>> {
+    take_snapshot_at_from(db, data_dir, quarantine_dir, keep, now_secs())
+}
+
 /// Take a PINNED, rotation-exempt snapshot into `<data_dir>/snapshots/pinned/<label>_<ts>/`,
 /// keeping only the newest `keep_pinned` snapshots that share `label`. Used for the two moments the
 /// rolling ~100-minute window cannot cover (true-10 audit 2026-07-09): (a) BEFORE running pending
@@ -664,6 +680,29 @@ mod tests {
         let after_ok = snapshot_health();
         assert_eq!(after_ok.consecutive_failures, 0, "success resets the failure streak");
         assert!(after_ok.last_success_epoch_secs.is_some(), "success stamps last_success");
+
+        // Round-25 hunt: an off-drive (second-directory) backup SUCCESS must NOT touch the shared health
+        // counters — else a succeeding off-drive tree MASKS a failing PRIMARY snapshot tree and
+        // health_check reads a false green. Force a fresh primary failure, then a good off-drive
+        // snapshot, and assert the primary's failure streak SURVIVES and last_success is NOT re-stamped.
+        assert!(take_snapshot(&db, &blocked_data_dir, 3).is_err(), "second primary failure");
+        let failures_before_offsite = snapshot_health().consecutive_failures;
+        assert!(failures_before_offsite >= 1, "a primary failure is outstanding before the off-drive run");
+        let last_success_before = snapshot_health().last_success_epoch_secs;
+        let offsite_dir = tempfile::TempDir::new().unwrap();
+        assert!(
+            take_offsite_snapshot(&db, offsite_dir.path(), good_dir.path(), 3).unwrap().is_some(),
+            "the off-drive snapshot itself succeeds"
+        );
+        let after_offsite = snapshot_health();
+        assert_eq!(
+            after_offsite.consecutive_failures, failures_before_offsite,
+            "an off-drive SUCCESS must not reset the primary's failure streak (no masking)"
+        );
+        assert_eq!(
+            after_offsite.last_success_epoch_secs, last_success_before,
+            "an off-drive SUCCESS must not stamp last_success — health reflects the PRIMARY tree only"
+        );
     }
 
     #[test]

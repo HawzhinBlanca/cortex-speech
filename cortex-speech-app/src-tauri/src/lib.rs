@@ -496,7 +496,10 @@ pub fn run() {
                             // Quarantine files live in the PRIMARY data dir — thread it in so the
                             // off-drive tree's prune-pin and accumulation cap see the corruption too
                             // (its own parent never holds *.corrupt.* files).
-                            match crate::snapshot::take_snapshot_with_quarantine_source(
+                            // take_offsite_snapshot (NOT ..._with_quarantine_source): the off-drive tree
+                            // must not touch the shared health counters, or its success masks a failing
+                            // primary snapshot tree and health_check reads a false green (round-25 hunt).
+                            match crate::snapshot::take_offsite_snapshot(
                                 &snap_db,
                                 std::path::Path::new(second.trim()),
                                 &snap_data_dir,
