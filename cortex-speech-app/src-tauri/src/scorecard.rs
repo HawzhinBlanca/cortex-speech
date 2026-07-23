@@ -367,21 +367,34 @@ pub fn render_markdown(sc: &Scorecard) -> String {
         s.substitutions, s.deletions, s.insertions
     ));
     if let Some(b) = &sc.vs_baseline {
-        out.push_str(&format!(
-            "\n**vs `{}`** ({} paired segments): system WER {} vs baseline {} — MAPSSWE p = {:.4} → {}\n",
-            b.baseline_model_id,
-            b.paired_segments,
-            pct(b.system_micro_wer),
-            pct(b.baseline_micro_wer),
-            b.mapsswe_p_value,
-            if b.beats_baseline {
-                "**significantly beats baseline** ✅"
-            } else if b.significant_at_05 {
-                "significantly different (not better)"
-            } else {
-                "no significant difference"
-            }
-        ));
+        // Honesty guard, mirroring the scored_segments==0 case above: with ZERO paired segments the two runs
+        // share no gold audio (e.g. the gold set was replaced between the baseline and challenger runs), so
+        // micro_rate over the empty paired arrays is 0.0/0.0 and MAPSSWE short-circuits to p=1.0 — rendering
+        // "0.00% vs 0.00% → no significant difference" would be a MEASURED-EQUIVALENCE verdict conjured from
+        // zero comparison data. Say the comparison is undefined and stop, never a fabricated equivalence.
+        if b.paired_segments == 0 {
+            out.push_str(&format!(
+                "\n**vs `{}`**: ⚠️ **no overlapping gold segments** between the two runs — the comparison is \
+                 UNDEFINED (not an equivalence). Re-run both models on the SAME gold set to compare.\n",
+                b.baseline_model_id
+            ));
+        } else {
+            out.push_str(&format!(
+                "\n**vs `{}`** ({} paired segments): system WER {} vs baseline {} — MAPSSWE p = {:.4} → {}\n",
+                b.baseline_model_id,
+                b.paired_segments,
+                pct(b.system_micro_wer),
+                pct(b.baseline_micro_wer),
+                b.mapsswe_p_value,
+                if b.beats_baseline {
+                    "**significantly beats baseline** ✅"
+                } else if b.significant_at_05 {
+                    "significantly different (not better)"
+                } else {
+                    "no significant difference"
+                }
+            ));
+        }
     }
     out
 }
@@ -944,6 +957,30 @@ mod tests {
         assert!(md.contains("undefined"), "must call the metric undefined: {md}");
         assert!(!md.contains("0.00%"), "must NOT render a 0.00% rate from zero data: {md}");
         assert!(!md.contains("| **WER** (micro) |"), "must not print the metric table: {md}");
+    }
+
+    #[test]
+    fn render_markdown_at_zero_paired_segments_says_undefined_not_no_significant_difference() {
+        // The system is genuinely scored, but the baseline shares NO audio_path with it (e.g. the gold set was
+        // replaced between the two runs). compare_to_baseline then yields paired_segments==0, both micro-WERs
+        // 0.0 (micro_rate over an empty vector), and MAPSSWE p=1.0 (n<2). Rendering "(0 paired segments): 0.00%
+        // vs 0.00% — p=1.0000 → no significant difference" is a MEASURED-EQUIVALENCE verdict conjured from zero
+        // comparison data — the same fabricated-clean-from-nothing the scored_segments==0 guard forbids.
+        let sys = eval_with(&[("/sys/1.wav", "کوردستان")], &["کوردستان"], "sys");
+        let base = eval_with(&[("/base/1.wav", "کوردستان")], &["کوردستان"], "base");
+        let sc = build_scorecard(&sys, Some(&base), ScorecardOptions::default());
+        assert_eq!(
+            sc.vs_baseline.as_ref().expect("a baseline comparison exists").paired_segments,
+            0,
+            "precondition: disjoint audio_paths -> 0 paired segments"
+        );
+        let md = render_markdown(&sc);
+        assert!(!md.contains("no significant difference"), "must NOT fabricate an equivalence verdict: {md}");
+        assert!(!md.contains("0.00% vs"), "must NOT render 0.00% vs 0.00% from zero paired data: {md}");
+        assert!(
+            md.contains("no overlapping") || md.contains("UNDEFINED"),
+            "must say the comparison is undefined: {md}"
+        );
     }
 
     #[test]
