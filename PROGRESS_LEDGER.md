@@ -7745,3 +7745,39 @@ QUEUE (hand-verify each against source BEFORE fixing):
 - [MED] SearchBar.svelte:74 — active FTS search freezes the match id-set; a refine/import reload silently drops or keeps the wrong rows. ← next (last hunt-111 survivor)
 - DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (Command-snapshot of child tables + archive-delta reversal; focused session).
 - ENHANCEMENT (not a bug): undo-able speaker rename (RenameSpeaker command).
+
+---
+
+## 2026-07-23T06:52Z — iter 116 — stale FTS search scope after a reload (MEDIUM) fixed; hunt-111 queue drained (f41627d)
+
+**Fixed the last hunt-111 survivor. Hand-verified the store wiring; refuted one sub-claim (the transient race).**
+
+**segmentStore.ts — an active FTS search scope went stale after a segment reload (MEDIUM; f41627d).** Hand-verified:
+applySearchScope (segmentStore.ts:161-163) filters the LIVE segments by the FROZEN id-set of the last FTS
+searchResults (`new Set(searchResults.map(s=>s.id))`), feeding both filteredSegments (curate view) and
+searchScopedSegments (review queue). SearchBar is the sole writer of searchResults and only refreshes it on a
+keystroke fetch. A full segments.load() — fired on import/batch/refine completion (the load() comment itself
+notes "background reloads fire while filters are active") — replaces every row but never invalidated
+searchResults, so the scope kept filtering the fresh rows by the pre-reload match set: a clip whose refined
+transcript now matches the query is hidden, one that no longer matches stays shown, until the user retypes.
+
+Sub-claim REFUTED: the "transient dog→dogs mid-fetch" variant is ALREADY handled — SearchBar guards every fetch
+with a searchGeneration counter (SearchBar.svelte:51/54/58), so a stale in-flight fetch can't overwrite a newer
+query's results. Only the reload-staleness was real.
+
+Fix: load() now invalidates searchResults after the reload commit (`if (get(searchResults) !== null)
+searchResults.set(null)`), so applySearchScope falls back to its LIVE substring predicate (the
+searchResults===null branch already used on the non-Tauri path) until the next keystroke re-runs FTS — never a
+silently stale search scope. Guarded so it only fires when a search is actually active. Source policy check #13;
+fail-before verified.
+
+Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies** (13 checks now in
+test_frontend_review_guards.py).
+
+**Score: 78 fixed + 1 cleanup, ~28 refuted (transient-race sub-claim), 2 measure-deferred, 0 hunt-queued + 1
+deferred-large + 1 enhancement.** hunt-111 queue DRAINED — the next iteration resumes the adversarial hunt.
+Owner-gated finish line unchanged.
+
+CARRIED (not from a hunt queue; owner-facing):
+- DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (Command-snapshot of child tables + archive-delta reversal; focused session).
+- ENHANCEMENT (not a bug): undo-able speaker rename (RenameSpeaker command); re-run FTS (not just substring fallback) on reload if search quality matters.
