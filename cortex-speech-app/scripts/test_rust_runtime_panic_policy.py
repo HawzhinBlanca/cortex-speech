@@ -1934,6 +1934,18 @@ def test_snapshot_restore_preserves_live_cloud_consent() -> None:
             "AppSettings::load re-grants the revoked cloud consent. Call restored.save(&data_dir.join("
             "\"settings.json\")) after narrowing the opt-ins."
         )
+    # The persist-back alone is not enough: the EXTRA_STATE copy loop must SKIP settings.json, so the
+    # snapshot's (possibly cloud-ON) opt-ins never touch data_dir/settings.json in the first place. Otherwise a
+    # plain fs::copy writes the cloud-ON value and, if the best-effort re-save then fails/is-interrupted (disk
+    # full during recovery, or a process kill in the window), the revoked consent silently returns on the next
+    # launch. The narrowed struct must be the FIRST and ONLY settings.json write (hunt-9 / iter 165).
+    if 'if extra == "settings.json"' not in code_body:
+        raise AssertionError(
+            "restore_db_from_snapshot's EXTRA_STATE loop plain-copies settings.json — the snapshot's cloud "
+            "opt-ins reach disk before the consent-narrowing re-save, so a failed/interrupted re-save re-grants "
+            "revoked consent on the next launch. Skip settings.json in the copy loop (`if extra == "
+            "\"settings.json\" { continue; }`) and load the snapshot's settings for narrowing instead."
+        )
 
 
 def test_bundle_runconfig_denoising_reflects_loadability_not_mere_presence() -> None:

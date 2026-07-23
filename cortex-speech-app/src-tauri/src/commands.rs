@@ -1785,6 +1785,14 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
     // so save-side and restore-side can never drift out of sync.
     let snap_dir = data_dir.join("snapshots").join(&name);
     for &extra in crate::snapshot::EXTRA_STATE {
+        // settings.json is NOT plain-copied here — it is loaded from the snapshot, consent-narrowed, and
+        // saved below, so the snapshot's cloud opt-ins NEVER touch disk. A plain fs::copy would write the
+        // snapshot's (possibly cloud-ON) opt-ins to data_dir/settings.json first, and if the consent-narrowing
+        // re-save then failed or was interrupted (disk full during disaster recovery, or a process kill in the
+        // window), the revoked consent would silently come back on the next launch. Every OTHER extra copies.
+        if extra == "settings.json" {
+            continue;
+        }
         let from = snap_dir.join(extra);
         if from.is_file() {
             if let Err(e) = std::fs::copy(&from, data_dir.join(extra)) {
@@ -1793,8 +1801,15 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
         }
     }
     // Apply the restored settings to memory AND the running pipeline (mirrors update_settings) so the
-    // engine / thresholds / consent flags take effect immediately, not only on the next launch.
-    let mut restored = crate::settings::AppSettings::load(&data_dir.join("settings.json"));
+    // engine / thresholds / consent flags take effect immediately, not only on the next launch. Load the
+    // SNAPSHOT's settings (it was intentionally not copied above), never the snapshot value straight to disk.
+    let snapshot_settings_path = snap_dir.join("settings.json");
+    let live_settings_path = data_dir.join("settings.json");
+    let mut restored = crate::settings::AppSettings::load(if snapshot_settings_path.is_file() {
+        &snapshot_settings_path
+    } else {
+        &live_settings_path
+    });
     // PRIVACY: a DB snapshot restore must NEVER silently re-grant cloud consent the user has since revoked.
     // Consent (cloud_llm / cloud_stt / jury_cloud opt-in) is a LIVE per-session privacy decision, not dataset
     // state a rollback should change — carry the CURRENT opt-ins across instead of adopting the snapshot's, so
@@ -1806,13 +1821,13 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
         restored.cloud_stt_opt_in = live.cloud_stt_opt_in;
         restored.jury_cloud_opt_in = live.jury_cloud_opt_in;
     }
-    // Persist the consent-narrowed settings to disk. The fs::copy above overwrote data_dir/settings.json with
-    // the SNAPSHOT's file, which may carry a cloud opt-in from a cloud-ON era; narrowing only the in-memory
-    // struct leaves that stale value on disk, so the NEXT launch's AppSettings::load (which does NOT reset
-    // opt-ins) would silently re-grant the revoked consent — defeating the "a restore may narrow consent,
-    // never escalate it" guarantee across a restart. Write the narrowed struct back so disk matches the
-    // consent-safe in-memory state. Best-effort, matching the per-file copy above.
-    if let Err(e) = restored.save(&data_dir.join("settings.json")) {
+    // Persist the consent-narrowed settings as the FIRST and ONLY write of settings.json to disk (the
+    // snapshot's file was deliberately NOT copied above). data_dir/settings.json still holds the PRE-restore
+    // settings until this write lands, so if it fails or is interrupted (disk full during recovery, or a kill
+    // in the window) the on-disk consent stays the user's current REVOKED value — a consent-safe partial
+    // restore — never the snapshot's cloud-ON opt-ins. AppSettings::load does NOT reset opt-ins, so this is
+    // exactly what the next launch reads. Best-effort: the DB is already restored and consent fails SAFE.
+    if let Err(e) = restored.save(&live_settings_path) {
         tracing::warn!("snapshot restore: could not persist consent-narrowed settings to disk: {e}");
     }
     *state.lock_settings() = restored.clone();
