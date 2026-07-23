@@ -52,7 +52,11 @@
               {$t(cat.labelKey)}
             </h3>
             <div class="space-y-0.5">
-              {#each shortcuts.filter((s) => s.category === cat.id) as s (s.description)}
+              <!-- Key on the loop INDEX, not s.description: descriptions are NOT unique (two navigation
+                   shortcuts both read "Keyboard shortcuts (? key)" — the / and ? help chords), so keying on
+                   description throws Svelte's each_key_duplicate and crashes the help modal on open. The list
+                   is static and never reorders, so an index key is safe. -->
+              {#each shortcuts.filter((s) => s.category === cat.id) as s, i (i)}
                 <div
                   class="flex items-center justify-between gap-4 rounded-token px-2 py-1.5 text-sm transition-colors hover:bg-surface-2"
                 >

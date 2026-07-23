@@ -334,6 +334,21 @@ def test_segment_stats_verified_excludes_placeholder_only_rows() -> None:
         )
 
 
+def test_keyboard_shortcuts_help_each_uses_a_unique_key() -> None:
+    """The Keyboard Shortcuts help modal renders {#each shortcuts.filter(...) as s (KEY)}. Keying on
+    s.description throws Svelte's each_key_duplicate (crash / dropped row) when two shortcuts share a
+    description — and two DO: two navigation-category entries both read 'Keyboard shortcuts (? key)' (the / and
+    ? chords). So opening the help modal (via / or ?) crashes it. The key must be unique per row (the loop
+    index — the list is static and never reorders), never s.description."""
+    src = _read("src/lib/KeyboardShortcuts.svelte")
+    if "as s (s.description)" in src:
+        raise AssertionError(
+            "KeyboardShortcuts {#each} keys on (s.description), which is NOT unique — two shortcuts sharing a "
+            "description (the / and ? help chords) collide → each_key_duplicate crashes the help modal. Key on "
+            "the loop index instead: `as s, i (i)`."
+        )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -350,6 +365,7 @@ def main() -> None:
     test_segment_reload_invalidates_the_frozen_search_scope()
     test_processing_progress_eta_uses_chunk_scoped_elapsed_not_whole_pipeline()
     test_segment_stats_verified_excludes_placeholder_only_rows()
+    test_keyboard_shortcuts_help_each_uses_a_unique_key()
     print("frontend review-guard source policy passed")
 
 
