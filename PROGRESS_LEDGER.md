@@ -9148,6 +9148,42 @@ will be closed with reasoned notes unless a reachable harm surfaces.
 commands.rs:638 spawn-panic) + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 155 — 2026-07-23 — TRIAGE (not a fix): closed the last 2 hunt-2 LOW survivors as over-engineering
+
+Per the owner's standing guidance ("brutal reality checks… beware over-engineering… don't add extra
+unneeded stuff… top reliable system for WHAT IT DOES"), hand-verified the final two reality-check survivors
+against source and CLOSED both with reasoned notes rather than adding unneeded code. Applied the same rigor
+that flipped iter 154's "likely close" into a real fix — the difference is these two do NOT clear that bar:
+
+**denoiser.rs:14 — no SHA-256 verify at load → CLOSED (over-engineering).** The GTCRN denoiser is OPTIONAL,
+best-effort audio cleanup, and it already fails safe: a missing OR corrupt/unloadable model →
+`OfflineSpeechDenoiser::create()` returns `None` → `is_active()==false` → `process()` is a pass-through AND
+the pipeline does NOT record the audio as denoised (provenance-honest, round-23 #3, denoiser.rs:53-58). It
+is NOT transcript-load-bearing like ASR/VAD, whose load-time SHA-verify protects the actual dataset-producing
+artifacts from a corrupt download. Here a corrupt download is already caught by create() returning None —
+adding a bundled expected-hash constant + verify + test buys no reliability, only surface area.
+
+**commands.rs:638 — ImportGuard armed inside the spawned closure → CLOSED (real but unreachable).**
+`try_start_import()` sets ImportState::Running (commands.rs:626) BEFORE `std::thread::spawn`, and the RAII
+`ImportGuard` that calls `finish_import()` is created INSIDE the closure (649). So IF `thread::spawn` itself
+panics, the guard never arms and import state wedges Running. But that window is precisely OS
+thread-creation failure — once spawn returns Ok the closure always runs and the guard always drops (even on
+a worker panic: `catch_unwind` at 654 + `Drop`). On the owner's 64-core/256GB rig a single import spawn
+failing needs catastrophic resource exhaustion the app can't function through anyway; the harm is a
+restart-recoverable state wedge (no data loss); and std's own API treats spawn failure as a panic, not a
+recoverable `Result`. `Builder::spawn` + Err-handling + a test would be speculative hardening for an edge
+that isn't reachable in practice — exactly what the owner told me not to add.
+
+No code, no gate run (nothing changed). This DRAINS the hunt-2 actionable queue: every survivor is now
+fixed (#104-#115 across the two hunts) or reasoned-refuted/closed. Remaining backlog is owner-facing /
+larger-scope only (see below), not quick reliability fixes.
+
+**Score: 115 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 0 hunt-queued (drained) + 1
+chunking-deferred + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
@@ -9164,9 +9200,9 @@ QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - ~~export.rs:859 — dropped_unavailable over-counts~~ FIXED iter 153 (#114, 9th count-exclusion instance).
 - ~~i18n/index.ts:32 repeated-placeholder~~ FIXED iter 154 (#115) — reality-check found it REAL
   (speaker.mergeConfirm repeats {target}, reachable via SpeakerPanel), so fixed not closed.
-- REALITY-CHECK-BEFORE-FIXING (likely over-engineering per owner "beware over-engineering" — CLOSE with a
-  reasoned note unless a real reachable harm is confirmed): denoiser.rs:14 SHA-verify (denoiser is
-  best-effort preprocessing, not transcript-load-bearing), commands.rs:638 spawn-panic (only on OS
-  thread-creation failure — astronomically rare).
+- ~~denoiser.rs:14 SHA-verify~~ CLOSED iter 155 (over-engineering — model already fails safe to
+  pass-through + honest provenance; not transcript-load-bearing). See iter-155 entry.
+- ~~commands.rs:638 spawn-panic wedge~~ CLOSED iter 155 (real but unreachable — needs thread::spawn itself
+  to panic on OS thread-creation failure; restart-recoverable, no data loss). See iter-155 entry.
 - ~~aligner + campp orphan~~ FIXED in iter 148 (#109).
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
