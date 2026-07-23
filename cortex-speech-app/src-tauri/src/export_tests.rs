@@ -1433,6 +1433,70 @@ fn hf_reexport_removes_orphan_wav_for_a_dropped_segment() {
     }
 }
 
+#[test]
+fn hf_partial_reexport_keeps_a_consistent_snapshot_of_the_available_source() {
+    // Behavior contract (iter 110): when SOME sources are unavailable on a re-export (a drive temporarily
+    // unmounted), the run drops those sources and commits a CONSISTENT, smaller snapshot of the available
+    // ones — the on-disk *.wav set == metadata.csv == SHA256SUMS — never a half-broken mix or an orphan clip.
+    // The dropped source reappears on the next re-export once readable. (The old written_clips keep-set /
+    // orphan-prune was dead post-staging-refactor; the atomic data/←staging swap gives this by construction.)
+    let db_tmp = NamedTempFile::new().unwrap();
+    let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let a_wav = tmp_dir.path().join("aaa.wav");
+    let b_wav = tmp_dir.path().join("bbb.wav");
+    write_silent_wav(&a_wav);
+    write_silent_wav(&b_wav);
+
+    let mut sa = sample_segment("seg-a");
+    sa.audio_path = a_wav.to_string_lossy().to_string();
+    db.insert_segment(&sa).unwrap();
+    let mut sb = sample_segment("seg-b");
+    sb.audio_path = b_wav.to_string_lossy().to_string();
+    db.insert_segment(&sb).unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let settings =
+        crate::settings::AppSettings { hf_speaker_disjoint: false, ..crate::settings::AppSettings::default() };
+
+    let find_wavs = |root: &std::path::Path| -> Vec<std::path::PathBuf> {
+        ["train", "validation", "test"]
+            .iter()
+            .flat_map(|s| std::fs::read_dir(root.join("data").join(s)).ok().into_iter().flatten().flatten())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
+            .collect()
+    };
+
+    // Run 1: both sources export.
+    export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+    assert_eq!(find_wavs(out_dir.path()).len(), 2, "run 1 exports both sources");
+
+    // Source B vanishes (drive unmounted); re-export.
+    std::fs::remove_file(&b_wav).unwrap();
+    export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
+
+    // Only the available source A survives, and the snapshot is internally consistent.
+    let wavs = find_wavs(out_dir.path());
+    assert_eq!(wavs.len(), 1, "partial re-export keeps only the available source's clip, got {wavs:?}");
+    let meta = all_huggingface_metadata(out_dir.path());
+    assert!(meta.contains("seg-a"), "the available source stays in metadata");
+    assert!(!meta.contains("seg-b"), "the unavailable source is dropped from metadata (no orphan row)");
+
+    let info = std::fs::read_to_string(out_dir.path().join("dataset_infos.json")).unwrap();
+    assert!(info.contains("\"droppedUnavailableAudio\": 1"), "the drop is surfaced, not silent: {info}");
+
+    // SHA256SUMS must match every on-disk artifact exactly — no orphan WAV, no stale row.
+    let sums = std::fs::read_to_string(out_dir.path().join("SHA256SUMS")).unwrap();
+    for line in sums.lines() {
+        let (hash, rel) = line.split_once("  ").unwrap();
+        assert_eq!(hash, sha256_hex(&std::fs::read(out_dir.path().join(rel)).unwrap()), "manifest hash matches {rel}");
+    }
+    assert!(!sums.contains("seg-b"), "no orphan clip for the dropped source in the manifest");
+}
+
 fn assert_no_tmp_exports(dir: &std::path::Path) {
     let tmp_left =
         std::fs::read_dir(dir).unwrap().flatten().any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"));

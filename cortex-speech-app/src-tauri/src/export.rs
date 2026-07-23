@@ -764,11 +764,10 @@ pub fn export_huggingface_dataset(
                          dest_dir: &std::path::Path|
      -> AppResult<(usize, f64, usize, Vec<String>)> {
         // NOTE: do NOT early-return when this split is empty on a re-export. Falling through writes a
-        // HEADER-ONLY metadata.csv (the per-source loop below simply runs zero times) and runs the
-        // orphan-prune below, which clears clips a prior, larger export left in this split dir. So an
-        // empty split's on-disk metadata agrees with dataset_infos.json's num_examples=0 — never a
-        // stale or missing file. Returning early left that stale metadata.csv + orphaned clips on disk
-        // (and cemented into SHA256SUMS), disagreeing with the actual (now-empty) split.
+        // HEADER-ONLY metadata.csv (the per-source loop below simply runs zero times) into the fresh
+        // staging split dir, so an empty split's on-disk metadata agrees with dataset_infos.json's
+        // num_examples=0 — never a stale or missing file. Returning early would leave the split dir with no
+        // metadata.csv at all, disagreeing with the declared (now-empty) split after the swap.
         let csv_path = dest_dir.join("metadata.csv");
         let csv_tmp = csv_path.with_extension("csv.tmp");
         remove_file_on_error(
@@ -789,8 +788,6 @@ pub fn export_huggingface_dataset(
 
                 let mut total_exported_dur = 0.0;
                 let mut count = 0;
-                // Filenames written this run; used to prune orphaned clips left by a prior, larger export.
-                let mut written_clips: std::collections::HashSet<String> = std::collections::HashSet::new();
                 // Segments dropped because their source audio is unavailable (missing or
                 // undecodable) — real, previously-silent data loss, surfaced after export.
                 let mut dropped_unavailable = 0usize;
@@ -815,17 +812,19 @@ pub fn export_huggingface_dataset(
 
                 for (source_path_str, segs) in segs_by_source {
                     let source_path = std::path::Path::new(source_path_str);
-                    // Preserve any clips a PRIOR successful export wrote for a source that is only
-                    // TRANSIENTLY unavailable this run (unmounted/network drive, momentary decode
-                    // error). Their expected filenames go into the keep-set so the orphan-prune
-                    // below does NOT delete them — pruning them would be permanent training-data
-                    // loss from a recoverable error. They stay on disk but are (correctly) absent
-                    // from this run's metadata.csv until a later run can re-read the source.
-                    let source_stem = source_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                    // A source unavailable this run (unmounted/network drive, or an undecodable file) is
+                    // DROPPED from this snapshot: its rows are absent from metadata.csv, and since each run
+                    // stages into a FRESH tree (never carrying prior clips forward), the atomic swap replaces
+                    // its old clips too. This is a consistent, self-healing snapshot — the prior dataset
+                    // survives an ALL-unavailable run (the total_count==0 guard before the commit), and a
+                    // transiently-unavailable source reappears on the next re-export once it is readable
+                    // again. The drop is counted in dropped_unavailable (surfaced in dataset_infos.json), not
+                    // silent. (Carrying a transiently-unavailable source's prior clips + rows forward to keep
+                    // a larger interim snapshot is possible but must preserve metadata.csv/SHA consistency;
+                    // deferred as an enhancement, tracked in the ledger.)
                     if !source_path.exists() {
                         for seg in &segs {
                             tracing::warn!("Skipping segment {} in HF export: audio not found", seg.id);
-                            written_clips.insert(sanitized_clip_filename(&source_stem, &seg.id));
                         }
                         dropped_unavailable += segs.len();
                         continue;
@@ -836,9 +835,6 @@ pub fn export_huggingface_dataset(
                         Ok(res) => res,
                         Err(e) => {
                             tracing::error!("Failed to decode {source_path_str} in HF export: {e}");
-                            for seg in &segs {
-                                written_clips.insert(sanitized_clip_filename(&source_stem, &seg.id));
-                            }
                             dropped_unavailable += segs.len();
                             continue;
                         }
@@ -888,7 +884,6 @@ pub fn export_huggingface_dataset(
                         let out_audio_path = dest_dir.join(&filename);
 
                         write_wav_atomic(&out_audio_path, 16000, pcm_slice.as_ref())?;
-                        written_clips.insert(filename.clone());
 
                         // Report the duration of the clip ACTUALLY written, not the segment's stored
                         // duration_ms. The two drift when slice_for_export clamps an over-long window to
@@ -930,22 +925,11 @@ pub fn export_huggingface_dataset(
                     }
                 }
 
-                // Prune orphaned clips from a previous, larger export so the on-disk *.wav set
-                // matches the freshly-written metadata.csv exactly (stale clips otherwise disagree
-                // with the manifest and get cemented into SHA256SUMS). Runs only after every current
-                // clip wrote successfully, so a mid-export failure never half-empties the directory.
-                if let Ok(entries) = std::fs::read_dir(dest_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let is_wav =
-                            path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("wav"));
-                        let keep = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| written_clips.contains(n));
-                        if is_wav && !keep {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    }
-                }
-
+                // No orphan-prune here: each run stages into a FRESH tree (staging_dir is wiped + recreated
+                // at the top of the export), so this split dir only ever contains the clips written just
+                // above — there is never a stale clip from a prior, larger export to prune. Old clips are
+                // removed wholesale by the atomic data/ ← staging swap at commit, so the on-disk *.wav set
+                // always matches this run's metadata.csv (and SHA256SUMS) by construction.
                 csv_wtr.flush()?;
                 drop(csv_wtr);
                 replace_file(&csv_tmp, &csv_path)?;
