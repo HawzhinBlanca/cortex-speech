@@ -8312,3 +8312,50 @@ QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
 - IN-LOOP ACCURACY-MACHINERY (owner-surfaced, unblocks the eventual retrain; none move the CER number):
   gold-CER/WER PR-gating test (currently #[ignore]/num_segs>0); int8 quantization script (export emits
   fp32 only); one-click gate_and_promote IPC+button; reconcile stale ledger measured-numbers table.
+
+---
+
+### Iteration 131 — 2026-07-23 — Accuracy & Usefulness Loop authored + checkpoint + FIX #93 (int8 quant machinery) + self-caught hygiene regression
+
+**Owner request:** "write the best possible ~10-min loop to get this to highest-grade accuracy and
+usefulness — with a brutal reality check and deep research into the latest (Jul 2026) tech." Also: keep a
+checkpoint of the working app first.
+
+**Checkpoint.** Annotated tag `checkpoint-2026-07-23-known-good` on `main` (was 7b577db) pushed to origin
+— an explicit rollback point before deeper accuracy-machinery work (`git checkout` it to restore).
+
+**Deep research (real web, 5 parallel agents, evidence-first).** Findings synthesized into
+`docs/ASR_TECH_SCAN_2026-07-23.md` (every number cited to its external source; honest gaps flagged).
+Headline: **as of 2026-07-23 no released model credibly beats the champion's 7.03% CER on FLEURS-ckb** —
+newest ckb base is OmniASR (your family, Nov–Dec 2025); Whisper has no v4 (~99% WER ckb), Qwen3/Voxtral/
+Granite/NVIDIA add no Kurdish; the only 2026 Kurdish paper (FLEURS-Kobani) is Kurmanji. Real levers =
+AsoSoft/ScriptNormalization normalizer, KenLM n-gram fusion, pseudo-labeling on the 1.74M corpus,
+OmniASR-CTC-1B swap, and the review marathon — **all owner-gated to RUN**. Ranked in-loop-vs-owner-gated
+backlog in the scan.
+
+**Loop doctrine authored.** `docs/ACCURACY_USEFULNESS_LOOP.md` — the standing per-fire doctrine, leading
+with the brutal reality check (**a 10-min autonomous loop CANNOT move the measured CER**; its honest job
+is to maximize the owner's scarce rig/review-time leverage and keep "machinery built" ≠ "accuracy
+raised"). Same lock/reality-check/fail-before/gate/ledger discipline. The ~10-min session cron was
+repointed from the generic prompt (deleted 40a870dc) to a new job firing this doctrine.
+
+**FIX #93 — machinery backlog #5: in-tree int8 quantization script.** `scripts/quantize_finetuned_onnx.py`
+closes the "int8 produced out-of-band" gap (export_finetuned_onnx.py emits fp32 only; hand-verified — no
+quant script existed, no `quantize_*` call anywhere in scripts/). onnxruntime dynamic int8 that keeps the
+CTC output head in fp32 (quantizing it is the documented CER-hit cause), warns loudly if the head can't
+be identified, and prints the CER-parity NEXT step (verify_onnx_export.py is the real correctness gate).
+Dependency-free `test_quantize_finetuned_policy.py` unit-tests the head-selection + pins the guards.
+**Fail-before:** neutralizing `head_nodes_to_exclude` → 2 tests fail; restored → pass. RUN owner-gated.
+
+**Self-caught regression (honesty).** The two docs above initially hardcoded the owner's private profile
+path (lock + CARGO_TARGET_DIR). `test_windows_repo_hygiene.py` scans TRACKED files, so running it before
+`git add` passed vacuously and the leak reached `main`. The full gate (run after staging) caught it;
+fixed in `bf6c09a` by genericizing to MONTH_LOOP.md's phrasing. **Lesson: run policies after staging, not
+before.** Not counted as a defect fix (self-inflicted, same-session).
+
+Gate: **python policies 37/37** (new quant test included), repo hygiene clean, `py_compile` clean. No
+Rust/JS changed. Reality check pre-work: exe not running, git clean, HEAD 7b577db, lock free.
+
+**Score: 93 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 2 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged. (FIX #93 is accuracy MACHINERY, not a CER change — the number is
+untouched and unmovable by the loop.)
