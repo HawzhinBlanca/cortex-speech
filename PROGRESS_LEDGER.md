@@ -8628,3 +8628,32 @@ QUEUE (hunt-135 survivors remaining):
 - [MED] constrained_decode.rs:157 — run_constrained skips the SHA-256 pin the default path enforces.
 - [LOW] audio.rs:163 — check_audio duration_ms=0 for a valid VBR MP3 without a Xing header.
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+### Iteration 139 — 2026-07-23 — FIX #101: placeholder draft leaked into the permanent gold reference
+
+**Class: placeholder-leak-into-gate (honesty; corrupts the benchmark yardstick).** Hand-verified:
+`create_gold_from_verified_file` (eval.rs:114-186) concatenates each reviewed chunk's effective transcript
+(`COALESCE(verdict_transcript, annotated_transcript, raw_transcript)`) into the PERMANENT holdout gold
+reference. Accepting a chunk BEFORE its ASR finishes leaves verdict/annotated empty, so the COALESCE falls
+to `raw_transcript='[Pending WSL 7B ASR]'`, and the only guard (`!trimmed.is_empty()`, line 174) lets that
+placeholder through — the literal "[Pending WSL 7B ASR]" joined into the gold benchmark, permanently
+poisoning every future engine comparison + the promotion-gate numbers. Same hazard the sibling
+reject/unreviewed guards already refuse the file for.
+
+Fix: refuse the file when any reviewed chunk's effective transcript is a placeholder
+(`quality::is_placeholder_transcript`), matching the reject/unreviewed guard philosophy. Fail-before:
+`create_gold_refuses_a_chunk_whose_only_text_is_a_placeholder` (accept + empty verdict/annotated + raw
+placeholder → Err); disabling the guard makes create_gold succeed (joining it) and fails the test.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 990 passed / 0 failed**;
+**python policies 38 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD 438314c, lock free.
+
+**Score: 101 fixed + 1 cleanup, ~33 refuted, 2 measure-deferred, 2 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-135 survivors remaining):
+- [MED] constrained_decode.rs:157 — run_constrained skips the SHA-256 pin the default path enforces. ← next
+- [LOW] audio.rs:163 — check_audio duration_ms=0 for a valid VBR MP3 without a Xing header.
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
