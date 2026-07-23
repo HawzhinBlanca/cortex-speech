@@ -26,10 +26,13 @@ static ZWNJ: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u200C").unwrap());
 /// renders. Deleted, not spaced:
 ///   ZWSP U+200B, ZWJ U+200D, BOM/ZWNBSP U+FEFF,
 ///   ALM U+061C (Arabic Letter Mark),
+///   WORD JOINER U+2060 (the modern replacement for U+FEFF-as-word-joiner, common in text pasted
+///   from Word/PDF/web) and the invisible math operators U+2061-U+2064 (Cf, zero-width, no boundary \u2014
+///   neither ZWNJ nor White_Space, so nothing else strips them; left in, they break dedup and inflate CER),
 ///   the explicit bidi formatting marks LRE/RLE/PDF/LRO/RLO U+202A-U+202E,
 ///   and the bidi isolates LRI/RLI/FSI/PDI U+2066-U+2069.
 static ZERO_WIDTH_FORMAT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[\u061C\u200B\u200D\u202A-\u202E\u2066-\u2069\uFEFF]").unwrap());
+    LazyLock::new(|| Regex::new(r"[\u061C\u200B\u200D\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]").unwrap());
 static MULTI_SPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 static ARABIC_HAMZA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u0623\u0625]").unwrap());
 static ARABIC_DIACTIRICS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u064B-\u065F\u0670]").unwrap());
@@ -678,6 +681,24 @@ mod tests {
             assert!(!out.contains(cp), "bidi control U+{:04X} must be stripped, got {out:?}", cp as u32);
         }
         assert_eq!(out, "کوردی", "bidi controls deleted without introducing spaces");
+    }
+
+    #[test]
+    fn word_joiner_and_invisible_operators_are_stripped() {
+        // U+2060 WORD JOINER (the modern replacement for U+FEFF-as-word-joiner, common in text pasted from
+        // Word/PDF/web) and the invisible math operators U+2061-U+2064 are Cf, zero-width, and carry NO word
+        // boundary — but they are neither ZWNJ (U+200C) nor White_Space, so nothing else removes them. Left
+        // in, a transcript with an invisible U+2060 normalizes to a DIFFERENT byte string than the same
+        // visible text without it, breaking dedup/exact-match and inflating WER/CER on the very labels that
+        // feed retraining. They must be deleted (not spaced — the letters stay joined).
+        let n = SoraniNormalizer::new();
+        let out = n.normalize("کورد\u{2060}ی\u{2061}\u{2062}\u{2063}\u{2064}");
+        for cp in ['\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}'] {
+            assert!(!out.contains(cp), "invisible format U+{:04X} must be stripped, got {out:?}", cp as u32);
+        }
+        assert_eq!(out, "کوردی", "a word joiner must be deleted, not turned into a space");
+        // Dedup/idempotence: the joiner-bearing string must normalize identically to the clean one.
+        assert_eq!(out, n.normalize("کوردی"), "an invisible word joiner must not change the canonical form");
     }
 
     #[test]
