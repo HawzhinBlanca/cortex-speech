@@ -8722,3 +8722,42 @@ Owner-gated finish line unchanged. **Hunt-135 fully drained: 8 survivors → 7 f
 QUEUE (hunt-135 drained):
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
 - A fresh adversarial hunt (different subsystems) or the accuracy-machinery backlog are the next moves.
+
+---
+
+### Iteration 142 — 2026-07-23 — FIX #104 (doc-honesty): the DEFAULT transcription engine is the WSL7B 7B champion, not CTC-300M
+
+**Numbering note:** teed up by a read-only side chat that was at an OLD HEAD (5b50927, thought this was
+"iter 135", 96 fixed). This session had already advanced to iter 141 / HEAD 6ba6c17 / 103 fixed, so this
+is iter **142**. Reality check pre-work: exe not running, git clean, HEAD 6ba6c17, lock free.
+
+**Class: honesty (a governing doc contradicted the code; also corrects wrong info I stated verbally).**
+The loop docs called OmniASR-CTC-300M "the offline default", but the configured default is the WSL-served
+7B champion. Hand-verified against source (did NOT trust the side-chat prompt): `settings.rs:318`
+`asr_model_size: AsrModelSize::WSL7B` in `AppSettings::default()`, pinned by `settings.rs:760`
+`assert_eq!(...WSL7B)`; and the F2 fail-hard contract (`pipeline.rs:294-306`,
+`ASR_7B_UNAVAILABLE_TAG = "E_ASR_7B_UNAVAILABLE"`) — "The app NEVER silently substitutes a [offline model]",
+it fails LOUD and offers retry-or-offline. So **default = WSL7B (7.03% CER FLEURS-ckb)**; CTC-300M (11.34%)
+is only a user-chosen per-clip fallback.
+
+Fix: `ACCURACY_USEFULNESS_LOOP.md` "current honest state" relabelled (7.03% = the DEFAULT engine; 11.34% =
+the offline FALLBACK, user-chosen when the 7B is down, fails loud per F2). `ASR_TECH_SCAN_2026-07-23.md` §2
+clarified that the sherpa/CTC-300M path is the offline fallback, not the default. **The scan did NOT
+actually contain an "offline default" misstatement** (grep found none — the framing was in my earlier CHAT
+messages, not the committed doc); §2 line 42 was accurate-in-context, lightly clarified anyway.
+
+**Also corrects my own error:** throughout this session's status reports I repeatedly called CTC-300M "the
+offline default (11.34% CER)" — that was WRONG; the default is the 7B champion. Recorded here per the
+one-law.
+
+Docs-only, no code, **no metric change** (machinery/wording ≠ accuracy). Per the task, no docs↔code policy
+added (over-engineering; a guard would be a separate decision). Gate: **python policies 38 scripts passed**
+(windows-repo-hygiene + ledger-staleness incl.).
+
+**Score: 104 fixed + 1 cleanup, ~33 refuted, 2 measure-deferred, 0 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-135 drained):
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+- Next: a fresh adversarial hunt (untouched subsystems), the accuracy-machinery backlog (ASR_TECH_SCAN §5,
+  owner-gated to RUN), or the DEFERRED-LARGE history undo-of-delete — per the doctrine's priority order.
