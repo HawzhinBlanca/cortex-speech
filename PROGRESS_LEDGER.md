@@ -7380,3 +7380,45 @@ QUEUE (hand-verify each against source BEFORE fixing):
 - [MED] ValidationPanel.svelte:519 — Signal-Anomaly tab shows "no anomalies" all-clear before any screen has run.
 - [MED] AudioPlayer.svelte:259 — autoplay fires only on element reload; dies after the first same-source clip.
 - [partial/LOW] export.rs written_clips keep-set dead post-staging-refactor (partial-availability clip drop).
+
+---
+
+## 2026-07-23T03:40Z — iter 107 — couch undo dropped a jury verdict (HIGH data-loss) fixed (76db359)
+
+**Fixed the queued HIGH couch.rs:369 whole-row-clobber. Hand-verified the full mechanism against source.**
+
+**couch.rs api_undo — undo cleared the pre-decision jury verdict instead of restoring it (HIGH, data-loss;
+76db359).** The couch phone-review undo ran `db.clear_human_decision(&id)` then `db.insert_segment(&prev)`.
+insert_segment (db.rs:407) writes a 17-column subset that DELIBERATELY omits every jury/decision column
+(verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated, human_decision,
+corrected_at, is_gold) — those "survive an upsert" of a still-existing row, but here they must be RESTORED
+to prev's values, not left as clear_human_decision set them (jury verdict/evidence → NULL, escalated → 1).
+Reachability (hand-traced): api_queue serves get_segments(Some(false)) = UNVERIFIED clips; a jury-ESCALATED
+clip is unverified (verdict='escalated', escalated=true, verified=false, human_decision=NULL), so it sits in
+the couch queue. Phone-review → api_decision (record_human_decision overwrites verdict with the human verdict,
+sets is_gold, verified=true) → api_undo: clear nulls the jury columns, insert_segment can't restore them, so
+the jury's escalation verdict + evidence are permanently DROPPED, and is_gold set by the now-undone accept is
+left = 1 (insert_segment omits is_gold, clear doesn't touch it). Not a true inverse.
+
+Root-cause fix: restore via `insert_segment_full(&prev)` (db.rs:470 — the same lossless whole-row restore the
+desktop delete-undo uses at segments_write.rs:82), which rewrites EVERY column (incl. verified, is_gold, all
+jury columns, and created_at — get_segment_by_id populates created_at via SEGMENT_SELECT_COLUMNS, so no
+reordering) back to the pre-decision snapshot. Kept clear_human_decision ONLY for its side effect of deleting
+the agent_examples DPO/few-shot learning pair (a retracted edit left trainable permanently teaches the model a
+fix the human took back) — insert_segment_full then overwrites its column-clears with prev's true values.
+
+Fail-before verified: new test undo_restores_a_pre_decision_jury_verdict_instead_of_clearing_it FAILED with
+`left: None, right: Some("escalated")` (verdict cleared) before the fix. The desktop review-undo is a separate
+path (HistoryManager.undo) and is unaffected — the couch comment claiming it "mirrors the desktop two-step" was
+inaccurate; fixed the comment too.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 978 passed / 0 failed / 6 ignored** (was 977, +1),
+**35/35 python policies**.
+
+**Score: 70 fixed, ~26 refuted, 2 measure-deferred, 4 queued.** Owner-gated finish line unchanged.
+
+QUEUE (hand-verify each against source BEFORE fixing):
+- [MED] jury/mod.rs:331 — hard-veto escalations inherit IRT agreement confidence, defeating riskiest-first order.
+- [MED] ValidationPanel.svelte:519 — Signal-Anomaly tab shows "no anomalies" all-clear before any screen has run.
+- [MED] AudioPlayer.svelte:259 — autoplay fires only on element reload; dies after the first same-source clip.
+- [partial/LOW] export.rs written_clips keep-set dead post-staging-refactor (partial-availability clip drop).
