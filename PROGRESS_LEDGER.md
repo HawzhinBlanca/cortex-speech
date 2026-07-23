@@ -7634,3 +7634,42 @@ QUEUE (hand-verify each against source BEFORE fixing):
 - [MED] pipeline.rs:112 — loop0_would_fire counts whitespace-only normalization as a memory firing, inflating a metric.
 - [MED] SearchBar.svelte:74 — active FTS search freezes the match id-set; a refine/import reload silently drops or keeps the wrong rows.
 - DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (needs a Command-snapshot of child tables + archive-delta reversal; focused session).
+
+---
+
+## 2026-07-23T05:42Z — iter 113 — speaker rename silently merged groups (MEDIUM) fixed (676c0bb)
+
+**Fixed the queued MEDIUM SpeakerPanel destructive-merge. Hand-verified reachability + backend behavior.**
+
+**SpeakerPanel.svelte handleRename — a rename could silently, irreversibly merge two speakers (MEDIUM,
+data-loss; 676c0bb).** Hand-verified: handleRename (SpeakerPanel:30) called api.renameSpeaker(oldId, newName)
+directly — no collision check, no confirm. The backend rename_speaker (segments_write.rs:166 → db.rs) is a
+blanket `UPDATE speech_segments SET speaker_id=new WHERE speaker_id=old` and, unlike delete_segments (which
+pushes Command::DeleteSegments), records NOTHING on the undo stack. So renaming SPEAKER_00 to an id that already
+belongs to SPEAKER_01 collapses both diarization groups into one (e.g. 50/30 → 80), and the split is
+unrecoverable — no window.confirm to catch a typo (the rename box is prefilled free-text) and no Ctrl+Z to
+reverse it. The `speakers` array already holds every id + segment count, so the collision is detectable
+client-side.
+
+Fix: handleRename now detects a target that ALREADY belongs to another speaker
+(speakers.find(s => s.speakerId === trimmed && s.speakerId !== oldId)) and window.confirm's before the merge —
+naming the source, target, and the target's existing segment count — matching StatsDashboard's destructive-action
+pattern (window.confirm on restore/prune). A plain relabel (no collision) is unaffected (no prompt). New i18n
+key speaker.mergeConfirm in en + ckb (locale parity gate green). Source policy check #12 added; fail-before verified.
+
+Note: making rename fully UNDOABLE (a RenameSpeaker command with apply_undo/redo) is the larger,
+belt-and-suspenders option; the confirm-on-merge stops the ACCIDENTAL destructive case, which is the reachable
+harm. Logged the undo-able rename as a possible future enhancement.
+
+Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies** (12 checks now in
+test_frontend_review_guards.py; i18n parity green).
+
+**Score: 75 fixed + 1 cleanup, ~27 refuted, 2 measure-deferred, 4 queued + 1 deferred-large.** Owner-gated finish
+line unchanged.
+
+QUEUE (hand-verify each against source BEFORE fixing):
+- [MED] audio.rs:1140 — Energy-VAD fallback drops <~300ms utterances that Silero (96ms floor) keeps — short words lost. ← next
+- [MED] pipeline.rs:112 — loop0_would_fire counts whitespace-only normalization as a memory firing, inflating a metric.
+- [MED] SearchBar.svelte:74 — active FTS search freezes the match id-set; a refine/import reload silently drops or keeps the wrong rows.
+- DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (Command-snapshot of child tables + archive-delta reversal; focused session).
+- ENHANCEMENT (not a bug): undo-able speaker rename (RenameSpeaker command).
