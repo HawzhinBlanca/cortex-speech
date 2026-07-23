@@ -9076,6 +9076,44 @@ lock free.
 export.rs:859; 3 to reality-check) + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 153 — 2026-07-23 — FIX #114: droppedUnavailableAudio inflated by non-exportable rows (9th count-exclusion instance)
+
+**Class: honesty / count-must-exclude-what-the-export-drops (RECURRING, 9th).** Hand-verified: HF export's
+`dropped_unavailable` did `+= segs.len()` for every segment of an unavailable (export.rs:867) or undecodable
+(export.rs:876) source. But `split_segs` (train/val/test_segs) is NOT pre-filtered to training-ready — the
+write loop filters per-row (`!grade.training_ready` continue at 883; `!is_training_ready_for_huggingface_export`
+continue at 892; alignment-window `None` continue at 916). So a source's REVIEW-grade rows — dropped
+regardless of availability — were counted as "dropped because unavailable."
+
+**Harm (real, not cosmetic — triaged per the LOW tag):** (1) `droppedUnavailableAudio` in the SHIPPED
+dataset_infos.json (export.rs:1147) is inflated — a wrong provenance number the honesty law forbits
+regardless of direction; (2) the `dropped_unavailable > 0` operator warning (1036) fires even when an
+unavailable source held ZERO exportable rows — a false data-loss alarm; (3) the zero-clip message (1020)
+mislabels REVIEW rows as lost "training-ready segment(s)."
+
+**Root fix:** count only rows passing the same gate the write loop applies — a `count_exportable` closure
+calling `is_training_ready_for_huggingface_export` (which reads only grade + DB records, never the audio, so
+it is valid for a source we can't open; it also subsumes the `training_ready` check). Both drop sites now
+`+= count_exportable(&segs)?`. The alignment-window filter (3rd) can't be evaluated without decoding, so
+"passes the exportability gate" is the correct, defensible semantic for "training-ready rows lost to
+unavailable audio." Not over-engineering — it's the same recurring class fixed 8× before; reused the existing
+predicate, ~15-line helper.
+
+**Fail-before (neutralize-then-restore):** reverted both sites to `segs.len()` →
+`export_huggingface_dropped_unavailable_counts_only_exportable_rows` FAILED (count 2 instead of 1); restored
+→ PASS. The test seeds one available training-ready source (so dataset_infos.json is written) + one
+unavailable source carrying one training-ready + one REVIEW seg, and asserts `droppedUnavailableAudio == 1`.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 996 passed / 0 failed**
+(+1 test); **python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean,
+HEAD b059ed9, lock free.
+
+**Score: 114 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 3 to reality-check (denoiser.rs:14 SHA,
+commands.rs:638 spawn-panic, i18n/index.ts:32) + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
@@ -9089,7 +9127,7 @@ QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
   (chunks retain offsets normally; only legacy/clobber loses them — 1/3 refuters doubted it).
 - ~~export_bundle.rs:499 — stale learning_preferences.jsonl orphan~~ FIXED iter 151 (#112).
 - ~~audio.rs:404 — decode ResetRequired silent truncation~~ FIXED iter 152 (#113, both decode loops).
-- [LOW] export.rs:859 — dropped_unavailable over-counts (honesty; verify harm isn't purely cosmetic). ← next
+- ~~export.rs:859 — dropped_unavailable over-counts~~ FIXED iter 153 (#114, 9th count-exclusion instance).
 - REALITY-CHECK-BEFORE-FIXING (likely over-engineering per owner "beware over-engineering" — CLOSE with a
   reasoned note unless a real reachable harm is confirmed): denoiser.rs:14 SHA-verify (denoiser is
   best-effort preprocessing, not transcript-load-bearing), commands.rs:638 spawn-panic (only on OS
