@@ -7422,3 +7422,46 @@ QUEUE (hand-verify each against source BEFORE fixing):
 - [MED] ValidationPanel.svelte:519 — Signal-Anomaly tab shows "no anomalies" all-clear before any screen has run.
 - [MED] AudioPlayer.svelte:259 — autoplay fires only on element reload; dies after the first same-source clip.
 - [partial/LOW] export.rs written_clips keep-set dead post-staging-refactor (partial-availability clip drop).
+
+---
+
+## 2026-07-23T03:55Z — iter 108 — jury IRT-confidence REFUTED; ValidationPanel false all-clear fixed (d61528a)
+
+**Two queued items handled: the HIGH-ish jury lead REFUTED after full consumer analysis; the ValidationPanel
+MEDIUM honesty bug fixed.**
+
+**REFUTED — jury/mod.rs:331 "hard-veto escalations carry IRT agreement confidence, defeating riskiest-first
+ordering."** The mechanism is real: run_t0_gate stamps agent_confidence=irt_confidence on every escalation,
+get_escalation_queue orders `COALESCE(agent_confidence,0.5) ASC`, and a hard-veto escalation (poor audio, or a
+single distinct recognizer whose lone-model confidence the code ITSELF calls degenerate, mod.rs:75-76) can
+carry a HIGH agreement confidence and sort last. BUT the naive fix (pin veto→0.0) is WRONG: agent_confidence is
+NOT just an ordering key — ReviewInbox.svelte:521/545 renders it as a user-facing confidenceBand, and
+export_bundle.rs:683 exports it as provenance. Overwriting it with 0.0 would corrupt the displayed band and the
+exported IRT confidence to fix an ordering concern — the exact iter-106 trap (don't corrupt a semantic field for
+a presentation problem). Ordering escalations by label-confidence (most-uncertain-first) is a defensible policy,
+and a proper veto-aware ordering needs a NEW stored risk signal (the `escalated` flag doesn't distinguish
+veto-vs-threshold) or a composite ORDER BY on snr/clipping — a design decision, not a clear bug. Left as-is;
+surfaced for the owner. (~27 refuted.)
+
+**FIXED — ValidationPanel.svelte Signal-Anomaly tab showed a false all-clear before any screen ran (MEDIUM;
+d61528a).** signalAnomalyScore is written ONLY by the manual Run Signal-Anomaly Screen
+(compute_signal_anomaly_scores); the import/transcribe pipeline never sets it. The empty-state `{:else}` rendered
+`noSignalAnomaly` ("No segments flagged as anomalous.") whenever displayedSignalAnomalySegments.length===0 —
+which includes the case where NO segment has a score at all (never screened). compute_signal_anomaly_scores
+scores every segment, so signalAnomalySegments.length===0 ⟺ never screened. So the tab showed a green all-clear
+over audio nobody had screened (undefined-vs-clean honesty class, same family as iter-106's 0%-from-zero-data).
+Fix: added an `{:else if signalAnomalySegments.length === 0}` branch rendering a distinct notScreened message,
+reserving noSignalAnomaly for a real post-screen all-clear (scores exist, none above threshold). New i18n key
+validation.signalAnomaly.notScreened in en + ckb (locale parity gate green). Source policy check #10 added;
+fail-before verified.
+
+Gate: typecheck 0 errors, **vitest 201 passed**, lint 0 errors, **35/35 python policies** (10 checks now in
+test_frontend_review_guards.py; i18n parity green).
+
+**Score: 71 fixed, ~27 refuted, 2 measure-deferred, 2 queued.** Owner-gated finish line unchanged.
+
+QUEUE (hand-verify each against source BEFORE fixing):
+- [MED] AudioPlayer.svelte:259 — autoplay fires only in handleLoaded (onloadedmetadata); the element reloads only
+  when the audioPath prop VALUE changes, so consecutive same-source review clips don't reload → autoplay dies
+  after the first clip.
+- [partial/LOW] export.rs written_clips keep-set dead post-staging-refactor (partial-availability clip drop).
