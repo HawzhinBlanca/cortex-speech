@@ -9273,6 +9273,43 @@ lock free.
 gold-builder empty-chunk, MED, hand-verify next) + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 158 — 2026-07-23 — REFUTED (hand-verified): hunt-3 MED survivor eval.rs:186 gold-builder empty-chunk
+
+Hand-verified `create_gold_from_verified_file` (eval.rs:114-199). The asymmetry the finder flagged is REAL:
+the reject (120), unreviewed (140), and placeholder (179) guards all REFUSE (Err), while an empty effective
+transcript is SILENTLY skipped (`if !trimmed.is_empty()`, line 186). 2 of 3 verify lenses called it a real
+poisoning; the impact lens refuted it. My independent verification sides with the impact lens — I did NOT
+just agree with the majority:
+
+1. **The reachable trigger is the case where omitting is CORRECT.** The concrete reachable path is a
+non-speech/noise chunk that passes the `is_silent` ENERGY gate (pipeline.rs:1810 is energy, not content) →
+default CTC returns `Ok("")` → curator accepts empty. Omitting a genuinely non-speech chunk from a whole-file
+reference is right (the audio has no words). Empty-**ACCEPTED** is an affirmative "no text here" human
+decision — categorically unlike placeholder ("text pending, will exist") or reject ("draft known wrong"),
+which is why the asymmetry is justified, not a bug.
+
+2. **A placeholder-style hard-refuse would break the legitimate common case with no remediation.** Reject /
+unreviewed / placeholder each have a concrete fix (correct / review / transcribe); a genuinely-empty
+non-speech chunk has none — the human already made the correct call. Refusing would block gold promotion for
+ANY file containing a legit non-speech span. That is exactly the friction the owner's "beware
+over-engineering, don't add unneeded stuff" guidance warns against.
+
+3. **The residual poisoning sub-case needs curator NEGLIGENCE** (accepting an empty draft over audible
+speech, rather than editing/rejecting), and it perturbs only THIS user-gold set — a RELATIVE promotion
+yardstick (the same reference error cancels in the champion-vs-challenger delta the gate decides on). It does
+NOT touch the FROZEN FLEURS ckb_IQ set behind the absolute 7.03% SOTA honesty claim.
+
+Net: silently omitting an empty human-accepted chunk is defensible behavior for the reachable (non-speech)
+case; a refuse-fix trades a common legitimate workflow to defend a rare misuse. CLOSED as refuted-on-impact.
+(If the owner later observes a poisoned yardstick, a targeted "this chunk is intentionally empty vs. a missed
+transcript" affordance would be the right fix — not a blanket refuse.) No code change.
+
+**Score: 117 fixed + 1 cleanup, ~38 refuted, 2 measure-deferred, 0 hunt-queued (hunt-3 drained: 1 fixed, 1
+refuted) + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
