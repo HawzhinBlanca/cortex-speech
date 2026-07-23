@@ -21,6 +21,7 @@ Usage:  python scripts/calibration_ece.py <predictions.tsv> [n_bins]
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -38,6 +39,14 @@ def expected_calibration_error(confidences, correct, n_bins: int = 10):
         raise ValueError("no predictions to score")
     if n_bins < 1:
         raise ValueError("n_bins must be >= 1")
+    # A confidence must be a FINITE probability in [0, 1]. A NaN / >1 / <0 value would fall in NO bin (the
+    # membership filter below) yet still count toward n, silently scaling ECE DOWN — a better-looking,
+    # FABRICATED calibration number the honesty law forbids. Refuse it loudly: an out-of-range confidence is
+    # an upstream scorer bug, not something to quietly average away. (Mirrors iter-123: a metric that reaches
+    # the ledger must never be silently wrong.)
+    for i, c in enumerate(confidences):
+        if not (isinstance(c, (int, float)) and math.isfinite(c) and 0.0 <= c <= 1.0):
+            raise ValueError(f"confidence[{i}] = {c!r} is not a finite probability in [0, 1]; refusing to score")
     ece = 0.0
     bins = []
     for b in range(n_bins):

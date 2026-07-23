@@ -51,7 +51,17 @@ def test_confidence_one_lands_in_last_bin() -> None:
 
 
 def test_guards() -> None:
-    for bad in (lambda: ce.expected_calibration_error([0.5], [1, 0]), lambda: ce.expected_calibration_error([], [])):
+    bad_cases = (
+        lambda: ce.expected_calibration_error([0.5], [1, 0]),  # length mismatch
+        lambda: ce.expected_calibration_error([], []),  # empty
+        # A NaN / >1 / <0 confidence must be REFUSED, not silently dropped from every bin while still
+        # counting toward n (which scales ECE down — a fabricated, better-looking calibration number).
+        lambda: ce.expected_calibration_error([float("nan"), 0.5], [1, 0]),
+        lambda: ce.expected_calibration_error([1.5, 0.5], [1, 0]),
+        lambda: ce.expected_calibration_error([-0.1, 0.5], [1, 0]),
+        lambda: ce.expected_calibration_error([float("inf"), 0.5], [1, 0]),
+    )
+    for bad in bad_cases:
         try:
             bad()
         except ValueError:
