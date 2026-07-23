@@ -8914,6 +8914,27 @@ Owner-gated finish line unchanged. NOTE: the **aligner (pipeline.rs:3266) + camp
 (pipeline.rs:3398)** share the same all-or-nothing `resolved_dir()` orphaning — now a one-liner each via
 `resolve_root_for`; queued below.
 
+---
+
+### Iteration 148 — 2026-07-23 — FIX #109: aligner + campp resolved per-file too (model-resolution orphan class fully closed)
+
+**Class: resolve-wrong-dir (completes #106/#107).** The MMS forced aligner and the campp SpeakerEmbedding
+speaker model — both bundled-only on a fresh install — were still loaded via `model_manager.resolved_dir()`
+(all-or-nothing), so downloading OmniASR silently disabled forced alignment (→ energy/linear timestamps)
+AND speaker diarization (→ no speaker labels), no error. Routed all four sites through
+`resolve_root_for(<file>)`: aligner (pipeline.rs:3269) via "mms_aligner.onnx"; the three
+SpeakerEmbeddingService::new sites (1487, 1644, 3401) via CAMPP_MODEL — using the already-tested per-file
+resolver (resolve_root_in unit test, iter 146). Regression guard: source policy
+`test_bundled_only_models_resolve_per_file_not_all_or_nothing` forbids constructing these from resolved_dir()
+and requires resolve_root_for. **Fail-before:** reverting the aligner to resolved_dir() fails the policy.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 994 passed / 0 failed**;
+**python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD 3292f4f, lock free.
+
+**Score: 109 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 9 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged. **The all-or-nothing model-resolution orphan class is now fully closed
+(VAD, denoiser, aligner, campp) and guarded by a source policy.**
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
@@ -8928,6 +8949,5 @@ QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [LOW] export.rs:859 — dropped_unavailable over-counts (counts non-training-ready REVIEW rows the write loop skips).
 - [LOW] commands.rs:638 — import worker thread::spawn panic skips ImportGuard Drop → shared-state wedge.
 - [LOW] src/lib/i18n/index.ts:32 — translator replace() substitutes only the FIRST occurrence of a repeated placeholder.
-- [MED] aligner (pipeline.rs:3266) + campp/SpeakerEmbedding (pipeline.rs:3398) orphaned by the same
-  all-or-nothing resolved_dir() — one-liner each via resolve_root_for (found while fixing #107).
+- ~~aligner + campp orphan~~ FIXED in iter 148 (#109).
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
