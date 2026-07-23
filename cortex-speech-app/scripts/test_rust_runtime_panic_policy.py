@@ -1982,6 +1982,27 @@ def test_constrained_transcribe_verifies_model_and_tokens_pin() -> None:
         )
 
 
+def test_check_audio_and_get_duration_share_the_decode_fallback() -> None:
+    """check_audio_file and get_duration_ms must compute duration through the SAME helper
+    (duration_ms_with_decode_fallback). They previously duplicated the logic and diverged: check_audio_file
+    used num_frames.unwrap_or(0) with NO fallback and reported 0 ms for a valid VBR MP3 (no Xing/Info
+    header), contradicting get_duration_ms's true (decode-based) value. Exercising the no-frame-count
+    fallback needs a real decode (flaky to unit-test under the parallel suite), so the consolidation is
+    source-pinned here."""
+    src = (REPO_ROOT / "src-tauri" / "src" / "audio.rs").read_text(encoding="utf-8")
+    if "duration_ms: duration_ms_with_decode_fallback(" not in src:
+        raise AssertionError(
+            "check_audio_file does not compute duration_ms via the shared duration_ms_with_decode_fallback "
+            "helper — it would report 0 ms for a valid file with no frame count (VBR MP3 without a Xing "
+            "header), diverging from get_duration_ms."
+        )
+    if "duration_ms_with_decode_fallback(path.as_ref()" not in src:
+        raise AssertionError(
+            "get_duration_ms must also route through duration_ms_with_decode_fallback so the two functions "
+            "can never disagree on a no-frame-count file."
+        )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -2039,6 +2060,7 @@ def main() -> None:
     test_batch_transcribe_refuses_blank_draft()
     test_batch_processor_never_deletes_a_segment_with_an_existing_transcript()
     test_constrained_transcribe_verifies_model_and_tokens_pin()
+    test_check_audio_and_get_duration_share_the_decode_fallback()
     test_pipeline_hypothesis_population_reports_failures()
     test_asr_pool_recovers_poisoned_state_lock()
     test_global_rate_limiter_recovers_poisoned_lock()

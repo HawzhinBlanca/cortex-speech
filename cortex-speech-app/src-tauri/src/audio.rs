@@ -107,6 +107,27 @@ fn frames_to_duration_ms(n_frames: u64, sample_rate: f64) -> i64 {
     (n_frames as f64 / sample_rate * 1000.0) as i64
 }
 
+/// Duration in ms with a DECODE FALLBACK. A container that reports no usable frame count (VBR MP3 without
+/// a Xing/Info header, streamed OGG/WebM, some live recordings) leaves `num_frames` None/0; reporting 0
+/// then makes a perfectly decodable file look empty. Fall back to an actual decode (cached by
+/// decode_to_pcm, so the pipeline reuses it) to get the true duration; a genuinely empty file still
+/// yields 0. Both [`check_audio_file`] and [`get_duration_ms`] route through here so they can never
+/// disagree (they previously diverged: check_audio_file used num_frames.unwrap_or(0) with NO fallback and
+/// reported 0 ms for a valid VBR MP3, contradicting get_duration_ms's true value).
+fn duration_ms_with_decode_fallback(path: &Path, num_frames: Option<u64>, sample_rate: f64) -> AppResult<i64> {
+    match num_frames {
+        Some(n) if n > 0 => Ok(frames_to_duration_ms(n, sample_rate)),
+        _ => {
+            let (decoded_rate, samples) = decode_to_pcm(path)?;
+            if samples.is_empty() || decoded_rate == 0 {
+                Ok(0)
+            } else {
+                Ok(((samples.len() as f64 / decoded_rate as f64) * 1000.0) as i64)
+            }
+        }
+    }
+}
+
 /// Validate that a file is a readable audio file and return its basic info.
 pub fn check_audio_file<P: AsRef<Path>>(path: P) -> AppResult<AudioInfo> {
     let path = path.as_ref();
@@ -149,7 +170,7 @@ pub fn check_audio_file<P: AsRef<Path>>(path: P) -> AppResult<AudioInfo> {
         Some(CodecParameters::Audio(p)) => p,
         _ => return Err(AppError::Audio(AudioError::NoTracks(path.to_path_buf()))),
     };
-    let n_frames = track.num_frames.unwrap_or(0);
+    let num_frames = track.num_frames;
     let sample_rate = audio.sample_rate.unwrap_or(TARGET_SAMPLE_RATE) as f64;
     let channels = audio.channels.as_ref().map(|c| c.count() as u16).unwrap_or(1);
 
@@ -160,7 +181,9 @@ pub fn check_audio_file<P: AsRef<Path>>(path: P) -> AppResult<AudioInfo> {
     let format = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown").to_string();
 
     Ok(AudioInfo {
-        duration_ms: frames_to_duration_ms(n_frames, sample_rate),
+        // Same decode fallback as get_duration_ms: a VBR MP3 without a Xing header has no frame count, and
+        // reporting 0 ms here made check_audio disagree with the real import path (round-25 hunt).
+        duration_ms: duration_ms_with_decode_fallback(path, num_frames, sample_rate)?,
         sample_rate: sample_rate as u32,
         channels,
         format,
@@ -522,23 +545,10 @@ pub fn get_duration_ms<P: AsRef<Path>>(path: P) -> AppResult<i64> {
         return Err(AppError::Audio(AudioError::Decode("Invalid sample rate".into())));
     }
 
-    match track_num_frames {
-        // Container reported a real frame count (the common path): cheap, metadata-only.
-        Some(n) if n > 0 => Ok(frames_to_duration_ms(n, sample_rate)),
-        // No usable frame count (VBR MP3 without a Xing/Info header, streamed OGG/WebM, some
-        // live recordings). Reporting 0 here makes every import entry point reject the file as
-        // "Empty audio file" even though it decodes fine. Fall back to an actual decode to get
-        // the true duration; decode_to_pcm caches, so the subsequent pipeline decode reuses it.
-        // A genuinely empty/0-sample file still yields 0 and is still rejected.
-        _ => {
-            let (decoded_rate, samples) = decode_to_pcm(path.as_ref())?;
-            if samples.is_empty() || decoded_rate == 0 {
-                Ok(0)
-            } else {
-                Ok(((samples.len() as f64 / decoded_rate as f64) * 1000.0) as i64)
-            }
-        }
-    }
+    // Shared with check_audio_file so the two can never disagree (the decode fallback handles a VBR MP3
+    // without a Xing/Info header, streamed OGG/WebM, etc. — a missing frame count that would otherwise
+    // report 0 ms for a perfectly decodable file).
+    duration_ms_with_decode_fallback(path.as_ref(), track_num_frames, sample_rate)
 }
 
 /// Clear the PCM decode cache.
@@ -1375,6 +1385,36 @@ mod tests {
         writer.finalize().unwrap();
 
         assert_eq!(get_duration_ms(&path).unwrap(), 1000);
+    }
+
+    #[test]
+    fn check_audio_and_get_duration_agree_via_shared_helper() {
+        use hound::{WavSpec, WavWriter};
+        use tempfile::TempDir;
+
+        // Round-25 hunt: check_audio_file reported duration_ms=0 for a file get_duration_ms measured
+        // correctly, because they duplicated the duration logic and check_audio used num_frames.unwrap_or(0)
+        // with NO decode fallback. Both now route through duration_ms_with_decode_fallback, so they must
+        // AGREE and report the real duration. Deterministic (WAV frame-count path, no decode): a source
+        // policy (test_rust_runtime_panic_policy.py) pins that both functions use the shared helper; the
+        // no-frame-count fallback branch itself is get_duration_ms's pre-existing, decode-based path.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("one_sec.wav");
+        let spec =
+            WavSpec { channels: 1, sample_rate: 16000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut writer = WavWriter::create(&path, spec).unwrap();
+        for _ in 0..16_000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let info = check_audio_file(&path).unwrap();
+        assert_eq!(info.duration_ms, 1000, "check_audio reports the real duration, not 0");
+        assert_eq!(
+            info.duration_ms,
+            get_duration_ms(&path).unwrap(),
+            "check_audio and get_duration_ms must agree (they route through the same helper)"
+        );
     }
 
     #[test]
