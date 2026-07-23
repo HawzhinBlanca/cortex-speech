@@ -35,6 +35,13 @@ pub async fn transcribe_segment_constrained(
         if !model.exists() || !tokens.exists() {
             return Err("OmniASR model/tokens not found for constrained decode".to_string());
         }
+        // Runtime integrity gate — the SAME SHA-256 pin the default ASR path enforces (asr.rs:288-311):
+        // a tampered/swapped same-line-count tokens.txt (wrong id->grapheme map) or ONNX still LOADS but
+        // decodes every clip to the WRONG graphemes, persisted as trustworthy. Verify BOTH the model and
+        // the tokens vocab before the constrained decode runs; the default path refuses on mismatch and so
+        // must this opt-in one. verify_model_path_runtime is a no-op for an unpinned file.
+        crate::models::verify_model_path_runtime(&model, crate::models::OMNIASR_CTC_300M_MODEL)?;
+        crate::models::verify_model_path_runtime(&tokens, crate::models::OMNIASR_CTC_300M_TOKENS)?;
         // decode_to_pcm returns 16 kHz mono PCM (the model's expected input rate).
         let (rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
         // Slice only THIS segment's clip — every VAD chunk shares the whole-source audio_path (the range is

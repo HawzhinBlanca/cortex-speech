@@ -1962,6 +1962,26 @@ def test_batch_processor_never_deletes_a_segment_with_an_existing_transcript() -
         )
 
 
+def test_constrained_transcribe_verifies_model_and_tokens_pin() -> None:
+    """The opt-in constrained decode loads model.int8.onnx + tokens.txt via ort with NO built-in SHA check
+    (constrained_decode::run_constrained), so its command must enforce the SAME runtime integrity pin the
+    default ASR path does (asr.rs:288-311): a tampered/swapped same-line-count tokens.txt still loads but
+    decodes every clip to the WRONG graphemes, persisted as trustworthy. Runtime needs the real ONNX, so
+    it is source-pinned. `transcribe_segment_constrained(` matches only the constrained command."""
+    src = (COMMANDS_DIR / "transcribe.rs").read_text(encoding="utf-8")
+    start = src.find("pub async fn transcribe_segment_constrained(")
+    if start == -1:
+        raise AssertionError("transcribe_segment_constrained command not found in commands/transcribe.rs")
+    end = src.find("#[tauri::command]", start)
+    body = src[start:end] if end != -1 else src[start:]
+    if body.count("verify_model_path_runtime(") < 2:  # call form only (a comment mention has no '(')
+        raise AssertionError(
+            "constrained transcribe command does not verify BOTH the model and tokens SHA-256 pin before "
+            "decoding — a tampered/swapped tokens.txt would decode to the wrong graphemes, persisted as "
+            "trustworthy. Add verify_model_path_runtime for the model AND the tokens (mirror asr.rs)."
+        )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -2018,6 +2038,7 @@ def main() -> None:
     test_default_transcribe_segment_refuses_blank_draft()
     test_batch_transcribe_refuses_blank_draft()
     test_batch_processor_never_deletes_a_segment_with_an_existing_transcript()
+    test_constrained_transcribe_verifies_model_and_tokens_pin()
     test_pipeline_hypothesis_population_reports_failures()
     test_asr_pool_recovers_poisoned_state_lock()
     test_global_rate_limiter_recovers_poisoned_lock()
