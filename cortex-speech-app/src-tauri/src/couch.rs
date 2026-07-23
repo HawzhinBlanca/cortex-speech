@@ -356,8 +356,19 @@ fn api_decision(db: &Database, body: &[u8], undo_stack: &mut Vec<(String, Speech
     json_reply(200, serde_json::json!({ "ok": true }))
 }
 
-/// Undo the LAST phone decision: clear the human decision and restore the pre-decision row
-/// (the same two-step the desktop `undoLast` performs). Returns the undone segment id.
+/// Undo the LAST phone decision: retract the learning pair the decision produced, then restore the
+/// pre-decision row LOSSLESSLY. Returns the undone segment id.
+///
+/// `clear_human_decision` is kept ONLY for its side effect of deleting the DPO/few-shot agent_examples
+/// row the edit produced (a retracted edit left in the trainable pool permanently teaches the model a
+/// fix the human took back). The row-restore itself MUST go through `insert_segment_full`, not
+/// `insert_segment`: `prev` is the exact pre-decision snapshot, and a clip served to the couch queue can
+/// carry jury state (a jury-ESCALATED clip is unverified, so it is in `get_segments(false)`) — verdict,
+/// verdict_transcript, rationale, evidence_json, agent_confidence, escalated, is_gold. `insert_segment`
+/// writes a 17-column subset that OMITS every one of those, so it would leave them at whatever
+/// `clear_human_decision` set (jury verdict/evidence NULLed, is_gold from the undone accept still set) —
+/// silently dropping the pre-decision jury verdict on undo. `insert_segment_full` rewrites the whole row
+/// (including created_at) back to `prev`, so undo is a true inverse.
 fn api_undo(db: &Database, undo_stack: &mut Vec<(String, SpeechSegment)>) -> Reply {
     let Some((id, prev)) = undo_stack.pop() else {
         return err_reply(409, "nothing to undo");
@@ -366,7 +377,7 @@ fn api_undo(db: &Database, undo_stack: &mut Vec<(String, SpeechSegment)>) -> Rep
         undo_stack.push((id, prev));
         return err_reply(500, &e.to_string());
     }
-    if let Err(e) = db.insert_segment(&prev) {
+    if let Err(e) = db.insert_segment_full(&prev) {
         return err_reply(500, &e.to_string());
     }
     json_reply(200, serde_json::json!({ "id": id }))
@@ -467,6 +478,52 @@ mod tests {
         assert_eq!(code, 200);
         let (code, _, _) = api_undo(&db, &mut undo);
         assert_eq!(code, 409, "empty undo stack is a 409, not a phantom undo");
+    }
+
+    #[test]
+    fn undo_restores_a_pre_decision_jury_verdict_instead_of_clearing_it() {
+        // DATA-LOSS (whole-row-clobber family): a jury-ESCALATED clip (verdict='escalated', escalated=true,
+        // verified=false, human_decision=NULL) is served by the couch queue (get_segments(Some(false)) =
+        // unverified). Phone-reviewing it then UNDOING must restore the pre-decision row EXACTLY — including
+        // the jury verdict and the gold flag. The old undo ran clear_human_decision (nulls verdict/
+        // rationale/evidence/agent_confidence) + insert_segment (a 17-col subset that OMITS every jury/
+        // decision column AND is_gold), so undo CLEARED the jury's escalation verdict rather than restoring
+        // it, and left is_gold=1 that the now-undone accept had set. The restore must go through
+        // insert_segment_full so the row returns to its pre-decision snapshot losslessly.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _p) = test_db(tmp.path());
+
+        // Persist the jury columns with insert_segment_full (insert_segment would drop them).
+        let mut s = seg("esc1", "دەق یەک");
+        s.verdict = Some("escalated".into());
+        s.escalated = true;
+        s.verified = false;
+        s.is_gold = false;
+        db.insert_segment_full(&s).unwrap();
+
+        let mut undo = Vec::new();
+        let body = serde_json::json!({ "id": "esc1", "action": "accept", "text": "دەق یەک" });
+        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), &mut undo);
+        assert_eq!(code, 200, "the accept decision must succeed");
+        assert!(db.get_segment_by_id("esc1").unwrap().unwrap().verified, "accept verifies the clip");
+
+        let (code, _, _) = api_undo(&db, &mut undo);
+        assert_eq!(code, 200, "undo must succeed");
+
+        let restored = db.get_segment_by_id("esc1").unwrap().unwrap();
+        assert_eq!(
+            restored.verdict.as_deref(),
+            Some("escalated"),
+            "undo must RESTORE the pre-decision jury verdict, not clear it (got {:?})",
+            restored.verdict
+        );
+        assert!(
+            !restored.is_gold,
+            "undo must not leave the gold flag the undone accept set (is_gold={})",
+            restored.is_gold
+        );
+        assert!(!restored.verified, "undo reopens the clip for re-review");
+        assert!(restored.human_decision.is_none(), "undo clears the human decision it recorded");
     }
 
     #[test]
