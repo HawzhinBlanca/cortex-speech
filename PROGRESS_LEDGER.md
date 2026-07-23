@@ -8525,3 +8525,43 @@ QUEUE (hunt-135 survivors — hand-verify EACH against source before fixing):
 - [LOW] audio.rs:163 — check_audio reports duration_ms=0 for a valid VBR MP3 without a Xing header
   (contradicts get_duration_ms).
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+### Iteration 136 — 2026-07-23 — REFUTE pipeline.rs:2264 (already fixed) + FIX #98: conformal certificate excludes human-rejected clips
+
+**REFUTE — survivor pipeline.rs:2264 (empty-7B-rolls-back-import).** Hand-verified against source and it
+is ALREADY FIXED. `parse_wsl_segment_result` (pipeline.rs:242-277) returns `Ok(("", conf))` for a healthy
+server emitting a `__RESULT__` line with an empty transcript (silent/music/noise clip); it returns `Err`
+ONLY when NO `__RESULT__` line appears at all. The comment (268-271) literally documents this exact past
+bug ("Returning Err on an empty-but-present result made ONE silent chunk roll back the ENTIRE import") as
+fixed. The empty flows: Ok("") → pipeline 2211 arm → usable=false → 2252-2253 infra_failure=FALSE → after
+loop, NO rollback → escalate this one segment. The finder AND all 3 refuters missed
+`parse_wsl_segment_result`'s contract — a textbook reason the loop hand-verifies and never trusts agent
+verdicts (this survivor had refutes=0, i.e. 3/3 "confirmed"). No code change.
+
+**FIX #98 — survivor conformal.rs:146 (count-must-exclude-rejected, 8th instance).** Hand-verified:
+`calibrate_and_certify` built its conformal CALIBRATION set (verified + non-empty annotated) and its
+CERTIFIED set (nonconformity ≤ threshold) with no `is_human_rejected` exclusion. 'Mark bad' sets
+verified=true and keeps the machine draft as annotated_transcript, so a rejected clip's ~0 CER adds a
+spurious low-nonconformity point tightening `expected_error_bound`, and it lands in
+`certified_segment_ids`/`total_certified` — a fabricated dataset-quality guarantee over discarded clips.
+Every sibling gate (export.rs:318, export_bundle.rs:242, jury/mod.rs:206) and the db.rs C3 count
+(db.rs:2073, identical predicate + the exact reject-exclusion, comment describing this bug) already
+exclude rejects; conformal was the lone omission. Fix: `!crate::quality::is_human_rejected` on both
+filters. Fail-before: `human_rejected_clips_never_pollute_or_get_certified` — neutralizing both exclusions
+fails it ("must never be certified as good: [g, bad]").
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 989 passed / 0 failed**;
+**python policies 38 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD 909d497, lock free.
+
+**Score: 98 fixed + 1 cleanup, ~33 refuted, 2 measure-deferred, 5 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-135 survivors remaining — hand-verify EACH before fixing):
+- [HIGH] commands.rs:1206 — batch_transcribe blank-overwrite (sibling of #97, different command). ← next
+- [MED] batch_processor.rs:146 — headless re-transcribe DELETES a segment on a legit empty result.
+- [MED] eval.rs:174 — placeholder draft leaks into the permanent gold reference.
+- [MED] constrained_decode.rs:157 — run_constrained skips the SHA-256 pin the default path enforces.
+- [LOW] audio.rs:163 — check_audio duration_ms=0 for a valid VBR MP3 without a Xing header.
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
