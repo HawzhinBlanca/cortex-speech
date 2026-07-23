@@ -496,9 +496,19 @@ fn build_agent_promotion_readiness(reports: &[crate::runs::AgentImportReport]) -
 fn write_learning_artifacts(db: &Database, output_dir: &Path) -> AppResult<(LearningBundleManifest, Vec<String>)> {
     let dpo_export = crate::jury::learning::build_dpo_dataset(db)?;
     let mut files = Vec::new();
+    // Re-exporting into a REUSED directory must not leave a stale learning_preferences.jsonl ORPHAN.
+    // Unlike the bundle's other fixed-name files (rewritten every run), this one is written CONDITIONALLY —
+    // only when pair_count > 0 — so an earlier export's file would survive a later export that has ZERO pairs
+    // (the underlying human edits were rescinded / their clips became gold holdout), get re-hashed into
+    // SHA256SUMS by the whole-tree walk, and re-ship WITHDRAWN preference pairs vouched as current. Clear it
+    // first — mirroring source_transcripts — so only this run's file (if any) survives.
+    let preferences_disk_path = output_dir.join("learning_preferences.jsonl");
+    if preferences_disk_path.exists() {
+        std::fs::remove_file(&preferences_disk_path)?;
+    }
     let preferences_path = if dpo_export.pair_count > 0 {
         let path = "learning_preferences.jsonl".to_string();
-        write_text(&output_dir.join(&path), &dpo_export.jsonl)?;
+        write_text(&preferences_disk_path, &dpo_export.jsonl)?;
         files.push(path.clone());
         Some(path)
     } else {
@@ -599,8 +609,10 @@ fn write_source_reference_artifacts(
     // `segments` upstream — would keep its old .txt on disk, get re-hashed into SHA256SUMS by the whole-tree
     // walk, and (worst case) leave a holdout clip's HUMAN reference transcript (the WER/CER answer key)
     // inside the "holdout-free" bundle. Clear the dir first — even when `records` is empty — so ONLY this
-    // run's records survive. (Fixed-name artifacts like metadata.csv and the manifests are overwritten each
-    // run; source_transcripts is the sole variable-named dir and thus the only orphan vector.)
+    // run's records survive. (Fixed-name artifacts that are written UNCONDITIONALLY every run — metadata.csv,
+    // the manifests — are overwritten and can't orphan. source_transcripts is the only variable-named dir;
+    // learning_preferences.jsonl is the one fixed-name file written CONDITIONALLY, so it clears itself the
+    // same way in write_learning_artifacts.)
     if source_dir.exists() {
         std::fs::remove_dir_all(&source_dir)?;
     }

@@ -1330,6 +1330,108 @@ fn draft_export_includes_self_learning_preference_artifacts() {
 }
 
 #[test]
+fn re_export_into_reused_dir_removes_stale_learning_preferences_orphan() {
+    // A first export with DPO pairs writes learning_preferences.jsonl; a later export into the SAME
+    // directory with ZERO pairs must not leave that file behind as a stale orphan — it would be re-hashed
+    // into SHA256SUMS by the whole-tree walk and re-ship withdrawn preference pairs vouched as current.
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let audio = tmp.path().join("learning-source.wav");
+    std::fs::write(&audio, b"audio").unwrap();
+    let identity = crate::pipeline::source_audio_identity(&audio).unwrap();
+    let audio_path = audio.to_string_lossy().to_string();
+    let segment = SpeechSegment {
+        id: "learning-seg-1".into(),
+        created_at: None,
+        audio_path: audio_path.clone(),
+        raw_transcript: "raw candidate".into(),
+        normalized_transcript: Some("normalized candidate".into()),
+        annotated_transcript: None,
+        alignment_json: None,
+        duration_ms: 1800,
+        speaker_id: Some("spk1".into()),
+        verified: false,
+        confidence: Some(0.82),
+        ctc_score: None,
+        clipping_ratio: Some(0.0),
+        rms_db: Some(-20.0),
+        snr_db: Some(20.0),
+        split: Some("train".into()),
+        signal_anomaly_score: None,
+        verdict: Some("jury_accept".into()),
+        verdict_transcript: Some("agent wrong text".into()),
+        rationale: Some("reference-aware agent selected a weak candidate".into()),
+        evidence_json: Some(
+            serde_json::json!({
+                "referenceModelId": "gemini-2.5-pro",
+                "selectedModelId": "omniasr-wsl-7b",
+                "selectedTranscript": "agent wrong text",
+                "shouldCommit": true
+            })
+            .to_string(),
+        ),
+        agent_confidence: Some(0.90),
+        escalated: false,
+        human_decision: None,
+        corrected_at: None,
+        is_gold: false,
+        alignment_quality: None,
+        ..SpeechSegment::default()
+    };
+    db.insert_segment(&segment).unwrap();
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "omniasr-wsl-7b".to_string(),
+        transcript: "agent wrong text".to_string(),
+        confidence: Some(0.90),
+    })
+    .unwrap();
+    db.upsert_source_transcript(&SourceTranscriptRecord {
+        audio_path: audio_path.clone(),
+        model_id: "gemini-2.5-pro".to_string(),
+        audio_content_hash: Some(identity.content_hash),
+        audio_size_bytes: Some(identity.size_bytes),
+        transcript_path: "source_transcripts\\learning-source__gemini_2_5_pro.txt".to_string(),
+        transcript_text: "whole file reference for learning".to_string(),
+        created_at: None,
+    })
+    .unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["learning-example-1", "learning-seg-1", "agent wrong text", "human corrected text"],
+        )
+        .unwrap();
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+
+    // First export: the preference pair exists → learning_preferences.jsonl is written.
+    let first = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+    assert!(first.files.contains(&"learning_preferences.jsonl".to_string()));
+    assert!(out.join("learning_preferences.jsonl").exists());
+
+    // Withdraw the human edit so the next export has zero pairs.
+    db.connection().execute("DELETE FROM agent_examples WHERE id = 'learning-example-1'", []).unwrap();
+
+    // Second export into the SAME directory: the stale file must be gone, not re-shipped.
+    let second = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+    assert!(!second.files.contains(&"learning_preferences.jsonl".to_string()));
+    assert!(!out.join("learning_preferences.jsonl").exists(), "stale learning_preferences.jsonl orphan re-shipped");
+
+    let learning_manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("learning_manifest.json")).unwrap()).unwrap();
+    assert_eq!(learning_manifest["pairCount"].as_u64(), Some(0));
+    assert!(learning_manifest["preferencesPath"].is_null());
+
+    // SHA256SUMS must not vouch for the withdrawn file.
+    let sums = std::fs::read_to_string(out.join("SHA256SUMS")).unwrap();
+    assert!(!sums.contains("learning_preferences.jsonl"), "SHA256SUMS vouches a stale orphan");
+}
+
+#[test]
 fn draft_export_records_model_metadata_load_errors() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
