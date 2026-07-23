@@ -76,10 +76,16 @@ guarantees** — and all degrade on conversational speech.
 2. **Confidence-filtered pseudo-labels** (avg token log-prob / entropy / ensemble agreement) prevent
    error amplification — but at the *very bottom* (tens of minutes) unfiltered can win (quantity
    dominates). Threshold is empirical; leave the knob. (uDistil-Whisper 2407.01257.)
-3. **KenLM n-gram shallow fusion** — cheapest win: **text only, no retrain**, and morphologically-rich
-   Kurdish is where an LM recovers rare word-forms. **Fit caveat:** native in sherpa-onnx for
-   CTC/transducer *decoding*, but confirm sherpa runs n-gram fusion on the Omnilingual CTC path (hotwords
-   are transducer-only — n-gram LM is a different feature; verify). (NGPU-LM 2505.22857.)
+3. **KenLM n-gram shallow fusion** — ~~cheapest win~~ **VERIFIED NOT FEASIBLE on our path (iter 144).**
+   sherpa-onnx 1.13.2's `OfflineLMConfig` is `{ model, scale }` where `model` is a path to a NEURAL RNN-LM
+   **ONNX** file (offline_asr.rs:200-204) — a KenLM is an ARPA/binary n-gram, not ONNX, so it **mechanically
+   cannot be wired into sherpa's offline LM at all**; and sherpa's offline LM + hotwords are transducer /
+   beam-search features that don't apply to the OmniASR **CTC** greedy path. A real KenLM fusion would need
+   a CUSTOM CTC prefix-beam-search + KenLM decoder in the app's own `ort` path (constrained_decode.rs) —
+   a large, opt-in-only build, NOT a cheap win. The only offline **CTC-applicable** decode knob that exists
+   is `OfflineRecognizerConfig.blank_penalty` (default 0.0, app unset) — biasing against blank cuts
+   deletions — but its value must be **tuned on the gold set** (owner-gated; setting it blind is an
+   unmeasured change → honesty violation). (NGPU-LM 2505.22857 is NeMo-side, not sherpa.)
 4. **LoRA / QLoRA** — matches full fine-tune at ~5% of params (LoRA-Whisper: 18–23% rel. WER); the win is
    **cheap, repeatable self-training rounds** on 2×3090 Ti, not a standalone CER drop. **Don't chase the
    exotic-variant zoo** (AdaLoRA/DoRA/VeRA) — noise at this scale.
@@ -131,7 +137,7 @@ the actual GPU/marathon execution needs the owner. **None of these lets the loop
 |---|------|--------------|----------|--------|
 | 1 | ~~Sorani normalizer = AsoSoft/ScriptNormalization~~ **AUDITED 2026-07-23 → already implemented** in `normalizer.rs` (Kaf U+0643→ک, Yeh U+064A→ی, Alef-Maksura→ی, ZWNJ incl. heh+ZWNJ→ە, zero-width strips, tashkeel, Persian/Arabic digits, NFC-idempotent). In-loop part DONE. | — (done) | re-score 7.03% under it on a contamination-checked split (still owner-gated) | §4, SN-WER |
 | 2 | **Pseudo-labeling / noisy-student harness** on 1.74M clips (batch infer → confidence-filter → QLoRA pack → per-round held-out regression gate) | build all scripts + the gate | GPU run each round | §3.1–2 |
-| 3 | **KenLM n-gram fusion**: verify sherpa CTC n-gram support, then build the `ckb` n-gram from clean text + wire decode-time fusion | verify + build | swap + measure | §3.3 |
+| 3 | ~~KenLM n-gram fusion~~ **REFUTED (iter 144)** — sherpa offline LM is neural-ONNX + transducer-only; a KenLM can't be wired to CTC at all. Residual: tune `blank_penalty` (owner-gated) or write a custom CTC+KenLM beam decoder (large, opt-in). See §3.3. | — (refuted) | tune blank_penalty (owner) | §3.3 |
 | 4 | **OmniASR-CTC-1B int8 benchmark harness** (config swap + one-command 300M-vs-1B ckb scorecard + runbook) | build harness + runbook | GPU run + measure | §2 |
 | 5 | **int8 quantization script** (`quantize_dynamic`, exclude CTC head, WER assert) + py policy | write script + policy | quantize new ckpt | §2 |
 | 6 | **Active-learning queue ranking** (uncertainty × diversity) in the review-queue workflow | implement re-sort | owner reviews | §3.5 |
@@ -142,5 +148,6 @@ the actual GPU/marathon execution needs the owner. **None of these lets the loop
 | 11 | **Two-stage CV→FLEURS fine-tune recipe** (FLEURS-Kobani) prepared as the champion's next retrain script | build script | GPU retrain | §1, facet 1 |
 
 **Honest gaps to keep visible:** no reproduced-externally 7.03%; no measured 1B-ckb delta; no Sorani TTS;
-sherpa CTC n-gram/homophone-path support unverified; 1.74M + PawanKrd provenance unverified; conversational
-Sorani entirely unmeasured. Refresh this scan on cadence and re-date.
+**sherpa CTC n-gram fusion VERIFIED impossible (iter 144 — offline LM is neural-ONNX + transducer-only)**;
+homophone-path support still unverified; 1.74M + PawanKrd provenance unverified; conversational Sorani
+entirely unmeasured. Refresh this scan on cadence and re-date.
