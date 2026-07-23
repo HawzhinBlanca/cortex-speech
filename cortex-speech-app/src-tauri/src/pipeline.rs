@@ -1825,8 +1825,12 @@ impl ProcessingPipeline {
             // import and every clip was transcribed with stock CTC. Any failure/empty output falls
             // through to the configured engine so import never breaks. Uses the raw chunk PCM, exactly
             // like transcribe()'s fine-tuned path (no extra RMS/denoise, so the two paths agree).
+            // Evaluate the WSL-7B-primary routing ONCE per chunk: it decides both the placeholder branch
+            // below AND whether a fine-tuned miss is a genuine STOCK downgrade (it is NOT when the 7B is the
+            // primary drafter — the miss falls to the 7B champion, not stock local CTC).
+            let wsl_primary = self.should_use_wsl_primary_asr();
             let finetuned_text: Option<String> = if self.settings.use_finetuned_asr {
-                // F2: every attempted chunk is counted; every fall-through increments the fallback
+                // F2: every attempted chunk is counted; a fall-through TO STOCK increments the fallback
                 // counter so the import completion can report the downgrade LOUDLY (a log-only
                 // warn here left a whole import drafted at stock ~29.4% CER instead of the selected
                 // 21.0% engine with nothing visible in the UI).
@@ -1850,7 +1854,13 @@ impl ProcessingPipeline {
                         None
                     }
                 };
-                if drafted.is_none() {
+                // Count a fine-tuned MISS as a stock downgrade ONLY when the chunk actually falls back to
+                // stock local CTC. Under the WSL-7B primary the miss falls to the 7B champion (the
+                // placeholder branch below), which is NOT a stock downgrade — counting it would raise a
+                // FALSE "ALL N chunk(s) were drafted by the STOCK engine … stock-grade" completion error on
+                // an import the 7B actually drafted (the owner's WSL7B+use_finetuned config when the
+                // fine-tuned checkpoint is absent — a direct honesty-law violation).
+                if drafted.is_none() && !wsl_primary {
                     self.finetuned_fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 drafted
@@ -1860,7 +1870,7 @@ impl ProcessingPipeline {
 
             let (raw_transcript, confidence, confidence_source, model_version_id) = if let Some(text) = finetuned_text {
                 (text, None, Some("fine_tuned_no_posterior".to_string()), Some("finetuned-mms-ckb".to_string()))
-            } else if self.should_use_wsl_primary_asr() {
+            } else if wsl_primary {
                 (
                     "[Pending WSL 7B ASR]".to_string(),
                     None,

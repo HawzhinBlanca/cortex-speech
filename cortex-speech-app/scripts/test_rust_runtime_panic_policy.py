@@ -1793,6 +1793,33 @@ def test_telemetry_tracer_recovers_poisoned_span_buffer() -> None:
         raise AssertionError("telemetry/mod.rs must keep a unit test for poisoned span-buffer recovery")
 
 
+def test_finetuned_fallback_counter_excludes_the_wsl_7b_primary_path() -> None:
+    """build_segments_from_pcm's fine-tuned FALLBACK counter (finetuned_fallbacks) drives the completion-time
+    "stock-grade" downgrade alarm (finetuned_downgrade_message). A fine-tuned miss counts as a STOCK downgrade
+    ONLY when the chunk actually falls back to stock local CTC. When WSL 7B is the primary drafter, a miss
+    falls to the 7B champion via the "[Pending WSL 7B ASR]" placeholder — NOT stock — so counting it raises a
+    FALSE "ALL N chunk(s) were drafted by the STOCK engine … stock-grade" PipelineEvent::Error on an import the
+    7B actually drafted (the owner's WSL7B + use_finetuned config when the fine-tuned checkpoint is absent — a
+    direct honesty-law violation). The finetuned_fallbacks.fetch_add must be gated to EXCLUDE the wsl-primary
+    path. Exercising it end-to-end needs the full import harness + a live 7B server, so it is source-pinned
+    (like finetuned_downgrade_message's own unit test)."""
+    pipeline = pipeline_surface()
+    anchor = "self.finetuned_fallbacks.fetch_add("
+    idx = pipeline.find(anchor)
+    if idx == -1:
+        raise AssertionError("finetuned_fallbacks.fetch_add not found — this gate would pass vacuously")
+    # The condition immediately preceding the increment must carry the wsl-primary exclusion, so a fine-tuned
+    # miss while WSL 7B is the primary is NOT miscounted as a stock downgrade.
+    guard_window = pipeline[max(0, idx - 240):idx]
+    if "!wsl_primary" not in guard_window and "!self.should_use_wsl_primary_asr()" not in guard_window:
+        raise AssertionError(
+            "finetuned_fallbacks.fetch_add is not gated on the wsl-primary exclusion — a fine-tuned miss while "
+            "WSL 7B is the primary drafter is miscounted as a STOCK downgrade, emitting a false 'stock-grade' "
+            "completion error on a 7B-drafted import. Guard the increment with `&& !wsl_primary` (the chunk "
+            "falls to the 7B champion, not stock local CTC)."
+        )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -1837,6 +1864,7 @@ def main() -> None:
     test_run_t2_for_segment_respects_the_autonomy_dial()
     test_optin_transcribe_commands_reject_a_blank_decode()
     test_pipeline_wsl_retranscribe_rejects_an_empty_result()
+    test_finetuned_fallback_counter_excludes_the_wsl_7b_primary_path()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()
