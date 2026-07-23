@@ -7707,3 +7707,41 @@ QUEUE (hand-verify each against source BEFORE fixing):
 - [MED] SearchBar.svelte:74 — active FTS search freezes the match id-set; a refine/import reload silently drops or keeps the wrong rows.
 - DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (Command-snapshot of child tables + archive-delta reversal; focused session).
 - ENHANCEMENT (not a bug): undo-able speaker rename (RenameSpeaker command).
+
+---
+
+## 2026-07-23T06:28Z — iter 115 — loop0 shadow signal counted whitespace as a firing (MEDIUM honesty) fixed (63dd748)
+
+**Fixed the queued MEDIUM loop0 metric-inflation. Hand-verified apply_memories + the gate-accurate detector.**
+
+**pipeline.rs loop0_would_fire — whitespace normalization counted as a correction-memory firing, inflating the
+C5 over-trigger metric (MEDIUM, honesty; 63dd748).** Hand-verified: loop0_would_fire (pipeline.rs:109) — the
+always-on LOOP-0 shadow signal recorded per segment — decided "a memory would fire" via
+`apply_memories(text, mems, cfg) != text`. But apply_memories (corrections.rs) rebuilds the text as
+`words.split_whitespace()...join(" ")` and applies replacements only at matching slots — so with ZERO matching
+memories it still returns the WHITESPACE-CANONICALIZED text. Any draft with non-canonical whitespace
+(leading/trailing space, double space, tab, newline — reachable e.g. with auto_normalize off so the draft is
+raw ASR, or a provider whose raw carries a trailing newline) therefore differs from its input and flipped
+would_fire=true with no memory firing. intelligence_report sums these into `wouldFire` and, for later
+human-accepted segments, `firedButHumanAcceptedOriginal` — the C5 "must be 0" over-trigger count that gates
+whether loop0_firing may ever go live. So pure whitespace edits were being reported as memory-firing
+over-triggers, an honesty-metric inflation.
+
+Fix: loop0_would_fire now uses `!fired_memories_summary(text, mems, cfg).is_empty()` — the gate-accurate
+detector (firing_winner_indices: same slot/confidence/hit/phon_tau gates + winner-take-all as apply_memories,
+and the exact provenance the REAL firing path already uses), which is empty unless a memory actually wins a
+slot. Immune to the whitespace artifact; a genuine match still fires even with padding. apply_memories stays
+in use on the real firing path (clippy clean). Fail-before verified: extended the existing shadow-signal test
+with double-space/leading-trailing/tab drafts — they FAILED ("a double space alone is not a firing") before the
+fix and pass after; a real match with padding still fires.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 981 passed / 0 failed / 6 ignored**, **35/35 python
+policies**.
+
+**Score: 77 fixed + 1 cleanup, ~27 refuted, 2 measure-deferred, 2 queued + 1 deferred-large.** Owner-gated finish
+line unchanged.
+
+QUEUE (hand-verify each against source BEFORE fixing):
+- [MED] SearchBar.svelte:74 — active FTS search freezes the match id-set; a refine/import reload silently drops or keeps the wrong rows. ← next (last hunt-111 survivor)
+- DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (Command-snapshot of child tables + archive-delta reversal; focused session).
+- ENHANCEMENT (not a bug): undo-able speaker rename (RenameSpeaker command).
