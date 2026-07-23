@@ -7781,3 +7781,44 @@ Owner-gated finish line unchanged.
 CARRIED (not from a hunt queue; owner-facing):
 - DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (Command-snapshot of child tables + archive-delta reversal; focused session).
 - ENHANCEMENT (not a bug): undo-able speaker rename (RenameSpeaker command); re-run FTS (not just substring fallback) on reload if search quality matters.
+
+---
+
+## 2026-07-23T07:20Z — iter 117 — bundle re-export orphan reference (HIGH holdout-contamination) fixed (9869cbb)
+
+**Ran a fresh hunt (commands/consent, asr/models/registry, aligner/wer, jury-deep, export-bundle/audio + remaining
+frontend; 6 finders × 3-lens verify → 6 survivors). Fixed the top HIGH honesty/eval-integrity finding, queued 5.**
+
+**export_bundle.rs write_source_reference_artifacts — a bundle re-export left an orphan source-reference that
+could re-contaminate the holdout eval set (HIGH, honesty; 9869cbb).** Hand-verified: source_transcripts/*.txt use
+content-hashed variable names (source_reference_bundle_filename, {stem}.{model}.{hash}.txt), and
+export_dataset_bundle only create_dir_all's the reused output_dir (no staging/clear, unlike the HF export's
+.data-staging swap). `segments` is holdout-filtered (exclude_holdout_segments, :238) + rejection-filtered
+(!is_human_rejected, :242), and source-reference records derive from it (:253) — so a clip present in an earlier
+export but DROPPED from a later one (its segment now a gold holdout or human-rejected) is NOT rewritten, yet its
+old .txt persists. write_sha256sums (:436) recurses the whole tree → re-hashes the orphan; source_reference_manifest.json
+lists only current records → manifest-vs-disk mismatch; and WORST CASE the dropped clip's HUMAN reference
+transcript (the WER/CER answer key) stays inside the "holdout-free" bundle and passes `sha256sum -c`, defeating
+the exact source-level holdout guarantee the comment at :230-237 exists for. Confirmed source_transcripts is the
+SOLE variable-named artifact dir (all data files dataset.{json,jsonl,csv,parquet} + every manifest/card are
+fixed-name, overwritten each run), so it is the only orphan vector.
+
+Fix: clear source_transcripts (remove_dir_all) before writing it — UNCONDITIONALLY (even when records is empty,
+so an all-dropped re-export leaves no stale dir) — so only THIS run's records survive. Fail-before verified: the
+new test (silver clip with a source ref → export → human-reject it → re-export same dir) FAILED with the orphan
+drop-seg.<model>.<hash>.whole_file_reference.txt still on disk; passes after the clear. Existing holdout-exclusion
+tests (bundle/hf/plain/dpo/lm/few-shot) all still green.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 982 passed / 0 failed / 6 ignored** (was 981, +1),
+**35/35 python policies**.
+
+**Score: 79 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 5 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-117; hand-verify each against source BEFORE fixing):
+- [MED] segments_write.rs:287 — update_segment_bounds round-trips alignment_json through SegmentSourceMeta (4 fields), DROPPING the merged "words" array, then whole-overwrites alignment_json — the exact flat-overwrite pipeline.rs:2063-2071 forbids (merge via merge_word_timestamps). Word timings lost + training-grade flip. ← next
+- [MED] asr.rs:297 — runtime integrity gate verifies model.int8.onnx but NEVER tokens.txt (equally pinned; the CTC index→grapheme map). A tampered/same-line-count-swapped tokens.txt decodes to wrong graphemes with no gate flagging.
+- [LOW] jury/learning.rs:238 — export_lm_corpus can emit an ASR placeholder as human-confirmed LM training text (honesty/poisoning).
+- [LOW] eval.rs:885 — label-quality lift micro-CER folds empty-normalized-ref rows into the numerator only.
+- [LOW] ProcessingProgress.svelte:49 — ETA extrapolated from whole-pipeline elapsed vs chunk-scope done/total (wildly wrong early).
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
