@@ -7895,3 +7895,37 @@ QUEUE (hunt-117; hand-verify each against source BEFORE fixing):
 - [LOW] eval.rs:885 — label-quality lift micro-CER folds empty-normalized-ref rows into the numerator only.
 - [LOW] ProcessingProgress.svelte:49 — ETA extrapolated from whole-pipeline elapsed vs chunk-scope done/total (wildly wrong early).
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+## 2026-07-23T08:40Z — iter 120 — LM corpus could ship an ASR placeholder as human text (LOW honesty) fixed (00f93a6)
+
+**Fixed the queued LOW LM-corpus poisoning gap. Hand-verified against the existing placeholder helpers.**
+
+**jury/learning.rs export_lm_corpus — a bracket-placeholder could be emitted as human-confirmed LM training
+text (LOW, honesty/poisoning; 00f93a6).** Hand-verified: export_lm_corpus SELECTs
+COALESCE(verdict_transcript, annotated_transcript, normalized_transcript, raw_transcript) for
+human_decision IN ('accept','edit') and skipped only EMPTY text (and holdout). So a segment whose COALESCE'd
+draft falls through to a raw placeholder ("[Pending WSL 7B ASR]", "[ASR unavailable: …]") — reachable on an
+export taken mid-import or after a stuck-placeholder incident — emitted the placeholder marker as
+human-confirmed LM text, poisoning the corpus with a non-speech string. The dataset export paths route through
+the training-grade gate (quality.rs is_placeholder_transcript / is_effective_placeholder, whose doc explicitly
+warns about "emit[ting] the literal '[Pending WSL 7B ASR]' string as a training row"), but this LM path bypasses
+that gate.
+
+Fix: skip placeholders in export_lm_corpus via crate::quality::is_placeholder_transcript (the existing, tested
+helper that matches "[Pending…", "[ASR unavailable", "n/a", "null"). Fail-before verified: with the guard
+neutralized, the new test showed the corpus = ["کوردی", "[Pending WSL 7B ASR]"] (placeholder leaked); passes
+after (only the real draft remains). Existing export_lm_corpus tests (holdout/annotated-fix/reviewed-nongold)
+all still green.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 984 passed / 0 failed / 6 ignored** (was 983, +1),
+**35/35 python policies**.
+
+**Score: 82 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 2 hunt-queued (both LOW) + 1 deferred-large + 1
+enhancement.** Owner-gated finish line unchanged.
+
+QUEUE (hunt-117; hand-verify each against source BEFORE fixing):
+- [LOW] eval.rs:885 — label-quality lift micro-CER folds empty-normalized-ref rows into the numerator only. ← next
+- [LOW] ProcessingProgress.svelte:49 — ETA extrapolated from whole-pipeline elapsed vs chunk-scope done/total (wildly wrong early).
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
