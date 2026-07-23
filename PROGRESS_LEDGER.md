@@ -7994,3 +7994,43 @@ hunt-117 queue DRAINED — the next iteration resumes the adversarial hunt. Owne
 CARRIED (owner-facing, not from a hunt queue):
 - DEFERRED-LARGE: history/mod.rs undo-of-delete loses cascade children + archive over-count (Command-snapshot of child tables + archive-delta reversal; focused session).
 - ENHANCEMENT: undo-able speaker rename (RenameSpeaker command); re-run FTS (not just substring) on reload.
+
+---
+
+## 2026-07-23T10:02Z — iter 123 — validate_output_path UNC → NTLM leak (HIGH security) fixed (393e6b3)
+
+**Ran hunt-123 (stats/gate math, run/session/snapshot, validation/media, diarization/denoiser + frontend
+stores/components; 6 finders × 3-lens verify → 9 survivors, 2 HIGH). Fixed the HIGH security sibling, queued 8.**
+
+**validation/input.rs validate_output_path — canonicalized a UNC parent, leaking NTLM creds (HIGH, security;
+393e6b3).** Hand-verified: validate_file_path was hardened in iter 98 with a syntactic UNC pre-check (:29-32) +
+post-canonicalize check (:41-44), because std::fs::canonicalize opens a handle to the target and on Windows
+drives the SMB redirector → outbound TCP/445 that transmits the logged-in user's NTLM credentials to an
+attacker host. validate_output_path (:106) — the EXPORT/BACKUP destination validator — called
+canonicalize(parent) (:112) with NO UNC guard at all. A webview-supplied `\attacker\share\out.wav` parses to
+parent `\attacker\share`; canonicalizing it authenticates before any check. Reachable from 6 IPC commands
+(db_backup, export_dataset/transcript/bundle/huggingface, audio export) that forward the frontend path straight
+in. Root-cause-incomplete sibling of the closed validate_file_path fix.
+
+Fix: applied the SAME guard — syntactic is_unc_path(p) pre-check on the raw input (zero I/O) + post-canonicalize
+is_unc_path(&canonical_parent) (the local-symlink-to-share case). Fail-before verified: with the pre-check
+neutralized, the new #[cfg(windows)] test hit "Invalid output directory: The network path was not found. (os
+error 53)" — i.e. canonicalize ACTUALLY drove the SMB redirector — proving the leak path; passes after (returns
+the UNC error). Used the reserved ".invalid" TLD so no real host is contacted.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 986 passed / 0 failed / 6 ignored** (was 985, +1),
+**35/35 python policies**.
+
+**Score: 85 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 8 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
+- [HIGH] Modal.svelte:35 — global shortcuts (Ctrl+Enter/Ctrl+D → handleToggleVerify) fire while a Modal is open, silently flipping `verified` on the hidden $selectedSegment (a wrong human-gold label). The window KeyboardManager gates only on inEditable/inReview, not modal-open. ← next
+- [MED] commands.rs:1776 — restore_db_from_snapshot copies the snapshot's settings.json over live + applies to the pipeline, silently re-enabling snapshot-era cloud consent opt-ins (privacy — "never send without acknowledged consent").
+- [MED] scorecard.rs:369 — render_markdown prints a fabricated "no significant difference" baseline verdict at 0 paired segments (honesty).
+- [MED] stores/segmentStore.ts:216 — segmentStats.verified counts placeholder/empty verified rows that every export drops (the count-must-exclude-placeholder class; see memory).
+- [MED] KeyboardShortcuts.svelte:55 — duplicate {#each} key when two shortcuts share a description → each_key_duplicate crash/dropped row.
+- [MED] export_bundle.rs:394 — exported runConfig.denoising reports true when the denoiser model is present but fails to load (provenance lie).
+- [MED] snapshot.rs:78 — off-drive backup success resets the SHARED health counters, masking a FAILING primary (restore-picker) snapshot tree (false-green safety net).
+- [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits (sibling of the bundle orphan fix; audio export has no staging).
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
