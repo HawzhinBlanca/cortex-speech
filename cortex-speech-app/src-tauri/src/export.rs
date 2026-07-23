@@ -637,6 +637,36 @@ pub(crate) fn write_sha256sums(dir: &std::path::Path) -> AppResult<()> {
     write_text_atomic(&dir.join("SHA256SUMS"), &body)
 }
 
+/// Like `write_sha256sums` but covers ONLY the named files (relative to `dir`) instead of scanning the
+/// whole directory. `write_sha256sums`'s whole-dir scan is correct for exporters that stage into a CLEAN
+/// dir, but the audio export writes into a caller-chosen dir it does not stage: a re-export of a smaller
+/// selection leaves ORPHAN clips from a prior run, and a whole-dir manifest would then vouch for a stale
+/// clip that this export's metadata.csv omits — an integrity manifest asserting a file the dataset itself
+/// does not list (sibling of the bundle orphan-source fix). Pass the export's own file list so the
+/// manifest describes exactly this dataset. Missing entries are skipped; `SHA256SUMS` is never self-listed.
+pub(crate) fn write_sha256sums_for(dir: &std::path::Path, rel_files: &[String]) -> AppResult<()> {
+    let mut files: Vec<(String, String)> = Vec::new();
+    for rel in rel_files {
+        if rel == "SHA256SUMS" {
+            continue;
+        }
+        let path = dir.join(rel);
+        if path.is_file() {
+            files.push((rel.replace('\\', "/"), sha256_hex(&std::fs::read(&path)?)));
+        }
+    }
+    files.sort();
+    files.dedup();
+    let mut body = String::new();
+    for (rel, hash) in &files {
+        body.push_str(hash);
+        body.push_str("  ");
+        body.push_str(rel);
+        body.push('\n');
+    }
+    write_text_atomic(&dir.join("SHA256SUMS"), &body)
+}
+
 /// Export a HuggingFace Datasets–compatible directory (split folders + metadata + dataset card).
 /// Build the per-clip output filename for the HF export. Both the source stem and the segment id
 /// are caller/import-controlled (`validate_segment` only checks non-empty), so each is reduced to

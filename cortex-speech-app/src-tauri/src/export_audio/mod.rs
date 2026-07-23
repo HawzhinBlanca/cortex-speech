@@ -126,7 +126,10 @@ pub fn export_audio_segments(
     // to detect a corrupted, truncated, or partially-copied WAV in a shared dataset. Written LAST so it
     // covers all artifacts. Skipped when nothing was exported (all failed/held-out) — no files to cover.
     if !files.is_empty() {
-        crate::export::write_sha256sums(output_dir)?;
+        // Scope the manifest to THIS export's files (not a whole-dir scan): the output dir is
+        // caller-chosen and unstaged, so a re-export of a smaller selection can leave orphan clips from a
+        // prior run that metadata.csv omits — a whole-dir SHA256SUMS would vouch for them (round-25 hunt).
+        crate::export::write_sha256sums_for(output_dir, &files)?;
         files.push("SHA256SUMS".to_string());
     }
 
@@ -477,6 +480,46 @@ mod tests {
         for id in ["ok-1", "ok-2", "gone-1", "gone-2"] {
             assert!(text.contains(id), "table export must include {id} regardless of audio presence");
         }
+    }
+
+    #[test]
+    fn sha256sums_covers_only_this_export_not_orphan_clips() {
+        // Round-25 hunt: export_audio writes into a caller-chosen dir it does NOT stage/clean, so a
+        // re-export of a smaller selection leaves ORPHAN clips from a prior run. A whole-dir SHA256SUMS
+        // would vouch for a stale clip that metadata.csv (this export only) omits — an integrity manifest
+        // asserting a file the dataset itself does not list. The manifest must cover exactly this export.
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let wav = tmp.path().join("clip.wav");
+        make_wav_file(&wav);
+        insert_test_segment(&db, "seg-1", &wav);
+
+        let out = tmp.path().join("audio_out");
+        fs::create_dir_all(&out).unwrap();
+        // A stale artifact from a PRIOR export already sits in the target dir.
+        let orphan = out.join("orphan_from_previous_run.wav");
+        fs::write(&orphan, b"stale clip bytes not part of this export").unwrap();
+
+        let options = AudioExportOptions {
+            output_dir: out.to_string_lossy().to_string(),
+            format: AudioExportFormat::Wav,
+            sample_rate: 16000,
+            include_metadata: true,
+        };
+        let result = export_audio_segments(&db, &["seg-1".to_string()], &options).unwrap();
+        assert_eq!(result.succeeded, 1);
+
+        let sums = fs::read_to_string(out.join("SHA256SUMS")).unwrap();
+        assert!(
+            !sums.contains("orphan_from_previous_run.wav"),
+            "SHA256SUMS must NOT vouch for an orphan clip the dataset's metadata omits:\n{sums}"
+        );
+        assert!(sums.contains("metadata.csv"), "manifest covers this export's metadata.csv");
+        let exported_wav = result.files.iter().find(|f| f.ends_with(".wav")).expect("an exported wav");
+        assert!(sums.contains(exported_wav.as_str()), "manifest covers the exported clip {exported_wav}");
+        // The fix scopes the manifest; it does not delete the user's other files.
+        assert!(orphan.is_file(), "orphan is left on disk (not vouched, not deleted)");
     }
 
     #[test]
