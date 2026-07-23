@@ -8258,3 +8258,57 @@ QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
 - [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree. ← next
 - [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+### Iteration 130 — 2026-07-23 — FIX #92 (owner-directed): frozen FLEURS eval manifest same-sentence-id duplication inflated N (922 rows → 348 distinct clips)
+
+**Class: honesty / metric-provenance (fabricated precision from a duplicated eval set).** Owner asked
+(mid-session, outside the cron hunt) whether accuracy needs raising and how. Ran a 4-reader ultracode
+scout over the accuracy machinery (measurement / training-data flow / model+retrain / corpus+roadmap),
+hand-verified every load-bearing claim against source, and it surfaced a real integrity defect the
+owner elected to fix: the committed frozen eval manifest `docs/eval/fleurs_ckb_iq_frozen.rel.tsv` had
+**922 rows but only 348 unique clip paths** — 574 *exact*-duplicate rows (path AND reference identical).
+
+Root cause (hand-verified): FLEURS `id` is the **sentence** id, shared across multiple recordings of a
+sentence; `build_fleurs_ckb_manifest.py` named every clip `<id>.wav`, so same-id recordings clobbered
+each other on disk and emitted identical manifest rows (same sentence ⇒ same reference text ⇒ exact-dup
+row). `scorecard_7b.py:104,163,223` and `scorecard_stats.py` **count every row (N = len(rows), no
+dedup)**, so the pinned FLEURS numbers (7B 7.03% / stock 11.34% / MMS 9.32%, all "N=922") over-count
+distinct clips ~2.6×, duplication-weight each micro-CER toward the sentences with more recordings, and
+narrow the bootstrap CI below what 348 distinct clips warrant. The point estimates were really run
+(honest) — but their **N and CI are duplication-affected**.
+
+Fix (one logical change, four coupled parts):
+1. **Generator root cause** — `build_fleurs_ckb_manifest.py` now disambiguates same-id clips with a
+   `.<n>.wav` suffix (first occurrence keeps `<id>.wav`); a rebuild yields distinct clips = rows.
+2. **Committed artifact** — deduped the portable manifest to its 348 distinct rows (first-occurrence
+   order), regenerated the `.sha256` sidecar (`b5509f…` → `4063da…`).
+3. **Policy guard** — new dependency-free `scripts/test_frozen_eval_manifest_integrity.py` asserts
+   unique clip paths, no exact-dup rows, and sidecar-matches-content. **Fail-before**: fired on the
+   922/348 manifest (574 dupes); passes after dedup. Auto-discovered by run_python_policies.py.
+4. **Provenance** — MEASUREMENTS.md + EVAL.md corrected honestly: point estimates kept as-run, N/CI
+   labelled duplication-affected, clean re-score on a uniquely-rebuilt ~922-distinct set marked
+   owner-gated. (Generator unit test `test_write_manifest_disambiguates_duplicate_ids` added; runs
+   FULL where numpy+soundfile exist, SKIPs on bare policy runners — so it did not execute in-sandbox.)
+
+Gate: **python policies 36/36** (new integrity test included); `py_compile` clean. No Rust/JS changed,
+so no cargo gate needed. Reality check pre-fix: exe not running, git clean, HEAD=main b8da231, lock free.
+
+CONTEXT surfaced for the owner (hand-verified, not acted on — accuracy is owner-gated): real pinned
+baselines DO exist (champion 7B **7.03% CER** on read-speech FLEURS; offline default stock **11.34%**);
+the honest gaps are (a) **zero measurement on the owner's own conversational audio** — app DB has 3
+human-verified segments, Gold Marathon at **3/500**; (b) best number needs the WSL GPU rig, offline
+default is 11.34%; (c) the no-retrain script-lock lever is already shipped. The remaining accuracy lever
+is the **marathon → QLoRA retrain → re-audit** loop, which needs the owner's rig + review decisions.
+
+**Score: 92 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 2 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
+- [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree. ← next
+- [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+- IN-LOOP ACCURACY-MACHINERY (owner-surfaced, unblocks the eventual retrain; none move the CER number):
+  gold-CER/WER PR-gating test (currently #[ignore]/num_segs>0); int8 quantization script (export emits
+  fp32 only); one-click gate_and_promote IPC+button; reconcile stale ledger measured-numbers table.
