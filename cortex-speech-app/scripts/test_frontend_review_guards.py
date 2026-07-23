@@ -205,6 +205,28 @@ def test_refinery_panel_renders_undefined_metric_for_a_zero_segment_eval() -> No
             )
 
 
+def test_validation_signal_anomaly_distinguishes_not_screened_from_clean() -> None:
+    """ValidationPanel's Signal-Anomaly tab must NOT render the 'no anomalies' all-clear before any screen has
+    run. signalAnomalyScore is populated ONLY by the manual Run Signal-Anomaly Screen (compute_signal_anomaly_scores);
+    the import/transcribe pipeline never sets it — so an empty signalAnomalySegments means NOT SCREENED, not a
+    clean sheet. Conflating the two shows a green all-clear over audio nobody has screened. The tab must render a
+    distinct 'not screened yet' state when signalAnomalySegments.length === 0, reserving noSignalAnomaly for a
+    genuine post-screen all-clear (scores exist but none above threshold)."""
+    src = _read("src/lib/ValidationPanel.svelte")
+    if "signalAnomalySegments.length === 0" not in src:
+        raise AssertionError(
+            "ValidationPanel's Signal-Anomaly empty state does not distinguish 'not screened yet' "
+            "(signalAnomalySegments.length === 0) from a real all-clear — it shows noSignalAnomaly before any "
+            "screen has run, a false green light over unscreened audio. Add an `{:else if "
+            "signalAnomalySegments.length === 0}` branch that renders the notScreened message."
+        )
+    if "signalAnomaly.notScreened" not in src:
+        raise AssertionError(
+            "ValidationPanel must render validation.signalAnomaly.notScreened for the never-screened state "
+            "(distinct from noSignalAnomaly, the post-screen all-clear)."
+        )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -215,6 +237,7 @@ def main() -> None:
     test_app_save_handlers_use_field_level_updates()
     test_settings_close_persist_routes_through_savequietly()
     test_refinery_panel_renders_undefined_metric_for_a_zero_segment_eval()
+    test_validation_signal_anomaly_distinguishes_not_screened_from_clean()
     print("frontend review-guard source policy passed")
 
 

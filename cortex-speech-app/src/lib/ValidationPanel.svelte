@@ -516,6 +516,13 @@
                 </li>
               {/each}
             </ul>
+          {:else if signalAnomalySegments.length === 0}
+            <!-- No segment carries a score at all: the screen has NEVER run (compute_signal_anomaly_scores
+                 is the only writer; the import/transcribe pipeline never sets it). Show a NOT-SCREENED state,
+                 not the 'no anomalies' all-clear — a green light over unscreened audio is a false negative. -->
+            <div class="text-center py-8 text-cortex-500 text-xs italic">
+              {$t('validation.signalAnomaly.notScreened')}
+            </div>
           {:else}
             <div class="text-center py-8 text-cortex-500 text-xs italic">
               {$t('validation.signalAnomaly.noSignalAnomaly')}

@@ -334,6 +334,8 @@ export const en: Record<string, string> = {
   'validation.signalAnomaly.score': 'Anomaly Score',
   'validation.signalAnomaly.isSignalAnomaly': 'Anomalous signal',
   'validation.signalAnomaly.noSignalAnomaly': 'No segments flagged as anomalous.',
+  'validation.signalAnomaly.notScreened':
+    'Not screened yet — run the Signal-Anomaly Screen to check these segments.',
   'validation.signalAnomaly.showAll': 'Show all segments (not just anomalous ones)',
   'validation.category.MissingAudio': 'Missing audio',
   'validation.category.EmptyTranscript': 'Empty transcript',

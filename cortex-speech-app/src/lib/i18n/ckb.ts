@@ -333,6 +333,8 @@ export const ckb: Record<string, string> = {
   'validation.signalAnomaly.score': 'نمرەی ناهەنجاری',
   'validation.signalAnomaly.isSignalAnomaly': 'سیگناڵی ناهەنجار',
   'validation.signalAnomaly.noSignalAnomaly': 'هیچ بەشێک وەک ناهەنجار دیاری نەکرا.',
+  'validation.signalAnomaly.notScreened':
+    'هێشتا پشکنین نەکراوە — پشکنینی ناهەنجاری سیگناڵ ئەنجام بدە بۆ ئەم بەشانە.',
   'validation.signalAnomaly.showAll': 'پیشاندانی هەموو بەشەکان (نەک تەنها ناهەنجارەکان)',
   'validation.category.MissingAudio': 'دەنگی ون',
   'validation.category.EmptyTranscript': 'دەقی بەتاڵ',
