@@ -9036,6 +9036,46 @@ a 3-line clear mirroring existing code + one honest regression test, not a new a
 audio.rs:404, export.rs:859; 3 to reality-check) + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 152 — 2026-07-23 — FIX #113: audio decode silently truncated on a mid-stream reset
+
+**Class: silent-truncation data loss (RECURRING — the `Err(_) => break` trap, second door).** Hand-verified:
+BOTH decode loops — `decode_to_pcm` (audio.rs:264) and `decode_pcm_windows` (audio.rs:404) — matched
+`next_packet()`'s `Err(ResetRequired)` with `tracing::warn!` + `break`, then flushed the buffered prefix
+(audio.rs:448-450) and returned `Ok(())`. `ResetRequired` is emitted ONLY mid-stream (a chained/multi-stream
+file, e.g. chained OGG / concatenated Opus) — by definition there is more audio after the reset — so the
+import kept only the decodable PREFIX and silently dropped the tail. A GUI importer never sees the log line,
+so a 60-min chained recording could import as its first stream only, then be curated/transcribed as if
+whole. This is the identical outcome the sibling `Err(e)` arm (audio.rs:268/410) already fails LOUD on,
+its own comment calling silent-prefix import "a data-loss trap for a curation app." Reached through a
+different match arm.
+
+**Reachability reality-check (the LOW tag demanded it):** low probability (needs a genuinely chained/
+multi-stream input; normal single-stream WAV/MP3/FLAC/M4A/OGG never emit ResetRequired — true EOF is
+`Ok(None)`/`UnexpectedEof`), but non-zero and the harm is severe + exactly the class this project rules
+unacceptable. NOT over-engineering: it makes an inconsistent silent path match the loud one beside it; the
+fix can't regress any correct import (single-stream files never trigger it).
+
+**Root fix (both arms, per the ponytail shared-class rule):** replace warn+break with a loud
+`AppError::Audio(AudioError::Decode(...))` that names the remedy (re-encode to a single continuous stream,
+`ffmpeg -i INPUT -ar 16000 -ac 1 out.wav`). `tracing::` stays used elsewhere in the file (no unused import).
+
+**Guard (recurring class → source policy justified):** added
+`test_audio_decode_reset_required_fails_loud_not_silent_truncation` to `test_rust_runtime_panic_policy.py`
+(a FUNCTION in the existing script — policy-script count stays 39). Asserts both loops carry the loud
+handler (count == 2) and the old silent-break text is gone. **Fail-before (neutralize-then-restore):**
+reverted one arm to warn+break → policy FAILED ("audio.rs still silently breaks on a mid-stream
+ResetRequired"); restored → PASS.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 995 passed / 0 failed**;
+**python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD 1af81ca,
+lock free.
+
+**Score: 113 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 3-ish hunt-queued (1 to fix:
+export.rs:859; 3 to reality-check) + 1 chunking-deferred + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
@@ -9048,8 +9088,8 @@ QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
   callers (pipeline.rs:2633, commands.rs:2300/2369) in a focused change. Reachability is also uncertain
   (chunks retain offsets normally; only legacy/clobber loses them — 1/3 refuters doubted it).
 - ~~export_bundle.rs:499 — stale learning_preferences.jsonl orphan~~ FIXED iter 151 (#112).
-- [LOW] audio.rs:404 — decode_pcm_windows silently truncates on a symphonia ResetRequired (verify reachability). ← next
-- [LOW] export.rs:859 — dropped_unavailable over-counts (honesty; verify harm isn't purely cosmetic).
+- ~~audio.rs:404 — decode ResetRequired silent truncation~~ FIXED iter 152 (#113, both decode loops).
+- [LOW] export.rs:859 — dropped_unavailable over-counts (honesty; verify harm isn't purely cosmetic). ← next
 - REALITY-CHECK-BEFORE-FIXING (likely over-engineering per owner "beware over-engineering" — CLOSE with a
   reasoned note unless a real reachable harm is confirmed): denoiser.rs:14 SHA-verify (denoiser is
   best-effort preprocessing, not transcript-load-bearing), commands.rs:638 spawn-panic (only on OS
