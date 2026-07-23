@@ -25,6 +25,11 @@
   let evalBusy = false;
 
   const pct = (x: number): string => `${(x * 100).toFixed(1)}%`;
+  // A WER/CER over ZERO scored segments is UNDEFINED, not 0% — the backend already refuses to read it as a
+  // real rate (scorecard/render_markdown say "undefined (not 0%)"; the promotion gate returns "CANNOT
+  // EVALUATE … undefined, not 0"). This panel is the one surface showing raw run.wer/run.cer, so mirror
+  // that: an all-engine-fail run (numSegs=0, wer/cer persisted as 0.0) must show "—", never a perfect 0.0%.
+  const metric = (x: number, numSegs: number): string => (numSegs > 0 ? pct(x) : '—');
 
   async function refreshRuns() {
     try {
@@ -42,7 +47,7 @@
       evalResult = await api.runGoldEvalAsr(evalModelId.trim() || null);
       await refreshRuns();
       notifications.success(
-        `Honest-CER eval done: CER ${pct(evalResult.run.cer)} (N=${evalResult.run.numSegs}).`,
+        `Honest-CER eval done: CER ${metric(evalResult.run.cer, evalResult.run.numSegs)} (N=${evalResult.run.numSegs}).`,
       );
     } catch (e) {
       notifications.error('Honest-CER eval failed', { detail: String(e) });
@@ -59,7 +64,7 @@
       evalResult = await api.runGoldEvalLocal(evalModelId.trim());
       await refreshRuns();
       notifications.success(
-        `Local eval done: CER ${pct(evalResult.run.cer)} (N=${evalResult.run.numSegs}).`,
+        `Local eval done: CER ${metric(evalResult.run.cer, evalResult.run.numSegs)} (N=${evalResult.run.numSegs}).`,
       );
     } catch (e) {
       notifications.error('Local eval failed', { detail: String(e) });
@@ -188,8 +193,10 @@
         </div>
         {#if evalResult}
           <p class="muted" data-testid="eval-result">
-            Last eval: CER {pct(evalResult.run.cer)} · WER {pct(evalResult.run.wer)} · N={evalResult
-              .run.numSegs}
+            Last eval: CER {metric(evalResult.run.cer, evalResult.run.numSegs)} · WER {metric(
+              evalResult.run.wer,
+              evalResult.run.numSegs,
+            )} · N={evalResult.run.numSegs}
             <button
               class="btn btn-ghost"
               onclick={buildScorecardFromResult}
@@ -222,8 +229,8 @@
                 <td><bdi>{run.modelId}</bdi></td>
                 <td><bdi>{run.runAt}</bdi></td>
                 <td>{run.numSegs}</td>
-                <td>{pct(run.wer)}</td>
-                <td>{pct(run.cer)}</td>
+                <td>{metric(run.wer, run.numSegs)}</td>
+                <td>{metric(run.cer, run.numSegs)}</td>
               </tr>
             {/each}
           </tbody>

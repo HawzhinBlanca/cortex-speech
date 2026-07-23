@@ -183,6 +183,28 @@ def test_settings_close_persist_routes_through_savequietly() -> None:
         )
 
 
+def test_refinery_panel_renders_undefined_metric_for_a_zero_segment_eval() -> None:
+    """RefineryPanel surfaces eval-run WER/CER. A run that scored ZERO segments — the all-engine-fail case
+    (every gold clip's transcription errors → run_gold_eval_with_transcriber and both pipeline closed-loop
+    paths drop them all, so numSegs=0 and wer/cer persist as 0.0) — must NOT render as a perfect 0.0%. The
+    backend already refuses to read a zero-scored eval as a real rate: build_scorecard/render_markdown say
+    "WER/CER are undefined (not 0%)" and the promotion gate returns "CANNOT EVALUATE … undefined, not 0".
+    This panel is the one surface that shows the raw run.wer/run.cer, so it must mirror that convention:
+    WER/CER go through a numSegs-guarded formatter, never a bare pct(run.wer)/pct(evalResult.run.wer)."""
+    src = _read("src/lib/RefineryPanel.svelte")
+    if "numSegs > 0 ? pct" not in src:
+        raise AssertionError(
+            "RefineryPanel has no numSegs-guarded WER/CER formatter — a zero-segment eval renders as a "
+            "perfect 0.0%. Add `const metric = (x, numSegs) => numSegs > 0 ? pct(x) : '—';` and use it."
+        )
+    for bare in ("pct(run.wer)", "pct(run.cer)", "pct(evalResult.run.wer)", "pct(evalResult.run.cer)"):
+        if bare in src:
+            raise AssertionError(
+                f"RefineryPanel still renders a raw {bare} — a zero-segment run prints 0.0% (reads as a "
+                f"perfect model from zero data). Route it through the numSegs-guarded metric() formatter."
+            )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -192,6 +214,7 @@ def main() -> None:
     test_waveform_stretches_peaks_across_the_canvas()
     test_app_save_handlers_use_field_level_updates()
     test_settings_close_persist_routes_through_savequietly()
+    test_refinery_panel_renders_undefined_metric_for_a_zero_segment_eval()
     print("frontend review-guard source policy passed")
 
 
