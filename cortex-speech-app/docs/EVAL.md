@@ -11,7 +11,7 @@ The fair comparison this document demanded (boundary-aligned gold set, space-KEP
 + normalization for every engine) now exists — pinned record with SHAs + exact commands in
 [MEASUREMENTS.md](MEASUREMENTS.md), frozen manifest committed at `docs/eval/fleurs_ckb_iq_frozen.rel.tsv`:
 
-| Engine (identical 922 clips) | micro CER | 95% CI | micro WER | Harness |
+| Engine (identical set, N=922 rows / 348 distinct†) | micro CER | 95% CI | micro WER | Harness |
 |---|:--:|:--:|:--:|---|
 | **OmniASR-7B champion (base + Kurdish LoRA)** | **7.03%** | [6.53%, 7.55%] | 32.93% [31.89%, 33.98%] | `scorecard_7b.py` (warm server, space-kept) |
 | Fine-tuned MMS-CTC-1B (HF fp32) | 9.32% | — (harness prints point estimate only) | — | `measure_finetuned_cer.py` |
@@ -20,7 +20,11 @@ The fair comparison this document demanded (boundary-aligned gold set, space-KEP
 The champion is the measured-best local engine on known-disjoint data: **−4.3 CER pts vs stock (38%
 relative), −2.3 pts vs the fine-tuned 1B (25% relative)**. Same-set context: ElevenLabs Scribe v1
 publishes **32.1% WER on FLEURS-ckb** — the champion's 32.93% [31.89, 33.98] is statistically on par.
-Honest caveats: the default normalization counts digit verbalization (٥→پێنج) and Arabic→Latin digit
+Honest caveats: **† the pinned N=922 is duplication-weighted** — the frozen manifest held 348 distinct
+FLEURS clips duplicated to 922 rows via a same-sentence-id filename collision (corrected 2026-07-23;
+committed manifest now deduped to 348, builder disambiguates same-id clips, a clean re-score is
+owner-gated — see MEASUREMENTS.md). The point estimates were really run but their N/CI reflect the
+duplication. The default normalization counts digit verbalization (٥→پێنج) and Arabic→Latin digit
 form (١٠٠→100) as errors, penalizing the 7B's verbalization style — the true recognition gap vs Scribe
 is likely smaller/reversed but is NOT claimed until measured under an owner-approved fair basis; the
 CV22 5.04% (2026-07-09) stays caveated for unverified train/test disjointness — FLEURS 7.03% is the

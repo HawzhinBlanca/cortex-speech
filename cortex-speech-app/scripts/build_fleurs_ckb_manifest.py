@@ -39,6 +39,7 @@ def write_manifest(examples, out_dir: Path, wsl: bool = False, limit: int | None
     clips_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[tuple[str, str]] = []
+    seen_ids: dict[str, int] = {}
     skipped = 0
     for i, ex in enumerate(examples):
         if limit is not None and len(rows) >= limit:
@@ -50,8 +51,16 @@ def write_manifest(examples, out_dir: Path, wsl: bool = False, limit: int | None
         if array is None or len(array) == 0 or not reference:
             skipped += 1
             continue
+        # FLEURS `id` is the SENTENCE id, shared across multiple recordings of the same sentence.
+        # Naming every same-id clip `<id>.wav` clobbers the audio on disk AND emits exact-duplicate
+        # manifest rows (identical path + reference), which the scorecards count as separate clips —
+        # inflating N and duplication-weighting micro-CER. Suffix each recording after the first with
+        # `.<n>` so every row maps to a distinct clip (guarded by test_frozen_eval_manifest_integrity).
         clip_id = str(ex.get("id", i))
-        clip_path = clips_dir / f"{clip_id}.wav"
+        dup = seen_ids.get(clip_id, 0)
+        seen_ids[clip_id] = dup + 1
+        clip_name = clip_id if dup == 0 else f"{clip_id}.{dup}"
+        clip_path = clips_dir / f"{clip_name}.wav"
         sf.write(str(clip_path), array, sample_rate, subtype="PCM_16")
         out_path = to_wsl_path(str(clip_path.resolve())) if wsl else str(clip_path.resolve())
         rows.append((out_path, reference))

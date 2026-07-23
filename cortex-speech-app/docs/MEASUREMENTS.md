@@ -11,17 +11,30 @@ recorded, never a placeholder number.
 ## 2026-07-10 — Same-set three-engine scorecard, FLEURS ckb_IQ **test** (N=922)
 
 The first apples-to-apples engine comparison on a **known-disjoint, boundary-aligned** gold set:
-identical 922 clips, identical NFC+lower+whitespace (space-KEPT) normalization for all engines.
+identical set (N=922 rows = 348 distinct clips; see duplication correction below), identical
+NFC+lower+whitespace (space-KEPT) normalization for all engines.
 
 ### Frozen eval set
 - google/fleurs `ckb_iq` **test** split, all 922 rows with non-empty audio+reference (0 skipped),
   16 kHz mono PCM_16 WAV, decoded via `Audio(decode=False)` + soundfile.
 - Machine manifest SHA-256 (absolute WSL paths, as scored):
   `bb5737581094e7ce4e717eb3b7726c693cfd3799eb8a03a4b0032eee1af58ac5  fleurs_ckb_iq_frozen.tsv`
-- Committed portable copy (identical rows, clip-relative paths):
-  [`docs/eval/fleurs_ckb_iq_frozen.rel.tsv`](eval/fleurs_ckb_iq_frozen.rel.tsv) —
-  `b5509f52090e6de15e6d9bf37e02b41759716de0543df304def7f66aa3c30c13` (`.sha256` sidecar committed).
+- Committed portable copy (clip-relative paths), **deduplicated to 348 distinct clips** (see
+  correction below): [`docs/eval/fleurs_ckb_iq_frozen.rel.tsv`](eval/fleurs_ckb_iq_frozen.rel.tsv) —
+  `4063da0309b11046069bb40f865a75f56053199b28fd37580c4312049c4dd3ce` (`.sha256` sidecar committed).
   Rebuild clips with `scripts/build_fleurs_ckb_manifest.py` (FLEURS is CC-BY-4.0; see ATTRIBUTION.md).
+
+> **Duplication correction (2026-07-23).** FLEURS `id` is the *sentence* id, shared across multiple
+> recordings; the builder named every clip `<id>.wav`, so same-id recordings clobbered each other on
+> disk and produced exact-duplicate manifest rows. The scored manifest above (`bb5737…`, N=922) thus
+> held **348 distinct clips duplicated to 922 rows** (574 dupes). `scorecard_7b.py` /
+> `scorecard_stats.py` count every row, so the pinned N=922 over-counts distinct clips ~2.6×, each
+> engine's micro-CER is weighted toward the sentences with more recordings, and the bootstrap CI (over
+> 922 rows) is narrower than 348 distinct clips warrant. The point estimates below were really run and
+> are reported as-is; their **N and CI are duplication-affected**, not fabricated. The committed
+> portable manifest is now deduped to its 348 distinct rows, and the builder disambiguates same-id
+> clips (`<id>.<n>.wav`, guarded by `test_frozen_eval_manifest_integrity.py`). A clean re-score on a
+> uniquely-rebuilt ~922-distinct set is owner-gated (needs the FLEURS download + the rig).
 
 ### Results (verbatim harness headlines)
 

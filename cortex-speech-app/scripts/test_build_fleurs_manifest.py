@@ -67,6 +67,25 @@ def test_write_manifest_falls_back_to_raw_transcription() -> None:
         assert ref == "خاو", "raw_transcription is used when transcription is absent"
 
 
+def test_write_manifest_disambiguates_duplicate_ids() -> None:
+    # FLEURS shares one `id` across multiple recordings of a sentence; each must become its own clip
+    # + row (no clobbering, no duplicate manifest rows). Regression for the 922-rows/348-unique defect.
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d)
+        examples = [
+            _ex("77", 16000, 16000, transcription="alpha"),
+            _ex("77", 16000, 16000, transcription="alpha"),  # same id + ref (same FLEURS sentence)
+            _ex("77", 16000, 16000, transcription="alpha"),
+        ]
+        n, skipped = write_manifest(examples, out, wsl=False)
+        assert n == 3 and skipped == 0, "every same-id recording is written"
+        lines = (out / "fleurs_ckb_iq_frozen.tsv").read_text(encoding="utf-8").strip().splitlines()
+        paths = [ln.split("\t")[0] for ln in lines]
+        assert len(paths) == len(set(paths)) == 3, f"same-id clips must get distinct paths: {paths}"
+        for p in paths:
+            assert (out / "clips" / Path(p).name).is_file(), f"clip WAV not written (clobbered?): {p}"
+
+
 def test_write_manifest_limit_caps_rows() -> None:
     with tempfile.TemporaryDirectory() as d:
         out = Path(d)
