@@ -8359,3 +8359,39 @@ Rust/JS changed. Reality check pre-work: exe not running, git clean, HEAD 7b577d
 **Score: 93 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 2 hunt-queued + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged. (FIX #93 is accuracy MACHINERY, not a CER change — the number is
 untouched and unmovable by the loop.)
+
+---
+
+### Iteration 132 — 2026-07-23 — REFUTE backlog #1 (normalizer already implements AsoSoft) + FIX #94 (machinery #7: inter-annotator κ harness)
+
+**Note on cadence:** owner observed the ~10-min session cron (`c61885a7`) did NOT fire for ~1.5 h (also a
+2 h gap 08:02→10:02 earlier) — confirmed by zero commits + free lock + clean tree. Honest cause: the cron
+is session-only and fires **only while the Claude app is open, foregrounded, and the REPL is idle** on the
+PC; missed ticks don't back-fill. Iters 130–132 were owner-message-driven, not cron-driven. I over-stated
+"it will keep working every 10 min"; corrected. Owner chose to keep the app open for the cron; meanwhile I
+drive iterations directly when active. (The durable fallback is the nightly Task-Scheduler `cortex-month-loop`.)
+
+**REFUTE — backlog #1 (Sorani AsoSoft/ScriptNormalization normalizer).** Hand-verified `normalizer.rs`
+against the SN-WER/AsoSoft canonicalization the research recommended: it is **already implemented**, and
+more carefully than the naive recipe — Kaf U+0643/06AA/06AC→ک, Yeh U+064A→ی, Alef-Maksura→ی,
+Yeh-two-dots→ێ, ZWNJ→space with the subtle heh+ZWNJ→ە keyboard-encoding fold, ZWJ/ZWSP/BOM/directional
+strips, tatweel, contextual heh, hamza, tashkeel, Persian(U+06F0)+Arabic(U+0660) digit folding, and
+double-NFC idempotency (normalizer.rs:16-35,100-194). Its own comments cite "inflate CER / break dedup".
+So the in-loop part is DONE; only the owner-gated re-score of 7.03% under a contamination-checked FLEURS
+split remains. Marked done in the scan backlog; no code change (ponytail: don't touch correct code).
+
+**FIX #94 — machinery backlog #7: inter-annotator agreement (Cohen's κ).** `scripts/agreement_kappa.py` —
+facet 5 named the gold-set label ceiling as the CURRENT bottleneck (κ≈0.80 caps measurable accuracy near
+0.80; the app has ~3 verified segments). Computes Cohen's κ for the realistic 2-annotator case
+(accept/edit/reject) with a Landis-Koch band + TSV CLI; >2 raters → Krippendorff's α, deliberately not
+built yet (YAGNI). Dependency-free `test_agreement_kappa_policy.py` anchors the math on the textbook
+κ=0.40 example so a broken formula can't ship a flattering agreement. **Fail-before:** returning raw `po`
+failed the 0.40 + chance tests; also caught a bug in my OWN test (asserted interpret(0.40)=="moderate";
+0.40 is "fair", moderate starts at 0.41) and fixed it. RUN owner-gated (needs real double-annotation).
+
+Gate: **python policies 38/38** (new κ test included), hygiene clean, `py_compile` clean. No Rust/JS
+changed. Reality check pre-work: exe not running, git clean, HEAD f2e206b, lock free.
+
+**Score: 94 fixed + 1 cleanup, ~29 refuted, 2 measure-deferred, 2 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged. (FIX #94 is accuracy MACHINERY — builds the gold-ceiling measurement;
+it does not itself change any CER.)
