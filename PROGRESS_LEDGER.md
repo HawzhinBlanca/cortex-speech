@@ -7822,3 +7822,39 @@ QUEUE (hunt-117; hand-verify each against source BEFORE fixing):
 - [LOW] eval.rs:885 — label-quality lift micro-CER folds empty-normalized-ref rows into the numerator only.
 - [LOW] ProcessingProgress.svelte:49 — ETA extrapolated from whole-pipeline elapsed vs chunk-scope done/total (wildly wrong early).
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+## 2026-07-23T07:48Z — iter 118 — bounds edit stripped word timestamps (MEDIUM data-loss) fixed (d86ebcd)
+
+**Fixed the queued MEDIUM alignment-json flat-overwrite. Hand-verified against the documented merge invariant.**
+
+**commands/segments_write.rs update_segment_bounds — editing a segment's source bounds DROPPED its word
+timestamps (MEDIUM, data-loss; d86ebcd).** Hand-verified: update_segment_bounds parsed alignment_json into
+SegmentSourceMeta (from_alignment_json → 4 fields only: source_start_ms/source_end_ms/chunk_index/chunk_count),
+mutated the bounds, then `segment.alignment_json = Some(meta.to_alignment_json())` — and to_alignment_json
+serializes ONLY those 4 fields. The alignment_json is an OBJECT holding those 4 fields AND (after forced
+alignment) a merged `words` array (chunking.rs). So the round-trip DROPPED the words, then persist_segment_update
+→ db.insert_segment whole-overwrote alignment_json (ON CONFLICT alignment_json=excluded). This is exactly the
+flat-overwrite pipeline.rs:2068 documents as forbidden ("MERGE its word array back under a `words` key via
+merge_word_timestamps — NEVER flat-overwrite alignment_json"). A bounds edit on any word-aligned clip (auto_align
+on, or an alignment run) permanently lost every word timing and can flip its alignment-based training grade.
+
+Fix: extracted a testable helper chunking::rebound_alignment_json(existing, start_ms, end_ms) that updates the
+source bounds AND re-merges the existing words via merge_word_timestamps (word timestamps are absolute
+source-time positions, still valid across a bounds change), then update_segment_bounds uses it — a simpler
+function too. Fail-before verified: with the helper's merge temporarily neutralized to the old
+to_alignment_json-only behavior, the new unit test FAILED ("words must survive the rebound"); passes after.
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 983 passed / 0 failed / 6 ignored** (was 982, +1),
+**35/35 python policies**.
+
+**Score: 80 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 4 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-117; hand-verify each against source BEFORE fixing):
+- [MED] asr.rs:297 — runtime integrity gate verifies model.int8.onnx but NEVER tokens.txt (equally pinned CTC index→grapheme map). A tampered/same-line-count tokens.txt decodes to wrong graphemes, no gate flags it. ← next
+- [LOW] jury/learning.rs:238 — export_lm_corpus can emit an ASR placeholder as human-confirmed LM training text (honesty/poisoning).
+- [LOW] eval.rs:885 — label-quality lift micro-CER folds empty-normalized-ref rows into the numerator only.
+- [LOW] ProcessingProgress.svelte:49 — ETA extrapolated from whole-pipeline elapsed vs chunk-scope done/total (wildly wrong early).
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
