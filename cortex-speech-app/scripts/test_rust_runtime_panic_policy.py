@@ -1922,6 +1922,25 @@ def test_default_transcribe_segment_refuses_blank_draft() -> None:
         )
 
 
+def test_batch_transcribe_refuses_blank_draft() -> None:
+    """batch_transcribe must SKIP a blank draft, not persist it. update_batch_transcription_if_unreviewed
+    (db.rs) writes raw_transcript unconditionally, guarding only human-reviewed rows — so an empty ASR
+    result would overwrite an existing good UNREVIEWED transcript with "" (e.g. a jury_accept 7B draft
+    re-batch-transcribed by the offline CTC engine that returns Ok("") on a quiet clip). Recurring
+    blank-transcript-never-overwrites-good data-loss class. The runtime path needs a full app + pipeline,
+    so it is source-pinned."""
+    src = (REPO_ROOT / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
+    if "update_batch_transcription_if_unreviewed" not in src:
+        raise AssertionError("batch_transcribe persist call not found in commands.rs")
+    guard = "Ok(draft) if draft.final_text.trim().is_empty() && draft.raw_text.trim().is_empty()"
+    if guard not in src:
+        raise AssertionError(
+            "batch_transcribe does not guard a blank draft before update_batch_transcription_if_unreviewed "
+            '— an empty ASR result would overwrite a good unreviewed transcript with "". Add the match-guard '
+            "arm that skips when final_text and raw_text are both empty."
+        )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -1976,6 +1995,7 @@ def main() -> None:
     test_pipeline_rediarize_reports_db_update_failures()
     test_batch_processor_asr_errors_are_not_blank_transcripts()
     test_default_transcribe_segment_refuses_blank_draft()
+    test_batch_transcribe_refuses_blank_draft()
     test_pipeline_hypothesis_population_reports_failures()
     test_asr_pool_recovers_poisoned_state_lock()
     test_global_rate_limiter_recovers_poisoned_lock()

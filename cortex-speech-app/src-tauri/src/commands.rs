@@ -1196,6 +1196,17 @@ pub fn batch_transcribe(
                 // Capture full snapshot BEFORE transcription for complete undo.
                 let pre_transcription_snapshot = seg.clone();
                 match pipeline.transcribe(Some(id), &seg.audio_path, seg.alignment_json.as_deref(), None) {
+                    Ok(draft) if draft.final_text.trim().is_empty() && draft.raw_text.trim().is_empty() => {
+                        // A blank draft is NOT a transcript. update_batch_transcription_if_unreviewed would
+                        // overwrite an existing good (unreviewed) transcript with "" — e.g. a jury_accept 7B
+                        // draft re-batch-transcribed by the weaker offline CTC engine that returns Ok("") on
+                        // a quiet clip. Skip; keep the current text. (Recurring
+                        // blank-transcript-never-overwrites-good data-loss class; matches transcribe_segment.)
+                        tracing::info!(
+                            "Batch transcribe skipped {id}: empty transcript (silent clip) — existing transcript kept"
+                        );
+                        skipped += 1;
+                    }
                     Ok(draft) => {
                         let normalized = normalizer.normalize(&draft.final_text);
                         // Guarded targeted write (NOT a full insert_segment of the stale snapshot): a
