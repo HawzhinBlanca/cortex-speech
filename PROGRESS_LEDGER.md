@@ -7542,3 +7542,48 @@ resumes the frontend/backend adversarial hunt. Deferred enhancement (not a bug):
 source's prior clips + rows forward into staging to keep a larger interim snapshot (must preserve
 metadata.csv/SHA consistency) — logged for the owner. Owner-gated finish line unchanged (exe rebuild to activate
 source-only fixes; real-audio e2e/RTF/CER eval).
+
+---
+
+## 2026-07-23T04:58Z — iter 111 — F2 "stock-grade" alarm falsely fired on a 7B-drafted import (MEDIUM honesty) fixed (a64b229)
+
+**Queue was drained → ran a fresh adversarial hunt (pipeline/chunking/normalizer/migrations/history + untouched
+frontend; 6 finders × 3-lens verify → 7 MEDIUM survivors). Fixed the top honesty finding, queued 6.**
+
+**pipeline.rs build_segments_from_pcm — the fine-tuned "downgrade" alarm falsely labeled a 7B-drafted import
+"stock-grade" (MEDIUM, honesty; a64b229).** Hand-verified the full path: with use_finetuned_asr ON, attempts++
+fires per chunk (1833); if the fine-tuned model is ABSENT, finetuned_model_paths() returns None → drafted=None →
+fallbacks++ (1854). But when WSL 7B is the primary (asr_model_size=WSL7B + external script), should_use_wsl_primary_asr()
+stays true (its own comment 718-720: "with the flag on but the model ABSENT, the 7B remains the primary … never a
+silent stock downgrade"), so the chunk takes the "[Pending WSL 7B ASR]" placeholder branch (1863) — stock CTC
+(1875) NEVER runs — and run_primary_wsl_pass_for_import fills it with the 7B champion. At completion
+attempts==fallbacks==N → finetuned_downgrade_message emits a PipelineEvent::Error "ALL N chunk(s) were drafted
+by the STOCK engine … this import's accuracy is stock-grade." FALSE: no stock CTC ran; the 7B did the work. This
+hits the owner's exact config (WSL7B champion + fine-tuned checkpoint frequently absent, per memory
+finetuned-mms-checkpoint-location) — a fabricated engine/accuracy label = honesty-law violation. Confirmed by all
+3 refuter lenses AND independently by hand.
+
+Root cause: the fallback counter conflated "fine-tuned didn't draft" with "stock drafted." Fix: gate the
+finetuned_fallbacks increment on `!wsl_primary` — a fine-tuned miss counts as a stock downgrade ONLY when the
+chunk actually falls to stock local CTC, not when it falls to the 7B champion. Hoisted
+should_use_wsl_primary_asr() into a per-chunk `wsl_primary` local (reused at the routing branch, so no extra
+per-chunk fs stat). All other cases unchanged (model present + WSL7B → wsl_primary false → a genuine fine-tuned
+failure still correctly counts as a stock fallback; non-WSL configs unchanged).
+
+Fail-before verified: the source policy fired the assertion with the guard removed. End-to-end can't be
+unit-tested (the WSL7B path hard-fails without a live 7B server; build_segments needs embedding/denoiser
+services), so source-pinned in test_rust_runtime_panic_policy.py — the same rationale finetuned_downgrade_message
+uses (pure-fn test + source guard).
+
+Gate: fmt clean, **clippy 0 warnings**, **cargo test --lib 979 passed / 0 failed / 6 ignored**, **35/35 python
+policies**.
+
+**Score: 73 fixed + 1 cleanup, ~27 refuted, 2 measure-deferred, 6 queued.** Owner-gated finish line unchanged.
+
+QUEUE (from hunt-111; hand-verify each against source BEFORE fixing):
+- [MED] history/mod.rs:183 — undo-of-delete loses cascade children; c4/loop0 evidence archive double-counts. ← next (data-loss)
+- [MED] SpeakerPanel.svelte:33 — speaker rename silently & irreversibly merges into an existing speaker (no confirm, no undo).
+- [MED] normalizer.rs:32 — ZERO_WIDTH_FORMAT strips BOM/ZWNBSP but not U+2060 WORD JOINER (+U+2061-2064): invisible char survives → breaks dedup, inflates CER, pollutes labels.
+- [MED] audio.rs:1140 — Energy-VAD fallback drops <~300ms utterances that Silero (96ms floor) keeps — short words lost.
+- [MED] pipeline.rs:112 — loop0_would_fire counts whitespace-only normalization as a memory firing, inflating a metric.
+- [MED] SearchBar.svelte:74 — active FTS search freezes the match id-set; a refine/import reload silently drops or keeps the wrong rows.
