@@ -128,7 +128,7 @@ the actual GPU/marathon execution needs the owner. **None of these lets the loop
 
 | # | Item | In-loop work | RUN gate | Source |
 |---|------|--------------|----------|--------|
-| 1 | **Sorani normalizer = AsoSoft/ScriptNormalization** (Kaf/Yeh/ZWNJ/digits); audit `normalizer.rs`, add missing rules, re-derive whether 7.03% is skill vs normalization | audit + implement + fail-before tests + policy | re-score on rig | §4, SN-WER |
+| 1 | ~~Sorani normalizer = AsoSoft/ScriptNormalization~~ **AUDITED 2026-07-23 → already implemented** in `normalizer.rs` (Kaf U+0643→ک, Yeh U+064A→ی, Alef-Maksura→ی, ZWNJ incl. heh+ZWNJ→ە, zero-width strips, tashkeel, Persian/Arabic digits, NFC-idempotent). In-loop part DONE. | — (done) | re-score 7.03% under it on a contamination-checked split (still owner-gated) | §4, SN-WER |
 | 2 | **Pseudo-labeling / noisy-student harness** on 1.74M clips (batch infer → confidence-filter → QLoRA pack → per-round held-out regression gate) | build all scripts + the gate | GPU run each round | §3.1–2 |
 | 3 | **KenLM n-gram fusion**: verify sherpa CTC n-gram support, then build the `ckb` n-gram from clean text + wire decode-time fusion | verify + build | swap + measure | §3.3 |
 | 4 | **OmniASR-CTC-1B int8 benchmark harness** (config swap + one-command 300M-vs-1B ckb scorecard + runbook) | build harness + runbook | GPU run + measure | §2 |
