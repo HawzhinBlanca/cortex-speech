@@ -44,7 +44,9 @@ struct LearningRow {
     raw_transcript: String,
     normalized_transcript: Option<String>,
     verdict: Option<String>,
-    verdict_transcript: Option<String>,
+    // verdict_transcript intentionally NOT loaded — for a DPO-eligible (edit) row it equals the human fix
+    // (== the pair's `chosen`), so surfacing it in the learning prompt leaked the gold label. See
+    // build_learning_prompt.
     rationale: Option<String>,
     evidence_json: Option<String>,
     audio_path: String,
@@ -74,7 +76,6 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
                 ss.raw_transcript,
                 ss.normalized_transcript,
                 ss.verdict,
-                ss.verdict_transcript,
                 ss.rationale,
                 ss.evidence_json,
                 ss.audio_path,
@@ -96,14 +97,13 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
             raw_transcript: row.get(3)?,
             normalized_transcript: row.get(4)?,
             verdict: row.get(5)?,
-            verdict_transcript: row.get(6)?,
-            rationale: row.get(7)?,
-            evidence_json: row.get(8)?,
-            audio_path: row.get(9)?,
-            duration_ms: row.get(10)?,
-            speaker_id: row.get(11)?,
-            confidence: row.get(12)?,
-            agent_confidence: row.get(13)?,
+            rationale: row.get(6)?,
+            evidence_json: row.get(7)?,
+            audio_path: row.get(8)?,
+            duration_ms: row.get(9)?,
+            speaker_id: row.get(10)?,
+            confidence: row.get(11)?,
+            agent_confidence: row.get(12)?,
         })
     })?;
 
@@ -285,7 +285,12 @@ fn build_learning_prompt(db: &Database, row: &LearningRow) -> AppResult<String> 
     push_field(&mut prompt, "raw_asr", Some(row.raw_transcript.as_str()));
     push_field(&mut prompt, "normalized_asr", row.normalized_transcript.as_deref());
     push_field(&mut prompt, "jury_verdict", row.verdict.as_deref());
-    push_field(&mut prompt, "jury_transcript", row.verdict_transcript.as_deref());
+    // NOTE: deliberately NOT emitting verdict_transcript. record_human_decision("edit", fix) overwrites
+    // speech_segments.verdict_transcript to the human fix AND that same fix becomes the DPO pair's `chosen`
+    // (agent_examples.human_fix). Every DPO-eligible row is created by an edit, so verdict_transcript == chosen
+    // for 100% of pairs — echoing it here would embed the gold label in the shared prompt and train a
+    // copy-the-jury_transcript shortcut instead of ASR correction (a label leak that defeats the flywheel).
+    // The model already gets the text to correct from raw_asr / normalized_asr / the Hypotheses block below.
     push_field(&mut prompt, "jury_rationale", row.rationale.as_deref());
     push_field(&mut prompt, "asr_confidence", row.confidence.map(|v| format!("{v:.3}")).as_deref());
     push_field(&mut prompt, "agent_confidence", row.agent_confidence.map(|v| format!("{v:.3}")).as_deref());
@@ -1234,5 +1239,37 @@ mod tests {
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "re-edit re-creates the pair");
         db.record_human_decision("s-retract", "reject", None, None).expect("reject");
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "reject must retract the learning pair");
+    }
+
+    #[test]
+    fn dpo_prompt_does_not_leak_the_human_fix_into_the_shared_prompt() {
+        // record_human_decision("edit", fix) sets speech_segments.verdict_transcript = fix AND makes that same
+        // fix the DPO pair's `chosen` (agent_examples.human_fix). EVERY DPO-eligible pair is edit-born, so
+        // verdict_transcript == chosen for 100% of pairs. If the learning prompt echoed verdict_transcript,
+        // every pair would embed its own gold label in the shared prompt — fine-tuning would learn a
+        // copy-the-jury_transcript shortcut instead of ASR correction, defeating the flywheel. The prompt must
+        // NOT contain the chosen fix. Uses the PRODUCTION correction path (not a hand-built fixture that
+        // decouples verdict_transcript from the fix, which is why the older prompt tests missed this). (hunt-9)
+        let db = open_mem_db();
+        let fix = "ئەو دەقە ڕاستکراوەیە";
+        let seg = SpeechSegment {
+            id: "seg-no-leak".to_string(),
+            audio_path: "/tmp/no-leak.wav".to_string(),
+            raw_transcript: "raw asr text".to_string(),
+            duration_ms: 4200,
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&seg).expect("insert");
+        db.record_human_decision("seg-no-leak", "edit", Some(fix), None).expect("edit");
+
+        let result = build_dpo_dataset(&db).expect("build dpo");
+        assert_eq!(result.pair_count, 1, "an edit produces one DPO pair");
+        let pair: DpoPair = serde_json::from_str(result.jsonl.lines().next().expect("jsonl row")).expect("dpo pair");
+        assert_eq!(pair.chosen, fix, "the human fix is the chosen answer");
+        assert!(
+            !pair.prompt.contains(fix),
+            "the DPO prompt must NOT contain the chosen fix (jury_transcript label leak):\n{}",
+            pair.prompt
+        );
     }
 }
