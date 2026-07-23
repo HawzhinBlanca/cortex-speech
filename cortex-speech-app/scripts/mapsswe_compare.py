@@ -31,10 +31,22 @@ def load(path):
 
 def mapsswe(diffs):
     n = len(diffs)
+    if n < 2:
+        # A matched-pairs test needs >= 2 paired segments; with one the sample variance is undefined (the
+        # /(n-1) below divides by zero). Report non-significant honestly rather than crash or fabricate a p.
+        return (sum(diffs) / n if n else 0.0), float("nan"), 1.0
     mean = sum(diffs) / n
     var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
     if var == 0:
-        return mean, float("inf") if mean else 0.0, 0.0 if mean else 1.0
+        if mean == 0:
+            return mean, 0.0, 1.0  # every paired diff identical and zero -> systems indistinguishable
+        # Constant NON-zero gap: the z-statistic mean/(s/sqrt(n)) has a zero denominator and is UNDEFINED —
+        # NOT infinitely significant (the old `inf, 0.0` printed a fabricated "SIGNIFICANT p<0.05"). A uniform
+        # gap over a handful of segments is weak evidence. Fall back to the two-sided sign test: all n diffs
+        # share one sign, so p = 2*0.5^n (n=3 -> 0.25, i.e. NOT significant). Mirrors the canonical Rust
+        # reference significance.rs:182-193, which fixed this exact p=0.0 fabrication (and its test
+        # mapsswe_constant_nonzero_gap_is_not_falsely_significant).
+        return mean, float("nan"), min(1.0, 2.0 * 0.5 ** n)
     z = mean / math.sqrt(var / n)
     # two-tailed normal p-value via erfc
     p = math.erfc(abs(z) / math.sqrt(2))
