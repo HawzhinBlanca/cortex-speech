@@ -8565,3 +8565,35 @@ QUEUE (hunt-135 survivors remaining — hand-verify EACH before fixing):
 - [MED] constrained_decode.rs:157 — run_constrained skips the SHA-256 pin the default path enforces.
 - [LOW] audio.rs:163 — check_audio duration_ms=0 for a valid VBR MP3 without a Xing header.
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+### Iteration 137 — 2026-07-23 — FIX #99: batch_transcribe blank draft overwrote a good unreviewed transcript
+
+**Class: blank-overwrite data-loss (recurring; sibling of #97).** Hand-verified: batch_transcribe
+(commands.rs:1198-1231) persists the pipeline draft via `update_batch_transcription_if_unreviewed`
+(db.rs:814-855), whose UPDATE writes `raw_transcript = ?2` unconditionally and guards ONLY human-reviewed
+rows (`verified=0 AND human_decision IS NULL AND verdict NOT IN human_*`) — NO empty-text guard. So
+re-batch-transcribing an UNREVIEWED row that already holds a good machine transcript (e.g. a `jury_accept`
+7B draft) with the weaker offline CTC engine that returns `Ok("")` on a quiet clip overwrote it with "" —
+silent, irreversible data loss.
+
+Fix: a match-guard arm `Ok(draft) if draft.final_text.trim().is_empty() && draft.raw_text.trim().is_empty()`
+skips the persist (logs it, counts skipped) before the db call — the per-id progress emit still fires
+(so no `continue` that would drop a progress tick). Fail-before: source policy
+`test_batch_transcribe_refuses_blank_draft` (runtime needs a full app+pipeline) — removing the guard arm
+fails it.
+
+Gate: `cargo fmt --check` clean (fmt wrapped the long log line); `clippy -D warnings` clean;
+**`cargo test --lib` 989 passed / 0 failed**; **python policies 38 scripts passed**. Reality check
+pre-work: exe not running, git clean, HEAD 69610d9, lock free.
+
+**Score: 99 fixed + 1 cleanup, ~33 refuted, 2 measure-deferred, 4 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-135 survivors remaining):
+- [MED] batch_processor.rs:146 — headless re-transcribe DELETES a segment on a legit empty result. ← next
+- [MED] eval.rs:174 — placeholder draft leaks into the permanent gold reference.
+- [MED] constrained_decode.rs:157 — run_constrained skips the SHA-256 pin the default path enforces.
+- [LOW] audio.rs:163 — check_audio duration_ms=0 for a valid VBR MP3 without a Xing header.
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
