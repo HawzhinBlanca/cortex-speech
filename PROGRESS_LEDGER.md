@@ -8761,3 +8761,37 @@ QUEUE (hunt-135 drained):
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
 - Next: a fresh adversarial hunt (untouched subsystems), the accuracy-machinery backlog (ASR_TECH_SCAN §5,
   owner-gated to RUN), or the DEFERRED-LARGE history undo-of-delete — per the doctrine's priority order.
+
+---
+
+### Iteration 143 — 2026-07-23 — FIX #105 (accuracy machinery): Expected Calibration Error (ECE) + reliability harness
+
+**Owner picked "accuracy machinery" (doctrine-priority after the honesty repair).** Built the next
+gold-trust harness: `scripts/calibration_ece.py`. Pairs with `agreement_kappa.py` (iter 132) — kappa
+measures the gold set's LABEL ceiling; ECE measures whether the model's CONFIDENCE means anything. The
+conformal/jury/autonomy stack calibrates on `seg.confidence`, so those numbers can't be believed until a
+stated 0.95 is shown to be right ~95% of the time (ASR_TECH_SCAN §4/§5). Computes ECE (bin-weighted
+|stated_conf − observed_accuracy|) + a reliability table, TSV CLI.
+
+Honesty caveat baked in: on the offline OmniASR-CTC path confidence is the fixed 0.90 HEURISTIC (sherpa
+exposes no posteriors), so its ECE is meaningless — the harness + its printed output warn to run ONLY over
+REAL-posterior confidences (the WSL-7B path). It computes the metric; it does not decide the source.
+
+Dependency-free `test_calibration_ece_policy.py` anchors the math on known-answer cases (perfect → 0; conf
+0.8 with 50% correct → 0.3; two-bin weighted → 0.14; conf 1.0 counted in the last bin) so a broken formula
+can't ship a flattering (too-low) ECE. **Fail-before:** dropping the bin-weight accumulation fails 4 tests.
+CLI smoke-tested (ECE 0.14 on a synthetic file). RUN owner-gated (needs real confidence+correctness pairs).
+
+Gate: **python policies 39 scripts passed** (new calibration test included). No Rust/JS changed. Reality
+check pre-work: exe not running, git clean, HEAD 0983b29, lock free.
+
+**Score: 105 fixed + 1 cleanup, ~33 refuted, 2 measure-deferred, 0 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged. (FIX #105 is accuracy MACHINERY — builds the confidence-trust
+measurement; it does not itself change any CER.)
+
+QUEUE (hunt-135 drained; accuracy-machinery backlog continuing):
+- Machinery remaining (ASR_TECH_SCAN §5, none move the CER — all owner-gated to RUN): OmniASR-CTC-1B
+  benchmark harness; KenLM n-gram fusion (verify sherpa CTC n-gram support first); pseudo-labeling harness;
+  gold-CER/WER PR-gating test; CV-ckb + SoraniTTS importers; one-click gate_and_promote IPC+button;
+  homophone-replacer FST (verify Omnilingual-path support). Gold-trust pair now complete (kappa + ECE).
+- CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
