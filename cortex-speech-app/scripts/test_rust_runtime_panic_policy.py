@@ -2041,6 +2041,23 @@ def test_wsl_refinement_loop_refuses_blank_draft() -> None:
         )
 
 
+def test_writers_active_includes_the_wsl_refinement_writer() -> None:
+    """prepare_restore refuses a DB restore only while writers_active(). The WSL-7B refinement loop is a
+    background DB WRITER (update_asr_transcript_if_unreviewed) tracked by WSL_REFINE_RUNNING, so
+    writers_active() must include it — else a restore runs mid-refinement-write and tears the DB. Runtime
+    concurrency isn't unit-testable without a live batch, so source-pinned."""
+    src = (REPO_ROOT / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
+    start = src.find("pub fn writers_active(&self) -> bool {")
+    if start == -1:
+        raise AssertionError("writers_active not found in lib.rs")
+    body = src[start : src.find("}", start)]
+    if "WSL_REFINE_RUNNING" not in body:
+        raise AssertionError(
+            "writers_active() does not account for the WSL-7B refinement writer (WSL_REFINE_RUNNING) — a DB "
+            "restore could run mid-refinement-write and tear the DB. Include it alongside import/batch state."
+        )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -2101,6 +2118,7 @@ def main() -> None:
     test_check_audio_and_get_duration_share_the_decode_fallback()
     test_bundled_only_models_resolve_per_file_not_all_or_nothing()
     test_wsl_refinement_loop_refuses_blank_draft()
+    test_writers_active_includes_the_wsl_refinement_writer()
     test_pipeline_hypothesis_population_reports_failures()
     test_asr_pool_recovers_poisoned_state_lock()
     test_global_rate_limiter_recovers_poisoned_lock()

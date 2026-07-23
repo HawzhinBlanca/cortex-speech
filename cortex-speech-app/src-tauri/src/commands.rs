@@ -1825,7 +1825,7 @@ const WSL_LOG_LINE_PREVIEW_CHARS: usize = 4096;
 /// True while a batch 7B refinement run is in flight. A plain flag (not a child handle) because the
 /// batch drives the per-segment warm client in a loop — there is no single long-lived child to hold.
 /// Guards against a second concurrent batch starting on top of the first.
-static WSL_REFINE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static WSL_REFINE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Set by `cancel_wsl_refinement`; polled between segments by the batch loop AND in-flight by the
 /// per-segment spawn so a cancel stops the run within ~50 ms. Reset to false when a new batch starts.
 static WSL_REFINE_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

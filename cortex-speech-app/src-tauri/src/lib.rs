@@ -333,7 +333,11 @@ impl AppState {
     /// restore pushed a stale undo command into the freshly-cleared history — pressing Ctrl+Z then
     /// replayed pre-restore rows into the restored dataset.
     pub fn writers_active(&self) -> bool {
-        *self.lock_import_state() == ImportState::Running || *self.lock_batch_state() == BatchState::Running
+        *self.lock_import_state() == ImportState::Running
+            || *self.lock_batch_state() == BatchState::Running
+            // The WSL-7B refinement loop is a background DB WRITER too (update_asr_transcript_if_unreviewed),
+            // tracked by its own atomic — restoring a snapshot while it writes tears the DB (round-26 hunt).
+            || crate::commands::WSL_REFINE_RUNNING.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
