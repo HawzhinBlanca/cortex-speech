@@ -532,6 +532,61 @@ fn asr_and_consensus_updates_store_nfc_so_search_still_matches() {
 }
 
 #[test]
+fn wsl_refinement_must_not_overwrite_a_verified_transcript() {
+    // A human who clicked "Verify"/"Verify selected" (batch_verify -> update_verified) sets ONLY
+    // verified=1, leaving human_decision/verdict NULL. The background WSL-7B refinement loop
+    // (update_asr_transcript_if_unreviewed) must SKIP such a row — otherwise it silently overwrites a
+    // human-verified transcript with unapproved machine text while the row still exports as human-verified
+    // GOLD. Sibling of consensus_batch_preserves_human_reviewed_transcripts; guards the verified=1 hole the
+    // human_decision/verdict-only guard missed (found by adversarial hunt-4).
+    let db = make_db();
+    let mut seg = make_segment("ver-1", "/v.wav");
+    seg.raw_transcript = "human re-transcribed then verified".to_string();
+    seg.normalized_transcript = Some("human re-transcribed then verified".to_string());
+    db.insert_segment(&seg).expect("insert");
+
+    // Human verifies via the same single-column path batch_verify uses (verified only; decision/verdict NULL).
+    assert!(db.update_verified("ver-1", true).unwrap());
+    let locked = db.get_segment_by_id("ver-1").unwrap().unwrap();
+    assert!(locked.verified);
+    assert!(locked.human_decision.is_none(), "verify leaves human_decision NULL — the race precondition");
+
+    // The WSL-7B loop reaches the same segment and tries to write fresh 7B text.
+    let updated = db
+        .update_asr_transcript_if_unreviewed(
+            "ver-1",
+            "unapproved 7b machine text",
+            Some("unapproved 7b machine text"),
+            Some(0.9),
+            Some("external_provider"),
+            Some("omniasr-wsl-7b"),
+            false,
+        )
+        .unwrap();
+    assert!(!updated, "a verified row must be SKIPPED, not overwritten");
+
+    let after = db.get_segment_by_id("ver-1").unwrap().unwrap();
+    assert_eq!(after.raw_transcript, "human re-transcribed then verified", "verified transcript must be intact");
+    assert!(after.verified, "verified flag must stay set");
+
+    // Sanity: an UNVERIFIED segment is still refined normally (the guard only protects verified/reviewed rows).
+    db.insert_segment(&make_segment("unver-1", "/u.wav")).unwrap();
+    assert!(
+        db.update_asr_transcript_if_unreviewed(
+            "unver-1",
+            "7b text",
+            None,
+            Some(0.9),
+            Some("external_provider"),
+            Some("omniasr-wsl-7b"),
+            false,
+        )
+        .unwrap(),
+        "an unverified row must still be updated"
+    );
+}
+
+#[test]
 fn insert_hypothesis_stores_nfc_so_jury_agreement_is_not_normalization_fragile() {
     // The jury scores inter-engine agreement by exact surface word-equality. If two engines emit the
     // same Sorani word in different normalization forms (NFD vs NFC), a real consensus would be

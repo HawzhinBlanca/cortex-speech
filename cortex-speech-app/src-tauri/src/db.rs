@@ -782,6 +782,14 @@ impl Database {
                  cloud_call            = ?7,
                  updated_at            = datetime('now')
              WHERE id = ?1
+               -- verified = 0: a human who clicked \"Verify\"/\"Verify selected\" (batch_verify ->
+               -- update_verified) sets ONLY `verified`, leaving human_decision/verdict NULL. Without this
+               -- clause the background WSL-7B refinement loop (which snapshots empty-transcript targets at
+               -- start) would reach a segment the human re-transcribed + verified mid-run and silently
+               -- overwrite its raw/normalized transcript with unapproved 7B text, while the row stays
+               -- verified=1 and still exports as human-verified GOLD. Mirrors the sibling
+               -- update_batch_transcription_if_unreviewed's guard for the identical race.
+               AND verified = 0
                AND (human_decision IS NULL OR human_decision = '')
                AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
             params![
