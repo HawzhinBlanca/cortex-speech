@@ -252,6 +252,27 @@ def test_audioplayer_autoplays_each_clip_not_only_on_source_reload() -> None:
             raise AssertionError(f"{consumer} does not pass clipKey to AudioPlayer — autoplay won't advance per clip")
 
 
+def test_speaker_rename_confirms_before_merging_into_an_existing_speaker() -> None:
+    """SpeakerPanel.handleRename renames a speaker via a blanket speaker_id UPDATE that is NOT on the undo
+    stack (unlike delete). Renaming into an existing speaker id MERGES both groups — and the input is prefilled
+    free-text, so a typo matching an existing id collapses a diarization split (e.g. 50/30 → 80) with no
+    window.confirm and no Ctrl+Z to reverse it. handleRename must detect a target that already belongs to
+    ANOTHER speaker and window.confirm before the (irreversible) merge, matching StatsDashboard's
+    destructive-action pattern (window.confirm on restore/prune)."""
+    body = _function_body(_read("src/lib/SpeakerPanel.svelte"), "async function handleRename(")
+    if "window.confirm" not in body:
+        raise AssertionError(
+            "SpeakerPanel.handleRename has no window.confirm guard — a rename colliding with an existing "
+            "speaker id silently, irreversibly merges the two groups. Confirm before the merge."
+        )
+    if "speakers.find" not in body:
+        raise AssertionError(
+            "handleRename does not check the new name against existing speakers, so it can't tell a MERGE from "
+            "a plain relabel. Detect the collision (speakers.find(s => s.speakerId === trimmed && s.speakerId "
+            "!== oldId)) and confirm only then."
+        )
+
+
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
@@ -264,6 +285,7 @@ def main() -> None:
     test_refinery_panel_renders_undefined_metric_for_a_zero_segment_eval()
     test_validation_signal_anomaly_distinguishes_not_screened_from_clean()
     test_audioplayer_autoplays_each_clip_not_only_on_source_reload()
+    test_speaker_rename_confirms_before_merging_into_an_existing_speaker()
     print("frontend review-guard source policy passed")
 
 

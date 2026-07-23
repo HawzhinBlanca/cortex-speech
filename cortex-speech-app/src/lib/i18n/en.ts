@@ -642,6 +642,8 @@ export const en: Record<string, string> = {
   'speaker.loadFailed': 'Failed to load speakers',
   'speaker.renameFailed': 'Rename failed',
   'speaker.renameSuccess': 'Updated {n} segments',
+  'speaker.mergeConfirm':
+    "Rename '{source}' to '{target}'? '{target}' already exists ({n} segments) — this MERGES both speakers into one and cannot be undone.",
   // Audio player
   'audio.loadFailed': 'Failed to load audio file',
   // Command palette

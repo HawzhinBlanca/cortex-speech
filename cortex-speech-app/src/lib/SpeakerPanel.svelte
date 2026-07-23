@@ -28,9 +28,23 @@
   }
 
   async function handleRename(oldId: string) {
-    if (!newName.trim()) return;
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    // A rename whose target ALREADY belongs to another speaker MERGES the two groups (rename is a blanket
+    // speaker_id UPDATE, and — unlike delete — records nothing on the undo stack, so the merge is
+    // irreversible). The box is prefilled free-text, so a typo matching an existing id silently collapses a
+    // diarization split. Confirm before the merge, matching the destructive-action pattern elsewhere.
+    const mergeTarget = speakers.find((s) => s.speakerId === trimmed && s.speakerId !== oldId);
+    if (mergeTarget) {
+      const message = $t('speaker.mergeConfirm', {
+        source: oldId,
+        target: trimmed,
+        n: String(mergeTarget.segmentCount),
+      });
+      if (!window.confirm(message)) return;
+    }
     try {
-      const count = await api.renameSpeaker(oldId, newName.trim());
+      const count = await api.renameSpeaker(oldId, trimmed);
       notifications.success($t('speaker.renameSuccess', { n: String(count) }));
       renamingId = null;
       newName = '';

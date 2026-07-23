@@ -639,6 +639,8 @@ export const ckb: Record<string, string> = {
   'speaker.loadFailed': 'بارکردنی قسەکەران سەرکەوتوو نەبوو',
   'speaker.renameFailed': 'گۆڕینی ناو سەرکەوتوو نەبوو',
   'speaker.renameSuccess': '{n} بەش نوێکرایەوە',
+  'speaker.mergeConfirm':
+    "ناوی '{source}' بگۆڕدرێت بۆ '{target}'؟ '{target}' پێشتر هەیە ({n} بەش) — ئەمە هەردوو قسەکەر تێکەڵ دەکات و ناگەڕێتەوە.",
   // Audio player
   'audio.loadFailed': 'بارکردنی فایلی دەنگ سەرکەوتوو نەبوو',
   // Command palette
