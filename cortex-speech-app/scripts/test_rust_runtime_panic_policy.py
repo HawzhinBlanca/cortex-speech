@@ -1941,6 +1941,27 @@ def test_batch_transcribe_refuses_blank_draft() -> None:
         )
 
 
+def test_batch_processor_never_deletes_a_segment_with_an_existing_transcript() -> None:
+    """The headless batch_processor prunes fresh placeholder segments (VAD false-positives), but must
+    NEVER delete a segment that already holds a real transcript just because THIS run's bundled-engine
+    re-transcription is empty/silent/unsliceable — that destroys a good draft (e.g. a stronger WSL-7B
+    draft), silent data loss. Every `to_delete.push` must be guarded by `has_existing_transcript`. The
+    runtime path needs real ONNX models + a DB, so it is source-pinned."""
+    src = (REPO_ROOT / "src-tauri" / "src" / "bin" / "batch_processor.rs").read_text(encoding="utf-8")
+    if "has_existing_transcript" not in src:
+        raise AssertionError(
+            "batch_processor computes no has_existing_transcript guard — an empty/silent re-transcription "
+            "can delete a segment that already holds a good draft."
+        )
+    deletes = src.count("to_delete.push(seg.id.clone())")
+    guards = src.count("if !has_existing_transcript {")
+    if deletes == 0 or guards < deletes:
+        raise AssertionError(
+            f"batch_processor has {deletes} to_delete.push site(s) but only {guards} has_existing_transcript "
+            "guard(s) — an unguarded delete can destroy a segment that already has a good transcript."
+        )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -1996,6 +2017,7 @@ def main() -> None:
     test_batch_processor_asr_errors_are_not_blank_transcripts()
     test_default_transcribe_segment_refuses_blank_draft()
     test_batch_transcribe_refuses_blank_draft()
+    test_batch_processor_never_deletes_a_segment_with_an_existing_transcript()
     test_pipeline_hypothesis_population_reports_failures()
     test_asr_pool_recovers_poisoned_state_lock()
     test_global_rate_limiter_recovers_poisoned_lock()

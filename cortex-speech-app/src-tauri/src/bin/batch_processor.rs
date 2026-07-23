@@ -97,6 +97,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut to_delete = Vec::new();
 
         for mut seg in segments {
+            // Never DELETE a segment that already holds a REAL transcript (raw draft or human annotation)
+            // just because THIS run can't (re)transcribe it: an empty/silent bundled-engine result — or an
+            // unsliceable window — must not destroy a good draft a stronger engine (e.g. WSL 7B) produced.
+            // Deletion is only for FRESH placeholder segments (VAD false-positives: no real transcript yet).
+            // (blank-transcript-never-overwrites-good data-loss class.)
+            let has_existing_transcript = {
+                let raw = seg.raw_transcript.trim();
+                let ann = seg.annotated_transcript.as_deref().unwrap_or("").trim();
+                (!raw.is_empty() && !cortex_speech_app_lib::quality::is_placeholder_transcript(raw))
+                    || (!ann.is_empty() && !cortex_speech_app_lib::quality::is_placeholder_transcript(ann))
+            };
+
             // Slice the per-chunk window from the SAME canonical schema the app writes
             // (source_start_ms / source_end_ms via SegmentSourceMeta) and errors on. The previous code
             // read non-existent `source_start_sample`/`source_end_sample` keys and `unwrap_or`-ed into
@@ -111,12 +123,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok((pcm, _suffix)) => pcm,
                 Err(error) => {
                     warn!("Skipping segment {}: cannot slice chunk window: {error}", seg.id);
-                    to_delete.push(seg.id.clone());
+                    if !has_existing_transcript {
+                        to_delete.push(seg.id.clone());
+                    }
                     continue;
                 }
             };
             if audio::is_silent(&chunk_pcm) {
-                to_delete.push(seg.id.clone());
+                if !has_existing_transcript {
+                    to_delete.push(seg.id.clone());
+                }
                 continue;
             }
 
@@ -143,14 +159,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if text.trim().is_empty() {
-                to_delete.push(seg.id.clone());
+                if !has_existing_transcript {
+                    to_delete.push(seg.id.clone());
+                }
                 continue;
             }
 
             // Normalize
             let norm = normalizer.normalize(&text);
             if norm.trim().is_empty() {
-                to_delete.push(seg.id.clone());
+                if !has_existing_transcript {
+                    to_delete.push(seg.id.clone());
+                }
                 continue;
             }
 
