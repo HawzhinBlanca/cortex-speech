@@ -2139,6 +2139,22 @@ fn run_wsl_refinement_loop(
             db_path,
             Some(&WSL_REFINE_CANCEL),
         ) {
+            Ok((raw_transcript, _)) if raw_transcript.trim().is_empty() => {
+                // A blank 7B result (silent/music/noise clip — parse_wsl_segment_result returns Ok(""))
+                // must NOT overwrite an existing good transcript: update_asr_transcript_if_unreviewed
+                // writes raw_transcript unconditionally (guarding only human-reviewed rows). Skip; keep the
+                // current text. Neither transcribed nor failed, like the human-reviewed skip below.
+                // (blank-transcript-never-overwrites-good; sibling of transcribe_segment / batch_transcribe.)
+                emit_or_log(
+                    app,
+                    "wsl-log",
+                    format!(
+                        "[{}/{}] {id} produced an empty transcript (silent clip) — existing transcript kept",
+                        idx + 1,
+                        total
+                    ),
+                );
+            }
             Ok((raw_transcript, confidence)) => {
                 let normalized = if auto_normalize && !raw_transcript.is_empty() {
                     Some(normalizer.normalize(&raw_transcript))

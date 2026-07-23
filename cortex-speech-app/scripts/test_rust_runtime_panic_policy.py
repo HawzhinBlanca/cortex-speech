@@ -2025,6 +2025,22 @@ def test_bundled_only_models_resolve_per_file_not_all_or_nothing() -> None:
         )
 
 
+def test_wsl_refinement_loop_refuses_blank_draft() -> None:
+    """The WSL-7B batch refinement loop persists via update_asr_transcript_if_unreviewed, which writes
+    raw_transcript unconditionally (guarding only human-reviewed rows) — so a blank 7B result (Ok("") for a
+    silent/music/noise clip, per parse_wsl_segment_result) would overwrite a good existing transcript. It
+    must SKIP a blank draft. Runtime path needs the WSL server, so source-pinned. (blank-transcript-never-
+    overwrites-good class; siblings transcribe_segment / batch_transcribe / batch_processor.)"""
+    src = (REPO_ROOT / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
+    if "update_asr_transcript_if_unreviewed" not in src:
+        raise AssertionError("WSL refinement persist call not found in commands.rs")
+    if "Ok((raw_transcript, _)) if raw_transcript.trim().is_empty()" not in src:
+        raise AssertionError(
+            "the WSL-7B refinement loop does not guard a blank draft before update_asr_transcript_if_unreviewed "
+            '— an empty 7B result would overwrite a good transcript with "". Add the guarded match arm.'
+        )
+
+
 def main() -> None:
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
@@ -2084,6 +2100,7 @@ def main() -> None:
     test_constrained_transcribe_verifies_model_and_tokens_pin()
     test_check_audio_and_get_duration_share_the_decode_fallback()
     test_bundled_only_models_resolve_per_file_not_all_or_nothing()
+    test_wsl_refinement_loop_refuses_blank_draft()
     test_pipeline_hypothesis_population_reports_failures()
     test_asr_pool_recovers_poisoned_state_lock()
     test_global_rate_limiter_recovers_poisoned_lock()
