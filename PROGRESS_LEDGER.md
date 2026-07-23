@@ -9184,6 +9184,51 @@ larger-scope only (see below), not quick reliability fixes.
 chunking-deferred + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 156 — 2026-07-23 — FIX #116: re-transcribe fell back to the WHOLE file on a clobbered chunk (undeferred)
+
+**Class: data-correctness / whole-file-vs-clip (the class pipeline.rs:2069 explicitly tracks).** This was
+the CHUNKING-DEFERRED item; I re-opened it and the deferral's PREMISE proved wrong. `slice_pcm_by_alignment`
+(chunking.rs:348, the re-transcribe read path — agentic.rs:489, pipeline.rs:2633/3259/3318) matched only
+`Some(meta-with-offset)` and sent EVERYTHING else — including a present-but-offset-less `alignment_json` — to
+an `else` that returned the WHOLE recording's PCM. That is the "clobbered chunk" shape (a bare word array, or
+`{"words":…}` with no `source_start_ms`, "the exact state a broken background aligner leaves" per the export
+test). Re-transcribing a chunk against the whole recording pairs the chunk's transcript with whole-file audio
+— the exact corruption `slice_for_export` (export.rs:551) already SKIPS on the export side (test
+`slice_for_export_skips_present_but_offsetless_alignment`). The two paths were inconsistent; the write/re-
+transcribe side was unguarded.
+
+**Why the deferral was wrong:** it claimed erroring "would break every aligned single-segment file." But
+import writes `Some(source_meta.to_alignment_json())` for EVERY segment unconditionally (pipeline.rs:1973),
+including a `chunk_count=1` single-file segment (source_start_ms present) — and word alignment PRESERVES the
+offset via `merge_word_timestamps`. So a genuine whole-file segment has `alignment_json=None` (→ whole file,
+still allowed) or a valid offset (→ slices) — NEVER an offset-less blob. Offset-less-present ⟹ a clobbered/
+legacy anomaly. No sibling-count needed after all; just mirror `slice_for_export`'s None-vs-Some-offsetless
+split.
+
+**Root fix:** rewrite the tail as an explicit `match`: `None` → whole file (unchanged); `Some(offset)` →
+slice (unchanged, absurd/degenerate offsets still Err); `Some`-but-offset-less → `Err` (refuse, never
+whole-file). Refusing loudly is strictly safer than silent mis-slicing and matches the export side.
+
+**Fail-before (neutralize-then-restore):** reverted the offset-less arm to whole-pcm →
+`slice_pcm_by_alignment_refuses_present_but_offsetless_alignment` FAILED ("bare word array must refuse");
+restored → PASS. `cargo test --lib` full run had 0 regressions, confirming no legitimate path relied on the
+old whole-file fallback.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 997 passed / 0 failed**
+(+1 test); **python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean,
+HEAD ada9faf, lock free.
+
+**Discipline note:** a DEFERRED item is a hypothesis, not a fact — re-verifying it against source (import
+always writes the offset) overturned the premise and surfaced a real reachable corruption the deferral had
+been shielding. Do not trust prior deferrals any more than prior agent verdicts.
+
+**Score: 116 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 0 hunt-queued (drained) + 0
+chunking-deferred (fixed) + 1 deferred-large (history undo-of-delete) + 1 enhancement (undo-able speaker
+rename).**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
