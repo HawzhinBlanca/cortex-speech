@@ -8187,3 +8187,34 @@ QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
 - [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree.
 - [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
 - CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+---
+
+## 2026-07-23T12:22Z — iter 128 — keyboard-help modal crashed on a duplicate {#each} key (MEDIUM) fixed (5e07db8)
+
+**Fixed the queued MEDIUM render crash. Hand-verified the duplicate is real.**
+
+**KeyboardShortcuts.svelte — the help modal threw each_key_duplicate on open (MEDIUM, crash; 5e07db8).**
+Hand-verified: line 55 rendered `{#each shortcuts.filter((s) => s.category === cat.id) as s (s.description)}` —
+keyed on s.description, which is NOT unique. The registered shortcuts (App.svelte) include TWO navigation-category
+entries whose description is both "Keyboard shortcuts (? key)" (the / and ? help chords, App.svelte ~799/806) —
+plus a third '/' "Keyboard shortcuts". A Svelte 5 keyed {#each} with a duplicate key throws each_key_duplicate
+(dev crash / mis-rendered rows in prod), so opening the Keyboard Shortcuts help — via the very / or ? that opens
+it — crashes the modal. Reachable on every help-open.
+
+Fix: key the {#each} on the loop INDEX (`as s, i (i)`) instead of s.description — the help list is static and
+never reorders, so an index key is safe and unique regardless of duplicate descriptions/chords (root-cause fix:
+covers all current + future duplicates). Fail-before verified (source policy check #16 fired on the
+`as s (s.description)` key). typecheck/vitest unaffected.
+
+Gate: typecheck 0 errors (419 files), **vitest 206 passed** (36 files), lint 0 errors, **35/35 python policies**
+(16 checks now in test_frontend_review_guards.py).
+
+**Score: 90 fixed + 1 cleanup, ~28 refuted, 2 measure-deferred, 3 hunt-queued + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
+QUEUE (hunt-123; hand-verify each against source BEFORE fixing):
+- [MED] export_bundle.rs:394 — runConfig.denoising reports true when the denoiser model fails to load (provenance lie). ← next
+- [MED] snapshot.rs:78 — off-drive backup success resets shared health counters, masking a failing primary snapshot tree.
+- [MED] export_audio/mod.rs:129 — whole-dir SHA256SUMS vouches for stale/orphan clips metadata.csv omits.
+- CARRIED: DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
