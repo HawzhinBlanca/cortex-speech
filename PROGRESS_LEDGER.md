@@ -9229,6 +9229,50 @@ chunking-deferred (fixed) + 1 deferred-large (history undo-of-delete) + 1 enhanc
 rename).**
 Owner-gated finish line unchanged.
 
+---
+
+### Iteration 157 — 2026-07-23 — HUNT-3 launched + FIX #117: snapshot restore silently re-granted revoked cloud consent across a relaunch
+
+**Hunt-3** (Workflow, 6 finders over under-swept modules — jury/agentic, db/snapshot, normalizer/eval,
+settings-consent, export split-math, frontend stores — each → 3-lens adversarial refute, survives = refutes
+< 2, 1.5M subagent tokens, 12 agents, 0 errors). 4 finders reported their surface already-hardened; 2
+survivors: this HIGH consent defect (0 refutes) and a MED gold-builder empty-chunk drop (1 refute, queued
+next). Every survivor hand-verified by ME against source — agent verdicts are not evidence.
+
+**FIX #117 — class: privacy/consent (HIGH), the CLAUDE.md hard guardrail.** Hand-verified:
+`restore_db_from_snapshot` (commands.rs:1740) fs::copies the snapshot's `settings.json` over the live on-disk
+file (EXTRA_STATE = ["settings.json","champion.json"], snapshot.rs:22), then narrows the three cloud opt-ins
+to the CURRENT live values — but ONLY on the in-memory `restored` struct (commands.rs:1793-1800). It never
+saved the narrowed struct back to disk. Three sub-claims I verified in source: (A) the snapshot's
+settings.json is copied over the live one (line 1780); (B) `AppSettings::load` (settings.rs:427) scrubs only
+the plaintext key + repairs numeric knobs — it does NOT reset opt-ins; (C) no settings `.save()` on exit
+(RunEvent::Exit at lib.rs:792 only shuts the engine; line 228 is a *session* save). So restoring a cloud-ON-
+era snapshot left `data_dir/settings.json` = cloud_llm_opt_in:true, the in-memory narrowing protected only
+the live session, and the NEXT launch's `load()` silently re-granted the revoked consent → effective_llm_mode
+/ build_refiner then permit cloud calls with no fresh acknowledgment. The guardrail comment's own intent ("a
+restore may narrow consent, never escalate it") held for the session but was defeated across a restart.
+
+**Root fix:** `restored.save(&data_dir.join("settings.json"))` after the narrowing block (best-effort, warn
+on failure), so disk matches the consent-safe in-memory state and a relaunch loads the revoked opt-ins.
+
+**Guard (privacy invariant → source policy justified) + policy-gap closed:** the PRE-EXISTING
+`test_snapshot_restore_preserves_live_cloud_consent` checked only that the in-memory narrowing was present —
+it never verified the narrowed settings are PERSISTED, which is exactly how this slipped. Extended it to also
+require `restored.save(`, AND strip comment-only lines first so a commented-out save can't false-pass
+(caught a real comment-false-match during fail-before — the recurring policy trap). Runtime path is an async
+Tauri command + State + file I/O + relaunch, so not unit-testable; source-pinned.
+
+**Fail-before (neutralize-then-restore):** commented out the save → policy FAILED ("narrows consent IN MEMORY
+but never persists…"); restored → PASS.
+
+Gate: `cargo fmt --check` clean; `clippy -D warnings` clean; **`cargo test --lib` 997 passed / 0 failed**;
+**python policies 39 scripts passed**. Reality check pre-work: exe not running, git clean, HEAD 1aae728,
+lock free.
+
+**Score: 117 fixed + 1 cleanup, ~37 refuted, 2 measure-deferred, 1 hunt-3-survivor-queued (eval.rs:186
+gold-builder empty-chunk, MED, hand-verify next) + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
