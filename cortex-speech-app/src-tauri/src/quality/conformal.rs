@@ -143,7 +143,12 @@ pub fn calibrate_and_certify(
     let cal_scored: Vec<(f64, f64)> = all_segments
         .iter()
         .filter_map(|s| {
-            if !s.verified {
+            // 'mark bad' sets verified=true (to leave the review queue) and KEEPS the machine draft as
+            // annotated_transcript, so a human-REJECTED clip satisfies the verified+non-empty-reference
+            // membership. It must NOT calibrate the certificate (its ~0 CER tightens the error bound over
+            // data the human discarded) — matching every sibling gate (export/export_bundle/jury) and the
+            // db.rs C3 count, which apply this exact exclusion. (round-25 hunt: conformal was the lone omission.)
+            if !s.verified || crate::quality::is_human_rejected(s) {
                 return None;
             }
             let ref_text = s.annotated_transcript.as_deref()?.trim();
@@ -163,10 +168,12 @@ pub fn calibrate_and_certify(
     let cal_n = cal_scored.len();
     let (threshold, bound, is_calibrated) = calibrate_threshold(&cal_scored, target_error, confidence_level);
 
-    // Certify every segment whose nonconformity is at or below the calibrated threshold.
+    // Certify every segment whose nonconformity is at or below the calibrated threshold — but NEVER a
+    // human-rejected clip: 'mark bad' keeps verified=true + the draft, so it would otherwise pass the
+    // nonconformity gate and be vouched as good over the reviewer's explicit rejection.
     let certified_segment_ids: Vec<String> = all_segments
         .iter()
-        .filter(|seg| compute_nonconformity_score(seg) <= threshold)
+        .filter(|seg| !crate::quality::is_human_rejected(seg) && compute_nonconformity_score(seg) <= threshold)
         .map(|seg| seg.id.clone())
         .collect();
 
@@ -237,6 +244,30 @@ mod tests {
         assert_eq!(
             cert.calibration_heuristic, 2,
             "heuristic + legacy-unknown are the fallback; the unverified segment is excluded entirely"
+        );
+    }
+
+    #[test]
+    fn human_rejected_clips_never_pollute_or_get_certified() {
+        // Round-25 hunt: 'mark bad' sets verified=true and KEEPS the machine draft as
+        // annotated_transcript (verdict='human_reject'), so a rejected clip satisfies the
+        // verified+non-empty-reference membership. It must NOT enter the calibration set (its ~0 CER
+        // would tighten the error bound over discarded data) NOR be certified as good — matching every
+        // sibling gate. conformal was the lone path that omitted is_human_rejected.
+        let good = mock_segment("g", 0.9, -1.0, true, "text", "text");
+        let mut rejected = mock_segment("bad", 0.9, -1.0, true, "text", "text");
+        rejected.verdict = Some("human_reject".to_string());
+
+        let cert = calibrate_and_certify(&[good, rejected], 0.3, 0.90);
+        assert!(
+            !cert.certified_segment_ids.iter().any(|id| id == "bad"),
+            "a human-rejected clip must never be certified as good: {:?}",
+            cert.certified_segment_ids
+        );
+        assert_eq!(
+            cert.calibration_real_posterior + cert.calibration_heuristic,
+            1,
+            "only the one good clip is in the calibration set; the rejected clip is excluded"
         );
     }
 
