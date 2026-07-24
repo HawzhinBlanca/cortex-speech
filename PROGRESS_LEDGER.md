@@ -10461,3 +10461,48 @@ review-visible, not the accidental-omission threat).
 
 **Tier-3 status:** P3.2 cloud-egress inventory shipped (T2 cloud half closed). **Next: P3.1** generated IPC
 contract (close T1) → P3.3 → P3.4 → (revisit main-thread inventory). "Best / real #1" NOT claimed.
+
+### Iteration 184 — 2026-07-24 — P3.1 generated IPC contract (closes T1) (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 3964df4, lock held (iter18-P3.1). Traced the real
+sources first: the sole `generate_handler!` (lib.rs:618, 127 commands) and the sole invoke wrapper
+(src/lib/commands.ts, all string-literal invokes); confirmed no `#[tauri::command(rename)]` and no second
+registry/invoke_handler before writing the gate.
+
+**FIX P3.1 (closes T1, committed 53e571f).** Nothing diffed frontend `invoke('name')` against the Rust
+registry, so a renamed/removed command stayed green in vitest+Playwright+cargo (vitest mocks invoke; the
+Playwright tauri-mock returns null for unknown commands; cargo never sees the frontend) — the dangling call
+fails only at runtime. New scripts/test_ipc_contract_policy.py (auto-discovered) builds the contract from BOTH
+real sources — `registered_commands()` bracket-matches generate_handler! (comment-stripped, last `::` segment
+= the Tauri command name) and `frontend_invocations()` scans src/**/*.ts + *.svelte for invoke literals — and
+FAILS on any invoked name the registry does not export. `test_no_command_rename_attribute` pins the
+fn-name==registered-name mapping. Registered-but-uninvoked (19, genuinely backend/reserved — spot-checked) +
+dynamic invokes are INFO only; fails loudly if either set parses empty (never vacuous).
+
+**FAIL-BEFORE.** Renaming a frontend invoke to `'get_segments_RENAMED'` (TARGETED edit — the exact T1
+scenario) made the gate FAIL "…does NOT export: ['get_segments_RENAMED']"; restored → passes clean
+(108 invoked / 127 registered, 0 dangling, 0 dynamic).
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched; policy-only,
+Rust + frontend byte-unchanged so npm not re-run):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (42.76s) ·
+`cargo test --lib` → `test result: ok. 1013 passed; 0 failed; 6 ignored` · `python run_python_policies.py` → 43 passed.
+
+**Adversarially verified** (Workflow, 3 independent skeptics vs source): 2 refuted=false (registry+frontend
+parse complete; the single registry is authoritative — slices re-export via `pub use`; plugin invokes
+`plugin:…|…` structurally can't be flagged; no false-positive, clean run passes). The 3rd found a REAL gap
+(CONFIRMED, low): the tight `[A-Za-z0-9_]+` literal regex left a quoted-but-odd arg — a whitespace-padded
+name `invoke('get_segments ')` or a backtick literal `invoke(\`x\`)` — falling through BOTH the literal and
+dynamic paths, so a dangling invoke in those forms shipped uncaught. **FIXED + verified end-to-end:** now
+every `invoke(` is classified by its first-arg char and the WHOLE quoted string extracted (`'`/`"`/backtick,
+skipping `:`/`|` plugin names + interpolated backticks) — a backtick dangling `invoke(\`x_GONE\`)` now FAILS,
+`invoke('plugin:dialog|open')` is correctly skipped, clean run unchanged (108/127). Also hardened (their
+latent note): the registry bracket-matcher strips comments BEFORE matching so a `[`/`]` in a block comment
+can't corrupt depth.
+
+**NOT verified / remaining:** the gate is STATIC — a genuinely-dynamic `invoke(runtimeName)` (0 today) is
+reported, not checked (unavoidable without running the app); shape/argument mismatch (only NAMES are
+diffed) is out of scope. No exe rebuild needed (policy-only).
+
+**Tier-3 status:** P3.2 (T2 cloud half) + P3.1 (T1) shipped. **Next: P3.3** coverage/mutation → P3.4 e2e →
+(revisit the deferred main-thread whole-surface inventory). "Best / real #1" NOT claimed.
