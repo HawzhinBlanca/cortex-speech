@@ -10213,3 +10213,61 @@ proven by unit truth-table, not by a live run against a genuinely corrupt on-dis
 **Tier-1 status:** P1.1/P1.2/P1.3-fence/P1.4/P1.3b/P1.4b all shipped — Tier-1 reliability items COMPLETE.
 **Next: P0.4** per-segment provenance (schema migration) → Tier-3. P2.4 i18n owner-gated (native Sorani).
 "Best / real #1" NOT claimed.
+
+### Iteration 179 — 2026-07-24 — P0.4 per-segment provenance, WRITE SIDE (denoised/diarized) (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 0ae584d, lock held (iter13-P0.4). Mapped the
+whole change surface first with a 3-agent Workflow (export-runConfig / segment schema+migrations /
+import-time provenance) + direct reads before editing.
+
+**THE DEFECT (H3, audit MED).** The export bundle's manifest `runConfig` (export_bundle.rs:398) stamps a
+SINGLE denoising/diarization flag computed at EXPORT time from *current* model loadability
+(`config_from_settings(settings, denoiser_loadable(), diarizer_loadable())`) onto every segment — the
+temporal inverse of the #132 fix. The mapping confirmed there was NO stored per-segment truth to read
+instead (the `dataset_runs.config_json` table is DEAD — only ever CREATE/DROP, never read/written), so
+closing it needs a persisted per-row provenance first.
+
+**SCOPE (independent judgment — decomposed the roadmap's largest item along a real complexity boundary).**
+P0.4 = schema migration + per-row population + export-read. This iteration ships the WRITE side for the
+two signals computable inline at the single import construction site with zero new plumbing and airtight
+semantics: `denoised` = `enable_denoising && denoiser_service.is_active()`, `diarized` =
+`enable_diarization && embedding_service.is_available()` (the setting on AND the model actually loadable —
+whether processing RAN, not the bare flag). Deferred: `vad_backend` (the VAD stack computes the backend in
+audio.rs and DISCARDS it — threading it up through plan_speech_chunks + 2 call sites + a "none" state + a
+present-but-corrupt-model-falls-back-to-energy lie-risk is its own slice) and the export-READ that closes
+the visible lie (next slice).
+
+**CHANGE (committed 82eff42).** Migration v41 adds nullable `denoised`/`diarized` INTEGER to speech_segments
+(STRICT-compatible; ALTER ADD COLUMN fires no FK cascade → not in FK_OFF_MIGRATIONS). Nullable is
+deliberate: NULL = "not recorded" for legacy rows — a fabricated 0 would be its own provenance lie. Threaded
+through the struct, the shared SEGMENT_SELECT_COLUMNS + positional map_row (idx 32/33), and all three insert
+paths (insert_segment, insert_segment_full — restore stays lossless, insert_segments_batch — the import
+path), mirroring the v36 proof-metadata columns. Populated at pipeline.rs build_segments_from_pcm (the ONE
+local-import site; both streaming + non-streaming route through it). Scribe cloud path leaves them None (no
+local denoise/diarization runs there — honest "not recorded", not a fabricated value).
+
+**FAIL-BEFORE:** db_tests `per_segment_processing_provenance_round_trips_and_stays_unknown_for_legacy_rows`
+uses DISTINCT true/false through the import + restore paths + None-stays-NULL; a TARGETED revert of the
+map_row read (denoised→None) failed it `left:None right:Some(true)`, passes with the fix. Also fixed the v40
+STRICT-recreate test: it re-ran v40 in isolation (which drops the new columns) then read via a HEAD-schema
+getter — now re-applies every post-v40 migration first (faithful to a real v40-THEN-v41 upgrade; weakens
+none of v40's STRICT/rowid/cascade/index assertions).
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (12.68s) ·
+`cargo test --lib` → `test result: ok. 1010 passed; 0 failed; 6 ignored` · `python run_python_policies.py` → 42 passed.
+
+**Adversarially verified** (Workflow, 4 independent skeptics vs source): positional column alignment,
+population semantics + missed sites, migration safety/replay/idempotency, serde/consumer back-compat — ALL
+refuted=false. No CONFIRMED findings. Two survivor notes (both non-defects, hand-verified): (1) the JSON/JSONL
+per-row export flattens SpeechSegment, so it now ADDITIVELY carries denoised/diarized for free (honest; no
+consumer depends on the exact key set — export tests green); (2) LOW/optional — Scribe could record
+Some(false) rather than None (deferred to the read-side slice, where cloud rows resolve via cloud_call).
+
+**NOT verified / NOT yet closed:** the export manifest STILL recomputes runConfig from export-day model
+state — the visible H3 lie is NOT closed until the export-READ slice reads these stored columns. No exe
+rebuild (import-write behavior changed). The write side is proven by unit round-trip, not a live import run.
+
+**Tier-0 status:** P0.2/P0.3 shipped; P0.4 WRITE side shipped, P0.4 READ side + vad_backend remain; P0.1
+owner-gated (GPU re-score). **Next: P0.4 read side** (export reads stored provenance, closing H3) →
+vad_backend → Tier-3. "Best / real #1" NOT claimed.
