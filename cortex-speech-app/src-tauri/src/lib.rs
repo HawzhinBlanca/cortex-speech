@@ -801,7 +801,58 @@ pub fn run() {
 fn fatal_app_error(message: String) -> ! {
     tracing::error!("CORTEX_STARTUP_FAIL: {message}");
     eprintln!("CORTEX_STARTUP_FAIL: {message}");
+    // P1.2: the release GUI runs with windows_subsystem="windows", so stdout/stderr are DISCARDED and
+    // the tracing file sink may not exist yet (data-dir create is itself a fatal path) — every fatal
+    // startup cause (instance lock held, unopenable/newer-schema DB, data-dir create failure) would
+    // otherwise present as "double-click the icon, nothing happens". Show a native modal so the user
+    // sees the real reason. show_fatal_message_box self-suppresses under headless/CDP automation.
+    #[cfg(windows)]
+    show_fatal_message_box(&message);
     std::process::exit(1);
+}
+
+/// UTF-16 encode with a trailing NUL terminator, for the `*W` Win32 APIs (which read until the NUL).
+#[cfg(windows)]
+fn to_wide_null(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// True when the app is being driven by an automated CDP / remote-debugging session — the e2e drivers
+/// (e2e_real_app.cjs, e2e_*_ipc.cjs, e2e_7b_connect.cjs) all spawn the exe with
+/// `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<n>`. Pure for testing.
+#[cfg(windows)]
+fn is_cdp_remote_debug(webview2_browser_args: Option<&str>) -> bool {
+    webview2_browser_args.is_some_and(|v| v.contains("--remote-debugging-port"))
+}
+
+/// Show a native modal error box for a fatal startup failure (no Tauri/webview exists this early, so
+/// tauri-plugin-dialog cannot be used — this is a raw Win32 MessageBoxW). Best-effort and side-effect
+/// only; the caller exits regardless of the user's click.
+#[cfg(windows)]
+fn show_fatal_message_box(message: &str) {
+    // No human is waiting on a modal when the app is driven headlessly (smoke/integration/audiobook) or
+    // over a CDP/remote-debugging automation session. Popping a topmost modal there blocks the desktop
+    // and hangs the driver's ~90s connect poll (e.g. the InstanceLock fatal fires when the owner's app
+    // is already open and an e2e driver launches a second instance). Suppress it — the eprintln/tracing
+    // above still record the reason. Only a genuine interactive double-click reaches the MessageBox.
+    if is_headless_mode() || is_cdp_remote_debug(std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").ok().as_deref())
+    {
+        return;
+    }
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST};
+    let caption = to_wide_null("Cortex Speech — cannot start");
+    let body = to_wide_null(message);
+    // SAFETY: hwnd is null (no parent window exists before the event loop); `body`/`caption` are valid,
+    // NUL-terminated UTF-16 buffers that outlive the call. MessageBoxW runs its own modal loop and needs
+    // no pre-existing message pump. The return value (which button) is irrelevant — we exit either way.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+    }
 }
 
 fn is_headless_mode() -> bool {
@@ -852,6 +903,33 @@ fn dirs_fallback(suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn to_wide_null_is_nul_terminated_utf16() {
+        // P1.2: the fatal-dialog marshalling. A `*W` Win32 API reads until a NUL, so a MISSING
+        // terminator would over-read past the buffer (garbage title/body or a crash). Assert the NUL is
+        // present, is the ONLY interior-free terminator for plain ASCII, and that non-ASCII (Sorani)
+        // round-trips through UTF-16.
+        assert_eq!(to_wide_null("Hi"), vec![0x48, 0x69, 0x00], "ASCII encodes + NUL-terminates");
+        assert_eq!(to_wide_null(""), vec![0x00], "empty string is a single NUL");
+        let w = to_wide_null("کوردی");
+        assert_eq!(*w.last().unwrap(), 0, "must end in a NUL terminator");
+        assert_eq!(String::from_utf16(&w[..w.len() - 1]).unwrap(), "کوردی", "Sorani round-trips via UTF-16");
+        assert!(w[..w.len() - 1].iter().all(|&u| u != 0), "no interior NUL before the terminator");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cdp_remote_debug_suppresses_the_fatal_dialog() {
+        // P1.2 regression: the fatal modal must be suppressed under CDP automation, or a fatal startup
+        // (e.g. InstanceLock held while the owner's app is open) pops a topmost box that hangs the e2e
+        // driver's connect poll. All e2e drivers set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS with the port.
+        assert!(is_cdp_remote_debug(Some("--remote-debugging-port=9222")), "the CDP port arg suppresses");
+        assert!(is_cdp_remote_debug(Some("--foo --remote-debugging-port=9222 --bar")), "embedded arg detected");
+        assert!(!is_cdp_remote_debug(Some("--disable-gpu")), "unrelated webview2 args do not suppress");
+        assert!(!is_cdp_remote_debug(None), "a real interactive launch (no such env) shows the dialog");
+    }
 
     fn test_app_state(data_dir: PathBuf) -> AppState {
         let normalizer = Arc::new(SoraniNormalizer::new());
