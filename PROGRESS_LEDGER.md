@@ -9808,3 +9808,45 @@ the user editing a file, not a code writer — out of scope; a one-time migratio
 **Next (roadmap):** P1.1 UNC guards on relink_audio / merge_dataset_json / restore_segment_snapshot →
 P1.2 native fatal-error dialog → P1.3 restore writer fence. Tier-0 done except owner-gated P0.1 (GPU re-score).
 "Best / real #1" NOT claimed — Tier-1 not yet shipped.
+
+### Iteration 169 — 2026-07-24 — P1.1 UNC/NTLM leak closed at 3 write paths + shared-guard hardening (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD d07782a, lock free (acquired). Next item = P1.1.
+
+**FIX P1.1 (HIGH security, audit R1/R2b) — renderer-supplied UNC paths could drive the SMB redirector
+(NTLM forced-auth leak) at three unguarded commands** (relink_audio, merge_dataset_json/all inserts,
+restore_segment_snapshot) — the class #131 fixed for exports, left open on these siblings. Root-cause fix
+at the SHARED write boundary: new validation::input::reject_unc_path (syntactic null+UNC, no canonicalize —
+for write paths where the path is stored/searched as-is and the target may not exist yet); validate_segment
+(the gate for insert_segment / insert_segment_full / insert_segments_batch / merge_dataset_json) now rejects
+a UNC audio_path, so merge AND every restore-via-insert_segment_full caller (couch undo, history undo) are
+covered — broader than the 3 audit-named sites. relink_audio + restore_segment_snapshot also get explicit
+boundary guards (relink's raw UPDATE bypasses validate_segment). Committed cec0a1e.
+
+**Adversarial verification FOUND A REAL LATENT GAP (fixed same commit).** 3-skeptic Workflow: over-blocking
+NONE, bypass/completeness NONE, but the guard-completeness skeptic (running actual rustc on this box)
+discovered the SHARED is_unc_path matched only Prefix::UNC|VerbatimUNC, while `\?\unc\...` (lowercase →
+Prefix::Verbatim) and `\.\UNC\...` (device namespace → Prefix::DeviceNS) ALSO drive the redirector yet
+slipped the guard under two aliases — a gap PRE-DATING this change (affected #131 export guard +
+validate_file_path/validate_output_path too). **Hand-verified independently** with a standalone rustc probe
+(scratchpad/unc_probe.rs): current guard=false for both spellings, hardened guard=true, and legit
+VerbatimDisk/Disk/empty stay false. Hardened is_unc_path to match the "UNC" keyword case-insensitively in
+the verbatim/device forms — closing all 4 spellings across every validator that routes through it.
+
+Regression gates (both FAIL-BEFORE verified): reject_unc_path_blocks_null_everywhere_and_unc_on_windows
+(null all-platforms; all 4 UNC spellings rejected; empty + verbatim-disk pass); insert_segment_rejects_unc_
+audio_path_ntlm_leak_guard (db_tests — UNC rejected at write boundary + not persisted; local inserts;
+FAIL-BEFORE shown by disabling the validate_segment guard → insert_segment(UNC) returned Ok → test failed →
+restored).
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (8.52s) ·
+`cargo test --lib` → `test result: ok. 1004 passed; 0 failed; 6 ignored` (89.54s).
+
+**NOT verified:** no rebuild of the shipped exe (security behavior changed — rebuild pending, owner's call).
+**Bonus beyond P1.1 scope:** the is_unc_path hardening also fixes the two-spelling gap in the pre-existing
+#131 export guard and validate_file_path/validate_output_path.
+
+**Next (roadmap):** P1.2 native fatal-error dialog (fatal_app_error is invisible under windows_subsystem) →
+P1.3 restore writer fence (jury/Scribe/couch). Tier-0 done except owner-gated P0.1. Tier-1: 1 of ~4 shipped.
+"Best / real #1" NOT claimed.
