@@ -21,6 +21,42 @@ fn make_segment(id: &str, audio_path: &str) -> SpeechSegment {
 }
 
 #[test]
+fn per_segment_processing_provenance_round_trips_and_stays_unknown_for_legacy_rows() {
+    // P0.4 (H3): denoised/diarized are persisted per segment (Migration v41) so a future export reads
+    // stored per-segment truth instead of recomputing from export-day model loadability. A fresh in-memory
+    // DB applies v41, so these round-trips also prove the migration ran. DISTINCT true/false values (never
+    // equal within a row) make the assertions catch a positional SELECT/map_row/INSERT column swap; None
+    // must persist as SQL NULL — "not recorded" — never a fabricated false (the honesty-law posture).
+    let db = make_db();
+
+    // IMPORT path — insert_segments_batch (what pipeline.rs::persist_segments actually calls).
+    let mut imported = make_segment("prov-import", "/a.wav");
+    imported.denoised = Some(true);
+    imported.diarized = Some(false);
+    db.insert_segments_batch(std::slice::from_ref(&imported)).unwrap();
+    let got = db.get_segment_by_id("prov-import").unwrap().expect("imported segment persisted");
+    assert_eq!(got.denoised, Some(true), "denoised must round-trip true via the batch import path");
+    assert_eq!(got.diarized, Some(false), "diarized must round-trip false — NOT the denoised value (positional guard)");
+
+    // RESTORE path — insert_segment_full must be lossless (opposite values from the import row).
+    let mut restored = make_segment("prov-restore", "/b.wav");
+    restored.denoised = Some(false);
+    restored.diarized = Some(true);
+    db.insert_segment_full(&restored).unwrap();
+    let got = db.get_segment_by_id("prov-restore").unwrap().expect("restored segment persisted");
+    assert_eq!(got.denoised, Some(false), "denoised must round-trip false via insert_segment_full");
+    assert_eq!(got.diarized, Some(true), "diarized must round-trip true via insert_segment_full");
+
+    // NOT-RECORDED — a row that never set the fields (a legacy pre-v41 row reads identically: NULL).
+    let legacy = make_segment("prov-legacy", "/c.wav");
+    assert_eq!(legacy.denoised, None, "default construction leaves provenance unrecorded");
+    db.insert_segment(&legacy).unwrap();
+    let got = db.get_segment_by_id("prov-legacy").unwrap().expect("legacy segment persisted");
+    assert_eq!(got.denoised, None, "unrecorded denoising must persist as NULL/None, never a fabricated false");
+    assert_eq!(got.diarized, None, "unrecorded diarization must persist as NULL/None, never a fabricated false");
+}
+
+#[test]
 fn insert_segment_rejects_unc_audio_path_ntlm_leak_guard() {
     // P1.1: validate_segment is the shared DB write boundary for merge_dataset_json AND every insert
     // path, so a UNC/network audio_path must be rejected here — otherwise a renderer-planted

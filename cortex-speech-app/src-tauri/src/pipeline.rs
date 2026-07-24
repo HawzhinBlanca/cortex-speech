@@ -2046,6 +2046,14 @@ impl ProcessingPipeline {
                 cloud_call: false,
                 decoder_config_hash: None,
                 normalizer_version,
+                // P0.4 per-segment processing provenance: record whether denoising / diarization
+                // ACTUALLY ran for this clip (the setting enabled AND the model was loadable), not the
+                // bare setting. This is per-FILE truth duplicated across the file's rows (honest), read
+                // at export instead of recomputing from export-day model state (H3). For diarization,
+                // `is_available()` reflects whether the CAM++ pass ran, independent of whether THIS
+                // segment received a label (streaming defers labeling; single-speaker files get one id).
+                denoised: Some(self.settings.enable_denoising && denoiser_service.is_active()),
+                diarized: Some(self.settings.enable_diarization && embedding_service.is_available()),
             });
         }
 

@@ -1124,6 +1124,27 @@ pub static MIGRATIONS: &[Migration] = &[
              INSERT INTO segments_fts(segments_fts) VALUES('rebuild');",
         ),
     },
+    Migration {
+        version: 41,
+        description: "Per-segment processing provenance: whether denoising/diarization actually ran (P0.4)",
+        // H3 fix (docs/ROADMAP_TO_NUMBER_ONE.md): the export manifest's runConfig stamps a single
+        // denoising/diarization flag computed from EXPORT-DAY model loadability onto every segment,
+        // regardless of what actually processed each clip at import. These per-row columns store the
+        // real outcome so a later export can read stored truth instead of recomputing from today's state.
+        //
+        // Nullable INTEGER (0/1): NULL = "not recorded" — every row imported before this migration, where
+        // we genuinely did not capture whether the denoiser/CAM++ ran; asserting a fabricated 0 would be
+        // its own provenance lie. New rows record `settings.enable_X && <model actually loadable>` at the
+        // single import construction site (pipeline.rs build_segments_from_pcm). STRICT-compatible
+        // (INTEGER); ALTER ADD COLUMN does not drop/recreate speech_segments, so it fires no FK cascade
+        // (unlike the v40 STRICT recreate) and needs no FK-off window.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN denoised INTEGER;
+                 ALTER TABLE speech_segments ADD COLUMN diarized INTEGER;",
+        down_sql: Some(
+            "ALTER TABLE speech_segments DROP COLUMN diarized;
+             ALTER TABLE speech_segments DROP COLUMN denoised;",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -1182,6 +1203,14 @@ mod tests {
                 Ok(())
             })
             .expect("the FK-off recreate must succeed");
+        }
+
+        // A live upgrade applies v40 and THEN every later migration; re-running v40's recreate in
+        // isolation leaves the table at v40's 34-column shape (its INSERT…SELECT copies only those 34),
+        // dropping any column a post-v40 migration added. Re-apply everything after v40 so HEAD-schema
+        // readers (get_segment_by_id below) see the real current shape — future-proof against v42+.
+        for later in MIGRATIONS.iter().filter(|m| m.version > 40) {
+            db.connection().execute_batch(later.up_sql).expect("re-applying a post-v40 migration must succeed");
         }
 
         let conn = db.connection();
