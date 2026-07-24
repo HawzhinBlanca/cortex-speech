@@ -10605,3 +10605,40 @@ non-empty; `PRAGMA integrity_check` = ok.
 
 **NOT yet done (Phase B remainder):** live export-bundle manifest + HF README checks on the real library;
 the full user loop (7B refine via WSL, review, verify, export) driven like a user; `make verify-10`.
+
+### Iteration 187 — 2026-07-25 — SHIP PHASE B: verify-10 driven to 21 PASS / 0 FAIL (real defect found + fixed)
+
+**verify-10 (the charter's done-gate) exposed a REAL production defect.** First run: RED on
+ignored-real-model. The lib-target preflight failure (7B server cold) MASKED two deeper failures that
+surfaced once the champion server was up: `pipeline_routes_to_finetuned_when_enabled` +
+`import_routes_to_finetuned_when_enabled` panicked E_ASR_7B_UNAVAILABLE — the fine-tuned engine was
+unreachable. Root cause (the recurring all-or-nothing class, one level up from the round-26 per-file fix):
+`select_bundled_models_dir` keys the ONE bundled root on CTC presence, so the partial exe-adjacent copy
+(target/release/models: CTC+Silero only) won the root and ORPHANED every repo-only sibling. In PRODUCTION
+(user dir has only the aligner) this orphaned the fine-tuned MMS engine, CAM++ diarization, the denoiser,
+and CTC-1B. **Fixed at the shared resolution layer** (a7cb10b): `bundled_dir_containing` searches the
+candidates PER FILE (selected-dir behavior unchanged when the file is present there);
+`model_root_candidates` + finetuned_model_paths require model.onnx+vocab.json in the SAME root.
+FAIL-BEFORE: the two real_audio tests (real FLEURS fixture + real fine-tuned ONNX) red before, green after.
+
+**7B champion server:** cold at first (the RED). start_7b_server.ps1's nohup-detach dies under a headless
+runner (its own NOTE documents this); launched via the documented headless pattern (harness holds
+`wsl -- bash -lc "exec python cortex_7b_server.py"`) → both GPUs serving ckb_Arab on 8799 (17.4 GB VRAM
+each); `wsl_7b_preflight_passes_when_server_up` ok. NOTE: this instance dies with the session — for daily
+use run start_7b_server.ps1 from an interactive console.
+
+**Final verify-10 (exe rebuilt at HEAD a7cb10b, freshness OK, CORTEX_AUDIO set):**
+`kept gates run: 23 - 21 PASS, 0 FAIL, 2 skipped` — incl. test-rust 394s, ignored-real-model 27.7s,
+real-app-e2e 23.9s (real exe + real Kurdish audio + real transcript), rtf-bench, egress-runtime, fairness.
+`VERDICT: INCOMPLETE - 2 kept gate(s) could not run (fuzz-smoke, refinery-lift). Green cannot be claimed.`
+
+**Honest residue (why not GREEN):** fuzz-smoke — cargo-fuzz cannot link on windows-msvc (ASAN CRT vs
+static-MT sherpa; measured 2026-07-11, documented in the probe) → a Linux-CI leg, structurally never
+runnable on this rig. refinery-lift — the fixed-seed injected-error synthetic benchmark is NOT BUILT; the
+last buildable charter gate. Plus the 5 OWNER-GATED-PENDING items and 8 owner-descoped distribution legs.
+
+**Ship-phase state:** Phase A complete (iter 186) + Phase B verification complete: 0 failing gates, every
+gate runnable on this rig runs and passes, the exe at HEAD, the champion engine proven live, the real
+user-loop e2e green. Remaining to claim GREEN: build refinery-lift; run fuzz-smoke in Linux CI; owner-gated
+items. Remaining human step per docs/SHIP_FINAL_PHASE.md: the owner's real review/export cycle + a quiet
+week of daily use.
