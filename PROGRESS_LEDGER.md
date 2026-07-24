@@ -9970,3 +9970,39 @@ window) and P1.4b denoiser/diarization streaming-loop rebuild retry. "Best / rea
 **Next (roadmap execution order — correcting a small out-of-order pick):** P2.1 honest library-load failure
 (frontend; npm gates) → P2.2 window unhandledrejection trap → P1.3b reservation gate → P1.4b denoiser retry →
 P0.4 per-segment provenance → P2.3/P2.4.
+
+### Iteration 173 — 2026-07-24 — P2.1 honest library-load failure + a red-gate fix from P1.1 (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD d3ce56d, lock free (acquired). Next item = P2.1.
+
+**GATE FIX (honesty) — P1.1 (cec0a1e) left run_python_policies.py RED.** Running the python policy gate this
+iteration surfaced that the P1.1 verbatim-disk test string r"\?\C:\Users\me\clip.wav" (input.rs) trips
+test_windows_repo_hygiene (hardcoded C:\Users\<name> in a public repo). P1.1 was Rust-only so I ran the cargo
+gates but not the python policies — which scan Rust too — and missed it. Changed the string to \?\C:\media\
+clip.wav (still a verbatim-disk non-UNC path; the test's point is unchanged). Committed eab9bb0. Lesson logged:
+run the python policies even on Rust-only changes (several policies scan the whole tree, not just python).
+
+**FIX P2.1 (audit F1) — a DB/IPC read failure rendered as an empty library.** segmentStore.ts load() swallowed
+failures to console.error and never updated the store, so a first-load failure showed "No segments loaded" —
+indistinguishable from a wiped library. New libraryLoadError store (cleared on success, set in catch + a toast
+via the reused, previously-dead notifications.loadSegmentsFailed key); App.svelte empty-state gains a leading
+{#if $libraryLoadError} branch with the real error + a Retry. Committed 4753edc.
+
+**Adversarial verification FOUND A REAL RACE (fixed same commit).** 2-skeptic Workflow: rendering / import-
+cycle / i18n-parity / tailwind all NONE; the lifecycle skeptic found the success-path libraryLoadError.set(null)
+ran AFTER the awaited conformal-threshold refresh WITHOUT a seq guard, so an older load resuming after a newer
+load already failed would clear the newer error (silently dropping the failure — the F1 bug, in a race).
+Hand-verified against source; added the same `if (seq !== loadSeq) return;` the page loop uses, before the clear.
+
+Regression gates (both FAIL-BEFORE verified): failing-load-sets-error + retry-clears; and superseded-run-does-
+not-clear-newer-error (removing the guard failed it: expected 'a newer load already failed', got null).
+
+Gate (frontend; Rust untouched beyond the hygiene one-liner): `npm run typecheck` → 0 errors ·
+`npm run lint` → 0 errors (4 pre-existing warnings) · `npm test` → 209 passed ·
+`python scripts/run_python_policies.py` → 41 passed · `cargo test --lib reject_unc_path_blocks` → ok.
+
+**NOT verified:** no rebuild of the shipped exe (UI behavior changed — pending); the error branch renders only
+in the segment-list view (a failure on another view is surfaced by the toast, which auto-dismisses in 8 s).
+
+**Next (roadmap):** P2.2 window unhandledrejection trap → P1.3b reservation gate → P1.4b denoiser retry →
+P0.4 → P2.3/P2.4. Tier-1 main items done; two sub-items + Tier-2 remain. "Best / real #1" NOT claimed.
