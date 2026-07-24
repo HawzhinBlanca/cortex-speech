@@ -57,6 +57,15 @@ pub struct CouchStatus {
 /// Start the couch server (idempotent: returns the existing session if already running).
 pub fn start(db_path: String) -> Result<CouchStatus, String> {
     let mut guard = COUCH.lock().unwrap_or_else(|p| p.into_inner());
+    // P1.3b: don't stand up the phone-review server (a background DB writer on a submit) while a DB
+    // restore is reserved. Checked UNDER the COUCH lock — the SAME lock is_running() (the restore fence)
+    // reads and that `*guard = Some(handle)` registers under — so the check+register and the fence read
+    // are mutex-serialized (airtight, like try_start_import): a restore reserved concurrently either sees
+    // the server registered (fence refuses) or is seen here (this refuses). An already-running server is
+    // also caught by the fence.
+    if crate::commands::restore_pending() {
+        return Err(crate::commands::RESTORE_IN_PROGRESS_MSG.to_string());
+    }
     if let Some(h) = guard.as_ref() {
         return Ok(status_of(h));
     }

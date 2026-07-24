@@ -47,6 +47,9 @@ pub async fn run_t0_gate(
 #[tauri::command]
 pub async fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("add_scribe_votes")?;
+    if super::restore_pending() {
+        return Err(super::RESTORE_IN_PROGRESS_MSG.into());
+    }
     // Same cloud-STT privacy gate as transcribe_audio_with_scribe: no segment audio is uploaded to
     // ElevenLabs unless the user explicitly opted in, even if a key is present in secrets.env.
     require_cloud_stt_consent(&state)?;
@@ -90,6 +93,12 @@ pub async fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> R
     // await, including run_blocking's JoinError path (result is captured, not `?`-propagated).
     if SCRIBE_VOTES_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Err("A Scribe vote batch is already running — wait for it to finish.".to_string());
+    }
+    // P1.3b (publish-then-recheck): the flag is PUBLISHED; re-read the reservation to close the atomic
+    // check-then-set race with prepare_restore (see run_wsl_refinement). Roll back the flag on refuse.
+    if super::restore_pending() {
+        SCRIBE_VOTES_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err(super::RESTORE_IN_PROGRESS_MSG.to_string());
     }
     let result = run_blocking(move || {
         let mut added = 0usize;
@@ -143,6 +152,9 @@ pub async fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> R
 #[tauri::command]
 pub async fn run_dpo_update(state: State<'_, AppState>, endpoint: String) -> Result<String, String> {
     RATE_LIMITER.check("run_dpo_update")?;
+    if super::restore_pending() {
+        return Err(super::RESTORE_IN_PROGRESS_MSG.into());
+    }
     // DPO POSTs private, transcript-derived preference pairs outbound — a parallel cloud-LLM channel,
     // so it requires the same explicit cloud-LLM opt-in (the endpoint allow-list is a separate,
     // non-consent control). Gate before building/serializing any of that private data — the consent
@@ -158,6 +170,12 @@ pub async fn run_dpo_update(state: State<'_, AppState>, endpoint: String) -> Res
         .ok_or_else(|| "App data directory is unavailable for the DPO update.".to_string())?;
     // R3: fence a restore while the DPO learning write is in flight (dedicated connection).
     let _jury_writer = super::BgDbWriterGuard::new();
+    // P1.3b (publish-then-recheck): the writer is now registered in BG_DB_WRITERS; re-read the
+    // reservation to close the check-then-register race with prepare_restore. The guard drops on this
+    // return, so BG_DB_WRITERS rolls back.
+    if super::restore_pending() {
+        return Err(super::RESTORE_IN_PROGRESS_MSG.into());
+    }
     run_blocking(move || crate::jury::learning::run_dpo_update(&db, &endpoint).map_err(|e| e.to_string())).await
 }
 
@@ -167,6 +185,9 @@ pub async fn run_jury_pipeline(
     segment_ids: Vec<String>,
 ) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("run_jury_pipeline")?;
+    if super::restore_pending() {
+        return Err(super::RESTORE_IN_PROGRESS_MSG.into());
+    }
     let settings = state.lock_settings().clone();
     // Run on a dedicated connection so the global db Mutex is not held across the jury's blocking T2
     // cloud calls — holding it would freeze the UI's get_segments for the whole run (JuryDbSource
@@ -181,6 +202,12 @@ pub async fn run_jury_pipeline(
     // its own dedicated connection (not the global db Mutex), so without this a restore could run
     // mid-pipeline and take late verdicts into the just-restored library.
     let _jury_writer = super::BgDbWriterGuard::new();
+    // P1.3b (publish-then-recheck): the writer is now registered in BG_DB_WRITERS; re-read the
+    // reservation to close the check-then-register race with prepare_restore. The guard drops on this
+    // return, so BG_DB_WRITERS rolls back.
+    if super::restore_pending() {
+        return Err(super::RESTORE_IN_PROGRESS_MSG.into());
+    }
     run_blocking(move || {
         source.with(|db| run_jury_pipeline_core_via(db, &settings, segment_ids, jury_data_dir.as_deref()))
     })
@@ -198,6 +225,9 @@ pub async fn run_t2_for_segment(
     api_key: String,
 ) -> Result<crate::jury::t2_listener::T2Result, String> {
     STRICT_RATE_LIMITER.check("run_t2_for_segment")?;
+    if super::restore_pending() {
+        return Err(super::RESTORE_IN_PROGRESS_MSG.into());
+    }
     validate::validate_identifier(&segment_id)?;
 
     let settings = state.lock_settings().clone();
@@ -225,6 +255,12 @@ pub async fn run_t2_for_segment(
     // lock AFTER the cloud call, so a restore that slipped in during the (lock-free) cloud window would
     // otherwise take this machine verdict into the just-restored library.
     let _jury_writer = super::BgDbWriterGuard::new();
+    // P1.3b (publish-then-recheck): the writer is now registered in BG_DB_WRITERS; re-read the
+    // reservation to close the check-then-register race with prepare_restore. The guard drops on this
+    // return, so BG_DB_WRITERS rolls back.
+    if super::restore_pending() {
+        return Err(super::RESTORE_IN_PROGRESS_MSG.into());
+    }
     // Gather every DB input under a BRIEF lock, then drop it before listen_and_judge. Holding the
     // global AppState db Mutex across the cloud T2 round-trip (n_samples Gemini audio calls) would
     // freeze every other DB-touching command app-wide for the whole network call. The lock is

@@ -285,6 +285,11 @@ impl AppState {
 
     pub fn try_start_import(&self) -> Result<(), String> {
         let mut import = self.lock_import_state();
+        // P1.3b: refuse to start while a DB restore is reserved. Checked UNDER the import_state lock (and
+        // set-Running is under the same lock) so it can't race prepare_restore's writers_active() read.
+        if crate::commands::restore_pending() {
+            return Err(crate::commands::RESTORE_IN_PROGRESS_MSG.into());
+        }
         if *import == ImportState::Running {
             return Err("Import already in progress".into());
         }
@@ -306,6 +311,10 @@ impl AppState {
 
     pub fn try_start_batch(&self) -> Result<(), String> {
         let mut batch = self.lock_batch_state();
+        // P1.3b: refuse to start a batch while a DB restore is reserved (checked under the batch_state lock).
+        if crate::commands::restore_pending() {
+            return Err(crate::commands::RESTORE_IN_PROGRESS_MSG.into());
+        }
         if *batch == BatchState::Running {
             return Err("Batch operation already in progress".into());
         }

@@ -1647,11 +1647,55 @@ pub async fn db_backup(dest: String, state: State<'_, AppState>) -> Result<serde
     .await
 }
 
+/// P1.3b (audit): set for the whole DB restore (prepare_restore → page swap complete). `writers_active`
+/// is the FENCE (refuse a restore while a writer is already running); this is the RESERVATION (refuse a
+/// NEW writer while a restore is pending). Together they close the check-then-act window where a writer
+/// could start between prepare_restore's `writers_active()` check and the swap.
+pub(crate) static RESTORE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True while a DB restore is reserved/in progress — consulted by every writer-START path.
+pub(crate) fn restore_pending() -> bool {
+    RESTORE_PENDING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The uniform error a writer-start returns while a restore is pending.
+pub(crate) const RESTORE_IN_PROGRESS_MSG: &str =
+    "A database restore is in progress — wait for it to finish before starting this operation.";
+
+/// RAII reservation: sets [`RESTORE_PENDING`] on construction, clears it on drop, so the reservation is
+/// released even if the restore errors or panics. Held by db_restore / restore_db_from_snapshot for the
+/// whole restore, and (crucially) dropped on prepare_restore's own early-return if a writer is active.
+pub(crate) struct RestoreReservation;
+impl RestoreReservation {
+    fn new() -> Self {
+        RESTORE_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+impl Drop for RestoreReservation {
+    fn drop(&mut self) {
+        RESTORE_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Shared restore precondition (true-10 audit 2026-07-09): refuse while an import/batch worker may
 /// be writing, and pin a rotation-exempt copy of the CURRENT live DB first so a mis-restore of the
 /// wrong snapshot is itself recoverable (previously only from a ≤10-min rolling snapshot that
-/// rotated out within ~100 minutes).
-fn prepare_restore(state: &State<'_, AppState>) -> Result<(), String> {
+/// rotated out within ~100 minutes). Returns a RestoreReservation the caller MUST hold across the
+/// restore so no new writer can start mid-restore (P1.3b).
+fn prepare_restore(state: &State<'_, AppState>) -> Result<RestoreReservation, String> {
+    // Reserve FIRST: set RESTORE_PENDING before checking writers_active, so a writer racing this check
+    // observes the reservation and refuses. THEN verify none is already running (the fence). The
+    // reservation is closed by ONE OF TWO airtight mechanisms per writer, NOT a single shared lock:
+    //   • import/batch and couch::start check restore_pending() UNDER the same mutex writers_active()
+    //     reads (import_state / batch_state / COUCH), so their check+register is totally ordered against
+    //     the fence read — a concurrent restore either sees them registered or is seen by them.
+    //   • the atomic-flag writers (WSL refine, Scribe votes, jury via BG_DB_WRITERS) use publish-then-
+    //     recheck: they SET their flag, then RE-READ the reservation and roll back if set. Under SeqCst
+    //     the fence's {store RESTORE_PENDING; load flag} and the writer's {store flag; load RESTORE_PENDING}
+    //     can't both read stale, so one side always refuses.
+    // If a writer IS already running, the reservation drops on this early return.
+    let reservation = RestoreReservation::new();
     if state.writers_active() {
         return Err("A background write is in progress (import, batch, 7B refinement, jury, Scribe \
                     votes, or the Couch Review server) — cancel it, let it finish, or stop Couch \
@@ -1666,7 +1710,7 @@ fn prepare_restore(state: &State<'_, AppState>) -> Result<(), String> {
             Err(e) => tracing::warn!("pre-restore snapshot failed (continuing with restore): {e}"),
         }
     }
-    Ok(())
+    Ok(reservation)
 }
 
 #[tauri::command]
@@ -1675,7 +1719,9 @@ pub async fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), S
     // database (PRAGMA integrity_check on open verifies this). This completes the backup/restore
     // pair so the app is never at risk of data loss mid-import or mid-review.
     let validated = validate::validate_file_path(&src)?;
-    prepare_restore(&state)?;
+    // Hold the reservation across the whole restore: RESTORE_PENDING stays set until this guard drops
+    // (after the page swap + history clear), so no new writer can start mid-restore (P1.3b).
+    let _restore_reservation = prepare_restore(&state)?;
     // Heavy DB file-copy + reopen — off the main thread. The lock is taken INSIDE the task (never
     // across the await); prepare_restore already refused if writers are active.
     let db = state.db_arc();
@@ -1766,7 +1812,9 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
     if !src.is_file() {
         return Err(format!("snapshot '{name}' has no database file"));
     }
-    prepare_restore(&state)?;
+    // Hold the reservation across the whole restore: RESTORE_PENDING stays set until this guard drops
+    // (after the page swap + history clear), so no new writer can start mid-restore (P1.3b).
+    let _restore_reservation = prepare_restore(&state)?;
     // Heavy DB file-copy + reopen — off the main thread; the lock is taken INSIDE the task.
     let restore_result = {
         let db = state.db_arc();
@@ -2007,11 +2055,23 @@ pub fn run_wsl_refinement(
     test_one: bool,
 ) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("run_wsl_refinement")?;
+    // P1.3b: don't start the 7B refinement loop (a background DB writer) while a restore is reserved.
+    if restore_pending() {
+        return Err(RESTORE_IN_PROGRESS_MSG.into());
+    }
 
     // Single-run guard: claim the running flag atomically. If it was already true, a batch is in
     // flight — refuse rather than starting a second concurrent loop over the same segments.
     if WSL_REFINE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Err("WSL 7B refinement batch transcription is already running.".into());
+    }
+    // P1.3b (publish-then-recheck): the running flag is now PUBLISHED; re-read the reservation. This
+    // closes the atomic check-then-set race with prepare_restore (which sets RESTORE_PENDING then reads
+    // this flag via writers_active): either it already observed our flag (the fence refuses the restore),
+    // or we observe its reservation here and roll back — the two orderings can no longer both slip.
+    if restore_pending() {
+        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err(RESTORE_IN_PROGRESS_MSG.into());
     }
     // The running flag is now OURS; every early return below MUST clear it or the guard would wedge.
     // Reset CANCEL at the START of the run (standard cancellation-token pattern) rather than trusting
