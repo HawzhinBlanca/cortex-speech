@@ -202,6 +202,50 @@ fn list_stage_events_for_reports(
     Ok(events)
 }
 
+/// P0.4 read side (H3): the per-segment processing-provenance distribution, tallied from the STORED
+/// `denoised`/`diarized` columns (Migration v41) of the segments actually being exported — the honest
+/// replacement for the export-day model-loadability booleans the old manifest computed at export time and
+/// stamped uniformly on every row regardless of when each clip was processed.
+///
+/// `applied` = the model actually ran for that segment at import; `not_applied` = it did not;
+/// `not_recorded` = a legacy row imported before the columns existed (`NULL`). A MIXED export is reported
+/// as this real distribution, never collapsed to a single fabricated aggregate boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ProvenanceCounts {
+    applied: usize,
+    not_applied: usize,
+    not_recorded: usize,
+}
+
+impl ProvenanceCounts {
+    fn tally(values: impl Iterator<Item = Option<bool>>) -> Self {
+        let mut c = Self::default();
+        for v in values {
+            match v {
+                Some(true) => c.applied += 1,
+                Some(false) => c.not_applied += 1,
+                None => c.not_recorded += 1,
+            }
+        }
+        c
+    }
+
+    /// The honest source for the single `runConfig` boolean: true ONLY when EVERY exported segment
+    /// recorded the model as having actually run (at least one, none not-applied, none unrecorded). Never
+    /// true for a mixed or partially-unrecorded export — those are described by the full distribution.
+    fn all_applied(&self) -> bool {
+        self.applied > 0 && self.not_applied == 0 && self.not_recorded == 0
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "applied": self.applied,
+            "notApplied": self.not_applied,
+            "notRecorded": self.not_recorded,
+        })
+    }
+}
+
 pub fn export_dataset_bundle(
     db: &Database,
     model_manager: &ModelManager,
@@ -375,6 +419,24 @@ pub fn export_dataset_bundle(
     let total_duration_ms: i64 = segments.iter().map(|s| s.duration_ms).sum();
     let verified_segments = segments.iter().filter(|s| s.verified).count();
     let training_ready_segments = training_grade_summary.training_ready_segments;
+
+    // P0.4 read side (H3): read the STORED per-segment provenance of the rows actually being exported,
+    // instead of recomputing denoising/diarization from export-day model loadability and stamping it on
+    // every clip. `denoised`/`diarized` (Migration v41) record whether each model actually ran at IMPORT.
+    let denoised_provenance = ProvenanceCounts::tally(segments.iter().map(|s| s.denoised));
+    let diarized_provenance = ProvenanceCounts::tally(segments.iter().map(|s| s.diarized));
+    let run_config = {
+        // The two capability args to config_from_settings are inert here (immediately overridden below):
+        // runConfig's denoising/diarization now report STORED per-segment truth, not export-day
+        // loadability. The single boolean is honest ONLY when unanimous — a mixed export reads false and
+        // is fully described by `processingProvenance` below (never a fabricated aggregate). model_version
+        // / vad_threshold / durations / normalization remain the export-time settings snapshot.
+        let mut rc = crate::runs::config_from_settings(settings, false, false);
+        rc.denoising = denoised_provenance.all_applied();
+        rc.diarization = diarized_provenance.all_applied();
+        rc
+    };
+
     let manifest = serde_json::json!({
         "schemaVersion": 1,
         "app": "cortex-speech-app",
@@ -391,15 +453,16 @@ pub fn export_dataset_bundle(
         "agentStageEventCount": agent_stage_event_count,
         "longFileDossierCount": long_file_dossier_count,
         "totalDurationMs": total_duration_ms,
-        // Provenance: pass the ACTUAL model loadability (is_active/is_available), NOT mere on-disk
-        // presence or the settings flag — a present-but-unloadable model leaves audio un-denoised /
-        // segments unlabeled, so the flag alone would record a false denoising=true / diarization=true
-        // (see ModelManager::denoiser_loadable + diarizer_loadable and their is_active/is_available contracts).
-        "runConfig": crate::runs::config_from_settings(
-            settings,
-            model_manager.denoiser_loadable(),
-            model_manager.diarizer_loadable(),
-        ),
+        // H3 (P0.4 read side): runConfig.denoising/diarization report STORED per-segment truth (whether
+        // the model actually ran at import), and processingProvenance carries the full per-segment
+        // distribution — instead of recomputing from export-day model loadability and stamping one flag on
+        // every clip regardless of when it was processed.
+        "runConfig": run_config,
+        "processingProvenance": {
+            "total": segments.len(),
+            "denoised": denoised_provenance.to_json(),
+            "diarized": diarized_provenance.to_json(),
+        },
         "validation": {
             "blocked": validation_gate.blocked,
             "errors": validation_gate.error_count,

@@ -1948,25 +1948,39 @@ def test_snapshot_restore_preserves_live_cloud_consent() -> None:
         )
 
 
-def test_bundle_runconfig_denoising_reflects_loadability_not_mere_presence() -> None:
-    """The bundle manifest's runConfig.denoising is the provenance record of whether audio was denoised.
-    config_from_settings(settings, ACTIVE) computes `enable_denoising && ACTIVE`, and DenoiserService::is_active's
-    contract explicitly forbids recording denoising the model did not perform. denoiser_present() is a mere disk
-    check (GTCRN file exists >=400KB), so a present-but-unloadable model (opset/EP incompatibility, provider init
-    failure) would record denoising=true while the pipeline correctly left the audio un-denoised (pipeline.rs:1780
-    warns). The bundle must pass the LOADABILITY signal (denoiser_loadable / is_active), not denoiser_present.
-    Exercising it needs the real GTCRN ONNX to actually load, so it is source-pinned."""
+def test_bundle_runconfig_reflects_stored_per_segment_provenance_not_export_day_state() -> None:
+    """P0.4 (H3): the bundle manifest's runConfig.denoising/diarization is the provenance record of whether
+    each clip was ACTUALLY denoised/diarized. It MUST be read from the STORED per-segment provenance of the
+    exported rows (the Migration-v41 `denoised`/`diarized` columns), NOT recomputed at export time from
+    current model state and stamped uniformly on every clip. Computing it from export-day loadability (or
+    mere disk presence) is the H3 provenance lie: a corpus assembled when the denoiser worked, exported
+    after it was removed/broke, would falsely record denoising=false for clips that WERE denoised (and vice
+    versa). The manifest also emits the full per-segment distribution as `processingProvenance`, so a MIXED
+    export is never collapsed to a single fabricated boolean (the runConfig bool is unanimity-only). The
+    round-trip is exercised by export_bundle_tests; this source-pins the invariant against regression.
+
+    Supersedes the earlier gate that REQUIRED export-day denoiser_loadability here (round-23): that was the
+    honest interim before per-segment provenance existed; P0.4 replaces it with the stronger stored truth.
+    """
     bundle = (REPO_ROOT / "src-tauri" / "src" / "export_bundle.rs").read_text(encoding="utf-8")
-    if "config_from_settings(settings, model_manager.denoiser_present())" in bundle:
-        raise AssertionError(
-            "bundle runConfig passes denoiser_present() (mere disk presence) to config_from_settings — records "
-            "denoising=true for a present-but-unloadable model, a provenance lie. Pass model_manager."
-            "denoiser_loadable() (actual is_active) instead."
-        )
-    if "denoiser_loadable" not in bundle:
-        raise AssertionError(
-            "bundle runConfig does not use the denoiser LOADABILITY signal — denoising provenance may over-claim."
-        )
+    # Regression guard: runConfig provenance must NOT be recomputed from export-day model state. These
+    # probes construct an ONNX service to test TODAY's loadability — the exact export-day signal H3 forbids.
+    for banned in ("denoiser_present", "denoiser_loadable", "diarizer_present", "diarizer_loadable"):
+        if banned in bundle:
+            raise AssertionError(
+                f"export_bundle.rs references `{banned}` — runConfig provenance must come from the STORED "
+                "per-segment denoised/diarized columns of the exported rows, never from export-day model "
+                "loadability/presence (the H3 lie). Use ProvenanceCounts over the exported segments."
+            )
+    # Positive: the manifest must read stored per-segment provenance and emit the full distribution.
+    for required in ("ProvenanceCounts", "denoised_provenance", "diarized_provenance", '"processingProvenance"'):
+        if required not in bundle:
+            raise AssertionError(
+                f"bundle manifest no longer reads stored per-segment provenance (`{required}` missing) — "
+                "runConfig may have regressed to recomputing denoising/diarization from export-day model "
+                "state (H3). Derive it from the exported rows' denoised/diarized columns and emit "
+                "processingProvenance."
+            )
 
 
 def test_default_transcribe_segment_refuses_blank_draft() -> None:
@@ -2230,7 +2244,7 @@ def main() -> None:
     test_finetuned_fallback_counter_excludes_the_wsl_7b_primary_path()
     test_asr_load_gate_verifies_the_tokens_vocab_not_only_the_model()
     test_snapshot_restore_preserves_live_cloud_consent()
-    test_bundle_runconfig_denoising_reflects_loadability_not_mere_presence()
+    test_bundle_runconfig_reflects_stored_per_segment_provenance_not_export_day_state()
     test_pipeline_duration_probe_failures_are_not_silent()
     test_export_bundle_model_metadata_load_errors_are_visible()
     test_eval_read_paths_do_not_silently_drop_rows()

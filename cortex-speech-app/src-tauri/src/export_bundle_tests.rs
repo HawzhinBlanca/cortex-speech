@@ -1519,3 +1519,74 @@ fn draft_export_replaces_bundle_metadata_atomically() {
     assert!(!out.join("manifest.json.tmp").exists());
     assert!(!out.join("dataset_card.md.tmp").exists());
 }
+
+#[test]
+fn provenance_counts_tally_and_unanimity() {
+    // P0.4 read side: the pure helper the manifest uses. Distinct counts across all three states catch a
+    // mis-tally; all_applied() must be TRUE only when every segment recorded the model as having run.
+    let c = ProvenanceCounts::tally([Some(true), Some(false), None, Some(true)].into_iter());
+    assert_eq!((c.applied, c.not_applied, c.not_recorded), (2, 1, 1));
+    assert!(!c.all_applied(), "a mixed set is NOT unanimously applied");
+    assert!(ProvenanceCounts::tally([Some(true), Some(true)].into_iter()).all_applied(), "all true -> unanimous");
+    assert!(
+        !ProvenanceCounts::tally([Some(true), None].into_iter()).all_applied(),
+        "an unrecorded row breaks unanimity"
+    );
+    assert!(!ProvenanceCounts::tally(std::iter::empty()).all_applied(), "an empty export is not 'all applied'");
+    assert!(!ProvenanceCounts::tally([Some(false)].into_iter()).all_applied(), "not-applied is not unanimous");
+}
+
+#[test]
+fn manifest_reads_stored_per_segment_provenance_not_export_day_model_state() {
+    // P0.4 read side (H3): the manifest must report the STORED denoised/diarized of the EXPORTED rows,
+    // never a single flag recomputed from export-day model loadability. Mixed denoising (applied/not/
+    // unrecorded) + unanimous diarization proves both the distribution and the unanimity boolean.
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let mk = |id: &str, denoised: Option<bool>, diarized: Option<bool>| {
+        let audio = tmp.path().join(format!("{id}.wav"));
+        std::fs::write(&audio, b"audio").unwrap();
+        SpeechSegment {
+            id: id.into(),
+            audio_path: audio.to_string_lossy().to_string(),
+            raw_transcript: "ڕستەیەکی کوردی".into(),
+            duration_ms: 1000,
+            denoised,
+            diarized,
+            ..SpeechSegment::default()
+        }
+    };
+    // denoised: applied=1, not_applied=1, not_recorded=1 (mixed) -> denoising=false.
+    // diarized:  applied=3, not_applied=0, not_recorded=0 (unanimous) -> diarization=true.
+    db.insert_segments_batch(&[
+        mk("s-a", Some(true), Some(true)),
+        mk("s-b", Some(false), Some(true)),
+        mk("s-c", None, Some(true)),
+    ])
+    .unwrap();
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+    // Non-production so the training-ready gate does not block; the manifest is written regardless.
+    export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+
+    let prov = &manifest["processingProvenance"];
+    assert_eq!(prov["total"].as_u64(), Some(3));
+    assert_eq!(prov["denoised"]["applied"].as_u64(), Some(1));
+    assert_eq!(prov["denoised"]["notApplied"].as_u64(), Some(1));
+    assert_eq!(prov["denoised"]["notRecorded"].as_u64(), Some(1));
+    assert_eq!(prov["diarized"]["applied"].as_u64(), Some(3));
+    assert_eq!(prov["diarized"]["notApplied"].as_u64(), Some(0));
+    assert_eq!(prov["diarized"]["notRecorded"].as_u64(), Some(0));
+    // The single runConfig boolean reflects STORED unanimity, not export-day loadability (no models on
+    // disk here — the old code would have computed denoising/diarization from failed load probes).
+    assert_eq!(manifest["runConfig"]["denoising"].as_bool(), Some(false), "mixed denoising -> false");
+    assert_eq!(
+        manifest["runConfig"]["diarization"].as_bool(),
+        Some(true),
+        "unanimous diarization -> true (from stored truth)"
+    );
+}
