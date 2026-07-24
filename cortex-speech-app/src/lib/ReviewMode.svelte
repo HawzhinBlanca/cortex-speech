@@ -5,7 +5,7 @@
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import { settings } from './stores/settingsStore';
-  import { showReviewInbox, showConfirmDialog } from './stores/uiStore';
+  import { showReviewInbox, showConfirmDialog, isProcessing } from './stores/uiStore';
   import { physicalKey } from './keyboard';
   import { t } from './i18n';
   import Waveform from './Waveform.svelte';
@@ -157,7 +157,11 @@
   let retranscribing = $state(false);
   function retranscribe(engine: 'champion' | 'finetuned') {
     const seg = current;
-    if (!seg || retranscribing || saving || aligning) return;
+    // P2.3b: refuse while a batch/import is running. doRetranscribe writes rawTranscript, which is NOT
+    // in the targeted field-update whitelist, so it must whole-row upsert — and the store row is stale
+    // vs the DB during a batch, so it would revert the batch's writes. Re-transcribe is itself a machine
+    // op, so refusing it during another machine run is correct (matches the curate transcribe handlers).
+    if (!seg || retranscribing || saving || aligning || $isProcessing) return;
     // GUARD (2026-07-15, from the live-test incident): re-transcribing a VERIFIED clip replaces the
     // human-reviewed gold with a machine draft and reopens it — destroying review work must never be
     // one accidental click. The pre-save snapshot goes on the undo stack either way, so even a
@@ -177,8 +181,10 @@
   async function doRetranscribe(engine: 'champion' | 'finetuned') {
     const seg = current;
     // `aligning` too: the clip-load background align persists fresh CTC timings mid-flight; an
-    // upsert built from the pre-align snapshot would revert them (stale-spread clobber).
-    if (!seg || retranscribing || saving || aligning) return;
+    // upsert built from the pre-align snapshot would revert them (stale-spread clobber). `$isProcessing`
+    // (P2.3b): rawTranscript is not field-update-whitelisted so this must whole-row upsert, which would
+    // revert a concurrent batch's writes (the store is stale vs the DB during a batch) — refuse instead.
+    if (!seg || retranscribing || saving || aligning || $isProcessing) return;
     retranscribing = true;
     try {
       const result =
@@ -257,9 +263,10 @@
       // recordHumanDecision FIRST so a validation failure aborts before updateSegment commits (same
       // ordering rationale as submit()). freshRow AFTER it: same stale-spread rationale as submit().
       await api.recordHumanDecision(seg.id, 'reject', null);
-      const updated: SpeechSegment = { ...freshRow(seg.id, seg), verified: true };
-      await api.updateSegment(updated);
-      segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
+      // P2.3b: targeted field update (verified is whitelisted) — no whole-row upsert of the batch-stale
+      // store row, which would revert a concurrent batch's writes to this segment.
+      await api.updateSegmentFields(seg.id, { verified: true });
+      segments.update((list) => list.map((s) => (s.id === seg.id ? { ...s, verified: true } : s)));
       notifications.success($t('review.markedBad'));
       advance();
     } catch (e) {
@@ -495,9 +502,16 @@
       // Build the upsert AFTER the slow decision call (whole-file hash on 'edit' takes hundreds of
       // ms) from the freshest store row: update_segment writes the whole row, so a pre-await spread
       // would revert timings the background aligner persisted inside that window.
-      const updated: SpeechSegment = { ...freshRow(seg.id, seg), annotatedTranscript: text, verified: true };
-      await api.updateSegment(updated);
-      segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
+      // P2.3b (audit F2 completeness): persist ONLY the whitelisted fields via the targeted field
+      // update — never a whole-row updateSegment of freshRow (the STORE row), which is stale vs the DB
+      // while a background batch (normalize/transcribe/rediarize) writes this segment on its own
+      // connection, so the upsert reverted the batch's freshly-written columns. A field update touches
+      // only annotatedTranscript + verified (both whitelisted), so it is clobber-safe vs a batch AND an
+      // aligner. The backend re-reads the fresh row under the db lock (no TOCTOU).
+      await api.updateSegmentFields(seg.id, { annotatedTranscript: text, verified: true });
+      segments.update((list) =>
+        list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text, verified: true } : s)),
+      );
       editCache.delete(seg.id); // persisted — drop the in-progress copy
       notifications.success($t('saved'));
       // The DB/store write above targets seg by id and is correct even if the reviewer navigated away during
@@ -538,19 +552,19 @@
     // A CLEARED textarea is dirty too but must NOT be drafted: persisting annotatedTranscript=''
     // blanks the gold transcript with no undo entry (submit() refuses the same state). The cleared
     // text survives in editCache for this session, so nothing is lost by skipping the persist.
-    // `!aligning` too: while a clip's background CTC alignment is in flight, a whole-row draft built from
-    // the pre-align store row carries the STALE (heuristic) alignmentJson/quality; if it lands after the
-    // aligner persisted real CTC timings it reverts them (the whole-row-clobber class — every sibling
-    // mutator submit/markBad/doRetranscribe already bails on `aligning`). Skipping the persist here loses
-    // nothing: the load $effect stashes the dirty edit in editCache before switching, and the unmount
-    // flush persists it. freshRow (not `{...seg}`) re-reads the current row so we never spread a stale one.
-    if (dirty && current && !saving && !aligning && editText.trim()) {
+    // P2.3b: persist the navigation DRAFT via the targeted field update (annotatedTranscript only). The
+    // old whole-row updateSegment of the store row reverted a concurrent batch's writes to this segment
+    // (batch-stale store), and needed a `!aligning` skip to avoid reverting the aligner's timings too. A
+    // field update never touches alignmentJson, so it is clobber-safe vs BOTH a batch and an in-flight
+    // aligner — no `aligning` skip needed, and the draft is persisted immediately rather than deferred to
+    // the unmount flush / editCache.
+    if (dirty && current && !saving && editText.trim()) {
       const seg = current;
-      const draft: SpeechSegment = { ...freshRow(seg.id, seg), annotatedTranscript: editText.trim() };
+      const text = editText.trim();
       saving = true;
       try {
-        await api.updateSegment(draft);
-        segments.update((list) => list.map((s) => (s.id === seg.id ? draft : s)));
+        await api.updateSegmentFields(seg.id, { annotatedTranscript: text });
+        segments.update((list) => list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)));
       } catch (e) {
         notifications.error($t('notifications.saveFailed'), { detail: String(e) });
       } finally {

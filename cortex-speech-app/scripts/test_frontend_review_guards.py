@@ -64,7 +64,10 @@ def test_submit_guards_editor_writes_against_navigation() -> None:
     `if (current?.id !== seg.id) return;` must sit between the store write and the editor write. Sibling of
     doRetranscribe's identical guard (found by adversarial hunt-7 / iter 163)."""
     body = _function_body(_read("src/lib/ReviewMode.svelte"), "async function submit(")
-    store_write = body.find("await api.updateSegment(updated);")
+    # P2.3b: the persist is now the TARGETED field update (was a whole-row updateSegment). The
+    # wrong-segment-guard invariant is unchanged — the guard must still sit between the store write and
+    # the editor write; only the store-write marker moved.
+    store_write = body.find("await api.updateSegmentFields(seg.id,")
     editor_write = body.find("editText = text;")
     guard = body.find("if (current?.id !== seg.id) return;")
     if store_write == -1 or editor_write == -1:
@@ -77,26 +80,25 @@ def test_submit_guards_editor_writes_against_navigation() -> None:
         )
 
 
-def test_go_draft_persist_bails_on_aligning_and_uses_freshrow() -> None:
-    """ReviewMode.go(): navigating with a dirty edit persists it as a draft via a WHOLE-ROW updateSegment.
-    That row includes alignment_json/alignment_quality, so (a) it must not run while a background CTC
-    alignment is in flight (`!aligning`) — else a draft built from the pre-align row reverts freshly
-    persisted CTC timings to heuristic (the whole-row-clobber class) — and (b) the draft must be built from
-    freshRow(seg.id, seg), NOT a stale `{...seg}` spread. Every sibling mutator (submit/markBad/
-    doRetranscribe) already guards `aligning` + uses freshRow; go() must match."""
+def test_go_draft_persist_uses_targeted_field_update() -> None:
+    """ReviewMode.go(): navigating with a dirty edit persists it as a draft. P2.3b: it must use the
+    TARGETED api.updateSegmentFields (annotatedTranscript only) — NEVER a whole-row api.updateSegment of
+    the store row. A whole-row upsert reverts a concurrent background batch's writes to this segment (the
+    store is stale vs the DB during a batch) AND a mid-align aligner's CTC timings (the whole-row-clobber
+    class). A field update touches only annotatedTranscript, so it is clobber-safe vs BOTH — which is why
+    the old `!aligning` skip + freshRow spread are no longer needed here. Stronger invariant than before:
+    the persist is structurally incapable of the clobber, not merely guarded against it."""
     body = _function_body(_read("src/lib/ReviewMode.svelte"), "async function go(")
-    if "!saving && !aligning" not in body:
+    if "updateSegmentFields(seg.id, { annotatedTranscript:" not in body:
         raise AssertionError(
-            "go()'s draft-persist condition does not bail on `aligning` — a navigate during a background "
-            "CTC alignment can revert freshly-persisted CTC timings via the whole-row updateSegment. "
-            "Add `!aligning` to the `if (dirty && current && !saving && ... )` condition."
+            "go()'s draft-persist does not use the targeted updateSegmentFields — a whole-row upsert of the "
+            "batch-stale store row reverts a concurrent batch's writes. Persist annotatedTranscript via "
+            "api.updateSegmentFields(seg.id, { annotatedTranscript: text })."
         )
-    if "freshRow(seg.id, seg)" not in body:
-        raise AssertionError("go() must build its draft from freshRow(seg.id, seg), not a stale snapshot")
-    if "{ ...seg, annotatedTranscript" in body:
+    if "api.updateSegment(" in body:
         raise AssertionError(
-            "go() is spreading a stale `{ ...seg }` whole row into the draft (the clobber class the "
-            "update-segment-whole-row-upsert discipline forbids); use freshRow(seg.id, seg) instead"
+            "go() still whole-row upserts via api.updateSegment(...) — that reverts a concurrent batch's "
+            "writes to the segment (whole-row-clobber class); use the targeted api.updateSegmentFields."
         )
 
 
@@ -435,7 +437,7 @@ def test_selection_reseats_playback_centrally_for_store_only_selections() -> Non
 def main() -> None:
     test_retranscribe_guards_editor_writes_against_navigation()
     test_submit_guards_editor_writes_against_navigation()
-    test_go_draft_persist_bails_on_aligning_and_uses_freshrow()
+    test_go_draft_persist_uses_targeted_field_update()
     test_inbox_undo_bails_while_a_decision_is_in_flight()
     test_app_normalize_uses_freshrow_not_a_stale_spread()
     test_app_export_audio_excludes_human_rejected()

@@ -30,4 +30,30 @@ describe('whole-row clobber guards (P2.3 / audit F2)', () => {
     const body = src.slice(start, start + 700);
     expect(body).toContain('if ($isProcessing) return;');
   });
+
+  it('the 4 ReviewMode mutators are clobber-safe: submit/markBad/go use targeted field updates; doRetranscribe refuses a batch (P2.3b)', () => {
+    const src = read('../../src/lib/ReviewMode.svelte');
+    const region = (fn: string, next: string) => {
+      const s = src.indexOf(fn);
+      expect(s, `missing ${fn}`).toBeGreaterThan(-1);
+      const e = src.indexOf(next, s + fn.length);
+      expect(e, `missing ${next} after ${fn}`).toBeGreaterThan(s);
+      return src.slice(s, e);
+    };
+    // submit / markBad / go persist only whitelisted fields via the targeted update — never a whole-row
+    // upsert of the batch-stale store row.
+    const submit = region('async function submit(', 'function advance(');
+    expect(submit).toContain('updateSegmentFields(seg.id, { annotatedTranscript: text, verified: true })');
+    expect(submit).not.toMatch(/api\.updateSegment\(/);
+    const markBad = region('async function markBad(', 'async function submit(');
+    expect(markBad).toContain('updateSegmentFields(seg.id, { verified: true })');
+    expect(markBad).not.toMatch(/api\.updateSegment\(/);
+    const go = region('async function go(', 'function resetToOriginal(');
+    expect(go).toContain('updateSegmentFields(seg.id, { annotatedTranscript: text })');
+    expect(go).not.toMatch(/api\.updateSegment\(/);
+    // doRetranscribe writes rawTranscript (not whitelisted) so it stays a whole-row upsert, but must be
+    // refused during a batch/import.
+    const doRetranscribe = region('async function doRetranscribe(', 'async function markBad(');
+    expect(doRetranscribe).toMatch(/if \(!seg[^)]*\$isProcessing\) return;/);
+  });
 });
