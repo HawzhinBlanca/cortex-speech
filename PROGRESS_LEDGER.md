@@ -10506,3 +10506,73 @@ diffed) is out of scope. No exe rebuild needed (policy-only).
 
 **Tier-3 status:** P3.2 (T2 cloud half) + P3.1 (T1) shipped. **Next: P3.3** coverage/mutation → P3.4 e2e →
 (revisit the deferred main-thread whole-surface inventory). "Best / real #1" NOT claimed.
+
+### Iteration 185 — 2026-07-24 — Tier-3 remainder assessment + HONEST HAND-OFF (interactive loop; LOOP STOPPED)
+
+Reality check pre-work: exe NOT running, git clean, HEAD d33a347, lock held (iter19-P3.3assess). No code
+change this iteration — the mandatory scope is complete, so this is the honest tractability assessment of
+the remaining Tier-3 items + the hand-off, per the loop's stop condition.
+
+**REMAINING TIER-3 ITEMS — assessed NOT tractable as clean in-loop increments (verified, not assumed):**
+- **P3.3 coverage ratchet + mutation testing** — `cargo-mutants` is NOT installed and is slow (runs the
+  full suite once per mutant → hours), and the roadmap itself frames it as a "hypothesis to measure" (a
+  measure-first item for owner review, not a fast per-commit gate). Frontend coverage: `test:coverage` is
+  scripted but `@vitest/coverage-v8` is NOT installed and the config has NO thresholds — a real floor would
+  need a NEW dev-dependency + a measured baseline + CI wiring, and a floor-below-current is a weak guard
+  (allows regression to the floor). Against the owner's reliability-first / no-new-surface directive, a weak
+  coverage floor is diminishing-returns; the valuable half (mutation score on db.rs/eval.rs) is the slow
+  owner-measurement piece. → deferred as owner/measurement-gated.
+- **P3.4 full import→review→export e2e in CI** — CI ALREADY runs the mock Playwright e2e (ci.yml:129,
+  release.yml:71). The MISSING piece is `test:e2e:real` (e2e_real_app.cjs), which spawns the real .exe and
+  REQUIRES `CORTEX_AUDIO` (real audio) + the release build + the multi-GB ONNX models on the runner
+  (nightly-real-audio.yml already WARNS it is skipped without them). Wiring it needs a runner provisioned
+  with models + audio fixtures — owner/infra-gated; not runnable or verifiable in this loop.
+- **Main-thread whole-surface inventory** (deferred iter183) — a robust "fails on a NEW un-offloaded heavy
+  sync command" is NOT statically expressible: test_ui_thread_blocking_audit.py itself documents that static
+  scanning cannot classify "heavy work" (hence its hand-verified lists), and its migration worklist is
+  already EMPTY (every known heavy command is async). A complete sync-command allow-list (~62 entries) would
+  be exactly the enumeration the T2 critique rejects, and hand-classifying it is error-prone scope-creep.
+  → left as the honest state (TRACER records real per-command timings for owner review; worklist empty).
+
+**Per the loop's stop condition, this is the STOP point.** Final full verification (warm default target; exe
+not running so target/release + %APPDATA% provably untouched):
+`cargo test --lib` → `test result: ok. 1013 passed; 0 failed; 6 ignored` · `npm test` → `Tests 214 passed
+(214)` (39 files) · `python scripts/run_python_policies.py` → 43 passed.
+
+---
+
+## HAND-OFF — state of the audit plan (docs/ROADMAP_TO_NUMBER_ONE.md), 2026-07-24
+
+**DONE + gated + adversarially verified (every non-owner-gated Tier-0/Tier-1/Tier-2 item + the T1/T2
+structural test-gaps):**
+- Tier-0 honesty: **H2** diarization provenance guard (P0.2), **H4** DPAPI key at-rest (P0.3), **H3**
+  per-segment processing provenance — denoised/diarized/vad_backend persisted at import (v41/v42) + the
+  export manifest reads STORED truth via `processingProvenance` (P0.4 write+read+vad); plus the HF dataset-
+  card ASR-model sibling (reads stored model_version_id, not the export-day setting). **H1** is annotated
+  cross-basis; the re-score is owner-gated P0.1.
+- Tier-1 reliability: UNC guards (P1.1), fatal-error dialog (P1.2), restore writer fence + reservation
+  (P1.3/P1.3b), ASR + streaming denoiser/diarization load-retry breakers (P1.4/P1.4b).
+- Tier-2 frontend: library-load-error surface (P2.1), unhandled-rejection trap (P2.2), whole-row-clobber
+  class fully closed across App + ReviewMode (P2.3/P2.3b). **P2.4 i18n is OWNER-GATED** (native Sorani).
+- Tier-3 structural gates: **T1** generated IPC contract — frontend invoke() diffed vs generate_handler!
+  (P3.1); **T2** cloud-egress whole-surface consent inventory replacing the count floor (P3.2).
+
+**REMAINING — OWNER-GATED (surfaced, never faked):**
+- **P0.1 / P4.1** re-score all engines on ONE normalization basis + re-pin MEASUREMENTS.md (needs the GPU
+  run on the owner's rig). Until then the cross-engine table stays annotated cross-basis / not-directly-
+  comparable — the honest interim.
+- **P2.4** translate the core CKB surfaces (RefineryPanel/ModelRegistry/Diagnostics/shortcuts) — needs a
+  native Sorani reviewer; injecting best-guess Sorani would violate the honesty law + the parity gate.
+- **P4.2** FLEURS train/test contamination check (H5); **P4.3** measure Scribe v2 / Chirp on the frozen set
+  (consent-gated; gemini-2.5-pro / Scribe only); **P4.4** wire + A/B the built-but-unused chunk-overlap
+  stitching, ship only on measured non-regression.
+
+**REMAINING — Tier-3 infra deliberately NOT automated in-loop (with reasons, above):** P3.3 mutation/coverage
+(slow / install-gated / measure-first + a new dep), P3.4 real-audio e2e in CI (needs a runner with models +
+audio), the main-thread heavy-sync inventory (not robustly statically expressible).
+
+**HONEST BAR:** the app is at its **best verifiable state** — every honesty, reliability, and correctness
+defect the audit found that can be fixed + verified WITHOUT owner hardware or native-Sorani review is closed,
+gated, and adversarially verified. This is **NOT "#1"**: the SOTA-results claims (P0.1/P4.*) and the native
+Sorani UI (P2.4) remain owner-gated and unmeasured/unverified here — so the "number 1 reliable and
+professional" bar is not independently earned while those stand. **LOOP STOPPED** (ScheduleWakeup stop).
