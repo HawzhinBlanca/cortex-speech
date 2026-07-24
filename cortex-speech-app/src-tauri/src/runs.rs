@@ -161,18 +161,24 @@ impl AgentImportReportOptions {
     }
 }
 
-/// Build the run's provenance config. `denoising_active` is whether the denoiser model is actually
-/// available — round-23 #3: the denoiser is a silent pass-through when its (optional) model is absent,
-/// so the run must record whether denoising was ACTUALLY applied, not merely requested in settings.
-/// Recording the requested flag while the audio passed through un-denoised is a provenance lie.
-pub fn config_from_settings(settings: &crate::settings::AppSettings, denoising_active: bool) -> DatasetRunConfig {
+/// Build the honest run-config provenance. `denoising_active` and `diarization_active` MUST be the
+/// ACTUAL model loadability (`ModelManager::denoiser_loadable` / `diarizer_loadable`), never mere
+/// on-disk presence or the raw settings flag: a requested-but-unloadable model leaves the audio
+/// un-denoised / the segments unlabeled, so recording `true` from the flag alone would be the exact
+/// provenance lie the honesty law forbids (round-23 fixed this for denoising; the sibling diarization
+/// flag carried the same latent lie until it was guarded here).
+pub fn config_from_settings(
+    settings: &crate::settings::AppSettings,
+    denoising_active: bool,
+    diarization_active: bool,
+) -> DatasetRunConfig {
     DatasetRunConfig {
         model_version: format!("{:?}", settings.asr_model_size),
         vad_threshold: settings.vad_threshold,
         min_segment_duration_ms: settings.min_segment_duration_ms,
         max_segment_duration_ms: settings.max_segment_duration_ms,
         denoising: settings.enable_denoising && denoising_active,
-        diarization: settings.enable_diarization,
+        diarization: settings.enable_diarization && diarization_active,
         normalization: settings.auto_normalize,
     }
 }
@@ -887,10 +893,26 @@ mod tests {
         // Round-23 #3: denoising requested but the model absent -> the run config must record
         // denoising=false (the audio passed through un-denoised), never the requested flag.
         let on = crate::settings::AppSettings { enable_denoising: true, ..Default::default() };
-        assert!(!config_from_settings(&on, false).denoising, "requested but inactive -> recorded false");
-        assert!(config_from_settings(&on, true).denoising, "requested and active -> recorded true");
+        assert!(!config_from_settings(&on, false, true).denoising, "requested but inactive -> recorded false");
+        assert!(config_from_settings(&on, true, true).denoising, "requested and active -> recorded true");
         let off = crate::settings::AppSettings { enable_denoising: false, ..Default::default() };
-        assert!(!config_from_settings(&off, true).denoising, "not requested -> false regardless of model");
+        assert!(!config_from_settings(&off, true, true).denoising, "not requested -> false regardless of model");
+    }
+
+    #[test]
+    fn run_config_records_diarization_only_when_actually_applied() {
+        // P0.2 (2026-07-24 audit): the sibling of the denoising provenance fix. diarization requested
+        // but CAM++ absent/unloadable -> zero speaker labels are produced, so the run config must record
+        // diarization=false, never the raw settings flag. Recording true here is the exact provenance
+        // lie ModelManager::diarizer_loadable exists to prevent.
+        let on = crate::settings::AppSettings { enable_diarization: true, ..Default::default() };
+        assert!(
+            !config_from_settings(&on, true, false).diarization,
+            "requested but CAM++ unloadable -> recorded false"
+        );
+        assert!(config_from_settings(&on, true, true).diarization, "requested and CAM++ loadable -> recorded true");
+        let off = crate::settings::AppSettings { enable_diarization: false, ..Default::default() };
+        assert!(!config_from_settings(&off, true, true).diarization, "not requested -> false regardless of model");
     }
 
     #[test]

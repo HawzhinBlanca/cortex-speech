@@ -741,6 +741,18 @@ impl ModelManager {
         crate::denoiser::DenoiserService::new(&self.resolve_root_for(DENOISER_MODEL)).is_active()
     }
 
+    /// Whether the CAM++ speaker-embedding model can ACTUALLY load, not merely exist on disk. This — not
+    /// `campp_present()` — is the honest input to the `diarization` run-config provenance flag: a
+    /// present-but-unloadable CAM++ model (onnxruntime opset/EP incompatibility, sherpa-onnx init failure)
+    /// leaves `SpeakerEmbeddingService::is_available()==false`, so the pipeline produces ZERO speaker
+    /// labels (diarization.rs falls back to no high-tier labels), and recording `diarization=true` from
+    /// mere presence — or worse, from the settings flag alone — would be exactly the provenance lie the
+    /// sibling `denoiser_loadable` guard forbids. Constructs the service once from the same resolved dir
+    /// the pipeline uses (pipeline.rs:1498-1499) and reports whether it loaded.
+    pub fn diarizer_loadable(&self) -> bool {
+        crate::diarization::SpeakerEmbeddingService::new(&self.resolve_root_for(CAMPP_MODEL)).is_available()
+    }
+
     /// Download the GTCRN denoiser ONNX (a single direct file, not an archive) and verify it against
     /// its pinned SHA-256 before placing it as `denoiser/model.onnx`.
     pub fn download_denoiser(&self, progress_cb: impl Fn(f32)) -> Result<(), String> {
