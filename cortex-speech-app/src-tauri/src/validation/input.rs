@@ -266,7 +266,7 @@ mod tests {
                 assert!(e.contains("UNC"), "must reject as UNC ({p}): {e}");
             }
             // Legit local prefixes must still pass — including the verbatim-disk form canonicalize returns.
-            assert!(reject_unc_path(r"\\?\C:\Users\me\clip.wav").is_ok(), "verbatim-disk local path must pass");
+            assert!(reject_unc_path(r"\\?\C:\media\clip.wav").is_ok(), "verbatim-disk local path must pass");
         }
     }
 
