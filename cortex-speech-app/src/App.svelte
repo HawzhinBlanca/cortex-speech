@@ -1314,6 +1314,12 @@
     const seg = $selectedSegment;
     if (!seg?.rawTranscript) return;
     if (!requireDesktopRuntime()) return;
+    // P2.3 (audit F2): refuse while a batch/import is running. normalizedTranscript is not in the
+    // targeted field-update whitelist, so this handler must upsert the whole row — and during a batch
+    // the STORE row is stale vs the DB (the batch writes on its own connection, the store is not
+    // reloaded yet), so the freshRow-by-id below re-reads a stale copy and the upsert reverts the
+    // batch's freshly-written columns for this segment. Every sibling mutator already guards $isProcessing.
+    if ($isProcessing) return;
     try {
       const normalizedTranscript = await api.normalizeText(seg.rawTranscript);
       const updatedSeg = {
@@ -2847,8 +2853,10 @@
                     {$t('scribe.vote')}
                   </button>
                 {/if}
-                <button class="btn btn-secondary !text-xs" onclick={handleNormalize}
-                  >{$t('normalize')}</button
+                <button
+                  class="btn btn-secondary !text-xs"
+                  onclick={handleNormalize}
+                  disabled={$isProcessing}>{$t('normalize')}</button
                 >
               </div>
             </div>

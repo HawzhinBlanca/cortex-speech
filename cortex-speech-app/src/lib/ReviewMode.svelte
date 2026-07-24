@@ -575,11 +575,17 @@
       // The empty-edit guard mirrors go() and submit(): a cleared textarea on teardown must not
       // persist annotatedTranscript='' and blank the gold transcript with no undo entry.
       if (!seg || !dirty || saving || !editText.trim()) return;
-      const draft: SpeechSegment = { ...seg, annotatedTranscript: editText.trim() };
-      segments.update((list) => list.map((s) => (s.id === seg.id ? draft : s)));
+      const text = editText.trim();
+      // P2.3 (audit F2): persist ONLY annotatedTranscript via the TARGETED field update — never the
+      // whole-row updateSegment. The old whole-row draft spread the (possibly pre-align) store row, so
+      // if a background CTC alignment finished after teardown its real timings were reverted (the
+      // whole-row-clobber class). A field update never touches alignmentJson, so it is clobber-safe
+      // even mid-align and needs NO `aligning` guard — which would instead LOSE this edit, since
+      // editCache dies with the component and teardown cannot re-stash it.
+      segments.update((list) => list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)));
       // Fire-and-forget: teardown cannot await. Surface a failure — the notification store outlives
       // this component — so a lost draft is never silent.
-      api.updateSegment(draft).catch((e) => {
+      api.updateSegmentFields(seg.id, { annotatedTranscript: text }).catch((e) => {
         notifications.error($t('notifications.saveFailed'), { detail: String(e) });
       });
     };
