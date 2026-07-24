@@ -9931,3 +9931,42 @@ clicked" case for every writer.
 **Next (roadmap):** P1.4 model-load circuit breaker → P1.3b restore-pending reservation gate (the TOCTOU
 window) → P2.1 honest library-load failure. Tier-1: P1.1/P1.2/P1.3-fence shipped (3 of 4 + the reservation
 sub-item). "Best / real #1" NOT claimed.
+
+### Iteration 172 — 2026-07-24 — P1.4 ASR model-load circuit breaker (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 8c12daf, lock free (acquired). Next item = P1.4.
+
+**FIX P1.4 (audit R4) — a present-but-corrupt/unloadable ONNX model re-hashed gigabytes on EVERY call.**
+AsrPool::ensure_loaded retried a cached-UNAVAILABLE service unconditionally (round-24 fresh-install
+recovery), re-running new_with_config's full-file SHA-256 verify + ONNX load — for a 300 MB–1.4 GB model,
+once per chunk during import and twice per segment. Circuit breaker keyed on a cheap file fingerprint
+((model size,mtime),(tokens size,mtime)) + a 30 s half-open cooldown: present-but-failed is skipped for the
+cooldown then re-probed; absent always retries cheaply (round-24 preserved); a re-download re-attempts
+immediately. The AVAILABLE fast path now short-circuits with zero disk access. Committed 45aca9a.
+
+**Adversarial verification CAUGHT A HIGH REGRESSION in my first cut (fingerprint-only, no cooldown) — fixed
+before commit.** 3-skeptic Workflow: a TRANSIENT failure (an AV/sharing lock on the freshly-downloaded ONNX
+making compute_file_sha256 open/read Err — models.rs:992; this box's own "Windows FS flaky" memory makes it
+real) latched a GOOD file as permanently failed, wedging the exact round-24 flow to a restart. **Hand-verified
+against source** and matched my own pre-verdict concern. Fix: the half-open cooldown re-probes the same file
+after 30 s → self-heals. Wiring + soundness lenses returned NONE (latch set only on present+fail, cleared on
+success/absent; body atomic under the pool Mutex; exact truth table; no panic on a mtime-less platform).
+
+Regression gate model_load_breaker_skips_within_cooldown_then_retries_absent_changed_or_elapsed (pure: within-
+cooldown skip; absent/changed/elapsed all attempt). round-24 test still passes.
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (9.66s) ·
+`cargo test --lib` → `test result: ok. 1008 passed; 0 failed; 6 ignored` (87.20s).
+
+**NOT verified:** no rebuild of the shipped exe (ASR-load behavior changed — pending). Residuals (honest): a
+genuinely-corrupt model re-hashes at most once/30 s during an active import (bounded, not per-chunk); a
+transient failure yields up to 30 s of ASR-unavailable before self-heal.
+
+**Tier-1 status:** the four MAIN items P1.1/P1.2/P1.3-fence/P1.4 are shipped + adversarially verified. TWO
+deferred sub-items remain before Tier-1 is fully closed: P1.3b restore-pending reservation gate (the TOCTOU
+window) and P1.4b denoiser/diarization streaming-loop rebuild retry. "Best / real #1" is therefore NOT claimed.
+
+**Next (roadmap execution order — correcting a small out-of-order pick):** P2.1 honest library-load failure
+(frontend; npm gates) → P2.2 window unhandledrejection trap → P1.3b reservation gate → P1.4b denoiser retry →
+P0.4 per-segment provenance → P2.3/P2.4.
