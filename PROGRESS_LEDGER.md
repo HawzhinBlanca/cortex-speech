@@ -9726,3 +9726,46 @@ QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
   to panic on OS thread-creation failure; restart-recoverable, no data loss). See iter-155 entry.
 - ~~aligner + campp orphan~~ FIXED in iter 148 (#109).
 - CARRIED (owner-facing): DEFERRED-LARGE history undo-of-delete; ENHANCEMENT undo-able speaker rename.
+
+### Iteration 167 — 2026-07-24 — Deep audit + roadmap; P0.2 diarization provenance guard (interactive loop)
+
+**Owner-driven interactive run** (not the 02:00 cron): user asked for a deep audit, a brutal rating vs the
+top 3, and the plan to #1, then started a 15-min implement loop (session cron d2bfd940). Reality check
+pre-work: exe NOT running, git clean, HEAD 71e0972, lock free (re-acquired for this run).
+
+**Deep audit (committed 15930dd → docs/ROADMAP_TO_NUMBER_ONE.md).** 12-agent adversarial Workflow (9
+subsystem auditors + 3 web-research agents; 66 agents, ~5.5M tokens, 0 died), every HIGH/MED finding put
+through independent refutation, TOP findings hand-verified against source by the orchestrator (agent
+verdicts are not evidence). Scorecard avg 6.9/10 vs the top-professional bar — storage-durability 8,
+panic-paths 8 (beat commercial tools); security 6, ops 6. Confirmed defect ledger with file:line + tiered
+plan (Tier 0 honesty-law → Tier 1 security/reliability → Tier 2 frontend → Tier 3 test-structure → Tier 4
+measured results). Web-cited ASR positioning: 7.03% CER on FLEURS ckb_iq is the best PUBLISHED FLEURS-ckb
+CER (none lower exists); WER 32.93% ties ElevenLabs Scribe v1's published 32.1% — Scribe v2's "Kurdish
+10-20%" tier is unverified and flagged to measure before any WER-leadership claim.
+
+**FIX P0.2 (HIGH honesty) — runConfig.diarization recorded the raw settings flag, not real CAM++
+loadability.** runs.rs:175 read `diarization: settings.enable_diarization` while the sibling `denoising`
+one field up was already loadability-guarded (round-23). enable_diarization=true + CAM++ absent/unloadable
+→ zero speaker labels produced (diarization.rs:94 emits empty embeddings → every chunk None; the fbank
+fallback was deliberately removed as confidently-wrong), yet the exported bundle asserted diarization=true
+— a recorded provenance lie. Fix: added ModelManager::diarizer_loadable() (mirrors denoiser_loadable +
+the pipeline's own SpeakerEmbeddingService construction at pipeline.rs:1498-1499); config_from_settings now
+takes diarization_active and records `enable_diarization && diarization_active`; export_bundle.rs passes
+diarizer_loadable(). Regression gate run_config_records_diarization_only_when_actually_applied (fail-before:
+the flag-only code recorded true for the requested-but-unloadable case). Adversarially checked the one real
+trap — an fbank fallback that would still label speakers without CAM++ — and confirmed CLOSED at
+diarization.rs:94 (no labels when is_available()==false), so the guard adds no inverse lie. Committed 10df0eb.
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched; a cold
+isolated Tauri+ort build does not fit a 15-min iteration, and cargo test/clippy build debug not release):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (1m27s) ·
+`cargo test --lib run_config_records` → `test result: ok. 2 passed; 0 failed; 0 ignored`.
+
+**NOT yet verified this iter:** full `cargo test --lib` (only the 2 targeted provenance tests ran — no
+reason to expect breakage, the change is a 1-field guard + new pure fn, but the whole suite was not run);
+no rebuild of the shipped exe (shipped provenance behavior changed — rebuild pending, owner's call).
+
+**Next (roadmap execution order):** P0.3 wire DPAPI into set_api_key → P1.1 UNC guards on relink_audio/
+merge_dataset_json/restore_segment_snapshot → P1.2 native fatal-error dialog. Tier-0 P0.1 (re-pin the
+cross-engine normalization table) is owner-gated (GPU re-score). "Best / real #1" is NOT claimed — Tier-0
+and Tier-1 are not yet shipped.
