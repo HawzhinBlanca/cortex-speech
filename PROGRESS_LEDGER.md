@@ -10127,3 +10127,47 @@ surfaces.
 
 **Next (roadmap):** P2.4 i18n the core CKB surfaces → P1.3b reservation gate → P1.4b denoiser retry → P0.4.
 Tier-2: P2.1/P2.2/P2.3/P2.3b shipped; P2.4 remains. "Best / real #1" NOT claimed.
+
+### Iteration 177 — 2026-07-24 — P1.3b restore-pending reservation gate (interactive loop; reordered ahead of P2.4)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 1c8ecfc, lock free (acquired).
+
+**REORDER (independent judgment):** the roadmap put P2.4 (i18n the core CKB surfaces) next, but assessing it
+found RefineryPanel alone needs ~30 Sorani translations incl. technical ASR terms (CER/ASR/eval) — the
+CORRECT translations are genuinely OWNER-GATED (native Sorani review), and injecting my best-guess Sorani
+into a technical panel would violate "surface owner-gated items, never fake them" (the parity gate also forces
+ckb values I can't verify). Per the owner's reliability-first priority, pivoted to the fully-verifiable Rust
+reliability item P1.3b. P2.4 is marked substantially owner-gated (the i18n WIRING is doable; the translations
+need the owner).
+
+**FIX P1.3b (audit MED) — the restore reservation gate closes the check-then-act TOCTOU the P1.3 fence left.**
+New RESTORE_PENDING atomic + RAII RestoreReservation; prepare_restore reserves BEFORE the writers_active fence
+and returns the guard (both restore callers bind it across the swap). Every writer-start refuses while
+restore_pending(): try_start_import/batch, run_wsl_refinement, add_scribe_votes/run_dpo_update/run_jury_
+pipeline/run_t2_for_segment, couch::start; import-spawned threads transitively covered. Committed 11202c8.
+
+**Adversarial verification FOUND + I FIXED a residual TOCTOU in the first cut.** import/batch were airtight
+(check under the same mutex writers_active reads). But the 5 atomic-flag writers (WSL/scribe/jury/couch)
+checked the reservation BEFORE registering their flag (reversed-order double-check) → a narrow residual race
+(the agent rated it LOW real-world on a single-user desktop), AND my prepare_restore comment OVERCLAIMED a
+single-lock guarantee for all writers. **Hand-verified** the race (classic lock-free check-then-publish).
+Fixed: couch's check MOVED under the COUCH lock (mutex-airtight like import/batch); WSL/scribe/jury use
+PUBLISH-THEN-RECHECK (set flag, then re-read the reservation, roll back if set — SeqCst makes the two
+orderings unable to both read stale); corrected the overclaiming comment to describe the real per-writer
+mechanism.
+
+**Regression gate** scripts/test_restore_reservation_gate.py (auto-discovered → 42 policies): pins reserve-
+before-fence + guard-returned + both callers bind it + every writer-start checks restore_pending().
+FAIL-BEFORE verified (removing try_start_batch's check failed the policy). [Note: my fail-before demo used
+`git checkout src/lib.rs` which reverted my uncommitted lib.rs edits — re-applied both checks; lesson: use
+targeted edits for temp reverts, never git checkout.]
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (9.60s) ·
+`cargo test --lib` → `test result: ok. 1008 passed; 0 failed; 6 ignored` · `python run_python_policies.py` → 42 passed.
+
+**NOT verified:** no rebuild of the shipped exe (restore-safety behavior changed — pending).
+
+**Tier-1 status:** P1.1/P1.2/P1.3-fence/P1.4/P1.3b shipped; P1.4b (denoiser/diarization streaming retry)
+remains. **Next: P1.4b** → P0.4 per-segment provenance → Tier-3. P2.4 i18n is owner-gated (native Sorani).
+"Best / real #1" NOT claimed.
