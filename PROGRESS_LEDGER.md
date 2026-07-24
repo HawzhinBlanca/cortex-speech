@@ -10081,3 +10081,49 @@ are NOT fixed yet.
 updateSegmentFields (annotatedTranscript/verified are whitelisted); doRetranscribe -> import $isProcessing +
 guard (rawTranscript is not whitelisted, and re-transcribe during a batch is a machine op safe to refuse).
 Then P2.4 → P1.3b → P1.4b → P0.4. "Best / real #1" NOT claimed (the clobber class is NOT fully closed yet).
+
+### Iteration 176 — 2026-07-24 — P2.3b: the 4 ReviewMode clobber paths — CARDINAL CLASS NOW CLOSED (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 6c2b524, lock free (acquired). Next item = P2.3b
+(the 4 paths the P2.3 adversarial pass found).
+
+**FIX P2.3b — closed the 4 ReviewMode whole-row-clobber paths.** submit/markBad/go -> api.updateSegmentFields
+(targeted; annotatedTranscript/verified whitelisted); go also dropped its now-needless `!aligning` skip (the
+field update never touches alignmentJson and serializes under the db lock against the aligner's targeted
+alignment_json UPDATE — either ordering preserves both). doRetranscribe/retranscribe -> added $isProcessing to
+the guard (rawTranscript is NOT whitelisted so it stays whole-row, but is refused during a batch). Committed
+e6984b6.
+
+**Adversarially verified — 2-skeptic Workflow, BOTH refuted=false / NONE.** Conversions correct (no persist
+lost; the submit wrong-segment guard stays between the store write and the editor write; **go-during-align
+does NOT race** — confirmed the aligner's alignment_json UPDATE and go's annotatedTranscript field-update are
+serialized under the db lock, either ordering safe). doRetranscribe guard effective. **Completeness: the
+whole-row-clobber class is CLOSED** across App.svelte + ReviewMode.svelte — every remaining api.updateSegment(
+is $isProcessing-guarded with freshRow-by-id (App transcribe handlers + handleNormalize; ReviewMode
+doRetranscribe), and every whitelistable review persist is field-targeted (submit/markBad/go/unmount-flush);
+grep confirms no 5th path and no invoke('update_segment') bypass. Hand-verified the same sweep independently.
+
+**GATE UPDATE (STRENGTHENED, not weakened) — scripts/test_frontend_review_guards.py.** My refactor tripped
+the policy's own not-vacuous self-check (good design). Updated test_submit's store-write marker to
+updateSegmentFields (SAME wrong-segment-guard invariant, moved marker) and REWROTE test_go to require the
+targeted update and REJECT any whole-row updateSegment in go() — a structurally-clobber-proof invariant,
+STRONGER than the old whole-row+!aligning+freshRow guard. Mirrors the pre-existing
+test_app_save_handlers_use_field_level_updates policy.
+
+Regression gate tests/lib/clobber-guards.test.ts (source invariants over the 4 handlers; FAIL-BEFORE verified
+by removing doRetranscribe's $isProcessing -> test failed, then restored).
+
+Gate (frontend + policies; Rust untouched): `npm run typecheck` → 0 errors · `npm run lint` → 0 errors
+(4 pre-existing warnings) · `npm test` → 214 passed · `python scripts/run_python_policies.py` → 41 passed.
+
+**NOT verified:** no rebuild of the shipped exe (UI behavior changed — pending). **Accepted residual** (pre-
+existing, out of scope): doRetranscribe's whole-row upsert is still raceable by the WSL-7B refine loop —
+identical to the accepted App transcribe siblings, largely benign (it replaces the very transcript the
+metadata describes).
+
+**MILESTONE:** the whole-row-clobber class (the cardinal data-loss bug, fixed 6x before this session, then
+found in 6 more paths by the audit + adversarial verification) is now FULLY CLOSED across the review + curate
+surfaces.
+
+**Next (roadmap):** P2.4 i18n the core CKB surfaces → P1.3b reservation gate → P1.4b denoiser retry → P0.4.
+Tier-2: P2.1/P2.2/P2.3/P2.3b shipped; P2.4 remains. "Best / real #1" NOT claimed.
