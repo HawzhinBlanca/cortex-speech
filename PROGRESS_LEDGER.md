@@ -9769,3 +9769,42 @@ shipped exe (shipped provenance behavior changed — rebuild pending, owner's ca
 merge_dataset_json/restore_segment_snapshot → P1.2 native fatal-error dialog. Tier-0 P0.1 (re-pin the
 cross-engine normalization table) is owner-gated (GPU re-score). "Best / real #1" is NOT claimed — Tier-0
 and Tier-1 are not yet shipped.
+
+### Iteration 168 — 2026-07-24 — P0.3 DPAPI at-rest key encryption (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 792a519, lock free (acquired). Next item per
+roadmap execution order = P0.3.
+
+**FIX P0.3 (MED security/honesty, audit H4) — API keys were stored in PLAINTEXT while the code advertised
+DPAPI.** commands/settings.rs set_api_key (the sole production writer of secrets.env) called the plaintext
+ApiKeys::save_key, so Gemini/ElevenLabs/OpenRouter keys sat cleartext in %APPDATA%\cortex-speech\secrets.env
+— while save_key_protected (DPAPI CryptProtectData → NAME=dpapi:<base64>) was fully built + unit-tested with
+ZERO production callers, and the module header claimed keys "persist via the DPAPI-protected key store."
+Capability theater. Fix: wire set_api_key → save_key_protected. Existing plaintext keys keep loading
+(parse_env_file decrypts dpapi: AND reads legacy plaintext) and upgrade to a blob on next save; empty value
+still clears; on non-Windows a non-empty key errors rather than storing plaintext under a "protected" API
+(the app ships Windows-only, so unreachable in production). Also corrected the now-stale "byte-for-byte
+identical" header claim. Committed 457d30b.
+
+Regression gate set_api_key_persists_via_dpapi_protected_store_not_plaintext (source invariant — the command
+needs full AppState to invoke; scans only the pre-`mod tests` region so the assertion's own literals don't
+self-match — a self-reference bug caught during authoring). **FAIL-BEFORE DEMONSTRATED:** reverting line 90
+to save_key made the gate FAIL ("must persist keys via the DPAPI-protected store"); restored.
+
+Adversarially verified — 3-skeptic Workflow (data-loss / cross-platform-CI / completeness), ALL refuted=false
+severity NONE: no key loss or wrong read-back (round-trip verified; undecryptable blob → unset-and-logged,
+never ciphertext); no non-Windows runtime path errors (non-Windows dpapi::protect is a compiling stub; CI
+runs cargo test only on windows-latest, linux/mac jobs build only); set_api_key confirmed the ONLY production
+secrets writer; protect() failure leaves secrets.env untouched and the frontend retains the paste for retry.
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (8.99s) ·
+`cargo test --lib` → `test result: ok. 1002 passed; 0 failed; 6 ignored` (86.26s).
+
+**NOT verified:** no rebuild of the shipped exe (at-rest key storage changed — rebuild pending, owner's call);
+keys the owner PASTED into secrets.env by hand stay plaintext until re-saved through the Settings UI (that is
+the user editing a file, not a code writer — out of scope; a one-time migration could be a later enhancement).
+
+**Next (roadmap):** P1.1 UNC guards on relink_audio / merge_dataset_json / restore_segment_snapshot →
+P1.2 native fatal-error dialog → P1.3 restore writer fence. Tier-0 done except owner-gated P0.1 (GPU re-score).
+"Best / real #1" NOT claimed — Tier-1 not yet shipped.
