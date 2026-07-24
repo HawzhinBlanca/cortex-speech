@@ -9850,3 +9850,42 @@ Gate (warm default target — app not running so target/release + %APPDATA% prov
 **Next (roadmap):** P1.2 native fatal-error dialog (fatal_app_error is invisible under windows_subsystem) →
 P1.3 restore writer fence (jury/Scribe/couch). Tier-0 done except owner-gated P0.1. Tier-1: 1 of ~4 shipped.
 "Best / real #1" NOT claimed.
+
+### Iteration 170 — 2026-07-24 — P1.2 native fatal-startup dialog (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD ae9d85e, lock free (acquired). Next item = P1.2.
+
+**FIX P1.2 (HIGH, audit R2) — fatal startup errors were INVISIBLE in the release GUI.** fatal_app_error did
+only tracing + eprintln + exit(1); windows_subsystem="windows" discards stdout/stderr and the tracing file
+sink may not exist yet (data-dir create is itself a fatal path), so instance-lock-held / unopenable-or-
+newer-schema-DB / data-dir-create / Tauri-build failures all presented as "double-click, nothing happens".
+Now on Windows fatal_app_error pops a native MessageBoxW (raw Win32 via windows-sys + new
+Win32_UI_WindowsAndMessaging feature — no webview exists this early, so tauri-plugin-dialog is unavailable)
+with the real reason, then exits. Committed d8b5a29.
+
+**Adversarial verification FOUND A REAL MED REGRESSION (fixed same commit).** 3-skeptic Workflow: FFI
+soundness NONE (buffers NUL-terminated+live, null hwnd valid, signatures/constants match windows-sys 0.61,
+no UB); always-exit / non-Windows / newer-schema-message-reachable all NONE; but the CI-hang skeptic found
+that ALL FOUR CDP e2e drivers (e2e_real_app.cjs, e2e_{pipeline,constrained,finetuned}_ipc.cjs) + e2e_7b_
+connect.cjs launch the exe WITHOUT a headless flag, three against the real %APPDATA% profile — so a fatal
+startup (classically: InstanceLock fails because the owner's app is already open) would pop a modal and hang
+the driver's ~90s connect poll. **Hand-verified**: grepped all drivers — every one sets
+WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port. Fix: show_fatal_message_box self-suppresses
+under is_headless_mode() OR is_cdp_remote_debug() (that WEBVIEW2 arg). Also softened MB_SYSTEMMODAL →
+MB_TOPMOST|MB_SETFOREGROUND (visible without freezing the whole desktop). Only a genuine interactive double-
+click reaches the box.
+
+Regression gates: to_wide_null_is_nul_terminated_utf16 (the *W marshalling — asserts NUL terminator, empty
+= [0], Sorani UTF-16 round-trip, no interior NUL) and cdp_remote_debug_suppresses_the_fatal_dialog (port arg
++ embedded form suppress; unrelated args / None do not). Both pure-predicate, fail-before by construction.
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (8.52s) ·
+`cargo test --lib` → `test result: ok. 1006 passed; 0 failed; 6 ignored` (88.00s). Cargo.lock unchanged.
+
+**NOT verified:** the dialog was NOT rendered live (unit tests can't pop a modal; the marshalling +
+suppression logic are gated, the MessageBoxW side-effect is not) — a real fatal-startup render should be
+eyeballed once on the owner's desktop. No rebuild of the shipped exe (startup behavior changed — pending).
+
+**Next (roadmap):** P1.3 restore writer fence (invert to one writer registry; fence jury/Scribe/couch) →
+P2.1 honest library-load failure → P2.2 unhandledrejection trap. Tier-1: 2 of ~4 shipped ("best/#1" NOT claimed).
