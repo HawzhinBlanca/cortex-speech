@@ -9889,3 +9889,45 @@ eyeballed once on the owner's desktop. No rebuild of the shipped exe (startup be
 
 **Next (roadmap):** P1.3 restore writer fence (invert to one writer registry; fence jury/Scribe/couch) →
 P2.1 honest library-load failure → P2.2 unhandledrejection trap. Tier-1: 2 of ~4 shipped ("best/#1" NOT claimed).
+
+### Iteration 171 — 2026-07-24 — P1.3 restore writer-fence completed (jury/Scribe/couch/alignment) (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 3ed80be, lock free (acquired). Next item = P1.3.
+
+**FIX P1.3 (HIGH, audit R3) — the restore writer fence was incomplete: 5 background writers escaped it.**
+AppState::writers_active() (consulted by prepare_restore before db_restore/restore_db_from_snapshot) covered
+only import/batch/WSL, so a restore could run while these dedicated-connection (or post-cloud) writers were
+mid-write, mixing a late write into the just-restored library: Scribe vote batches, the jury pipeline/T2/DPO
+command writers, the post-import single-file jury ADJUDICATION thread (spawned after import-complete → import
+guard down), the DETACHED background-ALIGNMENT thread (outlives the import guard), and the Couch phone-review
+server. Root-cause fix: one BG_DB_WRITERS counter + RAII BgDbWriterGuard as the single registration point for
+dedicated-connection background writers (new writers take a guard, not another || term — closing the recurring
+"forgot the new writer" class that CAUSED this bug). writers_active() gains bg_db_writers_active() +
+SCRIBE_VOTES_IN_FLIGHT + couch::is_running(). Committed b236f8d.
+
+**Adversarial verification FOUND A REAL MED GAP + I hand-found ANOTHER (both fixed same commit).** 3-skeptic
+Workflow: guard-lifetime NONE (all guards named _bindings held across their writes), atomic/deadlock NONE
+(balanced counter; writers_active never locks db; couch lock self-contained + acquired outside any other lock).
+The completeness skeptic FOUND the detached background-alignment thread (pipeline.rs:2115 — own connection,
+update_segment_alignment, outlives ImportGuard; non-default auto_align, alignment-columns-only → MED); I
+independently hand-found the post-import adjudication thread (commands.rs:805). **Hand-verified BOTH against
+source** (read pipeline.rs:2095-2164 + commands.rs:725-838) and did a FULL sweep of every Database::open +
+std::thread::spawn — confirmed no dedicated-connection segment writer remains unfenced (batch/pipeline inline
+jury run within Import/Batch state; WSL worker → WSL_REFINE_RUNNING; snapshot loop is a reader).
+
+Regression gate writers_active_fences_background_db_writers (a held BgDbWriterGuard arms the fence + clears on
+drop). **FAIL-BEFORE DEMONSTRATED**: removing the bg term made writers_active() false while a guard was held →
+test failed → restored.
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (10.40s) ·
+`cargo test --lib` → `test result: ok. 1007 passed; 0 failed; 6 ignored` (83.02s).
+
+**NOT verified:** no rebuild of the shipped exe (restore-safety behavior changed — pending). The check-then-act
+TOCTOU window in prepare_restore (a NEW writer STARTING between the check and the swap) is a SEPARATE increment
+(a restore-pending reservation gate) — NOT closed here; this closes the "writer already running when restore is
+clicked" case for every writer.
+
+**Next (roadmap):** P1.4 model-load circuit breaker → P1.3b restore-pending reservation gate (the TOCTOU
+window) → P2.1 honest library-load failure. Tier-1: P1.1/P1.2/P1.3-fence shipped (3 of 4 + the reservation
+sub-item). "Best / real #1" NOT claimed.
