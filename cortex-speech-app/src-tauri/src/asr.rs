@@ -558,6 +558,51 @@ pub struct AsrPool {
 struct AsrPoolState {
     services: std::collections::HashMap<AsrLoadConfig, KurdishAsrService>,
     loaded_dir: Option<PathBuf>,
+    /// Circuit breaker (P1.4): per config, the model+tokens fingerprint at the last PRESENT-but-failed
+    /// load AND when it failed. While the on-disk file is unchanged, ensure_loaded skips re-running the
+    /// expensive full-file SHA-256 verify + ONNX load for a cooldown, then re-probes (half-open). Cleared
+    /// on success or when a file goes absent (the cheap round-24 retry path); a re-download changes the
+    /// fingerprint and re-attempts immediately.
+    load_failed: std::collections::HashMap<AsrLoadConfig, (ModelFingerprint, std::time::Instant)>,
+}
+
+/// How long a present-but-failed model load is skipped before a half-open re-probe. Bounds the R4
+/// gigabyte re-hash to at most once per this window (vs once per chunk) while still letting a TRANSIENT
+/// failure — an AV/sharing lock during the SHA-256 read, a transient GPU provider init — recover on its
+/// own within it, so the round-24 "download in-app then transcribe" flow is never wedged to a restart.
+const LOAD_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A cheap on-disk identity for the model+tokens pair: ((model size, model mtime), (tokens size, tokens
+/// mtime)). Changes on any re-download; `None` (see [`model_files_fingerprint`]) means a file is absent.
+type ModelFingerprint = ((u64, std::time::SystemTime), (u64, std::time::SystemTime));
+
+/// The current fingerprint of the model+tokens files, or `None` if EITHER is absent. Pure `fs::metadata`
+/// — no read, no hash — so consulting it is negligible next to the SHA-256 it gates.
+fn model_files_fingerprint(model_dir: &Path, size: &AsrModelSize) -> Option<ModelFingerprint> {
+    let (model_path, tokens_path) = omniasr_model_paths(model_dir, size);
+    let id = |p: &Path| -> Option<(u64, std::time::SystemTime)> {
+        let m = std::fs::metadata(p).ok()?;
+        Some((m.len(), m.modified().ok()?))
+    };
+    Some((id(&model_path)?, id(&tokens_path)?))
+}
+
+/// Whether `ensure_loaded` should (re)attempt the expensive load for an UNAVAILABLE service (the caller
+/// returns first for an available one, so this never touches the happy path). Pure — the breaker is
+/// unit-testable without a real ONNX model or a clock. Skip ONLY when the model is present (`current_fp`
+/// Some), unchanged since it failed, AND still within the cooldown. Otherwise attempt: an absent model
+/// always retries (round-24), a changed fingerprint is a re-download, and an elapsed cooldown is a
+/// half-open re-probe that lets a transient failure self-heal without a restart.
+fn should_attempt_load(
+    current_fp: &Option<ModelFingerprint>,
+    last_failed_fp: Option<&ModelFingerprint>,
+    elapsed_since_fail: Option<std::time::Duration>,
+    cooldown: std::time::Duration,
+) -> bool {
+    match current_fp {
+        Some(fp) if last_failed_fp == Some(fp) => elapsed_since_fail.map_or(true, |e| e >= cooldown),
+        _ => true,
+    }
 }
 
 impl Default for AsrPool {
@@ -568,7 +613,13 @@ impl Default for AsrPool {
 
 impl AsrPool {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(AsrPoolState { services: std::collections::HashMap::new(), loaded_dir: None }) }
+        Self {
+            inner: Mutex::new(AsrPoolState {
+                services: std::collections::HashMap::new(),
+                loaded_dir: None,
+                load_failed: std::collections::HashMap::new(),
+            }),
+        }
     }
 
     fn lock_state(&self) -> MutexGuard<'_, AsrPoolState> {
@@ -585,17 +636,28 @@ impl AsrPool {
 
         if state.loaded_dir.as_ref() != Some(&model_dir.to_path_buf()) {
             state.services.clear();
+            state.load_failed.clear();
             state.loaded_dir = Some(model_dir.to_path_buf());
         }
 
-        // Reuse only an AVAILABLE cached service. A cached UNAVAILABLE placeholder is retried
-        // instead: it used to be cached forever (bare contains_key), so the fresh-install flow —
-        // download the model in-app, then transcribe — stayed "ASR model not loaded" until app
-        // restart, because the resolved model dir and the config key are both identical before and
-        // after the download, so neither invalidation path ever fired (round-24 hunt #2). The retry
-        // is a cheap existence probe while the model is still absent, and recovers the moment the
-        // files appear (or a re-download fixes a failed integrity pin).
+        // Fast path: reuse an AVAILABLE cached service with ZERO disk access (this runs per chunk).
         if state.services.get(config).is_some_and(|svc| svc.is_available()) {
+            return false;
+        }
+
+        // Unavailable. A cached UNAVAILABLE placeholder used to be retried UNCONDITIONALLY (round-24 hunt
+        // #2, so a fresh-install in-app download recovers without restart) — but that re-runs the
+        // full-file SHA-256 verify + ONNX load on EVERY call, and for a PRESENT-but-corrupt/unloadable
+        // model (300 MB–1.4 GB) it re-hashed gigabytes per chunk (P1.4 / audit R4). Circuit breaker: an
+        // absent model has no fingerprint and always retries cheaply (new_with_config bails at the
+        // presence check before hashing — round-24 preserved); a present model that FAILED for this exact
+        // file is skipped for LOAD_RETRY_COOLDOWN, then half-open re-probed so a TRANSIENT failure (an AV
+        // lock during the hash read; a transient GPU init) self-heals; a re-download changes the
+        // fingerprint and re-attempts immediately.
+        let current_fp = model_files_fingerprint(model_dir, &config.model_size);
+        let last = state.load_failed.get(config).copied();
+        let elapsed = last.map(|(_, when)| when.elapsed());
+        if !should_attempt_load(&current_fp, last.as_ref().map(|(fp, _)| fp), elapsed, LOAD_RETRY_COOLDOWN) {
             return false;
         }
 
@@ -612,7 +674,19 @@ impl AsrPool {
                 KurdishAsrService::new_unavailable()
             }
         };
+        let now_available = service.is_available();
         state.services.insert(config.clone(), service);
+        // Latch a PRESENT-but-failed load (current_fp is Some) with the time it failed, so it is skipped
+        // for the cooldown then half-open re-probed; clear on success OR when a file is absent (keep the
+        // cheap round-24 retry alive).
+        match (now_available, current_fp) {
+            (false, Some(fp)) => {
+                state.load_failed.insert(config.clone(), (fp, std::time::Instant::now()));
+            }
+            _ => {
+                state.load_failed.remove(config);
+            }
+        }
         true
     }
 
@@ -673,6 +747,41 @@ mod tests {
         // The available-service fast path (reuse without reload) cannot be unit-covered here —
         // constructing an available service needs a real ONNX model on disk; the ignored
         // ort_omniasr_smoke test covers real loading on machines that have the model.
+    }
+
+    #[test]
+    fn model_load_breaker_skips_within_cooldown_then_retries_absent_changed_or_elapsed() {
+        // P1.4 (audit R4): the circuit-breaker decision. A present-but-corrupt model must be re-verified
+        // (full SHA-256 of 300 MB–1.4 GB) at most once per cooldown, not once per chunk — while an absent
+        // model always retries (round-24 fresh-install recovery), a re-download (changed fingerprint)
+        // retries immediately, and — critically — an elapsed cooldown half-open re-probes so a TRANSIENT
+        // failure (an AV lock during the hash, a transient GPU init) self-heals without a restart.
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let fp_a: ModelFingerprint = ((300_000_000, t), (5_000, t));
+        let fp_b: ModelFingerprint = ((300_000_001, t), (5_000, t)); // a re-download changed the model size
+        let cd = Duration::from_secs(30);
+
+        // Absent (no fingerprint) -> ALWAYS attempt, even with a stale latch: round-24 recovery.
+        assert!(should_attempt_load(&None, None, None, cd), "absent + no latch -> attempt");
+        assert!(should_attempt_load(&None, Some(&fp_a), Some(Duration::from_secs(1)), cd), "absent -> retry");
+        // Present, no prior failure -> attempt the first (expensive) verify.
+        assert!(should_attempt_load(&Some(fp_a), None, None, cd), "present + first try -> attempt");
+        // Present + UNCHANGED since it failed, WITHIN cooldown -> SKIP (no per-chunk re-hash).
+        assert!(
+            !should_attempt_load(&Some(fp_a), Some(&fp_a), Some(Duration::from_secs(5)), cd),
+            "within cooldown -> skip"
+        );
+        // Present + UNCHANGED, cooldown ELAPSED -> half-open re-probe (transient self-heals).
+        assert!(
+            should_attempt_load(&Some(fp_a), Some(&fp_a), Some(Duration::from_secs(30)), cd),
+            "cooldown elapsed -> re-probe"
+        );
+        // Present but CHANGED (a re-download) -> attempt immediately regardless of cooldown.
+        assert!(
+            should_attempt_load(&Some(fp_b), Some(&fp_a), Some(Duration::from_secs(1)), cd),
+            "re-download -> attempt"
+        );
     }
 
     /// Feasibility gate for the constrained-decode port: can we load the OmniASR ONNX via `ort`
