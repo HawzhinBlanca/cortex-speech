@@ -3046,7 +3046,12 @@ impl ProcessingPipeline {
     /// Resolve the embedded fine-tuned MMS-CTC model (`finetuned-mms-ckb/{model.onnx,vocab.json}`)
     /// from the active (user) models dir, then the bundled one. `None` if it is not present.
     fn finetuned_model_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        for base in [crate::models::active_models_dir(), crate::models::bundled_models_dir()] {
+        // Search EVERY model root (user dir, then each bundled candidate), not just the all-or-nothing
+        // active/selected pair: the CTC-keyed bundled root (e.g. target/release/models with only
+        // CTC + Silero) orphaned the fine-tuned engine even though the full repo models dir has it —
+        // use_finetuned_asr then hit the WSL7B fail-hard instead of routing to the engine the user chose.
+        // Both files must coexist in the SAME root (a split onnx/vocab pair would be incoherent).
+        for base in crate::models::model_root_candidates() {
             let dir = base.join("finetuned-mms-ckb");
             let (onnx, vocab) = (dir.join("model.onnx"), dir.join("vocab.json"));
             if onnx.exists() && vocab.exists() {

@@ -134,7 +134,31 @@ pub fn resolve_models_dir(user_dir: &Path) -> PathBuf {
 /// present, else the bundled copy. Falls back to the user path when neither exists (so a caller's
 /// not-found error points at the writable dir).
 pub fn resolve_model_file(relative: &str) -> PathBuf {
-    resolve_file_in(USER_MODELS_DIR.get().map(|d| d.as_path()), &bundled_models_dir(), relative)
+    resolve_file_in(USER_MODELS_DIR.get().map(|d| d.as_path()), &bundled_dir_containing(relative), relative)
+}
+
+/// The bundled candidate dir that actually CONTAINS `relative`, else the CTC-selected default.
+///
+/// `select_bundled_models_dir` keys the ONE bundled root on OmniASR-CTC presence, so a partial copy next
+/// to the exe (e.g. `target/release/models` holding only CTC + Silero) wins the root and ORPHANS every
+/// sibling that exists only in the full repo models dir (fine-tuned MMS, CAM++, denoiser, CTC-1B) — the
+/// same all-or-nothing class `resolve_model_file` was built to fix, recurring one level up. Searching the
+/// candidates PER FILE recovers them; a file present in the selected dir resolves exactly as before (that
+/// dir is itself the first containing candidate), so the primary-CTC path is unchanged.
+fn bundled_dir_containing(relative: &str) -> PathBuf {
+    bundled_model_dir_candidates()
+        .into_iter()
+        .find(|candidate| candidate.join(relative).exists())
+        .unwrap_or_else(bundled_models_dir)
+}
+
+/// Every root that may hold model files, in resolution order: the user models dir (when registered)
+/// followed by each bundled candidate. For callers that need a DIRECTORY where several files must
+/// coexist (e.g. the fine-tuned model.onnx + vocab.json), which per-file resolution cannot guarantee.
+pub fn model_root_candidates() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = USER_MODELS_DIR.get().cloned().into_iter().collect();
+    roots.extend(bundled_model_dir_candidates());
+    dedupe_paths(roots)
 }
 
 fn resolve_file_in(user_dir: Option<&Path>, bundled_dir: &Path, relative: &str) -> PathBuf {
@@ -397,7 +421,9 @@ impl ModelManager {
     /// which live only in the bundled dir, unreachable via `resolved_dir()`). Falls back to
     /// `self.models_dir` when neither has it (the writable download target + a sensible not-found path).
     pub fn resolve_root_for(&self, relative: &str) -> PathBuf {
-        resolve_root_in(&self.models_dir, &bundled_models_dir(), relative)
+        // Per-file bundled fallback (see bundled_dir_containing): the CTC-selected dir alone orphans
+        // bundled-only siblings when the exe sits next to a partial models copy.
+        resolve_root_in(&self.models_dir, &bundled_dir_containing(relative), relative)
     }
 
     fn meta_path(&self) -> PathBuf {
