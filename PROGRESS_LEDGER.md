@@ -10576,3 +10576,32 @@ defect the audit found that can be fixed + verified WITHOUT owner hardware or na
 gated, and adversarially verified. This is **NOT "#1"**: the SOTA-results claims (P0.1/P4.*) and the native
 Sorani UI (P2.4) remain owner-gated and unmeasured/unverified here — so the "number 1 reliable and
 professional" bar is not independently earned while those stand. **LOOP STOPPED** (ScheduleWakeup stop).
+
+### Iteration 186 — 2026-07-25 — SHIP PHASE A EXECUTED: build → backup → migrate → live smoke (all real runs)
+
+Per docs/SHIP_FINAL_PHASE.md, driven interactively. Every result below is from a real run on this rig.
+
+**A1 build:** `npm run build` (2.6s) + `cargo build --release` (6m39s) →
+`EXE FRESHNESS GATE: OK (exe at HEAD 22cdc7b, newer than all sources)` — the shipped exe was 334 commits
+stale (baked 6f8fe3c, Jul 16); it now IS HEAD.
+
+**A2 backup (before any schema change):** cold copy of the whole data dir (app closed; 555 MB incl.
+db+wal+shm, media-cache; old nested backups excluded) to Desktop/cortex-speech-backups/pre-v42-20260725-001658;
+DB byte-size verified identical.
+
+**A4-first on a DISPOSABLE profile (the driver refuses the real one by design):** `node e2e_real_app.cjs`
+with a real Kurdish clip (Nawras - KU.wav), CTC300M → **REAL-DATA RUN OK: 3 segments; first transcript
+203 chars** of real Sorani; run.jsonl written. Fresh profile DB: schema **v42**; all 3 segments carry
+stored provenance `vad_backend='silero'`, `denoised=0`, `diarized=0` (honest false — not enabled),
+`model_version_id=omniasr-ctc-300m`. The session's provenance chain verified LIVE end-to-end. (This also
+discharges the B1 e2e:real gate: exit 0.)
+
+**A3 real-library migration (only after the exe was proven):** launched the real exe; migrations v38→v42
+applied to the production DB (was v37, 144 segments); closed gracefully via CloseMainWindow. Read-only
+verify: schema **42**; **144 segments intact**; speech_segments IS STRICT; all FK children survived the
+v40 FK-off recreate (segment_hypotheses 432, decision_verdicts 144, corrections 9, correction_memory 25);
+provenance columns present with all 144 legacy rows honestly NULL (= not recorded); spot transcripts
+non-empty; `PRAGMA integrity_check` = ok.
+
+**NOT yet done (Phase B remainder):** live export-bundle manifest + HF README checks on the real library;
+the full user loop (7B refine via WSL, review, verify, export) driven like a user; `make verify-10`.
