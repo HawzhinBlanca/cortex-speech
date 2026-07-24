@@ -5,8 +5,9 @@
 //! untouched. Same functions, only relocated.
 //!
 //! update_settings refreshes the live pipeline through AppState::update_pipeline_settings (never locking
-//! the pipeline/settings directly) and set_api_key persists via the DPAPI-protected key store — both
-//! byte-for-byte identical to before.
+//! the pipeline/settings directly) — byte-for-byte identical to the pre-decomposition commands.rs.
+//! set_api_key persists via the DPAPI-protected key store (P0.3, 2026-07-24 — the write path was
+//! upgraded from plaintext save_key to save_key_protected; see the note at that call site).
 
 use super::{RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::settings::AppSettings;
@@ -81,7 +82,36 @@ pub fn set_api_key(provider: String, key: String, state: State<'_, AppState>) ->
         other => return Err(format!("unknown provider '{other}'")),
     };
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    crate::api_keys::ApiKeys::save_key(&data_dir, name, &key)?;
+    // P0.3 (2026-07-24 audit H4): DPAPI-encrypt the key at rest on Windows (the ship target) rather than
+    // storing it plaintext — save_key_protected was built + unit-tested but never wired to production, so
+    // the module header above (and the "privacy-first" posture) was capability theater. On non-Windows a
+    // non-empty key ERRORS instead of silently storing plaintext under a "protected" API (the honest
+    // fail-safe); clearing a key (empty value) still works everywhere. Existing plaintext keys keep
+    // loading (parse_env_file reads both) and upgrade to a dpapi: blob the next time they are saved here.
+    crate::api_keys::ApiKeys::save_key_protected(&data_dir, name, &key)?;
     let keys = crate::api_keys::ApiKeys::load(&data_dir);
     Ok(keys.configured_providers().into_iter().map(String::from).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    /// P0.3 (audit H4): the sole production key-writer MUST DPAPI-encrypt at rest, never fall back to the
+    /// plaintext `save_key`. Wiring `set_api_key` to `save_key` (the plaintext path) is the exact
+    /// regression this guards; a source-invariant check because the command needs full AppState to call.
+    /// Fail-before: the pre-fix line `ApiKeys::save_key(&data_dir, ...)` trips the second assertion.
+    #[test]
+    fn set_api_key_persists_via_dpapi_protected_store_not_plaintext() {
+        // Scan ONLY the production region — everything before `mod tests` — so this assertion's own
+        // string literals (which necessarily contain the forbidden call) don't match themselves.
+        let src = include_str!("settings.rs");
+        let prod = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            prod.contains("ApiKeys::save_key_protected(&data_dir"),
+            "set_api_key must persist keys via the DPAPI-protected store (save_key_protected)"
+        );
+        assert!(
+            !prod.contains("ApiKeys::save_key(&data_dir"),
+            "set_api_key must NOT write API keys in plaintext via save_key(&data_dir, ...)"
+        );
+    }
 }
