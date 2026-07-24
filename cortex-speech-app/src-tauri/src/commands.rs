@@ -797,6 +797,12 @@ pub fn import_audio_file(
                                 emit_or_log(&app_clone, "pipeline-complete", done_payload);
                                 return;
                             };
+                            // R3: this background adjudication thread writes verdicts + the import report on
+                            // its OWN connection (opened above) AFTER import-complete fired — so the import
+                            // fence is already down. Arm the jury writer fence for its lifetime so a restore
+                            // cannot run while it writes into a possibly-just-restored library. (The
+                            // run_jury_pipeline COMMAND guards its path; this direct-core caller needs its own.)
+                            let _jury_writer = BgDbWriterGuard::new();
                             let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&settings);
                             report_options.agent_run_id = Some(agent_run_id.clone());
                             report_options.agentic_readiness = Some(agentic_readiness);
@@ -1647,9 +1653,10 @@ pub async fn db_backup(dest: String, state: State<'_, AppState>) -> Result<serde
 /// rotated out within ~100 minutes).
 fn prepare_restore(state: &State<'_, AppState>) -> Result<(), String> {
     if state.writers_active() {
-        return Err("An import or batch operation is running — cancel it or let it finish before \
-                    restoring. Restoring mid-write would mix pre-restore rows into the restored \
-                    library and re-arm stale undo history."
+        return Err("A background write is in progress (import, batch, 7B refinement, jury, Scribe \
+                    votes, or the Couch Review server) — cancel it, let it finish, or stop Couch \
+                    Review before restoring. Restoring mid-write would mix pre-restore rows into the \
+                    restored library and re-arm stale undo history."
             .to_string());
     }
     if let Some(data_dir) = state.lock_data_dir().clone() {
@@ -2582,7 +2589,39 @@ const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v1";
 /// existing-vote check and double-POSTing the same consented audio — duplicate Scribe COST, never
 /// duplicate data: the (segment_id, model_id) upsert keeps one scribe-v1 row). This flag restores the
 /// old one-at-a-time behavior explicitly.
-static SCRIBE_VOTES_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static SCRIBE_VOTES_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Count of in-flight BACKGROUND DB writers that use their OWN dedicated connection (NOT the global db
+/// Mutex) and may run OUTSIDE the import/batch guards — so they escape the db-Mutex serialization the
+/// restore relies on, and `AppState::writers_active` must consult this to fence a restore while any is
+/// mid-write (R3). Registrants: the jury writers (run_jury_pipeline / run_t2_for_segment /
+/// run_dpo_update + the post-import adjudication thread) and the detached background-alignment thread.
+/// A COUNTER, not a bool: unlike the WSL/Scribe flags (which reject overlap), these may legitimately
+/// overlap, and a bool would clear the fence when the FIRST of two concurrent writers finished. This is
+/// the one place a NEW dedicated-connection writer registers — extend by taking a guard, not by growing
+/// the writers_active() || chain (the recurring "forgot the new writer" bug this closes twice over).
+pub(crate) static BG_DB_WRITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII registration for a background DB writer: increments [`BG_DB_WRITERS`] on construction and
+/// decrements on drop, so the restore fence is armed for exactly the writer's lifetime — even if the
+/// work panics (Drop still runs on unwind). ZST, so it is `Send` and can be moved into a worker thread.
+pub(crate) struct BgDbWriterGuard;
+impl BgDbWriterGuard {
+    pub(crate) fn new() -> Self {
+        BG_DB_WRITERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+impl Drop for BgDbWriterGuard {
+    fn drop(&mut self) {
+        BG_DB_WRITERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// True while any background DB writer is in flight — consulted by the restore fence.
+pub(crate) fn bg_db_writers_active() -> bool {
+    BG_DB_WRITERS.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
 
 /// Undo a review-inbox `flag()`: clear the escalation the flag set. Distinct from clear_human_decision
 /// (which reopens a decided row by SETTING escalated=1); this is the inverse of flag.

@@ -333,11 +333,24 @@ impl AppState {
     /// restore pushed a stale undo command into the freshly-cleared history — pressing Ctrl+Z then
     /// replayed pre-restore rows into the restored dataset.
     pub fn writers_active(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
         *self.lock_import_state() == ImportState::Running
             || *self.lock_batch_state() == BatchState::Running
             // The WSL-7B refinement loop is a background DB WRITER too (update_asr_transcript_if_unreviewed),
             // tracked by its own atomic — restoring a snapshot while it writes tears the DB (round-26 hunt).
-            || crate::commands::WSL_REFINE_RUNNING.load(std::sync::atomic::Ordering::SeqCst)
+            || crate::commands::WSL_REFINE_RUNNING.load(SeqCst)
+            // R3: the OTHER background writers that use dedicated connections (or land a write after a
+            // lock-free cloud window) and so also escape the db-Mutex serialization the restore relies on:
+            //   - Scribe vote batches (add_scribe_votes) — SCRIBE_VOTES_IN_FLIGHT,
+            //   - every dedicated-connection background writer that registers a BgDbWriterGuard: the jury
+            //     pipeline / T2 / DPO / post-import adjudication writers AND the detached background-
+            //     alignment thread (which outlives the import guard) — one BG_DB_WRITERS counter,
+            //   - the Couch phone-review server — a running server can persist a decision on submit.
+            // Each was a real "restore mixes late writes into the just-restored library" hole. New
+            // dedicated-connection writers register a BgDbWriterGuard rather than growing this chain.
+            || crate::commands::SCRIBE_VOTES_IN_FLIGHT.load(SeqCst)
+            || crate::commands::bg_db_writers_active()
+            || crate::couch::is_running()
     }
 }
 
@@ -917,6 +930,23 @@ mod tests {
         assert_eq!(*w.last().unwrap(), 0, "must end in a NUL terminator");
         assert_eq!(String::from_utf16(&w[..w.len() - 1]).unwrap(), "کوردی", "Sorani round-trips via UTF-16");
         assert!(w[..w.len() - 1].iter().all(|&u| u != 0), "no interior NUL before the terminator");
+    }
+
+    #[test]
+    fn writers_active_fences_background_db_writers() {
+        // P1.3 (audit R3): the restore fence covered only import/batch/WSL, so a background writer on its
+        // OWN connection (jury pipeline/T2/DPO/post-import adjudication, or the detached alignment thread)
+        // could land a late write in a just-restored library. A held BgDbWriterGuard must now report
+        // writers_active()==true so prepare_restore refuses. Uses the counter, so it is robust to any
+        // concurrently-held guard (asserts the delta, not an absolute rest state).
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_app_state(tmp.path().to_path_buf());
+        let before = state.writers_active();
+        {
+            let _writer = crate::commands::BgDbWriterGuard::new();
+            assert!(state.writers_active(), "an in-flight background DB writer must arm the restore fence");
+        }
+        assert_eq!(state.writers_active(), before, "the fence clears when the background writer finishes");
     }
 
     #[cfg(windows)]

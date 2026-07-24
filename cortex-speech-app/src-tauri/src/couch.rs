@@ -103,6 +103,13 @@ pub fn status() -> CouchStatus {
     guard.as_ref().map(status_of).unwrap_or(CouchStatus { running: false, url: None, tailscale_url: None })
 }
 
+/// Whether the Couch Review server is currently running. A running server can WRITE to the DB (a phone
+/// submit persists a decision/verdict via insert_segment_full on its own connection), so the restore
+/// fence must refuse while it is up — cheaper than `status()` (no URL/IP computation). R3.
+pub fn is_running() -> bool {
+    COUCH.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+}
+
 fn status_of(h: &CouchHandle) -> CouchStatus {
     CouchStatus {
         running: true,

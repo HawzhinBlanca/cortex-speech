@@ -156,6 +156,8 @@ pub async fn run_dpo_update(state: State<'_, AppState>, endpoint: String) -> Res
     // Mirrors run_jury_pipeline / run_t2_for_segment.
     let db = open_jury_db_connection(&state)
         .ok_or_else(|| "App data directory is unavailable for the DPO update.".to_string())?;
+    // R3: fence a restore while the DPO learning write is in flight (dedicated connection).
+    let _jury_writer = super::BgDbWriterGuard::new();
     run_blocking(move || crate::jury::learning::run_dpo_update(&db, &endpoint).map_err(|e| e.to_string())).await
 }
 
@@ -175,6 +177,10 @@ pub async fn run_jury_pipeline(
     // settings clone, segment_ids, jury_data_dir, and the Send JuryDbSource (path + Arc handle).
     let jury_data_dir = state.lock_data_dir().clone();
     let source = jury_db_source(&state);
+    // R3: arm the restore fence for the writer's whole lifetime — the jury writes verdicts/decisions on
+    // its own dedicated connection (not the global db Mutex), so without this a restore could run
+    // mid-pipeline and take late verdicts into the just-restored library.
+    let _jury_writer = super::BgDbWriterGuard::new();
     run_blocking(move || {
         source.with(|db| run_jury_pipeline_core_via(db, &settings, segment_ids, jury_data_dir.as_deref()))
     })
@@ -215,6 +221,10 @@ pub async fn run_t2_for_segment(
         );
     }
 
+    // R3: arm the restore fence for the whole T2 run. The verdict write below RE-ACQUIRES the global
+    // lock AFTER the cloud call, so a restore that slipped in during the (lock-free) cloud window would
+    // otherwise take this machine verdict into the just-restored library.
+    let _jury_writer = super::BgDbWriterGuard::new();
     // Gather every DB input under a BRIEF lock, then drop it before listen_and_judge. Holding the
     // global AppState db Mutex across the cloud T2 round-trip (n_samples Gemini audio calls) would
     // freeze every other DB-touching command app-wide for the whole network call. The lock is

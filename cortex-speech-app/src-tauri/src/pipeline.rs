@@ -2112,7 +2112,15 @@ impl ProcessingPipeline {
         }
         let db_path = self.db_path.clone();
 
+        // R3: this DETACHED thread is spawned during import (ImportState::Running) but OUTLIVES the
+        // ImportGuard, then writes segment alignments (update_segment_alignment) on its OWN connection —
+        // so in the post-import window it escapes the import fence AND the db-Mutex serialization the
+        // restore relies on. Register it as a background DB writer for its whole lifetime. Acquire the
+        // guard HERE (still on the import worker thread, so there is no unfenced gap between enqueue and
+        // the thread starting) and move it into the closure; it drops when the thread ends, incl. panic.
+        let align_writer_guard = crate::commands::BgDbWriterGuard::new();
         std::thread::spawn(move || {
+            let _align_writer_guard = align_writer_guard; // held for the whole alignment thread
             let db = match crate::db::Database::open(&db_path) {
                 Ok(db) => db,
                 Err(error) => {
