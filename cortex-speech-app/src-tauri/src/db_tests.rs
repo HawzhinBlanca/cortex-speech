@@ -33,27 +33,33 @@ fn per_segment_processing_provenance_round_trips_and_stays_unknown_for_legacy_ro
     let mut imported = make_segment("prov-import", "/a.wav");
     imported.denoised = Some(true);
     imported.diarized = Some(false);
+    imported.vad_backend = Some("silero".to_string()); // v42
     db.insert_segments_batch(std::slice::from_ref(&imported)).unwrap();
     let got = db.get_segment_by_id("prov-import").unwrap().expect("imported segment persisted");
     assert_eq!(got.denoised, Some(true), "denoised must round-trip true via the batch import path");
     assert_eq!(got.diarized, Some(false), "diarized must round-trip false — NOT the denoised value (positional guard)");
+    assert_eq!(got.vad_backend.as_deref(), Some("silero"), "vad_backend must round-trip via the batch import path");
 
     // RESTORE path — insert_segment_full must be lossless (opposite values from the import row).
     let mut restored = make_segment("prov-restore", "/b.wav");
     restored.denoised = Some(false);
     restored.diarized = Some(true);
+    restored.vad_backend = Some("energy".to_string());
     db.insert_segment_full(&restored).unwrap();
     let got = db.get_segment_by_id("prov-restore").unwrap().expect("restored segment persisted");
     assert_eq!(got.denoised, Some(false), "denoised must round-trip false via insert_segment_full");
     assert_eq!(got.diarized, Some(true), "diarized must round-trip true via insert_segment_full");
+    assert_eq!(got.vad_backend.as_deref(), Some("energy"), "vad_backend must round-trip via insert_segment_full");
 
-    // NOT-RECORDED — a row that never set the fields (a legacy pre-v41 row reads identically: NULL).
+    // NOT-RECORDED — a row that never set the fields (a legacy pre-v41/v42 row reads identically: NULL).
     let legacy = make_segment("prov-legacy", "/c.wav");
     assert_eq!(legacy.denoised, None, "default construction leaves provenance unrecorded");
+    assert_eq!(legacy.vad_backend, None, "default construction leaves vad_backend unrecorded");
     db.insert_segment(&legacy).unwrap();
     let got = db.get_segment_by_id("prov-legacy").unwrap().expect("legacy segment persisted");
     assert_eq!(got.denoised, None, "unrecorded denoising must persist as NULL/None, never a fabricated false");
     assert_eq!(got.diarized, None, "unrecorded diarization must persist as NULL/None, never a fabricated false");
+    assert_eq!(got.vad_backend, None, "unrecorded vad_backend must persist as NULL/None");
 }
 
 #[test]

@@ -1004,11 +1004,44 @@ fn lock_vad_cache() -> MutexGuard<'static, VadCacheEntry> {
     })
 }
 
+/// Which VAD backend ACTUALLY produced the speech regions — the honest per-segment provenance the export
+/// reports, NOT a path-exists probe. Only the branch that actually returned regions may name itself: a
+/// Silero that loads but then fails to build/run falls back to Energy at runtime (below), so a
+/// present-but-broken model is never mislabeled as Silero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VadBackend {
+    /// Silero VAD v4 (ONNX) ran successfully.
+    Silero,
+    /// Silero was absent on disk, or loaded but failed to CREATE/RUN (SileroVad build or detect error) →
+    /// adaptive energy-threshold fallback. (A model that fails its integrity hash or ONNX session load
+    /// returns an `Err` instead — no regions at all — so it can never be recorded as a silent Silero.)
+    Energy,
+    /// No VAD ran — the whole buffer was taken as a single region (a file short enough to skip chunking),
+    /// or there was no audio. `plan_speech_chunks` also returns this for its whole-buffer path.
+    None,
+}
+
+impl VadBackend {
+    /// Stable lowercase token persisted per segment (`vad_backend` column) and reported in the export.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VadBackend::Silero => "silero",
+            VadBackend::Energy => "energy",
+            VadBackend::None => "none",
+        }
+    }
+}
+
 /// Voice Activity Detection using Silero VAD v4 via ONNX Runtime.
-/// Falls back to energy-based VAD if the model file is not found.
-pub fn voice_activity_detection(pcm: &[i16], sample_rate: u32, threshold: f32) -> AppResult<Vec<(usize, usize)>> {
+/// Falls back to energy-based VAD if the model file is not found. Returns the regions AND which backend
+/// actually produced them, so the pipeline can record honest per-segment VAD provenance.
+pub fn voice_activity_detection(
+    pcm: &[i16],
+    sample_rate: u32,
+    threshold: f32,
+) -> AppResult<(Vec<(usize, usize)>, VadBackend)> {
     if pcm.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), VadBackend::None));
     }
 
     crate::models::init_ort_dylib_path();
@@ -1066,7 +1099,7 @@ pub fn voice_activity_detection(pcm: &[i16], sample_rate: u32, threshold: f32) -
                 let result = vad.detect(pcm);
                 timer.finish(result.is_ok());
                 if result.is_ok() {
-                    return result;
+                    return result.map(|regions| (regions, VadBackend::Silero));
                 }
                 tracing::warn!("Silero VAD with cached session failed; invalidating VAD cache to force fresh load");
             } else {
@@ -1103,14 +1136,14 @@ pub fn voice_activity_detection(pcm: &[i16], sample_rate: u32, threshold: f32) -
                 if result.is_ok() {
                     // Update cache since fresh load succeeded
                     *lock_vad_cache() = Some((session.clone(), state_dims));
-                    return result;
+                    return result.map(|regions| (regions, VadBackend::Silero));
                 }
                 tracing::warn!("Silero VAD fresh load failed, falling back to energy-based VAD");
             }
         }
     }
 
-    vad_energy_fallback(pcm, sample_rate, threshold)
+    vad_energy_fallback(pcm, sample_rate, threshold).map(|regions| (regions, VadBackend::Energy))
 }
 
 fn vad_energy_fallback(pcm: &[i16], _sample_rate: u32, threshold: f32) -> AppResult<Vec<(usize, usize)>> {
@@ -1240,14 +1273,15 @@ mod tests {
 
     #[test]
     fn test_vad_empty() {
-        let result = voice_activity_detection(&[], 16000, 0.5).unwrap();
+        let (result, backend) = voice_activity_detection(&[], 16000, 0.5).unwrap();
         assert!(result.is_empty());
+        assert_eq!(backend, VadBackend::None, "empty input runs no VAD");
     }
 
     #[test]
     fn test_vad_silence_returns_segment() {
         let pcm = vec![0i16; 16000];
-        let segments = voice_activity_detection(&pcm, 16000, 0.5).unwrap();
+        let (segments, _backend) = voice_activity_detection(&pcm, 16000, 0.5).unwrap();
         assert!(!segments.is_empty());
     }
 
@@ -1671,7 +1705,7 @@ mod proptests {
 
         #[test]
         fn vad_empty_input_returns_empty(sample_rate in (8000u32..96000)) {
-            let result = voice_activity_detection(&[], sample_rate, 0.5).unwrap();
+            let (result, _backend) = voice_activity_detection(&[], sample_rate, 0.5).unwrap();
             prop_assert!(result.is_empty());
         }
 

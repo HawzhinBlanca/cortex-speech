@@ -114,7 +114,7 @@ fn test_compute_waveform_zero_points() {
 #[test]
 fn test_vad_silence_returns_entire_buffer() {
     let pcm = vec![0i16; 48000];
-    let segments = voice_activity_detection(&pcm, 16000, 0.5).unwrap();
+    let (segments, _backend) = voice_activity_detection(&pcm, 16000, 0.5).unwrap();
 
     // Silence should produce a single segment covering the whole buffer
     assert_eq!(segments.len(), 1, "Silence should produce exactly one segment");
@@ -128,7 +128,7 @@ fn test_vad_signal_detects_speech() {
         .map(|i| (i16::MAX as f64 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 16000.0).sin()) as i16)
         .collect();
 
-    let segments = voice_activity_detection(&pcm, 16000, 0.5).unwrap();
+    let (segments, _backend) = voice_activity_detection(&pcm, 16000, 0.5).unwrap();
 
     // Signal should be detected as speech (at least some region)
     assert!(!segments.is_empty(), "VAD should detect speech regions");
@@ -139,7 +139,7 @@ fn test_vad_signal_detects_speech() {
 
 #[test]
 fn test_vad_returns_empty_for_empty_input() {
-    let segments = voice_activity_detection(&[], 16000, 0.5).unwrap();
+    let (segments, _backend) = voice_activity_detection(&[], 16000, 0.5).unwrap();
     assert!(segments.is_empty(), "Empty input should produce no segments");
 }
 
@@ -150,8 +150,8 @@ fn test_vad_uses_different_thresholds() {
         .collect();
 
     // Low threshold should detect more speech than high threshold
-    let low_seg = voice_activity_detection(&pcm, 16000, 0.01).unwrap();
-    let high_seg = voice_activity_detection(&pcm, 16000, 10.0).unwrap();
+    let (low_seg, _) = voice_activity_detection(&pcm, 16000, 0.01).unwrap();
+    let (high_seg, _) = voice_activity_detection(&pcm, 16000, 10.0).unwrap();
 
     let low_speech = low_seg.iter().map(|&(s, e)| e - s).sum::<usize>();
     let high_speech = high_seg.iter().map(|&(s, e)| e - s).sum::<usize>();

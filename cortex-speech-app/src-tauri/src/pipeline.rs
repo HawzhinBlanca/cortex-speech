@@ -1490,7 +1490,7 @@ impl ProcessingPipeline {
             .check_and_register(&pcm, sample_rate, Some(path))
             .map_err(|e| AppError::Validation(e.into()))?;
 
-        let chunk_ranges = chunking::plan_speech_chunks(
+        let (chunk_ranges, vad_backend) = chunking::plan_speech_chunks(
             &pcm,
             sample_rate,
             self.settings.vad_threshold,
@@ -1532,6 +1532,7 @@ impl ProcessingPipeline {
             sample_rate,
             0,
             &chunk_ranges,
+            vad_backend,
             cancel,
             embedding_service,
             denoiser_service,
@@ -1638,7 +1639,7 @@ impl ProcessingPipeline {
             }
             let pcm = effective_pcm;
 
-            let mut chunk_ranges = chunking::plan_speech_chunks(
+            let (mut chunk_ranges, vad_backend) = chunking::plan_speech_chunks(
                 &pcm,
                 sample_rate,
                 self.settings.vad_threshold,
@@ -1714,6 +1715,7 @@ impl ProcessingPipeline {
                 sample_rate,
                 base_sample,
                 &global_ranges,
+                vad_backend,
                 cancel,
                 embedding_service,
                 denoiser_service,
@@ -1774,6 +1776,7 @@ impl ProcessingPipeline {
         sample_rate: u32,
         global_base_sample: usize,
         chunk_ranges: &[(usize, usize)],
+        vad_backend: crate::audio::VadBackend,
         cancel: Option<&CancellationToken>,
         embedding_service: &crate::diarization::SpeakerEmbeddingService,
         denoiser_service: &crate::denoiser::DenoiserService,
@@ -2054,6 +2057,10 @@ impl ProcessingPipeline {
                 // segment received a label (streaming defers labeling; single-speaker files get one id).
                 denoised: Some(self.settings.enable_denoising && denoiser_service.is_active()),
                 diarized: Some(self.settings.enable_diarization && embedding_service.is_available()),
+                // P0.4: the VAD backend that ACTUALLY produced this file/window's regions (silero / energy
+                // fallback / none for the short whole-buffer path) — surfaced from the detector, not a
+                // path-exists probe (a corrupt Silero falls back to energy at runtime).
+                vad_backend: Some(vad_backend.as_str().to_string()),
             });
         }
 

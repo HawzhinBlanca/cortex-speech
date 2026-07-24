@@ -1544,7 +1544,7 @@ fn manifest_reads_stored_per_segment_provenance_not_export_day_model_state() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
     let tmp = TempDir::new().unwrap();
-    let mk = |id: &str, denoised: Option<bool>, diarized: Option<bool>| {
+    let mk = |id: &str, denoised: Option<bool>, diarized: Option<bool>, vad: Option<&str>| {
         let audio = tmp.path().join(format!("{id}.wav"));
         std::fs::write(&audio, b"audio").unwrap();
         SpeechSegment {
@@ -1554,15 +1554,17 @@ fn manifest_reads_stored_per_segment_provenance_not_export_day_model_state() {
             duration_ms: 1000,
             denoised,
             diarized,
+            vad_backend: vad.map(str::to_string),
             ..SpeechSegment::default()
         }
     };
     // denoised: applied=1, not_applied=1, not_recorded=1 (mixed) -> denoising=false.
     // diarized:  applied=3, not_applied=0, not_recorded=0 (unanimous) -> diarization=true.
+    // vad_backend: silero=2, energy=1 (byBackend), notRecorded=0.
     db.insert_segments_batch(&[
-        mk("s-a", Some(true), Some(true)),
-        mk("s-b", Some(false), Some(true)),
-        mk("s-c", None, Some(true)),
+        mk("s-a", Some(true), Some(true), Some("silero")),
+        mk("s-b", Some(false), Some(true), Some("silero")),
+        mk("s-c", None, Some(true), Some("energy")),
     ])
     .unwrap();
 
@@ -1581,6 +1583,10 @@ fn manifest_reads_stored_per_segment_provenance_not_export_day_model_state() {
     assert_eq!(prov["diarized"]["applied"].as_u64(), Some(3));
     assert_eq!(prov["diarized"]["notApplied"].as_u64(), Some(0));
     assert_eq!(prov["diarized"]["notRecorded"].as_u64(), Some(0));
+    // vad_backend distribution: the stored per-segment backend, honestly counted (silero=2, energy=1).
+    assert_eq!(prov["vadBackend"]["byBackend"]["silero"].as_u64(), Some(2));
+    assert_eq!(prov["vadBackend"]["byBackend"]["energy"].as_u64(), Some(1));
+    assert_eq!(prov["vadBackend"]["notRecorded"].as_u64(), Some(0));
     // The single runConfig boolean reflects STORED unanimity, not export-day loadability (no models on
     // disk here — the old code would have computed denoising/diarization from failed load probes).
     assert_eq!(manifest["runConfig"]["denoising"].as_bool(), Some(false), "mixed denoising -> false");

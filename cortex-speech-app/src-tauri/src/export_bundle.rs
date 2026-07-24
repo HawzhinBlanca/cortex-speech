@@ -246,6 +246,24 @@ impl ProvenanceCounts {
     }
 }
 
+/// P0.4: per-segment VAD-backend distribution over the exported rows (Migration v42) — how each region was
+/// ACTUALLY detected ("silero" / "energy" fallback / "none" for the short whole-buffer path), read from the
+/// stored `vad_backend` column, never a probe. `None` (a legacy row or the cloud Scribe path, where no
+/// local VAD runs) is bucketed as `not_recorded`. Returns (count-by-backend, not_recorded).
+fn tally_vad_backends<'a>(
+    values: impl Iterator<Item = Option<&'a str>>,
+) -> (std::collections::BTreeMap<String, usize>, usize) {
+    let mut by_backend = std::collections::BTreeMap::new();
+    let mut not_recorded = 0usize;
+    for v in values {
+        match v {
+            Some(backend) => *by_backend.entry(backend.to_string()).or_insert(0) += 1,
+            None => not_recorded += 1,
+        }
+    }
+    (by_backend, not_recorded)
+}
+
 pub fn export_dataset_bundle(
     db: &Database,
     model_manager: &ModelManager,
@@ -425,6 +443,8 @@ pub fn export_dataset_bundle(
     // every clip. `denoised`/`diarized` (Migration v41) record whether each model actually ran at IMPORT.
     let denoised_provenance = ProvenanceCounts::tally(segments.iter().map(|s| s.denoised));
     let diarized_provenance = ProvenanceCounts::tally(segments.iter().map(|s| s.diarized));
+    let (vad_backend_counts, vad_backend_not_recorded) =
+        tally_vad_backends(segments.iter().map(|s| s.vad_backend.as_deref()));
     let run_config = {
         // The two capability args to config_from_settings are inert here (immediately overridden below):
         // runConfig's denoising/diarization now report STORED per-segment truth, not export-day
@@ -462,6 +482,10 @@ pub fn export_dataset_bundle(
             "total": segments.len(),
             "denoised": denoised_provenance.to_json(),
             "diarized": diarized_provenance.to_json(),
+            "vadBackend": {
+                "byBackend": vad_backend_counts,
+                "notRecorded": vad_backend_not_recorded,
+            },
         },
         "validation": {
             "blocked": validation_gate.blocked,

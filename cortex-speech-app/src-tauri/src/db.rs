@@ -61,6 +61,10 @@ pub struct SpeechSegment {
     /// CAM++ speaker-embedding model was loadable). `None` = not recorded (legacy row). Distinct from
     /// `speaker_id`, which can be a filename hint even when diarization did not run.
     pub diarized: Option<bool>,
+    /// Which VAD backend ACTUALLY produced this segment's speech region (Migration v42): "silero",
+    /// "energy" (fallback), or "none" (short file taken whole, no VAD). `None` = not recorded (legacy row
+    /// / cloud Scribe path). Surfaced from the detector at import, never a path-exists probe.
+    pub vad_backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,7 +209,7 @@ const SEGMENT_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript
                     verdict, verdict_transcript, rationale, evidence_json,
                     agent_confidence, escalated, human_decision, corrected_at, is_gold,
                     alignment_quality, model_version_id, confidence_source, cloud_call,
-                    decoder_config_hash, normalizer_version, denoised, diarized";
+                    decoder_config_hash, normalizer_version, denoised, diarized, vad_backend";
 
 /// Reject structurally-invalid segments at the DB write boundary, before they can
 /// corrupt the downstream split/stats/training-grade math that every later stage
@@ -426,8 +430,8 @@ impl Database {
             "INSERT INTO speech_segments
                 (id, audio_path, raw_transcript, normalized_transcript,
                  annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score, alignment_quality,
-                 model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(?18, 'unknown@pre-registry'), COALESCE(?19, 'unknown'), ?20, ?21, ?22, ?23, ?24)
+                 model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized, vad_backend)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(?18, 'unknown@pre-registry'), COALESCE(?19, 'unknown'), ?20, ?21, ?22, ?23, ?24, ?25)
              ON CONFLICT(id) DO UPDATE SET
                 audio_path=excluded.audio_path,
                 raw_transcript=excluded.raw_transcript,
@@ -452,6 +456,7 @@ impl Database {
                 normalizer_version=excluded.normalizer_version,
                 denoised=excluded.denoised,
                 diarized=excluded.diarized,
+                vad_backend=excluded.vad_backend,
                 updated_at=datetime('now')",
             params![
                 seg.id, seg.audio_path, raw_nfc,
@@ -467,6 +472,7 @@ impl Database {
                 seg.normalizer_version,
                 seg.denoised.map(|b| b as i32),
                 seg.diarized.map(|b| b as i32),
+                seg.vad_backend,
             ],
         )?;
         self.track_write()?;
@@ -499,10 +505,10 @@ impl Database {
                  ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
                  verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
                  human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
-                 confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized, updated_at)
+                 confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized, vad_backend, updated_at)
              VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                  ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                 COALESCE(?28, 'unknown@pre-registry'), COALESCE(?29, 'unknown'), ?30, ?31, ?32, ?33, ?34, datetime('now'))
+                 COALESCE(?28, 'unknown@pre-registry'), COALESCE(?29, 'unknown'), ?30, ?31, ?32, ?33, ?34, ?35, datetime('now'))
              ON CONFLICT(id) DO UPDATE SET
                 created_at=excluded.created_at,
                 audio_path=excluded.audio_path,
@@ -537,6 +543,7 @@ impl Database {
                 normalizer_version=excluded.normalizer_version,
                 denoised=excluded.denoised,
                 diarized=excluded.diarized,
+                vad_backend=excluded.vad_backend,
                 updated_at=datetime('now')",
             params![
                 seg.id,
@@ -573,6 +580,7 @@ impl Database {
                 seg.normalizer_version,
                 seg.denoised.map(|b| b as i32),
                 seg.diarized.map(|b| b as i32),
+                seg.vad_backend,
             ],
         )?;
         self.track_write()?;
@@ -622,8 +630,8 @@ impl Database {
                 "INSERT INTO speech_segments
                     (id, audio_path, raw_transcript, normalized_transcript,
                      annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
-                     model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'), ?19, ?20, ?21, ?22, ?23)
+                     model_version_id, confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized, vad_backend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'), ?19, ?20, ?21, ?22, ?23, ?24)
                  ON CONFLICT(id) DO UPDATE SET
                     audio_path=excluded.audio_path,
                     raw_transcript=excluded.raw_transcript,
@@ -647,6 +655,7 @@ impl Database {
                     normalizer_version=excluded.normalizer_version,
                     denoised=excluded.denoised,
                     diarized=excluded.diarized,
+                    vad_backend=excluded.vad_backend,
                     updated_at=datetime('now')"
             )?;
             for seg in segments {
@@ -676,6 +685,7 @@ impl Database {
                     seg.normalizer_version,
                     seg.denoised.map(|b| b as i32),
                     seg.diarized.map(|b| b as i32),
+                    seg.vad_backend,
                 ])?;
             }
             Ok(())
@@ -2017,6 +2027,8 @@ impl Database {
             // None (absent/NULL, i.e. a legacy pre-v41 row) stays "not recorded" rather than a fake false.
             denoised: Self::optional_col::<i32>(row, 32)?.map(|v| v != 0),
             diarized: Self::optional_col::<i32>(row, 33)?.map(|v| v != 0),
+            // VAD backend — Migration v42; nullable TEXT. None (absent/NULL) stays "not recorded".
+            vad_backend: Self::optional_col(row, 34)?,
         })
     }
 

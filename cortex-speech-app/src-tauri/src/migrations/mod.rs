@@ -1145,6 +1145,16 @@ pub static MIGRATIONS: &[Migration] = &[
              ALTER TABLE speech_segments DROP COLUMN denoised;",
         ),
     },
+    Migration {
+        version: 42,
+        description: "Per-segment VAD backend provenance: which detector produced each region (P0.4)",
+        // Completes the P0.4 per-segment processing provenance (denoised/diarized landed in v41). Records
+        // the VAD backend that ACTUALLY produced each segment's region — "silero", "energy" (fallback), or
+        // "none" (short file taken whole). NULL = not recorded (legacy row / cloud Scribe path). Nullable
+        // TEXT, STRICT-compatible; ADD COLUMN fires no FK cascade, so no FK-off window.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN vad_backend TEXT;",
+        down_sql: Some("ALTER TABLE speech_segments DROP COLUMN vad_backend;"),
+    },
 ];
 
 #[cfg(test)]

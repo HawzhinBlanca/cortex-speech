@@ -44,7 +44,7 @@ fn audiobook_mp3_decode_and_chunk_plan() {
     audio::decode_pcm_windows(&path, audio::DECODE_WINDOW_MS, |window| {
         window_count += 1;
         let (sample_rate, pcm) = audio::ensure_pcm_16khz(window.sample_rate, window.pcm).expect("resample");
-        let ranges = chunking::plan_speech_chunks(
+        let (ranges, _vad_backend) = chunking::plan_speech_chunks(
             &pcm,
             sample_rate,
             settings.vad_threshold,

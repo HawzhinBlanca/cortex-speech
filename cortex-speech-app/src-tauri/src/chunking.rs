@@ -109,18 +109,21 @@ pub fn plan_speech_chunks(
     vad_threshold: f32,
     min_segment_ms: u32,
     max_segment_ms: u32,
-) -> AppResult<Vec<(usize, usize)>> {
+) -> AppResult<(Vec<(usize, usize)>, audio::VadBackend)> {
     if pcm.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), audio::VadBackend::None));
     }
 
     let min_samples = ms_to_samples(min_segment_ms, sample_rate).max(1);
     let max_samples = ms_to_samples(max_segment_ms, sample_rate).max(min_samples);
 
-    let mut regions = if needs_chunking(pcm.len(), sample_rate, max_segment_ms) {
+    // The backend is decided at the SOURCE — whether VAD actually ran. The post-processing below only
+    // reshapes the regions (merge/split/absorb), so `vad_backend` stays what the detector reported. A file
+    // short enough to skip chunking takes the whole buffer as one region: no VAD ran -> None.
+    let (mut regions, vad_backend) = if needs_chunking(pcm.len(), sample_rate, max_segment_ms) {
         audio::voice_activity_detection(pcm, sample_rate, vad_threshold)?
     } else {
-        vec![(0, pcm.len())]
+        (vec![(0, pcm.len())], audio::VadBackend::None)
     };
 
     if regions.is_empty() {
@@ -159,7 +162,7 @@ pub fn plan_speech_chunks(
         final_regions.push((0, pcm.len().min(max_samples)));
     }
 
-    Ok(final_regions)
+    Ok((final_regions, vad_backend))
 }
 
 /// Merge consecutive VAD regions when the combined span fits within `max_samples` AND the silence gap
@@ -579,16 +582,18 @@ mod tests {
     #[test]
     fn plan_short_audio_single_chunk() {
         let pcm = vec![1000i16; 16000]; // 1 second
-        let chunks = plan_speech_chunks(&pcm, 16000, 0.5, 500, 15_000).unwrap();
+        let (chunks, backend) = plan_speech_chunks(&pcm, 16000, 0.5, 500, 15_000).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], (0, pcm.len()));
+        // A file below the chunking threshold skips VAD entirely — the whole buffer is one region.
+        assert_eq!(backend, audio::VadBackend::None, "short-file whole-buffer path runs no VAD");
     }
 
     #[test]
     fn plan_long_audio_multiple_chunks() {
         // ~40s of non-silence — exceeds 15s max and produces multiple chunks (keep short for Silero VAD in CI)
         let pcm = vec![8000i16; 16000 * 40];
-        let chunks = plan_speech_chunks(&pcm, 16000, 0.5, 3000, 15_000).unwrap();
+        let (chunks, _backend) = plan_speech_chunks(&pcm, 16000, 0.5, 3000, 15_000).unwrap();
         assert!(chunks.len() > 1, "expected multiple chunks, got {}", chunks.len());
         assert_eq!(chunks.first().unwrap().0, 0);
         assert_eq!(chunks.last().unwrap().1, pcm.len());

@@ -295,7 +295,8 @@ fn test_vad_on_real_kurdish_audio() {
     assert_eq!(sr, 16000);
 
     let start = Instant::now();
-    let vad_segments = voice_activity_detection(&pcm, 16000, 0.5).expect("VAD should succeed on real audio");
+    let (vad_segments, _backend) =
+        voice_activity_detection(&pcm, 16000, 0.5).expect("VAD should succeed on real audio");
     eprintln!(
         "[VAD] Found {} speech segments in {:.1}s audio, took {:.3}s",
         vad_segments.len(),
@@ -879,7 +880,7 @@ fn transcribe_file_with_finetuned() {
     eprintln!("[finetuned] {:.1}s @ 16 kHz mono (decoded)", f32_pcm.len() as f64 / 16000.0);
 
     let normalizer = SoraniNormalizer::new();
-    let vad = voice_activity_detection(&pcm, 16000, 0.5).unwrap_or_default();
+    let vad = voice_activity_detection(&pcm, 16000, 0.5).map(|(regions, _backend)| regions).unwrap_or_default();
     let raw_segments: Vec<(usize, usize)> = if vad.is_empty() { vec![(0, f32_pcm.len())] } else { vad };
 
     // The fine-tuned MMS-CTC model is trained on short utterances; a single >~15 s pass can duplicate
@@ -1092,7 +1093,7 @@ fn end_to_end_review_run() {
     let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
 
     // App-faithful segmentation: VAD, then split anything over ~15 s (max_segment_duration_ms).
-    let vad = voice_activity_detection(&pcm, 16000, 0.5).unwrap_or_default();
+    let vad = voice_activity_detection(&pcm, 16000, 0.5).map(|(regions, _backend)| regions).unwrap_or_default();
     let raw_segs: Vec<(usize, usize)> = if vad.is_empty() { vec![(0, pcm.len())] } else { vad };
     const MAX: usize = 15 * 16000;
     let mut windows: Vec<(usize, usize)> = Vec::new();
