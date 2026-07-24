@@ -54,19 +54,30 @@ grep "fleurs\|ckb" /mnt/f/Kurdish\ Sorani\ Dataset/Kurdish_Sorani_ASR_Combined_v
 
 **What**: Run 7B, fine-tuned MMS-1B, and stock OmniASR-CTC-300M on both FLEURS and CV22 ckb test sets. Measure CER, WER, RTF with identical normalization and bootstrap 95% CI.
 
+> **Fastest path**: use the verified copy-paste block at the bottom of this file — `run_measurements.py`
+> runs the 7B + fine-tuned scorecards in one honesty-stamped command AND leaves the per-clip TSVs the
+> significance test needs. The per-engine commands below are the manual equivalent.
+
 ### 7B (warm server):
 ```bash
-wsl python scripts/scorecard_7b.py scripts/cv22_ckb_test_frozen.tsv 3000 \
-  > /tmp/7b_cv22_results.tsv
-# Computes: CER (%), WER (%), micro aggregation, Bisani & Ney bootstrap CI
-# (swap in scripts/fleurs_ckb_iq_frozen.tsv once the FLEURS builder lands)
+# scorecard_7b writes its PER-CLIP TSV to omni7b_results.tsv NEXT TO the manifest (stdout is the headline).
+wsl python3 cortex-speech-app/scripts/scorecard_7b.py scripts/fleurs_ckb_iq/fleurs_ckb_iq_frozen.tsv 3000
+# Computes: CER (%), WER (%), micro aggregation, seeded utterance-bootstrap 95% CI.
 ```
 
 ### Fine-tuned MMS-1B:
 ```bash
-python scripts/measure_finetuned_cer.py scripts/cv22_ckb_test_frozen.tsv 3000 \
-  > /tmp/finetuned_cv22_results.tsv
-# Identical normalization + bootstrap as 7B
+# Use scorecard_finetuned.py (not measure_finetuned_cer.py) — it writes the per-clip finetuned_results.tsv
+# the paired significance test pairs against omni7b_results.tsv. Needs CORTEX_FINETUNED_MODEL + _ONNX.
+python scripts/scorecard_finetuned.py scripts/fleurs_ckb_iq/fleurs_ckb_iq_frozen.tsv 3000
+# Identical normalization + bootstrap as 7B.
+```
+
+### Paired significance (the p-value M1.4 needs):
+```bash
+python scripts/mapsswe_compare.py scripts/fleurs_ckb_iq/omni7b_results.tsv \
+    scripts/fleurs_ckb_iq/finetuned_results.tsv 7B finetuned
+# Matched-pairs z-test on CER + WER, paired by clip_index (safe when engines skip different clips).
 ```
 
 ### Stock OmniASR-CTC-300M:
@@ -117,24 +128,47 @@ pub fn new() -> Self {
 
 ---
 
-## Commands to run (summary for quick copy-paste)
+## Commands to run (summary — verified copy-paste, 2026-07-24)
+
+> The FLEURS builder now EXISTS (`build_fleurs_ckb_manifest.py`, M1.1). Every number below comes from a
+> real run of the real harness; `run_measurements.py` stamps the git SHA + manifest SHA-256 + row count +
+> exact command line, and the paired significance step (`mapsswe_compare.py`) is the honest way to decide
+> "which engine wins" — do NOT eyeball two overlapping CIs.
 
 ```bash
-# Step 1: Freeze the CV22 manifest (TSV; FLEURS builder still to be written — see M1.1)
-python cortex-speech-app/scripts/build_cv22_ckb_manifest.py \
-    --cv22-dir "$CORTEX_CV22_DIR" --split test --extract --wsl-paths \
-    --output cortex-speech-app/scripts/cv22_ckb_test_frozen.tsv
+# ── ONE-TIME PREREQUISITES ──────────────────────────────────────────────────────────────────────
+# a) Warm OmniASR-7B server in WSL (for the 7B scorecard) — leave it running in its own terminal:
+#      wsl python3 cortex-speech-app/scripts/cortex_7b_server.py
+# b) Fine-tuned ONNX exported + env pointing at it (for the fine-tuned scorecard):
+#      export CORTEX_FINETUNED_MODEL="<your fine-tuned HF export dir>"
+#      export CORTEX_FINETUNED_ONNX="<that dir>/model.int8.onnx"
+#      # (first time only: scripts/export_finetuned_onnx.py then scripts/quantize_finetuned_onnx.py)
 
-# Step 2: Run benchmarks (GPU-heavy, ~2h each)
-wsl python cortex-speech-app/scripts/scorecard_7b.py cortex-speech-app/scripts/cv22_ckb_test_frozen.tsv 3000
-python cortex-speech-app/scripts/measure_finetuned_cer.py cortex-speech-app/scripts/cv22_ckb_test_frozen.tsv 3000
-cd cortex-speech-app && cargo test --manifest-path src-tauri/Cargo.toml --test real_audio -- --ignored omniasr_on_fleurs --nocapture
+# ── STEP 1 · FREEZE A GOLD MANIFEST (writes a .sha256 sidecar so the eval set is pinned) ──────────
+# FLEURS ckb_IQ — the ~350-sentence set the champion's 7.03% CER is measured on (wide CI, report it):
+python cortex-speech-app/scripts/build_fleurs_ckb_manifest.py \
+    --output-dir cortex-speech-app/scripts/fleurs_ckb_iq --wsl-paths
+MANIFEST=cortex-speech-app/scripts/fleurs_ckb_iq/fleurs_ckb_iq_frozen.tsv
+# OR the larger CV22 ckb test split (~5.3k clips, already on disk — no download):
+#   python cortex-speech-app/scripts/build_cv22_ckb_manifest.py --cv22-dir "$CORTEX_CV22_DIR" \
+#       --split test --extract --wsl-paths --output cortex-speech-app/scripts/cv22_ckb_test_frozen.tsv
 
-# Step 3: Record results in EVAL.md with artifacts (command SHA, dataset SHA, N, metric, CI)
+# ── STEP 2 · CER / WER / 95% CI PER ENGINE (one command; honesty-stamped output) ──────────────────
+python cortex-speech-app/scripts/run_measurements.py "$MANIFEST" --engines 7b,finetuned --bootstrap 3000
+# Also leaves the PER-CLIP TSVs next to the manifest — omni7b_results.tsv + finetuned_results.tsv —
+# which the significance test below consumes. (7B must run where it can reach the warm WSL socket.)
 
-# Step 4: Apply decision protocol, flip default in settings.rs, test
+# ── STEP 3 · PAIRED SIGNIFICANCE — the p-value the decision rule needs ─────────────────────────────
+MDIR=$(dirname "$MANIFEST")
+python cortex-speech-app/scripts/mapsswe_compare.py \
+    "$MDIR/omni7b_results.tsv" "$MDIR/finetuned_results.tsv" 7B finetuned
+# MAPSSWE matched-pairs z-test on CER + WER, paired BY clip_index — correct even if the two engines
+# skipped different clips (a plain row-zip would silently mispair). Prints mean diff, z, p, verdict.
 
-# Step 5: Commit "feat(m1): engine decision protocol and measured default"
+# ── STEP 4 · DECIDE + (only if it flips) change the default ────────────────────────────────────────
+# Apply the M1.4 rule to the measured CER + the mapsswe p. If the default changes, set
+# AsrModelSize in settings.rs::new(), then verify USER-OBSERVABLE (import a clip, check the engine badge).
+# Paste the numbers + the exact commands + SHAs into the ledger. Never a metric without its real run.
 ```
 
 **Owner time required**: ~0 (GPU runs in background, results reviewed once complete).
