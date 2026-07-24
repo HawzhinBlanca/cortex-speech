@@ -1490,7 +1490,9 @@ impl ProcessingPipeline {
         )?;
 
         let mut diarization_guard = self.lock_diarization_service();
-        if diarization_guard.is_none() {
+        // Rebuild when unset OR cached-INACTIVE (see the denoiser site below): caching an inactive
+        // service ignored a CAM++ model downloaded mid-session until an app restart. Cheap while absent.
+        if diarization_guard.as_ref().map_or(true, |s| !s.is_available()) {
             // Per-file (round-26): resolve_root_for avoids resolved_dir()'s all-or-nothing orphan of the
             // bundled-only campp speaker model once the user downloads OmniASR into the user dir.
             let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
@@ -1501,7 +1503,12 @@ impl ProcessingPipeline {
             .ok_or_else(|| AppError::Other("Failed to initialize diarization service".into()))?;
 
         let mut denoiser_guard = self.lock_denoiser_service();
-        if denoiser_guard.is_none() {
+        // Rebuild when unset OR cached-INACTIVE: an inactive service means the model was absent when it
+        // was first built, so caching that pass-through for the whole session ignored a denoiser
+        // downloaded mid-session until an app restart (hunt-10 #3) — and the export's fresh-service
+        // denoising flag then read `true` over un-denoised audio. The absent-path rebuild is a cheap
+        // path.exists() stat; once the model appears the load runs once and is_active() latches true.
+        if denoiser_guard.as_ref().map_or(true, |s| !s.is_active()) {
             // Per-file (round-26): resolved_dir() is all-or-nothing, so a bundled-only or user-downloaded
             // denoiser is orphaned once OmniASR flips the root. resolve_root_for loads it from wherever it is.
             let model_dir = self.model_manager.resolve_root_for(crate::models::DENOISER_MODEL);
@@ -1649,7 +1656,8 @@ impl ProcessingPipeline {
             };
 
             let mut diarization_guard = self.lock_diarization_service();
-            if diarization_guard.is_none() {
+            // Rebuild when unset OR cached-inactive — see the non-streaming sibling site.
+            if diarization_guard.as_ref().map_or(true, |s| !s.is_available()) {
                 // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
                 let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
                 *diarization_guard = Some(crate::diarization::SpeakerEmbeddingService::new(&model_dir));
@@ -1659,7 +1667,8 @@ impl ProcessingPipeline {
                 .ok_or_else(|| AppError::Other("Failed to initialize diarization service".into()))?;
 
             let mut denoiser_guard = self.lock_denoiser_service();
-            if denoiser_guard.is_none() {
+            // Rebuild when unset OR cached-inactive — see the non-streaming sibling site.
+            if denoiser_guard.as_ref().map_or(true, |s| !s.is_active()) {
                 // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
                 let model_dir = self.model_manager.resolve_root_for(crate::models::DENOISER_MODEL);
                 *denoiser_guard = Some(crate::denoiser::DenoiserService::new(&model_dir));

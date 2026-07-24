@@ -2157,8 +2157,31 @@ def test_directory_exports_validate_out_dir_against_unc() -> None:
             )
 
 
+def test_cached_model_services_rebuild_when_inactive_not_just_unset() -> None:
+    # hunt-10 #3: the pipeline lazily caches the denoiser + speaker-embedding services under
+    # `if guard.is_none()`. When the model is absent at first import, ::new returns an INACTIVE service
+    # (a pass-through) that is still Some(..) — so a model DOWNLOADED mid-session was ignored until an
+    # app restart, and post-download imports silently ran un-denoised while the export's fresh-service
+    # denoising flag said true. The cache must rebuild while INACTIVE too (the absent-path rebuild is a
+    # cheap path.exists() stat; the heavy load runs once, when the model appears). Guard against a
+    # regression back to is_none()-only caching.
+    text = pipeline_surface()
+    stale = [p for p in ("denoiser_guard.is_none()", "diarization_guard.is_none()") if p in text]
+    if stale:
+        formatted = "\n".join(f"- if {entry}" for entry in stale)
+        raise AssertionError(
+            "pipeline.rs caches a lazily-built model service on is_none() alone, so a model downloaded "
+            "mid-session is ignored until restart. Rebuild while inactive too:\n" + formatted
+        )
+    if "!s.is_active()" not in text:
+        raise AssertionError("denoiser cache must rebuild when the cached service is inactive (!s.is_active())")
+    if "!s.is_available()" not in text:
+        raise AssertionError("speaker-embedding cache must rebuild when inactive (!s.is_available())")
+
+
 def main() -> None:
     test_directory_exports_validate_out_dir_against_unc()
+    test_cached_model_services_rebuild_when_inactive_not_just_unset()
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
     test_wsl_refinement_lifecycle_failures_are_reported()
