@@ -9761,9 +9761,9 @@ isolated Tauri+ort build does not fit a 15-min iteration, and cargo test/clippy 
 `cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (1m27s) ·
 `cargo test --lib run_config_records` → `test result: ok. 2 passed; 0 failed; 0 ignored`.
 
-**NOT yet verified this iter:** full `cargo test --lib` (only the 2 targeted provenance tests ran — no
-reason to expect breakage, the change is a 1-field guard + new pure fn, but the whole suite was not run);
-no rebuild of the shipped exe (shipped provenance behavior changed — rebuild pending, owner's call).
+**Full-suite reality check:** `cargo test --lib` → `test result: ok. 1001 passed; 0 failed; 6 ignored`
+(89.83s; the 6 ignored are the model-fetch-gated real-audio tests). **NOT verified:** no rebuild of the
+shipped exe (shipped provenance behavior changed — rebuild pending, owner's call).
 
 **Next (roadmap execution order):** P0.3 wire DPAPI into set_api_key → P1.1 UNC guards on relink_audio/
 merge_dataset_json/restore_segment_snapshot → P1.2 native fatal-error dialog. Tier-0 P0.1 (re-pin the
