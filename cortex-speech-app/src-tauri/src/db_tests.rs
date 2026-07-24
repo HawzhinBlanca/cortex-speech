@@ -21,6 +21,23 @@ fn make_segment(id: &str, audio_path: &str) -> SpeechSegment {
 }
 
 #[test]
+fn insert_segment_rejects_unc_audio_path_ntlm_leak_guard() {
+    // P1.1: validate_segment is the shared DB write boundary for merge_dataset_json AND every insert
+    // path, so a UNC/network audio_path must be rejected here — otherwise a renderer-planted
+    // `\\attacker\share\clip.wav` reaches the row and drives the SMB redirector (NTLM forced-auth leak)
+    // the moment any later exists()/decode touches it. A plain local path still inserts. UNC is a
+    // Windows concept, so the rejection assertion is windows-gated; the accept path runs everywhere.
+    let db = make_db();
+    db.insert_segment(&make_segment("ok-1", "/a/local.wav")).expect("a plain local audio_path must still insert");
+    #[cfg(windows)]
+    {
+        let err = db.insert_segment(&make_segment("unc-1", r"\\attacker\share\clip.wav")).unwrap_err();
+        assert!(format!("{err}").contains("UNC"), "a UNC audio_path must be rejected at the write boundary: {err}");
+        assert!(db.get_segment_by_id("unc-1").unwrap().is_none(), "the rejected UNC row must never be persisted");
+    }
+}
+
+#[test]
 fn update_normalized_transcript_is_targeted_and_avoids_the_whole_row_clobber() {
     // iter-88: batch_normalize used a read-modify-write + whole-row insert_segment upsert. A concurrent
     // write to the SAME segment (e.g. a background aligner / 7B pass on the pipeline's own connection)

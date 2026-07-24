@@ -125,9 +125,11 @@ pub async fn get_audio_health(state: State<'_, AppState>) -> Result<crate::db::A
 #[tauri::command]
 pub async fn relink_audio(search_dir: String, state: State<'_, AppState>) -> Result<crate::db::RelinkResult, String> {
     STRICT_RATE_LIMITER.check("relink_audio")?;
-    if search_dir.contains('\0') {
-        return Err("Search directory contains null bytes".to_string());
-    }
+    // P1.1: reject a UNC search dir BEFORE db.relink_audio probes `search_dir.join(name).is_file()` — a
+    // renderer-supplied `\\attacker\share` would otherwise drive the SMB redirector (NTLM forced-auth
+    // leak) on the is_file() stat and then PERSIST the UNC path into the row. Syntactic guard, zero I/O
+    // (no canonicalize: the picked dir is searched as-is); also subsumes the prior null-byte check.
+    validate::reject_unc_path(&search_dir)?;
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());

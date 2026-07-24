@@ -206,6 +206,12 @@ fn validate_segment(seg: &SpeechSegment) -> AppResult<()> {
     if seg.id.trim().is_empty() {
         return Err(AppError::Validation("Segment id must not be empty".into()));
     }
+    // P1.1: reject a UNC/network audio_path at the shared DB write boundary (covers merge_dataset_json
+    // and every other insert path). A renderer-planted `\\attacker\share\clip.wav` would otherwise flow
+    // into the row and drive the SMB redirector (NTLM forced-auth leak) the moment any downstream
+    // consumer (validate_dataset, compute_acoustic_scores, decode) touches it. Syntactic, zero I/O; an
+    // empty audio_path is allowed (not a UNC path). Mirrors the export-side guard shipped in #131.
+    crate::validation::input::reject_unc_path(&seg.audio_path).map_err(AppError::Validation)?;
     if seg.duration_ms < 0 {
         return Err(AppError::Validation(format!(
             "Segment '{}' has a negative duration_ms ({})",

@@ -66,6 +66,11 @@ pub fn update_segment(segment: SpeechSegment, state: State<'_, AppState>) -> Res
 pub fn restore_segment_snapshot(segment: SpeechSegment, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("restore_segment_snapshot")?;
     validate::validate_identifier(&segment.id)?;
+    // P1.1: the sibling update_segment validates a changed audio_path; this whole-row restore must too,
+    // or a compromised renderer could repoint an existing row's audio_path to a UNC share (NTLM leak on
+    // the next decode/exists). Syntactic UNC guard — no canonicalize, since the snapshot's path is
+    // written back as-is and may point at audio that was legitimately moved since it was captured.
+    validate::reject_unc_path(&segment.audio_path)?;
     validate::validate_text(&segment.raw_transcript, 100000, "Raw transcript")?;
     if let Some(ref t) = segment.annotated_transcript {
         validate::validate_text(t, 100000, "Annotated transcript")?;

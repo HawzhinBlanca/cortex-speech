@@ -46,15 +46,47 @@ pub fn validate_file_path(path: &str) -> Result<String, String> {
     Ok(canonical.to_string_lossy().to_string())
 }
 
-/// True if `p` begins with a Windows UNC / verbatim-UNC prefix (`\\server\share` or `\\?\UNC\...`).
-/// Purely syntactic — inspects the parsed prefix only, with no filesystem or network access.
+/// True if `p` begins with any Windows prefix that routes through the network (MUP) redirector — the
+/// forced-authentication / NTLM-leak surface. Purely syntactic: inspects the parsed prefix only, with
+/// zero filesystem/network access.
+///
+/// Covers FOUR spellings, not two. Rust's `Path` parser only classifies `\\server\share` and the
+/// uppercase `\\?\UNC\server\share` as `Prefix::UNC`/`VerbatimUNC`; but `\\?\unc\...` (lowercase — Rust
+/// sees `Prefix::Verbatim("unc")`) and `\\.\UNC\...` (device namespace — `Prefix::DeviceNS("UNC")`)
+/// ALSO drive the redirector (measured: `std::fs::metadata` returns os error 53 ERROR_BAD_NETPATH for
+/// all four, vs os error 3 for a local path). A guard that matched only the first two left the exact
+/// leak open under two aliases, so the "UNC" keyword is matched case-insensitively in the verbatim and
+/// device-namespace forms too. Legit local prefixes (`Disk`, `VerbatimDisk` — what `canonicalize`
+/// returns) never match.
 #[cfg(windows)]
 fn is_unc_path(p: &Path) -> bool {
     use std::path::{Component, Prefix};
-    matches!(
-        p.components().next(),
-        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
-    )
+    match p.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::UNC(..) | Prefix::VerbatimUNC(..) => true,
+            Prefix::Verbatim(s) | Prefix::DeviceNS(s) => s.eq_ignore_ascii_case("unc"),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Reject a renderer-supplied path that would drive the Windows SMB redirector (a UNC / network path)
+/// or that contains a null byte. This is the SYNTACTIC half of [`validate_file_path`], extracted for
+/// the WRITE paths (dataset merge, snapshot restore, the relink search dir) where the path is stored
+/// or searched AS-IS and must NOT be canonicalized: the target may legitimately not exist yet, and
+/// canonicalizing a UNC path is ITSELF the NTLM-forced-auth leak we are preventing (it opens a handle
+/// to the target). Zero filesystem/network I/O. On non-Windows only the null-byte check applies (UNC is
+/// a Windows concept), matching the `#[cfg(windows)]` guards in [`validate_file_path`].
+pub fn reject_unc_path(path: &str) -> Result<(), String> {
+    if path.contains('\0') {
+        return Err("Path contains null bytes".to_string());
+    }
+    #[cfg(windows)]
+    if is_unc_path(Path::new(path)) {
+        return Err("Network (UNC) paths are not allowed".to_string());
+    }
+    Ok(())
 }
 
 /// Validate that a string is a safe identifier (alphanumeric + underscore + hyphen).
@@ -207,6 +239,35 @@ mod tests {
     fn test_validate_file_path_null_byte() {
         let result = validate_file_path("safe.txt\0malicious.exe");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_unc_path_blocks_null_everywhere_and_unc_on_windows() {
+        // P1.1: the syntactic write-path guard. Null bytes are rejected on every platform; a
+        // non-UNC relative/local path passes WITHOUT canonicalization (no existence requirement);
+        // and on Windows both UNC spellings are rejected with zero I/O.
+        assert!(reject_unc_path("some/local/clip.wav").is_ok(), "a plain local path must pass (no canonicalize)");
+        assert!(reject_unc_path("").is_ok(), "an empty audio_path is not a UNC path");
+        assert!(reject_unc_path("a.wav\0b.exe").is_err(), "null bytes rejected on all platforms");
+        #[cfg(windows)]
+        {
+            // All FOUR redirector-driving spellings must be rejected — not just the two canonical ones.
+            // The lowercase-verbatim and device-namespace forms were a real bypass of the pre-#131 guard
+            // (Rust parses them as Prefix::Verbatim("unc") / Prefix::DeviceNS("UNC"), not Prefix::UNC),
+            // confirmed to hit the SMB redirector (os error 53). Verified on this box.
+            for p in [
+                r"\\host.invalid\share\x.wav",
+                "//host.invalid/share/x.wav",
+                r"\\?\UNC\host.invalid\share\x.wav",
+                r"\\?\unc\host.invalid\share\x.wav",
+                r"\\.\UNC\host.invalid\share\x.wav",
+            ] {
+                let e = reject_unc_path(p).expect_err("UNC spelling must be rejected");
+                assert!(e.contains("UNC"), "must reject as UNC ({p}): {e}");
+            }
+            // Legit local prefixes must still pass — including the verbatim-disk form canonicalize returns.
+            assert!(reject_unc_path(r"\\?\C:\Users\me\clip.wav").is_ok(), "verbatim-disk local path must pass");
+        }
     }
 
     #[cfg(windows)]
