@@ -10171,3 +10171,45 @@ Gate (warm default target — app not running so target/release + %APPDATA% prov
 **Tier-1 status:** P1.1/P1.2/P1.3-fence/P1.4/P1.3b shipped; P1.4b (denoiser/diarization streaming retry)
 remains. **Next: P1.4b** → P0.4 per-segment provenance → Tier-3. P2.4 i18n is owner-gated (native Sorani).
 "Best / real #1" NOT claimed.
+
+### Iteration 178 — 2026-07-24 — P1.4b streaming denoiser/diarization rebuild breaker (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 8e4edaa, lock held (iter12-P1.4b). Frontend
+untouched → npm gates correctly skipped.
+
+**FIX P1.4b (audit R4) — bound the streaming per-window service rebuild to once per file.** The
+per-90s-window loop in `process_single_file_streaming` (pipeline.rs) rebuilt a cached denoiser/diarization
+service whenever it was unset OR inactive (`map_or(true, |s| !s.is_active())`). For a PRESENT-but-unloadable
+model (corrupt/partial ONNX) that meant a full GPU-then-CPU load attempt on EVERY 90 s window — the same
+retry-storm P1.4 fixed for the ASR loader, but per window instead of per call. Added a pure helper
+`should_rebuild_streaming_service(present, active, already_tried) = !present || (!already_tried && !active)`
+and two function-local `*_rebuild_tried` flags: a missing service is still built; a present-but-inactive one
+is re-attempted AT MOST ONCE per file, never per window. Flags are locals of `process_single_file_streaming`
+(one streaming call per file, verified: only call site pipeline.rs:1469, itself once-per-file in the import
+loop), so a model that appears mid-session recovers on the NEXT file — #132's between-file recovery preserved
+at file granularity, matching the non-streaming sibling. Committed 510436c.
+
+**Faithful refactor (hand-verified algebra):** for a healthy loadable model the helper yields the identical
+decision to the original inline condition across all three REACHABLE states — None→build, Some+active→reuse,
+Some+inactive→rebuild (the (present=false, active=true) pair is unreachable because `is_some_and` is false on
+None). The only new behavior is the once-per-file latch.
+
+**FAIL-BEFORE:** new unit test `streaming_service_rebuild_is_bounded_to_once_per_file` (pipeline_tests.rs)
+pins the truth table; with the latch dropped via a TARGETED edit (`!present || !active`, `let _ = already_tried`
+— NOT git checkout) it failed exactly on `present+inactive+already_tried → SKIP`, and passes with the fix.
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (9.57s) ·
+`cargo test --lib` → `test result: ok. 1009 passed; 0 failed; 6 ignored` · `python run_python_policies.py` → 42 passed.
+
+**Adversarially verified** (Workflow, 3 independent skeptics tasked to REFUTE against source): faithful-healthy-path,
+recovery-132-preserved, no-other-per-window-reload — all returned refuted=false / severity none, each citing
+exact lines matching my hand-verification (VAD/ASR/wav2vec2 all use their own session caches or the P1.4-style
+cooldown breaker, so no other unbounded per-window ONNX reload remains). No CONFIRMED findings; no survivors.
+
+**NOT verified:** no rebuild of the shipped exe (streaming-loop behavior changed — pending); the breaker is
+proven by unit truth-table, not by a live run against a genuinely corrupt on-disk model.
+
+**Tier-1 status:** P1.1/P1.2/P1.3-fence/P1.4/P1.3b/P1.4b all shipped — Tier-1 reliability items COMPLETE.
+**Next: P0.4** per-segment provenance (schema migration) → Tier-3. P2.4 i18n owner-gated (native Sorani).
+"Best / real #1" NOT claimed.
