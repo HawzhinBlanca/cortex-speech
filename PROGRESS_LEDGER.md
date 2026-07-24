@@ -10271,3 +10271,60 @@ rebuild (import-write behavior changed). The write side is proven by unit round-
 **Tier-0 status:** P0.2/P0.3 shipped; P0.4 WRITE side shipped, P0.4 READ side + vad_backend remain; P0.1
 owner-gated (GPU re-score). **Next: P0.4 read side** (export reads stored provenance, closing H3) →
 vad_backend → Tier-3. "Best / real #1" NOT claimed.
+
+### Iteration 180 — 2026-07-24 — P0.4 READ side: manifest reads stored provenance, closes H3 (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD eefbd8b, lock held (iter14-P0.4read). Mapped the
+export-runConfig site + all consumers first (3-agent map already had it; confirmed no rust test / no
+frontend reads runConfig — free to make it honest).
+
+**H3 CLOSED (audit MED).** The export bundle manifest's `runConfig.denoising/diarization` was computed at
+EXPORT time from current model loadability (`config_from_settings(settings, denoiser_loadable(),
+diarizer_loadable())`) and stamped as one flag on every segment regardless of what actually processed each
+clip — the temporal inverse of #132. The write side (iter179) persisted per-segment truth (v41
+denoised/diarized); this reads it. Committed c296ddc.
+
+**CHANGE.** New private `ProvenanceCounts { applied, not_applied, not_recorded }` with `tally(iter<Option<
+bool>>)` + `all_applied()` (unanimity: true iff every exported row recorded the model as having run) +
+`to_json()`. The manifest now tallies over the EXPORTED rows' stored `denoised`/`diarized` and emits
+`processingProvenance: { total, denoised:{applied,notApplied,notRecorded}, diarized:{...} }` (the honest
+per-segment distribution — a MIXED export is never collapsed), and `runConfig.denoising/diarization =
+all_applied()` (a unanimity bool, not a fabricated aggregate). The two `*_loadable()` probes are removed
+from the manifest (methods kept as pub capability API; `model_manager` still used for the separate
+model_manifest.json installed-model report — a legit export-day capability list, NOT per-segment provenance).
+Other runConfig fields (model_version/vad/durations/normalization) remain the settings snapshot.
+
+**SCOPE (independent judgment).** The manifest runConfig IS the audit's H3 finding — now closed. The milder
+HF-README sibling (export.rs still prints `settings.asr_model_size`) reads a DIFFERENT signal
+(model_version_id) with a written-subset nuance → deferred to its own slice; vad_backend likewise.
+
+**FAIL-BEFORE.** `manifest_reads_stored_per_segment_provenance_not_export_day_model_state` exports a MIXED
+set (denoised applied/not/unrecorded = 1/1/1, diarized unanimous 3/0/0) with NO models on disk; a TARGETED
+revert of `rc.diarization` to the old `model_manager.diarizer_loadable()` made it `Some(false)` where stored
+truth is `Some(true)` → test failed, passes with the fix. Plus a pure `ProvenanceCounts::tally/all_applied`
+unit test (empty→false, mixed→false, unrecorded-breaks-unanimity).
+
+**Superseded gate UPDATED, not weakened.** test_rust_runtime_panic_policy.py's bundle-runConfig check
+REQUIRED export-day `denoiser_loadable` (the round-23 honest interim, before per-segment provenance existed).
+Renamed + rewritten to the STRICTER invariant: REQUIRE stored-per-segment reads (ProvenanceCounts /
+denoised_provenance / diarized_provenance / processingProvenance) AND BAN the four export-day probes in
+export_bundle.rs. Verified non-vacuous (banned counts 0, required present; removing any fails it).
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (15.03s) ·
+`cargo test --lib` → `test result: ok. 1012 passed; 0 failed; 6 ignored` · `python run_python_policies.py` → 42 passed.
+
+**Adversarially verified** (Workflow, 4 independent skeptics vs source): H3 residual-leak, counted-over-
+exported-rows, semantics + P0.2 guard intact, policy-not-weakened + siblings — ALL refuted=false / severity
+none. Hand-verified: the counted set (post holdout/rejected/placeholder filters) is IDENTICAL to what
+export::export_dataset ships (same three filters, no training-ready-only drop) → processingProvenance.total
+== segmentCount == shipped rows.
+
+**NOT verified / remaining:** no exe rebuild (export output changed — a live export would show the new
+manifest fields). H3 (denoising/diarization) is CLOSED for the bundle manifest; the HF-README model_version
+sibling + `vad_backend` per-row provenance are NOT yet done. The Scribe cloud path records None
+(not-recorded) for denoised/diarized — honest (no local processing), reads as notRecorded in the distribution.
+
+**Tier-0 status:** P0.2/P0.3/P0.4(write+read, H3 closed) shipped; P0.4 vad_backend + HF-README model_version
+remain; P0.1 owner-gated (GPU re-score). **Next: P0.4 vad_backend** → HF-README model_version → Tier-3.
+"Best / real #1" NOT claimed.
