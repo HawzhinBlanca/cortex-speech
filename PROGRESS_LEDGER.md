@@ -9638,6 +9638,72 @@ sustained tail is MED honesty/data-quality/data-safety bugs (~2-3/hunt, still re
 finders clean) + 1 deferred-large + 1 enhancement.**
 Owner-gated finish line unchanged.
 
+### Iteration 166 — 2026-07-24 — HUNT-10 processed: 2 fixes (#131, #132) + 1 hand-verified close; 3 finders clean
+
+**Hunt-10** (Workflow, 6 finders weighted to the highest-stakes surface — cloud-egress/consent across ALL
+provider paths, IPC input-validation, the word-edit flow, pipeline speaker/denoiser routing, DB migrations,
+gold-manifest builders; 1.57M tokens, 15 agents, 0 died). 3 candidates returned for review (all MED);
+3 finders clean (cloud-egress-consent found every off-box path opt-in gated; migrations idempotent +
+defended; gold-builders uncontaminated). Per method, hand-verified EACH candidate against source — agent
+verdicts are not evidence, including the 2 that carried a refutation.
+
+**FIX #131 (MED security) — export_gold_eval_set / export_finetune_pack skipped the UNC path guard.** Both
+took `out_dir` with ONLY a null-byte check; every sibling export (incl. the directory export export_audio)
+routes its path through validate::validate_output_path, whose `#[cfg(windows)] is_unc_path` guard rejects
+UNC syntactically (zero I/O). Under the codebase's own XSS'd-renderer threat model, a compromised renderer
+could invoke() a `\\attacker\share` out_dir → flowed unvalidated into eval::export_*(out_dir) →
+create_dir_all(out_dir.join("clips")), driving the Windows SMB redirector (forced-auth NTLMv2 credential
+leak) + writing the gold references/16 kHz voice clips off-machine — the exact harm input.rs's guard exists
+to stop. All 3 verify lenses confirmed (0 refutes); hand-verified: the two are the lone path-taking export
+outliers, and the real flow supplies out_dir from an OS folder picker (always exists → parent-must-exist
+never rejects a legit run). Root fix: route both through validate::validate_output_path, matching export_audio.
+Regression gate: test_directory_exports_validate_out_dir_against_unc (per-command body scan). Fail-before ✓.
+
+**FIX #132 (MED reliability/honesty) — cached denoiser/speaker services never rebuilt after a mid-session
+model download.** The import pipeline lazily caches the DenoiserService + SpeakerEmbeddingService under
+`if guard.is_none()`. If a model is absent at the session's first import, ::new returns an INACTIVE
+pass-through that is still Some(..) → a model downloaded mid-session was ignored until an app restart:
+post-download imports silently ran un-denoised / fell back to fbank embeddings, and the export's
+fresh-service (denoiser_loadable) denoising flag then read `true` over un-denoised audio. **Hand-verified
+the finder's HEADLINE ("provenance lie") was WRONG** (the impact lens refuted it, correctly): the export
+flag is computed fresh off disk, independent of the stale cache, and the whole-bundle denoising boolean
+already can't represent per-file denoising even in a bug-free build — so no NEW fabrication. The REAL
+residual is the functional staleness (downloaded model unused until restart), which is genuine and cheap
+to root-fix. All 4 lazy-init sites (streaming + non-streaming, both services) now rebuild when unset OR
+inactive; the absent-path rebuild is a cheap path.exists() stat, the heavy ONNX load still runs once.
+is_none_or trips clippy::incompatible_msrv → map_or(true, ..). Gate:
+test_cached_model_services_rebuild_when_inactive_not_just_unset. Fail-before ✓.
+
+**CLOSED (hand-verified LATENT / UNREACHABLE, not a fix) — App.svelte:310 word-chip stale-merge.** Finder:
+a chip edit merges the stale $wordTimestamps store over a freshly-reloaded alignmentJson, reverting a
+background re-alignment. The reachability lens refuted it; my source read AGREES and the refutation holds.
+The mechanism is real (mergeWordTimestamps does {...base, words} with no reconciliation; the nav $effect
+reads get(selectedSegment) non-reactively so it never reseeds the store on a same-id reload) — but there is
+NO reachable trigger: neither update_asr_transcript_if_unreviewed (WSL-7B) nor
+update_batch_transcription_if_unreviewed (batch) writes alignment_json at all (verified their UPDATE column
+lists), so a same-id background reload returns byte-identical words → the merge is a no-op. The SOLE
+background alignment writer, enqueue_background_alignments, targets only the freshly-imported batch whose
+alignment_json is offsets-only (no `words` key) → parseWordTimestamps returns [] (alignment.ts:39) → zero
+word chips render → finishEditingWord is unreachable for exactly those segments; its later completion does
+not refire the nav $effect (same id), so chips still don't appear until a re-selection, which reseeds from
+the now-fresh worded base. Foreground re-aligners (handleTranscribe/handleAlign) set wordTimestamps
+immediately. The finder conflated "background reload of the row" (real) with "background re-alignment of a
+selected worded segment" (no such writer). NOT adding a speculative reconciliation guard (YAGNI); noted that
+any future background writer of a selected segment's words must reseed the store.
+
+Gate per fix: #131 cargo fmt/clippy/test --lib (1000 passed) + 41 python policies; #132 same (1000 passed,
+41 policies). Reality check pre-work: exe not running, git clean, HEAD 4633867, lock free (absolute path).
+
+**Session hunt tally (hunt-3..hunt-10, 8 hunts): 16 hunt-found fixes (#117-#132) + 6 earlier non-hunt fixes
+(#111-#116) = 22 this session.** Hunt-10 hit rate 2/3 candidates real (the 3rd a genuine latent-unreachable
+close). The consent/egress finder came back CLEAN — that HIGH-value surface reads as mined; the sustained
+tail stays MED honesty/reliability/security-hardening (~2/hunt). Higher-value frontier remains the
+owner-gated accuracy run (M1 runbook now runnable).
+
+**Score: 132 fixed + 1 cleanup, ~44 refuted/closed, 2 measure-deferred, 0 hunt-queued (hunt-10 drained: 2
+fixed, 1 latent-close, 3 finders clean) + 1 deferred-large + 1 enhancement.**
+Owner-gated finish line unchanged.
+
 QUEUE (hunt-2 survivors — hand-verify EACH against source before fixing):
 - [MED] export_bundle.rs:499 — a stale learning_preferences.jsonl orphan (pair_count 0 branch, fixed name)
   survives + is hashed into SHA256SUMS while the manifest disclaims it (re-ships holdout-derived DPO pairs).
