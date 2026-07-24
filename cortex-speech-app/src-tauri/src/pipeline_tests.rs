@@ -14,6 +14,21 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[test]
+fn streaming_service_rebuild_is_bounded_to_once_per_file() {
+    // P1.4b (audit R4): the streaming loop must build a denoiser/diarization service when unset, and
+    // re-attempt a present-but-inactive one AT MOST ONCE PER FILE — never a full GPU-then-CPU ONNX load
+    // on every 90 s window for an unloadable model. An ACTIVE service is always reused. args:
+    // should_rebuild_streaming_service(present, active, already_tried).
+    use super::should_rebuild_streaming_service as rebuild;
+    assert!(rebuild(false, false, false), "unset -> build");
+    assert!(rebuild(false, false, true), "unset -> build (a fresh/None guard always builds)");
+    assert!(!rebuild(true, true, false), "present + active -> reuse, never rebuild");
+    assert!(!rebuild(true, true, true), "present + active -> reuse");
+    assert!(rebuild(true, false, false), "present + inactive + not tried yet -> attempt once");
+    assert!(!rebuild(true, false, true), "present + inactive + already tried -> SKIP (no per-window reload)");
+}
+
+#[test]
 fn primary_7b_failures_carry_the_ui_sentinel_and_never_leak_a_small_model() {
     use super::{tag_7b_unavailable, ASR_7B_UNAVAILABLE_TAG};
     use crate::error::AppError;

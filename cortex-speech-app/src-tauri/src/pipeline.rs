@@ -21,6 +21,15 @@ const SUBPROCESS_ERROR_PREVIEW_CHARS: usize = 4096;
 const SOURCE_AUDIO_HASH_BUFFER_BYTES: usize = 128 * 1024;
 const NORMALIZER_VERSION: &str = "sorani-normalizer-v1";
 
+/// P1.4b: whether the streaming loop should (re)build a cached denoiser/diarization service this window.
+/// Build if the service is UNSET (`!present`); otherwise re-attempt a present-but-INACTIVE service only
+/// if we have NOT already tried this file (`!already_tried`) — so an unloadable model is not reloaded
+/// (a full GPU-then-CPU ONNX attempt) on every 90 s window, at most once per file. Pure, so the breaker
+/// decision is unit-testable without a real ONNX model.
+fn should_rebuild_streaming_service(present: bool, active: bool, already_tried: bool) -> bool {
+    !present || (!already_tried && !active)
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscriptionDraft {
     pub raw_text: String,
@@ -1590,6 +1599,14 @@ impl ProcessingPipeline {
         // Accumulate one speaker embedding per retained segment across ALL decode windows, so speakers
         // are clustered over the WHOLE file once (below) rather than re-clustered per 90s window.
         let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
+        // P1.4b (audit R4): the per-window rebuild-when-inactive below (fix #132, for a model that appears
+        // mid-session) re-attempted a full GPU-then-CPU ONNX load on EVERY 90 s window for a PRESENT-but-
+        // unloadable model. These flags bound the (re)build to at most ONCE per FILE — matching the
+        // non-streaming sibling that builds once per file — so a corrupt/unloadable denoiser/CAM++ is not
+        // reloaded per window. A NEW file (new streaming call) resets them, so a between-file download
+        // still recovers (#132's intent, at file granularity).
+        let mut diarization_rebuild_tried = false;
+        let mut denoiser_rebuild_tried = false;
         for (w_idx, window) in windows.into_iter().enumerate() {
             if let Some(token) = cancel {
                 token.check()?;
@@ -1656,8 +1673,15 @@ impl ProcessingPipeline {
             };
 
             let mut diarization_guard = self.lock_diarization_service();
-            // Rebuild when unset OR cached-inactive — see the non-streaming sibling site.
-            if diarization_guard.as_ref().map_or(true, |s| !s.is_available()) {
+            // Rebuild when unset, OR when cached-inactive AND we have not yet tried this file (P1.4b:
+            // don't re-attempt an unloadable CAM++ every window — at most once per file). See the
+            // non-streaming sibling site.
+            if should_rebuild_streaming_service(
+                diarization_guard.is_some(),
+                diarization_guard.as_ref().is_some_and(|s| s.is_available()),
+                diarization_rebuild_tried,
+            ) {
+                diarization_rebuild_tried = true;
                 // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
                 let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
                 *diarization_guard = Some(crate::diarization::SpeakerEmbeddingService::new(&model_dir));
@@ -1667,8 +1691,15 @@ impl ProcessingPipeline {
                 .ok_or_else(|| AppError::Other("Failed to initialize diarization service".into()))?;
 
             let mut denoiser_guard = self.lock_denoiser_service();
-            // Rebuild when unset OR cached-inactive — see the non-streaming sibling site.
-            if denoiser_guard.as_ref().map_or(true, |s| !s.is_active()) {
+            // Rebuild when unset, OR when cached-inactive AND we have not yet tried this file (P1.4b:
+            // don't re-attempt an unloadable GTCRN every window — at most once per file). See the
+            // non-streaming sibling site.
+            if should_rebuild_streaming_service(
+                denoiser_guard.is_some(),
+                denoiser_guard.as_ref().is_some_and(|s| s.is_active()),
+                denoiser_rebuild_tried,
+            ) {
+                denoiser_rebuild_tried = true;
                 // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
                 let model_dir = self.model_manager.resolve_root_for(crate::models::DENOISER_MODEL);
                 *denoiser_guard = Some(crate::denoiser::DenoiserService::new(&model_dir));
