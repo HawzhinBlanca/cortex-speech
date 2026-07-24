@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -5,6 +6,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_RS = REPO_ROOT / "src-tauri" / "src" / "settings.rs"
 PIPELINE_RS = REPO_ROOT / "src-tauri" / "src" / "pipeline.rs"
 COMMANDS_RS = REPO_ROOT / "src-tauri" / "src" / "commands.rs"
+SCRIBE_API_RS = REPO_ROOT / "src-tauri" / "src" / "scribe_api.rs"
 LLM_REFINER_RS = REPO_ROOT / "src-tauri" / "src" / "llm_refiner.rs"
 T2_LISTENER_RS = REPO_ROOT / "src-tauri" / "src" / "jury" / "t2_listener.rs"
 GEMINI_API_RS = REPO_ROOT / "src-tauri" / "src" / "gemini_api.rs"
@@ -13,6 +15,75 @@ RELEASE_DOCS = REPO_ROOT / "docs" / "RELEASE.md"
 
 def read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+# ── P3.2: whole-surface cloud-STT-egress INVENTORY (closes T2) ─────────────────────────────────────────
+# The old check counted `require_cloud_stt_consent(&state)?` call sites (>= 2). A frozen count is a floor:
+# a THIRD command that uploads audio to ElevenLabs Scribe WITHOUT the consent gate keeps the count at 2 and
+# passes. This inventory instead keys on real evidence — every command-surface function that reaches a
+# Scribe egress sink must have consent enforced on EVERY path to it, so a new un-gated egress is caught.
+
+# Every audio-upload pub fn in scribe_api.rs is named `transcribe*` (the ElevenLabs HTTP POST itself is a
+# PRIVATE helper); the two pure-text helpers below never egress. Pinned by test_scribe_egress_surface_is_
+# only_transcribe_fns so the command-surface prefix scan (`scribe_api::transcribe`) stays COMPLETE.
+PURE_SCRIBE_FNS = {"dedupe_repeated", "segment_words"}
+SCRIBE_EGRESS_CALL = "scribe_api::transcribe"  # matches transcribe / transcribe_wav_bytes / transcribe_segments / transcribe_*
+CONSENT_MARKERS = ("require_cloud_stt_consent", "cloud_stt_opt_in")
+
+_FN_RE = re.compile(r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
+
+
+def _strip_comments(text: str) -> str:
+    """Drop `/* */` block comments AND `//` line comments so a COMMENTED-OUT consent gate (or a marker
+    mentioned only in prose) never counts as enforcement. Over-stripping on a stray `*/`/`//` inside a
+    string literal only makes the marker/caller scan STRICTER — it fails closed, never open."""
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)  # block comments (non-nested — the norm here)
+    return "\n".join(line.split("//", 1)[0] for line in text.splitlines())  # line comments
+
+
+def _parse_functions(text: str) -> tuple[dict[str, str], set[str]]:
+    """{fn_name: brace-matched body} plus the set of #[tauri::command] fn names, over the whole surface.
+    Comments are stripped first, so both the consent-marker check and the caller search see CODE only."""
+    text = _strip_comments(text)
+    bodies: dict[str, str] = {}
+    commands: set[str] = set()
+    for m in _FN_RE.finditer(text):
+        name = m.group(1)
+        brace = text.find("{", m.end())
+        semi = text.find(";", m.end())
+        if brace == -1 or (semi != -1 and semi < brace):
+            continue  # a trait/extern declaration with no body — skip
+        depth, i = 0, brace
+        while i < len(text):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        bodies[name] = text[brace : i + 1]
+        if "#[tauri::command]" in text[max(0, m.start() - 200) : m.start()]:
+            commands.add(name)
+    return bodies, commands
+
+
+def _consent_covered(name: str, bodies: dict[str, str], commands: set[str], stack: frozenset[str]) -> bool:
+    """True iff consent (require_cloud_stt_consent / cloud_stt_opt_in) is enforced on EVERY path that can
+    reach `name`. A co-located gate in the body satisfies it; otherwise a private helper is covered only if
+    EVERY caller is covered (recursing through helpers, terminating at commands — a command that reaches an
+    egress with no gate is NOT covered)."""
+    body = bodies.get(name, "")
+    if any(marker in body for marker in CONSENT_MARKERS):
+        return True
+    if name in commands:
+        return False  # a command that egresses (directly or via a helper) with no consent gate
+    if name in stack:
+        return True  # recursion guard: a cycle is judged by its members' own external callers
+    callers = [c for c, b in bodies.items() if c != name and re.search(rf"\b{re.escape(name)}\s*\(", b)]
+    if not callers:
+        return False  # an egress helper nothing calls and with no gate — cannot prove it is reached only under consent
+    return all(_consent_covered(c, bodies, commands, stack | {name}) for c in callers)
 
 
 # Week-4 decomposes commands.rs into slices under src/commands/. The cloud-consent gates for the jury
@@ -89,16 +160,48 @@ def test_cloud_stt_scribe_egress_requires_opt_in() -> None:
         commands, "fn require_cloud_stt_consent(state: &AppState) -> Result<(), String>", COMMANDS_RS.name
     )
     assert_contains(commands, "if state.lock_settings().cloud_stt_opt_in", COMMANDS_RS.name)
-    # BOTH Scribe egress commands (whole-file transcribe + jury votes) must call the guard — dropping it
-    # from either would upload audio to ElevenLabs with no consent. Count the enforced call sites.
-    call_sites = commands.count("require_cloud_stt_consent(&state)?")
-    if call_sites < 2:
+    # WHOLE-SURFACE INVENTORY (P3.2, replaces the old >= 2 count floor): every command-surface function
+    # that reaches a Scribe egress sink (`scribe_api::transcribe*`) must have consent enforced on EVERY
+    # path to it. A NEW third egress command with no gate is now FAILED, not silently allowed by a frozen
+    # count. `command_surface()` already fails vacuously-empty; require at least one egress site so a moved/
+    # renamed helper cannot make this pass by finding nothing to check.
+    bodies, cmd_names = _parse_functions(commands)
+    egress_fns = sorted(name for name, body in bodies.items() if SCRIBE_EGRESS_CALL in body)
+    if not egress_fns:
         raise AssertionError(
-            f"both Scribe egress commands must call require_cloud_stt_consent (found {call_sites} call site(s))"
+            "no Scribe egress call site (`scribe_api::transcribe*`) found in the command surface — the "
+            "cloud-egress inventory would pass vacuously; did the egress helper move or get renamed?"
+        )
+    ungated = [name for name in egress_fns if not _consent_covered(name, bodies, cmd_names, frozenset())]
+    if ungated:
+        raise AssertionError(
+            f"Scribe cloud egress reachable WITHOUT a consent gate on the path: {ungated}. Every command that "
+            "(directly or via a helper) uploads audio to ElevenLabs must enforce require_cloud_stt_consent / "
+            "cloud_stt_opt_in before the egress — audio must never leave the device without opt-in."
         )
     # The import path gates the key itself behind the same opt-in (defense in depth).
     assert_contains(pipeline, "fn scribe_api_key_if_enabled", PIPELINE_RS.name)
     assert_contains(pipeline, "if !self.settings.cloud_stt_opt_in", PIPELINE_RS.name)
+
+
+def test_scribe_egress_surface_is_only_transcribe_fns() -> None:
+    # The cloud-egress inventory scans the command surface for `scribe_api::transcribe*` call sites. That
+    # prefix is COMPLETE only while every audio-upload pub fn in scribe_api.rs is named `transcribe*` (the
+    # ElevenLabs HTTP POST itself is a private helper). Pin it: a NEW pub fn that is neither a known pure
+    # helper nor a transcribe* egress fn forces the inventory's egress scan to be updated, so a differently
+    # named upload fn cannot slip past the prefix.
+    scribe = _strip_comments(read(SCRIBE_API_RS))
+    # `pub fn` AND `pub(crate) fn` (idiomatic here — the poster itself is pub(crate)); any visibility so a
+    # non-transcribe* upload helper cannot hide behind a wider `pub(crate)`/multi-space form.
+    for match in re.finditer(r"pub(?:\([^)]*\))?\s+fn\s+([A-Za-z_]\w*)", scribe):
+        fn = match.group(1)
+        if fn not in PURE_SCRIBE_FNS and not fn.startswith("transcribe"):
+            raise AssertionError(
+                f"scribe_api.rs has a new pub fn `{fn}` that is neither a known pure-text helper "
+                f"({sorted(PURE_SCRIBE_FNS)}) nor a `transcribe*` egress fn. If it uploads audio, extend the "
+                "cloud-egress inventory's SCRIBE_EGRESS_CALL scan to cover it; if it is pure, add it to "
+                "PURE_SCRIBE_FNS."
+            )
 
 
 def test_api_keys_are_not_persisted_or_returned_to_client() -> None:
@@ -144,6 +247,7 @@ def main() -> None:
     test_cloud_llm_defaults_are_opt_out()
     test_gemini_refinement_requires_effective_opt_in_mode()
     test_cloud_stt_scribe_egress_requires_opt_in()
+    test_scribe_egress_surface_is_only_transcribe_fns()
     test_t2_audio_cloud_calls_require_jury_opt_in()
     test_api_keys_are_not_persisted_or_returned_to_client()
     test_cloud_error_paths_redact_secrets()
