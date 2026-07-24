@@ -9976,11 +9976,12 @@ P0.4 per-segment provenance → P2.3/P2.4.
 Reality check pre-work: exe NOT running, git clean, HEAD d3ce56d, lock free (acquired). Next item = P2.1.
 
 **GATE FIX (honesty) — P1.1 (cec0a1e) left run_python_policies.py RED.** Running the python policy gate this
-iteration surfaced that the P1.1 verbatim-disk test string r"\?\C:\Users\me\clip.wav" (input.rs) trips
-test_windows_repo_hygiene (hardcoded C:\Users\<name> in a public repo). P1.1 was Rust-only so I ran the cargo
-gates but not the python policies — which scan Rust too — and missed it. Changed the string to \?\C:\media\
-clip.wav (still a verbatim-disk non-UNC path; the test's point is unchanged). Committed eab9bb0. Lesson logged:
-run the python policies even on Rust-only changes (several policies scan the whole tree, not just python).
+iteration surfaced that a P1.1 verbatim-disk test string embedded a private user-profile path segment (the
+form test_windows_repo_hygiene forbids in a public repo — do NOT write that literal here either). P1.1 was
+Rust-only so I ran the cargo gates but not the python policies — which scan Rust too — and missed it. Changed
+the string to a profile-free verbatim-disk path (still non-UNC; the test's point is unchanged). Committed
+eab9bb0. Lesson logged: run the python policies even on Rust-only changes (several policies scan the whole
+tree, not just python) — AND never quote a forbidden profile path in a tracked doc/ledger while describing it.
 
 **FIX P2.1 (audit F1) — a DB/IPC read failure rendered as an empty library.** segmentStore.ts load() swallowed
 failures to console.error and never updated the store, so a first-load failure showed "No segments loaded" —
@@ -10006,3 +10007,40 @@ in the segment-list view (a failure on another view is surfaced by the toast, wh
 
 **Next (roadmap):** P2.2 window unhandledrejection trap → P1.3b reservation gate → P1.4b denoiser retry →
 P0.4 → P2.3/P2.4. Tier-1 main items done; two sub-items + Tier-2 remain. "Best / real #1" NOT claimed.
+
+### Iteration 174 — 2026-07-24 — P2.2 global unhandledrejection trap + a ledger hygiene self-fix (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD c4cd48d, lock free (acquired). Next item = P2.2.
+
+**LEDGER HYGIENE SELF-FIX (honesty) — my OWN iter-173 ledger entry left test_windows_repo_hygiene RED.**
+Running the python gate this iteration flagged PROGRESS_LEDGER.md itself: the iter-173 entry, while
+DESCRIBING the P1.1 hygiene fix, QUOTED the forbidden private-profile path literal — and the hygiene scanner
+reads every tracked file, ledger included. Rewrote that entry to describe the issue without reproducing the
+literal. Lesson compounded: never quote a forbidden profile path in ANY tracked doc, even to explain a fix.
+(An earlier agent hit the same trap at ledger line 524 and phrased it safely — precedent I should have followed.)
+
+**FIX P2.2 (audit F3) — un-awaited promise rejections vanished.** No window 'unhandledrejection' listener
+existed; ErrorBoundary hooked only synchronous 'error' events, so a rejected fire-and-forget promise (an
+onclick invoke() that fails, a teardown write to a closed webview) disappeared with no user trace. New
+src/lib/globalErrorTrap.ts (describeRejection + notifyUnhandledRejection + idempotent installGlobalErrorTrap);
+main.ts installs it before mount. Routes to a TOAST (notifications.error), never a panel-blanking boundary.
+New i18n key notifications.unexpectedError (en+ckb; Sorani flagged for owner verification). Committed 9f07814.
+
+**Adversarially verified — 2-skeptic Workflow, BOTH refuted=false / NONE** (first clean code iteration this
+session): no loop/re-entrancy (handler fully synchronous), no double-report (unhandledrejection fires only for
+still-unhandled rejections, so the existing per-invoke() catches are unaffected), bounded noise (8 s
+auto-dismiss), no empty toast, idempotent, no ErrorBoundary overlap, i18n parity confirmed by tests/lib/
+i18n.test.ts, test non-vacuous. The one edge (a pathological non-serializable rejection reason) is
+app-unreachable and not a loop — left as-is (hardening it would be over-engineering).
+
+Regression gate tests/lib/globalErrorTrap.test.ts (fail-before: the module did not exist).
+
+Gate (frontend; Rust untouched): `npm run typecheck` → 0 errors · `npm run lint` → 0 errors (4 pre-existing
+warnings) · `npm test` → 211 passed · `python scripts/run_python_policies.py` → 41 passed (incl. i18n parity +
+windows-repo-hygiene, both green after the ledger self-fix).
+
+**NOT verified:** no rebuild of the shipped exe (UI behavior changed — pending); the Sorani wording of
+notifications.unexpectedError is my rendering, not a native review.
+
+**Next (roadmap):** P2.3 → P2.4 (remaining Tier-2) → P1.3b reservation gate → P1.4b denoiser retry → P0.4.
+Tier-1 main items done; Tier-2 progressing (P2.1, P2.2 shipped). "Best / real #1" NOT claimed.
