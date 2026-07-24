@@ -597,6 +597,7 @@ export const ckb: Record<string, string> = {
   'notifications.normalizationFailed': 'ئاسانکردن سەرکەوتوو نەبوو',
   'notifications.annotationSaved': 'تێبینی پاشەکەوت کرا',
   'notifications.saveFailed': 'پاشەکەوت سەرکەوتوو نەبوو',
+  'notifications.unexpectedError': 'هەڵەیەکی چاوەڕواننەکراو ڕوویدا',
   'notifications.segmentDeleted': 'بەش سڕایەوە',
   'notifications.deleteFailed': 'سڕینەوە سەرکەوتوو نەبوو',
   'notifications.alignmentComplete': 'هاوشێوەکردن تەواو بوو',

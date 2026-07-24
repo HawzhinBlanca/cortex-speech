@@ -1,6 +1,11 @@
 import { mount } from 'svelte';
 import App from './App.svelte';
 import './app.css';
+import { installGlobalErrorTrap } from './lib/globalErrorTrap';
+
+// P2.2 (audit F3): surface un-awaited promise rejections as a toast instead of letting them vanish.
+// Installed BEFORE mount so it covers the whole app lifetime. Idempotent.
+installGlobalErrorTrap();
 
 // ---------------------------------------------------------------------------
 // Dev-only Tauri IPC mock.

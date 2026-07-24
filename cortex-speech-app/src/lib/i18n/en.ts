@@ -599,6 +599,7 @@ export const en: Record<string, string> = {
   'notifications.normalizationFailed': 'Normalization failed',
   'notifications.annotationSaved': 'Annotation saved',
   'notifications.saveFailed': 'Save failed',
+  'notifications.unexpectedError': 'An unexpected error occurred',
   'notifications.segmentDeleted': 'Segment deleted',
   'notifications.deleteFailed': 'Delete failed',
   'notifications.alignmentComplete': 'Alignment complete',
