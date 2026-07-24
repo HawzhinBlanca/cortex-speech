@@ -2128,7 +2128,37 @@ def test_writers_active_includes_the_wsl_refinement_writer() -> None:
         )
 
 
+def _async_fn_body(source: str, fn_name: str) -> str:
+    """Text from `pub async fn <fn_name>` up to the next `pub async fn` (or EOF) — a cheap way to
+    scope a per-command content check to one command's body without a full Rust parse."""
+    marker = f"pub async fn {fn_name}"
+    start = source.find(marker)
+    if start == -1:
+        raise AssertionError(f"{fn_name} not found in export.rs — this gate would pass vacuously")
+    rest = source[start + len(marker):]
+    nxt = rest.find("pub async fn ")
+    return rest if nxt == -1 else rest[:nxt]
+
+
+def test_directory_exports_validate_out_dir_against_unc() -> None:
+    # hunt-10 #1: export_gold_eval_set / export_finetune_pack took out_dir with ONLY a null-byte check,
+    # skipping validate::validate_output_path — the UNC/null trust-boundary guard every sibling export
+    # (incl. the directory export export_audio) enforces. A compromised/XSS'd renderer could hand a
+    # `\\attacker\share` out_dir straight to eval::create_dir_all(out_dir.join("clips")), driving the
+    # Windows SMB redirector (forced-auth NTLM-credential leak) and writing the gold clips off-machine.
+    # A bare out_dir.contains('\0') is NOT sufficient; the syntactic UNC guard is the actual defense.
+    export_rs = (COMMANDS_DIR / "export.rs").read_text(encoding="utf-8")
+    for fn in ("export_gold_eval_set", "export_finetune_pack"):
+        body = _async_fn_body(export_rs, fn)
+        if "validate::validate_output_path" not in body:
+            raise AssertionError(
+                f"{fn} must route out_dir through validate::validate_output_path (UNC/null guard) "
+                f"before it reaches create_dir_all — a null-byte-only check leaves the SMB/NTLM leak open."
+            )
+
+
 def main() -> None:
+    test_directory_exports_validate_out_dir_against_unc()
     test_known_runtime_panic_patterns_do_not_return()
     test_wsl_refinement_batch_is_panic_safe_and_cancellable()
     test_wsl_refinement_lifecycle_failures_are_reported()

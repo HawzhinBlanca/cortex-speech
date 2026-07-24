@@ -131,13 +131,17 @@ pub async fn export_gold_eval_set(
     state: State<'_, AppState>,
 ) -> Result<crate::eval::GoldEvalExport, String> {
     STRICT_RATE_LIMITER.check("export_gold_eval_set")?;
-    if out_dir.contains('\0') {
-        return Err("Output path contains null bytes".to_string());
-    }
+    // Same trust-boundary guard every sibling export (incl. the directory export export_audio) enforces:
+    // reject null bytes + Windows UNC syntactically, so a compromised renderer can't hand a
+    // `\\attacker\share` out_dir straight to create_dir_all — which would drive the SMB redirector (a
+    // forced-auth NTLM-credential leak) and write the gold clips off-machine. A null-byte-only check
+    // (what this had) left that open. The dir comes from an OS folder picker in the real flow, so it
+    // always exists → validate_output_path's parent-must-exist requirement never rejects a legit run.
+    let validated = validate::validate_output_path(&out_dir)?;
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::eval::export_gold_eval_set(&db, std::path::Path::new(&out_dir)).map_err(|e| e.to_string())
+        crate::eval::export_gold_eval_set(&db, std::path::Path::new(&validated)).map_err(|e| e.to_string())
     })
     .await
 }
@@ -150,15 +154,16 @@ pub async fn export_finetune_pack(
     state: State<'_, AppState>,
 ) -> Result<crate::eval::FinetunePackResult, String> {
     STRICT_RATE_LIMITER.check("export_finetune_pack")?;
-    if out_dir.contains('\0') {
-        return Err("Output path contains null bytes".to_string());
-    }
+    // Same UNC/null trust-boundary guard as export_gold_eval_set above (and every sibling export): the
+    // pack writes 16 kHz clips under out_dir via create_dir_all, so a webview-supplied `\\attacker\share`
+    // would leak NTLM creds + write off-machine. Null-byte-only was insufficient.
+    let validated = validate::validate_output_path(&out_dir)?;
     // P5.5: every pack export appends its provenance line to the durable corpus ledger.
     let ledger = state.lock_data_dir().clone().map(|d| d.join("corpus_ledger.jsonl"));
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::eval::export_finetune_pack(&db, std::path::Path::new(&out_dir), ledger.as_deref())
+        crate::eval::export_finetune_pack(&db, std::path::Path::new(&validated), ledger.as_deref())
             .map_err(|e| e.to_string())
     })
     .await
