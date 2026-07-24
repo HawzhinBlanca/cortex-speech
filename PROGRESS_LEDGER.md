@@ -10044,3 +10044,40 @@ notifications.unexpectedError is my rendering, not a native review.
 
 **Next (roadmap):** P2.3 → P2.4 (remaining Tier-2) → P1.3b reservation gate → P1.4b denoiser retry → P0.4.
 Tier-1 main items done; Tier-2 progressing (P2.1, P2.2 shipped). "Best / real #1" NOT claimed.
+
+### Iteration 175 — 2026-07-24 — P2.3 two whole-row-clobber paths + a NEW 4-path finding queued (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD d2d0ad1, lock free (acquired). Next item = P2.3.
+
+**FIX P2.3 (audit F2, cardinal whole-row-clobber class) — two paths closed.** (1) ReviewMode unmount flush:
+whole-row api.updateSegment({...seg, annotatedTranscript}) -> targeted api.updateSegmentFields(seg.id,
+{annotatedTranscript}) (never touches alignmentJson -> clobber-safe even mid-align; backend re-reads the fresh
+row under the db lock, no TOCTOU). (2) handleNormalize: added `if ($isProcessing) return;` + disabled button
+(normalizedTranscript is not field-update-whitelisted, so it must whole-row upsert; the store is stale vs the
+DB during a batch, so refuse during one — matching every sibling). Committed f558751.
+
+**Adversarial verification CONFIRMED the two fixes AND found a NEW reachable 4-path instance of the same
+class (queued, NOT silently shipped).** Lens 1 (unmount flush) = NONE end-to-end. Lens 2 refuted COMPLETENESS
+(MED): the SAME clobber lives in FOUR ReviewMode mutators — submit / markBad / doRetranscribe / go-draft —
+which build whole-row upserts from freshRow (the STORE), stale vs the DB during a background batch, and guard
+only saving/retranscribing/aligning, never $isProcessing. **Hand-verified reachable**: enterReviewMode
+(App.svelte:895) does NOT gate $isProcessing, and batches run on a Rust background thread, so a reviewer can
+submit/markBad/re-transcribe a segment a batch is concurrently writing -> the store-based upsert reverts the
+batch's write. The freshRow comments only reason about the background ALIGNER (which reloads the store via
+ensureWordTimings), not a batch (which does not) — so the existing mitigation does not cover this. These are
+PRE-EXISTING (untouched by P2.3) and the P2.3 commit message + this entry DISCLOSE them rather than claiming
+the class is closed.
+
+**Regression gate** tests/lib/clobber-guards.test.ts (source invariants; fail-before verified by neutralizing
+the handleNormalize guard -> test failed, then restored).
+
+Gate (frontend; Rust untouched): `npm run typecheck` → 0 errors · `npm run lint` → 0 errors (4 pre-existing
+warnings) · `npm test` → 213 passed · `python scripts/run_python_policies.py` → 41 passed.
+
+**NOT verified:** no rebuild of the shipped exe (UI behavior changed — pending). The 4 ReviewMode paths above
+are NOT fixed yet.
+
+**Next: P2.3b (NEW, adversarial-found) — close the 4 ReviewMode clobber paths:** submit/markBad/go-draft ->
+updateSegmentFields (annotatedTranscript/verified are whitelisted); doRetranscribe -> import $isProcessing +
+guard (rawTranscript is not whitelisted, and re-transcribe during a batch is a machine op safe to refuse).
+Then P2.4 → P1.3b → P1.4b → P0.4. "Best / real #1" NOT claimed (the clobber class is NOT fully closed yet).
