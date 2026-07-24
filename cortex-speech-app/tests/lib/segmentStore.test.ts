@@ -13,6 +13,7 @@ import {
   segmentStats,
   libraryTotal,
   libraryTruncated,
+  libraryLoadError,
 } from '../../src/lib/stores/segmentStore';
 import type { SpeechSegment } from '../../src/lib/types';
 
@@ -58,6 +59,7 @@ describe('segmentStore', () => {
     sortOrder.set('newest');
     libraryTotal.set(0);
     libraryTruncated.set(false);
+    libraryLoadError.set(null);
     invokeMock.mockReset();
   });
 
@@ -178,6 +180,46 @@ describe('segmentStore', () => {
       expect(get(segments)).toHaveLength(0);
       expect(get(libraryTotal)).toBe(0);
       expect(get(libraryTruncated)).toBe(false);
+    });
+
+    it('surfaces a load FAILURE as a distinct error state, not an empty library, and clears it on retry', async () => {
+      // P2.1 (audit F1): a DB/IPC read failure must NEVER be indistinguishable from an empty/wiped
+      // library. load() must set libraryLoadError (the backend message) instead of swallowing it, so
+      // the empty view renders "load failed + Retry". A subsequent successful load must clear it.
+      invokeMock.mockImplementation(((command: string) => {
+        if (command === 'get_dataset_certificate') return Promise.resolve({ threshold: 0.35 });
+        return Promise.reject(new Error('database is locked'));
+      }) as typeof invoke);
+      await segments.load();
+      expect(get(libraryLoadError)).toBe('database is locked');
+      expect(get(segments)).toHaveLength(0); // still empty, but the view now knows WHY
+
+      // Retry succeeds -> the error state clears so the view leaves the error branch.
+      invokeMock.mockImplementation(fakeBackend(3) as typeof invoke);
+      await segments.load();
+      expect(get(libraryLoadError)).toBeNull();
+      expect(get(segments)).toHaveLength(3);
+    });
+
+    it('a run superseded during the threshold refresh does NOT clear a newer load error (race guard)', async () => {
+      // Adversarial-found race: the success-path libraryLoadError.set(null) runs AFTER the awaited
+      // conformal-threshold refresh. Without a seq guard there, an OLDER load resuming after a NEWER
+      // load already failed (and set the error) would clear it — silently dropping the failure. Simulate
+      // by bumping the load generation DURING this run's threshold await; the guard must then bail before
+      // clearing, leaving the newer load's error intact.
+      libraryLoadError.set('a newer load already failed');
+      invokeMock.mockImplementation(((command: string) => {
+        if (command === 'get_dataset_certificate') {
+          segments.bumpLoadGeneration(); // a newer load supersedes this one mid-await
+          return Promise.resolve({ threshold: 0.35 });
+        }
+        if (command === 'get_segments_page') {
+          return Promise.resolve({ items: [makeSeg('a')], total: 1, nextCursor: null });
+        }
+        return Promise.reject(new Error(`unexpected ${command}`));
+      }) as typeof invoke);
+      await segments.load();
+      expect(get(libraryLoadError)).toBe('a newer load already failed');
     });
 
     it('NEVER bakes the view filters into the backend query — the store is always the whole library', async () => {

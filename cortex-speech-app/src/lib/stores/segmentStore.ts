@@ -3,6 +3,8 @@ import type { SpeechSegment, WordTimestamp } from '../types';
 import * as api from '../commands';
 import { isHumanRejected, hasRealTranscript } from '../segmentQuality';
 import { dedupeById } from '../dedupeById';
+import { notifications } from './notificationStore';
+import { t } from '../i18n';
 
 // Fetch the whole library by walking every backend page. Page size is the backend's max (fewest
 // round-trips). MAX_LOAD is a defensive ceiling so a pathological library can't exhaust memory or
@@ -70,8 +72,22 @@ function createSegmentsStore() {
         }
         // Refresh threshold after loading segments
         await refreshConformalThreshold();
+        // A newer load (or a write) may have superseded this run DURING the awaited threshold refresh —
+        // mirror the in-loop seq guard so a stale/older run cannot CLEAR a newer FAILED load's error
+        // (which would silently drop the failure back to a "looks fine" state — the F1 bug, in a race).
+        if (seq !== loadSeq) return;
+        // The load fully succeeded — clear any prior error state so the view leaves the error branch.
+        libraryLoadError.set(null);
       } catch (e) {
         console.error('Failed to load segments', e);
+        // P2.1 (audit F1): a DB/IPC read failure must NEVER render as an empty library. The store keeps
+        // its prior value (empty on FIRST load), so without this the empty-state showed "No segments
+        // loaded" — indistinguishable from a wiped library, in an app whose one law is honesty about
+        // data. Surface a distinct, PERSISTENT error the empty view reads (with a Retry), plus a toast
+        // for the case where a background reload fails while the user is on another view.
+        const msg = e instanceof Error ? e.message : String(e);
+        libraryLoadError.set(msg);
+        notifications.error(get(t)('notifications.loadSegmentsFailed'), { detail: msg });
       }
     },
   };
@@ -83,6 +99,10 @@ export const segments = createSegmentsStore();
 // hide it. For any realistic personal library these are `segments.length` and `false`.
 export const libraryTotal = writable(0);
 export const libraryTruncated = writable(false);
+// P2.1: non-null when the LAST library load() failed (the backend error message). Cleared on the next
+// successful load. The empty view reads this to show a distinct "load failed + Retry" state instead of
+// the "No segments loaded" hint, so a DB/IPC read error is never mistaken for an empty/wiped library.
+export const libraryLoadError = writable<string | null>(null);
 export const selectedSegmentId = writable<string | null>(null);
 export const wordTimestamps = writable<WordTimestamp[]>([]);
 export const filterVerified = writable<boolean | null>(null);

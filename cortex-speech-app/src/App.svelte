@@ -21,6 +21,7 @@
     selectedSegment,
     filteredSegments,
     segmentStats,
+    libraryLoadError,
   } from './lib/stores/segmentStore';
   import { settings, showSettings, openSettings } from './lib/stores/settingsStore';
   import {
@@ -2601,7 +2602,35 @@
                 data-testid="segments-empty-state"
                 class="flex h-full flex-col items-center justify-center gap-3 px-6 text-center animate-fade-in"
               >
-                {#if $searchQuery}
+                {#if $libraryLoadError}
+                  <!-- P2.1: a DB/IPC read failure is NOT an empty library — show it distinctly, with the
+                       real error and a Retry, so the user never mistakes a load error for wiped data. -->
+                  <div
+                    data-testid="segments-load-error"
+                    class="flex h-14 w-14 items-center justify-center rounded-2xl bg-surface-2 text-danger"
+                  >
+                    <svg
+                      width="26"
+                      height="26"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    >
+                      <path d="M12 9v4M12 17h.01" />
+                      <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+                    </svg>
+                  </div>
+                  <div class="max-w-[16rem]">
+                    <p class="text-sm font-semibold text-default">{$t('notifications.loadSegmentsFailed')}</p>
+                    <p class="mt-1 break-words text-xs leading-relaxed text-muted">{$libraryLoadError}</p>
+                  </div>
+                  <div class="mt-1">
+                    <button class="btn btn-primary !text-xs" onclick={loadSegments}>{$t('retry')}</button>
+                  </div>
+                {:else if $searchQuery}
                   <div
                     class="flex h-12 w-12 items-center justify-center rounded-full bg-surface-2 text-subtle"
                   >
