@@ -10376,3 +10376,42 @@ a live run against a genuinely corrupt Silero model. Scribe/legacy rows read as 
 **Tier-0 status:** P0.2/P0.3/P0.4 (write + read/H3 + vad_backend) all shipped — Tier-0 complete EXCEPT the
 owner-gated P0.1 GPU re-score. **Next: HF-README model_version sibling** (export.rs reads stored
 model_version_id) → Tier-3. "Best / real #1" NOT claimed.
+
+### Iteration 182 — 2026-07-24 — HF dataset-card ASR model provenance (export-day-state sibling) (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 1d69a81, lock held (iter16-hfmodel). Traced the HF
+write loop (exported_ids tracking) before editing.
+
+**FIX (milder cousin of H3).** The HuggingFace dataset card's Provenance line printed
+`format!("{:?}", settings.asr_model_size)` — the EXPORT-DAY setting — regardless of which model actually
+produced each shipped clip (a corpus assembled across a 300M↔7B switch, exported later, was labeled with
+only the current dropdown value). Now the card names the distinct STORED `model_version_id` of the rows
+ACTUALLY WRITTEN to the dataset. Committed 9157a74.
+
+**CHANGE (export.rs export_huggingface_dataset).** `written_ids = train_ids ∪ val_ids ∪ test_ids` (the ids
+`exported_ids` pushes ONLY after a clip is written to disk + CSV, so not-training-ready / missing-coverage /
+unavailable-audio / bad-alignment rows are excluded); `written_models = distinct model_version_id of the
+segments whose id ∈ written_ids`, joined + sorted (BTreeSet → byte-reproducible card + SHA256SUMS). Empty
+written set (a first-ever export of an empty/all-filtered library still writes the card) → "unknown". README
+line "using ASR Model {}" → "ASR model(s): {}". `settings.asr_model_size` now appears only in a comment.
+
+**FAIL-BEFORE.** New test `hf_readme_provenance_lists_stored_model_version_not_export_day_setting` writes a
+gold clip stamped model_version_id="omniasr-ctc-300m@sha-test" and exports with default settings
+(asr_model_size WSL7B); a TARGETED revert of model_str to the old `settings.asr_model_size` made the card
+print "WSL7B" → the test failed, passes with the fix (card lists the stored id, NOT WSL7B).
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (9.77s) ·
+`cargo test --lib` → `test result: ok. 1013 passed; 0 failed; 6 ignored` · `python run_python_policies.py` → 42 passed.
+
+**Adversarially verified** (Workflow, 3 independent skeptics vs source): written-set == shipped rows (no
+un-shipped model listed, no shipped model missed), no residual export-day leak + honest edges (empty→unknown,
+deterministic BTreeSet, no panic), no consumer/test break (grep "using ASR Model" = 0 matches; SHA test
+recomputes from bytes). ALL refuted=false / severity none.
+
+**NOT verified / remaining:** no exe rebuild (HF card text changed — a live HF export would show the stored
+model(s) line). Proven by unit test, not a live multi-model export.
+
+**Tier-0 status:** P0.2/P0.3/P0.4 + the HF-README model sibling all shipped — every non-owner-gated Tier-0
+provenance-honesty item is CLOSED (H1 is P0.1, owner-gated GPU re-score). **Next: Tier-3** — P3.2 body-scan
+policy inventories (close T2) → P3.1 generated IPC contract (close T1) → P3.3 → P3.4. "Best / real #1" NOT claimed.
