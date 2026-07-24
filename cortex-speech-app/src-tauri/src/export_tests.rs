@@ -1006,6 +1006,51 @@ fn export_huggingface_writes_dataset_files() {
 }
 
 #[test]
+fn hf_readme_provenance_lists_stored_model_version_not_export_day_setting() {
+    // P0.4 sibling (milder cousin of H3): the dataset card's Provenance line must name the ASR model(s)
+    // that ACTUALLY produced the WRITTEN rows (stored per-segment model_version_id), not the export-day
+    // settings.asr_model_size. Default settings.asr_model_size is WSL7B, so a written row stamped with a
+    // DISTINCT model_version_id proves the card reads stored truth, not the current setting.
+    let db_tmp = NamedTempFile::new().unwrap();
+    let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let wav_path = tmp_dir.path().join("hf-prov.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+    for _ in 0..16000 {
+        writer.write_sample(0i16).unwrap();
+    }
+    writer.finalize().unwrap();
+
+    let mut seg = sample_segment("hf-prov"); // gold + HF-exportable, so it is WRITTEN
+    seg.audio_path = wav_path.to_string_lossy().to_string();
+    seg.model_version_id = Some("omniasr-ctc-300m@sha-test".to_string());
+    db.insert_segment(&seg).unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    // Default settings -> asr_model_size == WSL7B (the export-day value the OLD card printed).
+    export_huggingface_dataset(&db, out_dir.path(), &crate::settings::AppSettings::default()).unwrap();
+
+    let readme = std::fs::read_to_string(out_dir.path().join("README.md")).unwrap();
+    let provenance = readme.lines().find(|l| l.contains("**Provenance**")).expect("card has a Provenance line");
+    assert!(
+        provenance.contains("omniasr-ctc-300m@sha-test"),
+        "Provenance must list the STORED model_version_id of the written rows: {provenance}"
+    );
+    assert!(
+        !provenance.contains("WSL7B"),
+        "Provenance must NOT print the export-day settings.asr_model_size (WSL7B): {provenance}"
+    );
+}
+
+#[test]
 fn export_huggingface_counts_dropped_missing_audio() {
     let db_tmp = NamedTempFile::new().unwrap();
     let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();

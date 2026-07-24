@@ -1065,7 +1065,24 @@ pub fn export_huggingface_dataset(
     }
 
     // Write dataset card (README.md)
-    let model_str = format!("{:?}", settings.asr_model_size);
+    // Provenance: name the ASR model(s) that ACTUALLY produced the WRITTEN rows — the stored per-segment
+    // model_version_id — not the export-day settings.asr_model_size. A corpus assembled across model
+    // switches lists every distinct model, honestly, instead of one current-setting label (the milder
+    // cousin of the H3 export-day-state lie the bundle manifest already closed). Distinct + sorted
+    // (BTreeSet) so the card — and its recorded SHA256 — stays byte-reproducible across runs.
+    let written_ids: std::collections::BTreeSet<&str> =
+        train_ids.iter().chain(&val_ids).chain(&test_ids).map(String::as_str).collect();
+    let written_models: std::collections::BTreeSet<&str> = segments
+        .iter()
+        .filter(|seg| written_ids.contains(seg.id.as_str()))
+        .map(|seg| seg.model_version_id.as_deref().unwrap_or("unknown"))
+        .collect();
+    let model_str = if written_models.is_empty() {
+        // No clips written (a first-ever export of an empty/all-filtered library still writes the card).
+        "unknown".to_string()
+    } else {
+        written_models.into_iter().collect::<Vec<_>>().join(", ")
+    };
     // Round-24 #5: the HuggingFace size_categories tag must reflect the ACTUAL example count, not a
     // hardcoded `n<1K` that contradicts the split-statistics table once the dataset exceeds 1000 rows.
     let size_category = match total_count {
@@ -1098,7 +1115,7 @@ This dataset was exported from Cortex Speech Processor.
 ## Dataset Summary
 - **Language**: Central Kurdish (Sorani, ckb)
 - **License**: {}
-- **Provenance**: Exported via Cortex Speech App v{}, using ASR Model {} on {}
+- **Provenance**: Exported via Cortex Speech App v{}, ASR model(s): {} on {}
 
 ## Split Statistics
 | Split | Examples | Duration (seconds) |
