@@ -10415,3 +10415,49 @@ model(s) line). Proven by unit test, not a live multi-model export.
 **Tier-0 status:** P0.2/P0.3/P0.4 + the HF-README model sibling all shipped — every non-owner-gated Tier-0
 provenance-honesty item is CLOSED (H1 is P0.1, owner-gated GPU re-score). **Next: Tier-3** — P3.2 body-scan
 policy inventories (close T2) → P3.1 generated IPC contract (close T1) → P3.3 → P3.4. "Best / real #1" NOT claimed.
+
+### Iteration 183 — 2026-07-24 — P3.2 cloud-STT-egress inventory (closes T2 cloud half) (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 6e26954, lock held (iter17-P3.2). Read all three
+candidate policies FIRST (the roadmap warns companion whole-surface audits exist) before deciding the gap.
+
+**FINDING (understand-first).** The roadmap T2 names two floor/enumeration gates. Verified per class:
+- Cloud-egress (test_cloud_privacy_policy.py): `test_cloud_stt_scribe_egress_requires_opt_in` counted
+  `require_cloud_stt_consent(&state)?` sites (>= 2) — a TRUE floor: a 3rd un-gated Scribe egress command keeps
+  the count and passes. GENUINE, TRACTABLE gap (egress has a clear sink).
+- Main-thread (test_command_main_thread_policy.py + test_ui_thread_blocking_audit.py): BOTH are hand-verified
+  RATCHETS/allow-lists — a new sync-heavy command isn't auto-caught either. BUT a robust automated inventory
+  is genuinely hard (the audit itself documents that static scanning can't classify "heavy work", hence the
+  hand lists). Deferred as a separate item — NOT converted here (avoid a fragile false-positive-prone gate).
+
+**FIX P3.2 (cloud-egress inventory, committed 90c6ec1).** Replaced the count floor with a whole-surface
+inventory keyed on real evidence: parse every fn body in the command surface (comment-stripped, brace-
+matched) + flag #[tauri::command] names; find every fn calling a Scribe egress sink (`scribe_api::transcribe*`);
+require consent enforced on EVERY path via `_consent_covered` (marker in body, OR — for a private helper —
+every caller covered, recursing helper→caller, terminating False at an un-gated command). Fails loudly if
+zero egress sites found (no vacuous pass). A companion test pins the scribe_api egress SURFACE (every pub
+fn is a known pure helper or `transcribe*`; the ElevenLabs POST is private) so the prefix scan stays complete.
+
+**FAIL-BEFORE.** Removing `add_scribe_votes`' `require_cloud_stt_consent(&state)?` (TARGETED edit) made the
+inventory FAIL: "Scribe cloud egress reachable WITHOUT a consent gate on the path: ['add_scribe_votes']" —
+the exact T2 scenario the old floor allowed; restored → passes clean.
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched; Rust unchanged,
+policy-only):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok (8.72s) ·
+`cargo test --lib` → `test result: ok. 1013 passed; 0 failed; 6 ignored` · `python run_python_policies.py` → 42 passed.
+
+**Adversarially verified** (Workflow, 3 independent skeptics vs source): a real un-gated egress cannot pass
+(traced 8 adversarial shapes — all flagged), no missed sink/parse-gap (fail-closed on mis-parse), not
+vacuous / not false-positive (clean run passes, recursion terminates). Core refuted=false. Two LOW
+future-proofing gaps they surfaced were then FIXED + re-verified: (1) also strip `/* */` block comments (a
+gate hidden in a block comment is now flagged — fail-before shown); (2) the surface-pin now matches
+`pub(crate) fn` too (was `pub fn ` only), so a wider-visibility non-transcribe* upload helper can't evade it.
+
+**NOT verified / remaining:** the main-thread inventory (the OTHER T2 half) is NOT done — a robust static
+"heavy work" classifier is hard; the hand-verified ratchets remain the honest state (flagged for a future
+item). String-literal marker decoys share the substring weakness of every assert_contains here (contrived,
+review-visible, not the accidental-omission threat).
+
+**Tier-3 status:** P3.2 cloud-egress inventory shipped (T2 cloud half closed). **Next: P3.1** generated IPC
+contract (close T1) → P3.3 → P3.4 → (revisit main-thread inventory). "Best / real #1" NOT claimed.
