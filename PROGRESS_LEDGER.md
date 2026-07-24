@@ -10328,3 +10328,51 @@ sibling + `vad_backend` per-row provenance are NOT yet done. The Scribe cloud pa
 **Tier-0 status:** P0.2/P0.3/P0.4(write+read, H3 closed) shipped; P0.4 vad_backend + HF-README model_version
 remain; P0.1 owner-gated (GPU re-score). **Next: P0.4 vad_backend** → HF-README model_version → Tier-3.
 "Best / real #1" NOT claimed.
+
+### Iteration 181 — 2026-07-24 — P0.4 vad_backend: record the VAD backend actually used (interactive loop)
+
+Reality check pre-work: exe NOT running, git clean, HEAD 4a6cf03, lock held (iter15-P0.4vad). Traced the full
+VAD stack (audio::voice_activity_detection → chunking::plan_speech_chunks → 2 pipeline call sites) + all
+callers before editing.
+
+**COMPLETES P0.4 per-segment provenance** (denoised/diarized = v41). The VAD backend (Silero vs energy
+fallback) was decided inside `voice_activity_detection` and DISCARDED — the export could not say how each
+clip's regions were detected, and a path-exists probe would LIE (a present-but-broken Silero falls back to
+energy at RUNTIME). Committed 41cdfe1.
+
+**CHANGE (root-cause: surface the ACTUAL backend from the detector, thread it, persist it, report it).**
+New `pub enum VadBackend { Silero, Energy, None }` (audio.rs); `voice_activity_detection` returns
+`(regions, backend)` — Silero only on a successful Silero detect() (cached/fresh), Energy on every
+fallback, None for empty input. `plan_speech_chunks` returns `(regions, backend)` — None for the
+needs_chunking()==false whole-buffer path (no VAD ran), else the detector's backend (post-processing only
+reshapes regions). Both pipeline call sites (non-streaming + streaming) thread it into
+build_segments_from_pcm (new param), stamped on every segment at the single construction site; streaming
+stamps each 90 s window's segments with THAT window's backend (honest per-window truth). Scribe cloud path
+stays None (no local VAD). Migration v42 (nullable TEXT vad_backend) + struct field + SEGMENT_SELECT_COLUMNS
++ positional map_row (idx 34) + all 3 insert paths (mirror the v41 plumbing). Export processingProvenance
+gains `vadBackend: { byBackend: {silero,energy,none}, notRecorded }` — the stored distribution, honest for a
+mixed export. The 4 integration-test call sites (audio_integration/e2e_pipeline/real_audio/audiobook_smoke)
+updated to the tuple return.
+
+**FAIL-BEFORE:** chunking `plan_short_audio_single_chunk` asserts the short-file whole-buffer path reports
+`VadBackend::None`; mislabeling that branch `Silero` (TARGETED edit) failed it `left: Silero right: None`,
+passes with the fix. Plus db round-trip (distinct silero via batch + energy via full, None stays NULL) and
+the export manifest distribution (silero=2, energy=1, notRecorded=0); `test_vad_empty` asserts None.
+
+Gate (warm default target — app not running so target/release + %APPDATA% provably untouched):
+`cargo fmt --check` → ok · `cargo clippy --all-targets -- -D warnings` → ok · `cargo test --lib` →
+`test result: ok. 1012 passed; 0 failed; 6 ignored` · `python run_python_policies.py` → 42 passed.
+
+**Adversarially verified** (Workflow, 4 independent skeptics vs source): backend-is-the-one-actually-used,
+chunking+pipeline threading, db positional + migration v42, export distribution + consumers — ALL
+refuted=false / severity none. The backend skeptic surfaced a DOC-COMMENT inaccuracy (my Energy comment said
+"failed integrity → energy", but an integrity/ONNX-load failure `?`-propagates an Err — no regions — never a
+false Silero); NOT a code defect, but I corrected the comment for provenance accuracy before commit.
+
+**NOT verified / remaining:** no exe rebuild (import/export behavior changed — a live run would show
+per-segment vad_backend + the manifest vadBackend distribution). Backend truth is proven by unit tests, not
+a live run against a genuinely corrupt Silero model. Scribe/legacy rows read as notRecorded (honest).
+
+**Tier-0 status:** P0.2/P0.3/P0.4 (write + read/H3 + vad_backend) all shipped — Tier-0 complete EXCEPT the
+owner-gated P0.1 GPU re-score. **Next: HF-README model_version sibling** (export.rs reads stored
+model_version_id) → Tier-3. "Best / real #1" NOT claimed.
