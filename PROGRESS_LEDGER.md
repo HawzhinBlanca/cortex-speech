@@ -10642,3 +10642,64 @@ gate runnable on this rig runs and passes, the exe at HEAD, the champion engine 
 user-loop e2e green. Remaining to claim GREEN: build refinery-lift; run fuzz-smoke in Linux CI; owner-gated
 items. Remaining human step per docs/SHIP_FINAL_PHASE.md: the owner's real review/export cycle + a quiet
 week of daily use.
+
+---
+
+### Iteration 188 — 2026-07-25 — refinery-lift BUILT (last buildable charter gate) + real IRT defect found & fixed → verify-10 at 22 PASS / 0 FAIL
+
+**What was done (commits f3b7c55, 7124724):**
+1. **Built the refinery-lift charter gate** (`src-tauri/tests/refinery_lift.rs` + `scripts/verify_10.py`
+   stub → real cmd gate): fixed-seed injected-error benchmark on the REAL shipped T0 jury path
+   (`jury::run_t0_gate`, ActConfirm — real IRT consensus, real per-SNR-bucket conformal calibration,
+   real verdict writes; nothing reimplemented). 5,000 i.i.d. calibration + 400 test segments (above the
+   `min_calibration_n` ≈2,334 the shipped 5%-target math requires); references built only from words of
+   the committed human-verified FLEURS ckb fixture; 3 voters at measured-ordering error rates; 10% hard
+   + 5% vhard so BOTH sides of the conformal frontier are exercised. Verbatim result:
+   ```
+   REFINERY-LIFT BENCH (seed 0xc0de5eed, 5000 calibration / 400 test)
+     raw_micro_cer      = 0.05167
+     jury_micro_cer     = 0.02082
+     cer_lift (abs)     = 0.03085 [95% CI 0.02765, 0.03386]
+     relative_reduction = 59.7% (gate: >=30%)
+     escalation         = 22/400 = 5.5% (gate: <=15%)
+     [info, not gated] strongest-voter (wsl-7b) micro CER = 0.02141; jury vs strongest lift = +0.00059
+   ```
+   Gated baseline is raw CTC per the charter's literal definition; the shipped-default raw producer
+   (WSL-7B champion) is surfaced via the not-gated transparency line.
+2. **The benchmark immediately found a REAL production defect** (first run: 100% escalation, all
+   consensus empty): the IRT EM M-step applied the RAW-SUM gradient, which scales with corpus size —
+   past the ≥10-segment activation, the first lr×O(n_obs) update slammed every model ability into the
+   ±3 clamp (abilities read exactly −3.0; consensus all-deletion; conformal could not calibrate). The
+   documented "abilities cannot drift unboundedly" contract was void at every realistic corpus size.
+   **Fix (f3b7c55):** mean gradient per entity → strict contraction, fixed point |ability−prior|<1;
+   plus warm-start sanitation (persisted ability >1.0 from its heuristic prior = provable raw-sum-era
+   clamp poison, discarded at seeding). FAIL-BEFORE demonstrated: with raw-sum temporarily restored,
+   `em_ability_update_is_scale_invariant_and_anchored` fails ("wsl-7b ability 0.4409… drifted
+   unboundedly from its prior 1.5"); green after.
+
+**Adversarial verification:** 3 independent skeptics (irt-math / bench-rig / gate-wiring), every finding
+hand-verified. Both CONFIRMED findings fixed pre-commit: (a) header falsely claimed 300m produces the
+shipped raw_transcript (default is WSL-7B) → corrected + transparency line added; (b) the new #[ignore]
+tests leaked into ignored-real-model (double-run + stale "37" count) → `--skip refinery_lift` + charter
+string fixed. PLAUSIBLE persisted-ability-poison closed via seeding sanitation + regression test.
+Accepted residuals stated honestly: the cmd gate is exit-code-only (a renamed filter would vacuously
+pass — same idiom as rtf-bench); independent synthetic corruption cannot model correlated 300M/1B kin
+errors (the benchmark gates the machinery, not real-audio accuracy).
+
+**Gates (verbatim, this rig):** `cargo test --lib` → 1015 passed, 0 failed; full `cargo test` → exit 0
+(31 targets, 0 failed); fmt/clippy clean; python policies 43/43. Exe rebuilt at HEAD 7124724
+("EXE FRESHNESS GATE: OK"). Full `verify_10.py` sweep (7B server live, CORTEX_AUDIO=committed FLEURS
+fixture):
+```
+ kept gates run: 23 - 22 PASS, 0 FAIL, 1 skipped (env/not-built)
+ owner-descoped: 8   owner-gated pending: 5
+ VERDICT: INCOMPLETE - 1 kept gate(s) could not run (fuzz-smoke). Green cannot be claimed.
+```
+(refinery-lift PASS 36.9s in the aggregate.) One flake noted honestly: test-e2e+a11y failed once inside
+the first sweep (conformal-cert visibility timing) and passed 47/47 standalone and in the final sweep —
+no code change involved.
+
+**What is NOT verified / remaining:** fuzz-smoke is the ONLY kept-gate residue (measured windows-msvc
+ASAN/static-MT linker impossibility — Linux-CI leg). 5 owner-gated items + 8 owner-descoped distribution
+legs unchanged. The refinery-lift number is a synthetic machinery benchmark, NOT a real-audio accuracy
+claim (the in-product lift gate remains owner-gated on the Gold Marathon).
