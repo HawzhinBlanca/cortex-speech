@@ -173,7 +173,9 @@ pub fn fit_irt_consensus(hypotheses: &[SegmentHypothesis]) -> IrtResults {
 /// hardcoded heuristic). An EMPTY `priors` map makes this byte-identical to the heuristic-only path,
 /// so the default gate is unchanged; a populated map warm-starts from previously-learned abilities.
 /// The EM's regularization still anchors to the base heuristic prior, so learned abilities cannot
-/// drift unboundedly across runs.
+/// drift unboundedly across runs. A stored prior farther than 1.0 from its heuristic prior is
+/// DISCARDED at seeding: the mean-gradient fixed point always satisfies |ability − prior| < 1, so
+/// such a value can only be raw-sum-era clamp poison (see the seeding site below).
 pub fn fit_irt_consensus_with_priors(hypotheses: &[SegmentHypothesis], priors: &HashMap<String, f64>) -> IrtResults {
     let mut segment_hyps: HashMap<String, Vec<&SegmentHypothesis>> = HashMap::new();
     for h in hypotheses {
@@ -192,7 +194,14 @@ pub fn fit_irt_consensus_with_priors(hypotheses: &[SegmentHypothesis], priors: &
         for slot in &slots {
             for obs in &slot.observations {
                 model_abilities.entry(obs.model_id.clone()).or_insert_with(|| {
-                    priors.get(&obs.model_id).copied().unwrap_or_else(|| get_initial_ability(&obs.model_id))
+                    let heuristic = get_initial_ability(&obs.model_id);
+                    // Warm-start sanitation: under the mean-gradient M-step the fixed point always
+                    // satisfies |ability − heuristic prior| < 1 (per-obs grad ∈ (−1,1)), so a
+                    // persisted ability outside that window can only come from the pre-fix raw-sum
+                    // era (clamp-saturated ±3 values). Seeding from such a poisoned value would
+                    // distort the E-step weighting for ~5+ learning-enabled runs before the
+                    // regularizer washes it out — discard it and fall back to the heuristic.
+                    priors.get(&obs.model_id).copied().filter(|p| (p - heuristic).abs() <= 1.0).unwrap_or(heuristic)
                 });
             }
         }
@@ -253,8 +262,18 @@ pub fn fit_irt_consensus_with_priors(hypotheses: &[SegmentHypothesis], priors: &
         }
 
         // --- M-step: Perform gradient updates on ability and difficulty ---
-        let mut grad_theta = HashMap::new();
-        let mut grad_b = HashMap::new();
+        // Gradients are AVERAGED per entity (per model / per segment), not raw-summed. The raw sum
+        // scales with the total observation count, so on any corpus past the ≥10-segment activation
+        // the very first update (lr × O(n_obs)) slams every ability into the ±3 clamp — the O(1)
+        // prior-anchoring regularizer can never counter an O(n_obs) term, silently destroying the
+        // heuristic 7B-over-kin-pair weighting and (on disagreement-heavy data) collapsing the
+        // consensus to all-deletion. The mean gradient makes the step size scale-invariant, so the
+        // documented contract ("regularization anchors to the prior; abilities cannot drift
+        // unboundedly") actually holds at every corpus size. Found by the refinery-lift benchmark.
+        let mut grad_theta: HashMap<String, f64> = HashMap::new();
+        let mut grad_b: HashMap<String, f64> = HashMap::new();
+        let mut obs_count_theta: HashMap<String, usize> = HashMap::new();
+        let mut obs_count_b: HashMap<String, usize> = HashMap::new();
 
         // Accumulate gradients in a deterministic segment order. grad_theta sums a
         // per-model gradient across segments, and f64 addition is not associative,
@@ -281,25 +300,29 @@ pub fn fit_irt_consensus_with_priors(hypotheses: &[SegmentHypothesis], priors: &
 
                     let grad = w_val - p_ij;
                     *grad_theta.entry(obs.model_id.clone()).or_insert(0.0) += grad;
+                    *obs_count_theta.entry(obs.model_id.clone()).or_insert(0) += 1;
                     *grad_b.entry(segment_id.clone()).or_insert(0.0) += p_ij - w_val;
+                    *obs_count_b.entry(segment_id.clone()).or_insert(0) += 1;
                 }
             }
         }
 
-        // Apply gradient updates
+        // Apply gradient updates (mean gradient — see the M-step comment above)
         if update_abilities {
             for (model_id, grad) in grad_theta {
                 if let Some(ability) = model_abilities.get_mut(&model_id) {
+                    let n = obs_count_theta.get(&model_id).copied().unwrap_or(1).max(1) as f64;
                     let prior = get_initial_ability(&model_id);
                     let reg = 1.0 * (*ability - prior);
-                    *ability += learning_rate * (grad - reg);
+                    *ability += learning_rate * (grad / n - reg);
                     *ability = (*ability).clamp(-3.0, 3.0);
                 }
             }
         }
         for (segment_id, grad) in grad_b {
             if let Some(diff) = segment_difficulties.get_mut(&segment_id) {
-                *diff += learning_rate * grad;
+                let n = obs_count_b.get(&segment_id).copied().unwrap_or(1).max(1) as f64;
+                *diff += learning_rate * (grad / n);
                 *diff = (*diff).clamp(-3.0, 3.0);
             }
         }
@@ -522,11 +545,14 @@ mod tests {
         assert_eq!(a.model_abilities, b.model_abilities);
         assert!(!a.abilities_were_fit, "one segment (<10) must NOT fit abilities");
         let heuristic = *a.model_abilities.get("custom-x").expect("custom-x present");
-        // Warm-start: a stored prior seeds the ability (single segment ⇒ EM doesn't update ⇒ stays the seed).
-        let priors = HashMap::from([("custom-x".to_string(), 2.5)]);
+        // Warm-start: an IN-WINDOW stored prior (|prior − heuristic| ≤ 1, the only values the
+        // mean-gradient fit can legitimately produce) seeds the ability (single segment ⇒ EM
+        // doesn't update ⇒ stays the seed). Out-of-window values are discarded as raw-sum-era
+        // poison — pinned by poisoned_persisted_ability_is_discarded_at_warm_start.
+        let priors = HashMap::from([("custom-x".to_string(), 0.9)]);
         let c = fit_irt_consensus_with_priors(&hyps, &priors);
         let warm = *c.model_abilities.get("custom-x").expect("custom-x present");
-        assert!((warm - 2.5).abs() < 1e-9, "warm-start must seed custom-x from the stored 2.5, got {warm}");
+        assert!((warm - 0.9).abs() < 1e-9, "warm-start must seed custom-x from the stored 0.9, got {warm}");
         assert!((warm - heuristic).abs() > 1e-6, "warm-started ability must differ from the heuristic seed");
     }
 
@@ -567,6 +593,81 @@ mod tests {
             .expect("a word tying a deletion must yield a consensus, not an all-deletion None");
         assert_eq!(text, "ئەمە", "the gate must KEEP a word that ties a deletion, matching the draft");
         assert!((conf - 0.5).abs() < 1e-9, "the kept word contributes its 0.5 posterior over 1 slot");
+    }
+
+    #[test]
+    fn em_ability_update_is_scale_invariant_and_anchored() {
+        // FAIL-BEFORE (found by the refinery-lift benchmark): the M-step applied the RAW-SUM ability
+        // gradient, which scales with the total observation count — on any corpus past the
+        // ≥10-segment activation the first lr×O(n_obs) update slammed every ability into the ±3
+        // clamp (the O(1) prior-anchoring regularizer can never counter it), destroying the
+        // heuristic model weighting and, on disagreement-heavy data, collapsing the consensus to
+        // all-deletion. With the mean gradient, abilities must stay anchored near their priors even
+        // under worst-case disagreement pressure at scale.
+        let hyp = |seg: &str, model: &str, text: &str| SegmentHypothesis {
+            segment_id: seg.to_string(),
+            model_id: model.to_string(),
+            transcript: text.to_string(),
+            confidence: Some(0.8),
+        };
+        // 400 segments × 6 slots of 3-way disagreement (A/B/C rotated per slot so every slot sees
+        // three distinct tokens) ⇒ ~2,400 observations per model — the scale at which the raw-sum
+        // gradient (lr × Σgrad ≈ ±7 per iteration) overwhelms the clamp within the first iterations.
+        let (a, b, c) = ("کوردستان", "دەنگە", "ئێران");
+        let rot = |x: &str, y: &str| format!("{x} {y} {x} {y} {x} {y}");
+        let mut hyps = Vec::new();
+        for i in 0..400 {
+            let seg = format!("seg{i:03}");
+            hyps.push(hyp(&seg, "wsl-7b", &rot(a, b)));
+            hyps.push(hyp(&seg, "ctc-1b", &rot(b, c)));
+            hyps.push(hyp(&seg, "omniasr-ctc-300m", &rot(c, a)));
+        }
+        let res = fit_irt_consensus(&hyps);
+        assert!(res.abilities_were_fit, "≥10 segments must activate the ability update");
+        for (model, prior) in [("wsl-7b", 1.5), ("ctc-1b", 0.5), ("omniasr-ctc-300m", -0.5)] {
+            let ability = res.model_abilities.get(model).copied().expect("ability present");
+            assert!(
+                (ability - prior).abs() < 1.0,
+                "{model} ability {ability} drifted unboundedly from its prior {prior} — the raw-sum gradient is back"
+            );
+        }
+        for i in 0..400 {
+            let id = format!("seg{i:03}");
+            assert!(
+                res.consensus_transcripts.get(&id).is_some_and(|t| !t.trim().is_empty()),
+                "segment {id} lost its consensus (all-deletion collapse)"
+            );
+        }
+    }
+
+    #[test]
+    fn poisoned_persisted_ability_is_discarded_at_warm_start() {
+        // Abilities persisted under the pre-fix raw-sum M-step were clamp-saturated (±3). The new
+        // math can only ever produce |ability − heuristic prior| < 1, so an out-of-window persisted
+        // value is provably from the broken era and must be discarded at the seeding site, not
+        // trusted for ~5 learning-enabled runs while the regularizer slowly decays it.
+        let hyp = |seg: &str, model: &str, text: &str| SegmentHypothesis {
+            segment_id: seg.to_string(),
+            model_id: model.to_string(),
+            transcript: text.to_string(),
+            confidence: Some(0.8),
+        };
+        let hyps = vec![
+            hyp("seg1", "wsl-7b", "کوردستان دەنگە"),
+            hyp("seg1", "ctc-1b", "کوردستان دەنگە"),
+            hyp("seg1", "omniasr-ctc-300m", "کوردستان ڕەنگە"),
+        ];
+        let mut poisoned = HashMap::new();
+        poisoned.insert("wsl-7b".to_string(), -3.0); // raw-sum-era clamp value; heuristic prior is 1.5
+        poisoned.insert("ctc-1b".to_string(), 0.9); // within ±1 of prior 0.5 — legitimately learned, kept
+        let res = fit_irt_consensus_with_priors(&hyps, &poisoned);
+        let a7b = res.model_abilities.get("wsl-7b").copied().expect("present");
+        assert!(
+            (a7b - 1.5).abs() < 1.0,
+            "poisoned −3.0 warm-start must be discarded in favor of the heuristic prior: got {a7b}"
+        );
+        let a1b = res.model_abilities.get("ctc-1b").copied().expect("present");
+        assert!((a1b - 0.9).abs() < 0.5, "an in-window persisted ability must still warm-start: got {a1b}");
     }
 
     #[test]
