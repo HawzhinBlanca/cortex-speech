@@ -208,8 +208,10 @@ and a naive fence could destroy a legitimate ctc-based calibration.
   ASR subchunks; **regression-test boundary words on long recordings** (the real A/B is owner-gated).
 - **Per-source SRT/VTT export** — a multi-source library currently must use TXT or filter to one source
   (this session added the guard); a true per-source-file subtitle export would let it get subtitles.
-- **`verify_10.py` not-built legs:** `egress-runtime` (full, see above) and `refinery-lift`
-  (fixed-seed injected-error synthetic benchmark, ≥30% CER reduction at ≤15% escalation).
+- **`verify_10.py` not-built legs:** both since built — `egress-runtime` (runtime socket-interception
+  harness) and `refinery-lift` (2026-07-25: `tests/refinery_lift.rs`, fixed-seed injected-error
+  benchmark on the real T0 jury path; measured 59.7% CER reduction at 5.5% escalation vs the
+  ≥30%/≤15% charter thresholds).
 
 ## How to run each local gate (Windows, from `cortex-speech-app/` unless noted)
 
@@ -329,8 +331,9 @@ python cortex_7b_server.py"` process alive; `start_7b_server.ps1`'s nohup-detach
 console exits on a NON-interactive runner (the server is killed with the launching session). From
 your own interactive terminal the launcher works as designed.
 
-**Still between here and the full-charter 10/10** (unchanged in kind, updated in count):
-build the `egress-runtime` full leg and `refinery-lift` benchmark; run `fuzz-smoke` on Linux;
+**Still between here and the full-charter 10/10** (unchanged in kind, updated in count —
+`egress-runtime` and `refinery-lift` have since been BUILT and pass; see PROGRESS_LEDGER.md):
+run `fuzz-smoke` on Linux;
 the 5 owner-gated legs (annotators, CORDI, Gold Marathon, branch protection, AsoSoft licensing);
 the 8 owner-descoped distribution legs if scope ever widens. Nothing else verifiable-here was
 found by a 33-agent sweep — 11 confirmed findings, all fixed above; 3 killed as not-real.

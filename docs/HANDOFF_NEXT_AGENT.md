@@ -96,9 +96,10 @@ source-grep with a socket-interception harness asserting ZERO outbound sockets i
 across import→T0→T1→T2→debate. This is the `egress-runtime` gate that verify-10 currently reports
 NOT-BUILT.
 
-**WS4 — nightly gates (the other NOT-BUILT verify-10 legs):** `refinery-lift` (fixed-seed
-injected-error synthetic benchmark, ≥30% CER reduction at ≤15% escalation) and `fairness-gender-age`
-(disparity gate on existing corpus metadata). Also wire `fuzz-smoke` (5 targets) into nightly.
+**WS4 — nightly gates (the other NOT-BUILT verify-10 legs):** ~~`refinery-lift`~~ (BUILT
+2026-07-25: `tests/refinery_lift.rs`, measured 59.7% CER reduction at 5.5% escalation vs the
+≥30%/≤15% thresholds) and ~~`fairness-gender-age`~~ (since built). Also wire `fuzz-smoke`
+(5 targets) into nightly — still open (windows-msvc cannot link ASAN; Linux-CI leg).
 
 **WS5 — accuracy levers (optional, lowest priority):** KenLM shallow fusion + pseudo-labeling. The
 champion is already measured best (7.03% CER FLEURS-ckb), so this is upside, not ship-critical.
