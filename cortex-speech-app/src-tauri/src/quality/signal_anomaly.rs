@@ -80,6 +80,77 @@ impl SignalAnomalyDetector {
 mod tests {
     use super::*;
 
+    /// EXACT scores for signals whose ZCR and energy variance are known by construction.
+    ///
+    /// The whole module scored 35 surviving mutants in the first full cargo-mutants sweep: the only
+    /// tests asserted `score < 0.5` / `score > 0.5`, which stays true when the ZCR loop, the frame
+    /// energy mean, the variance, or the final weighting is quietly wrong. This score feeds the
+    /// audio-quality signal shown next to a clip, so a silently wrong number misdirects review
+    /// attention. Each expectation below is derived from the documented formula, not observed and
+    /// pasted: base 0.15 + zcr_factor*0.4 + var_factor*0.4, clamped to 1.0.
+    #[test]
+    fn heuristic_score_is_exact_for_known_signals() {
+        let d = SignalAnomalyDetector::new(Path::new("")).unwrap();
+
+        // (1) Digital silence: no sign changes => zcr 0 => zcr_factor 0. All frame energies 0 =>
+        // variance 0 < 1e-4 => var_factor = (1 - 0) = 1. Score = 0.15 + 0 + 0.4 = 0.55.
+        let silence = vec![0i16; 1000];
+        let s = d.heuristic_signal_anomaly_score(&silence);
+        assert!((s - 0.55).abs() < 1e-12, "silence must score exactly 0.55, got {s}");
+
+        // (2) Full-scale alternating square wave: a sign change at every sample => zcr ~1 =>
+        // zcr_factor clamps to 1. Every frame has identical energy (|v| = 0.5) => variance 0 =>
+        // var_factor 1. Score = 0.15 + 0.4 + 0.4 = 0.95.
+        let alternating: Vec<i16> = (0..1000).map(|i| if i % 2 == 0 { 16384 } else { -16384 }).collect();
+        let s = d.heuristic_signal_anomaly_score(&alternating);
+        assert!((s - 0.95).abs() < 1e-12, "alternating full-scale must score exactly 0.95, got {s}");
+
+        // (3) Loud-then-silent, all one polarity: no sign changes => zcr_factor 0, but the frame
+        // energies differ wildly => variance >> 1e-4 => var_factor 0. Score = the bare baseline,
+        // 0.15. This is the case that pins base_distance and BOTH factor branches being inactive.
+        let mut half_loud = vec![16384i16; 500];
+        half_loud.extend(std::iter::repeat(0i16).take(500));
+        let s = d.heuristic_signal_anomaly_score(&half_loud);
+        assert!((s - 0.15).abs() < 1e-12, "high-variance one-polarity signal is the 0.15 baseline, got {s}");
+    }
+
+    /// A signal whose energy variance lands INSIDE the (0, 1e-4) window, so `var_factor` is
+    /// partially active rather than saturated at 0 or 1.
+    ///
+    /// This is the case that pins the absolute AMPLITUDE arithmetic. The three saturated signals
+    /// above cannot: with variance either exactly 0 or enormous, scaling every sample (the
+    /// `/ 32768.0` -> `* 32768.0` mutant) or replacing `val * val` with `val + val` leaves
+    /// var_factor pinned at the same end of its range and the score unchanged. Here the 1e-4
+    /// threshold is close enough that any magnitude error pushes variance over it and collapses
+    /// the score to the bare 0.15 baseline.
+    ///
+    /// Deliberately a strict-interval assertion rather than a golden constant: what matters is
+    /// that the factor is genuinely partial, and that is exactly what the mutants destroy.
+    #[test]
+    fn partially_active_variance_factor_pins_the_amplitude_math() {
+        let d = SignalAnomalyDetector::new(Path::new("")).unwrap();
+        // All one polarity => no zero crossings => zcr_factor is 0, isolating the variance path.
+        // Two amplitude plateaus give a small, non-zero spread in per-frame RMS.
+        let mut pcm = vec![328i16; 480]; // RMS ~= 0.0100
+        pcm.extend(std::iter::repeat(131i16).take(480)); // RMS ~= 0.0040
+        let s = d.heuristic_signal_anomaly_score(&pcm);
+        assert!(
+            s > 0.15 + 1e-9 && s < 0.55 - 1e-9,
+            "variance must be partially active (strictly between the 0.15 baseline and the \
+             0.55 zero-variance score), got {s}"
+        );
+    }
+
+    /// The `n < 100` short-circuit. Tested only well below the cap, `<` -> `<=` / `==` survive.
+    #[test]
+    fn too_short_input_is_maximally_anomalous_at_the_exact_boundary() {
+        let d = SignalAnomalyDetector::new(Path::new("")).unwrap();
+        assert_eq!(d.heuristic_signal_anomaly_score(&vec![0i16; 99]), 1.0, "99 samples is too short");
+        // Exactly 100 must NOT short-circuit: it is silence, so it takes the real path and scores 0.55.
+        let s = d.heuristic_signal_anomaly_score(&vec![0i16; 100]);
+        assert!((s - 0.55).abs() < 1e-12, "exactly 100 samples must be scored, not short-circuited: {s}");
+    }
+
     #[test]
     fn test_heuristic_speech() {
         let detector = SignalAnomalyDetector::new(Path::new("")).unwrap();
