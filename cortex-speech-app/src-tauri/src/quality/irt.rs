@@ -640,6 +640,123 @@ mod tests {
         }
     }
 
+    /// Deterministic corpus for the EM golden test: 12 segments (>= the 10 needed to activate the
+    /// ability update), 3 voters, a fixed agree/disagree pattern so the gradients are non-trivial.
+    fn golden_corpus() -> Vec<SegmentHypothesis> {
+        let hyp = |seg: &str, model: &str, text: &str| SegmentHypothesis {
+            segment_id: seg.to_string(),
+            model_id: model.to_string(),
+            transcript: text.to_string(),
+            confidence: Some(0.8),
+        };
+        let mut hyps = Vec::new();
+        for i in 0..12 {
+            let seg = format!("g{i:02}");
+            // Every 3rd segment is unanimous; the rest disagree on the second word, and every 4th
+            // also disagrees on the first. Fixed by index, so the corpus is byte-reproducible.
+            let unanimous = i % 3 == 0;
+            let first_differs = i % 4 == 0;
+            hyps.push(hyp(&seg, "wsl-7b", "کوردستان دەنگە"));
+            hyps.push(hyp(&seg, "ctc-1b", if unanimous { "کوردستان دەنگە" } else { "کوردستان ڕەنگە" }));
+            hyps.push(hyp(
+                &seg,
+                "omniasr-ctc-300m",
+                match (unanimous, first_differs) {
+                    (true, _) => "کوردستان دەنگە",
+                    (false, true) => "ئێران ڕەنگە",
+                    (false, false) => "کوردستان ئێران",
+                },
+            ));
+        }
+        hyps
+    }
+
+    /// GOLDEN VALUES for the EM. Every constant below was produced by running this fit, not derived
+    /// by hand — the EM is fully deterministic (sorted M-step, fixed 50 iterations, no RNG, pinned
+    /// toolchain), so it is reproducible to the last bit.
+    ///
+    /// Why exact values rather than bounds: a cargo-mutants run over the 2026-07-25 M-step change
+    /// left 11 of 26 mutants ALIVE (`cargo mutants --in-diff`, 14 caught / 1 unviable). Every
+    /// survivor changed an arithmetic operator in the gradient accumulation, the ability update, or
+    /// the difficulty update while staying inside the loose `|ability - prior| < 1.0` bound the
+    /// existing test asserted — and the segment-difficulty update was asserted by NOTHING at all, so
+    /// all four of its mutants survived automatically. Bounds cannot pin a numerical kernel; values
+    /// can. This is the same blind spot that let the original raw-sum bug ship green.
+    ///
+    /// If you change the EM deliberately, these numbers SHOULD move: re-run
+    /// `cargo test --lib quality::irt::tests::em_golden_values -- --nocapture`, confirm the new
+    /// values are what you intended, and update them in the same commit as the behavior change.
+    #[test]
+    fn em_golden_values() {
+        let res = fit_irt_consensus(&golden_corpus());
+        const EPS: f64 = 1e-12;
+        let close = |a: f64, b: f64| (a - b).abs() < EPS;
+
+        // Abilities: ordered 7B > 1B > 300M, each anchored near its heuristic prior (1.5/0.5/-0.5).
+        for (model, expected) in
+            [("wsl-7b", 1.512460322683539), ("ctc-1b", 0.537600829981519), ("omniasr-ctc-300m", -0.411918051171204)]
+        {
+            let got = res.model_abilities.get(model).copied().expect("ability present");
+            assert!(close(got, expected), "ability {model}: expected {expected:.15}, got {got:.15}");
+        }
+
+        // Difficulties fall into exactly three classes, one per generated agreement pattern.
+        // Nothing asserted these before, which is why every difficulty-update mutant survived.
+        let unanimous = -0.175345550561822; // i % 3 == 0
+        let one_word_split = -0.014922148422716; // disagrees on word 2 only
+        let two_word_split = 0.043648562776725; // disagrees on both words
+        for i in 0..12 {
+            let id = format!("g{i:02}");
+            let expected = if i % 3 == 0 {
+                unanimous
+            } else if i % 4 == 0 {
+                two_word_split
+            } else {
+                one_word_split
+            };
+            let got = res.segment_difficulties.get(&id).copied().expect("difficulty present");
+            assert!(close(got, expected), "difficulty {id}: expected {expected:.15}, got {got:.15}");
+        }
+        assert!(
+            !close(unanimous, one_word_split) && !close(one_word_split, two_word_split),
+            "the three difficulty classes must stay distinct, or this test cannot detect a change"
+        );
+
+        // Consensus text + confidence: a unanimous segment scores strictly higher than a split one.
+        for i in 0..12 {
+            let id = format!("g{i:02}");
+            assert_eq!(
+                res.consensus_transcripts.get(&id).map(String::as_str),
+                Some("کوردستان دەنگە"),
+                "segment {id} consensus must be the anchor reading"
+            );
+            let conf = res.segment_confidences.get(&id).copied().expect("confidence present");
+            // Three classes, matching the three difficulty classes: more disagreement => lower
+            // confidence. The monotonic ordering is asserted below so this is not just three magic
+            // numbers - it encodes the property the gate depends on.
+            let expected = if i % 3 == 0 {
+                0.985679887653454
+            } else if i % 4 == 0 {
+                0.777012840254519
+            } else {
+                0.795083249089748
+            };
+            assert!(close(conf, expected), "confidence {id}: expected {expected:.15}, got {conf:.15}");
+        }
+
+        // The PROPERTY the golden numbers encode: agreement must outrank disagreement, and a
+        // two-word split must score below a one-word split. If a future EM change moves the values,
+        // this ordering is what must survive - the constants above are only its fingerprint.
+        let conf_of = |id: &str| res.segment_confidences.get(id).copied().expect("present");
+        assert!(
+            conf_of("g00") > conf_of("g01") && conf_of("g01") > conf_of("g04"),
+            "confidence must fall as disagreement rises: unanimous {:.6} > 1-word {:.6} > 2-word {:.6}",
+            conf_of("g00"),
+            conf_of("g01"),
+            conf_of("g04")
+        );
+    }
+
     #[test]
     fn poisoned_persisted_ability_is_discarded_at_warm_start() {
         // Abilities persisted under the pre-fix raw-sum M-step were clamp-saturated (±3). The new
@@ -657,17 +774,25 @@ mod tests {
             hyp("seg1", "ctc-1b", "کوردستان دەنگە"),
             hyp("seg1", "omniasr-ctc-300m", "کوردستان ڕەنگە"),
         ];
+        // One segment => update_abilities is false (needs >=10), so each ability stays EXACTLY at
+        // whatever the seeding step chose. Assert exact values, not bounds: with a loose tolerance
+        // the `(p - heuristic)` -> `(p + heuristic)` mutant survived, because a warm-started 0.9 and
+        // a heuristic fallback of 0.5 sit only 0.4 apart. Distances are chosen so that flipping the
+        // operator changes which branch each model takes.
         let mut poisoned = HashMap::new();
-        poisoned.insert("wsl-7b".to_string(), -3.0); // raw-sum-era clamp value; heuristic prior is 1.5
-        poisoned.insert("ctc-1b".to_string(), 0.9); // within ±1 of prior 0.5 — legitimately learned, kept
+        poisoned.insert("wsl-7b".to_string(), -3.0); // |-3.0 - 1.5| = 4.5 > 1 -> discarded (clamp poison)
+        poisoned.insert("ctc-1b".to_string(), 1.4); // |1.4 - 0.5| = 0.9 <= 1 -> kept; under `+` it is 1.9 -> dropped
         let res = fit_irt_consensus_with_priors(&hyps, &poisoned);
         let a7b = res.model_abilities.get("wsl-7b").copied().expect("present");
         assert!(
-            (a7b - 1.5).abs() < 1.0,
-            "poisoned −3.0 warm-start must be discarded in favor of the heuristic prior: got {a7b}"
+            (a7b - 1.5).abs() < 1e-12,
+            "poisoned -3.0 warm-start must be discarded for the exact heuristic prior 1.5: got {a7b}"
         );
         let a1b = res.model_abilities.get("ctc-1b").copied().expect("present");
-        assert!((a1b - 0.9).abs() < 0.5, "an in-window persisted ability must still warm-start: got {a1b}");
+        assert!(
+            (a1b - 1.4).abs() < 1e-12,
+            "an in-window persisted ability must warm-start at exactly 1.4, not fall back to 0.5: got {a1b}"
+        );
     }
 
     #[test]

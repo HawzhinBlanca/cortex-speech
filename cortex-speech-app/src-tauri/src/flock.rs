@@ -2,6 +2,9 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 pub struct InstanceLock {
+    /// RAII guard, never read on purpose: the OS lock lives as long as this handle is open, so
+    /// dropping the field to satisfy dead_code would silently disable single-instance locking and
+    /// let a second copy of the app open the same database. Held, not used.
     #[allow(dead_code)]
     file: Option<File>,
     path: String,

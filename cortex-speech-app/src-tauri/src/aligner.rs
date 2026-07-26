@@ -45,6 +45,9 @@ impl AlignmentQuality {
 
 pub struct ForcedAligner {
     session: Option<std::sync::Mutex<ort::session::Session>>,
+    // Loaded from the model bundle and retained as the model's declared contract: the alignment
+    // path currently reads neither, but a token-level (rather than frame-level) alignment needs
+    // both, and re-deriving them from the ONNX metadata later is strictly harder than keeping them.
     #[allow(dead_code)]
     tokens: Vec<String>,
     #[allow(dead_code)]
