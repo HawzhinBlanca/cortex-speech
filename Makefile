@@ -1,4 +1,5 @@
-.PHONY: help governance-proof verify-10 verify-10-quick gate test-rust test-frontend lint typecheck \
+.PHONY: help governance-proof verify-10 verify-10-quick verify-10-status coverage mutants gate \
+        test-rust test-frontend lint typecheck \
         fmt-check python-policies test-e2e audit deny eval-ckb egress-offline \
         bench-rtf release-proof ship-check build-app check-fresh ship-check-local
 
@@ -20,6 +21,24 @@ verify-10:
 ## best INCOMPLETE (exit 2) — tier-2/3 gates are counted NOT-RUN; never a ship verdict.
 verify-10-quick:
 	python scripts/verify_10.py --quick
+
+## verify-10-status: full sweep + regenerate docs/STATUS.md (the generated gate-status file docs
+## link to). Deterministic per commit: re-running without a gate change produces a zero diff.
+verify-10-status:
+	python scripts/verify_10.py --status-md docs/STATUS.md
+
+## coverage: line coverage for the core modules (cargo-llvm-cov; install: cargo install cargo-llvm-cov
+## + rustup component add llvm-tools-preview). Charter target: >80% on normalizer/diff/audio parsers.
+coverage:
+	cd cortex-speech-app/src-tauri && cargo llvm-cov --lib --summary-only
+
+## mutants: mutation-test the 5 core modules the charter names (irt/conformal/signal_anomaly/diff/
+## normalizer). --in-place is REQUIRED: cargo-mutants' copied tree has no ../dist, which
+## tauri::generate_context! demands. Commit first - an interrupted run can leave a mutated source
+## file behind (recover with `git checkout -- src/`). A full sweep is 844 mutants; nightly CI runs
+## --in-diff instead. Scope/timeouts live in src-tauri/mutants.toml.
+mutants:
+	cd cortex-speech-app/src-tauri && cargo mutants --in-place
 
 ## gate: alias for the narrow governance proof (use verify-10 for the full charter gate)
 gate: governance-proof

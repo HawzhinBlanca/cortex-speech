@@ -111,10 +111,15 @@ round-trip tests for the ~102 commands; docs; dependabot bumps.
 ### verify-10 is the scoreboard
 `python scripts/verify_10.py` (or `make verify-10`) runs the personal-use full-charter aggregator:
 23 tiered gates, honest verdict (RED / INCOMPLETE / GREEN-PERSONAL-USE), with owner-descoped and
-owner-gated legs always printed. Last full run: **19 PASS, 0 FAIL, 4 skipped (NOT-BUILT:
-egress-runtime, refinery-lift, fairness-gender-age; SKIP-ENV: fuzz-smoke)** → verdict INCOMPLETE.
-Closing WS3b + WS4 turns those NOT-BUILT legs green. `--static` preserves the CI contract (ci.yml /
-release.yml call it that way) — never change that.
+owner-gated legs always printed.
+
+**Current gate status lives in [STATUS.md](STATUS.md) — generated, never hand-written.** This
+paragraph used to restate the last run's tally here, and it went stale the moment any leg flipped
+(it claimed `egress-runtime` and `refinery-lift` were NOT-BUILT for weeks after both shipped).
+Regenerate with `python scripts/verify_10.py --status-md docs/STATUS.md`; the verdict there is
+computed by the same code path that sets the exit code, so the two can never disagree.
+
+`--static` preserves the CI contract (ci.yml / release.yml call it that way) — never change that.
 
 ---
 

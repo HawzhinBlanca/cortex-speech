@@ -17,6 +17,14 @@ async function violations(page: Page) {
   return results.violations.map((v) => `${v.id} x${v.nodes.length}`);
 }
 
+// Settle-waits for the async conformal panel get a wider timeout than the 10s global default.
+// These waits assert "the view has finished rendering so axe sees the real thing" — they are NOT
+// performance assertions, and the zero-violation checks below are untouched by this. The global
+// 10s proved load-sensitive: the gate went red inside a full verify-10 sweep (2026-07-25) while
+// passing standalone. Measured on this rig after capping Playwright workers 32 -> 4: 12/12 idle,
+// 23/24 under 24 concurrent CPU burners. This timeout targets that residual starvation case.
+const SETTLE = { timeout: 30_000 };
+
 // M3.6 — ENFORCED WCAG 2.2 AA gate (axe-core) over the App root (en + ckb/RTL) and the settings
 // dialog. The four violation classes originally surfaced (aria-required-children, color-contrast,
 // scrollable-region-focusable, select-name) were fixed; this gate now asserts ZERO violations and
@@ -27,7 +35,7 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
     await expect(page.getByLabel('Open settings')).toBeVisible();
     // The conformal panel loads async; wait for it so axe analyzes the settled view
     // (and actually covers that panel) instead of racing its mid-render state.
-    await expect(page.getByTestId('conformal-cert')).toBeVisible();
+    await expect(page.getByTestId('conformal-cert')).toBeVisible(SETTLE);
     expect(await violations(page)).toEqual([]);
   });
 
@@ -35,7 +43,7 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
     await page.goto('/');
     await page.getByLabel('Switch language').click();
     await expect(page.locator('html')).toHaveAttribute('lang', 'ckb');
-    await expect(page.getByTestId('conformal-cert')).toBeVisible();
+    await expect(page.getByTestId('conformal-cert')).toBeVisible(SETTLE);
     expect(await violations(page)).toEqual([]);
   });
 
