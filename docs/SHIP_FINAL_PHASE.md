@@ -179,9 +179,27 @@ which requires **zero failing gates and zero skipped gates**. There are currentl
 link at all (measured 2026-07-11: ASAN's dynamic-CRT model multiply-defines std:: symbols against
 the static-MT sherpa-onnx prebuilt, LNK2005; `--sanitizer none` then strips the runtime providing
 libFuzzer's sancov symbols, LNK2001). Two honest ways to close it, and only these two:
-  - **A1.** Run it in WSL (Ubuntu, 64 cores, Rust 1.95 already present) and make `_fn_fuzz_smoke`
-    genuinely execute the 5 targets there. This makes the gate *really run* on this rig — it is
-    not a loosening, and it is the only path to a locally-green verdict.
+  - **A1. Run it in WSL** — attempted 2026-07-26, and it gets a long way. Provisioned and verified:
+    nightly `rustc 1.99.0` + `cargo-fuzz 0.13.2` installed in WSL, all 5 targets enumerate
+    (`cargo +nightly fuzz list` → cache, diff, features, normalizer, validation), and `dist/` +
+    `models/silero_vad_v4.onnx` are both reachable at `/mnt/c/...` so `build.rs` is satisfied.
+    The build then stops on a missing Linux system library, NOT on the ASAN/CRT problem that
+    blocks Windows:
+    ```
+    The system library `dbus-1` required by crate `libdbus-sys` was not found.
+    ```
+    **This is blocked on exactly one owner command** (installing dev headers needs a sudo password,
+    which an agent must not enter). In a WSL shell:
+    ```bash
+    sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config \
+      libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+    ```
+    (`libdbus-1-dev` + `pkg-config` are what the build just asked for; the rest is the same set
+    `ci.yml`/`nightly-real-audio.yml` install for Linux Tauri builds, listed together so the build
+    does not stop again on the next one.) After that, `cargo +nightly fuzz build normalizer` should
+    proceed — and if all 5 targets build and run clean, `_fn_fuzz_smoke` can be pointed at WSL so
+    the gate *really executes* on this rig. That is not a loosening; it is the only path to a
+    locally-green verdict.
   - **A2.** Accept it as a CI-only leg. The nightly job now exists; once it has actually run on a
     runner, the evidence is real but it lives in CI, and the local verdict stays INCOMPLETE
     forever by design.
