@@ -329,6 +329,94 @@ mod tests {
         assert_eq!(min_calibration_n(0.0, 0.02), usize::MAX, "zero target is never reachable");
     }
 
+    /// Boundary-exact tests for the conformal machinery. This module decides which transcripts are
+    /// auto-accepted WITHOUT a human ever reading them, so "roughly right" is not a standard it can
+    /// be held to. The first full cargo-mutants sweep left 16 mutants alive here, every one of them
+    /// because the existing tests checked ranges and orderings rather than values and edges.
+    #[test]
+    fn nonconformity_pins_the_formula_not_just_its_shape() {
+        // The existing test used ctc = -1.0, where the 0.1 COEFFICIENT is invisible:
+        // 0.1 * 1.0 == 0.1 / 1.0, so `*` -> `/` survived. Any other ctc separates them.
+        // S = (1 - confidence) + 0.1 * (-ctc)
+        let s = nonconformity(0.9, Some(-5.0));
+        assert!((s - 0.6).abs() < 1e-12, "0.1 + 0.1*5 = 0.6, got {s}"); // `/` would give 0.12
+        let s = nonconformity(0.5, Some(-10.0));
+        assert!((s - 1.5).abs() < 1e-12, "0.5 + 0.1*10 = 1.5, got {s}"); // `/` would give 0.51
+
+        // Missing ctc defaults to -5.0 -- pinned, because the default IS the offline CTC path.
+        let s = nonconformity(0.9, None);
+        assert!((s - 0.6).abs() < 1e-12, "None must behave as ctc = -5.0, got {s}");
+    }
+
+    #[test]
+    fn snr_bucket_edges_are_exact() {
+        // The cutoffs are `< 5.0`, `< 15.0`, `< 25.0`. The existing test sampled 2/10/20/30 --
+        // comfortably inside each band, so `<` -> `<=` at every edge survived. A segment sitting
+        // exactly on a boundary must fall in the UPPER band, or it is calibrated against the wrong
+        // acoustic condition and the per-condition coverage guarantee silently does not apply.
+        assert_eq!(snr_bucket(Some(4.999)), 0);
+        assert_eq!(snr_bucket(Some(5.0)), 1, "exactly 5 dB is NOT the <5 very-noisy band");
+        assert_eq!(snr_bucket(Some(14.999)), 1);
+        assert_eq!(snr_bucket(Some(15.0)), 2, "exactly 15 dB belongs to the upper band");
+        assert_eq!(snr_bucket(Some(24.999)), 2);
+        assert_eq!(snr_bucket(Some(25.0)), 3, "exactly 25 dB is clean");
+    }
+
+    #[test]
+    fn min_calibration_n_is_exact_not_approximate() {
+        // Pinned to the value, not a 2_000..3_000 window: the window let `-` -> `+` and
+        // `<` -> `<=` mutants inside the fixed-point iteration survive. This number is quoted to
+        // the user as "how far away the gate is", so drift in it is a wrong claim, not a nuance.
+        assert_eq!(min_calibration_n(0.05, 0.02), 2334);
+        assert_eq!(min_calibration_n(0.15, 0.02), 206);
+        assert_eq!(min_calibration_n(0.0, 0.02), usize::MAX);
+    }
+
+    #[test]
+    fn calibrate_threshold_pins_the_risk_math() {
+        // A fixed, hand-checkable calibration set: 30 clean items at score 0.10, 10 wrong at 0.50.
+        // Deterministic, so the chosen cutoff and the reported bound are exact values.
+        let mut scored: Vec<(f64, f64)> = (0..30).map(|_| (0.10, 0.0)).collect();
+        scored.extend((0..10).map(|_| (0.50, 1.0)));
+        // Target 0.40, not 0.30: cutting at the 30 clean points gives a Bonferroni-corrected bound
+        // of sqrt(ln(400)/60) ~= 0.316, so a 0.30 target certifies NOTHING here. That is the gate
+        // being correctly conservative, and it is worth pinning that it refuses (below).
+        let (threshold, bound, calibrated) = calibrate_threshold(&scored, 0.40, 0.90);
+        assert!(calibrated, "40 well-separated points must calibrate at target 0.40");
+        assert!((threshold - 0.10).abs() < 1e-12, "cutoff must sit at the clean tie-group, got {threshold}");
+        // bound = empirical_risk + sqrt(ln(n/delta) / (2k)) = 0 + sqrt(ln(400)/60)
+        let expected = ((40.0f64 / 0.1).ln() / (2.0 * 30.0)).sqrt();
+        assert!((bound - expected).abs() < 1e-12, "expected {expected}, got {bound}");
+        assert!(bound <= 0.40, "a calibrated bound may never exceed the target");
+
+        // The same data at a target BELOW that bound must refuse to certify rather than stretch.
+        let (_, _, cal_tight) = calibrate_threshold(&scored, 0.30, 0.90);
+        assert!(!cal_tight, "target 0.30 < achievable bound 0.316 must report uncalibrated");
+
+        // Under 10 items is the cold-start path: uncalibrated, fixed 0.35 heuristic threshold.
+        let (t, b, cal) = calibrate_threshold(&[(0.1, 0.0); 9], 0.05, 0.90);
+        assert!(!cal);
+        assert!((t - 0.35).abs() < 1e-12, "cold-start threshold is 0.35, got {t}");
+        assert!((b - 0.05).abs() < 1e-12, "cold-start reports the target as the bound, got {b}");
+
+        // EXACTLY 10 is the first non-cold-start size (the check is `< 10`). Tested at 9 only, the
+        // `<` -> `<=` mutant is invisible because 9 is cold-start either way.
+        let (t10, _, _) = calibrate_threshold(&[(0.1, 0.0); 10], 0.9, 0.90);
+        assert!((t10 - 0.35).abs() > 1e-12, "10 items must NOT take the cold-start path, got {t10}");
+
+        // The empirical risk is a MEAN (sum / k). With an all-zero-risk prefix `sum * k` and
+        // `sum / k` are both 0, so that mutant needs a certified prefix carrying real error:
+        // 20 items at risk 0.5 => mean 0.5, and the reported bound must exceed it.
+        let risky: Vec<(f64, f64)> = (0..20).map(|_| (0.10, 0.5)).collect();
+        let (_, rb, rcal) = calibrate_threshold(&risky, 0.9, 0.90);
+        assert!(rcal, "20 items at target 0.9 must calibrate");
+        let expected_risk_bound = 0.5 + ((20.0f64 / 0.1).ln() / (2.0 * 20.0)).sqrt();
+        assert!(
+            (rb - expected_risk_bound).abs() < 1e-12,
+            "bound must be MEAN risk 0.5 plus slack ({expected_risk_bound}), got {rb}"
+        );
+    }
+
     #[test]
     fn snr_buckets_partition_by_condition() {
         assert_eq!(snr_bucket(None), 4, "unknown SNR");
