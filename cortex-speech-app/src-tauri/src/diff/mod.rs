@@ -229,6 +229,88 @@ mod tests {
         assert!(d.changes.iter().all(|c| c.op == DiffOp::Equal));
     }
 
+    /// Render a diff as a compact op string so a test can pin the EXACT alignment:
+    /// `=w` equal, `+w` insert, `-w` delete, `~v` replace.
+    fn ops(raw: &str, ann: &str) -> String {
+        compute_diff(raw, ann)
+            .changes
+            .iter()
+            .map(|c| {
+                let tag = match c.op {
+                    DiffOp::Equal => '=',
+                    DiffOp::Insert => '+',
+                    DiffOp::Delete => '-',
+                    DiffOp::Replace => '~',
+                };
+                format!("{tag}{}", c.value)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// GOLDEN alignments for the LCS diff. Every expectation was produced by running the function
+    /// and then read to confirm it is the alignment a reviewer would want; none was guessed.
+    ///
+    /// Why exact strings instead of properties: a cargo-mutants sweep over this file left 19
+    /// mutants alive, and the existing tests were the reason — they asserted "some Replace exists"
+    /// or "similarity is within bounds", which stays true when a loop bound or an index arithmetic
+    /// operator is quietly wrong. The alignment is what the review UI shows the curator and what
+    /// the word-level corrections ledger records, so a silently shifted diff is a real product
+    /// defect, not a cosmetic one. Pinning the op sequence is what actually holds it.
+    #[test]
+    fn diff_alignment_golden() {
+        // Pure equality, and the empty edges.
+        assert_eq!(ops("a b c", "a b c"), "=a =b =c");
+        assert_eq!(ops("", ""), "");
+        assert_eq!(ops("a b", ""), "-a -b");
+        assert_eq!(ops("", "a b"), "+a +b");
+
+        // A single word changed in the middle keeps both anchors Equal.
+        assert_eq!(ops("a x c", "a y c"), "=a ~x → y =c");
+
+        // Insertion and deletion at the head, middle and tail.
+        assert_eq!(ops("b c", "a b c"), "+a =b =c");
+        assert_eq!(ops("a b c", "b c"), "-a =b =c");
+        assert_eq!(ops("a c", "a b c"), "=a +b =c");
+        assert_eq!(ops("a b c", "a c"), "=a -b =c");
+        assert_eq!(ops("a b", "a b c"), "=a =b +c");
+        assert_eq!(ops("a b c", "a b"), "=a =b -c");
+
+        // Repeated words: the LCS is ambiguous, so this pins WHICH alignment is chosen.
+        assert_eq!(ops("a a b", "a b"), "=a -a =b");
+        assert_eq!(ops("a b", "a a b"), "=a +a =b");
+
+        // No common words at all -> a clean run of replacements, not interleaved noise.
+        assert_eq!(ops("x y", "p q"), "~x → p ~y → q");
+
+        // Longer raw than annotated with a shared prefix AND suffix.
+        assert_eq!(ops("a b c d e", "a d e"), "=a -b -c =d =e");
+    }
+
+    /// The stats block is what the UI badge and the similarity score are computed from, and
+    /// `similarity` divides by the total op count — so an off-by-one in any counter is a wrong
+    /// number shown to the curator. Pinned exactly (the `+=` -> `-=` / `*=` mutants survived).
+    #[test]
+    fn diff_stats_golden() {
+        let d = compute_diff("a b c d e", "a d e");
+        assert_eq!(d.stats.unchanged_words, 3);
+        assert_eq!(d.stats.removed_words, 2);
+        assert_eq!(d.stats.added_words, 0);
+        assert_eq!(d.stats.changed_words, 0);
+        assert!((d.stats.similarity - 60.0).abs() < 1e-9, "3 of 5 ops equal => 60%");
+
+        let d = compute_diff("a x c", "a y c");
+        assert_eq!((d.stats.unchanged_words, d.stats.changed_words), (2, 1));
+        assert!((d.stats.similarity - (2.0 / 3.0 * 100.0)).abs() < 1e-9);
+
+        let d = compute_diff("a c", "a b c");
+        assert_eq!((d.stats.unchanged_words, d.stats.added_words), (2, 1));
+
+        // Empty vs empty: no ops at all must report 100%, not a divide-by-zero NaN.
+        let d = compute_diff("", "");
+        assert!(d.stats.similarity.is_finite() && (d.stats.similarity - 100.0).abs() < 1e-9);
+    }
+
     #[test]
     fn test_identical_texts() {
         let diff = compute_diff("hello world", "hello world");
