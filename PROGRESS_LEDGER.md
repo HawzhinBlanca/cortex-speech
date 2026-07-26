@@ -1252,3 +1252,62 @@ real runner**, so the first scheduled run is their real proof, not this entry; t
 measured result (all 11 of its survivors are now closed, but the other ~818 mutants across the
 5 core modules have never been run); 5 owner-gated legs and 8 owner-descoped distribution legs
 unchanged.
+
+---
+
+### Iteration 190 — 2026-07-26 — **verify-10 GREEN: 23/23, zero skips** — fuzz-smoke now genuinely runs (via WSL) and found 2 stale harness defects on its first-ever execution
+
+```
+ kept gates run: 23 - 23 PASS, 0 FAIL, 0 skipped (env/not-built)
+ owner-descoped: 8   owner-gated pending: 5
+ VERDICT: GREEN - PERSONAL-USE SHIP-READY. (Not full-charter 10/10: 8 legs owner-descoped,
+ 5 owner-gated pending.)
+```
+Exit 0. **First verdict in this project's history with nothing skipped.**
+
+**How the last skip closed.** windows-msvc still cannot link cargo-fuzz — the 2026-07-11
+measurement stands (ASAN dynamic-CRT multiply-defines std:: against the static-MT sherpa prebuilt,
+LNK2005; `--sanitizer none` strips libFuzzer's sancov symbols, LNK2001). But WSL on the same
+machine is a real Linux toolchain where ASAN + `-fPIC` static libs link fine. Provisioned nightly
+`rustc 1.99.0` + `cargo-fuzz 0.13.2` there (plus libdbus-1-dev/libssl-dev/pkg-config and the
+Tauri Linux set), and `_probe_fuzz` now detects a capable WSL and lets the gate proceed while
+`_fn_fuzz_smoke` runs the targets through it. **Nothing was loosened — the gate does strictly
+more work than before.** Measured, 30s per target: cache 136,970 execs / diff 97,153 /
+features 151,266 / normalizer 3,301 / validation 2,311,088, 0 crashes; in-gate PASS 273.9s.
+
+**It found 2 defects immediately — both in the harnesses, which had never been executed anywhere.**
+1. `validation.rs` asserted `s.len() <= max_len` (BYTES) while `validate_text` deliberately counts
+   CHARACTERS — its own comment records that a byte check "rejected valid Kurdish text at roughly
+   half the advertised budget" (Sorani ≈2 bytes/char). The harness encoded the very contract
+   production had fixed, so it fired on essentially any Kurdish string: it would have reported
+   **correct** behaviour as a crash.
+2. `features.rs` asserted finite output for arbitrary input. The crash decoded to
+   `sample_rate = 128` Hz with a sample of `9.44e21`; squaring that in the power spectrum
+   overflows f32 (max 3.4e38) to inf. Unreachable in production — PCM arrives finite, in [-1,1]
+   (i16/32768), resampled to 16 kHz — and `FbankExtractor` has **zero production callers** today
+   (every call site is a test at 16000). Constrained to that real domain.
+
+Honest framing: **harness bugs, not live production bugs.** The finding that matters is that
+targets which had never run accumulated stale assertions — which is exactly why "authored but
+never executed" is not the same as "green", and why iteration 189 listed the nightly jobs as
+unproven.
+
+**And a vacuous pass I wrote myself, caught live.** My first WSL smoke script used
+`bash script.sh`, which does not source the login profile; cargo fell off PATH,
+`cargo fuzz list` returned nothing, both loops iterated zero times, and it printed
+"all targets clean, 0 crashes" with exit 0. `_fn_fuzz_smoke` now fails LOUD on an empty target
+list. The guard is written from having hit it, not from theory — and it is the precise failure
+class the charter forbids.
+
+**What GREEN does and does not mean.** `GREEN - PERSONAL-USE SHIP-READY` means every kept gate
+runs and passes on this rig. It is NOT the literal `CORTEX 10/10: ALL GATES GREEN`, which
+requires nothing descoped and nothing owner-gated: 8 distribution legs remain descoped by the
+owner's 2026-07-10 amendment (reversing that costs money + external lead time) and 5 legs remain
+owner-gated (2 of which need people other than the owner). See docs/SHIP_FINAL_PHASE.md
+"What remains".
+
+**Still open, unchanged:** `audio.rs` 78.85% under the 80% coverage floor (genuinely untested
+code, not an artifact); the nightly fuzz/mutation CI jobs have still never executed on a real
+runner (this run was local via WSL, which is different evidence); ~818 of 844 core-module mutants
+never run; the owner-gated and owner-descoped legs. And the one no gate can measure: a quiet week
+of real daily use.
