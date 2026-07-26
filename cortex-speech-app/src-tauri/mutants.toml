@@ -1,0 +1,30 @@
+# cargo-mutants — charter gate: "0 surviving mutants in irt/conformal/ood/diff/normalizer".
+#
+# Why this exists: on 2026-07-25 the IRT EM M-step shipped a raw-sum gradient that saturated
+# every model ability into the clamp and collapsed consensus to empty on any corpus past 10
+# segments. All 1,015 unit tests stayed green — the suite asserted shapes, not values. A
+# synthetic benchmark caught it by accident. Mutation testing is the systematic version of
+# that accident, aimed at exactly the modules where a silently-wrong number does the most
+# damage: they decide which transcripts are auto-accepted without a human ever looking.
+#
+# "ood" in the charter is this repo's quality/signal_anomaly.rs (there is no module literally
+# named ood); diff and normalizer are the Sorani text-comparison core every metric flows through.
+examine_globs = [
+    "src/quality/irt.rs",
+    "src/quality/conformal.rs",
+    "src/quality/signal_anomaly.rs",
+    "src/diff/**/*.rs",
+    "src/normalizer.rs",
+    "src/normalizer/**/*.rs",
+]
+
+# --lib only. Integration tests need real ONNX models and a ~90s run; multiplied by hundreds of
+# mutants that is a day per sweep. Scoping to unit tests errs toward MORE survivors (a mutant an
+# integration test would have caught now reports as alive), which is the safe direction: every
+# survivor is hand-reviewed, so the cost is reviewer time, never false confidence.
+additional_cargo_args = ["--lib"]
+
+# The default 20x baseline multiplier is generous; these modules are pure CPU with no I/O, and a
+# mutant that makes them hang (an infinite loop in the EM) should be caught as a timeout quickly.
+timeout_multiplier = 5.0
+minimum_test_timeout = 60

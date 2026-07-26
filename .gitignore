@@ -101,3 +101,12 @@ cortex-speech-app/src-tauri/onnxruntime_providers_shared.dll
 # it as a local reference). Ignored so it can't be committed by accident and doesn't clutter git status.
 /1010PATH.md
 .month-loop.lock
+
+# cargo-mutants run output (reports are CI artifacts, never committed)
+mutants.out/
+mutants-out/
+mutants.out.old/
+
+# cargo-llvm-cov output
+lcov.info
+coverage/

@@ -1,0 +1,11 @@
+# Pinned so a measurement reproduces byte-for-byte on any machine and in CI.
+# This project publishes CER/WER/RTF numbers as evidence; a silent toolchain bump
+# can move a float or a lint and there would be no record of why. Bump this
+# deliberately (its own commit + a ledger entry re-running the affected gates),
+# never incidentally.
+#
+# Placed at the repo root so it applies whether cargo is invoked from here
+# (--manifest-path, how verify_10.py runs) or from cortex-speech-app/src-tauri.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]

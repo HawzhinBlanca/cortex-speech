@@ -42,9 +42,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
 
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+      # Same toolchain action as ci.yml / release.yml - one action across all workflows so a
+      # nightly-only failure can never be an artifact of a different installer. The version
+      # itself comes from //rust-toolchain.toml, which rustup honors automatically.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: stable
+          components: clippy, rustfmt
 
       - name: Cache Rust dependencies
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -100,3 +103,160 @@ jobs:
           python -m pip install --quiet transformers soundfile jiwer onnxruntime numpy
           # Exits non-zero if micro CER exceeds the committed baseline ci_hi by > the noise margin.
           python scripts/scorecard_finetuned.py "$CORTEX_FINETUNED_GOLD" 3000
+
+  # ---------------------------------------------------------------------------------------
+  # Fuzz campaign - the charter's "5 fuzz targets, 0 unresolved crashes".
+  #
+  # This job is the ONLY place the leg can run. On the owner's windows-msvc rig cargo-fuzz
+  # cannot link at all (measured 2026-07-11: ASAN's dynamic-CRT model multiply-defines std::
+  # symbols against the static-MT sherpa-onnx prebuilt, LNK2005; --sanitizer none then strips
+  # the runtime providing libFuzzer's sancov symbols, LNK2001). verify_10.py honestly reports
+  # SKIP-ENV there and will keep doing so - this job, not a loosened local gate, is the evidence.
+  # ---------------------------------------------------------------------------------------
+  fuzz:
+    name: Fuzz campaign (5 targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+
+      # cargo-fuzz requires nightly (-Z build-std / sanitizer flags), so this job deliberately
+      # departs from //rust-toolchain.toml. That pin governs the measurement-bearing builds;
+      # fuzzing only needs to crash or not crash, so toolchain drift here cannot move a number.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo + fuzz corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          # The corpus is cached so coverage ACCUMULATES across nights rather than each run
+          # restarting from zero - a fresh-corpus fuzzer re-derives trivial inputs every time
+          # and never reaches the deep paths where real bugs live.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cortex-speech-app/src-tauri/fuzz/corpus
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('cortex-speech-app/src-tauri/Cargo.lock') }}-${{ github.run_number }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-${{ hashFiles('cortex-speech-app/src-tauri/Cargo.lock') }}-
+            ${{ runner.os }}-fuzz-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # build.rs -> tauri-build validates bundle.resources, and tauri::generate_context!
+      # requires build.frontendDist - the fuzz crate links the lib, so it needs both.
+      - name: Provision models + dist (build.rs prerequisites)
+        working-directory: cortex-speech-app
+        run: |
+          npm run fetch-models
+          npm ci
+          npm run build
+
+      - name: Fuzz each target (15 min, charter campaign length)
+        working-directory: cortex-speech-app/src-tauri
+        run: |
+          set -o pipefail
+          targets=$(cargo +nightly fuzz list)
+          if [ -z "$targets" ]; then
+            echo "::error title=No fuzz targets::cargo fuzz list returned nothing - the campaign would pass vacuously."
+            exit 1
+          fi
+          echo "Targets: $targets"
+          failed=0
+          for t in $targets; do
+            echo "::group::fuzz $t"
+            if ! cargo +nightly fuzz run "$t" -- -max_total_time=900 -print_final_stats=1; then
+              echo "::error title=Fuzz crash in $t::cargo fuzz run $t found a crash. Artifact uploaded."
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-artifacts
+          path: cortex-speech-app/src-tauri/fuzz/artifacts/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------------------
+  # Mutation testing - the charter's "0 surviving mutants in irt/conformal/ood/diff/normalizer",
+  # run --in-diff as the charter specifies (a full sweep is 844 mutants ~= a day; the changed
+  # lines are where regressions actually enter).
+  #
+  # Motivating incident: the 2026-07-25 IRT raw-sum-gradient bug passed all 1,015 unit tests
+  # because they asserted shapes rather than values. This is the gate that would have caught it.
+  # ---------------------------------------------------------------------------------------
+  mutants:
+    name: Mutation gate (core modules, --in-diff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0  # --in-diff needs real history to compute the day's diff
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cortex-speech-app/src-tauri/target
+          key: ${{ runner.os }}-cargo-mutants-${{ hashFiles('cortex-speech-app/src-tauri/Cargo.lock') }}
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Provision models + dist (build.rs prerequisites)
+        working-directory: cortex-speech-app
+        run: |
+          npm run fetch-models
+          npm ci
+          npm run build
+
+      - name: Mutate the last day's changes to the core modules
+        working-directory: cortex-speech-app/src-tauri
+        run: |
+          set -o pipefail
+          BASE=$(git log --since='24 hours ago' --format=%H | tail -1)
+          if [ -z "$BASE" ]; then
+            # Honest signal: no commits means nothing to mutate, NOT a passed gate.
+            echo "::warning title=Mutation gate idle::No commits in the last 24h - no diff to mutate. This is not a pass."
+            exit 0
+          fi
+          git diff "$BASE^" HEAD -- src/quality/irt.rs src/quality/conformal.rs \
+            src/quality/signal_anomaly.rs 'src/diff/*' src/normalizer.rs 'src/normalizer/*' \
+            > /tmp/core.diff || true
+          if [ ! -s /tmp/core.diff ]; then
+            echo "::notice title=Mutation gate idle::No core-module changes in the last 24h."
+            exit 0
+          fi
+          # examine_globs / --lib scoping / timeouts all come from src-tauri/mutants.toml.
+          cargo mutants --in-diff /tmp/core.diff
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutants-report
+          path: cortex-speech-app/src-tauri/mutants.out/
+          if-no-files-found: ignore
