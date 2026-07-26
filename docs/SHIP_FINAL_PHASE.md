@@ -8,11 +8,18 @@ daily use. The bar is NOT lowered — ship-ready means a truly reliable, bug-fre
 privacy, reliability, and correctness gate stays mandatory. Distribution (installer signing, stores,
 updater, macOS) is out of scope and never blocks ship.
 
-**The one-sentence status:** all of this session's fixes exist ONLY in source — the shipped exe is
-**334 commits stale** (baked SHA `6f8fe3c`, built Jul 16; `scripts/check_exe_freshness.py` = FAIL).
-The final phase is therefore: **build → migrate → validate live → measure → done-gate**, in that
-order. Phases A and B make the app fully working; Phase C makes its claims honest; Phase D is
-optional hardening. Nothing below invents a number — every metric comes from a real run.
+> **STATUS UPDATE 2026-07-26.** Phases A and B are DONE (ledger iters 186–189): the exe is built
+> from HEAD, the real library is migrated to v42 with a cold backup, the live loop is proven on
+> real Kurdish audio, and `verify_10.py` stands at **22 PASS / 0 FAIL / 1 skip**. The original
+> "334 commits stale" status below is historical. **Live gate status is always
+> [STATUS.md](STATUS.md), never this file.** What actually remains is in
+> [What remains](#what-remains-the-honest-list) at the bottom — read that section, not Phase A/B.
+
+**The one-sentence status (historical, 2026-07-24):** all of that session's fixes existed ONLY in
+source — the shipped exe was **334 commits stale** (baked SHA `6f8fe3c`, built Jul 16). The final
+phase was therefore: **build → migrate → validate live → measure → done-gate**, in that order.
+Phases A and B make the app fully working; Phase C makes its claims honest; Phase D is optional
+hardening. Nothing below invents a number — every metric comes from a real run.
 
 ---
 
@@ -141,3 +148,79 @@ Sorani strings merged through the parity gate. *(GPU time dominates; runs unatte
 
 **Order matters:** A unblocks everything; B proves "fully working"; C makes it honest; D keeps it
 that way. A + B are the ship gate; C is the claims gate; D is maintenance.
+
+---
+
+## What remains (the honest list)
+
+_Last measured 2026-07-26 at `961feb4`. Regenerate gate state with
+`make verify-10-status`; never hand-edit a gate claim into this file._
+
+### First, what "10/10" can and cannot mean here
+
+`verify_10.py` prints the literal `CORTEX 10/10: ALL GATES GREEN` **only when nothing is
+owner-descoped and nothing is owner-gated**. Today 8 legs are descoped *by the owner's own
+2026-07-10 amendment* (installer signing, SLSA provenance, signed auto-updater, winget/Homebrew/
+Flathub, HF model card, macOS notarization, OpenSSF Scorecard, signed protected tags). Those are
+all **distribution**, they were descoped deliberately because ship = personal use, and re-scoping
+them costs real money and external lead time (Apple Developer $99/yr + macOS hardware + a macOS
+runner, Azure Trusted Signing onboarding, store review queues).
+
+So the literal 10/10 line is not a code problem — it is a *scope decision only the owner can
+reverse*. The meaningful, reachable target is the next verdict down:
+
+> `VERDICT: GREEN - PERSONAL-USE SHIP-READY` (exit 0)
+
+which requires **zero failing gates and zero skipped gates**. There are currently zero failures.
+
+### Tier A — the ONLY thing between here and that green line
+
+**A. `fuzz-smoke` (1 skip).** Every other kept gate passes. On windows-msvc cargo-fuzz cannot
+link at all (measured 2026-07-11: ASAN's dynamic-CRT model multiply-defines std:: symbols against
+the static-MT sherpa-onnx prebuilt, LNK2005; `--sanitizer none` then strips the runtime providing
+libFuzzer's sancov symbols, LNK2001). Two honest ways to close it, and only these two:
+  - **A1.** Run it in WSL (Ubuntu, 64 cores, Rust 1.95 already present) and make `_fn_fuzz_smoke`
+    genuinely execute the 5 targets there. This makes the gate *really run* on this rig — it is
+    not a loosening, and it is the only path to a locally-green verdict.
+  - **A2.** Accept it as a CI-only leg. The nightly job now exists; once it has actually run on a
+    runner, the evidence is real but it lives in CI, and the local verdict stays INCOMPLETE
+    forever by design.
+
+### Tier B — owner-only, no engineering help needed (minutes to hours each)
+
+| Item | What it needs | Blocked on |
+|---|---|---|
+| `branch-protection` | Toggle required checks on GitHub | Repo-admin clicks |
+| `asosoft-600-licensing` | Read + record the eval-use license terms | Owner's legal read |
+| P2.4 Sorani UI strings | Native-speaker review of the ckb strings | Owner reads Sorani |
+| `refinery-lift-in-product` | ≥500 real review decisions (Gold Marathon) | Owner using the app |
+| P0.1 / P4.1 GPU re-score | `make measure-10` on the 3090 Tis | Hours of owner's GPU |
+| P4.2 contamination check | Train/eval overlap audit | Owner's compute |
+
+### Tier C — genuinely external (cannot be done by owner alone)
+
+| Item | Blocked on |
+|---|---|
+| `iaa-kappa-ceiling` | ≥2 *independent* Sorani annotators (the point is they are not the owner) |
+| `cordi-dialect-fairness` | A corpus agreement with the CORDI maintainers |
+| The 8 descoped distribution legs | Money + external review queues, and reversing the scope decision |
+
+### Tier D — real quality work that does NOT block any gate
+
+- **`audio.rs` coverage 78.85%**, under the charter's 80% floor for "audio parsers". Confirmed by
+  measurement to be genuinely untested code, not an artifact: `SileroVad::new`/`detect`,
+  `voice_activity_detection`'s model branch, and the non-WAV branches of `decode_to_pcm` /
+  `decode_pcm_windows`. Closing it needs in-process VAD tests against the bundled Silero model or
+  committed MP3/M4A/FLAC fixtures. **Do not close it with padding tests.**
+- **The nightly fuzz + mutation jobs have never executed on a runner.** They are authored, not
+  proven. Their first scheduled run is the evidence.
+- **~818 of 844 core-module mutants never run.** Only the 26-mutant `--in-diff` slice has a
+  measured result (all 11 of its survivors are now closed).
+- **Deferred dependency majors**, no security driver: typescript 7, tailwindcss 4, jsdom 29,
+  commitlint 21, lint-staged 17, prettier-plugin-svelte 4, @testing-library/jest-dom 7.
+- The Phase D items above (stitching A/B, frontend coverage floor, nightly local e2e).
+
+### The part no gate can measure
+
+Per the Definition of DONE: **a quiet week of real daily use.** For a one-user app that is the
+only ship signal that means anything, and no amount of green CI substitutes for it.
