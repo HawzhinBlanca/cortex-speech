@@ -1140,3 +1140,89 @@ no code change involved.
 ASAN/static-MT linker impossibility — Linux-CI leg). 5 owner-gated items + 8 owner-descoped distribution
 legs unchanged. The refinery-lift number is a synthetic machinery benchmark, NOT a real-audio accuracy
 claim (the in-product lift gate remains owner-gated on the Gold Marathon).
+
+---
+
+### Iteration 189 — 2026-07-26 — tech-debt pass: mutation + coverage + fuzz gates built; the mutation gate immediately found 11 live mutants in yesterday's fix
+
+Audit-driven pass (11 scored items). Three commits: `df206bc` (rigor infrastructure), `408f9ed`
+(e2e flake + dependency security), `383c996` (EM golden tests). No production behavior changed
+except the two documented `#[allow(dead_code)]` sites.
+
+**1. Mutation testing BUILT — and it earned its keep on the first run.** The charter has always
+required "0 surviving mutants in irt/conformal/ood/diff/normalizer"; no tooling existed.
+`src-tauri/mutants.toml` scopes it to those 5 modules ("ood" is this repo's
+`quality/signal_anomaly.rs` — no module by that name exists) and the nightly runs `--in-diff`
+exactly as the charter specifies. Run against yesterday's M-step fix, verbatim:
+```
+26 mutants tested in 2h: 11 missed, 14 caught, 1 unviable
+```
+Every survivor swapped an arithmetic operator in the gradient accumulation, the ability update,
+or the difficulty update. Two root causes: the **segment-difficulty update was asserted by
+nothing at all** (all 4 of its mutants survived automatically, including `/`→`*` on the
+mean-gradient divisor — the exact shape of the bug fixed yesterday), and the ability update was
+covered only by the loose bound `|ability − prior| < 1.0`, which the prior-anchoring regularizer
+keeps true under most operator swaps. **This is the same blind spot that let the raw-sum bug ship
+green through 1,015 tests: the suite asserted shapes, never values.**
+
+Fix: `em_golden_values` pins a deterministic 12-segment / 3-voter fit with EXACT abilities,
+difficulties, consensus text and confidences to 1e-12, plus a monotonicity assertion stating the
+property the constants only fingerprint. Every constant came from running the fit. FAIL-BEFORE,
+four survivors re-applied by hand and reverted: **4/4 now killed** (e.g. `325:48 / → *` →
+"ability wsl-7b: expected 1.512460322683539, got 1.501093613784506").
+
+**2. Coverage measured for the first time** (cargo-llvm-cov, all non-ignored targets):
+`TOTAL 74.63%` lines; irt 97.57%, conformal 98.91%, signal_anomaly 100%, normalizer 92.45%,
+normalizer/g2p 93.99%, diff/mod 90.91%, diff/phonetic 93.98%, chunking 95.35%, wer 80.62%,
+**audio.rs 78.85%**. The charter's ">80% on normalizer/diff/audio parsers" is MET for normalizer
+and diff, **NOT met for audio.rs**. Its uncovered mass is decode_to_pcm / decode_pcm_windows /
+SileroVad / voice_activity_detection — paths only the real-model `#[ignore]` suite exercises.
+NOT papered over: no coverage gate was added while a named module sits under its floor, and no
+padding tests were written. Tracked follow-up.
+
+**3. Fuzz campaign wired** (nightly, 5 targets x 15 min, accumulating cached corpus). This is the
+only place the leg can run — windows-msvc cannot link cargo-fuzz (measured 2026-07-11). verify-10
+keeps honestly reporting SKIP-ENV locally; CI is the evidence, not a loosened gate.
+
+**4. e2e a11y flake root-caused.** `playwright.config.ts` had `workers: undefined`, which scales
+to ~half the CPU count — ~32 Chromium instances for 47 tests on this 64-core box, making every
+visibility wait race the dev server. Capped to 4. Measured: 12/12 idle before; after the cap,
+11/12 then 12/12 under 24 concurrent CPU burners (**23/24**). Residual starvation sensitivity
+addressed by an explicit 30s timeout on the two async-panel settle-waits — the axe zero-violation
+assertions are untouched.
+
+**5. All 5 high-severity npm advisories closed** (one root cause: brace-expansion DoS reachable
+only via eslint's dep chain). eslint 10 + @eslint/js 10 + eslint-config-prettier 10 + globals 17
++ eslint-plugin-playwright 2; the repo was already on flat config so the major was clean.
+`npm audit` 5 high → **0**. `npm audit --omit=dev` was 0 before and after (that gate was never red).
+
+**6. Ledger archived** 10,705 → 1,142 lines (history verbatim in `docs/ledger/`, accounting
+reconciled exactly). **Toolchain pinned** (`rust-toolchain.toml` 1.95.0 — resolves to the version
+already in use, so a no-op today and a guarantee tomorrow) and the nightly unified on the same
+toolchain action as ci/release. **`docs/STATUS.md` generated** by `verify_10.py --status-md`;
+handoff docs now link to it instead of restating gate state, the claim that kept rotting.
+
+**Honest corrections to my own audit.** Two of eleven items were largely invalid and were NOT
+forced through: retiring 4 "superseded" docs (3 must stay — `ROADMAP_TO_10.md` and
+`RESEARCH_SOTA_2026.md` are named by the required-files gate and the charter still cites the
+former as the live north star; only the orphaned wave0 handoff was archived), and the
+`#[allow(dead_code)]` cleanup (all 6 are deliberate; `flock.rs`'s is an RAII handle whose removal
+would silently disable single-instance locking — now documented so nobody "cleans" it).
+
+**Gates (real runs):** `cargo test --lib` 1016 passed / 0 failed; clippy `-D warnings` clean;
+fmt clean; python-policies 43/43 (test_workflow_policy caught real non-ASCII in my YAML — fixed
+by complying); vitest 214/214; e2e 47/47; typecheck 426 files 0 errors. Full sweep with the 7B
+server warm and the exe rebuilt at HEAD:
+```
+ kept gates run: 23 - 22 PASS, 0 FAIL, 1 skipped (env/not-built)
+ VERDICT: INCOMPLETE - 1 kept gate(s) could not run (fuzz-smoke). Green cannot be claimed.
+```
+**Unchanged from before this pass — nothing regressed, and fuzz-smoke remains the single
+kept-gate residue.** What is genuinely better: the two gates the charter demanded now exist and
+have already paid for themselves, one real test-quality defect is fixed, all dependency
+advisories are closed, and a load-sensitive gate is measurably steadier.
+
+**NOT verified / still open:** audio.rs below the 80% coverage floor; fuzz + mutation nightly
+jobs are authored but have never executed on a real runner (first scheduled run will be their
+proof); the full 844-mutant sweep was abandoned at ~8h projected — only the 26-mutant in-diff
+slice has a measured result; 5 owner-gated legs and 8 owner-descoped distribution legs unchanged.
