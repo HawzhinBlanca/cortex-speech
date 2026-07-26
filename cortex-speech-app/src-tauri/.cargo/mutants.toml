@@ -24,6 +24,19 @@ examine_globs = [
 # survivor is hand-reviewed, so the cost is reviewer time, never false confidence.
 additional_cargo_args = ["--lib"]
 
+# Run only the test modules that could plausibly kill a mutant in the examined files. MEASURED:
+# the full --lib suite is 1,016 tests / ~89s dominated by SQLite temp-file I/O, and ten parallel
+# jobs of that thrash one disk (observed: CPU at 8%, ~2 mutants per 30 minutes -- a full sweep
+# would have taken days). Scoped: 144 tests / ~2s, a 30x speedup that makes the charter's
+# "0 surviving mutants in the core modules" actually runnable.
+#
+# Same safe-direction tradeoff as --lib: a mutant that only a db/export test would have caught now
+# reports as ALIVE rather than silently passing, so the cost is reviewer time, never false
+# confidence. Widen this list if a survivor turns out to be covered elsewhere.
+# The leading "--" matters: these are filters for the TEST BINARY (libtest accepts several), not
+# for cargo. Without it cargo sees them as extra TESTNAME positionals and errors out.
+additional_cargo_test_args = ["--", "quality::", "diff::", "normalizer::", "wer::"]
+
 # The default 20x baseline multiplier is generous; these modules are pure CPU with no I/O, and a
 # mutant that makes them hang (an infinite loop in the EM) should be caught as a timeout quickly.
 timeout_multiplier = 5.0

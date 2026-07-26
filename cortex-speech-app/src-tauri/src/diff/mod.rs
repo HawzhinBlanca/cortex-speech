@@ -196,6 +196,39 @@ fn extract_lcs<'a>(a: &[&'a str], b: &[&str], dp: &[Vec<usize>]) -> Vec<&'a str>
 mod tests {
     use super::*;
 
+    /// The >10,000-word bail-out. `compute_diff` builds an O(n*m) LCS table, so a pathological
+    /// input (a pasted book, a runaway ASR loop) would allocate ~n*m cells and hang the UI thread;
+    /// past the cap it returns a no-change diff instead. That guard had NO test at all, which
+    /// cargo-mutants proved: mutating `||` to `&&` and `>` to `==` on the condition both survived
+    /// the entire suite. Either mutation silently disables the protection for the realistic case
+    /// where only ONE side is huge — exactly the shape of the runaway-ASR input it exists to stop.
+    ///
+    /// Pinned here as behaviour, including the honest bit: the bail-out reports similarity 100.0
+    /// and zero changes, i.e. it degrades to "no diff computed" rather than blocking.
+    #[test]
+    fn oversized_input_bails_out_before_building_the_lcs_table() {
+        let huge = "w ".repeat(10_001);
+        let small = "hello world";
+
+        // Only the RAW side oversized -> must still bail (this is what `&&` would break).
+        let d = compute_diff(&huge, small);
+        assert!(d.changes.is_empty(), "oversized raw must short-circuit, got {} changes", d.changes.len());
+        assert_eq!(d.stats.similarity, 100.0);
+        assert_eq!(d.stats.changed_words, 0);
+
+        // Only the ANNOTATED side oversized -> must still bail.
+        let d = compute_diff(small, &huge);
+        assert!(d.changes.is_empty(), "oversized annotated must short-circuit");
+        assert_eq!(d.stats.similarity, 100.0);
+
+        // Exactly at the cap (10,000) is NOT oversized: the guard is `> 10_000`, so this must
+        // still diff normally. This is the case the `>` -> `==` mutant flips.
+        let at_cap = "w ".repeat(10_000);
+        let d = compute_diff(&at_cap, &at_cap);
+        assert!(!d.changes.is_empty(), "exactly 10_000 words must still be diffed, not bailed");
+        assert!(d.changes.iter().all(|c| c.op == DiffOp::Equal));
+    }
+
     #[test]
     fn test_identical_texts() {
         let diff = compute_diff("hello world", "hello world");

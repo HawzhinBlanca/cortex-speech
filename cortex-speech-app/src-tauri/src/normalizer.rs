@@ -1,8 +1,9 @@
-// Every `unwrap()` in this module is on compile-time-constant input — a static regex
-// literal or a fixed Unicode code point — so it is infallible by construction; any
-// failure would be a programming error caught immediately by this module's tests. The
-// crate denies `clippy::unwrap_used` in production; these are the reviewed exceptions.
-#![allow(clippy::unwrap_used)]
+// NOTE: this module deliberately does NOT carry a file-level `#![allow(clippy::unwrap_used)]`.
+// It used to, and that silently voided the charter's "any new production unwrap fails CI" rule
+// for the single file with the most unwraps — the count had already drifted to 14 against a
+// stated budget of 12 with nothing to catch it. Every fallible regex construction now goes
+// through `static_regex` below, which owns the ONE reviewed exception, so a new raw `.unwrap()`
+// anywhere in this file fails clippy again exactly as the charter promises.
 
 pub mod g2p;
 
@@ -11,14 +12,26 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
 
+/// Compile a regex from a literal pattern that is fixed at compile time.
+///
+/// The single reviewed `unwrap` exception in this module. A failure here is unreachable by
+/// construction (the patterns are literals, and every one is exercised by this module's tests on
+/// first use), so it can only mean a programmer typo'd a pattern \u2014 which must be loud, not
+/// silently degraded into "normalization stopped working". Centralising it means clippy still
+/// denies `unwrap_used` everywhere else in the file.
+#[allow(clippy::unwrap_used)]
+fn static_regex(pattern: &'static str) -> Regex {
+    Regex::new(pattern).unwrap()
+}
+
 /// Pure-Rust Sorani Kurdish normalizer implementing the character-mapping rules
 /// from the MIT-licensed AsoSoft library. Bypasses copyleft restrictions of KLPT/KurdishHunspell.
-static ARABIC_KAF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u0643\u06AA\u06AC]").unwrap());
-static ARABIC_YAH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u064A\u06D2]").unwrap());
-static YEH_TWO_DOTS_BELOW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u06D0").unwrap());
-static ALEF_MAKSURA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u0649").unwrap());
-static TATWEEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u0640").unwrap());
-static ZWNJ: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u200C").unwrap());
+static ARABIC_KAF: LazyLock<Regex> = LazyLock::new(|| static_regex(r"[\u0643\u06AA\u06AC]"));
+static ARABIC_YAH: LazyLock<Regex> = LazyLock::new(|| static_regex(r"[\u064A\u06D2]"));
+static YEH_TWO_DOTS_BELOW: LazyLock<Regex> = LazyLock::new(|| static_regex(r"\u06D0"));
+static ALEF_MAKSURA: LazyLock<Regex> = LazyLock::new(|| static_regex(r"\u0649"));
+static TATWEEL: LazyLock<Regex> = LazyLock::new(|| static_regex(r"\u0640"));
+static ZWNJ: LazyLock<Regex> = LazyLock::new(|| static_regex(r"\u200C"));
 /// Zero-width / directional FORMAT characters that carry NO content and NO word boundary (unlike
 /// ZWNJ U+200C, handled as a space). Left in place they make two visually identical strings normalize
 /// differently, breaking dedup/exact-match and inflating WER/CER, and \u2014 critically for a
@@ -32,13 +45,20 @@ static ZWNJ: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u200C").unwrap());
 ///   the explicit bidi formatting marks LRE/RLE/PDF/LRO/RLO U+202A-U+202E,
 ///   and the bidi isolates LRI/RLI/FSI/PDI U+2066-U+2069.
 static ZERO_WIDTH_FORMAT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[\u061C\u200B\u200D\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]").unwrap());
-static MULTI_SPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
-static ARABIC_HAMZA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u0623\u0625]").unwrap());
-static ARABIC_DIACTIRICS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\u064B-\u065F\u0670]").unwrap());
+    LazyLock::new(|| static_regex(r"[\u061C\u200B\u200D\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]"));
+static MULTI_SPACE: LazyLock<Regex> = LazyLock::new(|| static_regex(r"\s+"));
+static ARABIC_HAMZA: LazyLock<Regex> = LazyLock::new(|| static_regex(r"[\u0623\u0625]"));
+static ARABIC_DIACTIRICS: LazyLock<Regex> = LazyLock::new(|| static_regex(r"[\u064B-\u065F\u0670]"));
 
 const PERSIAN_TO_LATIN: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
 const ARABIC_TO_LATIN: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+/// The source glyphs, written out rather than computed as `char::from_u32(0x06F0 + i).unwrap()`.
+/// Those two calls were the only fallible conversions in this module — infallible in practice, but
+/// they made the module header's "every unwrap is on compile-time-constant input" not literally
+/// true, and they pushed the file to 14 production unwraps against the charter's budget of 12.
+/// A literal table is also cheaper (no per-iteration conversion) and shows the mapping directly.
+const PERSIAN_DIGITS: &[char] = &['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
+const ARABIC_DIGITS: &[char] = &['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizationConfig {
@@ -269,13 +289,11 @@ fn protect_word_final_heh_tatweel(text: &str) -> String {
 fn normalize_digits(text: &str, verbalize: bool) -> String {
     let mut result = text.to_string();
     // Persian digits -> Latin
-    for (i, &latin) in PERSIAN_TO_LATIN.iter().enumerate() {
-        let persian_char = char::from_u32(0x06F0 + i as u32).unwrap();
+    for (&persian_char, &latin) in PERSIAN_DIGITS.iter().zip(PERSIAN_TO_LATIN) {
         result = result.replace(persian_char, &latin.to_string());
     }
     // Arabic digits -> Latin
-    for (i, &latin) in ARABIC_TO_LATIN.iter().enumerate() {
-        let arabic_char = char::from_u32(0x0660 + i as u32).unwrap();
+    for (&arabic_char, &latin) in ARABIC_DIGITS.iter().zip(ARABIC_TO_LATIN) {
         result = result.replace(arabic_char, &latin.to_string());
     }
     // Native Sorani/Persian-script number separators: ARABIC DECIMAL SEPARATOR U+066B (٫) and ARABIC
@@ -295,7 +313,7 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
     // stage, since step 84 of normalize() rewrites ASCII ',' to '،' — survives into the WER/CER string
     // and counts a correct "1,000" as wrong against a reference "1000". The 3-digit grouping requirement
     // means ordinary prose commas are left untouched.
-    static THOUSANDS_SEP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{1,3}(?:[،,]\d{3})+").unwrap());
+    static THOUSANDS_SEP_RE: LazyLock<Regex> = LazyLock::new(|| static_regex(r"\d{1,3}(?:[،,]\d{3})+"));
     let result = THOUSANDS_SEP_RE
         .replace_all(&result, |caps: &regex::Captures| {
             caps[0].chars().filter(|c| *c != '،' && *c != ',').collect::<String>()
@@ -311,7 +329,7 @@ fn normalize_digits(text: &str, verbalize: bool) -> String {
     // bare `\d+`. Matching `\d+` split "3,000" (by then "3،000") into "3" and "000", verbalizing it
     // as "three، zero" instead of "three thousand".
     static DIGITS_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\d{1,3}(?:[،,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?").unwrap());
+        LazyLock::new(|| static_regex(r"\d{1,3}(?:[،,]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?"));
 
     let expanded = DIGITS_RE.replace_all(&result, |caps: &regex::Captures| {
         // Surround the multi-word expansion with spaces so a numeral glued to a word ("ساڵی٢٠٢٠") or a
