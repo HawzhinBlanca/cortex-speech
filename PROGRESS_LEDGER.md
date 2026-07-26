@@ -1167,18 +1167,40 @@ green through 1,015 tests: the suite asserted shapes, never values.**
 
 Fix: `em_golden_values` pins a deterministic 12-segment / 3-voter fit with EXACT abilities,
 difficulties, consensus text and confidences to 1e-12, plus a monotonicity assertion stating the
-property the constants only fingerprint. Every constant came from running the fit. FAIL-BEFORE,
-four survivors re-applied by hand and reverted: **4/4 now killed** (e.g. `325:48 / → *` →
-"ability wsl-7b: expected 1.512460322683539, got 1.501093613784506").
+property the constants only fingerprint. Every constant came from running the fit.
 
-**2. Coverage measured for the first time** (cargo-llvm-cov, all non-ignored targets):
-`TOTAL 74.63%` lines; irt 97.57%, conformal 98.91%, signal_anomaly 100%, normalizer 92.45%,
-normalizer/g2p 93.99%, diff/mod 90.91%, diff/phonetic 93.98%, chunking 95.35%, wer 80.62%,
+FAIL-BEFORE, **all 11 survivors** re-applied by hand to the real source one at a time and
+reverted (full-statement anchors, compile errors distinguished from test failures so an
+uncompilable mutant can never be miscounted as caught):
+```
+11 killed, 0 unviable, 0 STILL SURVIVING (of 11)
+```
+e.g. `325:48 / → *` → "ability wsl-7b: expected 1.512460322683539, got 1.501093613784506";
+`204:70 - → +` → "an in-window persisted ability must warm-start at exactly 1.4, not fall back
+to 0.5". Note the discrimination this buys: several survivors now die on differences in the
+FOURTH decimal place (`317:59` gives 1.520321958053807 vs 1.512460322683539) — precisely the
+size of error a bounds-based assertion can never see. A second `cargo mutants --in-diff` replay
+was attempted first but refused: the saved diff no longer matches the tree now that the golden
+test shifted line numbers ("Diff content doesn't match source file"), so the per-mutant hand
+replay above is the evidence.
+
+**2. Coverage measured for the first time** (cargo-llvm-cov). Two runs merged — the normal suite
+plus the `--ignored` real-model suite with the 7B server warm (both exit 0):
+`TOTAL 75.06%` lines; irt 97.57%, conformal 98.91%, signal_anomaly 100%, normalizer 92.45%,
+normalizer/g2p 93.99%, diff/mod 90.91%, diff/phonetic 93.98%, chunking 95.35%, wer 81.88%,
 **audio.rs 78.85%**. The charter's ">80% on normalizer/diff/audio parsers" is MET for normalizer
-and diff, **NOT met for audio.rs**. Its uncovered mass is decode_to_pcm / decode_pcm_windows /
-SileroVad / voice_activity_detection — paths only the real-model `#[ignore]` suite exercises.
-NOT papered over: no coverage gate was added while a named module sits under its floor, and no
-padding tests were written. Tracked follow-up.
+and diff, **NOT met for audio.rs**.
+
+CORRECTION to my first reading of this: I assumed audio.rs's gap was a measurement artifact —
+decode/VAD paths covered by the `#[ignore]` suite but excluded from a `--lib` run. Measured with
+that suite merged in, **audio.rs did not move one line (78.85% both times)**. So the gap is not
+an artifact: `SileroVad::new`/`detect`, `voice_activity_detection`'s model branch, and the
+non-WAV decode branches of `decode_to_pcm`/`decode_pcm_windows` are exercised by NO test at all.
+That is a stronger and more actionable finding than the artifact story, and it is the honest one.
+Closing it needs either in-process VAD tests against the bundled Silero model or committed
+MP3/M4A/FLAC fixtures — neither is a quick win. NOT papered over: no coverage gate was added
+while a named module sits under its floor, and no padding tests were written to nudge the number
+past 80% without exercising those paths. Tracked follow-up.
 
 **3. Fuzz campaign wired** (nightly, 5 targets x 15 min, accumulating cached corpus). This is the
 only place the leg can run — windows-msvc cannot link cargo-fuzz (measured 2026-07-11). verify-10
@@ -1222,7 +1244,11 @@ kept-gate residue.** What is genuinely better: the two gates the charter demande
 have already paid for themselves, one real test-quality defect is fixed, all dependency
 advisories are closed, and a load-sensitive gate is measurably steadier.
 
-**NOT verified / still open:** audio.rs below the 80% coverage floor; fuzz + mutation nightly
-jobs are authored but have never executed on a real runner (first scheduled run will be their
-proof); the full 844-mutant sweep was abandoned at ~8h projected — only the 26-mutant in-diff
-slice has a measured result; 5 owner-gated legs and 8 owner-descoped distribution legs unchanged.
+**NOT verified / still open:** `audio.rs` at 78.85% is below the charter's 80% floor, and the gap
+is genuinely untested code (SileroVad, the VAD model branch, non-WAV decode branches) — not a
+measurement artifact; fuzz + mutation nightly jobs are authored but have **never executed on a
+real runner**, so the first scheduled run is their real proof, not this entry; the full
+844-mutant sweep was abandoned at ~8h projected, so only the 26-mutant `--in-diff` slice has a
+measured result (all 11 of its survivors are now closed, but the other ~818 mutants across the
+5 core modules have never been run); 5 owner-gated legs and 8 owner-descoped distribution legs
+unchanged.
