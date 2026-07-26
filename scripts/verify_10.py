@@ -421,37 +421,73 @@ def _probe_egress():
     return None
 
 
+# --- fuzz-smoke ------------------------------------------------------------------------
+# windows-msvc CANNOT link cargo-fuzz at all: ASAN's dynamic-CRT model multiply-defines std::
+# symbols against the static-MT sherpa-onnx prebuilt (LNK2005), and --sanitizer none strips the
+# runtime providing libFuzzer's sancov section symbols (LNK2001 __stop___sancov_pcs);
+# sherpa-onnx-sys ships no MD prebuilt. Measured 2026-07-11, still true.
+#
+# But WSL on the same machine is a real Linux toolchain, and there the ASAN + -fPIC static libs
+# link fine (verified 2026-07-26: all 5 targets built and ran, ~2.7M execs, 0 crashes). So on
+# Windows this gate runs the targets THROUGH WSL rather than declaring itself unrunnable. That is
+# the gate genuinely executing on this rig — not a relaxation.
+def _wsl_path(win_path):
+    """C:\\x\\y -> /mnt/c/x/y (WSL's default drive mount)."""
+    p = str(win_path).replace("\\", "/")
+    if len(p) > 1 and p[1] == ":":
+        return f"/mnt/{p[0].lower()}{p[2:]}"
+    return p
+
+
+def _wsl_fuzz_available():
+    """True when WSL exists AND has cargo-fuzz + a nightly toolchain."""
+    if not shutil.which("wsl"):
+        return False
+    r = subprocess.run(
+        ["wsl", "--", "bash", "-lc", "command -v cargo-fuzz >/dev/null && cargo +nightly --version"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    return r.returncode == 0
+
+
 def _probe_fuzz():
+    if sys.platform == "win32":
+        if _wsl_fuzz_available():
+            return None  # runnable via WSL — see _fn_fuzz_smoke
+        return (
+            "cargo-fuzz cannot link on windows-msvc (ASAN CRT vs static-MT sherpa). Install it in "
+            "WSL to run this leg locally: wsl -- bash -lc 'rustup toolchain install nightly && "
+            "cargo install cargo-fuzz' (plus libdbus-1-dev, libssl-dev and the Tauri Linux deps); "
+            "otherwise it runs in Linux CI."
+        )
     if not shutil.which("cargo-fuzz"):
         return "cargo-fuzz not installed (cargo install cargo-fuzz + nightly toolchain)"
-    if sys.platform == "win32":
-        # Measured on the owner's rig (2026-07-11), not assumed: the fuzz harness now COMPILES
-        # (tauri cfg/build-override, chrono dep, cdylib/include:main all fixed) but cannot LINK on
-        # windows-msvc — ASAN's dynamic-CRT model multiply-defines std:: symbols against the
-        # static-MT sherpa-onnx prebuilt (LNK2005), and --sanitizer none strips the runtime that
-        # provides libFuzzer's sancov section symbols (LNK2001 __stop___sancov_pcs).
-        # sherpa-onnx-sys 1.13.4 ships no MD prebuilt. Run this leg on Linux (CI), where
-        # ASAN + the -fPIC static libs link fine.
-        return "cargo-fuzz cannot link on windows-msvc (ASAN CRT vs static-MT sherpa); run on Linux CI"
     return None
 
 
+def _fuzz_cmd(argstr):
+    """`cargo +nightly fuzz <argstr>` — natively, or through a WSL login shell on Windows."""
+    if sys.platform == "win32":
+        return ["wsl", "--", "bash", "-lc", f"cd {_wsl_path(SRC_TAURI)} && cargo +nightly fuzz {argstr}"]
+    return ["cargo", "+nightly", "fuzz", *argstr.split()]
+
+
 def _fn_fuzz_smoke():
-    """30s smoke per fuzz target; PASS only if every target runs crash-free."""
-    lst = subprocess.run(
-        ["cargo", "+nightly", "fuzz", "list"], cwd=SRC_TAURI, capture_output=True, text=True
-    )
+    """30s smoke per fuzz target; PASS only if EVERY target actually ran and was crash-free."""
+    lst = subprocess.run(_fuzz_cmd("list"), capture_output=True, text=True)
     targets = [t for t in lst.stdout.split() if t]
+    # Fail LOUD on an empty target list. A run that enumerates nothing would otherwise sail
+    # through the loop below and return True — a vacuous pass, which is exactly the class of
+    # dishonesty this repo's charter forbids. (Hit for real on 2026-07-26 when a non-login shell
+    # left cargo off PATH: 0 targets, 0 iterations, "all clean".)
     if lst.returncode != 0 or not targets:
-        print("  [ERR] cargo +nightly fuzz list failed or found no targets")
+        print("  [ERR] cargo fuzz list failed or found no targets - refusing to report a pass")
         return False
+    print(f"  {len(targets)} targets: {', '.join(targets)}")
     for t in targets:
-        r = subprocess.run(
-            ["cargo", "+nightly", "fuzz", "run", t, "--", "-max_total_time=30"],
-            cwd=SRC_TAURI,
-            capture_output=True,
-            text=True,
-        )
+        r = subprocess.run(_fuzz_cmd(f"run {t} -- -max_total_time=30"), capture_output=True, text=True)
         print(f"  fuzz {t}: {'ok' if r.returncode == 0 else 'CRASH/FAIL'}")
         if r.returncode != 0:
             for line in (r.stderr or r.stdout).splitlines()[-10:]:

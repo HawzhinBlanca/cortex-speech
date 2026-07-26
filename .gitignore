@@ -110,3 +110,8 @@ mutants.out.old/
 # cargo-llvm-cov output
 lcov.info
 coverage/
+
+# cargo-fuzz working data: the corpus accumulates thousands of tiny inputs (CI caches it
+# between nights) and artifacts/ holds crash reproducers for triage. Neither is source.
+cortex-speech-app/src-tauri/fuzz/corpus/
+cortex-speech-app/src-tauri/fuzz/artifacts/

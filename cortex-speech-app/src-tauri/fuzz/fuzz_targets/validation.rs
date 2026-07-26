@@ -28,7 +28,14 @@ fuzz_target!(|data: &[u8]| {
                 assert!(!e.is_empty(), "Error message must not be empty");
             }
             if text_result.is_ok() {
-                assert!(s.len() <= *max_len, "Valid text must be <= {max_len} chars");
+                // CHARACTERS, not bytes. validate_text deliberately counts chars: Sorani is
+                // ~2 bytes/char in UTF-8, and a byte-based limit rejected valid Kurdish text at
+                // roughly half the advertised budget (see the comment on validate_text). This
+                // assertion previously used s.len(), i.e. it encoded the very contract production
+                // fixed — so it fired on almost any Kurdish string and would have reported CORRECT
+                // behaviour as a crash. Found the first time these targets were ever executed.
+                let chars = s.chars().count();
+                assert!(chars <= *max_len, "Valid text must be <= {max_len} chars (got {chars})");
             }
         }
 
