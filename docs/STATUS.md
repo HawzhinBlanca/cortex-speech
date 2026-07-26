@@ -4,9 +4,9 @@
 
 # Gate status — generated
 
-**Commit:** `7544abd` · **Mode:** full
+**Commit:** `5a02979` · **Mode:** full
 
-**Verdict:** **INCOMPLETE** — 1 kept gate(s) could not run (fuzz-smoke). Green cannot be claimed.
+**Verdict:** **GREEN — PERSONAL-USE SHIP-READY.** (Not full-charter 10/10: 8 legs owner-descoped, 5 owner-gated pending.)
 
 ## Kept gates
 
@@ -31,7 +31,7 @@
 | `real-app-e2e` | PASS |
 | `egress-runtime` | PASS |
 | `ignored-real-model` | PASS |
-| `fuzz-smoke` | SKIP-ENV |
+| `fuzz-smoke` | PASS |
 | `rtf-bench` | PASS |
 | `refinery-lift` | PASS |
 | `fairness-gender-age` | PASS |
