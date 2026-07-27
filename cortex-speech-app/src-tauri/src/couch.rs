@@ -64,6 +64,17 @@ const MAX_REVIEWER_NAME: usize = 40;
 /// version of this hazard was caught live — see `stop`).
 const ACCEPT_POLL: Duration = Duration::from_millis(250);
 
+/// Per-reviewer request budget (P1.6). Every desktop IPC command is throttled; these HTTP routes were
+/// the one unthrottled way into the database, so a phone stuck in a reload loop could hammer it
+/// unbounded. 120/min sustained with a burst of 60 is far above any human — a reviewer averages a
+/// handful per clip (queue, audio, decision, a renewal) — while still stopping a runaway page.
+///
+/// Keyed by REVIEWER, so one person's misbehaving tab cannot starve anyone else. Applied only AFTER
+/// the token resolves: an unauthenticated request is rejected before it touches the database, and the
+/// 244-bit token space puts guessing out of reach, so throttling that path would buy nothing.
+static COUCH_RATE_LIMITER: crate::throttle::GlobalRateLimiter =
+    crate::throttle::GlobalRateLimiter::new_with_burst(120, 60);
+
 /// Per-session state shared by the accept threads. One mutex: the critical sections are map lookups,
 /// held for microseconds, while the slow work (DB writes, WAV encoding) happens outside it.
 #[derive(Default)]
@@ -411,6 +422,9 @@ fn handle_request(
     let Some(reviewer) = token_from_url(&url).and_then(|t| tokens.get(t)) else {
         return err_reply(401, "unauthorized");
     };
+    if let Err(e) = COUCH_RATE_LIMITER.check(reviewer) {
+        return (429, "text/plain; charset=utf-8", e.into_bytes());
+    }
 
     match (method, path.as_str()) {
         (tiny_http::Method::Get, "/") => {
@@ -422,6 +436,10 @@ fn handle_request(
         }
         (tiny_http::Method::Post, "/api/decision") => match read_body(request) {
             Ok(body) => api_decision(db, &body, reviewer, state),
+            Err(e) => err_reply(400, &e),
+        },
+        (tiny_http::Method::Post, "/api/renew") => match read_body(request) {
+            Ok(body) => api_renew(&body, reviewer, state),
             Err(e) => err_reply(400, &e),
         },
         (tiny_http::Method::Post, "/api/undo") => api_undo(db, reviewer, state),
@@ -524,6 +542,69 @@ fn api_audio(db: &Database, raw_id: &str) -> Reply {
 }
 
 #[derive(serde::Deserialize)]
+struct RenewBody {
+    id: String,
+}
+
+/// Extend this reviewer's hold on the clip they still have open (P1.3).
+///
+/// A 15-minute lease can genuinely expire mid-clip on a hard piece of audio. Without renewal the
+/// reviewer discovers it only at save time, as a 409, with their correction already typed and now
+/// unsaveable — the exact work-destroying moment leases exist to prevent. The page heartbeats while a
+/// clip is open, so an ACTIVE reviewer keeps their clip indefinitely while an idle one still releases
+/// it on schedule.
+///
+/// Reclaiming an unheld clip is allowed and deliberate: if the lease lapsed but nobody else took it,
+/// the reviewer who still has it open should keep it.
+fn api_renew(body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
+    let parsed: RenewBody = match serde_json::from_slice(body) {
+        Ok(p) => p,
+        Err(e) => return err_reply(400, &format!("bad json: {e}")),
+    };
+    if crate::validation::input::validate_identifier(&parsed.id).is_err() {
+        return err_reply(400, "bad id");
+    }
+    let now = Instant::now();
+    let mut guard = lock_state(state);
+    if guard.holder(&parsed.id, now).is_some_and(|who| who != reviewer) {
+        // Someone else took it while this reviewer was away. Telling them NOW — rather than at save —
+        // is the whole point: they can still copy their correction before it is refused.
+        return err_reply(409, "another reviewer is working on this clip");
+    }
+    guard.leases.insert(parsed.id.clone(), (reviewer.to_string(), now));
+    json_reply(200, serde_json::json!({ "ok": true, "ttlSeconds": LEASE_TTL.as_secs() }))
+}
+
+/// Whether this submit is a REPEAT of the decision already stored for this reviewer (P1.2).
+///
+/// A phone on the edge of Wi-Fi drops requests. If the write lands but the response is lost, the page
+/// retries — and without this check the retry is recorded as a SECOND human decision: another undo
+/// entry, and for an edit another DPO learning pair distilled from a correction the human made once.
+/// Treating an identical re-submit as already-done makes retry safe, which is what lets the page
+/// retry at all.
+///
+/// Deliberately narrow. It matches only when the SAME reviewer's stored decision has the SAME
+/// outcome; change one character and it is a genuine re-review that must be recorded. Text is
+/// NFC-compared because the write path canonicalizes, so a decomposed phone-IME paste would otherwise
+/// never match the value it just stored.
+fn is_repeat_of_stored_decision(prev: &SpeechSegment, reviewer: &str, decision: &str, text: Option<&str>) -> bool {
+    if prev.reviewed_by.as_deref() != Some(reviewer) || !prev.verified {
+        return false;
+    }
+    match (decision, text) {
+        ("reject", _) => prev.human_decision.as_deref() == Some("reject"),
+        // A repeat of an accept can arrive classified as either: the first submit may have been an
+        // "edit", after which the stored text IS the review text, so the retry re-classifies as
+        // "accept". Both are the same human act.
+        (_, Some(t)) => {
+            matches!(prev.human_decision.as_deref(), Some("accept") | Some("edit"))
+                && prev.annotated_transcript.as_deref().map(crate::db::to_nfc) == Some(crate::db::to_nfc(t))
+        }
+        _ => false,
+    }
+}
+
+#[derive(serde::Deserialize)]
 struct DecisionBody {
     id: String,
     /// "accept" | "edit" | "bad"
@@ -570,6 +651,29 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         "bad" => ("reject", None),
         other => return err_reply(400, &format!("unknown action '{other}'")),
     };
+
+    // A dropped RESPONSE (not a dropped request) means the write landed and the page never heard so.
+    // Answer the retry with the success it already earned, before taking a lease or pushing an undo
+    // entry for a decision that is already recorded.
+    if is_repeat_of_stored_decision(&prev, reviewer, decision, text.as_deref()) {
+        return json_reply(200, serde_json::json!({ "ok": true, "duplicate": true }));
+    }
+
+    // THE LATE-SUBMIT GUARD. The lease is RELEASED the moment a clip is decided — correctly, since it
+    // is no longer pending work — which leaves an already-decided clip unprotected by the collision
+    // check below. A stale page could then submit onto it minutes later and silently replace another
+    // human's verdict, `reviewed_by` and all: precisely the destruction leases exist to prevent, just
+    // arriving late instead of concurrently. A decided clip never legitimately reaches a phone queue
+    // (the queue serves unverified rows only), so refusing costs nothing real.
+    //
+    // The SAME reviewer is exempt: correcting your own decision is a genuine re-review, and the
+    // retry case above has already been answered.
+    if prev.verified && prev.reviewed_by.as_deref() != Some(reviewer) {
+        return match prev.reviewed_by.as_deref() {
+            Some(other) => err_reply(409, &format!("already reviewed by {other}")),
+            None => err_reply(409, "already reviewed at the desktop"),
+        };
+    }
 
     // THE COLLISION GUARD, placed here — after every validation, immediately before the write.
     //
@@ -923,6 +1027,159 @@ mod tests {
             Some("Hemn".to_string()),
             "and is now held by whoever picked it up"
         );
+    }
+
+    #[test]
+    fn a_retried_submit_is_recorded_once_but_a_real_re_review_still_lands() {
+        // P1.2. A phone on the edge of Wi-Fi loses RESPONSES, not just requests: the write commits,
+        // the page hears nothing, and it retries. Without idempotency that retry is a SECOND human
+        // decision — a second undo entry, and for an edit a second DPO learning pair distilled from a
+        // correction the human made once. This is what makes retrying safe enough to do at all.
+        //
+        // The narrowness matters as much as the idempotency: change one character and it must be a
+        // genuine re-review that IS recorded, or a reviewer could never correct their own mistake.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("r1", "دەق")).unwrap();
+        db.insert_segment(&seg("r2", "دەق")).unwrap();
+        let state = state();
+
+        let edit = serde_json::json!({"id": "r1", "action": "edit", "text": "دەقی ڕاستکراوە"}).to_string();
+        assert_eq!(api_decision(&db, edit.as_bytes(), "Sara", &state).0, 200);
+        let pairs = |id: &str| -> i64 {
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(pairs("r1"), 1, "the edit produced exactly one learning pair");
+
+        // The identical resubmit — the retry — must be answered as already-done.
+        let (code, _, body) = api_decision(&db, edit.as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "a retry must succeed, not error");
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["duplicate"], true, "and must say it was already recorded");
+        assert_eq!(pairs("r1"), 1, "the retry must NOT distil a second learning pair");
+        assert_eq!(
+            lock_state(&state).undo.get("Sara").map(Vec::len),
+            Some(1),
+            "the retry must NOT push a second undo entry — one human act, one undo"
+        );
+
+        // A GENUINE re-review (different text) is a new decision and must land.
+        let redo = serde_json::json!({"id": "r1", "action": "edit", "text": "دەقی دیسان ڕاستکراوە"}).to_string();
+        assert_eq!(api_decision(&db, redo.as_bytes(), "Sara", &state).0, 200);
+        assert_eq!(
+            db.get_segment_by_id("r1").unwrap().unwrap().annotated_transcript.as_deref(),
+            Some("دەقی دیسان ڕاستکراوە"),
+            "changing the text is a real re-review and must be recorded"
+        );
+
+        // Someone ELSE's identical submit is never a "retry" — and it must not be allowed through as a
+        // fresh decision either. Writing this assertion is what exposed the LATE-SUBMIT gap: the lease
+        // is released the instant a clip is decided, so an already-decided clip had NO protection, and
+        // a stale page could silently replace another human's verdict minutes later.
+        let reject = serde_json::json!({"id": "r2", "action": "bad"}).to_string();
+        assert_eq!(api_decision(&db, reject.as_bytes(), "Sara", &state).0, 200);
+        let (code, _, msg) = api_decision(&db, reject.as_bytes(), "Hemn", &state);
+        assert_eq!(code, 409, "a decided clip must not be re-decided by a different reviewer");
+        assert!(
+            String::from_utf8_lossy(&msg).contains("already reviewed by Sara"),
+            "and the refusal must name whose verdict it is protecting: {}",
+            String::from_utf8_lossy(&msg)
+        );
+        assert_eq!(
+            db.get_segment_by_id("r2").unwrap().unwrap().reviewed_by.as_deref(),
+            Some("Sara"),
+            "Sara's attribution must survive the late submit untouched"
+        );
+    }
+
+    #[test]
+    fn renewing_keeps_an_active_reviewers_clip_but_never_steals_one() {
+        // P1.3. A 15-minute lease can expire mid-clip on hard audio. Without renewal the reviewer
+        // finds out at SAVE time, as a 409, with the correction already typed and now unsaveable —
+        // the exact work-destroying moment leases exist to prevent.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("n1", "دەق")).unwrap();
+        let state = state();
+        let body = serde_json::json!({"id": "n1"}).to_string();
+
+        assert_eq!(queue_ids(&db, "Sara", &state), vec!["n1"]);
+        // Age her lease to the brink, then renew: the clip must stay hers rather than lapsing.
+        let stale = Instant::now().checked_sub(LEASE_TTL - Duration::from_secs(1)).unwrap();
+        lock_state(&state).leases.insert("n1".into(), ("Sara".into(), stale));
+        let (code, _, reply) = api_renew(body.as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "an active reviewer may extend their own hold");
+        let json: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(json["ttlSeconds"], LEASE_TTL.as_secs(), "the page is told the real TTL, not a guess");
+        assert!(queue_ids(&db, "Hemn", &state).is_empty(), "the renewed clip is still Sara's");
+
+        // Renewal is NOT a way to take someone else's clip.
+        let (code, _, msg) = api_renew(body.as_bytes(), "Hemn", &state);
+        assert_eq!(code, 409, "renewal must never steal a live lease");
+        assert!(String::from_utf8_lossy(&msg).contains("another reviewer"));
+        assert_eq!(
+            lock_state(&state).leases.get("n1").map(|(who, _)| who.clone()),
+            Some("Sara".to_string()),
+            "and the refused renewal must not have moved the holder"
+        );
+
+        // Reclaiming a clip whose lease lapsed with nobody else taking it is allowed and deliberate.
+        let expired = Instant::now().checked_sub(LEASE_TTL).unwrap();
+        lock_state(&state).leases.insert("n1".into(), ("Sara".into(), expired));
+        assert_eq!(api_renew(body.as_bytes(), "Sara", &state).0, 200, "she still has it open — give it back");
+        assert_eq!(api_renew(b"not json", "Sara", &state).0, 400);
+        assert_eq!(api_renew(serde_json::json!({"id": "../etc"}).to_string().as_bytes(), "Sara", &state).0, 400);
+    }
+
+    #[test]
+    fn a_runaway_page_is_throttled_per_reviewer() {
+        // P1.6. Every desktop IPC command is rate-limited; these HTTP routes were the one unthrottled
+        // path into the database. The budget is far above any human, so this asserts the LIMIT EXISTS
+        // and is per-reviewer — one person's stuck tab must not be able to starve anyone else.
+        let tokens = HashMap::from([("t-a".to_string(), "Loop".to_string()), ("t-b".to_string(), "Calm".to_string())]);
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let state = state();
+
+        // Drain "Loop"'s bucket directly — the same limiter the request path calls.
+        let mut throttled = false;
+        for _ in 0..500 {
+            if COUCH_RATE_LIMITER.check("Loop").is_err() {
+                throttled = true;
+                break;
+            }
+        }
+        assert!(throttled, "an unbounded request loop must eventually be refused");
+
+        // The throttled reviewer gets 429 through the real request path...
+        let reply = route_for_test(&db, &tokens, &state, "t-a");
+        assert_eq!(reply.0, 429, "a throttled reviewer is refused with 429, not served");
+        // ...while the other reviewer is completely unaffected.
+        assert_eq!(route_for_test(&db, &tokens, &state, "t-b").0, 200, "one bad tab must not starve anyone else");
+    }
+
+    /// Drive `handle_request`'s auth + throttle path without a live socket, by issuing a real request
+    /// against a loopback server and handing it to the handler exactly as an accept thread would.
+    fn route_for_test(
+        db: &Database,
+        tokens: &HashMap<String, String>,
+        state: &Mutex<CouchState>,
+        token: &str,
+    ) -> Reply {
+        let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/api/queue?t={token}");
+        let client = std::thread::spawn(move || {
+            let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build();
+            let _ = agent.get(&url).call();
+        });
+        let mut request = server.recv().unwrap();
+        let reply = handle_request(&mut request, db, tokens, state);
+        let _ = respond(request, reply.clone());
+        let _ = client.join();
+        reply
     }
 
     #[test]

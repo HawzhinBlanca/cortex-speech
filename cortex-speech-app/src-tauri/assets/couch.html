@@ -1,28 +1,109 @@
 <!doctype html>
-<html lang="en">
+<html lang="ckb" dir="rtl">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Cortex Couch Review</title>
+<title>Cortex</title>
+<!--
+  PHONE STRINGS. Kurdish-first, like the desktop app: the page opens in Sorani (RTL) and the reviewer
+  can switch to English. Serving an English chrome around a Kurdish text box was the single largest UX
+  defect of the remote surface (docs/REMOTE_REVIEW_PLAN.md §1.1).
+
+  `source` names the desktop i18n key each Sorani string was COPIED FROM, byte for byte.
+  scripts/test_couch_page_i18n.py enforces that: a sourced string must still match its desktop value
+  exactly, so the phone can never drift away from text a native speaker already reviewed, and en/ckb
+  key sets must stay identical. `source: null` means genuinely NEW Sorani that has NOT had a native
+  review — the policy pins that list so it can never grow silently.
+-->
+<script id="i18n" type="application/json">
+{
+  "en": {
+    "progress": "Clip {n} of {total}",
+    "accept": "Looks good",
+    "bad": "Reject",
+    "save": "Save & next",
+    "undo": "Undo review",
+    "saved": "Saved",
+    "markedBad": "Reject",
+    "undone": "Decision undone — the clip is back in the queue.",
+    "undoFailed": "Undo failed",
+    "saveFailed": "Failed to save edit: {err}",
+    "loadFailed": "Failed to load queue: {err}",
+    "allDone": "All clips reviewed!",
+    "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later."
+  },
+  "ckb": {
+    "progress": "پارچەی {n} لە {total}",
+    "accept": "دروستە",
+    "bad": "ڕەتکردنەوە",
+    "save": "پاشەکەوت و دواتر",
+    "undo": "گەڕاندنەوەی پێداچوونەوە",
+    "saved": "پاشەکەوتکرا",
+    "markedBad": "ڕەتکردنەوە",
+    "undone": "بڕیارەکە گەڕایەوە — پارچەکە گەڕایەوە بۆ ڕیزەکە.",
+    "undoFailed": "گەڕاندنەوە سەرکەوتوو نەبوو",
+    "saveFailed": "پاشەکەوتی دەستکاری سەرکەوتوو نەبوو: {err}",
+    "loadFailed": "بارکردنی ڕیز سەرکەوتوو نەبوو: {err}",
+    "allDone": "هەموو پارچەکان پێداچوونەوەیان بۆ کرا!",
+    "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە."
+  },
+  "source": {
+    "progress": "review.progress",
+    "accept": "review.acceptAsIs",
+    "bad": "inbox.reject",
+    "save": "review.saveNext",
+    "undo": "review.undoLast",
+    "saved": "saved",
+    "markedBad": "inbox.reject",
+    "undone": "review.undone",
+    "undoFailed": "review.undoFailed",
+    "saveFailed": "inbox.status.editFailed",
+    "loadFailed": "inbox.status.loadFailed",
+    "allDone": "review.allDone",
+    "heldByOthers": null
+  }
+}
+</script>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; }
+  /* `hidden` is only a display:none DEFAULT, and an explicit `display` in a rule beats it. #card sets
+     display:flex, so every `card.hidden = true` was a no-op: the empty card stayed on screen next to
+     the "all reviewed" message. Caught by looking at the rendered page, not by any test. */
+  [hidden] { display: none !important; }
   body { font-family: system-ui, sans-serif; background: #0b1220; color: #e2e8f0;
-         min-height: 100dvh; display: flex; flex-direction: column; padding: 12px; gap: 12px; }
-  header { display: flex; justify-content: space-between; align-items: baseline; }
+         /* vh first as the fallback: dvh is the one that accounts for a mobile browser's collapsing
+            address bar, but a browser that does not know it must still get a full-height layout
+            rather than a card floating in a short page. */
+         min-height: 100vh; min-height: 100dvh;
+         display: flex; flex-direction: column; padding: 12px; gap: 12px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
   h1 { font-size: 15px; color: #7dd3fc; }
   #who { font-size: 11px; color: #94a3b8; font-weight: 600; }
   #progress { font-size: 12px; color: #94a3b8; }
+  /* The language toggle mirrors the desktop `locale-toggle`. Labels are the language's own endonym,
+     so it reads correctly whichever locale is active and needs no translation of its own. */
+  #lang { flex: 0 0 auto; padding: 4px 10px; font-size: 11px; font-weight: 600; border-radius: 999px;
+          border: 1px solid #334155; background: #1e293b; color: #94a3b8; }
   #card { background: #111a2e; border: 1px solid #1e293b; border-radius: 14px; padding: 14px;
           display: flex; flex-direction: column; gap: 12px; flex: 1; }
   audio { width: 100%; }
+  /* Transport row: replay-last-2s, loop and speed. A transcriber re-listens to the same second many
+     times per clip; a bare <audio> makes that a fiddly drag on a phone-sized scrubber. */
+  .transport { display: flex; gap: 8px; align-items: center; }
+  .transport button { flex: 1; padding: 9px 6px; font-size: 13px; font-weight: 600; }
+  .transport button[aria-pressed="true"] { background: #0369a1; border-color: #0284c7; color: #f1f5f9; }
+  #warn { font-size: 12px; color: #fcd34d; text-align: center; }
   textarea { width: 100%; min-height: 34dvh; background: #0b1220; color: #f1f5f9;
              border: 1px solid #334155; border-radius: 10px; padding: 12px;
              font-size: 18px; line-height: 1.9; direction: rtl; }
   .meta { font-size: 11px; color: #64748b; }
   .row { display: flex; gap: 8px; }
-  button { flex: 1; padding: 14px 8px; border-radius: 12px; border: 1px solid #334155;
-           background: #1e293b; color: #e2e8f0; font-size: 15px; font-weight: 600; }
+  button { flex: 1; padding: 14px 6px; border-radius: 12px; border: 1px solid #334155;
+           background: #1e293b; color: #e2e8f0; font-size: 14px; font-weight: 600;
+           /* Sorani labels are longer than their English counterparts and wrapped mid-phrase at
+              375px; keep each action on one line and let the font shrink instead. */
+           white-space: nowrap; }
   button:disabled { opacity: 0.45; }
   #save   { background: #0369a1; border-color: #0284c7; }
   #accept { background: #14532d; border-color: #166534; }
@@ -37,25 +118,68 @@
 </style>
 </head>
 <body>
-<header><h1>Cortex · Couch Review<span id="who"></span></h1><div id="progress"></div></header>
+<header>
+  <h1>Cortex<span id="who"></span></h1>
+  <div id="progress"></div>
+  <button id="lang" type="button"></button>
+</header>
 <div id="card" hidden>
   <audio id="player" controls preload="auto"></audio>
-  <textarea id="text" lang="ckb" spellcheck="false"></textarea>
+  <div class="transport">
+    <button id="again" type="button" title="↺ 2s">↺ 2s</button>
+    <button id="loop" type="button" aria-pressed="false">⟳</button>
+    <button id="speed" type="button">1×</button>
+  </div>
+  <textarea id="text" lang="ckb" dir="rtl" spellcheck="false"></textarea>
   <div class="meta" id="meta"></div>
+  <div id="warn" hidden></div>
   <div class="row">
-    <button id="undo" title="Undo last review">↩</button>
-    <button id="bad">✗ Bad</button>
-    <button id="accept">✓ Looks good</button>
-    <button id="save">Save &amp; next</button>
+    <button id="undo">↩</button>
+    <button id="bad"></button>
+    <button id="accept"></button>
+    <button id="save"></button>
   </div>
 </div>
-<div id="done" hidden>🎉 Queue reviewed. New clips appear here automatically.</div>
+<div id="done" hidden></div>
 <div id="err" hidden></div>
 <div class="toast" id="toast"></div>
 <script>
   const token = new URLSearchParams(location.search).get('t') || '';
   const $ = (id) => document.getElementById(id);
   let queue = [], i = 0, busy = false;
+
+  // ── i18n ────────────────────────────────────────────────────────────────────
+  const STRINGS = JSON.parse($('i18n').textContent);
+  // Kurdish-first, matching the desktop app. An explicit ?lang= wins (so a link can pin a language),
+  // then the reviewer's own saved choice, then ckb — NOT navigator.language, because the browser
+  // language of a shared phone says nothing about which language this corpus is in.
+  let locale = new URLSearchParams(location.search).get('lang')
+    || localStorage.getItem('cortex.couch.lang')
+    || 'ckb';
+  if (!STRINGS[locale]) locale = 'ckb';
+  // Fall back to English for a key missing from ckb, exactly like the desktop dictionary does, so a
+  // gap shows the other language rather than a raw key.
+  const t = (key, params) => {
+    let s = (STRINGS[locale] || {})[key] ?? STRINGS.en[key] ?? key;
+    for (const [k, v] of Object.entries(params || {})) s = s.replaceAll('{' + k + '}', v);
+    return s;
+  };
+  function applyLocale() {
+    localStorage.setItem('cortex.couch.lang', locale);
+    document.documentElement.lang = locale;
+    document.documentElement.dir = locale === 'ckb' ? 'rtl' : 'ltr';
+    $('lang').textContent = locale === 'ckb' ? 'English' : 'کوردی';
+    $('bad').textContent = '✗ ' + t('bad');
+    $('accept').textContent = '✓ ' + t('accept');
+    $('save').textContent = t('save');
+    $('undo').title = t('undo');
+    renderProgress();
+    renderEmptyState();
+  }
+  $('lang').onclick = () => { locale = locale === 'ckb' ? 'en' : 'ckb'; applyLocale(); };
+
+  // ── rendering ───────────────────────────────────────────────────────────────
+  let heldByOthers = 0;
 
   function toast(msg) {
     $('toast').textContent = msg;
@@ -64,52 +188,155 @@
   }
   async function api(path, opts) {
     const r = await fetch(path + (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(token), opts);
-    if (!r.ok) throw new Error(await r.text());
+    if (!r.ok) {
+      // Carry the status so callers can tell "the server refused" (a real answer, do not retry) from
+      // "the request never arrived" (fetch throws a TypeError with no status, and IS worth retrying).
+      const err = new Error(await r.text());
+      err.status = r.status;
+      throw err;
+    }
     return r.headers.get('content-type')?.includes('json') ? r.json() : r;
   }
+  function renderProgress() {
+    $('progress').textContent = queue.length ? t('progress', { n: i + 1, total: queue.length }) : '';
+  }
+  function renderEmptyState() {
+    // An empty queue does NOT mean the work is finished when other reviewers are holding clips —
+    // claiming "all reviewed" there would be a flat lie to whoever loaded last.
+    $('done').textContent = heldByOthers ? t('heldByOthers', { n: heldByOthers }) : '🎉 ' + t('allDone');
+  }
+  // ── drafts, so a reload or a crash never costs a typed correction ───────────
+  const draftKey = (id) => 'cortex.couch.draft.' + id;
+  $('text').addEventListener('input', () => {
+    const seg = queue[i];
+    if (seg) localStorage.setItem(draftKey(seg.id), $('text').value);
+  });
+
+  // ── unsent decisions, so a dropped request is not a lost decision ───────────
+  // Kept in localStorage rather than memory: the most likely way to lose a submit is the reviewer
+  // giving up on a frozen page and reloading it. Flushed on load and whenever the phone reconnects.
+  // Safe to replay because the server answers an identical re-submit as already-recorded.
+  const OUTBOX = 'cortex.couch.outbox';
+  const readOutbox = () => { try { return JSON.parse(localStorage.getItem(OUTBOX)) || []; } catch { return []; } };
+  const writeOutbox = (v) => localStorage.setItem(OUTBOX, JSON.stringify(v));
+  async function flushOutbox() {
+    for (const item of readOutbox()) {
+      try {
+        await api('/api/decision', {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(item),
+        });
+      } catch (e) {
+        if (e.status === undefined) return; // still offline — keep everything for the next attempt
+        // The server gave a real answer (409 taken, 400 invalid). Retrying can never change it, so
+        // drop this one rather than wedging the queue behind a decision that will never land.
+      }
+      writeOutbox(readOutbox().filter((q) => q.id !== item.id));
+      localStorage.removeItem(draftKey(item.id));
+    }
+  }
+  addEventListener('online', () => void flushOutbox());
+
   function show() {
     const seg = queue[i];
     $('card').hidden = !seg; $('done').hidden = !!seg;
-    $('progress').textContent = queue.length ? (queue.length - i) + ' left' : '';
+    $('warn').hidden = true;
+    renderProgress();
     if (!seg) return;
     $('player').src = '/api/audio/' + encodeURIComponent(seg.id) + '?t=' + encodeURIComponent(token);
-    $('text').value = seg.text;
+    $('player').playbackRate = speed;
+    $('player').loop = looping;
+    // A saved draft is a correction the reviewer already typed; it must win over the server's copy.
+    $('text').value = localStorage.getItem(draftKey(seg.id)) ?? seg.text;
     $('meta').textContent = (seg.durationMs / 1000).toFixed(1) + 's' + (seg.speakerId ? ' · ' + seg.speakerId : '');
+    prefetchNext();
+  }
+  // Warm the NEXT clip's audio while this one is being reviewed. The gap between clips is dead time,
+  // and on a phone it is the difference between a steady rhythm and a stutter every few seconds.
+  let prefetched = null;
+  function prefetchNext() {
+    const next = queue[i + 1];
+    if (!next) return;
+    prefetched = new Audio('/api/audio/' + encodeURIComponent(next.id) + '?t=' + encodeURIComponent(token));
+    prefetched.preload = 'auto';
+    prefetched.load();
   }
   async function load() {
     try {
+      await flushOutbox();
       const res = await api('/api/queue');
-      queue = res.items; i = 0;
-      // An empty queue does NOT mean the work is finished when other reviewers are holding clips —
-      // saying "🎉 Queue reviewed" there would be a flat lie to whoever loaded last.
-      $('done').textContent = res.heldByOthers
-        ? res.heldByOthers + ' clip(s) are with other reviewers right now. Reload in a few minutes.'
-        : '🎉 Queue reviewed. New clips appear here automatically.';
+      queue = res.items; i = 0; heldByOthers = res.heldByOthers || 0;
+      renderEmptyState();
       // Show WHO the server is recording these decisions as. Every save is stored under this name, so
       // the reviewer must be able to see it — silent attribution is attribution nobody can correct.
       $('who').textContent = ' · ' + res.reviewer;
       show();
-    } catch (e) { $('err').hidden = false; $('err').textContent = 'Cannot load queue:\n' + e.message; }
+    } catch (e) { $('err').hidden = false; $('err').textContent = t('loadFailed', { err: e.message }); }
   }
   async function decide(action) {
     if (busy || !queue[i]) return;
     busy = true;
     const btns = ['save','accept','bad','undo'].map($); btns.forEach(b => b.disabled = true);
+    const submission = { id: queue[i].id, action, text: $('text').value };
     try {
       await api('/api/decision', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id: queue[i].id, action, text: $('text').value }),
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),
       });
-      toast(action === 'bad' ? 'Marked bad' : 'Saved');
+      localStorage.removeItem(draftKey(submission.id));
+      toast(action === 'bad' ? t('markedBad') : t('saved'));
       i += 1; show();
     } catch (e) {
-      toast('Failed: ' + e.message);
-      // The server refused because someone else took this clip (409). Staying here would keep
-      // re-submitting a decision that can never land, so move past it rather than trapping the reviewer.
-      if (/another reviewer/.test(e.message)) { i += 1; show(); }
+      if (e.status === undefined) {
+        // The request never reached the server. Hold it and move on rather than making the reviewer
+        // sit on a dead clip — it will be replayed the moment the phone reconnects.
+        writeOutbox([...readOutbox().filter((q) => q.id !== submission.id), submission]);
+        toast(t('saved'));
+        i += 1; show();
+      } else {
+        toast(t('saveFailed', { err: e.message }));
+        // The server refused because someone else has this clip (409). Staying here would keep
+        // re-submitting a decision that can never land, so move past it rather than trapping the reviewer.
+        if (e.status === 409) { i += 1; show(); }
+      }
     }
     finally { busy = false; btns.forEach(b => b.disabled = false); }
   }
+
+  // ── transport: the controls a transcriber actually uses ────────────────────
+  const SPEEDS = [0.75, 1, 1.25, 1.5];
+  let speed = Number(localStorage.getItem('cortex.couch.speed')) || 1;
+  let looping = localStorage.getItem('cortex.couch.loop') === '1';
+  function applyTransport() {
+    $('player').playbackRate = speed;
+    $('player').loop = looping;
+    $('speed').textContent = speed + '×';
+    $('loop').setAttribute('aria-pressed', String(looping));
+    localStorage.setItem('cortex.couch.speed', String(speed));
+    localStorage.setItem('cortex.couch.loop', looping ? '1' : '0');
+  }
+  $('speed').onclick = () => { speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length]; applyTransport(); };
+  $('loop').onclick  = () => { looping = !looping; applyTransport(); };
+  // Re-listening to the last couple of seconds is the single most repeated action in transcription,
+  // and dragging a phone-sized scrubber to do it is where the time goes.
+  $('again').onclick = () => {
+    $('player').currentTime = Math.max(0, $('player').currentTime - 2);
+    void $('player').play();
+  };
+
+  // ── keep an ACTIVE reviewer's clip from lapsing under them ─────────────────
+  // Well inside the server's TTL, so a slow clip never expires while it is genuinely being worked on.
+  // A 409 here means someone else took it — said NOW, while the correction can still be copied,
+  // instead of at save time when it is already unsaveable.
+  setInterval(async () => {
+    const seg = queue[i];
+    if (!seg || document.hidden) return;
+    try {
+      await api('/api/renew', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: seg.id }),
+      });
+    } catch (e) {
+      if (e.status === 409) { $('warn').textContent = t('heldByOthers', { n: 1 }); $('warn').hidden = false; }
+    }
+  }, 4 * 60 * 1000);
   $('save').onclick   = () => decide('edit');
   $('accept').onclick = () => decide('accept');
   $('bad').onclick    = () => decide('bad');
@@ -117,14 +344,16 @@
     if (busy) return; busy = true;
     try {
       const undone = await api('/api/undo', { method: 'POST' });
-      toast('Review undone');
+      toast(t('undone'));
       await load();
       const pos = queue.findIndex((s) => s.id === undone.id);
       if (pos >= 0) i = pos;
       show();
-    } catch (e) { toast('Undo failed: ' + e.message); }
+    } catch (e) { toast(t('undoFailed') + ': ' + e.message); }
     finally { busy = false; }
   };
+  applyLocale();
+  applyTransport();
   load();
 </script>
 </body>

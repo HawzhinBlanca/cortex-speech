@@ -155,7 +155,11 @@ type HumanDecisionContext =
 /// madda, hamza) can arrive decomposed from ASR or import; storing inconsistent forms
 /// silently fragments FTS search, content-dedup, and WER references that all assume one
 /// canonical spelling. Idempotent — NFC of already-NFC text is unchanged.
-fn to_nfc(s: &str) -> String {
+/// `pub(crate)` so sibling modules can canonicalize the SAME way before comparing against a stored
+/// transcript. `couch.rs` needs it to tell a network retry apart from a genuine re-review: the write
+/// path NFC-normalizes, so a decomposed (NFD) paste from a phone IME would otherwise never compare
+/// equal to the value it just stored, and every retry would look like a brand-new decision.
+pub(crate) fn to_nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
