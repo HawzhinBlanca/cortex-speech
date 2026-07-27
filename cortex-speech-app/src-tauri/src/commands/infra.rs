@@ -142,15 +142,20 @@ pub fn restore_session(state: State<'_, AppState>) -> Result<Option<crate::sessi
 }
 
 /// Start Couch Review — the LAN-only, token-gated phone review server (see couch.rs for the privacy
-/// stance). Explicit per-session start; returns the URL (with the session token) to open on the phone.
+/// stance). Explicit per-session start; returns one URL PER named reviewer, each carrying that
+/// reviewer's own token. An empty `reviewers` list starts a single-reviewer session under the default
+/// name, which is the previous behaviour exactly.
 #[tauri::command]
-pub fn start_couch_review(state: State<'_, AppState>) -> Result<crate::couch::CouchStatus, String> {
+pub fn start_couch_review(
+    state: State<'_, AppState>,
+    reviewers: Option<Vec<String>>,
+) -> Result<crate::couch::CouchStatus, String> {
     STRICT_RATE_LIMITER.check("start_couch_review")?;
     let db_path = { state.lock_db().path().to_string() };
-    crate::couch::start(db_path)
+    crate::couch::start(db_path, reviewers.unwrap_or_default())
 }
 
-/// Stop Couch Review and invalidate the session token.
+/// Stop Couch Review and invalidate every reviewer's session token.
 #[tauri::command]
 pub fn stop_couch_review() -> Result<crate::couch::CouchStatus, String> {
     STRICT_RATE_LIMITER.check("stop_couch_review")?;

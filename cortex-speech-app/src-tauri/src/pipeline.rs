@@ -2061,6 +2061,9 @@ impl ProcessingPipeline {
                 // fallback / none for the short whole-buffer path) — surfaced from the detector, not a
                 // path-exists probe (a corrupt Silero falls back to energy at runtime).
                 vad_backend: Some(vad_backend.as_str().to_string()),
+                // v43: a freshly imported clip has had no human decision, so it has no reviewer to
+                // attribute. `record_human_decision_by` fills this in when someone actually decides it.
+                reviewed_by: None,
             });
         }
 

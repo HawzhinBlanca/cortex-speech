@@ -1155,6 +1155,33 @@ pub static MIGRATIONS: &[Migration] = &[
         up_sql: "ALTER TABLE speech_segments ADD COLUMN vad_backend TEXT;",
         down_sql: Some("ALTER TABLE speech_segments DROP COLUMN vad_backend;"),
     },
+    Migration {
+        version: 43,
+        description: "Reviewer attribution: WHICH human made the decision on each row (multi-reviewer Couch Review)",
+        // Couch Review became multi-reviewer: several named people can review from their own phones at
+        // once, each on their own token. Without attribution every decision lands anonymous, so the
+        // corpus cannot answer "who labelled this?" — which is both an audit gap and the missing
+        // substrate for inter-annotator agreement (a decision you cannot attribute cannot be compared
+        // against a second opinion).
+        //
+        // `reviewed_by` is the author of the row's CURRENT human decision, written in the same
+        // transaction as the verdict so the two can never diverge.
+        //
+        // NULL means "not attributed": every pre-v43 row, and every decision made at the owner's own
+        // desktop (where there is exactly one human and no token to name them). Writing a fabricated
+        // "owner" onto legacy rows would assert provenance we never captured. Nullable TEXT is
+        // STRICT-compatible, and ADD COLUMN fires no FK cascade, so no FK-off window is needed.
+        //
+        // Deliberately ONE column, on speech_segments only. A parallel `decision_log.annotator` was
+        // written and removed: decision_log rows exist only for decisions carrying a timestamp_ms, which
+        // the phone path does not send, so the column could never hold anything but NULL — and unlike
+        // speech_segments (which v40 recreates), a second ALTER on an untouched table also breaks the
+        // migration-replay tests. Per-decision annotator history is the right substrate for an
+        // inter-annotator agreement study, but that needs MULTIPLE decisions per segment, which this
+        // one-row-per-segment schema cannot express; it is not faked with an always-NULL column here.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN reviewed_by TEXT;",
+        down_sql: Some("ALTER TABLE speech_segments DROP COLUMN reviewed_by;"),
+    },
 ];
 
 #[cfg(test)]

@@ -427,6 +427,72 @@ fn dedicated_connection_via_path_shares_committed_data() {
 }
 
 #[test]
+fn a_human_decision_records_which_reviewer_made_it() {
+    // Migration v43. Multi-reviewer Couch Review means several named people decide clips at once, so a
+    // decision that does not say WHO made it is unattributable — an audit gap, and the missing substrate
+    // for any later inter-annotator agreement study. Four properties, each of which broke a real design:
+    //
+    //   1. an attributed decision stores the name,
+    //   2. an UNattributed one (the owner's desktop, one human, no token naming them) stores SQL NULL
+    //      rather than a fabricated "owner" — a provenance column that invents values is worse than none,
+    //   3. re-deciding REPLACES the name (a stale reviewer must never be left credited for someone
+    //      else's verdict — this is why the UPDATE sets reviewed_by unconditionally, not via COALESCE),
+    //   4. undo clears it, because the attribution belongs to the decision being retracted.
+    let db = make_db();
+    for id in ["att-phone", "att-desktop", "att-redecide"] {
+        db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+    }
+    let reviewed_by = |id: &str| db.get_segment_by_id(id).unwrap().unwrap().reviewed_by;
+
+    db.record_human_decision_by("att-phone", "accept", None, None, Some("Sara")).unwrap();
+    assert_eq!(reviewed_by("att-phone").as_deref(), Some("Sara"), "an attributed decision names its reviewer");
+
+    db.record_human_decision("att-desktop", "accept", None, None).unwrap();
+    assert_eq!(reviewed_by("att-desktop"), None, "an unattributed decision stores NULL, never a made-up name");
+
+    db.record_human_decision_by("att-redecide", "accept", None, None, Some("Sara")).unwrap();
+    db.record_human_decision_by("att-redecide", "edit", Some("ڕاستکراوە"), None, Some("Hemn")).unwrap();
+    assert_eq!(reviewed_by("att-redecide").as_deref(), Some("Hemn"), "the CURRENT decision's author wins");
+    db.record_human_decision("att-redecide", "accept", None, None).unwrap();
+    assert_eq!(reviewed_by("att-redecide"), None, "a desktop re-review clears the previous reviewer's name");
+
+    db.clear_human_decision("att-phone").unwrap();
+    assert_eq!(reviewed_by("att-phone"), None, "undo retracts the attribution along with the decision");
+}
+
+#[test]
+fn reviewer_attribution_survives_a_whole_row_upsert() {
+    // WHOLE-ROW CLOBBER — the recurring defect family in this file. `insert_segment_full` rewrites EVERY
+    // column from a snapshot, and the couch's own undo path uses it. A `reviewed_by` missing from that
+    // statement's column list would silently revert to NULL on any restore, stripping the attribution off
+    // rows that still carry the decision. `insert_segment`'s 17-column subset deliberately OMITS it, the
+    // same way it omits human_decision, so an ASR-only re-write must LEAVE it intact, not clear it.
+    let db = make_db();
+    db.insert_segment(&make_segment("rt-1", "/rt-1.wav")).unwrap();
+    db.record_human_decision_by("rt-1", "accept", None, Some(4200), Some("Sara")).unwrap();
+
+    // Round-trip the FULL row, exactly as the couch undo does.
+    let snapshot = db.get_segment_by_id("rt-1").unwrap().unwrap();
+    assert_eq!(snapshot.reviewed_by.as_deref(), Some("Sara"));
+    db.insert_segment_full(&snapshot).unwrap();
+    assert_eq!(
+        db.get_segment_by_id("rt-1").unwrap().unwrap().reviewed_by.as_deref(),
+        Some("Sara"),
+        "insert_segment_full must persist reviewed_by — dropping it is the whole-row-clobber bug"
+    );
+
+    // The ASR-column subset must not touch it (it never carries a human decision).
+    let mut asr_only = make_segment("rt-1", "/rt-1.wav");
+    asr_only.raw_transcript = "re-decoded".to_string();
+    db.insert_segment(&asr_only).unwrap();
+    assert_eq!(
+        db.get_segment_by_id("rt-1").unwrap().unwrap().reviewed_by.as_deref(),
+        Some("Sara"),
+        "an ASR-only upsert must leave the human attribution intact"
+    );
+}
+
+#[test]
 fn write_segment_verdict_records_all_machine_verdict_classes() {
     // P1.2: decision_verdicts must classify every machine verdict for the C4 denominator. Before the
     // fix only jury_accept recorded a row; auto_accept and jury_edit (also auto-resolutions) dropped.

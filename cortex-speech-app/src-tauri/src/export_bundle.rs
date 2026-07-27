@@ -246,22 +246,28 @@ impl ProvenanceCounts {
     }
 }
 
-/// P0.4: per-segment VAD-backend distribution over the exported rows (Migration v42) — how each region was
-/// ACTUALLY detected ("silero" / "energy" fallback / "none" for the short whole-buffer path), read from the
-/// stored `vad_backend` column, never a probe. `None` (a legacy row or the cloud Scribe path, where no
-/// local VAD runs) is bucketed as `not_recorded`. Returns (count-by-backend, not_recorded).
-fn tally_vad_backends<'a>(
+/// Count a nullable per-segment label over the exported rows, bucketing `None` separately rather than
+/// inventing a value for it. Used for two stored provenance columns:
+///
+///   * `vad_backend` (P0.4, Migration v42) — how each region was ACTUALLY detected ("silero" / "energy"
+///     fallback / "none" for the short whole-buffer path), read from the stored column, never a probe.
+///     `None` is a legacy row or the cloud Scribe path, where no local VAD runs.
+///   * `reviewed_by` (Migration v43) — WHICH human decided each row. `None` is an undecided row, a
+///     desktop decision, or a pre-v43 row.
+///
+/// Returns (count-by-label, none-count). BTreeMap so the manifest is byte-stable across runs.
+fn tally_labels<'a>(
     values: impl Iterator<Item = Option<&'a str>>,
 ) -> (std::collections::BTreeMap<String, usize>, usize) {
-    let mut by_backend = std::collections::BTreeMap::new();
-    let mut not_recorded = 0usize;
+    let mut by_label = std::collections::BTreeMap::new();
+    let mut unlabelled = 0usize;
     for v in values {
         match v {
-            Some(backend) => *by_backend.entry(backend.to_string()).or_insert(0) += 1,
-            None => not_recorded += 1,
+            Some(label) => *by_label.entry(label.to_string()).or_insert(0) += 1,
+            None => unlabelled += 1,
         }
     }
-    (by_backend, not_recorded)
+    (by_label, unlabelled)
 }
 
 pub fn export_dataset_bundle(
@@ -444,7 +450,12 @@ pub fn export_dataset_bundle(
     let denoised_provenance = ProvenanceCounts::tally(segments.iter().map(|s| s.denoised));
     let diarized_provenance = ProvenanceCounts::tally(segments.iter().map(|s| s.diarized));
     let (vad_backend_counts, vad_backend_not_recorded) =
-        tally_vad_backends(segments.iter().map(|s| s.vad_backend.as_deref()));
+        tally_labels(segments.iter().map(|s| s.vad_backend.as_deref()));
+    // v43: WHO labelled this dataset. A corpus reviewed by several named people must say so — the
+    // per-reviewer counts are what makes a label attributable (and are the honest place to see that, say,
+    // one reviewer produced 90% of the gold). `notAttributed` covers desktop and pre-v43 decisions; it is
+    // reported as its own bucket rather than folded under the owner's name, which would be a fabrication.
+    let (reviewer_counts, reviewer_not_attributed) = tally_labels(segments.iter().map(|s| s.reviewed_by.as_deref()));
     let run_config = {
         // The two capability args to config_from_settings are inert here (immediately overridden below):
         // runConfig's denoising/diarization now report STORED per-segment truth, not export-day
@@ -485,6 +496,10 @@ pub fn export_dataset_bundle(
             "vadBackend": {
                 "byBackend": vad_backend_counts,
                 "notRecorded": vad_backend_not_recorded,
+            },
+            "reviewedBy": {
+                "byReviewer": reviewer_counts,
+                "notAttributed": reviewer_not_attributed,
             },
         },
         "validation": {

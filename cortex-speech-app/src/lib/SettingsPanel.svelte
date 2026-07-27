@@ -49,17 +49,20 @@
     }
   });
 
-  // Couch Review (LAN phone review server): session state + start/stop. The URL (with its one-session
-  // token) is only ever displayed here for the owner to open on the phone.
+  // Couch Review (LAN phone review server): session state + start/stop. Each reviewer's URL (with its
+  // own one-session token) is only ever displayed here, for the owner to hand to that person.
   let couchStatus = $state<import('./commands').CouchStatus | null>(null);
   let couchBusy = $state(false);
+  // Comma-separated reviewer names. Left blank, the server starts a single-reviewer session under its
+  // default name — the previous behaviour exactly.
+  let couchNames = $state('');
   async function toggleCouch() {
     if (couchBusy || !tauriAvailable) return;
     couchBusy = true;
     try {
       couchStatus = couchStatus?.running
         ? await api.stopCouchReview()
-        : await api.startCouchReview();
+        : await api.startCouchReview(couchNames.split(',').map((n) => n.trim()).filter(Boolean));
     } catch (e) {
       notifications.error($t('settings.couchFailed'), { detail: String(e) });
     } finally {
@@ -389,16 +392,29 @@
                     : $t('settings.couchStart')}
               </button>
             </div>
-            {#if couchStatus?.running && couchStatus.url}
-              <span class="text-[10px] text-subtle">{$t('settings.couchWifiUrl')}</span>
-              <input class="input w-full !text-xs font-mono" readonly value={couchStatus.url} onfocus={(e) => (e.target as HTMLInputElement).select()} />
-              {#if couchStatus.tailscaleUrl}
-                <span class="text-[10px] text-subtle">{$t('settings.couchTailscaleUrl')}</span>
-                <input class="input w-full !text-xs font-mono" readonly value={couchStatus.tailscaleUrl} onfocus={(e) => (e.target as HTMLInputElement).select()} />
-              {/if}
+            {#if couchStatus?.running && couchStatus.reviewers.length}
+              <!-- One block per reviewer: each link carries that person's own token, and every decision
+                   they make is stored under their name. Handing out the wrong link mislabels the data,
+                   so the name is shown above the URL it belongs to. -->
+              {#each couchStatus.reviewers as reviewer (reviewer.name)}
+                <div class="space-y-1 border-t border-cortex-700/30 pt-2 first:border-t-0 first:pt-0">
+                  <span class="text-xs text-default font-semibold">{reviewer.name}</span>
+                  <span class="text-[10px] text-subtle block">{$t('settings.couchWifiUrl')}</span>
+                  <input class="input w-full !text-xs font-mono" readonly value={reviewer.url} onfocus={(e) => (e.target as HTMLInputElement).select()} />
+                  {#if reviewer.tailscaleUrl}
+                    <span class="text-[10px] text-subtle block">{$t('settings.couchTailscaleUrl')}</span>
+                    <input class="input w-full !text-xs font-mono" readonly value={reviewer.tailscaleUrl} onfocus={(e) => (e.target as HTMLInputElement).select()} />
+                  {/if}
+                </div>
+              {/each}
               <p class="text-[10px] text-subtle">{$t('settings.couchRunningHint')}</p>
             {:else}
+              <label class="block space-y-1">
+                <span class="text-[10px] text-subtle">{$t('settings.couchReviewers')}</span>
+                <input class="input w-full !text-xs" bind:value={couchNames} placeholder={$t('settings.couchReviewersPlaceholder')} />
+              </label>
               <p class="text-[10px] text-subtle">{$t('settings.couchHint')}</p>
+              <p class="text-[10px] text-subtle">{$t('settings.couchReviewersHint')}</p>
             {/if}
           </div>
         {:else if activeTab === 'asr'}

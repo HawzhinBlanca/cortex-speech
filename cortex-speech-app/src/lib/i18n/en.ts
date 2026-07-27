@@ -693,6 +693,10 @@ export const en: Record<string, string> = {
   'settings.couchHint': 'Serve a review page to your phone over your home network only. Off by default; a new random access token every session; audio never leaves your network.',
   'settings.couchRunningHint': 'Open this URL on your phone (same Wi-Fi). Stop the server when done — the link stops working immediately.',
   'settings.couchFailed': 'Couch Review failed',
+  'settings.couchReviewers': 'Reviewer names (comma-separated)',
+  'settings.couchReviewersPlaceholder': 'e.g. Sara, Hemn — leave blank to review alone',
+  'settings.couchReviewersHint':
+    'Each name gets its own private link, and every decision is stored under that name. Reviewers are handed different clips, so two people never review the same one at the same time.',
   'settings.useFinetuned': 'Use fine-tuned model',
   'settings.useFinetunedHint':
     'Best local Sorani accuracy (measured 21.0% CER, N=900) — runs on CPU, no setup. Overrides the engine below.',

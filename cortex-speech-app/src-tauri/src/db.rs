@@ -65,6 +65,12 @@ pub struct SpeechSegment {
     /// "energy" (fallback), or "none" (short file taken whole, no VAD). `None` = not recorded (legacy row
     /// / cloud Scribe path). Surfaced from the detector at import, never a path-exists probe.
     pub vad_backend: Option<String>,
+    // ── Reviewer attribution (Migration v43) ───────────────────────
+    /// WHICH human made this row's current decision — a named Couch Review reviewer. `None` = not
+    /// attributed: a legacy pre-v43 row, an undecided row, or a decision made at the owner's own
+    /// desktop (one human, no token to name them). Written in the same transaction as the verdict by
+    /// `record_human_decision_by`, and cleared by `clear_human_decision` along with the decision itself.
+    pub reviewed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,7 +215,8 @@ const SEGMENT_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript
                     verdict, verdict_transcript, rationale, evidence_json,
                     agent_confidence, escalated, human_decision, corrected_at, is_gold,
                     alignment_quality, model_version_id, confidence_source, cloud_call,
-                    decoder_config_hash, normalizer_version, denoised, diarized, vad_backend";
+                    decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
+                    reviewed_by";
 
 /// Reject structurally-invalid segments at the DB write boundary, before they can
 /// corrupt the downstream split/stats/training-grade math that every later stage
@@ -505,10 +512,11 @@ impl Database {
                  ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
                  verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
                  human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
-                 confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized, vad_backend, updated_at)
+                 confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
+                 reviewed_by, updated_at)
              VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                  ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                 COALESCE(?28, 'unknown@pre-registry'), COALESCE(?29, 'unknown'), ?30, ?31, ?32, ?33, ?34, ?35, datetime('now'))
+                 COALESCE(?28, 'unknown@pre-registry'), COALESCE(?29, 'unknown'), ?30, ?31, ?32, ?33, ?34, ?35, ?36, datetime('now'))
              ON CONFLICT(id) DO UPDATE SET
                 created_at=excluded.created_at,
                 audio_path=excluded.audio_path,
@@ -544,6 +552,7 @@ impl Database {
                 denoised=excluded.denoised,
                 diarized=excluded.diarized,
                 vad_backend=excluded.vad_backend,
+                reviewed_by=excluded.reviewed_by,
                 updated_at=datetime('now')",
             params![
                 seg.id,
@@ -581,6 +590,7 @@ impl Database {
                 seg.denoised.map(|b| b as i32),
                 seg.diarized.map(|b| b as i32),
                 seg.vad_backend,
+                seg.reviewed_by,
             ],
         )?;
         self.track_write()?;
@@ -2029,6 +2039,9 @@ impl Database {
             diarized: Self::optional_col::<i32>(row, 33)?.map(|v| v != 0),
             // VAD backend — Migration v42; nullable TEXT. None (absent/NULL) stays "not recorded".
             vad_backend: Self::optional_col(row, 34)?,
+            // Reviewer attribution — Migration v43; nullable TEXT. None = not attributed (legacy row,
+            // undecided row, or a desktop decision), never a fabricated "owner".
+            reviewed_by: Self::optional_col(row, 35)?,
         })
     }
 
@@ -2280,6 +2293,9 @@ impl Database {
             "UPDATE speech_segments
              SET human_decision     = NULL,
                  corrected_at       = NULL,
+                 -- The attribution belongs to the decision being undone; leaving it would credit a
+                 -- reviewer for a verdict that no longer exists (v43).
+                 reviewed_by        = NULL,
                  verdict            = NULL,
                  verdict_transcript = NULL,
                  rationale          = NULL,
@@ -2374,6 +2390,26 @@ impl Database {
         decision: &str,
         corrected_transcript: Option<&str>,
         timestamp_ms: Option<i64>,
+    ) -> AppResult<()> {
+        self.record_human_decision_by(segment_id, decision, corrected_transcript, timestamp_ms, None)
+    }
+
+    /// [`record_human_decision`] with reviewer attribution (Migration v43).
+    ///
+    /// `annotator` names the human who made THIS decision — a named Couch Review reviewer. `None` means
+    /// "not attributed" and is the correct value for the owner's own desktop, where there is exactly one
+    /// human and no token naming them; it is stored as SQL NULL rather than a fabricated "owner", because
+    /// a provenance column that invents its own values is worse than an empty one.
+    ///
+    /// The attribution is written INSIDE the same transaction as the verdict, so a crash can never leave a
+    /// decision whose author is unknown (or an author for a decision that never committed).
+    pub fn record_human_decision_by(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        timestamp_ms: Option<i64>,
+        annotator: Option<&str>,
     ) -> AppResult<()> {
         let human_verdict = human_verdict_for_decision(decision)?;
         // NFC-canonicalize the human correction like EVERY other transcript write path (insert/restore/
@@ -2504,10 +2540,14 @@ impl Database {
                  verdict            = ?3,
                  verdict_transcript = COALESCE(?4, verdict_transcript),
                  escalated          = 0,
+                 reviewed_by        = ?5,
                  corrected_at       = datetime('now'),
                  updated_at         = datetime('now')
              WHERE id = ?1",
-            params![segment_id, decision, human_verdict, corrected_transcript],
+            // reviewed_by is set UNCONDITIONALLY (not COALESCEd): it names the author of the row's
+            // CURRENT decision, so a desktop re-review of a clip a phone reviewer had decided must clear
+            // the stale name rather than leave the previous reviewer credited for someone else's verdict.
+            params![segment_id, decision, human_verdict, corrected_transcript, annotator],
         )?;
 
         // Rejecting a clip retracts any prior EDIT's learning pair (round-24 hunt #9): a human who

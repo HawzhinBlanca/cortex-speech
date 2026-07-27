@@ -143,15 +143,24 @@ export async function installTauriMock(page: Page): Promise<void> {
             // F10 partial autosave: true = the fresh row existed and the fields were applied.
             return true;
           case 'couch_review_status':
-            return { running: false, url: null, tailscaleUrl: null };
+            return { running: false, reviewers: [] };
           case 'start_couch_review':
+            // v43 multi-reviewer: one entry PER named reviewer, each with its own token. Mirror the real
+            // command by echoing the requested names, so a mock session cannot pass with a shape the
+            // backend no longer returns.
             return {
               running: true,
-              url: 'http://192.168.0.2:8737/?t=mock-token',
-              tailscaleUrl: 'http://100.64.0.2:8737/?t=mock-token',
+              reviewers: ((args?.reviewers as string[] | undefined)?.length
+                ? (args?.reviewers as string[])
+                : ['owner']
+              ).map((name, i) => ({
+                name,
+                url: `http://192.168.0.2:8737/?t=mock-token-${i}`,
+                tailscaleUrl: `http://100.64.0.2:8737/?t=mock-token-${i}`,
+              })),
             };
           case 'stop_couch_review':
-            return { running: false, url: null, tailscaleUrl: null };
+            return { running: false, reviewers: [] };
           case 'get_fingerprint_count':
             return 1;
           case 'get_tracing_stats':

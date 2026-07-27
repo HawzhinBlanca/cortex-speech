@@ -461,20 +461,30 @@ export async function setApiKey(
   return invoke<string[]>('set_api_key', { provider, key });
 }
 
-/** Couch Review: the token-gated phone review server (off by default, per-session). */
-export interface CouchStatus {
-  running: boolean;
-  /** Wi-Fi (LAN) URL with the session token to open on the phone; null when stopped. */
-  url: string | null;
+/** One reviewer's private way in. Each named reviewer gets their own token, so two people never share
+ *  a link and therefore never share an identity in the data. */
+export interface CouchReviewer {
+  /** The name recorded on every row this person decides (`speech_segments.reviewed_by`). */
+  name: string;
+  /** Wi-Fi (LAN) URL carrying this reviewer's own token. */
+  url: string;
   /**
    * Same page over the owner's Tailscale tailnet — works from ANY network (4G, elsewhere),
-   * end-to-end encrypted between the owner's own devices. Null when no tailnet is up.
+   * end-to-end encrypted between devices in the tailnet. Null when no tailnet is up.
    */
   tailscaleUrl: string | null;
 }
 
-export async function startCouchReview(): Promise<CouchStatus> {
-  return invoke<CouchStatus>('start_couch_review');
+/** Couch Review: the token-gated phone review server (off by default, per-session). */
+export interface CouchStatus {
+  running: boolean;
+  /** One entry per named reviewer; empty when stopped. */
+  reviewers: CouchReviewer[];
+}
+
+/** Start the server. An empty list starts a single-reviewer session under the default name. */
+export async function startCouchReview(reviewers: string[] = []): Promise<CouchStatus> {
+  return invoke<CouchStatus>('start_couch_review', { reviewers });
 }
 
 export async function stopCouchReview(): Promise<CouchStatus> {
