@@ -1525,3 +1525,81 @@ clean; fmt clean; python-policies 43/43.
 - **5 owner-gated legs** (2 needing other people) and **8 owner-descoped distribution legs** —
   unchanged and not mine to move.
 - **The quiet week of real daily use.** Still the only signal that matters, and still ahead.
+
+## 2026-07-27 — iter 194 — Couch Review is multi-reviewer: named identities, attributed decisions, leased clips (2ce269c)
+
+**Owner asked whether the app could be used remotely by phone/web and "sent to users".** The honest
+answer was half-yes: Couch Review already served a phone page over LAN/Tailscale, but it was built
+for exactly ONE reviewer, and handing its link to a second person did not merely lack features — it
+silently broke three things. All three are now closed, each with its own fail-before gate.
+
+**1. Attribution (Migration v43, `speech_segments.reviewed_by`).** One shared token meant every
+decision landed anonymous: the corpus could not answer "who labelled this?". Each reviewer now has
+their own token; the token RESOLVES the identity server-side (an unknown token has no reviewer, so
+there is no path on which a decision can be written without a name); the name is written INSIDE the
+same transaction as the verdict. `NULL` = not attributed (pre-v43 row, undecided row, or a desktop
+decision where there is one human and no token naming them). **A fabricated "owner" was rejected** —
+a provenance column that invents its own values is worse than an empty one.
+
+**2. Per-reviewer undo (data loss).** ONE shared undo stack meant reviewer B's ↩ popped whichever
+decision was last GLOBALLY — usually A's, on a clip B had never seen, with no indication to either
+of them. Keyed by reviewer now.
+
+**3. Leases.** Without them both phones get the same head-of-queue clips: duplicated work, and one
+verdict silently overwriting the other. 15-minute lease on serve; another reviewer's queue skips it;
+a decision on someone else's live lease is REFUSED (409). Leases expire, so a closed tab never
+strands work.
+
+Also: one accept thread per reviewer (one reviewer = exactly the previous single-thread server),
+`recv_timeout` so every thread observes shutdown even if `unblock()` reaches only one; a failed
+second spawn tears down the threads that did start; export manifest gains
+`processingProvenance.reviewedBy` = `{byReviewer, notAttributed}`; the page shows WHICH reviewer it
+is recording as; `heldByOthers` stops the page claiming "Queue reviewed" when the work is simply
+held by someone else.
+
+**TWO OF MY OWN DEFECTS, found by writing the gates rather than by the compiler:**
+- A parallel `decision_log.annotator` column was written and **removed**. `decision_log` rows exist
+  only for decisions carrying a `timestamp_ms`, which the phone path does not send — the column
+  could never hold anything but NULL. It also broke three migration-replay tests: unlike
+  `speech_segments` (which v40 recreates), a second ALTER on an untouched table is not replayable.
+- The lease claim initially sat BEFORE validation in `api_decision`, so one malformed request would
+  lock a clip away from every other reviewer for the full TTL — **a denial of service by typo**.
+
+An export test also caught a wrong assumption of mine: it set `reviewed_by` as a struct field, but
+`insert_segments_batch` correctly carries no human-decision column. The test now EARNS the
+attribution through the real decision path.
+
+**Gates (verbatim):** `cargo test --lib` **1055 passed; 0 failed; 6 ignored**; clippy
+`--all-targets -D warnings` clean; `cargo fmt --check` clean; `npm run typecheck` 0 errors 0
+warnings; `npm test` **39 passed (39) / 214 passed (214)**; `python scripts/run_python_policies.py`
+**43 policy test scripts passed**.
+
+**Fail-before demonstrated for all four new guarantees** by targeted reverts (never `git checkout`):
+shared undo stack → `undo_is_per_reviewer_...` FAILED; lease check removed →
+`deciding_a_clip_another_reviewer_holds_is_refused` FAILED; `reviewed_by` dropped from
+`insert_segment_full` → `reviewer_attribution_survives_a_whole_row_upsert` FAILED; claim moved
+before validation → `an_unqueued_submit_..._leaves_no_lease` FAILED.
+
+**verify-10 at HEAD 2ce269c: VERDICT RED — 22 PASS, 1 FAIL, 1 SKIP-ENV.**
+The single failure is `exe-freshness`, and it is CORRECT: the app was running during this
+iteration, so the exe could not be relinked and still carries the previous commit's SHA
+(`a9b7b45` != HEAD `2ce269c`). Nothing about the feature is unproven by it — every other kept gate
+passed, including `test-rust` (422s), `fuzz-smoke` (671.9s), `refinery-lift` (37.0s), and
+`egress-runtime`. **RED is the honest verdict until the app is closed and rebuilt**; it is not
+downgraded here. `real-app-e2e` is SKIP-ENV (needs `CORTEX_AUDIO`), unchanged from prior runs.
+
+**WHAT THIS DOES NOT DO, and is not pretended:**
+- **Inter-annotator agreement is NOT enabled by this commit.** Leasing deliberately PREVENTS two
+  reviewers seeing the same clip, which is the opposite of what IAA needs. Real agreement requires
+  deliberate double-assignment plus a per-decision table; this schema holds one row per segment and
+  cannot express it. Surfaced, not half-built.
+- **Still plain HTTP**, token in the query string. Honest for a home LAN or a WireGuard tailnet;
+  it must NOT be port-forwarded to the public internet.
+- **No fair-share scheduler.** Whoever loads first takes up to 25 clips — bounded, self-correcting
+  (leases expire, batches drain), and now honestly reported via `heldByOthers`.
+- **OWNER REVIEW NEEDED:** three NEW Sorani strings (`settings.couchReviewers*` in `ckb.ts`) have
+  had no native review. They exist because `test_i18n_consistency.py` requires en/ckb key parity —
+  English-only fails the gate, and weakening the gate is not an option. Vocabulary is limited to
+  words already used elsewhere in that file.
+- The nightly CI jobs, the ~72 triaged mutants, the owner-gated legs, and the quiet week of real
+  daily use are all unchanged from iter 193.
