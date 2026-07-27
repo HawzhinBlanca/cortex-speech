@@ -225,15 +225,25 @@ libFuzzer's sancov symbols, LNK2001). Two honest ways to close it, and only thes
 
 ### Tier D — real quality work that does NOT block any gate
 
-- **`audio.rs` coverage 78.85%**, under the charter's 80% floor for "audio parsers". Confirmed by
-  measurement to be genuinely untested code, not an artifact: `SileroVad::new`/`detect`,
-  `voice_activity_detection`'s model branch, and the non-WAV branches of `decode_to_pcm` /
-  `decode_pcm_windows`. Closing it needs in-process VAD tests against the bundled Silero model or
-  committed MP3/M4A/FLAC fixtures. **Do not close it with padding tests.**
-- **The nightly fuzz + mutation jobs have never executed on a runner.** They are authored, not
-  proven. Their first scheduled run is the evidence.
-- **~818 of 844 core-module mutants never run.** Only the 26-mutant `--in-diff` slice has a
-  measured result (all 11 of its survivors are now closed).
+_Updated 2026-07-27 (ledger iters 191–192)._
+
+- ~~**`audio.rs` coverage**~~ **CLOSED.** 77.17% → 86.36% tool-reported, 78.32% → 83.36%
+  production-only. Every charter-named module now clears the 80% floor: audio 86.36, diff/mod
+  98.09, diff/phonetic 99.59, normalizer 94.46, g2p 98.66, conformal 99.07, irt 97.47,
+  signal_anomaly 100.00, chunking 92.32, wer 80.62. Both numbers are quoted deliberately —
+  `#[cfg(test)]` code counts toward a file's coverage, so adding tests raises the tool number
+  mechanically; production-only is the honest floor and it also clears 80%.
+- **81 surviving mutants of 841** (was 200; 25% → 10.2% survival). Now concentrated in the
+  *expensive* and *equivalent* tail rather than unpinned arithmetic. Five are individually proven
+  equivalent; two are knowingly-skipped million-cell performance guards with the reasoning recorded
+  in the tests. **The rest are unreviewed — that is the real remaining triage.** Note the
+  achievable bar is 0 UNREVIEWED survivors; 0 survivors is not reachable in any mutation project.
+- **The nightly fuzz + mutation jobs have still never executed on a runner.** Authored and locally
+  proven (fuzz: 5 targets, ~2.7M execs, 0 crashes via WSL); their first scheduled run is the
+  evidence that they work *in CI*.
+- **`wer.rs` at 80.62%** is the thinnest margin of the charter-named set.
+- **TOTAL coverage 73.94%**, dragged by `pipeline.rs` (~24%), `models.rs`, `wav2vec2_asr.rs` — all
+  needing real models/hardware. No charter requirement covers the total; stated for honesty.
 - **Deferred dependency majors**, no security driver: typescript 7, tailwindcss 4, jsdom 29,
   commitlint 21, lint-staged 17, prettier-plugin-svelte 4, @testing-library/jest-dom 7.
 - The Phase D items above (stitching A/B, frontend coverage floor, nightly local e2e).

@@ -1395,3 +1395,71 @@ genuinely untested. Fixed (`ee5e640`) — the contradiction was real information
 SileroVad, the VAD model branch, non-WAV decode); the nightly fuzz/mutation CI jobs have still
 never executed on a real runner; 81 survivors remain, now concentrated in the expensive/equivalent
 tail rather than in unpinned arithmetic; the owner-gated and owner-descoped legs unchanged.
+
+---
+
+### Iteration 192 — 2026-07-27 — audio.rs clears the 80% coverage floor (77.17% → 86.36%); every charter-named module now above it
+
+**The charter's ">80% line coverage on normalizer/diff/audio parsers" is now MET on all of them**
+(`cargo llvm-cov --lib`):
+```
+audio.rs        86.36%     diff/mod.rs      98.09%     normalizer.rs     94.46%
+audio_quality   97.59%     diff/phonetic    99.59%     normalizer/g2p    98.66%
+chunking.rs     92.32%     conformal.rs     99.07%     irt.rs            97.47%
+wer.rs          80.62%     signal_anomaly  100.00%     calibration      100.00%
+TOTAL 73.94%
+```
+
+**BOTH numbers are reported for audio.rs, because they differ and the difference matters:**
+```
+tool-reported (cargo llvm-cov)  77.17% → 86.36%
+production-only                 78.32% → 83.36%   (uncovered 258 → 188)
+```
+Adding tests to a file raises its coverage **mechanically** — `#[cfg(test)]` code counts toward the
+total. After the first batch the tool said 80.45% while only **13** production lines had actually
+been covered; production-only was still 78.32%, *under the floor*. Reporting 80.45% there would
+have been technically true and substantively false, so the work continued until both cleared 80%.
+
+**What was uncovered:** 103 of the 138 never-executed functions were `check_audio_file`,
+`decode_to_pcm`, `get_duration_ms` and `decode_pcm_windows` — the audio PARSERS the charter names —
+reachable only through the running app or the model-gated integration suite. Ordinary parsing code
+with no unit tests. Now covered against real containers decoded by real symphonia (nothing mocked):
+metadata for mono-16k and stereo-44.1k, missing/empty/garbage-byte errors, downmix+resample to
+mono 16 kHz, the content-hash cache, windowed streaming with strictly-increasing offsets and no
+dropped/duplicated samples, a failing callback aborting the decode, the timeout wrappers on both
+outcomes (asserting a timeout is classified TRANSIENT so a slow disk retries instead of hard
+failing), `ensure_pcm_16khz` in all four modes, `normalize_pcm_rms` (no inversion/clip/NaN, silence
+left alone), `voice_activity_detection` over the real entry point, and `SileroVad::new` against the
+bundled model **including the non-16 kHz path** where Silero resamples internally and maps segments
+back onto the caller's indices — an 8 kHz phone recording is ordinary, and a wrong mapping there
+silently misplaces every chunk boundary in the file.
+
+**TWO OF MY ASSUMPTIONS WERE WRONG AND THE CODE WAS RIGHT** — recorded in the tests, not quietly
+deleted:
+1. I asserted silence yields no VAD regions. It returns the **whole buffer** as one region:
+   `probs_to_segments` deliberately falls back to `(0, total)` so a file is never silently dropped.
+2. I then asserted that result must not be labelled `Silero`. It must be — `VadBackend::Silero`
+   documents *"Silero ran successfully"*, not *"Silero positively detected speech"*, and
+   `VadBackend::None` means no VAD ran at all, which is not this case. **Worth knowing when reading
+   `vad_backend` in an export: a silero-labelled segment does NOT imply positive detection.**
+
+The VAD test deliberately does **not** skip when the model is absent — it asserts the invariants
+that hold on either backend and names the one that ran, so it always exercises a complete real path
+and can never pass vacuously by exercising neither.
+
+**Gates:** `cargo test --lib` **1046 passed / 0 failed** (1015 at iter 190, 1036 at iter 191);
+clippy `--all-targets -D warnings` clean; fmt clean; python-policies 43/43.
+
+**WHAT REMAINS — the honest list.**
+- **81 surviving mutants** (of 841), down from 200. Now concentrated in the *expensive* and
+  *equivalent* tail, not in unpinned arithmetic. Five are individually proven equivalent; two are
+  knowingly-skipped million-cell performance guards with the reasoning recorded in the tests.
+  The rest are unreviewed and are the real remaining triage.
+- **The nightly fuzz and mutation CI jobs have still never executed on a real runner.** They are
+  authored and locally proven; their first scheduled run is the actual evidence.
+- **`wer.rs` at 80.62%** is the thinnest margin of the charter-named set.
+- **TOTAL coverage 73.94%** — dragged by `pipeline.rs` (~24%), `models.rs`, `wav2vec2_asr.rs`,
+  all of which need real models/hardware. No charter requirement covers the total; stated for honesty.
+- **5 owner-gated legs** (2 needing people other than the owner: independent annotators, CORDI
+  agreement) and **8 owner-descoped distribution legs** — unchanged, and only the owner can move them.
+- **The quiet week of real daily use.** No gate can substitute for it.
