@@ -664,6 +664,7 @@ pub fn run() {
             commands::stop_couch_review,
             commands::couch_review_status,
             commands::spot_check_report,
+            commands::export_agreement_sample,
             commands::transcribe_audio_with_scribe,
             commands::add_scribe_votes,
             commands::get_blocking_validation_issues,

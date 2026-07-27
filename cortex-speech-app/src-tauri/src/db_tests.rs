@@ -472,6 +472,51 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
 }
 
 #[test]
+fn the_agreement_sample_pairs_two_raters_and_never_hides_a_third() {
+    // P2.4. Inter-annotator agreement needs the SAME clip answered by two people independently — and
+    // spot checks already provide exactly that, because they are deliberately not leased. So the
+    // overlap is a side effect that already exists; what was missing was only the export.
+    //
+    // The output feeds scripts/agreement_kappa.py, which is already unit-tested against the textbook
+    // kappa=0.40 example. No kappa is computed here: a second implementation would be an unverified
+    // copy of a verified one.
+    let db = make_db();
+    for id in ["a1", "a2", "a3", "solo"] {
+        db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+    }
+    assert!(db.agreement_sample().unwrap().is_none(), "no double-review yet means NO sample, not an empty one");
+
+    // Sara and Hemn both answer a1..a3; they agree on two and differ on one.
+    for (id, sara, hemn) in [("a1", "accept", "accept"), ("a2", "edit", "edit"), ("a3", "accept", "reject")] {
+        db.record_spot_check(id, "Sara", sara, "x", "x").unwrap();
+        db.record_spot_check(id, "Hemn", hemn, "y", "x").unwrap();
+    }
+    // Only Sara saw this one, so it cannot appear in a PAIRED sample.
+    db.record_spot_check("solo", "Sara", "accept", "x", "x").unwrap();
+
+    let s = db.agreement_sample().unwrap().expect("two raters overlap");
+    assert_eq!(s.items, 3, "exactly the three clips BOTH answered");
+    assert!(s.other_reviewers.is_empty());
+    let lines: Vec<&str> = s.tsv.lines().collect();
+    assert_eq!(lines[0], format!("{}\t{}", s.rater_a, s.rater_b), "header names the two raters");
+    assert_eq!(lines.len(), 4, "header + one row per shared clip, and NOT the unpaired one");
+    assert!(lines[1..].iter().all(|l| l.split('\t').count() == 2), "two label columns, as the script expects");
+
+    // A THIRD reviewer must never be silently folded in: Cohen's kappa takes exactly two, and quietly
+    // averaging three raters into one number is precisely the fabrication the honesty law forbids.
+    for id in ["a1", "a2"] {
+        db.record_spot_check(id, "Ali", "reject", "z", "x").unwrap();
+    }
+    let s = db.agreement_sample().unwrap().expect("still a pair");
+    assert_eq!(s.items, 3, "Sara/Hemn share the most clips, so they stay the reported pair");
+    assert_eq!(s.other_reviewers, vec!["Ali".to_string()], "and the excluded rater is NAMED, not dropped");
+
+    // Determinism: the same data must yield the same pair and the same bytes, or two kappa numbers
+    // computed a day apart would not be comparable and nobody would know why.
+    assert_eq!(db.agreement_sample().unwrap().unwrap().tsv, s.tsv);
+}
+
+#[test]
 fn a_human_decision_records_which_reviewer_made_it() {
     // Migration v43. Multi-reviewer Couch Review means several named people decide clips at once, so a
     // decision that does not say WHO made it is unattributable — an audit gap, and the missing substrate

@@ -511,6 +511,23 @@ export async function spotCheckReport(): Promise<SpotCheckScore[]> {
   return invoke<SpotCheckScore[]>('spot_check_report');
 }
 
+/** A two-rater agreement sample, ready for `scripts/agreement_kappa.py`. */
+export interface AgreementExport {
+  raterA: string;
+  raterB: string;
+  /** Clips BOTH raters answered. Kappa on a handful of items means nothing. */
+  items: number;
+  tsv: string;
+  path: string;
+  /** Reviewers excluded because Cohen's kappa takes exactly two — never silently dropped. */
+  otherReviewers: string[];
+}
+
+/** Null when no clip has been answered by two different people yet. */
+export async function exportAgreementSample(): Promise<AgreementExport | null> {
+  return invoke<AgreementExport | null>('export_agreement_sample');
+}
+
 /** A row of the model-version registry (snake_case, as serialized by the backend). */
 export interface ModelVersion {
   id: string;

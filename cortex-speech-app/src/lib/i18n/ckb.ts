@@ -695,6 +695,10 @@ export const ckb: Record<string, string> = {
   // leaving them English-only fails the gate, and weakening the gate is not an option. Vocabulary is kept
   // to words already used elsewhere in this file ('پێداچوونەوە', 'ناو', 'بەستەر', 'پارچە'). Correct them
   // freely; nothing else depends on the wording.
+  'settings.couchAgreement': 'هەناردەکردنی نمونەی ڕێککەوتن',
+  'settings.couchAgreementNone': 'تا ئێستا هیچ پارچەیەک لەلایەن دوو کەسەوە پێداچوونەوەی بۆ نەکراوە',
+  'settings.couchAgreementHint':
+    'ئەو پارچانەی دوو پێداچوونەوەر وەڵامیان داوەتەوە، ئامادە بۆ scripts/agreement_kappa.py. ئەو سکریپتە لەسەر ئەم فایلە جێبەجێ بکە بۆ وەرگرتنی کاپا — لێرەدا خەمڵێندراو نییە.',
   'settings.couchSpotChecks': 'پشکنینی نمونەیی (تێبینیکراو / دراو · هەڵە بەراورد بە وەڵامی زانراو)',
   'settings.couchSpotChecksHint':
     'هەندێک پارچە لە ڕیزی هەر پێداچوونەوەرێکدا پێشتر وەڵامی پشتڕاستکراویان هەیە و بە ڕەشنووسی هەڵەوە پیشان دەدرێن. ئەو کەسەی گوێ دەگرێت ڕاستیان دەکاتەوە. ژمارەی یەکەمی نزم واتە لەوانەیە بەبێ گوێگرتن پەسەند بکات.',

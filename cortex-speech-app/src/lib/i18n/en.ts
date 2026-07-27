@@ -695,6 +695,10 @@ export const en: Record<string, string> = {
   'settings.couchFailed': 'Couch Review failed',
   'settings.couchReviewers': 'Reviewer names (comma-separated)',
   'settings.couchReviewersPlaceholder': 'e.g. Sara, Hemn — leave blank to review alone',
+  'settings.couchAgreement': 'Export agreement sample',
+  'settings.couchAgreementNone': 'No clip has been reviewed by two people yet',
+  'settings.couchAgreementHint':
+    'Clips answered by two reviewers, ready for scripts/agreement_kappa.py. Run that script on this file to get the kappa — it is not estimated here.',
   'settings.couchSpotChecks': 'Spot checks (noticed / given · error vs the known answer)',
   'settings.couchSpotChecksHint':
     'Some clips in each reviewer’s queue already have a verified answer and are shown with the wrong draft. A reviewer who listens corrects them. A low first number means they may be accepting without listening.',

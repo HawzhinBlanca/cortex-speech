@@ -73,6 +73,22 @@
   // the only signal in the app about whether a REVIEWER was honest, as opposed to whether the machine
   // was — so it is shown wherever their links are handed out.
   let spotChecks = $state<import('./commands').SpotCheckScore[]>([]);
+  // Agreement sample: exported on demand, because writing a file every time Settings opens would be
+  // a surprising side effect of merely looking.
+  let agreement = $state<import('./commands').AgreementExport | null>(null);
+  let agreementBusy = $state(false);
+  async function exportAgreement() {
+    if (agreementBusy || !tauriAvailable) return;
+    agreementBusy = true;
+    try {
+      agreement = await api.exportAgreementSample();
+      if (!agreement) notifications.info($t('settings.couchAgreementNone'));
+    } catch (e) {
+      notifications.error($t('settings.couchAgreement'), { detail: String(e) });
+    } finally {
+      agreementBusy = false;
+    }
+  }
   onMount(async () => {
     if (!tauriAvailable) return;
     try {
@@ -441,6 +457,26 @@
                   </div>
                 {/each}
                 <p class="text-[10px] text-subtle">{$t('settings.couchSpotChecksHint')}</p>
+                <!-- Inter-annotator agreement. Spot checks are not leased, so two reviewers already
+                     answer the same clips independently — the overlap a kappa study needs exists
+                     already. This exports the TSV; the number comes from the unit-tested harness
+                     (scripts/agreement_kappa.py), never from a second implementation here. -->
+                <button
+                  type="button"
+                  class="btn-secondary text-xs px-3 w-full"
+                  disabled={agreementBusy || !tauriAvailable}
+                  onclick={() => void exportAgreement()}
+                >
+                  {$t('settings.couchAgreement')}
+                </button>
+                {#if agreement}
+                  <p class="text-[10px] text-subtle">
+                    {agreement.raterA} · {agreement.raterB} — {agreement.items}
+                    {#if agreement.otherReviewers.length}· +{agreement.otherReviewers.join(', ')}{/if}
+                  </p>
+                  <input class="input w-full !text-[10px] font-mono" readonly value={agreement.path} onfocus={(e) => (e.target as HTMLInputElement).select()} />
+                  <p class="text-[10px] text-subtle">{$t('settings.couchAgreementHint')}</p>
+                {/if}
               </div>
             {/if}
           </div>

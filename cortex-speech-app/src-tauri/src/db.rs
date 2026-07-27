@@ -73,6 +73,29 @@ pub struct SpeechSegment {
     pub reviewed_by: Option<String>,
 }
 
+/// A two-rater agreement sample, ready for `scripts/agreement_kappa.py`.
+///
+/// Cohen's kappa is a TWO-rater statistic, so when more than two people have reviewed overlapping
+/// clips this reports the pair with the most items in common and NAMES the reviewers it left out —
+/// silently averaging three raters into one number would be exactly the kind of quiet fabrication the
+/// honesty law exists to prevent. (For >2 raters the right statistic is Krippendorff's alpha, which
+/// the script deliberately does not implement.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementExport {
+    pub rater_a: String,
+    pub rater_b: String,
+    /// Clips BOTH raters answered. Kappa on a handful of items means nothing; this is the number that
+    /// says whether the figure is worth quoting.
+    pub items: usize,
+    /// Header row + one `label_a<TAB>label_b` line per shared clip, exactly what the script consumes.
+    pub tsv: String,
+    /// Where the file was written, so the owner can run the harness on it directly.
+    pub path: String,
+    /// Reviewers excluded because kappa takes exactly two. Never silently dropped.
+    pub other_reviewers: Vec<String>,
+}
+
 /// One remote reviewer's score on clips whose answer was already known (Migration v44).
 ///
 /// `noticed` is the blind-accept signal and the number to read first: a reviewer who listens corrects
@@ -1150,6 +1173,76 @@ impl Database {
         )?;
         self.track_write()?;
         Ok(())
+    }
+
+    /// Build the two-rater agreement sample from clips more than one reviewer has answered.
+    ///
+    /// INTER-ANNOTATOR AGREEMENT NEEDS DOUBLE-ASSIGNMENT, AND SPOT CHECKS ALREADY PROVIDE IT. Leasing
+    /// exists to stop two reviewers colliding on the same pending clip — but spot checks are
+    /// deliberately NOT leased, because measuring two people independently is the point. So the
+    /// overlap an agreement study requires is already there as a side effect, and `spot_checks` is
+    /// already one row per (clip, reviewer): a per-decision table in all but name.
+    ///
+    /// The labels compared are the ACTIONS (accept / edit / reject) — the categorical judgement kappa
+    /// is defined over. Comparing free transcripts instead would measure typing, not agreement.
+    ///
+    /// Returns `None` when no clip has yet been answered by two different people; a kappa computed
+    /// from nothing would be a number with no evidence under it.
+    pub fn agreement_sample(&self) -> AppResult<Option<AgreementExport>> {
+        let mut stmt =
+            self.conn.prepare("SELECT segment_id, reviewer, action FROM spot_checks ORDER BY segment_id ASC")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+        // segment -> (reviewer -> action), BTreeMap so the emitted TSV is byte-identical run to run.
+        let mut by_segment: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+            std::collections::BTreeMap::new();
+        let mut reviewers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for row in rows {
+            let (segment, reviewer, action) = row?;
+            reviewers.insert(reviewer.clone());
+            by_segment.entry(segment).or_default().insert(reviewer, action);
+        }
+
+        // The pair sharing the most clips. Ties break on the (sorted) names so the choice is
+        // deterministic — a report that silently picked a different pair on each run would make two
+        // kappa numbers incomparable for no visible reason.
+        let names: Vec<&String> = reviewers.iter().collect();
+        let mut best: Option<(usize, &String, &String)> = None;
+        for (ai, a) in names.iter().enumerate() {
+            for b in names.iter().skip(ai + 1) {
+                let shared =
+                    by_segment.values().filter(|m| m.contains_key(a.as_str()) && m.contains_key(b.as_str())).count();
+                // Written out rather than via `is_none_or`, which is stable only since Rust 1.82 while
+                // this crate's MSRV is 1.81 (clippy::incompatible_msrv catches it).
+                let better = match best {
+                    None => true,
+                    Some((most, _, _)) => shared > most,
+                };
+                if shared > 0 && better {
+                    best = Some((shared, a, b));
+                }
+            }
+        }
+        let Some((items, a, b)) = best else {
+            return Ok(None);
+        };
+
+        let mut tsv = format!("{a}\t{b}\n");
+        for actions in by_segment.values() {
+            if let (Some(la), Some(lb)) = (actions.get(a.as_str()), actions.get(b.as_str())) {
+                tsv.push_str(&format!("{la}\t{lb}\n"));
+            }
+        }
+        let other_reviewers: Vec<String> =
+            reviewers.iter().filter(|r| *r != a && *r != b).map(|r| r.to_string()).collect();
+        Ok(Some(AgreementExport {
+            rater_a: a.to_string(),
+            rater_b: b.to_string(),
+            items,
+            tsv,
+            path: String::new(), // filled in by the command that writes it
+            other_reviewers,
+        }))
     }
 
     /// Per-reviewer spot-check scores, worst `noticed` rate first — the order that puts a reviewer who
