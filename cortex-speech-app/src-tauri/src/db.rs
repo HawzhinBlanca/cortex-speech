@@ -73,6 +73,20 @@ pub struct SpeechSegment {
     pub reviewed_by: Option<String>,
 }
 
+/// One reviewer's measured throughput, from the append-only `review_events` trail (Migration v45).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewerThroughput {
+    pub reviewer: String,
+    /// DISTINCT clips they decided. Counting rows instead would let a network retry inflate it.
+    pub clips: usize,
+    /// Median seconds between their consecutive decisions, computed WITHIN this reviewer's own
+    /// stream. `None` until they have two decisions close enough together to time.
+    pub median_seconds: Option<f64>,
+    /// How many gaps that median is drawn from — a median over two samples is not a rate.
+    pub samples: usize,
+}
+
 /// A two-rater agreement sample, ready for `scripts/agreement_kappa.py`.
 ///
 /// Cohen's kappa is a TWO-rater statistic, so when more than two people have reviewed overlapping
@@ -252,6 +266,12 @@ fn to_fts5_match(query: &str) -> String {
 
 /// The only split labels the export/stats math understands.
 const VALID_SPLITS: &[&str] = &["train", "validation", "test"];
+
+/// Longest gap still counted as "one reviewing session" for per-reviewer throughput (Migration v45).
+/// Matches `stats.rs::SESSION_GAP_MS` deliberately, so the phone figure and the desktop figure mean
+/// the same thing; a reviewer who closes the page and returns tomorrow did not spend fourteen hours
+/// on one clip.
+const REVIEW_SESSION_GAP_MS: i64 = 300_000; // 5 minutes
 
 const SEGMENT_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript, normalized_transcript,
                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
@@ -1184,6 +1204,77 @@ impl Database {
         )?;
         self.track_write()?;
         Ok(())
+    }
+
+    /// Append one row to the audit trail (Migration v45). Never updates, never deletes.
+    ///
+    /// Best-effort by contract: the caller logs a failure and carries on. Losing an audit row must
+    /// never cost a reviewer their decision — the decision is the work, this is the record of it.
+    pub fn record_review_event(
+        &self,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        source: &str,
+        timestamp_ms: i64,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO review_events (segment_id, reviewer, action, source, timestamp_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![segment_id, reviewer, action, source, timestamp_ms],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
+    /// Per-reviewer throughput from the audit trail, busiest first.
+    ///
+    /// The median is computed **within each reviewer's own stream**, which is the entire reason this
+    /// does not reuse `stats.rs::compute_review_timing`: that one orders `decision_log` GLOBALLY, so
+    /// with several people reviewing at once it would measure the gap between two DIFFERENT humans'
+    /// decisions and report it as one person's pace. Correct for a single reviewer, meaningless for a
+    /// team — so the existing metric is left exactly as it is and this one is partitioned by design.
+    ///
+    /// Gaps longer than [`REVIEW_SESSION_GAP_MS`] are dropped: a reviewer who closes the page and
+    /// returns tomorrow did not spend fourteen hours on one clip.
+    pub fn reviewer_throughput(&self) -> AppResult<Vec<ReviewerThroughput>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT reviewer, segment_id, timestamp_ms FROM review_events ORDER BY reviewer ASC, timestamp_ms ASC",
+        )?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?;
+
+        let mut by_reviewer: std::collections::BTreeMap<String, (std::collections::BTreeSet<String>, Vec<i64>)> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let (reviewer, segment, ts) = row?;
+            let entry = by_reviewer.entry(reviewer).or_default();
+            entry.0.insert(segment);
+            entry.1.push(ts);
+        }
+
+        let mut out: Vec<ReviewerThroughput> = by_reviewer
+            .into_iter()
+            .map(|(reviewer, (segments, stamps))| {
+                let mut deltas: Vec<i64> =
+                    stamps.windows(2).map(|w| w[1] - w[0]).filter(|&d| d > 0 && d <= REVIEW_SESSION_GAP_MS).collect();
+                deltas.sort_unstable();
+                let median_seconds = if deltas.is_empty() {
+                    None
+                } else {
+                    let mid = deltas.len() / 2;
+                    let ms = if deltas.len() % 2 == 1 {
+                        deltas[mid] as f64
+                    } else {
+                        (deltas[mid - 1] + deltas[mid]) as f64 / 2.0
+                    };
+                    Some(ms / 1000.0)
+                };
+                ReviewerThroughput { reviewer, clips: segments.len(), median_seconds, samples: deltas.len() }
+            })
+            .collect();
+        out.sort_by(|a, b| b.clips.cmp(&a.clips).then_with(|| a.reviewer.cmp(&b.reviewer)));
+        Ok(out)
     }
 
     /// Build the two-rater agreement sample from clips more than one reviewer has answered.

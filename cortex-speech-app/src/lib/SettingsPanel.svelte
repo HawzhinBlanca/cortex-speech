@@ -75,6 +75,20 @@
   let spotChecks = $state<import('./commands').SpotCheckScore[]>([]);
   // Agreement sample: exported on demand, because writing a file every time Settings opens would be
   // a surprising side effect of merely looking.
+  // Per-reviewer throughput from the append-only audit trail. Partitioned per person — unlike the
+  // global stats.rs figure, which is only meaningful when exactly one human is reviewing.
+  let throughput = $state<import('./commands').ReviewerThroughput[]>([]);
+  async function revokeReviewer(name: string) {
+    if (couchBusy || !tauriAvailable) return;
+    couchBusy = true;
+    try {
+      couchStatus = await api.revokeCouchReviewer(name);
+    } catch (e) {
+      notifications.error($t('settings.couchRevoke'), { detail: String(e) });
+    } finally {
+      couchBusy = false;
+    }
+  }
   let agreement = $state<import('./commands').AgreementExport | null>(null);
   let agreementBusy = $state(false);
   async function exportAgreement() {
@@ -104,6 +118,12 @@
     } catch (e) {
       console.error('spot-check report load failed:', e);
       spotChecks = [];
+    }
+    try {
+      throughput = (await api.reviewerThroughput()) ?? [];
+    } catch (e) {
+      console.error('reviewer throughput load failed:', e);
+      throughput = [];
     }
   });
 
@@ -427,7 +447,19 @@
                    so the name is shown above the URL it belongs to. -->
               {#each couchStatus.reviewers as reviewer (reviewer.name)}
                 <div class="space-y-1 border-t border-cortex-700/30 pt-2 first:border-t-0 first:pt-0">
-                  <span class="text-xs text-default font-semibold">{reviewer.name}</span>
+                  <div class="flex items-center justify-between">
+                    <span class="text-xs text-default font-semibold">{reviewer.name}</span>
+                    {#if couchStatus.reviewers.length > 1}
+                      <!-- Revoking one link leaves every other reviewer working. Their completed work,
+                           scores and audit trail are untouched - a record, not a permission. -->
+                      <button
+                        type="button"
+                        class="btn-secondary !text-[10px] px-2 py-0.5"
+                        disabled={couchBusy}
+                        onclick={() => void revokeReviewer(reviewer.name)}
+                      >{$t('settings.couchRevoke')}</button>
+                    {/if}
+                  </div>
                   <span class="text-[10px] text-subtle block">{$t('settings.couchWifiUrl')}</span>
                   <input class="input w-full !text-xs font-mono" readonly value={reviewer.url} onfocus={(e) => (e.target as HTMLInputElement).select()} />
                   {#if reviewer.tailscaleUrl}
@@ -444,6 +476,19 @@
               </label>
               <p class="text-[10px] text-subtle">{$t('settings.couchHint')}</p>
               <p class="text-[10px] text-subtle">{$t('settings.couchReviewersHint')}</p>
+            {/if}
+            {#if throughput.length}
+              <div class="border-t border-cortex-700/30 pt-2 space-y-1">
+                <span class="text-[10px] text-subtle">{$t('settings.couchThroughput')}</span>
+                {#each throughput as r (r.reviewer)}
+                  <div class="flex items-center justify-between text-xs">
+                    <span class="text-default">{r.reviewer}</span>
+                    <span class="text-muted">
+                      {r.clips}{r.medianSeconds !== null ? ` · ${r.medianSeconds.toFixed(1)}s` : ''}
+                    </span>
+                  </div>
+                {/each}
+              </div>
             {/if}
             {#if spotChecks.length}
               <!-- Spot checks: a share of every reviewer's queue is drawn from clips that already have

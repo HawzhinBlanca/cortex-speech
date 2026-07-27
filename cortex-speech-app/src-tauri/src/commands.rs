@@ -2574,6 +2574,18 @@ pub fn spot_check_report(state: State<'_, AppState>) -> Result<Vec<crate::db::Sp
     state.lock_db().spot_check_report().map_err(|e| e.to_string())
 }
 
+/// Per-reviewer throughput from the append-only review trail (Migration v45).
+///
+/// Distinct from `stats.rs`'s median seconds-per-decision, deliberately: that one orders
+/// `decision_log` GLOBALLY, which is correct for a single reviewer and meaningless for a team — with
+/// several people working at once it would time the gap between two DIFFERENT humans' decisions. This
+/// one partitions per reviewer, so the existing metric keeps its meaning and this one is honest.
+#[tauri::command]
+pub fn reviewer_throughput(state: State<'_, AppState>) -> Result<Vec<crate::db::ReviewerThroughput>, String> {
+    RATE_LIMITER.check("reviewer_throughput")?;
+    state.lock_db().reviewer_throughput().map_err(|e| e.to_string())
+}
+
 /// Write the two-rater agreement sample beside the library and return where it went
 /// (docs/REMOTE_REVIEW_PLAN.md §2.4).
 ///

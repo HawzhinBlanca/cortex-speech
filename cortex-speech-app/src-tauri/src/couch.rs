@@ -93,6 +93,13 @@ struct CouchState {
     /// segment id -> (reviewer who holds it, when it was granted). Entries older than [`LEASE_TTL`]
     /// are ignored and pruned, so a lease needs no explicit release on disconnect.
     leases: HashMap<String, (String, Instant)>,
+    /// token -> reviewer name. The token is the credential; the name is what lands in the database.
+    ///
+    /// Lives HERE, in the state every accept thread shares, rather than in a snapshot handed to each
+    /// thread at spawn. With per-thread `Arc<HashMap>` copies, revoking a reviewer would have removed
+    /// them from the owner's view while every serving thread kept honouring the token forever — a
+    /// revoke that revokes nothing. One shared map means removal takes effect on the next request.
+    reviewers: HashMap<String, String>,
     /// (segment id, reviewer) pairs this session actually SERVED as spot checks.
     ///
     /// A spot check must be identified by why the clip was HANDED OUT, never by its current state.
@@ -123,8 +130,9 @@ struct CouchHandle {
     /// non-hanging shutdown — the live end-to-end test caught stop() deadlocking on join() without it.
     server: Arc<tiny_http::Server>,
     port: u16,
-    /// token -> reviewer name. The token is the credential; the name is what lands in the database.
-    reviewers: HashMap<String, String>,
+    /// The one shared state the accept threads also hold — so `status_of` and `revoke` read and write
+    /// the SAME token map the request path authenticates against.
+    state: Arc<Mutex<CouchState>>,
     joins: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -230,22 +238,14 @@ pub fn start(db_path: String, reviewers: Vec<String>) -> Result<CouchStatus, Str
     );
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let state = Arc::new(Mutex::new(CouchState::default()));
+    let state = Arc::new(Mutex::new(CouchState { reviewers: tokens, ..CouchState::default() }));
     // One accept thread per reviewer. tiny_http hands a request to whichever thread is free, so a
     // reviewer downloading a clip no longer blocks another reviewer's save — with a single reviewer this
     // is exactly the previous one-thread server. Each thread owns its own WAL connection (SQLite
     // serializes the writes; `busy_timeout` is already set at open).
-    let shared_tokens = Arc::new(tokens.clone());
     let mut joins = Vec::with_capacity(names.len());
     for index in 0..names.len() {
-        match spawn_server_loop(
-            index,
-            server.clone(),
-            db_path.clone(),
-            shared_tokens.clone(),
-            state.clone(),
-            shutdown.clone(),
-        ) {
+        match spawn_server_loop(index, server.clone(), db_path.clone(), state.clone(), shutdown.clone()) {
             Ok(join) => joins.push(join),
             Err(e) => {
                 // Tear down the threads that DID start before giving up. Returning early with them
@@ -260,7 +260,7 @@ pub fn start(db_path: String, reviewers: Vec<String>) -> Result<CouchStatus, Str
             }
         }
     }
-    let handle = CouchHandle { shutdown, server, port: COUCH_PORT, reviewers: tokens, joins };
+    let handle = CouchHandle { shutdown, server, port: COUCH_PORT, state, joins };
     let status = status_of(&handle);
     *guard = Some(handle);
     tracing::info!(
@@ -289,6 +289,48 @@ pub fn stop() -> Result<CouchStatus, String> {
     Ok(CouchStatus::stopped())
 }
 
+/// Revoke ONE reviewer's link without disturbing anyone else (docs/REMOTE_REVIEW_PLAN.md §3.7).
+///
+/// Before this, removing one person meant stopping the server — which regenerates every token and
+/// forces the owner to re-issue links to reviewers who did nothing wrong. Dropping the token from the
+/// map is total and immediate: `handle_request` resolves the reviewer FROM the token, so an
+/// unrecognised token has no identity and every route answers 401 on the next request.
+///
+/// Their completed work is untouched, and deliberately so: `reviewed_by`, their spot-check scores and
+/// their audit trail are a record of what happened, not a permission that can be withdrawn.
+///
+/// Refuses the LAST reviewer — a running server nobody can reach is a worse state than a stopped one,
+/// and `stop()` is the honest way to express that intent.
+/// The revocation itself, separated from the global handle so it is DIRECTLY testable.
+///
+/// Keeping this inside `revoke()` meant the only way to cover it was to reimplement it in a test —
+/// which is exactly what happened, and that test then PASSED against a deliberately broken revoke.
+/// A guarantee proven only by a copy of the code is not proven at all.
+fn revoke_in(state: &Mutex<CouchState>, name: &str) -> Result<(), String> {
+    let mut st = lock_state(state);
+    let Some(token) = st.reviewers.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|(t, _)| t.clone()) else {
+        return Err(format!("No reviewer named '{name}' in this session"));
+    };
+    if st.reviewers.len() <= 1 {
+        return Err("That is the only reviewer — stop Couch Review instead".to_string());
+    }
+    st.reviewers.remove(&token);
+    // Their held clips go back to the pool at once; leaving them leased would strand real work behind
+    // someone who can no longer reach the server.
+    st.leases.retain(|_, (who, _)| !who.eq_ignore_ascii_case(name));
+    Ok(())
+}
+
+pub fn revoke(name: &str) -> Result<CouchStatus, String> {
+    let mut guard = COUCH.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(handle) = guard.as_mut() else {
+        return Err("Couch Review is not running".to_string());
+    };
+    revoke_in(&handle.state, name)?;
+    tracing::info!("Couch Review access revoked for one reviewer");
+    Ok(status_of(handle))
+}
+
 pub fn status() -> CouchStatus {
     let guard = COUCH.lock().unwrap_or_else(|p| p.into_inner());
     guard.as_ref().map(status_of).unwrap_or_else(CouchStatus::stopped)
@@ -306,7 +348,7 @@ fn status_of(h: &CouchHandle) -> CouchStatus {
     // opens a socket, and every reviewer's URL differs only in its token.
     let lan = lan_ip();
     let tailscale = tailscale_ip();
-    let mut reviewers: Vec<CouchReviewer> = h
+    let mut reviewers: Vec<CouchReviewer> = lock_state(&h.state)
         .reviewers
         .iter()
         .map(|(token, name)| CouchReviewer {
@@ -356,7 +398,6 @@ fn spawn_server_loop(
     index: usize,
     server: Arc<tiny_http::Server>,
     db_path: String,
-    tokens: Arc<HashMap<String, String>>,
     state: Arc<Mutex<CouchState>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>, String> {
@@ -388,7 +429,7 @@ fn spawn_server_loop(
                 if shutdown.load(Ordering::SeqCst) {
                     break;
                 }
-                let response = handle_request(&mut request, &db, &tokens, &state);
+                let response = handle_request(&mut request, &db, &state);
                 let _ = respond(request, response);
             }
         })
@@ -422,12 +463,7 @@ fn token_from_url(url: &str) -> Option<&str> {
     query.split('&').find_map(|kv| kv.strip_prefix("t="))
 }
 
-fn handle_request(
-    request: &mut tiny_http::Request,
-    db: &Database,
-    tokens: &HashMap<String, String>,
-    state: &Mutex<CouchState>,
-) -> Reply {
+fn handle_request(request: &mut tiny_http::Request, db: &Database, state: &Mutex<CouchState>) -> Reply {
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
     let method = request.method().clone();
@@ -435,9 +471,12 @@ fn handle_request(
     // EVERY route is token-gated — including the page itself, so a URL is unusable without `?t=`. The
     // token also RESOLVES the reviewer: an unknown token has no identity, so there is no path on which a
     // decision can be written without a name attached.
-    let Some(reviewer) = token_from_url(&url).and_then(|t| tokens.get(t)) else {
+    // Resolved from the SHARED map on every request, so a revoked token stops working immediately
+    // rather than at the next server restart.
+    let Some(reviewer) = token_from_url(&url).and_then(|t| lock_state(state).reviewers.get(t).cloned()) else {
         return err_reply(401, "unauthorized");
     };
+    let reviewer = reviewer.as_str();
     if let Err(e) = COUCH_RATE_LIMITER.check(reviewer) {
         return (429, "text/plain; charset=utf-8", e.into_bytes());
     }
@@ -711,6 +750,18 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // The reply is byte-identical to a normal success. A reviewer who could tell a test from real work
     // would simply be careful on the tests, which measures nothing.
     let was_served_as_check = lock_state(state).spot_checks.contains(&(parsed.id.clone(), reviewer.to_string()));
+    // AUDIT TRAIL (v45), written for every accepted submit including spot checks — a reviewer's
+    // throughput must count the work they actually did, and a check is real work to them. Best-effort
+    // and logged on failure: losing the RECORD of a decision must never cost the DECISION.
+    let audit = |db: &Database, action: &str| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if let Err(e) = db.record_review_event(&parsed.id, reviewer, action, "couch", now_ms) {
+            tracing::warn!("Couch Review audit event not recorded for {}: {e}", parsed.id);
+        }
+    };
     if was_served_as_check {
         let expected = crate::quality::human_verified_text(&prev).unwrap_or_default().to_string();
         let submitted = text.as_deref().unwrap_or_default();
@@ -719,6 +770,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             // let the missing row show up as a smaller `checks` count rather than as a failed save.
             tracing::warn!("Couch Review spot-check not recorded for {}: {e}", parsed.id);
         }
+        audit(db, decision);
         return json_reply(200, serde_json::json!({ "ok": true }));
     }
 
@@ -790,6 +842,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // Decided, so the lease has served its purpose — release it rather than waiting out the TTL. (The
     // clip also leaves the pending queue, so this is housekeeping, not correctness.)
     lock_state(state).leases.remove(&parsed.id);
+    audit(db, decision);
     json_reply(200, serde_json::json!({ "ok": true }))
 }
 
@@ -1331,10 +1384,15 @@ mod tests {
         // P1.6. Every desktop IPC command is rate-limited; these HTTP routes were the one unthrottled
         // path into the database. The budget is far above any human, so this asserts the LIMIT EXISTS
         // and is per-reviewer — one person's stuck tab must not be able to starve anyone else.
-        let tokens = HashMap::from([("t-a".to_string(), "Loop".to_string()), ("t-b".to_string(), "Calm".to_string())]);
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());
-        let state = state();
+        let state = Mutex::new(CouchState {
+            reviewers: HashMap::from([
+                ("t-a".to_string(), "Loop".to_string()),
+                ("t-b".to_string(), "Calm".to_string()),
+            ]),
+            ..CouchState::default()
+        });
 
         // Drain "Loop"'s bucket directly — the same limiter the request path calls.
         let mut throttled = false;
@@ -1347,20 +1405,15 @@ mod tests {
         assert!(throttled, "an unbounded request loop must eventually be refused");
 
         // The throttled reviewer gets 429 through the real request path...
-        let reply = route_for_test(&db, &tokens, &state, "t-a");
+        let reply = route_for_test(&db, &state, "t-a");
         assert_eq!(reply.0, 429, "a throttled reviewer is refused with 429, not served");
         // ...while the other reviewer is completely unaffected.
-        assert_eq!(route_for_test(&db, &tokens, &state, "t-b").0, 200, "one bad tab must not starve anyone else");
+        assert_eq!(route_for_test(&db, &state, "t-b").0, 200, "one bad tab must not starve anyone else");
     }
 
     /// Drive `handle_request`'s auth + throttle path without a live socket, by issuing a real request
     /// against a loopback server and handing it to the handler exactly as an accept thread would.
-    fn route_for_test(
-        db: &Database,
-        tokens: &HashMap<String, String>,
-        state: &Mutex<CouchState>,
-        token: &str,
-    ) -> Reply {
+    fn route_for_test(db: &Database, state: &Mutex<CouchState>, token: &str) -> Reply {
         let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         let url = format!("http://127.0.0.1:{port}/api/queue?t={token}");
@@ -1369,10 +1422,99 @@ mod tests {
             let _ = agent.get(&url).call();
         });
         let mut request = server.recv().unwrap();
-        let reply = handle_request(&mut request, db, tokens, state);
+        let reply = handle_request(&mut request, db, state);
         let _ = respond(request, reply.clone());
         let _ = client.join();
         reply
+    }
+
+    #[test]
+    fn revoking_one_reviewer_stops_only_their_token_and_frees_their_clips() {
+        // P3.7. Before this, removing one person meant STOPPING the server, which regenerates every
+        // token and forces the owner to re-issue links to reviewers who did nothing wrong.
+        //
+        // The first version of this was a NO-OP and the compiler could not see it: each accept thread
+        // held an `Arc<HashMap>` SNAPSHOT of the tokens, so removing one from the owner's handle left
+        // every serving thread honouring it forever — a revoke that revoked nothing, visible only in
+        // the owner's UI. The token map now lives in the one shared state the threads authenticate
+        // against, which is what this test pins.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("rv1", "دەق")).unwrap();
+        let state = Mutex::new(CouchState {
+            reviewers: HashMap::from([
+                ("tok-sara".to_string(), "Sara".to_string()),
+                ("tok-hemn".to_string(), "Hemn".to_string()),
+            ]),
+            ..CouchState::default()
+        });
+
+        // Sara holds the only clip.
+        assert_eq!(queue_ids(&db, "Sara", &state), vec!["rv1"]);
+        assert!(queue_ids(&db, "Hemn", &state).is_empty(), "Sara holds it, so Hemn sees nothing");
+
+        // The REAL revocation path, not a reimplementation of it.
+        assert!(revoke_in(&state, "sara").is_ok(), "revoke matches the name case-insensitively");
+        assert!(revoke_in(&state, "Nobody").is_err(), "an unknown name is refused, not silently ignored");
+        assert!(
+            revoke_in(&state, "Hemn").is_err(),
+            "revoking the LAST reviewer must be refused - a running server nobody can reach is worse              than a stopped one, and stop() is the honest way to say that"
+        );
+
+        // Her token no longer resolves to anyone, so every route refuses it...
+        assert_eq!(route_for_test(&db, &state, "tok-sara").0, 401, "a revoked token must stop working at once");
+        // ...while Hemn is entirely unaffected...
+        assert_eq!(route_for_test(&db, &state, "tok-hemn").0, 200, "revoking one link must not touch another");
+        // ...and the clip she was holding is back in the pool rather than stranded behind her.
+        assert_eq!(queue_ids(&db, "Hemn", &state), vec!["rv1"], "a revoked reviewer's held work returns");
+    }
+
+    #[test]
+    fn every_decision_lands_in_the_append_only_audit_trail() {
+        // P2.2 + P2.3. Nothing in the schema answered "who decided this, and when": `decision_log`
+        // gets no phone rows (the couch passes no timestamp) and has no reviewer column; `corrections`
+        // records before/after only for EDITS whose audio identity resolves. This trail answers it.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        for id in ["e1", "e2"] {
+            db.insert_segment(&seg(id, "دەق")).unwrap();
+        }
+        gold_seg(&db, "e-gold", "دەقی هەڵە", "دەقی ڕاست");
+        let state = state();
+        lock_state(&state).spot_checks.insert(("e-gold".to_string(), "Sara".to_string()));
+
+        let edit = serde_json::json!({"id": "e1", "action": "edit", "text": "ڕاستکراوە"}).to_string();
+        assert_eq!(api_decision(&db, edit.as_bytes(), "Sara", &state).0, 200);
+        let reject = serde_json::json!({"id": "e2", "action": "bad"}).to_string();
+        assert_eq!(api_decision(&db, reject.as_bytes(), "Hemn", &state).0, 200);
+        // A spot check is real work to the reviewer who did it, so it is audited too.
+        let check = serde_json::json!({"id": "e-gold", "action": "accept", "text": "دەقی ڕاست"}).to_string();
+        assert_eq!(api_decision(&db, check.as_bytes(), "Sara", &state).0, 200);
+
+        let rows: Vec<(String, String, String)> = db
+            .connection()
+            .prepare("SELECT segment_id, reviewer, action FROM review_events ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 3, "one row per decision, spot check included: {rows:?}");
+        assert_eq!(rows[0], ("e1".into(), "Sara".into(), "edit".into()));
+        assert_eq!(rows[1], ("e2".into(), "Hemn".into(), "reject".into()));
+        // "edit", not "accept", even though the page sent action:"accept". The server classifies by
+        // what the human actually DID — the submitted text differs from the draft they were shown —
+        // rather than by which button was tapped. An audit trail that recorded the button would
+        // describe the UI, not the work.
+        assert_eq!(rows[2], ("e-gold".into(), "Sara".into(), "edit".into()));
+
+        // Throughput is per reviewer and counts DISTINCT clips, so a retry cannot inflate it.
+        assert_eq!(api_decision(&db, edit.as_bytes(), "Sara", &state).0, 200); // retry: duplicate
+        let t = db.reviewer_throughput().unwrap();
+        let sara = t.iter().find(|r| r.reviewer == "Sara").expect("Sara has throughput");
+        assert_eq!(sara.clips, 2, "distinct clips, not rows — a retry is not extra work");
+        assert_eq!(t.iter().find(|r| r.reviewer == "Hemn").unwrap().clips, 1);
+        assert_eq!(t[0].reviewer, "Sara", "busiest reviewer first");
     }
 
     #[test]
@@ -1524,13 +1666,14 @@ mod tests {
         let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
         let port = server.server_addr().to_ip().unwrap().port();
         let people = [("tok-a", "Sara"), ("tok-b", "Hemn"), ("tok-c", "Ali")];
-        let tokens: Arc<HashMap<String, String>> =
-            Arc::new(people.iter().map(|(t, n)| (t.to_string(), n.to_string())).collect());
-        let state = Arc::new(Mutex::new(CouchState::default()));
+        let state = Arc::new(Mutex::new(CouchState {
+            reviewers: people.iter().map(|(t, n)| (t.to_string(), n.to_string())).collect(),
+            ..CouchState::default()
+        }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let joins: Vec<_> = (0..people.len())
             .map(|i| {
-                spawn_server_loop(i, server.clone(), db_path.clone(), tokens.clone(), state.clone(), shutdown.clone())
+                spawn_server_loop(i, server.clone(), db_path.clone(), state.clone(), shutdown.clone())
                     .expect("server thread spawns")
             })
             .collect();
@@ -1649,15 +1792,17 @@ mod tests {
 
         let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
         let port = server.server_addr().to_ip().unwrap().port();
-        let tokens: Arc<HashMap<String, String>> = Arc::new(HashMap::from([
-            ("saratoken123".to_string(), "Sara".to_string()),
-            ("hemntoken456".to_string(), "Hemn".to_string()),
-        ]));
-        let state = Arc::new(Mutex::new(CouchState::default()));
+        let state = Arc::new(Mutex::new(CouchState {
+            reviewers: HashMap::from([
+                ("saratoken123".to_string(), "Sara".to_string()),
+                ("hemntoken456".to_string(), "Hemn".to_string()),
+            ]),
+            ..CouchState::default()
+        }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let joins: Vec<_> = (0..2)
             .map(|i| {
-                spawn_server_loop(i, server.clone(), db_path.clone(), tokens.clone(), state.clone(), shutdown.clone())
+                spawn_server_loop(i, server.clone(), db_path.clone(), state.clone(), shutdown.clone())
                     .expect("test server thread spawns")
             })
             .collect();

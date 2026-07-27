@@ -161,6 +161,10 @@ export async function installTauriMock(page: Page): Promise<void> {
             };
           case 'stop_couch_review':
             return { running: false, reviewers: [] };
+          case 'reviewer_throughput':
+            return []; // an ARRAY, never null - see the spot_check_report note below
+          case 'revoke_couch_reviewer':
+            return { running: true, reviewers: [] };
           case 'spot_check_report':
             // An ARRAY, never null. Returning null here is what took the settings dialog down: the
             // panel rendered `spotChecks.length` on it and threw mid-render.

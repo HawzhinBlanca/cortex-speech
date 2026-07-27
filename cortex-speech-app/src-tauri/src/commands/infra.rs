@@ -155,6 +155,15 @@ pub fn start_couch_review(
     crate::couch::start(db_path, reviewers.unwrap_or_default())
 }
 
+/// Revoke ONE reviewer's Couch Review link, leaving everyone else's working
+/// (docs/REMOTE_REVIEW_PLAN.md §3.7). Their completed work, scores and audit trail are untouched —
+/// those are a record of what happened, not a permission being withdrawn.
+#[tauri::command]
+pub fn revoke_couch_reviewer(reviewer: String) -> Result<crate::couch::CouchStatus, String> {
+    STRICT_RATE_LIMITER.check("revoke_couch_reviewer")?;
+    crate::couch::revoke(&reviewer)
+}
+
 /// Stop Couch Review and invalidate every reviewer's session token.
 #[tauri::command]
 pub fn stop_couch_review() -> Result<crate::couch::CouchStatus, String> {

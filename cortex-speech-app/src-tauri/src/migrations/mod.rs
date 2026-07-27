@@ -1212,6 +1212,47 @@ pub static MIGRATIONS: &[Migration] = &[
                  CREATE INDEX IF NOT EXISTS idx_spot_checks_reviewer ON spot_checks(reviewer);",
         down_sql: Some("DROP INDEX IF EXISTS idx_spot_checks_reviewer; DROP TABLE IF EXISTS spot_checks;"),
     },
+    Migration {
+        version: 45,
+        description: "Append-only review events: who decided what, when — per-reviewer throughput and audit trail",
+        // docs/REMOTE_REVIEW_PLAN.md §2.2 + §2.3, deliberately ONE table rather than two changes.
+        //
+        // WHY NOT `decision_log`, which already looks like the right home:
+        //   1. It only gets a row when a decision carries a `timestamp_ms`, and the phone path passes
+        //      None — so phone reviews are invisible to it today.
+        //   2. It has no reviewer column, and ADDING one is NOT migration-replay-safe: v40 recreates
+        //      speech_segments (which is why v41/v42's ALTERs survive re-application) but nothing
+        //      recreates decision_log, so a bare ALTER breaks three existing replay tests. Measured,
+        //      not assumed — it broke them.
+        //   3. `stats.rs` computes its median seconds-per-decision over a GLOBALLY ordered
+        //      decision_log. Feeding concurrent reviewers into that would count the gap between two
+        //      DIFFERENT people's decisions as one person's pace, making a shipped number look
+        //      artificially fast. This table keeps that metric untouched and partitions per reviewer.
+        //
+        // WHY NOT the existing `corrections` ledger: it records before/after text only for EDITS, and
+        // only when the audio identity resolves (best-effort `.ok()`), so a moved file leaves no row.
+        // It also does not record who. None of the three existing tables answers "who decided this,
+        // and when" — which is exactly what an audit trail is.
+        //
+        // Append-only by intent: no UPDATE path exists. A retry writes a second row with the same
+        // (segment, reviewer) and that is CORRECT for an audit trail — the history is the point, and
+        // the throughput query counts distinct segments rather than rows.
+        //
+        // Deliberately NO foreign key to speech_segments, unlike spot_checks. An audit trail whose
+        // rows vanish when the audited row is deleted is not an audit trail: "who reviewed the clip
+        // that was later removed" is precisely the question it has to survive to answer.
+        up_sql: "CREATE TABLE IF NOT EXISTS review_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     segment_id TEXT NOT NULL,
+                     reviewer TEXT NOT NULL,
+                     action TEXT NOT NULL,
+                     source TEXT NOT NULL,
+                     timestamp_ms INTEGER NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 ) STRICT;
+                 CREATE INDEX IF NOT EXISTS idx_review_events_reviewer ON review_events(reviewer, timestamp_ms);",
+        down_sql: Some("DROP INDEX IF EXISTS idx_review_events_reviewer; DROP TABLE IF EXISTS review_events;"),
+    },
 ];
 
 #[cfg(test)]

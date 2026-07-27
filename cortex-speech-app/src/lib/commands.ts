@@ -511,6 +511,27 @@ export async function spotCheckReport(): Promise<SpotCheckScore[]> {
   return invoke<SpotCheckScore[]>('spot_check_report');
 }
 
+/** One reviewer's measured throughput, from the append-only review trail. */
+export interface ReviewerThroughput {
+  reviewer: string;
+  /** DISTINCT clips decided — counting rows would let a network retry inflate it. */
+  clips: number;
+  /** Median seconds between their consecutive decisions, within their OWN stream. */
+  medianSeconds: number | null;
+  /** How many gaps that median is drawn from; a median over two samples is not a rate. */
+  samples: number;
+}
+
+/** Busiest reviewer first. Partitioned per reviewer, unlike the global stats.rs timing. */
+export async function reviewerThroughput(): Promise<ReviewerThroughput[]> {
+  return invoke<ReviewerThroughput[]>('reviewer_throughput');
+}
+
+/** Revoke ONE reviewer's link; everyone else's keeps working. */
+export async function revokeCouchReviewer(reviewer: string): Promise<CouchStatus> {
+  return invoke<CouchStatus>('revoke_couch_reviewer', { reviewer });
+}
+
 /** A two-rater agreement sample, ready for `scripts/agreement_kappa.py`. */
 export interface AgreementExport {
   raterA: string;
