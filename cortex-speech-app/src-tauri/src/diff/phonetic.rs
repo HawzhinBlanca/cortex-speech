@@ -282,6 +282,17 @@ mod tests {
         assert!(
             normalized_phonetic_word_distance("بەیانی", "پەیانی") < normalized_phonetic_word_distance("دەنگە", "ڕەنگە")
         );
+
+        // A large ASYMMETRIC length difference leans on the DP's initialised first row/column
+        // (row[0] = i, dp[0][j] = j). If either init loop stops one short, the deletion-only path
+        // is scored from an uninitialised 0 and the distance collapses.
+        let long_short = phonetic_word_distance("کوردستان", "کو");
+        assert!(
+            long_short >= 5.0,
+            "deleting most of /kurdstAn/ must cost about one per dropped phoneme, got {long_short}"
+        );
+        let norm_ls = normalized_phonetic_word_distance("کوردستان", "کو");
+        assert!(norm_ls > 0.6 && norm_ls <= 1.0, "a mostly-deleted word must be far from a match, got {norm_ls}");
     }
 
     /// Exact op sequences from the phonetic aligner's backtrack.
@@ -325,6 +336,35 @@ mod tests {
         let d = compute_phonetic_diff("کوردستان بەیانی هاتن", "کوردستان پەیانی هاتن");
         assert_eq!((d.stats.unchanged_words, d.stats.changed_words), (2, 1));
         assert!((d.stats.similarity - (2.0 / 3.0 * 100.0)).abs() < 1e-9);
+
+        // Every counter NON-ZERO at once. The case above leaves added and removed at 0, where
+        // `+= 1` and `*= 1` are indistinguishable - which is exactly why those mutants survived.
+        let d2 = compute_phonetic_diff("کوردستان بەیانی زۆر", "کوردستان پەیانی هاتن نوێ");
+        let st = &d2.stats;
+        assert_eq!(
+            st.unchanged_words + st.added_words + st.removed_words + st.changed_words,
+            d2.changes.len(),
+            "the four counters must sum to the op count"
+        );
+        assert!(st.unchanged_words > 0 && st.changed_words > 0, "expected equal and replaced words");
+        assert!(st.added_words > 0, "the longer annotation must register an insertion");
+
+        // And a case with a DELETION, so `removed` is non-zero too - with it at 0 the `+= 1` and
+        // `*= 1` mutants on that counter are identical, which is why one of them survived the
+        // first pass.
+        let d3 = compute_phonetic_diff("کوردستان بەیانی هاتن نوێ", "کوردستان پەیانی");
+        let st3 = &d3.stats;
+        assert!(st3.removed_words > 0, "a shorter annotation must register deletions");
+        assert_eq!(
+            st3.unchanged_words + st3.added_words + st3.removed_words + st3.changed_words,
+            d3.changes.len(),
+            "counters must still sum to the op count when deletions are present"
+        );
+        assert!(
+            (st.similarity - (st.unchanged_words as f64 / d2.changes.len() as f64 * 100.0)).abs() < 1e-9,
+            "similarity must be unchanged/total, got {}",
+            st.similarity
+        );
     }
 
     /// The >1000-word fallback to the plain LCS differ. `compute_phonetic_diff` is O(m*n) with a
