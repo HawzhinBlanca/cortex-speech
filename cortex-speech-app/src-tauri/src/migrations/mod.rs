@@ -1182,6 +1182,36 @@ pub static MIGRATIONS: &[Migration] = &[
         up_sql: "ALTER TABLE speech_segments ADD COLUMN reviewed_by TEXT;",
         down_sql: Some("ALTER TABLE speech_segments DROP COLUMN reviewed_by;"),
     },
+    Migration {
+        version: 44,
+        description: "Spot-check results: how each remote reviewer scored on clips whose answer is already known",
+        // docs/REMOTE_REVIEW_PLAN.md §2.1. Once review is handed to other people, the dominant risk
+        // stops being a crash and becomes a human tapping "accept" without listening. Every gate in
+        // this repo measures whether the MACHINE is honest; none measured whether the REVIEWER was.
+        //
+        // A small share of each reviewer's queue is silently drawn from clips that already carry a
+        // human-verified transcript, served with the RAW (known-wrong) draft. A reviewer who listens
+        // corrects it; one who taps accept does not. The result lands HERE and never touches
+        // speech_segments — grading a reviewer must not be able to alter the corpus it grades against.
+        //
+        // PRIMARY KEY (segment_id, reviewer) so a network retry upserts its own row instead of
+        // inflating someone's score with duplicates. `noticed` is the blind-accept signal (did they
+        // change the draft at all); `cer` is how close the correction landed to the known answer.
+        up_sql: "CREATE TABLE IF NOT EXISTS spot_checks (
+                     segment_id TEXT NOT NULL,
+                     reviewer TEXT NOT NULL,
+                     action TEXT NOT NULL,
+                     submitted_transcript TEXT NOT NULL,
+                     expected_transcript TEXT NOT NULL,
+                     noticed INTEGER NOT NULL,
+                     cer REAL NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     PRIMARY KEY (segment_id, reviewer),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+                 ) STRICT;
+                 CREATE INDEX IF NOT EXISTS idx_spot_checks_reviewer ON spot_checks(reviewer);",
+        down_sql: Some("DROP INDEX IF EXISTS idx_spot_checks_reviewer; DROP TABLE IF EXISTS spot_checks;"),
+    },
 ];
 
 #[cfg(test)]

@@ -73,6 +73,23 @@ pub struct SpeechSegment {
     pub reviewed_by: Option<String>,
 }
 
+/// One remote reviewer's score on clips whose answer was already known (Migration v44).
+///
+/// `noticed` is the blind-accept signal and the number to read first: a reviewer who listens corrects
+/// a deliberately-wrong draft, one who taps "accept" hands it straight back. `mean_cer` then says how
+/// close their corrections landed. A low `noticed` with any `checks` at all is the finding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotCheckScore {
+    pub reviewer: String,
+    /// How many known-answer clips this reviewer has been given. Interpret nothing from a handful.
+    pub checks: usize,
+    /// On how many of them they changed the wrong draft (or rejected the clip) rather than accepting it.
+    pub noticed: usize,
+    /// Mean character error rate of their submitted text against the known answer.
+    pub mean_cer: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentsPage {
@@ -1053,6 +1070,110 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    /// Segments usable as SPOT CHECKS: a human-verified answer already exists, and the raw ASR draft
+    /// DIFFERS from it (Migration v44, docs/REMOTE_REVIEW_PLAN.md §2.1).
+    ///
+    /// The difference is the whole mechanism. Served with its raw draft, such a clip is a trap that a
+    /// reviewer who actually listens will correct and a reviewer who taps "accept" will not — with no
+    /// synthetic or planted data anywhere: these are real clips a human already answered.
+    ///
+    /// Ordered by id so the selection is deterministic; a queue that reshuffled its traps every poll
+    /// would grade two reviewers on different material and make the scores incomparable.
+    pub fn list_spot_check_candidates(&self, limit: usize) -> AppResult<Vec<(SpeechSegment, String)>> {
+        let query = format!(
+            "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments
+             WHERE verified = 1 AND raw_transcript <> '' ORDER BY id ASC"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map([], Self::map_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            // Checked BEFORE the push, not after. Testing it afterwards makes `limit == 0` return ONE
+            // candidate — an off-by-one that silently hands a spot check to a caller that asked for
+            // none. Found by a fail-before revert that failed to fail.
+            if out.len() >= limit {
+                break;
+            }
+            let seg = row?;
+            let Some(expected) = crate::quality::human_verified_text(&seg) else {
+                continue; // a machine verdict is not an answer key
+            };
+            // Only a clip whose raw draft is WRONG can distinguish listening from tapping.
+            if learning_text_key(expected) == learning_text_key(&seg.raw_transcript) {
+                continue;
+            }
+            let expected = expected.to_string();
+            out.push((seg, expected));
+        }
+        Ok(out)
+    }
+
+    /// Record how a reviewer answered one spot check. Upserts on (segment_id, reviewer) so a network
+    /// retry cannot inflate a score with duplicate rows — and so a reviewer is graded on their latest
+    /// answer for a clip rather than on whichever attempt happened to arrive first.
+    ///
+    /// Writes ONLY to `spot_checks`. Grading a reviewer must never be able to alter the corpus it
+    /// grades against, so the segment itself is left completely untouched.
+    pub fn record_spot_check(
+        &self,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        submitted: &str,
+        expected: &str,
+    ) -> AppResult<()> {
+        let submitted_nfc = to_nfc(submitted.trim());
+        let expected_nfc = to_nfc(expected.trim());
+        // "Noticed" = they did not simply hand back the draft they were given. A reject counts: judging
+        // a clip unusable is a real act of attention, not a blind accept.
+        let raw: String = self.conn.query_row(
+            "SELECT raw_transcript FROM speech_segments WHERE id = ?1",
+            params![segment_id],
+            |row| row.get(0),
+        )?;
+        let noticed = action == "reject" || learning_text_key(&submitted_nfc) != learning_text_key(&raw);
+        let cer = crate::wer::compute_cer(&expected_nfc, &submitted_nfc);
+        self.conn.execute(
+            "INSERT INTO spot_checks
+                 (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(segment_id, reviewer) DO UPDATE SET
+                action=excluded.action,
+                submitted_transcript=excluded.submitted_transcript,
+                expected_transcript=excluded.expected_transcript,
+                noticed=excluded.noticed,
+                cer=excluded.cer,
+                created_at=datetime('now')",
+            params![segment_id, reviewer, action, submitted_nfc, expected_nfc, noticed as i32, cer],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
+    /// Per-reviewer spot-check scores, worst `noticed` rate first — the order that puts a reviewer who
+    /// may not be listening at the top of the list rather than buried under the diligent ones.
+    pub fn spot_check_report(&self) -> AppResult<Vec<SpotCheckScore>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT reviewer, COUNT(*), SUM(noticed), AVG(cer)
+             FROM spot_checks GROUP BY reviewer ORDER BY (CAST(SUM(noticed) AS REAL) / COUNT(*)) ASC, reviewer ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let checks: i64 = row.get(1)?;
+            let noticed: i64 = row.get(2)?;
+            Ok(SpotCheckScore {
+                reviewer: row.get(0)?,
+                checks: checks as usize,
+                noticed: noticed as usize,
+                mean_cer: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn get_segments(&self, verified: Option<bool>) -> AppResult<Vec<SpeechSegment>> {

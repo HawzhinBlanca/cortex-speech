@@ -2563,6 +2563,17 @@ pub fn couch_review_status() -> Result<crate::couch::CouchStatus, String> {
     Ok(crate::couch::status())
 }
 
+/// Per-reviewer spot-check scores — how each remote reviewer did on clips whose answer was already
+/// known (Migration v44, docs/REMOTE_REVIEW_PLAN.md §2.1).
+///
+/// Worst `noticed` rate first, because the finding this exists to surface is a reviewer who is not
+/// listening, and burying them under the diligent ones would defeat the point.
+#[tauri::command]
+pub fn spot_check_report(state: State<'_, AppState>) -> Result<Vec<crate::db::SpotCheckScore>, String> {
+    RATE_LIMITER.check("spot_check_report")?;
+    state.lock_db().spot_check_report().map_err(|e| e.to_string())
+}
+
 /// Consent gate for any ElevenLabs Scribe upload. Voice is biometric data (GDPR Art. 9), so audio
 /// must NEVER be sent to a provider without the user's explicit cloud-STT opt-in. The pipeline path
 /// enforces this; the direct Scribe IPC commands must too, or they silently bypass consent.

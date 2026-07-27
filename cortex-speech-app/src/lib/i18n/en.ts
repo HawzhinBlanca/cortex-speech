@@ -695,6 +695,9 @@ export const en: Record<string, string> = {
   'settings.couchFailed': 'Couch Review failed',
   'settings.couchReviewers': 'Reviewer names (comma-separated)',
   'settings.couchReviewersPlaceholder': 'e.g. Sara, Hemn — leave blank to review alone',
+  'settings.couchSpotChecks': 'Spot checks (noticed / given · error vs the known answer)',
+  'settings.couchSpotChecksHint':
+    'Some clips in each reviewer’s queue already have a verified answer and are shown with the wrong draft. A reviewer who listens corrects them. A low first number means they may be accepting without listening.',
   'settings.couchReviewersHint':
     'Each name gets its own private link, and every decision is stored under that name. Reviewers are handed different clips, so two people never review the same one at the same time.',
   'settings.useFinetuned': 'Use fine-tuned model',

@@ -427,6 +427,51 @@ fn dedicated_connection_via_path_shares_committed_data() {
 }
 
 #[test]
+fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
+    // Migration v44. Two properties:
+    //
+    // (a) `limit` is honoured EXACTLY, including zero. The check used to sit after the push, so
+    //     asking for none returned one — which silently hands a spot check to a caller that decided
+    //     it did not want any. Found by a fail-before revert that failed to fail.
+    //
+    // (b) a candidate needs a human answer AND a raw draft that DIFFERS from it. A clip whose draft
+    //     is already correct cannot tell a reviewer who listened from one who tapped accept — both
+    //     hand back the same text — so including it would quietly dilute every score toward "fine".
+    let db = make_db();
+    let plant = |id: &str, raw: &str, answer: Option<&str>| {
+        let mut s = make_segment(id, &format!("/{id}.wav"));
+        s.raw_transcript = raw.to_string();
+        s.verified = true;
+        if let Some(a) = answer {
+            s.human_decision = Some("edit".into());
+            s.verdict = Some("human_edit".into());
+            s.verdict_transcript = Some(a.to_string());
+        }
+        db.insert_segment_full(&s).unwrap();
+    };
+    plant("sc-wrong-1", "دەقی هەڵە", Some("دەقی ڕاست"));
+    plant("sc-wrong-2", "هەڵەی دوو", Some("ڕاستی دوو"));
+    plant("sc-already-right", "دەقی ڕاست", Some("دەقی ڕاست")); // draft == answer: no trap
+    plant("sc-no-answer", "دەقی بێ وەڵام", None); // machine-only: not an answer key
+
+    let ids = |limit: usize| -> Vec<String> {
+        db.list_spot_check_candidates(limit).unwrap().into_iter().map(|(s, _)| s.id).collect()
+    };
+    assert!(ids(0).is_empty(), "a limit of zero must return NOTHING, not one");
+    assert_eq!(ids(1).len(), 1, "a limit of one returns exactly one");
+    let all = ids(10);
+    assert_eq!(all.len(), 2, "only the two clips with a WRONG draft qualify, got {all:?}");
+    assert!(!all.contains(&"sc-already-right".to_string()), "a correct draft catches nobody");
+    assert!(!all.contains(&"sc-no-answer".to_string()), "a clip with no human answer is not an answer key");
+
+    // The expected text is the HUMAN answer, never the raw draft — grading against the draft would
+    // score a blind accept as perfect.
+    let (seg, expected) = db.list_spot_check_candidates(1).unwrap().pop().unwrap();
+    assert_ne!(expected, seg.raw_transcript);
+    assert_eq!(expected, "دەقی ڕاست");
+}
+
+#[test]
 fn a_human_decision_records_which_reviewer_made_it() {
     // Migration v43. Multi-reviewer Couch Review means several named people decide clips at once, so a
     // decision that does not say WHO made it is unattributable — an audit gap, and the missing substrate

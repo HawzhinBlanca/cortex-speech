@@ -35,7 +35,7 @@
 //! public internet: there is no TLS, and the token rides in the query string.
 
 use crate::db::{Database, SpeechSegment};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,14 @@ const LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 const QUEUE_BATCH: usize = 25;
 /// Upper bound on named reviewers — each gets a server thread and its own DB connection.
 const MAX_REVIEWERS: usize = 8;
+/// One clip in every [`SPOT_CHECK_EVERY`] served is a SPOT CHECK: a clip whose correct answer is
+/// already known, handed over with its raw (wrong) draft (docs/REMOTE_REVIEW_PLAN.md §2.1).
+///
+/// Rate is a real trade-off. Too rare and a reviewer can coast for hours before being measured; too
+/// frequent and honest reviewers spend their session re-doing work the corpus already has. One in
+/// eight puts ~3 checks in every batch — enough to notice a blind-accepter within one sitting, while
+/// 7/8 of the reviewer's effort still goes to work that needs doing.
+const SPOT_CHECK_EVERY: usize = 8;
 /// Longest accepted reviewer name. Names are stored on every row they decide, not shown in a URL.
 const MAX_REVIEWER_NAME: usize = 40;
 /// Accept-loop poll interval. `unblock()` is what actually wakes the threads on stop; this bounds the
@@ -85,6 +93,14 @@ struct CouchState {
     /// segment id -> (reviewer who holds it, when it was granted). Entries older than [`LEASE_TTL`]
     /// are ignored and pruned, so a lease needs no explicit release on disconnect.
     leases: HashMap<String, (String, Instant)>,
+    /// (segment id, reviewer) pairs this session actually SERVED as spot checks.
+    ///
+    /// A spot check must be identified by why the clip was HANDED OUT, never by its current state.
+    /// The obvious test — "does this row already have a human answer?" — is wrong in a way that
+    /// silently breaks ordinary reviewing: a reviewer's own edit MAKES the row human-verified, so
+    /// their next submit on it (a retry, or a genuine correction) would be graded as a test and
+    /// never written to the corpus. Recording what was served removes the ambiguity entirely.
+    spot_checks: HashSet<(String, String)>,
 }
 
 impl CouchState {
@@ -512,6 +528,44 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // a long session. Cheap: the pending queue is the only thing that can be leased.
     guard.leases.retain(|_, (_, granted)| now.duration_since(*granted) < LEASE_TTL);
     drop(guard);
+
+    // Salt the batch with spot checks (P2.1). They are NOT leased: two reviewers meeting the same
+    // known-answer clip is the point — independent measurement — not a collision. They also carry no
+    // marker of any kind in the payload, because a reviewer who can spot the test is not being tested.
+    if !queue.is_empty() {
+        // CEILING, not floor. `len / EVERY` silently gives ZERO checks to any batch under EVERY
+        // items — so a reviewer arriving late to a nearly-drained queue, or sharing a small backlog,
+        // would never be measured at all. Rounding up guarantees at least one check in every non-empty
+        // batch while holding the ~1-in-8 ratio wherever the batch is large enough for it to mean
+        // something. A reviewer must not be able to coast just because their batches came out short.
+        let wanted = queue.len().div_ceil(SPOT_CHECK_EVERY);
+        {
+            match db.list_spot_check_candidates(wanted) {
+                Ok(candidates) => {
+                    let mut guard = lock_state(state);
+                    for (idx, (seg, _)) in candidates.into_iter().enumerate() {
+                        guard.spot_checks.insert((seg.id.clone(), reviewer.to_string()));
+                        // Interleave rather than append: a run of traps at the tail of every batch is a
+                        // pattern a reviewer would learn within a session.
+                        let at = ((idx + 1) * SPOT_CHECK_EVERY).min(queue.len());
+                        queue.insert(
+                            at,
+                            serde_json::json!({
+                                "id": seg.id,
+                                // The RAW draft — the known-wrong one. Serving the corrected text would
+                                // make the check unpassable-by-failing: there would be nothing to catch.
+                                "text": seg.raw_transcript,
+                                "durationMs": seg.duration_ms,
+                                "speakerId": seg.speaker_id,
+                            }),
+                        );
+                    }
+                }
+                // A spot check is a quality measure, never a reason to stop a reviewer working.
+                Err(e) => tracing::warn!("Couch Review spot-check selection failed: {e}"),
+            }
+        }
+    }
     // Two things travel with the queue, and both exist to stop the page from misleading its reviewer:
     //
     //   `reviewer` — WHO the server is recording these decisions as. Attribution a reviewer cannot see
@@ -651,6 +705,24 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         "bad" => ("reject", None),
         other => return err_reply(400, &format!("unknown action '{other}'")),
     };
+
+    // SPOT CHECK (P2.1): this clip already has a human answer, so the reviewer was being measured, not
+    // asked to do new work. Record the score and stop — the corpus row is left completely untouched,
+    // because a mechanism that grades reviewers must never be able to alter the data it grades against.
+    //
+    // The reply is byte-identical to a normal success. A reviewer who could tell a test from real work
+    // would simply be careful on the tests, which measures nothing.
+    let was_served_as_check = lock_state(state).spot_checks.contains(&(parsed.id.clone(), reviewer.to_string()));
+    if was_served_as_check {
+        let expected = crate::quality::human_verified_text(&prev).unwrap_or_default().to_string();
+        let submitted = text.as_deref().unwrap_or_default();
+        if let Err(e) = db.record_spot_check(&parsed.id, reviewer, decision, submitted, &expected) {
+            // Losing a score must not cost the reviewer their place in the queue: answer normally and
+            // let the missing row show up as a smaller `checks` count rather than as a failed save.
+            tracing::warn!("Couch Review spot-check not recorded for {}: {e}", parsed.id);
+        }
+        return json_reply(200, serde_json::json!({ "ok": true }));
+    }
 
     // A dropped RESPONSE (not a dropped request) means the write landed and the page never heard so.
     // Answer the retry with the success it already earned, before taking a lease or pushing an undo
@@ -1131,6 +1203,127 @@ mod tests {
         assert_eq!(api_renew(body.as_bytes(), "Sara", &state).0, 200, "she still has it open — give it back");
         assert_eq!(api_renew(b"not json", "Sara", &state).0, 400);
         assert_eq!(api_renew(serde_json::json!({"id": "../etc"}).to_string().as_bytes(), "Sara", &state).0, 400);
+    }
+
+    /// A clip with a known human answer whose RAW draft is wrong — the shape a spot check needs.
+    fn gold_seg(db: &Database, id: &str, wrong_draft: &str, human_answer: &str) {
+        let mut s = seg(id, wrong_draft);
+        s.verified = true;
+        s.human_decision = Some("edit".into());
+        s.verdict = Some("human_edit".into());
+        s.verdict_transcript = Some(human_answer.into());
+        db.insert_segment_full(&s).unwrap();
+    }
+
+    #[test]
+    fn spot_checks_catch_a_blind_accepter_without_touching_the_corpus() {
+        // P2.1 — the item the whole remote-review plan turns on. Once review is handed to other
+        // people the dominant failure mode is a human tapping "accept" without listening, and nothing
+        // in this repo measured that: every other gate asks whether the MACHINE is honest.
+        //
+        // The mechanism uses no synthetic data. A clip that a human already answered, served with its
+        // RAW (known-wrong) draft, is a trap that separates listening from tapping by itself.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        gold_seg(&db, "g1", "دەقی هەڵە", "دەقی ڕاست");
+        gold_seg(&db, "g2", "دەقی هەڵەی دوو", "دەقی ڕاستی دوو");
+        let state = state();
+
+        let candidates = db.list_spot_check_candidates(10).unwrap();
+        assert_eq!(candidates.len(), 2, "both clips have a human answer that differs from the raw draft");
+        // A check is graded only because it was SERVED as one; mark both as served to each reviewer,
+        // which is exactly what api_queue records when it salts a batch.
+        for id in ["g1", "g2"] {
+            for who in ["Sara", "Hemn"] {
+                lock_state(&state).spot_checks.insert((id.to_string(), who.to_string()));
+            }
+        }
+
+        // Sara LISTENS: she corrects the wrong draft to the known answer.
+        let fix = serde_json::json!({"id": "g1", "action": "edit", "text": "دەقی ڕاست"}).to_string();
+        assert_eq!(api_decision(&db, fix.as_bytes(), "Sara", &state).0, 200);
+        // Hemn does NOT: he hands the wrong draft straight back.
+        let blind = serde_json::json!({"id": "g1", "action": "accept", "text": "دەقی هەڵە"}).to_string();
+        assert_eq!(api_decision(&db, blind.as_bytes(), "Hemn", &state).0, 200);
+
+        // Re-queries every call: a snapshot taken once would be read as live after later decisions.
+        let of = |who: &str| {
+            db.spot_check_report().unwrap().into_iter().find(|r| r.reviewer == who).expect("reviewer scored")
+        };
+        let report = db.spot_check_report().unwrap();
+        assert_eq!(of("Sara").noticed, 1, "correcting a wrong draft is noticing");
+        assert_eq!(of("Sara").mean_cer, 0.0, "and her answer matched the known one exactly");
+        assert_eq!(of("Hemn").noticed, 0, "handing the wrong draft back is NOT noticing");
+        assert!(of("Hemn").mean_cer > 0.0, "and his answer is measurably wrong");
+        assert_eq!(report[0].reviewer, "Hemn", "the report leads with the reviewer who may not be listening");
+
+        // THE CORPUS IS UNTOUCHED. A mechanism that grades reviewers must never be able to alter the
+        // data it grades against — otherwise a blind accept would overwrite the very answer key.
+        let row = db.get_segment_by_id("g1").unwrap().unwrap();
+        assert_eq!(row.verdict_transcript.as_deref(), Some("دەقی ڕاست"), "the known answer must survive");
+        assert_eq!(row.reviewed_by, None, "a spot check is not a review — it must not claim attribution");
+        assert_eq!(row.annotated_transcript, None, "and must not write the reviewer's text into the corpus");
+        assert!(lock_state(&state).undo.get("Hemn").is_none_or(Vec::is_empty), "nor leave an undo entry");
+
+        // A retry must not inflate a score: the row is keyed (segment, reviewer) and upserts.
+        assert_eq!(api_decision(&db, blind.as_bytes(), "Hemn", &state).0, 200);
+        assert_eq!(of("Hemn").checks, 1, "a retried spot check is still ONE check, not two");
+
+        // Rejecting counts as noticing — judging a clip unusable is attention, not a blind accept.
+        let reject = serde_json::json!({"id": "g2", "action": "bad"}).to_string();
+        assert_eq!(api_decision(&db, reject.as_bytes(), "Hemn", &state).0, 200);
+        let hemn = of("Hemn");
+        assert_eq!((hemn.checks, hemn.noticed), (2, 1), "the reject scored as noticed");
+    }
+
+    #[test]
+    fn the_queue_hides_spot_checks_among_real_work_and_never_leases_them() {
+        // Two properties, both load-bearing:
+        //   * a reviewer who can SPOT the test is not being tested — so the payload carries no marker
+        //     and the traps are interleaved, not appended in a run at the tail;
+        //   * spot checks are deliberately NOT leased, because two reviewers meeting the same
+        //     known-answer clip is independent measurement, not a collision to prevent.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        // More pending work than ONE batch, so the second reviewer still has real work to be salted —
+        // a reviewer with nothing to do is correctly served nothing at all, checks included.
+        for n in 0..QUEUE_BATCH + 5 {
+            db.insert_segment(&seg(&format!("p{n:02}"), "کاری ڕاستەقینە")).unwrap();
+        }
+        gold_seg(&db, "gold-a", "دەقی هەڵە", "دەقی ڕاست");
+        let state = state();
+
+        let (code, _, body) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 200);
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = payload["items"].as_array().unwrap();
+        let ids: Vec<&str> = items.iter().map(|s| s["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"gold-a"), "the batch must contain a spot check: {ids:?}");
+        assert_ne!(ids.last(), Some(&"gold-a"), "a trap always at the tail is a pattern, not a test");
+
+        // Every item exposes exactly the same fields — nothing distinguishes a check from real work.
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<&String> = v.as_object().unwrap().keys().collect();
+            k.sort();
+            k.into_iter().cloned().collect::<Vec<String>>()
+        };
+        let gold_item = items.iter().find(|s| s["id"] == "gold-a").unwrap();
+        let real_item = items.iter().find(|s| s["id"] != "gold-a").unwrap();
+        assert_eq!(keys(gold_item), keys(real_item), "a spot check must be indistinguishable from real work");
+        assert_eq!(
+            gold_item["text"], "دەقی هەڵە",
+            "it is served with the WRONG draft — else there is nothing to catch"
+        );
+
+        // Not leased: Hemn must be able to receive the same check independently.
+        assert!(
+            !lock_state(&state).leases.contains_key("gold-a"),
+            "spot checks must not be leased — two reviewers meeting one is the point"
+        );
+        let (_, _, body) = api_queue(&db, "Hemn", &state);
+        let hemn: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let hemn_ids: Vec<&str> = hemn["items"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+        assert!(hemn_ids.contains(&"gold-a"), "the same check must reach a second reviewer: {hemn_ids:?}");
     }
 
     #[test]

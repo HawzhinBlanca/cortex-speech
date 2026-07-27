@@ -695,6 +695,9 @@ export const ckb: Record<string, string> = {
   // leaving them English-only fails the gate, and weakening the gate is not an option. Vocabulary is kept
   // to words already used elsewhere in this file ('پێداچوونەوە', 'ناو', 'بەستەر', 'پارچە'). Correct them
   // freely; nothing else depends on the wording.
+  'settings.couchSpotChecks': 'پشکنینی نمونەیی (تێبینیکراو / دراو · هەڵە بەراورد بە وەڵامی زانراو)',
+  'settings.couchSpotChecksHint':
+    'هەندێک پارچە لە ڕیزی هەر پێداچوونەوەرێکدا پێشتر وەڵامی پشتڕاستکراویان هەیە و بە ڕەشنووسی هەڵەوە پیشان دەدرێن. ئەو کەسەی گوێ دەگرێت ڕاستیان دەکاتەوە. ژمارەی یەکەمی نزم واتە لەوانەیە بەبێ گوێگرتن پەسەند بکات.',
   'settings.couchReviewers': 'ناوی پێداچوونەوەرەکان (بە کۆما جیایان بکەرەوە)',
   'settings.couchReviewersPlaceholder': 'وەک: سارا، هێمن — بەتاڵی بهێڵەرەوە بۆ تەنیا خۆت',
   'settings.couchReviewersHint':

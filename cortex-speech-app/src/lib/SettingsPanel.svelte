@@ -69,12 +69,21 @@
       couchBusy = false;
     }
   }
+  // Spot-check scores: how each remote reviewer did on clips whose answer was already known. This is
+  // the only signal in the app about whether a REVIEWER was honest, as opposed to whether the machine
+  // was — so it is shown wherever their links are handed out.
+  let spotChecks = $state<import('./commands').SpotCheckScore[]>([]);
   onMount(async () => {
     if (!tauriAvailable) return;
     try {
       couchStatus = await api.couchReviewStatus();
     } catch (e) {
       console.error('couch status load failed:', e);
+    }
+    try {
+      spotChecks = await api.spotCheckReport();
+    } catch (e) {
+      console.error('spot-check report load failed:', e);
     }
   });
 
@@ -415,6 +424,24 @@
               </label>
               <p class="text-[10px] text-subtle">{$t('settings.couchHint')}</p>
               <p class="text-[10px] text-subtle">{$t('settings.couchReviewersHint')}</p>
+            {/if}
+            {#if spotChecks.length}
+              <!-- Spot checks: a share of every reviewer's queue is drawn from clips that already have
+                   a human answer, served with the known-WRONG draft. "Noticed" is the number to read
+                   first — a reviewer who listens corrects it, one who taps accept hands it back. Sorted
+                   worst-first by the backend, so a reviewer who may not be listening appears at top. -->
+              <div class="border-t border-cortex-700/30 pt-2 space-y-1">
+                <span class="text-[10px] text-subtle">{$t('settings.couchSpotChecks')}</span>
+                {#each spotChecks as s (s.reviewer)}
+                  <div class="flex items-center justify-between text-xs">
+                    <span class="text-default">{s.reviewer}</span>
+                    <span class={s.noticed < s.checks / 2 ? 'text-rose-300 font-semibold' : 'text-muted'}>
+                      {s.noticed}/{s.checks} · CER {(s.meanCer * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                {/each}
+                <p class="text-[10px] text-subtle">{$t('settings.couchSpotChecksHint')}</p>
+              </div>
             {/if}
           </div>
         {:else if activeTab === 'asr'}

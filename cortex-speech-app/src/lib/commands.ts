@@ -495,6 +495,22 @@ export async function couchReviewStatus(): Promise<CouchStatus> {
   return invoke<CouchStatus>('couch_review_status');
 }
 
+/** How one remote reviewer scored on clips whose answer was already known. */
+export interface SpotCheckScore {
+  reviewer: string;
+  /** How many known-answer clips they were given. Read nothing into a handful. */
+  checks: number;
+  /** On how many they changed the wrong draft (or rejected it) rather than accepting it blindly. */
+  noticed: number;
+  /** Mean character error rate of their text against the known answer. */
+  meanCer: number;
+}
+
+/** Worst `noticed` rate first — the reviewer who may not be listening comes top, not last. */
+export async function spotCheckReport(): Promise<SpotCheckScore[]> {
+  return invoke<SpotCheckScore[]>('spot_check_report');
+}
+
 /** A row of the model-version registry (snake_case, as serialized by the backend). */
 export interface ModelVersion {
   id: string;
