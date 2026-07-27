@@ -1311,3 +1311,87 @@ code, not an artifact); the nightly fuzz/mutation CI jobs have still never execu
 runner (this run was local via WSL, which is different evidence); ~818 of 844 core-module mutants
 never run; the owner-gated and owner-descoped legs. And the one no gate can measure: a quiet week
 of real daily use.
+
+---
+
+### Iteration 191 — 2026-07-27 — first full mutation sweep of the core modules, then the cleanup: **200 survivors → 81** (25% → 10.2%)
+
+Triggered by the owner asking whether the code work was genuinely finished. It was not. GREEN means
+every *gate* passes; three charter requirements have **no gate at all**, and checking them found
+real defects.
+
+**THE SWEEP.** First full `cargo mutants` run over the 5 charter core modules — 841 mutants,
+61 minutes:
+```
+598 caught, 200 missed, 10 unviable, 33 timeouts     (25% survival)
+```
+After the cleanup below, re-run at `189a0f9` — 841 mutants, 49 minutes:
+```
+716 caught,  81 missed, 10 unviable, 34 timeouts     (10.2% survival)
+```
+**A 60% reduction in surviving mutants**, and the re-run predates the final normalizer commit
+(`ee5e640`) which killed 5 more. Survivors by file now: phonetic 21, diff/mod 16, irt 14, g2p 10,
+normalizer 7, conformal 7, signal_anomaly 6.
+
+**THREE DEFECTS FOUND BEFORE THE SWEEP EVEN RAN:**
+1. **The mutants config I wrote the day before was never read.** cargo-mutants reads
+   `.cargo/mutants.toml`; mine was at `mutants.toml`. `cargo mutants --list` returned **9,285**
+   mutants (the whole crate) instead of 840. The nightly job would have mutated everything and
+   timed out — a gate that looked configured and was inert.
+2. **The unwrap budget was unenforced in the file with the most unwraps.** `normalizer.rs` carried
+   a file-level `#![allow(clippy::unwrap_used)]`, voiding the charter's "any new production unwrap
+   fails CI"; the count had already drifted to **14 against a stated budget of 12**. Fixed at the
+   root, not by editing the budget: **12 → 1**, routed through one reviewed `static_regex()` helper,
+   blanket allow removed, clippy enforcing again.
+3. **The LCS bail-out had no test.** `compute_diff`'s >10,000-word O(n·m) guard: both `||`→`&&`
+   and `>`→`==` survived the whole suite. Either silently disables the protection when only ONE
+   side is huge — the runaway-ASR case it exists for.
+
+**AND A VACUOUS PASS I WROTE MYSELF**, caught live: my first WSL fuzz script used
+`bash script.sh`, which does not source the login profile; cargo fell off PATH, `cargo fuzz list`
+returned nothing, both loops iterated zero times, and it printed "all targets clean, 0 crashes"
+with exit 0. `_fn_fuzz_smoke` now fails LOUD on an empty target list.
+
+**THE PATTERN, everywhere:** tests asserted *ranges and orderings* rather than *values and edges*.
+Concretely — `nonconformity`'s `*`→`/` lived because the one test used `ctc = -1.0`, where
+`0.1 * 1.0 == 0.1 / 1.0`. Every `snr_bucket` edge survived `<`→`<=` because the tests sampled
+2/10/20/30 dB, never *on* a boundary (a clip at exactly 5.0 dB would calibrate against the wrong
+acoustic condition and silently void its coverage guarantee). `signal_anomaly`'s entire arithmetic
+sat behind `score < 0.5`. 18 of g2p's survivors were "delete match arm" — a dropped Kurdish letter
+falls through to the catch-all and quietly shifts every downstream phonetic distance forever.
+9 of normalizer's were the irregular Kurdish TEENS, where a deleted arm makes the number vanish
+from shipped training text.
+
+**Modules pinned this iteration** (commits `2074f02`, `62a8ff8`, `df523ed`, `188e3eb`, `510ff45`,
+`12fec8d`, `189a0f9`, `ee5e640`), each with a hand fail-before against real source:
+conformal 6/8 · signal_anomaly 8/8 · diff/mod 3/7 · phonetic 6/7 · g2p 6/6 · irt 2/2 ·
+normalizer 6/6 then 5/5.
+
+**EQUIVALENT MUTANTS, proven not waved away.** "0 surviving mutants" is not literally reachable —
+every mutation project has mutants that alter no behaviour. Demonstrated individually:
+`i -= 1` → `i /= 1` in the LCS backtrack (the `dp[i-1][j] > dp[i][j-1]` branch decrements `i`
+anyway, output byte-identical); both `min_calibration_n` convergence tweaks (tests assert the exact
+outputs 2334/206 and PASS under the mutants); `any_non_empty`'s `!` (both formulations evaluate
+true on any mixed slot); `total_weight > 0.0` → `>=` (exp2 weights are strictly positive, branch
+unreachable); the leading-zero `len() > 1` → `>= 1` (`starts_with('0')` already excludes every
+other token). **The achievable bar is 0 UNREVIEWED survivors, not 0 survivors.**
+
+**KNOWINGLY LEFT ALIVE, with the reasoning recorded in the tests** rather than as silent misses:
+the >1000-word phonetic fallback and the 12.5M-cell LCS memory guard both need million-cell inputs
+to discriminate — measured at ~27s, in a suite that runs in every CI job and once per mutant. And
+checked rather than assumed: the phonetic and plain differs were compared directly on reordering,
+insertion, deletion and near-homophone inputs and produced IDENTICAL op sequences every time.
+
+**A reconciliation worth recording.** After the first cleanup, `normalizer.rs:411/413` still showed
+ALIVE while a hand fail-before said they died. Rather than trust either, I re-checked: the line
+numbers had shifted under my own earlier edits, so 411 is the **billions** divisor, not the
+hundreds divisor I had been mutating. My table stopped at 2000, so every path above a thousand was
+genuinely untested. Fixed (`ee5e640`) — the contradiction was real information, not noise.
+
+**Gates:** `cargo test --lib` **1036 passed / 0 failed** (was 1015 at iteration 190); clippy
+`--all-targets -D warnings` clean; fmt clean; python-policies 43/43.
+
+**Still open:** `audio.rs` 78.85% under the 80% coverage floor (genuinely untested code —
+SileroVad, the VAD model branch, non-WAV decode); the nightly fuzz/mutation CI jobs have still
+never executed on a real runner; 81 survivors remain, now concentrated in the expensive/equivalent
+tail rather than in unpinned arithmetic; the owner-gated and owner-descoped legs unchanged.
