@@ -852,6 +852,95 @@ mod tests {
         assert!(words[1].alternatives.contains(&"ڕەنگە".to_string()), "alternative shows what the CTC pair said");
     }
 
+    /// EXACT consensus-draft values. The sibling test above asserts `agreement < 0.7`, which is
+    /// why mutants lived in `segment_consensus_words`: a bound stays true while the weighting, the
+    /// deletion-demotion flag, or the alternatives filter is wrong. The draft is what the curator
+    /// sees and edits, and `agreement` drives which words get highlighted for review first.
+    /// `get_initial_ability` maps a model id to its prior by NAME SUBSTRING, and those priors decide
+    /// who wins a contested slot. The fine-tuned arm matches "finetuned" OR "mms" - and the only id
+    /// exercised anywhere was "finetuned-mms-ckb", which contains BOTH, so `||` -> `&&` was
+    /// invisible. An id carrying just one of the two (a re-exported "mms-ckb" checkpoint, say) would
+    /// silently drop from ability 1.0 to the 0.0 catch-all and be outvoted by the kin CTC pair -
+    /// exactly the failure this arm was added to prevent.
+    #[test]
+    fn initial_ability_priors_are_pinned_per_name_class() {
+        assert_eq!(get_initial_ability("gemini-2.5-pro"), 2.0);
+        assert_eq!(get_initial_ability("omniasr-wsl-7b"), 1.5);
+        // BOTH spellings of the fine-tuned voter, independently.
+        assert_eq!(get_initial_ability("finetuned-mms-ckb"), 1.0);
+        assert_eq!(get_initial_ability("mms-ckb"), 1.0, "an 'mms' id alone must still be the fine-tuned prior");
+        assert_eq!(get_initial_ability("finetuned-ckb"), 1.0, "a 'finetuned' id alone must too");
+        assert_eq!(get_initial_ability("omniasr-ctc-1b"), 0.5);
+        assert_eq!(get_initial_ability("omniasr-ctc-300m"), -0.5);
+        assert_eq!(get_initial_ability("whisper-large-v3"), 0.0);
+        assert_eq!(get_initial_ability("qwen-audio"), -1.0);
+        assert_eq!(get_initial_ability("something-unknown"), 0.0);
+
+        // The ORDERING is what the weighting depends on: the fine-tuned voter must outrank stock
+        // 1B (it is the independent voter that breaks the correlated 300M/1B kin pair) while
+        // staying below the 7B champion and the cloud judge.
+        assert!(get_initial_ability("gemini") > get_initial_ability("omniasr-wsl-7b"));
+        assert!(get_initial_ability("omniasr-wsl-7b") > get_initial_ability("finetuned-mms-ckb"));
+        assert!(get_initial_ability("finetuned-mms-ckb") > get_initial_ability("omniasr-ctc-1b"));
+        assert!(get_initial_ability("omniasr-ctc-1b") > get_initial_ability("omniasr-ctc-300m"));
+        assert!(get_initial_ability("omniasr-ctc-300m") > get_initial_ability("qwen-audio"));
+    }
+
+    #[test]
+    fn segment_consensus_draft_values_are_exact() {
+        let h = |m: &str, t: &str| SegmentHypothesis {
+            segment_id: "s".to_string(),
+            model_id: m.to_string(),
+            transcript: t.to_string(),
+            confidence: None,
+        };
+        let hyps = vec![
+            h("omniasr-wsl-7b", "ئەمە دەنگە"),
+            h("omniasr-ctc-1b", "ئەمە ڕەنگە"),
+            h("omniasr-ctc-300m", "ئەمە ڕەنگە"),
+        ];
+        let w = segment_consensus_words(&hyps);
+        assert_eq!(w.len(), 2);
+
+        // Unanimous slot: every model agrees, so agreement is exactly 1 and all three count.
+        assert!((w[0].agreement - 1.0).abs() < 1e-12);
+        assert_eq!((w[0].models_agreeing, w[0].total_models), (3, 3));
+        assert!(w[0].alternatives.is_empty(), "a unanimous slot has no alternatives");
+
+        // Contested slot: weights are exp2(ability) => 7B 2^1.5, 1B 2^0.5, 300M 2^-0.5.
+        // The 7B's share is 2*sqrt(2) / (3.5*sqrt(2)) = 4/7 EXACTLY - the kin pair sums to 3/7 and
+        // loses. Pinning the value (not "< 0.7") is what makes the weighting itself testable.
+        assert!((w[1].agreement - 4.0 / 7.0).abs() < 1e-12, "7B share must be exactly 4/7, got {}", w[1].agreement);
+        assert_eq!((w[1].models_agreeing, w[1].total_models), (1, 3));
+        // The alternatives list must be EXACTLY the losing token: not the winner, and never an
+        // empty string (the `!t.is_empty()` half of that filter).
+        assert_eq!(w[1].alternatives, vec!["ڕەنگە".to_string()]);
+    }
+
+    /// A slot where one model DELETED the word. The empty token must be demoted so the real word
+    /// survives, and it must never appear as an "alternative" in the UI.
+    #[test]
+    fn deletion_is_demoted_and_never_offered_as_an_alternative() {
+        let h = |m: &str, t: &str| SegmentHypothesis {
+            segment_id: "s".to_string(),
+            model_id: m.to_string(),
+            transcript: t.to_string(),
+            confidence: None,
+        };
+        // The 300M drops the second word entirely; the other two keep it.
+        let hyps =
+            vec![h("omniasr-wsl-7b", "ئەمە دەنگە"), h("omniasr-ctc-1b", "ئەمە دەنگە"), h("omniasr-ctc-300m", "ئەمە")];
+        let w = segment_consensus_words(&hyps);
+        assert_eq!(w.len(), 2, "the deleted word must still appear in the draft");
+        assert_eq!(w[1].text, "دەنگە");
+        assert!(
+            w[1].alternatives.iter().all(|a| !a.is_empty()),
+            "an empty (deletion) token must never be shown as an alternative: {:?}",
+            w[1].alternatives
+        );
+        assert!(w[1].agreement > 0.0 && w[1].agreement <= 1.0);
+    }
+
     #[test]
     fn segment_consensus_is_deterministic_and_keeps_a_word_over_a_tied_deletion() {
         let h = |m: &str, t: &str| SegmentHypothesis {

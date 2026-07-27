@@ -455,6 +455,60 @@ fn num_to_kurdish(mut n: u64) -> String {
 mod tests {
     use super::*;
 
+    /// Kurdish number verbalisation, pinned value by value.
+    ///
+    /// All 16 of normalizer.rs's surviving mutants were here, 9 of them 'delete match arm' on the
+    /// TEENS - which in Kurdish are irregular (11 is یازدە, not دە-یەک), so a deleted arm returns an
+    /// empty string and the number silently vanishes from the transcript. Nothing caught that.
+    /// Verbalised numbers are written into training text, so a wrong or missing one is corrupt
+    /// data rather than a display glitch.
+    #[test]
+    fn num_to_kurdish_is_exact() {
+        let cases: &[(u64, &str)] = &[
+            (0, "سفر"),
+            (1, "یەک"),
+            (2, "دوو"),
+            (3, "سێ"),
+            (4, "چوار"),
+            (5, "پێنج"),
+            (6, "شەش"),
+            (7, "حەوت"),
+            (8, "ھەشت"),
+            (9, "نۆ"),
+            (10, "دە"),
+            (11, "یازدە"),
+            (12, "دوانزدە"),
+            (13, "سیانزدە"),
+            (14, "چواردە"),
+            (15, "پازدە"),
+            (16, "شازدە"),
+            (17, "حەڤدە"),
+            (18, "ھەژدە"),
+            (19, "نۆزدە"),
+            (20, "بیست"),
+            (21, "بیست و یەک"),
+            (30, "سی"),
+            (45, "چل و پێنج"),
+            (99, "نەوەد و نۆ"),
+            (100, "سەد"),
+            (101, "سەد و یەک"),
+            (200, "دووسەد"),
+            (999, "نۆسەد و نەوەد و نۆ"),
+            (1000, "ھەزار"),
+            (2000, "دوو ھەزار"),
+        ];
+        for (n, expected) in cases {
+            assert_eq!(&num_to_kurdish(*n), expected, "num_to_kurdish({n})");
+        }
+        // Every teen must be distinct and non-empty: a deleted arm yields "" and the digit is lost.
+        let teens: Vec<String> = (10..=19).map(num_to_kurdish).collect();
+        assert!(teens.iter().all(|t| !t.is_empty()), "no teen may verbalise to nothing");
+        let mut uniq = teens.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 10, "all ten teens must be distinct words");
+    }
+
     #[test]
     fn test_kurdish_normalization() {
         let n = SoraniNormalizer::new();

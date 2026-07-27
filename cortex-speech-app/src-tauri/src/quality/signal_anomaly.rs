@@ -145,9 +145,9 @@ mod tests {
     #[test]
     fn too_short_input_is_maximally_anomalous_at_the_exact_boundary() {
         let d = SignalAnomalyDetector::new(Path::new("")).unwrap();
-        assert_eq!(d.heuristic_signal_anomaly_score(&vec![0i16; 99]), 1.0, "99 samples is too short");
+        assert_eq!(d.heuristic_signal_anomaly_score(&[0i16; 99]), 1.0, "99 samples is too short");
         // Exactly 100 must NOT short-circuit: it is silence, so it takes the real path and scores 0.55.
-        let s = d.heuristic_signal_anomaly_score(&vec![0i16; 100]);
+        let s = d.heuristic_signal_anomaly_score(&[0i16; 100]);
         assert!((s - 0.55).abs() < 1e-12, "exactly 100 samples must be scored, not short-circuited: {s}");
     }
 
