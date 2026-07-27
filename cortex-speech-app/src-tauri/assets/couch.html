@@ -5,6 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Cortex</title>
 <!--
+  ADD TO HOME SCREEN. These meta tags give a full-screen, chrome-free app launched from a home-screen
+  icon on iOS — which is the owner's phone and the realistic reviewer device.
+
+  DELIBERATELY NO service worker and NO web app manifest, and this is a browser constraint rather
+  than a shortcut: service workers require a SECURE CONTEXT, and this page is plain HTTP on a LAN or
+  tailnet IP. Tailscale does not change that — it is still http://100.x.y.z. So genuine offline
+  caching and Android/Chrome installability are UNREACHABLE here without TLS, which docs/
+  REMOTE_REVIEW_PLAN.md deliberately rules out. What IS reachable is the standalone iOS experience
+  below, so that is what this claims. The outbox (localStorage) covers the connectivity gap a service
+  worker would otherwise have handled.
+-->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="Cortex" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)" />
+<meta name="theme-color" content="#f8fafc" media="(prefers-color-scheme: light)" />
+<!--
   PHONE STRINGS. Kurdish-first, like the desktop app: the page opens in Sorani (RTL) and the reviewer
   can switch to English. Serving an English chrome around a Kurdish text box was the single largest UX
   defect of the remote surface (docs/REMOTE_REVIEW_PLAN.md §1.1).
@@ -65,63 +83,84 @@
 }
 </script>
 <style>
-  :root { color-scheme: dark; }
+  /* Light and dark, driven by the phone's own setting. The page was hardcoded dark, which is
+     unreadable on a phone held outdoors — and reviewing happens wherever the reviewer happens to be,
+     not at a desk. Colours live in variables so both themes are defined once, together. */
+  :root {
+    color-scheme: light dark;
+    --bg: #f8fafc; --panel: #ffffff; --line: #cbd5e1; --ink: #0f172a; --dim: #475569; --faint: #64748b;
+    --accent: #0369a1; --accent-line: #0284c7; --ok: #15803d; --ok-line: #166534;
+    --bad: #b91c1c; --warn: #a16207; --chip: #e2e8f0;
+    /* Reviewer-adjustable transcript size (see the A-/A+ control). Sorani at a fixed 18px is small
+       for some readers, and there was no way to change it. */
+    --tsize: 18px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b1220; --panel: #111a2e; --line: #334155; --ink: #e2e8f0; --dim: #94a3b8; --faint: #64748b;
+      --accent: #0369a1; --accent-line: #0284c7; --ok: #14532d; --ok-line: #166534;
+      --bad: #fda4af; --warn: #fcd34d; --chip: #1e293b;
+    }
+  }
   * { box-sizing: border-box; margin: 0; }
   /* `hidden` is only a display:none DEFAULT, and an explicit `display` in a rule beats it. #card sets
      display:flex, so every `card.hidden = true` was a no-op: the empty card stayed on screen next to
      the "all reviewed" message. Caught by looking at the rendered page, not by any test. */
   [hidden] { display: none !important; }
-  body { font-family: system-ui, sans-serif; background: #0b1220; color: #e2e8f0;
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--ink);
          /* vh first as the fallback: dvh is the one that accounts for a mobile browser's collapsing
             address bar, but a browser that does not know it must still get a full-height layout
             rather than a card floating in a short page. */
          min-height: 100vh; min-height: 100dvh;
          display: flex; flex-direction: column; padding: 12px; gap: 12px; }
   header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-  h1 { font-size: 15px; color: #7dd3fc; }
-  #who { font-size: 11px; color: #94a3b8; font-weight: 600; }
-  #progress { font-size: 12px; color: #94a3b8; }
-  /* The language toggle mirrors the desktop `locale-toggle`. Labels are the language's own endonym,
-     so it reads correctly whichever locale is active and needs no translation of its own. */
-  #lang { flex: 0 0 auto; padding: 4px 10px; font-size: 11px; font-weight: 600; border-radius: 999px;
-          border: 1px solid #334155; background: #1e293b; color: #94a3b8; }
-  #card { background: #111a2e; border: 1px solid #1e293b; border-radius: 14px; padding: 14px;
+  h1 { font-size: 15px; color: var(--accent-line); }
+  #who { font-size: 11px; color: var(--dim); font-weight: 600; }
+  #progress { font-size: 12px; color: var(--dim); }
+  /* The language and text-size controls mirror the desktop `locale-toggle`. Language labels are the
+     language's own endonym, so each reads correctly whichever locale is active. */
+  .chip { flex: 0 0 auto; padding: 4px 10px; font-size: 11px; font-weight: 600; border-radius: 999px;
+          border: 1px solid var(--line); background: var(--chip); color: var(--dim); }
+  #card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px;
           display: flex; flex-direction: column; gap: 12px; flex: 1; }
   audio { width: 100%; }
   /* Transport row: replay-last-2s, loop and speed. A transcriber re-listens to the same second many
      times per clip; a bare <audio> makes that a fiddly drag on a phone-sized scrubber. */
   .transport { display: flex; gap: 8px; align-items: center; }
   .transport button { flex: 1; padding: 9px 6px; font-size: 13px; font-weight: 600; }
-  .transport button[aria-pressed="true"] { background: #0369a1; border-color: #0284c7; color: #f1f5f9; }
-  #warn { font-size: 12px; color: #fcd34d; text-align: center; }
-  textarea { width: 100%; min-height: 34dvh; background: #0b1220; color: #f1f5f9;
-             border: 1px solid #334155; border-radius: 10px; padding: 12px;
-             font-size: 18px; line-height: 1.9; direction: rtl; }
-  .meta { font-size: 11px; color: #64748b; }
+  .transport button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent-line); color: #f1f5f9; }
+  #warn { font-size: 12px; color: var(--warn); text-align: center; }
+  textarea { width: 100%; min-height: 34dvh; background: var(--bg); color: var(--ink);
+             border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+             font-size: var(--tsize); line-height: 1.9; direction: rtl; }
+  .meta { font-size: 11px; color: var(--faint); }
   .row { display: flex; gap: 8px; }
-  button { flex: 1; padding: 14px 6px; border-radius: 12px; border: 1px solid #334155;
-           background: #1e293b; color: #e2e8f0; font-size: 14px; font-weight: 600;
+  button { flex: 1; padding: 14px 6px; border-radius: 12px; border: 1px solid var(--line);
+           background: var(--chip); color: var(--ink); font-size: 14px; font-weight: 600;
            /* Sorani labels are longer than their English counterparts and wrapped mid-phrase at
               375px; keep each action on one line and let the font shrink instead. */
            white-space: nowrap; }
   button:disabled { opacity: 0.45; }
-  #save   { background: #0369a1; border-color: #0284c7; }
-  #accept { background: #14532d; border-color: #166534; }
-  #bad    { color: #fda4af; }
+  #save   { background: var(--accent); border-color: var(--accent-line); color: #f1f5f9; }
+  #accept { background: var(--ok); border-color: var(--ok-line); color: #f1f5f9; }
+  #bad    { color: var(--bad); }
   #undo   { flex: 0 0 auto; padding: 14px 16px; }
   #done, #err { text-align: center; padding: 40px 10px; font-size: 16px; }
-  #err { color: #fda4af; white-space: pre-wrap; }
+  #err { color: var(--bad); white-space: pre-wrap; }
   .toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
-           background: #1e293b; border: 1px solid #334155; padding: 8px 18px;
+           background: var(--chip); border: 1px solid var(--line); color: var(--ink); padding: 8px 18px;
            border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .2s; }
   .toast.show { opacity: 1; }
+  /* Respect a reviewer who has asked their phone to reduce motion. */
+  @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
 </style>
 </head>
 <body>
 <header>
   <h1>Cortex<span id="who"></span></h1>
   <div id="progress"></div>
-  <button id="lang" type="button"></button>
+  <button id="textsize" class="chip" type="button" title="A±">A±</button>
+  <button id="lang" class="chip" type="button"></button>
 </header>
 <div id="card" hidden>
   <audio id="player" controls preload="auto"></audio>
@@ -178,6 +217,18 @@
   }
   $('lang').onclick = () => { locale = locale === 'ckb' ? 'en' : 'ckb'; applyLocale(); };
 
+  // ── transcript text size ───────────────────────────────────────────────────
+  // Sorani at a fixed 18px is small for some readers and there was no way to change it. Cycles rather
+  // than using two buttons: header space is scarce on a phone, and this is set once and forgotten.
+  const SIZES = [16, 18, 21, 24, 28];
+  let tsize = Number(localStorage.getItem('cortex.couch.tsize')) || 18;
+  function applyTextSize() {
+    if (!SIZES.includes(tsize)) tsize = 18;
+    document.documentElement.style.setProperty('--tsize', tsize + 'px');
+    localStorage.setItem('cortex.couch.tsize', String(tsize));
+  }
+  $('textsize').onclick = () => { tsize = SIZES[(SIZES.indexOf(tsize) + 1) % SIZES.length]; applyTextSize(); };
+
   // ── rendering ───────────────────────────────────────────────────────────────
   let heldByOthers = 0;
 
@@ -197,8 +248,12 @@
     }
     return r.headers.get('content-type')?.includes('json') ? r.json() : r;
   }
+  // How many clips this reviewer has finished in this sitting. A session with no visible total is a
+  // session with no sense of an ending, and the count is the cheapest form of pacing there is.
+  let doneThisSession = 0;
   function renderProgress() {
-    $('progress').textContent = queue.length ? t('progress', { n: i + 1, total: queue.length }) : '';
+    const pos = queue.length ? t('progress', { n: i + 1, total: queue.length }) : '';
+    $('progress').textContent = doneThisSession ? `${pos} · ✓${doneThisSession}` : pos;
   }
   function renderEmptyState() {
     // An empty queue does NOT mean the work is finished when other reviewers are holding clips —
@@ -283,6 +338,7 @@
       });
       localStorage.removeItem(draftKey(submission.id));
       toast(action === 'bad' ? t('markedBad') : t('saved'));
+      doneThisSession += 1;
       i += 1; show();
     } catch (e) {
       if (e.status === undefined) {
@@ -352,8 +408,30 @@
     } catch (e) { toast(t('undoFailed') + ': ' + e.message); }
     finally { busy = false; }
   };
+  // ── swipe: accept / reject without reaching for a button ───────────────────
+  // Bound to the CARD, not the page, and ignored when the gesture starts on the textarea — a reviewer
+  // dragging to place a cursor in their correction must never be read as a verdict. The vertical and
+  // distance thresholds keep an ordinary scroll from deciding a clip.
+  let touch = null;
+  $('card').addEventListener('touchstart', (e) => {
+    if (e.target.closest('textarea, audio, button')) { touch = null; return; }
+    touch = { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+  }, { passive: true });
+  $('card').addEventListener('touchend', (e) => {
+    if (!touch) return;
+    const dx = e.changedTouches[0].clientX - touch.x;
+    const dy = e.changedTouches[0].clientY - touch.y;
+    touch = null;
+    if (Math.abs(dx) < 90 || Math.abs(dy) > 60) return;
+    // Direction is meaning, not screen side: in RTL "forward" is leftward. Accept is the forward
+    // gesture in both directions so the muscle memory matches the reading order.
+    const forward = document.documentElement.dir === 'rtl' ? dx < 0 : dx > 0;
+    void decide(forward ? 'accept' : 'bad');
+  }, { passive: true });
+
   applyLocale();
   applyTransport();
+  applyTextSize();
   load();
 </script>
 </body>
