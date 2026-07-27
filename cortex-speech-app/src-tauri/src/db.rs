@@ -1095,8 +1095,19 @@ impl Database {
         }
     }
 
-    /// Segments usable as SPOT CHECKS: a human-verified answer already exists, and the raw ASR draft
-    /// DIFFERS from it (Migration v44, docs/REMOTE_REVIEW_PLAN.md §2.1).
+    /// Segments usable as SPOT CHECKS: a GOLD, human-verified answer already exists, and the raw ASR
+    /// draft DIFFERS from it (Migration v44, docs/REMOTE_REVIEW_PLAN.md §2.1).
+    ///
+    /// `is_gold` is load-bearing, not decoration. Without it every clip a reviewer had just corrected
+    /// became an answer key the moment they saved it — so the next reviewer was graded against a
+    /// PEER'S FRESH GUESS and marked wrong for merely disagreeing with it. (Found by the soak test:
+    /// clients reported 61 successes against 60 clips, the extra one being a just-decided clip
+    /// re-served as a check.) An answer key has to actually be an answer key, which is precisely what
+    /// the gold flag means in this schema.
+    ///
+    /// The cost is honest and bounded: spot-check volume is capped by the size of the gold set, so a
+    /// small gold set yields few checks. `SpotCheckScore::checks` reports the real number rather than
+    /// hiding it, and no conclusion should be drawn from a handful.
     ///
     /// The difference is the whole mechanism. Served with its raw draft, such a clip is a trap that a
     /// reviewer who actually listens will correct and a reviewer who taps "accept" will not — with no
@@ -1107,7 +1118,7 @@ impl Database {
     pub fn list_spot_check_candidates(&self, limit: usize) -> AppResult<Vec<(SpeechSegment, String)>> {
         let query = format!(
             "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments
-             WHERE verified = 1 AND raw_transcript <> '' ORDER BY id ASC"
+             WHERE verified = 1 AND is_gold = 1 AND raw_transcript <> '' ORDER BY id ASC"
         );
         let mut stmt = self.conn.prepare(&query)?;
         let rows = stmt.query_map([], Self::map_row)?;

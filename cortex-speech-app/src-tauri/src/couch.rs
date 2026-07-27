@@ -1205,10 +1205,12 @@ mod tests {
         assert_eq!(api_renew(serde_json::json!({"id": "../etc"}).to_string().as_bytes(), "Sara", &state).0, 400);
     }
 
-    /// A clip with a known human answer whose RAW draft is wrong — the shape a spot check needs.
+    /// A GOLD clip with a known human answer whose RAW draft is wrong — the shape a spot check needs.
+    /// `is_gold` matters: without it a peer's fresh correction would qualify as an answer key.
     fn gold_seg(db: &Database, id: &str, wrong_draft: &str, human_answer: &str) {
         let mut s = seg(id, wrong_draft);
         s.verified = true;
+        s.is_gold = true;
         s.human_decision = Some("edit".into());
         s.verdict = Some("human_edit".into());
         s.verdict_transcript = Some(human_answer.into());
@@ -1497,6 +1499,137 @@ mod tests {
         }
         assert!(lock_state(&state).undo.values().all(Vec::is_empty), "no failed decision may leave an undo entry");
         assert!(!db.get_segment_by_id("s1").unwrap().unwrap().verified, "row untouched by rejected requests");
+    }
+
+    #[test]
+    fn three_reviewers_hammering_at_once_never_double_decide_or_lose_a_clip() {
+        // P2.6 SOAK. Every other couch test drives one function at a time; this one runs THREE real
+        // reviewers concurrently over real HTTP against real threads and a real SQLite file, and
+        // checks the invariants that actually matter when the app is handed to a team:
+        //
+        //   * no clip is ever decided by two different people,
+        //   * no clip is silently lost (everything handed out is accounted for),
+        //   * a LOST RESPONSE cannot inflate the corpus. Every decision is submitted TWICE — the
+        //     realistic phone failure, where the write lands and the reply does not — so the retry
+        //     path is exercised under genuine concurrency rather than in isolation.
+        //
+        // This is the shape of test that would have caught the late-submit overwrite and the shared
+        // undo stack without anyone having to think of them first.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        const CLIPS: usize = 60;
+        for n in 0..CLIPS {
+            db.insert_segment(&seg(&format!("s{n:03}"), "دەقی سەرەتایی")).unwrap();
+        }
+        drop(db);
+
+        let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let people = [("tok-a", "Sara"), ("tok-b", "Hemn"), ("tok-c", "Ali")];
+        let tokens: Arc<HashMap<String, String>> =
+            Arc::new(people.iter().map(|(t, n)| (t.to_string(), n.to_string())).collect());
+        let state = Arc::new(Mutex::new(CouchState::default()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let joins: Vec<_> = (0..people.len())
+            .map(|i| {
+                spawn_server_loop(i, server.clone(), db_path.clone(), tokens.clone(), state.clone(), shutdown.clone())
+                    .expect("server thread spawns")
+            })
+            .collect();
+
+        // One client thread per reviewer, all working the queue at the same time.
+        let clients: Vec<_> = people
+            .iter()
+            .map(|(token, _)| {
+                let (token, base) = (token.to_string(), format!("http://127.0.0.1:{port}"));
+                std::thread::spawn(move || {
+                    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20)).build();
+                    let (mut accepted, mut throttled) = (0usize, 0usize);
+                    for _round in 0..4 {
+                        let queue: serde_json::Value =
+                            match agent.get(&format!("{base}/api/queue?t={token}")).call() {
+                                Ok(r) => r.into_json().unwrap(),
+                                Err(_) => continue,
+                            };
+                        let items = queue["items"].as_array().cloned().unwrap_or_default();
+                        if items.is_empty() {
+                            break;
+                        }
+                        for item in items {
+                            let body = serde_json::json!({
+                                "id": item["id"], "action": "edit", "text": format!("{} ✓", item["text"].as_str().unwrap_or("x")),
+                            })
+                            .to_string();
+                            // Returns (ok, throttled) rather than ureq's Result: clippy flags a
+                            // closure whose Err variant is 272 bytes, and the two flags are all this
+                            // loop needs from the response.
+                            let post = || match agent
+                                .post(&format!("{base}/api/decision?t={token}"))
+                                .send_string(&body)
+                            {
+                                Ok(r) => (r.status() == 200, false),
+                                Err(ureq::Error::Status(429, _)) => (false, true),
+                                Err(_) => (false, false),
+                            };
+                            let (ok, limited) = post();
+                            accepted += usize::from(ok);
+                            throttled += usize::from(limited);
+                            // The lost-response retry. Must be absorbed, never counted twice.
+                            throttled += usize::from(post().1);
+                        }
+                    }
+                    (accepted, throttled)
+                })
+            })
+            .collect();
+        let results: Vec<(usize, usize)> = clients.into_iter().map(|c| c.join().expect("client thread")).collect();
+        let accepted: usize = results.iter().map(|(a, _)| a).sum();
+        let throttled: usize = results.iter().map(|(_, t)| t).sum();
+
+        shutdown.store(true, Ordering::SeqCst);
+        server.unblock();
+        for join in joins {
+            join.join().expect("every server thread joins cleanly under load");
+        }
+
+        let db = Database::open(&db_path).unwrap();
+        let decided = db.get_segments(Some(true)).unwrap();
+        assert!(decided.len() >= CLIPS / 2, "three reviewers should get through most of it, got {}", decided.len());
+        // Every 200 the clients OBSERVED corresponds to a real decided clip: no phantom successes.
+        // The REVERSE is deliberately not asserted. A first attempt that fails transiently under
+        // three-way contention, followed by a retry that lands, leaves a decided clip the client never
+        // counted — which is the retry path doing its job, not a lost decision. Requiring equality
+        // would make this test fail on the very behaviour it exists to prove.
+        assert!(
+            accepted <= decided.len(),
+            "clients saw {accepted} successes but only {} clips are decided — a success was phantom",
+            decided.len()
+        );
+        // Measured, not assumed: the throttle does NOT fire here, because leasing partitions 60 clips
+        // across three reviewers so none of them approaches the 120/min budget. That is a real
+        // property worth knowing — normal team review does not brush the rate limit — and the limiter
+        // itself is proven by `a_runaway_page_is_throttled_per_reviewer` rather than duplicated here.
+        assert_eq!(throttled, 0, "ordinary concurrent reviewing must not be rate limited");
+
+        for s in &decided {
+            let who = s.reviewed_by.as_deref().unwrap_or("");
+            assert!(
+                people.iter().any(|(_, n)| *n == who),
+                "clip {} is attributed to '{who}', which is not one of the reviewers",
+                s.id
+            );
+            // THE DOUBLE-DECIDE CHECK. A retry or a late submit that slipped through would show up as
+            // a second learning pair on a clip only one human ever corrected.
+            let pairs: i64 = db
+                .connection()
+                .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = ?1", [&s.id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                pairs, 1,
+                "clip {} has {pairs} learning pairs — a retry was recorded as a second decision",
+                s.id
+            );
+        }
     }
 
     #[test]

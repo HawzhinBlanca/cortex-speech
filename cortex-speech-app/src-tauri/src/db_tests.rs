@@ -442,6 +442,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
         let mut s = make_segment(id, &format!("/{id}.wav"));
         s.raw_transcript = raw.to_string();
         s.verified = true;
+        s.is_gold = true;
         if let Some(a) = answer {
             s.human_decision = Some("edit".into());
             s.verdict = Some("human_edit".into());
@@ -453,6 +454,18 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     plant("sc-wrong-2", "هەڵەی دوو", Some("ڕاستی دوو"));
     plant("sc-already-right", "دەقی ڕاست", Some("دەقی ڕاست")); // draft == answer: no trap
     plant("sc-no-answer", "دەقی بێ وەڵام", None); // machine-only: not an answer key
+                                                 // Human-verified but NOT gold — a peer's fresh correction. It must never become an answer key,
+                                                 // or a reviewer would be graded against another reviewer's guess.
+    {
+        let mut peer = make_segment("sc-peer-edit", "/peer.wav");
+        peer.raw_transcript = "دەقی هەڵە".into();
+        peer.verified = true;
+        peer.is_gold = false;
+        peer.human_decision = Some("edit".into());
+        peer.verdict = Some("human_edit".into());
+        peer.verdict_transcript = Some("وەڵامی هاوکار".into());
+        db.insert_segment_full(&peer).unwrap();
+    }
 
     let ids = |limit: usize| -> Vec<String> {
         db.list_spot_check_candidates(limit).unwrap().into_iter().map(|(s, _)| s.id).collect()
@@ -463,6 +476,10 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     assert_eq!(all.len(), 2, "only the two clips with a WRONG draft qualify, got {all:?}");
     assert!(!all.contains(&"sc-already-right".to_string()), "a correct draft catches nobody");
     assert!(!all.contains(&"sc-no-answer".to_string()), "a clip with no human answer is not an answer key");
+    assert!(
+        !all.contains(&"sc-peer-edit".to_string()),
+        "a peer's fresh correction is NOT gold and must never be used to grade another reviewer"
+    );
 
     // The expected text is the HUMAN answer, never the raw draft — grading against the draft would
     // score a blind accept as perfect.
