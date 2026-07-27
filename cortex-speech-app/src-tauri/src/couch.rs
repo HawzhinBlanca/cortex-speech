@@ -170,7 +170,7 @@ fn normalize_reviewers(names: &[String]) -> Result<Vec<String>, String> {
         if name.is_empty() {
             continue;
         }
-        if name.chars().count() < /* ~ changed by cargo-mutants ~ */ MAX_REVIEWER_NAME {
+        if name.chars().count() > MAX_REVIEWER_NAME {
             return Err(format!("Reviewer name '{name}' is longer than {MAX_REVIEWER_NAME} characters"));
         }
         if name.chars().any(|c| c.is_control()) {
@@ -1373,6 +1373,40 @@ mod tests {
         let _ = respond(request, reply.clone());
         let _ = client.join();
         reply
+    }
+
+    #[test]
+    fn the_session_constants_are_pinned_to_their_real_values() {
+        // Surfaced by the cargo-mutants sweep after couch.rs entered its scope: both of these were
+        // written as arithmetic (`256 * 1024`, `15 * 60`) and NOTHING pinned the result, so mutating
+        // `*` to `+` survived. Neither is cosmetic — each wrong value breaks reviewing in a way that
+        // would look like a mysterious bug rather than a bad constant:
+        //
+        //   MAX_BODY_BYTES 256*1024 -> 256+1024 = 1,280 bytes. Every correction longer than a couple
+        //   of sentences would be refused as "body too large", on a page whose whole purpose is
+        //   submitting corrections. Sorani is multi-byte UTF-8, so 1,280 bytes is far less text than
+        //   it sounds.
+        //
+        //   LEASE_TTL 15*60 -> 15+60 = 75 seconds. Leases would expire mid-clip constantly: reviewers
+        //   would lose held work to each other while merely listening, and the page's renewal
+        //   heartbeat (every 4 minutes) would fire long after the lease it exists to protect had gone.
+        assert_eq!(MAX_BODY_BYTES, 262_144, "the body cap must be 256 KiB");
+        assert_eq!(LEASE_TTL, Duration::from_secs(900), "a lease must last 15 minutes");
+        assert!(ACCEPT_POLL <= Duration::from_millis(250), "the accept poll bounds shutdown latency");
+        // The heartbeat interval baked into the page (4 min) must stay comfortably inside the TTL, or
+        // an ACTIVE reviewer's clip lapses before the renewal that was meant to save it.
+        assert!(
+            Duration::from_secs(4 * 60) * 2 < LEASE_TTL,
+            "the page's 4-minute renewal heartbeat must have room to retry before the lease expires"
+        );
+        // A realistic long correction must fit the cap with room to spare, measured in BYTES of real
+        // Sorani text rather than in characters.
+        let long_correction = "ئەمە ڕستەیەکی دووبارەکراوەی کوردییە بۆ تاقیکردنەوەی قەبارە. ".repeat(40);
+        assert!(
+            long_correction.len() < MAX_BODY_BYTES / 4,
+            "a long Sorani correction ({} bytes) must sit far inside the cap",
+            long_correction.len()
+        );
     }
 
     #[test]
