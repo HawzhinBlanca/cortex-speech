@@ -97,9 +97,13 @@
       console.error('couch status load failed:', e);
     }
     try {
-      spotChecks = await api.spotCheckReport();
+      // `?? []` is load-bearing, not defensive noise: a backend (or a test double) that answers with
+      // null made `spotChecks.length` throw during render and took the WHOLE settings dialog down —
+      // a reviewer-quality panel must never be able to break the settings the app depends on.
+      spotChecks = (await api.spotCheckReport()) ?? [];
     } catch (e) {
       console.error('spot-check report load failed:', e);
+      spotChecks = [];
     }
   });
 

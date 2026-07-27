@@ -161,6 +161,12 @@ export async function installTauriMock(page: Page): Promise<void> {
             };
           case 'stop_couch_review':
             return { running: false, reviewers: [] };
+          case 'spot_check_report':
+            // An ARRAY, never null. Returning null here is what took the settings dialog down: the
+            // panel rendered `spotChecks.length` on it and threw mid-render.
+            return [];
+          case 'export_agreement_sample':
+            return null; // nothing double-reviewed in a mock session — the null path the UI must handle
           case 'get_fingerprint_count':
             return 1;
           case 'get_tracing_stats':
