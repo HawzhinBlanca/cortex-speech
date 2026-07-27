@@ -1696,3 +1696,65 @@ removed, floor division, limit-after-push.
   injected network failure), §3.6–3.8 remain.
 - One new Sorani string (`heldByOthers`) plus the three `settings.couchReviewers*` and two
   `settings.couchSpotChecks*` strings await a native read.
+
+## 2026-07-27 — iter 196 — Phase 2.4 / 2.6 shipped; verify-10 GREEN except the ledger gate itself
+
+Continues iter 195. Commits `0256dae` (P2.4 agreement export), `96f6945` (P2.6 soak + gold fix),
+`3cde966` (settings crash fix). Exe rebuilt twice; **`exe-freshness` now PASSES**.
+
+**P2.4 — inter-annotator agreement, and a scope correction.** The plan sized this as the LARGEST
+remaining item, needing a per-decision table and a double-assignment mechanism. **Both already
+existed.** Spot checks are deliberately NOT leased — measuring two people independently is the point —
+so the overlap a kappa study needs is already produced as a side effect, and `spot_checks` is already
+one row per (clip, reviewer). Only the export was missing. `Database::agreement_sample()` emits the
+exact TSV `scripts/agreement_kappa.py` consumes; a new IPC command writes it beside the library.
+**No kappa is computed in Rust** — the script is already unit-tested against the textbook κ=0.40
+example, and a second implementation would be an unverified copy of a verified one. Verified end to
+end: a TSV of the exported shape fed to the real script returned *"Cohen's kappa = 0.5000 (moderate)
+N=3 items, 2 raters"* — that proves the FORMAT; the 0.5000 is synthetic test data, not a measurement.
+With ≥3 reviewers the pair sharing the most clips is reported and the excluded raters are NAMED.
+
+**P2.6 — soak, and it found a defect I would not have looked for.** Three reviewers concurrently over
+real HTTP, every decision submitted twice. Clients reported **61 successes against 60 clips**: a clip
+a reviewer had JUST corrected became a spot-check candidate the moment they saved it, so the next
+reviewer was graded against **a peer's guess** and marked "did not notice" for merely disagreeing.
+Fixed by requiring `is_gold = 1` — an answer key has to actually be an answer key. Honest cost, now
+stated in the code: spot-check volume is bounded by the gold set, so a small gold set yields few
+checks; `checks` reports the real number.
+
+Two things the soak MEASURED rather than assumed, recorded in the test instead of worked around: the
+throttle does NOT fire during ordinary concurrent reviewing (leasing partitions the work), and
+`accepted <= decided` rather than equality (requiring equality would fail the test on the very retry
+behaviour it exists to prove). Stability confirmed 8/8 isolated + 5/5 whole-suite after the fix; it
+was 7/8 before.
+
+**A regression I introduced, caught only by the FULL e2e suite.** verify-10 went RED on
+`test-e2e+a11y`, and the failures were NOT my new phone-page spec (7/7 standalone) — they were
+`settings modal has aria-modal and role` and `settings panel opens and closes`. The e2e tauri mock had
+no case for `spot_check_report`, so `invoke` resolved to undefined, `spotChecks` became null, and
+`{#if spotChecks.length}` threw mid-render: **the entire settings dialog failed to mount.** A panel
+that merely REPORTS reviewer quality took down the settings the app depends on. Fixed on both sides
+(`?? []` in the component, an array in the mock).
+
+**Also fixed:** a cargo-mutants `--in-place` artifact I had committed in `39ccd55` (see `07f5724`) —
+`name.chars().count() < MAX_REVIEWER_NAME`, inverted, which would have rejected every reviewer name
+shorter than 40 characters. Rule recorded: **cargo-mutants `--in-place` is not a background job.**
+
+**verify-10 at `3cde966`: 21 PASS, 1 FAIL, 1 SKIP-ENV.** The single FAIL is `python-policies`, and it
+is *this gate*: `test_ledger_staleness` refusing commits without a ledger entry — which this entry
+answers. Everything else passed, including `test-rust` (397.3s), `fuzz-smoke` (966.6s), `test-e2e+a11y`
+(16.3s), `refinery-lift`, `egress-runtime`, and **`exe-freshness`**. `real-app-e2e` remains SKIP-ENV
+(needs `CORTEX_AUDIO`).
+
+**NOT DONE, and not implied:**
+- **verify-10 has not yet been observed GREEN end to end.** The two RED runs were `exe-freshness`
+  (stale binary) then `python-policies` (this ledger). Neither indicates a defect in the shipped work,
+  but *"GREEN"* is not claimed until a run actually prints it.
+- Plan §2.2 (throughput panel + timestamps), §2.3 (audit log), §2.5 (two-browser e2e — partially
+  covered by the Rust soak and the phone-page spec), §3.6–3.8 remain.
+- **The `couch.rs` mutation sweep has never completed.** The one run was aborted after it corrupted the
+  working tree; it reported 2 MISSED constants before dying, both now pinned. The full survivor list is
+  UNKNOWN and must not be described as clean.
+- Owner review still pending on: `heldByOthers`, `settings.couchReviewers*`, `settings.couchSpotChecks*`,
+  `settings.couchAgreement*`.
+- The nightly CI jobs and the quiet week of real daily use are unchanged from iter 193/194.

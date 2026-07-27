@@ -6,6 +6,38 @@ annotators is something you'd defend in front of an auditor."
 
 ---
 
+## SHIPPED — status as of 2026-07-27 (HEAD after `3cde966`)
+
+Phases 0, 1 (all), 2.1, 2.4, 2.6, 2.7 and 3.1–3.5 are **done, gated, and pushed**. Two items in this
+plan were mis-scoped when it was written, and both corrections are recorded here rather than quietly
+dropped:
+
+* **3.1 PWA — a service worker is UNREACHABLE, not deferred.** Service workers require a *secure
+  context*. This page is plain HTTP on a LAN or tailnet IP, and Tailscale does not change that (still
+  `http://100.x`). Offline caching and Android installability therefore need TLS, which this plan
+  deliberately rules out. What shipped is the iOS home-screen standalone app — the part that is
+  actually reachable — plus the localStorage outbox, which covers the connectivity gap a service
+  worker would otherwise have handled.
+* **2.4 IAA was NOT the largest item.** It was sized as needing a per-decision table and a
+  double-assignment mechanism. Both already existed: spot checks are deliberately **not leased**,
+  because measuring two people independently is the point, so the required overlap is already produced
+  as a side effect and `spot_checks` is already one row per (clip, reviewer). Only the export was
+  missing. Kappa is still computed by `scripts/agreement_kappa.py`, never re-implemented in Rust.
+
+**Defects found while building, none of them by reasoning:** late-submit overwrite (a stale page could
+silently replace another human's verdict); `hidden` defeated by `display:flex` on the review card
+(pre-existing); spot checks identified by row state, which broke ordinary reviewing; floor division
+exempting short batches from measurement; `list_spot_check_candidates(0)` returning one; three real
+a11y violations including an **unlabelled transcript box**; a peer's fresh correction being used as an
+answer key (found by the soak test); and a null spot-check report **crashing the whole settings
+dialog** (found only by the full e2e suite).
+
+**Still open:** §2.2 (throughput panel + timestamps), §2.3 (audit log), §2.5 (two-browser e2e —
+partially covered by the Rust soak test and the phone-page spec), §3.6 waveform, §3.7 per-reviewer
+revoke, §3.8 token out of the query string, and a clean `couch.rs` mutation sweep run to completion.
+
+---
+
 ## The thing that changes when other people use it
 
 Up to now every reviewer was you. Your incentives were perfect: you wanted the corpus to be right.

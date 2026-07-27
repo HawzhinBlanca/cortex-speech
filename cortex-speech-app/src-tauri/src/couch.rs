@@ -539,31 +539,29 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         // batch while holding the ~1-in-8 ratio wherever the batch is large enough for it to mean
         // something. A reviewer must not be able to coast just because their batches came out short.
         let wanted = queue.len().div_ceil(SPOT_CHECK_EVERY);
-        {
-            match db.list_spot_check_candidates(wanted) {
-                Ok(candidates) => {
-                    let mut guard = lock_state(state);
-                    for (idx, (seg, _)) in candidates.into_iter().enumerate() {
-                        guard.spot_checks.insert((seg.id.clone(), reviewer.to_string()));
-                        // Interleave rather than append: a run of traps at the tail of every batch is a
-                        // pattern a reviewer would learn within a session.
-                        let at = ((idx + 1) * SPOT_CHECK_EVERY).min(queue.len());
-                        queue.insert(
-                            at,
-                            serde_json::json!({
-                                "id": seg.id,
-                                // The RAW draft — the known-wrong one. Serving the corrected text would
-                                // make the check unpassable-by-failing: there would be nothing to catch.
-                                "text": seg.raw_transcript,
-                                "durationMs": seg.duration_ms,
-                                "speakerId": seg.speaker_id,
-                            }),
-                        );
-                    }
+        match db.list_spot_check_candidates(wanted) {
+            Ok(candidates) => {
+                let mut guard = lock_state(state);
+                for (idx, (seg, _)) in candidates.into_iter().enumerate() {
+                    guard.spot_checks.insert((seg.id.clone(), reviewer.to_string()));
+                    // Interleave rather than append: a run of traps at the tail of every batch is a
+                    // pattern a reviewer would learn within a session.
+                    let at = ((idx + 1) * SPOT_CHECK_EVERY).min(queue.len());
+                    queue.insert(
+                        at,
+                        serde_json::json!({
+                            "id": seg.id,
+                            // The RAW draft — the known-wrong one. Serving the corrected text would
+                            // make the check unpassable-by-failing: there would be nothing to catch.
+                            "text": seg.raw_transcript,
+                            "durationMs": seg.duration_ms,
+                            "speakerId": seg.speaker_id,
+                        }),
+                    );
                 }
-                // A spot check is a quality measure, never a reason to stop a reviewer working.
-                Err(e) => tracing::warn!("Couch Review spot-check selection failed: {e}"),
             }
+            // A spot check is a quality measure, never a reason to stop a reviewer working.
+            Err(e) => tracing::warn!("Couch Review spot-check selection failed: {e}"),
         }
     }
     // Two things travel with the queue, and both exist to stop the page from misleading its reviewer:
