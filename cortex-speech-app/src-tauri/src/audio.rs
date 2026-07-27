@@ -1226,6 +1226,375 @@ fn vad_energy_fallback(pcm: &[i16], _sample_rate: u32, threshold: f32) -> AppRes
 mod tests {
     use super::*;
 
+    /// Write a mono/stereo 16-bit WAV of `secs` seconds at `rate` Hz containing a 440 Hz tone.
+    /// A real container decoded by real symphonia - nothing about the parser under test is mocked.
+    fn write_tone_wav(path: &std::path::Path, rate: u32, secs: f32, channels: u16) {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).expect("create wav");
+        let n = (rate as f32 * secs) as usize;
+        for i in 0..n {
+            let v = ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI / rate as f32).sin() * 12000.0) as i16;
+            for _ in 0..channels {
+                w.write_sample(v).expect("write sample");
+            }
+        }
+        w.finalize().expect("finalize wav");
+    }
+
+    /// The audio PARSER path on a real container: probe -> metadata -> decode -> resample.
+    ///
+    /// The charter asks for >80% line coverage on the audio parsers; this file sat at 77% because
+    /// check_audio_file, decode_to_pcm, get_duration_ms and decode_pcm_windows - 103 of the 138
+    /// never-executed functions - were reachable only through the running app or the model-gated
+    /// integration suite. They are ordinary parsing code and deserve ordinary unit tests.
+    #[test]
+    fn check_audio_file_reports_real_container_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let p = dir.path().join("mono16k.wav");
+        write_tone_wav(&p, 16_000, 1.0, 1);
+        let info = check_audio_file(&p).expect("must probe a real wav");
+        assert_eq!(info.sample_rate, 16_000);
+        assert_eq!(info.channels, 1);
+        assert_eq!(info.format, "wav");
+        assert!((info.duration_ms - 1000).abs() <= 2, "about 1000 ms, got {}", info.duration_ms);
+
+        // Metadata must report the SOURCE rate and channel count, not the 16 kHz mono the decoder
+        // later converts to.
+        let p2 = dir.path().join("stereo44k.wav");
+        write_tone_wav(&p2, 44_100, 0.5, 2);
+        let info2 = check_audio_file(&p2).expect("must probe stereo");
+        assert_eq!(info2.sample_rate, 44_100);
+        assert_eq!(info2.channels, 2);
+        assert!((info2.duration_ms - 500).abs() <= 2, "about 500 ms, got {}", info2.duration_ms);
+
+        // Error paths, each one a failure a user can actually hit.
+        assert!(check_audio_file(dir.path().join("nope.wav")).is_err(), "missing file must error");
+        let empty = dir.path().join("empty.wav");
+        std::fs::write(&empty, b"").expect("write empty");
+        assert!(check_audio_file(&empty).is_err(), "empty file must error");
+        let garbage = dir.path().join("garbage.wav");
+        std::fs::write(&garbage, vec![0x00u8; 4096]).expect("write garbage");
+        assert!(check_audio_file(&garbage).is_err(), "non-audio bytes must error, not panic");
+    }
+
+    #[test]
+    fn decode_to_pcm_converts_to_target_rate_mono() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let p = dir.path().join("a.wav");
+        write_tone_wav(&p, 16_000, 1.0, 1);
+        let (rate, pcm) = decode_to_pcm(&p).expect("decode");
+        assert_eq!(rate, TARGET_SAMPLE_RATE);
+        assert!((pcm.len() as i64 - 16_000).abs() <= 2, "about 16000 samples, got {}", pcm.len());
+        assert!(pcm.iter().any(|&s| s != 0), "a tone must not decode to silence");
+
+        // Stereo 44.1 kHz must come back MONO at 16 kHz: about 0.5 s => about 8000 samples.
+        let p2 = dir.path().join("b.wav");
+        write_tone_wav(&p2, 44_100, 0.5, 2);
+        let (rate2, pcm2) = decode_to_pcm(&p2).expect("decode stereo");
+        assert_eq!(rate2, TARGET_SAMPLE_RATE, "output is always the target rate");
+        let expected = 8_000i64;
+        assert!(
+            (pcm2.len() as i64 - expected).abs() < expected / 10,
+            "about 8000 mono samples after downmix+resample, got {}",
+            pcm2.len()
+        );
+
+        // A second call hits the content-hash cache and must return the identical buffer.
+        let (rate3, pcm3) = decode_to_pcm(&p).expect("cached decode");
+        assert_eq!((rate3, pcm3.len()), (rate, pcm.len()));
+
+        assert!(decode_to_pcm(dir.path().join("missing.wav")).is_err());
+    }
+
+    #[test]
+    fn get_duration_ms_matches_the_written_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (rate, secs, expected) in [(16_000u32, 1.0f32, 1000i64), (44_100, 0.25, 250), (8_000, 2.0, 2000)] {
+            let p = dir.path().join(format!("d{rate}_{expected}.wav"));
+            write_tone_wav(&p, rate, secs, 1);
+            let ms = get_duration_ms(&p).expect("duration");
+            assert!((ms - expected).abs() <= 3, "{rate} Hz / {secs}s => about {expected} ms, got {ms}");
+        }
+        assert!(get_duration_ms(dir.path().join("missing.wav")).is_err());
+    }
+
+    #[test]
+    fn decode_pcm_windows_streams_the_whole_file_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("stream.wav");
+        write_tone_wav(&p, 16_000, 2.0, 1); // 2 s => 32,000 samples at the target rate
+
+        let mut offsets = Vec::new();
+        let mut total = 0usize;
+        let mut rates = Vec::new();
+        decode_pcm_windows(&p, 500, |w| {
+            offsets.push(w.offset_ms);
+            rates.push(w.sample_rate);
+            total += w.pcm.len();
+            Ok(())
+        })
+        .expect("windowed decode");
+
+        assert!(!offsets.is_empty(), "a 2 s file must yield at least one window");
+        assert!(rates.iter().all(|&r| r == TARGET_SAMPLE_RATE), "every window is at the target rate");
+        // Offsets must strictly increase - a repeated or reordered offset misplaces every
+        // downstream segment timestamp.
+        assert!(offsets.windows(2).all(|w| w[1] > w[0]), "offsets must increase: {offsets:?}");
+        assert_eq!(offsets[0], 0, "the first window starts at the beginning of the file");
+        // No samples may be dropped or duplicated across the windowing.
+        assert!(
+            (total as i64 - 32_000).abs() <= 32,
+            "windows must cover the whole file (about 32000 samples), got {total}"
+        );
+
+        // A callback error must propagate rather than being swallowed mid-stream.
+        let err = decode_pcm_windows(&p, 500, |_| Err(crate::error::AppError::Validation("stop".into())));
+        assert!(err.is_err(), "a failing callback must abort the decode");
+
+        assert!(decode_pcm_windows(dir.path().join("missing.wav"), 500, |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn normalize_pcm_rms_moves_level_toward_the_target() {
+        // A quiet tone normalised to a louder target must get louder, and the waveform shape must
+        // survive: normalisation may not invert, clip, or NaN the signal.
+        let mut pcm: Vec<f32> =
+            (0..1600).map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16_000.0).sin() * 0.01).collect();
+        let signs: Vec<bool> = pcm.iter().map(|v| *v >= 0.0).collect();
+        let rms_before = (pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len() as f32).sqrt();
+
+        normalize_pcm_rms(&mut pcm, -20.0);
+
+        let rms_after = (pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len() as f32).sqrt();
+        assert!(rms_after > rms_before, "a quiet clip must get louder: {rms_before} -> {rms_after}");
+        assert!(pcm.iter().all(|v| v.is_finite()), "normalisation must not produce NaN/inf");
+        assert!(pcm.iter().all(|v| v.abs() <= 1.0), "normalisation must not clip past full scale");
+        assert!(pcm.iter().zip(&signs).all(|(v, s)| (*v >= 0.0) == *s), "normalisation must not invert the waveform");
+
+        // Digital silence has no RMS to scale: leave it alone rather than divide by zero.
+        let mut silent = vec![0.0f32; 128];
+        normalize_pcm_rms(&mut silent, -20.0);
+        assert!(silent.iter().all(|v| *v == 0.0), "silence must stay silent, not become NaN");
+    }
+
+    /// The worker-thread decode wrappers, on both outcomes.
+    ///
+    /// These exist so a pathological file cannot wedge the import pipeline forever, and their
+    /// timeout branch is exactly the one that must work when it is finally needed - yet nothing
+    /// exercised either wrapper or the shared `send_decode_worker_result` helper.
+    #[test]
+    fn timeout_wrappers_return_the_decode_or_a_transient_timeout_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("t.wav");
+        write_tone_wav(&p, 16_000, 1.0, 1);
+
+        // Generous budget: must behave exactly like the direct call.
+        let (rate, pcm) = decode_to_pcm_with_timeout(&p, Duration::from_secs(30)).expect("decode within budget");
+        assert_eq!(rate, TARGET_SAMPLE_RATE);
+        assert!((pcm.len() as i64 - 16_000).abs() <= 2);
+
+        // Shared counter: the callback is moved into the worker thread, so the assertion needs a
+        // handle that outlives it (a plain `mut` local would be moved and silently never read).
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_cb = seen.clone();
+        decode_pcm_windows_with_timeout(p.clone(), 500, Duration::from_secs(30), move |_w| {
+            seen_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("windowed decode within budget");
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the timeout wrapper must actually deliver windows, not just return Ok"
+        );
+
+        // A missing file must surface the decode error, not a timeout.
+        let missing = decode_to_pcm_with_timeout(dir.path().join("missing.wav"), Duration::from_secs(30));
+        assert!(missing.is_err());
+
+        // An impossibly small budget must produce a TIMEOUT error, and that error must be
+        // classified transient so the caller's retry logic engages (a permanent classification
+        // would turn a slow disk into a hard import failure).
+        let timed_out = decode_to_pcm_with_timeout(&p, Duration::from_nanos(1));
+        if let Err(e) = timed_out {
+            assert!(is_transient_decode_error(&e), "a decode timeout must be retryable, got: {e}");
+        }
+        // Not asserted as always-Err: a 1 ns budget races a fast local decode, and demanding the
+        // timeout would be a flaky test. The classification above is the part that matters, and it
+        // is checked whenever the race lands on the timeout side.
+    }
+
+    /// `ensure_pcm_16khz` is the rate-normalisation seam every decode path funnels through.
+    #[test]
+    fn ensure_pcm_16khz_passes_through_or_resamples() {
+        // Already at the target rate: returned untouched, same length, same samples.
+        let pcm: Vec<i16> = (0..1000).map(|i| (i % 200) as i16 * 10).collect();
+        let (rate, out) = ensure_pcm_16khz(TARGET_SAMPLE_RATE, pcm.clone()).expect("passthrough");
+        assert_eq!(rate, TARGET_SAMPLE_RATE);
+        assert_eq!(out, pcm, "a clip already at the target rate must not be resampled at all");
+
+        // Downsampling halves the sample count (48 kHz -> 16 kHz is 3:1).
+        let (rate2, out2) = ensure_pcm_16khz(48_000, pcm.clone()).expect("downsample");
+        assert_eq!(rate2, TARGET_SAMPLE_RATE);
+        let expected = 1000 / 3;
+        assert!(
+            (out2.len() as i64 - expected as i64).abs() < 20,
+            "48k->16k is 3:1, expected about {expected}, got {}",
+            out2.len()
+        );
+
+        // Upsampling grows it (8 kHz -> 16 kHz is 1:2).
+        let (rate3, out3) = ensure_pcm_16khz(8_000, pcm.clone()).expect("upsample");
+        assert_eq!(rate3, TARGET_SAMPLE_RATE);
+        assert!((out3.len() as i64 - 2000).abs() < 40, "8k->16k is 1:2, expected about 2000, got {}", out3.len());
+        assert!(out3.iter().all(|s| s.abs() as i32 <= i16::MAX as i32));
+
+        // Empty input must stay empty rather than panic on an empty resample window.
+        let (_, empty) = ensure_pcm_16khz(44_100, Vec::new()).expect("empty");
+        assert!(empty.is_empty());
+    }
+
+    /// Voice activity detection over the REAL entry point, on whichever backend this machine has.
+    ///
+    /// Deliberately not skipped when the ONNX model is missing. `voice_activity_detection` reports
+    /// which backend actually ran, so the test asserts the invariants that must hold either way and
+    /// then states the backend - it always exercises one complete real path (Silero when the model
+    /// is present, as on the dev rig and in CI after `npm run fetch-models`; the energy fallback
+    /// otherwise) and can never pass vacuously by exercising neither.
+    #[test]
+    fn voice_activity_detection_finds_bursts_on_whichever_backend_is_available() {
+        // 3 s at 16 kHz: silence, a 1 s loud tone, silence. One obvious speech region.
+        let rate = TARGET_SAMPLE_RATE;
+        let mut pcm = vec![0i16; rate as usize]; // 1 s silence
+        pcm.extend(
+            (0..rate as usize)
+                .map(|i| ((i as f32 * 220.0 * 2.0 * std::f32::consts::PI / rate as f32).sin() * 14000.0) as i16),
+        );
+        pcm.extend(vec![0i16; rate as usize]); // 1 s silence
+
+        let (regions, backend) = voice_activity_detection(&pcm, rate, 0.5).expect("vad must not error");
+        println!("VAD backend in this environment: {backend:?}");
+
+        assert!(!regions.is_empty(), "a 1 s tone between silences must yield at least one region");
+        for (start, end) in &regions {
+            assert!(start < end, "every region must be non-empty: {start}..{end}");
+            assert!(*end <= pcm.len(), "a region may not run past the buffer: {end} > {}", pcm.len());
+        }
+        // Regions must be ordered and non-overlapping, or downstream chunk timestamps interleave.
+        for pair in regions.windows(2) {
+            assert!(pair[0].1 <= pair[1].0, "regions must not overlap: {:?} then {:?}", pair[0], pair[1]);
+        }
+        // The detected speech must actually intersect the loud middle second.
+        let (lo, hi) = (rate as usize, 2 * rate as usize);
+        assert!(
+            regions.iter().any(|(s, e)| *s < hi && *e > lo),
+            "no region overlapped the tone at {lo}..{hi}: {regions:?}"
+        );
+        assert!(
+            matches!(backend, VadBackend::Silero | VadBackend::Energy),
+            "a non-empty buffer must be attributed to a real backend, got {backend:?}"
+        );
+
+        // Empty input is the documented None case - no regions, no backend claimed.
+        let (empty, none_backend) = voice_activity_detection(&[], rate, 0.5).expect("empty vad");
+        assert!(empty.is_empty());
+        assert!(matches!(none_backend, VadBackend::None), "empty audio must claim no backend");
+
+        // Pure silence returns the WHOLE buffer as one region, still labelled with the backend that
+        // ran. That surprised me, so it is pinned here with the reasoning rather than left implicit:
+        // `probs_to_segments` deliberately falls back to (0, total) when it finds no speech, so a
+        // file is never silently dropped, and `VadBackend::Silero` documents "Silero ran
+        // successfully" - not "Silero positively detected speech". `VadBackend::None` means no VAD
+        // ran at all, which is not this case. The labelling is therefore correct, but the
+        // distinction matters to anyone reading `vad_backend` in an export: a silero-labelled
+        // segment does NOT imply positive detection.
+        let (silent_regions, silent_backend) =
+            voice_activity_detection(&vec![0i16; rate as usize], rate, 0.5).expect("silence vad");
+        assert_eq!(silent_regions.len(), 1, "no-speech audio collapses to a single whole-buffer region");
+        assert_eq!(silent_regions[0], (0, rate as usize), "and that region spans the entire buffer");
+        assert!(
+            !matches!(silent_backend, VadBackend::None),
+            "a backend DID run, so it must be named, not reported as None: {silent_backend:?}"
+        );
+    }
+
+    /// VAD on audio that is NOT already at 16 kHz.
+    ///
+    /// Silero runs at a fixed rate, so `detect` resamples internally and then maps the segment
+    /// boundaries back onto the caller's original sample indices. That mapping is a separate branch
+    /// from the 16 kHz passthrough and had no coverage - yet importing an 8 kHz phone recording or a
+    /// 44.1 kHz download is entirely ordinary, and a wrong mapping there silently misplaces every
+    /// chunk boundary in the file.
+    #[test]
+    fn vad_maps_segments_back_to_the_source_rate() {
+        for rate in [8_000u32, 44_100] {
+            // 3 s at `rate`: silence, a 1 s tone, silence.
+            let sec = rate as usize;
+            let mut pcm = vec![0i16; sec];
+            pcm.extend(
+                (0..sec)
+                    .map(|i| ((i as f32 * 220.0 * 2.0 * std::f32::consts::PI / rate as f32).sin() * 14000.0) as i16),
+            );
+            pcm.extend(vec![0i16; sec]);
+
+            let (regions, backend) = voice_activity_detection(&pcm, rate, 0.5)
+                .unwrap_or_else(|e| panic!("vad at {rate} Hz must not error: {e}"));
+            assert!(!regions.is_empty(), "{rate} Hz: expected at least one region");
+            for (s, e) in &regions {
+                assert!(s < e, "{rate} Hz: empty region {s}..{e}");
+                // The mapped indices must land inside the CALLER's buffer, not the internal
+                // 16 kHz one - this is exactly what the back-mapping exists to guarantee.
+                assert!(
+                    *e <= pcm.len(),
+                    "{rate} Hz: region end {e} exceeds the source buffer ({}) - segments were not \
+                     mapped back to the source rate",
+                    pcm.len()
+                );
+            }
+            assert!(
+                matches!(backend, VadBackend::Silero | VadBackend::Energy),
+                "{rate} Hz: a real backend must be named, got {backend:?}"
+            );
+        }
+    }
+
+    /// The direct `SileroVad::new` constructor - the public API a caller uses without going through
+    /// `voice_activity_detection`'s session cache. Skipped only when the bundled model is genuinely
+    /// absent, and it says so rather than passing quietly.
+    #[test]
+    fn silero_vad_constructs_from_the_bundled_model_and_detects() {
+        let model_path = crate::models::resolve_model_file("silero_vad_v4.onnx");
+        if !model_path.exists() {
+            println!("SKIP: silero_vad_v4.onnx not present at {model_path:?} - run npm run fetch-models");
+            return;
+        }
+        crate::models::init_ort_dylib_path();
+
+        let mut vad = SileroVad::new(&model_path, TARGET_SAMPLE_RATE, 0.5).expect("construct from bundled model");
+
+        let sec = TARGET_SAMPLE_RATE as usize;
+        let mut pcm = vec![0i16; sec / 2];
+        pcm.extend((0..sec).map(|i| {
+            ((i as f32 * 220.0 * 2.0 * std::f32::consts::PI / TARGET_SAMPLE_RATE as f32).sin() * 14000.0) as i16
+        }));
+        pcm.extend(vec![0i16; sec / 2]);
+
+        let regions = vad.detect(&pcm).expect("detect on a real tone");
+        assert!(!regions.is_empty(), "a 1 s tone must produce at least one region");
+        assert!(regions.iter().all(|(s, e)| s < e && *e <= pcm.len()), "regions must be well formed");
+
+        // The same instance must be reusable - `detect` carries recurrent state between calls, and a
+        // second call must not error or return garbage indices.
+        let again = vad.detect(&pcm).expect("second detect on the same instance");
+        assert!(again.iter().all(|(s, e)| s < e && *e <= pcm.len()));
+    }
+
     #[test]
     fn test_compute_waveform_empty() {
         assert!(compute_waveform(&[], 100).is_empty());
