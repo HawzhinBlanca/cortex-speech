@@ -462,6 +462,20 @@ mod tests {
     /// empty string and the number silently vanishes from the transcript. Nothing caught that.
     /// Verbalised numbers are written into training text, so a wrong or missing one is corrupt
     /// data rather than a display glitch.
+    /// Leading zeros are read digit by digit ("07" is a code, not the number seven), while a bare
+    /// "0" is the word for zero. Nothing covered this path, so the sweep flagged its guard.
+    #[test]
+    fn leading_zero_tokens_are_read_digit_by_digit() {
+        assert_eq!(verbalize_number_token("07"), "سفر حەوت");
+        assert_eq!(verbalize_number_token("007"), "سفر سفر حەوت");
+        assert_eq!(verbalize_number_token("0"), "سفر", "a bare zero is the word, not a digit list");
+        assert_eq!(verbalize_number_token("10"), "دە", "no leading zero => read as a number");
+        // NOTE: the `len() > 1` half of that guard is EQUIVALENT to `>= 1` in practice - the
+        // starts_with('0') half already excludes every non-zero-leading token, and for "0" itself
+        // both branches produce "سفر" (digits_individually of one zero IS the zero word). Recorded
+        // so the surviving mutant there is a known no-op rather than an untested gap.
+    }
+
     #[test]
     fn num_to_kurdish_is_exact() {
         let cases: &[(u64, &str)] = &[
@@ -496,6 +510,12 @@ mod tests {
             (999, "نۆسەد و نەوەد و نۆ"),
             (1000, "ھەزار"),
             (2000, "دوو ھەزار"),
+            (12345, "دوانزدە ھەزار و سێسەد و چل و پێنج"),
+            (100000, "سەد ھەزار"),
+            (1000000, "یەک ملیۆن"),
+            (2500000, "دوو ملیۆن و پێنجسەد ھەزار"),
+            (1000000000, "یەک ملیار"),
+            (3000000007, "سێ ملیار و حەوت"),
         ];
         for (n, expected) in cases {
             assert_eq!(&num_to_kurdish(*n), expected, "num_to_kurdish({n})");
