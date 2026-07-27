@@ -48,7 +48,8 @@
     "saveFailed": "Failed to save edit: {err}",
     "loadFailed": "Failed to load queue: {err}",
     "allDone": "All clips reviewed!",
-    "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later."
+    "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
+    "editHint": "Listen, and correct the text if needed"
   },
   "ckb": {
     "progress": "پارچەی {n} لە {total}",
@@ -63,7 +64,8 @@
     "saveFailed": "پاشەکەوتی دەستکاری سەرکەوتوو نەبوو: {err}",
     "loadFailed": "بارکردنی ڕیز سەرکەوتوو نەبوو: {err}",
     "allDone": "هەموو پارچەکان پێداچوونەوەیان بۆ کرا!",
-    "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە."
+    "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
+    "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
   },
   "source": {
     "progress": "review.progress",
@@ -78,7 +80,8 @@
     "saveFailed": "inbox.status.editFailed",
     "loadFailed": "inbox.status.loadFailed",
     "allDone": "review.allDone",
-    "heldByOthers": null
+    "heldByOthers": null,
+    "editHint": "review.editHint"
   }
 }
 </script>
@@ -89,6 +92,10 @@
   :root {
     color-scheme: light dark;
     --bg: #f8fafc; --panel: #ffffff; --line: #cbd5e1; --ink: #0f172a; --dim: #475569; --faint: #64748b;
+    /* `--brand` is separate from `--accent-line` because the two have different jobs: one is a text
+       colour that must clear 4.5:1 against the page, the other is a border on a filled button. Sharing
+       them put the heading at 3.91:1 in light mode — caught by the axe gate, not by eye. */
+    --brand: #075985;
     --accent: #0369a1; --accent-line: #0284c7; --ok: #15803d; --ok-line: #166534;
     --bad: #b91c1c; --warn: #a16207; --chip: #e2e8f0;
     /* Reviewer-adjustable transcript size (see the A-/A+ control). Sorani at a fixed 18px is small
@@ -97,7 +104,10 @@
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #0b1220; --panel: #111a2e; --line: #334155; --ink: #e2e8f0; --dim: #94a3b8; --faint: #64748b;
+      /* --faint is #94a3b8, not the #64748b it was: on the dark panel that read 3.64:1 and failed AA
+         for the clip's duration/speaker line. */
+      --bg: #0b1220; --panel: #111a2e; --line: #334155; --ink: #e2e8f0; --dim: #94a3b8; --faint: #94a3b8;
+      --brand: #7dd3fc;
       --accent: #0369a1; --accent-line: #0284c7; --ok: #14532d; --ok-line: #166534;
       --bad: #fda4af; --warn: #fcd34d; --chip: #1e293b;
     }
@@ -114,7 +124,7 @@
          min-height: 100vh; min-height: 100dvh;
          display: flex; flex-direction: column; padding: 12px; gap: 12px; }
   header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-  h1 { font-size: 15px; color: var(--accent-line); }
+  h1 { font-size: 15px; color: var(--brand); }
   #who { font-size: 11px; color: var(--dim); font-weight: 600; }
   #progress { font-size: 12px; color: var(--dim); }
   /* The language and text-size controls mirror the desktop `locale-toggle`. Language labels are the
@@ -212,6 +222,9 @@
     $('accept').textContent = '✓ ' + t('accept');
     $('save').textContent = t('save');
     $('undo').title = t('undo');
+    // The transcript box had NO accessible name at all — a screen-reader user reached an unlabelled
+    // edit field and had to guess what it was for. Reuses the desktop's own review hint.
+    $('text').setAttribute('aria-label', t('editHint'));
     renderProgress();
     renderEmptyState();
   }

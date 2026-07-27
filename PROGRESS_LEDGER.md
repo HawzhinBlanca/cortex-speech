@@ -1603,3 +1603,96 @@ downgraded here. `real-app-e2e` is SKIP-ENV (needs `CORTEX_AUDIO`), unchanged fr
   words already used elsewhere in that file.
 - The nightly CI jobs, the ~72 triaged mutants, the owner-gated legs, and the quiet week of real
   daily use are all unchanged from iter 193.
+
+## 2026-07-27 — iter 195 — remote review taken to a professional bar: Phase 0-3 of docs/REMOTE_REVIEW_PLAN.md
+
+**Owner: "app is closed, start phase 0 and do all".** Phase 0 (rebuild), Phase 1 (1.1–1.6), Phase 2.1,
+Phase 2.7 and Phase 3.1–3.5 are shipped, each gated and each with a fail-before proof.
+Commits: `41a037e` (P1), `59c4604` (P2.1), `976d8b8` (P3), plus this entry's gate work.
+
+**P0 — exe rebuilt.** `npm run tauri build` succeeded in 7m57s at `cc7fadf`; the MSI bundled. Note the
+exe went stale again immediately, because every commit below changed source — a final rebuild is
+required before verify-10 can be GREEN, and that is stated rather than glossed.
+
+**P1.1 — the phone page was ENGLISH.** `<html lang="en">` with hardcoded "Looks good" / "Save & next"
+around an RTL textarea: an English chrome on a Kurdish-first app. Now opens in Sorani RTL with an
+English toggle. **13 of its 14 strings are copied BYTE-FOR-BYTE from Sorani a native speaker already
+reviewed** (review.acceptAsIs, review.saveNext, inbox.reject, review.undone, review.undoFailed,
+review.allDone, review.progress, review.editHint, inbox.status.{load,edit}Failed, saved). Only
+`heldByOthers` is new and it is flagged. New policy `scripts/test_couch_page_i18n.py` pins that: a
+sourced string must still match its desktop value exactly, the unreviewed set cannot grow silently,
+en/ckb keys stay in parity, and `{param}` placeholders match across languages.
+
+**P1.2/1.3/1.6 — reliability on a real phone.** Server-side idempotent re-submit (a retry no longer
+writes a second decision or distils a second DPO pair); localStorage drafts + an outbox replayed on
+reconnect; `POST /api/renew` heartbeat so a 15-minute lease cannot expire mid-correction; per-reviewer
+rate limiting (120/min, burst 60) — these HTTP routes were the ONE unthrottled path into the DB.
+
+**P1.4/1.5 — transport + prefetch.** Replay-2s, loop, 0.75–1.5x speed (persisted); next clip's audio
+warmed while the current one is reviewed.
+
+**P2.1 — GOLD SPOT-CHECKS, the item this whole plan turns on.** Every gate in this repo asks whether
+the MACHINE is honest; none asked whether the REVIEWER was. A clip a human already answered, served
+with its RAW (known-wrong) draft, separates listening from tapping with no synthetic data at all.
+Migration v44 `spot_checks` (PK (segment_id, reviewer), so a retry upserts). ~1 in 8 of each batch,
+unmarked and interleaved. **A spot-check submit writes ONLY to `spot_checks` — `speech_segments` is
+untouched**, so a blind accept cannot overwrite the answer key it is graded against. Surfaced in
+Settings (noticed/given + mean CER, worst first) and via new IPC `spot_check_report`.
+
+**P2.7 — gates extended to the phone surface.** `couch.rs` added to `.cargo/mutants.toml` (it now
+carries real decision logic, not HTTP plumbing). New `e2e/couch-page.spec.ts`: 7 tests including a
+WCAG 2.2 AA axe gate in BOTH themes — `e2e/axe.spec.ts` covered the desktop only, and the phone is the
+surface handed to people who are not the owner.
+
+**P3.1–3.5 — light/dark via CSS variables, adjustable Sorani text size (16–28px), swipe
+accept/reject, a session counter, and iOS home-screen standalone.** Scope corrected honestly: there
+is deliberately **no service worker and no manifest**, because service workers require a secure
+context and this is plain HTTP on a LAN/tailnet IP — Tailscale does not change that. Offline caching
+and Android installability are UNREACHABLE without TLS, which the plan rules out.
+
+**SIX DEFECTS FOUND, every one by a check rather than by reasoning:**
+1. **Late-submit overwrite (data loss).** The lease is released the instant a clip is decided, leaving
+   an already-decided clip unprotected: a stale page could silently replace another human's verdict
+   minutes later. Now 409, naming whose verdict is protected.
+2. **`hidden` was a no-op on the review card (pre-existing).** `#card` sets `display:flex`, which beats
+   the attribute's `display:none` default — the empty card rendered beside "all reviewed". Caught by
+   LOOKING at the page in a browser, not by any test.
+3. **Spot checks identified by row STATE broke ordinary reviewing.** A reviewer's own edit makes a row
+   human-verified, so their next submit was graded as a test and never written to the corpus. Now
+   identified by why the clip was HANDED OUT.
+4. **Floor division silently exempted short batches** from spot checks — a reviewer on a nearly-drained
+   queue was never measured. Now `div_ceil`.
+5. **`list_spot_check_candidates(0)` returned ONE** (limit tested after the push). Found because a
+   fail-before revert FAILED TO FAIL; chasing that instead of waving it through is the only reason it
+   surfaced.
+6. **Three real a11y violations**, found by the new axe gate: heading contrast 3.91:1 in light, meta
+   contrast 3.64:1 in dark, and **the transcript textarea had no accessible name at all** — a
+   screen-reader user reached an unlabelled edit field. All fixed; the label reuses `review.editHint`,
+   so it cost zero new unreviewed Sorani.
+
+**Gates (verbatim):** `cargo test --lib` **1061 passed; 0 failed; 6 ignored**; clippy
+`--all-targets -D warnings` clean; `cargo fmt --check` clean; `npm run typecheck` 0 errors 0 warnings;
+`npm test` **214 passed (39 files)**; `npx playwright test e2e/couch-page.spec.ts` **7 passed**;
+couch-page i18n policy: *"14 strings, Kurdish-first; 13 reuse natively-reviewed desktop Sorani
+byte-for-byte; 1 awaiting owner review"*.
+
+**Fail-before demonstrated** for every new guarantee by targeted revert (never `git checkout`):
+shared undo stack, missing lease check, `reviewed_by` dropped from `insert_segment_full`, claim before
+validation, idempotency removed, renewal ignoring the holder, rate limiter removed, spot-check routing
+removed, floor division, limit-after-push.
+
+**NOT DONE, and not implied:**
+- **The exe is stale again.** verify-10 cannot be GREEN until a final rebuild; it was RED on
+  `exe-freshness` alone at `2ce269c` (22 PASS / 1 FAIL / 1 SKIP-ENV) and nothing since has changed
+  that gate's status.
+- **Inter-annotator agreement is still NOT enabled** (plan §2.4). Spot checks measure ATTENTION, not
+  agreement; leasing prevents the overlap IAA needs on purpose. `scripts/agreement_kappa.py` exists and
+  is unit-tested — what is missing is a per-decision table and deliberate double-assignment.
+- **Spot checks are only as good as the gold behind them.** With few human-verified clips whose draft
+  is wrong, `checks` stays small; the panel reports the real count so that limit is visible.
+- **A mutation sweep over `couch.rs` is running and has already reported survivors** (the
+  `MAX_BODY_BYTES` and `LEASE_TTL` constants have no test pinning them). Not yet triaged.
+- Plan §2.2 (throughput panel + timestamps), §2.3 (audit log), §2.5 (two-browser e2e), §2.6 (soak with
+  injected network failure), §3.6–3.8 remain.
+- One new Sorani string (`heldByOthers`) plus the three `settings.couchReviewers*` and two
+  `settings.couchSpotChecks*` strings await a native read.

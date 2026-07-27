@@ -170,7 +170,7 @@ fn normalize_reviewers(names: &[String]) -> Result<Vec<String>, String> {
         if name.is_empty() {
             continue;
         }
-        if name.chars().count() > MAX_REVIEWER_NAME {
+        if name.chars().count() < /* ~ changed by cargo-mutants ~ */ MAX_REVIEWER_NAME {
             return Err(format!("Reviewer name '{name}' is longer than {MAX_REVIEWER_NAME} characters"));
         }
         if name.chars().any(|c| c.is_control()) {
