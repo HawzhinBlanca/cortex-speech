@@ -300,6 +300,67 @@ mod tests {
         assert_eq!(word_to_g2p("دوو"), "d U", "baseline digraph unchanged");
     }
 
+    /// The grapheme-to-phoneme letter table, pinned letter by letter.
+    ///
+    /// 28 of the sweep's survivors were literally "delete match arm" here: nothing asserted what
+    /// any individual Kurdish letter maps to, so an arm could vanish and every existing test still
+    /// passed (a dropped letter silently falls through to the catch-all). g2p output is the
+    /// comparison space for the whole refinery - the phonetic edit distance, consensus alignment
+    /// and dedup all run on these strings - so one wrong letter quietly corrupts every downstream
+    /// distance without ever erroring.
+    ///
+    /// Frame: consonant + alef, which g2p renders as space-separated phonemes ("b A").
+    #[test]
+    fn g2p_letter_table_is_exact() {
+        let table: &[(char, &str)] = &[
+            ('ب', "b"),
+            ('پ', "p"),
+            ('ت', "t"),
+            ('ج', "j"),
+            ('چ', "c"),
+            ('ح', "H"),
+            ('خ', "x"),
+            ('د', "d"),
+            ('ر', "r"),
+            ('ڕ', "R"),
+            ('ز', "z"),
+            ('ژ', "Z"),
+            ('س', "s"),
+            ('ش', "S"),
+            ('ع', "E"),
+            ('غ', "G"),
+            ('ف', "f"),
+            ('ڤ', "v"),
+            ('ق', "q"),
+            ('ک', "k"),
+            ('گ', "g"),
+            ('ل', "l"),
+            ('ڵ', "L"),
+            ('م', "m"),
+            ('ن', "n"),
+            ('ھ', "h"),
+            ('ه', "h"),
+        ];
+        for (letter, phoneme) in table {
+            let got = g2p(&format!("{letter}ا"));
+            assert_eq!(got, format!("{phoneme} A"), "letter {letter} must map to /{phoneme}/");
+        }
+
+        // Vowels, in a consonant frame.
+        assert_eq!(g2p("بە"), "b a");
+        assert_eq!(g2p("بێ"), "b e");
+        assert_eq!(g2p("بۆ"), "b o");
+        assert_eq!(g2p("بو"), "b u");
+
+        // Kurdish orthography distinguishes plain and emphatic forms; collapsing either pair would
+        // make genuinely different words compare as identical.
+        assert_ne!(g2p("را"), g2p("ڕا"), "r and R must stay distinct");
+        assert_ne!(g2p("لا"), g2p("ڵا"), "l and L must stay distinct");
+        // Arabic heh and Kurdish heh are the SAME phoneme - load-bearing for the homophone
+        // handling in compute_phonetic_diff.
+        assert_eq!(g2p("ها"), g2p("ھا"), "both heh forms are /h/");
+    }
+
     #[test]
     fn transparent_chars_dont_corrupt_neighbor_roles() {
         // A non-phonetic char adjacent to an ambiguous 'و'/'ی' must not change the neighbor's
