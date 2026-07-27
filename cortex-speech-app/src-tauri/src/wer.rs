@@ -213,6 +213,47 @@ pub fn word_error_breakdown(reference: &str, hypothesis: &str) -> ErrorBreakdown
 mod tests {
     use super::*;
 
+    /// The empty-input guards in the metric core.
+    ///
+    /// These were the only genuinely uncovered PRODUCTION lines in wer.rs (its headline 80.62%
+    /// is otherwise depressed by the `#[ignore]`d, opt-in `emit_crossval_vectors` tool, which is
+    /// test code). They are the divide-by-zero and empty-sequence branches every CER/WER number
+    /// funnels through: an empty gold reference is not hypothetical - it is what a blank or
+    /// not-yet-transcribed row looks like, and a wrong answer here silently poisons an average.
+    #[test]
+    fn empty_reference_and_hypothesis_edge_cases() {
+        // rate(): an empty reference scores 0.0 only when the hypothesis is also empty, else 1.0.
+        // Anything else would divide by zero.
+        let both_empty = word_error_breakdown("", "");
+        assert_eq!(both_empty.ref_len, 0);
+        assert_eq!(both_empty.total(), 0);
+        assert_eq!(both_empty.rate(), 0.0, "empty vs empty is a perfect match, not an error");
+
+        let spurious = word_error_breakdown("", "hello world");
+        assert_eq!(spurious.ref_len, 0);
+        assert!(spurious.total() > 0, "words invented against an empty reference are errors");
+        assert_eq!(spurious.rate(), 1.0, "errors against an empty reference saturate at 1.0");
+        assert!(spurious.rate().is_finite(), "must never divide by zero");
+
+        // The levenshtein empty-sequence early returns: distance equals the other side's length.
+        let del_all = word_error_breakdown("hello world", "");
+        assert_eq!(del_all.total(), 2, "both reference words are deletions");
+        assert_eq!(del_all.deletions, 2);
+        assert_eq!(del_all.insertions, 0);
+        assert_eq!(del_all.rate(), 1.0);
+
+        let ins_all = word_error_breakdown("", "a b c");
+        assert_eq!(ins_all.insertions, 3, "every hypothesis word is an insertion");
+        assert_eq!(ins_all.deletions, 0);
+
+        // And the same guards through the public rate functions.
+        assert_eq!(compute_wer("", ""), 0.0);
+        assert_eq!(compute_cer("", ""), 0.0);
+        assert_eq!(compute_wer("", "x"), 1.0);
+        assert_eq!(compute_cer("", "x"), 1.0);
+        assert!(compute_wer("x", "").is_finite() && compute_cer("x", "").is_finite());
+    }
+
     #[test]
     fn identical_text_zero_wer() {
         assert_eq!(compute_wer("hello world", "hello world"), 0.0);

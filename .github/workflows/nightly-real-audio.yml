@@ -243,7 +243,12 @@ jobs:
             echo "::warning title=Mutation gate idle::No commits in the last 24h - no diff to mutate. This is not a pass."
             exit 0
           fi
-          git diff "$BASE^" HEAD -- src/quality/irt.rs src/quality/conformal.rs \
+          # --relative is REQUIRED. Without it git writes repo-root-relative paths
+          # (b/cortex-speech-app/src-tauri/src/...) while cargo-mutants runs from src-tauri and
+          # matches package-relative ones, so every hunk is rejected with
+          # "Diff content doesn't match source file". Verified locally against a real commit range
+          # before this job ever ran on a runner.
+          git diff --relative "$BASE^" HEAD -- src/quality/irt.rs src/quality/conformal.rs \
             src/quality/signal_anomaly.rs 'src/diff/*' src/normalizer.rs 'src/normalizer/*' \
             > /tmp/core.diff || true
           if [ ! -s /tmp/core.diff ]; then
