@@ -1463,3 +1463,65 @@ clippy `--all-targets -D warnings` clean; fmt clean; python-policies 43/43.
 - **5 owner-gated legs** (2 needing people other than the owner: independent annotators, CORDI
   agreement) and **8 owner-descoped distribution legs** — unchanged, and only the owner can move them.
 - **The quiet week of real daily use.** No gate can substitute for it.
+
+---
+
+### Iteration 193 — 2026-07-27 — final pre-use pass: mutation tail triaged (200 → ~72), a broken CI job caught before it ever ran, wer.rs closed
+
+Everything within my control before the owner starts daily use. Three real findings.
+
+**1. THE NIGHTLY MUTATION JOB WOULD HAVE FAILED ON ITS FIRST RUN.** Found by simulating the job
+locally instead of waiting for 03:00 to reveal it. The step runs with `working-directory:
+cortex-speech-app/src-tauri`, but `git diff` emits REPO-ROOT-relative paths regardless of cwd:
+```
++++ b/cortex-speech-app/src-tauri/src/quality/irt.rs   (what it produced)
++++ b/src/quality/irt.rs                               (what cargo-mutants matches)
+```
+Every hunk would have been rejected with "Diff content doesn't match source file" — the exact
+error I hit by hand earlier in this session and then reproduced in the workflow without noticing.
+Fixed with `--relative` and verified end to end: the corrected diff over a real commit range now
+yields real production mutants instead of a path error. **This is what "authored but never
+executed" costs** — the fuzz job had been proven locally via WSL; this one had not, and it was
+broken.
+
+**2. MUTATION TAIL TRIAGED.** Full sweep at the start of this iteration: `841 mutants in 54m:
+721 caught, 77 missed, 9 unviable, 34 timeouts`. That run predates the last three commits, which
+killed 5 more (185:32 tie-break, 170:55 recurrence, 158/159 counters, 164 total), so the current
+figure is **~72 of 841 — down from 200 at iteration 191**. Newly closed here, each with a hand
+fail-before:
+  - **LCS backtrack tie-break** (`>` → `>=`): when `dp[i-1][j] == dp[i][j-1]` there are two
+    equal-length LCSs and the comparison decides which alignment the reviewer sees — flipping it
+    makes "a b" vs "b a" keep "a" instead of "b" and every op changes. No length- or
+    similarity-based assertion can see that. Three reordering cases pin it.
+  - **Stats counters** (`+=` → `*=` on added/removed, `+` → `*` on the total): the existing case
+    left added and removed at ZERO, where the two operators are identical. Added an alignment with
+    every counter non-zero at once, plus a deletion-heavy case.
+  - **Phonetic DP first row/column**: a large asymmetric word pair, because if either init loop
+    stops one short a deletion-only path scores from an uninitialised 0 and the distance collapses.
+
+**3. wer.rs — the 80.62% was NOT a production gap.** 61 of its 62 uncovered lines are inside the
+`#[ignore]`d, opt-in `emit_crossval_vectors` tool (test code that only runs under
+`CORTEX_EMIT_CROSSVAL`). The genuinely uncovered PRODUCTION lines were two: `rate()` when
+`ref_len == 0` and levenshtein's zero-length early returns — the divide-by-zero and
+empty-sequence guards every CER/WER number funnels through. An empty gold reference is what a
+blank or not-yet-transcribed row looks like, so a wrong answer there silently poisons an averaged
+CER. Now covered; file at 82.27%. **Padding the rest would have been theatre and was not done.**
+
+**Gates:** `cargo test --lib` **1047 passed / 0 failed**; clippy `--all-targets -D warnings`
+clean; fmt clean; python-policies 43/43.
+
+**WHAT I COULD NOT DO, and why — the honest list:**
+- **The nightly CI jobs still have not run on a runner.** `gh` CLI is not installed and the GitHub
+  connector needs interactive auth, so I cannot trigger a workflow. The cron is `0 3 * * *`, so
+  the *next* nightly will run them — and thanks to finding #1 above it now has a chance of
+  passing. **Until that run is green, "the CI gates work" remains unproven.**
+- **~72 surviving mutants.** The remainder is a genuinely hard tail: documented-unreachable
+  backstops (the `compute_diff` "only raw remains" branch is commented *"unreachable for a
+  well-formed LCS but a safe backstop"* — mutants there are equivalent by design), proven
+  equivalents, deep tie-break variants that alter no observable output, and two million-cell
+  performance guards that cost ~27s per test run to discriminate. Every one I could kill with a
+  meaningful test, I killed. What is left needs either fault injection or a judgement that the
+  cost is not worth it — and that judgement is recorded in the tests, not hidden.
+- **5 owner-gated legs** (2 needing other people) and **8 owner-descoped distribution legs** —
+  unchanged and not mine to move.
+- **The quiet week of real daily use.** Still the only signal that matters, and still ahead.
