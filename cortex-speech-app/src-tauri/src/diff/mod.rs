@@ -285,6 +285,15 @@ mod tests {
 
         // Longer raw than annotated with a shared prefix AND suffix.
         assert_eq!(ops("a b c d e", "a d e"), "=a -b -c =d =e");
+
+        // REORDERING. These pin the backtrack's TIE-BREAK: when `dp[i-1][j]` equals `dp[i][j-1]`
+        // there are two equal-length LCSs, and which one is taken decides the whole alignment.
+        // "a b" vs "b a" can keep either token; this code keeps "b". Flipping the comparison to
+        // `>=` keeps "a" instead and every op changes - a real, visible difference in what the
+        // review UI shows, which no length- or similarity-based assertion can detect.
+        assert_eq!(ops("a b", "b a"), "-a =b +a");
+        assert_eq!(ops("a b c", "c b a"), "-a -b =c +b +a");
+        assert_eq!(ops("x a b", "b a x"), "-x -a =b +a +x");
     }
 
     /// The stats block is what the UI badge and the similarity score are computed from, and
