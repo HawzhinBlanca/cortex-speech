@@ -182,6 +182,183 @@ pub fn compute_phonetic_diff(raw: &str, annotated: &str) -> TextDiff {
 mod tests {
     use super::*;
 
+    /// The phoneme confusion table, pinned cost by cost.
+    ///
+    /// Nothing tested it: the first full cargo-mutants sweep left 16 mutants alive inside
+    /// `phone_distance` alone, because every existing test only looked at whole-word outcomes
+    /// ("these align as Replace"), which survives any individual cost being wrong. These costs are
+    /// the substitution weights of the phonetic edit distance, so they decide which ASR hypothesis
+    /// wins a slot in the IRT consensus - a wrong weight silently changes which transcript is
+    /// committed, and it would never show up as a crash.
+    ///
+    /// The classes come from the module's design: voicing pairs are cheap (0.3), liquid/length
+    /// variants cheaper still (0.2), the nasal pair mid (0.4), and anything unrelated is a full
+    /// substitution (1.0).
+    #[test]
+    fn phone_distance_cost_table_is_exact() {
+        // Identity costs nothing.
+        for c in ['p', 'b', 'a', 'S', 'R'] {
+            assert_eq!(phone_distance(c, c), 0.0, "identical phonemes must cost 0");
+        }
+
+        // Voiced/voiceless pairs: 0.3.
+        for (x, y) in [('p', 'b'), ('t', 'd'), ('k', 'g'), ('s', 'z'), ('S', 'Z'), ('f', 'v'), ('x', 'G')] {
+            assert_eq!(phone_distance(x, y), 0.3, "voicing pair {x}/{y}");
+            assert_eq!(phone_distance(y, x), 0.3, "voicing pair must be symmetric: {y}/{x}");
+        }
+
+        // Liquid / vowel-length variants: 0.2 (the cheapest non-identity class).
+        for (x, y) in [('r', 'R'), ('l', 'L'), ('u', 'U')] {
+            assert_eq!(phone_distance(x, y), 0.2, "liquid/length pair {x}/{y}");
+            assert_eq!(phone_distance(y, x), 0.2, "must be symmetric: {y}/{x}");
+        }
+
+        // Nasals are a distinct, more expensive class: 0.4.
+        assert_eq!(phone_distance('m', 'n'), 0.4);
+        assert_eq!(phone_distance('n', 'm'), 0.4);
+
+        // Vowel confusions: 0.3.
+        for (x, y) in [('a', 'e'), ('A', 'a'), ('o', 'u'), ('i', 'e')] {
+            assert_eq!(phone_distance(x, y), 0.3, "vowel pair {x}/{y}");
+            assert_eq!(phone_distance(y, x), 0.3, "must be symmetric: {y}/{x}");
+        }
+
+        // Anything not in the table is a full substitution. Includes pairs that are individually
+        // in the table but not with EACH OTHER - the table is a set of pairs, not an equivalence.
+        for (x, y) in [('p', 'z'), ('k', 'm'), ('a', 'u'), ('b', 'd'), ('s', 'S'), ('r', 'l')] {
+            assert_eq!(phone_distance(x, y), 1.0, "unrelated pair {x}/{y} must be a full substitution");
+        }
+
+        // The ordering the classes encode must hold: length < voicing < nasal < unrelated.
+        assert!(phone_distance('r', 'R') < phone_distance('p', 'b'));
+        assert!(phone_distance('p', 'b') < phone_distance('m', 'n'));
+        assert!(phone_distance('m', 'n') < phone_distance('p', 'z'));
+    }
+
+    /// GOLDEN phonetic distances on real Sorani pairs, each chosen to exercise a different edge of
+    /// the DP. Values were measured from the real g2p + edit distance, and each is explained by the
+    /// phoneme strings so a future reader can re-derive it rather than trust it.
+    ///
+    /// The previous tests asserted only "< 0.01" or "== 1.0" at the extremes, which is why 16
+    /// mutants lived inside `phonetic_word_distance`: the deletion/insertion cost, the
+    /// substitution cost lookup, and the normalising divisor were all free to be wrong in the
+    /// middle of the range. That range is exactly where this function does its work - it is the
+    /// substitution cost that decides ASR hypothesis alignment in the IRT consensus.
+    #[test]
+    fn phonetic_word_distance_golden() {
+        let g2p = |w: &str| crate::normalizer::g2p::g2p(w).replace(" ", "");
+
+        // Identical surface and identical phonemes: zero on both scales.
+        assert_eq!(g2p("کوردستان"), "kurdstAn");
+        assert_eq!(phonetic_word_distance("کوردستان", "کوردستان"), 0.0);
+        assert_eq!(normalized_phonetic_word_distance("کوردستان", "کوردستان"), 0.0);
+
+        // Homophones, different spelling: Arabic heh vs Kurdish heh both -> /hAtn/, so the
+        // PHONETIC distance is 0 even though the surfaces differ (the Equal-vs-Replace rule in
+        // compute_phonetic_diff is what keeps that honest downstream).
+        assert_eq!(g2p("هاتن"), "hAtn");
+        assert_eq!(g2p("ھاتن"), "hAtn");
+        assert_eq!(phonetic_word_distance("هاتن", "ھاتن"), 0.0);
+
+        // One VOICING substitution: /bayAni/ vs /payAni/ differ only b->p, which the table prices
+        // at 0.3. Normalised over 6 phonemes = 0.05. This is the case that proves the table is
+        // actually consulted by the DP rather than every substitution costing a flat 1.0.
+        assert_eq!((g2p("بەیانی"), g2p("پەیانی")), ("bayAni".into(), "payAni".into()));
+        assert!((phonetic_word_distance("بەیانی", "پەیانی") - 0.3).abs() < 1e-12);
+        assert!((normalized_phonetic_word_distance("بەیانی", "پەیانی") - 0.05).abs() < 1e-12);
+
+        // One UNRELATED substitution: /danga/ vs /Ranga/ differ d->R, not a table pair, so full
+        // cost 1.0; normalised over 5 phonemes = 0.2.
+        assert!((phonetic_word_distance("دەنگە", "ڕەنگە") - 1.0).abs() < 1e-12);
+        assert!((normalized_phonetic_word_distance("دەنگە", "ڕەنگە") - 0.2).abs() < 1e-12);
+
+        // Two DELETIONS: /sALakAni/ -> /sALAni/ drops "ka", at 1.0 each = 2.0; normalised over the
+        // longer form's 8 phonemes = 0.25. Pins the deletion arm of the recurrence and the fact
+        // that the divisor is the MAX length, not the min or the sum.
+        assert!((phonetic_word_distance("ساڵەکانی", "ساڵانی") - 2.0).abs() < 1e-12);
+        assert!((normalized_phonetic_word_distance("ساڵەکانی", "ساڵانی") - 0.25).abs() < 1e-12);
+
+        // Ordering the costs must preserve: voicing slip < unrelated slip < multi-phoneme edit.
+        assert!(
+            normalized_phonetic_word_distance("بەیانی", "پەیانی") < normalized_phonetic_word_distance("دەنگە", "ڕەنگە")
+        );
+    }
+
+    /// Exact op sequences from the phonetic aligner's backtrack.
+    ///
+    /// The old tests checked `changes.len() == 1` and "op is Replace", which leaves the whole
+    /// backtrack free: 29 mutants lived in `compute_phonetic_diff`. The alignment is what the
+    /// review UI renders and what irt.rs reads as the other model's token, so a shifted or
+    /// mis-ordered op is a product defect.
+    #[test]
+    fn phonetic_alignment_golden() {
+        let ops = |raw: &str, ann: &str| {
+            compute_phonetic_diff(raw, ann)
+                .changes
+                .iter()
+                .map(|c| match c.op {
+                    DiffOp::Equal => format!("={}", c.value),
+                    DiffOp::Insert => format!("+{}", c.value),
+                    DiffOp::Delete => format!("-{}", c.value),
+                    DiffOp::Replace => format!("~{}", c.value),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        // Order is preserved after the reverse(): the FIRST word must come first.
+        assert_eq!(ops("کوردستان هاتن", "کوردستان هاتن"), "=کوردستان =هاتن");
+
+        // A near-homophone substitution in the middle keeps both neighbours Equal.
+        assert_eq!(ops("کوردستان بەیانی هاتن", "کوردستان پەیانی هاتن"), "=کوردستان ~بەیانی → پەیانی =هاتن");
+
+        // Pure insertion and deletion at the tail.
+        assert_eq!(ops("کوردستان", "کوردستان هاتن"), "=کوردستان +هاتن");
+        assert_eq!(ops("کوردستان هاتن", "کوردستان"), "=کوردستان -هاتن");
+
+        // Empty sides.
+        assert_eq!(ops("", ""), "");
+        assert_eq!(ops("هاتن", ""), "-هاتن");
+        assert_eq!(ops("", "هاتن"), "+هاتن");
+
+        // Stats follow the ops exactly.
+        let d = compute_phonetic_diff("کوردستان بەیانی هاتن", "کوردستان پەیانی هاتن");
+        assert_eq!((d.stats.unchanged_words, d.stats.changed_words), (2, 1));
+        assert!((d.stats.similarity - (2.0 / 3.0 * 100.0)).abs() < 1e-9);
+    }
+
+    /// The >1000-word fallback to the plain LCS differ. `compute_phonetic_diff` is O(m*n) with a
+    /// g2p + edit-distance call per cell, so a long transcript would hang the UI; past the cap it
+    /// delegates. Nothing covered the boundary, so `>` mutants there survived.
+    #[test]
+    fn oversized_word_count_falls_back_to_the_plain_differ() {
+        // A pair where the two differs DISAGREE, so the test can tell which one ran: these words
+        // are phonetically close (one voicing slip), which the phonetic aligner reports as a single
+        // Replace, while the plain LCS differ sees two unrelated tokens.
+        let phon = compute_phonetic_diff("بەیانی", "پەیانی");
+        assert_eq!(phon.changes.len(), 1, "phonetic path aligns a near-homophone as one Replace");
+
+        // 1001 words on one side must take the plain path. Identical content keeps the assertion
+        // about WHICH path ran independent of alignment quality: the plain differ marks all Equal.
+        let long_raw = vec!["کوردستان"; 1001].join(" ");
+        let d = compute_phonetic_diff(&long_raw, &long_raw);
+        assert_eq!(d.changes.len(), 1001);
+        assert!(d.changes.iter().all(|c| c.op == DiffOp::Equal));
+
+        // NOT pinned here: the exact `> 1000` vs `>= 1000` edge, and the `>` -> `<` inversion.
+        // Both need 1000+ words on BOTH sides for the phonetic aligner to actually run, which is a
+        // 1,000,000-cell DP with a g2p + inner edit distance per cell - measured at ~27s, in a
+        // suite that runs in every CI job and once per mutant during a mutation sweep. Paying that
+        // forever to pin an off-by-one on a performance guard is the wrong trade.
+        //
+        // Checked rather than assumed: on small inputs the phonetic and plain differs were compared
+        // directly across reordering, insertion, deletion and near-homophone cases and produced
+        // IDENTICAL op sequences every time, so an inverted guard changes nothing observable below
+        // the cap - it is near-equivalent there by construction. Above the cap the 1001-word case
+        // above would route into the million-cell DP, where the cost itself is the signal.
+        // Same call as the 12.5M-cell guard in diff/mod.rs.
+    }
+
     #[test]
     fn test_phonetic_diff() {
         let raw = "کوردستان";
