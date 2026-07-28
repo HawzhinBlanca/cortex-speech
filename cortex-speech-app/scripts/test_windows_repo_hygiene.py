@@ -134,9 +134,69 @@ def test_no_hardcoded_local_windows_profile_paths() -> None:
         raise AssertionError(f"Tracked files must not hardcode a private local profile path (public repo):\n{formatted}")
 
 
+def test_no_private_network_addresses_or_device_names() -> None:
+    """The owner's tailnet/LAN addresses and device names must not enter a public repo.
+
+    Not a credential — a CGNAT 100.64/10 address is unroutable from the internet and a 192.168.x one
+    is meaningless off the LAN — but it is device-identifying metadata, and it reached the ledger
+    simply by pasting real evidence out of a live remote-review session. That is exactly the honest
+    habit this project wants, so the fix is a gate rather than a rule nobody remembers: paste the
+    evidence, keep the addresses out of it.
+
+    Documentation of the RANGE is fine and necessary (couch.rs explains the CGNAT check); what is
+    forbidden is a specific host address or hostname.
+    """
+    offenders: list[str] = []
+    forbidden = [
+        # Tailscale CGNAT hosts: 100.64.0.0/10.
+        (re.compile(r"\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b"), "tailnet host address"),
+        # RFC1918 LAN hosts. Deliberately NOT scanning 10.0.0.0/8: it is indistinguishable from a
+        # four-part version string (10.0.19041.1), and the owner's LAN is 192.168.x — a rule that
+        # cries wolf on every version number would be turned off within a week.
+        (re.compile(r"\b192\.168\.\d{1,3}\.\d{1,3}\b"), "LAN host address"),
+        (re.compile(r"\bhawapc01\b|\bcomms-pc01\b|\bdesktop-pkdj819\b|\bmacbook-pro-3\b", re.I), "device hostname"),
+        (re.compile(r"\biphone-15-pro-max\b", re.I), "device hostname"),
+    ]
+    # Addresses that are NOT anyone's device, listed individually rather than by exempting whole files
+    # — a path exemption is a hole a real address can later be pasted into, and these are fixtures that
+    # should stay frozen anyway.
+    allowed_literals = {
+        "100.100.100.100",  # Tailscale's public MagicDNS anycast address; couch.rs routes to it by design
+        "100.64.0.2",  # synthetic reviewer URL in e2e/helpers/tauri-mock.ts
+        "192.168.0.2",  # ditto
+    }
+    self_rel = str(Path(__file__).resolve().relative_to(GIT_ROOT.resolve())).replace("\\", "/")
+    try:
+        tracked = _git_tracked_text_files(GIT_ROOT)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return  # no git: the private-path test already covers the filesystem walk
+    for rel, path in tracked:
+        if rel == self_rel:
+            continue  # this file defines the patterns and would match itself
+        for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
+            for pattern, what in forbidden:
+                for match in pattern.finditer(line):
+                    hit = match.group(0)
+                    if hit in allowed_literals:
+                        continue
+                    # CIDR notation names a RANGE, not a host: `100.64.0.0/10` is the documentation the
+                    # CGNAT check in couch.rs is built on and must stay readable.
+                    if line[match.end() : match.end() + 1] == "/":
+                        continue
+                    offenders.append(f"{rel}:{line_no}: {what} {hit!r} in: {line.strip()[:90]}")
+    if offenders:
+        formatted = "\n".join(f"- {entry}" for entry in offenders)
+        raise AssertionError(
+            "Tracked files must not carry a specific private network address or device name (public "
+            "repo). Redact to a placeholder like <this-pc-tailnet-ip>; the evidence is just as good "
+            "without the octets:\n" + formatted
+        )
+
+
 def main() -> None:
     test_no_windows_reserved_repo_entries()
     test_no_hardcoded_local_windows_profile_paths()
+    test_no_private_network_addresses_or_device_names()
     print("windows repo hygiene regression passed")
 
 

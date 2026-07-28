@@ -1848,7 +1848,7 @@ themes); python-policies **44/44**.
 
 **Then I stopped trusting the test suite and drove the real server instead.** Couch Review started
 via CDP against the running app (`start_couch_review`), both links issued including the Tailscale
-one, and a real headless iPhone-profile browser pointed at `http://100.107.91.64:8737`. Everything
+one, and a real headless iPhone-profile browser pointed at `http://<this-pc-tailnet-ip>:8737`. Everything
 the suite covers came back green — `ckb`/`rtl`, 25 clips, real Sorani text, token stripped from the
 URL, `cortex_couch` HttpOnly cookie set, zero console errors. **Two defects that no test could see
 came back with it.**
@@ -1894,7 +1894,7 @@ typecheck` **426 FILES 0 ERRORS 0 WARNINGS**; `npm test` **214 passed (39 files)
 per-request full-file decode was a remote-UX problem and it is NOT — measured, not assumed, and the
 page already prefetches the next clip, so the cost is hidden anyway. **No cache was added.**
 
-**Live tailnet state:** `hawapc01` = 100.107.91.64 online; `iphone-15-pro-max` = 100.113.237.79
+**Live tailnet state:** `<this-pc>` = <this-pc-tailnet-ip> online; `<phone>` = <phone-tailnet-ip>
 online, `tailscale ping` **pong via DERP(fra) in 184 ms** (relayed, not direct). Tailscale adapter is
 categorised **Private**, and the `cortex-speech-app.exe` inbound rule allows Private — so the path is
 open. Review queue depth from the live DB: **128 unverified clips**, 16 verified, single source WAV
@@ -1948,7 +1948,7 @@ serving over Tailscale. All three fixes from iter 198 verified ON THE LIVE SERVE
   had `reviewed_by = None` (owner-verified) and a draft that differs from the stored answer. One is a
   textbook trap: served `500 لیترە`, answer `پێنج سەد لیترە`.
 
-Live page check over `100.107.91.64`: page 23 ms, `ckb`/`rtl`, token stripped from the URL,
+Live page check over `<this-pc-tailnet-ip>`: page 23 ms, `ckb`/`rtl`, token stripped from the URL,
 `cortex_couch` HttpOnly cookie set, **zero console errors**. Tailnet: phone online, `tailscale ping`
 pong via DERP(fra) — 184 ms warm, 2.1 s on the first cold packet.
 
