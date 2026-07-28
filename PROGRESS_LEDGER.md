@@ -1934,3 +1934,71 @@ present on disk.
   `settings.couchSpotChecks*`, `settings.couchAgreement*`, `settings.couchRevoke`,
   `settings.couchThroughput`). "Remote 10/10" stays qualified while they do.
 - Nightly CI has still never run on a runner; the quiet week of real daily use is still ahead.
+
+## 2026-07-28 — iter 199 — remote review is LIVE and proven on real data; two hardening passes taken while it runs (bf3c0c5, 8b9abbd)
+
+**Handed over working.** Exe rebuilt at `615501f`, freshness gate OK, app running, Couch Review
+serving over Tailscale. All three fixes from iter 198 verified ON THE LIVE SERVER, not in a test:
+
+- `Content-Length: 395340` now present on clip responses; a real headless iPhone-profile browser
+  reports **`duration: 12.353`** where it previously reported `Infinity`.
+- Five consecutive Stop→Start cycles succeeded (`stopMs` 6/18/26/27/28). Before the fix, cycle 2 died
+  with `os error 10048`.
+- The batch served **29 clips = 25 real work + 4 spot checks** (`div_ceil(25, 8) = 4`). Every check
+  had `reviewed_by = None` (owner-verified) and a draft that differs from the stored answer. One is a
+  textbook trap: served `500 لیترە`, answer `پێنج سەد لیترە`.
+
+Live page check over `100.107.91.64`: page 23 ms, `ckb`/`rtl`, token stripped from the URL,
+`cortex_couch` HttpOnly cookie set, **zero console errors**. Tailnet: phone online, `tailscale ping`
+pong via DERP(fra) — 184 ms warm, 2.1 s on the first cold packet.
+
+**A concern I chased and DISPROVED, rather than "fixed".** One live spot check differs from its
+answer only by `ه` vs `ھ`, so I checked whether reviewers get marked wrong for orthographic variants.
+They do not: `noticed` compares the submission against the **draft** they were given, not against the
+answer, so any genuine correction counts as attention; agreement is a continuous CER, not pass/fail.
+`learning_text_key` deliberately keeps the variants distinct, which is right for CANDIDATE selection.
+No change made.
+
+**Hardening 1 (`bf3c0c5`) — the gate could not run while the app was being used.** The one test
+covering `start()`'s wiring bound the production port 8737, so `cargo test` failed with
+`os error 10048` whenever Couch Review was running: the project could not verify itself during
+exactly the daily use the gate protects. `start()` now delegates to `start_on_port()` and the test
+takes port 0. **The gate is not weakened** — the re-start assertion rebinds the SAME port, read back
+out of the issued URL (asking for another ephemeral port would pass even with the socket leak,
+because the OS would just hand out a different one), and `COUCH_PORT` is now pinned to 8737 by the
+constants test. Fail-before still catches the leak, now on port 51195. **Proven by running
+`cargo test --lib` to 1070 passed WITH the live server holding 8737.**
+
+**Hardening 2 (`8b9abbd`) — the most-repeated defect in this repo had no gate on the phone path.** A
+save path that treats `""` as a successful transcript and writes it over a good draft has been found
+and fixed twice elsewhere. couch.rs HAD the guards; nothing pinned them, so either could be deleted
+in a refactor with the suite still green. Now covered for empty / whitespace-only / newline-only on
+both `accept` and `edit`, plus the `[Pending WSL 7B ASR]` placeholder family — and, the half that
+actually matters, the stored row is asserted UNCHANGED afterwards. A refusal that still wrote would
+look like a working guard from the client's side and lose the data anyway.
+
+**Gates (verbatim, with the live server running):** `cargo test --lib` **1070 passed; 0 failed; 6
+ignored** (before iter-199 test additions), `couch::` **25 passed**; clippy `--all-targets -D
+warnings` clean; fmt clean; `npm run typecheck` **426 FILES 0 ERRORS 0 WARNINGS**; `npm test` **214
+passed**; `npm run test:e2e` **57 passed**; playwright couch-page **10 passed**; python-policies
+**44/44**; `cargo test --test soak` **passed in 143.69 s** standalone.
+
+**NOT DONE / NOT CLAIMED:**
+- **verify-10 has NOT completed at any HEAD today.** The run I started wedged: under `cargo test
+  --jobs 4` the pipeline soak was starved for 30 minutes (it passes in 143 s alone). I killed it. I
+  am NOT calling this GREEN, because no run produced that. `real-app-e2e` also cannot run while the
+  app is open — it spawns the exe and the single-instance lock refuses it — so a full sweep needs the
+  app closed.
+- **`npm run tauri build` exited 1 on the final rebuild** — MSI bundling only, `os error 32`, because
+  I launched the app while `light.exe` still held the exe. My race, not a code fault. The exe itself
+  compiled clean and the freshness gate confirms it is at HEAD. The NSIS/MSI bundles on disk are from
+  the PREVIOUS build; installer artifacts are descoped from personal use, but they are stale and I am
+  saying so rather than letting them look current.
+- **The exe is now behind HEAD again** (`bf3c0c5`, `8b9abbd` touched couch.rs). Both are test//
+  test-support changes and production behaviour on port 8737 is unchanged, so the running binary is
+  functionally current — but exe-freshness will fail until the next rebuild, which needs the app
+  closed.
+- **Still no request from the phone itself.** Everything is driven from this PC. The inbound path is
+  proven only as far as "tunnel up, firewall allows, adapter is Private".
+- **Seven Sorani strings still await a native read.**
+- Nightly CI has still never run on a runner; the quiet week of real daily use is still ahead.
