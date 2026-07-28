@@ -508,7 +508,14 @@ fn respond_with_cookie(
     (status, ctype, body): Reply,
     set_cookie: Option<String>,
 ) -> std::io::Result<()> {
-    let mut response = tiny_http::Response::from_data(body).with_status_code(status);
+    // `with_chunked_threshold(usize::MAX)` is load-bearing, not a tuning knob. tiny_http defaults to
+    // 32 KB: any larger body is sent `Transfer-Encoding: chunked` with NO `Content-Length`. Every clip
+    // is 300-500 KB, so every clip crossed it — and a browser given an audio stream of unknown length
+    // reports `duration = Infinity` and `seekable.end = Infinity`. Measured on the live server: the
+    // phone's progress bar showed no total time and tap-to-seek computed `fraction * Infinity`, so
+    // seeking silently did nothing. The body is always a fully-materialised Vec, so its length is
+    // ALWAYS known — there is never a reason to chunk it away.
+    let mut response = tiny_http::Response::from_data(body).with_status_code(status).with_chunked_threshold(usize::MAX);
     if let Some(cookie) = set_cookie {
         if let Ok(header) = tiny_http::Header::from_bytes(&b"Set-Cookie"[..], cookie.as_bytes()) {
             response = response.with_header(header);
@@ -1538,6 +1545,37 @@ mod tests {
         let _ = respond_with_cookie(request, reply.clone(), cookie);
         let _ = client.join();
         reply
+    }
+
+    #[test]
+    fn a_large_body_is_sent_with_a_content_length_so_audio_has_a_finite_duration() {
+        // REGRESSION, found on the live server and not by any test: tiny_http chunks any body at or
+        // above its 32 KB default threshold, and a chunked response carries NO Content-Length. Clips
+        // are 300-500 KB, so every single one arrived with an unknown length — and an <audio> element
+        // fed a stream of unknown length reports `duration = Infinity`. The phone's progress bar had
+        // no total time and tap-to-seek multiplied by Infinity, so seeking did nothing at all.
+        //
+        // Sized deliberately ABOVE the 32 KB default: at 1 KB this test passes even with the bug,
+        // which is exactly why the bug survived a suite full of small JSON replies.
+        const BIG: usize = 200 * 1024;
+        let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = std::thread::spawn(move || {
+            let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build();
+            let r = agent.get(&url).call().expect("large body is served");
+            (r.header("content-length").map(str::to_string), r.header("transfer-encoding").map(str::to_string))
+        });
+        let request = server.recv().unwrap();
+        let _ = respond_with_cookie(request, (200, "audio/wav", vec![0u8; BIG]), None);
+        let (content_length, transfer_encoding) = client.join().expect("client thread");
+
+        assert_eq!(
+            content_length.as_deref(),
+            Some(BIG.to_string().as_str()),
+            "a body whose length is known must declare it, or the browser cannot compute a duration"
+        );
+        assert_eq!(transfer_encoding, None, "nothing here needs chunking — the body is already in memory");
     }
 
     #[test]
