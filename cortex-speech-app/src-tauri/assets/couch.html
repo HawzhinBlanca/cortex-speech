@@ -194,6 +194,16 @@
 <div class="toast" id="toast"></div>
 <script>
   const token = new URLSearchParams(location.search).get('t') || '';
+  // The server planted an HttpOnly cookie when it served this page, so the token no longer has to
+  // ride in the URL. Strip it from the visible address and from this history entry: a token in the
+  // query string ends up in browser history, in the address bar of a phone anyone can glance at, and
+  // in the logs of anything that ever proxies the request. The link the reviewer was SENT keeps
+  // working — this only cleans up after it.
+  if (token && window.history?.replaceState) {
+    const clean = new URL(location.href);
+    clean.searchParams.delete('t');
+    history.replaceState(null, '', clean.pathname + clean.search + clean.hash);
+  }
   const $ = (id) => document.getElementById(id);
   let queue = [], i = 0, busy = false;
 

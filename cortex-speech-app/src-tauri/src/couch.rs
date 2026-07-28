@@ -429,8 +429,8 @@ fn spawn_server_loop(
                 if shutdown.load(Ordering::SeqCst) {
                     break;
                 }
-                let response = handle_request(&mut request, &db, &state);
-                let _ = respond(request, response);
+                let (response, set_cookie) = handle_request(&mut request, &db, &state);
+                let _ = respond_with_cookie(request, response, set_cookie);
             }
         })
         .map_err(|e| format!("Couch Review server thread failed to spawn: {e}"))
@@ -439,6 +439,20 @@ fn spawn_server_loop(
 /// (status, content_type, body)
 type Reply = (u16, &'static str, Vec<u8>);
 
+/// A reply that also plants the session cookie. Used only for the page itself: the token arrives in
+/// the URL exactly once, and from then on the cookie carries it.
+///
+/// `HttpOnly` is the point — the SERVER sets it, so page JavaScript can never read the token back
+/// out. Setting it from JS would have been simpler and strictly worse. No `Secure` flag, and that is
+/// honest rather than an oversight: this is plain HTTP on a LAN or tailnet, and marking a cookie
+/// Secure there would stop it being sent at all. `SameSite=Strict` keeps it off cross-site requests.
+fn page_reply_with_cookie(token: &str, body: Vec<u8>) -> (Reply, Option<String>) {
+    (
+        (200, "text/html; charset=utf-8", body),
+        Some(format!("{COUCH_COOKIE}={token}; Path=/; Max-Age=604800; SameSite=Strict; HttpOnly")),
+    )
+}
+
 fn json_reply(status: u16, value: serde_json::Value) -> Reply {
     (status, "application/json", value.to_string().into_bytes())
 }
@@ -446,8 +460,17 @@ fn err_reply(status: u16, msg: &str) -> Reply {
     (status, "text/plain; charset=utf-8", msg.as_bytes().to_vec())
 }
 
-fn respond(request: tiny_http::Request, (status, ctype, body): Reply) -> std::io::Result<()> {
+fn respond_with_cookie(
+    request: tiny_http::Request,
+    (status, ctype, body): Reply,
+    set_cookie: Option<String>,
+) -> std::io::Result<()> {
     let mut response = tiny_http::Response::from_data(body).with_status_code(status);
+    if let Some(cookie) = set_cookie {
+        if let Ok(header) = tiny_http::Header::from_bytes(&b"Set-Cookie"[..], cookie.as_bytes()) {
+            response = response.with_header(header);
+        }
+    }
     // The content types here are static ASCII literals, so this never fails in practice — but the
     // panic policy forbids expect(); a (hypothetical) bad header just means the response ships
     // without a Content-Type rather than killing the server thread.
@@ -457,13 +480,38 @@ fn respond(request: tiny_http::Request, (status, ctype, body): Reply) -> std::io
     request.respond(response)
 }
 
+/// The cookie the server sets so the token stops travelling in the URL (P3.8).
+const COUCH_COOKIE: &str = "cortex_couch";
+
+/// Resolve the session token from a request: the `?t=` query FIRST (how a shared link always
+/// arrives), then the `Cookie` header (how every request after the first one carries it).
+///
+/// Why bother: a token in the query string lands in browser history, in the phone's address bar for
+/// anyone glancing over, and in the logs of anything that ever proxies the request. The page strips
+/// `?t=` from the visible URL after the first load, and the cookie carries it from then on —
+/// including for `<audio src>`, which cannot send a custom header but does send cookies.
+fn token_from_request(request: &tiny_http::Request) -> Option<String> {
+    if let Some(t) = token_from_url(request.url()) {
+        return Some(t.to_string());
+    }
+    let cookies = request.headers().iter().find(|h| h.field.equiv("Cookie"))?;
+    cookies.value.as_str().split(';').find_map(|kv| {
+        let (name, value) = kv.split_once('=')?;
+        (name.trim() == COUCH_COOKIE).then(|| value.trim().to_string())
+    })
+}
+
 /// Extract `t` from a raw request URL's query string.
 fn token_from_url(url: &str) -> Option<&str> {
     let query = url.split_once('?')?.1;
     query.split('&').find_map(|kv| kv.strip_prefix("t="))
 }
 
-fn handle_request(request: &mut tiny_http::Request, db: &Database, state: &Mutex<CouchState>) -> Reply {
+fn handle_request(
+    request: &mut tiny_http::Request,
+    db: &Database,
+    state: &Mutex<CouchState>,
+) -> (Reply, Option<String>) {
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
     let method = request.method().clone();
@@ -473,18 +521,22 @@ fn handle_request(request: &mut tiny_http::Request, db: &Database, state: &Mutex
     // decision can be written without a name attached.
     // Resolved from the SHARED map on every request, so a revoked token stops working immediately
     // rather than at the next server restart.
-    let Some(reviewer) = token_from_url(&url).and_then(|t| lock_state(state).reviewers.get(t).cloned()) else {
-        return err_reply(401, "unauthorized");
+    let Some(token) = token_from_request(request) else {
+        return (err_reply(401, "unauthorized"), None);
+    };
+    let Some(reviewer) = lock_state(state).reviewers.get(&token).cloned() else {
+        return (err_reply(401, "unauthorized"), None);
     };
     let reviewer = reviewer.as_str();
     if let Err(e) = COUCH_RATE_LIMITER.check(reviewer) {
-        return (429, "text/plain; charset=utf-8", e.into_bytes());
+        return ((429, "text/plain; charset=utf-8", e.into_bytes()), None);
     }
 
-    match (method, path.as_str()) {
-        (tiny_http::Method::Get, "/") => {
-            (200, "text/html; charset=utf-8", include_str!("../assets/couch.html").as_bytes().to_vec())
-        }
+    // Only the page plants the cookie; every other route just answers.
+    if let (tiny_http::Method::Get, "/") = (&method, path.as_str()) {
+        return page_reply_with_cookie(&token, include_str!("../assets/couch.html").as_bytes().to_vec());
+    }
+    let reply = match (method, path.as_str()) {
         (tiny_http::Method::Get, "/api/queue") => api_queue(db, reviewer, state),
         (tiny_http::Method::Get, p) if p.starts_with("/api/audio/") => {
             api_audio(db, p.trim_start_matches("/api/audio/"))
@@ -499,7 +551,8 @@ fn handle_request(request: &mut tiny_http::Request, db: &Database, state: &Mutex
         },
         (tiny_http::Method::Post, "/api/undo") => api_undo(db, reviewer, state),
         _ => err_reply(404, "not found"),
-    }
+    };
+    (reply, None)
 }
 
 /// Lock the shared state, recovering from a poisoned mutex rather than killing the accept thread. The
@@ -1438,8 +1491,8 @@ mod tests {
             let _ = agent.get(&url).call();
         });
         let mut request = server.recv().unwrap();
-        let reply = handle_request(&mut request, db, state);
-        let _ = respond(request, reply.clone());
+        let (reply, cookie) = handle_request(&mut request, db, state);
+        let _ = respond_with_cookie(request, reply.clone(), cookie);
         let _ = client.join();
         reply
     }
@@ -1914,6 +1967,24 @@ mod tests {
         assert_eq!(post("/api/undo", ""), 200, "/api/undo is wired");
         // /api/audio/<id> reaches api_audio: the id is unknown to the db, which is its 404 — NOT the
         // router's 404, which a deleted guard would give for a well-formed id it never matched.
+        // P3.8: the page response plants an HttpOnly cookie, and the token then works from the
+        // COOKIE ALONE — which is what lets the page strip `?t=` out of the visible URL and out of
+        // browser history. Proven end to end rather than asserted: no query param, cookie only.
+        let page = agent.get(&format!("{base}/?t=saratoken123")).call().unwrap();
+        let cookie = page.header("Set-Cookie").unwrap_or_default().to_string();
+        assert!(cookie.starts_with("cortex_couch=saratoken123"), "the page must plant the session cookie: {cookie}");
+        assert!(cookie.contains("HttpOnly"), "the token must be unreadable from page JavaScript: {cookie}");
+        assert!(cookie.contains("SameSite=Strict"), "the cookie must not ride cross-site requests: {cookie}");
+        let by_cookie = agent
+            .get(&format!("{base}/api/queue"))
+            .set("Cookie", "cortex_couch=saratoken123")
+            .call()
+            .expect("the cookie alone must authenticate");
+        assert_eq!(by_cookie.status(), 200, "no ?t= in the URL, and the request still works");
+        // A wrong cookie is still nobody.
+        let bad = agent.get(&format!("{base}/api/queue")).set("Cookie", "cortex_couch=nope").call();
+        assert!(matches!(bad, Err(ureq::Error::Status(401, _))), "an unknown cookie token is unauthorized");
+
         // A BAD id gives api_audio's own 400 — a deleted guard would give the router's 404 instead,
         // and asserting only "404 for an unknown id" cannot tell those two apart (it did not).
         assert_eq!(
