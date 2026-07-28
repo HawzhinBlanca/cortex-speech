@@ -1901,11 +1901,28 @@ open. Review queue depth from the live DB: **128 unverified clips**, 16 verified
 present on disk.
 
 **NOT DONE / NOT CLAIMED:**
-- **The spot-check pool is EMPTY.** `list_spot_check_candidates` requires `verified = 1 AND
-  is_gold = 1`; the live DB has **0** such rows (0 gold of any kind). So the proof-of-work measurement
-  ships inert on this data — reviewers will be attributed and throughput tracked, but nobody is being
-  scored until some verified clips are marked gold. This is data state, not a code defect, and it is
-  NOT a claim that spot checks "work in production".
+- **CORRECTION to my own first reading: the spot-check pool is not merely empty, it is UNREACHABLE.**
+  I first wrote this up as "data state, not a code defect". That was wrong, and checking rather than
+  assuming is what caught it. `list_spot_check_candidates` requires `verified = 1 AND is_gold = 1`,
+  and **no production code path anywhere sets `is_gold = 1`** — every write of it lives inside
+  `#[cfg(test)]` (`couch.rs:1383`, `history/mod.rs:347,430`, `jury/learning.rs:689`), and the
+  migrations only ever declare it `DEFAULT 0`. The `gold_segments` table is a DIFFERENT thing (the
+  frozen eval set via `import_gold_segments`) and does not feed this flag. The live DB agrees: 0 gold
+  rows. So the proof-of-work centrepiece of plan §2.1 is structurally inert in any real install, and
+  no amount of reviewing will change that.
+
+  **FIXED in `3d1c418`, and without touching `is_gold` semantics.** The intent behind the flag was
+  right — an answer key must not be a peer's fresh guess — so I kept the guarantee and expressed it
+  with a column that is actually populated: `reviewed_by IS NULL`. `record_human_decision_by` sets
+  `reviewed_by` unconditionally to the deciding reviewer's name and ONLY the desktop path passes
+  `None`, so NULL means "verified here, by the owner". `is_gold = 1` is still honoured. This
+  deliberately does NOT mark anything gold, so the learning-set exclusion and export holdout
+  quarantine are untouched. The live library yields **15** usable answer keys immediately.
+
+  The old test had expressed "peer" as `is_gold = false` and never set `reviewed_by` — so it passed
+  against a query that could match nothing in production, which is exactly how a dead feature keeps a
+  green test. Its fixture now carries the column production writes. Fail-before: candidates left 2,
+  right 3.
 - verify-10 has NOT been re-run at this HEAD yet.
 - `start_issues_working_tokens_and_stop_takes_them_away` binds the real fixed port 8737, so it FAILS
   while the app is running with Couch Review on. That is by design (a silent skip would restore the

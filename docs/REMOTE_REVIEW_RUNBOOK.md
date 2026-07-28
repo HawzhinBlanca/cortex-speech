@@ -102,12 +102,19 @@ exactly the blind spot it exists to remove.
 
 ## What is NOT measured yet
 
-- **Spot checks need gold clips and there are none.** `list_spot_check_candidates` requires
-  `verified = 1 AND is_gold = 1`; the live library currently has **0** such rows. Reviewers are still
-  named, attributed and throughput-tracked, but **nobody is being scored for honesty** until some
-  verified clips are marked gold. The Settings panel hides the spot-check section entirely when it is
-  empty, which reads as "no problems" rather than "not measuring" — read this paragraph, not the
-  absence of a warning.
+- **Spot-check volume is small, and it is capped by how much you have verified yourself.** A clip can
+  serve as an answer key only if you verified it on the desktop (`reviewed_by IS NULL`) and the raw
+  ASR draft actually differs from your answer — a draft that was already right cannot tell a reviewer
+  who listened from one who tapped accept. At the time of writing the live library yields **15**
+  usable answer keys, so early scores rest on a handful of checks. `SpotCheckScore.checks` reports
+  the real count; do not read a verdict into two or three.
+
+  This was worse until `3d1c418`: the predicate required `is_gold = 1`, which **nothing in the app
+  ever sets**, so the mechanism could never fire at all. If you are reading an older build, spot
+  checks are inert regardless of how much you review.
+
+  A phone reviewer's own correction is never used as an answer key — that would grade the next
+  reviewer against a peer's guess.
 - **Seven Sorani strings on this surface have not had a native read** (`heldByOthers`,
   `settings.couchReviewers*`, `settings.couchSpotChecks*`, `settings.couchAgreement*`,
   `settings.couchRevoke`, `settings.couchThroughput`).
