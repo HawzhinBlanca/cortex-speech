@@ -1758,3 +1758,84 @@ answers. Everything else passed, including `test-rust` (397.3s), `fuzz-smoke` (9
 - Owner review still pending on: `heldByOthers`, `settings.couchReviewers*`, `settings.couchSpotChecks*`,
   `settings.couchAgreement*`.
 - The nightly CI jobs and the quiet week of real daily use are unchanged from iter 193/194.
+
+## 2026-07-28 — iter 197 — verify-10 GREEN 23/23 (real audio); first completed mutation sweep; P2.2/2.3/3.7/3.8 shipped
+
+Commits `d1f531b` (STATUS regen), `afd6057` (P2.2/2.3/3.7), `4759030` (mutation kills), `c2302b2`
+(P3.8 cookie).
+
+**verify-10 is GREEN — 23/23, ZERO SKIPS, at `ad2d89e`.** The last skip was closed by driving
+`real-app-e2e` with real Kurdish audio (`CORTEX_AUDIO`, passed at runtime — never written into a
+tracked file). It is not a vacuous pass: the driver spawned the real exe on an ISOLATED data dir (it
+refuses the owner's `%APPDATA%` profile by design), applied migrations v1→v44, and reported
+*"Wrote run.jsonl with 144 segments … REAL-DATA RUN OK: 14 segments; first transcript 194 chars"*.
+`docs/STATUS.md` regenerated from that run — it had been claiming GREEN at `9228618`, many commits
+stale, which is dangerous precisely because it happened to be RIGHT.
+
+**THE FIRST MUTATION SWEEP THAT HAS EVER COMPLETED here.** In COPY mode, so the working tree is never
+touched — the earlier `--in-place` run is what corrupted the tree and got an artifact committed.
+Verbatim: **`946 mutants tested: 98 missed, 789 caught, 23 unviable, 36 timeouts`**. 29 survivors were
+in `couch.rs`; after two rounds of gates, **29 → 19 → 13 killed in total**. Each was invisible to
+1,066 passing tests:
+- **The routing table was never exercised.** Deleting the `/api/renew` or `/api/undo` arms changed
+  nothing — every test called the handlers DIRECTLY, so they stayed correct while becoming
+  unreachable. `/api/audio` needed a BAD id (its own 400) because "404 for an unknown id" cannot be
+  told apart from the router's 404 — which is why that guard survived the first fix.
+- **The body cap could TRUNCATE instead of refuse**: `take(MAX+1)`→`take(MAX-1)` makes an over-size
+  body read short, pass the `> MAX` check, and fail later as bad json — a truncated transcript
+  disguised as a parse error.
+- **A re-sent reject was uncovered** (only the edit retry was), so a retried reject would have been
+  recorded as a second human decision.
+- **The placeholder guard needs `&&` and nothing proved it.** With `||`, any transcript merely ENDING
+  in `]` would be refused. A rejects-only loop STRUCTURALLY cannot catch this — the bug refuses MORE —
+  so it needed an ACCEPT assertion. I first wrote that case into the rejects loop expecting 400, which
+  was wrong.
+- **The limits themselves were never tested**, only limit+1: `>`→`>=` would reject a legal 40-char
+  name or an eighth reviewer.
+
+**P2.2/P2.3 — checking the code changed the design twice.** The plan said "pass a timestamp into
+`decision_log`". Reading `stats.rs` first: it medians over a GLOBALLY ordered stream, so feeding
+concurrent reviewers in would time the gap between two DIFFERENT people and report it as one person's
+pace — poisoning a shipped number. And an ALTER on `decision_log` is not replay-safe (v40 recreates
+speech_segments; nothing recreates decision_log). So Migration v45 adds `review_events` instead:
+replay-safe, partitioned per reviewer by construction, existing metric untouched. I also expected
+§2.3 to be redundant and CHECKED: `corrections` covers only edits with resolvable audio,
+`decision_log` gets no phone rows, and neither records WHO — so it is not redundant.
+
+**P3.7 — my first revoke was a NO-OP and the compiler could not see it.** Each accept thread held an
+`Arc<HashMap>` SNAPSHOT of the tokens, so removing one left every serving thread honouring it forever:
+revoked in the UI, working in reality. The token map now lives in the one shared state the request
+path authenticates against. **And the fail-before for it PASSED at first** — the test had
+reimplemented the revocation inline instead of calling it. Extracted `revoke_in()` so the test drives
+the real path; only then did the no-op revert fail.
+
+**P3.8 — the token is out of the URL.** The page response plants `cortex_couch` (HttpOnly,
+SameSite=Strict, server-set so page JS can never read it) and the page strips `?t=` from the visible
+URL and history. Cookies also ride `<audio src>`, which cannot send a custom header — which is why a
+cookie and not an Authorization header. NO `Secure` flag, deliberately: on plain HTTP that would stop
+it being sent at all.
+
+**A regression I introduced and the FULL suite caught:** a null `spot_check_report` from the e2e mock
+made `spotChecks.length` throw mid-render and took the WHOLE settings dialog down (`3cde966`). My new
+spec passed 7/7 standalone; only `npm run test:e2e` saw it.
+
+**Gates (verbatim):** `cargo test --lib` **1066 passed; 0 failed; 6 ignored**; clippy
+`--all-targets -D warnings` clean; fmt clean; `npm run typecheck` 0 errors 0 warnings; `npm test` 214
+passed; `npm run test:e2e` **54 passed**; playwright couch-page 7 passed (zero axe violations, both
+themes); python-policies **44/44**.
+
+**NOT DONE / NOT CLAIMED:**
+- **The exe is stale again** (every commit since `ad2d89e` changed source). verify-10 was GREEN at
+  `ad2d89e`; it has NOT been re-run at the current HEAD.
+- **Remaining couch mutants are named, not rounded away:** `tailscale_ip` + its CGNAT guard need a
+  live tailnet (the UDP connect returns early without one, so the guard is unreachable); `lan_ip` only
+  affects a displayed URL; `start()`'s own wiring (`reviewers: tokens`, `is_running`) is untested
+  because start() binds the fixed port 8737 — a flake risk on this box worth weighing, not casually
+  adding; the spot-check interleave-position survivors are cosmetic placement.
+- **~69 long-standing survivors in diff/normalizer/g2p/conformal/irt/signal_anomaly** are unchanged
+  and still the documented hard tail.
+- Plan §2.5 (two-browser e2e) and §3.6 (waveform) remain. §2.5 is partly covered by the Rust soak.
+- **Seven Sorani strings await a native read** (`heldByOthers`, `settings.couchReviewers*`,
+  `settings.couchSpotChecks*`, `settings.couchAgreement*`, `settings.couchRevoke`,
+  `settings.couchThroughput`). "Remote 10/10" stays qualified while they do.
+- Nightly CI has still never run on a runner; the quiet week of real daily use is still ahead.
