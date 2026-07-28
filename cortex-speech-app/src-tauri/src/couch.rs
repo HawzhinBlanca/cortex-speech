@@ -1853,6 +1853,49 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_or_placeholder_submit_is_refused_and_leaves_the_draft_untouched() {
+        // DATA LOSS, and this project's most-repeated bug: a save path that treats "" as a successful
+        // transcript and writes it over a good draft. It has been found and fixed twice elsewhere in
+        // the codebase. The couch path had the guards but NOTHING pinned them, so a refactor could
+        // delete either one and every test would still pass — which is precisely how it came back the
+        // second time.
+        //
+        // The 400 is only half the property. The half that matters is that the stored row is UNCHANGED:
+        // a rejection that still wrote would be the actual bug, and would look like a working guard
+        // from the client's side.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _p) = test_db(tmp.path());
+        db.insert_segment(&seg("d1", "دەقێکی باش کە نابێت لەدەست بچێت")).unwrap();
+        let state = state();
+
+        let refused = |text: &str, action: &str| {
+            let body = serde_json::json!({ "id": "d1", "action": action, "text": text });
+            api_decision(&db, body.to_string().as_bytes(), "Sara", &state).0
+        };
+
+        // Empty, and whitespace-only — the trim happens before the check, so a page that sends "   "
+        // after the reviewer clears the box must be refused just as firmly as one that sends "".
+        for (text, why) in
+            [("", "an empty transcript"), ("   ", "whitespace only"), ("\n\t ", "newlines and tabs only")]
+        {
+            for action in ["accept", "edit"] {
+                assert_eq!(refused(text, action), 400, "{why} must be refused on '{action}'");
+            }
+        }
+        // A placeholder draft is not a human answer either — verifying one would mint gold from a
+        // string the ASR emitted to say it had nothing.
+        for text in ["[Pending WSL 7B ASR]", "[ASR unavailable]"] {
+            assert_eq!(refused(text, "accept"), 400, "a placeholder ({text}) must never be verifiable");
+        }
+
+        let after = db.get_segment_by_id("d1").unwrap().expect("the clip still exists");
+        assert_eq!(after.raw_transcript, "دەقێکی باش کە نابێت لەدەست بچێت", "the good draft must survive");
+        assert!(after.annotated_transcript.is_none(), "a refused submit must not write an annotation");
+        assert!(!after.verified, "a refused submit must not mark the clip reviewed");
+        assert!(after.human_decision.is_none(), "a refused submit must not record a decision");
+    }
+
+    #[test]
     fn undo_restores_a_pre_decision_jury_verdict_instead_of_clearing_it() {
         // DATA-LOSS (whole-row-clobber family): a jury-ESCALATED clip (verdict='escalated', escalated=true,
         // verified=false, human_decision=NULL) is served by the couch queue (get_segments(Some(false)) =
