@@ -1197,6 +1197,22 @@ mod tests {
             "changing the text is a real re-review and must be recorded"
         );
 
+        // A REJECT retry must also be absorbed. Only the edit path was covered, so deleting the
+        // ("reject", _) arm of is_repeat_of_stored_decision changed nothing any test could see —
+        // and a re-sent reject would have been recorded as a second human decision.
+        let rej = serde_json::json!({"id": "r2", "action": "bad"}).to_string();
+        assert_eq!(api_decision(&db, rej.as_bytes(), "Sara", &state).0, 200);
+        let before = lock_state(&state).undo.get("Sara").map(Vec::len).unwrap_or(0);
+        let (code, _, body) = api_decision(&db, rej.as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "a re-sent reject must succeed");
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["duplicate"], true, "and be recognised as already recorded");
+        assert_eq!(
+            lock_state(&state).undo.get("Sara").map(Vec::len).unwrap_or(0),
+            before,
+            "a retried reject must not push a second undo entry"
+        );
+
         // Someone ELSE's identical submit is never a "retry" — and it must not be allowed through as a
         // fresh decision either. Writing this assertion is what exposed the LATE-SUBMIT gap: the lease
         // is released the instant a clip is decided, so an already-decided clip had NO protection, and
@@ -1572,6 +1588,19 @@ mod tests {
         assert!(normalize_reviewers(&["x".repeat(MAX_REVIEWER_NAME + 1)]).is_err(), "over-long name refused");
         let too_many: Vec<String> = (0..=MAX_REVIEWERS).map(|i| format!("r{i}")).collect();
         assert!(normalize_reviewers(&too_many).is_err(), "more reviewers than threads are refused, not silently cut");
+        // THE LIMITS THEMSELVES, not just limit+1. Only the over-limit cases were pinned, so a `>` that
+        // slipped to `>=` would reject a perfectly legal 40-character name, or an eighth reviewer, and
+        // every test would still pass. Both survived the mutation sweep until these two lines existed.
+        assert!(
+            normalize_reviewers(&["x".repeat(MAX_REVIEWER_NAME)]).is_ok(),
+            "a name of exactly the maximum length is legal"
+        );
+        let exactly_max: Vec<String> = (0..MAX_REVIEWERS).map(|i| format!("r{i}")).collect();
+        assert_eq!(
+            normalize_reviewers(&exactly_max).unwrap().len(),
+            MAX_REVIEWERS,
+            "exactly MAX_REVIEWERS is allowed — the cap is the last accepted value, not the first refused"
+        );
     }
 
     #[test]
@@ -1638,6 +1667,18 @@ mod tests {
             assert_eq!(code, expect, "body: {body}");
         }
         assert!(lock_state(&state).undo.values().all(Vec::is_empty), "no failed decision may leave an undo entry");
+
+        // Both brackets are required TOGETHER. With `||` in that guard, any transcript merely ENDING
+        // in ']' — or merely STARTING with '[' — would be refused as a placeholder, silently blocking
+        // legitimate text. Only "[...]" on both sides is a placeholder, so this half-bracketed text
+        // must be ACCEPTED. (A rejects-only loop could never have caught this: the bug refuses MORE.)
+        db.insert_segment(&seg("s2", "دەق")).unwrap();
+        let half = serde_json::json!({"id": "s2", "action": "accept", "text": "[ناتەواو"}).to_string();
+        assert_eq!(
+            api_decision(&db, half.as_bytes(), "Sara", &state).0,
+            200,
+            "text with only ONE bracket is ordinary text, not a placeholder"
+        );
         assert!(!db.get_segment_by_id("s1").unwrap().unwrap().verified, "row untouched by rejected requests");
     }
 
@@ -1813,7 +1854,7 @@ mod tests {
             .build();
 
         let base = format!("http://127.0.0.1:{port}");
-        let status_of = |url: String| -> u16 {
+        let status_of_url = |url: String| -> u16 {
             agent.get(&url).call().map(|r| r.status()).unwrap_or_else(|e| match e {
                 ureq::Error::Status(c, _) => c,
                 other => panic!("{url} transport error (timeout/hang?): {other}"),
@@ -1821,13 +1862,13 @@ mod tests {
         };
         // No token -> 401 on the page, the queue, and audio alike.
         for path in ["/", "/api/queue", "/api/audio/s1"] {
-            assert_eq!(status_of(format!("{base}{path}")), 401, "{path} must be token-gated");
+            assert_eq!(status_of_url(format!("{base}{path}")), 401, "{path} must be token-gated");
         }
         // An unrecognised token has no reviewer, so it has no way in either.
-        assert_eq!(status_of(format!("{base}/api/queue?t=notatoken")), 401, "an unknown token resolves to nobody");
+        assert_eq!(status_of_url(format!("{base}/api/queue?t=notatoken")), 401, "an unknown token resolves to nobody");
 
         // With a token: the page serves, and the queue identifies WHICH reviewer it answered.
-        assert_eq!(status_of(format!("{base}/?t=saratoken123")), 200);
+        assert_eq!(status_of_url(format!("{base}/?t=saratoken123")), 200);
         let sara: serde_json::Value =
             agent.get(&format!("{base}/api/queue?t=saratoken123")).call().unwrap().into_json().unwrap();
         assert_eq!(sara["reviewer"], "Sara", "the token, not the request, decides the identity");
@@ -1853,6 +1894,46 @@ mod tests {
         let row = db.get_segment_by_id(mine).unwrap().unwrap();
         assert!(row.verified);
         assert_eq!(row.reviewed_by.as_deref(), Some("Sara"), "the decision is attributed in the real database");
+
+        // THE ROUTING TABLE ITSELF. Every other test calls api_renew / api_undo / api_audio directly,
+        // so deleting their match arms — or flipping the /api/audio/ guard — changed nothing any test
+        // could observe: the handlers stayed correct while becoming unreachable. Mutation testing
+        // found exactly that. Each route is asserted to be WIRED, by a status only its own handler
+        // can produce.
+        let post = |path: &str, body: &str| -> u16 {
+            agent.post(&format!("{base}{path}?t=saratoken123")).send_string(body).map(|r| r.status()).unwrap_or_else(
+                |e| match e {
+                    ureq::Error::Status(c, _) => c,
+                    other => panic!("{path} transport error: {other}"),
+                },
+            )
+        };
+        // /api/renew reaches api_renew: a bad id is its 400, a missing route would be 404.
+        assert_eq!(post("/api/renew", &serde_json::json!({"id": "../etc"}).to_string()), 400, "/api/renew is wired");
+        // /api/undo reaches api_undo: Sara has one decision above, so this is its 200.
+        assert_eq!(post("/api/undo", ""), 200, "/api/undo is wired");
+        // /api/audio/<id> reaches api_audio: the id is unknown to the db, which is its 404 — NOT the
+        // router's 404, which a deleted guard would give for a well-formed id it never matched.
+        // A BAD id gives api_audio's own 400 — a deleted guard would give the router's 404 instead,
+        // and asserting only "404 for an unknown id" cannot tell those two apart (it did not).
+        assert_eq!(
+            status_of_url(format!("{base}/api/audio/..%2Fetc?t=saratoken123")),
+            400,
+            "/api/audio is wired — this 400 comes from its id validation, not from the router"
+        );
+        // And an unrelated GET must still reach the router's 404, not be swallowed by a widened guard.
+        assert_eq!(status_of_url(format!("{base}/nonsense?t=saratoken123")), 404, "unknown paths stay 404");
+        // And the body cap rejects an over-sized payload with ITS OWN message, so a truncating `take`
+        // (which would leave a short body to fail later as bad json) is distinguishable from a refusal.
+        let huge = "x".repeat(MAX_BODY_BYTES + 4096);
+        let resp = agent.post(&format!("{base}/api/decision?t=saratoken123")).send_string(&huge);
+        match resp {
+            Err(ureq::Error::Status(400, r)) => assert!(
+                r.into_string().unwrap_or_default().contains("body too large"),
+                "an over-cap body must be REFUSED, not silently truncated into a parse error"
+            ),
+            other => panic!("expected 400 body-too-large, got {other:?}"),
+        }
 
         shutdown.store(true, Ordering::SeqCst);
         server.unblock(); // the fix under test: unblock() (not a bare connect) ends the accept loops
