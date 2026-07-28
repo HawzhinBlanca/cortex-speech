@@ -67,6 +67,12 @@ const MAX_REVIEWERS: usize = 8;
 const SPOT_CHECK_EVERY: usize = 8;
 /// Longest accepted reviewer name. Names are stored on every row they decide, not shown in a URL.
 const MAX_REVIEWER_NAME: usize = 40;
+/// Bounded wait for the listening socket to actually come free after `stop()`. See
+/// [`release_listener`] for why a wait is needed at all. Worst case ~1.2 s, and only on the failing
+/// path — the normal case returns on the first attempt.
+const LISTENER_RELEASE_ATTEMPTS: u32 = 12;
+const LISTENER_RELEASE_DELAY: Duration = Duration::from_millis(50);
+const LISTENER_RELEASE_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 /// Accept-loop poll interval. `unblock()` is what actually wakes the threads on stop; this bounds the
 /// shutdown of any thread it does not reach, so `stop()` can never hang on `join()` (the single-thread
 /// version of this hazard was caught live — see `stop`).
@@ -284,9 +290,46 @@ pub fn stop() -> Result<CouchStatus, String> {
         for join in h.joins.drain(..) {
             let _ = join.join();
         }
+        let port = h.port;
+        // Drop the Server BEFORE waking it. Dropping is what sets tiny_http's internal close flag, so
+        // the order decides whether the wake-up connection means "exit" or "serve me".
+        drop(h);
+        release_listener(port);
         tracing::info!("Couch Review stopped");
     }
     Ok(CouchStatus::stopped())
+}
+
+/// Make sure the listening socket is really gone, and not just scheduled to be.
+///
+/// tiny_http parks a private accept thread in a blocking `accept()`, and that thread — not the
+/// `Server` value — is what holds the socket. `Server::drop` sets a close flag and then tries to wake
+/// the thread by connecting to its own listening address. That address is `0.0.0.0`, and on Windows
+/// connecting to `0.0.0.0` fails outright: it is a wildcard for BINDING, not a destination. So the
+/// wake never lands, the thread stays parked, and port 8737 stays bound for as long as the process
+/// lives — measured still LISTENing 120 s after `stop()` returned.
+///
+/// The user-visible cost was total: Settings -> Stop -> Start answered "os error 10048" and remote
+/// review stayed dead until the whole app was restarted. Worse, the port kept accepting TCP the whole
+/// time with nobody left to answer, so anyone who opened an old link simply hung.
+///
+/// Connecting to loopback performs the wake tiny_http intended. The bind is what PROVES it worked: a
+/// successful connect proves nothing, since the OS accepts into the backlog of a listener that is on
+/// its way out.
+fn release_listener(port: u16) {
+    let wake = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    for _ in 0..LISTENER_RELEASE_ATTEMPTS {
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(&wake, LISTENER_RELEASE_CONNECT_TIMEOUT) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() {
+            return; // the probe listener drops here, leaving the port free for the next start()
+        }
+        std::thread::sleep(LISTENER_RELEASE_DELAY);
+    }
+    // Not fatal, and deliberately not a panic: the session IS stopped either way. Say so plainly so a
+    // later bind failure reads as this, rather than as a mystery.
+    tracing::warn!("Couch Review port {port} was still bound after stop; starting again may need the app reopened");
 }
 
 /// Revoke ONE reviewer's link without disturbing anyone else (docs/REMOTE_REVIEW_PLAN.md §3.7).
@@ -1639,6 +1682,19 @@ mod tests {
             matches!(after, Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Transport(_))),
             "a stopped server must not keep honouring its tokens: {after:?}"
         );
+
+        // AND THE PORT MUST ACTUALLY BE FREE. This is the half that was missing, and the bug it hides
+        // is not subtle: Settings -> Stop -> Start failed with "os error 10048", and stayed broken
+        // until the whole app was restarted. tiny_http's `Server::drop` wakes its parked accept thread
+        // by connecting to its own listening address — which is 0.0.0.0, and on Windows connecting to
+        // 0.0.0.0 fails outright, so the wake never lands and the socket is held indefinitely.
+        // Measured before the fix: still LISTENing 120 s after stop() returned.
+        //
+        // Asserted by RE-STARTING rather than by inspecting the socket: restarting is the thing the
+        // owner actually does, and it is what was broken.
+        let restarted = start(db_path, vec!["Sara".into()]).expect("stop must leave the port free to start again");
+        assert!(restarted.running, "a stop/start cycle must produce a working server, not a bind error");
+        stop().expect("second stop succeeds");
     }
 
     #[test]
