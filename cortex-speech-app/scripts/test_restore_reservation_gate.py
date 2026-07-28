@@ -78,7 +78,17 @@ def test_every_writer_start_checks_restore_pending() -> None:
     _assert_guarded(jury, "pub async fn run_t2_for_segment(", "run_t2_for_segment", "super::restore_pending()")
 
     couch = _read("couch.rs")
-    _assert_guarded(couch, "pub fn start(", "couch::start", "restore_pending()")
+    # `start_on_port`, NOT `start`. `start` is a one-line delegate that injects the production port;
+    # the guard must stay in the function that takes the COUCH lock, because the whole argument for it
+    # being airtight is that the check and the `*guard = Some(handle)` register are serialized by the
+    # SAME mutex the restore fence reads. Hoisting it into `start` would satisfy a naive scan while
+    # moving the check OUTSIDE the lock and reopening the race this gate exists to close.
+    _assert_guarded(couch, "fn start_on_port(", "couch::start_on_port", "restore_pending()")
+    if "start_on_port(db_path, reviewers, COUCH_PORT)" not in couch:
+        raise AssertionError(
+            "couch::start must delegate to start_on_port so the guarded path is the only way in; if it "
+            "grew its own body, this gate is checking a function the app no longer calls."
+        )
 
 
 def main() -> None:

@@ -152,6 +152,49 @@ test.describe('Couch Review phone page', () => {
       .toBe(0);
   });
 
+  test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {
+    // DATA LOSS, and made MORE reachable by fixing Stop/Start: every outstanding token is regenerated
+    // when the owner restarts Couch Review or reissues a link. A reviewer who was offline then
+    // reconnects to a 401 — and the outbox used to treat ANY status as "the server gave a real
+    // answer, drop it", so their queued decisions were thrown away without a word.
+    //
+    // 401 is not a verdict on the decision. It says the LINK died. A fresh link replays it.
+    // The mode lives in localStorage, not on `window`: addInitScript re-runs on every navigation, so
+    // a mode held in a variable would be reset to 'ok' by the very reload this test depends on.
+    await page.addInitScript(() => {
+      window.fetch = async () => {
+        const mode = localStorage.getItem('__netmode') || 'ok';
+        if (mode === 'offline') throw new TypeError('Failed to fetch');
+        if (mode === 'expired') return new Response('unauthorized', { status: 401 });
+        return new Response('{"ok":true,"items":[],"reviewer":"Sara"}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+    });
+    await page.goto(PAGE);
+    await showAClip(page);
+
+    // Offline: the decision is held.
+    await page.evaluate(`localStorage.setItem('__netmode', 'offline')`);
+    await page.locator('#accept').click();
+    await expect
+      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .toBe(1);
+
+    // Back online, but the owner restarted the server meanwhile — the token is dead.
+    await page.evaluate(`localStorage.setItem('__netmode', 'expired')`);
+    await page.reload();
+
+    // The reviewer is TOLD the link expired...
+    await expect(page.locator('#err')).toBeVisible();
+    await expect(page.locator('#err')).toContainText('بەسەرچووە');
+    // ...and their unsent decision is STILL THERE, waiting for a working link.
+    expect(
+      await page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+    ).toBe(1);
+  });
+
   test('the token is stripped from the visible URL after the first load', async ({ page }) => {
     // The server plants an HttpOnly cookie, so the token no longer needs to ride in the URL where it
     // lands in history and in any proxy log. The link the reviewer was SENT keeps working; this only
