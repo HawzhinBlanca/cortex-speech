@@ -490,7 +490,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     }
 
     let ids = |limit: usize| -> Vec<String> {
-        db.list_spot_check_candidates(limit).unwrap().into_iter().map(|(s, _)| s.id).collect()
+        db.list_spot_check_candidates(limit, "Sara").unwrap().into_iter().map(|(s, _)| s.id).collect()
     };
     assert!(ids(0).is_empty(), "a limit of zero must return NOTHING, not one");
     assert_eq!(ids(1).len(), 1, "a limit of one returns exactly one");
@@ -511,7 +511,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     // score a blind accept as perfect. Asserted against the row that came back rather than a
     // hardcoded string: the answer key must be right for EVERY candidate, not just whichever one
     // happens to sort first.
-    for (seg, expected) in db.list_spot_check_candidates(10).unwrap() {
+    for (seg, expected) in db.list_spot_check_candidates(10, "Sara").unwrap() {
         assert_ne!(expected, seg.raw_transcript, "{} was graded against its own draft", seg.id);
         assert_eq!(
             Some(expected.as_str()),
@@ -520,6 +520,21 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
             seg.id
         );
     }
+
+    // A TRAP ALREADY ANSWERED MUST NOT COME BACK to the same reviewer. Selection is deterministic
+    // (id ASC), so without this every batch drew the identical first-N: after one batch the reviewer
+    // answers from memory rather than by listening, and because record_spot_check upserts on
+    // (segment_id, reviewer) the memorised attempt OVERWRITES the one honest measurement. The score
+    // then drifts upward the longer someone works, which is worse than no score at all.
+    db.record_spot_check("sc-wrong-1", "Sara", "edit", "دەقی ڕاست", "دەقی ڕاست").unwrap();
+    let after = ids(10);
+    assert!(!after.contains(&"sc-wrong-1".to_string()), "Sara must not be re-tested on a trap she has answered");
+    assert!(after.contains(&"sc-wrong-2".to_string()), "her remaining traps are still available");
+
+    // Per REVIEWER, not global: two people meeting the same clip independently is the entire basis of
+    // the agreement sample, so Sara's answer must not consume Hemn's.
+    let hemn: Vec<String> = db.list_spot_check_candidates(10, "Hemn").unwrap().into_iter().map(|(s, _)| s.id).collect();
+    assert!(hemn.contains(&"sc-wrong-1".to_string()), "one reviewer's answer must not exhaust another's pool");
 }
 
 #[test]

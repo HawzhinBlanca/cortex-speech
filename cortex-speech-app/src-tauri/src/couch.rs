@@ -701,7 +701,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         // batch while holding the ~1-in-8 ratio wherever the batch is large enough for it to mean
         // something. A reviewer must not be able to coast just because their batches came out short.
         let wanted = queue.len().div_ceil(SPOT_CHECK_EVERY);
-        match db.list_spot_check_candidates(wanted) {
+        match db.list_spot_check_candidates(wanted, reviewer) {
             Ok(candidates) => {
                 let mut guard = lock_state(state);
                 for (idx, (seg, _)) in candidates.into_iter().enumerate() {
@@ -1421,7 +1421,7 @@ mod tests {
         gold_seg(&db, "g2", "دەقی هەڵەی دوو", "دەقی ڕاستی دوو");
         let state = state();
 
-        let candidates = db.list_spot_check_candidates(10).unwrap();
+        let candidates = db.list_spot_check_candidates(10, "Sara").unwrap();
         assert_eq!(candidates.len(), 2, "both clips have a human answer that differs from the raw draft");
         // A check is graded only because it was SERVED as one; mark both as served to each reviewer,
         // which is exactly what api_queue records when it salts a batch.

@@ -1147,14 +1147,28 @@ impl Database {
     ///
     /// Ordered by id so the selection is deterministic; a queue that reshuffled its traps every poll
     /// would grade two reviewers on different material and make the scores incomparable.
-    pub fn list_spot_check_candidates(&self, limit: usize) -> AppResult<Vec<(SpeechSegment, String)>> {
+    ///
+    /// Excludes what THIS reviewer has already been scored on, and that exclusion is what makes the
+    /// number mean anything. Without it every batch drew the same first-N-by-id, so a reviewer met the
+    /// identical traps over and over: after the first batch they are answering from memory, not from
+    /// listening. Worse, `record_spot_check` upserts on (segment_id, reviewer) — so the later,
+    /// memorised attempt OVERWRITES the one honest measurement, and the score drifts upward the longer
+    /// someone works. It also meant only the first few candidates were ever used no matter how many
+    /// existed. Per-reviewer, not global: two reviewers meeting the same clip independently is the
+    /// point (it is what `agreement_sample` reads).
+    ///
+    /// When a reviewer exhausts the pool they simply stop being measured, which is the honest outcome:
+    /// `SpotCheckScore::checks` reports how many they actually answered, and re-testing on answers they
+    /// already know would be a bigger number meaning less.
+    pub fn list_spot_check_candidates(&self, limit: usize, reviewer: &str) -> AppResult<Vec<(SpeechSegment, String)>> {
         let query = format!(
             "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments
              WHERE verified = 1 AND raw_transcript <> '' AND (is_gold = 1 OR reviewed_by IS NULL)
+               AND id NOT IN (SELECT segment_id FROM spot_checks WHERE reviewer = ?1)
              ORDER BY id ASC"
         );
         let mut stmt = self.conn.prepare(&query)?;
-        let rows = stmt.query_map([], Self::map_row)?;
+        let rows = stmt.query_map([reviewer], Self::map_row)?;
         let mut out = Vec::new();
         for row in rows {
             // Checked BEFORE the push, not after. Testing it afterwards makes `limit == 0` return ONE
