@@ -195,6 +195,43 @@ test.describe('Couch Review phone page', () => {
     ).toBe(1);
   });
 
+  test('a decision made after the link dies is HELD, not just toasted away', async ({ page }) => {
+    // The sibling of the outbox-replay bug, and the more likely one: the link does not usually die
+    // while the reviewer is idle, it dies WHILE THEY ARE WORKING — the owner restarts Couch Review to
+    // add a second reviewer and every outstanding token is regenerated.
+    //
+    // Before this, a 401 on submit only raised a toast reading "Failed to save edit: unauthorized".
+    // The reviewer stayed on the clip, their typed text survived as a draft, but the VERDICT
+    // (accept / reject / edit) was never recorded anywhere and was simply gone.
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        if (String(input).includes('/api/decision')) return new Response('unauthorized', { status: 401 });
+        return new Response('{"ok":true,"items":[],"reviewer":"Sara"}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+    });
+    await page.goto(PAGE);
+    await showAClip(page);
+    await page.locator('#accept').click();
+
+    // The verdict is held for the next working link...
+    await expect
+      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .toBe(1);
+    const held = (await page.evaluate(
+      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`,
+    )) as Array<{ id: string; action: string }>;
+    expect(held[0]).toMatchObject({ id: 's1', action: 'accept' });
+
+    // ...the reviewer is told why, persistently rather than in a toast that vanishes...
+    await expect(page.locator('#err')).toBeVisible();
+    await expect(page.locator('#err')).toContainText('بەسەرچووە');
+    // ...and they are moved on so they can keep working instead of tapping a dead clip.
+    await expect(page.locator('#text')).toHaveValue('دەقی دووەم');
+  });
+
   test('the token is stripped from the visible URL after the first load', async ({ page }) => {
     // The server plants an HttpOnly cookie, so the token no longer needs to ride in the URL where it
     // lands in history and in any proxy log. The link the reviewer was SENT keeps working; this only

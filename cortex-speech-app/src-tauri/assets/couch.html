@@ -392,11 +392,25 @@
       doneThisSession += 1;
       i += 1; show();
     } catch (e) {
-      if (e.status === undefined) {
-        // The request never reached the server. Hold it and move on rather than making the reviewer
-        // sit on a dead clip — it will be replayed the moment the phone reconnects.
+      // HOLD, and move on. None of these is a verdict on the decision itself, so the reviewer must
+      // not lose it and must not be stranded on the clip:
+      //   no status  — the request never reached the server (offline).
+      //   401        — the LINK died mid-session, which happens whenever the owner restarts Couch
+      //                Review or reissues a link (adding a second reviewer does it). Only toasting
+      //                here meant every decision made after that moment was dropped: the typed text
+      //                survived in the draft, but the accept/reject verdict did not.
+      //   5xx        — the server is unwell, not disagreeing.
+      // Held decisions replay on the next working link, so the reviewer can keep going meanwhile.
+      if (e.status === undefined || e.status === 401 || e.status >= 500) {
         writeOutbox([...readOutbox().filter((q) => q.id !== submission.id), submission]);
-        toast(t('saved'));
+        if (e.status === 401) {
+          // Say it once, persistently — a toast about a dead link vanishes before it is understood,
+          // and this one needs an action from the reviewer (ask for a new link).
+          $('err').hidden = false;
+          $('err').textContent = t('linkExpired');
+        } else {
+          toast(t('saved'));
+        }
         i += 1; show();
       } else {
         toast(t('saveFailed', { err: e.message }));
