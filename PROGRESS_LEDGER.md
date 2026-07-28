@@ -1839,3 +1839,81 @@ themes); python-policies **44/44**.
   `settings.couchSpotChecks*`, `settings.couchAgreement*`, `settings.couchRevoke`,
   `settings.couchThroughput`). "Remote 10/10" stays qualified while they do.
 - Nightly CI has still never run on a runner; the quiet week of real daily use is still ahead.
+
+## 2026-07-28 — iter 198 — the phone page was broken over the wire in two ways, and only a LIVE run found them (1758d1e, 475a1ca)
+
+**The exe finally matches HEAD.** `npm run tauri build` exit 0, both bundles produced. The stale
+`cortex.lock` left by force-killing the old process did NOT block startup — the flock fix from
+`4924a88` proved itself in production, which is the first time it has been exercised for real.
+
+**Then I stopped trusting the test suite and drove the real server instead.** Couch Review started
+via CDP against the running app (`start_couch_review`), both links issued including the Tailscale
+one, and a real headless iPhone-profile browser pointed at `http://100.107.91.64:8737`. Everything
+the suite covers came back green — `ckb`/`rtl`, 25 clips, real Sorani text, token stripped from the
+URL, `cortex_couch` HttpOnly cookie set, zero console errors. **Two defects that no test could see
+came back with it.**
+
+**Defect 1 — every clip had an INFINITE duration.** `player.duration` and `seekable.end(0)` both read
+`Infinity`, so the phone's progress bar showed no total time and tap-to-seek multiplied by Infinity
+and silently did nothing. Raw wire capture:
+
+```
+HTTP/1.1 200 OK
+Content-Type: audio/wav
+Transfer-Encoding: chunked          <- and NO Content-Length
+```
+
+tiny_http chunks any body at or above its 32 KB default. Clips are 300–500 KB so every one crossed
+it; the JSON replies this suite is full of are 2–10 KB and sat comfortably underneath. That gap is
+the whole reason 1069 passing tests missed it. Fixed at the single choke point every reply passes
+through. The regression test uses a 200 KB body **deliberately** — at 1 KB it passes with the bug
+present.
+
+**Defect 2 — `stop()` reported a stopped server while still holding port 8737.** Settings → Stop →
+Start answered `os error 10048` and remote review stayed dead until the whole app was restarted.
+Measured, not inferred: the listener was **still LISTENing 120 s after `stop()` returned**, and a
+five-cycle stop/start loop against the live app failed on cycle 2.
+
+Root cause is Windows-specific and sits in a dependency: tiny_http parks a private accept thread in a
+blocking `accept()`, and *that thread*, not the `Server` value, holds the socket. `Server::drop` sets
+its close flag and wakes the thread by connecting to its own listening address — which is `0.0.0.0`,
+and on Windows connecting to `0.0.0.0` fails outright (it is a wildcard for BINDING, not a
+destination). The wake never landed. Worse, the port kept accepting TCP with nobody left to answer,
+so an old link didn't fail — it **hung**. My own HTTP probe is what accidentally freed the port
+mid-investigation, which is what made the first reading look like a race.
+
+**The existing start/stop test asserted the tokens died but never that the PORT came back.** It now
+re-starts the server, because restarting is what the owner actually does and what was broken.
+
+**Gates (verbatim, this machine, this HEAD):** `cargo test --lib` **1070 passed; 0 failed; 6
+ignored**; `couch::` **24 passed**; clippy `--all-targets -D warnings` clean; fmt clean; `npm run
+typecheck` **426 FILES 0 ERRORS 0 WARNINGS**; `npm test` **214 passed (39 files)**.
+
+**Measured on the live server (127.0.0.1 and the Tailscale address, both):** `GET /` 6.4 ms ·
+`GET /api/queue` 1.8 ms · `GET /api/audio/<id>` 82–111 ms for 330–460 KB clips. I had suspected the
+per-request full-file decode was a remote-UX problem and it is NOT — measured, not assumed, and the
+page already prefetches the next clip, so the cost is hidden anyway. **No cache was added.**
+
+**Live tailnet state:** `hawapc01` = 100.107.91.64 online; `iphone-15-pro-max` = 100.113.237.79
+online, `tailscale ping` **pong via DERP(fra) in 184 ms** (relayed, not direct). Tailscale adapter is
+categorised **Private**, and the `cortex-speech-app.exe` inbound rule allows Private — so the path is
+open. Review queue depth from the live DB: **128 unverified clips**, 16 verified, single source WAV
+present on disk.
+
+**NOT DONE / NOT CLAIMED:**
+- **The spot-check pool is EMPTY.** `list_spot_check_candidates` requires `verified = 1 AND
+  is_gold = 1`; the live DB has **0** such rows (0 gold of any kind). So the proof-of-work measurement
+  ships inert on this data — reviewers will be attributed and throughput tracked, but nobody is being
+  scored until some verified clips are marked gold. This is data state, not a code defect, and it is
+  NOT a claim that spot checks "work in production".
+- verify-10 has NOT been re-run at this HEAD yet.
+- `start_issues_working_tokens_and_stop_takes_them_away` binds the real fixed port 8737, so it FAILS
+  while the app is running with Couch Review on. That is by design (a silent skip would restore the
+  blind spot) but it means verify-10 cannot be run during a live review session.
+- **No request has yet come from the phone itself.** Everything above was driven from this PC; the
+  inbound-from-another-device path is proven only as far as "the tunnel is up and the firewall
+  allows it".
+- **Seven Sorani strings still await a native read** (`heldByOthers`, `settings.couchReviewers*`,
+  `settings.couchSpotChecks*`, `settings.couchAgreement*`, `settings.couchRevoke`,
+  `settings.couchThroughput`). "Remote 10/10" stays qualified while they do.
+- Nightly CI has still never run on a runner; the quiet week of real daily use is still ahead.
