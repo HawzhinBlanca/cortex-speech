@@ -90,6 +90,77 @@ test.describe('Couch Review phone page', () => {
     expect(await size()).toBe(bigger);
   });
 
+  test('a dropped submit goes to the outbox and is replayed on the next load', async ({ page }) => {
+    // THE DATA-LOSS PATH, and it had no test. A phone at the edge of Wi-Fi loses requests; the outbox
+    // is what turns "your correction is gone" into "it lands when you reconnect". If this silently
+    // broke, a reviewer would keep working and their decisions would evaporate one by one — the exact
+    // failure that is invisible until the corpus is short and nobody knows why.
+    //
+    // fetch is stubbed rather than routed: page.route cannot intercept a file:// page, and the point
+    // here is the PAGE's behaviour when the network fails, not the server's.
+    await page.addInitScript(() => {
+      (window as unknown as { __net: { fail: boolean; calls: string[] } }).__net = { fail: false, calls: [] };
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const net = (window as unknown as { __net: { fail: boolean; calls: string[] } }).__net;
+        const url = String(input);
+        net.calls.push(url + ' ' + String(init?.body ?? ''));
+        // A dropped request is a TypeError from fetch — no status — which is exactly how the page
+        // tells "never arrived" (retry) from "the server refused" (do not retry).
+        if (net.fail) throw new TypeError('Failed to fetch');
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await showAClip(page);
+
+    // The network drops, then the reviewer saves.
+    await page.evaluate(`window.__net.fail = true`);
+    await page.locator('#accept').click();
+
+    // Their decision is HELD, not lost — and they are moved on rather than stranded on a dead clip.
+    const queued = await page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`);
+    expect(queued).toHaveLength(1);
+    expect((queued as Array<{ id: string }>)[0].id).toBe('s1');
+    await expect(page.locator('#text')).toHaveValue('دەقی دووەم', { timeout: 5000 });
+
+    // Network returns; the next load flushes it. Replay is safe only because the SERVER answers an
+    // identical re-submit as already-recorded (couch.rs is_repeat_of_stored_decision).
+    await page.evaluate(`window.__net.fail = false`);
+    await page.reload();
+    await page.waitForFunction(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length === 0`, null, {
+      timeout: 5000,
+    });
+    const calls = (await page.evaluate(`window.__net.calls`)) as string[];
+    expect(calls.some((c) => c.includes('/api/decision') && c.includes('s1'))).toBe(true);
+  });
+
+  test('a submit the server REFUSES is dropped, not retried forever', async ({ page }) => {
+    // The mirror image, and just as important: a 409 (someone else took the clip) or a 400 is a real
+    // ANSWER. Queueing it would wedge the outbox behind a decision that can never land, and every
+    // later decision would be stuck behind it.
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        if (String(input).includes('/api/decision')) return new Response('another reviewer', { status: 409 });
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await showAClip(page);
+    await page.locator('#accept').click();
+    await expect
+      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .toBe(0);
+  });
+
+  test('the token is stripped from the visible URL after the first load', async ({ page }) => {
+    // The server plants an HttpOnly cookie, so the token no longer needs to ride in the URL where it
+    // lands in history and in any proxy log. The link the reviewer was SENT keeps working; this only
+    // cleans up after it.
+    await page.goto(PAGE + '?t=secret-token-123');
+    await expect.poll(async () => page.url()).not.toContain('secret-token-123');
+    await expect.poll(async () => page.evaluate(`location.search`)).not.toContain('t=');
+  });
+
   for (const scheme of ['light', 'dark'] as const) {
     test(`has zero WCAG 2.2 AA violations while reviewing (${scheme})`, async ({ page }) => {
       // Both themes, because the page renders in whichever the phone is set to and a contrast
