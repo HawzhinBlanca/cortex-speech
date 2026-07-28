@@ -512,7 +512,7 @@
   // Well inside the server's TTL, so a slow clip never expires while it is genuinely being worked on.
   // A 409 here means someone else took it — said NOW, while the correction can still be copied,
   // instead of at save time when it is already unsaveable.
-  setInterval(async () => {
+  async function renewLease() {
     const seg = queue[i];
     if (!seg || document.hidden) return;
     try {
@@ -522,7 +522,19 @@
     } catch (e) {
       if (e.status === 409) { $('warn').textContent = t('heldByOthers', { n: 1 }); $('warn').hidden = false; }
     }
-  }, 4 * 60 * 1000);
+  }
+  setInterval(() => void renewLease(), 4 * 60 * 1000);
+  // Renew the moment the reviewer COMES BACK, not up to four minutes later. Ticks are skipped while
+  // the page is hidden — deliberately, so a reviewer who wanders off releases their clips — but that
+  // leaves a real gap on a phone, where backgrounding is constant (a call, a notification, the screen
+  // locking). Someone who returns at minute 13 of a 15-minute lease would have it lapse under them at
+  // 15 while they are actively typing, with the next tick not due until 16; another reviewer can take
+  // the clip in that window and their correction comes back 409 at save time. Renewing on return
+  // collapses that exposure to nothing, and costs one request per time the page is opened.
+  // On `document`, which is where visibilitychange is dispatched — a window-level listener only sees
+  // it because the event bubbles, which is a needless dependency for the one event that must not be
+  // missed here.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) void renewLease(); });
   $('save').onclick   = () => decide('edit');
   $('accept').onclick = () => decide('accept');
   $('bad').onclick    = () => decide('bad');

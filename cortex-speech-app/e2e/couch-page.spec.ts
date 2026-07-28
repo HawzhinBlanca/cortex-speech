@@ -232,6 +232,41 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('دەقی دووەم');
   });
 
+  test('coming back to the page renews the lease immediately, not four minutes later', async ({ page }) => {
+    // Renewal ticks are skipped while the page is hidden, deliberately: a reviewer who wanders off
+    // should release their clips. But on a phone, backgrounding is constant — a call, a notification,
+    // the screen locking — and the tick is every 4 minutes against a 15-minute lease. Someone who
+    // comes back at minute 13 would have the lease lapse under them at 15, while actively typing,
+    // with no renewal due until 16. Another reviewer takes the clip in that window and their
+    // correction is refused at save time.
+    await page.addInitScript(() => {
+      (window as unknown as { __renews: string[] }).__renews = [];
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).includes('/api/renew')) {
+          (window as unknown as { __renews: string[] }).__renews.push(String(init?.body ?? ''));
+        }
+        return new Response('{"ok":true,"items":[],"reviewer":"Sara"}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+    });
+    await page.goto(PAGE);
+    await showAClip(page);
+    await page.evaluate(`window.__renews = []`);
+
+    // Going away must NOT renew — that is the property that lets an idle reviewer's clips go back.
+    await page.evaluate(`Object.defineProperty(document, 'hidden', { value: true, configurable: true });
+                         document.dispatchEvent(new Event('visibilitychange'));`);
+    expect(await page.evaluate(`window.__renews.length`)).toBe(0);
+
+    // Coming back must renew at once.
+    await page.evaluate(`Object.defineProperty(document, 'hidden', { value: false, configurable: true });
+                         document.dispatchEvent(new Event('visibilitychange'));`);
+    await expect.poll(async () => page.evaluate(`window.__renews.length`)).toBe(1);
+    expect(await page.evaluate(`window.__renews[0]`)).toContain('s1');
+  });
+
   test('the token is stripped from the visible URL after the first load', async ({ page }) => {
     // The server plants an HttpOnly cookie, so the token no longer needs to ride in the URL where it
     // lands in history and in any proxy log. The link the reviewer was SENT keeps working; this only
