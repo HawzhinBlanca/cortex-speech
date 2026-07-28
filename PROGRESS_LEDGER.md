@@ -2002,3 +2002,64 @@ passed**; `npm run test:e2e` **57 passed**; playwright couch-page **10 passed**;
   proven only as far as "tunnel up, firewall allows, adapter is Private".
 - **Seven Sorani strings still await a native read.**
 - Nightly CI has still never run on a runner; the quiet week of real daily use is still ahead.
+
+## 2026-07-28 — iter 200 — three more data-loss / work-loss paths on the phone page, found by reading failure paths rather than happy ones (ef3a7b7, b8bc3a3, 3fa7acb)
+
+All three were found the same way the iter-198 defects were: by asking what a REMOTE reviewer
+actually experiences when something goes wrong, rather than by running the suite. All three are fixed
+with a fail-before. The app stayed running and serving throughout — nothing here touched the live
+session.
+
+**`ef3a7b7` — an expired link silently destroyed queued work, and MY OWN FIX made it more reachable.**
+Fixing Stop→Start (iter 198) means restarting Couch Review is now easy, and every restart regenerates
+every token. A reviewer who was offline with decisions in the outbox reconnects to a 401 — and
+`flushOutbox` treated ANY status as "the server gave a real answer, drop it". Their queued decisions
+were discarded without a word. **401 is not a verdict on the decision; it says the LINK died**, and a
+fresh link replays it. 401 and 5xx are now kept; 409 (taken) and 400 (invalid) are still dropped,
+because those genuinely are answers about that decision. Fail-before: outbox 0, expected 1.
+
+The page also rendered this as `Failed to load queue: unauthorized` — the operative word in ENGLISH,
+on a Kurdish-first page, with no hint that the fix is to ask for a new link. 401 now gets its own
+message, which can honestly promise nothing is lost only BECAUSE of the outbox change above.
+
+**`b8bc3a3` — the sibling, and the likelier half.** A link does not usually die while the reviewer is
+idle; it dies WHILE THEY ARE WORKING, because the owner restarted the server or added a reviewer.
+`flushOutbox` had been taught to keep a 401, but `decide()` never queued one at all: a 401 on submit
+only raised a toast. The reviewer's typed text survived as a draft, and the VERDICT — accept, reject,
+edit — was recorded nowhere and simply lost, for every tap after that moment. Now held exactly like
+the offline case, with the reviewer moved on so they can keep working. Fail-before: held 0, expected 1.
+
+**`3fa7acb` — an ACTIVE reviewer could still lose their clip.** Renewal ticks are skipped while the
+page is hidden (deliberate — an idle reviewer should release clips), but the tick is 4 minutes
+against a 15-minute lease, and on a phone backgrounding is constant. A reviewer returning at minute
+13 has the lease lapse under them at 15 while they are typing, with no renewal due until 16; another
+reviewer takes the clip and their correction is refused 409 at save. Now renewed on return. The test
+pins BOTH directions — a listener that also fired on hide would quietly defeat the release-when-idle
+property. Fail-before: renewals 0, expected 1.
+
+**A gate I had to change, stated plainly rather than buried.** The port refactor (`bf3c0c5`) moved
+`start()`'s body into `start_on_port`, and `test_restore_reservation_gate.py` scans a named function
+for the restore fence — so it failed. I did NOT hoist the check back into `start()`: that would
+satisfy the scan while moving the check OUTSIDE the `COUCH` lock, and the entire atomicity argument
+is that the check and the handle register are serialized by the same mutex the restore fence reads.
+The gate now scans `start_on_port` and additionally asserts `start` still delegates to it. **Verified
+the gate still bites** by deleting the guard (it fails).
+
+**Gates (verbatim):** playwright couch-page **13 passed**; `npm run test:e2e` **60 passed**;
+python-policies **44/44**; `cargo test --lib couch::` **25 passed**; `cargo test --lib` **1070
+passed** (run WITH the live server holding 8737 — the point of `bf3c0c5`); clippy `--all-targets -D
+warnings` clean; fmt clean.
+
+**NOT DONE / NOT CLAIMED:**
+- **Still zero remote reviews.** `review_events` = 0, `spot_checks` = 0, 128 clips pending. The
+  inbound-from-the-phone path remains the one thing nothing on this PC can prove. A monitor is armed
+  on the audit trail to catch the first one.
+- **verify-10 has not completed at any HEAD today.** It needs the app CLOSED — `real-app-e2e` spawns
+  the exe and the single-instance lock refuses it.
+- **The exe is behind HEAD.** The running binary has the three iter-198 fixes; everything in iter 199
+  and 200 (`linkExpired`, both outbox fixes, the lease renewal) needs a rebuild, which is not being
+  done under a live session.
+- **`linkExpired` is NEW Sorani** and is acknowledged in `UNREVIEWED_SORANI` — now 2 keys awaiting a
+  native read, up from 1. The other seven desktop-sourced strings are unchanged.
+- The on-disk NSIS/MSI installers are stale (the last `tauri build` exited 1 on MSI bundling, my race
+  with launching the app).
