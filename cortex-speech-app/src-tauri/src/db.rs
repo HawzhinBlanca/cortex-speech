@@ -1115,19 +1115,31 @@ impl Database {
         }
     }
 
-    /// Segments usable as SPOT CHECKS: a GOLD, human-verified answer already exists, and the raw ASR
-    /// draft DIFFERS from it (Migration v44, docs/REMOTE_REVIEW_PLAN.md §2.1).
+    /// Segments usable as SPOT CHECKS: a trusted human answer already exists, and the raw ASR draft
+    /// DIFFERS from it (Migration v44, docs/REMOTE_REVIEW_PLAN.md §2.1).
     ///
-    /// `is_gold` is load-bearing, not decoration. Without it every clip a reviewer had just corrected
-    /// became an answer key the moment they saved it — so the next reviewer was graded against a
-    /// PEER'S FRESH GUESS and marked wrong for merely disagreeing with it. (Found by the soak test:
-    /// clients reported 61 successes against 60 clips, the extra one being a just-decided clip
-    /// re-served as a check.) An answer key has to actually be an answer key, which is precisely what
-    /// the gold flag means in this schema.
+    /// "Trusted" must exclude a PEER'S FRESH GUESS. Without that, every clip a reviewer had just
+    /// corrected became an answer key the moment they saved it, and the next reviewer was graded
+    /// against it and marked wrong for merely disagreeing. (Found by the soak test: clients reported
+    /// 61 successes against 60 clips, the extra one being a just-decided clip re-served as a check.)
     ///
-    /// The cost is honest and bounded: spot-check volume is capped by the size of the gold set, so a
-    /// small gold set yields few checks. `SpotCheckScore::checks` reports the real number rather than
-    /// hiding it, and no conclusion should be drawn from a handful.
+    /// That was first expressed as `is_gold = 1`, which was correct in intent and inert in fact:
+    /// **nothing in this application ever sets `is_gold`.** Every write of it lives inside
+    /// `#[cfg(test)]`, and the migrations only ever declare it `DEFAULT 0` — the `gold_segments`
+    /// table is a different thing entirely (the frozen eval set). So the candidate set was
+    /// unconditionally empty in every real installation and the whole spot-check mechanism could
+    /// never fire, silently, while the UI simply showed nothing.
+    ///
+    /// `reviewed_by IS NULL` is the trust signal that is actually populated. It is set
+    /// UNCONDITIONALLY by `record_human_decision_by` to the name of whoever authored the row's
+    /// current decision, and the desktop path passes `None` while every phone decision passes a
+    /// reviewer name — so NULL means "verified here, by the owner, not by a remote reviewer", which
+    /// is exactly the distinction the gold flag was reaching for. `is_gold = 1` is still honoured so
+    /// that anything which does mark gold in future keeps working.
+    ///
+    /// The cost is honest and bounded: spot-check volume is capped by how much owner-verified work
+    /// exists, so a small library yields few checks. `SpotCheckScore::checks` reports the real number
+    /// rather than hiding it, and no conclusion should be drawn from a handful.
     ///
     /// The difference is the whole mechanism. Served with its raw draft, such a clip is a trap that a
     /// reviewer who actually listens will correct and a reviewer who taps "accept" will not — with no
@@ -1138,7 +1150,8 @@ impl Database {
     pub fn list_spot_check_candidates(&self, limit: usize) -> AppResult<Vec<(SpeechSegment, String)>> {
         let query = format!(
             "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments
-             WHERE verified = 1 AND is_gold = 1 AND raw_transcript <> '' ORDER BY id ASC"
+             WHERE verified = 1 AND raw_transcript <> '' AND (is_gold = 1 OR reviewed_by IS NULL)
+             ORDER BY id ASC"
         );
         let mut stmt = self.conn.prepare(&query)?;
         let rows = stmt.query_map([], Self::map_row)?;

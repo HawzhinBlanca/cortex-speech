@@ -454,8 +454,15 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     plant("sc-wrong-2", "هەڵەی دوو", Some("ڕاستی دوو"));
     plant("sc-already-right", "دەقی ڕاست", Some("دەقی ڕاست")); // draft == answer: no trap
     plant("sc-no-answer", "دەقی بێ وەڵام", None); // machine-only: not an answer key
-                                                 // Human-verified but NOT gold — a peer's fresh correction. It must never become an answer key,
-                                                 // or a reviewer would be graded against another reviewer's guess.
+
+    // A PHONE reviewer's fresh correction. It must never become an answer key, or the next reviewer
+    // is graded against a peer's guess and marked wrong for disagreeing with it.
+    //
+    // `reviewed_by` is what identifies it, and setting it here is the whole point: this fixture used
+    // to express "peer" as `is_gold = false`, which nothing in the app ever sets to true — so the
+    // test passed against a query that could never match ANYTHING in production. It now carries the
+    // column production actually writes (`record_human_decision_by` sets it unconditionally to the
+    // deciding reviewer's name).
     {
         let mut peer = make_segment("sc-peer-edit", "/peer.wav");
         peer.raw_transcript = "دەقی هەڵە".into();
@@ -464,7 +471,22 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
         peer.human_decision = Some("edit".into());
         peer.verdict = Some("human_edit".into());
         peer.verdict_transcript = Some("وەڵامی هاوکار".into());
+        peer.reviewed_by = Some("Hemn".into()); // decided on a phone, by someone who is not the owner
         db.insert_segment_full(&peer).unwrap();
+    }
+    // The OWNER's own desktop verification: not flagged gold either, but `reviewed_by` is NULL
+    // because the desktop path passes no annotator. This is the case that makes the mechanism
+    // reachable at all — without it the candidate set is empty in every real installation.
+    {
+        let mut owner = make_segment("sc-owner-edit", "/owner.wav");
+        owner.raw_transcript = "دەقی هەڵەی سێ".into();
+        owner.verified = true;
+        owner.is_gold = false;
+        owner.human_decision = Some("edit".into());
+        owner.verdict = Some("human_edit".into());
+        owner.verdict_transcript = Some("ڕاستی سێ".into());
+        owner.reviewed_by = None;
+        db.insert_segment_full(&owner).unwrap();
     }
 
     let ids = |limit: usize| -> Vec<String> {
@@ -473,19 +495,31 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     assert!(ids(0).is_empty(), "a limit of zero must return NOTHING, not one");
     assert_eq!(ids(1).len(), 1, "a limit of one returns exactly one");
     let all = ids(10);
-    assert_eq!(all.len(), 2, "only the two clips with a WRONG draft qualify, got {all:?}");
+    assert_eq!(all.len(), 3, "the two gold traps plus the owner-verified one qualify, got {all:?}");
     assert!(!all.contains(&"sc-already-right".to_string()), "a correct draft catches nobody");
     assert!(!all.contains(&"sc-no-answer".to_string()), "a clip with no human answer is not an answer key");
     assert!(
         !all.contains(&"sc-peer-edit".to_string()),
-        "a peer's fresh correction is NOT gold and must never be used to grade another reviewer"
+        "a peer's fresh correction must never be used to grade another reviewer"
+    );
+    assert!(
+        all.contains(&"sc-owner-edit".to_string()),
+        "the owner's own verified answer IS an answer key — without this the mechanism never fires"
     );
 
     // The expected text is the HUMAN answer, never the raw draft — grading against the draft would
-    // score a blind accept as perfect.
-    let (seg, expected) = db.list_spot_check_candidates(1).unwrap().pop().unwrap();
-    assert_ne!(expected, seg.raw_transcript);
-    assert_eq!(expected, "دەقی ڕاست");
+    // score a blind accept as perfect. Asserted against the row that came back rather than a
+    // hardcoded string: the answer key must be right for EVERY candidate, not just whichever one
+    // happens to sort first.
+    for (seg, expected) in db.list_spot_check_candidates(10).unwrap() {
+        assert_ne!(expected, seg.raw_transcript, "{} was graded against its own draft", seg.id);
+        assert_eq!(
+            Some(expected.as_str()),
+            seg.verdict_transcript.as_deref(),
+            "{} must be graded against its human verdict",
+            seg.id
+        );
+    }
 }
 
 #[test]
