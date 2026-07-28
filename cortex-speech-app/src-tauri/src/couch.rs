@@ -210,6 +210,23 @@ const DEFAULT_REVIEWER: &str = "owner";
 /// Start the couch server for `reviewers` (idempotent: returns the existing session if already running,
 /// WITHOUT re-tokenizing — a running session's links must not be invalidated by a status refresh).
 pub fn start(db_path: String, reviewers: Vec<String>) -> Result<CouchStatus, String> {
+    start_on_port(db_path, reviewers, COUCH_PORT)
+}
+
+/// `start` with the port injected, so the test can drive the REAL start/stop path without squatting
+/// the production port.
+///
+/// This is not test scaffolding for its own sake. The one test covering `start()`'s wiring bound
+/// 8737 directly, which meant the project's own gate could not run while Couch Review was running —
+/// `cargo test` failed with "os error 10048" for an entirely healthy app, during exactly the daily
+/// use the gate exists to protect. Skipping the test when the port was busy was the wrong answer: it
+/// would restore the blind spot the test was written to remove (mutation testing found `start()`
+/// wholly untested). Injecting the port keeps every assertion and removes the collision.
+///
+/// The production value is not weakened by being a parameter: `start()` is the only non-test caller
+/// and passes `COUCH_PORT`, which `the_session_constants_are_pinned_to_their_real_values` pins to
+/// 8737 — so a mutant that changed the constant still fails.
+fn start_on_port(db_path: String, reviewers: Vec<String>, port: u16) -> Result<CouchStatus, String> {
     let mut guard = COUCH.lock().unwrap_or_else(|p| p.into_inner());
     // P1.3b: don't stand up the phone-review server (a background DB writer on a submit) while a DB
     // restore is reserved. Checked UNDER the COUCH lock — the SAME lock is_running() (the restore fence)
@@ -239,8 +256,8 @@ pub fn start(db_path: String, reviewers: Vec<String>) -> Result<CouchStatus, Str
         .collect();
 
     let server = Arc::new(
-        tiny_http::Server::http(("0.0.0.0", COUCH_PORT))
-            .map_err(|e| format!("Couch server could not bind port {COUCH_PORT}: {e}"))?,
+        tiny_http::Server::http(("0.0.0.0", port))
+            .map_err(|e| format!("Couch server could not bind port {port}: {e}"))?,
     );
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -266,11 +283,14 @@ pub fn start(db_path: String, reviewers: Vec<String>) -> Result<CouchStatus, Str
             }
         }
     }
-    let handle = CouchHandle { shutdown, server, port: COUCH_PORT, state, joins };
+    // Read the port back off the socket rather than trusting the argument: a caller may pass 0 to
+    // mean "any free port", and the issued URLs must carry the port that was ACTUALLY bound.
+    let bound = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(port);
+    let handle = CouchHandle { shutdown, server, port: bound, state, joins };
     let status = status_of(&handle);
     *guard = Some(handle);
     tracing::info!(
-        "Couch Review started on port {COUCH_PORT} for {} reviewer(s) (token gated; stop from Settings)",
+        "Couch Review started on port {bound} for {} reviewer(s) (token gated; stop from Settings)",
         names.len()
     );
     Ok(status)
@@ -1676,21 +1696,27 @@ mod tests {
         // `is_running()`, the fence a DB restore consults before touching the library, could be
         // hardcoded either way undetected.
         //
-        // This binds the real fixed port 8737. If something already holds it the test FAILS with that
-        // reason named, rather than skipping — a silent skip here would restore exactly the blind spot
-        // it exists to remove.
+        // Port 0 (ephemeral), NOT the production 8737. Binding 8737 here meant this gate could not run
+        // while Couch Review was running — `cargo test` failed with "os error 10048" for a perfectly
+        // healthy app, during exactly the daily use it exists to protect. Skipping when the port was
+        // busy would have restored the blind spot; injecting the port keeps every assertion below and
+        // removes the collision. `COUCH_PORT` itself stays pinned by
+        // `the_session_constants_are_pinned_to_their_real_values`.
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("start-test.db").to_string_lossy().to_string();
         Database::open(&db_path).unwrap().initialize().unwrap();
 
         // An in-memory library is refused BEFORE any port is bound — the couch persists decisions, so a
         // database that evaporates on exit is not a thing it may serve.
-        assert!(start(":memory:".to_string(), vec!["Sara".into()]).is_err(), "an in-memory library must be refused");
+        assert!(
+            start_on_port(":memory:".to_string(), vec!["Sara".into()], 0).is_err(),
+            "an in-memory library must be refused"
+        );
         assert!(!is_running(), "a refused start must leave nothing running");
 
-        let status = match start(db_path.clone(), vec!["Sara".into(), "Hemn".into()]) {
+        let status = match start_on_port(db_path.clone(), vec!["Sara".into(), "Hemn".into()], 0) {
             Ok(s) => s,
-            Err(e) => panic!("start failed (port 8737 already in use?): {e}"),
+            Err(e) => panic!("start failed: {e}"),
         };
         assert!(is_running(), "the restore fence must see a running server");
         assert_eq!(status.reviewers.len(), 2, "one entry per named reviewer");
@@ -1699,7 +1725,18 @@ mod tests {
         let sara = status.reviewers.iter().find(|r| r.name == "Sara").expect("Sara was issued a link");
         let token = sara.url.split("?t=").nth(1).expect("the URL carries a token").to_string();
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
-        let url = format!("http://127.0.0.1:{COUCH_PORT}/api/queue?t={token}");
+        // Read the port back out of the URL the owner is actually handed. That doubles as an assertion
+        // that the issued link carries the port that was really bound — with an ephemeral port, a URL
+        // built from the REQUESTED port would say ":0" and reach nothing.
+        let bound_port: u16 = sara
+            .url
+            .split(':')
+            .nth(2)
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("the issued URL must carry a real port: {}", sara.url));
+        assert_ne!(bound_port, 0, "an issued link must never advertise port 0");
+        let url = format!("http://127.0.0.1:{bound_port}/api/queue?t={token}");
         let code = agent.get(&url).call().map(|r| r.status()).unwrap_or_else(|e| match e {
             ureq::Error::Status(c, _) => c,
             other => panic!("the issued link did not reach the server: {other}"),
@@ -1730,7 +1767,12 @@ mod tests {
         //
         // Asserted by RE-STARTING rather than by inspecting the socket: restarting is the thing the
         // owner actually does, and it is what was broken.
-        let restarted = start(db_path, vec!["Sara".into()]).expect("stop must leave the port free to start again");
+        //
+        // Re-bound to the SAME port on purpose. Asking for an ephemeral port again would succeed even
+        // with the leak present — the OS would simply hand out a different one — so the assertion would
+        // pass while the bug lived. It must be the port stop() was supposed to release.
+        let restarted = start_on_port(db_path, vec!["Sara".into()], bound_port)
+            .expect("stop must leave the port free to start again");
         assert!(restarted.running, "a stop/start cycle must produce a working server, not a bind error");
         stop().expect("second stop succeeds");
     }
@@ -1752,6 +1794,11 @@ mod tests {
         //   heartbeat (every 4 minutes) would fire long after the lease it exists to protect had gone.
         assert_eq!(MAX_BODY_BYTES, 262_144, "the body cap must be 256 KiB");
         assert_eq!(LEASE_TTL, Duration::from_secs(900), "a lease must last 15 minutes");
+        // Pinned because `start()` now takes the port as an argument so the start/stop test can use an
+        // ephemeral one. That flexibility must not reach production: reviewers are sent a link with
+        // this port in it, and a firewall rule was granted for it. `start()` is the only non-test
+        // caller and passes exactly this.
+        assert_eq!(COUCH_PORT, 8737, "the port reviewers are sent, and the one the firewall allows");
         assert!(ACCEPT_POLL <= Duration::from_millis(250), "the accept poll bounds shutdown latency");
         // The heartbeat interval baked into the page (4 min) must stay comfortably inside the TTL, or
         // an ACTIVE reviewer's clip lapses before the renewal that was meant to save it.
