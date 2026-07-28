@@ -1587,6 +1587,61 @@ mod tests {
     }
 
     #[test]
+    fn start_issues_working_tokens_and_stop_takes_them_away() {
+        // THE LAST GENUINELY UNTESTED LOGIC IN THIS FILE, and the mutation sweep is what proved it:
+        // every other test builds `CouchState` by hand, so `start()`'s own wiring was never exercised.
+        // Deleting `reviewers: tokens` from its struct literal — which the sweep does — leaves a server
+        // that issues URLs nobody can use: every reviewer gets 401, and not one test noticed. Likewise
+        // `is_running()`, the fence a DB restore consults before touching the library, could be
+        // hardcoded either way undetected.
+        //
+        // This binds the real fixed port 8737. If something already holds it the test FAILS with that
+        // reason named, rather than skipping — a silent skip here would restore exactly the blind spot
+        // it exists to remove.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("start-test.db").to_string_lossy().to_string();
+        Database::open(&db_path).unwrap().initialize().unwrap();
+
+        // An in-memory library is refused BEFORE any port is bound — the couch persists decisions, so a
+        // database that evaporates on exit is not a thing it may serve.
+        assert!(start(":memory:".to_string(), vec!["Sara".into()]).is_err(), "an in-memory library must be refused");
+        assert!(!is_running(), "a refused start must leave nothing running");
+
+        let status = match start(db_path.clone(), vec!["Sara".into(), "Hemn".into()]) {
+            Ok(s) => s,
+            Err(e) => panic!("start failed (port 8737 already in use?): {e}"),
+        };
+        assert!(is_running(), "the restore fence must see a running server");
+        assert_eq!(status.reviewers.len(), 2, "one entry per named reviewer");
+
+        // The issued URL must actually WORK — this is what the deleted-field mutant breaks.
+        let sara = status.reviewers.iter().find(|r| r.name == "Sara").expect("Sara was issued a link");
+        let token = sara.url.split("?t=").nth(1).expect("the URL carries a token").to_string();
+        let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
+        let url = format!("http://127.0.0.1:{COUCH_PORT}/api/queue?t={token}");
+        let code = agent.get(&url).call().map(|r| r.status()).unwrap_or_else(|e| match e {
+            ureq::Error::Status(c, _) => c,
+            other => panic!("the issued link did not reach the server: {other}"),
+        });
+        assert_eq!(code, 200, "a token issued by start() must authenticate against the running server");
+
+        // Two reviewers were named, so each must have a DISTINCT token — one shared credential would
+        // erase the attribution the whole design rests on.
+        let hemn = status.reviewers.iter().find(|r| r.name == "Hemn").expect("Hemn was issued a link");
+        assert_ne!(sara.url, hemn.url, "reviewers must never share a link");
+
+        let stopped = stop().expect("stop succeeds");
+        assert!(!stopped.running && stopped.reviewers.is_empty(), "stop reports a stopped server");
+        assert!(!is_running(), "and the fence agrees");
+        // The token dies with the session: stopping revokes every link at once.
+        let after = agent.get(&url).call();
+        assert!(
+            matches!(after, Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Transport(_))),
+            "a stopped server must not keep honouring its tokens: {after:?}"
+        );
+    }
+
+    #[test]
     fn the_session_constants_are_pinned_to_their_real_values() {
         // Surfaced by the cargo-mutants sweep after couch.rs entered its scope: both of these were
         // written as arithmetic (`256 * 1024`, `15 * 60`) and NOTHING pinned the result, so mutating
