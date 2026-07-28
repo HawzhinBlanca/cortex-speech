@@ -134,6 +134,11 @@
   #card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px;
           display: flex; flex-direction: column; gap: 12px; flex: 1; }
   audio { width: 100%; }
+  /* Waveform: seeing silence vs speech makes "is this clip usable?" a glance instead of a listen, and
+     tapping it seeks straight to the word in doubt. Decorative in the a11y sense — the <audio> element
+     above it is the real, labelled control — so it is aria-hidden and never the only way to do anything. */
+  #wave { width: 100%; height: 56px; display: block; border-radius: 8px; background: var(--bg);
+          border: 1px solid var(--line); touch-action: manipulation; }
   /* Transport row: replay-last-2s, loop and speed. A transcriber re-listens to the same second many
      times per clip; a bare <audio> makes that a fiddly drag on a phone-sized scrubber. */
   .transport { display: flex; gap: 8px; align-items: center; }
@@ -174,6 +179,7 @@
 </header>
 <div id="card" hidden>
   <audio id="player" controls preload="auto"></audio>
+  <canvas id="wave" aria-hidden="true"></canvas>
   <div class="transport">
     <button id="again" type="button" title="↺ 2s">↺ 2s</button>
     <button id="loop" type="button" aria-pressed="false">⟳</button>
@@ -320,7 +326,9 @@
     $('warn').hidden = true;
     renderProgress();
     if (!seg) return;
-    $('player').src = '/api/audio/' + encodeURIComponent(seg.id) + '?t=' + encodeURIComponent(token);
+    const audioUrl = '/api/audio/' + encodeURIComponent(seg.id) + '?t=' + encodeURIComponent(token);
+    $('player').src = audioUrl;
+    void loadWave(audioUrl);
     $('player').playbackRate = speed;
     $('player').loop = looping;
     // A saved draft is a correction the reviewer already typed; it must win over the server's copy.
@@ -400,6 +408,71 @@
     $('player').currentTime = Math.max(0, $('player').currentTime - 2);
     void $('player').play();
   };
+
+  // ── waveform ───────────────────────────────────────────────────────────────
+  // Peaks are computed ONCE per clip and cached with it; redraw is then pure canvas work, so seeking
+  // and the playback cursor stay smooth on a phone. Decoding is best-effort: a codec the browser
+  // cannot decode leaves the strip blank and changes nothing else — the reviewer still has the audio
+  // element, the transport row and every button.
+  const WAVE_BUCKETS = 160;
+  let peaks = null;
+  async function drawWave() {
+    const c = $('wave');
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(c.clientWidth * dpr));
+    const h = Math.max(1, Math.round(c.clientHeight * dpr));
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    const ctx = c.getContext('2d');
+    ctx.clearRect(0, 0, w, h);
+    if (!peaks || !peaks.length) return;
+    const style = getComputedStyle(document.documentElement);
+    const played = style.getPropertyValue('--accent-line').trim() || '#0284c7';
+    const ahead = style.getPropertyValue('--line').trim() || '#334155';
+    const dur = $('player').duration;
+    const frac = dur && isFinite(dur) ? $('player').currentTime / dur : 0;
+    const bw = w / peaks.length;
+    for (let i = 0; i < peaks.length; i++) {
+      const bh = Math.max(2 * dpr, peaks[i] * h * 0.92);
+      ctx.fillStyle = i / peaks.length <= frac ? played : ahead;
+      ctx.fillRect(i * bw, (h - bh) / 2, Math.max(1, bw - dpr), bh);
+    }
+  }
+  async function loadWave(url) {
+    peaks = null;
+    void drawWave();
+    try {
+      const buf = await (await fetch(url)).arrayBuffer();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const audio = await new AudioCtx().decodeAudioData(buf);
+      const data = audio.getChannelData(0);
+      const per = Math.max(1, Math.floor(data.length / WAVE_BUCKETS));
+      const out = [];
+      // Peak (not mean) per bucket: a mean flattens speech into a uniform smear at this width, which
+      // is precisely the silence-vs-speech distinction the strip exists to show.
+      for (let i = 0; i < WAVE_BUCKETS; i++) {
+        let m = 0;
+        for (let j = i * per; j < Math.min((i + 1) * per, data.length); j++) m = Math.max(m, Math.abs(data[j]));
+        out.push(m);
+      }
+      const top = Math.max(...out, 0.01);
+      peaks = out.map((v) => v / top); // normalise: a quiet clip must still be readable
+      void drawWave();
+    } catch { /* undecodable audio simply leaves the strip blank */ }
+  }
+  $('player').addEventListener('timeupdate', () => void drawWave());
+  $('player').addEventListener('loadedmetadata', () => void drawWave());
+  addEventListener('resize', () => void drawWave());
+  // Tap to seek — the reason a transcriber wants a waveform at all: jump straight to the word in doubt
+  // instead of dragging a scrubber the width of a thumb.
+  $('wave').addEventListener('click', (e) => {
+    const dur = $('player').duration;
+    if (!dur || !isFinite(dur)) return;
+    const r = $('wave').getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width;
+    $('player').currentTime = Math.min(dur, Math.max(0, x * dur));
+    void drawWave();
+  });
 
   // ── keep an ACTIVE reviewer's clip from lapsing under them ─────────────────
   // Well inside the server's TTL, so a slow clip never expires while it is genuinely being worked on.
