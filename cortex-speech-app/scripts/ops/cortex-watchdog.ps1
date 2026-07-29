@@ -29,9 +29,15 @@ $probeUrl = 'http://127.0.0.1:8737/'
 $logDir = Join-Path $env:APPDATA 'cortex-speech\logs'
 $log = Join-Path $logDir 'watchdog.log'
 
+# Logging must never be able to stop the watchdog. With $ErrorActionPreference = 'Stop' a failed
+# Add-Content (full disk, the log opened by an editor, a locked profile) threw and aborted the run
+# BEFORE the kill/relaunch below — so the one condition most likely to take the app down was also the
+# condition that disabled its recovery. Recovering matters more than recording why.
 function Write-Log([string]$msg) {
-    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null }
-    Add-Content -Path $log -Value ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg)
+    try {
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null }
+        Add-Content -Path $log -Value ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg)
+    } catch { }
 }
 
 if ($Register) {
@@ -43,8 +49,12 @@ if ($Register) {
     $logon = New-ScheduledTaskTrigger -AtLogOn
     $logon.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
         -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+    # Battery flags are ON by default and would silently disable the whole watchdog the moment Windows
+    # believes it is on battery — which includes a desktop behind a UPS, exactly the machine most
+    # likely to be running this. An always-on server must not stop healing itself during a power event.
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-        -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+        -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName 'CortexWatchdog' -Action $action -Trigger $logon `
         -Settings $settings -Force | Out-Null
     Write-Log "registered (exe: $exe)"
@@ -53,17 +63,38 @@ if ($Register) {
 }
 
 # ── the probe ──────────────────────────────────────────────────────────────────
+# THREE attempts, and a timeout longer than anything the server may legitimately be inside.
+#
+# The old single 5s probe force-killed healthy apps. couch.rs spawns ONE accept thread per reviewer,
+# and while that thread is inside handle_request it is not accepting — so the probe's connection sits
+# in the listen backlog unanswered. Two ordinary things hold it past 5s: any DB call contending with
+# the desktop app (busy_timeout is 10s — twice the old probe), and materialising a clip's WAV. A
+# transport timeout leaves $_.Exception.Response empty, which read as "dead", so the busier the
+# reviewer the likelier the watchdog was to kill the app mid-review and destroy their in-flight work.
+#
+# 20s clears busy_timeout with margin, and one answer out of three attempts is enough to prove life.
 $alive = $false
-try {
-    $resp = Invoke-WebRequest -Uri $probeUrl -UseBasicParsing -TimeoutSec 5
-    $alive = $true   # 2xx/3xx
-} catch {
-    # A status-carrying refusal (401 et al.) is the server ANSWERING — alive. Only a transport
-    # failure (refused, timeout, reset) leaves .Response empty and means dead.
-    if ($null -ne $_.Exception.Response) { $alive = $true }
+foreach ($attempt in 1..3) {
+    try {
+        Invoke-WebRequest -Uri $probeUrl -UseBasicParsing -TimeoutSec 20 | Out-Null
+        $alive = $true   # 2xx/3xx
+    } catch {
+        # A status-carrying refusal (401 et al.) is the server ANSWERING — alive. Only a transport
+        # failure (refused, timeout, reset) leaves .Response empty and means dead.
+        if ($null -ne $_.Exception.Response) { $alive = $true }
+    }
+    if ($alive) { break }
+    if ($attempt -lt 3) { Start-Sleep -Seconds 5 }
 }
 
+# Consecutive forced kills that did NOT restore service. Killing is only ever justified as a way to
+# fix a wedge; when it demonstrably is not fixing one, continuing is just an app that dies every five
+# minutes forever. Reset the moment the server answers.
+$killCountFile = Join-Path $logDir 'watchdog-kills.txt'
+$maxConsecutiveKills = 3
+
 if ($alive) {
+    if (Test-Path $killCountFile) { Remove-Item $killCountFile -Force -ErrorAction SilentlyContinue }
     # Optional dead-man ping: silence at healthchecks.io alerts the owner's phone.
     $hcFile = Join-Path $env:APPDATA 'cortex-speech\healthcheck.url'
     if (Test-Path $hcFile) {
@@ -84,14 +115,31 @@ if ($alive) {
 #     feel haunted. Leave a running app alone; only launch if the process itself is gone
 #     (the autostart half of this task).
 $session = Join-Path $env:APPDATA 'cortex-speech\couch_session.json'
-$proc = Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue
+# Matched by PATH, not by name. `Get-Process -Name cortex-speech-app` force-kills ANY process with
+# that name — a second checkout, a debug build, an installed copy under Program Files — while the
+# relaunch below only ever starts THIS one. The watchdog would happily kill a build it is not
+# responsible for and then report success. (A process whose Path cannot be read is not ours to kill.)
+$exeFull = try { (Resolve-Path $exe -ErrorAction Stop).Path } catch { $exe }
+$proc = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path -eq $exeFull })
 if (-not (Test-Path $session)) {
-    if ($proc) { exit 0 }   # deliberate Stop; the app is fine
+    if ($proc.Count) { exit 0 }   # deliberate Stop; the app is fine
     Write-Log "app not running (no session) - launching for availability"
-} elseif ($proc) {
-    Write-Log "session expected but port dead - killing wedged pid(s): $($proc.Id -join ', ')"
+} elseif ($proc.Count) {
+    # THE KILL LOOP. A present session file does NOT mean couch can come up. resume() swallows every
+    # start failure (something else holding 8737), and load_session refuses a session whose db_path
+    # moved — both leave the file on disk with the port dead and the app running, forever. Killing
+    # then never helps and the app dies every five minutes, losing in-flight work each time.
+    $kills = 0
+    if (Test-Path $killCountFile) { $kills = [int]((Get-Content $killCountFile -TotalCount 1).Trim()) }
+    if ($kills -ge $maxConsecutiveKills) {
+        Write-Log "port still dead after $kills forced restarts - NOT killing again; couch cannot start (port taken, or the library moved). Owner action needed."
+        exit 1
+    }
+    Write-Log "session expected but port dead - killing wedged pid(s): $($proc.Id -join ', ') (attempt $($kills + 1)/$maxConsecutiveKills)"
     $proc | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2   # flock.rs clears the stale lock on the next start
+    try { Set-Content -Path $killCountFile -Value ([string]($kills + 1)) -Encoding utf8 } catch { }
 } else {
     Write-Log "session expected but app not running - relaunching"
 }
