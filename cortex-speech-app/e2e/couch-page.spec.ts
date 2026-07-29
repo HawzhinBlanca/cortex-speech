@@ -304,6 +304,74 @@ test.describe('Couch Review phone page', () => {
     expect(left.map((q) => q.id)).toEqual(['sara1']);
   });
 
+  test('the drained state is honest: undo reachable, audio stopped, count not off by one', async ({ page }) => {
+    // Four separate defects that all only appear once the batch runs out — the moment the reviewer is
+    // least likely to be watching closely, and most likely to close the page.
+    await page.addInitScript(() => {
+      (window as unknown as { __q: { n: number } }).__q = { n: 0 };
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          const st = (window as unknown as { __q: { n: number } }).__q;
+          const items =
+            st.n === 0 ? [{ id: 'z1', text: 'تاکە پارچە', durationMs: 1000, speakerId: null }] : [];
+          st.n += 1;
+          return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('تاکە پارچە', { timeout: 5000 });
+    // Header must never read "Clip 2 of 1".
+    await expect(page.locator('#progress')).toHaveText('پارچەی 1 لە 1');
+
+    await page.locator('#accept').click();
+    await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
+
+    // UNDO must still be reachable. It used to live inside #card, so it vanished exactly when the
+    // reviewer wanted to take back the decision they had just made.
+    await expect(page.locator('#undo')).toBeVisible();
+    // The <audio> element must not still be playing behind the empty state.
+    expect(await page.evaluate(`document.getElementById('player').paused`)).toBe(true);
+    // And the progress counter must not have run past the end of the batch.
+    expect(await page.evaluate(`document.getElementById('progress').textContent`)).not.toContain('2');
+  });
+
+  test('"all reviewed" is never shown while decisions are still unsent', async ({ page }) => {
+    // The empty state outranked the outbox: a reviewer who went offline, decided their last clips and
+    // saw "🎉 All clips reviewed!" was being told they were finished at the precise moment closing the
+    // page would have cost them every one of those decisions.
+    await page.addInitScript(() => {
+      (window as unknown as { __q: { n: number } }).__q = { n: 0 };
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          const st = (window as unknown as { __q: { n: number } }).__q;
+          const items =
+            st.n === 0 ? [{ id: 'w1', text: 'کۆتا پارچە', durationMs: 1000, speakerId: null }] : [];
+          st.n += 1;
+          return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        if (url.includes('/api/decision')) throw new TypeError('Failed to fetch'); // offline
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('کۆتا پارچە', { timeout: 5000 });
+    await page.locator('#accept').click();
+
+    await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('#done')).not.toContainText('هەموو پارچەکان');
+    await expect(page.locator('#done')).toContainText('نەنێردراون'); // "have not been sent"
+  });
+
   test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {
     // DATA LOSS, and made MORE reachable by fixing Stop/Start: every outstanding token is regenerated
     // when the owner restarts Couch Review or reissues a link. A reviewer who was offline then

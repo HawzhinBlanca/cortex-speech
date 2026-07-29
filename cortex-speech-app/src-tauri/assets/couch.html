@@ -55,6 +55,7 @@
     "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
     "loadingMore": "Loading more clips…",
     "queued": "Queued — it will send when you are back online",
+    "stillSending": "{n} decision(s) have not been sent yet. Keep this page open until they go through.",
     "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
     "editHint": "Listen, and correct the text if needed"
   },
@@ -75,6 +76,7 @@
     "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
     "loadingMore": "بارکردنی پارچەی زیاتر…",
     "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
+    "stillSending": "{n} بڕیار هێشتا نەنێردراون. ئەم پەڕەیە کراوە بهێڵەوە تا دەنێردرێن.",
     "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
     "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
   },
@@ -95,6 +97,7 @@
     "heldByOthers": null,
     "loadingMore": null,
     "queued": null,
+    "stillSending": null,
     "refused": null,
     "editHint": "review.editHint"
   }
@@ -204,13 +207,18 @@
   <div class="meta" id="meta"></div>
   <div id="warn" hidden></div>
   <div class="row">
-    <button id="undo">↩</button>
     <button id="bad"></button>
     <button id="accept"></button>
     <button id="save"></button>
   </div>
 </div>
 <div id="done" hidden></div>
+<!-- Undo lives OUTSIDE the card on purpose. Inside it, the button vanished with the card the moment
+     the queue drained — so the one decision a reviewer is most likely to want back, the last one they
+     made, was the one they could never reach. Shown whenever there is something to undo. -->
+<div class="row" id="after" hidden>
+  <button id="undo">↩</button>
+</div>
 <div id="err" hidden></div>
 <div class="toast" id="toast"></div>
 <script>
@@ -318,10 +326,18 @@
   // session with no sense of an ending, and the count is the cheapest form of pacing there is.
   let doneThisSession = 0;
   function renderProgress() {
-    const pos = queue.length ? t('progress', { n: i + 1, total: queue.length }) : '';
+    // Clamped: once the batch drains `i` is one PAST the end, and the header read "Clip 26 of 25".
+    const pos = queue.length ? t('progress', { n: Math.min(i + 1, queue.length), total: queue.length }) : '';
     $('progress').textContent = doneThisSession ? `${pos} · ✓${doneThisSession}` : pos;
+    // Something to take back = the button is reachable, whether or not a card is on screen.
+    $('after').hidden = doneThisSession === 0;
   }
   function renderEmptyState() {
+    // Unsent work outranks both other messages. Decisions sitting in the outbox have NOT reached the
+    // server, and "All clips reviewed" over the top of them told the reviewer they were finished at
+    // the exact moment closing the page would have cost them the lot.
+    const unsent = readOutbox().length;
+    if (unsent) { $('done').textContent = t('stillSending', { n: unsent }); return; }
     // An empty queue does NOT mean the work is finished when other reviewers are holding clips —
     // claiming "all reviewed" there would be a flat lie to whoever loaded last.
     $('done').textContent = heldByOthers ? t('heldByOthers', { n: heldByOthers }) : '🎉 ' + t('allDone');
@@ -423,7 +439,15 @@
     $('card').hidden = !seg; $('done').hidden = !!seg;
     $('warn').hidden = true;
     renderProgress();
-    if (!seg) return;
+    if (!seg) {
+      // Hiding the card does not stop the <audio> element inside it. The last clip kept playing behind
+      // the empty state — forever, if loop was on — with every transport control now unreachable.
+      $('player').pause();
+      // Recomputed here, not just at load: a decision queued offline since then changes what the empty
+      // state is allowed to claim.
+      renderEmptyState();
+      return;
+    }
     const audioUrl = withToken('/api/audio/' + encodeURIComponent(seg.id));
     $('player').src = audioUrl;
     void loadWave(audioUrl);

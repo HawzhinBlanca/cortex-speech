@@ -33,7 +33,7 @@ CKB_TS = APP / "src" / "lib" / "i18n" / "ckb.ts"
 
 # Phone strings whose Sorani is NEW and has NOT had a native review. Owner-gated: this list is the
 # acknowledgement. Adding a key here is a deliberate act; growing it silently is not possible.
-UNREVIEWED_SORANI = {"heldByOthers", "linkExpired", "loadingMore", "queued", "refused"}
+UNREVIEWED_SORANI = {"heldByOthers", "linkExpired", "loadingMore", "queued", "refused", "stillSending"}
 
 
 def load_page_strings() -> dict:
