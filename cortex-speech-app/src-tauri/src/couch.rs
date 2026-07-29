@@ -1233,7 +1233,27 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     //
     // The reply is byte-identical to a normal success. A reviewer who could tell a test from real work
     // would simply be careful on the tests, which measures nothing.
-    let was_served_as_check = lock_state(state).spot_checks.contains(&(parsed.id.clone(), reviewer.to_string()));
+    // A spot check is BY DEFINITION a clip that already carries a human answer to grade against, and
+    // `prev.verified` is what makes it one. The served-set is never pruned and now SURVIVES RESTARTS,
+    // so a pair could outlive the answer key: the owner un-verifies the clip at the desktop (or
+    // re-transcribes it, which also clears `verified`), api_queue then serves it as ordinary pending
+    // work — nothing filters served checks out of the work queue — and the reviewer transcribes it for
+    // real. Grading that against a key that no longer exists recorded a bogus score, returned a reply
+    // deliberately indistinguishable from success, and wrote NOTHING to the corpus. The clip stayed
+    // unverified, came back in the next batch, and was swallowed again every single time.
+    let was_served_as_check = {
+        let mut guard = lock_state(state);
+        let key = (parsed.id.clone(), reviewer.to_string());
+        if guard.spot_checks.contains(&key) && !prev.verified {
+            // No longer an answer key. Drop the stale pair so it cannot swallow this clip again, and
+            // treat the submit as what it is: real work.
+            guard.spot_checks.remove(&key);
+            tracing::info!("Couch Review: stale spot check for {} dropped — the clip is no longer verified", parsed.id);
+            false
+        } else {
+            guard.spot_checks.contains(&key)
+        }
+    };
     // AUDIT TRAIL (v45), written for every accepted submit including spot checks — a reviewer's
     // throughput must count the work they actually did, and a check is real work to them. Best-effort
     // and logged on failure: losing the RECORD of a decision must never cost the DECISION.
@@ -1370,11 +1390,45 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
     let Some((id, prev)) = popped else {
         return err_reply(409, "nothing to undo");
     };
+    // STALENESS FENCE. `prev` is a whole-row snapshot taken at decision time and never refreshed, and
+    // the restore below rewrites EVERY column from it. If anyone touched the clip in between — the
+    // owner correcting it at the desktop, most obviously, since a decided clip is visible and editable
+    // there — undo silently destroys that work and reverts the row to a state the other person never
+    // agreed to. api_decision guards this exact class by re-reading the fresh row before it writes;
+    // the undo path simply did not. Refuse instead, and keep the entry so nothing is lost either way.
+    match db.get_segment_by_id(&id) {
+        Ok(Some(fresh)) if fresh.reviewed_by.as_deref() != Some(reviewer) => {
+            let owner = fresh.reviewed_by.clone();
+            lock_state(state).undo.entry(reviewer.to_string()).or_default().push((id, prev));
+            return match owner {
+                Some(other) => {
+                    err_reply(409, &format!("{other} has reviewed this clip since — undo would erase their work"))
+                }
+                None => {
+                    err_reply(409, "this clip has been changed at the desktop since — undo would erase that change")
+                }
+            };
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            lock_state(state).undo.entry(reviewer.to_string()).or_default().push((id, prev));
+            return err_reply(404, "no such segment");
+        }
+        Err(e) => {
+            lock_state(state).undo.entry(reviewer.to_string()).or_default().push((id, prev));
+            return err_reply(500, &e.to_string());
+        }
+    }
     if let Err(e) = db.clear_human_decision(&id) {
         lock_state(state).undo.entry(reviewer.to_string()).or_default().push((id, prev));
         return err_reply(500, &e.to_string());
     }
     if let Err(e) = db.insert_segment_full(&prev) {
+        // The snapshot is the ONLY copy of the pre-decision row and clear_human_decision has already
+        // committed, so dropping it here left the clip permanently half-undone: unverified columns
+        // cleared, the retracted edit still sitting in annotated_transcript, and nothing anywhere able
+        // to put it back. Push it back so a retry — or the next reviewer's ↩ — can still complete it.
+        lock_state(state).undo.entry(reviewer.to_string()).or_default().push((id, prev));
         return err_reply(500, &e.to_string());
     }
     // The clip is pending again and this reviewer is about to see it — hold it for them so a second
@@ -1576,6 +1630,78 @@ mod tests {
         // independent segment had confirmed it.
         assert_eq!(pairs(&side), pairs_after_failure, "a replay must not mint a second learning pair");
         assert_eq!(memory_hits(&side), hits_after_failure, "a replay must not bump correction_memory hit_count");
+    }
+
+    #[test]
+    fn undo_must_refuse_rather_than_erase_work_done_since_the_decision() {
+        // The undo snapshot is a WHOLE-ROW copy taken at decision time and never refreshed, and the
+        // restore rewrites every column from it — deliberately, so a pre-decision jury verdict is not
+        // lost. The cost is that anything done to the clip in between is erased, and a decided clip is
+        // exactly what the owner sees and edits at the desktop. api_decision already re-reads the fresh
+        // row before writing for precisely this reason; undo did not.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
+        let state = state();
+
+        let body = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوەی سارا"});
+        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200);
+
+        // The owner corrects the same clip at the desktop afterwards.
+        crate::jury::record_human_decision_by(&db, "s1", "edit", Some("ڕاستکراوەی خاوەن"), None, Some("Owner"))
+            .unwrap();
+
+        // Sara now taps undo. Her snapshot predates the owner's edit entirely.
+        let (code, _, msg) = api_undo(&db, "Sara", &state);
+        assert_eq!(code, 409, "undo must not silently revert someone else's later work");
+        assert!(String::from_utf8_lossy(&msg).contains("Owner"), "the refusal must name who would lose work: {msg:?}");
+        let row = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert_eq!(row.reviewed_by.as_deref(), Some("Owner"), "the owner's edit must survive the refused undo");
+        assert_eq!(row.verdict_transcript.as_deref(), Some("ڕاستکراوەی خاوەن"));
+
+        // And the entry is KEPT, not consumed by the refusal — a refused undo must not silently
+        // become "nothing to undo" on the next press.
+        let (code, _, _) = api_undo(&db, "Sara", &state);
+        assert_eq!(code, 409, "still refused, and still present rather than swallowed");
+    }
+
+    #[test]
+    fn a_clip_that_stopped_being_an_answer_key_is_reviewed_for_real_not_swallowed() {
+        // The served-check set is never pruned and now survives restarts, so a pair can outlive the
+        // answer key it was created against. Un-verifying the clip at the desktop (or re-transcribing
+        // it) makes api_queue serve it as ordinary pending work again — nothing filters served checks
+        // out of the work queue — and the old code then graded the reviewer's REAL transcription
+        // against a key that no longer existed: a bogus score, a reply byte-identical to success, and
+        // nothing written to the corpus. The clip stayed pending and was swallowed again every batch.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let mut gold = seg("g1", "دەقی خاو");
+        gold.annotated_transcript = Some("دەقی ڕاست".into());
+        gold.verified = true;
+        db.insert_segment(&gold).unwrap();
+        let state = state();
+
+        // It was handed to Sara as a check while it was still verified.
+        lock_state(&state).spot_checks.insert(("g1".to_string(), "Sara".to_string()));
+
+        // The owner then un-verifies it, so it is pending work again and no longer an answer key.
+        let mut reopened = db.get_segment_by_id("g1").unwrap().unwrap();
+        reopened.verified = false;
+        db.insert_segment(&reopened).unwrap();
+
+        let body = serde_json::json!({"id": "g1", "action": "edit", "text": "ڕاستکراوەی سارا"});
+        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200);
+
+        let row = db.get_segment_by_id("g1").unwrap().unwrap();
+        assert!(row.verified, "the review must actually LAND, not be graded and discarded");
+        assert_eq!(row.annotated_transcript.as_deref(), Some("ڕاستکراوەی سارا"));
+        assert_eq!(row.reviewed_by.as_deref(), Some("Sara"), "real work must be attributed");
+        assert!(
+            !lock_state(&state).spot_checks.contains(&("g1".to_string(), "Sara".to_string())),
+            "the stale pair must be dropped so it cannot swallow this clip again"
+        );
     }
 
     #[test]
