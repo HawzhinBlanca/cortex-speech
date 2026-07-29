@@ -2124,3 +2124,67 @@ test:e2e` **61 passed**; python-policies **44/44**.
   exe); installers on disk are stale. The compiled exe itself was verified at HEAD both times.
 - verify-10 still has not completed at any HEAD since `7d77fb5`.
 - `linkExpired` + `heldByOthers` still await a native Sorani read.
+
+## 2026-07-29 — iter 202 — public-links plan phases 1/2/3/4/6 executed and live-verified; phase 5 at the owner's gate (625e8b1, 525ece3, 1efd8d4, d1f9663, ee8a106)
+
+The plan (`docs/REMOTE_PUBLIC_LINKS_PLAN.md`, from the 12-agent research workflow) went from paper to
+running system in one sitting. Everything below was verified against the LIVE server after one
+rebuild, not claimed from tests alone.
+
+**Phase 1 (`625e8b1`)** — the repo stopped lying: couch.rs header + runbook said tokens are "never
+persisted" and closing the app revokes links — the opposite of shipped behaviour. Acceptance grep
+went 2 hits → 0 (the plan estimated 3; the real count was 2, recorded as counted).
+
+**Phase 2 (`525ece3`) — fragment links.** Issued URLs now carry `#t=`, which a browser never sends to
+any server: a link pasted into WhatsApp/Telegram hands the platform's preview bot the EMPTY shell,
+not a durable credential to biometric audio. `GET /` and `POST /api/claim` are the only
+credential-free routes (the shell embeds nothing; the claim moves the fragment token into the
+existing HttpOnly cookie, once). Sliding cookie on authenticated page loads. Deliberately NOT
+single-use — the preview bot fetches before the human taps, so a one-shot link would be burned by
+the bot. Legacy `?t=` stays until the same commit that enables public exposure. LIVE: bot's-eye
+`GET /` → 200, 35,564 b shell, **no Set-Cookie**; claim → cookie → `/api/queue` 200 with 29 items.
+
+**Phase 4 (`1efd8d4`) — restarts stopped eating spot-check scores.** Durable links made restarts
+routine, and a check served before one became unanswerable after it (409 "already reviewed at the
+desktop", score silently lost — the fail-before reproduced EXACTLY that). The served set now rides
+the session file (plaintext by design — it is a list of which clips were handed out, not a
+credential) and rehydrates at start. Undo stacks and leases deliberately NOT persisted, per plan.
+
+**Phase 6 (`d1f9663`)** — 512px icon + manifest served by the router (public like the shell;
+`start_url` is `/` and NEVER a token, pinned by test — an installed app must die with its revoke),
+and Screen Wake Lock on play (inert on plain HTTP, alive on the coming ts.net URL). Service worker
+deliberately OUT. LIVE: `/icon.png` 200 image/png 3,598 b; `/manifest.json` start_url "/".
+
+**Phase 3 (`ee8a106`) — the watchdog, with my own first-draft bug caught before it shipped.** A dead
+port with a live process has two meanings only `couch_session.json` distinguishes: file present =
+wedged (kill + relaunch; flock clears the stale lock), file absent = the owner pressed Stop, and
+killing a healthy app every 5 minutes would make Stop feel haunted — which is precisely what my
+first draft did. Registered via schtasks (every 5 min, interactive-only; the CIM path is
+access-denied unelevated). **Crash drill passed live:** force-killed the app → watchdog script →
+same link serving 29 clips, watchdog.log showing "session expected but app not running -
+relaunching". The task was DISABLED during the rebuild window — a watchdog launch mid-bundle is the
+exact os-error-32 race hit twice yesterday — and re-enabled after.
+
+**Resume proved twice more, the hard way:** the pre-phase-4 session file (old schema, no
+spot_checks field) resumed under the new binary via serde(default) with the SAME token — the owner's
+saved link survived a schema change, a rebuild, a force-kill, and a watchdog revival unchanged.
+
+**Gates (verbatim):** `cargo test --lib` **1080 passed; 0 failed** (couch:: 30); clippy
+`--all-targets -D warnings` clean (after factoring a `RememberedSession` type alias); fmt clean;
+playwright couch-page **15 passed**; `npm run test:e2e` **62 passed**; python-policies **44/44**;
+exe-freshness OK at `ee8a106`; `npm run tauri build` exit 0 WITH bundles this time (the watchdog
+disable closed yesterday's race).
+
+**NOT DONE / OWNER-GATED:**
+- **Phase 5 is parked at a literal URL only the owner can click:** `tailscale serve` answered
+  "Serve is not enabled on your tailnet" with an enablement link (surfaced in chat). After that:
+  serve → verify over ts.net → funnel (its own approval) → remove legacy `?t=` in the same commit →
+  Settings shows the ts.net URL. Until then, "send to someone with nothing installed" is DESIGNED
+  and CODE-READY but NOT true.
+- `cortex-once-admin.ps1` (fast startup, NIC power, active hours, disk timeout) needs one elevated
+  run by the owner; auto-login is the owner's personal step by design.
+- The watchdog's Stop-is-respected branch is reviewed but NOT drilled live — the drill would revoke
+  the owner's real link (Stop deletes the session). Stated, not skipped silently.
+- The reboot drill (full restart → link back within ~2 min) awaits a natural reboot; the crash drill
+  stands in until then.
+- Two Sorani strings still await native review; verify-10 still not run at today's HEADs.
