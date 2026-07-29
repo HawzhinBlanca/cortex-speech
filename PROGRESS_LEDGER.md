@@ -2063,3 +2063,64 @@ warnings` clean; fmt clean.
   native read, up from 1. The other seven desktop-sourced strings are unchanged.
 - The on-disk NSIS/MSI installers are stale (the last `tauri build` exited 1 on MSI bundling, my race
   with launching the app).
+
+## 2026-07-29 — iter 201 — the durable-remote-use ask: links now survive closing the app; plus a returning-reviewer lockout and three loop finds (74437c6, 8ef685a, 120ff6f, 2a50a49, d151afa)
+
+**Owner ask, verbatim intent: "whenever I want, from my phone or laptop, I open it and review — without
+coming back to this PC."** Two separate defects stood in the way; both are fixed with fail-befores.
+
+**1. `74437c6` — a returning reviewer was locked out by an EMPTY token shadowing their cookie.**
+Reported as "I close the browser on my iPhone and go back and it doesn't open." Reproduced with a real
+browser: the page strips `?t=` after the first load and relies on the HttpOnly cookie — but it kept
+appending `?t=` (empty) to every request, and the server reads query-before-cookie, so `""` was
+treated as a supplied-but-WRONG credential and the valid cookie in the SAME request was ignored.
+Measured on the wire: `cookie, no t=` → 200; `cookie + empty t=` → 401. Every piece was individually
+correct, which is why no test saw it — the defect only exists in the combination a second visit
+produces. Fixed both sides (server: empty `t=` counts as absent; page: a single `withToken()` omits
+the param entirely), and pinned end-to-end. A NON-empty wrong token still fails — falling back to the
+cookie there would let a revoked link keep working.
+
+**2. Session persistence — closing the app no longer kills every link.** Tokens were per-session by
+design ("never persisted"), which is airtight and unusable: every app restart meant walking back to
+the desktop for a fresh URL. The new distinction is between the two ways a session ends: **closing
+the app is not an access decision** (nothing calls `stop()` on exit) so the session is remembered
+(`couch_session.json`, tokens DPAPI-protected at rest like API keys, atomic replace on write);
+**pressing Stop IS the decision** and deletes the file, so "stopping revokes every link" stays
+literally true — and the revoke now provably survives a restart. Resume happens in `.setup()` at app
+launch, best-effort (a bind failure must not stop the app opening). A session remembered against a
+DIFFERENT library refuses to resume. Pinned by `a_link_survives_closing_the_app_but_not_pressing_stop`.
+
+**Honest cost, stated not hidden:** links are now long-lived credentials. Anyone holding one can
+review until Stop/revoke. The file is DPAPI-bound to this Windows user so copying it off-machine
+yields nothing.
+
+**A test-interaction bug I introduced and fixed in the same sitting:** the new start/stop test and the
+existing one both drive the global `COUCH` singleton; in parallel they steal each other's server.
+Reproduced 3-for-3, serialized with a test-local lock, stable 3-for-3 after.
+
+**Also this ledger entry: loop iterations 1–4** (details in each commit): `8ef685a` the dashboard
+counted clips the export refuses to publish — 7th instance of the recurring count bug, caught by
+cross-checking stats against the REAL export output; `120ff6f` v46 — a reviewer's spot-check score
+now survives deleting the clip it was measured on (the v45 principle applied to the table it named);
+`2a50a49` the aligner now reports a vocabulary with no word-delimiter token (found: two copies of
+mms_aligner_tokens.txt differing by ONE trimmed byte); `d151afa` pinned the UI-thread retry budget in
+stop()'s listener release (~600 ms measured worst case, 1.5 s budget).
+
+**Live-session verification this morning:** rebuild at `d151afa` → v46 applied on the real library
+(score preserved byte-identical, FK gone, integrity ok) → fresh couch session served **4 fresh spot
+checks, zero repeats** (the answered trap correctly excluded — with the old binary it would have been
+re-served and overwritten the honest score).
+
+**Gates (verbatim):** `cargo test --lib` **1078 passed; 0 failed; 6 ignored** (couch:: 28, 3× stable);
+clippy `--all-targets -D warnings` clean; fmt clean; playwright couch-page **14 passed**; `npm run
+test:e2e` **61 passed**; python-policies **44/44**.
+
+**NOT DONE / NOT CLAIMED:**
+- **The exe predates everything in this entry** — the durable-link system, the returning-reviewer
+  fix, and the aligner guard are source-only until the next rebuild.
+- **Resume-at-launch has not yet been observed in the running app** (unit-tested only); it will be
+  verified on the next real launch cycle.
+- The two MSI bundle failures today were MY race (launching the app while light.exe still held the
+  exe); installers on disk are stale. The compiled exe itself was verified at HEAD both times.
+- verify-10 still has not completed at any HEAD since `7d77fb5`.
+- `linkExpired` + `heldByOthers` still await a native Sorani read.

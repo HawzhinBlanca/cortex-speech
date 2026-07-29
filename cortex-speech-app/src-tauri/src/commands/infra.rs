@@ -152,7 +152,10 @@ pub fn start_couch_review(
 ) -> Result<crate::couch::CouchStatus, String> {
     STRICT_RATE_LIMITER.check("start_couch_review")?;
     let db_path = { state.lock_db().path().to_string() };
-    crate::couch::start(db_path, reviewers.unwrap_or_default())
+    // The data dir is where the session is remembered, so a link survives closing the app. None (no
+    // data dir registered) simply means nothing is remembered — the previous per-session behaviour.
+    let data_dir = state.lock_data_dir().clone();
+    crate::couch::start(db_path, reviewers.unwrap_or_default(), data_dir)
 }
 
 /// Revoke ONE reviewer's Couch Review link, leaving everyone else's working

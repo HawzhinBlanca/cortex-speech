@@ -775,6 +775,23 @@ pub fn run() {
                 }
             }
 
+            // Bring back Couch Review if the app was closed without pressing Stop, with the SAME
+            // links. Without this, closing the app killed every reviewer's URL and using the phone at
+            // all meant returning to this desktop for a fresh one — the single thing that stopped
+            // remote review being usable on the owner's own terms. Pressing Stop still revokes.
+            //
+            // Deliberately after the data-dir work above (the session file lives there) and
+            // best-effort: `resume` never propagates an error, because a port already in use must not
+            // stop the app from opening.
+            {
+                let state = app.state::<AppState>();
+                let data_dir = state.lock_data_dir().clone();
+                let db_path = state.lock_db().path().to_string();
+                if let Some(dir) = data_dir {
+                    crate::couch::resume(db_path, &dir);
+                }
+            }
+
             // Champion 7B supervision loop (engine_runtime): idles until the owner enables
             // champion_supervision_enabled; re-reads the setting every tick.
             crate::engine_runtime::spawn_supervision_loop(app.handle().clone());

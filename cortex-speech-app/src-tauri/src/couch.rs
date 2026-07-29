@@ -37,6 +37,7 @@
 use crate::db::{Database, SpeechSegment};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -140,6 +141,10 @@ struct CouchHandle {
     /// the SAME token map the request path authenticates against.
     state: Arc<Mutex<CouchState>>,
     joins: Vec<std::thread::JoinHandle<()>>,
+    /// Where the remembered session lives, so `stop()` — the explicit revoke — can delete it. Carried
+    /// on the handle because `stop()` has no other context, and forgetting to clear the file would
+    /// leave "Stop" issuing working links again on the next launch.
+    data_dir: Option<PathBuf>,
 }
 
 /// One reviewer's private way in. Two people never share a link, so two people never share an identity.
@@ -207,10 +212,122 @@ fn normalize_reviewers(names: &[String]) -> Result<Vec<String>, String> {
 /// The name used when the owner starts the server without naming anyone.
 const DEFAULT_REVIEWER: &str = "owner";
 
+/// Where a started session is remembered, so a link keeps working after the app is closed and
+/// reopened (`{data_dir}/couch_session.json`).
+const SESSION_FILE: &str = "couch_session.json";
+
+/// One remembered session: the reviewer names and the tokens their links carry.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct SavedSession {
+    /// token -> reviewer name, the same map `CouchState::reviewers` holds at runtime.
+    reviewers: HashMap<String, String>,
+    /// The database the session was serving. A session remembered against a DIFFERENT library must
+    /// not silently resume: the links would hand out clips from a corpus the owner did not intend.
+    db_path: String,
+}
+
+/// Tokens SURVIVE closing the app, and do not survive pressing Stop.
+///
+/// The original design regenerated every token on every start, which is airtight and unusable: a
+/// reviewer's link died whenever the app was restarted, so using the phone at all meant coming back
+/// to the desktop for a fresh URL. What the owner needs is to open the page from any device, review,
+/// close it, and come back later without touching the PC.
+///
+/// The distinction that makes this safe is between the two ways a session ends. Closing the app is
+/// not a decision about access — nothing calls `stop()` on exit — so the session is remembered.
+/// Pressing **Stop** IS that decision, and it deletes this file, so "stopping revokes every link"
+/// stays literally true.
+///
+/// Tokens are DPAPI-protected at rest (same treatment as API keys), so the file is useless if copied
+/// off this machine. They are still long-lived credentials, which is the honest cost of a durable
+/// link: anyone holding one can review until the owner presses Stop or revokes that reviewer.
+fn session_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(SESSION_FILE)
+}
+
+fn save_session(data_dir: &Path, reviewers: &HashMap<String, String>, db_path: &str) {
+    let protected: HashMap<String, String> = reviewers
+        .iter()
+        .filter_map(|(token, name)| crate::dpapi::protect(token).ok().map(|t| (t, name.clone())))
+        .collect();
+    if protected.len() != reviewers.len() {
+        // Refuse to write a PARTIAL map: a session that resumes with only some links working is
+        // worse than one that asks the owner to press Start again, because the missing reviewer sees
+        // a dead link and has no way to tell it apart from a bug.
+        tracing::warn!("Couch Review session not remembered: a token could not be protected at rest");
+        return;
+    }
+    let saved = SavedSession { reviewers: protected, db_path: db_path.to_string() };
+    let path = session_path(data_dir);
+    let Ok(json) = serde_json::to_string_pretty(&saved) else { return };
+    // Written via a temp file + atomic replace, like every other state file here: a half-written
+    // session would resume with a truncated token map and silently issue links that do not work.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, json.as_bytes()).and_then(|()| crate::atomic_file::replace_file(&tmp, &path)) {
+        tracing::warn!("Couch Review session not remembered: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn clear_session(data_dir: &Path) {
+    let path = session_path(data_dir);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("Couch Review session file not removed ({}): {e}", path.display());
+        }
+    }
+}
+
+/// Read back a remembered session, or None if there is none / it is unreadable / it belongs to a
+/// different library.
+fn load_session(data_dir: &Path, db_path: &str) -> Option<HashMap<String, String>> {
+    let raw = std::fs::read_to_string(session_path(data_dir)).ok()?;
+    let saved: SavedSession = serde_json::from_str(&raw).ok()?;
+    if saved.db_path != db_path {
+        tracing::warn!("Couch Review session ignored: it was started against a different library");
+        return None;
+    }
+    let mut out = HashMap::new();
+    for (protected, name) in saved.reviewers {
+        // One unreadable token invalidates the whole session rather than half-resuming it: DPAPI
+        // fails as a unit (different user/machine), so a partial read means the file is not ours.
+        let token = crate::dpapi::unprotect(&protected).ok()?;
+        out.insert(token, name);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// Start the couch server for `reviewers` (idempotent: returns the existing session if already running,
 /// WITHOUT re-tokenizing — a running session's links must not be invalidated by a status refresh).
-pub fn start(db_path: String, reviewers: Vec<String>) -> Result<CouchStatus, String> {
-    start_on_port(db_path, reviewers, COUCH_PORT)
+pub fn start(db_path: String, reviewers: Vec<String>, data_dir: Option<PathBuf>) -> Result<CouchStatus, String> {
+    start_on_port(db_path, reviewers, COUCH_PORT, data_dir)
+}
+
+/// Bring back the session the owner last started, if the app was closed without pressing Stop.
+///
+/// This is what makes the phone usable on the owner's terms: start Couch Review once, then open the
+/// same link from any device whenever, close the app in between, and never come back to the desktop
+/// for a fresh URL. Returns None when there is nothing remembered, which is the normal first-run and
+/// post-Stop state.
+pub fn resume(db_path: String, data_dir: &Path) -> Option<CouchStatus> {
+    let remembered = load_session(data_dir, &db_path)?;
+    let mut names: Vec<String> = remembered.values().cloned().collect();
+    names.sort();
+    match start(db_path, names, Some(data_dir.to_path_buf())) {
+        Ok(status) => {
+            tracing::info!(
+                "Couch Review resumed for {} reviewer(s) — previous links still work",
+                status.reviewers.len()
+            );
+            Some(status)
+        }
+        Err(e) => {
+            // Never fatal: a port already in use, or a restore in flight, must not stop the app from
+            // opening. The owner can press Start themselves and gets a real error there.
+            tracing::warn!("Couch Review could not resume: {e}");
+            None
+        }
+    }
 }
 
 /// `start` with the port injected, so the test can drive the REAL start/stop path without squatting
@@ -226,7 +343,12 @@ pub fn start(db_path: String, reviewers: Vec<String>) -> Result<CouchStatus, Str
 /// The production value is not weakened by being a parameter: `start()` is the only non-test caller
 /// and passes `COUCH_PORT`, which `the_session_constants_are_pinned_to_their_real_values` pins to
 /// 8737 — so a mutant that changed the constant still fails.
-fn start_on_port(db_path: String, reviewers: Vec<String>, port: u16) -> Result<CouchStatus, String> {
+fn start_on_port(
+    db_path: String,
+    reviewers: Vec<String>,
+    port: u16,
+    data_dir: Option<PathBuf>,
+) -> Result<CouchStatus, String> {
     let mut guard = COUCH.lock().unwrap_or_else(|p| p.into_inner());
     // P1.3b: don't stand up the phone-review server (a background DB writer on a submit) while a DB
     // restore is reserved. Checked UNDER the COUCH lock — the SAME lock is_running() (the restore fence)
@@ -245,12 +367,19 @@ fn start_on_port(db_path: String, reviewers: Vec<String>, port: u16) -> Result<C
     }
     let names = normalize_reviewers(&reviewers)?;
 
-    // One per-session random token PER REVIEWER (2× UUIDv4 = 244 random bits each). Never persisted,
-    // never logged — the token IS the identity, so sharing one would erase the attribution.
+    // One random token PER REVIEWER (2× UUIDv4 = 244 random bits each). Never logged — the token IS
+    // the identity, so sharing one would erase the attribution.
+    //
+    // REUSED from the remembered session when the same person is still on the list, so a link the
+    // owner already sent keeps working after the app is closed and reopened. A name that was not in
+    // the saved session gets a fresh token, and a name that has been dropped simply stops existing.
+    let remembered = data_dir.as_deref().and_then(|dir| load_session(dir, &db_path)).unwrap_or_default();
     let tokens: HashMap<String, String> = names
         .iter()
         .map(|name| {
-            let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+            let existing = remembered.iter().find(|(_, n)| n == &name).map(|(t, _)| t.clone());
+            let token = existing
+                .unwrap_or_else(|| format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple()));
             (token, name.clone())
         })
         .collect();
@@ -286,8 +415,13 @@ fn start_on_port(db_path: String, reviewers: Vec<String>, port: u16) -> Result<C
     // Read the port back off the socket rather than trusting the argument: a caller may pass 0 to
     // mean "any free port", and the issued URLs must carry the port that was ACTUALLY bound.
     let bound = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(port);
-    let handle = CouchHandle { shutdown, server, port: bound, state, joins };
+    let handle = CouchHandle { shutdown, server, port: bound, state, joins, data_dir: data_dir.clone() };
     let status = status_of(&handle);
+    // Remember it only once the server is actually serving. Saving earlier would leave a session file
+    // pointing at a start that failed, and the next launch would resume links to nothing.
+    if let Some(dir) = data_dir.as_deref() {
+        save_session(dir, &lock_state(&handle.state).reviewers.clone(), &db_path);
+    }
     *guard = Some(handle);
     tracing::info!(
         "Couch Review started on port {bound} for {} reviewer(s) (token gated; stop from Settings)",
@@ -311,6 +445,12 @@ pub fn stop() -> Result<CouchStatus, String> {
             let _ = join.join();
         }
         let port = h.port;
+        // STOP IS THE REVOKE. Closing the app remembers the session so a link keeps working; pressing
+        // Stop is the owner deciding it should not. Forgetting this line would make "stopping revokes
+        // every link" a lie the moment the app reopened.
+        if let Some(dir) = h.data_dir.as_deref() {
+            clear_session(dir);
+        }
         // Drop the Server BEFORE waking it. Dropping is what sets tiny_http's internal close flag, so
         // the order decides whether the wake-up connection means "exit" or "serve me".
         drop(h);
@@ -1018,6 +1158,13 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests that drive the real `start`/`stop` path share the ONE global `COUCH` singleton, and
+    /// cargo runs tests in parallel — two such tests steal each other's server mid-assertion.
+    /// Reproduced 3-for-3 the moment a second start/stop test existed; each passes alone. Any test
+    /// touching the global handle must hold this first. `unwrap_or_else(into_inner)`: a poisoned
+    /// lock from one failed test must not cascade every later one into a meaningless panic.
+    static GLOBAL_SESSION_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_db(dir: &std::path::Path) -> (Database, String) {
         let path = dir.join("couch-test.db").to_string_lossy().to_string();
@@ -1777,6 +1924,7 @@ mod tests {
 
     #[test]
     fn start_issues_working_tokens_and_stop_takes_them_away() {
+        let _serial = GLOBAL_SESSION_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // THE LAST GENUINELY UNTESTED LOGIC IN THIS FILE, and the mutation sweep is what proved it:
         // every other test builds `CouchState` by hand, so `start()`'s own wiring was never exercised.
         // Deleting `reviewers: tokens` from its struct literal — which the sweep does — leaves a server
@@ -1797,15 +1945,17 @@ mod tests {
         // An in-memory library is refused BEFORE any port is bound — the couch persists decisions, so a
         // database that evaporates on exit is not a thing it may serve.
         assert!(
-            start_on_port(":memory:".to_string(), vec!["Sara".into()], 0).is_err(),
+            start_on_port(":memory:".to_string(), vec!["Sara".into()], 0, None).is_err(),
             "an in-memory library must be refused"
         );
         assert!(!is_running(), "a refused start must leave nothing running");
 
-        let status = match start_on_port(db_path.clone(), vec!["Sara".into(), "Hemn".into()], 0) {
-            Ok(s) => s,
-            Err(e) => panic!("start failed: {e}"),
-        };
+        let status =
+            match start_on_port(db_path.clone(), vec!["Sara".into(), "Hemn".into()], 0, Some(tmp.path().to_path_buf()))
+            {
+                Ok(s) => s,
+                Err(e) => panic!("start failed: {e}"),
+            };
         assert!(is_running(), "the restore fence must see a running server");
         assert_eq!(status.reviewers.len(), 2, "one entry per named reviewer");
 
@@ -1859,10 +2009,70 @@ mod tests {
         // Re-bound to the SAME port on purpose. Asking for an ephemeral port again would succeed even
         // with the leak present — the OS would simply hand out a different one — so the assertion would
         // pass while the bug lived. It must be the port stop() was supposed to release.
-        let restarted = start_on_port(db_path, vec!["Sara".into()], bound_port)
+        let restarted = start_on_port(db_path.clone(), vec!["Sara".into()], bound_port, Some(tmp.path().to_path_buf()))
             .expect("stop must leave the port free to start again");
         assert!(restarted.running, "a stop/start cycle must produce a working server, not a bind error");
         stop().expect("second stop succeeds");
+    }
+
+    #[test]
+    fn a_link_survives_closing_the_app_but_not_pressing_stop() {
+        let _serial = GLOBAL_SESSION_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // What the owner asked for: open the page from any device whenever, review, close it, come
+        // back later — without returning to the desktop for a fresh URL. Regenerating every token on
+        // every start made that impossible, and it is the single thing that stopped remote review
+        // being usable on their own terms.
+        //
+        // The distinction that keeps it safe is between the two ways a session ends. Closing the app
+        // is not a decision about access — nothing calls stop() on exit — so the session is
+        // remembered. Pressing Stop IS that decision, and must still revoke everything.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db_path = tmp.path().join("links.db").to_string_lossy().to_string();
+        Database::open(&db_path).unwrap().initialize().unwrap();
+
+        let first = start_on_port(db_path.clone(), vec!["Sara".into(), "Hemn".into()], 0, Some(data_dir.clone()))
+            .expect("first start");
+        let sara_link = first.reviewers.iter().find(|r| r.name == "Sara").unwrap().url.clone();
+        let hemn_link = first.reviewers.iter().find(|r| r.name == "Hemn").unwrap().url.clone();
+        let token_of = |url: &str| url.split("?t=").nth(1).unwrap().to_string();
+
+        // CLOSING THE APP: no stop() call, the process simply goes away. Drop the handle the way an
+        // exit would, without touching the remembered session.
+        if let Some(mut h) = COUCH.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            h.shutdown.store(true, Ordering::SeqCst);
+            h.server.unblock();
+            for join in h.joins.drain(..) {
+                let _ = join.join();
+            }
+            let port = h.port;
+            drop(h);
+            release_listener(port);
+        }
+
+        // Reopening issues the SAME tokens, so the links already sent still work.
+        let again = start_on_port(db_path.clone(), vec!["Sara".into(), "Hemn".into()], 0, Some(data_dir.clone()))
+            .expect("second start");
+        let sara_again = again.reviewers.iter().find(|r| r.name == "Sara").unwrap().url.clone();
+        assert_eq!(
+            token_of(&sara_again),
+            token_of(&sara_link),
+            "closing and reopening the app must not invalidate a link the owner already sent"
+        );
+        assert_ne!(token_of(&sara_again), token_of(&hemn_link), "reviewers must still hold DIFFERENT tokens");
+
+        // PRESSING STOP is the revoke, and it must outlive a restart: the remembered session is gone,
+        // so the next start issues genuinely new tokens.
+        stop().expect("stop succeeds");
+        assert!(!session_path(&data_dir).exists(), "Stop must delete the remembered session, not just the server");
+        let after_stop = start_on_port(db_path, vec!["Sara".into()], 0, Some(data_dir)).expect("start after stop");
+        let sara_new = after_stop.reviewers.iter().find(|r| r.name == "Sara").unwrap().url.clone();
+        assert_ne!(
+            token_of(&sara_new),
+            token_of(&sara_link),
+            "a link revoked with Stop must NOT come back to life on the next launch"
+        );
+        stop().expect("final stop");
     }
 
     #[test]
