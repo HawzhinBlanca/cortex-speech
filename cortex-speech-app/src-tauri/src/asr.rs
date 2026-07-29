@@ -784,6 +784,109 @@ mod tests {
         );
     }
 
+    /// Do sherpa-onnx HOTWORDS do anything on the offline CTC path? Measured, not assumed.
+    ///
+    /// The offline config exposes `hotwords_file`/`hotwords_score`, and the crate even offers a
+    /// per-stream `create_stream_with_hotwords` — which reads as a live contextual-biasing lever for
+    /// the owner's recurring proper nouns. MEASURED 2026-07-29 (sherpa-onnx 1.13.2, CTC-300M int8,
+    /// CPU, the committed FLEURS fixture):
+    ///
+    ///   * config `hotwords_file` + greedy_search  -> construction REFUSED: upstream validates
+    ///     "Please use --decoding-method=modified_beam_search if you provide --hotwords-file".
+    ///   * `create_stream_with_hotwords` on a CTC recognizer -> HARD PROCESS ABORT (exit 0xffffffff,
+    ///     "Only transducer models support contextual biasing", offline-recognizer-impl.h:38). A C++
+    ///     abort cannot be caught from Rust, so this test must never call it — and neither may any
+    ///     production path, ever: one call kills the whole app. The pin for that leg is therefore a
+    ///     source-scan in this crate (no call sites) rather than a runtime probe.
+    ///
+    /// Net: contextual biasing is CLOSED on this stack, more definitively than LM fusion — the knobs
+    /// exist on the shared config struct but the CTC implementation actively refuses or aborts. If
+    /// the construction assert below ever fails after a sherpa upgrade, re-probe: biasing may have
+    /// become real, and then it belongs on the improvement list.
+    #[test]
+    #[ignore]
+    fn hotwords_are_refused_on_the_offline_ctc_path() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let model = root.join("models/omniasr-ctc-300m/model.int8.onnx");
+        let tokens = root.join("models/omniasr-ctc-300m/tokens.txt");
+        let fixture = root.join("tests/fixtures/fleurs_ckb_sample.wav");
+        if !model.exists() || !fixture.exists() {
+            eprintln!("model or fixture not present; skipping hotwords probe");
+            return;
+        }
+        crate::models::init_ort_dylib_path();
+        let (sr, pcm) =
+            crate::audio::decode_to_pcm_with_timeout(&fixture, std::time::Duration::from_secs(120)).expect("decode");
+        assert_eq!(sr, 16000);
+        let audio: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+
+        let base_config = |hotwords: Option<&std::path::Path>, method: &str| {
+            let mut c = OfflineRecognizerConfig { decoding_method: Some(method.into()), ..Default::default() };
+            c.model_config.omnilingual =
+                OfflineOmnilingualAsrCtcModelConfig { model: Some(model.to_string_lossy().into_owned()) };
+            c.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
+            c.model_config.num_threads = 4;
+            c.model_config.provider = Some("cpu".into()); // deterministic: same EP for every leg
+            if let Some(h) = hotwords {
+                c.hotwords_file = Some(h.to_string_lossy().into_owned());
+                c.hotwords_score = 50.0; // absurd on purpose: a live mechanism could not ignore this
+            }
+            c
+        };
+        let decode = |rec: &OfflineRecognizer, stream: sherpa_onnx::OfflineStream| -> String {
+            stream.accept_waveform(16000, &audio);
+            rec.decode(&stream);
+            stream.get_result().map(|r| r.text).unwrap_or_default()
+        };
+
+        // A: baseline, exactly the production shape (greedy, no hotwords).
+        let rec_a = OfflineRecognizer::create(&base_config(None, "greedy_search")).expect("baseline recognizer");
+        let text_a = decode(&rec_a, rec_a.create_stream());
+        assert!(!text_a.trim().is_empty(), "baseline must produce a real transcript");
+        let bias_word = "کوردستان";
+        assert!(!text_a.contains(bias_word), "probe needs a bias word the baseline does NOT emit; got: {text_a}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let hw = tmp.path().join("hotwords.txt");
+        std::fs::write(&hw, format!("{bias_word}\n")).unwrap();
+
+        // B: config-level hotwords_file + score 50 on the shipped decoding method. The PIN: upstream
+        // refuses to construct this at all. (If it ever starts constructing, decode and compare.)
+        let b = OfflineRecognizer::create(&base_config(Some(&hw), "greedy_search"));
+        eprintln!("[hotwords] A baseline: {text_a}");
+        eprintln!("[hotwords] B config+greedy constructs: {}", b.is_some());
+        assert!(
+            b.is_none(),
+            "config-level hotwords on CTC+greedy now CONSTRUCTS — re-probe: biasing may have become real"
+        );
+
+        // C is deliberately NOT exercised: `create_stream_with_hotwords` on this recognizer is a
+        // measured hard process abort (see doc above). The pin for C is the source scan below —
+        // the fatal call must have zero call sites anywhere in the crate (this file's own mentions
+        // are comments and the scan, so asr.rs is excluded by name).
+        let mut offenders = Vec::new();
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src_dir];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|e| e == "rs") && p.file_name().is_some_and(|n| n != "asr.rs") {
+                    let s = std::fs::read_to_string(&p).unwrap_or_default();
+                    if s.contains("create_stream_with_hotwords") {
+                        offenders.push(p.display().to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "create_stream_with_hotwords is a measured PROCESS ABORT on the CTC model and must never \
+             be called: {offenders:?}"
+        );
+    }
+
     /// Feasibility gate for the constrained-decode port: can we load the OmniASR ONNX via `ort`
     /// (dynamic onnxruntime) and run one inference to get the [1, T, 9812] CTC logits? Gated on the
     /// model being present; sets ORT_DYLIB_PATH to the bundled onnxruntime.dll.

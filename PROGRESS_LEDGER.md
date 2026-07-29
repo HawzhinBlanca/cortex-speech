@@ -2490,3 +2490,35 @@ decisions — the corpus stands at 28), branch-protection, asosoft-600-licensing
 **Outside the gate entirely and still true:** Tailscale Serve is not enabled, so sharing outside the
 tailnet does not work; `cortex-once-admin.ps1` has not had its elevated run, so FastStartup=1 and
 ARSO=unset and a reboot still leaves the system down; eight Sorani strings await native review.
+
+---
+
+## Iteration 207 — hotwords on CTC: measured CLOSED, and the per-stream call is process-fatal
+
+The one unverified lever left from the iter-205 crate inspection ("whether hotwords do anything for a
+CTC model is UNVERIFIED") is now measured, on the real model and the committed FLEURS fixture.
+
+**New ignored gate `asr::tests::hotwords_are_refused_on_the_offline_ctc_path`.** Probe design: decode
+the fixture with an absurd bias (score 50) toward a Sorani word the baseline does not emit. Measured
+outcomes (sherpa-onnx 1.13.2, CTC-300M int8, CPU):
+
+- config `hotwords_file` + greedy_search: **construction REFUSED** — upstream Validate says "Please
+  use --decoding-method=modified_beam_search if you provide --hotwords-file".
+- `create_stream_with_hotwords` on the CTC recognizer: **HARD PROCESS ABORT**, exit 0xffffffff,
+  "Only transducer models support contextual biasing" (offline-recognizer-impl.h:38). A C++ abort is
+  uncatchable from Rust: ONE call to this crate-public method kills the entire app.
+
+So contextual biasing is closed on this stack even more definitively than LM fusion: the knobs sit on
+the shared config struct, and the CTC implementation refuses or aborts. The test pins the refusal at
+runtime and pins the abort by SOURCE SCAN — zero call sites of `create_stream_with_hotwords` allowed
+anywhere in the crate — because a runtime probe of an abort would kill the test runner itself.
+
+Honesty note on process: the first draft of this test pinned my EXPECTED outcome ("silently ignored")
+before running. Reality was refusal + abort; the pin was rewritten to what was measured, and the
+failing first run is what caught it. The improvement avenue list for the owner is now, with all three
+decode-side levers measured dead (LM fusion, LOOP-0 promotion, hotwords): review volume -> acoustic
+fine-tune. There is no decode-side shortcut on this stack.
+
+**Gates (unmasked exits):** fmt 0; clippy 0; `cargo test --lib` 0 — **1089 passed, 7 ignored** (the
+new probe is the 7th). Exe rebuild required by the freshness gate (asr.rs changed, test-only) and run
+after commit.
