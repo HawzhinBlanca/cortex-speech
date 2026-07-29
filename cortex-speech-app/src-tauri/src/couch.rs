@@ -1778,6 +1778,38 @@ mod tests {
     }
 
     #[test]
+    fn release_listener_gives_up_in_bounded_time_when_the_port_never_frees() {
+        // `stop_couch_review` is a SYNC #[tauri::command], so it runs on the UI thread — and
+        // release_listener retries. The happy path returns on the first attempt (measured 6-28 ms in
+        // a live stop/start cycle), but the failing path is the one that decides whether the window
+        // freezes, and "it should be about a second" is not a measurement.
+        //
+        // A LIVE listener the whole time: the bind probe can never succeed, so every attempt is
+        // spent. This is the true ceiling, not a typical case.
+        let held = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind a port to hold");
+        let port = held.local_addr().unwrap().port();
+
+        let started = Instant::now();
+        release_listener(port);
+        let elapsed = started.elapsed();
+        drop(held);
+
+        // Bounded, and bounded by the constants rather than by luck.
+        let ceiling = (LISTENER_RELEASE_CONNECT_TIMEOUT + LISTENER_RELEASE_DELAY) * LISTENER_RELEASE_ATTEMPTS
+            + Duration::from_secs(1); // scheduling slack on a loaded CI box
+        assert!(elapsed < ceiling, "release_listener must give up in bounded time, took {elapsed:?}");
+        // And the ceiling itself must stay small enough to sit on the UI thread without the window
+        // visibly hanging. If a future change raises the retry budget past this, the command has to
+        // move off the main thread first (see ASYNC_SLOW_COMMANDS in
+        // scripts/test_command_main_thread_policy.py).
+        assert!(
+            (LISTENER_RELEASE_CONNECT_TIMEOUT + LISTENER_RELEASE_DELAY) * LISTENER_RELEASE_ATTEMPTS
+                <= Duration::from_millis(1500),
+            "the retry budget is on the UI thread; keep it under 1.5s or make stop_couch_review async"
+        );
+    }
+
+    #[test]
     fn the_session_constants_are_pinned_to_their_real_values() {
         // Surfaced by the cargo-mutants sweep after couch.rs entered its scope: both of these were
         // written as arithmetic (`256 * 1024`, `15 * 60`) and NOTHING pinned the result, so mutating
