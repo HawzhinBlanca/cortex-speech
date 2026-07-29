@@ -53,6 +53,7 @@
     "linkExpired": "This link has expired. Ask for a new one — anything you already saved is safe, and anything still waiting to send will go through on the new link.",
     "allDone": "All clips reviewed!",
     "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
+    "loadingMore": "Loading more clips…",
     "editHint": "Listen, and correct the text if needed"
   },
   "ckb": {
@@ -70,6 +71,7 @@
     "linkExpired": "ئەم بەستەرە بەسەرچووە. داوای بەستەرێکی نوێ بکە — هەرچی پاشەکەوتت کردووە پارێزراوە، و هەرچی چاوەڕێی ناردنە بە بەستەرە نوێیەکە دەنێردرێت.",
     "allDone": "هەموو پارچەکان پێداچوونەوەیان بۆ کرا!",
     "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
+    "loadingMore": "بارکردنی پارچەی زیاتر…",
     "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
   },
   "source": {
@@ -87,6 +89,7 @@
     "linkExpired": null,
     "allDone": "review.allDone",
     "heldByOthers": null,
+    "loadingMore": null,
     "editHint": "review.editHint"
   }
 }
@@ -312,6 +315,26 @@
     // claiming "all reviewed" there would be a flat lie to whoever loaded last.
     $('done').textContent = heldByOthers ? t('heldByOthers', { n: heldByOthers }) : '🎉 ' + t('allDone');
   }
+  // The server hands out at most QUEUE_BATCH clips per fetch and says nothing about the backlog behind
+  // them, so "my local array ran out" is NOT "the corpus is finished". Without a refetch the page
+  // showed "🎉 All clips reviewed!" after one batch with the entire remaining backlog still pending —
+  // and an installed PWA (display:standalone) has no address bar to reload from, so that screen was a
+  // dead end as well as a lie. `exhausted` is the only thing that may draw the finished state, and it
+  // is set solely by a fetch that came back with nothing.
+  let refilling = false;
+  let exhausted = false;
+  async function refill() {
+    if (refilling) return;
+    refilling = true;
+    $('card').hidden = true;
+    $('done').hidden = false;
+    $('done').textContent = t('loadingMore');
+    try {
+      await load();
+    } finally {
+      refilling = false;
+    }
+  }
   // ── drafts, so a reload or a crash never costs a typed correction ───────────
   const draftKey = (id) => 'cortex.couch.draft.' + id;
   $('text').addEventListener('input', () => {
@@ -354,6 +377,10 @@
 
   function show() {
     const seg = queue[i];
+    // Drained the batch: go ask for the next one before claiming anything is finished. `exhausted`
+    // breaks the recursion — load() calls show() again, and a fetch that returned nothing sets it, so
+    // the empty state renders on the second pass instead of refetching forever.
+    if (!seg && !exhausted && !refilling) { void refill(); return; }
     $('card').hidden = !seg; $('done').hidden = !!seg;
     $('warn').hidden = true;
     renderProgress();
@@ -386,6 +413,9 @@
       await flushOutbox();
       const res = await api('/api/queue');
       queue = res.items; i = 0; heldByOthers = res.heldByOthers || 0;
+      // Recomputed on EVERY load: a fetch that brings work back re-arms the refetch, so a reviewer who
+      // drains one batch, sees the finished screen, and later reloads is not stuck with a stale verdict.
+      exhausted = queue.length === 0;
       renderEmptyState();
       // Show WHO the server is recording these decisions as. Every save is stored under this name, so
       // the reviewer must be able to see it — silent attribution is attribution nobody can correct.

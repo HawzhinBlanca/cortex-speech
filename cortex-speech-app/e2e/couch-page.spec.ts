@@ -152,6 +152,55 @@ test.describe('Couch Review phone page', () => {
       .toBe(0);
   });
 
+  test('draining a batch fetches the next one instead of claiming the corpus is finished', async ({ page }) => {
+    // THE THROUGHPUT LIE. The server hands out at most QUEUE_BATCH (25) clips per fetch and says
+    // nothing about the backlog behind them, but the page called load() in exactly two places — on
+    // open and after an undo — so when the local array ran out it went straight to
+    // "🎉 All clips reviewed!". Measured against the owner's own library: 116 pending clips, so a
+    // reviewer did 25 and was told the corpus was done with 91 left. The installed PWA is
+    // display:standalone, so there is no address bar to reload from either — the lie was also a dead
+    // end. The server comment claimed "the page refetches as it drains"; it did not.
+    await page.addInitScript(() => {
+      (window as unknown as { __q: { fetches: number } }).__q = { fetches: 0 };
+      const batches = [
+        [{ id: 'a1', text: 'یەکەم', durationMs: 1000, speakerId: null }],
+        [{ id: 'b1', text: 'دووەم', durationMs: 1000, speakerId: null }],
+        [],
+      ];
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          const st = (window as unknown as { __q: { fetches: number } }).__q;
+          const items = batches[Math.min(st.fetches, batches.length - 1)];
+          st.fetches += 1;
+          return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
+
+    // Draining batch 1 must go BACK to the server, not declare victory.
+    await page.locator('#accept').click();
+    await expect(page.locator('#text')).toHaveValue('دووەم', { timeout: 5000 });
+    await expect(page.locator('#done')).toBeHidden();
+
+    // Only a fetch that genuinely comes back empty may draw the finished state.
+    await page.locator('#accept').click();
+    await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('#done')).toContainText('هەموو پارچەکان');
+    expect(await page.evaluate(`window.__q.fetches`)).toBe(3);
+
+    // ...and it must STOP there. An empty answer that still triggered a refill would spin the phone's
+    // radio forever on a drained corpus, which on a battery is worse than the bug it replaced.
+    await page.waitForTimeout(300);
+    expect(await page.evaluate(`window.__q.fetches`)).toBe(3);
+  });
+
   test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {
     // DATA LOSS, and made MORE reachable by fixing Stop/Start: every outstanding token is regenerated
     // when the owner restarts Couch Review or reissues a link. A reviewer who was offline then
