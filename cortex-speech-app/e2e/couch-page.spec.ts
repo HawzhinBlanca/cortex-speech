@@ -267,6 +267,36 @@ test.describe('Couch Review phone page', () => {
     expect(await page.evaluate(`window.__renews[0]`)).toContain('s1');
   });
 
+  test('a return visit sends no token at all rather than an empty one', async ({ page }) => {
+    // THE REPORTED BUG: "I close the browser on my iPhone and go back and it doesn't open."
+    //
+    // The page strips ?t= from the URL after the first load, so on a return visit its `token` is "".
+    // It still appended `?t=` to every request, and the server read that empty value as a
+    // supplied-but-WRONG credential, which shadowed the valid HttpOnly cookie riding the same
+    // request. The reviewer was refused while the browser was sending exactly what would have let
+    // them in. Both sides are fixed; this pins the page half.
+    const urls: string[] = [];
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        (window as unknown as { __urls: string[] }).__urls ??= [];
+        (window as unknown as { __urls: string[] }).__urls.push(String(input));
+        return new Response('{"ok":true,"items":[],"reviewer":"Sara"}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+    });
+    // No token in the URL — exactly the state a returning reviewer's history entry is in.
+    await page.goto(PAGE);
+    await page.waitForFunction(`(window.__urls || []).length > 0`, null, { timeout: 5000 });
+    urls.push(...((await page.evaluate(`window.__urls`)) as string[]));
+
+    expect(urls.length).toBeGreaterThan(0);
+    for (const u of urls) {
+      expect(u, 'a tokenless page must not send an empty t= — it shadows the cookie').not.toMatch(/[?&]t=(&|$)/);
+    }
+  });
+
   test('the token is stripped from the visible URL after the first load', async ({ page }) => {
     // The server plants an HttpOnly cookie, so the token no longer needs to ride in the URL where it
     // lands in history and in any proxy log. The link the reviewer was SENT keeps working; this only

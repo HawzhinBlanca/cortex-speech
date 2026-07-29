@@ -572,9 +572,20 @@ fn token_from_request(request: &tiny_http::Request) -> Option<String> {
 }
 
 /// Extract `t` from a raw request URL's query string.
+///
+/// An EMPTY `t=` counts as ABSENT, not as a token that happens to be the empty string. That
+/// distinction is the whole reason a returning reviewer can get back in: the page strips `?t=` from
+/// the URL after the first load (P3.8), so on a return visit its `token` variable is `""` and every
+/// request goes out as `?t=`. Treating that as a supplied-but-wrong token made the query shadow the
+/// perfectly good session cookie sitting in the same request, so the server answered 401 while
+/// holding the credential that would have let them in — the cookie mechanism could never actually be
+/// used for the one job it was added to do.
+///
+/// A NON-empty wrong token still fails, and must: someone presenting an explicit credential is
+/// making a claim, and silently falling back to a cookie there would let a revoked link keep working.
 fn token_from_url(url: &str) -> Option<&str> {
     let query = url.split_once('?')?.1;
-    query.split('&').find_map(|kv| kv.strip_prefix("t="))
+    query.split('&').find_map(|kv| kv.strip_prefix("t=")).filter(|t| !t.is_empty())
 }
 
 fn handle_request(
@@ -1044,6 +1055,18 @@ mod tests {
         assert_eq!(token_from_url("/api/queue?x=1&t=abc"), Some("abc"));
         assert_eq!(token_from_url("/api/queue"), None);
         assert_eq!(token_from_url("/api/queue?token=abc"), None);
+        // AN EMPTY `t=` IS ABSENT, NOT A TOKEN. This is what locked a returning reviewer out: the
+        // page strips `?t=` from the URL after the first load, so on a return visit its token is ""
+        // and every request goes out as `?t=`. Read as a supplied-but-wrong credential, the query
+        // shadowed the valid session cookie in the SAME request and the server answered 401 while
+        // holding what would have let them in. Measured on the wire before the fix:
+        //   cookie, no t=     -> 200
+        //   cookie + empty t= -> 401
+        assert_eq!(token_from_url("/api/queue?t="), None, "an empty t= must fall through to the cookie");
+        assert_eq!(token_from_url("/api/queue?t=&x=1"), None);
+        // ...but a non-empty WRONG token must still be honoured as a claim and fail. Falling back to
+        // the cookie there would let a revoked link keep working by simply carrying a stale cookie.
+        assert_eq!(token_from_url("/api/queue?t=wrong"), Some("wrong"));
     }
 
     #[test]
@@ -1565,6 +1588,71 @@ mod tests {
         let _ = respond_with_cookie(request, reply.clone(), cookie);
         let _ = client.join();
         reply
+    }
+
+    #[test]
+    fn a_returning_reviewer_is_let_in_by_their_cookie_even_though_the_page_sends_an_empty_token() {
+        // THE REPORTED BUG: "I close the browser on my iPhone and go back and it doesn't open."
+        //
+        // Every piece worked in isolation, which is why nothing caught it. The server accepted the
+        // cookie in every form when asked directly; the browser faithfully sent the cookie on the
+        // return visit; the page correctly stripped the token from the URL. What no test covered was
+        // the COMBINATION the second visit actually produces: an empty `?t=` alongside a valid
+        // cookie. The empty query won, and the reviewer was refused while holding a good credential.
+        //
+        // Driven over real HTTP against a real server rather than by calling token_from_request,
+        // because the defect lives in how the two credentials interact on one request.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەقی تاقیکردنەوە")).unwrap();
+        drop(db);
+
+        let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let state = Arc::new(Mutex::new(CouchState {
+            reviewers: HashMap::from([("goodtoken".to_string(), "Sara".to_string())]),
+            ..CouchState::default()
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let join = spawn_server_loop(0, server.clone(), db_path, state, shutdown.clone()).unwrap();
+
+        let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
+        let base = format!("http://127.0.0.1:{port}");
+        let status = |url: String, cookie: Option<&str>| -> u16 {
+            let mut req = agent.get(&url);
+            if let Some(c) = cookie {
+                req = req.set("Cookie", c);
+            }
+            req.call().map(|r| r.status()).unwrap_or_else(|e| match e {
+                ureq::Error::Status(c, _) => c,
+                other => panic!("transport error: {other}"),
+            })
+        };
+        let cookie = format!("{COUCH_COOKIE}=goodtoken");
+
+        // The first visit: the token is in the URL.
+        assert_eq!(status(format!("{base}/api/queue?t=goodtoken"), None), 200);
+        // The RETURN visit, exactly as the page issues it — empty t=, cookie present.
+        assert_eq!(
+            status(format!("{base}/api/queue?t="), Some(&cookie)),
+            200,
+            "a returning reviewer must be let in by their cookie; the page sends an empty t= because \
+             it stripped the token from the URL on the first load"
+        );
+        // Cookie alone (no query at all) keeps working.
+        assert_eq!(status(format!("{base}/api/queue"), Some(&cookie)), 200);
+        // And the gate is NOT loosened: no credential, or an explicit WRONG one, still fails.
+        assert_eq!(status(format!("{base}/api/queue?t="), None), 401, "an empty token alone is not a way in");
+        assert_eq!(
+            status(format!("{base}/api/queue?t=revoked"), Some(&cookie)),
+            401,
+            "an explicit wrong token must not silently fall back to a cookie — that would let a \
+             revoked link keep working"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        server.unblock();
+        let _ = join.join();
     }
 
     #[test]
