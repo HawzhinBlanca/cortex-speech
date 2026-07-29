@@ -594,10 +594,8 @@ fn revoke_in(state: &Mutex<CouchState>, name: &str) -> Result<(), String> {
     //
     // Snapshot under the lock and write outside it, like the batch-serve path: save_session does DPAPI
     // plus file IO, which has no business inside the request-path mutex.
-    let persist = st
-        .session_store
-        .clone()
-        .map(|(dir, db_path)| (dir, db_path, st.reviewers.clone(), st.spot_checks.clone()));
+    let persist =
+        st.session_store.clone().map(|(dir, db_path)| (dir, db_path, st.reviewers.clone(), st.spot_checks.clone()));
     drop(st);
     if let Some((dir, db_path, reviewers, checks)) = persist {
         // Access is already denied in memory at this point, so this is not a rollback — it is the
@@ -1115,7 +1113,7 @@ fn api_renew(body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
     json_reply(200, serde_json::json!({ "ok": true, "ttlSeconds": LEASE_TTL.as_secs() }))
 }
 
-/// Whether this submit is a REPEAT of the decision already stored for this reviewer (P1.2).
+/// Whether this reviewer's decision is ALREADY STORED on the row (P1.2).
 ///
 /// A phone on the edge of Wi-Fi drops requests. If the write lands but the response is lost, the page
 /// retries — and without this check the retry is recorded as a SECOND human decision: another undo
@@ -1127,8 +1125,18 @@ fn api_renew(body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
 /// outcome; change one character and it is a genuine re-review that must be recorded. Text is
 /// NFC-compared because the write path canonicalizes, so a decomposed phone-IME paste would otherwise
 /// never match the value it just stored.
+///
+/// This deliberately does NOT look at `verified`, and that is the whole point. One phone decision is
+/// TWO non-atomic writes: `record_human_decision_by` (which sets human_decision / verdict_transcript /
+/// reviewed_by) and then the row upsert (which sets verified / annotated_transcript). Keying the guard
+/// on `verified` meant a mid-submit failure — write one committed, write two refused — left a row the
+/// guard could not recognise, so the outbox replay ran the ENTIRE write a second time: a duplicate
+/// agent_examples pair into the DPO export, a correction_memory hit_count bumped as though it were an
+/// independent cross-segment confirmation, and that memory then graded against the very edit that
+/// created it. `verified` is an artefact of the second write; the identity of the decision lives in
+/// the first. Callers pair this with `prev.verified` to tell a COMPLETE repeat from a half-written one.
 fn is_repeat_of_stored_decision(prev: &SpeechSegment, reviewer: &str, decision: &str, text: Option<&str>) -> bool {
-    if prev.reviewed_by.as_deref() != Some(reviewer) || !prev.verified {
+    if prev.reviewed_by.as_deref() != Some(reviewer) {
         return false;
     }
     match (decision, text) {
@@ -1136,9 +1144,17 @@ fn is_repeat_of_stored_decision(prev: &SpeechSegment, reviewer: &str, decision: 
         // A repeat of an accept can arrive classified as either: the first submit may have been an
         // "edit", after which the stored text IS the review text, so the retry re-classifies as
         // "accept". Both are the same human act.
+        //
+        // Matched against EITHER column holding the human's text. After a complete submit that is
+        // `annotated_transcript`; after a half-written one only `verdict_transcript` exists, because
+        // the upsert that would have copied it across is exactly the write that failed.
         (_, Some(t)) => {
+            let want = crate::db::to_nfc(t);
             matches!(prev.human_decision.as_deref(), Some("accept") | Some("edit"))
-                && prev.annotated_transcript.as_deref().map(crate::db::to_nfc) == Some(crate::db::to_nfc(t))
+                && [prev.annotated_transcript.as_deref(), prev.verdict_transcript.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|stored| crate::db::to_nfc(stored) == want)
         }
         _ => false,
     }
@@ -1151,6 +1167,16 @@ struct DecisionBody {
     action: String,
     #[serde(default)]
     text: String,
+    /// Who the PAGE believed it was when this decision was made.
+    ///
+    /// Only ever set on a replay out of the phone's outbox, and checked against the cookie identity
+    /// rather than trusted. The outbox lives in localStorage, which is per-ORIGIN, not per-reviewer:
+    /// two reviewers using the same browser (or one person handed a colleague's link) share it, so a
+    /// decision queued while offline by Sara could be flushed under Hemn's cookie and be recorded,
+    /// permanently, as Hemn's judgement of a clip he never heard. Attribution is the one thing a
+    /// review corpus cannot be wrong about.
+    #[serde(default)]
+    reviewer: Option<String>,
 }
 
 /// Record one phone decision through the exact desktop path: `record_human_decision_by` FIRST (its
@@ -1167,6 +1193,15 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     }
     if crate::validation::input::validate_text(&parsed.text, 100_000, "Transcript").is_err() {
         return err_reply(400, "text too large");
+    }
+    // ATTRIBUTION FENCE. A queued decision names its author; the cookie names who is asking now. When
+    // they disagree the decision belongs to somebody else and must not be written under this name —
+    // refuse it and let the page hold it for the reviewer who actually made it. Absent field = a live
+    // submit from a page that has no reason to claim anything, which is the ordinary path.
+    if let Some(claimed) = parsed.reviewer.as_deref() {
+        if !claimed.eq_ignore_ascii_case(reviewer) {
+            return err_reply(409, &format!("this decision was made by {claimed}, not {reviewer}"));
+        }
     }
     let prev = match db.get_segment_by_id(&parsed.id) {
         Ok(Some(seg)) => seg,
@@ -1226,7 +1261,13 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // A dropped RESPONSE (not a dropped request) means the write landed and the page never heard so.
     // Answer the retry with the success it already earned, before taking a lease or pushing an undo
     // entry for a decision that is already recorded.
-    if is_repeat_of_stored_decision(&prev, reviewer, decision, text.as_deref()) {
+    //
+    // `already_recorded` without `verified` is the HALF-WRITTEN state: write one committed and the row
+    // upsert did not. That is not a duplicate to be waved through — the clip is still unverified, so it
+    // would be served as pending work forever — and it is not new work either, because replaying write
+    // one would double the learning pair. It is an interrupted write to be FINISHED, below.
+    let already_recorded = is_repeat_of_stored_decision(&prev, reviewer, decision, text.as_deref());
+    if already_recorded && prev.verified {
         return json_reply(200, serde_json::json!({ "ok": true, "duplicate": true }));
     }
 
@@ -1263,16 +1304,30 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             return err_reply(409, "another reviewer is working on this clip");
         }
         guard.leases.insert(parsed.id.clone(), (reviewer.to_string(), now));
-        guard.undo.entry(reviewer.to_string()).or_default().push((prev.id.clone(), prev.clone()));
+        // No undo entry when finishing a half-written decision: `prev` is the HALF-DECIDED row, not the
+        // pre-decision one, so storing it would make the undo button restore a corrupt snapshot. The
+        // entry pushed by the original attempt is the true one and is deliberately left in place.
+        if !already_recorded {
+            guard.undo.entry(reviewer.to_string()).or_default().push((prev.id.clone(), prev.clone()));
+        }
     }
-    if let Err(e) =
-        crate::jury::record_human_decision_by(db, &parsed.id, decision, text.as_deref(), None, Some(reviewer))
-    {
-        let mut guard = lock_state(state);
-        guard.undo.entry(reviewer.to_string()).or_default().pop();
-        // Nothing was written, so hand the clip straight back rather than holding it for the full TTL.
-        guard.leases.remove(&parsed.id);
-        return err_reply(500, &e.to_string());
+    // Skipped entirely when the decision is already on the row: this is the write that mints the DPO
+    // pair and the correction memories, and running it twice for one human act is the corruption the
+    // half-written state used to cause.
+    if !already_recorded {
+        if let Err(e) =
+            crate::jury::record_human_decision_by(db, &parsed.id, decision, text.as_deref(), None, Some(reviewer))
+        {
+            let mut guard = lock_state(state);
+            guard.undo.entry(reviewer.to_string()).or_default().pop();
+            // The lease is deliberately KEPT. Handing the clip back the instant a write fails looks
+            // tidy, but the reviewer still has this clip open with their correction typed and now
+            // queued in the outbox — and a freed clip is picked up by the next reviewer's batch within
+            // seconds. Their replay then loses the race and is refused 409, destroying work that was
+            // never in conflict with anyone. An untouched lease expires on its own in LEASE_TTL, which
+            // is the right cost for a transient database error.
+            return err_reply(500, &e.to_string());
+        }
     }
     // Fresh row AFTER the (potentially slow) decision call — the same stale-spread rationale as the
     // desktop submit(); a background writer may have updated other columns in the meantime.
@@ -1455,6 +1510,146 @@ mod tests {
         assert_eq!(code, 200);
         let (code, _, _) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 409, "empty undo stack is a 409, not a phantom undo");
+    }
+
+    #[test]
+    fn an_interrupted_decision_is_finished_on_replay_and_never_recorded_twice() {
+        // One phone decision is TWO non-atomic writes: record_human_decision_by, then the row upsert.
+        // A failure between them (SQLITE_BUSY against a desktop batch, SQLITE_FULL) used to be
+        // unrecoverable in two separate ways at once, and this pins both.
+        //
+        // Made deterministic with the validation asymmetry the failure exploits: write one is a plain
+        // UPDATE that never calls validate_segment, write two goes through insert_segment which does —
+        // and which rejects a UNC audio_path. Flipping that column forces exactly the half-written row
+        // a transient fault produces, with no sleeps and no I/O races.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, path) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
+        let state = state();
+        let fix = "دەق یەک ڕاستکراوە";
+        let body = serde_json::json!({"id": "s1", "action": "edit", "text": fix});
+
+        let side = rusqlite::Connection::open(&path).unwrap();
+        let pairs = |c: &rusqlite::Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 's1'", [], |r| r.get(0)).unwrap()
+        };
+        let memory_hits = |c: &rusqlite::Connection| -> i64 {
+            c.query_row("SELECT COALESCE(SUM(hit_count), 0) FROM correction_memory", [], |r| r.get(0)).unwrap()
+        };
+
+        side.execute(
+            "UPDATE speech_segments SET audio_path = ?1 WHERE id = 's1'",
+            rusqlite::params![r"\\evil\share\a.wav"],
+        )
+        .unwrap();
+        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 500, "the row upsert must fail here — that is the state under test");
+
+        let half = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert!(!half.verified, "write two did NOT land");
+        assert_eq!(half.reviewed_by.as_deref(), Some("Sara"), "write one DID land — this is the half-written row");
+        let pairs_after_failure = pairs(&side);
+        let hits_after_failure = memory_hits(&side);
+        assert!(
+            pairs_after_failure >= 1,
+            "the failing submit still minted the learning pair; nothing to test otherwise"
+        );
+
+        // The clip stays leased across the failure. (This is the write-TWO branch, which always held
+        // the lease; the write-ONE branch that used to release it is covered by the SQLITE_BUSY test
+        // below. Pinned here anyway so the two failure paths cannot drift apart.)
+        let held = { lock_state(&state).holder("s1", Instant::now()).map(str::to_string) };
+        assert_eq!(held.as_deref(), Some("Sara"), "a failed write must not release the reviewer's lease");
+
+        // The outbox replays. The row is writable again (the real-world analogue: the DB is no longer busy).
+        side.execute("UPDATE speech_segments SET audio_path = '/audio/a.wav' WHERE id = 's1'", []).unwrap();
+        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "the replay must succeed, not 409 or 500");
+
+        let done = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert!(done.verified, "the replay FINISHES the interrupted write");
+        assert_eq!(done.annotated_transcript.as_deref(), Some(fix));
+
+        // DEFECT 2 (the dedup key): the guard keyed on `verified`, which only write two sets, so it
+        // could not recognise its own half-written row and replayed the ENTIRE decision — a second DPO
+        // pair from one human edit, and a correction_memory hit_count bumped as though a second,
+        // independent segment had confirmed it.
+        assert_eq!(pairs(&side), pairs_after_failure, "a replay must not mint a second learning pair");
+        assert_eq!(memory_hits(&side), hits_after_failure, "a replay must not bump correction_memory hit_count");
+    }
+
+    #[test]
+    fn a_busy_database_must_not_hand_the_clip_to_the_next_reviewer() {
+        // The write-ONE failure branch, driven by the real trigger rather than a stand-in: another
+        // connection holds the write lock, so `record_human_decision_by` blocks and then fails
+        // SQLITE_BUSY — exactly what a desktop batch or import does to a phone submit.
+        //
+        // It used to release the lease on that failure ("nothing was written, so hand the clip
+        // straight back"), which reads as tidy and is the opposite of safe: the reviewer still has the
+        // clip open with their correction typed and now queued in the outbox, and a freed clip is
+        // handed to the next reviewer's batch within seconds. Their replay then loses a race that
+        // never needed to happen and is refused 409, and 409 is the branch that discards the queued
+        // decision. A transient database error silently became permanent work loss.
+        //
+        // Costs one busy_timeout (10s, db.rs) by construction — the wait IS the mechanism under test.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, path) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
+        let state = state();
+
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").expect("take the write lock");
+
+        let body = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوە"});
+        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 500, "a locked database must surface as a server error, not a verdict");
+
+        let held = { lock_state(&state).holder("s1", Instant::now()).map(str::to_string) };
+        assert_eq!(
+            held.as_deref(),
+            Some("Sara"),
+            "the reviewer still has this clip open and their decision queued — releasing it here is what \
+             let the next batch steal it and turn a transient DB error into lost work"
+        );
+        // Nothing landed, so the row is untouched and the reviewer's replay is a genuinely new write.
+        let row = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert!(!row.verified);
+        assert_eq!(row.reviewed_by, None);
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn a_queued_decision_is_never_recorded_under_a_different_reviewers_name() {
+        // The outbox lives in localStorage, which is per-ORIGIN and not per-reviewer. Two people using
+        // one phone — or one person opening a colleague's link — share it, so a decision Sara queued
+        // while offline could flush under Hemn's cookie and be recorded, permanently, as Hemn's
+        // judgement of a clip he never heard. Attribution is the one thing a review corpus cannot be
+        // wrong about, and it was decided by whoever happened to be logged in at flush time.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
+        db.insert_segment(&seg("s2", "دەق دوو")).unwrap();
+        let state = state();
+
+        let sara_work = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوە", "reviewer": "Sara"});
+        let (code, _, msg) = api_decision(&db, sara_work.to_string().as_bytes(), "Hemn", &state);
+        assert_eq!(code, 409, "Sara's decision must not be written under Hemn's name");
+        assert!(String::from_utf8_lossy(&msg).contains("Sara"), "the refusal must name the real author: {msg:?}");
+        let untouched = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert!(!untouched.verified, "a mis-attributed decision must write NOTHING");
+        assert_eq!(untouched.reviewed_by, None);
+
+        // The very same queued item, flushed on Sara's own link, lands normally — it was never invalid,
+        // only in the wrong hands.
+        let (code, _, _) = api_decision(&db, sara_work.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200);
+        assert_eq!(db.get_segment_by_id("s1").unwrap().unwrap().reviewed_by.as_deref(), Some("Sara"));
+
+        // A live submit carries no claim at all, and that ordinary path is unchanged.
+        let live = serde_json::json!({"id": "s2", "action": "bad"});
+        let (code, _, _) = api_decision(&db, live.to_string().as_bytes(), "Hemn", &state);
+        assert_eq!(code, 200, "a submit with no reviewer field is the normal live path");
+        assert_eq!(db.get_segment_by_id("s2").unwrap().unwrap().reviewed_by.as_deref(), Some("Hemn"));
     }
 
     #[test]
