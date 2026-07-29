@@ -2443,3 +2443,50 @@ fine-tuning on the accumulated pairs — not this.
 code behind `tail`'s, so a failing clippy printed "CLIPPY OK". Caught when 3 real lint errors surfaced
 in this iteration's test code. Re-verified with unmasked exit codes: clippy 0, fmt 0, `cargo test --lib`
 0 with **1089 passed**.
+
+---
+
+## Iteration 206 — verify-10 is GREEN at the merge commit, for the first time since 7d77fb5
+
+```
+VERDICT: GREEN - PERSONAL-USE SHIP-READY. (Not full-charter 10/10: 8 legs owner-descoped, 5 owner-gated pending.)
+VERIFY-10 EXIT=0
+kept gates run: 23 - 23 PASS, 0 FAIL, 0 skipped (env/not-built)
+```
+
+Reproduced twice back to back at `aa9ce42`, the second run regenerating `docs/STATUS.md`.
+
+**Nothing was fixed to reach green — the gate had never been given its input.** `real-app-e2e` had
+been the sole blocker, and its own skip probe said why in one line: `set CORTEX_AUDIO=<absolute wav
+path> to drive the real app`. Pointed at the committed `fleurs_ckb_sample.wav`, it passes in ~18s,
+driving the real binary end to end and emitting a real Sorani transcript (77 chars, 1 segment). The
+driver defaults to a disposable temp profile and REFUSES `%APPDATA%\cortex-speech`, checked before
+running it against the owner's machine. `CORTEX_OUT` was pointed at scratch so `run.jsonl` and the
+debug log never touch the tree — the sweep left the repo at 0 changes.
+
+**The intermediate RED was harness contention, and the claim was tested rather than asserted.** Run 2
+failed `test-e2e+a11y` with **empty stdout, exit 1, 24.7s** — Playwright never reported a single test,
+so nothing asserted and failed. Standalone immediately after: exit 0, **69 passed, 17.2s**; port 1420
+free; no stray dev server. Re-running the sweep was the test of "this is contention, not a defect",
+and it passed at 19.1s and again at the status run. A no-output failure flanked by three clean passes
+is the harness, not the suite. It is recorded here rather than silently re-rolled.
+
+**Real timings, so this reads as the full sweep it was:** test-rust 379.4s; fuzz-smoke 281.9s (5
+targets, 0 crashes); egress-runtime 23.1s (zero outbound TCP across a REAL offline transcription, with
+the in-run positive control); ignored-real-model 30.8s; refinery-lift 38.0s; rtf-bench 17.9s;
+real-app-e2e 18.2s.
+
+**`docs/STATUS.md` regenerated: `37769fa` -> `aa9ce42`, a one-line diff.** The old file already said
+GREEN — attributed to a commit that is not what shipped, which is the precise failure the file's own
+header warns about. It is generated FROM the run so a doc can never assert a gate state no run
+produced; the single-line diff also confirms it is deterministic per commit as documented.
+
+**GREEN IS NOT 10/10, and the script refuses to say otherwise.** 8 legs owner-descoped by the
+2026-07-10 amendment (installer signing, SLSA, updater, stores, HF card, macOS notarization,
+Scorecard, signed tags) and 5 owner-gated pending: iaa-kappa-ceiling (>=2 independent Sorani
+annotators), cordi-dialect-fairness, refinery-lift-in-product (Gold Marathon, >=500 real review
+decisions — the corpus stands at 28), branch-protection, asosoft-600-licensing.
+
+**Outside the gate entirely and still true:** Tailscale Serve is not enabled, so sharing outside the
+tailnet does not work; `cortex-once-admin.ps1` has not had its elevated run, so FastStartup=1 and
+ARSO=unset and a reboot still leaves the system down; eight Sorani strings await native review.
