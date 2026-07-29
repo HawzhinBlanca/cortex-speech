@@ -372,6 +372,57 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#done')).toContainText('نەنێردراون'); // "have not been sent"
   });
 
+  test('a clip whose audio will not load offers a skip instead of forcing a false verdict', async ({ page }) => {
+    // The trap: audio 500s (file moved off disk), #player has no error handler, loadWave swallows the
+    // body, and show() hides #warn on every clip — so the reviewer saw a normal card with a dead
+    // player and no explanation. The queue only advances on a DECISION, so the two ways out both
+    // write a verdict nobody can justify: accept promotes an unheard ASR draft to gold, reject
+    // permanently excludes a clip that may be perfectly fine.
+    await page.addInitScript(() => {
+      (window as unknown as { __sent: string[] }).__sent = [];
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [
+                { id: 'broken', text: 'پارچەی تێکچوو', durationMs: 1000, speakerId: null },
+                { id: 'fine', text: 'پارچەی باش', durationMs: 1000, speakerId: null },
+              ],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (url.includes('/api/decision')) {
+          (window as unknown as { __sent: string[] }).__sent.push(String(init?.body ?? ''));
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('پارچەی تێکچوو', { timeout: 5000 });
+
+    // The <audio> element reports a load failure (a 500 body into src does exactly this).
+    await page.evaluate(`
+      const p = document.getElementById('player');
+      p.src = 'data:audio/wav;base64,QUJD';
+      p.dispatchEvent(new Event('error'));
+    `);
+    await expect(page.locator('#warn')).toBeVisible();
+    await expect(page.locator('#skip')).toBeVisible();
+
+    await page.locator('#skip').click();
+    // Moved on to the next clip...
+    await expect(page.locator('#text')).toHaveValue('پارچەی باش');
+    // ...and NOTHING was written about the broken one. That is the whole point.
+    const sent = (await page.evaluate(`window.__sent`)) as string[];
+    expect(sent.join(' ')).not.toContain('broken');
+    // The skip affordance does not linger onto a healthy clip.
+    await expect(page.locator('#skip')).toBeHidden();
+  });
+
   test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {
     // DATA LOSS, and made MORE reachable by fixing Stop/Start: every outstanding token is regenerated
     // when the owner restarts Couch Review or reissues a link. A reviewer who was offline then

@@ -2265,3 +2265,86 @@ these are fixed and none should be assumed benign.
 config", so sharing outside the tailnet remains untrue); one elevated run of `cortex-once-admin.ps1`;
 autologin if power-cut coverage is wanted. `loadingMore` joins `heldByOthers` and `linkExpired`
 awaiting native Sorani review. verify-10 still not run at this HEAD.
+
+---
+
+## Iteration 204 — working the audit list: 20 of 33 findings closed, every fix fail-before proven
+
+Continuation of iter 203's audit. Each fix below was proven by breaking it first and watching the new
+test fail with the predicted symptom, then restoring; the fail-before output is quoted per item.
+
+**The submit/outbox cluster — where the corpus was losing human labour.**
+- *A busy database gave the clip away.* A failed write released the lease ("nothing was written, so
+  hand it straight back"), so the next batch took it within seconds and the reviewer's outbox replay
+  was refused 409 — the branch that discards the decision. Transient error, permanent loss. Driven by
+  the real trigger: a second connection holding the write lock until `busy_timeout`. FAIL-BEFORE:
+  holder `None` instead of `Sara`.
+- *An interrupted decision was replayed whole.* One decision is two non-atomic writes; the retry guard
+  keyed on `verified`, which only the SECOND sets, so it could not recognise its own half-written row.
+  FAIL-BEFORE: learning pairs **1 -> 2** — a duplicate DPO pair from one human edit, plus a
+  `correction_memory` hit_count bumped as though an independent segment had confirmed it, which with
+  the self-confirmation would carry an unconfirmed memory to 0.667 and past BOTH firing gates. Made
+  deterministic via the validation asymmetry the fault exploits (write one is a plain UPDATE; write
+  two runs `validate_segment`, which rejects a UNC `audio_path`). Now the interrupted write is
+  FINISHED, not repeated.
+- *Attribution could be stolen.* `localStorage` is per-origin, not per-reviewer. Queued decisions now
+  name their author and the server refuses a mismatch. Verified live on the running server:
+  `409 this decision was made by Hemn, not Hawzhin`, with the clip left `verified=0`, `reviewed_by=NULL`.
+- *"Saved" was a lie and the draft was deleted.* An offline save now says QUEUED. A refused replay
+  still drops the queued decision (retrying cannot change a real answer) but KEEPS the typed text and
+  raises a persistent banner.
+
+**Undo and spot checks.**
+- Undo restored a never-refreshed whole-row snapshot, erasing any later desktop edit. Now refuses 409
+  naming who would lose work, and keeps the undo entry rather than consuming it on the refusal. The
+  restore-failure branch also dropped the only copy of the pre-decision row; pushed back now.
+- A persisted spot-check pair could outlive its answer key (un-verify or re-transcribe clears
+  `verified`), after which a REAL review was graded against a key that no longer existed, answered
+  200, and wrote nothing — permanently, every batch. Gated on `prev.verified`; stale pairs dropped.
+
+**Leases.** `api_queue` leases the whole batch with ONE timestamp while the page heartbeat renewed
+only the clip on screen — 36 seconds per clip at QUEUE_BATCH=25. The tail lapsed under the reviewer
+mid-session. A renew now refreshes everything that reviewer holds. FAIL-BEFORE: `s1` holder `None`.
+
+**The watchdog — five defects in the thing whose whole job is availability.**
+- Single 5s probe against a server with a 10s `busy_timeout` and one accept thread per reviewer: a
+  transport timeout read as "dead", so the BUSIER the reviewer the likelier a healthy app was
+  force-killed mid-review. Now 3 attempts at 20s; worst-case detection 70s against a 300s repetition.
+- Kill loop: a present session file does not mean couch CAN start (port taken, library moved), so it
+  killed and relaunched into the same condition every 5 minutes forever. Capped at 3, then it stops
+  and says the owner is needed; the counter resets when the server answers.
+- Killed by process NAME, so a second checkout or an installed copy was fair game while the relaunch
+  only ever started this one. Matched on full path now.
+- A failed log write aborted the run BEFORE the kill/relaunch — the condition most likely to take the
+  app down also disabled its healing.
+- **Measured on the live task, not inferred:** `DisallowStartIfOnBatteries` and
+  `StopIfGoingOnBatteries` were both **True**, which disables the watchdog whenever Windows believes
+  it is on battery — a desktop behind a UPS included. Flipped on the running task and in `-Register`.
+
+**The drained state.** Undo lived inside the card and vanished exactly when the reviewer wanted to
+take back their last decision; the audio kept playing behind the empty state (forever with loop on);
+the header read "Clip 26 of 25"; and "All clips reviewed!" was shown OVER unsent outbox work — telling
+someone they were finished at the moment closing the page would have cost them everything. All four
+closed. A clip whose audio will not load now offers a SKIP that writes nothing, instead of a trap
+whose only two exits are accept (an unheard draft promoted to gold) or reject (a good clip excluded).
+
+**Learning system, measured on the real library (owner asked whether corrections actually teach it):**
+22 human edits -> 22 `agent_examples` pairs, 1:1, none lost, and those ARE used as few-shot exemplars
+in the refine path. LOOP-0 correction memory IS wired into live transcription (`pipeline.rs`), but is
+dormant: **101 memories, every one at confidence 0.500, hit_count 0, `last_fired_at` NULL on all 101**
+— nothing has recurred across only 22 edits, and a new memory starts below `tau_conf` on purpose. DPO
+is EXPORT-only; model improvement is a deliberate offline retrain, not automatic. Reviewing the 116
+pending clips is what starts the memory loop.
+
+**Gates (verbatim):** `cargo test --lib` **1087 passed; 0 failed** (couch:: 37); clippy
+`--all-targets -D warnings` exit 0; fmt clean; `npm run test:e2e` **68 passed**; couch-page **21**;
+python-policies 44/44; `npm run tauri build` exit 0 with both bundles; exe verified at HEAD after each
+rebuild, and the pre-rebuild link re-authenticated every time (same token, 29 items).
+
+**NOT DONE.** ~13 findings remain, now mostly medium/low: torn `couch_session.json` write from
+concurrent accept threads (refuted 2/3 on reachability, asymmetry real); a couch thread that cannot
+open the DB exits leaving 8737 bound with no responder; undo history is process-local so a relaunch
+strands the last decision; `held_by_others` still does not count the un-leased remainder (the refetch
+hides this rather than corrects it); no spinner before the first queue resolves. Owner-gated as
+before: Tailscale Serve enablement, one elevated `cortex-once-admin.ps1` run, autologin if power-cut
+coverage is wanted. **Eight** Sorani strings now await native review. verify-10 still not run at HEAD.

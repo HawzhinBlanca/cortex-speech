@@ -55,6 +55,8 @@
     "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
     "loadingMore": "Loading more clips…",
     "queued": "Queued — it will send when you are back online",
+    "audioMissing": "This clip's audio will not play, so there is nothing to judge. Skip it — the owner will be told.",
+    "skip": "Skip this clip",
     "stillSending": "{n} decision(s) have not been sent yet. Keep this page open until they go through.",
     "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
     "editHint": "Listen, and correct the text if needed"
@@ -76,6 +78,8 @@
     "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
     "loadingMore": "بارکردنی پارچەی زیاتر…",
     "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
+    "audioMissing": "دەنگی ئەم پارچەیە لێ نادرێت، بۆیە شتێک نییە بڕیاری لەسەر بدرێت. تێیپەڕێنە — خاوەنەکە ئاگادار دەکرێتەوە.",
+    "skip": "تێپەڕاندنی ئەم پارچەیە",
     "stillSending": "{n} بڕیار هێشتا نەنێردراون. ئەم پەڕەیە کراوە بهێڵەوە تا دەنێردرێن.",
     "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
     "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
@@ -97,6 +101,8 @@
     "heldByOthers": null,
     "loadingMore": null,
     "queued": null,
+    "audioMissing": null,
+    "skip": null,
     "stillSending": null,
     "refused": null,
     "editHint": "review.editHint"
@@ -211,6 +217,11 @@
     <button id="accept"></button>
     <button id="save"></button>
   </div>
+  <!-- Only ever revealed when the audio genuinely will not load. Without it a reviewer facing a clip
+       whose file has moved had exactly two ways forward, and BOTH write a verdict they cannot justify:
+       accept, which promotes an unheard ASR draft to gold, or reject, which permanently excludes a
+       clip that may be perfectly fine. Skipping writes nothing. -->
+  <button id="skip" type="button" hidden></button>
 </div>
 <div id="done" hidden></div>
 <!-- Undo lives OUTSIDE the card on purpose. Inside it, the button vanished with the card the moment
@@ -271,6 +282,7 @@
     $('bad').textContent = '✗ ' + t('bad');
     $('accept').textContent = '✓ ' + t('accept');
     $('save').textContent = t('save');
+    $('skip').textContent = '⏭ ' + t('skip');
     $('undo').title = t('undo');
     // The transcript box had NO accessible name at all — a screen-reader user reached an unlabelled
     // edit field and had to guess what it was for. Reuses the desktop's own review hint.
@@ -438,6 +450,7 @@
     if (!seg && !exhausted && !refilling) { void refill(); return; }
     $('card').hidden = !seg; $('done').hidden = !!seg;
     $('warn').hidden = true;
+    $('skip').hidden = true; // re-armed per clip; only a real audio error reveals it
     renderProgress();
     if (!seg) {
       // Hiding the card does not stop the <audio> element inside it. The last clip kept playing behind
@@ -616,6 +629,25 @@
   }
   $('player').addEventListener('timeupdate', () => void drawWave());
   $('player').addEventListener('loadedmetadata', () => void drawWave());
+  // A clip whose file has moved off disk answers 500 into <audio src>, and nothing surfaced it: the
+  // element has no error handler, loadWave swallows the body in a bare catch, and show() hides #warn
+  // on every clip. The reviewer saw a normal card with a player that did nothing — and no way past it,
+  // because the queue only advances on a DECISION. Both available exits write a verdict they cannot
+  // justify: accept promotes an unheard ASR draft to gold, reject permanently excludes a clip that may
+  // be fine. Say what happened, and offer the one honest action: move on without judging it.
+  $('player').addEventListener('error', () => {
+    if (!queue[i]) return;
+    $('warn').textContent = t('audioMissing');
+    $('warn').hidden = false;
+    $('skip').hidden = false;
+  });
+  $('skip').onclick = () => {
+    if (!queue[i]) return;
+    // Deliberately writes NOTHING — no decision, no verdict, no attribution. The clip stays pending
+    // and the owner finds it still in the queue, which is the correct signal that a file is missing.
+    i += 1;
+    show();
+  };
   addEventListener('resize', () => void drawWave());
   // Tap to seek — the reason a transcriber wants a waveform at all: jump straight to the word in doubt
   // instead of dragging a scrubber the width of a thumb.

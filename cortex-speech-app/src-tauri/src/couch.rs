@@ -1109,6 +1109,21 @@ fn api_renew(body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
         // is the whole point: they can still copy their correction before it is refused.
         return err_reply(409, "another reviewer is working on this clip");
     }
+    // Refresh the reviewer's WHOLE batch, not just the clip on screen.
+    //
+    // api_queue leases up to QUEUE_BATCH clips in one shot, every one stamped with the same instant,
+    // so they all expire together — while the page only ever heartbeats `queue[i]`. That gave the
+    // reviewer LEASE_TTL to finish the entire batch (36 seconds per clip at 25), and real
+    // listen-and-correct on Sorani audio is nowhere near that. Everything they had not yet reached
+    // silently fell out from under them, another reviewer's next fetch picked it up, and the first
+    // reviewer's eventual save was refused 409 with their correction already typed. A renew request
+    // is proof this person is working; their claim on the rest of their batch is exactly as live as
+    // their claim on the clip in front of them.
+    for (_, (who, granted)) in guard.leases.iter_mut() {
+        if who == reviewer {
+            *granted = now;
+        }
+    }
     guard.leases.insert(parsed.id.clone(), (reviewer.to_string(), now));
     json_reply(200, serde_json::json!({ "ok": true, "ttlSeconds": LEASE_TTL.as_secs() }))
 }
@@ -1702,6 +1717,48 @@ mod tests {
             !lock_state(&state).spot_checks.contains(&("g1".to_string(), "Sara".to_string())),
             "the stale pair must be dropped so it cannot swallow this clip again"
         );
+    }
+
+    #[test]
+    fn renewing_keeps_the_whole_batch_not_just_the_clip_on_screen() {
+        // api_queue leases up to QUEUE_BATCH clips in ONE shot, all stamped with the same instant, so
+        // they expire together — while the page heartbeats only the clip in front of the reviewer.
+        // That gave them one LEASE_TTL to finish the entire batch (36s per clip at 25), and real
+        // listen-and-correct on Sorani audio is nowhere near that. Everything they had not yet reached
+        // fell out from under them mid-session, another reviewer's fetch took it, and their eventual
+        // save was refused 409 with the correction already typed.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        for n in 0..3 {
+            db.insert_segment(&seg(&format!("s{n}"), "دەق")).unwrap();
+        }
+        let state = state();
+        let served = queue_ids(&db, "Sara", &state);
+        assert_eq!(served.len(), 3, "all three leased to Sara in one batch");
+
+        // Age every lease to the brink of expiry, as a real session does while the reviewer works.
+        {
+            let mut guard = lock_state(&state);
+            let old = Instant::now() - (LEASE_TTL - Duration::from_secs(1));
+            for (_, (_, granted)) in guard.leases.iter_mut() {
+                *granted = old;
+            }
+        }
+        // The reviewer is on the FIRST clip and the heartbeat fires for it.
+        let body = serde_json::json!({"id": "s0"});
+        let (code, _, _) = api_renew(body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200);
+
+        // Past the point the batch would have lapsed, the tail must still be hers.
+        let later = Instant::now() + Duration::from_secs(5);
+        let mut guard = lock_state(&state);
+        for id in ["s0", "s1", "s2"] {
+            assert_eq!(
+                guard.holder(id, later).map(str::to_string).as_deref(),
+                Some("Sara"),
+                "{id} must still be held — an active reviewer keeps their whole batch"
+            );
+        }
     }
 
     #[test]
