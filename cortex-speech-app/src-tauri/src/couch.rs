@@ -121,7 +121,13 @@ struct CouchState {
     /// silently breaks ordinary reviewing: a reviewer's own edit MAKES the row human-verified, so
     /// their next submit on it (a retry, or a genuine correction) would be graded as a test and
     /// never written to the corpus. Recording what was served removes the ambiguity entirely.
+    ///
+    /// Persisted into the remembered session whenever a batch serves new checks, so a check
+    /// outstanding across an app restart is still recognized and SCORED when its answer arrives.
     spot_checks: HashSet<(String, String)>,
+    /// Where to re-save the remembered session when the served-set grows: (data_dir, db_path).
+    /// None outside a durable session (tests, no data dir) — then nothing is persisted, as before.
+    session_store: Option<(PathBuf, String)>,
 }
 
 impl CouchState {
@@ -231,6 +237,14 @@ struct SavedSession {
     /// The database the session was serving. A session remembered against a DIFFERENT library must
     /// not silently resume: the links would hand out clips from a corpus the owner did not intend.
     db_path: String,
+    /// (segment id, reviewer) pairs served as SPOT CHECKS and not yet answered (phase 4 of
+    /// docs/REMOTE_PUBLIC_LINKS_PLAN.md). Durable sessions make restarts routine, and a check served
+    /// before a restart used to become unanswerable after it: the in-memory served-set was gone, so
+    /// the submit fell into the already-reviewed 409 — score silently lost, reviewer shown a jarring
+    /// error for doing exactly what they were asked. `serde(default)` so a pre-phase-4 session file
+    /// still loads (missing field = empty set).
+    #[serde(default)]
+    spot_checks: Vec<(String, String)>,
 }
 
 /// Tokens SURVIVE closing the app, and do not survive pressing Stop.
@@ -252,7 +266,12 @@ fn session_path(data_dir: &Path) -> PathBuf {
     data_dir.join(SESSION_FILE)
 }
 
-fn save_session(data_dir: &Path, reviewers: &HashMap<String, String>, db_path: &str) {
+fn save_session(
+    data_dir: &Path,
+    reviewers: &HashMap<String, String>,
+    db_path: &str,
+    spot_checks: &HashSet<(String, String)>,
+) {
     let protected: HashMap<String, String> = reviewers
         .iter()
         .filter_map(|(token, name)| crate::dpapi::protect(token).ok().map(|t| (t, name.clone())))
@@ -264,7 +283,14 @@ fn save_session(data_dir: &Path, reviewers: &HashMap<String, String>, db_path: &
         tracing::warn!("Couch Review session not remembered: a token could not be protected at rest");
         return;
     }
-    let saved = SavedSession { reviewers: protected, db_path: db_path.to_string() };
+    let saved = SavedSession {
+        reviewers: protected,
+        db_path: db_path.to_string(),
+        // Plaintext by design: the pair (segment id, reviewer name) is which clips were handed out
+        // as checks — worth protecting from casual reading no more than the queue itself, and DPAPI
+        // per entry would make every batch serve cost a round of CryptProtectData for no threat.
+        spot_checks: spot_checks.iter().cloned().collect(),
+    };
     let path = session_path(data_dir);
     let Ok(json) = serde_json::to_string_pretty(&saved) else { return };
     // Written via a temp file + atomic replace, like every other state file here: a half-written
@@ -285,9 +311,12 @@ fn clear_session(data_dir: &Path) {
     }
 }
 
+/// What `load_session` recovers: the token->name map and the served-but-unanswered spot checks.
+type RememberedSession = (HashMap<String, String>, HashSet<(String, String)>);
+
 /// Read back a remembered session, or None if there is none / it is unreadable / it belongs to a
 /// different library.
-fn load_session(data_dir: &Path, db_path: &str) -> Option<HashMap<String, String>> {
+fn load_session(data_dir: &Path, db_path: &str) -> Option<RememberedSession> {
     let raw = std::fs::read_to_string(session_path(data_dir)).ok()?;
     let saved: SavedSession = serde_json::from_str(&raw).ok()?;
     if saved.db_path != db_path {
@@ -301,7 +330,7 @@ fn load_session(data_dir: &Path, db_path: &str) -> Option<HashMap<String, String
         let token = crate::dpapi::unprotect(&protected).ok()?;
         out.insert(token, name);
     }
-    (!out.is_empty()).then_some(out)
+    (!out.is_empty()).then_some((out, saved.spot_checks.into_iter().collect()))
 }
 
 /// Start the couch server for `reviewers` (idempotent: returns the existing session if already running,
@@ -317,7 +346,7 @@ pub fn start(db_path: String, reviewers: Vec<String>, data_dir: Option<PathBuf>)
 /// for a fresh URL. Returns None when there is nothing remembered, which is the normal first-run and
 /// post-Stop state.
 pub fn resume(db_path: String, data_dir: &Path) -> Option<CouchStatus> {
-    let remembered = load_session(data_dir, &db_path)?;
+    let (remembered, _) = load_session(data_dir, &db_path)?;
     let mut names: Vec<String> = remembered.values().cloned().collect();
     names.sort();
     match start(db_path, names, Some(data_dir.to_path_buf())) {
@@ -380,7 +409,8 @@ fn start_on_port(
     // REUSED from the remembered session when the same person is still on the list, so a link the
     // owner already sent keeps working after the app is closed and reopened. A name that was not in
     // the saved session gets a fresh token, and a name that has been dropped simply stops existing.
-    let remembered = data_dir.as_deref().and_then(|dir| load_session(dir, &db_path)).unwrap_or_default();
+    let (remembered, served_checks) =
+        data_dir.as_deref().and_then(|dir| load_session(dir, &db_path)).unwrap_or_default();
     let tokens: HashMap<String, String> = names
         .iter()
         .map(|name| {
@@ -397,7 +427,13 @@ fn start_on_port(
     );
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let state = Arc::new(Mutex::new(CouchState { reviewers: tokens, ..CouchState::default() }));
+    // Rehydrate the served spot-check set for names still on the roster, so a check outstanding
+    // across the restart is recognized and scored when its answer arrives instead of 409ing.
+    let spot_checks: HashSet<(String, String)> =
+        served_checks.into_iter().filter(|(_, name)| names.contains(name)).collect();
+    let session_store = data_dir.as_ref().map(|dir| (dir.clone(), db_path.clone()));
+    let state =
+        Arc::new(Mutex::new(CouchState { reviewers: tokens, spot_checks, session_store, ..CouchState::default() }));
     // One accept thread per reviewer. tiny_http hands a request to whichever thread is free, so a
     // reviewer downloading a clip no longer blocks another reviewer's save — with a single reviewer this
     // is exactly the previous one-thread server. Each thread owns its own WAL connection (SQLite
@@ -427,7 +463,11 @@ fn start_on_port(
     // Remember it only once the server is actually serving. Saving earlier would leave a session file
     // pointing at a start that failed, and the next launch would resume links to nothing.
     if let Some(dir) = data_dir.as_deref() {
-        save_session(dir, &lock_state(&handle.state).reviewers.clone(), &db_path);
+        let (reviewers, checks) = {
+            let st = lock_state(&handle.state);
+            (st.reviewers.clone(), st.spot_checks.clone())
+        };
+        save_session(dir, &reviewers, &db_path, &checks);
     }
     *guard = Some(handle);
     tracing::info!(
@@ -919,8 +959,9 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         match db.list_spot_check_candidates(wanted, reviewer) {
             Ok(candidates) => {
                 let mut guard = lock_state(state);
+                let mut grew = false;
                 for (idx, (seg, _)) in candidates.into_iter().enumerate() {
-                    guard.spot_checks.insert((seg.id.clone(), reviewer.to_string()));
+                    grew |= guard.spot_checks.insert((seg.id.clone(), reviewer.to_string()));
                     // Interleave rather than append: a run of traps at the tail of every batch is a
                     // pattern a reviewer would learn within a session.
                     let at = ((idx + 1) * SPOT_CHECK_EVERY).min(queue.len());
@@ -935,6 +976,19 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                             "speakerId": seg.speaker_id,
                         }),
                     );
+                }
+                // Persist the grown served-set into the remembered session (phase 4): a check served
+                // now may be answered AFTER an app restart, and it must still be scored then rather
+                // than 409ing the reviewer. Snapshot under the lock, write outside it — save_session
+                // does DPAPI + file IO, which has no business inside the request-path mutex.
+                let persist = if grew {
+                    guard.session_store.clone().map(|s| (s, guard.reviewers.clone(), guard.spot_checks.clone()))
+                } else {
+                    None
+                };
+                drop(guard);
+                if let Some(((dir, db_path), reviewers, checks)) = persist {
+                    save_session(&dir, &reviewers, &db_path, &checks);
                 }
             }
             // A spot check is a quality measure, never a reason to stop a reviewer working.
@@ -2145,6 +2199,59 @@ mod tests {
             .expect("stop must leave the port free to start again");
         assert!(restarted.running, "a stop/start cycle must produce a working server, not a bind error");
         stop().expect("second stop succeeds");
+    }
+
+    #[test]
+    fn a_spot_check_served_before_a_restart_is_still_scored_after_it() {
+        // Phase 4 of docs/REMOTE_PUBLIC_LINKS_PLAN.md, and the direct consequence of durable links:
+        // restarts are now ROUTINE, so "the served-set is in memory" became a data-loss window. A
+        // check served before a restart used to become unanswerable after it — the submit fell into
+        // the already-reviewed 409 (couch.rs guards a verified clip against overwrite, correctly),
+        // the score was never recorded, and the reviewer was shown an error for doing exactly what
+        // they were asked. The honesty measurement silently thinned with every restart.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let (db, db_path) = test_db(tmp.path());
+        gold_seg(&db, "trap1", "دەقی هەڵە", "دەقی ڕاست");
+        db.insert_segment(&seg("work1", "کاری ڕاستەقینە")).unwrap();
+
+        // Session 1: the batch serves the trap; the served-set is persisted with the session.
+        let state1 = Arc::new(Mutex::new(CouchState {
+            reviewers: HashMap::from([("tok-sara".to_string(), "Sara".to_string())]),
+            session_store: Some((data_dir.clone(), db_path.clone())),
+            ..CouchState::default()
+        }));
+        let served = queue_ids(&db, "Sara", &state1);
+        assert!(served.contains(&"trap1".to_string()), "the trap was handed out in session 1");
+        // The durable file must now know about it — save_session was called by the serve path. (The
+        // reviewers map is saved alongside; simulate what start_on_port persists at startup too.)
+
+        // THE RESTART: a brand-new state built the way start_on_port builds it — from the file.
+        let (remembered, rehydrated) = load_session(&data_dir, &db_path).expect("session file readable");
+        assert_eq!(remembered.get("tok-sara").map(String::as_str), Some("Sara"), "the token survived");
+        let state2 = Arc::new(Mutex::new(CouchState {
+            reviewers: remembered,
+            spot_checks: rehydrated,
+            session_store: Some((data_dir, db_path)),
+            ..CouchState::default()
+        }));
+
+        // The answer arrives AFTER the restart.
+        let body = serde_json::json!({ "id": "trap1", "action": "edit", "text": "دەقی ڕاست" });
+        let (code, _, msg) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state2);
+        assert_eq!(
+            code,
+            200,
+            "a check served before the restart must be answerable after it, got {code}: {}",
+            String::from_utf8_lossy(&msg)
+        );
+        let report = db.spot_check_report().unwrap();
+        assert_eq!(report.len(), 1, "and SCORED — the whole point of serving it");
+        assert_eq!(report[0].reviewer, "Sara");
+        assert_eq!(report[0].noticed, 1, "she corrected the planted error");
+        // The answer key itself is untouched, exactly as in the no-restart path.
+        let key = db.get_segment_by_id("trap1").unwrap().unwrap();
+        assert_eq!(key.verdict_transcript.as_deref(), Some("دەقی ڕاست"), "grading never rewrites the key");
     }
 
     #[test]
