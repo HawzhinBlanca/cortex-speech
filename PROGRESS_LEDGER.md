@@ -2348,3 +2348,21 @@ strands the last decision; `held_by_others` still does not count the un-leased r
 hides this rather than corrects it); no spinner before the first queue resolves. Owner-gated as
 before: Tailscale Serve enablement, one elevated `cortex-once-admin.ps1` run, autologin if power-cut
 coverage is wanted. **Eight** Sorani strings now await native review. verify-10 still not run at HEAD.
+
+**Addendum to iter 204 — three more closed.**
+- *A couch thread that could not open the library left port 8737 bound and mute.* Its only recourse
+  was `return`, so connections landed in the listen backlog and were never answered: every phone hung
+  instead of failing fast, and the watchdog saw an unreachable port that restarting could not fix. The
+  library is now opened BEFORE anything binds, turning it into an honest error on Start, and a
+  per-thread failure signals shutdown rather than leaving a socket nobody serves.
+- *`save_session` wrote through one fixed temp filename from any accept thread, unlocked.* Refuted 2/3
+  on reachability and shipped anyway as cheap insurance: an unparseable session file is unrecoverable
+  (load_session gives up silently, resume returns None, every link already sent is dead). Unique temp
+  name per write, plus a concurrency test — 8 threads x 10 saves with deliberately different payload
+  lengths, asserting the promoted file always parses and no temp files accumulate. Confirmed stable
+  5-for-5 standalone before shipping, per the known Windows FS write-then-read flakiness.
+- *Offline decisions replaying under whichever reviewer opened the browser next* was closed by the
+  attribution stamp above; counted once, not twice.
+
+**Gates after the addendum:** `cargo test --lib` **1088 passed; 0 failed** (couch:: 38); clippy exit 0;
+fmt clean; `npm run test:e2e` **68 passed**; couch-page **21**; python-policies 44/44.

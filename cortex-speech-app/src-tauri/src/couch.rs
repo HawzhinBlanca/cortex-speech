@@ -301,7 +301,19 @@ fn save_session(
     };
     // Written via a temp file + atomic replace, like every other state file here: a half-written
     // session would resume with a truncated token map and silently issue links that do not work.
-    let tmp = path.with_extension("json.tmp");
+    // UNIQUE temp name per write. save_session is called from any accept thread (one per reviewer)
+    // with no lock held — deliberately, since DPAPI plus file IO has no business inside the request
+    // mutex — so two of them could previously be inside `std::fs::write` on the SAME
+    // `couch_session.json.tmp` at once. Interleaved create/truncate and write there can promote a
+    // spliced file, and a session file that will not parse is unrecoverable: load_session gives up
+    // silently, resume returns None, and every link already sent is dead. Cheap insurance against a
+    // narrow window rather than a proof that the window cannot be hit.
+    static SESSION_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        SESSION_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     if let Err(e) = std::fs::write(&tmp, json.as_bytes()).and_then(|()| crate::atomic_file::replace_file(&tmp, &path)) {
         tracing::warn!("Couch Review session not remembered: {e}");
         let _ = std::fs::remove_file(&tmp);
@@ -435,6 +447,16 @@ fn start_on_port(
             (token, name.clone())
         })
         .collect();
+
+    // PRE-FLIGHT the library BEFORE binding anything. Each accept thread opens its own connection, and
+    // a failure there could only `return` — leaving the socket bound with nobody accepting. That is the
+    // worst available state: connections land in the listen backlog and are never answered, so every
+    // phone hangs instead of failing fast, and the watchdog sees an unreachable port that restarting
+    // cannot fix. Checking here turns it into an honest error on Start, and never binds a port this
+    // server cannot serve.
+    if let Err(e) = Database::open(&db_path) {
+        return Err(format!("Couch Review cannot open the library: {e}"));
+    }
 
     let server = Arc::new(
         tiny_http::Server::http(("0.0.0.0", port))
@@ -700,6 +722,11 @@ fn spawn_server_loop(
                 Ok(db) => db,
                 Err(e) => {
                     tracing::error!("Couch Review db open failed: {e}");
+                    // Never leave the listener bound and mute. A thread that cannot serve must take
+                    // the whole server down with it — a port that accepts and never answers hangs
+                    // every phone and defeats the watchdog, which cannot tell it from a wedge.
+                    shutdown.store(true, Ordering::SeqCst);
+                    server.unblock();
                     return;
                 }
             };
@@ -1759,6 +1786,50 @@ mod tests {
                 "{id} must still be held — an active reviewer keeps their whole batch"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_session_saves_never_leave_an_unparseable_file_or_stray_temps() {
+        // save_session runs from any accept thread with no lock held, so several can be writing at
+        // once. They used to share one fixed temp filename. A session file that does not parse is
+        // unrecoverable — load_session gives up silently, resume returns None, and every link already
+        // sent is dead — so the file must be either the old snapshot or a new one, never a splice.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let db_path = "some/library.db".to_string();
+
+        let mut writers = Vec::new();
+        for n in 0..8 {
+            let dir = dir.clone();
+            let db_path = db_path.clone();
+            writers.push(std::thread::spawn(move || {
+                let mut reviewers = HashMap::new();
+                // Different sizes per thread, so a spliced file would leave a longer tail behind a
+                // shorter body — the exact corruption shape a shared temp name can produce.
+                for k in 0..=n {
+                    reviewers.insert(format!("token-{n}-{k}-{}", "x".repeat(n * 8)), format!("Reviewer{n}{k}"));
+                }
+                for _ in 0..10 {
+                    let _ = save_session(&dir, &reviewers, &db_path, &HashSet::new());
+                }
+            }));
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        let raw = std::fs::read_to_string(session_path(&dir)).expect("session file exists");
+        let saved: SavedSession = serde_json::from_str(&raw).expect("session file must always parse");
+        assert!(!saved.reviewers.is_empty(), "a promoted session must carry a real roster");
+        assert_eq!(saved.db_path, db_path);
+
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "temp files must be renamed away, not accumulate: {strays:?}");
     }
 
     #[test]
