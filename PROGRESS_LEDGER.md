@@ -2188,3 +2188,80 @@ disable closed yesterday's race).
 - The reboot drill (full restart → link back within ~2 min) awaits a natural reboot; the crash drill
   stands in until then.
 - Two Sorani strings still await native review; verify-10 still not run at today's HEADs.
+
+---
+
+## Iteration 203 — the "are you sure?" audit: 33 confirmed defects, 2 fixed, 1 false all-green corrected
+
+**Trigger:** the owner asked whether the system was actually robust. Answering from memory would have
+been worthless, so the answer was re-derived from the live machine and an adversarial audit.
+
+**A claim of mine was wrong and is corrected here.** `test_restore_reservation_gate.py` was RED **at
+HEAD**, and had been since durable sessions gave `couch::start` its `data_dir` parameter: the gate
+asserts on the literal one-line body `start_on_port(db_path, reviewers, COUCH_PORT)`, which stopped
+matching and made the gate *raise on every run instead of checking anything*. Iteration 202 reported
+"python-policies 44/44". That report was false. Verified by `git show HEAD:...couch.rs | grep -c` =
+**0**. Repaired to the real signature — kept exact rather than loosened to `"start_on_port(" in couch`,
+which would pass even if `start` grew a real body (the exact bypass the gate exists to catch) — and
+extended to `resume`, the other way into a running server and the one the app takes unattended at
+every watchdog launch. Now genuinely **44/44**.
+
+**Adversarial audit:** 8 undrilled failure modes (queue exhaustion, token revocation, lease collision,
+DB contention, audio delivery, authz boundary, resume integrity, watchdog holes), each finding faced
+3 independent refuters on distinct lenses. 149 agents, 47 raw findings, **33 confirmed**, 1 contested,
+0 unjudged. The top findings were then re-verified by hand against the source — the agents were not
+taken at face value, and one of their two "critical" DB-contention findings was correctly refuted on
+reachability by its own skeptic.
+
+**Fixed 1 — revoke was not durable (critical, security).** `save_session` had exactly two call sites
+(start, batch-serve) and `revoke_in` was neither, so a revoked token stayed in `couch_session.json`
+and `resume()` **re-issued the same token to the same name**: a lost phone regained access to Art. 9
+audio at the next launch, which the watchdog performs unattended every 5 minutes. It was also
+nondeterministic — the batch-serve save fires only when some *other* reviewer's batch serves a
+brand-new spot check, so the same owner action sometimes stuck. Now persists under the
+snapshot-under-lock / write-outside-lock shape; `save_session` returns `Result` so a failed write is
+reported (access is already denied in memory, so this is not a rollback — it is "revoked" vs "revoked
+until the next restart", and an owner revoking a lost phone must be told which). `resume` gained a
+port-injected twin for the same reason `start` did. **Fail-before proven:** without the persist the
+new test's `resume()` returns `["Hemn", "Sara"]`.
+
+**Fixed 2 — reviewers capped at 25 clips and were told the corpus was finished (high).** `load()` had
+two call sites, neither on batch drain, so the page went straight to "All clips reviewed!". Measured
+against the real library: **116 pending**, so a reviewer did 25 and was lied to about 91. The page is
+an installable standalone PWA with no address bar, so the only escape — a manual reload — was not
+reachable either. `show()` now refetches; `exhausted` breaks the recursion and only an empty answer
+draws the finished state. **Fail-before proven** (spec line 189). Test pins both halves, including
+that it STOPS rather than spinning a phone radio on a drained corpus.
+
+**ARSO (ops).** `cortex-once-admin.ps1` gained auto-sign-in-after-update-restart plus a read-only
+BitLocker pre-boot probe. Measured first: `ARSOUserConsent` unset, `AutoAdminLogon=0`,
+`HiberbootEnabled=1`, active hours unset. ARSO gives the necessarily interactive-only watchdog a
+logged-on-but-LOCKED session after update reboots — recovered and still secure, with no password
+stored. **Correction to iteration 202:** autologin was called "optional"; for full reboot coverage it
+is mandatory, and ARSO covers only the update-initiated case. Nothing in this repo touches the
+account password; autologin stays an owner step.
+
+**Live verification after rebuild:** the pre-rebuild link still authenticates (same token, `Hawzhin`,
+29 items = 25 work + 4 interleaved checks); the page served by the running binary is **byte-identical**
+to the source asset (sha256 `ae21d65463c62aeb`, 37220 bytes both sides), which is the real proof the
+`include_str!` fix shipped rather than a stale binary. Watchdog disabled across the build window and
+re-enabled (Enabled, last result 0).
+
+**Gates (verbatim):** `cargo test --lib` **1081 passed; 0 failed**; clippy `--all-targets -D warnings`
+exit 0; `npm run test:e2e` **63 passed**; couch-page **16 passed**; python-policies **44/44** (for the
+first time honestly); `svelte-check && tsc` 0 errors; exe-freshness OK at `487f736`; `npm run tauri
+build` exit 0 with both bundles.
+
+**NOT DONE — 31 confirmed findings remain unfixed.** Notably: the outbox deletes a reviewer's typed
+correction on a 409 with no notification after having told them "Saved"; `held_by_others` skips the
+un-leased remainder without counting it (the refetch hides this rather than correcting it); a clip
+whose audio file is missing traps the reviewer with no skip, where both exits write a false verdict;
+a stale persisted spot-check pair silently swallows a real review and answers 200; undo restores a
+stale whole-row snapshot that clobbers a later desktop edit; and the watchdog's 5 s probe is shorter
+than the server's own 10 s DB `busy_timeout`, so a healthy-but-busy app can be force-killed. None of
+these are fixed and none should be assumed benign.
+
+**Still owner-gated:** Tailscale Serve enablement (Phase 5, `tailscale serve status` = "No serve
+config", so sharing outside the tailnet remains untrue); one elevated run of `cortex-once-admin.ps1`;
+autologin if power-cut coverage is wanted. `loadingMore` joins `heldByOthers` and `linkExpired`
+awaiting native Sorani review. verify-10 still not run at this HEAD.
