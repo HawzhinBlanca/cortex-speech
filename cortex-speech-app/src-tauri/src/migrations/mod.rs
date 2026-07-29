@@ -1253,6 +1253,70 @@ pub static MIGRATIONS: &[Migration] = &[
                  CREATE INDEX IF NOT EXISTS idx_review_events_reviewer ON review_events(reviewer, timestamp_ms);",
         down_sql: Some("DROP INDEX IF EXISTS idx_review_events_reviewer; DROP TABLE IF EXISTS review_events;"),
     },
+    Migration {
+        version: 46,
+        description: "Spot-check scores survive deleting the clip they were measured on (audit trail, not clip data)",
+        // v45 wrote the principle down — "an audit trail whose rows vanish when the audited row is
+        // deleted is not an audit trail" — and even said "unlike spot_checks". It then left
+        // spot_checks alone. This carries the reasoning across.
+        //
+        // A spot-check row is not data ABOUT a clip; it is the record of what a REVIEWER did on it:
+        // whether they listened or blind-accepted. ON DELETE CASCADE made that record a property of
+        // the clip, with two quiet consequences. Tidying up unrelated clips retroactively changed a
+        // reviewer's score — a number that moves when you delete something else is not a record. And
+        // delete+undo, an operation history/mod.rs works hard to make lossless, destroyed it outright:
+        // undo restores the segment row and cannot resurrect the cascaded children. Proven by
+        // `history::tests::deleting_a_clip_must_not_erase_the_record_of_how_reviewers_scored_on_it`.
+        //
+        // No FK_OFF needed, unlike v40: spot_checks is a LEAF. `ON DELETE CASCADE` fires when the
+        // PARENT is deleted, so dropping the child table itself cascades nothing.
+        //
+        // Replay-safe: on re-application the table already has no FK, so this copies it to itself and
+        // renames back. `INSERT OR IGNORE` because (segment_id, reviewer) stays the primary key.
+        up_sql: "CREATE TABLE IF NOT EXISTS spot_checks_no_fk (
+                     segment_id TEXT NOT NULL,
+                     reviewer TEXT NOT NULL,
+                     action TEXT NOT NULL,
+                     submitted_transcript TEXT NOT NULL,
+                     expected_transcript TEXT NOT NULL,
+                     noticed INTEGER NOT NULL,
+                     cer REAL NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     PRIMARY KEY (segment_id, reviewer)
+                 ) STRICT;
+                 INSERT OR IGNORE INTO spot_checks_no_fk
+                     (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer, created_at)
+                     SELECT segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer, created_at
+                     FROM spot_checks;
+                 DROP TABLE spot_checks;
+                 ALTER TABLE spot_checks_no_fk RENAME TO spot_checks;
+                 CREATE INDEX IF NOT EXISTS idx_spot_checks_reviewer ON spot_checks(reviewer);",
+        // The mirror image, so the migration set stays round-trip safe. Note what going BACK costs:
+        // the FK schema cannot represent a score whose clip has been deleted, so those rows are
+        // dropped here rather than failing the rollback. That asymmetry is the bug this migration
+        // fixes, stated in SQL — restoring the constraint means restoring the data loss.
+        down_sql: Some(
+            "CREATE TABLE IF NOT EXISTS spot_checks_fk (
+                 segment_id TEXT NOT NULL,
+                 reviewer TEXT NOT NULL,
+                 action TEXT NOT NULL,
+                 submitted_transcript TEXT NOT NULL,
+                 expected_transcript TEXT NOT NULL,
+                 noticed INTEGER NOT NULL,
+                 cer REAL NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 PRIMARY KEY (segment_id, reviewer),
+                 FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+             ) STRICT;
+             INSERT OR IGNORE INTO spot_checks_fk
+                 (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer, created_at)
+                 SELECT segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer, created_at
+                 FROM spot_checks WHERE segment_id IN (SELECT id FROM speech_segments);
+             DROP TABLE spot_checks;
+             ALTER TABLE spot_checks_fk RENAME TO spot_checks;
+             CREATE INDEX IF NOT EXISTS idx_spot_checks_reviewer ON spot_checks(reviewer);",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -2111,6 +2175,54 @@ mod tests {
             })
             .unwrap();
         assert_eq!(leaked_table, 0, "the partial table must have been rolled back");
+    }
+
+    #[test]
+    fn v46_drops_the_cascade_without_dropping_anybody_s_scores() {
+        // A table REBUILD is the migration shape that silently loses rows, so this exercises v46
+        // against a POPULATED table rather than the empty one initialize() sees — the same reason the
+        // v40 test exists. The owner's live library already holds real spot-check scores; a migration
+        // that quietly emptied them would destroy the only record of whether a remote reviewer was
+        // honest, and nothing downstream would notice a smaller number.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert!(get_current_version(&db).unwrap() >= 46, "v46 must have applied");
+
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "seg-scored".into(),
+            audio_path: "/a.wav".into(),
+            raw_transcript: "دەقی هەڵە".into(),
+            duration_ms: 1000,
+            ..Default::default()
+        })
+        .unwrap();
+        db.record_spot_check("seg-scored", "Sara", "edit", "دەقی ڕاست", "دەقی ڕاست").unwrap();
+        db.record_spot_check("seg-scored", "Hemn", "accept", "دەقی هەڵە", "دەقی ڕاست").unwrap();
+
+        // Re-apply the real migration over real rows.
+        let v46 = MIGRATIONS.iter().find(|m| m.version == 46).expect("v46 exists");
+        db.connection().execute_batch(v46.up_sql).expect("re-applying v46 must succeed");
+
+        let report = db.spot_check_report().unwrap();
+        assert_eq!(report.len(), 2, "both reviewers' scores must survive the rebuild: {report:?}");
+        let sara = report.iter().find(|r| r.reviewer == "Sara").expect("Sara survived");
+        assert_eq!(sara.checks, 1);
+        assert_eq!(sara.noticed, 1, "and her ANSWER survived, not just her row");
+        let hemn = report.iter().find(|r| r.reviewer == "Hemn").expect("Hemn survived");
+        assert_eq!(hemn.noticed, 0, "a blind accept must still read as a blind accept");
+
+        // The point of the migration: the FK is gone, so deleting the clip leaves the record standing.
+        let sql: String = db
+            .connection()
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='spot_checks'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!sql.to_uppercase().contains("REFERENCES"), "spot_checks must no longer reference the clip: {sql}");
+        db.delete_segment("seg-scored").unwrap();
+        assert_eq!(
+            db.spot_check_report().unwrap().len(),
+            2,
+            "deleting the clip must not rewrite the history of who reviewed it honestly"
+        );
     }
 
     #[test]
