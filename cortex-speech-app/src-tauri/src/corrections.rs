@@ -141,12 +141,48 @@ pub struct MemoryEntry {
     pub hit_count: i64,
 }
 
+/// How much of a memory's recorded neighbour context has to match before it may fire.
+///
+/// `Exact` is the shipped rule and the default: BOTH neighbours must be identical. It is
+/// precision-maximal by construction — and `loop0_eval` measured what that costs out-of-sample on the
+/// real library: with 101 memories and the confidence/hit gates BYPASSED entirely, it fired on 0 of 26
+/// clips. A memory can only fire when the exact same bigram context recurs, which at this corpus size
+/// essentially never happens, so the layer contributes nothing and the confidence gates never even get
+/// consulted. This enum exists so the looser rules can be MEASURED with the real firing function
+/// instead of a reimplementation of it — changing the default is an owner decision backed by numbers,
+/// not a refactor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextMode {
+    /// Both neighbours identical. The shipped behaviour.
+    #[default]
+    Exact,
+    /// Either neighbour identical. Halves the context requirement.
+    Either,
+    /// Neighbours ignored; the phonetic and confidence gates carry all the weight.
+    Ignore,
+}
+
+impl ContextMode {
+    fn matches(self, memory_slot: &str, left: &str, right: &str, slot_key: &str) -> bool {
+        match self {
+            ContextMode::Exact => memory_slot == slot_key,
+            ContextMode::Either => match memory_slot.split_once('|') {
+                Some((ml, mr)) => (ml == left && !ml.is_empty()) || (mr == right && !mr.is_empty()),
+                None => false,
+            },
+            ContextMode::Ignore => true,
+        }
+    }
+}
+
 /// The firing gates. Defaults are the doc's starting points; all are tunable against the gold set's
 /// over-trigger rate.
 #[derive(Debug, Clone)]
 pub struct FiringConfig {
     /// Max normalized phonetic distance between the candidate and the memory's wrong token.
     pub phon_tau: f64,
+    /// How much neighbour context must match. `Exact` is the shipped rule.
+    pub context: ContextMode,
     /// Min confidence for a memory to fire.
     pub tau_conf: f64,
     /// Min hit_count (independent confirmations) — the anti-one-off guard.
@@ -155,7 +191,7 @@ pub struct FiringConfig {
 
 impl Default for FiringConfig {
     fn default() -> Self {
-        Self { phon_tau: 0.2, tau_conf: 0.6, min_hits: 1 }
+        Self { phon_tau: 0.2, tau_conf: 0.6, min_hits: 1, context: ContextMode::Exact }
     }
 }
 
@@ -182,7 +218,8 @@ pub fn apply_memories(transcript: &str, memories: &[MemoryEntry], cfg: &FiringCo
         // function g2p's both inputs internally, so we pass the normalized WORDS, never phonemes.
         let best = memories
             .iter()
-            .filter(|m| m.slot_key == slot_key && m.confidence > cfg.tau_conf && m.hit_count >= cfg.min_hits)
+            .filter(|m| cfg.context.matches(&m.slot_key, left, right, &slot_key))
+            .filter(|m| m.confidence > cfg.tau_conf && m.hit_count >= cfg.min_hits)
             .map(|m| (m, crate::diff::phonetic::normalized_phonetic_word_distance(word_norm, &m.phonetic_key)))
             .filter(|(_, dist)| *dist <= cfg.phon_tau)
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -271,7 +308,8 @@ pub fn classify_memory_outcome(
     memory: &MemoryEntry,
     cfg: &FiringConfig,
 ) -> MemoryOutcome {
-    let eval_cfg = FiringConfig { phon_tau: cfg.phon_tau, tau_conf: f64::NEG_INFINITY, min_hits: 0 };
+    let eval_cfg =
+        FiringConfig { phon_tau: cfg.phon_tau, tau_conf: f64::NEG_INFINITY, min_hits: 0, context: cfg.context };
     let fired = apply_memories(original, std::slice::from_ref(memory), &eval_cfg);
     let before = word_error_count(original, reference) as i64;
     let after = word_error_count(&fired, reference) as i64;
@@ -336,7 +374,8 @@ pub fn classify_memory_outcomes(
     memories: &[MemoryEntry],
     cfg: &FiringConfig,
 ) -> Vec<(usize, MemoryOutcome)> {
-    let eval_cfg = FiringConfig { phon_tau: cfg.phon_tau, tau_conf: f64::NEG_INFINITY, min_hits: 0 };
+    let eval_cfg =
+        FiringConfig { phon_tau: cfg.phon_tau, tau_conf: f64::NEG_INFINITY, min_hits: 0, context: cfg.context };
     firing_winner_indices(original, memories, &eval_cfg)
         .into_iter()
         .filter_map(|idx| match classify_memory_outcome(original, reference, &memories[idx], cfg) {
@@ -375,6 +414,52 @@ mod tests {
             confidence,
             hit_count,
         }
+    }
+
+    #[test]
+    fn the_shipped_context_rule_is_exact_and_the_looser_modes_are_diagnostics_only() {
+        // `loop0_eval` measured, out-of-sample on the real library: Exact and Either both fire on 0 of
+        // 26 clips, while Ignore fires on 26 of 26 and RAISES mean CER from 0.0562 to 0.1383 — it made
+        // every single clip worse. The exact-context requirement is not over-caution, it is the thing
+        // protecting the corpus from a pool of one-off substitutions that do not generalise. This test
+        // exists so the default can never drift to a looser rule without someone deleting an assertion
+        // that says, in numbers, why that would corrupt the data.
+        assert_eq!(
+            FiringConfig::default().context,
+            ContextMode::Exact,
+            "loosening the shipped context rule made 26/26 clips worse when measured — do not change this default \
+             without re-running `cargo run --bin loop0_eval` and pasting the numbers"
+        );
+
+        let mem = captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 5);
+        let gated = |context| FiringConfig { phon_tau: 0.2, tau_conf: 0.0, min_hits: 0, context };
+
+        // Same bigram context: fires under every mode.
+        let same = "ئەو ساڵە باش بوو";
+        for mode in [ContextMode::Exact, ContextMode::Either, ContextMode::Ignore] {
+            assert!(
+                apply_memories(same, std::slice::from_ref(&mem), &gated(mode)).contains("خراپ"),
+                "{mode:?} must fire when the recorded context is present"
+            );
+        }
+
+        // Neither neighbour matches: only the context-free mode fires — which is precisely the mode
+        // the measurement showed to be harmful.
+        let elsewhere = "ژنێکی زۆر باش دیتم";
+        assert_eq!(
+            apply_memories(elsewhere, std::slice::from_ref(&mem), &gated(ContextMode::Exact)),
+            elsewhere,
+            "Exact must not fire without its context"
+        );
+        assert_eq!(
+            apply_memories(elsewhere, std::slice::from_ref(&mem), &gated(ContextMode::Either)),
+            elsewhere,
+            "Either must not fire when NEITHER neighbour matches"
+        );
+        assert!(
+            apply_memories(elsewhere, &[mem], &gated(ContextMode::Ignore)) != elsewhere,
+            "Ignore drops the context requirement entirely — this is the harmful mode, kept only for measurement"
+        );
     }
 
     #[test]

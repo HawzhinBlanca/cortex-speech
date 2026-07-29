@@ -2383,3 +2383,63 @@ string). couch-page **22 passed**; python-policies 44/44.
   now TOLD (refused-decision banner) instead of losing it silently, which was the actual defect.
 - Undo history dying with the process is benign in practice: the button is hidden while
   `doneThisSession` is 0, so a relaunched page does not offer an undo it cannot honour.
+
+---
+
+## Iteration 205 — sherpa-onnx LM fusion: NOT available. LOOP-0: measured, and it is inert by design.
+
+Both items the owner asked for, and both overturned a recommendation I had made in chat.
+
+**LM fusion is NOT reachable on this stack — my "biggest gap" advice was wrong.** Verified against the
+vendored crate source, not documentation:
+- `sherpa-onnx 1.13.2`, and `asr.rs:315` builds `OfflineRecognizerConfig { decoding_method: "greedy_search" }`
+  around `OfflineOmnilingualAsrCtcModelConfig`.
+- `OfflineLMConfig` EXISTS but is `{ model: Option<String>, scale: f32 }` — a neural ONNX LM for
+  transducer beam search, not an n-gram, and not wired to the CTC path.
+- The n-gram/HLG route is `CtcFstDecoderConfig`, and in 1.13.2 it exists **only** as
+  `OnlineCtcFstDecoderConfig` (streaming) in both the safe crate and `sherpa-onnx-sys`. There is no
+  offline equivalent to bind.
+So "build a KenLM from the corrections and fuse it into decoding" is not a small change here; it needs
+a different decode path (e.g. an offline re-transcribe pass outside sherpa), not a config flag.
+Also found and previously unnoticed: `hotwords_file`/`hotwords_score`, `rule_fsts`/`rule_fars`,
+`blank_penalty`, and an `hr` homophone-replacer are all exposed on the offline config. Whether hotwords
+do anything for a CTC model is UNVERIFIED and must be measured before being claimed.
+
+**`src-tauri/src/bin/loop0_eval.rs` (new) — the correction layer is now measured.** Read-only, opens
+the library read-only on purpose, and scores raw ASR against human gold before and after firing.
+**Leave-one-out is enforced**: every memory was extracted FROM some segment, so a memory is excluded
+from the clip it came from — otherwise every number is self-confirmation.
+
+Measured on the real library (26 scorable clips, 101 memories, mean CER of the raw draft **0.0562** —
+this library's own verified clips, NOT the frozen eval set, so it is not comparable to the 7.03%
+champion figure):
+
+| rule | clips rewritten | improved | worsened | mean CER after | verdict |
+|---|---|---|---|---|---|
+| ARMED (shipped gates) | 0 / 26 | 0 | 0 | 0.0562 | INERT |
+| gates bypassed, exact context | 0 / 26 | 0 | 0 | 0.0562 | INERT |
+| either neighbour | 0 / 26 | 0 | 0 | 0.0562 | INERT |
+| neighbours ignored | **26 / 26** | **0** | **26** | **0.1383** | **HARMFUL (+0.0820)** |
+
+**What this proves, and it is not what I expected.** The confidence/hit gates are NOT what keeps the
+layer quiet — bypassing them changes nothing. The `slot_key` is `"{left}|{right}"` and the firing rule
+demands an EXACT bigram-context match, so a memory can only fire when the same two neighbouring words
+recur; at 764 corrected words that never happens out-of-sample. And loosening it is not the fix:
+dropping the context requirement fires on every clip and makes **every one of them worse**, more than
+doubling CER. The exact-context rule is not over-caution — it is the thing protecting the corpus from a
+pool of one-off substitutions that do not generalise.
+
+`ContextMode` was added to `FiringConfig` (default `Exact`, **zero behaviour change**) purely so those
+alternatives could be measured through the REAL firing function instead of a reimplementation of it —
+the repo already learned that lesson with `revoke_in`. A unit test pins the default and quotes these
+numbers, so it cannot drift loose without someone deleting an assertion that says why.
+
+**Honest conclusion for the owner's question "does the app learn well?":** the capture layer is
+excellent and the few-shot path genuinely uses corrections. The LOOP-0 symbolic layer contributes
+exactly nothing today and cannot be switched on without harming the corpus. The real lever is acoustic
+fine-tuning on the accumulated pairs — not this.
+
+**Process defect found in my own gates:** `cargo clippy ... | tail -N && echo OK` masks clippy's exit
+code behind `tail`'s, so a failing clippy printed "CLIPPY OK". Caught when 3 real lint errors surfaced
+in this iteration's test code. Re-verified with unmasked exit codes: clippy 0, fmt 0, `cargo test --lib`
+0 with **1089 passed**.
