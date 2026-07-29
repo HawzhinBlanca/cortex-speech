@@ -561,10 +561,13 @@ fn status_of(h: &CouchHandle) -> CouchStatus {
     let mut reviewers: Vec<CouchReviewer> = lock_state(&h.state)
         .reviewers
         .iter()
+        // `#t=`, not `?t=`: a fragment never leaves the browser, so a link pasted into a chat app
+        // hands its preview bot the empty shell rather than a live credential. The page claims the
+        // fragment via POST /api/claim into the HttpOnly cookie on first open.
         .map(|(token, name)| CouchReviewer {
             name: name.clone(),
-            url: format!("http://{lan}:{}/?t={token}", h.port),
-            tailscale_url: tailscale.as_ref().map(|ip| format!("http://{ip}:{}/?t={token}", h.port)),
+            url: format!("http://{lan}:{}/#t={token}", h.port),
+            tailscale_url: tailscale.as_ref().map(|ip| format!("http://{ip}:{}/#t={token}", h.port)),
         })
         .collect();
     // HashMap iteration order is randomized per process, so sort for a stable Settings list — otherwise
@@ -663,6 +666,33 @@ fn page_reply_with_cookie(token: &str, body: Vec<u8>) -> (Reply, Option<String>)
     )
 }
 
+/// The fragment bootstrap (docs/REMOTE_PUBLIC_LINKS_PLAN.md phase 2): the page reads `#t=` out of
+/// `location.hash` — which the browser never transmits — and presents it here ONCE, in a POST body.
+/// The reply moves it into the HttpOnly cookie and the page strips the fragment. From that moment the
+/// token never appears in any URL, log line, or preview-bot fetch.
+///
+/// Deliberately NOT single-use: chat-app preview bots fetch a pasted link within seconds, before the
+/// human taps it. A one-shot claim would be burned by the bot and 401 the actual reviewer. The bot
+/// never sees the fragment at all, which is the whole protection — repeat claims by the same holder
+/// are simply the reviewer opening their link again.
+fn api_claim(body: &[u8], state: &Mutex<CouchState>) -> (Reply, Option<String>) {
+    #[derive(serde::Deserialize)]
+    struct ClaimBody {
+        token: String,
+    }
+    let Ok(parsed) = serde_json::from_slice::<ClaimBody>(body) else {
+        return (err_reply(400, "bad json"), None);
+    };
+    let Some(reviewer) = lock_state(state).reviewers.get(&parsed.token).cloned() else {
+        // Same answer as every other bad credential: no hint whether the token was close.
+        return (err_reply(401, "unauthorized"), None);
+    };
+    (
+        (200, "application/json", serde_json::json!({ "ok": true, "reviewer": reviewer }).to_string().into_bytes()),
+        Some(format!("{COUCH_COOKIE}={}; Path=/; Max-Age=604800; SameSite=Strict; HttpOnly", parsed.token)),
+    )
+}
+
 fn json_reply(status: u16, value: serde_json::Value) -> Reply {
     (status, "application/json", value.to_string().into_bytes())
 }
@@ -744,26 +774,53 @@ fn handle_request(
     let path = url.split('?').next().unwrap_or("").to_string();
     let method = request.method().clone();
 
-    // EVERY route is token-gated — including the page itself, so a URL is unusable without `?t=`. The
-    // token also RESOLVES the reviewer: an unknown token has no identity, so there is no path on which a
-    // decision can be written without a name attached.
-    // Resolved from the SHARED map on every request, so a revoked token stops working immediately
-    // rather than at the next server restart.
-    let Some(token) = token_from_request(request) else {
+    // EVERY DATA route is token-gated. Two routes are deliberately reachable without a credential,
+    // and the distinction is the Phase-2 design (docs/REMOTE_PUBLIC_LINKS_PLAN.md):
+    //
+    //   GET /            — the static shell. It embeds no clip data, no reviewer names, no counts;
+    //                      everything meaningful lives behind /api/*. Serving it openly is what lets
+    //                      the token move into the URL FRAGMENT (#t=), which the browser never sends
+    //                      to any server — so a link pasted into WhatsApp/Telegram gives their
+    //                      link-preview bots the empty shell instead of a live credential to
+    //                      biometric audio. "Every route gated" was the right posture when the token
+    //                      rode the query string; once it must not, gating the shell protects
+    //                      nothing and forces the token back onto the wire.
+    //   POST /api/claim  — the fragment bootstrap: the page presents the token ONCE in a request
+    //                      body, and the reply moves it into the HttpOnly cookie.
+    //
+    // The token still RESOLVES the reviewer everywhere else: an unknown token has no identity, so
+    // there is no path on which a decision can be written without a name attached. Resolved from the
+    // SHARED map on every request, so a revoked token stops working immediately.
+    let authenticated = token_from_request(request)
+        .and_then(|token| lock_state(state).reviewers.get(&token).cloned().map(|name| (token, name)));
+
+    if let (tiny_http::Method::Get, "/") = (&method, path.as_str()) {
+        let shell = include_str!("../assets/couch.html").as_bytes().to_vec();
+        return match authenticated {
+            // Authenticated page load: RE-plant the cookie. This is the sliding expiry — an active
+            // reviewer's cookie renews on every visit, so a bookmark used weekly never dies while
+            // the session lives. (A fixed Max-Age from first claim would expire mid-engagement.)
+            Some((token, _)) => page_reply_with_cookie(&token, shell),
+            // Unauthenticated: the bare shell, NO cookie. This is what a preview bot receives.
+            None => ((200, "text/html; charset=utf-8", shell), None),
+        };
+    }
+    if let (tiny_http::Method::Post, "/api/claim") = (&method, path.as_str()) {
+        return match read_body(request) {
+            Ok(body) => api_claim(&body, state),
+            Err(e) => (err_reply(400, &e), None),
+        };
+    }
+
+    let Some((token, reviewer)) = authenticated else {
         return (err_reply(401, "unauthorized"), None);
     };
-    let Some(reviewer) = lock_state(state).reviewers.get(&token).cloned() else {
-        return (err_reply(401, "unauthorized"), None);
-    };
+    let _ = token;
     let reviewer = reviewer.as_str();
     if let Err(e) = COUCH_RATE_LIMITER.check(reviewer) {
         return ((429, "text/plain; charset=utf-8", e.into_bytes()), None);
     }
 
-    // Only the page plants the cookie; every other route just answers.
-    if let (tiny_http::Method::Get, "/") = (&method, path.as_str()) {
-        return page_reply_with_cookie(&token, include_str!("../assets/couch.html").as_bytes().to_vec());
-    }
     let reply = match (method, path.as_str()) {
         (tiny_http::Method::Get, "/api/queue") => api_queue(db, reviewer, state),
         (tiny_http::Method::Get, p) if p.starts_with("/api/audio/") => {
@@ -1745,6 +1802,74 @@ mod tests {
     }
 
     #[test]
+    fn the_shell_is_public_the_data_is_not_and_a_fragment_claim_mints_the_cookie() {
+        // Phase 2 of docs/REMOTE_PUBLIC_LINKS_PLAN.md, pinned over real HTTP. The threat this shape
+        // exists for: a link pasted into WhatsApp/Telegram IS fetched by the platform's preview bot
+        // within seconds. With `?t=` that fetch handed the platform a durable credential to
+        // biometric audio. With `#t=` the bot's request carries no fragment — it must receive the
+        // EMPTY shell and, critically, NO cookie.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەقی تاقیکردنەوە")).unwrap();
+        drop(db);
+
+        let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let state = Arc::new(Mutex::new(CouchState {
+            reviewers: HashMap::from([("goodtoken".to_string(), "Sara".to_string())]),
+            ..CouchState::default()
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let join = spawn_server_loop(0, server.clone(), db_path, state, shutdown.clone()).unwrap();
+        let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // THE PREVIEW BOT'S REQUEST: bare GET /, no credential of any kind.
+        let bot = agent.get(&format!("{base}/")).call().expect("the shell is public");
+        assert_eq!(bot.status(), 200);
+        assert!(bot.header("set-cookie").is_none(), "an unauthenticated shell fetch must never mint a cookie");
+        let shell = bot.into_string().unwrap();
+        assert!(shell.contains("<html"), "it is the page shell");
+        assert!(!shell.contains("goodtoken"), "and it embeds no credential");
+
+        // The data stays gated exactly as before.
+        let data = agent.get(&format!("{base}/api/queue")).call();
+        assert!(matches!(data, Err(ureq::Error::Status(401, _))), "the shell being public must not open the data");
+
+        // THE REVIEWER'S FIRST OPEN: the page presents the fragment token once, by POST body.
+        let claim = agent
+            .post(&format!("{base}/api/claim"))
+            .set("content-type", "application/json")
+            .send_string(r#"{"token":"goodtoken"}"#)
+            .expect("a valid claim succeeds");
+        let cookie = claim.header("set-cookie").expect("the claim mints the cookie").to_string();
+        assert!(cookie.contains("HttpOnly"), "the minted cookie must stay unreadable to page JS");
+        let cookie_pair = cookie.split(';').next().unwrap().to_string();
+
+        // A wrong token gets the same flat refusal as everywhere else.
+        let bad = agent
+            .post(&format!("{base}/api/claim"))
+            .set("content-type", "application/json")
+            .send_string(r#"{"token":"guessed"}"#);
+        assert!(matches!(bad, Err(ureq::Error::Status(401, _))), "claim must not be a token oracle");
+
+        // The minted cookie is a working credential...
+        let queue = agent.get(&format!("{base}/api/queue")).set("Cookie", &cookie_pair).call().unwrap();
+        assert_eq!(queue.status(), 200);
+        // ...and an authenticated page load RE-plants it (sliding expiry): a bookmark used weekly
+        // must never die of a Max-Age counted from the first claim.
+        let revisit = agent.get(&format!("{base}/")).set("Cookie", &cookie_pair).call().unwrap();
+        assert!(
+            revisit.header("set-cookie").is_some_and(|c| c.contains("Max-Age")),
+            "an authenticated page load must refresh the cookie's lifetime"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        server.unblock();
+        let _ = join.join();
+    }
+
+    #[test]
     fn a_returning_reviewer_is_let_in_by_their_cookie_even_though_the_page_sends_an_empty_token() {
         // THE REPORTED BUG: "I close the browser on my iPhone and go back and it doesn't open."
         //
@@ -1968,7 +2093,7 @@ mod tests {
 
         // The issued URL must actually WORK — this is what the deleted-field mutant breaks.
         let sara = status.reviewers.iter().find(|r| r.name == "Sara").expect("Sara was issued a link");
-        let token = sara.url.split("?t=").nth(1).expect("the URL carries a token").to_string();
+        let token = sara.url.split("#t=").nth(1).expect("the URL carries a fragment token").to_string();
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
         // Read the port back out of the URL the owner is actually handed. That doubles as an assertion
         // that the issued link carries the port that was really bound — with an ephemeral port, a URL
@@ -2042,7 +2167,7 @@ mod tests {
             .expect("first start");
         let sara_link = first.reviewers.iter().find(|r| r.name == "Sara").unwrap().url.clone();
         let hemn_link = first.reviewers.iter().find(|r| r.name == "Hemn").unwrap().url.clone();
-        let token_of = |url: &str| url.split("?t=").nth(1).unwrap().to_string();
+        let token_of = |url: &str| url.split("#t=").nth(1).unwrap().to_string();
 
         // CLOSING THE APP: no stop() call, the process simply goes away. Drop the handle the way an
         // exit would, without touching the remembered session.
@@ -2489,10 +2614,13 @@ mod tests {
                 other => panic!("{url} transport error (timeout/hang?): {other}"),
             })
         };
-        // No token -> 401 on the page, the queue, and audio alike.
-        for path in ["/", "/api/queue", "/api/audio/s1"] {
+        // No token -> 401 on every DATA route. The page shell itself is deliberately public since
+        // phase 2 (fragment links): it embeds nothing, and gating it would force the token back into
+        // a server-visible part of the URL. The dedicated shell/claim test pins that side.
+        for path in ["/api/queue", "/api/audio/s1"] {
             assert_eq!(status_of_url(format!("{base}{path}")), 401, "{path} must be token-gated");
         }
+        assert_eq!(status_of_url(format!("{base}/")), 200, "the empty shell is public by design");
         // An unrecognised token has no reviewer, so it has no way in either.
         assert_eq!(status_of_url(format!("{base}/api/queue?t=notatoken")), 401, "an unknown token resolves to nobody");
 

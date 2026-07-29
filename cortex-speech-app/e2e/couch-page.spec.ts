@@ -297,6 +297,40 @@ test.describe('Couch Review phone page', () => {
     }
   });
 
+  test('a fragment token is claimed by POST and stripped, never sent in any request URL', async ({ page }) => {
+    // Phase 2 (docs/REMOTE_PUBLIC_LINKS_PLAN.md): links now carry #t=. A fragment never leaves the
+    // browser, so a chat app's preview bot fetching the pasted link gets the empty shell — the page
+    // must present the token exactly once, in a POST body, and then remove it from the address bar.
+    await page.addInitScript(() => {
+      (window as unknown as { __reqs: Array<{ url: string; body: string }> }).__reqs = [];
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        (window as unknown as { __reqs: Array<{ url: string; body: string }> }).__reqs.push({
+          url: String(input),
+          body: String(init?.body ?? ''),
+        });
+        return new Response('{"ok":true,"items":[],"reviewer":"Sara"}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+    });
+    // goto() from PAGE to PAGE#t=... is a SAME-DOCUMENT navigation (only the hash changes) and the
+    // boot script would not re-run — reload makes it a real load with the fragment present.
+    await page.goto(PAGE + '#t=frag-secret-42');
+    await page.reload();
+    await page.waitForFunction(`(window.__reqs || []).some((r) => r.url.includes('/api/claim'))`, null, {
+      timeout: 5000,
+    });
+    const reqs = (await page.evaluate(`window.__reqs`)) as Array<{ url: string; body: string }>;
+
+    const claim = reqs.find((r) => r.url.includes('/api/claim'));
+    expect(claim?.body).toContain('frag-secret-42');
+    for (const r of reqs) {
+      expect(r.url, 'the token must never appear in a request URL').not.toContain('frag-secret-42');
+    }
+    await expect.poll(async () => page.url()).not.toContain('frag-secret-42');
+  });
+
   test('the token is stripped from the visible URL after the first load', async ({ page }) => {
     // The server plants an HttpOnly cookie, so the token no longer needs to ride in the URL where it
     // lands in history and in any proxy log. The link the reviewer was SENT keeps working; this only

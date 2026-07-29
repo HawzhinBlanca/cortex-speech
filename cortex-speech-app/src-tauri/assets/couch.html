@@ -202,16 +202,27 @@
 <div id="err" hidden></div>
 <div class="toast" id="toast"></div>
 <script>
-  const token = new URLSearchParams(location.search).get('t') || '';
-  // The server planted an HttpOnly cookie when it served this page, so the token no longer has to
-  // ride in the URL. Strip it from the visible address and from this history entry: a token in the
-  // query string ends up in browser history, in the address bar of a phone anyone can glance at, and
-  // in the logs of anything that ever proxies the request. The link the reviewer was SENT keeps
-  // working — this only cleans up after it.
-  if (token && window.history?.replaceState) {
+  // The token arrives in the URL FRAGMENT (#t=...), which the browser never sends to any server —
+  // so a link pasted into a chat app hands its preview bot the empty shell, never a credential.
+  // ?t= is still read as the legacy transition form for links sent before the fragment change.
+  const fragToken = new URLSearchParams(location.hash.replace(/^#/, '')).get('t') || '';
+  const queryToken = new URLSearchParams(location.search).get('t') || '';
+  const token = queryToken; // only a QUERY token still needs to ride requests (legacy links)
+  // A fragment token is presented to the server exactly once, in a POST body, and comes back as the
+  // HttpOnly cookie every later request rides on. Fire-and-forget BEFORE load(): claimed is awaited
+  // by load() via this promise so the first /api/queue never races the cookie.
+  const claimed = fragToken
+    ? fetch('/api/claim', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: fragToken }),
+      }).then((r) => r.ok, () => false)
+    : Promise.resolve(true);
+  // Strip the credential from the visible address and this history entry either way: a token on
+  // screen is a token anyone glancing at the phone can photograph, and history survives the session.
+  if ((fragToken || queryToken) && window.history?.replaceState) {
     const clean = new URL(location.href);
     clean.searchParams.delete('t');
-    history.replaceState(null, '', clean.pathname + clean.search + clean.hash);
+    history.replaceState(null, '', clean.pathname + clean.search);
   }
   const $ = (id) => document.getElementById(id);
   let queue = [], i = 0, busy = false;
@@ -366,6 +377,9 @@
   }
   async function load() {
     try {
+      // The fragment claim must land before the first authenticated call, or a brand-new reviewer's
+      // very first /api/queue races the Set-Cookie and 401s a perfectly good link.
+      await claimed;
       await flushOutbox();
       const res = await api('/api/queue');
       queue = res.items; i = 0; heldByOthers = res.heldByOthers || 0;
