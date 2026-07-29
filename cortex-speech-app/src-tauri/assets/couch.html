@@ -54,6 +54,8 @@
     "allDone": "All clips reviewed!",
     "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
     "loadingMore": "Loading more clips…",
+    "queued": "Queued — it will send when you are back online",
+    "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
     "editHint": "Listen, and correct the text if needed"
   },
   "ckb": {
@@ -72,6 +74,8 @@
     "allDone": "هەموو پارچەکان پێداچوونەوەیان بۆ کرا!",
     "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
     "loadingMore": "بارکردنی پارچەی زیاتر…",
+    "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
+    "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
     "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
   },
   "source": {
@@ -90,6 +94,8 @@
     "allDone": "review.allDone",
     "heldByOthers": null,
     "loadingMore": null,
+    "queued": null,
+    "refused": null,
     "editHint": "review.editHint"
   }
 }
@@ -280,6 +286,11 @@
 
   // ── rendering ───────────────────────────────────────────────────────────────
   let heldByOthers = 0;
+  // Who the SERVER says this link belongs to. Stamped onto every queued decision, because the outbox
+  // lives in localStorage — which is per-origin, not per-reviewer. Two people using the same phone, or
+  // one person opening a colleague's link, share one outbox, and an unstamped decision flushes under
+  // whoever's cookie is current: Sara's offline judgement recorded, permanently, as Hemn's.
+  let me = '';
 
   function toast(msg) {
     $('toast').textContent = msg;
@@ -349,8 +360,30 @@
   const OUTBOX = 'cortex.couch.outbox';
   const readOutbox = () => { try { return JSON.parse(localStorage.getItem(OUTBOX)) || []; } catch { return []; } };
   const writeOutbox = (v) => localStorage.setItem(OUTBOX, JSON.stringify(v));
+  // Decisions the server REFUSED on replay. Kept so the reviewer can be told, once, that specific work
+  // did not land — silently discarding it after having toasted "Saved" is how a corpus quietly loses
+  // human labour nobody can account for afterwards.
+  const REFUSED = 'cortex.couch.refused';
+  const readRefused = () => { try { return JSON.parse(localStorage.getItem(REFUSED)) || []; } catch { return []; } };
+  function noteRefused(id) {
+    const r = readRefused();
+    if (!r.includes(id)) localStorage.setItem(REFUSED, JSON.stringify([...r, id]));
+  }
+  function renderRefused() {
+    const n = readRefused().length;
+    if (!n) return;
+    // Persistent, not a toast: this needs the reviewer to go back and re-do specific clips, and a
+    // message that disappears in three seconds cannot ask that.
+    $('err').hidden = false;
+    $('err').textContent = t('refused', { n });
+  }
   async function flushOutbox() {
     for (const item of readOutbox()) {
+      // Not mine to send. A decision names its author, and flushing someone else's under this cookie
+      // would attribute their judgement to this reviewer. Left queued for whoever actually made it.
+      // (Items with no author predate this field; sending them is still better than dropping work,
+      // and the server's own fence only engages when the claim is present.)
+      if (item.reviewer && me && item.reviewer !== me) continue;
       try {
         await api('/api/decision', {
           method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(item),
@@ -367,11 +400,17 @@
         if (e.status === undefined || e.status === 401 || e.status >= 500) return;
         // Everything else (409 taken, 400 invalid) IS a real answer about this decision. Retrying can
         // never change it, so drop it rather than wedging the queue behind something that will never
-        // land.
+        // land — but the reviewer's TYPED TEXT is not the server's to discard. Deleting the draft here
+        // destroyed the one copy of a correction they had already been told was saved. Keep it, and
+        // say what happened.
+        noteRefused(item.id);
+        writeOutbox(readOutbox().filter((q) => q.id !== item.id));
+        continue;
       }
       writeOutbox(readOutbox().filter((q) => q.id !== item.id));
       localStorage.removeItem(draftKey(item.id));
     }
+    renderRefused();
   }
   addEventListener('online', () => void flushOutbox());
 
@@ -419,6 +458,7 @@
       renderEmptyState();
       // Show WHO the server is recording these decisions as. Every save is stored under this name, so
       // the reviewer must be able to see it — silent attribution is attribution nobody can correct.
+      me = res.reviewer;
       $('who').textContent = ' · ' + res.reviewer;
       show();
     } catch (e) {
@@ -435,7 +475,7 @@
     if (busy || !queue[i]) return;
     busy = true;
     const btns = ['save','accept','bad','undo'].map($); btns.forEach(b => b.disabled = true);
-    const submission = { id: queue[i].id, action, text: $('text').value };
+    const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me };
     try {
       await api('/api/decision', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),
@@ -462,7 +502,10 @@
           $('err').hidden = false;
           $('err').textContent = t('linkExpired');
         } else {
-          toast(t('saved'));
+          // NOT "Saved" — it is not saved, it is queued. Telling a reviewer their work is safe when it
+          // is still sitting in localStorage is what made every later loss invisible: they had already
+          // been reassured, so they had no reason to check anything.
+          toast(t('queued'));
         }
         i += 1; show();
       } else {

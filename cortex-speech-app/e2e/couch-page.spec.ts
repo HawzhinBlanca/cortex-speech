@@ -201,6 +201,109 @@ test.describe('Couch Review phone page', () => {
     expect(await page.evaluate(`window.__q.fetches`)).toBe(3);
   });
 
+  test('a refused replay keeps the typed correction and says so, instead of deleting it in silence', async ({ page }) => {
+    // THE QUIETEST DATA LOSS IN THE SYSTEM. Offline, the page queued the decision and toasted
+    // "Saved". Back online, the server answered 409 (someone else got the clip, or the owner decided
+    // it at the desktop) — and the page deleted BOTH the queued decision and the reviewer's typed
+    // Sorani correction, with no toast, no banner, no counter. They had already been told it was
+    // safe, so they had no reason to look. Dropping the queued decision is right; retrying a 409
+    // cannot change it. Destroying the text and saying nothing is not.
+    await page.addInitScript(() => {
+      (window as unknown as { __net: { offline: boolean } }).__net = { offline: true };
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const net = (window as unknown as { __net: { offline: boolean } }).__net;
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [{ id: 'x1', text: 'دەقی سەرەتایی', durationMs: 1000, speakerId: null }],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (url.includes('/api/decision')) {
+          if (net.offline) throw new TypeError('Failed to fetch');
+          return new Response('already reviewed by Hemn', { status: 409 });
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('دەقی سەرەتایی', { timeout: 5000 });
+
+    // Offline: type a correction and save. It is QUEUED, and must not be called "Saved".
+    await page.locator('#text').fill('ڕاستکراوەی سارا');
+    await page.locator('#save').click();
+    await expect
+      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .toBe(1);
+    await expect(page.locator('#toast')).toHaveText('لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت');
+    const queued = (await page.evaluate(
+      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')[0]`,
+    )) as { reviewer?: string; text: string };
+    expect(queued.reviewer).toBe('Sara'); // stamped, so it can never be replayed under another name
+    expect(queued.text).toBe('ڕاستکراوەی سارا');
+
+    // Back online, the server refuses it. Driven by the 'online' event rather than a reload:
+    // addInitScript re-runs on every navigation and would reset __net.offline back to true.
+    await page.evaluate(`window.__net.offline = false; dispatchEvent(new Event('online'))`);
+    await expect
+      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .toBe(0);
+
+    // The decision is dropped — correct — but the WORK is kept and the reviewer is told.
+    expect(await page.evaluate(`localStorage.getItem('cortex.couch.draft.x1')`)).toBe('ڕاستکراوەی سارا');
+    await expect(page.locator('#err')).toBeVisible();
+    await expect(page.locator('#err')).toContainText('1');
+  });
+
+  test('a decision queued by one reviewer is never flushed under another reviewer name', async ({ page }) => {
+    // localStorage is per-ORIGIN, not per-reviewer. Two people sharing a phone, or one person opening
+    // a colleague's link, share one outbox — so an unstamped decision flushed under whoever's cookie
+    // is current would record Sara's judgement of a clip as Hemn's, permanently and invisibly.
+    await page.addInitScript(() => {
+      (window as unknown as { __sent: string[] }).__sent = [];
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/api/decision')) {
+          (window as unknown as { __sent: string[] }).__sent.push(String(init?.body ?? ''));
+          return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        if (url.includes('/api/queue')) {
+          return new Response(JSON.stringify({ reviewer: 'Hemn', items: [], heldByOthers: 0 }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    // Wait until the page knows who it is — the guard is meaningless before /api/queue answers.
+    await expect(page.locator('#who')).toHaveText(' · Hemn');
+    // Seeded AFTER load so addInitScript cannot wipe it, and flushed via the 'online' event, which is
+    // exactly how a reconnecting phone triggers it.
+    await page.evaluate(`
+      localStorage.setItem('cortex.couch.outbox', JSON.stringify([
+        { id: 'sara1', action: 'edit', text: 'هی سارا', reviewer: 'Sara' },
+        { id: 'hemn1', action: 'edit', text: 'هی هێمن', reviewer: 'Hemn' },
+      ]));
+      dispatchEvent(new Event('online'));
+    `);
+    await expect.poll(async () => page.evaluate(`window.__sent.length`)).toBe(1);
+
+    const sent = (await page.evaluate(`window.__sent`)) as string[];
+    expect(sent[0]).toContain('hemn1');
+    expect(sent.join(' ')).not.toContain('sara1');
+    // Sara's decision is still waiting for Sara — held, not sent, and not thrown away either.
+    const left = (await page.evaluate(
+      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`,
+    )) as Array<{ id: string }>;
+    expect(left.map((q) => q.id)).toEqual(['sara1']);
+  });
+
   test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {
     // DATA LOSS, and made MORE reachable by fixing Stop/Start: every outstanding token is regenerated
     // when the owner restarts Couch Review or reissues a link. A reviewer who was offline then
