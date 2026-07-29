@@ -32,9 +32,12 @@ a11y violations including an **unlabelled transcript box**; a peer's fresh corre
 answer key (found by the soak test); and a null spot-check report **crashing the whole settings
 dialog** (found only by the full e2e suite).
 
-**Still open:** §2.2 (throughput panel + timestamps), §2.3 (audit log), §2.5 (two-browser e2e —
-partially covered by the Rust soak test and the phone-page spec), §3.6 waveform, §3.7 per-reviewer
-revoke, §3.8 token out of the query string, and a clean `couch.rs` mutation sweep run to completion.
+**Still open (updated 2026-07-29):** §2.5 (two-browser e2e — partially covered by the Rust soak test
+and the phone-page spec) and a clean `couch.rs` mutation sweep at current HEAD. Everything else on
+the original list has SHIPPED: §2.2 throughput (v45 + Settings panel), §2.3 audit log (v45
+`review_events`), §3.6 waveform, §3.7 per-reviewer revoke, §3.8 token → HttpOnly cookie. Durable
+links + resume-at-launch shipped 2026-07-29 (`5ddc778`). The successor plan for public links and
+always-on operation is `REMOTE_PUBLIC_LINKS_PLAN.md`.
 
 ---
 

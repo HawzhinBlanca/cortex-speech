@@ -13,8 +13,13 @@ The desktop app runs a small HTTP server (`src-tauri/src/couch.rs`) on port **87
 their **own** link carrying their **own** random token. The token is the identity: every decision is
 stored with `speech_segments.reviewed_by` set to that reviewer's name.
 
-It is **off by default** and **per-session** — tokens are generated at start, never persisted, and
-die when you stop the server or close the app.
+It is **off by default**, and once started the session is **durable**: tokens are remembered
+(DPAPI-encrypted, in `couch_session.json`) and the server resumes automatically on the next app
+launch, so a link keeps working across app restarts and PC reboots. **Pressing Stop is the revoke** —
+it deletes the remembered session and every link dies, and stays dead across restarts. Losing one
+phone does not need the nuclear option: **revoke that one reviewer** from Settings and everyone else
+keeps working. The honest cost: a link is a durable credential — anyone holding it can review until
+you Stop or revoke.
 
 ## Starting a session
 
@@ -36,7 +41,9 @@ Reviewers need no app and no account — just the link in a browser.
   `tailscale status`; both must appear without an `offline` marker.
 - **This PC must stay awake.** On this rig, sleep and hibernate on AC are both set to *never*
   (`powercfg /query <scheme> SUB_SLEEP STANDBYIDLE` → `Current AC Power Setting Index: 0x00000000`).
-- **The app must stay running.** Closing it stops the server and revokes every token.
+- **The app must be running.** Closing it stops the server — but no longer revokes anything: on the
+  next launch the session resumes with the same links. (Phase 3 of
+  `REMOTE_PUBLIC_LINKS_PLAN.md` adds the watchdog that relaunches it unattended.)
 - **The Windows Firewall must allow the app inbound.** The Tailscale adapter is categorised
   **Private**, and the `cortex-speech-app.exe` inbound rule allows Private and Public.
 
@@ -95,10 +102,10 @@ before they lose it, not after.
 on the next load. A request the server *refused* is dropped rather than retried forever, so one bad
 decision cannot wedge everything behind it.
 
-**Starting Couch Review fails to bind port 8737.** Something else holds the port. Note that
-`cargo test` includes a test that binds the real 8737, so the Rust suite and a live review session
-cannot run at the same time — that is deliberate, because a test that skipped itself would restore
-exactly the blind spot it exists to remove.
+**Starting Couch Review fails to bind port 8737.** Something else holds the port. (Until `bf3c0c5`
+the Rust suite itself bound the real 8737 and could not run alongside a live session; the tests now
+use ephemeral ports, so the suite and a live review session coexist — proven by running the full
+suite to green with the server serving.)
 
 ## What is NOT measured yet
 

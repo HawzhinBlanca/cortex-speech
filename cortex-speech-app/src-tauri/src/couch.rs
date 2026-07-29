@@ -20,19 +20,26 @@
 //!      closes the page never strands work.
 //!
 //! Privacy stance (voice is biometric — GDPR Art. 9):
-//!   * OFF by default; started explicitly per session and stopped on demand or app exit.
-//!   * Serves on the LAN only in the sense that nothing is ever published or relayed — no cloud, no
-//!     tunneling. (A router/firewall still defines the actual reachable network; Windows prompts for
-//!     the inbound allow on first start.)
-//!   * EVERY endpoint — including audio bytes — requires a per-session random token. No token, no
-//!     data. Tokens are regenerated on every start, are per-reviewer, and are never persisted: stopping
-//!     the server, or restarting it, revokes every link at once.
+//!   * OFF by default; started explicitly by the owner. Once started, the session is REMEMBERED
+//!     across app restarts (couch_session.json, tokens DPAPI-protected at rest, bound to this
+//!     library) and resumed at launch — closing the app does not revoke anything, because closing is
+//!     not an access decision. Pressing STOP is: it deletes the remembered session and every link
+//!     dies at once, provably surviving a restart. Per-reviewer revoke exists for one lost phone.
+//!   * Nothing is ever published or relayed by THIS code — no cloud, no tunneling here. (A
+//!     router/firewall still defines the actual reachable network; Windows prompts for the inbound
+//!     allow on first start.)
+//!   * EVERY data endpoint — including audio bytes — requires a per-reviewer random token (244 bits).
+//!     No token, no data. A token is a DURABLE credential until Stop/revoke: anyone holding the link
+//!     can review, which is the honest cost of links that survive the desktop
+//!     (docs/REMOTE_PUBLIC_LINKS_PLAN.md states it rather than hiding it).
 //!   * Read + review only: the API can list the queue, stream one clip's audio, record a decision,
 //!     and undo it. No export, no settings, no keys, no file paths are reachable.
 //!
-//! Transport is plain HTTP. That is honest for a home LAN or a WireGuard tailnet, where the token never
-//! crosses a network the owner does not control — and it is why this must NOT be port-forwarded to the
-//! public internet: there is no TLS, and the token rides in the query string.
+//! Transport here is plain HTTP. That is honest for a home LAN or a WireGuard tailnet, where the token
+//! never crosses a network the owner does not control — and it is why this must NOT be naively
+//! port-forwarded: there is no TLS in this server. The one sanctioned public path is DEVICE-TERMINATED
+//! TLS in front of it (Tailscale Serve/Funnel — TLS ends on this PC, relays proxy ciphertext), per
+//! docs/REMOTE_PUBLIC_LINKS_PLAN.md phase 5.
 
 use crate::db::{Database, SpeechSegment};
 use std::collections::{HashMap, HashSet};
