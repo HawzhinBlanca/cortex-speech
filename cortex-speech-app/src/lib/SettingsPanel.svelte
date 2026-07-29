@@ -49,21 +49,58 @@
     }
   });
 
-  // Couch Review (LAN phone review server): session state + start/stop. The URL (with its one-session
-  // token) is only ever displayed here for the owner to open on the phone.
+  // Couch Review (LAN phone review server): session state + start/stop. Each reviewer's URL (with its
+  // own one-session token) is only ever displayed here, for the owner to hand to that person.
   let couchStatus = $state<import('./commands').CouchStatus | null>(null);
   let couchBusy = $state(false);
+  // Comma-separated reviewer names. Left blank, the server starts a single-reviewer session under its
+  // default name — the previous behaviour exactly.
+  let couchNames = $state('');
   async function toggleCouch() {
     if (couchBusy || !tauriAvailable) return;
     couchBusy = true;
     try {
       couchStatus = couchStatus?.running
         ? await api.stopCouchReview()
-        : await api.startCouchReview();
+        : await api.startCouchReview(couchNames.split(',').map((n) => n.trim()).filter(Boolean));
     } catch (e) {
       notifications.error($t('settings.couchFailed'), { detail: String(e) });
     } finally {
       couchBusy = false;
+    }
+  }
+  // Spot-check scores: how each remote reviewer did on clips whose answer was already known. This is
+  // the only signal in the app about whether a REVIEWER was honest, as opposed to whether the machine
+  // was — so it is shown wherever their links are handed out.
+  let spotChecks = $state<import('./commands').SpotCheckScore[]>([]);
+  // Agreement sample: exported on demand, because writing a file every time Settings opens would be
+  // a surprising side effect of merely looking.
+  // Per-reviewer throughput from the append-only audit trail. Partitioned per person — unlike the
+  // global stats.rs figure, which is only meaningful when exactly one human is reviewing.
+  let throughput = $state<import('./commands').ReviewerThroughput[]>([]);
+  async function revokeReviewer(name: string) {
+    if (couchBusy || !tauriAvailable) return;
+    couchBusy = true;
+    try {
+      couchStatus = await api.revokeCouchReviewer(name);
+    } catch (e) {
+      notifications.error($t('settings.couchRevoke'), { detail: String(e) });
+    } finally {
+      couchBusy = false;
+    }
+  }
+  let agreement = $state<import('./commands').AgreementExport | null>(null);
+  let agreementBusy = $state(false);
+  async function exportAgreement() {
+    if (agreementBusy || !tauriAvailable) return;
+    agreementBusy = true;
+    try {
+      agreement = await api.exportAgreementSample();
+      if (!agreement) notifications.info($t('settings.couchAgreementNone'));
+    } catch (e) {
+      notifications.error($t('settings.couchAgreement'), { detail: String(e) });
+    } finally {
+      agreementBusy = false;
     }
   }
   onMount(async () => {
@@ -72,6 +109,21 @@
       couchStatus = await api.couchReviewStatus();
     } catch (e) {
       console.error('couch status load failed:', e);
+    }
+    try {
+      // `?? []` is load-bearing, not defensive noise: a backend (or a test double) that answers with
+      // null made `spotChecks.length` throw during render and took the WHOLE settings dialog down —
+      // a reviewer-quality panel must never be able to break the settings the app depends on.
+      spotChecks = (await api.spotCheckReport()) ?? [];
+    } catch (e) {
+      console.error('spot-check report load failed:', e);
+      spotChecks = [];
+    }
+    try {
+      throughput = (await api.reviewerThroughput()) ?? [];
+    } catch (e) {
+      console.error('reviewer throughput load failed:', e);
+      throughput = [];
     }
   });
 
@@ -389,16 +441,92 @@
                     : $t('settings.couchStart')}
               </button>
             </div>
-            {#if couchStatus?.running && couchStatus.url}
-              <span class="text-[10px] text-subtle">{$t('settings.couchWifiUrl')}</span>
-              <input class="input w-full !text-xs font-mono" readonly value={couchStatus.url} onfocus={(e) => (e.target as HTMLInputElement).select()} />
-              {#if couchStatus.tailscaleUrl}
-                <span class="text-[10px] text-subtle">{$t('settings.couchTailscaleUrl')}</span>
-                <input class="input w-full !text-xs font-mono" readonly value={couchStatus.tailscaleUrl} onfocus={(e) => (e.target as HTMLInputElement).select()} />
-              {/if}
+            {#if couchStatus?.running && couchStatus.reviewers.length}
+              <!-- One block per reviewer: each link carries that person's own token, and every decision
+                   they make is stored under their name. Handing out the wrong link mislabels the data,
+                   so the name is shown above the URL it belongs to. -->
+              {#each couchStatus.reviewers as reviewer (reviewer.name)}
+                <div class="space-y-1 border-t border-cortex-700/30 pt-2 first:border-t-0 first:pt-0">
+                  <div class="flex items-center justify-between">
+                    <span class="text-xs text-default font-semibold">{reviewer.name}</span>
+                    {#if couchStatus.reviewers.length > 1}
+                      <!-- Revoking one link leaves every other reviewer working. Their completed work,
+                           scores and audit trail are untouched - a record, not a permission. -->
+                      <button
+                        type="button"
+                        class="btn-secondary !text-[10px] px-2 py-0.5"
+                        disabled={couchBusy}
+                        onclick={() => void revokeReviewer(reviewer.name)}
+                      >{$t('settings.couchRevoke')}</button>
+                    {/if}
+                  </div>
+                  <span class="text-[10px] text-subtle block">{$t('settings.couchWifiUrl')}</span>
+                  <input class="input w-full !text-xs font-mono" readonly value={reviewer.url} onfocus={(e) => (e.target as HTMLInputElement).select()} />
+                  {#if reviewer.tailscaleUrl}
+                    <span class="text-[10px] text-subtle block">{$t('settings.couchTailscaleUrl')}</span>
+                    <input class="input w-full !text-xs font-mono" readonly value={reviewer.tailscaleUrl} onfocus={(e) => (e.target as HTMLInputElement).select()} />
+                  {/if}
+                </div>
+              {/each}
               <p class="text-[10px] text-subtle">{$t('settings.couchRunningHint')}</p>
             {:else}
+              <label class="block space-y-1">
+                <span class="text-[10px] text-subtle">{$t('settings.couchReviewers')}</span>
+                <input class="input w-full !text-xs" bind:value={couchNames} placeholder={$t('settings.couchReviewersPlaceholder')} />
+              </label>
               <p class="text-[10px] text-subtle">{$t('settings.couchHint')}</p>
+              <p class="text-[10px] text-subtle">{$t('settings.couchReviewersHint')}</p>
+            {/if}
+            {#if throughput.length}
+              <div class="border-t border-cortex-700/30 pt-2 space-y-1">
+                <span class="text-[10px] text-subtle">{$t('settings.couchThroughput')}</span>
+                {#each throughput as r (r.reviewer)}
+                  <div class="flex items-center justify-between text-xs">
+                    <span class="text-default">{r.reviewer}</span>
+                    <span class="text-muted">
+                      {r.clips}{r.medianSeconds !== null ? ` · ${r.medianSeconds.toFixed(1)}s` : ''}
+                    </span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+            {#if spotChecks.length}
+              <!-- Spot checks: a share of every reviewer's queue is drawn from clips that already have
+                   a human answer, served with the known-WRONG draft. "Noticed" is the number to read
+                   first — a reviewer who listens corrects it, one who taps accept hands it back. Sorted
+                   worst-first by the backend, so a reviewer who may not be listening appears at top. -->
+              <div class="border-t border-cortex-700/30 pt-2 space-y-1">
+                <span class="text-[10px] text-subtle">{$t('settings.couchSpotChecks')}</span>
+                {#each spotChecks as s (s.reviewer)}
+                  <div class="flex items-center justify-between text-xs">
+                    <span class="text-default">{s.reviewer}</span>
+                    <span class={s.noticed < s.checks / 2 ? 'text-rose-300 font-semibold' : 'text-muted'}>
+                      {s.noticed}/{s.checks} · CER {(s.meanCer * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                {/each}
+                <p class="text-[10px] text-subtle">{$t('settings.couchSpotChecksHint')}</p>
+                <!-- Inter-annotator agreement. Spot checks are not leased, so two reviewers already
+                     answer the same clips independently — the overlap a kappa study needs exists
+                     already. This exports the TSV; the number comes from the unit-tested harness
+                     (scripts/agreement_kappa.py), never from a second implementation here. -->
+                <button
+                  type="button"
+                  class="btn-secondary text-xs px-3 w-full"
+                  disabled={agreementBusy || !tauriAvailable}
+                  onclick={() => void exportAgreement()}
+                >
+                  {$t('settings.couchAgreement')}
+                </button>
+                {#if agreement}
+                  <p class="text-[10px] text-subtle">
+                    {agreement.raterA} · {agreement.raterB} — {agreement.items}
+                    {#if agreement.otherReviewers.length}· +{agreement.otherReviewers.join(', ')}{/if}
+                  </p>
+                  <input class="input w-full !text-[10px] font-mono" readonly value={agreement.path} onfocus={(e) => (e.target as HTMLInputElement).select()} />
+                  <p class="text-[10px] text-subtle">{$t('settings.couchAgreementHint')}</p>
+                {/if}
+              </div>
             {/if}
           </div>
         {:else if activeTab === 'asr'}

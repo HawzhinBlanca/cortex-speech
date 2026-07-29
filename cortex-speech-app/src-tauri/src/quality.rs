@@ -339,6 +339,19 @@ pub fn training_grade_for_segment(seg: &SpeechSegment) -> TrainingGradeReport {
     }
 }
 
+/// The transcript for this segment ONLY when a human actually verified it — otherwise `None`.
+///
+/// Thin, deliberate wrapper over [`training_transcript_with_source`] so callers that need
+/// known-correct text cannot accidentally settle for a machine verdict. Used by the Couch Review
+/// spot-check (docs/REMOTE_REVIEW_PLAN.md §2.1), where grading a reviewer against a jury guess
+/// instead of a human answer would measure agreement with the model, not with the truth.
+pub fn human_verified_text(seg: &SpeechSegment) -> Option<&str> {
+    match training_transcript_with_source(seg) {
+        (text, "human_verified") => Some(text),
+        _ => None,
+    }
+}
+
 fn training_transcript_with_source(seg: &SpeechSegment) -> (&str, &'static str) {
     if let Some(text) = non_empty(seg.verdict_transcript.as_deref()) {
         if decision_is(seg.human_decision.as_deref(), &["accept", "edit", "human_accept", "human_edit"])

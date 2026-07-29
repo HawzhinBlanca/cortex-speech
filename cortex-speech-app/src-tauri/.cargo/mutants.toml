@@ -9,6 +9,12 @@
 #
 # "ood" in the charter is this repo's quality/signal_anomaly.rs (there is no module literally
 # named ood); diff and normalizer are the Sorani text-comparison core every metric flows through.
+#
+# couch.rs was added 2026-07-27 (docs/REMOTE_REVIEW_PLAN.md §2.7). It is no longer a thin HTTP
+# wrapper: it decides which reviewer holds which clip, whether a submit is a retry or a second
+# opinion, whether a decision may overwrite another human's verdict, and which clips are silently
+# graded as spot checks. Those are exactly the "a silently-wrong answer does real damage" branches
+# this config exists for — a flipped comparison there loses a human's work rather than a number.
 examine_globs = [
     "src/quality/irt.rs",
     "src/quality/conformal.rs",
@@ -16,6 +22,7 @@ examine_globs = [
     "src/diff/**/*.rs",
     "src/normalizer.rs",
     "src/normalizer/**/*.rs",
+    "src/couch.rs",
 ]
 
 # --lib only. Integration tests need real ONNX models and a ~90s run; multiplied by hundreds of
@@ -35,7 +42,7 @@ additional_cargo_args = ["--lib"]
 # confidence. Widen this list if a survivor turns out to be covered elsewhere.
 # The leading "--" matters: these are filters for the TEST BINARY (libtest accepts several), not
 # for cargo. Without it cargo sees them as extra TESTNAME positionals and errors out.
-additional_cargo_test_args = ["--", "quality::", "diff::", "normalizer::", "wer::"]
+additional_cargo_test_args = ["--", "quality::", "diff::", "normalizer::", "wer::", "couch::", "db::tests::spot_check", "db::tests::reviewer_attribution", "db::tests::a_human_decision"]
 
 # The default 20x baseline multiplier is generous; these modules are pure CPU with no I/O, and a
 # mutant that makes them hang (an infinite loop in the EM) should be caught as a timeout quickly.

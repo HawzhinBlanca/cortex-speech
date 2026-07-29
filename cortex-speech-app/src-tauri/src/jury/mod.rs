@@ -443,6 +443,20 @@ pub fn record_human_decision(
     db.record_human_decision(segment_id, decision, corrected_transcript, timestamp_ms)
 }
 
+/// [`record_human_decision`] attributed to a named reviewer (Migration v43). Used by the multi-reviewer
+/// Couch Review server, where the token identifies WHICH human decided; `None` is the desktop's single
+/// unnamed reviewer.
+pub fn record_human_decision_by(
+    db: &Database,
+    segment_id: &str,
+    decision: &str, // "accept" | "edit" | "reject"
+    corrected_transcript: Option<&str>,
+    timestamp_ms: Option<i64>,
+    annotator: Option<&str>,
+) -> AppResult<()> {
+    db.record_human_decision_by(segment_id, decision, corrected_transcript, timestamp_ms, annotator)
+}
+
 /// The normalized word set of a transcript, for lexical-relevance scoring. Uses the char-only
 /// normalizer so orthographic variants (Kaf/Yeh/Heh) count as the same word.
 fn relevance_token_set(text: &str) -> std::collections::HashSet<String> {

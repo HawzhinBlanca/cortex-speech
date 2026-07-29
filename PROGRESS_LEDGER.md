@@ -1525,3 +1525,921 @@ clean; fmt clean; python-policies 43/43.
 - **5 owner-gated legs** (2 needing other people) and **8 owner-descoped distribution legs** —
   unchanged and not mine to move.
 - **The quiet week of real daily use.** Still the only signal that matters, and still ahead.
+
+## 2026-07-27 — iter 194 — Couch Review is multi-reviewer: named identities, attributed decisions, leased clips (2ce269c)
+
+**Owner asked whether the app could be used remotely by phone/web and "sent to users".** The honest
+answer was half-yes: Couch Review already served a phone page over LAN/Tailscale, but it was built
+for exactly ONE reviewer, and handing its link to a second person did not merely lack features — it
+silently broke three things. All three are now closed, each with its own fail-before gate.
+
+**1. Attribution (Migration v43, `speech_segments.reviewed_by`).** One shared token meant every
+decision landed anonymous: the corpus could not answer "who labelled this?". Each reviewer now has
+their own token; the token RESOLVES the identity server-side (an unknown token has no reviewer, so
+there is no path on which a decision can be written without a name); the name is written INSIDE the
+same transaction as the verdict. `NULL` = not attributed (pre-v43 row, undecided row, or a desktop
+decision where there is one human and no token naming them). **A fabricated "owner" was rejected** —
+a provenance column that invents its own values is worse than an empty one.
+
+**2. Per-reviewer undo (data loss).** ONE shared undo stack meant reviewer B's ↩ popped whichever
+decision was last GLOBALLY — usually A's, on a clip B had never seen, with no indication to either
+of them. Keyed by reviewer now.
+
+**3. Leases.** Without them both phones get the same head-of-queue clips: duplicated work, and one
+verdict silently overwriting the other. 15-minute lease on serve; another reviewer's queue skips it;
+a decision on someone else's live lease is REFUSED (409). Leases expire, so a closed tab never
+strands work.
+
+Also: one accept thread per reviewer (one reviewer = exactly the previous single-thread server),
+`recv_timeout` so every thread observes shutdown even if `unblock()` reaches only one; a failed
+second spawn tears down the threads that did start; export manifest gains
+`processingProvenance.reviewedBy` = `{byReviewer, notAttributed}`; the page shows WHICH reviewer it
+is recording as; `heldByOthers` stops the page claiming "Queue reviewed" when the work is simply
+held by someone else.
+
+**TWO OF MY OWN DEFECTS, found by writing the gates rather than by the compiler:**
+- A parallel `decision_log.annotator` column was written and **removed**. `decision_log` rows exist
+  only for decisions carrying a `timestamp_ms`, which the phone path does not send — the column
+  could never hold anything but NULL. It also broke three migration-replay tests: unlike
+  `speech_segments` (which v40 recreates), a second ALTER on an untouched table is not replayable.
+- The lease claim initially sat BEFORE validation in `api_decision`, so one malformed request would
+  lock a clip away from every other reviewer for the full TTL — **a denial of service by typo**.
+
+An export test also caught a wrong assumption of mine: it set `reviewed_by` as a struct field, but
+`insert_segments_batch` correctly carries no human-decision column. The test now EARNS the
+attribution through the real decision path.
+
+**Gates (verbatim):** `cargo test --lib` **1055 passed; 0 failed; 6 ignored**; clippy
+`--all-targets -D warnings` clean; `cargo fmt --check` clean; `npm run typecheck` 0 errors 0
+warnings; `npm test` **39 passed (39) / 214 passed (214)**; `python scripts/run_python_policies.py`
+**43 policy test scripts passed**.
+
+**Fail-before demonstrated for all four new guarantees** by targeted reverts (never `git checkout`):
+shared undo stack → `undo_is_per_reviewer_...` FAILED; lease check removed →
+`deciding_a_clip_another_reviewer_holds_is_refused` FAILED; `reviewed_by` dropped from
+`insert_segment_full` → `reviewer_attribution_survives_a_whole_row_upsert` FAILED; claim moved
+before validation → `an_unqueued_submit_..._leaves_no_lease` FAILED.
+
+**verify-10 at HEAD 2ce269c: VERDICT RED — 22 PASS, 1 FAIL, 1 SKIP-ENV.**
+The single failure is `exe-freshness`, and it is CORRECT: the app was running during this
+iteration, so the exe could not be relinked and still carries the previous commit's SHA
+(`a9b7b45` != HEAD `2ce269c`). Nothing about the feature is unproven by it — every other kept gate
+passed, including `test-rust` (422s), `fuzz-smoke` (671.9s), `refinery-lift` (37.0s), and
+`egress-runtime`. **RED is the honest verdict until the app is closed and rebuilt**; it is not
+downgraded here. `real-app-e2e` is SKIP-ENV (needs `CORTEX_AUDIO`), unchanged from prior runs.
+
+**WHAT THIS DOES NOT DO, and is not pretended:**
+- **Inter-annotator agreement is NOT enabled by this commit.** Leasing deliberately PREVENTS two
+  reviewers seeing the same clip, which is the opposite of what IAA needs. Real agreement requires
+  deliberate double-assignment plus a per-decision table; this schema holds one row per segment and
+  cannot express it. Surfaced, not half-built.
+- **Still plain HTTP**, token in the query string. Honest for a home LAN or a WireGuard tailnet;
+  it must NOT be port-forwarded to the public internet.
+- **No fair-share scheduler.** Whoever loads first takes up to 25 clips — bounded, self-correcting
+  (leases expire, batches drain), and now honestly reported via `heldByOthers`.
+- **OWNER REVIEW NEEDED:** three NEW Sorani strings (`settings.couchReviewers*` in `ckb.ts`) have
+  had no native review. They exist because `test_i18n_consistency.py` requires en/ckb key parity —
+  English-only fails the gate, and weakening the gate is not an option. Vocabulary is limited to
+  words already used elsewhere in that file.
+- The nightly CI jobs, the ~72 triaged mutants, the owner-gated legs, and the quiet week of real
+  daily use are all unchanged from iter 193.
+
+## 2026-07-27 — iter 195 — remote review taken to a professional bar: Phase 0-3 of docs/REMOTE_REVIEW_PLAN.md
+
+**Owner: "app is closed, start phase 0 and do all".** Phase 0 (rebuild), Phase 1 (1.1–1.6), Phase 2.1,
+Phase 2.7 and Phase 3.1–3.5 are shipped, each gated and each with a fail-before proof.
+Commits: `41a037e` (P1), `59c4604` (P2.1), `976d8b8` (P3), plus this entry's gate work.
+
+**P0 — exe rebuilt.** `npm run tauri build` succeeded in 7m57s at `cc7fadf`; the MSI bundled. Note the
+exe went stale again immediately, because every commit below changed source — a final rebuild is
+required before verify-10 can be GREEN, and that is stated rather than glossed.
+
+**P1.1 — the phone page was ENGLISH.** `<html lang="en">` with hardcoded "Looks good" / "Save & next"
+around an RTL textarea: an English chrome on a Kurdish-first app. Now opens in Sorani RTL with an
+English toggle. **13 of its 14 strings are copied BYTE-FOR-BYTE from Sorani a native speaker already
+reviewed** (review.acceptAsIs, review.saveNext, inbox.reject, review.undone, review.undoFailed,
+review.allDone, review.progress, review.editHint, inbox.status.{load,edit}Failed, saved). Only
+`heldByOthers` is new and it is flagged. New policy `scripts/test_couch_page_i18n.py` pins that: a
+sourced string must still match its desktop value exactly, the unreviewed set cannot grow silently,
+en/ckb keys stay in parity, and `{param}` placeholders match across languages.
+
+**P1.2/1.3/1.6 — reliability on a real phone.** Server-side idempotent re-submit (a retry no longer
+writes a second decision or distils a second DPO pair); localStorage drafts + an outbox replayed on
+reconnect; `POST /api/renew` heartbeat so a 15-minute lease cannot expire mid-correction; per-reviewer
+rate limiting (120/min, burst 60) — these HTTP routes were the ONE unthrottled path into the DB.
+
+**P1.4/1.5 — transport + prefetch.** Replay-2s, loop, 0.75–1.5x speed (persisted); next clip's audio
+warmed while the current one is reviewed.
+
+**P2.1 — GOLD SPOT-CHECKS, the item this whole plan turns on.** Every gate in this repo asks whether
+the MACHINE is honest; none asked whether the REVIEWER was. A clip a human already answered, served
+with its RAW (known-wrong) draft, separates listening from tapping with no synthetic data at all.
+Migration v44 `spot_checks` (PK (segment_id, reviewer), so a retry upserts). ~1 in 8 of each batch,
+unmarked and interleaved. **A spot-check submit writes ONLY to `spot_checks` — `speech_segments` is
+untouched**, so a blind accept cannot overwrite the answer key it is graded against. Surfaced in
+Settings (noticed/given + mean CER, worst first) and via new IPC `spot_check_report`.
+
+**P2.7 — gates extended to the phone surface.** `couch.rs` added to `.cargo/mutants.toml` (it now
+carries real decision logic, not HTTP plumbing). New `e2e/couch-page.spec.ts`: 7 tests including a
+WCAG 2.2 AA axe gate in BOTH themes — `e2e/axe.spec.ts` covered the desktop only, and the phone is the
+surface handed to people who are not the owner.
+
+**P3.1–3.5 — light/dark via CSS variables, adjustable Sorani text size (16–28px), swipe
+accept/reject, a session counter, and iOS home-screen standalone.** Scope corrected honestly: there
+is deliberately **no service worker and no manifest**, because service workers require a secure
+context and this is plain HTTP on a LAN/tailnet IP — Tailscale does not change that. Offline caching
+and Android installability are UNREACHABLE without TLS, which the plan rules out.
+
+**SIX DEFECTS FOUND, every one by a check rather than by reasoning:**
+1. **Late-submit overwrite (data loss).** The lease is released the instant a clip is decided, leaving
+   an already-decided clip unprotected: a stale page could silently replace another human's verdict
+   minutes later. Now 409, naming whose verdict is protected.
+2. **`hidden` was a no-op on the review card (pre-existing).** `#card` sets `display:flex`, which beats
+   the attribute's `display:none` default — the empty card rendered beside "all reviewed". Caught by
+   LOOKING at the page in a browser, not by any test.
+3. **Spot checks identified by row STATE broke ordinary reviewing.** A reviewer's own edit makes a row
+   human-verified, so their next submit was graded as a test and never written to the corpus. Now
+   identified by why the clip was HANDED OUT.
+4. **Floor division silently exempted short batches** from spot checks — a reviewer on a nearly-drained
+   queue was never measured. Now `div_ceil`.
+5. **`list_spot_check_candidates(0)` returned ONE** (limit tested after the push). Found because a
+   fail-before revert FAILED TO FAIL; chasing that instead of waving it through is the only reason it
+   surfaced.
+6. **Three real a11y violations**, found by the new axe gate: heading contrast 3.91:1 in light, meta
+   contrast 3.64:1 in dark, and **the transcript textarea had no accessible name at all** — a
+   screen-reader user reached an unlabelled edit field. All fixed; the label reuses `review.editHint`,
+   so it cost zero new unreviewed Sorani.
+
+**Gates (verbatim):** `cargo test --lib` **1061 passed; 0 failed; 6 ignored**; clippy
+`--all-targets -D warnings` clean; `cargo fmt --check` clean; `npm run typecheck` 0 errors 0 warnings;
+`npm test` **214 passed (39 files)**; `npx playwright test e2e/couch-page.spec.ts` **7 passed**;
+couch-page i18n policy: *"14 strings, Kurdish-first; 13 reuse natively-reviewed desktop Sorani
+byte-for-byte; 1 awaiting owner review"*.
+
+**Fail-before demonstrated** for every new guarantee by targeted revert (never `git checkout`):
+shared undo stack, missing lease check, `reviewed_by` dropped from `insert_segment_full`, claim before
+validation, idempotency removed, renewal ignoring the holder, rate limiter removed, spot-check routing
+removed, floor division, limit-after-push.
+
+**NOT DONE, and not implied:**
+- **The exe is stale again.** verify-10 cannot be GREEN until a final rebuild; it was RED on
+  `exe-freshness` alone at `2ce269c` (22 PASS / 1 FAIL / 1 SKIP-ENV) and nothing since has changed
+  that gate's status.
+- **Inter-annotator agreement is still NOT enabled** (plan §2.4). Spot checks measure ATTENTION, not
+  agreement; leasing prevents the overlap IAA needs on purpose. `scripts/agreement_kappa.py` exists and
+  is unit-tested — what is missing is a per-decision table and deliberate double-assignment.
+- **Spot checks are only as good as the gold behind them.** With few human-verified clips whose draft
+  is wrong, `checks` stays small; the panel reports the real count so that limit is visible.
+- **A mutation sweep over `couch.rs` is running and has already reported survivors** (the
+  `MAX_BODY_BYTES` and `LEASE_TTL` constants have no test pinning them). Not yet triaged.
+- Plan §2.2 (throughput panel + timestamps), §2.3 (audit log), §2.5 (two-browser e2e), §2.6 (soak with
+  injected network failure), §3.6–3.8 remain.
+- One new Sorani string (`heldByOthers`) plus the three `settings.couchReviewers*` and two
+  `settings.couchSpotChecks*` strings await a native read.
+
+## 2026-07-27 — iter 196 — Phase 2.4 / 2.6 shipped; verify-10 GREEN except the ledger gate itself
+
+Continues iter 195. Commits `0256dae` (P2.4 agreement export), `96f6945` (P2.6 soak + gold fix),
+`3cde966` (settings crash fix). Exe rebuilt twice; **`exe-freshness` now PASSES**.
+
+**P2.4 — inter-annotator agreement, and a scope correction.** The plan sized this as the LARGEST
+remaining item, needing a per-decision table and a double-assignment mechanism. **Both already
+existed.** Spot checks are deliberately NOT leased — measuring two people independently is the point —
+so the overlap a kappa study needs is already produced as a side effect, and `spot_checks` is already
+one row per (clip, reviewer). Only the export was missing. `Database::agreement_sample()` emits the
+exact TSV `scripts/agreement_kappa.py` consumes; a new IPC command writes it beside the library.
+**No kappa is computed in Rust** — the script is already unit-tested against the textbook κ=0.40
+example, and a second implementation would be an unverified copy of a verified one. Verified end to
+end: a TSV of the exported shape fed to the real script returned *"Cohen's kappa = 0.5000 (moderate)
+N=3 items, 2 raters"* — that proves the FORMAT; the 0.5000 is synthetic test data, not a measurement.
+With ≥3 reviewers the pair sharing the most clips is reported and the excluded raters are NAMED.
+
+**P2.6 — soak, and it found a defect I would not have looked for.** Three reviewers concurrently over
+real HTTP, every decision submitted twice. Clients reported **61 successes against 60 clips**: a clip
+a reviewer had JUST corrected became a spot-check candidate the moment they saved it, so the next
+reviewer was graded against **a peer's guess** and marked "did not notice" for merely disagreeing.
+Fixed by requiring `is_gold = 1` — an answer key has to actually be an answer key. Honest cost, now
+stated in the code: spot-check volume is bounded by the gold set, so a small gold set yields few
+checks; `checks` reports the real number.
+
+Two things the soak MEASURED rather than assumed, recorded in the test instead of worked around: the
+throttle does NOT fire during ordinary concurrent reviewing (leasing partitions the work), and
+`accepted <= decided` rather than equality (requiring equality would fail the test on the very retry
+behaviour it exists to prove). Stability confirmed 8/8 isolated + 5/5 whole-suite after the fix; it
+was 7/8 before.
+
+**A regression I introduced, caught only by the FULL e2e suite.** verify-10 went RED on
+`test-e2e+a11y`, and the failures were NOT my new phone-page spec (7/7 standalone) — they were
+`settings modal has aria-modal and role` and `settings panel opens and closes`. The e2e tauri mock had
+no case for `spot_check_report`, so `invoke` resolved to undefined, `spotChecks` became null, and
+`{#if spotChecks.length}` threw mid-render: **the entire settings dialog failed to mount.** A panel
+that merely REPORTS reviewer quality took down the settings the app depends on. Fixed on both sides
+(`?? []` in the component, an array in the mock).
+
+**Also fixed:** a cargo-mutants `--in-place` artifact I had committed in `39ccd55` (see `07f5724`) —
+`name.chars().count() < MAX_REVIEWER_NAME`, inverted, which would have rejected every reviewer name
+shorter than 40 characters. Rule recorded: **cargo-mutants `--in-place` is not a background job.**
+
+**verify-10 at `3cde966`: 21 PASS, 1 FAIL, 1 SKIP-ENV.** The single FAIL is `python-policies`, and it
+is *this gate*: `test_ledger_staleness` refusing commits without a ledger entry — which this entry
+answers. Everything else passed, including `test-rust` (397.3s), `fuzz-smoke` (966.6s), `test-e2e+a11y`
+(16.3s), `refinery-lift`, `egress-runtime`, and **`exe-freshness`**. `real-app-e2e` remains SKIP-ENV
+(needs `CORTEX_AUDIO`).
+
+**NOT DONE, and not implied:**
+- **verify-10 has not yet been observed GREEN end to end.** The two RED runs were `exe-freshness`
+  (stale binary) then `python-policies` (this ledger). Neither indicates a defect in the shipped work,
+  but *"GREEN"* is not claimed until a run actually prints it.
+- Plan §2.2 (throughput panel + timestamps), §2.3 (audit log), §2.5 (two-browser e2e — partially
+  covered by the Rust soak and the phone-page spec), §3.6–3.8 remain.
+- **The `couch.rs` mutation sweep has never completed.** The one run was aborted after it corrupted the
+  working tree; it reported 2 MISSED constants before dying, both now pinned. The full survivor list is
+  UNKNOWN and must not be described as clean.
+- Owner review still pending on: `heldByOthers`, `settings.couchReviewers*`, `settings.couchSpotChecks*`,
+  `settings.couchAgreement*`.
+- The nightly CI jobs and the quiet week of real daily use are unchanged from iter 193/194.
+
+## 2026-07-28 — iter 197 — verify-10 GREEN 23/23 (real audio); first completed mutation sweep; P2.2/2.3/3.7/3.8 shipped
+
+Commits `d1f531b` (STATUS regen), `afd6057` (P2.2/2.3/3.7), `4759030` (mutation kills), `c2302b2`
+(P3.8 cookie).
+
+**verify-10 is GREEN — 23/23, ZERO SKIPS, at `ad2d89e`.** The last skip was closed by driving
+`real-app-e2e` with real Kurdish audio (`CORTEX_AUDIO`, passed at runtime — never written into a
+tracked file). It is not a vacuous pass: the driver spawned the real exe on an ISOLATED data dir (it
+refuses the owner's `%APPDATA%` profile by design), applied migrations v1→v44, and reported
+*"Wrote run.jsonl with 144 segments … REAL-DATA RUN OK: 14 segments; first transcript 194 chars"*.
+`docs/STATUS.md` regenerated from that run — it had been claiming GREEN at `9228618`, many commits
+stale, which is dangerous precisely because it happened to be RIGHT.
+
+**THE FIRST MUTATION SWEEP THAT HAS EVER COMPLETED here.** In COPY mode, so the working tree is never
+touched — the earlier `--in-place` run is what corrupted the tree and got an artifact committed.
+Verbatim: **`946 mutants tested: 98 missed, 789 caught, 23 unviable, 36 timeouts`**. 29 survivors were
+in `couch.rs`; after two rounds of gates, **29 → 19 → 13 killed in total**. Each was invisible to
+1,066 passing tests:
+- **The routing table was never exercised.** Deleting the `/api/renew` or `/api/undo` arms changed
+  nothing — every test called the handlers DIRECTLY, so they stayed correct while becoming
+  unreachable. `/api/audio` needed a BAD id (its own 400) because "404 for an unknown id" cannot be
+  told apart from the router's 404 — which is why that guard survived the first fix.
+- **The body cap could TRUNCATE instead of refuse**: `take(MAX+1)`→`take(MAX-1)` makes an over-size
+  body read short, pass the `> MAX` check, and fail later as bad json — a truncated transcript
+  disguised as a parse error.
+- **A re-sent reject was uncovered** (only the edit retry was), so a retried reject would have been
+  recorded as a second human decision.
+- **The placeholder guard needs `&&` and nothing proved it.** With `||`, any transcript merely ENDING
+  in `]` would be refused. A rejects-only loop STRUCTURALLY cannot catch this — the bug refuses MORE —
+  so it needed an ACCEPT assertion. I first wrote that case into the rejects loop expecting 400, which
+  was wrong.
+- **The limits themselves were never tested**, only limit+1: `>`→`>=` would reject a legal 40-char
+  name or an eighth reviewer.
+
+**P2.2/P2.3 — checking the code changed the design twice.** The plan said "pass a timestamp into
+`decision_log`". Reading `stats.rs` first: it medians over a GLOBALLY ordered stream, so feeding
+concurrent reviewers in would time the gap between two DIFFERENT people and report it as one person's
+pace — poisoning a shipped number. And an ALTER on `decision_log` is not replay-safe (v40 recreates
+speech_segments; nothing recreates decision_log). So Migration v45 adds `review_events` instead:
+replay-safe, partitioned per reviewer by construction, existing metric untouched. I also expected
+§2.3 to be redundant and CHECKED: `corrections` covers only edits with resolvable audio,
+`decision_log` gets no phone rows, and neither records WHO — so it is not redundant.
+
+**P3.7 — my first revoke was a NO-OP and the compiler could not see it.** Each accept thread held an
+`Arc<HashMap>` SNAPSHOT of the tokens, so removing one left every serving thread honouring it forever:
+revoked in the UI, working in reality. The token map now lives in the one shared state the request
+path authenticates against. **And the fail-before for it PASSED at first** — the test had
+reimplemented the revocation inline instead of calling it. Extracted `revoke_in()` so the test drives
+the real path; only then did the no-op revert fail.
+
+**P3.8 — the token is out of the URL.** The page response plants `cortex_couch` (HttpOnly,
+SameSite=Strict, server-set so page JS can never read it) and the page strips `?t=` from the visible
+URL and history. Cookies also ride `<audio src>`, which cannot send a custom header — which is why a
+cookie and not an Authorization header. NO `Secure` flag, deliberately: on plain HTTP that would stop
+it being sent at all.
+
+**A regression I introduced and the FULL suite caught:** a null `spot_check_report` from the e2e mock
+made `spotChecks.length` throw mid-render and took the WHOLE settings dialog down (`3cde966`). My new
+spec passed 7/7 standalone; only `npm run test:e2e` saw it.
+
+**Gates (verbatim):** `cargo test --lib` **1066 passed; 0 failed; 6 ignored**; clippy
+`--all-targets -D warnings` clean; fmt clean; `npm run typecheck` 0 errors 0 warnings; `npm test` 214
+passed; `npm run test:e2e` **54 passed**; playwright couch-page 7 passed (zero axe violations, both
+themes); python-policies **44/44**.
+
+**NOT DONE / NOT CLAIMED:**
+- **The exe is stale again** (every commit since `ad2d89e` changed source). verify-10 was GREEN at
+  `ad2d89e`; it has NOT been re-run at the current HEAD.
+- **Remaining couch mutants are named, not rounded away:** `tailscale_ip` + its CGNAT guard need a
+  live tailnet (the UDP connect returns early without one, so the guard is unreachable); `lan_ip` only
+  affects a displayed URL; `start()`'s own wiring (`reviewers: tokens`, `is_running`) is untested
+  because start() binds the fixed port 8737 — a flake risk on this box worth weighing, not casually
+  adding; the spot-check interleave-position survivors are cosmetic placement.
+- **~69 long-standing survivors in diff/normalizer/g2p/conformal/irt/signal_anomaly** are unchanged
+  and still the documented hard tail.
+- Plan §2.5 (two-browser e2e) and §3.6 (waveform) remain. §2.5 is partly covered by the Rust soak.
+- **Seven Sorani strings await a native read** (`heldByOthers`, `settings.couchReviewers*`,
+  `settings.couchSpotChecks*`, `settings.couchAgreement*`, `settings.couchRevoke`,
+  `settings.couchThroughput`). "Remote 10/10" stays qualified while they do.
+- Nightly CI has still never run on a runner; the quiet week of real daily use is still ahead.
+
+## 2026-07-28 — iter 198 — the phone page was broken over the wire in two ways, and only a LIVE run found them (1758d1e, 475a1ca)
+
+**The exe finally matches HEAD.** `npm run tauri build` exit 0, both bundles produced. The stale
+`cortex.lock` left by force-killing the old process did NOT block startup — the flock fix from
+`4924a88` proved itself in production, which is the first time it has been exercised for real.
+
+**Then I stopped trusting the test suite and drove the real server instead.** Couch Review started
+via CDP against the running app (`start_couch_review`), both links issued including the Tailscale
+one, and a real headless iPhone-profile browser pointed at `http://<this-pc-tailnet-ip>:8737`. Everything
+the suite covers came back green — `ckb`/`rtl`, 25 clips, real Sorani text, token stripped from the
+URL, `cortex_couch` HttpOnly cookie set, zero console errors. **Two defects that no test could see
+came back with it.**
+
+**Defect 1 — every clip had an INFINITE duration.** `player.duration` and `seekable.end(0)` both read
+`Infinity`, so the phone's progress bar showed no total time and tap-to-seek multiplied by Infinity
+and silently did nothing. Raw wire capture:
+
+```
+HTTP/1.1 200 OK
+Content-Type: audio/wav
+Transfer-Encoding: chunked          <- and NO Content-Length
+```
+
+tiny_http chunks any body at or above its 32 KB default. Clips are 300–500 KB so every one crossed
+it; the JSON replies this suite is full of are 2–10 KB and sat comfortably underneath. That gap is
+the whole reason 1069 passing tests missed it. Fixed at the single choke point every reply passes
+through. The regression test uses a 200 KB body **deliberately** — at 1 KB it passes with the bug
+present.
+
+**Defect 2 — `stop()` reported a stopped server while still holding port 8737.** Settings → Stop →
+Start answered `os error 10048` and remote review stayed dead until the whole app was restarted.
+Measured, not inferred: the listener was **still LISTENing 120 s after `stop()` returned**, and a
+five-cycle stop/start loop against the live app failed on cycle 2.
+
+Root cause is Windows-specific and sits in a dependency: tiny_http parks a private accept thread in a
+blocking `accept()`, and *that thread*, not the `Server` value, holds the socket. `Server::drop` sets
+its close flag and wakes the thread by connecting to its own listening address — which is `0.0.0.0`,
+and on Windows connecting to `0.0.0.0` fails outright (it is a wildcard for BINDING, not a
+destination). The wake never landed. Worse, the port kept accepting TCP with nobody left to answer,
+so an old link didn't fail — it **hung**. My own HTTP probe is what accidentally freed the port
+mid-investigation, which is what made the first reading look like a race.
+
+**The existing start/stop test asserted the tokens died but never that the PORT came back.** It now
+re-starts the server, because restarting is what the owner actually does and what was broken.
+
+**Gates (verbatim, this machine, this HEAD):** `cargo test --lib` **1070 passed; 0 failed; 6
+ignored**; `couch::` **24 passed**; clippy `--all-targets -D warnings` clean; fmt clean; `npm run
+typecheck` **426 FILES 0 ERRORS 0 WARNINGS**; `npm test` **214 passed (39 files)**.
+
+**Measured on the live server (127.0.0.1 and the Tailscale address, both):** `GET /` 6.4 ms ·
+`GET /api/queue` 1.8 ms · `GET /api/audio/<id>` 82–111 ms for 330–460 KB clips. I had suspected the
+per-request full-file decode was a remote-UX problem and it is NOT — measured, not assumed, and the
+page already prefetches the next clip, so the cost is hidden anyway. **No cache was added.**
+
+**Live tailnet state:** `<this-pc>` = <this-pc-tailnet-ip> online; `<phone>` = <phone-tailnet-ip>
+online, `tailscale ping` **pong via DERP(fra) in 184 ms** (relayed, not direct). Tailscale adapter is
+categorised **Private**, and the `cortex-speech-app.exe` inbound rule allows Private — so the path is
+open. Review queue depth from the live DB: **128 unverified clips**, 16 verified, single source WAV
+present on disk.
+
+**NOT DONE / NOT CLAIMED:**
+- **CORRECTION to my own first reading: the spot-check pool is not merely empty, it is UNREACHABLE.**
+  I first wrote this up as "data state, not a code defect". That was wrong, and checking rather than
+  assuming is what caught it. `list_spot_check_candidates` requires `verified = 1 AND is_gold = 1`,
+  and **no production code path anywhere sets `is_gold = 1`** — every write of it lives inside
+  `#[cfg(test)]` (`couch.rs:1383`, `history/mod.rs:347,430`, `jury/learning.rs:689`), and the
+  migrations only ever declare it `DEFAULT 0`. The `gold_segments` table is a DIFFERENT thing (the
+  frozen eval set via `import_gold_segments`) and does not feed this flag. The live DB agrees: 0 gold
+  rows. So the proof-of-work centrepiece of plan §2.1 is structurally inert in any real install, and
+  no amount of reviewing will change that.
+
+  **FIXED in `3d1c418`, and without touching `is_gold` semantics.** The intent behind the flag was
+  right — an answer key must not be a peer's fresh guess — so I kept the guarantee and expressed it
+  with a column that is actually populated: `reviewed_by IS NULL`. `record_human_decision_by` sets
+  `reviewed_by` unconditionally to the deciding reviewer's name and ONLY the desktop path passes
+  `None`, so NULL means "verified here, by the owner". `is_gold = 1` is still honoured. This
+  deliberately does NOT mark anything gold, so the learning-set exclusion and export holdout
+  quarantine are untouched. The live library yields **15** usable answer keys immediately.
+
+  The old test had expressed "peer" as `is_gold = false` and never set `reviewed_by` — so it passed
+  against a query that could match nothing in production, which is exactly how a dead feature keeps a
+  green test. Its fixture now carries the column production writes. Fail-before: candidates left 2,
+  right 3.
+- verify-10 has NOT been re-run at this HEAD yet.
+- `start_issues_working_tokens_and_stop_takes_them_away` binds the real fixed port 8737, so it FAILS
+  while the app is running with Couch Review on. That is by design (a silent skip would restore the
+  blind spot) but it means verify-10 cannot be run during a live review session.
+- **No request has yet come from the phone itself.** Everything above was driven from this PC; the
+  inbound-from-another-device path is proven only as far as "the tunnel is up and the firewall
+  allows it".
+- **Seven Sorani strings still await a native read** (`heldByOthers`, `settings.couchReviewers*`,
+  `settings.couchSpotChecks*`, `settings.couchAgreement*`, `settings.couchRevoke`,
+  `settings.couchThroughput`). "Remote 10/10" stays qualified while they do.
+- Nightly CI has still never run on a runner; the quiet week of real daily use is still ahead.
+
+## 2026-07-28 — iter 199 — remote review is LIVE and proven on real data; two hardening passes taken while it runs (bf3c0c5, 8b9abbd)
+
+**Handed over working.** Exe rebuilt at `615501f`, freshness gate OK, app running, Couch Review
+serving over Tailscale. All three fixes from iter 198 verified ON THE LIVE SERVER, not in a test:
+
+- `Content-Length: 395340` now present on clip responses; a real headless iPhone-profile browser
+  reports **`duration: 12.353`** where it previously reported `Infinity`.
+- Five consecutive Stop→Start cycles succeeded (`stopMs` 6/18/26/27/28). Before the fix, cycle 2 died
+  with `os error 10048`.
+- The batch served **29 clips = 25 real work + 4 spot checks** (`div_ceil(25, 8) = 4`). Every check
+  had `reviewed_by = None` (owner-verified) and a draft that differs from the stored answer. One is a
+  textbook trap: served `500 لیترە`, answer `پێنج سەد لیترە`.
+
+Live page check over `<this-pc-tailnet-ip>`: page 23 ms, `ckb`/`rtl`, token stripped from the URL,
+`cortex_couch` HttpOnly cookie set, **zero console errors**. Tailnet: phone online, `tailscale ping`
+pong via DERP(fra) — 184 ms warm, 2.1 s on the first cold packet.
+
+**A concern I chased and DISPROVED, rather than "fixed".** One live spot check differs from its
+answer only by `ه` vs `ھ`, so I checked whether reviewers get marked wrong for orthographic variants.
+They do not: `noticed` compares the submission against the **draft** they were given, not against the
+answer, so any genuine correction counts as attention; agreement is a continuous CER, not pass/fail.
+`learning_text_key` deliberately keeps the variants distinct, which is right for CANDIDATE selection.
+No change made.
+
+**Hardening 1 (`bf3c0c5`) — the gate could not run while the app was being used.** The one test
+covering `start()`'s wiring bound the production port 8737, so `cargo test` failed with
+`os error 10048` whenever Couch Review was running: the project could not verify itself during
+exactly the daily use the gate protects. `start()` now delegates to `start_on_port()` and the test
+takes port 0. **The gate is not weakened** — the re-start assertion rebinds the SAME port, read back
+out of the issued URL (asking for another ephemeral port would pass even with the socket leak,
+because the OS would just hand out a different one), and `COUCH_PORT` is now pinned to 8737 by the
+constants test. Fail-before still catches the leak, now on port 51195. **Proven by running
+`cargo test --lib` to 1070 passed WITH the live server holding 8737.**
+
+**Hardening 2 (`8b9abbd`) — the most-repeated defect in this repo had no gate on the phone path.** A
+save path that treats `""` as a successful transcript and writes it over a good draft has been found
+and fixed twice elsewhere. couch.rs HAD the guards; nothing pinned them, so either could be deleted
+in a refactor with the suite still green. Now covered for empty / whitespace-only / newline-only on
+both `accept` and `edit`, plus the `[Pending WSL 7B ASR]` placeholder family — and, the half that
+actually matters, the stored row is asserted UNCHANGED afterwards. A refusal that still wrote would
+look like a working guard from the client's side and lose the data anyway.
+
+**Gates (verbatim, with the live server running):** `cargo test --lib` **1070 passed; 0 failed; 6
+ignored** (before iter-199 test additions), `couch::` **25 passed**; clippy `--all-targets -D
+warnings` clean; fmt clean; `npm run typecheck` **426 FILES 0 ERRORS 0 WARNINGS**; `npm test` **214
+passed**; `npm run test:e2e` **57 passed**; playwright couch-page **10 passed**; python-policies
+**44/44**; `cargo test --test soak` **passed in 143.69 s** standalone.
+
+**NOT DONE / NOT CLAIMED:**
+- **verify-10 has NOT completed at any HEAD today.** The run I started wedged: under `cargo test
+  --jobs 4` the pipeline soak was starved for 30 minutes (it passes in 143 s alone). I killed it. I
+  am NOT calling this GREEN, because no run produced that. `real-app-e2e` also cannot run while the
+  app is open — it spawns the exe and the single-instance lock refuses it — so a full sweep needs the
+  app closed.
+- **`npm run tauri build` exited 1 on the final rebuild** — MSI bundling only, `os error 32`, because
+  I launched the app while `light.exe` still held the exe. My race, not a code fault. The exe itself
+  compiled clean and the freshness gate confirms it is at HEAD. The NSIS/MSI bundles on disk are from
+  the PREVIOUS build; installer artifacts are descoped from personal use, but they are stale and I am
+  saying so rather than letting them look current.
+- **The exe is now behind HEAD again** (`bf3c0c5`, `8b9abbd` touched couch.rs). Both are test//
+  test-support changes and production behaviour on port 8737 is unchanged, so the running binary is
+  functionally current — but exe-freshness will fail until the next rebuild, which needs the app
+  closed.
+- **Still no request from the phone itself.** Everything is driven from this PC. The inbound path is
+  proven only as far as "tunnel up, firewall allows, adapter is Private".
+- **Seven Sorani strings still await a native read.**
+- Nightly CI has still never run on a runner; the quiet week of real daily use is still ahead.
+
+## 2026-07-28 — iter 200 — three more data-loss / work-loss paths on the phone page, found by reading failure paths rather than happy ones (ef3a7b7, b8bc3a3, 3fa7acb)
+
+All three were found the same way the iter-198 defects were: by asking what a REMOTE reviewer
+actually experiences when something goes wrong, rather than by running the suite. All three are fixed
+with a fail-before. The app stayed running and serving throughout — nothing here touched the live
+session.
+
+**`ef3a7b7` — an expired link silently destroyed queued work, and MY OWN FIX made it more reachable.**
+Fixing Stop→Start (iter 198) means restarting Couch Review is now easy, and every restart regenerates
+every token. A reviewer who was offline with decisions in the outbox reconnects to a 401 — and
+`flushOutbox` treated ANY status as "the server gave a real answer, drop it". Their queued decisions
+were discarded without a word. **401 is not a verdict on the decision; it says the LINK died**, and a
+fresh link replays it. 401 and 5xx are now kept; 409 (taken) and 400 (invalid) are still dropped,
+because those genuinely are answers about that decision. Fail-before: outbox 0, expected 1.
+
+The page also rendered this as `Failed to load queue: unauthorized` — the operative word in ENGLISH,
+on a Kurdish-first page, with no hint that the fix is to ask for a new link. 401 now gets its own
+message, which can honestly promise nothing is lost only BECAUSE of the outbox change above.
+
+**`b8bc3a3` — the sibling, and the likelier half.** A link does not usually die while the reviewer is
+idle; it dies WHILE THEY ARE WORKING, because the owner restarted the server or added a reviewer.
+`flushOutbox` had been taught to keep a 401, but `decide()` never queued one at all: a 401 on submit
+only raised a toast. The reviewer's typed text survived as a draft, and the VERDICT — accept, reject,
+edit — was recorded nowhere and simply lost, for every tap after that moment. Now held exactly like
+the offline case, with the reviewer moved on so they can keep working. Fail-before: held 0, expected 1.
+
+**`3fa7acb` — an ACTIVE reviewer could still lose their clip.** Renewal ticks are skipped while the
+page is hidden (deliberate — an idle reviewer should release clips), but the tick is 4 minutes
+against a 15-minute lease, and on a phone backgrounding is constant. A reviewer returning at minute
+13 has the lease lapse under them at 15 while they are typing, with no renewal due until 16; another
+reviewer takes the clip and their correction is refused 409 at save. Now renewed on return. The test
+pins BOTH directions — a listener that also fired on hide would quietly defeat the release-when-idle
+property. Fail-before: renewals 0, expected 1.
+
+**A gate I had to change, stated plainly rather than buried.** The port refactor (`bf3c0c5`) moved
+`start()`'s body into `start_on_port`, and `test_restore_reservation_gate.py` scans a named function
+for the restore fence — so it failed. I did NOT hoist the check back into `start()`: that would
+satisfy the scan while moving the check OUTSIDE the `COUCH` lock, and the entire atomicity argument
+is that the check and the handle register are serialized by the same mutex the restore fence reads.
+The gate now scans `start_on_port` and additionally asserts `start` still delegates to it. **Verified
+the gate still bites** by deleting the guard (it fails).
+
+**Gates (verbatim):** playwright couch-page **13 passed**; `npm run test:e2e` **60 passed**;
+python-policies **44/44**; `cargo test --lib couch::` **25 passed**; `cargo test --lib` **1070
+passed** (run WITH the live server holding 8737 — the point of `bf3c0c5`); clippy `--all-targets -D
+warnings` clean; fmt clean.
+
+**NOT DONE / NOT CLAIMED:**
+- **Still zero remote reviews.** `review_events` = 0, `spot_checks` = 0, 128 clips pending. The
+  inbound-from-the-phone path remains the one thing nothing on this PC can prove. A monitor is armed
+  on the audit trail to catch the first one.
+- **verify-10 has not completed at any HEAD today.** It needs the app CLOSED — `real-app-e2e` spawns
+  the exe and the single-instance lock refuses it.
+- **The exe is behind HEAD.** The running binary has the three iter-198 fixes; everything in iter 199
+  and 200 (`linkExpired`, both outbox fixes, the lease renewal) needs a rebuild, which is not being
+  done under a live session.
+- **`linkExpired` is NEW Sorani** and is acknowledged in `UNREVIEWED_SORANI` — now 2 keys awaiting a
+  native read, up from 1. The other seven desktop-sourced strings are unchanged.
+- The on-disk NSIS/MSI installers are stale (the last `tauri build` exited 1 on MSI bundling, my race
+  with launching the app).
+
+## 2026-07-29 — iter 201 — the durable-remote-use ask: links now survive closing the app; plus a returning-reviewer lockout and three loop finds (74437c6, 8ef685a, 120ff6f, 2a50a49, d151afa)
+
+**Owner ask, verbatim intent: "whenever I want, from my phone or laptop, I open it and review — without
+coming back to this PC."** Two separate defects stood in the way; both are fixed with fail-befores.
+
+**1. `74437c6` — a returning reviewer was locked out by an EMPTY token shadowing their cookie.**
+Reported as "I close the browser on my iPhone and go back and it doesn't open." Reproduced with a real
+browser: the page strips `?t=` after the first load and relies on the HttpOnly cookie — but it kept
+appending `?t=` (empty) to every request, and the server reads query-before-cookie, so `""` was
+treated as a supplied-but-WRONG credential and the valid cookie in the SAME request was ignored.
+Measured on the wire: `cookie, no t=` → 200; `cookie + empty t=` → 401. Every piece was individually
+correct, which is why no test saw it — the defect only exists in the combination a second visit
+produces. Fixed both sides (server: empty `t=` counts as absent; page: a single `withToken()` omits
+the param entirely), and pinned end-to-end. A NON-empty wrong token still fails — falling back to the
+cookie there would let a revoked link keep working.
+
+**2. Session persistence — closing the app no longer kills every link.** Tokens were per-session by
+design ("never persisted"), which is airtight and unusable: every app restart meant walking back to
+the desktop for a fresh URL. The new distinction is between the two ways a session ends: **closing
+the app is not an access decision** (nothing calls `stop()` on exit) so the session is remembered
+(`couch_session.json`, tokens DPAPI-protected at rest like API keys, atomic replace on write);
+**pressing Stop IS the decision** and deletes the file, so "stopping revokes every link" stays
+literally true — and the revoke now provably survives a restart. Resume happens in `.setup()` at app
+launch, best-effort (a bind failure must not stop the app opening). A session remembered against a
+DIFFERENT library refuses to resume. Pinned by `a_link_survives_closing_the_app_but_not_pressing_stop`.
+
+**Honest cost, stated not hidden:** links are now long-lived credentials. Anyone holding one can
+review until Stop/revoke. The file is DPAPI-bound to this Windows user so copying it off-machine
+yields nothing.
+
+**A test-interaction bug I introduced and fixed in the same sitting:** the new start/stop test and the
+existing one both drive the global `COUCH` singleton; in parallel they steal each other's server.
+Reproduced 3-for-3, serialized with a test-local lock, stable 3-for-3 after.
+
+**Also this ledger entry: loop iterations 1–4** (details in each commit): `8ef685a` the dashboard
+counted clips the export refuses to publish — 7th instance of the recurring count bug, caught by
+cross-checking stats against the REAL export output; `120ff6f` v46 — a reviewer's spot-check score
+now survives deleting the clip it was measured on (the v45 principle applied to the table it named);
+`2a50a49` the aligner now reports a vocabulary with no word-delimiter token (found: two copies of
+mms_aligner_tokens.txt differing by ONE trimmed byte); `d151afa` pinned the UI-thread retry budget in
+stop()'s listener release (~600 ms measured worst case, 1.5 s budget).
+
+**Live-session verification this morning:** rebuild at `d151afa` → v46 applied on the real library
+(score preserved byte-identical, FK gone, integrity ok) → fresh couch session served **4 fresh spot
+checks, zero repeats** (the answered trap correctly excluded — with the old binary it would have been
+re-served and overwritten the honest score).
+
+**Gates (verbatim):** `cargo test --lib` **1078 passed; 0 failed; 6 ignored** (couch:: 28, 3× stable);
+clippy `--all-targets -D warnings` clean; fmt clean; playwright couch-page **14 passed**; `npm run
+test:e2e` **61 passed**; python-policies **44/44**.
+
+**NOT DONE / NOT CLAIMED:**
+- **The exe predates everything in this entry** — the durable-link system, the returning-reviewer
+  fix, and the aligner guard are source-only until the next rebuild.
+- **Resume-at-launch has not yet been observed in the running app** (unit-tested only); it will be
+  verified on the next real launch cycle.
+- The two MSI bundle failures today were MY race (launching the app while light.exe still held the
+  exe); installers on disk are stale. The compiled exe itself was verified at HEAD both times.
+- verify-10 still has not completed at any HEAD since `7d77fb5`.
+- `linkExpired` + `heldByOthers` still await a native Sorani read.
+
+## 2026-07-29 — iter 202 — public-links plan phases 1/2/3/4/6 executed and live-verified; phase 5 at the owner's gate (625e8b1, 525ece3, 1efd8d4, d1f9663, ee8a106)
+
+The plan (`docs/REMOTE_PUBLIC_LINKS_PLAN.md`, from the 12-agent research workflow) went from paper to
+running system in one sitting. Everything below was verified against the LIVE server after one
+rebuild, not claimed from tests alone.
+
+**Phase 1 (`625e8b1`)** — the repo stopped lying: couch.rs header + runbook said tokens are "never
+persisted" and closing the app revokes links — the opposite of shipped behaviour. Acceptance grep
+went 2 hits → 0 (the plan estimated 3; the real count was 2, recorded as counted).
+
+**Phase 2 (`525ece3`) — fragment links.** Issued URLs now carry `#t=`, which a browser never sends to
+any server: a link pasted into WhatsApp/Telegram hands the platform's preview bot the EMPTY shell,
+not a durable credential to biometric audio. `GET /` and `POST /api/claim` are the only
+credential-free routes (the shell embeds nothing; the claim moves the fragment token into the
+existing HttpOnly cookie, once). Sliding cookie on authenticated page loads. Deliberately NOT
+single-use — the preview bot fetches before the human taps, so a one-shot link would be burned by
+the bot. Legacy `?t=` stays until the same commit that enables public exposure. LIVE: bot's-eye
+`GET /` → 200, 35,564 b shell, **no Set-Cookie**; claim → cookie → `/api/queue` 200 with 29 items.
+
+**Phase 4 (`1efd8d4`) — restarts stopped eating spot-check scores.** Durable links made restarts
+routine, and a check served before one became unanswerable after it (409 "already reviewed at the
+desktop", score silently lost — the fail-before reproduced EXACTLY that). The served set now rides
+the session file (plaintext by design — it is a list of which clips were handed out, not a
+credential) and rehydrates at start. Undo stacks and leases deliberately NOT persisted, per plan.
+
+**Phase 6 (`d1f9663`)** — 512px icon + manifest served by the router (public like the shell;
+`start_url` is `/` and NEVER a token, pinned by test — an installed app must die with its revoke),
+and Screen Wake Lock on play (inert on plain HTTP, alive on the coming ts.net URL). Service worker
+deliberately OUT. LIVE: `/icon.png` 200 image/png 3,598 b; `/manifest.json` start_url "/".
+
+**Phase 3 (`ee8a106`) — the watchdog, with my own first-draft bug caught before it shipped.** A dead
+port with a live process has two meanings only `couch_session.json` distinguishes: file present =
+wedged (kill + relaunch; flock clears the stale lock), file absent = the owner pressed Stop, and
+killing a healthy app every 5 minutes would make Stop feel haunted — which is precisely what my
+first draft did. Registered via schtasks (every 5 min, interactive-only; the CIM path is
+access-denied unelevated). **Crash drill passed live:** force-killed the app → watchdog script →
+same link serving 29 clips, watchdog.log showing "session expected but app not running -
+relaunching". The task was DISABLED during the rebuild window — a watchdog launch mid-bundle is the
+exact os-error-32 race hit twice yesterday — and re-enabled after.
+
+**Resume proved twice more, the hard way:** the pre-phase-4 session file (old schema, no
+spot_checks field) resumed under the new binary via serde(default) with the SAME token — the owner's
+saved link survived a schema change, a rebuild, a force-kill, and a watchdog revival unchanged.
+
+**Gates (verbatim):** `cargo test --lib` **1080 passed; 0 failed** (couch:: 30); clippy
+`--all-targets -D warnings` clean (after factoring a `RememberedSession` type alias); fmt clean;
+playwright couch-page **15 passed**; `npm run test:e2e` **62 passed**; python-policies **44/44**;
+exe-freshness OK at `ee8a106`; `npm run tauri build` exit 0 WITH bundles this time (the watchdog
+disable closed yesterday's race).
+
+**NOT DONE / OWNER-GATED:**
+- **Phase 5 is parked at a literal URL only the owner can click:** `tailscale serve` answered
+  "Serve is not enabled on your tailnet" with an enablement link (surfaced in chat). After that:
+  serve → verify over ts.net → funnel (its own approval) → remove legacy `?t=` in the same commit →
+  Settings shows the ts.net URL. Until then, "send to someone with nothing installed" is DESIGNED
+  and CODE-READY but NOT true.
+- `cortex-once-admin.ps1` (fast startup, NIC power, active hours, disk timeout) needs one elevated
+  run by the owner; auto-login is the owner's personal step by design.
+- The watchdog's Stop-is-respected branch is reviewed but NOT drilled live — the drill would revoke
+  the owner's real link (Stop deletes the session). Stated, not skipped silently.
+- The reboot drill (full restart → link back within ~2 min) awaits a natural reboot; the crash drill
+  stands in until then.
+- Two Sorani strings still await native review; verify-10 still not run at today's HEADs.
+
+---
+
+## Iteration 203 — the "are you sure?" audit: 33 confirmed defects, 2 fixed, 1 false all-green corrected
+
+**Trigger:** the owner asked whether the system was actually robust. Answering from memory would have
+been worthless, so the answer was re-derived from the live machine and an adversarial audit.
+
+**A claim of mine was wrong and is corrected here.** `test_restore_reservation_gate.py` was RED **at
+HEAD**, and had been since durable sessions gave `couch::start` its `data_dir` parameter: the gate
+asserts on the literal one-line body `start_on_port(db_path, reviewers, COUCH_PORT)`, which stopped
+matching and made the gate *raise on every run instead of checking anything*. Iteration 202 reported
+"python-policies 44/44". That report was false. Verified by `git show HEAD:...couch.rs | grep -c` =
+**0**. Repaired to the real signature — kept exact rather than loosened to `"start_on_port(" in couch`,
+which would pass even if `start` grew a real body (the exact bypass the gate exists to catch) — and
+extended to `resume`, the other way into a running server and the one the app takes unattended at
+every watchdog launch. Now genuinely **44/44**.
+
+**Adversarial audit:** 8 undrilled failure modes (queue exhaustion, token revocation, lease collision,
+DB contention, audio delivery, authz boundary, resume integrity, watchdog holes), each finding faced
+3 independent refuters on distinct lenses. 149 agents, 47 raw findings, **33 confirmed**, 1 contested,
+0 unjudged. The top findings were then re-verified by hand against the source — the agents were not
+taken at face value, and one of their two "critical" DB-contention findings was correctly refuted on
+reachability by its own skeptic.
+
+**Fixed 1 — revoke was not durable (critical, security).** `save_session` had exactly two call sites
+(start, batch-serve) and `revoke_in` was neither, so a revoked token stayed in `couch_session.json`
+and `resume()` **re-issued the same token to the same name**: a lost phone regained access to Art. 9
+audio at the next launch, which the watchdog performs unattended every 5 minutes. It was also
+nondeterministic — the batch-serve save fires only when some *other* reviewer's batch serves a
+brand-new spot check, so the same owner action sometimes stuck. Now persists under the
+snapshot-under-lock / write-outside-lock shape; `save_session` returns `Result` so a failed write is
+reported (access is already denied in memory, so this is not a rollback — it is "revoked" vs "revoked
+until the next restart", and an owner revoking a lost phone must be told which). `resume` gained a
+port-injected twin for the same reason `start` did. **Fail-before proven:** without the persist the
+new test's `resume()` returns `["Hemn", "Sara"]`.
+
+**Fixed 2 — reviewers capped at 25 clips and were told the corpus was finished (high).** `load()` had
+two call sites, neither on batch drain, so the page went straight to "All clips reviewed!". Measured
+against the real library: **116 pending**, so a reviewer did 25 and was lied to about 91. The page is
+an installable standalone PWA with no address bar, so the only escape — a manual reload — was not
+reachable either. `show()` now refetches; `exhausted` breaks the recursion and only an empty answer
+draws the finished state. **Fail-before proven** (spec line 189). Test pins both halves, including
+that it STOPS rather than spinning a phone radio on a drained corpus.
+
+**ARSO (ops).** `cortex-once-admin.ps1` gained auto-sign-in-after-update-restart plus a read-only
+BitLocker pre-boot probe. Measured first: `ARSOUserConsent` unset, `AutoAdminLogon=0`,
+`HiberbootEnabled=1`, active hours unset. ARSO gives the necessarily interactive-only watchdog a
+logged-on-but-LOCKED session after update reboots — recovered and still secure, with no password
+stored. **Correction to iteration 202:** autologin was called "optional"; for full reboot coverage it
+is mandatory, and ARSO covers only the update-initiated case. Nothing in this repo touches the
+account password; autologin stays an owner step.
+
+**Live verification after rebuild:** the pre-rebuild link still authenticates (same token, `Hawzhin`,
+29 items = 25 work + 4 interleaved checks); the page served by the running binary is **byte-identical**
+to the source asset (sha256 `ae21d65463c62aeb`, 37220 bytes both sides), which is the real proof the
+`include_str!` fix shipped rather than a stale binary. Watchdog disabled across the build window and
+re-enabled (Enabled, last result 0).
+
+**Gates (verbatim):** `cargo test --lib` **1081 passed; 0 failed**; clippy `--all-targets -D warnings`
+exit 0; `npm run test:e2e` **63 passed**; couch-page **16 passed**; python-policies **44/44** (for the
+first time honestly); `svelte-check && tsc` 0 errors; exe-freshness OK at `487f736`; `npm run tauri
+build` exit 0 with both bundles.
+
+**NOT DONE — 31 confirmed findings remain unfixed.** Notably: the outbox deletes a reviewer's typed
+correction on a 409 with no notification after having told them "Saved"; `held_by_others` skips the
+un-leased remainder without counting it (the refetch hides this rather than correcting it); a clip
+whose audio file is missing traps the reviewer with no skip, where both exits write a false verdict;
+a stale persisted spot-check pair silently swallows a real review and answers 200; undo restores a
+stale whole-row snapshot that clobbers a later desktop edit; and the watchdog's 5 s probe is shorter
+than the server's own 10 s DB `busy_timeout`, so a healthy-but-busy app can be force-killed. None of
+these are fixed and none should be assumed benign.
+
+**Still owner-gated:** Tailscale Serve enablement (Phase 5, `tailscale serve status` = "No serve
+config", so sharing outside the tailnet remains untrue); one elevated run of `cortex-once-admin.ps1`;
+autologin if power-cut coverage is wanted. `loadingMore` joins `heldByOthers` and `linkExpired`
+awaiting native Sorani review. verify-10 still not run at this HEAD.
+
+---
+
+## Iteration 204 — working the audit list: 20 of 33 findings closed, every fix fail-before proven
+
+Continuation of iter 203's audit. Each fix below was proven by breaking it first and watching the new
+test fail with the predicted symptom, then restoring; the fail-before output is quoted per item.
+
+**The submit/outbox cluster — where the corpus was losing human labour.**
+- *A busy database gave the clip away.* A failed write released the lease ("nothing was written, so
+  hand it straight back"), so the next batch took it within seconds and the reviewer's outbox replay
+  was refused 409 — the branch that discards the decision. Transient error, permanent loss. Driven by
+  the real trigger: a second connection holding the write lock until `busy_timeout`. FAIL-BEFORE:
+  holder `None` instead of `Sara`.
+- *An interrupted decision was replayed whole.* One decision is two non-atomic writes; the retry guard
+  keyed on `verified`, which only the SECOND sets, so it could not recognise its own half-written row.
+  FAIL-BEFORE: learning pairs **1 -> 2** — a duplicate DPO pair from one human edit, plus a
+  `correction_memory` hit_count bumped as though an independent segment had confirmed it, which with
+  the self-confirmation would carry an unconfirmed memory to 0.667 and past BOTH firing gates. Made
+  deterministic via the validation asymmetry the fault exploits (write one is a plain UPDATE; write
+  two runs `validate_segment`, which rejects a UNC `audio_path`). Now the interrupted write is
+  FINISHED, not repeated.
+- *Attribution could be stolen.* `localStorage` is per-origin, not per-reviewer. Queued decisions now
+  name their author and the server refuses a mismatch. Verified live on the running server:
+  `409 this decision was made by Hemn, not Hawzhin`, with the clip left `verified=0`, `reviewed_by=NULL`.
+- *"Saved" was a lie and the draft was deleted.* An offline save now says QUEUED. A refused replay
+  still drops the queued decision (retrying cannot change a real answer) but KEEPS the typed text and
+  raises a persistent banner.
+
+**Undo and spot checks.**
+- Undo restored a never-refreshed whole-row snapshot, erasing any later desktop edit. Now refuses 409
+  naming who would lose work, and keeps the undo entry rather than consuming it on the refusal. The
+  restore-failure branch also dropped the only copy of the pre-decision row; pushed back now.
+- A persisted spot-check pair could outlive its answer key (un-verify or re-transcribe clears
+  `verified`), after which a REAL review was graded against a key that no longer existed, answered
+  200, and wrote nothing — permanently, every batch. Gated on `prev.verified`; stale pairs dropped.
+
+**Leases.** `api_queue` leases the whole batch with ONE timestamp while the page heartbeat renewed
+only the clip on screen — 36 seconds per clip at QUEUE_BATCH=25. The tail lapsed under the reviewer
+mid-session. A renew now refreshes everything that reviewer holds. FAIL-BEFORE: `s1` holder `None`.
+
+**The watchdog — five defects in the thing whose whole job is availability.**
+- Single 5s probe against a server with a 10s `busy_timeout` and one accept thread per reviewer: a
+  transport timeout read as "dead", so the BUSIER the reviewer the likelier a healthy app was
+  force-killed mid-review. Now 3 attempts at 20s; worst-case detection 70s against a 300s repetition.
+- Kill loop: a present session file does not mean couch CAN start (port taken, library moved), so it
+  killed and relaunched into the same condition every 5 minutes forever. Capped at 3, then it stops
+  and says the owner is needed; the counter resets when the server answers.
+- Killed by process NAME, so a second checkout or an installed copy was fair game while the relaunch
+  only ever started this one. Matched on full path now.
+- A failed log write aborted the run BEFORE the kill/relaunch — the condition most likely to take the
+  app down also disabled its healing.
+- **Measured on the live task, not inferred:** `DisallowStartIfOnBatteries` and
+  `StopIfGoingOnBatteries` were both **True**, which disables the watchdog whenever Windows believes
+  it is on battery — a desktop behind a UPS included. Flipped on the running task and in `-Register`.
+
+**The drained state.** Undo lived inside the card and vanished exactly when the reviewer wanted to
+take back their last decision; the audio kept playing behind the empty state (forever with loop on);
+the header read "Clip 26 of 25"; and "All clips reviewed!" was shown OVER unsent outbox work — telling
+someone they were finished at the moment closing the page would have cost them everything. All four
+closed. A clip whose audio will not load now offers a SKIP that writes nothing, instead of a trap
+whose only two exits are accept (an unheard draft promoted to gold) or reject (a good clip excluded).
+
+**Learning system, measured on the real library (owner asked whether corrections actually teach it):**
+22 human edits -> 22 `agent_examples` pairs, 1:1, none lost, and those ARE used as few-shot exemplars
+in the refine path. LOOP-0 correction memory IS wired into live transcription (`pipeline.rs`), but is
+dormant: **101 memories, every one at confidence 0.500, hit_count 0, `last_fired_at` NULL on all 101**
+— nothing has recurred across only 22 edits, and a new memory starts below `tau_conf` on purpose. DPO
+is EXPORT-only; model improvement is a deliberate offline retrain, not automatic. Reviewing the 116
+pending clips is what starts the memory loop.
+
+**Gates (verbatim):** `cargo test --lib` **1087 passed; 0 failed** (couch:: 37); clippy
+`--all-targets -D warnings` exit 0; fmt clean; `npm run test:e2e` **68 passed**; couch-page **21**;
+python-policies 44/44; `npm run tauri build` exit 0 with both bundles; exe verified at HEAD after each
+rebuild, and the pre-rebuild link re-authenticated every time (same token, 29 items).
+
+**NOT DONE.** ~13 findings remain, now mostly medium/low: torn `couch_session.json` write from
+concurrent accept threads (refuted 2/3 on reachability, asymmetry real); a couch thread that cannot
+open the DB exits leaving 8737 bound with no responder; undo history is process-local so a relaunch
+strands the last decision; `held_by_others` still does not count the un-leased remainder (the refetch
+hides this rather than corrects it); no spinner before the first queue resolves. Owner-gated as
+before: Tailscale Serve enablement, one elevated `cortex-once-admin.ps1` run, autologin if power-cut
+coverage is wanted. **Eight** Sorani strings now await native review. verify-10 still not run at HEAD.
+
+**Addendum to iter 204 — three more closed.**
+- *A couch thread that could not open the library left port 8737 bound and mute.* Its only recourse
+  was `return`, so connections landed in the listen backlog and were never answered: every phone hung
+  instead of failing fast, and the watchdog saw an unreachable port that restarting could not fix. The
+  library is now opened BEFORE anything binds, turning it into an honest error on Start, and a
+  per-thread failure signals shutdown rather than leaving a socket nobody serves.
+- *`save_session` wrote through one fixed temp filename from any accept thread, unlocked.* Refuted 2/3
+  on reachability and shipped anyway as cheap insurance: an unparseable session file is unrecoverable
+  (load_session gives up silently, resume returns None, every link already sent is dead). Unique temp
+  name per write, plus a concurrency test — 8 threads x 10 saves with deliberately different payload
+  lengths, asserting the promoted file always parses and no temp files accumulate. Confirmed stable
+  5-for-5 standalone before shipping, per the known Windows FS write-then-read flakiness.
+- *Offline decisions replaying under whichever reviewer opened the browser next* was closed by the
+  attribution stamp above; counted once, not twice.
+
+**Gates after the addendum:** `cargo test --lib` **1088 passed; 0 failed** (couch:: 38); clippy exit 0;
+fmt clean; `npm run test:e2e` **68 passed**; couch-page **21**; python-policies 44/44.
+
+**Second addendum to iter 204 — the blank first screen.** Both panels start hidden, so until the first
+`/api/queue` resolved the reviewer saw nothing at all. On a phone on weak signal — the normal case for
+this surface — a blank screen is indistinguishable from a dead link, at the moment someone is most
+likely to give up and message the owner. It now says it is loading, reusing the refill string (retitled
+"Loading clips…" so it reads correctly in both places rather than adding a ninth unreviewed Sorani
+string). couch-page **22 passed**; python-policies 44/44.
+
+**Judged NOT worth changing, with reasons, rather than left as silent debt:**
+- `held_by_others` skipping the un-leased remainder is now COSMETIC. The empty state only renders when
+  the server returns zero items, and at that point the remainder is zero by construction — the refetch
+  closed the user-visible half. The counter is still semantically wrong and is left recorded here.
+- A spot-check answer queued across Stop/Start is still lost. Stop is a deliberate full revoke that
+  clears the session, so a new session legitimately knows nothing about the old check; the reviewer is
+  now TOLD (refused-decision banner) instead of losing it silently, which was the actual defect.
+- Undo history dying with the process is benign in practice: the button is hidden while
+  `doneThisSession` is 0, so a relaunched page does not offer an undo it cannot honour.
+
+---
+
+## Iteration 205 — sherpa-onnx LM fusion: NOT available. LOOP-0: measured, and it is inert by design.
+
+Both items the owner asked for, and both overturned a recommendation I had made in chat.
+
+**LM fusion is NOT reachable on this stack — my "biggest gap" advice was wrong.** Verified against the
+vendored crate source, not documentation:
+- `sherpa-onnx 1.13.2`, and `asr.rs:315` builds `OfflineRecognizerConfig { decoding_method: "greedy_search" }`
+  around `OfflineOmnilingualAsrCtcModelConfig`.
+- `OfflineLMConfig` EXISTS but is `{ model: Option<String>, scale: f32 }` — a neural ONNX LM for
+  transducer beam search, not an n-gram, and not wired to the CTC path.
+- The n-gram/HLG route is `CtcFstDecoderConfig`, and in 1.13.2 it exists **only** as
+  `OnlineCtcFstDecoderConfig` (streaming) in both the safe crate and `sherpa-onnx-sys`. There is no
+  offline equivalent to bind.
+So "build a KenLM from the corrections and fuse it into decoding" is not a small change here; it needs
+a different decode path (e.g. an offline re-transcribe pass outside sherpa), not a config flag.
+Also found and previously unnoticed: `hotwords_file`/`hotwords_score`, `rule_fsts`/`rule_fars`,
+`blank_penalty`, and an `hr` homophone-replacer are all exposed on the offline config. Whether hotwords
+do anything for a CTC model is UNVERIFIED and must be measured before being claimed.
+
+**`src-tauri/src/bin/loop0_eval.rs` (new) — the correction layer is now measured.** Read-only, opens
+the library read-only on purpose, and scores raw ASR against human gold before and after firing.
+**Leave-one-out is enforced**: every memory was extracted FROM some segment, so a memory is excluded
+from the clip it came from — otherwise every number is self-confirmation.
+
+Measured on the real library (26 scorable clips, 101 memories, mean CER of the raw draft **0.0562** —
+this library's own verified clips, NOT the frozen eval set, so it is not comparable to the 7.03%
+champion figure):
+
+| rule | clips rewritten | improved | worsened | mean CER after | verdict |
+|---|---|---|---|---|---|
+| ARMED (shipped gates) | 0 / 26 | 0 | 0 | 0.0562 | INERT |
+| gates bypassed, exact context | 0 / 26 | 0 | 0 | 0.0562 | INERT |
+| either neighbour | 0 / 26 | 0 | 0 | 0.0562 | INERT |
+| neighbours ignored | **26 / 26** | **0** | **26** | **0.1383** | **HARMFUL (+0.0820)** |
+
+**What this proves, and it is not what I expected.** The confidence/hit gates are NOT what keeps the
+layer quiet — bypassing them changes nothing. The `slot_key` is `"{left}|{right}"` and the firing rule
+demands an EXACT bigram-context match, so a memory can only fire when the same two neighbouring words
+recur; at 764 corrected words that never happens out-of-sample. And loosening it is not the fix:
+dropping the context requirement fires on every clip and makes **every one of them worse**, more than
+doubling CER. The exact-context rule is not over-caution — it is the thing protecting the corpus from a
+pool of one-off substitutions that do not generalise.
+
+`ContextMode` was added to `FiringConfig` (default `Exact`, **zero behaviour change**) purely so those
+alternatives could be measured through the REAL firing function instead of a reimplementation of it —
+the repo already learned that lesson with `revoke_in`. A unit test pins the default and quotes these
+numbers, so it cannot drift loose without someone deleting an assertion that says why.
+
+**Honest conclusion for the owner's question "does the app learn well?":** the capture layer is
+excellent and the few-shot path genuinely uses corrections. The LOOP-0 symbolic layer contributes
+exactly nothing today and cannot be switched on without harming the corpus. The real lever is acoustic
+fine-tuning on the accumulated pairs — not this.
+
+**Process defect found in my own gates:** `cargo clippy ... | tail -N && echo OK` masks clippy's exit
+code behind `tail`'s, so a failing clippy printed "CLIPPY OK". Caught when 3 real lint errors surfaced
+in this iteration's test code. Re-verified with unmasked exit codes: clippy 0, fmt 0, `cargo test --lib`
+0 with **1089 passed**.

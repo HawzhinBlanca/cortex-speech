@@ -142,15 +142,32 @@ pub fn restore_session(state: State<'_, AppState>) -> Result<Option<crate::sessi
 }
 
 /// Start Couch Review — the LAN-only, token-gated phone review server (see couch.rs for the privacy
-/// stance). Explicit per-session start; returns the URL (with the session token) to open on the phone.
+/// stance). Explicit per-session start; returns one URL PER named reviewer, each carrying that
+/// reviewer's own token. An empty `reviewers` list starts a single-reviewer session under the default
+/// name, which is the previous behaviour exactly.
 #[tauri::command]
-pub fn start_couch_review(state: State<'_, AppState>) -> Result<crate::couch::CouchStatus, String> {
+pub fn start_couch_review(
+    state: State<'_, AppState>,
+    reviewers: Option<Vec<String>>,
+) -> Result<crate::couch::CouchStatus, String> {
     STRICT_RATE_LIMITER.check("start_couch_review")?;
     let db_path = { state.lock_db().path().to_string() };
-    crate::couch::start(db_path)
+    // The data dir is where the session is remembered, so a link survives closing the app. None (no
+    // data dir registered) simply means nothing is remembered — the previous per-session behaviour.
+    let data_dir = state.lock_data_dir().clone();
+    crate::couch::start(db_path, reviewers.unwrap_or_default(), data_dir)
 }
 
-/// Stop Couch Review and invalidate the session token.
+/// Revoke ONE reviewer's Couch Review link, leaving everyone else's working
+/// (docs/REMOTE_REVIEW_PLAN.md §3.7). Their completed work, scores and audit trail are untouched —
+/// those are a record of what happened, not a permission being withdrawn.
+#[tauri::command]
+pub fn revoke_couch_reviewer(reviewer: String) -> Result<crate::couch::CouchStatus, String> {
+    STRICT_RATE_LIMITER.check("revoke_couch_reviewer")?;
+    crate::couch::revoke(&reviewer)
+}
+
+/// Stop Couch Review and invalidate every reviewer's session token.
 #[tauri::command]
 pub fn stop_couch_review() -> Result<crate::couch::CouchStatus, String> {
     STRICT_RATE_LIMITER.check("stop_couch_review")?;

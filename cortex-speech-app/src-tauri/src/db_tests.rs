@@ -427,6 +427,228 @@ fn dedicated_connection_via_path_shares_committed_data() {
 }
 
 #[test]
+fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
+    // Migration v44. Two properties:
+    //
+    // (a) `limit` is honoured EXACTLY, including zero. The check used to sit after the push, so
+    //     asking for none returned one — which silently hands a spot check to a caller that decided
+    //     it did not want any. Found by a fail-before revert that failed to fail.
+    //
+    // (b) a candidate needs a human answer AND a raw draft that DIFFERS from it. A clip whose draft
+    //     is already correct cannot tell a reviewer who listened from one who tapped accept — both
+    //     hand back the same text — so including it would quietly dilute every score toward "fine".
+    let db = make_db();
+    let plant = |id: &str, raw: &str, answer: Option<&str>| {
+        let mut s = make_segment(id, &format!("/{id}.wav"));
+        s.raw_transcript = raw.to_string();
+        s.verified = true;
+        s.is_gold = true;
+        if let Some(a) = answer {
+            s.human_decision = Some("edit".into());
+            s.verdict = Some("human_edit".into());
+            s.verdict_transcript = Some(a.to_string());
+        }
+        db.insert_segment_full(&s).unwrap();
+    };
+    plant("sc-wrong-1", "دەقی هەڵە", Some("دەقی ڕاست"));
+    plant("sc-wrong-2", "هەڵەی دوو", Some("ڕاستی دوو"));
+    plant("sc-already-right", "دەقی ڕاست", Some("دەقی ڕاست")); // draft == answer: no trap
+    plant("sc-no-answer", "دەقی بێ وەڵام", None); // machine-only: not an answer key
+
+    // A PHONE reviewer's fresh correction. It must never become an answer key, or the next reviewer
+    // is graded against a peer's guess and marked wrong for disagreeing with it.
+    //
+    // `reviewed_by` is what identifies it, and setting it here is the whole point: this fixture used
+    // to express "peer" as `is_gold = false`, which nothing in the app ever sets to true — so the
+    // test passed against a query that could never match ANYTHING in production. It now carries the
+    // column production actually writes (`record_human_decision_by` sets it unconditionally to the
+    // deciding reviewer's name).
+    {
+        let mut peer = make_segment("sc-peer-edit", "/peer.wav");
+        peer.raw_transcript = "دەقی هەڵە".into();
+        peer.verified = true;
+        peer.is_gold = false;
+        peer.human_decision = Some("edit".into());
+        peer.verdict = Some("human_edit".into());
+        peer.verdict_transcript = Some("وەڵامی هاوکار".into());
+        peer.reviewed_by = Some("Hemn".into()); // decided on a phone, by someone who is not the owner
+        db.insert_segment_full(&peer).unwrap();
+    }
+    // The OWNER's own desktop verification: not flagged gold either, but `reviewed_by` is NULL
+    // because the desktop path passes no annotator. This is the case that makes the mechanism
+    // reachable at all — without it the candidate set is empty in every real installation.
+    {
+        let mut owner = make_segment("sc-owner-edit", "/owner.wav");
+        owner.raw_transcript = "دەقی هەڵەی سێ".into();
+        owner.verified = true;
+        owner.is_gold = false;
+        owner.human_decision = Some("edit".into());
+        owner.verdict = Some("human_edit".into());
+        owner.verdict_transcript = Some("ڕاستی سێ".into());
+        owner.reviewed_by = None;
+        db.insert_segment_full(&owner).unwrap();
+    }
+
+    let ids = |limit: usize| -> Vec<String> {
+        db.list_spot_check_candidates(limit, "Sara").unwrap().into_iter().map(|(s, _)| s.id).collect()
+    };
+    assert!(ids(0).is_empty(), "a limit of zero must return NOTHING, not one");
+    assert_eq!(ids(1).len(), 1, "a limit of one returns exactly one");
+    let all = ids(10);
+    assert_eq!(all.len(), 3, "the two gold traps plus the owner-verified one qualify, got {all:?}");
+    assert!(!all.contains(&"sc-already-right".to_string()), "a correct draft catches nobody");
+    assert!(!all.contains(&"sc-no-answer".to_string()), "a clip with no human answer is not an answer key");
+    assert!(
+        !all.contains(&"sc-peer-edit".to_string()),
+        "a peer's fresh correction must never be used to grade another reviewer"
+    );
+    assert!(
+        all.contains(&"sc-owner-edit".to_string()),
+        "the owner's own verified answer IS an answer key — without this the mechanism never fires"
+    );
+
+    // The expected text is the HUMAN answer, never the raw draft — grading against the draft would
+    // score a blind accept as perfect. Asserted against the row that came back rather than a
+    // hardcoded string: the answer key must be right for EVERY candidate, not just whichever one
+    // happens to sort first.
+    for (seg, expected) in db.list_spot_check_candidates(10, "Sara").unwrap() {
+        assert_ne!(expected, seg.raw_transcript, "{} was graded against its own draft", seg.id);
+        assert_eq!(
+            Some(expected.as_str()),
+            seg.verdict_transcript.as_deref(),
+            "{} must be graded against its human verdict",
+            seg.id
+        );
+    }
+
+    // A TRAP ALREADY ANSWERED MUST NOT COME BACK to the same reviewer. Selection is deterministic
+    // (id ASC), so without this every batch drew the identical first-N: after one batch the reviewer
+    // answers from memory rather than by listening, and because record_spot_check upserts on
+    // (segment_id, reviewer) the memorised attempt OVERWRITES the one honest measurement. The score
+    // then drifts upward the longer someone works, which is worse than no score at all.
+    db.record_spot_check("sc-wrong-1", "Sara", "edit", "دەقی ڕاست", "دەقی ڕاست").unwrap();
+    let after = ids(10);
+    assert!(!after.contains(&"sc-wrong-1".to_string()), "Sara must not be re-tested on a trap she has answered");
+    assert!(after.contains(&"sc-wrong-2".to_string()), "her remaining traps are still available");
+
+    // Per REVIEWER, not global: two people meeting the same clip independently is the entire basis of
+    // the agreement sample, so Sara's answer must not consume Hemn's.
+    let hemn: Vec<String> = db.list_spot_check_candidates(10, "Hemn").unwrap().into_iter().map(|(s, _)| s.id).collect();
+    assert!(hemn.contains(&"sc-wrong-1".to_string()), "one reviewer's answer must not exhaust another's pool");
+}
+
+#[test]
+fn the_agreement_sample_pairs_two_raters_and_never_hides_a_third() {
+    // P2.4. Inter-annotator agreement needs the SAME clip answered by two people independently — and
+    // spot checks already provide exactly that, because they are deliberately not leased. So the
+    // overlap is a side effect that already exists; what was missing was only the export.
+    //
+    // The output feeds scripts/agreement_kappa.py, which is already unit-tested against the textbook
+    // kappa=0.40 example. No kappa is computed here: a second implementation would be an unverified
+    // copy of a verified one.
+    let db = make_db();
+    for id in ["a1", "a2", "a3", "solo"] {
+        db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+    }
+    assert!(db.agreement_sample().unwrap().is_none(), "no double-review yet means NO sample, not an empty one");
+
+    // Sara and Hemn both answer a1..a3; they agree on two and differ on one.
+    for (id, sara, hemn) in [("a1", "accept", "accept"), ("a2", "edit", "edit"), ("a3", "accept", "reject")] {
+        db.record_spot_check(id, "Sara", sara, "x", "x").unwrap();
+        db.record_spot_check(id, "Hemn", hemn, "y", "x").unwrap();
+    }
+    // Only Sara saw this one, so it cannot appear in a PAIRED sample.
+    db.record_spot_check("solo", "Sara", "accept", "x", "x").unwrap();
+
+    let s = db.agreement_sample().unwrap().expect("two raters overlap");
+    assert_eq!(s.items, 3, "exactly the three clips BOTH answered");
+    assert!(s.other_reviewers.is_empty());
+    let lines: Vec<&str> = s.tsv.lines().collect();
+    assert_eq!(lines[0], format!("{}\t{}", s.rater_a, s.rater_b), "header names the two raters");
+    assert_eq!(lines.len(), 4, "header + one row per shared clip, and NOT the unpaired one");
+    assert!(lines[1..].iter().all(|l| l.split('\t').count() == 2), "two label columns, as the script expects");
+
+    // A THIRD reviewer must never be silently folded in: Cohen's kappa takes exactly two, and quietly
+    // averaging three raters into one number is precisely the fabrication the honesty law forbids.
+    for id in ["a1", "a2"] {
+        db.record_spot_check(id, "Ali", "reject", "z", "x").unwrap();
+    }
+    let s = db.agreement_sample().unwrap().expect("still a pair");
+    assert_eq!(s.items, 3, "Sara/Hemn share the most clips, so they stay the reported pair");
+    assert_eq!(s.other_reviewers, vec!["Ali".to_string()], "and the excluded rater is NAMED, not dropped");
+
+    // Determinism: the same data must yield the same pair and the same bytes, or two kappa numbers
+    // computed a day apart would not be comparable and nobody would know why.
+    assert_eq!(db.agreement_sample().unwrap().unwrap().tsv, s.tsv);
+}
+
+#[test]
+fn a_human_decision_records_which_reviewer_made_it() {
+    // Migration v43. Multi-reviewer Couch Review means several named people decide clips at once, so a
+    // decision that does not say WHO made it is unattributable — an audit gap, and the missing substrate
+    // for any later inter-annotator agreement study. Four properties, each of which broke a real design:
+    //
+    //   1. an attributed decision stores the name,
+    //   2. an UNattributed one (the owner's desktop, one human, no token naming them) stores SQL NULL
+    //      rather than a fabricated "owner" — a provenance column that invents values is worse than none,
+    //   3. re-deciding REPLACES the name (a stale reviewer must never be left credited for someone
+    //      else's verdict — this is why the UPDATE sets reviewed_by unconditionally, not via COALESCE),
+    //   4. undo clears it, because the attribution belongs to the decision being retracted.
+    let db = make_db();
+    for id in ["att-phone", "att-desktop", "att-redecide"] {
+        db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+    }
+    let reviewed_by = |id: &str| db.get_segment_by_id(id).unwrap().unwrap().reviewed_by;
+
+    db.record_human_decision_by("att-phone", "accept", None, None, Some("Sara")).unwrap();
+    assert_eq!(reviewed_by("att-phone").as_deref(), Some("Sara"), "an attributed decision names its reviewer");
+
+    db.record_human_decision("att-desktop", "accept", None, None).unwrap();
+    assert_eq!(reviewed_by("att-desktop"), None, "an unattributed decision stores NULL, never a made-up name");
+
+    db.record_human_decision_by("att-redecide", "accept", None, None, Some("Sara")).unwrap();
+    db.record_human_decision_by("att-redecide", "edit", Some("ڕاستکراوە"), None, Some("Hemn")).unwrap();
+    assert_eq!(reviewed_by("att-redecide").as_deref(), Some("Hemn"), "the CURRENT decision's author wins");
+    db.record_human_decision("att-redecide", "accept", None, None).unwrap();
+    assert_eq!(reviewed_by("att-redecide"), None, "a desktop re-review clears the previous reviewer's name");
+
+    db.clear_human_decision("att-phone").unwrap();
+    assert_eq!(reviewed_by("att-phone"), None, "undo retracts the attribution along with the decision");
+}
+
+#[test]
+fn reviewer_attribution_survives_a_whole_row_upsert() {
+    // WHOLE-ROW CLOBBER — the recurring defect family in this file. `insert_segment_full` rewrites EVERY
+    // column from a snapshot, and the couch's own undo path uses it. A `reviewed_by` missing from that
+    // statement's column list would silently revert to NULL on any restore, stripping the attribution off
+    // rows that still carry the decision. `insert_segment`'s 17-column subset deliberately OMITS it, the
+    // same way it omits human_decision, so an ASR-only re-write must LEAVE it intact, not clear it.
+    let db = make_db();
+    db.insert_segment(&make_segment("rt-1", "/rt-1.wav")).unwrap();
+    db.record_human_decision_by("rt-1", "accept", None, Some(4200), Some("Sara")).unwrap();
+
+    // Round-trip the FULL row, exactly as the couch undo does.
+    let snapshot = db.get_segment_by_id("rt-1").unwrap().unwrap();
+    assert_eq!(snapshot.reviewed_by.as_deref(), Some("Sara"));
+    db.insert_segment_full(&snapshot).unwrap();
+    assert_eq!(
+        db.get_segment_by_id("rt-1").unwrap().unwrap().reviewed_by.as_deref(),
+        Some("Sara"),
+        "insert_segment_full must persist reviewed_by — dropping it is the whole-row-clobber bug"
+    );
+
+    // The ASR-column subset must not touch it (it never carries a human decision).
+    let mut asr_only = make_segment("rt-1", "/rt-1.wav");
+    asr_only.raw_transcript = "re-decoded".to_string();
+    db.insert_segment(&asr_only).unwrap();
+    assert_eq!(
+        db.get_segment_by_id("rt-1").unwrap().unwrap().reviewed_by.as_deref(),
+        Some("Sara"),
+        "an ASR-only upsert must leave the human attribution intact"
+    );
+}
+
+#[test]
 fn write_segment_verdict_records_all_machine_verdict_classes() {
     // P1.2: decision_verdicts must classify every machine verdict for the C4 denominator. Before the
     // fix only jury_accept recorded a row; auto_accept and jury_edit (also auto-resolutions) dropped.

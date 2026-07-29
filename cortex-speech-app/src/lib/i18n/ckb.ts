@@ -690,6 +690,24 @@ export const ckb: Record<string, string> = {
   'settings.couchHint': 'پەڕەی پێداچوونەوە بۆ مۆبایلەکەت تەنیا لەسەر تۆڕی ماڵەوە. بە شێوەی بنەڕەتی کوژاوەیە؛ هەر دانیشتنێک تۆکنی نوێ؛ دەنگ هەرگیز تۆڕەکە بەجێناهێڵێت.',
   'settings.couchRunningHint': 'ئەم بەستەرە لە مۆبایلەکەت بکەرەوە (هەمان وایفای). کە تەواو بوویت ڕایبگرە — بەستەرەکە دەستبەجێ لە کار دەکەوێت.',
   'settings.couchFailed': 'پێداچوونەوەی قەنەفە سەرکەوتوو نەبوو',
+  // OWNER REVIEW NEEDED (v43 multi-reviewer): these three Sorani strings are NEW and have not had a
+  // native review. They are here because scripts/test_i18n_consistency.py requires en/ckb key parity —
+  // leaving them English-only fails the gate, and weakening the gate is not an option. Vocabulary is kept
+  // to words already used elsewhere in this file ('پێداچوونەوە', 'ناو', 'بەستەر', 'پارچە'). Correct them
+  // freely; nothing else depends on the wording.
+  'settings.couchAgreement': 'هەناردەکردنی نمونەی ڕێککەوتن',
+  'settings.couchAgreementNone': 'تا ئێستا هیچ پارچەیەک لەلایەن دوو کەسەوە پێداچوونەوەی بۆ نەکراوە',
+  'settings.couchAgreementHint':
+    'ئەو پارچانەی دوو پێداچوونەوەر وەڵامیان داوەتەوە، ئامادە بۆ scripts/agreement_kappa.py. ئەو سکریپتە لەسەر ئەم فایلە جێبەجێ بکە بۆ وەرگرتنی کاپا — لێرەدا خەمڵێندراو نییە.',
+  'settings.couchRevoke': 'هەڵوەشاندنەوە',
+  'settings.couchThroughput': 'پێداچوونەوەکراو لەم کتێبخانەیەدا (پارچە · ناوەندی چرکە بۆ هەر پارچەیەک)',
+  'settings.couchSpotChecks': 'پشکنینی نمونەیی (تێبینیکراو / دراو · هەڵە بەراورد بە وەڵامی زانراو)',
+  'settings.couchSpotChecksHint':
+    'هەندێک پارچە لە ڕیزی هەر پێداچوونەوەرێکدا پێشتر وەڵامی پشتڕاستکراویان هەیە و بە ڕەشنووسی هەڵەوە پیشان دەدرێن. ئەو کەسەی گوێ دەگرێت ڕاستیان دەکاتەوە. ژمارەی یەکەمی نزم واتە لەوانەیە بەبێ گوێگرتن پەسەند بکات.',
+  'settings.couchReviewers': 'ناوی پێداچوونەوەرەکان (بە کۆما جیایان بکەرەوە)',
+  'settings.couchReviewersPlaceholder': 'وەک: سارا، هێمن — بەتاڵی بهێڵەرەوە بۆ تەنیا خۆت',
+  'settings.couchReviewersHint':
+    'هەر ناوێک بەستەری تایبەتی خۆی وەردەگرێت، و هەر بڕیارێک بە ناوی ئەو کەسەوە تۆمار دەکرێت. پارچەی جیاواز بۆ هەر پێداچوونەوەرێک دەنێردرێت، بۆیە دوو کەس هەرگیز لە هەمان کاتدا پێداچوونەوە بۆ هەمان پارچە ناکەن.',
   'settings.useFinetuned': 'مۆدێلی ڕاهێنراو بەکاربهێنە',
   'settings.useFinetunedHint':
     'باشترین وردی کوردیی ناوخۆیی (پێوانەکراو ٪٢١ هەڵەی پیت، N=900) — لەسەر CPU، بێ ڕێکخستن. سەروپۆشی ئەندازیارەکەی خوارەوە دەکات.',

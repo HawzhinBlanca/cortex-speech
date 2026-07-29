@@ -1567,6 +1567,12 @@ fn manifest_reads_stored_per_segment_provenance_not_export_day_model_state() {
         mk("s-c", None, Some(true), Some("energy")),
     ])
     .unwrap();
+    // v43 reviewed_by is EARNED, not set: the import path never writes it (insert_segments_batch carries
+    // no human-decision column — correctly, since a freshly imported clip has no reviewer). Attribution
+    // exists only once someone actually decides a clip, so drive it through the real decision path.
+    // -> Sara=2, notAttributed=1 (s-c is undecided — the same bucket a desktop or pre-v43 decision lands in).
+    db.record_human_decision_by("s-a", "accept", None, None, Some("Sara")).unwrap();
+    db.record_human_decision_by("s-b", "accept", None, None, Some("Sara")).unwrap();
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");
@@ -1587,6 +1593,10 @@ fn manifest_reads_stored_per_segment_provenance_not_export_day_model_state() {
     assert_eq!(prov["vadBackend"]["byBackend"]["silero"].as_u64(), Some(2));
     assert_eq!(prov["vadBackend"]["byBackend"]["energy"].as_u64(), Some(1));
     assert_eq!(prov["vadBackend"]["notRecorded"].as_u64(), Some(0));
+    // v43 reviewer attribution reaches the exported manifest — a corpus labelled by named people must
+    // say WHO, and the unattributed rows must be counted separately, never folded under a reviewer.
+    assert_eq!(prov["reviewedBy"]["byReviewer"]["Sara"].as_u64(), Some(2));
+    assert_eq!(prov["reviewedBy"]["notAttributed"].as_u64(), Some(1));
     // The single runConfig boolean reflects STORED unanimity, not export-day loadability (no models on
     // disk here — the old code would have computed denoising/diarization from failed load probes).
     assert_eq!(manifest["runConfig"]["denoising"].as_bool(), Some(false), "mixed denoising -> false");

@@ -2563,6 +2563,56 @@ pub fn couch_review_status() -> Result<crate::couch::CouchStatus, String> {
     Ok(crate::couch::status())
 }
 
+/// Per-reviewer spot-check scores — how each remote reviewer did on clips whose answer was already
+/// known (Migration v44, docs/REMOTE_REVIEW_PLAN.md §2.1).
+///
+/// Worst `noticed` rate first, because the finding this exists to surface is a reviewer who is not
+/// listening, and burying them under the diligent ones would defeat the point.
+#[tauri::command]
+pub fn spot_check_report(state: State<'_, AppState>) -> Result<Vec<crate::db::SpotCheckScore>, String> {
+    RATE_LIMITER.check("spot_check_report")?;
+    state.lock_db().spot_check_report().map_err(|e| e.to_string())
+}
+
+/// Per-reviewer throughput from the append-only review trail (Migration v45).
+///
+/// Distinct from `stats.rs`'s median seconds-per-decision, deliberately: that one orders
+/// `decision_log` GLOBALLY, which is correct for a single reviewer and meaningless for a team — with
+/// several people working at once it would time the gap between two DIFFERENT humans' decisions. This
+/// one partitions per reviewer, so the existing metric keeps its meaning and this one is honest.
+#[tauri::command]
+pub fn reviewer_throughput(state: State<'_, AppState>) -> Result<Vec<crate::db::ReviewerThroughput>, String> {
+    RATE_LIMITER.check("reviewer_throughput")?;
+    state.lock_db().reviewer_throughput().map_err(|e| e.to_string())
+}
+
+/// Write the two-rater agreement sample beside the library and return where it went
+/// (docs/REMOTE_REVIEW_PLAN.md §2.4).
+///
+/// Deliberately exports the TSV rather than computing kappa here. `scripts/agreement_kappa.py`
+/// already implements the statistic and is unit-tested against the textbook kappa=0.40 example; a
+/// second implementation in Rust would be an unverified copy of a verified thing, and under the
+/// honesty law a metric must come from a real run of the real harness. This command produces the
+/// evidence; the harness produces the number.
+#[tauri::command]
+pub fn export_agreement_sample(state: State<'_, AppState>) -> Result<Option<crate::db::AgreementExport>, String> {
+    RATE_LIMITER.check("export_agreement_sample")?;
+    let (sample, db_path) = {
+        let db = state.lock_db();
+        (db.agreement_sample().map_err(|e| e.to_string())?, db.path().to_string())
+    };
+    let Some(mut sample) = sample else {
+        return Ok(None); // nothing double-reviewed yet — not an error, just no evidence
+    };
+    let out = std::path::Path::new(&db_path)
+        .parent()
+        .ok_or_else(|| "library path has no parent directory".to_string())?
+        .join("agreement_sample.tsv");
+    std::fs::write(&out, &sample.tsv).map_err(|e| format!("could not write {}: {e}", out.display()))?;
+    sample.path = out.to_string_lossy().to_string();
+    Ok(Some(sample))
+}
+
 /// Consent gate for any ElevenLabs Scribe upload. Voice is biometric data (GDPR Art. 9), so audio
 /// must NEVER be sent to a provider without the user's explicit cloud-STT opt-in. The pipeline path
 /// enforces this; the direct Scribe IPC commands must too, or they silently bypass consent.

@@ -461,20 +461,30 @@ export async function setApiKey(
   return invoke<string[]>('set_api_key', { provider, key });
 }
 
-/** Couch Review: the token-gated phone review server (off by default, per-session). */
-export interface CouchStatus {
-  running: boolean;
-  /** Wi-Fi (LAN) URL with the session token to open on the phone; null when stopped. */
-  url: string | null;
+/** One reviewer's private way in. Each named reviewer gets their own token, so two people never share
+ *  a link and therefore never share an identity in the data. */
+export interface CouchReviewer {
+  /** The name recorded on every row this person decides (`speech_segments.reviewed_by`). */
+  name: string;
+  /** Wi-Fi (LAN) URL carrying this reviewer's own token. */
+  url: string;
   /**
    * Same page over the owner's Tailscale tailnet — works from ANY network (4G, elsewhere),
-   * end-to-end encrypted between the owner's own devices. Null when no tailnet is up.
+   * end-to-end encrypted between devices in the tailnet. Null when no tailnet is up.
    */
   tailscaleUrl: string | null;
 }
 
-export async function startCouchReview(): Promise<CouchStatus> {
-  return invoke<CouchStatus>('start_couch_review');
+/** Couch Review: the token-gated phone review server (off by default, per-session). */
+export interface CouchStatus {
+  running: boolean;
+  /** One entry per named reviewer; empty when stopped. */
+  reviewers: CouchReviewer[];
+}
+
+/** Start the server. An empty list starts a single-reviewer session under the default name. */
+export async function startCouchReview(reviewers: string[] = []): Promise<CouchStatus> {
+  return invoke<CouchStatus>('start_couch_review', { reviewers });
 }
 
 export async function stopCouchReview(): Promise<CouchStatus> {
@@ -483,6 +493,60 @@ export async function stopCouchReview(): Promise<CouchStatus> {
 
 export async function couchReviewStatus(): Promise<CouchStatus> {
   return invoke<CouchStatus>('couch_review_status');
+}
+
+/** How one remote reviewer scored on clips whose answer was already known. */
+export interface SpotCheckScore {
+  reviewer: string;
+  /** How many known-answer clips they were given. Read nothing into a handful. */
+  checks: number;
+  /** On how many they changed the wrong draft (or rejected it) rather than accepting it blindly. */
+  noticed: number;
+  /** Mean character error rate of their text against the known answer. */
+  meanCer: number;
+}
+
+/** Worst `noticed` rate first — the reviewer who may not be listening comes top, not last. */
+export async function spotCheckReport(): Promise<SpotCheckScore[]> {
+  return invoke<SpotCheckScore[]>('spot_check_report');
+}
+
+/** One reviewer's measured throughput, from the append-only review trail. */
+export interface ReviewerThroughput {
+  reviewer: string;
+  /** DISTINCT clips decided — counting rows would let a network retry inflate it. */
+  clips: number;
+  /** Median seconds between their consecutive decisions, within their OWN stream. */
+  medianSeconds: number | null;
+  /** How many gaps that median is drawn from; a median over two samples is not a rate. */
+  samples: number;
+}
+
+/** Busiest reviewer first. Partitioned per reviewer, unlike the global stats.rs timing. */
+export async function reviewerThroughput(): Promise<ReviewerThroughput[]> {
+  return invoke<ReviewerThroughput[]>('reviewer_throughput');
+}
+
+/** Revoke ONE reviewer's link; everyone else's keeps working. */
+export async function revokeCouchReviewer(reviewer: string): Promise<CouchStatus> {
+  return invoke<CouchStatus>('revoke_couch_reviewer', { reviewer });
+}
+
+/** A two-rater agreement sample, ready for `scripts/agreement_kappa.py`. */
+export interface AgreementExport {
+  raterA: string;
+  raterB: string;
+  /** Clips BOTH raters answered. Kappa on a handful of items means nothing. */
+  items: number;
+  tsv: string;
+  path: string;
+  /** Reviewers excluded because Cohen's kappa takes exactly two — never silently dropped. */
+  otherReviewers: string[];
+}
+
+/** Null when no clip has been answered by two different people yet. */
+export async function exportAgreementSample(): Promise<AgreementExport | null> {
+  return invoke<AgreementExport | null>('export_agreement_sample');
 }
 
 /** A row of the model-version registry (snake_case, as serialized by the backend). */

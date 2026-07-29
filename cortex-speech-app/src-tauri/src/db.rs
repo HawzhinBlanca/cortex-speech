@@ -65,6 +65,66 @@ pub struct SpeechSegment {
     /// "energy" (fallback), or "none" (short file taken whole, no VAD). `None` = not recorded (legacy row
     /// / cloud Scribe path). Surfaced from the detector at import, never a path-exists probe.
     pub vad_backend: Option<String>,
+    // ── Reviewer attribution (Migration v43) ───────────────────────
+    /// WHICH human made this row's current decision — a named Couch Review reviewer. `None` = not
+    /// attributed: a legacy pre-v43 row, an undecided row, or a decision made at the owner's own
+    /// desktop (one human, no token to name them). Written in the same transaction as the verdict by
+    /// `record_human_decision_by`, and cleared by `clear_human_decision` along with the decision itself.
+    pub reviewed_by: Option<String>,
+}
+
+/// One reviewer's measured throughput, from the append-only `review_events` trail (Migration v45).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewerThroughput {
+    pub reviewer: String,
+    /// DISTINCT clips they decided. Counting rows instead would let a network retry inflate it.
+    pub clips: usize,
+    /// Median seconds between their consecutive decisions, computed WITHIN this reviewer's own
+    /// stream. `None` until they have two decisions close enough together to time.
+    pub median_seconds: Option<f64>,
+    /// How many gaps that median is drawn from — a median over two samples is not a rate.
+    pub samples: usize,
+}
+
+/// A two-rater agreement sample, ready for `scripts/agreement_kappa.py`.
+///
+/// Cohen's kappa is a TWO-rater statistic, so when more than two people have reviewed overlapping
+/// clips this reports the pair with the most items in common and NAMES the reviewers it left out —
+/// silently averaging three raters into one number would be exactly the kind of quiet fabrication the
+/// honesty law exists to prevent. (For >2 raters the right statistic is Krippendorff's alpha, which
+/// the script deliberately does not implement.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementExport {
+    pub rater_a: String,
+    pub rater_b: String,
+    /// Clips BOTH raters answered. Kappa on a handful of items means nothing; this is the number that
+    /// says whether the figure is worth quoting.
+    pub items: usize,
+    /// Header row + one `label_a<TAB>label_b` line per shared clip, exactly what the script consumes.
+    pub tsv: String,
+    /// Where the file was written, so the owner can run the harness on it directly.
+    pub path: String,
+    /// Reviewers excluded because kappa takes exactly two. Never silently dropped.
+    pub other_reviewers: Vec<String>,
+}
+
+/// One remote reviewer's score on clips whose answer was already known (Migration v44).
+///
+/// `noticed` is the blind-accept signal and the number to read first: a reviewer who listens corrects
+/// a deliberately-wrong draft, one who taps "accept" hands it straight back. `mean_cer` then says how
+/// close their corrections landed. A low `noticed` with any `checks` at all is the finding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotCheckScore {
+    pub reviewer: String,
+    /// How many known-answer clips this reviewer has been given. Interpret nothing from a handful.
+    pub checks: usize,
+    /// On how many of them they changed the wrong draft (or rejected the clip) rather than accepting it.
+    pub noticed: usize,
+    /// Mean character error rate of their submitted text against the known answer.
+    pub mean_cer: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,7 +209,11 @@ type HumanDecisionContext =
 /// madda, hamza) can arrive decomposed from ASR or import; storing inconsistent forms
 /// silently fragments FTS search, content-dedup, and WER references that all assume one
 /// canonical spelling. Idempotent — NFC of already-NFC text is unchanged.
-fn to_nfc(s: &str) -> String {
+/// `pub(crate)` so sibling modules can canonicalize the SAME way before comparing against a stored
+/// transcript. `couch.rs` needs it to tell a network retry apart from a genuine re-review: the write
+/// path NFC-normalizes, so a decomposed (NFD) paste from a phone IME would otherwise never compare
+/// equal to the value it just stored, and every retry would look like a brand-new decision.
+pub(crate) fn to_nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
@@ -203,13 +267,20 @@ fn to_fts5_match(query: &str) -> String {
 /// The only split labels the export/stats math understands.
 const VALID_SPLITS: &[&str] = &["train", "validation", "test"];
 
+/// Longest gap still counted as "one reviewing session" for per-reviewer throughput (Migration v45).
+/// Matches `stats.rs::SESSION_GAP_MS` deliberately, so the phone figure and the desktop figure mean
+/// the same thing; a reviewer who closes the page and returns tomorrow did not spend fourteen hours
+/// on one clip.
+const REVIEW_SESSION_GAP_MS: i64 = 300_000; // 5 minutes
+
 const SEGMENT_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript, normalized_transcript,
                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
                     confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
                     verdict, verdict_transcript, rationale, evidence_json,
                     agent_confidence, escalated, human_decision, corrected_at, is_gold,
                     alignment_quality, model_version_id, confidence_source, cloud_call,
-                    decoder_config_hash, normalizer_version, denoised, diarized, vad_backend";
+                    decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
+                    reviewed_by";
 
 /// Reject structurally-invalid segments at the DB write boundary, before they can
 /// corrupt the downstream split/stats/training-grade math that every later stage
@@ -505,10 +576,11 @@ impl Database {
                  ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
                  verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
                  human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
-                 confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized, vad_backend, updated_at)
+                 confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
+                 reviewed_by, updated_at)
              VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                  ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                 COALESCE(?28, 'unknown@pre-registry'), COALESCE(?29, 'unknown'), ?30, ?31, ?32, ?33, ?34, ?35, datetime('now'))
+                 COALESCE(?28, 'unknown@pre-registry'), COALESCE(?29, 'unknown'), ?30, ?31, ?32, ?33, ?34, ?35, ?36, datetime('now'))
              ON CONFLICT(id) DO UPDATE SET
                 created_at=excluded.created_at,
                 audio_path=excluded.audio_path,
@@ -544,6 +616,7 @@ impl Database {
                 denoised=excluded.denoised,
                 diarized=excluded.diarized,
                 vad_backend=excluded.vad_backend,
+                reviewed_by=excluded.reviewed_by,
                 updated_at=datetime('now')",
             params![
                 seg.id,
@@ -581,6 +654,7 @@ impl Database {
                 seg.denoised.map(|b| b as i32),
                 seg.diarized.map(|b| b as i32),
                 seg.vad_backend,
+                seg.reviewed_by,
             ],
         )?;
         self.track_write()?;
@@ -1039,6 +1113,289 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    /// Segments usable as SPOT CHECKS: a trusted human answer already exists, and the raw ASR draft
+    /// DIFFERS from it (Migration v44, docs/REMOTE_REVIEW_PLAN.md §2.1).
+    ///
+    /// "Trusted" must exclude a PEER'S FRESH GUESS. Without that, every clip a reviewer had just
+    /// corrected became an answer key the moment they saved it, and the next reviewer was graded
+    /// against it and marked wrong for merely disagreeing. (Found by the soak test: clients reported
+    /// 61 successes against 60 clips, the extra one being a just-decided clip re-served as a check.)
+    ///
+    /// That was first expressed as `is_gold = 1`, which was correct in intent and inert in fact:
+    /// **nothing in this application ever sets `is_gold`.** Every write of it lives inside
+    /// `#[cfg(test)]`, and the migrations only ever declare it `DEFAULT 0` — the `gold_segments`
+    /// table is a different thing entirely (the frozen eval set). So the candidate set was
+    /// unconditionally empty in every real installation and the whole spot-check mechanism could
+    /// never fire, silently, while the UI simply showed nothing.
+    ///
+    /// `reviewed_by IS NULL` is the trust signal that is actually populated. It is set
+    /// UNCONDITIONALLY by `record_human_decision_by` to the name of whoever authored the row's
+    /// current decision, and the desktop path passes `None` while every phone decision passes a
+    /// reviewer name — so NULL means "verified here, by the owner, not by a remote reviewer", which
+    /// is exactly the distinction the gold flag was reaching for. `is_gold = 1` is still honoured so
+    /// that anything which does mark gold in future keeps working.
+    ///
+    /// The cost is honest and bounded: spot-check volume is capped by how much owner-verified work
+    /// exists, so a small library yields few checks. `SpotCheckScore::checks` reports the real number
+    /// rather than hiding it, and no conclusion should be drawn from a handful.
+    ///
+    /// The difference is the whole mechanism. Served with its raw draft, such a clip is a trap that a
+    /// reviewer who actually listens will correct and a reviewer who taps "accept" will not — with no
+    /// synthetic or planted data anywhere: these are real clips a human already answered.
+    ///
+    /// Ordered by id so the selection is deterministic; a queue that reshuffled its traps every poll
+    /// would grade two reviewers on different material and make the scores incomparable.
+    ///
+    /// Excludes what THIS reviewer has already been scored on, and that exclusion is what makes the
+    /// number mean anything. Without it every batch drew the same first-N-by-id, so a reviewer met the
+    /// identical traps over and over: after the first batch they are answering from memory, not from
+    /// listening. Worse, `record_spot_check` upserts on (segment_id, reviewer) — so the later,
+    /// memorised attempt OVERWRITES the one honest measurement, and the score drifts upward the longer
+    /// someone works. It also meant only the first few candidates were ever used no matter how many
+    /// existed. Per-reviewer, not global: two reviewers meeting the same clip independently is the
+    /// point (it is what `agreement_sample` reads).
+    ///
+    /// When a reviewer exhausts the pool they simply stop being measured, which is the honest outcome:
+    /// `SpotCheckScore::checks` reports how many they actually answered, and re-testing on answers they
+    /// already know would be a bigger number meaning less.
+    pub fn list_spot_check_candidates(&self, limit: usize, reviewer: &str) -> AppResult<Vec<(SpeechSegment, String)>> {
+        let query = format!(
+            "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments
+             WHERE verified = 1 AND raw_transcript <> '' AND (is_gold = 1 OR reviewed_by IS NULL)
+               AND id NOT IN (SELECT segment_id FROM spot_checks WHERE reviewer = ?1)
+             ORDER BY id ASC"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map([reviewer], Self::map_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            // Checked BEFORE the push, not after. Testing it afterwards makes `limit == 0` return ONE
+            // candidate — an off-by-one that silently hands a spot check to a caller that asked for
+            // none. Found by a fail-before revert that failed to fail.
+            if out.len() >= limit {
+                break;
+            }
+            let seg = row?;
+            let Some(expected) = crate::quality::human_verified_text(&seg) else {
+                continue; // a machine verdict is not an answer key
+            };
+            // Only a clip whose raw draft is WRONG can distinguish listening from tapping.
+            if learning_text_key(expected) == learning_text_key(&seg.raw_transcript) {
+                continue;
+            }
+            let expected = expected.to_string();
+            out.push((seg, expected));
+        }
+        Ok(out)
+    }
+
+    /// Record how a reviewer answered one spot check. Upserts on (segment_id, reviewer) so a network
+    /// retry cannot inflate a score with duplicate rows — and so a reviewer is graded on their latest
+    /// answer for a clip rather than on whichever attempt happened to arrive first.
+    ///
+    /// Writes ONLY to `spot_checks`. Grading a reviewer must never be able to alter the corpus it
+    /// grades against, so the segment itself is left completely untouched.
+    pub fn record_spot_check(
+        &self,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        submitted: &str,
+        expected: &str,
+    ) -> AppResult<()> {
+        let submitted_nfc = to_nfc(submitted.trim());
+        let expected_nfc = to_nfc(expected.trim());
+        // "Noticed" = they did not simply hand back the draft they were given. A reject counts: judging
+        // a clip unusable is a real act of attention, not a blind accept.
+        let raw: String = self.conn.query_row(
+            "SELECT raw_transcript FROM speech_segments WHERE id = ?1",
+            params![segment_id],
+            |row| row.get(0),
+        )?;
+        let noticed = action == "reject" || learning_text_key(&submitted_nfc) != learning_text_key(&raw);
+        let cer = crate::wer::compute_cer(&expected_nfc, &submitted_nfc);
+        self.conn.execute(
+            "INSERT INTO spot_checks
+                 (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(segment_id, reviewer) DO UPDATE SET
+                action=excluded.action,
+                submitted_transcript=excluded.submitted_transcript,
+                expected_transcript=excluded.expected_transcript,
+                noticed=excluded.noticed,
+                cer=excluded.cer,
+                created_at=datetime('now')",
+            params![segment_id, reviewer, action, submitted_nfc, expected_nfc, noticed as i32, cer],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
+    /// Append one row to the audit trail (Migration v45). Never updates, never deletes.
+    ///
+    /// Best-effort by contract: the caller logs a failure and carries on. Losing an audit row must
+    /// never cost a reviewer their decision — the decision is the work, this is the record of it.
+    pub fn record_review_event(
+        &self,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        source: &str,
+        timestamp_ms: i64,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO review_events (segment_id, reviewer, action, source, timestamp_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![segment_id, reviewer, action, source, timestamp_ms],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
+    /// Per-reviewer throughput from the audit trail, busiest first.
+    ///
+    /// The median is computed **within each reviewer's own stream**, which is the entire reason this
+    /// does not reuse `stats.rs::compute_review_timing`: that one orders `decision_log` GLOBALLY, so
+    /// with several people reviewing at once it would measure the gap between two DIFFERENT humans'
+    /// decisions and report it as one person's pace. Correct for a single reviewer, meaningless for a
+    /// team — so the existing metric is left exactly as it is and this one is partitioned by design.
+    ///
+    /// Gaps longer than [`REVIEW_SESSION_GAP_MS`] are dropped: a reviewer who closes the page and
+    /// returns tomorrow did not spend fourteen hours on one clip.
+    pub fn reviewer_throughput(&self) -> AppResult<Vec<ReviewerThroughput>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT reviewer, segment_id, timestamp_ms FROM review_events ORDER BY reviewer ASC, timestamp_ms ASC",
+        )?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?;
+
+        let mut by_reviewer: std::collections::BTreeMap<String, (std::collections::BTreeSet<String>, Vec<i64>)> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let (reviewer, segment, ts) = row?;
+            let entry = by_reviewer.entry(reviewer).or_default();
+            entry.0.insert(segment);
+            entry.1.push(ts);
+        }
+
+        let mut out: Vec<ReviewerThroughput> = by_reviewer
+            .into_iter()
+            .map(|(reviewer, (segments, stamps))| {
+                let mut deltas: Vec<i64> =
+                    stamps.windows(2).map(|w| w[1] - w[0]).filter(|&d| d > 0 && d <= REVIEW_SESSION_GAP_MS).collect();
+                deltas.sort_unstable();
+                let median_seconds = if deltas.is_empty() {
+                    None
+                } else {
+                    let mid = deltas.len() / 2;
+                    let ms = if deltas.len() % 2 == 1 {
+                        deltas[mid] as f64
+                    } else {
+                        (deltas[mid - 1] + deltas[mid]) as f64 / 2.0
+                    };
+                    Some(ms / 1000.0)
+                };
+                ReviewerThroughput { reviewer, clips: segments.len(), median_seconds, samples: deltas.len() }
+            })
+            .collect();
+        out.sort_by(|a, b| b.clips.cmp(&a.clips).then_with(|| a.reviewer.cmp(&b.reviewer)));
+        Ok(out)
+    }
+
+    /// Build the two-rater agreement sample from clips more than one reviewer has answered.
+    ///
+    /// INTER-ANNOTATOR AGREEMENT NEEDS DOUBLE-ASSIGNMENT, AND SPOT CHECKS ALREADY PROVIDE IT. Leasing
+    /// exists to stop two reviewers colliding on the same pending clip — but spot checks are
+    /// deliberately NOT leased, because measuring two people independently is the point. So the
+    /// overlap an agreement study requires is already there as a side effect, and `spot_checks` is
+    /// already one row per (clip, reviewer): a per-decision table in all but name.
+    ///
+    /// The labels compared are the ACTIONS (accept / edit / reject) — the categorical judgement kappa
+    /// is defined over. Comparing free transcripts instead would measure typing, not agreement.
+    ///
+    /// Returns `None` when no clip has yet been answered by two different people; a kappa computed
+    /// from nothing would be a number with no evidence under it.
+    pub fn agreement_sample(&self) -> AppResult<Option<AgreementExport>> {
+        let mut stmt =
+            self.conn.prepare("SELECT segment_id, reviewer, action FROM spot_checks ORDER BY segment_id ASC")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+        // segment -> (reviewer -> action), BTreeMap so the emitted TSV is byte-identical run to run.
+        let mut by_segment: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+            std::collections::BTreeMap::new();
+        let mut reviewers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for row in rows {
+            let (segment, reviewer, action) = row?;
+            reviewers.insert(reviewer.clone());
+            by_segment.entry(segment).or_default().insert(reviewer, action);
+        }
+
+        // The pair sharing the most clips. Ties break on the (sorted) names so the choice is
+        // deterministic — a report that silently picked a different pair on each run would make two
+        // kappa numbers incomparable for no visible reason.
+        let names: Vec<&String> = reviewers.iter().collect();
+        let mut best: Option<(usize, &String, &String)> = None;
+        for (ai, a) in names.iter().enumerate() {
+            for b in names.iter().skip(ai + 1) {
+                let shared =
+                    by_segment.values().filter(|m| m.contains_key(a.as_str()) && m.contains_key(b.as_str())).count();
+                // Written out rather than via `is_none_or`, which is stable only since Rust 1.82 while
+                // this crate's MSRV is 1.81 (clippy::incompatible_msrv catches it).
+                let better = match best {
+                    None => true,
+                    Some((most, _, _)) => shared > most,
+                };
+                if shared > 0 && better {
+                    best = Some((shared, a, b));
+                }
+            }
+        }
+        let Some((items, a, b)) = best else {
+            return Ok(None);
+        };
+
+        let mut tsv = format!("{a}\t{b}\n");
+        for actions in by_segment.values() {
+            if let (Some(la), Some(lb)) = (actions.get(a.as_str()), actions.get(b.as_str())) {
+                tsv.push_str(&format!("{la}\t{lb}\n"));
+            }
+        }
+        let other_reviewers: Vec<String> =
+            reviewers.iter().filter(|r| *r != a && *r != b).map(|r| r.to_string()).collect();
+        Ok(Some(AgreementExport {
+            rater_a: a.to_string(),
+            rater_b: b.to_string(),
+            items,
+            tsv,
+            path: String::new(), // filled in by the command that writes it
+            other_reviewers,
+        }))
+    }
+
+    /// Per-reviewer spot-check scores, worst `noticed` rate first — the order that puts a reviewer who
+    /// may not be listening at the top of the list rather than buried under the diligent ones.
+    pub fn spot_check_report(&self) -> AppResult<Vec<SpotCheckScore>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT reviewer, COUNT(*), SUM(noticed), AVG(cer)
+             FROM spot_checks GROUP BY reviewer ORDER BY (CAST(SUM(noticed) AS REAL) / COUNT(*)) ASC, reviewer ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let checks: i64 = row.get(1)?;
+            let noticed: i64 = row.get(2)?;
+            Ok(SpotCheckScore {
+                reviewer: row.get(0)?,
+                checks: checks as usize,
+                noticed: noticed as usize,
+                mean_cer: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn get_segments(&self, verified: Option<bool>) -> AppResult<Vec<SpeechSegment>> {
@@ -2029,6 +2386,9 @@ impl Database {
             diarized: Self::optional_col::<i32>(row, 33)?.map(|v| v != 0),
             // VAD backend — Migration v42; nullable TEXT. None (absent/NULL) stays "not recorded".
             vad_backend: Self::optional_col(row, 34)?,
+            // Reviewer attribution — Migration v43; nullable TEXT. None = not attributed (legacy row,
+            // undecided row, or a desktop decision), never a fabricated "owner".
+            reviewed_by: Self::optional_col(row, 35)?,
         })
     }
 
@@ -2280,6 +2640,9 @@ impl Database {
             "UPDATE speech_segments
              SET human_decision     = NULL,
                  corrected_at       = NULL,
+                 -- The attribution belongs to the decision being undone; leaving it would credit a
+                 -- reviewer for a verdict that no longer exists (v43).
+                 reviewed_by        = NULL,
                  verdict            = NULL,
                  verdict_transcript = NULL,
                  rationale          = NULL,
@@ -2374,6 +2737,26 @@ impl Database {
         decision: &str,
         corrected_transcript: Option<&str>,
         timestamp_ms: Option<i64>,
+    ) -> AppResult<()> {
+        self.record_human_decision_by(segment_id, decision, corrected_transcript, timestamp_ms, None)
+    }
+
+    /// [`record_human_decision`] with reviewer attribution (Migration v43).
+    ///
+    /// `annotator` names the human who made THIS decision — a named Couch Review reviewer. `None` means
+    /// "not attributed" and is the correct value for the owner's own desktop, where there is exactly one
+    /// human and no token naming them; it is stored as SQL NULL rather than a fabricated "owner", because
+    /// a provenance column that invents its own values is worse than an empty one.
+    ///
+    /// The attribution is written INSIDE the same transaction as the verdict, so a crash can never leave a
+    /// decision whose author is unknown (or an author for a decision that never committed).
+    pub fn record_human_decision_by(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        timestamp_ms: Option<i64>,
+        annotator: Option<&str>,
     ) -> AppResult<()> {
         let human_verdict = human_verdict_for_decision(decision)?;
         // NFC-canonicalize the human correction like EVERY other transcript write path (insert/restore/
@@ -2504,10 +2887,14 @@ impl Database {
                  verdict            = ?3,
                  verdict_transcript = COALESCE(?4, verdict_transcript),
                  escalated          = 0,
+                 reviewed_by        = ?5,
                  corrected_at       = datetime('now'),
                  updated_at         = datetime('now')
              WHERE id = ?1",
-            params![segment_id, decision, human_verdict, corrected_transcript],
+            // reviewed_by is set UNCONDITIONALLY (not COALESCEd): it names the author of the row's
+            // CURRENT decision, so a desktop re-review of a clip a phone reviewer had decided must clear
+            // the stale name rather than leave the previous reviewer credited for someone else's verdict.
+            params![segment_id, decision, human_verdict, corrected_transcript, annotator],
         )?;
 
         // Rejecting a clip retracts any prior EDIT's learning pair (round-24 hunt #9): a human who

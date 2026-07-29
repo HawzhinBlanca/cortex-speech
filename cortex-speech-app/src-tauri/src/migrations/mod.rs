@@ -1155,6 +1155,168 @@ pub static MIGRATIONS: &[Migration] = &[
         up_sql: "ALTER TABLE speech_segments ADD COLUMN vad_backend TEXT;",
         down_sql: Some("ALTER TABLE speech_segments DROP COLUMN vad_backend;"),
     },
+    Migration {
+        version: 43,
+        description: "Reviewer attribution: WHICH human made the decision on each row (multi-reviewer Couch Review)",
+        // Couch Review became multi-reviewer: several named people can review from their own phones at
+        // once, each on their own token. Without attribution every decision lands anonymous, so the
+        // corpus cannot answer "who labelled this?" — which is both an audit gap and the missing
+        // substrate for inter-annotator agreement (a decision you cannot attribute cannot be compared
+        // against a second opinion).
+        //
+        // `reviewed_by` is the author of the row's CURRENT human decision, written in the same
+        // transaction as the verdict so the two can never diverge.
+        //
+        // NULL means "not attributed": every pre-v43 row, and every decision made at the owner's own
+        // desktop (where there is exactly one human and no token to name them). Writing a fabricated
+        // "owner" onto legacy rows would assert provenance we never captured. Nullable TEXT is
+        // STRICT-compatible, and ADD COLUMN fires no FK cascade, so no FK-off window is needed.
+        //
+        // Deliberately ONE column, on speech_segments only. A parallel `decision_log.annotator` was
+        // written and removed: decision_log rows exist only for decisions carrying a timestamp_ms, which
+        // the phone path does not send, so the column could never hold anything but NULL — and unlike
+        // speech_segments (which v40 recreates), a second ALTER on an untouched table also breaks the
+        // migration-replay tests. Per-decision annotator history is the right substrate for an
+        // inter-annotator agreement study, but that needs MULTIPLE decisions per segment, which this
+        // one-row-per-segment schema cannot express; it is not faked with an always-NULL column here.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN reviewed_by TEXT;",
+        down_sql: Some("ALTER TABLE speech_segments DROP COLUMN reviewed_by;"),
+    },
+    Migration {
+        version: 44,
+        description: "Spot-check results: how each remote reviewer scored on clips whose answer is already known",
+        // docs/REMOTE_REVIEW_PLAN.md §2.1. Once review is handed to other people, the dominant risk
+        // stops being a crash and becomes a human tapping "accept" without listening. Every gate in
+        // this repo measures whether the MACHINE is honest; none measured whether the REVIEWER was.
+        //
+        // A small share of each reviewer's queue is silently drawn from clips that already carry a
+        // human-verified transcript, served with the RAW (known-wrong) draft. A reviewer who listens
+        // corrects it; one who taps accept does not. The result lands HERE and never touches
+        // speech_segments — grading a reviewer must not be able to alter the corpus it grades against.
+        //
+        // PRIMARY KEY (segment_id, reviewer) so a network retry upserts its own row instead of
+        // inflating someone's score with duplicates. `noticed` is the blind-accept signal (did they
+        // change the draft at all); `cer` is how close the correction landed to the known answer.
+        up_sql: "CREATE TABLE IF NOT EXISTS spot_checks (
+                     segment_id TEXT NOT NULL,
+                     reviewer TEXT NOT NULL,
+                     action TEXT NOT NULL,
+                     submitted_transcript TEXT NOT NULL,
+                     expected_transcript TEXT NOT NULL,
+                     noticed INTEGER NOT NULL,
+                     cer REAL NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     PRIMARY KEY (segment_id, reviewer),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+                 ) STRICT;
+                 CREATE INDEX IF NOT EXISTS idx_spot_checks_reviewer ON spot_checks(reviewer);",
+        down_sql: Some("DROP INDEX IF EXISTS idx_spot_checks_reviewer; DROP TABLE IF EXISTS spot_checks;"),
+    },
+    Migration {
+        version: 45,
+        description: "Append-only review events: who decided what, when — per-reviewer throughput and audit trail",
+        // docs/REMOTE_REVIEW_PLAN.md §2.2 + §2.3, deliberately ONE table rather than two changes.
+        //
+        // WHY NOT `decision_log`, which already looks like the right home:
+        //   1. It only gets a row when a decision carries a `timestamp_ms`, and the phone path passes
+        //      None — so phone reviews are invisible to it today.
+        //   2. It has no reviewer column, and ADDING one is NOT migration-replay-safe: v40 recreates
+        //      speech_segments (which is why v41/v42's ALTERs survive re-application) but nothing
+        //      recreates decision_log, so a bare ALTER breaks three existing replay tests. Measured,
+        //      not assumed — it broke them.
+        //   3. `stats.rs` computes its median seconds-per-decision over a GLOBALLY ordered
+        //      decision_log. Feeding concurrent reviewers into that would count the gap between two
+        //      DIFFERENT people's decisions as one person's pace, making a shipped number look
+        //      artificially fast. This table keeps that metric untouched and partitions per reviewer.
+        //
+        // WHY NOT the existing `corrections` ledger: it records before/after text only for EDITS, and
+        // only when the audio identity resolves (best-effort `.ok()`), so a moved file leaves no row.
+        // It also does not record who. None of the three existing tables answers "who decided this,
+        // and when" — which is exactly what an audit trail is.
+        //
+        // Append-only by intent: no UPDATE path exists. A retry writes a second row with the same
+        // (segment, reviewer) and that is CORRECT for an audit trail — the history is the point, and
+        // the throughput query counts distinct segments rather than rows.
+        //
+        // Deliberately NO foreign key to speech_segments, unlike spot_checks. An audit trail whose
+        // rows vanish when the audited row is deleted is not an audit trail: "who reviewed the clip
+        // that was later removed" is precisely the question it has to survive to answer.
+        up_sql: "CREATE TABLE IF NOT EXISTS review_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     segment_id TEXT NOT NULL,
+                     reviewer TEXT NOT NULL,
+                     action TEXT NOT NULL,
+                     source TEXT NOT NULL,
+                     timestamp_ms INTEGER NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 ) STRICT;
+                 CREATE INDEX IF NOT EXISTS idx_review_events_reviewer ON review_events(reviewer, timestamp_ms);",
+        down_sql: Some("DROP INDEX IF EXISTS idx_review_events_reviewer; DROP TABLE IF EXISTS review_events;"),
+    },
+    Migration {
+        version: 46,
+        description: "Spot-check scores survive deleting the clip they were measured on (audit trail, not clip data)",
+        // v45 wrote the principle down — "an audit trail whose rows vanish when the audited row is
+        // deleted is not an audit trail" — and even said "unlike spot_checks". It then left
+        // spot_checks alone. This carries the reasoning across.
+        //
+        // A spot-check row is not data ABOUT a clip; it is the record of what a REVIEWER did on it:
+        // whether they listened or blind-accepted. ON DELETE CASCADE made that record a property of
+        // the clip, with two quiet consequences. Tidying up unrelated clips retroactively changed a
+        // reviewer's score — a number that moves when you delete something else is not a record. And
+        // delete+undo, an operation history/mod.rs works hard to make lossless, destroyed it outright:
+        // undo restores the segment row and cannot resurrect the cascaded children. Proven by
+        // `history::tests::deleting_a_clip_must_not_erase_the_record_of_how_reviewers_scored_on_it`.
+        //
+        // No FK_OFF needed, unlike v40: spot_checks is a LEAF. `ON DELETE CASCADE` fires when the
+        // PARENT is deleted, so dropping the child table itself cascades nothing.
+        //
+        // Replay-safe: on re-application the table already has no FK, so this copies it to itself and
+        // renames back. `INSERT OR IGNORE` because (segment_id, reviewer) stays the primary key.
+        up_sql: "CREATE TABLE IF NOT EXISTS spot_checks_no_fk (
+                     segment_id TEXT NOT NULL,
+                     reviewer TEXT NOT NULL,
+                     action TEXT NOT NULL,
+                     submitted_transcript TEXT NOT NULL,
+                     expected_transcript TEXT NOT NULL,
+                     noticed INTEGER NOT NULL,
+                     cer REAL NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     PRIMARY KEY (segment_id, reviewer)
+                 ) STRICT;
+                 INSERT OR IGNORE INTO spot_checks_no_fk
+                     (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer, created_at)
+                     SELECT segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer, created_at
+                     FROM spot_checks;
+                 DROP TABLE spot_checks;
+                 ALTER TABLE spot_checks_no_fk RENAME TO spot_checks;
+                 CREATE INDEX IF NOT EXISTS idx_spot_checks_reviewer ON spot_checks(reviewer);",
+        // The mirror image, so the migration set stays round-trip safe. Note what going BACK costs:
+        // the FK schema cannot represent a score whose clip has been deleted, so those rows are
+        // dropped here rather than failing the rollback. That asymmetry is the bug this migration
+        // fixes, stated in SQL — restoring the constraint means restoring the data loss.
+        down_sql: Some(
+            "CREATE TABLE IF NOT EXISTS spot_checks_fk (
+                 segment_id TEXT NOT NULL,
+                 reviewer TEXT NOT NULL,
+                 action TEXT NOT NULL,
+                 submitted_transcript TEXT NOT NULL,
+                 expected_transcript TEXT NOT NULL,
+                 noticed INTEGER NOT NULL,
+                 cer REAL NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 PRIMARY KEY (segment_id, reviewer),
+                 FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+             ) STRICT;
+             INSERT OR IGNORE INTO spot_checks_fk
+                 (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer, created_at)
+                 SELECT segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer, created_at
+                 FROM spot_checks WHERE segment_id IN (SELECT id FROM speech_segments);
+             DROP TABLE spot_checks;
+             ALTER TABLE spot_checks_fk RENAME TO spot_checks;
+             CREATE INDEX IF NOT EXISTS idx_spot_checks_reviewer ON spot_checks(reviewer);",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -2013,6 +2175,54 @@ mod tests {
             })
             .unwrap();
         assert_eq!(leaked_table, 0, "the partial table must have been rolled back");
+    }
+
+    #[test]
+    fn v46_drops_the_cascade_without_dropping_anybody_s_scores() {
+        // A table REBUILD is the migration shape that silently loses rows, so this exercises v46
+        // against a POPULATED table rather than the empty one initialize() sees — the same reason the
+        // v40 test exists. The owner's live library already holds real spot-check scores; a migration
+        // that quietly emptied them would destroy the only record of whether a remote reviewer was
+        // honest, and nothing downstream would notice a smaller number.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert!(get_current_version(&db).unwrap() >= 46, "v46 must have applied");
+
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "seg-scored".into(),
+            audio_path: "/a.wav".into(),
+            raw_transcript: "دەقی هەڵە".into(),
+            duration_ms: 1000,
+            ..Default::default()
+        })
+        .unwrap();
+        db.record_spot_check("seg-scored", "Sara", "edit", "دەقی ڕاست", "دەقی ڕاست").unwrap();
+        db.record_spot_check("seg-scored", "Hemn", "accept", "دەقی هەڵە", "دەقی ڕاست").unwrap();
+
+        // Re-apply the real migration over real rows.
+        let v46 = MIGRATIONS.iter().find(|m| m.version == 46).expect("v46 exists");
+        db.connection().execute_batch(v46.up_sql).expect("re-applying v46 must succeed");
+
+        let report = db.spot_check_report().unwrap();
+        assert_eq!(report.len(), 2, "both reviewers' scores must survive the rebuild: {report:?}");
+        let sara = report.iter().find(|r| r.reviewer == "Sara").expect("Sara survived");
+        assert_eq!(sara.checks, 1);
+        assert_eq!(sara.noticed, 1, "and her ANSWER survived, not just her row");
+        let hemn = report.iter().find(|r| r.reviewer == "Hemn").expect("Hemn survived");
+        assert_eq!(hemn.noticed, 0, "a blind accept must still read as a blind accept");
+
+        // The point of the migration: the FK is gone, so deleting the clip leaves the record standing.
+        let sql: String = db
+            .connection()
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='spot_checks'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!sql.to_uppercase().contains("REFERENCES"), "spot_checks must no longer reference the clip: {sql}");
+        db.delete_segment("seg-scored").unwrap();
+        assert_eq!(
+            db.spot_check_report().unwrap().len(),
+            2,
+            "deleting the clip must not rewrite the history of who reviewed it honestly"
+        );
     }
 
     #[test]

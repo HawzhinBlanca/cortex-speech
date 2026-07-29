@@ -130,11 +130,40 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
     // verified clip (NULL human_decision/verdict) would drop OUT of the verified count.
     const REJECTED: &str =
         "(COALESCE(human_decision,'') IN ('reject','human_reject') OR COALESCE(verdict,'') = 'human_reject')";
+    // A clip whose EFFECTIVE transcript is still an ASR placeholder is not a transcript, and
+    // `export_dataset` refuses to publish it. Counting it as verified told the owner the corpus
+    // contained work the export would never write — the same "a tally counts rows the export drops"
+    // defect this file already guards against for rejects, on a second axis.
+    //
+    // `quality::effective_transcript` / `is_placeholder_transcript` are the source of truth; this is a
+    // SQL mirror of them, kept because the single-pass aggregate is what makes this O(1) memory. A
+    // mirror can drift, so `the_dashboards_verified_count_equals_what_the_export_actually_writes` pins
+    // it against the REAL export path rather than against a second copy of the rules.
+    //
+    // substr(), not LIKE: SQLite's LIKE is case-INSENSITIVE for ASCII while Rust's `starts_with` is
+    // not, so LIKE would exclude a '[pending…' row that the export keeps — drift in the other
+    // direction. `n/a` and `null` DO compare case-insensitively, matching eq_ignore_ascii_case.
+    const EFFECTIVE: &str = "TRIM(CASE
+            WHEN TRIM(COALESCE(verdict_transcript,'')) <> ''
+                 AND (LOWER(COALESCE(human_decision,'')) IN ('accept','edit','human_accept','human_edit')
+                      OR LOWER(COALESCE(verdict,'')) IN ('human_accept','human_edit'))
+                THEN verdict_transcript
+            WHEN TRIM(COALESCE(annotated_transcript,'')) <> '' THEN annotated_transcript
+            WHEN TRIM(COALESCE(verdict_transcript,'')) <> '' THEN verdict_transcript
+            WHEN TRIM(COALESCE(normalized_transcript,'')) <> '' THEN normalized_transcript
+            ELSE COALESCE(raw_transcript,'') END)";
+    let placeholder = format!(
+        "(substr({EFFECTIVE}, 1, 8) = '[Pending'
+          OR substr({EFFECTIVE}, 1, 16) = '[ASR unavailable'
+          OR LOWER({EFFECTIVE}) IN ('n/a','null'))"
+    );
+    // Neither verified nor pending, exactly like a reject: it has no usable text either way.
+    let excluded = format!("({REJECTED} OR {placeholder})");
     let sql = format!(
         "SELECT
             COUNT(*),
             COALESCE(SUM(duration_ms), 0),
-            COALESCE(SUM(CASE WHEN verified AND NOT {REJECTED} THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN verified AND NOT {excluded} THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN NOT verified AND NOT {REJECTED} THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(LENGTH(CAST(COALESCE(annotated_transcript, normalized_transcript, raw_transcript) AS BLOB))), 0),
             COALESCE(SUM(CASE WHEN duration_ms BETWEEN 0 AND 4999 THEN 1 ELSE 0 END), 0),
@@ -364,6 +393,52 @@ mod tests {
         assert_eq!(st.pending_count, 1, "a rejected clip must NOT count as pending either");
         assert_eq!(st.verified_count + st.pending_count, 2, "rejected is excluded from BOTH buckets");
         assert!((st.verification_rate - 100.0 / 3.0).abs() < 1e-9, "1 of 3 segments verified-good");
+    }
+
+    #[test]
+    fn the_dashboards_verified_count_equals_what_the_export_actually_writes() {
+        // THE INVARIANT THAT KEEPS BREAKING. Per the project ledger this exact class — a tally that
+        // counts rows the export drops — has been found and fixed six times. It keeps coming back
+        // because the two sides are maintained independently and each has its own tests: stats.rs
+        // proves it excludes rejects, export.rs proves it excludes rejects, and NOTHING ever compares
+        // the two numbers. So the day one side gains an exclusion rule the other does not, the
+        // dashboard silently overstates the corpus and no test notices.
+        //
+        // That is not hypothetical here: export_dataset drops rejected AND placeholder AND held-out
+        // clips; compute_stats drops only rejected. The live library happens to contain no
+        // placeholders, which is the only reason the two agree today.
+        //
+        // Asserted against the REAL export path rather than a re-implementation of its rules — a
+        // second copy of the filter would drift in exactly the same way and prove nothing.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&seg("good", 1000, true, Some("A"), "دەقی ڕاست")).unwrap();
+        db.insert_segment(&seg("pend", 1000, false, Some("A"), "چاوەڕوان")).unwrap();
+        db.insert_segment(&seg("bad", 1000, true, Some("A"), "خراپ")).unwrap();
+        db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='bad'", []).unwrap();
+        // A clip whose EFFECTIVE transcript is still the ASR placeholder, marked verified. Export
+        // refuses to publish it (it is not a transcript); the dashboard must not call it verified
+        // either, or it reports progress the dataset does not contain.
+        db.insert_segment(&seg("hold", 1000, true, Some("A"), "[Pending WSL 7B ASR]")).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("dataset.jsonl");
+        crate::export::export_dataset(&db, &out, &crate::settings::ExportFormat::Jsonl).unwrap();
+        let exported_verified = std::fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("verified").and_then(serde_json::Value::as_bool).unwrap_or(false))
+            .count();
+
+        let st = compute_stats(&db).unwrap();
+        assert_eq!(
+            st.verified_count, exported_verified,
+            "the dashboard says {} clips are verified but the export writes {} — one of them is lying \
+             to the owner about how much of the corpus is real",
+            st.verified_count, exported_verified
+        );
     }
 
     #[test]

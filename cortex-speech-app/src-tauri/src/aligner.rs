@@ -43,6 +43,17 @@ impl AlignmentQuality {
     }
 }
 
+/// Does this vocabulary contain a token that can represent a WORD BOUNDARY?
+///
+/// Separated from the loader so it is testable without an ONNX session — the failure it detects is
+/// silent by nature, so a test that cannot run is no protection at all.
+///
+/// The three accepted forms cover the conventions in use: a literal space (MMS/wav2vec2 character
+/// vocabularies), `|` (the classic wav2vec2 word delimiter), and `▁` (U+2581, SentencePiece).
+fn has_word_delimiter(tokens: &[String]) -> bool {
+    tokens.iter().any(|t| t == " " || t == "|" || t == "\u{2581}")
+}
+
 pub struct ForcedAligner {
     session: Option<std::sync::Mutex<ort::session::Session>>,
     // Loaded from the model bundle and retained as the model's declared contract: the alignment
@@ -98,6 +109,28 @@ impl ForcedAligner {
                 tokens_path
             );
             return Ok(Self { session: None, tokens: Vec::new(), sample_rate: 16000 });
+        }
+
+        // A vocabulary that cannot represent a WORD BOUNDARY passes the emptiness check above and then
+        // degrades every alignment silently. `align_word` maps each transcript character with
+        // `tokens.position(|t| t == char)`, so if no token equals the delimiter, every space is simply
+        // dropped from the target sequence: the aligner still runs, still returns word timestamps, and
+        // still produces an alignment score — all of them guesses about where words begin. Those
+        // scores set clip tiers and gate `trainingReady`, so the failure is invisible exactly where it
+        // matters most.
+        //
+        // Found on this machine: two copies of `mms_aligner_tokens.txt` differing by ONE byte, because
+        // a trailing-whitespace trim turned the delimiter token (a single space, index 4) into an empty
+        // string. Same line count, same tail, same size to the nearest KB — nothing about it looks
+        // wrong. Not fatal, because a model may legitimately use a different delimiter convention, so
+        // this reports rather than disables.
+        if !has_word_delimiter(&tokens) {
+            tracing::warn!(
+                "aligner vocab {:?} has no word-delimiter token (' ', '|' or '▁'): word boundaries \
+                 cannot be aligned, so word timestamps and alignment scores will be approximations. \
+                 A trailing-whitespace trim on the vocab file is the usual cause.",
+                tokens_path
+            );
         }
 
         tracing::info!("MMS forced aligner loaded with {} tokens", tokens.len());
@@ -717,6 +750,31 @@ pub fn forward_backward_ctc_score(logits: &[f32], vocab_size: usize, target_toke
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vocab_whose_delimiter_was_trimmed_away_is_detected() {
+        // THE REAL CASE, not an invented one. Two copies of mms_aligner_tokens.txt on the owner's
+        // machine differed by ONE byte: a trailing-whitespace trim had turned the delimiter token —
+        // a single space at index 4 — into an empty string. Identical line count, identical tail,
+        // identical size to the nearest KB. Nothing about the file looks wrong.
+        //
+        // It matters because `align_word` maps transcript characters with
+        // `tokens.position(|t| t == char)`. With no token equal to " ", every space is dropped from
+        // the target sequence: the aligner still runs and still emits word timestamps and an
+        // alignment score, all of them guesses about where words begin. Those scores set clip tiers
+        // and gate trainingReady, so a degraded vocab is invisible exactly where it matters.
+        let head = |fifth: &str| {
+            ["<s>", "<pad>", "</s>", "<unk>", fifth, "ا"].iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+        assert!(has_word_delimiter(&head(" ")), "the intact vocab has its space delimiter");
+        assert!(!has_word_delimiter(&head("")), "the trimmed vocab must be reported, not silently used");
+
+        // The other conventions must keep working — flagging a healthy wav2vec2 or SentencePiece
+        // vocabulary would train the owner to ignore the warning.
+        assert!(has_word_delimiter(&head("|")), "wav2vec2 uses a pipe");
+        assert!(has_word_delimiter(&head("\u{2581}")), "SentencePiece uses U+2581");
+        assert!(!has_word_delimiter(&[]), "an empty vocab has no delimiter either");
+    }
 
     #[test]
     fn test_log_sum_exp() {

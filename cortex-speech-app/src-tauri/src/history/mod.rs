@@ -365,6 +365,49 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_clip_must_not_erase_the_record_of_how_reviewers_scored_on_it() {
+        // A spot-check row is not data ABOUT the clip, it is the record of what a REVIEWER did —
+        // whether they listened or blind-accepted. `spot_checks` was created with ON DELETE CASCADE,
+        // so deleting the clip silently deletes that record, and undo (which restores only the
+        // segment row) cannot bring it back.
+        //
+        // Two consequences, both quiet. A reviewer's score changes retroactively when unrelated
+        // clips are tidied up — a number that moves when you delete something else is not a record.
+        // And an ordinary delete+undo, a supported operation this module goes to lengths to make
+        // lossless, destroys it outright.
+        //
+        // `review_events` (the very next migration, for the same audit purpose) deliberately has NO
+        // foreign key so the trail survives deletion of the audited row. This asserts spot_checks
+        // holds the same line.
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        let mut seg = make_segment("sc1", "دەقی هەڵە");
+        seg.verified = true;
+        seg.human_decision = Some("edit".to_string());
+        seg.verdict = Some("human_edit".to_string());
+        seg.verdict_transcript = Some("دەقی ڕاست".to_string());
+        db.insert_segment_full(&seg).unwrap();
+        db.record_spot_check("sc1", "Sara", "edit", "دەقی ڕاست", "دەقی ڕاست").unwrap();
+        assert_eq!(db.spot_check_report().unwrap().len(), 1, "the score exists before the delete");
+
+        let snapshot = db.get_segment_by_id("sc1").unwrap().unwrap();
+        db.delete_segment("sc1").unwrap();
+        history.push(Command::DeleteSegments { segments: vec![snapshot] });
+        history.undo(&db).unwrap();
+
+        assert!(db.get_segment_by_id("sc1").unwrap().is_some(), "the clip itself comes back");
+        let report = db.spot_check_report().unwrap();
+        assert_eq!(
+            report.len(),
+            1,
+            "a reviewer's spot-check record must survive deleting the clip it was measured on — \
+             deleting data must never rewrite the history of who reviewed honestly"
+        );
+        assert_eq!(report[0].reviewer, "Sara");
+        assert_eq!(report[0].checks, 1);
+    }
+
+    #[test]
     fn redo_of_unsupported_batch_transcribe_keeps_the_command() {
         let db = setup_db();
         let history = HistoryManager::new(100);

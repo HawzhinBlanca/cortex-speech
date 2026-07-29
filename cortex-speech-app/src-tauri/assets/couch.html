@@ -1,99 +1,708 @@
 <!doctype html>
-<html lang="en">
+<html lang="ckb" dir="rtl">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Cortex Couch Review</title>
+<title>Cortex</title>
+<!--
+  ADD TO HOME SCREEN. These tags give a full-screen, chrome-free app launched from a home-screen icon
+  on iOS and, over HTTPS (Tailscale Serve/Funnel — docs/REMOTE_PUBLIC_LINKS_PLAN.md phase 5), an
+  installable app on Android Chrome. The manifest's start_url is "/" and NEVER carries a token: an
+  installed app rides the HttpOnly cookie, so revoking a reviewer revokes their installed app too.
+
+  DELIBERATELY NO service worker (plan phase 6, judgment call): it is the one addition that
+  introduces a NEW failure mode — a stale cached shell after the exe (which embeds this page via
+  include_str!) is rebuilt. The localStorage outbox already covers the connectivity gap, and
+  Background Sync remains unsupported on iOS Safari in 2026 anyway. Revisit only if reviewers report
+  the shell failing to open offline.
+-->
+<link rel="manifest" href="/manifest.json" />
+<link rel="apple-touch-icon" href="/icon.png" />
+<link rel="icon" type="image/png" href="/icon.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="Cortex" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)" />
+<meta name="theme-color" content="#f8fafc" media="(prefers-color-scheme: light)" />
+<!--
+  PHONE STRINGS. Kurdish-first, like the desktop app: the page opens in Sorani (RTL) and the reviewer
+  can switch to English. Serving an English chrome around a Kurdish text box was the single largest UX
+  defect of the remote surface (docs/REMOTE_REVIEW_PLAN.md §1.1).
+
+  `source` names the desktop i18n key each Sorani string was COPIED FROM, byte for byte.
+  scripts/test_couch_page_i18n.py enforces that: a sourced string must still match its desktop value
+  exactly, so the phone can never drift away from text a native speaker already reviewed, and en/ckb
+  key sets must stay identical. `source: null` means genuinely NEW Sorani that has NOT had a native
+  review — the policy pins that list so it can never grow silently.
+-->
+<script id="i18n" type="application/json">
+{
+  "en": {
+    "progress": "Clip {n} of {total}",
+    "accept": "Looks good",
+    "bad": "Reject",
+    "save": "Save & next",
+    "undo": "Undo review",
+    "saved": "Saved",
+    "markedBad": "Reject",
+    "undone": "Decision undone — the clip is back in the queue.",
+    "undoFailed": "Undo failed",
+    "saveFailed": "Failed to save edit: {err}",
+    "loadFailed": "Failed to load queue: {err}",
+    "linkExpired": "This link has expired. Ask for a new one — anything you already saved is safe, and anything still waiting to send will go through on the new link.",
+    "allDone": "All clips reviewed!",
+    "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
+    "loadingMore": "Loading clips…",
+    "queued": "Queued — it will send when you are back online",
+    "audioMissing": "This clip's audio will not play, so there is nothing to judge. Skip it — the owner will be told.",
+    "skip": "Skip this clip",
+    "stillSending": "{n} decision(s) have not been sent yet. Keep this page open until they go through.",
+    "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
+    "editHint": "Listen, and correct the text if needed"
+  },
+  "ckb": {
+    "progress": "پارچەی {n} لە {total}",
+    "accept": "دروستە",
+    "bad": "ڕەتکردنەوە",
+    "save": "پاشەکەوت و دواتر",
+    "undo": "گەڕاندنەوەی پێداچوونەوە",
+    "saved": "پاشەکەوتکرا",
+    "markedBad": "ڕەتکردنەوە",
+    "undone": "بڕیارەکە گەڕایەوە — پارچەکە گەڕایەوە بۆ ڕیزەکە.",
+    "undoFailed": "گەڕاندنەوە سەرکەوتوو نەبوو",
+    "saveFailed": "پاشەکەوتی دەستکاری سەرکەوتوو نەبوو: {err}",
+    "loadFailed": "بارکردنی ڕیز سەرکەوتوو نەبوو: {err}",
+    "linkExpired": "ئەم بەستەرە بەسەرچووە. داوای بەستەرێکی نوێ بکە — هەرچی پاشەکەوتت کردووە پارێزراوە، و هەرچی چاوەڕێی ناردنە بە بەستەرە نوێیەکە دەنێردرێت.",
+    "allDone": "هەموو پارچەکان پێداچوونەوەیان بۆ کرا!",
+    "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
+    "loadingMore": "بارکردنی پارچەکان…",
+    "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
+    "audioMissing": "دەنگی ئەم پارچەیە لێ نادرێت، بۆیە شتێک نییە بڕیاری لەسەر بدرێت. تێیپەڕێنە — خاوەنەکە ئاگادار دەکرێتەوە.",
+    "skip": "تێپەڕاندنی ئەم پارچەیە",
+    "stillSending": "{n} بڕیار هێشتا نەنێردراون. ئەم پەڕەیە کراوە بهێڵەوە تا دەنێردرێن.",
+    "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
+    "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
+  },
+  "source": {
+    "progress": "review.progress",
+    "accept": "review.acceptAsIs",
+    "bad": "inbox.reject",
+    "save": "review.saveNext",
+    "undo": "review.undoLast",
+    "saved": "saved",
+    "markedBad": "inbox.reject",
+    "undone": "review.undone",
+    "undoFailed": "review.undoFailed",
+    "saveFailed": "inbox.status.editFailed",
+    "loadFailed": "inbox.status.loadFailed",
+    "linkExpired": null,
+    "allDone": "review.allDone",
+    "heldByOthers": null,
+    "loadingMore": null,
+    "queued": null,
+    "audioMissing": null,
+    "skip": null,
+    "stillSending": null,
+    "refused": null,
+    "editHint": "review.editHint"
+  }
+}
+</script>
 <style>
-  :root { color-scheme: dark; }
+  /* Light and dark, driven by the phone's own setting. The page was hardcoded dark, which is
+     unreadable on a phone held outdoors — and reviewing happens wherever the reviewer happens to be,
+     not at a desk. Colours live in variables so both themes are defined once, together. */
+  :root {
+    color-scheme: light dark;
+    --bg: #f8fafc; --panel: #ffffff; --line: #cbd5e1; --ink: #0f172a; --dim: #475569; --faint: #64748b;
+    /* `--brand` is separate from `--accent-line` because the two have different jobs: one is a text
+       colour that must clear 4.5:1 against the page, the other is a border on a filled button. Sharing
+       them put the heading at 3.91:1 in light mode — caught by the axe gate, not by eye. */
+    --brand: #075985;
+    --accent: #0369a1; --accent-line: #0284c7; --ok: #15803d; --ok-line: #166534;
+    --bad: #b91c1c; --warn: #a16207; --chip: #e2e8f0;
+    /* Reviewer-adjustable transcript size (see the A-/A+ control). Sorani at a fixed 18px is small
+       for some readers, and there was no way to change it. */
+    --tsize: 18px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      /* --faint is #94a3b8, not the #64748b it was: on the dark panel that read 3.64:1 and failed AA
+         for the clip's duration/speaker line. */
+      --bg: #0b1220; --panel: #111a2e; --line: #334155; --ink: #e2e8f0; --dim: #94a3b8; --faint: #94a3b8;
+      --brand: #7dd3fc;
+      --accent: #0369a1; --accent-line: #0284c7; --ok: #14532d; --ok-line: #166534;
+      --bad: #fda4af; --warn: #fcd34d; --chip: #1e293b;
+    }
+  }
   * { box-sizing: border-box; margin: 0; }
-  body { font-family: system-ui, sans-serif; background: #0b1220; color: #e2e8f0;
-         min-height: 100dvh; display: flex; flex-direction: column; padding: 12px; gap: 12px; }
-  header { display: flex; justify-content: space-between; align-items: baseline; }
-  h1 { font-size: 15px; color: #7dd3fc; }
-  #progress { font-size: 12px; color: #94a3b8; }
-  #card { background: #111a2e; border: 1px solid #1e293b; border-radius: 14px; padding: 14px;
+  /* `hidden` is only a display:none DEFAULT, and an explicit `display` in a rule beats it. #card sets
+     display:flex, so every `card.hidden = true` was a no-op: the empty card stayed on screen next to
+     the "all reviewed" message. Caught by looking at the rendered page, not by any test. */
+  [hidden] { display: none !important; }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--ink);
+         /* vh first as the fallback: dvh is the one that accounts for a mobile browser's collapsing
+            address bar, but a browser that does not know it must still get a full-height layout
+            rather than a card floating in a short page. */
+         min-height: 100vh; min-height: 100dvh;
+         display: flex; flex-direction: column; padding: 12px; gap: 12px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  h1 { font-size: 15px; color: var(--brand); }
+  #who { font-size: 11px; color: var(--dim); font-weight: 600; }
+  #progress { font-size: 12px; color: var(--dim); }
+  /* The language and text-size controls mirror the desktop `locale-toggle`. Language labels are the
+     language's own endonym, so each reads correctly whichever locale is active. */
+  .chip { flex: 0 0 auto; padding: 4px 10px; font-size: 11px; font-weight: 600; border-radius: 999px;
+          border: 1px solid var(--line); background: var(--chip); color: var(--dim); }
+  #card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px;
           display: flex; flex-direction: column; gap: 12px; flex: 1; }
   audio { width: 100%; }
-  textarea { width: 100%; min-height: 34dvh; background: #0b1220; color: #f1f5f9;
-             border: 1px solid #334155; border-radius: 10px; padding: 12px;
-             font-size: 18px; line-height: 1.9; direction: rtl; }
-  .meta { font-size: 11px; color: #64748b; }
+  /* Waveform: seeing silence vs speech makes "is this clip usable?" a glance instead of a listen, and
+     tapping it seeks straight to the word in doubt. Decorative in the a11y sense — the <audio> element
+     above it is the real, labelled control — so it is aria-hidden and never the only way to do anything. */
+  #wave { width: 100%; height: 56px; display: block; border-radius: 8px; background: var(--bg);
+          border: 1px solid var(--line); touch-action: manipulation; }
+  /* Transport row: replay-last-2s, loop and speed. A transcriber re-listens to the same second many
+     times per clip; a bare <audio> makes that a fiddly drag on a phone-sized scrubber. */
+  .transport { display: flex; gap: 8px; align-items: center; }
+  .transport button { flex: 1; padding: 9px 6px; font-size: 13px; font-weight: 600; }
+  .transport button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent-line); color: #f1f5f9; }
+  #warn { font-size: 12px; color: var(--warn); text-align: center; }
+  textarea { width: 100%; min-height: 34dvh; background: var(--bg); color: var(--ink);
+             border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+             font-size: var(--tsize); line-height: 1.9; direction: rtl; }
+  .meta { font-size: 11px; color: var(--faint); }
   .row { display: flex; gap: 8px; }
-  button { flex: 1; padding: 14px 8px; border-radius: 12px; border: 1px solid #334155;
-           background: #1e293b; color: #e2e8f0; font-size: 15px; font-weight: 600; }
+  button { flex: 1; padding: 14px 6px; border-radius: 12px; border: 1px solid var(--line);
+           background: var(--chip); color: var(--ink); font-size: 14px; font-weight: 600;
+           /* Sorani labels are longer than their English counterparts and wrapped mid-phrase at
+              375px; keep each action on one line and let the font shrink instead. */
+           white-space: nowrap; }
   button:disabled { opacity: 0.45; }
-  #save   { background: #0369a1; border-color: #0284c7; }
-  #accept { background: #14532d; border-color: #166534; }
-  #bad    { color: #fda4af; }
+  #save   { background: var(--accent); border-color: var(--accent-line); color: #f1f5f9; }
+  #accept { background: var(--ok); border-color: var(--ok-line); color: #f1f5f9; }
+  #bad    { color: var(--bad); }
   #undo   { flex: 0 0 auto; padding: 14px 16px; }
   #done, #err { text-align: center; padding: 40px 10px; font-size: 16px; }
-  #err { color: #fda4af; white-space: pre-wrap; }
+  #err { color: var(--bad); white-space: pre-wrap; }
   .toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
-           background: #1e293b; border: 1px solid #334155; padding: 8px 18px;
+           background: var(--chip); border: 1px solid var(--line); color: var(--ink); padding: 8px 18px;
            border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .2s; }
   .toast.show { opacity: 1; }
+  /* Respect a reviewer who has asked their phone to reduce motion. */
+  @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
 </style>
 </head>
 <body>
-<header><h1>Cortex · Couch Review</h1><div id="progress"></div></header>
+<header>
+  <h1>Cortex<span id="who"></span></h1>
+  <div id="progress"></div>
+  <button id="textsize" class="chip" type="button" title="A±">A±</button>
+  <button id="lang" class="chip" type="button"></button>
+</header>
 <div id="card" hidden>
   <audio id="player" controls preload="auto"></audio>
-  <textarea id="text" lang="ckb" spellcheck="false"></textarea>
-  <div class="meta" id="meta"></div>
-  <div class="row">
-    <button id="undo" title="Undo last review">↩</button>
-    <button id="bad">✗ Bad</button>
-    <button id="accept">✓ Looks good</button>
-    <button id="save">Save &amp; next</button>
+  <canvas id="wave" aria-hidden="true"></canvas>
+  <div class="transport">
+    <button id="again" type="button" title="↺ 2s">↺ 2s</button>
+    <button id="loop" type="button" aria-pressed="false">⟳</button>
+    <button id="speed" type="button">1×</button>
   </div>
+  <textarea id="text" lang="ckb" dir="rtl" spellcheck="false"></textarea>
+  <div class="meta" id="meta"></div>
+  <div id="warn" hidden></div>
+  <div class="row">
+    <button id="bad"></button>
+    <button id="accept"></button>
+    <button id="save"></button>
+  </div>
+  <!-- Only ever revealed when the audio genuinely will not load. Without it a reviewer facing a clip
+       whose file has moved had exactly two ways forward, and BOTH write a verdict they cannot justify:
+       accept, which promotes an unheard ASR draft to gold, or reject, which permanently excludes a
+       clip that may be perfectly fine. Skipping writes nothing. -->
+  <button id="skip" type="button" hidden></button>
 </div>
-<div id="done" hidden>🎉 Queue reviewed. New clips appear here automatically.</div>
+<div id="done" hidden></div>
+<!-- Undo lives OUTSIDE the card on purpose. Inside it, the button vanished with the card the moment
+     the queue drained — so the one decision a reviewer is most likely to want back, the last one they
+     made, was the one they could never reach. Shown whenever there is something to undo. -->
+<div class="row" id="after" hidden>
+  <button id="undo">↩</button>
+</div>
 <div id="err" hidden></div>
 <div class="toast" id="toast"></div>
 <script>
-  const token = new URLSearchParams(location.search).get('t') || '';
+  // The token arrives in the URL FRAGMENT (#t=...), which the browser never sends to any server —
+  // so a link pasted into a chat app hands its preview bot the empty shell, never a credential.
+  // ?t= is still read as the legacy transition form for links sent before the fragment change.
+  const fragToken = new URLSearchParams(location.hash.replace(/^#/, '')).get('t') || '';
+  const queryToken = new URLSearchParams(location.search).get('t') || '';
+  const token = queryToken; // only a QUERY token still needs to ride requests (legacy links)
+  // A fragment token is presented to the server exactly once, in a POST body, and comes back as the
+  // HttpOnly cookie every later request rides on. Fire-and-forget BEFORE load(): claimed is awaited
+  // by load() via this promise so the first /api/queue never races the cookie.
+  const claimed = fragToken
+    ? fetch('/api/claim', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: fragToken }),
+      }).then((r) => r.ok, () => false)
+    : Promise.resolve(true);
+  // Strip the credential from the visible address and this history entry either way: a token on
+  // screen is a token anyone glancing at the phone can photograph, and history survives the session.
+  if ((fragToken || queryToken) && window.history?.replaceState) {
+    const clean = new URL(location.href);
+    clean.searchParams.delete('t');
+    history.replaceState(null, '', clean.pathname + clean.search);
+  }
   const $ = (id) => document.getElementById(id);
   let queue = [], i = 0, busy = false;
+
+  // ── i18n ────────────────────────────────────────────────────────────────────
+  const STRINGS = JSON.parse($('i18n').textContent);
+  // Kurdish-first, matching the desktop app. An explicit ?lang= wins (so a link can pin a language),
+  // then the reviewer's own saved choice, then ckb — NOT navigator.language, because the browser
+  // language of a shared phone says nothing about which language this corpus is in.
+  let locale = new URLSearchParams(location.search).get('lang')
+    || localStorage.getItem('cortex.couch.lang')
+    || 'ckb';
+  if (!STRINGS[locale]) locale = 'ckb';
+  // Fall back to English for a key missing from ckb, exactly like the desktop dictionary does, so a
+  // gap shows the other language rather than a raw key.
+  const t = (key, params) => {
+    let s = (STRINGS[locale] || {})[key] ?? STRINGS.en[key] ?? key;
+    for (const [k, v] of Object.entries(params || {})) s = s.replaceAll('{' + k + '}', v);
+    return s;
+  };
+  function applyLocale() {
+    localStorage.setItem('cortex.couch.lang', locale);
+    document.documentElement.lang = locale;
+    document.documentElement.dir = locale === 'ckb' ? 'rtl' : 'ltr';
+    $('lang').textContent = locale === 'ckb' ? 'English' : 'کوردی';
+    $('bad').textContent = '✗ ' + t('bad');
+    $('accept').textContent = '✓ ' + t('accept');
+    $('save').textContent = t('save');
+    $('skip').textContent = '⏭ ' + t('skip');
+    $('undo').title = t('undo');
+    // The transcript box had NO accessible name at all — a screen-reader user reached an unlabelled
+    // edit field and had to guess what it was for. Reuses the desktop's own review hint.
+    $('text').setAttribute('aria-label', t('editHint'));
+    renderProgress();
+    renderEmptyState();
+  }
+  $('lang').onclick = () => { locale = locale === 'ckb' ? 'en' : 'ckb'; applyLocale(); };
+
+  // ── transcript text size ───────────────────────────────────────────────────
+  // Sorani at a fixed 18px is small for some readers and there was no way to change it. Cycles rather
+  // than using two buttons: header space is scarce on a phone, and this is set once and forgotten.
+  const SIZES = [16, 18, 21, 24, 28];
+  let tsize = Number(localStorage.getItem('cortex.couch.tsize')) || 18;
+  function applyTextSize() {
+    if (!SIZES.includes(tsize)) tsize = 18;
+    document.documentElement.style.setProperty('--tsize', tsize + 'px');
+    localStorage.setItem('cortex.couch.tsize', String(tsize));
+  }
+  $('textsize').onclick = () => { tsize = SIZES[(SIZES.indexOf(tsize) + 1) % SIZES.length]; applyTextSize(); };
+
+  // ── rendering ───────────────────────────────────────────────────────────────
+  let heldByOthers = 0;
+  // Who the SERVER says this link belongs to. Stamped onto every queued decision, because the outbox
+  // lives in localStorage — which is per-origin, not per-reviewer. Two people using the same phone, or
+  // one person opening a colleague's link, share one outbox, and an unstamped decision flushes under
+  // whoever's cookie is current: Sara's offline judgement recorded, permanently, as Hemn's.
+  let me = '';
 
   function toast(msg) {
     $('toast').textContent = msg;
     $('toast').classList.add('show');
     setTimeout(() => $('toast').classList.remove('show'), 1400);
   }
+  // The token rides the query only while we HAVE one. After the first load it has been stripped from
+  // the URL (P3.8) and lives in the HttpOnly cookie, so `token` is "" — and sending `?t=` empty made
+  // the server treat the query as a supplied-but-wrong credential, shadowing the very cookie that
+  // would have authenticated the request. A reviewer who closed the tab and came back was locked out
+  // while the browser was faithfully sending everything needed to let them in.
+  const withToken = (path) => (token ? path + (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(token) : path);
   async function api(path, opts) {
-    const r = await fetch(path + (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(token), opts);
-    if (!r.ok) throw new Error(await r.text());
+    const r = await fetch(withToken(path), opts);
+    if (!r.ok) {
+      // Carry the status so callers can tell "the server refused" (a real answer, do not retry) from
+      // "the request never arrived" (fetch throws a TypeError with no status, and IS worth retrying).
+      const err = new Error(await r.text());
+      err.status = r.status;
+      throw err;
+    }
     return r.headers.get('content-type')?.includes('json') ? r.json() : r;
   }
+  // How many clips this reviewer has finished in this sitting. A session with no visible total is a
+  // session with no sense of an ending, and the count is the cheapest form of pacing there is.
+  let doneThisSession = 0;
+  function renderProgress() {
+    // Clamped: once the batch drains `i` is one PAST the end, and the header read "Clip 26 of 25".
+    const pos = queue.length ? t('progress', { n: Math.min(i + 1, queue.length), total: queue.length }) : '';
+    $('progress').textContent = doneThisSession ? `${pos} · ✓${doneThisSession}` : pos;
+    // Something to take back = the button is reachable, whether or not a card is on screen.
+    $('after').hidden = doneThisSession === 0;
+  }
+  function renderEmptyState() {
+    // Unsent work outranks both other messages. Decisions sitting in the outbox have NOT reached the
+    // server, and "All clips reviewed" over the top of them told the reviewer they were finished at
+    // the exact moment closing the page would have cost them the lot.
+    const unsent = readOutbox().length;
+    if (unsent) { $('done').textContent = t('stillSending', { n: unsent }); return; }
+    // An empty queue does NOT mean the work is finished when other reviewers are holding clips —
+    // claiming "all reviewed" there would be a flat lie to whoever loaded last.
+    $('done').textContent = heldByOthers ? t('heldByOthers', { n: heldByOthers }) : '🎉 ' + t('allDone');
+  }
+  // The server hands out at most QUEUE_BATCH clips per fetch and says nothing about the backlog behind
+  // them, so "my local array ran out" is NOT "the corpus is finished". Without a refetch the page
+  // showed "🎉 All clips reviewed!" after one batch with the entire remaining backlog still pending —
+  // and an installed PWA (display:standalone) has no address bar to reload from, so that screen was a
+  // dead end as well as a lie. `exhausted` is the only thing that may draw the finished state, and it
+  // is set solely by a fetch that came back with nothing.
+  let refilling = false;
+  let exhausted = false;
+  async function refill() {
+    if (refilling) return;
+    refilling = true;
+    $('card').hidden = true;
+    $('done').hidden = false;
+    $('done').textContent = t('loadingMore');
+    try {
+      await load();
+    } finally {
+      refilling = false;
+    }
+  }
+  // ── drafts, so a reload or a crash never costs a typed correction ───────────
+  const draftKey = (id) => 'cortex.couch.draft.' + id;
+  $('text').addEventListener('input', () => {
+    const seg = queue[i];
+    if (seg) localStorage.setItem(draftKey(seg.id), $('text').value);
+  });
+
+  // ── unsent decisions, so a dropped request is not a lost decision ───────────
+  // Kept in localStorage rather than memory: the most likely way to lose a submit is the reviewer
+  // giving up on a frozen page and reloading it. Flushed on load and whenever the phone reconnects.
+  // Safe to replay because the server answers an identical re-submit as already-recorded.
+  const OUTBOX = 'cortex.couch.outbox';
+  const readOutbox = () => { try { return JSON.parse(localStorage.getItem(OUTBOX)) || []; } catch { return []; } };
+  const writeOutbox = (v) => localStorage.setItem(OUTBOX, JSON.stringify(v));
+  // Decisions the server REFUSED on replay. Kept so the reviewer can be told, once, that specific work
+  // did not land — silently discarding it after having toasted "Saved" is how a corpus quietly loses
+  // human labour nobody can account for afterwards.
+  const REFUSED = 'cortex.couch.refused';
+  const readRefused = () => { try { return JSON.parse(localStorage.getItem(REFUSED)) || []; } catch { return []; } };
+  function noteRefused(id) {
+    const r = readRefused();
+    if (!r.includes(id)) localStorage.setItem(REFUSED, JSON.stringify([...r, id]));
+  }
+  function renderRefused() {
+    const n = readRefused().length;
+    if (!n) return;
+    // Persistent, not a toast: this needs the reviewer to go back and re-do specific clips, and a
+    // message that disappears in three seconds cannot ask that.
+    $('err').hidden = false;
+    $('err').textContent = t('refused', { n });
+  }
+  async function flushOutbox() {
+    for (const item of readOutbox()) {
+      // Not mine to send. A decision names its author, and flushing someone else's under this cookie
+      // would attribute their judgement to this reviewer. Left queued for whoever actually made it.
+      // (Items with no author predate this field; sending them is still better than dropping work,
+      // and the server's own fence only engages when the claim is present.)
+      if (item.reviewer && me && item.reviewer !== me) continue;
+      try {
+        await api('/api/decision', {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(item),
+        });
+      } catch (e) {
+        // KEEP, and stop: nothing here is a verdict on the decision itself, so dropping it would
+        // destroy work that can still land.
+        //   no status  — the request never arrived (offline).
+        //   401        — this LINK died, not this decision. The owner restarting Couch Review or
+        //                reissuing a link regenerates every token, so a reviewer who was offline
+        //                reconnects to a 401 and would otherwise have every queued decision thrown
+        //                away silently. A fresh link replays them.
+        //   5xx        — the server is unwell, not disagreeing.
+        if (e.status === undefined || e.status === 401 || e.status >= 500) return;
+        // Everything else (409 taken, 400 invalid) IS a real answer about this decision. Retrying can
+        // never change it, so drop it rather than wedging the queue behind something that will never
+        // land — but the reviewer's TYPED TEXT is not the server's to discard. Deleting the draft here
+        // destroyed the one copy of a correction they had already been told was saved. Keep it, and
+        // say what happened.
+        noteRefused(item.id);
+        writeOutbox(readOutbox().filter((q) => q.id !== item.id));
+        continue;
+      }
+      writeOutbox(readOutbox().filter((q) => q.id !== item.id));
+      localStorage.removeItem(draftKey(item.id));
+    }
+    renderRefused();
+  }
+  addEventListener('online', () => void flushOutbox());
+
   function show() {
     const seg = queue[i];
+    // Drained the batch: go ask for the next one before claiming anything is finished. `exhausted`
+    // breaks the recursion — load() calls show() again, and a fetch that returned nothing sets it, so
+    // the empty state renders on the second pass instead of refetching forever.
+    if (!seg && !exhausted && !refilling) { void refill(); return; }
     $('card').hidden = !seg; $('done').hidden = !!seg;
-    $('progress').textContent = queue.length ? (queue.length - i) + ' left' : '';
-    if (!seg) return;
-    $('player').src = '/api/audio/' + encodeURIComponent(seg.id) + '?t=' + encodeURIComponent(token);
-    $('text').value = seg.text;
+    $('warn').hidden = true;
+    $('skip').hidden = true; // re-armed per clip; only a real audio error reveals it
+    renderProgress();
+    if (!seg) {
+      // Hiding the card does not stop the <audio> element inside it. The last clip kept playing behind
+      // the empty state — forever, if loop was on — with every transport control now unreachable.
+      $('player').pause();
+      // Recomputed here, not just at load: a decision queued offline since then changes what the empty
+      // state is allowed to claim.
+      renderEmptyState();
+      return;
+    }
+    const audioUrl = withToken('/api/audio/' + encodeURIComponent(seg.id));
+    $('player').src = audioUrl;
+    void loadWave(audioUrl);
+    $('player').playbackRate = speed;
+    $('player').loop = looping;
+    // A saved draft is a correction the reviewer already typed; it must win over the server's copy.
+    $('text').value = localStorage.getItem(draftKey(seg.id)) ?? seg.text;
     $('meta').textContent = (seg.durationMs / 1000).toFixed(1) + 's' + (seg.speakerId ? ' · ' + seg.speakerId : '');
+    prefetchNext();
+  }
+  // Warm the NEXT clip's audio while this one is being reviewed. The gap between clips is dead time,
+  // and on a phone it is the difference between a steady rhythm and a stutter every few seconds.
+  let prefetched = null;
+  function prefetchNext() {
+    const next = queue[i + 1];
+    if (!next) return;
+    prefetched = new Audio(withToken('/api/audio/' + encodeURIComponent(next.id)));
+    prefetched.preload = 'auto';
+    prefetched.load();
   }
   async function load() {
     try {
-      queue = await api('/api/queue'); i = 0; show();
-    } catch (e) { $('err').hidden = false; $('err').textContent = 'Cannot load queue:\n' + e.message; }
+      // The fragment claim must land before the first authenticated call, or a brand-new reviewer's
+      // very first /api/queue races the Set-Cookie and 401s a perfectly good link.
+      await claimed;
+      await flushOutbox();
+      const res = await api('/api/queue');
+      queue = res.items; i = 0; heldByOthers = res.heldByOthers || 0;
+      // Recomputed on EVERY load: a fetch that brings work back re-arms the refetch, so a reviewer who
+      // drains one batch, sees the finished screen, and later reloads is not stuck with a stale verdict.
+      exhausted = queue.length === 0;
+      renderEmptyState();
+      // Show WHO the server is recording these decisions as. Every save is stored under this name, so
+      // the reviewer must be able to see it — silent attribution is attribution nobody can correct.
+      me = res.reviewer;
+      $('who').textContent = ' · ' + res.reviewer;
+      show();
+    } catch (e) {
+      $('err').hidden = false;
+      // A dead token is the single most likely thing a remote reviewer will hit — every outstanding
+      // link is regenerated whenever the owner restarts Couch Review or reissues one — and it used to
+      // surface as "Failed to load queue: unauthorized", with the operative word in English and no
+      // hint that the fix is to ask for a new link. Naming it is the difference between a reviewer
+      // who asks and one who assumes the tool is broken.
+      $('err').textContent = e.status === 401 ? t('linkExpired') : t('loadFailed', { err: e.message });
+    }
   }
   async function decide(action) {
     if (busy || !queue[i]) return;
     busy = true;
     const btns = ['save','accept','bad','undo'].map($); btns.forEach(b => b.disabled = true);
+    const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me };
     try {
       await api('/api/decision', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id: queue[i].id, action, text: $('text').value }),
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),
       });
-      toast(action === 'bad' ? 'Marked bad' : 'Saved');
+      localStorage.removeItem(draftKey(submission.id));
+      toast(action === 'bad' ? t('markedBad') : t('saved'));
+      doneThisSession += 1;
       i += 1; show();
-    } catch (e) { toast('Failed: ' + e.message); }
+    } catch (e) {
+      // HOLD, and move on. None of these is a verdict on the decision itself, so the reviewer must
+      // not lose it and must not be stranded on the clip:
+      //   no status  — the request never reached the server (offline).
+      //   401        — the LINK died mid-session, which happens whenever the owner restarts Couch
+      //                Review or reissues a link (adding a second reviewer does it). Only toasting
+      //                here meant every decision made after that moment was dropped: the typed text
+      //                survived in the draft, but the accept/reject verdict did not.
+      //   5xx        — the server is unwell, not disagreeing.
+      // Held decisions replay on the next working link, so the reviewer can keep going meanwhile.
+      if (e.status === undefined || e.status === 401 || e.status >= 500) {
+        writeOutbox([...readOutbox().filter((q) => q.id !== submission.id), submission]);
+        if (e.status === 401) {
+          // Say it once, persistently — a toast about a dead link vanishes before it is understood,
+          // and this one needs an action from the reviewer (ask for a new link).
+          $('err').hidden = false;
+          $('err').textContent = t('linkExpired');
+        } else {
+          // NOT "Saved" — it is not saved, it is queued. Telling a reviewer their work is safe when it
+          // is still sitting in localStorage is what made every later loss invisible: they had already
+          // been reassured, so they had no reason to check anything.
+          toast(t('queued'));
+        }
+        i += 1; show();
+      } else {
+        toast(t('saveFailed', { err: e.message }));
+        // The server refused because someone else has this clip (409). Staying here would keep
+        // re-submitting a decision that can never land, so move past it rather than trapping the reviewer.
+        if (e.status === 409) { i += 1; show(); }
+      }
+    }
     finally { busy = false; btns.forEach(b => b.disabled = false); }
   }
+
+  // ── transport: the controls a transcriber actually uses ────────────────────
+  const SPEEDS = [0.75, 1, 1.25, 1.5];
+  let speed = Number(localStorage.getItem('cortex.couch.speed')) || 1;
+  let looping = localStorage.getItem('cortex.couch.loop') === '1';
+  function applyTransport() {
+    $('player').playbackRate = speed;
+    $('player').loop = looping;
+    $('speed').textContent = speed + '×';
+    $('loop').setAttribute('aria-pressed', String(looping));
+    localStorage.setItem('cortex.couch.speed', String(speed));
+    localStorage.setItem('cortex.couch.loop', looping ? '1' : '0');
+  }
+  $('speed').onclick = () => { speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length]; applyTransport(); };
+  $('loop').onclick  = () => { looping = !looping; applyTransport(); };
+  // Re-listening to the last couple of seconds is the single most repeated action in transcription,
+  // and dragging a phone-sized scrubber to do it is where the time goes.
+  $('again').onclick = () => {
+    $('player').currentTime = Math.max(0, $('player').currentTime - 2);
+    void $('player').play();
+  };
+
+  // ── waveform ───────────────────────────────────────────────────────────────
+  // Peaks are computed ONCE per clip and cached with it; redraw is then pure canvas work, so seeking
+  // and the playback cursor stay smooth on a phone. Decoding is best-effort: a codec the browser
+  // cannot decode leaves the strip blank and changes nothing else — the reviewer still has the audio
+  // element, the transport row and every button.
+  const WAVE_BUCKETS = 160;
+  let peaks = null;
+  async function drawWave() {
+    const c = $('wave');
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(c.clientWidth * dpr));
+    const h = Math.max(1, Math.round(c.clientHeight * dpr));
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    const ctx = c.getContext('2d');
+    ctx.clearRect(0, 0, w, h);
+    if (!peaks || !peaks.length) return;
+    const style = getComputedStyle(document.documentElement);
+    const played = style.getPropertyValue('--accent-line').trim() || '#0284c7';
+    const ahead = style.getPropertyValue('--line').trim() || '#334155';
+    const dur = $('player').duration;
+    const frac = dur && isFinite(dur) ? $('player').currentTime / dur : 0;
+    const bw = w / peaks.length;
+    for (let i = 0; i < peaks.length; i++) {
+      const bh = Math.max(2 * dpr, peaks[i] * h * 0.92);
+      ctx.fillStyle = i / peaks.length <= frac ? played : ahead;
+      ctx.fillRect(i * bw, (h - bh) / 2, Math.max(1, bw - dpr), bh);
+    }
+  }
+  async function loadWave(url) {
+    peaks = null;
+    void drawWave();
+    try {
+      const buf = await (await fetch(url)).arrayBuffer();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const audio = await new AudioCtx().decodeAudioData(buf);
+      const data = audio.getChannelData(0);
+      const per = Math.max(1, Math.floor(data.length / WAVE_BUCKETS));
+      const out = [];
+      // Peak (not mean) per bucket: a mean flattens speech into a uniform smear at this width, which
+      // is precisely the silence-vs-speech distinction the strip exists to show.
+      for (let i = 0; i < WAVE_BUCKETS; i++) {
+        let m = 0;
+        for (let j = i * per; j < Math.min((i + 1) * per, data.length); j++) m = Math.max(m, Math.abs(data[j]));
+        out.push(m);
+      }
+      const top = Math.max(...out, 0.01);
+      peaks = out.map((v) => v / top); // normalise: a quiet clip must still be readable
+      void drawWave();
+    } catch { /* undecodable audio simply leaves the strip blank */ }
+  }
+  $('player').addEventListener('timeupdate', () => void drawWave());
+  $('player').addEventListener('loadedmetadata', () => void drawWave());
+  // A clip whose file has moved off disk answers 500 into <audio src>, and nothing surfaced it: the
+  // element has no error handler, loadWave swallows the body in a bare catch, and show() hides #warn
+  // on every clip. The reviewer saw a normal card with a player that did nothing — and no way past it,
+  // because the queue only advances on a DECISION. Both available exits write a verdict they cannot
+  // justify: accept promotes an unheard ASR draft to gold, reject permanently excludes a clip that may
+  // be fine. Say what happened, and offer the one honest action: move on without judging it.
+  $('player').addEventListener('error', () => {
+    if (!queue[i]) return;
+    $('warn').textContent = t('audioMissing');
+    $('warn').hidden = false;
+    $('skip').hidden = false;
+  });
+  $('skip').onclick = () => {
+    if (!queue[i]) return;
+    // Deliberately writes NOTHING — no decision, no verdict, no attribution. The clip stays pending
+    // and the owner finds it still in the queue, which is the correct signal that a file is missing.
+    i += 1;
+    show();
+  };
+  addEventListener('resize', () => void drawWave());
+  // Tap to seek — the reason a transcriber wants a waveform at all: jump straight to the word in doubt
+  // instead of dragging a scrubber the width of a thumb.
+  $('wave').addEventListener('click', (e) => {
+    const dur = $('player').duration;
+    if (!dur || !isFinite(dur)) return;
+    const r = $('wave').getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width;
+    $('player').currentTime = Math.min(dur, Math.max(0, x * dur));
+    void drawWave();
+  });
+
+  // ── keep an ACTIVE reviewer's clip from lapsing under them ─────────────────
+  // Well inside the server's TTL, so a slow clip never expires while it is genuinely being worked on.
+  // A 409 here means someone else took it — said NOW, while the correction can still be copied,
+  // instead of at save time when it is already unsaveable.
+  async function renewLease() {
+    const seg = queue[i];
+    if (!seg || document.hidden) return;
+    try {
+      await api('/api/renew', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: seg.id }),
+      });
+    } catch (e) {
+      if (e.status === 409) { $('warn').textContent = t('heldByOthers', { n: 1 }); $('warn').hidden = false; }
+    }
+  }
+  setInterval(() => void renewLease(), 4 * 60 * 1000);
+  // Renew the moment the reviewer COMES BACK, not up to four minutes later. Ticks are skipped while
+  // the page is hidden — deliberately, so a reviewer who wanders off releases their clips — but that
+  // leaves a real gap on a phone, where backgrounding is constant (a call, a notification, the screen
+  // locking). Someone who returns at minute 13 of a 15-minute lease would have it lapse under them at
+  // 15 while they are actively typing, with the next tick not due until 16; another reviewer can take
+  // the clip in that window and their correction comes back 409 at save time. Renewing on return
+  // collapses that exposure to nothing, and costs one request per time the page is opened.
+  // On `document`, which is where visibilitychange is dispatched — a window-level listener only sees
+  // it because the event bubbles, which is a needless dependency for the one event that must not be
+  // missed here.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) void renewLease(); });
+
+  // ── keep the screen awake while reviewing (phase 6) ─────────────────────────
+  // Listen-and-type means long stretches with no touch, and a phone dims and locks mid-clip — which
+  // also pauses audio and (on lock) backgrounds the page. Screen Wake Lock needs a SECURE CONTEXT,
+  // so this silently does nothing over plain http:// (LAN/tailnet IP links) and comes alive on the
+  // https:// ts.net URL. Feature-detected; a refusal (low battery, unsupported) costs nothing — the
+  // page merely behaves as it always did. The OS releases the lock whenever the page hides;
+  // re-acquired on return, same shape as the lease renewal above.
+  let wakeLock = null;
+  async function keepAwake() {
+    if (!('wakeLock' in navigator) || wakeLock) return;
+    try { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); }
+    catch { /* denied — dimming is the normal fallback, not an error */ }
+  }
+  $('player').addEventListener('play', () => void keepAwake());
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) void keepAwake(); });
   $('save').onclick   = () => decide('edit');
   $('accept').onclick = () => decide('accept');
   $('bad').onclick    = () => decide('bad');
@@ -101,14 +710,43 @@
     if (busy) return; busy = true;
     try {
       const undone = await api('/api/undo', { method: 'POST' });
-      toast('Review undone');
+      toast(t('undone'));
       await load();
       const pos = queue.findIndex((s) => s.id === undone.id);
       if (pos >= 0) i = pos;
       show();
-    } catch (e) { toast('Undo failed: ' + e.message); }
+    } catch (e) { toast(t('undoFailed') + ': ' + e.message); }
     finally { busy = false; }
   };
+  // ── swipe: accept / reject without reaching for a button ───────────────────
+  // Bound to the CARD, not the page, and ignored when the gesture starts on the textarea — a reviewer
+  // dragging to place a cursor in their correction must never be read as a verdict. The vertical and
+  // distance thresholds keep an ordinary scroll from deciding a clip.
+  let touch = null;
+  $('card').addEventListener('touchstart', (e) => {
+    if (e.target.closest('textarea, audio, button')) { touch = null; return; }
+    touch = { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+  }, { passive: true });
+  $('card').addEventListener('touchend', (e) => {
+    if (!touch) return;
+    const dx = e.changedTouches[0].clientX - touch.x;
+    const dy = e.changedTouches[0].clientY - touch.y;
+    touch = null;
+    if (Math.abs(dx) < 90 || Math.abs(dy) > 60) return;
+    // Direction is meaning, not screen side: in RTL "forward" is leftward. Accept is the forward
+    // gesture in both directions so the muscle memory matches the reading order.
+    const forward = document.documentElement.dir === 'rtl' ? dx < 0 : dx > 0;
+    void decide(forward ? 'accept' : 'bad');
+  }, { passive: true });
+
+  applyLocale();
+  applyTransport();
+  applyTextSize();
+  // Say something BEFORE the first fetch resolves. Both panels start hidden, so on a phone on weak
+  // signal — the normal case for this page — the reviewer opened their link to a blank screen for as
+  // long as the round trip took, with nothing to distinguish "loading" from "this link is broken".
+  $('done').hidden = false;
+  $('done').textContent = t('loadingMore');
   load();
 </script>
 </body>
