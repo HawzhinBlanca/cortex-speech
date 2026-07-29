@@ -2366,3 +2366,20 @@ coverage is wanted. **Eight** Sorani strings now await native review. verify-10 
 
 **Gates after the addendum:** `cargo test --lib` **1088 passed; 0 failed** (couch:: 38); clippy exit 0;
 fmt clean; `npm run test:e2e` **68 passed**; couch-page **21**; python-policies 44/44.
+
+**Second addendum to iter 204 — the blank first screen.** Both panels start hidden, so until the first
+`/api/queue` resolved the reviewer saw nothing at all. On a phone on weak signal — the normal case for
+this surface — a blank screen is indistinguishable from a dead link, at the moment someone is most
+likely to give up and message the owner. It now says it is loading, reusing the refill string (retitled
+"Loading clips…" so it reads correctly in both places rather than adding a ninth unreviewed Sorani
+string). couch-page **22 passed**; python-policies 44/44.
+
+**Judged NOT worth changing, with reasons, rather than left as silent debt:**
+- `held_by_others` skipping the un-leased remainder is now COSMETIC. The empty state only renders when
+  the server returns zero items, and at that point the remainder is zero by construction — the refetch
+  closed the user-visible half. The counter is still semantically wrong and is left recorded here.
+- A spot-check answer queued across Stop/Start is still lost. Stop is a deliberate full revoke that
+  clears the session, so a new session legitimately knows nothing about the old check; the reviewer is
+  now TOLD (refused-decision banner) instead of losing it silently, which was the actual defect.
+- Undo history dying with the process is benign in practice: the button is hidden while
+  `doneThisSession` is 0, so a relaunched page does not offer an undo it cannot honour.

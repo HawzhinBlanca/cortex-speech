@@ -53,7 +53,7 @@
     "linkExpired": "This link has expired. Ask for a new one — anything you already saved is safe, and anything still waiting to send will go through on the new link.",
     "allDone": "All clips reviewed!",
     "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
-    "loadingMore": "Loading more clips…",
+    "loadingMore": "Loading clips…",
     "queued": "Queued — it will send when you are back online",
     "audioMissing": "This clip's audio will not play, so there is nothing to judge. Skip it — the owner will be told.",
     "skip": "Skip this clip",
@@ -76,7 +76,7 @@
     "linkExpired": "ئەم بەستەرە بەسەرچووە. داوای بەستەرێکی نوێ بکە — هەرچی پاشەکەوتت کردووە پارێزراوە، و هەرچی چاوەڕێی ناردنە بە بەستەرە نوێیەکە دەنێردرێت.",
     "allDone": "هەموو پارچەکان پێداچوونەوەیان بۆ کرا!",
     "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
-    "loadingMore": "بارکردنی پارچەی زیاتر…",
+    "loadingMore": "بارکردنی پارچەکان…",
     "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
     "audioMissing": "دەنگی ئەم پارچەیە لێ نادرێت، بۆیە شتێک نییە بڕیاری لەسەر بدرێت. تێیپەڕێنە — خاوەنەکە ئاگادار دەکرێتەوە.",
     "skip": "تێپەڕاندنی ئەم پارچەیە",
@@ -742,6 +742,11 @@
   applyLocale();
   applyTransport();
   applyTextSize();
+  // Say something BEFORE the first fetch resolves. Both panels start hidden, so on a phone on weak
+  // signal — the normal case for this page — the reviewer opened their link to a blank screen for as
+  // long as the round trip took, with nothing to distinguish "loading" from "this link is broken".
+  $('done').hidden = false;
+  $('done').textContent = t('loadingMore');
   load();
 </script>
 </body>

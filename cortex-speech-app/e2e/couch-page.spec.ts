@@ -423,6 +423,36 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#skip')).toBeHidden();
   });
 
+  test('a slow first load says so instead of showing a blank page', async ({ page }) => {
+    // Both panels start hidden, so until /api/queue resolved the reviewer saw nothing at all — and on
+    // a phone on weak signal, which is the normal case for this page, a blank screen is
+    // indistinguishable from a dead link. The most likely moment to give up is the first one.
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          await new Promise((r) => setTimeout(r, 1500)); // a slow round trip
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [{ id: 'p1', text: 'دەق', durationMs: 1000, speakerId: null }],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    // While the fetch is still in flight the reviewer is told what is happening.
+    await expect(page.locator('#done')).toBeVisible();
+    await expect(page.locator('#done')).toContainText('بارکردنی');
+    // ...and it gives way to the clip once it lands.
+    await expect(page.locator('#text')).toHaveValue('دەق', { timeout: 8000 });
+    await expect(page.locator('#done')).toBeHidden();
+  });
+
   test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {
     // DATA LOSS, and made MORE reachable by fixing Stop/Start: every outstanding token is regenerated
     // when the owner restarts Couch Review or reissues a link. A reviewer who was offline then
