@@ -5,17 +5,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Cortex</title>
 <!--
-  ADD TO HOME SCREEN. These meta tags give a full-screen, chrome-free app launched from a home-screen
-  icon on iOS — which is the owner's phone and the realistic reviewer device.
+  ADD TO HOME SCREEN. These tags give a full-screen, chrome-free app launched from a home-screen icon
+  on iOS and, over HTTPS (Tailscale Serve/Funnel — docs/REMOTE_PUBLIC_LINKS_PLAN.md phase 5), an
+  installable app on Android Chrome. The manifest's start_url is "/" and NEVER carries a token: an
+  installed app rides the HttpOnly cookie, so revoking a reviewer revokes their installed app too.
 
-  DELIBERATELY NO service worker and NO web app manifest, and this is a browser constraint rather
-  than a shortcut: service workers require a SECURE CONTEXT, and this page is plain HTTP on a LAN or
-  tailnet IP. Tailscale does not change that — it is still http://100.x.y.z. So genuine offline
-  caching and Android/Chrome installability are UNREACHABLE here without TLS, which docs/
-  REMOTE_REVIEW_PLAN.md deliberately rules out. What IS reachable is the standalone iOS experience
-  below, so that is what this claims. The outbox (localStorage) covers the connectivity gap a service
-  worker would otherwise have handled.
+  DELIBERATELY NO service worker (plan phase 6, judgment call): it is the one addition that
+  introduces a NEW failure mode — a stale cached shell after the exe (which embeds this page via
+  include_str!) is rebuilt. The localStorage outbox already covers the connectivity gap, and
+  Background Sync remains unsupported on iOS Safari in 2026 anyway. Revisit only if reviewers report
+  the shell failing to open offline.
 -->
+<link rel="manifest" href="/manifest.json" />
+<link rel="apple-touch-icon" href="/icon.png" />
+<link rel="icon" type="image/png" href="/icon.png" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-title" content="Cortex" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -555,6 +558,22 @@
   // it because the event bubbles, which is a needless dependency for the one event that must not be
   // missed here.
   document.addEventListener('visibilitychange', () => { if (!document.hidden) void renewLease(); });
+
+  // ── keep the screen awake while reviewing (phase 6) ─────────────────────────
+  // Listen-and-type means long stretches with no touch, and a phone dims and locks mid-clip — which
+  // also pauses audio and (on lock) backgrounds the page. Screen Wake Lock needs a SECURE CONTEXT,
+  // so this silently does nothing over plain http:// (LAN/tailnet IP links) and comes alive on the
+  // https:// ts.net URL. Feature-detected; a refusal (low battery, unsupported) costs nothing — the
+  // page merely behaves as it always did. The OS releases the lock whenever the page hides;
+  // re-acquired on return, same shape as the lease renewal above.
+  let wakeLock = null;
+  async function keepAwake() {
+    if (!('wakeLock' in navigator) || wakeLock) return;
+    try { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); }
+    catch { /* denied — dimming is the normal fallback, not an error */ }
+  }
+  $('player').addEventListener('play', () => void keepAwake());
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) void keepAwake(); });
   $('save').onclick   = () => decide('edit');
   $('accept').onclick = () => decide('accept');
   $('bad').onclick    = () => decide('bad');

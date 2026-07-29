@@ -845,6 +845,24 @@ fn handle_request(
             None => ((200, "text/html; charset=utf-8", shell), None),
         };
     }
+    // Static assets for install-to-home-screen (phase 6), public for the same reason the shell is:
+    // an icon and a manifest carry nothing. The manifest's start_url is "/" and NEVER a token — an
+    // installed app must ride the cookie, or a revoked token would be frozen into someone's phone.
+    if let (tiny_http::Method::Get, "/icon.png") = (&method, path.as_str()) {
+        return ((200, "image/png", include_bytes!("../assets/couch-icon.png").to_vec()), None);
+    }
+    if let (tiny_http::Method::Get, "/manifest.json") = (&method, path.as_str()) {
+        let manifest = serde_json::json!({
+            "name": "Cortex Review",
+            "short_name": "Cortex",
+            "start_url": "/",
+            "display": "standalone",
+            "background_color": "#0b1220",
+            "theme_color": "#0b1220",
+            "icons": [{ "src": "/icon.png", "sizes": "512x512", "type": "image/png" }]
+        });
+        return ((200, "application/manifest+json", manifest.to_string().into_bytes()), None);
+    }
     if let (tiny_http::Method::Post, "/api/claim") = (&method, path.as_str()) {
         return match read_body(request) {
             Ok(body) => api_claim(&body, state),
@@ -1889,6 +1907,17 @@ mod tests {
         // The data stays gated exactly as before.
         let data = agent.get(&format!("{base}/api/queue")).call();
         assert!(matches!(data, Err(ureq::Error::Status(401, _))), "the shell being public must not open the data");
+
+        // The install assets (phase 6) are public like the shell, carry no cookie, and the manifest's
+        // start_url must NEVER embed a credential — an installed app rides the cookie, so revoking a
+        // reviewer revokes their installed app too.
+        let icon = agent.get(&format!("{base}/icon.png")).call().expect("icon is public");
+        assert_eq!(icon.header("content-type"), Some("image/png"));
+        assert!(icon.header("set-cookie").is_none());
+        let manifest = agent.get(&format!("{base}/manifest.json")).call().expect("manifest is public");
+        assert!(manifest.header("set-cookie").is_none());
+        let manifest: serde_json::Value = manifest.into_json().unwrap();
+        assert_eq!(manifest["start_url"], "/", "an installed app must never freeze a token into its start_url");
 
         // THE REVIEWER'S FIRST OPEN: the page presents the fragment token once, by POST body.
         let claim = agent
