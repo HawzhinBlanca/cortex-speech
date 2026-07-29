@@ -266,12 +266,16 @@ fn session_path(data_dir: &Path) -> PathBuf {
     data_dir.join(SESSION_FILE)
 }
 
+/// Returns Err when the session could NOT be written. Most callers treat that as advisory — a link
+/// that merely forgets itself is recoverable by pressing Start again. `revoke` is the exception and
+/// must surface it: a revoke that lives only in memory is silently undone by the next restart, which
+/// is the opposite of what the owner just asked for.
 fn save_session(
     data_dir: &Path,
     reviewers: &HashMap<String, String>,
     db_path: &str,
     spot_checks: &HashSet<(String, String)>,
-) {
+) -> Result<(), String> {
     let protected: HashMap<String, String> = reviewers
         .iter()
         .filter_map(|(token, name)| crate::dpapi::protect(token).ok().map(|t| (t, name.clone())))
@@ -281,7 +285,7 @@ fn save_session(
         // worse than one that asks the owner to press Start again, because the missing reviewer sees
         // a dead link and has no way to tell it apart from a bug.
         tracing::warn!("Couch Review session not remembered: a token could not be protected at rest");
-        return;
+        return Err("a token could not be protected at rest".to_string());
     }
     let saved = SavedSession {
         reviewers: protected,
@@ -292,14 +296,18 @@ fn save_session(
         spot_checks: spot_checks.iter().cloned().collect(),
     };
     let path = session_path(data_dir);
-    let Ok(json) = serde_json::to_string_pretty(&saved) else { return };
+    let Ok(json) = serde_json::to_string_pretty(&saved) else {
+        return Err("session could not be serialised".to_string());
+    };
     // Written via a temp file + atomic replace, like every other state file here: a half-written
     // session would resume with a truncated token map and silently issue links that do not work.
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, json.as_bytes()).and_then(|()| crate::atomic_file::replace_file(&tmp, &path)) {
         tracing::warn!("Couch Review session not remembered: {e}");
         let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
     }
+    Ok(())
 }
 
 fn clear_session(data_dir: &Path) {
@@ -346,10 +354,17 @@ pub fn start(db_path: String, reviewers: Vec<String>, data_dir: Option<PathBuf>)
 /// for a fresh URL. Returns None when there is nothing remembered, which is the normal first-run and
 /// post-Stop state.
 pub fn resume(db_path: String, data_dir: &Path) -> Option<CouchStatus> {
+    resume_on_port(db_path, data_dir, COUCH_PORT)
+}
+
+/// `resume` with the port injected, for the same reason `start_on_port` exists: the resurrection a
+/// revoke has to survive happens HERE, in the roster rebuilt from the remembered file, so the test
+/// must drive this exact path — and it cannot bind 8737 while the owner's own server is using it.
+fn resume_on_port(db_path: String, data_dir: &Path, port: u16) -> Option<CouchStatus> {
     let (remembered, _) = load_session(data_dir, &db_path)?;
     let mut names: Vec<String> = remembered.values().cloned().collect();
     names.sort();
-    match start(db_path, names, Some(data_dir.to_path_buf())) {
+    match start_on_port(db_path, names, port, Some(data_dir.to_path_buf())) {
         Ok(status) => {
             tracing::info!(
                 "Couch Review resumed for {} reviewer(s) — previous links still work",
@@ -467,7 +482,9 @@ fn start_on_port(
             let st = lock_state(&handle.state);
             (st.reviewers.clone(), st.spot_checks.clone())
         };
-        save_session(dir, &reviewers, &db_path, &checks);
+        // Advisory here: a session that fails to persist still serves every link it just issued, and
+        // save_session has already logged why. Only `revoke` treats this as an error worth raising.
+        let _ = save_session(dir, &reviewers, &db_path, &checks);
     }
     *guard = Some(handle);
     tracing::info!(
@@ -568,6 +585,28 @@ fn revoke_in(state: &Mutex<CouchState>, name: &str) -> Result<(), String> {
     // Their held clips go back to the pool at once; leaving them leased would strand real work behind
     // someone who can no longer reach the server.
     st.leases.retain(|_, (who, _)| !who.eq_ignore_ascii_case(name));
+
+    // PERSIST, or say so. Dropping the token from the in-memory map denies the lost phone right now,
+    // but `couch_session.json` is what `resume()` rebuilds the roster from — and `start_on_port`
+    // deliberately RE-ISSUES the remembered token for a remembered name, so a memory-only revoke is
+    // undone by the next launch, handing the revoked phone back its original working link. The
+    // watchdog relaunches this app unattended every 5 minutes, so that restart is not hypothetical.
+    //
+    // Snapshot under the lock and write outside it, like the batch-serve path: save_session does DPAPI
+    // plus file IO, which has no business inside the request-path mutex.
+    let persist = st
+        .session_store
+        .clone()
+        .map(|(dir, db_path)| (dir, db_path, st.reviewers.clone(), st.spot_checks.clone()));
+    drop(st);
+    if let Some((dir, db_path, reviewers, checks)) = persist {
+        // Access is already denied in memory at this point, so this is not a rollback — it is the
+        // difference between "revoked" and "revoked until the next restart", and the owner revoking a
+        // LOST PHONE has to be told which one they got.
+        save_session(&dir, &reviewers, &db_path, &checks).map_err(|e| {
+            format!("Access denied now, but it will come back when the app restarts — the session could not be saved ({e}). Press Stop to revoke every link for certain.")
+        })?;
+    }
     Ok(())
 }
 
@@ -1006,7 +1045,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 };
                 drop(guard);
                 if let Some(((dir, db_path), reviewers, checks)) = persist {
-                    save_session(&dir, &reviewers, &db_path, &checks);
+                    let _ = save_session(&dir, &reviewers, &db_path, &checks);
                 }
             }
             // A spot check is a quality measure, never a reason to stop a reviewer working.
@@ -2340,6 +2379,70 @@ mod tests {
             token_of(&sara_link),
             "a link revoked with Stop must NOT come back to life on the next launch"
         );
+        stop().expect("final stop");
+    }
+
+    #[test]
+    fn revoking_one_reviewer_must_outlive_a_restart_the_way_stop_does() {
+        let _serial = GLOBAL_SESSION_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The reason revoke exists is a LOST PHONE. Dropping the token from the in-memory map denied
+        // it instantly, but nothing wrote that to couch_session.json — and `resume()` rebuilds the
+        // roster from exactly that file, re-issuing the REMEMBERED token for a remembered name. So the
+        // revoked phone got its original working link back at the next launch, with no owner action
+        // and nothing in the UI to say so. The watchdog relaunches this app unattended every five
+        // minutes, so "the next launch" is not a hypothetical the owner controls.
+        //
+        // Worse than plainly broken, it was NONDETERMINISTIC: the only other save_session call sites
+        // are start and the batch-serve path, and the latter fires only when some OTHER reviewer's
+        // next batch happens to serve a brand-new spot check. The same owner action sometimes stuck
+        // and sometimes did not.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db_path = tmp.path().join("revoke.db").to_string_lossy().to_string();
+        Database::open(&db_path).unwrap().initialize().unwrap();
+
+        let started = start_on_port(db_path.clone(), vec!["Sara".into(), "Hemn".into()], 0, Some(data_dir.clone()))
+            .expect("start");
+        let token_of = |url: &str| url.split("#t=").nth(1).unwrap().to_string();
+        let sara_token = token_of(&started.reviewers.iter().find(|r| r.name == "Sara").unwrap().url);
+        let hemn_token = token_of(&started.reviewers.iter().find(|r| r.name == "Hemn").unwrap().url);
+
+        // Sara loses her phone; the owner revokes her from Settings.
+        revoke("Sara").expect("revoke succeeds");
+
+        // CLOSING THE APP — not Stop. The session is deliberately remembered here (that is the whole
+        // point of durable links), which is precisely why the revoke has to be remembered with it.
+        if let Some(mut h) = COUCH.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            h.shutdown.store(true, Ordering::SeqCst);
+            h.server.unblock();
+            for join in h.joins.drain(..) {
+                let _ = join.join();
+            }
+            let port = h.port;
+            drop(h);
+            release_listener(port);
+        }
+
+        // The production restart path: lib.rs calls resume(), which derives the roster from the file.
+        let resumed = resume_on_port(db_path, &data_dir, 0).expect("resume brings the session back");
+        let names: Vec<&str> = resumed.reviewers.iter().map(|r| r.name.as_str()).collect();
+        assert!(!names.contains(&"Sara"), "a revoked reviewer must not be resurrected by resume: {names:?}");
+        assert!(names.contains(&"Hemn"), "revoking one reviewer must not disturb the others: {names:?}");
+
+        let live: Vec<String> = resumed.reviewers.iter().map(|r| token_of(&r.url)).collect();
+        assert!(
+            !live.contains(&sara_token),
+            "the REVOKED token itself must never be served again — the lost phone still holds it"
+        );
+        assert!(live.contains(&hemn_token), "an untouched reviewer's link must still work after a restart");
+
+        // And the file on disk — the thing a fresh process actually reads — must agree.
+        let raw = std::fs::read_to_string(session_path(&data_dir)).expect("session file exists");
+        let saved: SavedSession = serde_json::from_str(&raw).expect("session file parses");
+        let remembered: Vec<&String> = saved.reviewers.values().collect();
+        assert!(!remembered.iter().any(|n| *n == "Sara"), "the revoked reviewer must be gone from disk too");
+        assert_eq!(remembered.len(), 1, "exactly one reviewer should remain remembered");
+
         stop().expect("final stop");
     }
 

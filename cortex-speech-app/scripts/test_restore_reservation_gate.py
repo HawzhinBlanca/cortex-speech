@@ -84,10 +84,23 @@ def test_every_writer_start_checks_restore_pending() -> None:
     # SAME mutex the restore fence reads. Hoisting it into `start` would satisfy a naive scan while
     # moving the check OUTSIDE the lock and reopening the race this gate exists to close.
     _assert_guarded(couch, "fn start_on_port(", "couch::start_on_port", "restore_pending()")
-    if "start_on_port(db_path, reviewers, COUCH_PORT)" not in couch:
+    # Must match `start`'s ACTUAL one-line body. This literal was written against the pre-`data_dir`
+    # signature and silently stopped matching when durable sessions added that parameter — so the gate
+    # raised on every run instead of checking anything, which is a broken gate, not a strict one. Keep
+    # it exact: a loose `"start_on_port(" in couch` would pass even if `start` grew a real body, which
+    # is precisely the bypass this check exists to catch.
+    if "start_on_port(db_path, reviewers, COUCH_PORT, data_dir)" not in couch:
         raise AssertionError(
             "couch::start must delegate to start_on_port so the guarded path is the only way in; if it "
-            "grew its own body, this gate is checking a function the app no longer calls."
+            "grew its own body, this gate is checking a function the app no longer calls. (If you "
+            "changed start's signature, update this literal to its new one-line body — do not loosen it.)"
+        )
+    # `resume` is the OTHER way into a running server — it is what the app calls at launch, unattended,
+    # every time the watchdog relaunches. It must reach the guarded function by the same delegate route.
+    if "resume_on_port(db_path, data_dir, COUCH_PORT)" not in couch:
+        raise AssertionError(
+            "couch::resume must delegate to resume_on_port, which must reach start_on_port — otherwise "
+            "the automatic launch path could start a writer without the restore guard."
         )
 
 
