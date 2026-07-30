@@ -2640,3 +2640,26 @@ outbox stays at **1** with the timer removed, **0** with it. Stable 3-for-3.
 
 **Gates (unmasked):** `npm run test:e2e` 0 — **73 passed**; couch-page **26**, stable 3-for-3;
 python-policies 0 — 44/44.
+
+**Iteration 210 — the retry timer's own second-order defect.** Self-audit again, and again it was the
+change from the previous iteration.
+
+`flushOutbox` had no re-entrancy guard, and after the 30s retry timer landed there were THREE callers:
+the `online` event, `load()`, and the timer. An overlapping run re-POSTs items another is already
+sending. The server's dedup guard means nothing corrupts — but every duplicate spends a
+COUCH_RATE_LIMITER token, which is perverse: throttling is the entire reason that timer exists, so
+re-entrancy made being throttled worse, and could sustain it.
+
+Guarded with an in-flight flag, added as a thin wrapper (`flushOutbox` -> `flushOutboxOnce`) so the
+loop body stays untouched and the diff stays reviewable. FAIL-BEFORE, measured against a deliberately
+slow server with every trigger fired at once: **4 identical POSTs for one decision** without the guard,
+1 with it. Stable 3-for-3.
+
+This is the fourth defect in a row found in code written earlier in the same loop, and the third that
+was a second-order consequence of the previous fix (429-drop -> unflushed outbox -> re-entrant flush).
+Recorded because the pattern is the useful part: each fix moved the failure one layer out rather than
+removing it, and only running the system exposed the next layer. Re-reading code has found nothing all
+night.
+
+**Gates (unmasked):** page script parses clean (node Function check); `npm run test:e2e` 0 —
+**74 passed**; couch-page **27**, stable 3-for-3; python-policies 0 — 44/44.

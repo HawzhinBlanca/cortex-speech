@@ -648,6 +648,51 @@ test.describe('Couch Review phone page', () => {
     expect(sent.join(' ')).toContain('k1');
   });
 
+  test('overlapping flushes never double-post the same decision', async ({ page }) => {
+    // Three things call flushOutbox now — the online event, load(), and the 30s retry timer added an
+    // hour ago. Without a guard, an overlapping run re-POSTs items another is already sending. The
+    // server dedups so nothing corrupts, but every duplicate spends a rate-limiter token, which is
+    // perverse: throttling is the whole reason that timer exists, so re-entrancy makes being throttled
+    // worse. Provoked here by firing every trigger at once against a deliberately slow server.
+    await page.addInitScript(() => {
+      (window as unknown as { __posts: string[] }).__posts = [];
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          return new Response(JSON.stringify({ reviewer: 'Sara', items: [], heldByOthers: 0 }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        if (url.includes('/api/decision')) {
+          (window as unknown as { __posts: string[] }).__posts.push(String(init?.body ?? ''));
+          await new Promise((r) => setTimeout(r, 300)); // slow enough for a second trigger to land
+          return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
+
+    // One queued decision, then every flush trigger fired at once while the first is still in flight.
+    await page.evaluate(`
+      localStorage.setItem('cortex.couch.outbox', JSON.stringify([{ id: 'x9', action: 'edit', text: 'y', reviewer: 'Sara' }]));
+      window.__posts = [];
+      dispatchEvent(new Event('online'));
+      dispatchEvent(new Event('online'));
+      dispatchEvent(new Event('online'));
+      void load();
+    `);
+    await expect
+      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .toBe(0);
+
+    const posts = (await page.evaluate(`window.__posts`)) as string[];
+    const forX9 = posts.filter((b) => b.includes('x9'));
+    expect(forX9).toHaveLength(1);
+  });
+
   test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {
     // DATA LOSS, and made MORE reachable by fixing Stop/Start: every outstanding token is regenerated
     // when the owner restarts Couch Review or reissues a link. A reviewer who was offline then

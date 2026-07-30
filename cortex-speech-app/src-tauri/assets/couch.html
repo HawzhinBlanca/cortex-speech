@@ -427,7 +427,22 @@
     $('err').hidden = false;
     $('err').textContent = t('refused', { n });
   }
+  // ONE flush at a time. Three things call this now — the `online` event, load(), and the 30s retry
+  // timer — and an overlapping run re-POSTs items another is already sending. The server dedups, so
+  // nothing corrupts, but every duplicate spends a rate-limiter token, which is perverse: throttling
+  // is the whole reason the retry timer exists, so re-entrancy here would make being throttled worse.
+  // A thin wrapper rather than wrapping the body, so the loop below stays untouched.
+  let flushing = false;
   async function flushOutbox() {
+    if (flushing) return;
+    flushing = true;
+    try {
+      await flushOutboxOnce();
+    } finally {
+      flushing = false;
+    }
+  }
+  async function flushOutboxOnce() {
     for (const item of readOutbox()) {
       // Not mine to send. A decision names its author, and flushing someone else's under this cookie
       // would attribute their judgement to this reviewer. Left queued for whoever actually made it.
