@@ -3179,6 +3179,114 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_decision_is_never_silently_overwritten_by_the_phone() {
+        // The owner reviews on BOTH surfaces. A clip the phone is holding can be decided at the desktop
+        // in the meantime, and the phone's submit then arrives against a row that already carries
+        // somebody's judgement. Silently overwriting it is the destruction leases exist to prevent,
+        // just arriving from the other direction — and the desktop path attributes differently
+        // (annotator None), so this leans on the late-submit guard rather than the collision guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("dk1", "دەقی خاو")).unwrap();
+        let state = state();
+
+        // The phone leases it as part of a batch.
+        let held = queue_ids(&db, "Hawzhin", &state);
+        assert!(held.contains(&"dk1".to_string()), "the phone must be holding the clip");
+
+        // The DESKTOP decides it first, the way the desktop review does: no phone reviewer name.
+        crate::jury::record_human_decision_by(&db, "dk1", "edit", Some("ڕاستکراوەی دێسکتۆپ"), None, None).unwrap();
+        let mut row = db.get_segment_by_id("dk1").unwrap().unwrap();
+        row.annotated_transcript = Some("ڕاستکراوەی دێسکتۆپ".into());
+        row.verified = true;
+        db.insert_segment(&row).unwrap();
+
+        // Now the phone's submit lands, minutes late, carrying a different correction.
+        let body = serde_json::json!({ "id": "dk1", "action": "edit", "text": "ڕاستکراوەی مۆبایل" });
+        let (code, _, msg) = api_decision(&db, body.to_string().as_bytes(), "Hawzhin", &state);
+        assert_eq!(code, 409, "a late phone submit must be refused, not written over the desktop's work");
+        assert!(
+            String::from_utf8_lossy(&msg).contains("desktop"),
+            "the refusal must name where the existing decision came from: {msg:?}"
+        );
+
+        let after = db.get_segment_by_id("dk1").unwrap().unwrap();
+        assert_eq!(
+            after.annotated_transcript.as_deref(),
+            Some("ڕاستکراوەی دێسکتۆپ"),
+            "the desktop correction must survive intact"
+        );
+        assert!(after.verified);
+    }
+
+    #[test]
+    fn reloading_mid_batch_returns_the_remainder_and_never_a_decided_clip() {
+        // A phone reload mid-batch is the single most common thing a reviewer does — a stutter, a
+        // rotation, a background/foreground cycle, or simply pulling to refresh — and nothing covered
+        // it. Two things could go wrong and both would be quiet: getting a FRESH batch (abandoning the
+        // in-progress work the leases were meant to protect) or getting back a clip already decided
+        // (asking the reviewer to judge the same audio twice, which corrupts the honest count of what
+        // they did).
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        const CLIPS: usize = 60;
+        for n in 0..CLIPS {
+            db.insert_segment(&seg(&format!("m{n:03}"), "دەقی سەرەتایی")).unwrap();
+        }
+        drop(db);
+
+        let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let state = Arc::new(Mutex::new(CouchState {
+            reviewers: [("tok".to_string(), "Hawzhin".to_string())].into_iter().collect(),
+            ..CouchState::default()
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let join = spawn_server_loop(0, server.clone(), db_path.clone(), state.clone(), shutdown.clone()).unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+        let fetch = || -> Vec<String> {
+            let q: serde_json::Value =
+                agent.get(&format!("{base}/api/queue?t=tok")).call().unwrap().into_json().unwrap();
+            q["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect()
+        };
+
+        let first = fetch();
+        assert!(first.len() >= 10, "need a real batch, got {}", first.len());
+        // Decide the first five, then "reload" — a bare re-fetch, which is exactly what load() does.
+        for id in first.iter().take(5) {
+            let body = serde_json::json!({ "id": id, "action": "accept", "text": "دەقی سەرەتایی" }).to_string();
+            let status = agent
+                .post(&format!("{base}/api/decision?t=tok"))
+                .set("content-type", "application/json")
+                .send_string(&body)
+                .map(|r| r.status())
+                .unwrap_or(0);
+            assert_eq!(status, 200, "{id} must land before the reload");
+        }
+        let after = fetch();
+
+        shutdown.store(true, Ordering::SeqCst);
+        server.unblock();
+        let _ = join.join();
+
+        // NO decided clip may come back. This is the assertion that protects the reviewer from being
+        // asked to judge the same audio twice.
+        for id in first.iter().take(5) {
+            assert!(!after.contains(id), "{id} was decided, yet the reload served it again");
+        }
+        // The UNDECIDED remainder of the same batch must still be theirs — the reload must not abandon
+        // in-progress work for a fresh batch, which is the whole reason api_queue preserves own leases.
+        let kept = first.iter().skip(5).filter(|id| after.contains(id)).count();
+        assert_eq!(
+            kept,
+            first.len() - 5,
+            "a reload must hand back the rest of the in-progress batch, kept {kept} of {}",
+            first.len() - 5
+        );
+    }
+
+    #[test]
     fn a_mid_session_server_restart_loses_no_work_and_double_decides_nothing() {
         // THE WATCHDOG CAN RESTART THIS APP AT ANY 5-MINUTE TICK — that is its job, and after the
         // probe/kill-loop fixes it will do so whenever the port is genuinely unreachable. So a real

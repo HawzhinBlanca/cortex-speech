@@ -2663,3 +2663,40 @@ night.
 
 **Gates (unmasked):** page script parses clean (node Function check); `npm run test:e2e` 0 —
 **74 passed**; couch-page **27**, stable 3-for-3; python-policies 0 — 44/44.
+
+---
+
+## Iteration 211 — hunt widened to untouched code: three probes, three clean
+
+The second-order chain from tonight's own changes terminated last iteration, so this one probed areas
+NOT touched all night. Reporting the null results, because "we looked and found nothing" is only worth
+anything if it is said as plainly as a defect would be.
+
+**Audio serving under a long session — MEASURED, fine.** The library's single source file is
+**172,764,670 bytes**, and a session costs ~2 audio requests per clip (the player plus the next-clip
+prefetch), so ~232 fetches. Timed against the live server: **~83ms each** (390–472 KB payloads), so the
+decode seeks rather than reading the file — about 19 seconds of audio serving across the whole 116-clip
+session. No defect, no change made.
+
+**Reloading mid-batch — PINNED, no defect.** The most common thing a phone reviewer does (a stutter, a
+rotation, a background cycle, a pull-to-refresh) and nothing covered it. Two quiet failures were
+possible: a FRESH batch, abandoning the in-progress work leases exist to protect, or a clip already
+decided coming back, asking the reviewer to judge the same audio twice. New
+`reloading_mid_batch_returns_the_remainder_and_never_a_decided_clip`: 60 clips, batch out, five decided,
+re-fetch — no decided clip returns and the whole undecided remainder is still theirs. Passed first try.
+
+**Desktop and phone at once — PINNED, no defect.** The owner uses both surfaces, so a clip the phone
+holds can be decided at the desktop meanwhile; the phone's late submit then arrives against a row that
+already carries a judgement. This leans on the LATE-SUBMIT guard, not the collision guard, because the
+desktop attributes with annotator None. New
+`a_desktop_decision_is_never_silently_overwritten_by_the_phone` asserts 409, a message naming the
+desktop, and the desktop's correction intact. Passed first try.
+
+**The honest signal from tonight as a whole:** five defects, all five in code written earlier the same
+night, three of them second-order consequences of the previous fix. Three probes into code NOT touched
+tonight found nothing. New code is where the defects were, which is why the loop audits its own diffs
+first — and it is also why these three null results are worth trusting rather than treating as
+insufficient effort.
+
+**Gates (unmasked):** `cargo test --lib` 0 — **1094 passed, 7 ignored**; clippy 0; `cargo fmt --check`
+0; python-policies 0 — 44/44.
