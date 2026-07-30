@@ -2700,3 +2700,43 @@ insufficient effort.
 
 **Gates (unmasked):** `cargo test --lib` 0 — **1094 passed, 7 ignored**; clippy 0; `cargo fmt --check`
 0; python-policies 0 — 44/44.
+
+---
+
+## Iteration 212 — the watchdog finally has a test, including the branch that could never be drilled
+
+The watchdog is the entire availability story — the only thing that brings the review server back after
+a crash, a wedge or a reboot — and it had **no test of any kind**. Its most dangerous branch force-kills
+the app, and the branch that must LEAVE A HEALTHY APP ALONE (the owner pressed Stop) had been reviewed
+but never verified. It could not be: proving it for real means pressing Stop, which deletes
+`couch_session.json` and revokes the owner's live link. That is why it stayed "reviewed but not drilled"
+across several iterations, stated each time rather than quietly dropped.
+
+**Made testable, then tested.** `cortex-watchdog.ps1` gained `-DryRun` (decide and REPORT
+`WATCHDOG-ACTION: ...`, kill and launch nothing) plus `CORTEX_WATCHDOG_DATA_DIR` /
+`CORTEX_WATCHDOG_PORT` overrides. Production behaviour is unchanged when neither is set. The
+`$env:APPDATA` hardcodes in the session-file and dead-man-ping paths now route through `$dataDir`, so a
+drill cannot touch the real profile.
+
+**`scripts/test_watchdog_decisions.py` (new, auto-discovered by the policy runner: 44 -> 45 scripts).**
+Runs against a throwaway data dir and a port nothing is listening on, so it is safe **while the owner is
+mid-review** — and it was: the real app was up and serving throughout. Measured:
+
+```
+OK   no session + app running -> must NOT touch it: leave-alone (deliberate Stop)
+OK   session + app running -> kill and relaunch:    kill-and-relaunch (attempt 1/3)
+OK   session + 3 prior kills -> give up:            give-up (kill cap reached)
+```
+
+FAIL-BEFORE: breaking the Stop branch the way the original draft had it produces
+`launch (no session, not running)` and the drill FAILS. That is precisely the bug caught by eye in
+review weeks ago — an app resurrected every 5 minutes after a deliberate Stop — now caught by a gate
+instead of by luck.
+
+Two branches are honestly reported as SKIP rather than silently passed when the real app is not running
+(the script matches by exe PATH, which a drill cannot fake), and the live-port leg is deliberately not
+drilled: an accept-only socket is exactly the wedged case the 3x20s probe exists to wait out, so
+asserting it would cost a minute of real sleep per gate run, while the owner's own server proves the
+alive path on every real 5-minute tick.
+
+**Gates (unmasked):** watchdog parses clean; python-policies 0 — **45/45**; hygiene 0.

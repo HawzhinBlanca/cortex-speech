@@ -20,14 +20,26 @@
 #   * The optional dead-man ping reads %APPDATA%\cortex-speech\healthcheck.url (untracked, owner
 #     creates it). The GET carries liveness and source IP only — no data, per the privacy stance.
 
-param([switch]$Register)
+# -DryRun decides and REPORTS without killing or launching anything, so every branch can be drilled.
+#
+# This script had no test of any kind, and its most dangerous branch is the one that force-kills. The
+# branch that must LEAVE A HEALTHY APP ALONE (the owner pressed Stop) was reviewed but never verified,
+# and it could not be: proving it for real means pressing Stop, which deletes the session file and
+# revokes the owner's live link. Ports and paths are overridable for the same reason — a drill must
+# never touch the real profile. Production behaviour is unchanged when neither is set.
+param([switch]$Register, [switch]$DryRun)
 
 $ErrorActionPreference = 'Stop'
 $repoApp = Resolve-Path (Join-Path $PSScriptRoot '..\..')   # cortex-speech-app/
 $exe = Join-Path $repoApp 'src-tauri\target\release\cortex-speech-app.exe'
-$probeUrl = 'http://127.0.0.1:8737/'
-$logDir = Join-Path $env:APPDATA 'cortex-speech\logs'
+$dataDir = if ($env:CORTEX_WATCHDOG_DATA_DIR) { $env:CORTEX_WATCHDOG_DATA_DIR } else { Join-Path $env:APPDATA 'cortex-speech' }
+$port = if ($env:CORTEX_WATCHDOG_PORT) { $env:CORTEX_WATCHDOG_PORT } else { '8737' }
+$probeUrl = "http://127.0.0.1:$port/"
+$logDir = Join-Path $dataDir 'logs'
 $log = Join-Path $logDir 'watchdog.log'
+
+# The one line a drill reads. Printed for every decision so a test asserts the CHOICE, not a side effect.
+function Report([string]$action) { Write-Output "WATCHDOG-ACTION: $action" }
 
 # Logging must never be able to stop the watchdog. With $ErrorActionPreference = 'Stop' a failed
 # Add-Content (full disk, the log opened by an editor, a locked profile) threw and aborted the run
@@ -95,8 +107,10 @@ $maxConsecutiveKills = 3
 
 if ($alive) {
     if (Test-Path $killCountFile) { Remove-Item $killCountFile -Force -ErrorAction SilentlyContinue }
+    Report 'alive'
+    if ($DryRun) { exit 0 }
     # Optional dead-man ping: silence at healthchecks.io alerts the owner's phone.
-    $hcFile = Join-Path $env:APPDATA 'cortex-speech\healthcheck.url'
+    $hcFile = Join-Path $dataDir 'healthcheck.url'
     if (Test-Path $hcFile) {
         $hc = (Get-Content $hcFile -TotalCount 1).Trim()
         if ($hc -match '^https://') {
@@ -114,7 +128,7 @@ if ($alive) {
 #     HEALTHY state — killing it here would resurrect-loop the app every 5 minutes and make Stop
 #     feel haunted. Leave a running app alone; only launch if the process itself is gone
 #     (the autostart half of this task).
-$session = Join-Path $env:APPDATA 'cortex-speech\couch_session.json'
+$session = Join-Path $dataDir 'couch_session.json'
 # Matched by PATH, not by name. `Get-Process -Name cortex-speech-app` force-kills ANY process with
 # that name — a second checkout, a debug build, an installed copy under Program Files — while the
 # relaunch below only ever starts THIS one. The watchdog would happily kill a build it is not
@@ -123,7 +137,8 @@ $exeFull = try { (Resolve-Path $exe -ErrorAction Stop).Path } catch { $exe }
 $proc = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -and $_.Path -eq $exeFull })
 if (-not (Test-Path $session)) {
-    if ($proc.Count) { exit 0 }   # deliberate Stop; the app is fine
+    if ($proc.Count) { Report 'leave-alone (deliberate Stop)'; exit 0 }   # the app is fine
+    Report 'launch (no session, not running)'
     Write-Log "app not running (no session) - launching for availability"
 } elseif ($proc.Count) {
     # THE KILL LOOP. A present session file does NOT mean couch can come up. resume() swallows every
@@ -133,16 +148,21 @@ if (-not (Test-Path $session)) {
     $kills = 0
     if (Test-Path $killCountFile) { $kills = [int]((Get-Content $killCountFile -TotalCount 1).Trim()) }
     if ($kills -ge $maxConsecutiveKills) {
+        Report 'give-up (kill cap reached)'
         Write-Log "port still dead after $kills forced restarts - NOT killing again; couch cannot start (port taken, or the library moved). Owner action needed."
         exit 1
     }
+    Report "kill-and-relaunch (attempt $($kills + 1)/$maxConsecutiveKills)"
+    if ($DryRun) { exit 0 }
     Write-Log "session expected but port dead - killing wedged pid(s): $($proc.Id -join ', ') (attempt $($kills + 1)/$maxConsecutiveKills)"
     $proc | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2   # flock.rs clears the stale lock on the next start
     try { Set-Content -Path $killCountFile -Value ([string]($kills + 1)) -Encoding utf8 } catch { }
 } else {
+    Report 'relaunch (session expected, not running)'
     Write-Log "session expected but app not running - relaunching"
 }
+if ($DryRun) { exit 0 }
 if (-not (Test-Path $exe)) {
     Write-Log "exe missing at $exe - nothing to launch (mid-rebuild?)"
     exit 1
