@@ -2965,3 +2965,43 @@ was claimed from the blank pass.
 **Still not measured, and not claimed:** the ≤ 11-audio-GETs-per-10-clip-drill count, and whether a real
 browser elides the repeat fetch (the 304 is proven server-side; the client cache hit is device
 behaviour). Both belong to the R5 real-device hour.
+
+## Iteration 216 — the watchdog's kill branch stops being covered by luck, and the drill's own false pass
+
+The drill added in iteration 212 SKIPped its three most important assertions whenever the real app was
+down, because it matched the process by exe PATH and could not fake one. So the force-kill decision —
+the line most able to destroy a reviewer's in-flight work — had coverage that depended on machine
+state, which for that line is no coverage at all.
+
+`cortex-watchdog.ps1` now honours `CORTEX_WATCHDOG_EXE`, the same shape as the existing DATA_DIR/PORT
+overrides and inert in production. The drill starts its own decoy — a copy of `powershell.exe` at
+`<tmp>\cortex-speech-app.exe` running `Start-Sleep`, so it matches both the hardcoded process NAME and
+a path the test controls — and points the override at it. The owner's live app is excluded by the
+watchdog's own path filter, so this is safe to run mid-review, and `-DryRun` means nothing is killed
+regardless. **3 conditional assertions → 8 unconditional ones.**
+
+**The fail-before found a defect in the drill itself, and it was a false pass.** With the override
+removed, one line printed `OK   session + not running -> relaunch: kill-and-relaunch (attempt 1/3)`.
+The matcher was `want not in got`, and `"relaunch"` is a substring of `"kill-and-relaunch"` — so a drill
+asserting a plain relaunch went green on a decision to FORCE-KILL the app first. That is the worst
+failure mode a test can have, it was in code written in this loop, and only running the fail-before
+surfaced it. `expect` now compares the leading action token exactly.
+
+Two assertions were added for a related reason: with the real app running, the three alive-branch
+results could have come from the real app rather than the decoy, making them vacuous. The drill now
+runs the same state twice — override pointing at an empty path (must report a DEAD process) and at the
+decoy path (must report ALIVE) — so the decoy is proven to be what matched. A third check asserts the
+decoy is still alive after three kill decisions, i.e. that `-DryRun` really is dry.
+
+**FAIL-BEFORE (real output, exit 1).** Reverting the `CORTEX_WATCHDOG_EXE` override:
+```
+  FAIL no session + not running -> launch: leave-alone (deliberate Stop)
+  FAIL session + not running -> relaunch: kill-and-relaunch (attempt 1/3)
+  FAIL decoy alive but override points elsewhere -> DEAD: kill-and-relaunch (attempt 1/3)
+```
+(Before the matcher fix, the middle one of those printed `OK`.)
+
+**Gates (unmasked).** `python scripts/test_watchdog_decisions.py` **0** — `watchdog decision drill
+passed (8 branch assertion(s))`, every branch OK, with the real app running throughout.
+`npm run test:python-policies` **0** — 45/45. No rebuild needed (`.ps1` + `.py` only), so the reviewer
+link never dropped: re-verified after the change at claim 200 / queue 200 / 29 items / pendingTotal=116.

@@ -31,7 +31,15 @@ param([switch]$Register, [switch]$DryRun)
 
 $ErrorActionPreference = 'Stop'
 $repoApp = Resolve-Path (Join-Path $PSScriptRoot '..\..')   # cortex-speech-app/
-$exe = Join-Path $repoApp 'src-tauri\target\release\cortex-speech-app.exe'
+# CORTEX_WATCHDOG_EXE exists for the same reason the DATA_DIR/PORT overrides do: the three branches
+# that depend on a LIVE process could only ever be drilled when the real app happened to be running,
+# so the coverage of the force-kill decision — the most dangerous line in the availability path — was
+# a coin toss on machine state. With the exe path overridable, the drill points this at a harmless
+# decoy process it starts itself and reaches all three deterministically. Production is unaffected
+# when unset.
+$exe = if ($env:CORTEX_WATCHDOG_EXE) { $env:CORTEX_WATCHDOG_EXE } else {
+    Join-Path $repoApp 'src-tauri\target\release\cortex-speech-app.exe'
+}
 $dataDir = if ($env:CORTEX_WATCHDOG_DATA_DIR) { $env:CORTEX_WATCHDOG_DATA_DIR } else { Join-Path $env:APPDATA 'cortex-speech' }
 $port = if ($env:CORTEX_WATCHDOG_PORT) { $env:CORTEX_WATCHDOG_PORT } else { '8737' }
 $probeUrl = "http://127.0.0.1:$port/"
