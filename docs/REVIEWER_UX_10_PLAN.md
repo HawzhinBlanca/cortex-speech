@@ -152,6 +152,20 @@ The Apple-quality core. Today every clip costs a reach-and-tap on the small nati
 6. **Safe-area insets** (`env(safe-area-inset-*)`) so installed/standalone mode does not draw
    under the notch (page ships `viewport-fit=cover` with a flat 12 px padding today).
 
+### R2 status — shipped 2026-07-30 (iteration 217), items 2/3/4/6
+
+Item 1 (welcome/Start gate) is NOT needed: its only job was unlocking the `<audio>` element for
+programmatic play on iOS, and the first clip's own play button already does that — iOS permits
+programmatic `play()` on an element a gesture has started. Auto-advance therefore works from clip 2
+onward with no new screen, no first-visit keying, and ZERO new unreviewed Sorani strings. Cost: clip 1
+takes two taps. Item 5 (3 px bar) skipped as decoration — it fixes no defect and the text counter now
+counts the real backlog. Items 2, 3, 4 and 6 are in, with five fail-before reverts recorded in the
+ledger. R2.4 needed two attempts: `scrollIntoView({block:'end'})` aligns to the LAYOUT viewport, whose
+bottom edge is the part behind the keyboard, so it lands the action row exactly where it cannot be seen
+(measured twice at y+h = 604px with 400px visible); the fix scrolls by the overshoot measured against
+the VISUAL viewport. Gates: couch-page 36 passed stable 3-for-3, e2e 83 passed, policies 45/45,
+typecheck 426, clippy/fmt/Rust all exit 0.
+
 **Gates:** real-iPhone drill: 10 consecutive accepts = exactly 10 taps with clip N+1 audible within
 1 s each (N2, N3); keyboard-open screenshot shows 100 % of the Save button and the toast inside the
 visual viewport on one real iPhone and one real Android; bar at clip 13/25 measures 48 % ± 4 % and

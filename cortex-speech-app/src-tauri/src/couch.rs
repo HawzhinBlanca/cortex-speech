@@ -1236,8 +1236,10 @@ fn parse_range(spec: &str, len: usize) -> Option<(usize, usize)> {
     }
     let (first, last) = spec.split_once('-')?;
     let (start, end) = match (first.trim(), last.trim()) {
-        // "bytes=-N": the LAST n bytes. N >= len means the whole body, not an error.
-        ("", n) => (len.saturating_sub(n.parse::<usize>().ok()?.max(1)), len - 1),
+        // "bytes=-N": the LAST n bytes. N >= len means the whole body, not an error. N == 0 falls out
+        // as unsatisfiable on its own (start == len fails the guard below), which is what RFC 9110
+        // requires — an earlier `.max(1)` here quietly turned it into a request for the final byte.
+        ("", n) => (len.saturating_sub(n.parse::<usize>().ok()?), len - 1),
         // "bytes=N-": from N to the end.
         (n, "") => (n.parse::<usize>().ok()?, len - 1),
         (a, b) => (a.parse::<usize>().ok()?, b.parse::<usize>().ok()?.min(len - 1)),
@@ -3993,7 +3995,9 @@ mod tests {
         assert_eq!(parse_range("items=0-1", 100), None, "only the bytes unit exists");
         assert_eq!(parse_range("bytes=abc-def", 100), None, "garbage");
         assert_eq!(parse_range("bytes=-", 100), None, "no numbers at all");
-        assert_eq!(parse_range("bytes=-0", 100), Some((99, 99)), "a zero-length suffix is treated as one byte");
+        // RFC 9110: a suffix-length of zero is unsatisfiable. Found by self-audit — a `.max(1)` here
+        // had been silently turning "give me the last 0 bytes" into "give me the last byte".
+        assert_eq!(parse_range("bytes=-0", 100), None, "a zero-length suffix is unsatisfiable");
     }
 
     #[test]

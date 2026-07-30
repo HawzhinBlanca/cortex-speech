@@ -1067,6 +1067,172 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#retry')).toContainText('دووبارە');
   });
 
+  test('deciding a clip starts the next one, so a session is one tap per clip', async ({ page }) => {
+    // TWO TAPS PER CLIP, a hundred times a session: decide, then reach for the player's small native
+    // play control. Deciding a clip IS the reviewer saying "next", so the next clip should just start.
+    // Not inside a user gesture (decide() awaits a POST first) — it works because the element is
+    // already unlocked by the reviewer having pressed play once, which is also why there is no
+    // welcome/Start screen: the first clip's own play button does the unlocking.
+    await page.addInitScript(() => {
+      const w = window as unknown as { __plays: string[] };
+      w.__plays = [];
+      // jsdom-less Chromium will not decode a nonexistent src, so record the INTENT rather than
+      // relying on real playback: the assertion is about whether the page asks to play, and when.
+      const proto = window.HTMLMediaElement.prototype;
+      proto.play = function play() {
+        w.__plays.push(this.getAttribute('src') || '');
+        return Promise.resolve();
+      };
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [
+                { id: 'one', text: 'یەکەم', durationMs: 1000, speakerId: null },
+                { id: 'two', text: 'دووەم', durationMs: 1000, speakerId: null },
+              ],
+              heldByOthers: 0,
+              pendingTotal: 2,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
+    // Opening the page must NOT start audio on its own — arriving is not a request to play.
+    expect(await page.evaluate(`window.__plays`)).toEqual([]);
+
+    await page.locator('#accept').click();
+    await expect(page.locator('#text')).toHaveValue('دووەم', { timeout: 5000 });
+    await expect.poll(async () => page.evaluate(`window.__plays.length`)).toBe(1);
+    // ...and it played the clip that is now on screen, not the one just decided.
+    expect(await page.evaluate(`window.__plays[0].includes('two')`)).toBe(true);
+  });
+
+  test('navigation never starts audio — only a decision does', async ({ page }) => {
+    // The other half of the same rule. A skip is the reviewer saying "I cannot judge this", and an undo
+    // is them going back to look; both deserve a loaded clip and silence, not a burst of sound.
+    await page.addInitScript(() => {
+      const w = window as unknown as { __plays: number };
+      w.__plays = 0;
+      window.HTMLMediaElement.prototype.play = function play() {
+        w.__plays += 1;
+        return Promise.resolve();
+      };
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [
+                { id: 'one', text: 'یەکەم', durationMs: 1000, speakerId: null },
+                { id: 'two', text: 'دووەم', durationMs: 1000, speakerId: null },
+              ],
+              heldByOthers: 0,
+              pendingTotal: 2,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
+    // Reveal skip the way a real audio failure does, then use it.
+    await page.evaluate(`document.getElementById('skip').hidden = false`);
+    await page.locator('#skip').click();
+    await expect(page.locator('#text')).toHaveValue('دووەم', { timeout: 5000 });
+    await page.waitForTimeout(200);
+    expect(await page.evaluate(`window.__plays`)).toBe(0);
+  });
+
+  test('typing pauses the audio, and resuming hands back the last 2 seconds', async ({ page }) => {
+    // A reviewer reaching for the transcript while audio runs is trying to do two things at once and
+    // loses the tail of what they just heard. Pause on focus, and give the run-up back on resume —
+    // but ONLY when this mechanism caused the pause: a pause the reviewer chose is a position they
+    // chose, and moving it would be the tool overriding them.
+    await showAClip(page);
+    await page.evaluate(`
+      const p = document.getElementById('player');
+      Object.defineProperty(p, 'paused', { value: false, writable: true, configurable: true });
+      p.currentTime = 10;
+      p.pause = function () { this.paused = true; };
+    `);
+    await page.locator('#text').focus();
+    expect(await page.evaluate(`document.getElementById('player').paused`)).toBe(true);
+    expect(await page.evaluate(`pausedByEdit`)).toBe(true);
+
+    // Resuming rewinds exactly the ↺2s amount.
+    await page.evaluate(`document.getElementById('player').dispatchEvent(new Event('play'))`);
+    expect(await page.evaluate(`document.getElementById('player').currentTime`)).toBe(8);
+    expect(await page.evaluate(`pausedByEdit`)).toBe(false);
+
+    // A SECOND play with no intervening edit-pause must not rewind again.
+    await page.evaluate(`document.getElementById('player').dispatchEvent(new Event('play'))`);
+    expect(await page.evaluate(`document.getElementById('player').currentTime`)).toBe(8);
+
+    // And ↺2s must not double up: it clears the flag before playing, or the reviewer silently gets -4s.
+    await page.evaluate(`
+      const p = document.getElementById('player');
+      p.currentTime = 10;
+      pausedByEdit = true;
+      p.play = function () { this.dispatchEvent(new Event('play')); return Promise.resolve(); };
+    `);
+    await page.locator('#again').click();
+    expect(await page.evaluate(`document.getElementById('player').currentTime`)).toBe(8);
+  });
+
+  test('the keyboard can never cover the save buttons or the toast', async ({ page }) => {
+    // THE WORST FLOW-BREAKER ON THE PAGE, verified: on iOS the on-screen keyboard does not resize the
+    // layout viewport, so a reviewer who tapped the transcript to fix a word had Save/Accept/Reject —
+    // and the "Saved" toast — sitting underneath it. They typed the correction and could not see the
+    // button that commits it. The page now tracks the covered height in `--kb`.
+    await showAClip(page);
+    const kb = () => page.evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--kb').trim()`);
+    // Nothing covered yet: no phantom padding from ordinary browser chrome.
+    expect(['', '0px']).toContain(await kb());
+
+    const roomBefore = await page.evaluate(`document.documentElement.scrollHeight`);
+    // Simulate the keyboard by shrinking the visual viewport, exactly as iOS reports it — the layout
+    // viewport does NOT change there, which is the whole reason this listener has to exist.
+    await page.locator('#text').focus();
+    await page.evaluate(`
+      Object.defineProperty(window.visualViewport, 'height', { value: window.innerHeight - 320, configurable: true });
+      Object.defineProperty(window.visualViewport, 'offsetTop', { value: 0, configurable: true });
+      window.visualViewport.dispatchEvent(new Event('resize'));
+    `);
+    expect(await kb()).toBe('320px');
+
+    // Half one: the page can now scroll far enough for the row to clear the keyboard. Without this
+    // there is no room at all — the buttons sit behind it with nowhere to go.
+    expect(await page.evaluate(`document.documentElement.scrollHeight`)).toBe(roomBefore + 320);
+
+    // Half two: it is actually scrolled there, so the reviewer does not have to discover that they
+    // could scroll. Every decision button must be inside what they can see.
+    const visibleBottom = await page.evaluate(`window.innerHeight - 320`);
+    for (const id of ['save', 'accept', 'bad']) {
+      await expect
+        .poll(async () => {
+          const box = await page.locator(`#${id}`).boundingBox();
+          return box ? box.y + box.height : Number.POSITIVE_INFINITY;
+        }, { message: `#${id} must clear the keyboard`, timeout: 5000 })
+        .toBeLessThanOrEqual(visibleBottom);
+    }
+    // Retracting the keyboard puts the padding back, rather than leaving a permanent gap.
+    await page.evaluate(`
+      Object.defineProperty(window.visualViewport, 'height', { value: window.innerHeight, configurable: true });
+      window.visualViewport.dispatchEvent(new Event('resize'));
+    `);
+    expect(await kb()).toBe('0px');
+  });
+
   for (const scheme of ['light', 'dark'] as const) {
     test(`has zero WCAG 2.2 AA violations while reviewing (${scheme})`, async ({ page }) => {
       // Both themes, because the page renders in whichever the phone is set to and a contrast

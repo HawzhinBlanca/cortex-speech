@@ -2,7 +2,11 @@
 <html lang="ckb" dir="rtl">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<!-- `interactive-widget=resizes-content` is the declarative half of the keyboard fix (R2.4): it tells
+     Android Chrome to shrink the layout viewport when the on-screen keyboard opens, so the action row
+     is pushed up instead of being covered. iOS Safari ignores it, which is why the visualViewport
+     listener below exists too — one of the two handles every phone a reviewer might use. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
 <title>Cortex</title>
 <!--
   ADD TO HOME SCREEN. These tags give a full-screen, chrome-free app launched from a home-screen icon
@@ -149,7 +153,21 @@
             address bar, but a browser that does not know it must still get a full-height layout
             rather than a card floating in a short page. */
          min-height: 100vh; min-height: 100dvh;
-         display: flex; flex-direction: column; padding: 12px; gap: 12px; }
+         display: flex; flex-direction: column; gap: 12px;
+         /* SAFE AREA (R2.6) + KEYBOARD (R2.4), in one padding declaration.
+            The page already shipped `viewport-fit=cover`, which is what lets it draw edge to edge —
+            and therefore also what lets it draw UNDER the notch and the home indicator once a
+            reviewer installs it to the home screen (display:standalone, no browser chrome to
+            protect it). A flat 12px was fine in a browser tab and wrong in the installed app the
+            plan is steering reviewers towards. env() resolves to 0px wherever there is no inset, so
+            this is the same 12px on a desktop or an Android without cutouts.
+            --kb is how much of the viewport the on-screen keyboard is covering, set by the
+            visualViewport listener. On iOS the keyboard does NOT resize the layout viewport, so
+            without this the Save/Accept/Reject row and the toast sat underneath it — the reviewer
+            typed a correction and then could not reach the button that saves it. */
+         padding: calc(12px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right))
+                  calc(12px + var(--kb, 0px) + env(safe-area-inset-bottom))
+                  calc(12px + env(safe-area-inset-left)); }
   header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
   h1 { font-size: 15px; color: var(--brand); }
   #who { font-size: 11px; color: var(--dim); font-weight: 600; }
@@ -189,7 +207,10 @@
   #undo   { flex: 0 0 auto; padding: 14px 16px; }
   #done, #err { text-align: center; padding: 40px 10px; font-size: 16px; }
   #err { color: var(--bad); white-space: pre-wrap; }
-  .toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+  /* Rides above the keyboard for the same reason the action row does: a confirmation the reviewer
+     cannot see is a confirmation that did not happen, and "Saved" is the one message that decides
+     whether they trust the tool. */
+  .toast { position: fixed; bottom: calc(14px + var(--kb, 0px) + env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%);
            background: var(--chip); border: 1px solid var(--line); color: var(--ink); padding: 8px 18px;
            border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .2s; }
   .toast.show { opacity: 1; }
@@ -215,7 +236,7 @@
   <textarea id="text" lang="ckb" dir="rtl" spellcheck="false"></textarea>
   <div class="meta" id="meta"></div>
   <div id="warn" hidden></div>
-  <div class="row">
+  <div class="row" id="actions">
     <button id="bad"></button>
     <button id="accept"></button>
     <button id="save"></button>
@@ -276,6 +297,9 @@
   }
   const $ = (id) => document.getElementById(id);
   let queue = [], i = 0, busy = false;
+  // True only while the audio was paused BY the reviewer focusing the transcript (R2.3), so the 2s
+  // rewind on resume never steals position from a pause they chose themselves.
+  let pausedByEdit = false;
 
   // ── i18n ────────────────────────────────────────────────────────────────────
   const STRINGS = JSON.parse($('i18n').textContent);
@@ -534,7 +558,9 @@
   }
   addEventListener('online', () => void flushOutbox());
 
-  function show() {
+  // `autoplay` is true ONLY when the advance came from the reviewer deciding a clip (R2.2). A load, an
+  // undo or a skip must not start audio on its own — those are navigation, not a rhythm.
+  function show(autoplay) {
     const seg = queue[i];
     // Drained the batch: go ask for the next one before claiming anything is finished. `exhausted`
     // breaks the recursion — load() calls show() again, and a fetch that returned nothing sets it, so
@@ -558,10 +584,28 @@
     void loadWave(audioUrl);
     $('player').playbackRate = speed;
     $('player').loop = looping;
+    pausedByEdit = false; // a new clip owes the reviewer no rewind
     // A saved draft is a correction the reviewer already typed; it must win over the server's copy.
     $('text').value = localStorage.getItem(draftKey(seg.id)) ?? seg.text;
     $('meta').textContent = (seg.durationMs / 1000).toFixed(1) + 's' + (seg.speakerId ? ' · ' + seg.speakerId : '');
     prefetchNext();
+    // ONE TAP PER CLIP (R2.2). Deciding a clip is the reviewer saying "next", so the next clip should
+    // simply start — otherwise every clip costs two taps, a decision and then a reach for the player's
+    // small native play control, a hundred times a session.
+    //
+    // This is NOT inside a user gesture: decide() awaited a POST first. It works because the element is
+    // already UNLOCKED — the reviewer pressed play on this same <audio> element for clip 1, and iOS
+    // permits programmatic play() on an element that has been started by a gesture once. That is also
+    // why there is deliberately no welcome/Start screen: the first clip's own play button does the
+    // unlocking, so the only cost is that clip 1 takes two taps instead of one.
+    //
+    // If a browser refuses anyway, the rejected promise is swallowed and the reviewer gets exactly
+    // today's behaviour: a loaded clip waiting for them to press play. Never a thrown error, and never
+    // a state where the page thinks it is playing and is not.
+    if (autoplay) {
+      const started = $('player').play();
+      if (started && typeof started.catch === 'function') started.catch(() => {});
+    }
   }
   // Warm the NEXT clip's audio while this one is being reviewed. The gap between clips is dead time,
   // and on a phone it is the difference between a steady rhythm and a stutter every few seconds.
@@ -649,7 +693,7 @@
       clearRefused(submission.id); // re-reviewing a refused clip must retract the warning about it
       toast(action === 'bad' ? t('markedBad') : t('saved'));
       doneThisSession += 1;
-      i += 1; show();
+      i += 1; show(true); // the decision IS the "next" gesture — start the next clip (R2.2)
     } catch (e) {
       // HOLD, and move on. None of these is a verdict on the decision itself, so the reviewer must
       // not lose it and must not be stranded on the clip:
@@ -678,7 +722,10 @@
           // been reassured, so they had no reason to check anything.
           toast(t('queued'));
         }
-        i += 1; show();
+        // Queued still counts as decided — the reviewer judged this clip and is moving on, so the
+        // rhythm continues. (The 409 path below does NOT autoplay: that is a forced skip, not a
+        // decision, and it deserves the reviewer's attention rather than more audio.)
+        i += 1; show(true);
       } else {
         toast(t('saveFailed', { err: e.message }));
         // The server refused because someone else has this clip (409). Staying here would keep
@@ -706,9 +753,71 @@
   // Re-listening to the last couple of seconds is the single most repeated action in transcription,
   // and dragging a phone-sized scrubber to do it is where the time goes.
   $('again').onclick = () => {
+    // Clear the edit-pause flag FIRST: otherwise the play() below fires the `play` handler, which
+    // rewinds another 2s on top of this one and the reviewer silently gets -4s.
+    pausedByEdit = false;
     $('player').currentTime = Math.max(0, $('player').currentTime - 2);
     void $('player').play();
   };
+
+  // ── pause to type, and hear the run-up again on resume (R2.3) ──────────────
+  // The Express Scribe / Descript mechanic, and the reason it matters here: a reviewer who reaches for
+  // the textarea while audio is still running is trying to do two things at once, and loses the tail of
+  // what they just heard. Pausing on focus lets them type in quiet; rewinding 2s when they press play
+  // again gives back the run-up, which is exactly the ↺2s button's amount, applied automatically at the
+  // one moment it is always wanted. Only ever rewinds when THIS pause caused it — a manual pause is the
+  // reviewer's own choice of position and must be left exactly where they put it.
+  // (`pausedByEdit` is declared with the rest of the page state, above: show() clears it per clip, and a
+  // `let` down here would put that reference in a temporal dead zone if show() ever ran earlier.)
+  $('text').addEventListener('focus', () => {
+    if (!$('player').paused) {
+      $('player').pause();
+      pausedByEdit = true;
+    }
+  });
+  $('player').addEventListener('play', () => {
+    if (!pausedByEdit) return;
+    pausedByEdit = false;
+    $('player').currentTime = Math.max(0, $('player').currentTime - 2);
+  });
+
+  // ── keep the action row and the toast above the on-screen keyboard (R2.4) ──
+  // The single worst flow-breaker on the page, and a verified one: on iOS the keyboard does NOT resize
+  // the layout viewport, so a reviewer who tapped the transcript to fix a word had Save, Accept and
+  // Reject — and the "Saved" toast — hidden underneath it. They typed the correction and then could not
+  // see the button that commits it. `interactive-widget=resizes-content` in the viewport meta handles
+  // Android declaratively; visualViewport is the iOS half. Both feed the same `--kb` variable, so the
+  // CSS has one thing to react to.
+  if (window.visualViewport) {
+    const vv = window.visualViewport;
+    const applyKb = () => {
+      // What the keyboard covers = the layout viewport minus the visual one, minus how far the visual
+      // viewport has been scrolled down inside it. Clamped at 0 so ordinary browser-chrome collapse
+      // (which also moves these numbers) can never add phantom padding.
+      const covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+      document.documentElement.style.setProperty('--kb', covered + 'px');
+      // Room is only half of it. The padding above makes the page scrollable far enough that the action
+      // row CAN clear the keyboard — but the browser scrolls the FOCUSED element into view, and that is
+      // the transcript, which sits above the buttons. So the reviewer was left having to notice they
+      // could scroll at all. Nudge the row itself, and only while they are actually typing: scrolling
+      // the page under someone who is merely listening would be the tool grabbing the wheel.
+      //
+      // Computed against the VISUAL viewport, not via scrollIntoView. `scrollIntoView({block:'end'})`
+      // aligns to the LAYOUT viewport, and on iOS the layout viewport's bottom edge is the part hidden
+      // behind the keyboard — so it lands the row precisely where it cannot be seen, with the padding it
+      // needs to clear sitting below it off-screen. Measured here: it left #save at 604px with only the
+      // top 400px visible. The overshoot is the honest number, so use it.
+      if (covered > 0 && document.activeElement === $('text')) {
+        requestAnimationFrame(() => {
+          const overshoot = $('actions').getBoundingClientRect().bottom - (vv.offsetTop + vv.height);
+          if (overshoot > 0) window.scrollBy(0, overshoot);
+        });
+      }
+    };
+    vv.addEventListener('resize', applyKb);
+    vv.addEventListener('scroll', applyKb);
+    applyKb();
+  }
 
   // ── waveform ───────────────────────────────────────────────────────────────
   // Peaks are computed ONCE per clip and cached with it; redraw is then pure canvas work, so seeking

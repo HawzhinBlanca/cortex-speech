@@ -3005,3 +3005,75 @@ decoy is still alive after three kill decisions, i.e. that `-DryRun` really is d
 passed (8 branch assertion(s))`, every branch OK, with the real app running throughout.
 `npm run test:python-policies` **0** — 45/45. No rebuild needed (`.ps1` + `.py` only), so the reviewer
 link never dropped: re-verified after the change at claim 200 / queue 200 / 29 items / pendingTotal=116.
+
+## Iteration 217 — R2: one tap per clip, and the keyboard stops covering the save buttons
+
+**Plan item R2** of `docs/REVIEWER_UX_10_PLAN.md`, items 2/3/4/6. Items 1 and 5 deliberately not built.
+
+**Item 1 (welcome/Start gate) is not needed, and dropping it costs nothing.** Its only job in the plan
+was to unlock the shared `<audio>` element for programmatic play on iOS, by calling `play()` inside a
+touch handler. But the FIRST CLIP'S OWN PLAY BUTTON does exactly that — iOS permits programmatic
+`play()` on an element a gesture has already started. So auto-advance works from clip 2 onward with no
+new screen at all. The entire cost is that clip 1 takes two taps instead of one; the saving is a new
+screen between a reviewer and their work, three new unreviewed Sorani strings, first-visit localStorage
+keying, and an identity-confirmation surface nobody asked for. **Net new Sorani strings for all of R2:
+zero** — so nothing here is owner-gated and nothing waits.
+
+**Item 5 (3 px progress bar) skipped as decoration.** It fixes no defect; the text counter already
+gives honest progress and iteration 215 made it count the real backlog. Logged, not built, per the
+standing "reliability first, not new surface" constraint.
+
+**R2.4 — the keyboard occlusion, and it took two attempts to actually fix.** On iOS the on-screen
+keyboard does not resize the layout viewport, so a reviewer who tapped the transcript to correct a word
+had Save/Accept/Reject and the "Saved" toast sitting underneath it: they typed the correction and could
+not see the button that commits it. `interactive-widget=resizes-content` handles Android declaratively;
+a `visualViewport` listener feeds `--kb` for iOS, and body padding + the toast offset consume it.
+
+My first version stopped there and the test caught that padding alone is only HALF the fix: it creates
+scroll room, but the browser scrolls the FOCUSED element into view — the transcript, which sits above the
+buttons — so the reviewer was left having to discover they could scroll. Measured: `#save` at y+h = 604px
+with only the top 400px visible.
+
+The second attempt used `scrollIntoView({block:'end'})` and **failed identically, 604px again**, for a
+reason worth writing down: `scrollIntoView` aligns to the LAYOUT viewport, and on iOS the layout
+viewport's bottom edge IS the part behind the keyboard — so it lands the row precisely where it cannot
+be seen, with the padding it needs to clear sitting off-screen below it. The fix computes the overshoot
+against the VISUAL viewport (`rect.bottom - (vv.offsetTop + vv.height)`) and scrolls by exactly that.
+Both halves now provably cooperate: the test asserts the document gained exactly 320 px of scroll room
+AND that all three decision buttons end up inside the visible band.
+
+**R2.2 — auto-advance.** Deciding a clip is the reviewer saying "next", so `show(true)` starts the next
+one. Applies to a successful decision AND to one queued offline (they judged it and moved on); NOT to
+the 409 forced-skip, a skip, an undo, or a page load — navigation is not a request for sound. The
+`play()` promise is `.catch()`-swallowed, so a browser that refuses degrades to exactly today's
+behaviour: a loaded clip waiting for a tap. Never a thrown error, never a page that thinks it is playing.
+
+**R2.3 — pause on edit, rewind 2 s on resume.** Reaching for the textarea while audio runs loses the
+tail of what was just heard. Focus pauses; the next play gives back the ↺2s amount automatically at the
+one moment it is always wanted. Only when THIS mechanism caused the pause — a manual pause is a position
+the reviewer chose. `again` clears the flag before playing, or the ↺2s button would silently rewind 4 s.
+
+**R2.6 — safe-area insets.** The page already shipped `viewport-fit=cover`, which is what lets it draw
+edge to edge and therefore also under the notch and home indicator once installed to the home screen
+(`display:standalone`, no browser chrome to protect it). `env()` is 0px where there are no insets, so
+desktop and non-cutout Android are unchanged.
+
+**Self-audit of iteration 215's own diff found one more.** `parse_range` had a `.max(1)` on the suffix
+length, which quietly turned `bytes=-0` — "give me the last zero bytes" — into a request for the final
+byte. RFC 9110 says a zero suffix-length is unsatisfiable, and removing the `.max(1)` makes it fall out
+correctly AND deletes code: `start == len` already fails the guard. Tenth finding in this loop's own
+code. The test that asserted the wrong behaviour was corrected with it.
+
+**FAIL-BEFORE (five reverts, real output).**
+* Auto-advance removed (`show()` for both decision paths) → `Expected: 1 / Received: 0` plays.
+* `visualViewport` listener disabled → `Expected: "320px" / Received: ""`.
+* Rewind-on-resume handler removed → `Expected: 8 / Received: 10` (no rewind).
+* `again`'s flag clear removed → `Expected: 8 / Received: 6` — the exact −4 s double-rewind.
+* Skip made to autoplay → `Expected: 0 / Received: 1` plays.
+
+**Gates (unmasked).** couch-page Playwright **36 passed**, exit 0, stable 3-for-3.
+`npm run test:e2e` **0** — **83 passed** (was 79). `cargo test --lib couch::` **0** — 49 passed.
+`cargo clippy --all-targets --all-features -D warnings` **0**. `cargo fmt --check` **0** (with
+`--manifest-path`; a bare `cargo fmt --all` from the app dir fails on `cargo metadata`, which is a cwd
+artifact and not a formatting result — worth knowing before reading that exit code as red).
+`npm run test:python-policies` **0** — 45/45. `npm run typecheck` **0** — 426 files, 0 errors.
