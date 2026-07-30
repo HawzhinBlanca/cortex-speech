@@ -397,6 +397,28 @@
     const r = readRefused();
     if (!r.includes(id)) localStorage.setItem(REFUSED, JSON.stringify([...r, id]));
   }
+  // ...and RETRACTED when that clip's decision finally lands. Nothing cleared this list, so a single
+  // refusal pinned the banner for the life of the browser profile — it kept telling the reviewer work
+  // had failed after they had already gone back and re-reviewed it, which is the same class of lie the
+  // banner exists to prevent, pointing the other way.
+  function clearRefused(id) {
+    const r = readRefused();
+    if (!r.includes(id)) return;
+    // Computed BEFORE the removal so the comparison uses the count currently on screen. #err is shared
+    // with the link-expired notice, which is more urgent and must never be retracted by this path.
+    const ourBannerIsUp = $('err').textContent === t('refused', { n: r.length });
+    const left = r.filter((x) => x !== id);
+    if (left.length) {
+      localStorage.setItem(REFUSED, JSON.stringify(left));
+      if (ourBannerIsUp) renderRefused(); // recount, still showing
+      return;
+    }
+    localStorage.removeItem(REFUSED);
+    if (ourBannerIsUp) {
+      $('err').hidden = true;
+      $('err').textContent = '';
+    }
+  }
   function renderRefused() {
     const n = readRefused().length;
     if (!n) return;
@@ -439,6 +461,7 @@
       }
       writeOutbox(readOutbox().filter((q) => q.id !== item.id));
       localStorage.removeItem(draftKey(item.id));
+      clearRefused(item.id); // it landed after all
     }
     renderRefused();
   }
@@ -520,6 +543,7 @@
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),
       });
       localStorage.removeItem(draftKey(submission.id));
+      clearRefused(submission.id); // re-reviewing a refused clip must retract the warning about it
       toast(action === 'bad' ? t('markedBad') : t('saved'));
       doneThisSession += 1;
       i += 1; show();

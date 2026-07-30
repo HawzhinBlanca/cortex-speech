@@ -403,6 +403,15 @@ test.describe('Couch Review phone page', () => {
     });
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('پارچەی تێکچوو', { timeout: 5000 });
+    // NOTE ON THIS ENVIRONMENT: the page is served over file://, so <audio src="/api/audio/..."> is a
+    // real request that always fails — window.fetch is stubbed, media loads are not. The handler
+    // therefore fires for EVERY clip here, which is correct behaviour, so "hidden by default" cannot be
+    // observed asynchronously. The reset is asserted in the SAME TICK as show() instead: show() clears
+    // the flag synchronously and the error event is async, so this reads the reset deterministically.
+    const hiddenRightAfterShow = await page.evaluate(
+      `show(); document.getElementById('skip').hidden`,
+    );
+    expect(hiddenRightAfterShow).toBe(true);
 
     // The <audio> element reports a load failure (a 500 body into src does exactly this).
     await page.evaluate(`
@@ -419,8 +428,6 @@ test.describe('Couch Review phone page', () => {
     // ...and NOTHING was written about the broken one. That is the whole point.
     const sent = (await page.evaluate(`window.__sent`)) as string[];
     expect(sent.join(' ')).not.toContain('broken');
-    // The skip affordance does not linger onto a healthy clip.
-    await expect(page.locator('#skip')).toBeHidden();
   });
 
   test('a slow first load says so instead of showing a blank page', async ({ page }) => {
@@ -502,6 +509,91 @@ test.describe('Couch Review phone page', () => {
       .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
       .toBe(0);
     await expect(page.locator('#err')).toBeHidden();
+  });
+
+  test('the refused-decisions banner is retracted once that clip is re-reviewed', async ({ page }) => {
+    // The banner had no way down. noteRefused only ever appended, so one 409 pinned it for the life of
+    // the browser profile — still insisting work had failed after the reviewer went back and redid it.
+    // That is the same lie the banner exists to prevent, aimed the other way.
+    await page.addInitScript(() => {
+      (window as unknown as { __refuse: boolean }).__refuse = true;
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [{ id: 'g1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (url.includes('/api/decision')) {
+          return (window as unknown as { __refuse: boolean }).__refuse
+            ? new Response('already reviewed by Hemn', { status: 409 })
+            : new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
+
+    // Seed a refusal through the real flush path, then confirm the banner is up.
+    await page.evaluate(`
+      localStorage.setItem('cortex.couch.outbox', JSON.stringify([{ id: 'g1', action: 'edit', text: 'x', reviewer: 'Sara' }]));
+      dispatchEvent(new Event('online'));
+    `);
+    await expect(page.locator('#err')).toBeVisible();
+    await expect(page.locator('#err')).toContainText('1 بڕیار');
+
+    // The reviewer goes back and re-reviews that same clip, and this time it lands.
+    await page.evaluate(`window.__refuse = false`);
+    await page.locator('#accept').click();
+
+    await expect
+      .poll(async () => page.evaluate(`localStorage.getItem('cortex.couch.refused')`))
+      .toBeNull();
+    await expect(page.locator('#err')).toBeHidden();
+  });
+
+  test('retracting a refusal must not swallow the link-expired notice', async ({ page }) => {
+    // #err is shared, and link-expired is the more urgent message: it needs an action from the reviewer
+    // (ask for a new link). Clearing a refusal must never take that banner down with it.
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [{ id: 'h1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
+
+    // A stale refusal on record, while the URGENT notice is what is actually on screen.
+    await page.evaluate(`
+      localStorage.setItem('cortex.couch.refused', JSON.stringify(['h1']));
+      document.getElementById('err').hidden = false;
+      document.getElementById('err').textContent = STRINGS[locale].linkExpired;
+    `);
+    await page.locator('#accept').click();
+
+    // The refusal is retracted from storage, but the link notice stays up.
+    await expect
+      .poll(async () => page.evaluate(`localStorage.getItem('cortex.couch.refused')`))
+      .toBeNull();
+    await expect(page.locator('#err')).toBeVisible();
+    await expect(page.locator('#err')).toContainText('بەسەرچووە');
   });
 
   test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {

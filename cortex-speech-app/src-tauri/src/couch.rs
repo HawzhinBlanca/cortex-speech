@@ -3179,6 +3179,106 @@ mod tests {
     }
 
     #[test]
+    fn a_mid_session_server_restart_loses_no_work_and_double_decides_nothing() {
+        // THE WATCHDOG CAN RESTART THIS APP AT ANY 5-MINUTE TICK — that is its job, and after the
+        // probe/kill-loop fixes it will do so whenever the port is genuinely unreachable. So a real
+        // session WILL sometimes be interrupted mid-batch, and the reviewer must not lose a decision or
+        // have one recorded twice. Existing tests cover a restart between sessions (links survive, spot
+        // checks stay scorable); none covers a restart DURING one, with a phone that keeps working from
+        // the queue it already holds.
+        //
+        // Modelled honestly: threads down, server dropped, a FRESH CouchState on a new port against the
+        // SAME database — so in-memory leases and undo are lost exactly as a process restart loses them,
+        // while the corpus persists.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        const CLIPS: usize = 40;
+        for n in 0..CLIPS {
+            db.insert_segment(&seg(&format!("r{n:03}"), "دەقی سەرەتایی")).unwrap();
+        }
+        drop(db);
+
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+        let mut decided: Vec<String> = Vec::new();
+
+        // Boot a server, hand out ONE batch, and decide only part of it — the reviewer is mid-batch.
+        let boot = |db_path: String| {
+            let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
+            let port = server.server_addr().to_ip().unwrap().port();
+            let state = Arc::new(Mutex::new(CouchState {
+                reviewers: [("tok".to_string(), "Hawzhin".to_string())].into_iter().collect(),
+                ..CouchState::default()
+            }));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let join = spawn_server_loop(0, server.clone(), db_path, state.clone(), shutdown.clone()).expect("spawn");
+            (server, port, shutdown, join)
+        };
+        let submit = |port: u16, id: &str| -> u16 {
+            let body = serde_json::json!({ "id": id, "action": "accept", "text": "دەقی سەرەتایی" }).to_string();
+            match agent
+                .post(&format!("http://127.0.0.1:{port}/api/decision?t=tok"))
+                .set("content-type", "application/json")
+                .send_string(&body)
+            {
+                Ok(r) => r.status(),
+                Err(ureq::Error::Status(c, _)) => c,
+                Err(e) => panic!("transport: {e}"),
+            }
+        };
+
+        let (server, port, shutdown, join) = boot(db_path.clone());
+        let queue: serde_json::Value =
+            agent.get(&format!("http://127.0.0.1:{port}/api/queue?t=tok")).call().unwrap().into_json().unwrap();
+        let held: Vec<String> =
+            queue["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
+        assert!(held.len() >= 10, "need a real batch to interrupt, got {}", held.len());
+        for id in held.iter().take(5) {
+            assert_eq!(submit(port, id), 200, "pre-restart decision {id} must land");
+            decided.push(id.clone());
+        }
+
+        // THE RESTART, mid-batch, with the phone still holding the rest of its queue.
+        shutdown.store(true, Ordering::SeqCst);
+        server.unblock();
+        let _ = join.join();
+        drop(server);
+
+        let (server2, port2, shutdown2, join2) = boot(db_path.clone());
+        // The phone does NOT refetch — it works through the queue it already had, which is exactly what
+        // a page mid-batch does. Every remaining clip must still be accepted.
+        for id in held.iter().skip(5) {
+            let code = submit(port2, id);
+            assert_eq!(code, 200, "post-restart decision {id} must still land, got {code}");
+            decided.push(id.clone());
+        }
+        // And a REPLAY of a pre-restart decision must be recognised as already-done, not recorded twice
+        // — the retry guard reads the row, not process memory, so it has to survive the restart.
+        let replay = submit(port2, &decided[0]);
+        assert_eq!(replay, 200, "an outbox replay across a restart must be answered as already-done");
+
+        shutdown2.store(true, Ordering::SeqCst);
+        server2.unblock();
+        let _ = join2.join();
+
+        let db = Database::open(&db_path).unwrap();
+        for id in &decided {
+            let row = db.get_segment_by_id(id).unwrap().unwrap();
+            assert!(row.verified, "{id} lost its decision across the restart");
+            assert_eq!(row.reviewed_by.as_deref(), Some("Hawzhin"), "{id} lost its attribution");
+        }
+        // Exactly one learning pair per decided clip — the replay must not have minted a second.
+        let side = rusqlite::Connection::open(&db_path).unwrap();
+        let pairs: i64 = side
+            .query_row(
+                "SELECT COUNT(*) FROM agent_examples WHERE segment_id = ?1",
+                rusqlite::params![&decided[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(pairs <= 1, "the replayed decision minted {pairs} learning pairs; a retry must mint none");
+    }
+
+    #[test]
     fn one_reviewer_can_drain_a_backlog_larger_than_a_batch_to_genuine_zero() {
         // THE SHAPE OF A REAL SESSION, and nothing covered it. Every other soak caps its rounds (the
         // three-reviewer test stops at 4) or works a backlog smaller than QUEUE_BATCH, so "the queue

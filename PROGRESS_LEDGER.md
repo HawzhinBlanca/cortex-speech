@@ -2584,3 +2584,38 @@ intact rather than corrupting anything.
 
 **Gates (unmasked):** fmt 0; clippy 0; `cargo test --lib` 0 — **1091 passed, 7 ignored**;
 python-policies 0 — 44/44.
+
+---
+
+## Iteration 209 — a restart drill that found nothing, and a false banner of my own making
+
+**Pinned, no defect: a mid-session server restart.** The watchdog can force-restart this app at any
+5-minute tick — that is its job — so a real session WILL sometimes be interrupted mid-batch. Existing
+tests covered a restart BETWEEN sessions; none covered one DURING a session with a phone still working
+from the queue it already holds. New `a_mid_session_server_restart_loses_no_work_and_double_decides_
+nothing`: 40 clips, one batch handed out, five decided, then threads down / server dropped / a FRESH
+CouchState on a new port against the SAME database (so in-memory leases and undo are lost exactly as a
+process restart loses them). Every remaining clip still lands, attribution survives, and a replay of a
+pre-restart decision is answered as already-done with **no second learning pair**. It passed first try
+— a regression pin, not a fix, and recorded as such.
+
+**Defect, and it was mine.** The refused-decisions banner added earlier today had no way down:
+`noteRefused` only ever appended, and nothing removed. One 409 pinned the warning for the life of the
+browser profile — still insisting work had failed after the reviewer went back and re-reviewed it,
+which is the same class of lie the banner exists to prevent, aimed the other way. `clearRefused` now
+retracts an id when its decision lands, on both the live-submit and outbox-flush paths. It compares
+`#err`'s text against the refused template computed BEFORE the removal, so it only ever retracts its
+OWN banner: `#err` is shared with the link-expired notice, which is more urgent and needs an action
+from the reviewer. Two Playwright pins, including one that asserts the link notice survives a
+retraction.
+
+**A test I wrote last iteration was wrong, and the fix is a finding in itself.** The audio-skip test
+asserted `#skip` hidden after skipping. On `file://` the page's `<audio src="/api/audio/...">` is a
+REAL request — `window.fetch` is stubbed, media loads are not — so every clip's audio genuinely fails
+and the handler correctly fires for the next clip too. The assertion was racing correct behaviour. The
+reset is now asserted in the SAME TICK as `show()` (synchronous clear, async error event), which is
+deterministic. Confirmed stable 3-for-3.
+
+**Gates (unmasked):** `cargo test --lib` 0 — **1092 passed, 7 ignored** (couch:: 41); clippy 0;
+`cargo fmt --check` 0 (after an initial exit 1 — rustfmt reflowed two of the new test lines);
+`npm run test:e2e` 0 — **72 passed**; couch-page **25**, stable 3-for-3; python-policies 0 — 44/44.
