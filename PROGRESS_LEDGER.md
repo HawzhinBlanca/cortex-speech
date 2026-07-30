@@ -2740,3 +2740,49 @@ asserting it would cost a minute of real sleep per gate run, while the owner's o
 alive path on every real 5-minute tick.
 
 **Gates (unmasked):** watchdog parses clean; python-policies 0 — **45/45**; hygiene 0.
+
+---
+
+## Iteration 213 — the Reviewer UX 10/10 plan, researched and adversarially verified
+
+Owner directive: Tailscale may stay on the PC, but reviewers must get "true best user experience,
+Apple-quality smoothness" — write the #1 plan to a genuine 10/10.
+
+**docs/REVIEWER_UX_10_PLAN.md (new).** Built by a 10-agent workflow: full line-cited inventories of
+couch.html and couch.rs, extraction of settled decisions (no service worker, Funnel-over-Cloudflare,
+fragment tokens, phase-6 scope cap), 2026 platform research with sources, a three-lens design panel
+(first 60 seconds / flow state / trust & recovery), and an adversarial verify pass over both the
+platform claims and the proposals themselves.
+
+**The verify pass earned its cost:** it killed two duplicate proposals (two timeout/retry designs in
+the same batch), exposed two fake gates (a drill that cannot execute with the server down because the
+shell itself is served by the app; a swipe network-gate the unmodified page already passes), rejected
+undo-survives-reload as specified (it corrupts the shared pace counter and conflates three distinct
+undo-409 meanings), and — the standout — **found a real defect in the shipped page**: the fragment->
+cookie claim is a one-shot const promise, so a FIRST-EVER visitor whose claim POST fails transiently
+(server restarting, cellular blip) is shown "link expired" — a false terminal state for a valid link —
+with no recovery except a manual reload an installed app cannot perform. Scheduled as R3.2.
+
+**Verified platform facts the plan rests on (each with a source):** Safari probes media with a 2-byte
+range request and expects 206 (today couch.rs ignores Range — playback measured working, scrubbing
+contract not met); iOS never shipped navigator.vibrate and the checkbox-switch haptics hack was patched
+away in 26.5 (haptics DEAD, dropped); Web Audio routes through the silent switch while <audio> ignores
+it (Web Audio playback REJECTED); iOS does NOT share cookies between Safari and an installed standalone
+app (install-nudge trap, device-test scheduled before the nudge ships); wake lock works from iOS 16.4,
+fixed in standalone 18.4; iOS 26 opens A2HS sites as web apps by default.
+
+**Shape:** an operational definition of 10/10 (N1 link-tap->audio <=15s/2 taps; N2 ONE tap per clip;
+N3 <=1s to next clip; N4 zero loss visible; N5 stranger completes first clip unaided), then R0 Funnel
+go-live (owner click) -> R1 transport (Range/206+HEAD, immutable caching+ETag, server byte-cache,
+single-fetch client buffer, pendingTotal, limiter-doc truth-fix) -> R2 one-tap flow (welcome gate as
+iOS audio unlock, autoplay-next, pause-on-edit+rew2s, keyboard-safe row via visualViewport, progress
+bar, safe-area) -> R3 visible trust (sync pill, the claim-retry defect fix, readable failures, a11y
+floor, swipe snap-back) -> R4 install & polish (owner-gated nudge + the cookie trap test, refused-
+banner follow-through, "unsure" as an owner data-policy question) -> R5 the real-device hour over
+Funnel with every number logged. Explicit rejected/descoped section so nothing is silently relitigated.
+Hard gates no code can substitute: native Sorani review of every source:null string, and real-device
+measurement — nothing claimable from emulators.
+
+Two truth items folded in: the couch limiter comment says 120/min but the bucket refills ~120/second
+(verified in throttle.rs — doc fix scheduled, behavior kept), and the batch-lease gap the inventory
+listed was already closed server-side in iteration 208's whole-batch renew.
