@@ -274,3 +274,59 @@ R2 lands next (welcome gate + autoplay are the N2/N3 unlock). R0 can happen any 
 wake-lock/installed-app legs. R4 waits on R5's device answers. Total engineering: roughly 6–7 focused
 days, all inside the existing gate discipline (fail-before proofs, unmasked exits, 3× Playwright
 stability, ledger per change).
+
+---
+
+## Where this plan stands — 2026-07-30, end of the build-out
+
+**Everything in this plan that does not need the owner is shipped, gated and verified live on the
+running server.** Six iterations (215–220), commits `df5d4d1 … 6337262`, both refs aligned.
+
+| Phase | Item | State |
+|---|---|---|
+| R1 | 1 Range/206 + HEAD | **shipped**, verified live (206 `bytes 0-1/390060`; HEAD 200 + 0-byte body) |
+| R1 | 2 immutable + ETag | **shipped**, verified live (304, 0 bytes) |
+| R1 | 3 server byte cache | **shipped** (32 MB, fingerprint-keyed) |
+| R1 | 4 single-fetch client buffer | **descoped** — item 2 delivers the same bytes-on-wire saving; see the R1 status block |
+| R1 | 5 `pendingTotal` | **shipped**, verified live (`pendingTotal=116`) |
+| R1 | 6 limiter truth fix | **shipped** (was wrong by 60×) |
+| R2 | 1 welcome/Start gate | **not needed** — the first clip's own play button unlocks the element; see the R2 status block |
+| R2 | 2 auto-advance | **shipped** |
+| R2 | 3 pause on edit, rewind 2 s | **shipped** |
+| R2 | 4 keyboard-safe action row | **shipped** (took two attempts — `scrollIntoView` aligns to the wrong viewport) |
+| R2 | 5 3 px progress bar | **skipped as decoration** — the text counter now counts the real backlog |
+| R2 | 6 safe-area insets | **shipped** |
+| R3 | 1 ambient sync pill | **OWNER-GATED** — needs a new Sorani string |
+| R3 | 2 no dead ends / false link-expired | **shipped** (iteration 214) |
+| R3 | 3 failures you can read | **shipped** + new policy gate against raw English |
+| R3 | 4 a11y live regions | **shipped** |
+| R3 | 5 swipe affordance | **shipped** |
+| R4 | 1 install nudge | **OWNER-GATED** — new Sorani *and* a conscious Phase-6 scope amendment |
+| R4 | 2 iOS standalone cookie trap | **OWNER-GATED** — needs the R5 device hour, and it gates R4.1 |
+| R4 | 3 refused-banner follow-through | **shipped** |
+| R4 | 4 "unsure" verdict | **OWNER-GATED** — changes corpus semantics; a data-policy decision, not a UX default |
+| R5 | the real-device hour | **OWNER-GATED** — one hour with a real iPhone on cellular |
+| R0 | Tailscale Serve → Funnel | **OWNER-GATED** — one click at the Tailscale admin URL |
+
+### What only the owner can do now, in the order that unblocks the most
+
+1. **Enable Tailscale Serve, then Funnel** (R0). Until this happens the link is LAN/tailnet-only, and
+   every latency number in R1 stays a LAN number. `tailscale serve status` still reports "No serve config".
+2. **One elevated run of `scripts/ops/cortex-once-admin.ps1`.** Verified state: `FastStartup=1` (want 0),
+   `ARSO` unset (want 1), ActiveHours unset. **A reboot still leaves the review server down** until this
+   runs — the watchdog cannot start what the login screen has not unlocked.
+3. **The R5 device hour** (R5, and it gates R4.2 → R4.1). The three things only a real phone can answer:
+   does auto-advance actually play on iOS after an awaited POST; is 100 % of the Save button inside the
+   visual viewport with the keyboard open; does the `#t=` link mint the cookie inside an installed
+   standalone app.
+4. **Native Sorani read of the 8 unreviewed strings** (`audioMissing`, `heldByOthers`, `linkExpired`,
+   `loadingMore`, `queued`, `refused`, `skip`, `stillSending`). Nothing added them this week — R1–R5 as
+   built needed **zero** new Sorani.
+5. **Two decisions**: amend the Phase-6 scope cap for the install nudge (R4.1), and rule on the "unsure"
+   verdict's corpus semantics (R4.4).
+
+### Not measured, and therefore not claimed
+
+The ≤ 11-audio-GETs-per-10-clip-drill count, whether a real browser elides the repeat fetch (the 304 is
+proven server-side; the client cache hit is device behaviour), and every R2 real-device gate. All belong
+to the R5 hour.
