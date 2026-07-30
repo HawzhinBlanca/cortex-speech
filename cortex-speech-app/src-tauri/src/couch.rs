@@ -63,6 +63,17 @@ const LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 /// Clips handed out per queue request. Small batches keep several reviewers moving through DIFFERENT
 /// work instead of the first one leasing the whole backlog; the page refetches as it drains.
 const QUEUE_BATCH: usize = 25;
+/// How many pre-decision snapshots to keep per reviewer for the ↩ button.
+///
+/// Every decision pushed a FULL `SpeechSegment` clone and nothing ever trimmed it, so a 116-clip
+/// session retained 116 whole rows for the life of the process — and this process is meant to run for
+/// weeks, healed by the watchdog, across many sessions. Unbounded growth in an always-on server is a
+/// leak whether or not any single session notices it.
+///
+/// 20 is far past use: the page offers ONE ↩ that pops the last decision, and each undo puts the clip
+/// straight back in the queue, so walking back twenty is already beyond anything a reviewer does. The
+/// cap drops the OLDEST entries — never the most recent, which is the only one anyone reaches for.
+const UNDO_DEPTH: usize = 20;
 /// Upper bound on named reviewers — each gets a server thread and its own DB connection.
 const MAX_REVIEWERS: usize = 8;
 /// One clip in every [`SPOT_CHECK_EVERY`] served is a SPOT CHECK: a clip whose correct answer is
@@ -1370,7 +1381,14 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         // pre-decision one, so storing it would make the undo button restore a corrupt snapshot. The
         // entry pushed by the original attempt is the true one and is deliberately left in place.
         if !already_recorded {
-            guard.undo.entry(reviewer.to_string()).or_default().push((prev.id.clone(), prev.clone()));
+            let stack = guard.undo.entry(reviewer.to_string()).or_default();
+            stack.push((prev.id.clone(), prev.clone()));
+            // Bounded HERE, at the only site that grows it: the pushes in api_undo are restorations of
+            // an entry just popped, so they cannot exceed what the stack already held.
+            let overflow = stack.len().saturating_sub(UNDO_DEPTH);
+            if overflow > 0 {
+                stack.drain(0..overflow);
+            }
         }
     }
     // Skipped entirely when the decision is already on the row: this is the write that mints the DPO
@@ -3122,6 +3140,42 @@ mod tests {
             "text with only ONE bracket is ordinary text, not a placeholder"
         );
         assert!(!db.get_segment_by_id("s1").unwrap().unwrap().verified, "row untouched by rejected requests");
+    }
+
+    #[test]
+    fn the_undo_stack_is_bounded_and_keeps_the_newest_not_the_oldest() {
+        // A long session used to retain one FULL row snapshot per decision, forever, in a process the
+        // watchdog keeps alive for weeks across many sessions. Bounding it is only safe if the cap
+        // discards the OLDEST — the ↩ button always reaches for the most recent decision, so trimming
+        // the wrong end would break the one thing undo is for.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let total = UNDO_DEPTH + 7;
+        for n in 0..total {
+            db.insert_segment(&seg(&format!("u{n:03}"), "دەق")).unwrap();
+        }
+        let state = state();
+        for n in 0..total {
+            let body = serde_json::json!({ "id": format!("u{n:03}"), "action": "accept", "text": "دەق" });
+            let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+            assert_eq!(code, 200, "decision u{n:03} must land");
+        }
+
+        let depth = lock_state(&state).undo.get("Sara").map(|s| s.len()).unwrap_or(0);
+        assert_eq!(depth, UNDO_DEPTH, "the stack must stop growing at the cap, not follow the session");
+
+        // The MOST RECENT decision is still undoable — the cap trimmed the far end.
+        let (code, _, body) = api_undo(&db, "Sara", &state);
+        assert_eq!(code, 200);
+        let undone: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(undone["id"], format!("u{:03}", total - 1), "undo must retract the LAST decision");
+        assert!(!db.get_segment_by_id(&format!("u{:03}", total - 1)).unwrap().unwrap().verified);
+
+        // ...and the oldest, dropped by the cap, is simply beyond reach rather than corrupting anything.
+        assert!(
+            db.get_segment_by_id("u000").unwrap().unwrap().verified,
+            "a trimmed-away entry leaves its decision intact; it is just no longer undoable"
+        );
     }
 
     #[test]

@@ -2561,3 +2561,26 @@ Caught by re-reading the file, repaired before any gate ran.
 
 **Gates (unmasked exits):** fmt 0; clippy 0; `cargo test --lib` 0 — **1090 passed, 7 ignored**;
 `npm run test:e2e` 0 — **70 passed**; couch-page **23**; python-policies 0 — 44/44.
+
+**Iteration 208b — pre-flight on the real data, and an unbounded undo stack.**
+
+*Data pre-flight for tomorrow (measured, read-only):* all **116 pending clips** have their audio
+present on disk, from a single source file, with valid durations — 0 missing, 0 empty `audio_path`,
+0 zero-duration. Worth checking because the whole corpus carries the extended-length `\?\C:\...`
+prefix, and `validate_segment` calls `reject_unc_path` — the exact rule the interrupted-write test
+uses to FORCE a failure. It is not tripped: that shape parses as `VerbatimDisk`, not UNC, and
+`input.rs:269` already pins it ("verbatim-disk local path must pass"). No new test added — the
+existing pin covers it, and a duplicate would be noise. Verified rather than assumed, because a naive
+future tightening of that check would make every clip in the library undecidable.
+
+*Defect: the undo stack was unbounded.* Every decision pushed a full `SpeechSegment` clone and nothing
+ever trimmed it, so a 116-clip session retained 116 whole rows for the life of a process the watchdog
+keeps alive for weeks across many sessions. Capped at `UNDO_DEPTH = 20`, trimming the OLDEST — the ↩
+button always reaches for the most recent decision, so trimming the wrong end would break the one
+thing undo is for. Bounded at the single growth site; the pushes in `api_undo` restore an
+already-popped entry and cannot exceed what the stack held. FAIL-BEFORE: depth **27 vs 20**. The test
+also pins that the newest decision is still undoable and that a trimmed entry leaves its decision
+intact rather than corrupting anything.
+
+**Gates (unmasked):** fmt 0; clippy 0; `cargo test --lib` 0 — **1091 passed, 7 ignored**;
+python-policies 0 — 44/44.
