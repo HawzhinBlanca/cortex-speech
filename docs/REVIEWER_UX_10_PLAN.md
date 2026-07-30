@@ -101,9 +101,31 @@ So every `/api/audio` request re-read 172 MB and memcpy'd ~172 MB more, then re-
 the WAV sample by sample. The byte cache short-circuits all of it; the justification is stronger than
 the plan claimed, for a different reason than the plan gave.
 
-**Not yet measured:** the two wire-level gates above (≤ 11 audio GETs across a 10-clip drill; 0 bytes
-on a repeat open) are real-device numbers and belong to the R5 hour with a phone on cellular. The
-server-side contract they depend on is now proven; the end-to-end counts are not, and are not claimed.
+**Measured live on the owner's running server** after the rebuild (exe at `df5d4d1`, freshness gate
+OK), driven over real HTTP with a real reviewer token:
+
+| Probe | Result |
+|---|---|
+| `POST /api/claim` → `GET /api/queue` | 200 / 200 — 29 items, `pendingTotal=116` |
+| `GET /api/audio/<id>` | 200, 390060 bytes, `ETag: "b386c3e8ff2e48a3"`, `Cache-Control: private, max-age=31536000, immutable`, `Accept-Ranges: bytes` |
+| `Range: bytes=0-1` (Safari's opening probe) | **206**, `Content-Range: bytes 0-1/390060`, exactly 2 bytes returned |
+| `HEAD` | **200**, `Content-Length: 390060`, 0-byte body |
+| `If-None-Match: "b386c3e8ff2e48a3"` | **304**, 0-byte body |
+| `Range: bytes=99999999-` | **416**, `Content-Range: bytes */390060` |
+
+`pendingTotal=116` matches the real backlog this plan cites in R1's motivation, so the honest-progress
+denominator is now the corpus rather than the 25-clip batch.
+
+**Still not measured, and not claimed:** the ≤ 11-audio-GETs-across-a-10-clip-drill count, and whether a
+real browser actually elides the repeat fetch (the server-side 304 is proven; the client-side cache hit
+is a device behaviour). Both are real-device numbers and belong to the R5 hour with a phone on cellular.
+
+**Harness note for whoever verifies this next.** Windows PowerShell 5.1's `Invoke-WebRequest` refuses
+restricted headers via `-Headers` (`The 'Range' header must be modified using the appropriate property
+or method`), and the thrown error then poisons every later probe on the same session — which is exactly
+how a first pass produced three blank results that looked like server failures and were not. Use
+`System.Net.Http.HttpClient` with `HttpRequestMessage.Headers.Range`, or `curl.exe`. The token stays in
+a variable and is presented via `POST /api/claim` so it never reaches a URL or a command line.
 
 ## Phase R2 — One tap per clip (client, ~2 days)
 

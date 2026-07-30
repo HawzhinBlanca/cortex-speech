@@ -2934,3 +2934,34 @@ masks a perfectly good build. Confirmed the Rust side is clean (a fresh `cargo b
 only with `os error 32`, the running app holding the exe lock — not a compile error). The loop's
 rebuild step now uses the existing bundle-free `tauri:build:smoke`, so exit 0 means what it says. The
 installer bundlers are out of scope per the owner's "ship = personal use" decision.
+
+**Iteration 215, live verification after the rebuild.** Rebuild via the bundle-free
+`npm run tauri:build:smoke`: `BUILD_EXIT=0` (release, 9m00s), `EXE FRESHNESS GATE: OK (exe at HEAD
+df5d4d1, newer than all sources)`, `FRESHNESS_EXIT=0`, app relaunched, watchdog re-enabled, server up
+after 10 s. Then every R1 behaviour driven over real HTTP against the owner's own server with a real
+reviewer token:
+
+| Probe | Result |
+|---|---|
+| `POST /api/claim` | **200** |
+| `GET /api/queue` | **200** — reviewer `Hawzhin`, 29 items, `pendingTotal=116`, `heldByOthers=0` |
+| `GET /api/audio/<id>` | **200**, 390060 bytes, `ETag: "b386c3e8ff2e48a3"`, `Cache-Control: private, max-age=31536000, immutable`, `Accept-Ranges: bytes` |
+| `Range: bytes=0-1` | **206**, `Content-Range: bytes 0-1/390060`, 2 bytes returned |
+| `HEAD` | **200**, `Content-Length: 390060`, 0-byte body |
+| `If-None-Match: "b386c3e8ff2e48a3"` | **304**, 0-byte body |
+| `Range: bytes=99999999-` | **416**, `Content-Range: bytes */390060` |
+
+`pendingTotal=116` is the real backlog, so the progress denominator is now the corpus rather than the
+batch — the exact number this plan's R1 motivation cites.
+
+**A harness bug that briefly looked like a server bug, recorded so it is not repeated.** The first
+verification pass reported `range:` / `head:` / `conditional:` as blank failures. Not the server:
+Windows PowerShell 5.1's `Invoke-WebRequest` refuses restricted headers passed via `-Headers` ("The
+'Range' header must be modified using the appropriate property or method"), and the thrown exception
+then poisoned the two probes after it, so one unsettable header produced three false negatives.
+Re-driven with `System.Net.Http.HttpClient` + `HttpRequestMessage.Headers.Range`, all six pass. Nothing
+was claimed from the blank pass.
+
+**Still not measured, and not claimed:** the ≤ 11-audio-GETs-per-10-clip-drill count, and whether a real
+browser elides the repeat fetch (the 304 is proven server-side; the client cache hit is device
+behaviour). Both belong to the R5 real-device hour.
