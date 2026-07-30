@@ -708,6 +708,17 @@
     }
   }
   setInterval(() => void renewLease(), 4 * 60 * 1000);
+  // RETRY HELD WORK ON A CLOCK, because nothing else does. flushOutbox ran on exactly two triggers:
+  // the `online` event and load(). Once 429 became a HOLD rather than a drop, that left a gap of my
+  // own making — throttling never fires `online` (the phone was never offline), so a rate-limited
+  // decision sat in localStorage until the batch happened to drain, up to a whole batch later. Work
+  // was not lost (localStorage outlives the page) but "queued" has to mean it actually goes.
+  //
+  // 30s, not the 4-minute lease heartbeat: the couch limiter refills at 120/min, so a throttle clears
+  // in seconds and the reviewer is watching a "not sent yet" counter meanwhile. Costs nothing when the
+  // outbox is empty, and unlike renewLease it runs while the page is HIDDEN — a backgrounded phone can
+  // still finish sending, which is exactly when a reviewer has walked away believing they were done.
+  setInterval(() => { if (readOutbox().length) void flushOutbox(); }, 30 * 1000);
   // Renew the moment the reviewer COMES BACK, not up to four minutes later. Ticks are skipped while
   // the page is hidden — deliberately, so a reviewer who wanders off releases their clips — but that
   // leaves a real gap on a phone, where backgrounding is constant (a call, a notification, the screen

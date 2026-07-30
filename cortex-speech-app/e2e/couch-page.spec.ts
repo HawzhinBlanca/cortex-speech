@@ -596,6 +596,58 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#err')).toContainText('بەسەرچووە');
   });
 
+  test('held work is retried on a clock, with no reload and no online event', async ({ page }) => {
+    // A gap created by making 429 a HOLD: flushOutbox only ran on the `online` event and inside
+    // load(), and throttling never fires `online` — the phone was never offline. So a rate-limited
+    // decision sat in localStorage until the batch happened to drain, up to a whole batch later, while
+    // the reviewer watched a "not sent yet" counter. Work was not lost, but "queued" must mean it goes.
+    //
+    // Driven with fake timers rather than a real 30s wait: the assertion is that a TIMER exists and
+    // drains the outbox unaided — not how long a stopwatch takes.
+    await page.clock.install();
+    await page.addInitScript(() => {
+      (window as unknown as { __throttle: boolean; __sent: string[] }).__throttle = true;
+      (window as unknown as { __sent: string[] }).__sent = [];
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const w = window as unknown as { __throttle: boolean; __sent: string[] };
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [{ id: 'k1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (url.includes('/api/decision')) {
+          if (w.__throttle) return new Response('rate limit exceeded', { status: 429 });
+          w.__sent.push(String(init?.body ?? ''));
+          return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
+
+    await page.locator('#accept').click();
+    await expect
+      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .toBe(1);
+
+    // The throttle clears. NOTHING else happens: no reload, no online event, no batch drain.
+    await page.evaluate(`window.__throttle = false`);
+    await page.clock.runFor(31_000);
+
+    await expect
+      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .toBe(0);
+    const sent = (await page.evaluate(`window.__sent`)) as string[];
+    expect(sent.join(' ')).toContain('k1');
+  });
+
   test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {
     // DATA LOSS, and made MORE reachable by fixing Stop/Start: every outstanding token is regenerated
     // when the owner restarts Couch Review or reissues a link. A reviewer who was offline then

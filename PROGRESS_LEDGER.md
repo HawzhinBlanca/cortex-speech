@@ -2619,3 +2619,24 @@ deterministic. Confirmed stable 3-for-3.
 **Gates (unmasked):** `cargo test --lib` 0 — **1092 passed, 7 ignored** (couch:: 41); clippy 0;
 `cargo fmt --check` 0 (after an initial exit 1 — rustfmt reflowed two of the new test lines);
 `npm run test:e2e` 0 — **72 passed**; couch-page **25**, stable 3-for-3; python-policies 0 — 44/44.
+
+**Iteration 209b — the gap my own 429 fix opened.** Self-audit, which the loop now mandates because
+two of the previous three findings were in changes made earlier the same night.
+
+Making 429 a HOLD instead of a drop created a dependency nothing satisfied: `flushOutbox` ran on
+exactly two triggers — the `online` event and `load()`. **Throttling never fires `online`** (the phone
+was never offline), so a rate-limited decision sat in localStorage until the batch happened to drain,
+up to a whole batch later, while the reviewer watched a "not sent yet" counter. Work was never lost —
+localStorage outlives the page — but "queued" has to mean it actually goes.
+
+A 30-second retry timer now drains the outbox unaided, deliberately NOT folded into the 4-minute lease
+heartbeat: the limiter refills at 120/min so a throttle clears in seconds, and unlike `renewLease` this
+runs while the page is HIDDEN — a backgrounded phone finishing its sends is exactly the case where a
+reviewer has walked away believing they were done. No cost when the outbox is empty.
+
+Pinned with Playwright fake timers (`page.clock`), asserting the drain happens with NO reload, NO
+`online` event and NO batch drain — the timer is the only thing that could have done it. FAIL-BEFORE:
+outbox stays at **1** with the timer removed, **0** with it. Stable 3-for-3.
+
+**Gates (unmasked):** `npm run test:e2e` 0 — **73 passed**; couch-page **26**, stable 3-for-3;
+python-policies 0 — 44/44.
