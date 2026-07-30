@@ -50,6 +50,7 @@
     "undoFailed": "Undo failed",
     "saveFailed": "Failed to save edit: {err}",
     "loadFailed": "Failed to load queue: {err}",
+    "retry": "Retry",
     "linkExpired": "This link has expired. Ask for a new one — anything you already saved is safe, and anything still waiting to send will go through on the new link.",
     "allDone": "All clips reviewed!",
     "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
@@ -73,6 +74,7 @@
     "undoFailed": "گەڕاندنەوە سەرکەوتوو نەبوو",
     "saveFailed": "پاشەکەوتی دەستکاری سەرکەوتوو نەبوو: {err}",
     "loadFailed": "بارکردنی ڕیز سەرکەوتوو نەبوو: {err}",
+    "retry": "دووبارە",
     "linkExpired": "ئەم بەستەرە بەسەرچووە. داوای بەستەرێکی نوێ بکە — هەرچی پاشەکەوتت کردووە پارێزراوە، و هەرچی چاوەڕێی ناردنە بە بەستەرە نوێیەکە دەنێردرێت.",
     "allDone": "هەموو پارچەکان پێداچوونەوەیان بۆ کرا!",
     "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
@@ -96,6 +98,7 @@
     "undoFailed": "review.undoFailed",
     "saveFailed": "inbox.status.editFailed",
     "loadFailed": "inbox.status.loadFailed",
+    "retry": "retry",
     "linkExpired": null,
     "allDone": "review.allDone",
     "heldByOthers": null,
@@ -231,6 +234,7 @@
   <button id="undo">↩</button>
 </div>
 <div id="err" hidden></div>
+<div class="row" id="errActions" hidden><button id="retry" type="button"></button></div>
 <div class="toast" id="toast"></div>
 <script>
   // The token arrives in the URL FRAGMENT (#t=...), which the browser never sends to any server —
@@ -242,12 +246,27 @@
   // A fragment token is presented to the server exactly once, in a POST body, and comes back as the
   // HttpOnly cookie every later request rides on. Fire-and-forget BEFORE load(): claimed is awaited
   // by load() via this promise so the first /api/queue never races the cookie.
-  const claimed = fragToken
-    ? fetch('/api/claim', {
+  // RETRYABLE, not one-shot. The first shipped version was a const promise created here at parse:
+  // a first-ever visitor whose claim POST failed transiently (server restarting, cellular blip) fell
+  // through to a 401 queue fetch and was shown "link expired" — a FALSE terminal state for a valid
+  // link, unrecoverable even by reload because the fragment is stripped from the URL below. The token
+  // is still right here in memory, so a failed claim must stay claimable. Only the server explicitly
+  // refusing the token (401) is a real verdict; anything else is "not yet".
+  let claimState = fragToken ? 'pending' : 'none'; // none | pending | ok | rejected
+  async function ensureClaimed() {
+    if (claimState !== 'pending') return claimState;
+    try {
+      const r = await fetch('/api/claim', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ token: fragToken }),
-      }).then((r) => r.ok, () => false)
-    : Promise.resolve(true);
+      });
+      if (r.ok) claimState = 'ok';
+      else if (r.status === 401) claimState = 'rejected'; // the server's answer, not a hiccup
+      // 429/5xx/anything else: stay pending, the next load() tries again.
+    } catch { /* network: stay pending */ }
+    return claimState;
+  }
+  void ensureClaimed(); // fire early so the cookie usually exists before the first queue fetch
   // Strip the credential from the visible address and this history entry either way: a token on
   // screen is a token anyone glancing at the phone can photograph, and history survives the session.
   if ((fragToken || queryToken) && window.history?.replaceState) {
@@ -283,6 +302,7 @@
     $('accept').textContent = '✓ ' + t('accept');
     $('save').textContent = t('save');
     $('skip').textContent = '⏭ ' + t('skip');
+    $('retry').textContent = '↻ ' + t('retry');
     $('undo').title = t('undo');
     // The transcript box had NO accessible name at all — a screen-reader user reached an unlabelled
     // edit field and had to guess what it was for. Reuses the desktop's own review hint.
@@ -324,7 +344,16 @@
   // while the browser was faithfully sending everything needed to let them in.
   const withToken = (path) => (token ? path + (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(token) : path);
   async function api(path, opts) {
-    const r = await fetch(withToken(path), opts);
+    // 15s timeout: a stalled cellular fetch otherwise hangs "Loading clips..." forever. An abort
+    // throws with NO status, which every caller already treats as "never arrived" — retryable.
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 15000);
+    let r;
+    try {
+      r = await fetch(withToken(path), { ...opts, signal: ctl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!r.ok) {
       // Carry the status so callers can tell "the server refused" (a real answer, do not retry) from
       // "the request never arrived" (fetch throws a TypeError with no status, and IS worth retrying).
@@ -360,6 +389,25 @@
   // and an installed PWA (display:standalone) has no address bar to reload from, so that screen was a
   // dead end as well as a lie. `exhausted` is the only thing that may draw the finished state, and it
   // is set solely by a fetch that came back with nothing.
+  // WHAT #err is currently saying. It is shared by three messages with different lifetimes — a load
+  // failure (clears itself the moment a load succeeds), a link-expired verdict (needs the reviewer to
+  // get a new link; must survive everything), and the refused-work banner (retracted only when that
+  // clip is re-reviewed). Clearing it by guessing wiped the refused banner on the next refetch, and
+  // comparing textContent was a fragile stand-in for this variable.
+  let errKind = ''; // '' | 'load' | 'expired' | 'refused'
+  function showErr(kind, text, withRetry) {
+    errKind = kind;
+    $('err').hidden = false;
+    $('err').textContent = text;
+    $('errActions').hidden = !withRetry;
+  }
+  function clearErr(kind) {
+    if (errKind !== kind) return; // never retract a message this caller did not write
+    errKind = '';
+    $('err').hidden = true;
+    $('err').textContent = '';
+    $('errActions').hidden = true;
+  }
   let refilling = false;
   let exhausted = false;
   async function refill() {
@@ -404,28 +452,23 @@
   function clearRefused(id) {
     const r = readRefused();
     if (!r.includes(id)) return;
-    // Computed BEFORE the removal so the comparison uses the count currently on screen. #err is shared
-    // with the link-expired notice, which is more urgent and must never be retracted by this path.
-    const ourBannerIsUp = $('err').textContent === t('refused', { n: r.length });
     const left = r.filter((x) => x !== id);
     if (left.length) {
       localStorage.setItem(REFUSED, JSON.stringify(left));
-      if (ourBannerIsUp) renderRefused(); // recount, still showing
+      if (errKind === 'refused') renderRefused(); // recount, still showing
       return;
     }
     localStorage.removeItem(REFUSED);
-    if (ourBannerIsUp) {
-      $('err').hidden = true;
-      $('err').textContent = '';
-    }
+    clearErr('refused'); // a no-op if #err is currently carrying a more urgent message
   }
   function renderRefused() {
     const n = readRefused().length;
     if (!n) return;
     // Persistent, not a toast: this needs the reviewer to go back and re-do specific clips, and a
-    // message that disappears in three seconds cannot ask that.
-    $('err').hidden = false;
-    $('err').textContent = t('refused', { n });
+    // message that disappears in three seconds cannot ask that. Never overwrites a link-expired
+    // verdict — that one needs an action from the reviewer and outranks this.
+    if (errKind === 'expired') return;
+    showErr('refused', t('refused', { n }), false);
   }
   // ONE flush at a time. Three things call this now — the `online` event, load(), and the 30s retry
   // timer — and an overlapping run re-POSTs items another is already sending. The server dedups, so
@@ -521,13 +564,22 @@
     prefetched.preload = 'auto';
     prefetched.load();
   }
+  // Auto-retry while unreachable: one gentle attempt a minute, riding the cookie (never re-hammering
+  // the claim — ensureClaimed self-gates). Cleared the moment a load succeeds.
+  let retryable = false;
+  let loading = false;
+  setInterval(() => { if (retryable && !loading) void load(); }, 60 * 1000);
   async function load() {
+    if (loading) return;
+    loading = true;
     try {
       // The fragment claim must land before the first authenticated call, or a brand-new reviewer's
       // very first /api/queue races the Set-Cookie and 401s a perfectly good link.
-      await claimed;
+      await ensureClaimed();
       await flushOutbox();
       const res = await api('/api/queue');
+      retryable = false;
+      clearErr('load');
       queue = res.items; i = 0; heldByOthers = res.heldByOthers || 0;
       // Recomputed on EVERY load: a fetch that brings work back re-arms the refetch, so a reviewer who
       // drains one batch, sees the finished screen, and later reloads is not stuck with a stale verdict.
@@ -539,13 +591,21 @@
       $('who').textContent = ' · ' + res.reviewer;
       show();
     } catch (e) {
-      $('err').hidden = false;
+      // "Loading clips..." must not sit beside a failure message — but an EMPTY-STATE message is a
+      // real answer and must survive an unrelated failure, so only the placeholder is taken down.
+      if ($('done').textContent === t('loadingMore')) $('done').hidden = true;
       // A dead token is the single most likely thing a remote reviewer will hit — every outstanding
-      // link is regenerated whenever the owner restarts Couch Review or reissues one — and it used to
-      // surface as "Failed to load queue: unauthorized", with the operative word in English and no
-      // hint that the fix is to ask for a new link. Naming it is the difference between a reviewer
-      // who asks and one who assumes the tool is broken.
-      $('err').textContent = e.status === 401 ? t('linkExpired') : t('loadFailed', { err: e.message });
+      // link is regenerated whenever the owner restarts Couch Review or reissues one. But 401 is only
+      // a VERDICT when the claim itself was answered: with the claim still pending (server was
+      // restarting, cellular blip), a 401 here is a race, not an expiry — showing "link expired"
+      // there was a false terminal state for a perfectly valid link. Anything not a settled 401 gets
+      // a Retry button and a once-a-minute auto-retry instead of a dead end.
+      const expired = e.status === 401 && claimState !== 'pending';
+      retryable = !expired;
+      if (expired) showErr('expired', t('linkExpired'), false);
+      else showErr('load', t('loadFailed', { err: e.message }), true);
+    } finally {
+      loading = false;
     }
   }
   async function decide(action) {
@@ -583,8 +643,7 @@
         if (e.status === 401) {
           // Say it once, persistently — a toast about a dead link vanishes before it is understood,
           // and this one needs an action from the reviewer (ask for a new link).
-          $('err').hidden = false;
-          $('err').textContent = t('linkExpired');
+          showErr('expired', t('linkExpired'), false);
         } else {
           // NOT "Saved" — it is not saved, it is queued. Telling a reviewer their work is safe when it
           // is still sitting in localStorage is what made every later loss invisible: they had already
@@ -761,6 +820,7 @@
   }
   $('player').addEventListener('play', () => void keepAwake());
   document.addEventListener('visibilitychange', () => { if (!document.hidden) void keepAwake(); });
+  $('retry').onclick  = () => void load();
   $('save').onclick   = () => decide('edit');
   $('accept').onclick = () => decide('accept');
   $('bad').onclick    = () => decide('bad');

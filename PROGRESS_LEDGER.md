@@ -2786,3 +2786,52 @@ measurement — nothing claimable from emulators.
 Two truth items folded in: the couch limiter comment says 120/min but the bucket refills ~120/second
 (verified in throttle.rs — doc fix scheduled, behavior kept), and the batch-lease gap the inventory
 listed was already closed server-side in iteration 208's whole-batch renew.
+
+---
+
+## Iteration 214 — R3.2: the false "link expired" dead end, fixed
+
+First item built from `docs/REVIEWER_UX_10_PLAN.md`. The defect was found by the plan's own adversarial
+verify pass, not by a test — and it was live in the shipped page.
+
+**The defect.** The fragment->cookie claim was a one-shot `const` promise created at script parse:
+`const claimed = fetch('/api/claim'...).then(r => r.ok, () => false)`. Any failure — server restarting,
+a cellular blip on the very first tap — resolved it `false` forever. The queue fetch then 401'd and the
+page told the reviewer **the link had expired**. False, and unrecoverable: `history.replaceState` has
+already stripped the fragment, so even a manual reload has no token, and an installed standalone app has
+no address bar to reload from. The only escape was finding the original chat message again. The token
+sat in page memory the entire time.
+
+**Fixed.** `ensureClaimed()` is a state machine — `none | pending | ok | rejected` — where **only an
+explicit 401 from the claim itself** is a verdict; a network error or 5xx stays `pending` and the next
+`load()` re-claims. The 401-means-expired test now also requires `claimState !== 'pending'`, so a race
+is never read as an expiry.
+
+**Also landed (same dead-end family, all from plan R3.2):**
+- `api()` gained a 15s AbortController timeout. A stalled cellular fetch used to hang "Loading clips…"
+  forever with no timeout anywhere in the file; an abort throws with no status, which every caller
+  already treats as retryable.
+- A localized **Retry** button (`#retry`) in every non-verdict failure state, plus a gentle 60s
+  auto-retry while unreachable. `retry` is COPIED from the desktop `retry` key, so it is native-reviewed
+  Sorani — `source: "retry"`, NOT a new owner-gated draft.
+- Retrying a real verdict would be a lie, so the button is hidden when the claim was genuinely refused.
+
+**A regression I introduced and had to fix properly.** Clearing `#err` on a successful load and hiding
+`#done` on failure broke two existing tests — correctly. `#err` is shared by three messages with
+different lifetimes (load failure, link-expired verdict, refused-work banner), and my blunt clear wiped
+the refused banner on the next refetch. Introduced `errKind` (`'' | load | expired | refused`) with
+`showErr`/`clearErr`, so no path can retract a message it did not write; link-expired now outranks the
+refused banner explicitly. This also replaced the fragile `textContent`-comparison hack `clearRefused`
+had been using — a named state was what that code always wanted.
+
+**One pre-existing test adjusted, and why that is not weakening it.** "the empty state is actually empty"
+drove `show()` with an empty queue, which now correctly triggers a refill whose fetch fails on
+`file://` — and the failure path takes down the "Loading clips…" placeholder, which IS the dead-end fix.
+Its stated subject is that `[hidden]` beats `display:flex`, so it now sets `exhausted = true` to reach
+the true empty state directly instead of relying on a placeholder that used to sit there forever.
+
+**FAIL-BEFORE:** restoring the one-shot claim makes the new test fail with the page showing
+`"ئەم بەستەرە بەسەرچووە..."` — this link has expired — to a reviewer holding a valid link.
+
+**Gates (unmasked):** page script parses clean; couch-page **29 passed, stable 3-for-3**;
+`npm run test:e2e` 0 — **76 passed**; python-policies 0 — 45/45; typecheck 0 — 426 files, 0 errors.

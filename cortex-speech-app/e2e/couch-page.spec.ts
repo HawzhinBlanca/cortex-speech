@@ -73,7 +73,14 @@ test.describe('Couch Review phone page', () => {
   test('the empty state is actually empty — `hidden` is not defeated by a display rule', async ({ page }) => {
     // Regression: #card sets display:flex, which beats the hidden attribute's display:none default,
     // so the empty review card rendered next to the "all reviewed" message.
-    await page.evaluate(`queue = []; i = 0; document.getElementById('err').hidden = true; show();`);
+    // `exhausted = true` states what this test is actually about: the TRUE empty state. Without it,
+    // show() now (correctly) tries a refill, whose fetch fails on file:// — and the failure path takes
+    // down the "Loading clips…" placeholder, which is the dead-end fix, not a regression. This test's
+    // subject is the CSS rule, so it must reach the empty state directly instead of relying on a
+    // placeholder that used to sit there forever.
+    await page.evaluate(
+      `queue = []; i = 0; exhausted = true; document.getElementById('err').hidden = true; show();`,
+    );
     await expect(page.locator('#card')).toBeHidden();
     await expect(page.locator('#done')).toBeVisible();
   });
@@ -836,6 +843,69 @@ test.describe('Couch Review phone page', () => {
     for (const u of urls) {
       expect(u, 'a tokenless page must not send an empty t= — it shadows the cookie').not.toMatch(/[?&]t=(&|$)/);
     }
+  });
+
+  test('a transient claim failure is retryable, never a false "link expired"', async ({ page }) => {
+    // THE DEFECT (found by the adversarial plan review, shipped until today): the fragment->cookie
+    // claim was a one-shot const promise created at script parse. A first-ever visitor whose claim
+    // POST failed transiently — server restarting, cellular blip — fell through to a 401 queue fetch
+    // and was told the link had EXPIRED. False, and unrecoverable: the fragment is stripped from the
+    // URL, so even a manual reload has no token. The only escape was re-tapping the original chat
+    // message. The token is still in page memory the whole time, so the claim must stay claimable.
+    await page.addInitScript(() => {
+      (window as unknown as { __up: boolean }).__up = false; // the server is briefly unreachable
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const up = (window as unknown as { __up: boolean }).__up;
+        if (url.includes('/api/claim')) {
+          if (!up) throw new TypeError('Failed to fetch'); // transient network failure, NOT a verdict
+          return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        if (url.includes('/api/queue')) {
+          if (!up) return new Response('unauthorized', { status: 401 }); // no cookie was ever minted
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [{ id: 'c1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE + '#t=valid-token-99');
+    await page.reload();
+
+    // The failure must present as RETRYABLE — never as the terminal "link expired" verdict.
+    await expect(page.locator('#err')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('#err')).not.toContainText('بەسەرچووە'); // "expired"
+    await expect(page.locator('#retry')).toBeVisible();
+
+    // The blip passes; the reviewer taps Retry and lands on their clip with the same in-memory token.
+    await page.evaluate(`window.__up = true`);
+    await page.locator('#retry').click();
+    await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
+    await expect(page.locator('#err')).toBeHidden();
+
+    // A genuinely revoked token must still be a real verdict: 401 from the claim itself = expired.
+  });
+
+  test('a genuinely refused claim still shows link-expired, with no retry offered', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/claim')) return new Response('unauthorized', { status: 401 }); // real verdict
+        if (url.includes('/api/queue')) return new Response('unauthorized', { status: 401 });
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE + '#t=revoked-token');
+    await page.reload();
+    await expect(page.locator('#err')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('#err')).toContainText('بەسەرچووە');
+    await expect(page.locator('#retry')).toBeHidden(); // retrying a verdict would be a lie
   });
 
   test('a fragment token is claimed by POST and stripped, never sent in any request URL', async ({ page }) => {
