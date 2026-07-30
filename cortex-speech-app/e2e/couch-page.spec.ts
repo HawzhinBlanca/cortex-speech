@@ -1323,6 +1323,74 @@ test.describe('Couch Review phone page', () => {
     expect(await page.locator('#err').getAttribute('role')).toBe('alert');
   });
 
+  test('the swipe shows what it is about to do, and snaps back when it will not', async ({ page }) => {
+    // The gesture worked and was invisible: nothing moved while the finger moved, so a reviewer whose
+    // thumb happened to travel 90 px cast a verdict with no warning, and one who wanted to use the
+    // gesture had no way to discover it or to see that they had crossed the threshold.
+    await showAClip(page);
+    // Begin the gesture on the card itself (not the textarea, which must never read as a verdict), and
+    // REMEMBER where it started. Re-reading getBoundingClientRect() per move is wrong once the card is
+    // translated — the rect moves with the transform, so each dx would be measured from the card's new
+    // position instead of the finger's origin. (That was a bug in this test, not in the page: it made a
+    // 120 px swipe arrive as 78 px and silently fall under the commit distance.)
+    await page.evaluate(`
+      const card = document.getElementById('card');
+      const box = card.getBoundingClientRect();
+      window.__origin = { x: box.left + 20, y: box.top + 40 };
+      card.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, changedTouches: [
+        new Touch({ identifier: 1, target: card, clientX: window.__origin.x, clientY: window.__origin.y }) ] }));
+    `);
+    const swipe = async (dx: number, dy: number, phase: 'move' | 'end') => {
+      await page.evaluate(
+        ([x, y, p]) => {
+          const card = document.getElementById('card')!;
+          const origin = (window as unknown as { __origin: { x: number; y: number } }).__origin;
+          card.dispatchEvent(
+            new TouchEvent(p === 'move' ? 'touchmove' : 'touchend', {
+              bubbles: true,
+              changedTouches: [
+                new Touch({
+                  identifier: 1,
+                  target: card,
+                  clientX: origin.x + (x as number),
+                  clientY: origin.y + (y as number),
+                }),
+              ],
+            }),
+          );
+        },
+        [dx, dy, phase] as const,
+      );
+    };
+
+    // UNDER the threshold: the card follows the finger, but promises nothing.
+    await swipe(40, 0, 'move');
+    const t40 = await page.evaluate(`document.getElementById('card').style.transform`);
+    expect(t40).toContain('translateX');
+    expect(t40).not.toBe('translateX(0.0px)');
+    await expect(page.locator('#card')).toHaveClass(/dragging/);
+    await expect(page.locator('#card')).not.toHaveClass(/willAccept|willReject/);
+
+    // PAST it: the page is RTL, so leftward (negative dx) is forward = accept.
+    await swipe(-120, 0, 'move');
+    await expect(page.locator('#card')).toHaveClass(/willAccept/);
+    await swipe(120, 0, 'move');
+    await expect(page.locator('#card')).toHaveClass(/willReject/);
+
+    // Too vertical is a scroll, and the feedback must drop instantly rather than leave the card
+    // hanging mid-drag while the page moves under it.
+    await swipe(120, 90, 'move');
+    await expect(page.locator('#card')).not.toHaveClass(/dragging|willAccept|willReject/);
+    expect(await page.evaluate(`document.getElementById('card').style.transform`)).toBe('');
+
+    // Releasing under the commit distance decides NOTHING and leaves no transform behind.
+    await swipe(30, 0, 'move');
+    await swipe(30, 0, 'end');
+    expect(await page.evaluate(`document.getElementById('card').style.transform`)).toBe('');
+    await expect(page.locator('#text')).toHaveValue(/نموونەیی/); // still on the same clip
+    await expect(page.locator('#card')).not.toHaveClass(/dragging/);
+  });
+
   for (const scheme of ['light', 'dark'] as const) {
     test(`has zero WCAG 2.2 AA violations while reviewing (${scheme})`, async ({ page }) => {
       // Both themes, because the page renders in whichever the phone is set to and a contrast

@@ -3199,3 +3199,41 @@ untouched this iteration. Not claimed as covered.
 −1 duplicate removed). `cargo clippy --all-targets --all-features -D warnings` **0** (two
 `unnecessary_cast` errors in my new test on the first run, fixed, not suppressed). `cargo fmt --check`
 **0**. No page change, so no Playwright/e2e delta this iteration.
+
+## Iteration 220 — R3.5, and the last two audit items were already closed
+
+**R3.5 — the swipe gesture stops being invisible.** It worked and gave no feedback of any kind: nothing
+moved while the finger moved, so a reviewer whose thumb happened to travel 90 px cast a verdict with no
+warning, and a reviewer who wanted the gesture had no way to discover it or to see they had crossed the
+threshold. The card now tracks the finger (damped 0.35, so it reads as pulling something weighted rather
+than flinging the clip away), shows an inset ring in the colour of the verdict a release would cast, and
+snaps back under the threshold. An inset ring rather than a background wash, so the transcript stays
+readable at the moment the reviewer is deciding. `prefers-reduced-motion` drops the transition.
+
+Two thresholds that had to agree were unified: the commit distance was a bare `90` inside `touchend`, and
+feedback that appeared at a different distance from the one that commits would be worse than no feedback,
+because the reviewer would trust it. `SWIPE_COMMIT_PX` / `SWIPE_ABORT_DY` are now defined once and used by
+both paths, along with a shared `isForward()` so the RTL direction rule cannot diverge either. A gesture
+that turns vertical drops the feedback immediately rather than leaving the card mid-drag while the page
+scrolls under it, and `touchcancel` resets too.
+
+**A bug in my own test, worth recording because it is the reusable kind.** The harness recomputed
+`getBoundingClientRect()` on every synthetic touchmove — but the rect moves WITH the transform, so each
+`dx` was measured from the card's new position instead of the finger's origin. A 120 px swipe arrived as
+78 px and fell silently under the commit distance, and the failure looked exactly like a missing
+`willReject` class. The origin is now captured once at touchstart. The page was correct throughout.
+
+**FAIL-BEFORE:** removing the `touchmove` handler → `Expected substring: "translateX" / Received: ""`.
+
+**NULL RESULTS, both audit items on this loop's list are already closed.**
+* **#25** (spot-check answer across Stop/Start) — covered since phase 4; my duplicate test was rejected by
+  the compiler and deleted (iteration 219).
+* **#28** (check-then-act race) — closed by P1.3b: `RESTORE_PENDING` + an RAII reservation, couch's check
+  moved under the COUCH lock, publish-then-recheck for the four atomic-flag writers. Verified still intact
+  today: **15** `restore_pending()` call sites, `couch.rs:440` among them, and
+  `scripts/test_restore_reservation_gate.py` passes standalone (exit 0). Nothing to do; the loop's
+  untested list was stale on both.
+
+**Gates (unmasked).** couch-page Playwright **41 passed**, exit 0, stable 3-for-3.
+`npm run test:e2e` **0** — **88 passed** (was 87). `npm run test:python-policies` **0** — 45/45.
+`npm run typecheck` **0** — 426 files, 0 errors. No Rust change this iteration.

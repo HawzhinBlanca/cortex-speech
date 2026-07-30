@@ -177,7 +177,18 @@
   .chip { flex: 0 0 auto; padding: 4px 10px; font-size: 11px; font-weight: 600; border-radius: 999px;
           border: 1px solid var(--line); background: var(--chip); color: var(--dim); }
   #card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px;
-          display: flex; flex-direction: column; gap: 12px; flex: 1; }
+          display: flex; flex-direction: column; gap: 12px; flex: 1;
+          /* The swipe gesture existed but was completely invisible (R3.5): nothing moved while the
+             finger moved, and crossing the 90px threshold submitted a verdict with no warning and no
+             way to see you had crossed it. The card now follows the finger and snaps back — the
+             transition is the snap-back; dragging turns it off so the card tracks the finger 1:1. */
+          transition: transform .18s ease-out; }
+  #card.dragging { transition: none; }
+  /* Past the threshold: which verdict this release will cast. An inset ring rather than a background
+     wash, so the transcript underneath stays readable at the moment the reviewer is deciding. */
+  #card.willAccept { box-shadow: inset 0 0 0 3px var(--ok-line); }
+  #card.willReject { box-shadow: inset 0 0 0 3px var(--bad); }
+  @media (prefers-reduced-motion: reduce) { #card { transition: none; } }
   audio { width: 100%; }
   /* Waveform: seeing silence vs speech makes "is this clip usable?" a glance instead of a listen, and
      tapping it seeks straight to the word in doubt. Decorative in the a11y sense — the <audio> element
@@ -1021,21 +1032,49 @@
   // Bound to the CARD, not the page, and ignored when the gesture starts on the textarea — a reviewer
   // dragging to place a cursor in their correction must never be read as a verdict. The vertical and
   // distance thresholds keep an ordinary scroll from deciding a clip.
+  // Thresholds defined ONCE. The commit distance used to be a bare `90` inside touchend, and the
+  // drag feedback below has to agree with it exactly — a tint that appears at a different distance
+  // from the one that commits is worse than no tint, because the reviewer would trust it.
+  const SWIPE_COMMIT_PX = 90;
+  const SWIPE_ABORT_DY = 60;
   let touch = null;
+  // Direction is meaning, not screen side: in RTL "forward" is leftward. Accept is the forward gesture
+  // in both directions so the muscle memory matches the reading order.
+  const isForward = (dx) => (document.documentElement.dir === 'rtl' ? dx < 0 : dx > 0);
+  function resetSwipe() {
+    $('card').classList.remove('dragging', 'willAccept', 'willReject');
+    $('card').style.transform = '';
+  }
   $('card').addEventListener('touchstart', (e) => {
     if (e.target.closest('textarea, audio, button')) { touch = null; return; }
     touch = { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
   }, { passive: true });
+  // DIRECT MANIPULATION (R3.5). The gesture was undiscoverable and, worse, gave no warning: a reviewer
+  // whose thumb travelled 90px while scrolling cast a verdict with nothing on screen having moved.
+  $('card').addEventListener('touchmove', (e) => {
+    if (!touch) return;
+    const dx = e.changedTouches[0].clientX - touch.x;
+    const dy = e.changedTouches[0].clientY - touch.y;
+    // Too vertical to be a verdict — it is a scroll. Drop the feedback immediately so the card is not
+    // left mid-drag while the page moves under it. touchend applies the same rule and commits nothing.
+    if (Math.abs(dy) > SWIPE_ABORT_DY) { resetSwipe(); return; }
+    $('card').classList.add('dragging');
+    // Damped, not 1:1 in distance: the card trails the finger, which reads as pulling something
+    // weighted rather than flinging the clip off the screen.
+    $('card').style.transform = 'translateX(' + (dx * 0.35).toFixed(1) + 'px)';
+    const past = Math.abs(dx) >= SWIPE_COMMIT_PX;
+    $('card').classList.toggle('willAccept', past && isForward(dx));
+    $('card').classList.toggle('willReject', past && !isForward(dx));
+  }, { passive: true });
+  $('card').addEventListener('touchcancel', () => { touch = null; resetSwipe(); }, { passive: true });
   $('card').addEventListener('touchend', (e) => {
     if (!touch) return;
     const dx = e.changedTouches[0].clientX - touch.x;
     const dy = e.changedTouches[0].clientY - touch.y;
     touch = null;
-    if (Math.abs(dx) < 90 || Math.abs(dy) > 60) return;
-    // Direction is meaning, not screen side: in RTL "forward" is leftward. Accept is the forward
-    // gesture in both directions so the muscle memory matches the reading order.
-    const forward = document.documentElement.dir === 'rtl' ? dx < 0 : dx > 0;
-    void decide(forward ? 'accept' : 'bad');
+    resetSwipe(); // snap back first, whether or not this commits
+    if (Math.abs(dx) < SWIPE_COMMIT_PX || Math.abs(dy) > SWIPE_ABORT_DY) return;
+    void decide(isForward(dx) ? 'accept' : 'bad');
   }, { passive: true });
 
   applyLocale();
