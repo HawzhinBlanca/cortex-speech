@@ -1090,15 +1090,28 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         // batch while holding the ~1-in-8 ratio wherever the batch is large enough for it to mean
         // something. A reviewer must not be able to coast just because their batches came out short.
         let wanted = queue.len().div_ceil(SPOT_CHECK_EVERY);
+        let work_len = queue.len();
         match db.list_spot_check_candidates(wanted, reviewer) {
             Ok(candidates) => {
                 let mut guard = lock_state(state);
                 let mut grew = false;
                 for (idx, (seg, _)) in candidates.into_iter().enumerate() {
                     grew |= guard.spot_checks.insert((seg.id.clone(), reviewer.to_string()));
-                    // Interleave rather than append: a run of traps at the tail of every batch is a
-                    // pattern a reviewer would learn within a session.
-                    let at = ((idx + 1) * SPOT_CHECK_EVERY).min(queue.len());
+                    // SPREAD EVENLY, and this is a fix, not a preference. The position used to be
+                    // `((idx + 1) * SPOT_CHECK_EVERY).min(queue.len())`, and the comment above it
+                    // claimed to interleave "rather than append in a run at the tail". Measured across a
+                    // five-batch session: a spot check landed LAST in 5 of 5 batches. `wanted` is
+                    // `div_ceil`, so a 25-clip batch asks for 4 checks while only three multiples of 8
+                    // fall inside it (8, 16, 24) — the fourth computed 32, clamped to the end, and was
+                    // appended every single time. A reviewer who noticed that the last clip of every
+                    // batch is a trap could pass every test in a session by listening to one clip.
+                    //
+                    // Dividing the batch into `wanted + 1` gaps puts every check strictly inside it:
+                    // 25 work clips and 4 checks give 5, 11, 17, 23 (the `+ idx` accounts for the
+                    // earlier insertions having shifted everything after them). The `.min` is kept only
+                    // so the index can never exceed the length — with this formula it does not bind, and
+                    // Vec::insert panicking is not an acceptable way to find that out.
+                    let at = ((idx + 1) * (work_len + 1) / (wanted + 1) + idx).min(queue.len());
                     queue.insert(
                         at,
                         serde_json::json!({
@@ -4209,6 +4222,153 @@ mod tests {
         assert!(total <= AUDIO_CACHE_BYTES, "the cache must stay inside its cap, held {total} bytes");
         assert!(!cache.iter().any(|(k, _)| *k == fp), "the OLDEST entry is the one evicted");
         assert_eq!(cache.last().map(|(k, _)| *k), Some(1006), "the newest entry always survives");
+    }
+
+    #[test]
+    fn spot_check_accounting_survives_a_long_multi_batch_session() {
+        // Everything about spot checks had been tested on ONE batch. A real sitting is a dozen batches,
+        // and the accounting has to hold across all of them: the served-set is in-memory AND persisted,
+        // the candidate query excludes only clips with a SCORE ROW, and the ratio is recomputed per
+        // batch. Any of those could drift over a session without a single-batch test noticing.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        const WORK: usize = QUEUE_BATCH * 5;
+        for n in 0..WORK {
+            db.insert_segment(&seg(&format!("w{n:03}"), "کاری ڕاستەقینە")).unwrap();
+        }
+        // Plenty of answer keys, so `wanted` is never starved and the ratio is the binding constraint.
+        for n in 0..30 {
+            gold_seg(&db, &format!("g{n:02}"), "دەقی هەڵە", "دەقی ڕاست");
+        }
+        let state = state();
+
+        let mut served_checks: Vec<String> = Vec::new();
+        let mut work_done = 0usize;
+        let mut tail_was_a_check = 0usize;
+        for round in 0..6 {
+            let (code, _, body, ..) = api_queue(&db, "Sara", &state);
+            assert_eq!(code, 200, "round {round}");
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let items = payload["items"].as_array().unwrap().clone();
+            if items.is_empty() {
+                break;
+            }
+            let ids: Vec<String> = items.iter().map(|s| s["id"].as_str().unwrap().to_string()).collect();
+            let checks: Vec<String> = ids.iter().filter(|id| id.starts_with('g')).cloned().collect();
+            let work: Vec<String> = ids.iter().filter(|id| id.starts_with('w')).cloned().collect();
+
+            // THE RATIO, per batch and rounded UP, so a short final batch is still measured.
+            assert_eq!(
+                checks.len(),
+                work.len().div_ceil(SPOT_CHECK_EVERY),
+                "round {round}: {} work clips must carry {} checks, got {}",
+                work.len(),
+                work.len().div_ceil(SPOT_CHECK_EVERY),
+                checks.len()
+            );
+            // A trap at the tail of every batch is a pattern a reviewer learns within a session, which
+            // is the one thing that makes the whole measurement worthless. Counted, not asserted per
+            // round, so the failure message can say how often it happened.
+            if ids.last().is_some_and(|id| id.starts_with('g')) {
+                tail_was_a_check += 1;
+            }
+            // Answer everything, checks included — a check is real work to the reviewer.
+            for id in &ids {
+                let text = if id.starts_with('g') { "دەقی ڕاست" } else { "کاری ڕاستەقینە" };
+                let body = serde_json::json!({ "id": id, "action": "edit", "text": text }).to_string();
+                let (dc, ..) = api_decision(&db, body.as_bytes(), "Sara", &state);
+                assert_eq!(dc, 200, "round {round}: submitting {id}");
+            }
+            served_checks.extend(checks);
+            work_done += work.len();
+        }
+
+        assert!(work_done >= QUEUE_BATCH * 4, "the session must span several batches, did {work_done}");
+        assert_eq!(
+            tail_was_a_check, 0,
+            "a spot check landed last in {tail_was_a_check} of the batches — the tail is the one \
+             position a reviewer can learn without trying"
+        );
+
+        // NEVER THE SAME CHECK TWICE to the same reviewer. Re-serving one they have already answered
+        // teaches them the answer and then scores them on knowing it.
+        let mut sorted = served_checks.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), served_checks.len(), "a check was served twice to the same reviewer");
+
+        // ONE SCORE PER CHECK ANSWERED. Not per submit, not per batch.
+        let report = db.spot_check_report().unwrap();
+        let sara = report.iter().find(|r| r.reviewer == "Sara").expect("Sara was scored");
+        assert_eq!(
+            sara.checks,
+            served_checks.len(),
+            "every check served and answered must appear exactly once in the score"
+        );
+        assert_eq!(sara.noticed, served_checks.len(), "she corrected every one, so all noticed");
+
+        // And the corpus got the WORK, not the checks: a spot check must never claim attribution.
+        for id in &served_checks {
+            let row = db.get_segment_by_id(id).unwrap().unwrap();
+            assert_eq!(row.reviewed_by, None, "{id} is an answer key, not a review");
+        }
+    }
+
+    #[test]
+    fn a_lease_that_lapsed_while_the_phone_slept_is_reclaimable_but_never_stolen_silently() {
+        // The backgrounded-phone case, which nothing covered. A reviewer's phone sleeps or their browser
+        // tab is backgrounded: the renew heartbeat stops, and after LEASE_TTL the lease lapses. Two
+        // things must then be true, and they pull in opposite directions —
+        //   * nobody else has taken it -> the reviewer who still has it open KEEPS it. Refusing here
+        //     would destroy a correction they typed before the phone slept, for no benefit at all.
+        //   * somebody else HAS taken it -> the reviewer is told, at renew time, while their text can
+        //     still be copied, rather than at save time when it is already unsaveable.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
+        db.insert_segment(&seg("s2", "دەق دوو")).unwrap();
+        let state = state();
+        assert_eq!(queue_ids(&db, "Sara", &state).len(), 2, "Sara holds both");
+
+        // Age Sara's leases past the TTL, which is what a sleeping phone produces. Instant cannot be
+        // fabricated, but it can be walked backwards.
+        let stale = Instant::now().checked_sub(LEASE_TTL + Duration::from_secs(60)).expect("clock has headroom");
+        {
+            let mut guard = lock_state(&state);
+            for (_, (_, granted)) in guard.leases.iter_mut() {
+                *granted = stale;
+            }
+        }
+
+        // NOBODY took it: renewing must succeed and hand the clip back, not refuse it.
+        let renew = serde_json::json!({ "id": "s1" }).to_string();
+        let (code, ..) = api_renew(renew.as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "a lapsed-but-unclaimed lease must be reclaimable by the reviewer holding it");
+        // ...and the decision she typed before the phone slept must still land.
+        let decide = serde_json::json!({ "id": "s1", "action": "edit", "text": "دەستکاری" }).to_string();
+        assert_eq!(api_decision(&db, decide.as_bytes(), "Sara", &state).0, 200);
+
+        // Now the other half: age the remaining lease again and let HEMN pick it up.
+        {
+            let mut guard = lock_state(&state);
+            for (_, (_, granted)) in guard.leases.iter_mut() {
+                *granted = stale;
+            }
+        }
+        assert!(queue_ids(&db, "Hemn", &state).contains(&"s2".to_string()), "an expired lease is available");
+
+        // Sara's phone wakes up. Renewing s2 must be REFUSED — now, not at save time.
+        let renew2 = serde_json::json!({ "id": "s2" }).to_string();
+        let (code2, _, msg, ..) = api_renew(renew2.as_bytes(), "Sara", &state);
+        assert_eq!(code2, 409, "a clip somebody else now holds must be refused at renew");
+        assert!(
+            String::from_utf8_lossy(&msg).contains("another reviewer"),
+            "and the refusal must say why, so the reviewer can copy their text: {}",
+            String::from_utf8_lossy(&msg)
+        );
+        // The refusal must not have quietly handed her the lease back as a side effect.
+        let holder = lock_state(&state).holder("s2", Instant::now()).map(str::to_string);
+        assert_eq!(holder.as_deref(), Some("Hemn"), "a refused renew must not steal the clip back");
     }
 
     #[test]

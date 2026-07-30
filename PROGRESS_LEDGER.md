@@ -3139,3 +3139,63 @@ iteration added none).
 
 Noted honestly: the first `npm run test:e2e` invocation exited **127** with no test output at all —
 command-not-found, not a failure. Re-run gave 0 / 87 passed. Reported rather than quietly retried.
+
+## Iteration 219 — the spot check was at the tail of EVERY batch; and two of the untested cases closed
+
+Three of the four behaviours on this loop's untested list. One of them found a real defect in code that
+predates this loop, and it defeats the measurement it exists to protect.
+
+**THE DEFECT: a spot check landed LAST in 5 of 5 batches.** The code above the position calculation
+said, in as many words, "Interleave rather than append: a run of traps at the tail of every batch is a
+pattern a reviewer would learn within a session." It did not interleave. `wanted` is
+`queue.len().div_ceil(8)`, so a 25-clip batch asks for **4** checks — but only three multiples of 8 fall
+inside 25 (8, 16, 24). The fourth computed 32, hit `.min(queue.len())`, and was appended to the end.
+Every batch. Every session.
+
+That is not a cosmetic issue: **a reviewer who noticed the last clip of every batch is a trap could pass
+every honesty test in a session by listening to exactly one clip per batch** — while tapping accept on
+the other 24. The one mechanism in this repo that measures whether a human is actually listening had a
+tell, and the comment asserting otherwise is what stopped anyone looking.
+
+Fixed by dividing the batch into `wanted + 1` gaps: 25 work clips and 4 checks now land at 5, 11, 17, 23
+(the `+ idx` accounts for earlier insertions shifting later indices). The `.min` is kept purely so the
+index can never exceed the length — it no longer binds, and `Vec::insert` panicking is not an acceptable
+way to discover that. The RATIO is unchanged; only the positions move, so the live batch is still 25 + 4
+= 29 items. Twelfth finding of this loop and the first in code it did not write.
+
+**FAIL-BEFORE** is the failing run itself, against the old positions:
+```
+assertion `left == right` failed: a spot check landed last in 5 of the batches — the tail is the one
+position a reviewer can learn without trying
+  left: 5
+ right: 0
+```
+
+**Covered now (spot-check accounting across many batches).** Everything about spot checks had been
+tested on ONE batch; a real sitting is a dozen. The new test drives six rounds over a 125-clip backlog
+with 30 answer keys and asserts, per batch and in aggregate: the ceiling ratio holds every round; no
+check is ever served twice to the same reviewer (re-serving one teaches the answer and then scores them
+on knowing it); every check answered produces exactly ONE score row, not one per submit; and no check
+lands at the tail. Plus the corpus invariant — every answer key still has `reviewed_by = None`.
+
+**Covered now (lease expiry with a slept/backgrounded phone).** A phone that sleeps stops the renew
+heartbeat, and after LEASE_TTL the lease lapses. The two requirements pull opposite ways and both are
+now pinned: if nobody else took the clip, the reviewer who still has it open KEEPS it (refusing there
+would destroy a correction typed before the phone slept, for no benefit); if somebody else did take it,
+the refusal arrives at RENEW time — while the text can still be copied — as a 409 naming the reason, and
+must not quietly steal the lease back. `Instant` cannot be fabricated, but it can be walked backwards
+with `checked_sub`, which is what makes this testable at all without a 15-minute wait.
+
+**NULL RESULT: audit #25 was already covered.** I wrote a test for "a spot check served before a restart
+is still scored after it" and the compiler rejected it as a duplicate — an existing test of that exact
+name has covered it since phase 4, including the answer-key-intact assertion. Mine added a blind-accept
+variant of the same mechanism, which is not worth a second test. Deleted rather than kept. Reported
+because the loop's own untested list named #25, and the honest answer is that the list was stale.
+
+**Still not done:** audit #28 (check-then-act race, previously refuted 2/3 by adversarial verify) is
+untouched this iteration. Not claimed as covered.
+
+**Gates (unmasked).** `cargo test --lib` **0** — **1102 passed**; 0 failed; 7 ignored (was 1100; +3 new,
+−1 duplicate removed). `cargo clippy --all-targets --all-features -D warnings` **0** (two
+`unnecessary_cast` errors in my new test on the first run, fixed, not suppressed). `cargo fmt --check`
+**0**. No page change, so no Playwright/e2e delta this iteration.
