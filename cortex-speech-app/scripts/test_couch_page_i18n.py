@@ -141,12 +141,43 @@ def test_params_survive_translation() -> None:
         )
 
 
+def test_no_raw_server_english_is_shown_to_the_reviewer() -> None:
+    """`e.message` must never reach the screen (plan R3.3).
+
+    Every string on this page is translated, and then the one word that says WHAT WENT WRONG used to
+    arrive in English straight from the server — "unauthorized", "Failed to fetch", "another reviewer
+    is working on this clip" — dropped inside a Sorani sentence. A reviewer who does not read English
+    got a message that looked translated and told them nothing at the exact moment they needed it.
+
+    A status code is the honest substitute: language-neutral, still diagnostic, and it fits the
+    reviewed strings' existing `{err}` slot without inventing new Sorani. This gate keeps it that way,
+    because the tempting fix when a new error path appears is to interpolate `e.message` again.
+    """
+    src = PAGE.read_text(encoding="utf-8")
+    offenders = [
+        f"  line {n}: {line.strip()}"
+        for n, line in enumerate(src.splitlines(), start=1)
+        # Only lines that actually RENDER something. `e.message` in a comment, or passed to console,
+        # is not shown to anyone.
+        if "e.message" in line
+        and not line.lstrip().startswith("//")
+        and ("t(" in line or "textContent" in line or "toast(" in line or "showErr(" in line)
+    ]
+    assert not offenders, (
+        "raw English server text is being rendered to the reviewer:\n"
+        + "\n".join(offenders)
+        + "\nUse the STATUS (`e.status || '—'`) instead — language-neutral and it fits the existing "
+        "{err} slot. A genuinely new message needs a new Sorani string, which is owner-gated."
+    )
+
+
 def main() -> None:
     test_page_is_kurdish_first()
     test_en_and_ckb_key_sets_match()
     test_sourced_sorani_still_matches_the_reviewed_desktop_string()
     test_unreviewed_sorani_list_is_exactly_as_acknowledged()
     test_params_survive_translation()
+    test_no_raw_server_english_is_shown_to_the_reviewer()
     strings = load_page_strings()
     reused = sum(1 for s in strings["source"].values() if s is not None)
     print(

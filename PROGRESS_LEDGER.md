@@ -3077,3 +3077,65 @@ code. The test that asserted the wrong behaviour was corrected with it.
 `--manifest-path`; a bare `cargo fmt --all` from the app dir fails on `cargo metadata`, which is a cwd
 artifact and not a formatting result — worth knowing before reading that exit code as red).
 `npm run test:python-policies` **0** — 45/45. `npm run typecheck` **0** — 426 files, 0 errors.
+
+## Iteration 218 — R3/R4: failures you can read, a banner that follows through, live regions
+
+Plan items **R3.3, R3.4 and R4.3**, all chosen because they need no new Sorani and each closes a
+defect rather than adding surface.
+
+**R3.3, the honesty defect in the error path.** Every string on this page is translated, and then the
+one word that says WHAT WENT WRONG arrived in English straight from the server, dropped inside a Sorani
+sentence. Measured, from the fail-before run:
+
+```
+بارکردنی ڕیز سەرکەوتوو نەبوو: another reviewer is working on this clip
+```
+
+A reviewer who does not read English got a message that *looked* translated and told them nothing, at
+the exact moment they needed it. Fixed by passing the STATUS instead of the message — language-neutral,
+still diagnostic, and it fits the existing reviewed `{err}` slot, so **no new Sorani was invented**. A
+transport failure has no status and gets a dash, which is more honest than "Failed to fetch"; the Retry
+button is what actually helps there. `undoFailed` stopped concatenating `e.message` entirely — the
+Sorani sentence reads fine alone. A proper "no connection" string is R3.1's owner-gated pill.
+
+New policy gate `test_no_raw_server_english_is_shown_to_the_reviewer` in `test_couch_page_i18n.py`, so
+the tempting fix next time an error path appears cannot reintroduce it. Policy scripts stay at 45; the
+gate is a new assertion inside an existing script.
+
+**R3.3, second half: failure toasts wait to be read.** 1.4 s is right for "Saved" — the reviewer knows
+what they did and is already moving. It is wrong for "could not save", which now arrives while their
+attention is on the NEXT clip (auto-advance, shipped last iteration, made this worse). Failures are
+sticky, styled as failures, and dismissible by tap. The shared timer is cleared on every toast, so a
+success arriving after a failure is not frozen on screen by the failure's absent timer.
+
+**R4.3, the banner that asked for something it did not enable.** "find those clips and review them
+again" — for ids the reviewer was never shown, in a queue they must scan by eye on a phone. Tapping the
+banner now jumps to the first refused clip present in the batch. If none is present — the usual case,
+since a refusal normally means someone else took it — the tap does **nothing**, deliberately: landing on
+the wrong clip would be worse than not moving, because the reviewer would trust it.
+
+**R3.4, live regions.** `aria-live="polite"` on progress/warn/done/toast: each changes without the
+reviewer touching anything, which is exactly what a screen reader cannot discover. `#err` gets
+`role="alert"` instead — it carries the link-expired verdict and the refused banner, both of which need
+an action before work can continue.
+
+**Self-audit of iteration 217's own diff, one fix.** The keyboard nudge ran from the visualViewport
+`scroll` handler as well as `resize`, so a reviewer scrolling up to re-read the transcript would be
+dragged straight back down to the buttons. The page fighting the finger is worse than the problem the
+nudge solves. Nudge is now resize-only; `--kb` still tracks scroll. Eleventh finding in this loop's own
+code — and, like the last one, found by reading the diff rather than by any test failing.
+
+**FAIL-BEFORE (four reverts, real output).**
+* Sticky toasts reverted to always-transient → `Expected pattern: /show/ / Received string: "toast sticky"`.
+* `e.message` restored in the load failure → `Expected substring: "409" / Received: "بارکردنی ڕیز سەرکەوتوو نەبوو: another reviewer is working on this clip"`.
+* Refused-banner click handler removed → stayed on clip 1 instead of jumping to clip 2.
+* `aria-live`/`role` attributes stripped → `Expected: "polite" / Received: null`.
+
+**Gates (unmasked).** couch-page Playwright **40 passed**, exit 0, stable 3-for-3.
+`npm run test:e2e` **0** — **87 passed** (was 83). `npm run test:python-policies` **0** — 45/45.
+`npm run typecheck` **0** — 426 files, 0 errors. `test_couch_page_i18n.py` standalone **0** — 22
+strings, 14 reusing natively-reviewed desktop Sorani, 8 awaiting owner review (unchanged: this
+iteration added none).
+
+Noted honestly: the first `npm run test:e2e` invocation exited **127** with no test output at all —
+command-not-found, not a failure. Re-run gave 0 / 87 passed. Reported rather than quietly retried.

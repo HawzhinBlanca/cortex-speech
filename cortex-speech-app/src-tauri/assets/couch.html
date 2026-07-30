@@ -214,6 +214,9 @@
            background: var(--chip); border: 1px solid var(--line); color: var(--ink); padding: 8px 18px;
            border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .2s; }
   .toast.show { opacity: 1; }
+  /* A failure that will not go away on its own has to look different from a confirmation that will,
+     and has to look tappable — it is the only way to dismiss it. */
+  .toast.sticky { background: var(--panel); border-color: var(--bad); color: var(--bad); cursor: pointer; }
   /* Respect a reviewer who has asked their phone to reduce motion. */
   @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
 </style>
@@ -221,7 +224,11 @@
 <body>
 <header>
   <h1>Cortex<span id="who"></span></h1>
-  <div id="progress"></div>
+  <!-- LIVE REGIONS (R3.4). Every one of these changes without the reviewer doing anything at the
+       moment it changes, which is precisely the case a screen reader cannot discover by itself: the
+       progress counter after a decision, a warning about a clip, the drained-queue verdict. `polite`
+       rather than `assertive` because none of them should interrupt a word being spoken. -->
+  <div id="progress" aria-live="polite"></div>
   <button id="textsize" class="chip" type="button" title="A±">A±</button>
   <button id="lang" class="chip" type="button"></button>
 </header>
@@ -235,7 +242,7 @@
   </div>
   <textarea id="text" lang="ckb" dir="rtl" spellcheck="false"></textarea>
   <div class="meta" id="meta"></div>
-  <div id="warn" hidden></div>
+  <div id="warn" aria-live="polite" hidden></div>
   <div class="row" id="actions">
     <button id="bad"></button>
     <button id="accept"></button>
@@ -247,16 +254,16 @@
        clip that may be perfectly fine. Skipping writes nothing. -->
   <button id="skip" type="button" hidden></button>
 </div>
-<div id="done" hidden></div>
+<div id="done" aria-live="polite" hidden></div>
 <!-- Undo lives OUTSIDE the card on purpose. Inside it, the button vanished with the card the moment
      the queue drained — so the one decision a reviewer is most likely to want back, the last one they
      made, was the one they could never reach. Shown whenever there is something to undo. -->
 <div class="row" id="after" hidden>
   <button id="undo">↩</button>
 </div>
-<div id="err" hidden></div>
+<div id="err" role="alert" hidden></div>
 <div class="row" id="errActions" hidden><button id="retry" type="button"></button></div>
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" aria-live="polite"></div>
 <script>
   // The token arrives in the URL FRAGMENT (#t=...), which the browser never sends to any server —
   // so a link pasted into a chat app hands its preview bot the empty shell, never a credential.
@@ -356,11 +363,24 @@
   // whoever's cookie is current: Sara's offline judgement recorded, permanently, as Hemn's.
   let me = '';
 
-  function toast(msg) {
+  // A SUCCESS toast may vanish; a FAILURE toast may not (R3.3). 1.4 s is right for "Saved" — the
+  // reviewer already knows what they did and is moving on. It is wrong for "could not save": that one
+  // arrives while their attention is on the next clip, and a message about lost or queued work that
+  // disappears before it is read is the same as no message at all. Failures stay until the reviewer
+  // taps them away or the next toast replaces them.
+  let toastTimer = null;
+  function toast(msg, sticky) {
     $('toast').textContent = msg;
     $('toast').classList.add('show');
-    setTimeout(() => $('toast').classList.remove('show'), 1400);
+    $('toast').classList.toggle('sticky', !!sticky);
+    if (toastTimer) clearTimeout(toastTimer); // a second toast must not be cut short by the first timer
+    toastTimer = sticky ? null : setTimeout(() => $('toast').classList.remove('show'), 1400);
   }
+  // Tapping dismisses. Only meaningful for a sticky toast, and harmless otherwise.
+  $('toast').addEventListener('click', () => {
+    $('toast').classList.remove('show', 'sticky');
+    if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+  });
   // The token rides the query only while we HAVE one. After the first load it has been stripped from
   // the URL (P3.8) and lives in the HttpOnly cookie, so `token` is "" — and sending `?t=` empty made
   // the server treat the query as a supplied-but-wrong credential, shadowing the very cookie that
@@ -503,6 +523,20 @@
     if (errKind === 'expired') return;
     showErr('refused', t('refused', { n }), false);
   }
+  // FOLLOW THROUGH ON WHAT THE BANNER ASKS (R4.3). The message says "find those clips and review them
+  // again" and then offered no way to find them — the reviewer was told to search a queue by eye, on a
+  // phone, for ids they were never shown. If any refused clip IS in the batch they are holding, tapping
+  // the banner goes to it. If none is (the usual case after a refusal — someone else took it), the tap
+  // does nothing rather than lying about having moved: a jump to the wrong clip would be worse than no
+  // jump, because the reviewer would trust it. No new string; the banner itself is the affordance.
+  $('err').addEventListener('click', () => {
+    if (errKind !== 'refused') return;
+    const refused = readRefused();
+    const pos = queue.findIndex((s) => refused.includes(s.id));
+    if (pos < 0) return;
+    i = pos;
+    show();
+  });
   // ONE flush at a time. Three things call this now — the `online` event, load(), and the 30s retry
   // timer — and an overlapping run re-POSTs items another is already sending. The server dedups, so
   // nothing corrupts, but every duplicate spends a rate-limiter token, which is perverse: throttling
@@ -674,7 +708,7 @@
       const expired = e.status === 401 && claimState !== 'pending';
       retryable = !expired;
       if (expired) showErr('expired', t('linkExpired'), false);
-      else showErr('load', t('loadFailed', { err: e.message }), true);
+      else showErr('load', t('loadFailed', { err: e.status || '—' }), true); // status, never English (R3.3)
     } finally {
       $('retry').disabled = false;
       $('retry').textContent = '↻ ' + t('retry');
@@ -727,7 +761,13 @@
         // decision, and it deserves the reviewer's attention rather than more audio.)
         i += 1; show(true);
       } else {
-        toast(t('saveFailed', { err: e.message }));
+        // The STATUS, not the message (R3.3). `e.message` is raw English from the server, and dropping
+        // it inside a Sorani sentence produced exactly the thing this page exists to avoid: the one word
+        // that says what went wrong, in a language the reviewer may not read. A status code is
+        // language-neutral, still diagnostic, and fits the reviewed string's existing {err} slot with no
+        // new Sorani. A transport failure has no status at all, and a dash is more honest there than
+        // "Failed to fetch" — the Retry affordance is what actually helps.
+        toast(t('saveFailed', { err: e.status || '—' }), true);
         // The server refused because someone else has this clip (409). Staying here would keep
         // re-submitting a decision that can never land, so move past it rather than trapping the reviewer.
         if (e.status === 409) { i += 1; show(); }
@@ -790,7 +830,11 @@
   // CSS has one thing to react to.
   if (window.visualViewport) {
     const vv = window.visualViewport;
-    const applyKb = () => {
+    // `nudge` only on RESIZE — the keyboard appearing or disappearing. Self-audit of R2: the scroll
+    // listener is here to keep `--kb` accurate, but re-running the nudge from it means a reviewer who
+    // deliberately scrolls up to re-read the transcript gets dragged straight back down to the buttons.
+    // The page fighting the finger is worse than the problem the nudge solves.
+    const applyKb = (nudge) => {
       // What the keyboard covers = the layout viewport minus the visual one, minus how far the visual
       // viewport has been scrolled down inside it. Clamped at 0 so ordinary browser-chrome collapse
       // (which also moves these numbers) can never add phantom padding.
@@ -807,16 +851,16 @@
       // behind the keyboard — so it lands the row precisely where it cannot be seen, with the padding it
       // needs to clear sitting below it off-screen. Measured here: it left #save at 604px with only the
       // top 400px visible. The overshoot is the honest number, so use it.
-      if (covered > 0 && document.activeElement === $('text')) {
+      if (nudge && covered > 0 && document.activeElement === $('text')) {
         requestAnimationFrame(() => {
           const overshoot = $('actions').getBoundingClientRect().bottom - (vv.offsetTop + vv.height);
           if (overshoot > 0) window.scrollBy(0, overshoot);
         });
       }
     };
-    vv.addEventListener('resize', applyKb);
-    vv.addEventListener('scroll', applyKb);
-    applyKb();
+    vv.addEventListener('resize', () => applyKb(true));
+    vv.addEventListener('scroll', () => applyKb(false));
+    applyKb(false);
   }
 
   // ── waveform ───────────────────────────────────────────────────────────────
@@ -970,7 +1014,7 @@
       const pos = queue.findIndex((s) => s.id === undone.id);
       if (pos >= 0) i = pos;
       show();
-    } catch (e) { toast(t('undoFailed') + ': ' + e.message); }
+    } catch { toast(t('undoFailed'), true); } // sticky, and no English server text appended (R3.3)
     finally { busy = false; }
   };
   // ── swipe: accept / reject without reaching for a button ───────────────────

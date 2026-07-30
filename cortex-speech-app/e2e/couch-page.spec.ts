@@ -1233,6 +1233,96 @@ test.describe('Couch Review phone page', () => {
     expect(await kb()).toBe('0px');
   });
 
+  test('a failure toast waits to be read; a success toast does not', async ({ page }) => {
+    // 1.4s is right for "Saved" — the reviewer knows what they did and is already moving. It is wrong
+    // for "could not save", which arrives while their attention is on the NEXT clip: a message about
+    // work that did not land, gone before it is read, is the same as no message.
+    await showAClip(page);
+    await page.evaluate(`toast('SUCCESS-MSG')`);
+    await expect(page.locator('#toast')).toHaveClass(/show/);
+    await expect(page.locator('#toast')).not.toHaveClass(/sticky/);
+    await expect(page.locator('#toast')).not.toHaveClass(/show/, { timeout: 4000 });
+
+    await page.evaluate(`toast('FAILURE-MSG', true)`);
+    await expect(page.locator('#toast')).toHaveClass(/sticky/);
+    await page.waitForTimeout(2200); // well past the success lifetime
+    await expect(page.locator('#toast')).toHaveClass(/show/);
+    // Dismissible, because a message that cannot be cleared is its own problem.
+    await page.locator('#toast').click();
+    await expect(page.locator('#toast')).not.toHaveClass(/show/);
+
+    // A success arriving after a failure must not be frozen on screen by the failure's missing timer.
+    await page.evaluate(`toast('FAILURE-MSG', true)`);
+    await page.evaluate(`toast('SUCCESS-MSG')`);
+    await expect(page.locator('#toast')).not.toHaveClass(/sticky/);
+    await expect(page.locator('#toast')).not.toHaveClass(/show/, { timeout: 4000 });
+  });
+
+  test('no raw English server text ever reaches a Sorani sentence', async ({ page }) => {
+    // Every string here is translated, and then the one word saying WHAT WENT WRONG used to arrive in
+    // English from the server — "unauthorized", "Failed to fetch" — inside a Sorani sentence. The
+    // status code is language-neutral, still diagnostic, and needs no new Sorani.
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        if (String(input).includes('/api/queue')) {
+          return new Response('another reviewer is working on this clip', { status: 409 });
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#err')).toBeVisible({ timeout: 5000 });
+    const text = (await page.locator('#err').textContent()) || '';
+    expect(text).toContain('409'); // the diagnostic survives
+    expect(text).not.toMatch(/[a-z]{4,}/i); // ...with no English word in it
+  });
+
+  test('tapping the refused banner goes to a refused clip, or honestly does nothing', async ({ page }) => {
+    // The banner says "find those clips and review them again" and gave the reviewer no way to find
+    // them — ids they were never shown, in a queue they must scan by eye on a phone.
+    await showAClip(page);
+    // Refuse the SECOND clip, so a correct jump is observable as a move.
+    await page.evaluate(`
+      localStorage.setItem('cortex.couch.refused', JSON.stringify(['s2']));
+      renderRefused();
+    `);
+    await expect(page.locator('#err')).toBeVisible();
+    await expect(page.locator('#text')).toHaveValue(/نموونەیی/); // still on clip 1
+    await page.locator('#err').click();
+    await expect(page.locator('#text')).toHaveValue('دەقی دووەم', { timeout: 5000 });
+
+    // A refusal for a clip NOT in this batch — the usual case, since someone else took it — must not
+    // jump anywhere. Landing on the wrong clip would be worse than not moving: the reviewer would
+    // trust it and re-review the wrong audio.
+    await page.evaluate(`
+      i = 0; show();
+      localStorage.setItem('cortex.couch.refused', JSON.stringify(['not-in-this-batch']));
+      renderRefused();
+    `);
+    await expect(page.locator('#text')).toHaveValue(/نموونەیی/);
+    await page.locator('#err').click();
+    await page.waitForTimeout(200);
+    await expect(page.locator('#text')).toHaveValue(/نموونەیی/);
+  });
+
+  test('everything that changes on its own is announced to a screen reader', async ({ page }) => {
+    // The progress counter after a decision, a warning about a clip, the drained-queue verdict: each
+    // changes without the reviewer touching anything, which is exactly what a screen reader cannot
+    // discover by itself. `polite` so none of them interrupts a word mid-utterance.
+    await showAClip(page);
+    for (const [id, expected] of [
+      ['progress', 'polite'],
+      ['warn', 'polite'],
+      ['done', 'polite'],
+      ['toast', 'polite'],
+    ] as const) {
+      expect(await page.locator(`#${id}`).getAttribute('aria-live'), `#${id}`).toBe(expected);
+    }
+    // #err is the one that must interrupt: it carries the link-expired verdict and the refused banner,
+    // both of which need an action from the reviewer before they can keep working.
+    expect(await page.locator('#err').getAttribute('role')).toBe('alert');
+  });
+
   for (const scheme of ['light', 'dark'] as const) {
     test(`has zero WCAG 2.2 AA violations while reviewing (${scheme})`, async ({ page }) => {
       // Both themes, because the page renders in whichever the phone is set to and a contrast
