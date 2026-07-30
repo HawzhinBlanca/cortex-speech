@@ -366,9 +366,18 @@
   // How many clips this reviewer has finished in this sitting. A session with no visible total is a
   // session with no sense of an ending, and the count is the cheapest form of pacing there is.
   let doneThisSession = 0;
+  // The whole pending backlog as of the last load (R1.5), or 0 from a server that does not send it.
+  let pendingTotal = 0;
   function renderProgress() {
+    // Count against the BACKLOG, not the batch. "Clip 7 of 25" was true of the clips in hand and
+    // useless as progress: a reviewer working a 400-clip corpus watched that bar fill and reset every
+    // 25 clips with no way to tell nearly-done from barely-started. `total` is the backlog measured at
+    // the last load and `i` is the position reached within it since, so the pair stays correct across
+    // a batch and re-bases when the next one arrives. Falls back to batch counting when the server
+    // sends no total. (✓ beside it is the true completed count — this is a position, not a tally.)
+    const total = pendingTotal || queue.length;
     // Clamped: once the batch drains `i` is one PAST the end, and the header read "Clip 26 of 25".
-    const pos = queue.length ? t('progress', { n: Math.min(i + 1, queue.length), total: queue.length }) : '';
+    const pos = queue.length ? t('progress', { n: Math.min(i + 1, total), total }) : '';
     $('progress').textContent = doneThisSession ? `${pos} · ✓${doneThisSession}` : pos;
     // Something to take back = the button is reachable, whether or not a card is on screen.
     $('after').hidden = doneThisSession === 0;
@@ -567,11 +576,26 @@
   // Auto-retry while unreachable: one gentle attempt a minute, riding the cookie (never re-hammering
   // the claim — ensureClaimed self-gates). Cleared the moment a load succeeds.
   let retryable = false;
-  let loading = false;
-  setInterval(() => { if (retryable && !loading) void load(); }, 60 * 1000);
-  async function load() {
-    if (loading) return;
-    loading = true;
+  // Concurrent callers JOIN the in-flight load; they do not skip it. My first version of this guard
+  // was `if (loading) return;`, which silently resolved `await load()` with the OLD queue still in
+  // place — and two callers genuinely await it for its DATA: refill() (batch drained, needs the next
+  // one) and undo (needs to find the restored clip in the refreshed queue, or it cannot put the
+  // reviewer back on it). Both would have quietly no-opped whenever an auto-retry happened to be in
+  // flight: the undone clip never came back on screen, and the drained-batch screen sat on
+  // "Loading clips…". Returning the shared promise keeps the request de-duplicated AND keeps the
+  // await honest.
+  let loadInFlight = null;
+  setInterval(() => { if (retryable && !loadInFlight) void load(); }, 60 * 1000);
+  function load() {
+    if (!loadInFlight) loadInFlight = doLoad().finally(() => { loadInFlight = null; });
+    return loadInFlight;
+  }
+  async function doLoad() {
+    // Tapping Retry must visibly do something. Without this the button swallowed the tap while the
+    // request was in flight and the failure message stayed put, so a reviewer on bad signal had no
+    // way to tell a working retry from a dead button and simply kept tapping.
+    $('retry').disabled = true;
+    $('retry').textContent = '↻ ' + t('loadingMore');
     try {
       // The fragment claim must land before the first authenticated call, or a brand-new reviewer's
       // very first /api/queue races the Set-Cookie and 401s a perfectly good link.
@@ -581,6 +605,9 @@
       retryable = false;
       clearErr('load');
       queue = res.items; i = 0; heldByOthers = res.heldByOthers || 0;
+      // The whole pending backlog, not just this batch (R1.5). Absent on an older server, and the
+      // progress line falls back to per-batch counting when it is.
+      pendingTotal = Number(res.pendingTotal) || 0;
       // Recomputed on EVERY load: a fetch that brings work back re-arms the refetch, so a reviewer who
       // drains one batch, sees the finished screen, and later reloads is not stuck with a stale verdict.
       exhausted = queue.length === 0;
@@ -605,7 +632,8 @@
       if (expired) showErr('expired', t('linkExpired'), false);
       else showErr('load', t('loadFailed', { err: e.message }), true);
     } finally {
-      loading = false;
+      $('retry').disabled = false;
+      $('retry').textContent = '↻ ' + t('retry');
     }
   }
   async function decide(action) {

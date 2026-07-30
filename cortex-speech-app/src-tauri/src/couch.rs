@@ -99,8 +99,15 @@ const ACCEPT_POLL: Duration = Duration::from_millis(250);
 
 /// Per-reviewer request budget (P1.6). Every desktop IPC command is throttled; these HTTP routes were
 /// the one unthrottled way into the database, so a phone stuck in a reload loop could hammer it
-/// unbounded. 120/min sustained with a burst of 60 is far above any human — a reviewer averages a
-/// handful per clip (queue, audio, decision, a renewal) — while still stopping a runaway page.
+/// unbounded.
+///
+/// The numbers are 120 requests per SECOND sustained, with a burst of 60. Read the refill in
+/// throttle.rs before changing them: `tokens += elapsed.as_secs_f64() * rate`, so `rate` is per second
+/// — this comment claimed "120/min" for a long time and was wrong by 60x. What that buys is honest but
+/// narrower than the old comment implied: it is far above any human (a reviewer averages a handful of
+/// requests per clip) and it does NOT throttle a merely chatty page, but it does bound a runaway loop
+/// running at machine speed. Measured: the solo-drain soak below outruns it and starts seeing 429 at
+/// clip 73, which is exactly the behaviour a phone stuck reloading would get.
 ///
 /// Keyed by REVIEWER, so one person's misbehaving tab cannot starve anyone else. Applied only AFTER
 /// the token resolves: an unauthenticated request is rejected before it touches the database, and the
@@ -764,8 +771,13 @@ fn spawn_server_loop(
         .map_err(|e| format!("Couch Review server thread failed to spawn: {e}"))
 }
 
-/// (status, content_type, body)
-type Reply = (u16, &'static str, Vec<u8>);
+/// (status, content_type, body, extra response headers)
+///
+/// The fourth slot exists for `/api/audio` (phase R1). Every reply used to ship with nothing but a
+/// Content-Type, which made caching and range requests impossible to express: a reviewer re-opening a
+/// clip they had already played re-downloaded all 300-500 KB of it over cellular, and a browser asking
+/// for a byte range got an unconditional full body back. Every other route passes `vec![]`.
+type Reply = (u16, &'static str, Vec<u8>, Vec<(&'static str, String)>);
 
 /// A reply that also plants the session cookie. Used only for the page itself: the token arrives in
 /// the URL exactly once, and from then on the cookie carries it.
@@ -776,7 +788,7 @@ type Reply = (u16, &'static str, Vec<u8>);
 /// Secure there would stop it being sent at all. `SameSite=Strict` keeps it off cross-site requests.
 fn page_reply_with_cookie(token: &str, body: Vec<u8>) -> (Reply, Option<String>) {
     (
-        (200, "text/html; charset=utf-8", body),
+        (200, "text/html; charset=utf-8", body, vec![]),
         Some(format!("{COUCH_COOKIE}={token}; Path=/; Max-Age=604800; SameSite=Strict; HttpOnly")),
     )
 }
@@ -803,21 +815,26 @@ fn api_claim(body: &[u8], state: &Mutex<CouchState>) -> (Reply, Option<String>) 
         return (err_reply(401, "unauthorized"), None);
     };
     (
-        (200, "application/json", serde_json::json!({ "ok": true, "reviewer": reviewer }).to_string().into_bytes()),
+        (
+            200,
+            "application/json",
+            serde_json::json!({ "ok": true, "reviewer": reviewer }).to_string().into_bytes(),
+            vec![],
+        ),
         Some(format!("{COUCH_COOKIE}={}; Path=/; Max-Age=604800; SameSite=Strict; HttpOnly", parsed.token)),
     )
 }
 
 fn json_reply(status: u16, value: serde_json::Value) -> Reply {
-    (status, "application/json", value.to_string().into_bytes())
+    (status, "application/json", value.to_string().into_bytes(), vec![])
 }
 fn err_reply(status: u16, msg: &str) -> Reply {
-    (status, "text/plain; charset=utf-8", msg.as_bytes().to_vec())
+    (status, "text/plain; charset=utf-8", msg.as_bytes().to_vec(), vec![])
 }
 
 fn respond_with_cookie(
     request: tiny_http::Request,
-    (status, ctype, body): Reply,
+    (status, ctype, body, extra): Reply,
     set_cookie: Option<String>,
 ) -> std::io::Result<()> {
     // `with_chunked_threshold(usize::MAX)` is load-bearing, not a tuning knob. tiny_http defaults to
@@ -838,6 +855,15 @@ fn respond_with_cookie(
     // without a Content-Type rather than killing the server thread.
     if let Ok(header) = tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()) {
         response = response.with_header(header);
+    }
+    // Caching / range headers from the route (R1). Same tolerance as Content-Type: a header that will
+    // not parse is dropped rather than allowed to kill the serving thread. Content-Length is set by
+    // tiny_http from the body itself and must never be overridden here — on a 206 the body IS the
+    // slice, so its length is already the right answer.
+    for (name, value) in &extra {
+        if let Ok(header) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            response = response.with_header(header);
+        }
     }
     request.respond(response)
 }
@@ -880,6 +906,12 @@ fn token_from_url(url: &str) -> Option<&str> {
     query.split('&').find_map(|kv| kv.strip_prefix("t=")).filter(|t| !t.is_empty())
 }
 
+/// One request header by name, case-insensitively (tiny_http's `equiv` does the casing, and requires
+/// a `'static` name — every caller passes a literal).
+fn request_header(request: &tiny_http::Request, name: &'static str) -> Option<String> {
+    request.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
+}
+
 fn handle_request(
     request: &mut tiny_http::Request,
     db: &Database,
@@ -917,14 +949,14 @@ fn handle_request(
             // the session lives. (A fixed Max-Age from first claim would expire mid-engagement.)
             Some((token, _)) => page_reply_with_cookie(&token, shell),
             // Unauthenticated: the bare shell, NO cookie. This is what a preview bot receives.
-            None => ((200, "text/html; charset=utf-8", shell), None),
+            None => ((200, "text/html; charset=utf-8", shell, vec![]), None),
         };
     }
     // Static assets for install-to-home-screen (phase 6), public for the same reason the shell is:
     // an icon and a manifest carry nothing. The manifest's start_url is "/" and NEVER a token — an
     // installed app must ride the cookie, or a revoked token would be frozen into someone's phone.
     if let (tiny_http::Method::Get, "/icon.png") = (&method, path.as_str()) {
-        return ((200, "image/png", include_bytes!("../assets/couch-icon.png").to_vec()), None);
+        return ((200, "image/png", include_bytes!("../assets/couch-icon.png").to_vec(), vec![]), None);
     }
     if let (tiny_http::Method::Get, "/manifest.json") = (&method, path.as_str()) {
         let manifest = serde_json::json!({
@@ -936,7 +968,7 @@ fn handle_request(
             "theme_color": "#0b1220",
             "icons": [{ "src": "/icon.png", "sizes": "512x512", "type": "image/png" }]
         });
-        return ((200, "application/manifest+json", manifest.to_string().into_bytes()), None);
+        return ((200, "application/manifest+json", manifest.to_string().into_bytes(), vec![]), None);
     }
     if let (tiny_http::Method::Post, "/api/claim") = (&method, path.as_str()) {
         return match read_body(request) {
@@ -951,13 +983,22 @@ fn handle_request(
     let _ = token;
     let reviewer = reviewer.as_str();
     if let Err(e) = COUCH_RATE_LIMITER.check(reviewer) {
-        return ((429, "text/plain; charset=utf-8", e.into_bytes()), None);
+        return ((429, "text/plain; charset=utf-8", e.into_bytes(), vec![]), None);
     }
+
+    // Copied out BEFORE the match, because the POST arms below take `request` mutably and a borrow
+    // held across them would not compile.
+    let range = request_header(request, "Range");
+    let if_none_match = request_header(request, "If-None-Match");
 
     let reply = match (method, path.as_str()) {
         (tiny_http::Method::Get, "/api/queue") => api_queue(db, reviewer, state),
-        (tiny_http::Method::Get, p) if p.starts_with("/api/audio/") => {
-            api_audio(db, p.trim_start_matches("/api/audio/"))
+        // HEAD alongside GET: some mobile media stacks probe with it before opening a stream, and every
+        // non-GET/POST method used to fall through to 404 — a probe answered "no such thing" while the
+        // GET beside it worked. tiny_http suppresses the body for a HEAD itself and keeps the
+        // Content-Length, so the same reply is the correct answer to both.
+        (tiny_http::Method::Get | tiny_http::Method::Head, p) if p.starts_with("/api/audio/") => {
+            api_audio(db, p.trim_start_matches("/api/audio/"), range.as_deref(), if_none_match.as_deref())
         }
         (tiny_http::Method::Post, "/api/decision") => match read_body(request) {
             Ok(body) => api_decision(db, &body, reviewer, state),
@@ -1098,10 +1139,120 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     //   expire and batches drain, so the imbalance is self-correcting). On a backlog smaller than one
     //   batch that leaves a second reviewer with an EMPTY queue, and "🎉 Queue reviewed" would then be a
     //   flat lie. This count lets the page say "someone else has them" instead.
-    json_reply(200, serde_json::json!({ "reviewer": reviewer, "items": queue, "heldByOthers": held_by_others }))
+    //   `pendingTotal` — how much pending work EXISTS, leased or not. The page could previously only
+    //   count the batch in its hands, so "clip 7 of 25" was the whole truth it had: a reviewer working
+    //   a 400-clip backlog saw a bar that filled up and reset, over and over, with no way to tell a
+    //   nearly-finished corpus from a barely-started one. Honest overall progress needs the total, and
+    //   the total is free here — the query already walked every pending row.
+    json_reply(
+        200,
+        serde_json::json!({
+            "reviewer": reviewer,
+            "items": queue,
+            "heldByOthers": held_by_others,
+            "pendingTotal": segments.len(),
+        }),
+    )
 }
 
-fn api_audio(db: &Database, raw_id: &str) -> Reply {
+/// Everything that determines a clip's WAV bytes, hashed into one value used as BOTH the cache key and
+/// the ETag. Deriving them from the same fingerprint is what makes a 304 free: the server can answer
+/// "unchanged" without decoding anything.
+///
+/// ponytail: covers the segment's identity and its alignment — a re-alignment moves the boundaries and
+/// therefore the bytes, and must invalidate both. It does NOT hash the source file's contents, so
+/// overwriting a source WAV in place while keeping its path would serve stale bytes for up to the
+/// cache's lifetime. That is out of reach of the app itself (imports are write-once under a
+/// content-addressed name), and hashing hundreds of MB per request to close it would cost far more
+/// than it buys. Add a mtime/len check here if sources ever become mutable.
+fn audio_fingerprint(seg: &crate::db::SpeechSegment) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    seg.id.hash(&mut h);
+    seg.audio_path.hash(&mut h);
+    seg.alignment_json.hash(&mut h);
+    seg.duration_ms.hash(&mut h);
+    h.finish()
+}
+
+/// Materialised clip bytes, newest last. Bounded by total SIZE, not entry count — clips vary.
+///
+/// What a repeat `/api/audio` hit actually costs without this, read out of audio.rs rather than
+/// assumed: `decode_to_pcm` consults an LRU of decoded source PCM, but its key is
+/// `pcm_cache_key` — which OPENS THE SOURCE FILE AND BLAKE3-HASHES ALL OF IT before the cache can be
+/// consulted at all. So every request re-reads the whole source (the owner's is 172 MB), then clones
+/// the entire decoded PCM out of the LRU (`cached.clone()`, another ~172 MB memcpy), then re-slices the
+/// clip and re-encodes the WAV sample by sample. The decode itself is cached; nothing else on that path
+/// is. Caching the finished bytes here skips all of it.
+///
+/// It matters because the page asks for the same clip up to three times — the `<audio>` element, the
+/// waveform's `decodeAudioData`, and the prefetch — and range support adds a fourth (Safari opens media
+/// with a 2-byte probe). Immutable caching now lets the browser elide most of those, but a reviewer
+/// replaying a clip, or a second reviewer meeting the same spot check, still arrives here.
+static AUDIO_CACHE: Mutex<Vec<(u64, Arc<Vec<u8>>)>> = Mutex::new(Vec::new());
+
+/// ~32 MB, i.e. roughly 80 clips at the measured 300-500 KB each: a whole batch plus its spot checks.
+const AUDIO_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Cached clip bytes, materialising on a miss. The decode happens OUTSIDE the cache lock: it takes
+/// seconds on a long source, and holding the lock through it would serialise every reviewer's audio
+/// behind one clip. Two racing misses for the same clip therefore both decode and the second simply
+/// replaces the first — wasteful once, never wrong.
+fn cached_audio(fp: u64, seg: &crate::db::SpeechSegment) -> Result<Arc<Vec<u8>>, String> {
+    {
+        let mut cache = lock_audio_cache();
+        if let Some(pos) = cache.iter().position(|(k, _)| *k == fp) {
+            let hit = cache.remove(pos);
+            let bytes = Arc::clone(&hit.1);
+            cache.push(hit); // newest last
+            return Ok(bytes);
+        }
+    }
+    let bytes = Arc::new(crate::agentic::segment_audio_as_wav_bytes(seg).map_err(|e| e.to_string())?);
+    let mut cache = lock_audio_cache();
+    cache.retain(|(k, _)| *k != fp);
+    cache.push((fp, Arc::clone(&bytes)));
+    let mut total: usize = cache.iter().map(|(_, b)| b.len()).sum();
+    while total > AUDIO_CACHE_BYTES && cache.len() > 1 {
+        total -= cache.remove(0).1.len(); // evict oldest
+    }
+    Ok(bytes)
+}
+
+/// Same poisoning stance as `lock_state`: a panic elsewhere must not take the audio route down.
+fn lock_audio_cache() -> std::sync::MutexGuard<'static, Vec<(u64, Arc<Vec<u8>>)>> {
+    AUDIO_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A single `bytes=` range against a known body length, per RFC 9110.
+///
+/// Deliberately narrow: ONE range only, and a multi-range request falls back to the full body (a legal
+/// answer — 206 multipart is optional, and no media element asks for it). Returns None for anything
+/// unsatisfiable so the caller can answer 416 rather than guess.
+fn parse_range(spec: &str, len: usize) -> Option<(usize, usize)> {
+    let spec = spec.trim().strip_prefix("bytes=")?;
+    if len == 0 || spec.contains(',') {
+        return None;
+    }
+    let (first, last) = spec.split_once('-')?;
+    let (start, end) = match (first.trim(), last.trim()) {
+        // "bytes=-N": the LAST n bytes. N >= len means the whole body, not an error.
+        ("", n) => (len.saturating_sub(n.parse::<usize>().ok()?.max(1)), len - 1),
+        // "bytes=N-": from N to the end.
+        (n, "") => (n.parse::<usize>().ok()?, len - 1),
+        (a, b) => (a.parse::<usize>().ok()?, b.parse::<usize>().ok()?.min(len - 1)),
+    };
+    (start <= end && start < len).then_some((start, end))
+}
+
+/// Clip audio, cacheable and range-capable (phase R1 of docs/REVIEWER_UX_10_PLAN.md).
+///
+/// `range` and `if_none_match` come from the request. Before this the route answered every request
+/// with an unconditional full body carrying only a Content-Type, which cost a remote reviewer the
+/// whole clip again on every replay and left seeking to whatever the browser could manage without
+/// ranges. The bytes are immutable for a given fingerprint, so `immutable` is the honest directive —
+/// and `private` because this is biometric audio that must never be held by a shared cache.
+fn api_audio(db: &Database, raw_id: &str, range: Option<&str>, if_none_match: Option<&str>) -> Reply {
     let id = raw_id.split('?').next().unwrap_or(raw_id);
     if crate::validation::input::validate_identifier(id).is_err() {
         return err_reply(400, "bad id");
@@ -1111,9 +1262,48 @@ fn api_audio(db: &Database, raw_id: &str) -> Reply {
         Ok(None) => return err_reply(404, "no such segment"),
         Err(e) => return err_reply(500, &e.to_string()),
     };
-    match crate::agentic::segment_audio_as_wav_bytes(&seg) {
-        Ok(bytes) => (200, "audio/wav", bytes),
-        Err(e) => err_reply(500, &e.to_string()),
+    let etag = format!("\"{:016x}\"", audio_fingerprint(&seg));
+    // Cacheable for a year AND immutable: the clip a reviewer replays costs zero bytes on the wire.
+    // `private` keeps it out of any shared cache. Accept-Ranges advertises what parse_range honours.
+    let base = || {
+        vec![
+            ("Cache-Control", "private, max-age=31536000, immutable".to_string()),
+            ("ETag", etag.clone()),
+            ("Accept-Ranges", "bytes".to_string()),
+        ]
+    };
+    // A conditional hit is answered without touching the decoder — the whole point of deriving the
+    // ETag from the fingerprint rather than from the bytes. Weak-comparison prefix and `*` both count,
+    // and a multi-value If-None-Match is split rather than compared whole.
+    if if_none_match.is_some_and(|inm| {
+        inm.split(',').any(|c| {
+            let c = c.trim();
+            c == "*" || c == etag || c.strip_prefix("W/").is_some_and(|c| c == etag)
+        })
+    }) {
+        return (304, "audio/wav", Vec::new(), base());
+    }
+    let bytes = match cached_audio(audio_fingerprint(&seg), &seg) {
+        Ok(bytes) => bytes,
+        Err(e) => return err_reply(500, &e),
+    };
+    let len = bytes.len();
+    match range {
+        None => (200, "audio/wav", bytes.as_ref().clone(), base()),
+        Some(spec) => match parse_range(spec, len) {
+            Some((start, end)) => {
+                let mut headers = base();
+                headers.push(("Content-Range", format!("bytes {start}-{end}/{len}")));
+                (206, "audio/wav", bytes[start..=end].to_vec(), headers)
+            }
+            // Unsatisfiable, and saying so is required: a client that gets a 200 full body here
+            // believes its range was honoured and reads the wrong offsets.
+            None => {
+                let mut headers = base();
+                headers.push(("Content-Range", format!("bytes */{len}")));
+                (416, "text/plain; charset=utf-8", b"range not satisfiable".to_vec(), headers)
+            }
+        },
     }
 }
 
@@ -1577,7 +1767,7 @@ mod tests {
 
     /// The ids `reviewer` is handed by a queue request (and, as a side effect, leases).
     fn queue_ids(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Vec<String> {
-        let (code, _, body) = api_queue(db, reviewer, state);
+        let (code, _, body, ..) = api_queue(db, reviewer, state);
         assert_eq!(code, 200);
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["reviewer"], reviewer, "the queue names the reviewer it was served to");
@@ -1594,7 +1784,7 @@ mod tests {
 
         // EDIT: corrected text becomes the annotated gold; row is verified; decision recorded.
         let body = serde_json::json!({"id": "s1", "action": "edit", "text": "دەق یەک ڕاستکراوە"});
-        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
         let row = db.get_segment_by_id("s1").unwrap().unwrap();
         assert!(row.verified);
@@ -1603,7 +1793,7 @@ mod tests {
 
         // BAD: reject decision, still marked reviewed.
         let body = serde_json::json!({"id": "s2", "action": "bad"});
-        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
         assert!(db.get_segment_by_id("s2").unwrap().unwrap().verified);
 
@@ -1611,7 +1801,7 @@ mod tests {
         assert!(queue_ids(&db, "Sara", &state).is_empty(), "both clips reviewed -> empty queue");
 
         // UNDO restores the LAST decision (s2): unverified again, decision cleared.
-        let (code, _, body) = api_undo(&db, "Sara", &state);
+        let (code, _, body, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 200);
         let undone: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(undone["id"], "s2");
@@ -1620,9 +1810,9 @@ mod tests {
         assert_eq!(row.reviewed_by, None, "undo retracts the attribution with the decision");
 
         // Second undo pops s1; third has nothing left.
-        let (code, _, _) = api_undo(&db, "Sara", &state);
+        let (code, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 200);
-        let (code, _, _) = api_undo(&db, "Sara", &state);
+        let (code, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 409, "empty undo stack is a 409, not a phantom undo");
     }
 
@@ -1656,7 +1846,7 @@ mod tests {
             rusqlite::params![r"\\evil\share\a.wav"],
         )
         .unwrap();
-        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 500, "the row upsert must fail here — that is the state under test");
 
         let half = db.get_segment_by_id("s1").unwrap().unwrap();
@@ -1677,7 +1867,7 @@ mod tests {
 
         // The outbox replays. The row is writable again (the real-world analogue: the DB is no longer busy).
         side.execute("UPDATE speech_segments SET audio_path = '/audio/a.wav' WHERE id = 's1'", []).unwrap();
-        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "the replay must succeed, not 409 or 500");
 
         let done = db.get_segment_by_id("s1").unwrap().unwrap();
@@ -1705,7 +1895,7 @@ mod tests {
         let state = state();
 
         let body = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوەی سارا"});
-        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
 
         // The owner corrects the same clip at the desktop afterwards.
@@ -1713,7 +1903,7 @@ mod tests {
             .unwrap();
 
         // Sara now taps undo. Her snapshot predates the owner's edit entirely.
-        let (code, _, msg) = api_undo(&db, "Sara", &state);
+        let (code, _, msg, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 409, "undo must not silently revert someone else's later work");
         assert!(String::from_utf8_lossy(&msg).contains("Owner"), "the refusal must name who would lose work: {msg:?}");
         let row = db.get_segment_by_id("s1").unwrap().unwrap();
@@ -1722,7 +1912,7 @@ mod tests {
 
         // And the entry is KEPT, not consumed by the refusal — a refused undo must not silently
         // become "nothing to undo" on the next press.
-        let (code, _, _) = api_undo(&db, "Sara", &state);
+        let (code, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 409, "still refused, and still present rather than swallowed");
     }
 
@@ -1751,7 +1941,7 @@ mod tests {
         db.insert_segment(&reopened).unwrap();
 
         let body = serde_json::json!({"id": "g1", "action": "edit", "text": "ڕاستکراوەی سارا"});
-        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
 
         let row = db.get_segment_by_id("g1").unwrap().unwrap();
@@ -1791,7 +1981,7 @@ mod tests {
         }
         // The reviewer is on the FIRST clip and the heartbeat fires for it.
         let body = serde_json::json!({"id": "s0"});
-        let (code, _, _) = api_renew(body.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = api_renew(body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
 
         // Past the point the batch would have lapsed, the tail must still be hers.
@@ -1873,7 +2063,7 @@ mod tests {
         blocker.execute_batch("BEGIN EXCLUSIVE").expect("take the write lock");
 
         let body = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوە"});
-        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 500, "a locked database must surface as a server error, not a verdict");
 
         let held = { lock_state(&state).holder("s1", Instant::now()).map(str::to_string) };
@@ -1904,7 +2094,7 @@ mod tests {
         let state = state();
 
         let sara_work = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوە", "reviewer": "Sara"});
-        let (code, _, msg) = api_decision(&db, sara_work.to_string().as_bytes(), "Hemn", &state);
+        let (code, _, msg, ..) = api_decision(&db, sara_work.to_string().as_bytes(), "Hemn", &state);
         assert_eq!(code, 409, "Sara's decision must not be written under Hemn's name");
         assert!(String::from_utf8_lossy(&msg).contains("Sara"), "the refusal must name the real author: {msg:?}");
         let untouched = db.get_segment_by_id("s1").unwrap().unwrap();
@@ -1913,13 +2103,13 @@ mod tests {
 
         // The very same queued item, flushed on Sara's own link, lands normally — it was never invalid,
         // only in the wrong hands.
-        let (code, _, _) = api_decision(&db, sara_work.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = api_decision(&db, sara_work.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
         assert_eq!(db.get_segment_by_id("s1").unwrap().unwrap().reviewed_by.as_deref(), Some("Sara"));
 
         // A live submit carries no claim at all, and that ordinary path is unchanged.
         let live = serde_json::json!({"id": "s2", "action": "bad"});
-        let (code, _, _) = api_decision(&db, live.to_string().as_bytes(), "Hemn", &state);
+        let (code, ..) = api_decision(&db, live.to_string().as_bytes(), "Hemn", &state);
         assert_eq!(code, 200, "a submit with no reviewer field is the normal live path");
         assert_eq!(db.get_segment_by_id("s2").unwrap().unwrap().reviewed_by.as_deref(), Some("Hemn"));
     }
@@ -1941,7 +2131,7 @@ mod tests {
         assert_eq!(api_decision(&db, accept("b1").as_bytes(), "Hemn", &state).0, 200);
 
         // Hemn undoes. Only b1 may move — a1 is Sara's and she has not asked for it back.
-        let (code, _, body) = api_undo(&db, "Hemn", &state);
+        let (code, _, body, ..) = api_undo(&db, "Hemn", &state);
         assert_eq!(code, 200);
         let undone: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(undone["id"], "b1", "Hemn's undo must reach Hemn's own last decision");
@@ -1989,7 +2179,7 @@ mod tests {
         // HONESTY: with everything leased out, a third reviewer's queue is empty — but the work is NOT
         // done, and the page must not be able to claim it is. The count of clips held elsewhere is what
         // lets it say "someone else has them" instead of "🎉 Queue reviewed".
-        let (code, _, body) = api_queue(&db, "Ali", &state);
+        let (code, _, body, ..) = api_queue(&db, "Ali", &state);
         assert_eq!(code, 200);
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(payload["items"].as_array().unwrap().is_empty(), "nothing is free for a third reviewer");
@@ -2008,7 +2198,7 @@ mod tests {
 
         assert_eq!(queue_ids(&db, "Sara", &state), vec!["x1"], "Sara leases the only clip");
         let body = serde_json::json!({"id": "x1", "action": "accept", "text": "دەق"}).to_string();
-        let (code, _, msg) = api_decision(&db, body.as_bytes(), "Hemn", &state);
+        let (code, _, msg, ..) = api_decision(&db, body.as_bytes(), "Hemn", &state);
         assert_eq!(code, 409, "Hemn must not decide a clip Sara holds");
         assert!(String::from_utf8_lossy(&msg).contains("another reviewer"), "the refusal says why");
         let row = db.get_segment_by_id("x1").unwrap().unwrap();
@@ -2051,7 +2241,7 @@ mod tests {
             serde_json::json!({"id": "u2", "action": "edit", "text": ""}),
             serde_json::json!({"id": "u2", "action": "explode", "text": "x"}),
         ] {
-            let (code, _, _) = api_decision(&db, bad.to_string().as_bytes(), "Sara", &state);
+            let (code, ..) = api_decision(&db, bad.to_string().as_bytes(), "Sara", &state);
             assert_eq!(code, 400, "body: {bad}");
             assert!(
                 !lock_state(&state).leases.contains_key("u2"),
@@ -2112,7 +2302,7 @@ mod tests {
         assert_eq!(pairs("r1"), 1, "the edit produced exactly one learning pair");
 
         // The identical resubmit — the retry — must be answered as already-done.
-        let (code, _, body) = api_decision(&db, edit.as_bytes(), "Sara", &state);
+        let (code, _, body, ..) = api_decision(&db, edit.as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "a retry must succeed, not error");
         let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(reply["duplicate"], true, "and must say it was already recorded");
@@ -2138,7 +2328,7 @@ mod tests {
         let rej = serde_json::json!({"id": "r2", "action": "bad"}).to_string();
         assert_eq!(api_decision(&db, rej.as_bytes(), "Sara", &state).0, 200);
         let before = lock_state(&state).undo.get("Sara").map(Vec::len).unwrap_or(0);
-        let (code, _, body) = api_decision(&db, rej.as_bytes(), "Sara", &state);
+        let (code, _, body, ..) = api_decision(&db, rej.as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "a re-sent reject must succeed");
         let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(reply["duplicate"], true, "and be recognised as already recorded");
@@ -2154,7 +2344,7 @@ mod tests {
         // a stale page could silently replace another human's verdict minutes later.
         let reject = serde_json::json!({"id": "r2", "action": "bad"}).to_string();
         assert_eq!(api_decision(&db, reject.as_bytes(), "Sara", &state).0, 200);
-        let (code, _, msg) = api_decision(&db, reject.as_bytes(), "Hemn", &state);
+        let (code, _, msg, ..) = api_decision(&db, reject.as_bytes(), "Hemn", &state);
         assert_eq!(code, 409, "a decided clip must not be re-decided by a different reviewer");
         assert!(
             String::from_utf8_lossy(&msg).contains("already reviewed by Sara"),
@@ -2183,14 +2373,14 @@ mod tests {
         // Age her lease to the brink, then renew: the clip must stay hers rather than lapsing.
         let stale = Instant::now().checked_sub(LEASE_TTL - Duration::from_secs(1)).unwrap();
         lock_state(&state).leases.insert("n1".into(), ("Sara".into(), stale));
-        let (code, _, reply) = api_renew(body.as_bytes(), "Sara", &state);
+        let (code, _, reply, ..) = api_renew(body.as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "an active reviewer may extend their own hold");
         let json: serde_json::Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(json["ttlSeconds"], LEASE_TTL.as_secs(), "the page is told the real TTL, not a guess");
         assert!(queue_ids(&db, "Hemn", &state).is_empty(), "the renewed clip is still Sara's");
 
         // Renewal is NOT a way to take someone else's clip.
-        let (code, _, msg) = api_renew(body.as_bytes(), "Hemn", &state);
+        let (code, _, msg, ..) = api_renew(body.as_bytes(), "Hemn", &state);
         assert_eq!(code, 409, "renewal must never steal a live lease");
         assert!(String::from_utf8_lossy(&msg).contains("another reviewer"));
         assert_eq!(
@@ -2297,7 +2487,7 @@ mod tests {
         gold_seg(&db, "gold-a", "دەقی هەڵە", "دەقی ڕاست");
         let state = state();
 
-        let (code, _, body) = api_queue(&db, "Sara", &state);
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state);
         assert_eq!(code, 200);
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let items = payload["items"].as_array().unwrap();
@@ -2324,7 +2514,7 @@ mod tests {
             !lock_state(&state).leases.contains_key("gold-a"),
             "spot checks must not be leased — two reviewers meeting one is the point"
         );
-        let (_, _, body) = api_queue(&db, "Hemn", &state);
+        let (_, _, body, ..) = api_queue(&db, "Hemn", &state);
         let hemn: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let hemn_ids: Vec<&str> = hemn["items"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
         assert!(hemn_ids.contains(&"gold-a"), "the same check must reach a second reviewer: {hemn_ids:?}");
@@ -2543,7 +2733,7 @@ mod tests {
             (r.header("content-length").map(str::to_string), r.header("transfer-encoding").map(str::to_string))
         });
         let request = server.recv().unwrap();
-        let _ = respond_with_cookie(request, (200, "audio/wav", vec![0u8; BIG]), None);
+        let _ = respond_with_cookie(request, (200, "audio/wav", vec![0u8; BIG], vec![]), None);
         let (content_length, transfer_encoding) = client.join().expect("client thread");
 
         assert_eq!(
@@ -2773,7 +2963,7 @@ mod tests {
 
         // The answer arrives AFTER the restart.
         let body = serde_json::json!({ "id": "trap1", "action": "edit", "text": "دەقی ڕاست" });
-        let (code, _, msg) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state2);
+        let (code, _, msg, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state2);
         assert_eq!(
             code,
             200,
@@ -3086,11 +3276,11 @@ mod tests {
 
         let state = state();
         let body = serde_json::json!({ "id": "esc1", "action": "accept", "text": "دەق یەک" });
-        let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "the accept decision must succeed");
         assert!(db.get_segment_by_id("esc1").unwrap().unwrap().verified, "accept verifies the clip");
 
-        let (code, _, _) = api_undo(&db, "Sara", &state);
+        let (code, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 200, "undo must succeed");
 
         let restored = db.get_segment_by_id("esc1").unwrap().unwrap();
@@ -3123,7 +3313,7 @@ mod tests {
             (serde_json::json!({"id": "../etc", "action": "accept", "text": "x"}), 400),
             (serde_json::json!({"id": "missing", "action": "accept", "text": "x"}), 404),
         ] {
-            let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+            let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
             assert_eq!(code, expect, "body: {body}");
         }
         assert!(lock_state(&state).undo.values().all(Vec::is_empty), "no failed decision may leave an undo entry");
@@ -3157,7 +3347,7 @@ mod tests {
         let state = state();
         for n in 0..total {
             let body = serde_json::json!({ "id": format!("u{n:03}"), "action": "accept", "text": "دەق" });
-            let (code, _, _) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+            let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
             assert_eq!(code, 200, "decision u{n:03} must land");
         }
 
@@ -3165,7 +3355,7 @@ mod tests {
         assert_eq!(depth, UNDO_DEPTH, "the stack must stop growing at the cap, not follow the session");
 
         // The MOST RECENT decision is still undoable — the cap trimmed the far end.
-        let (code, _, body) = api_undo(&db, "Sara", &state);
+        let (code, _, body, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 200);
         let undone: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(undone["id"], format!("u{:03}", total - 1), "undo must retract the LAST decision");
@@ -3203,7 +3393,7 @@ mod tests {
 
         // Now the phone's submit lands, minutes late, carrying a different correction.
         let body = serde_json::json!({ "id": "dk1", "action": "edit", "text": "ڕاستکراوەی مۆبایل" });
-        let (code, _, msg) = api_decision(&db, body.to_string().as_bytes(), "Hawzhin", &state);
+        let (code, _, msg, ..) = api_decision(&db, body.to_string().as_bytes(), "Hawzhin", &state);
         assert_eq!(code, 409, "a late phone submit must be refused, not written over the desktop's work");
         assert!(
             String::from_utf8_lossy(&msg).contains("desktop"),
@@ -3448,7 +3638,7 @@ mod tests {
                 let id = item["id"].as_str().unwrap().to_string();
                 let body = serde_json::json!({ "id": id, "action": "accept", "text": item["text"] }).to_string();
                 // THROTTLING IS PART OF THE TEST, not an obstacle to it. A machine-speed drain burns
-                // the couch limiter's 60-token burst and then rides its 120/min refill, which is
+                // the couch limiter's 60-token burst and then rides its 120/second refill, which is
                 // exactly what a phone in a reload loop does — and the first run of this soak hit 429
                 // at clip 73. A 429 means LATER, never NO, so the correct behaviour (client and test
                 // alike) is to wait and re-submit the same decision, and the drain must still finish.
@@ -3468,7 +3658,7 @@ mod tests {
                     }
                     throttled += 1;
                     let _ = attempt;
-                    std::thread::sleep(Duration::from_millis(600)); // ~1 token back at 120/min
+                    std::thread::sleep(Duration::from_millis(600)); // refills the full 60-token burst
                 }
                 assert_eq!(code, 200, "every submit in a solo session must eventually land; {id} got {code}");
                 served.push(id);
@@ -3604,7 +3794,7 @@ mod tests {
             decided.len()
         );
         // Measured, not assumed: the throttle does NOT fire here, because leasing partitions 60 clips
-        // across three reviewers so none of them approaches the 120/min budget. That is a real
+        // across three reviewers so none of them approaches the 120/second budget. That is a real
         // property worth knowing — normal team review does not brush the rate limit — and the limiter
         // itself is proven by `a_runaway_page_is_throttled_per_reviewer` rather than duplicated here.
         assert_eq!(throttled, 0, "ordinary concurrent reviewing must not be rate limited");
@@ -3777,5 +3967,284 @@ mod tests {
         for join in joins {
             join.join().expect("every server thread joins cleanly after unblock()");
         }
+    }
+
+    // ── R1: transport ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_byte_range_is_parsed_by_the_spec_or_refused_outright() {
+        // The whole point of answering 206 is that the client can trust the offsets. Every form below
+        // is one a real media stack sends, and every off-by-one here would hand back the wrong audio
+        // while claiming success — silent corruption, not a visible failure.
+        assert_eq!(parse_range("bytes=0-1", 100), Some((0, 1)), "Safari's opening 2-byte probe");
+        assert_eq!(parse_range("bytes=0-99", 100), Some((0, 99)), "the whole body, explicitly");
+        assert_eq!(parse_range("bytes=50-", 100), Some((50, 99)), "open-ended runs to the last byte");
+        assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)), "suffix range is the LAST n bytes");
+        assert_eq!(parse_range("bytes=-500", 100), Some((0, 99)), "a suffix longer than the body is the body");
+        assert_eq!(parse_range("bytes=0-500", 100), Some((0, 99)), "an over-long end CLAMPS, it does not fail");
+        assert_eq!(parse_range("bytes=99-99", 100), Some((99, 99)), "the final byte alone is satisfiable");
+        assert_eq!(parse_range(" bytes=2-4 ", 100), Some((2, 4)), "whitespace tolerated");
+        // Unsatisfiable or unsupported: None, so the caller answers 416 rather than guessing. A 200
+        // full body here is the dangerous answer — the client believes its range was honoured.
+        assert_eq!(parse_range("bytes=100-200", 100), None, "start at or past the end is unsatisfiable");
+        assert_eq!(parse_range("bytes=5-3", 100), None, "reversed range");
+        assert_eq!(parse_range("bytes=0-1", 0), None, "nothing is satisfiable in an empty body");
+        assert_eq!(parse_range("bytes=0-1,5-6", 100), None, "multi-range is not supported, and says so");
+        assert_eq!(parse_range("items=0-1", 100), None, "only the bytes unit exists");
+        assert_eq!(parse_range("bytes=abc-def", 100), None, "garbage");
+        assert_eq!(parse_range("bytes=-", 100), None, "no numbers at all");
+        assert_eq!(parse_range("bytes=-0", 100), Some((99, 99)), "a zero-length suffix is treated as one byte");
+    }
+
+    #[test]
+    fn the_audio_etag_tracks_everything_that_changes_the_bytes() {
+        // The ETag is derived from the fingerprint rather than from the bytes, which is what lets a 304
+        // skip the decode entirely. That trade is only sound if the fingerprint moves whenever the
+        // bytes would: a stale ETag serves a reviewer the OLD audio for a clip that was re-aligned,
+        // and `immutable` means their browser would keep it for a year.
+        let base = seg("s1", "دەق");
+        let fp = audio_fingerprint(&base);
+        assert_eq!(fp, audio_fingerprint(&seg("s1", "دەق")), "same segment, same fingerprint");
+        let mut other_text = base.clone();
+        other_text.raw_transcript = "دەقێکی تر".into();
+        assert_eq!(audio_fingerprint(&other_text), fp, "the TRANSCRIPT does not change the audio");
+        for (label, mutate) in [
+            ("id", (|s: &mut SpeechSegment| s.id = "s2".into()) as fn(&mut SpeechSegment)),
+            ("audio_path", |s: &mut SpeechSegment| s.audio_path = "/audio/b.wav".into()),
+            ("alignment", |s: &mut SpeechSegment| s.alignment_json = Some(r#"{"start":1.0}"#.into())),
+            ("duration", |s: &mut SpeechSegment| s.duration_ms = 9000),
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(audio_fingerprint(&changed), fp, "changing {label} must invalidate the ETag");
+        }
+    }
+
+    #[test]
+    fn a_matching_etag_is_answered_without_ever_touching_the_audio() {
+        // A 304 that decoded first would be pointless, and this proves it does not: the segment's
+        // audio_path does not exist, so ANY materialisation attempt fails with 500. Reaching 304 is
+        // therefore proof that the conditional short-circuited above the decoder.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let s = seg("s1", "دەق");
+        db.insert_segment(&s).unwrap();
+        let etag = format!("\"{:016x}\"", audio_fingerprint(&s));
+
+        let (code, _, body, headers) = api_audio(&db, "s1", None, Some(&etag));
+        assert_eq!(code, 304, "a matching If-None-Match must be answered 304, not re-sent");
+        assert!(body.is_empty(), "a 304 carries no body");
+        let hv = |n: &str| headers.iter().find(|(k, _)| *k == n).map(|(_, v)| v.clone());
+        assert_eq!(hv("ETag").as_deref(), Some(etag.as_str()), "the 304 restates the validator");
+        assert_eq!(
+            hv("Cache-Control").as_deref(),
+            Some("private, max-age=31536000, immutable"),
+            "the 304 must re-assert the freshness directives, or the browser stops caching"
+        );
+        // `private` is not a nicety here: this is biometric audio (GDPR Art. 9) and must never be
+        // retained by a shared/intermediary cache.
+        assert!(hv("Cache-Control").unwrap().contains("private"));
+        assert_eq!(hv("Accept-Ranges").as_deref(), Some("bytes"));
+
+        // Wildcard and weak forms are the same answer; a DIFFERENT validator is not.
+        assert_eq!(api_audio(&db, "s1", None, Some("*")).0, 304, "* matches anything");
+        assert_eq!(api_audio(&db, "s1", None, Some(&format!("W/{etag}"))).0, 304, "weak comparison");
+        assert_eq!(api_audio(&db, "s1", None, Some(&format!("\"nope\", {etag}"))).0, 304, "multi-value");
+        assert_eq!(
+            api_audio(&db, "s1", None, Some("\"stale\"")).0,
+            500,
+            "a NON-matching validator must fall through to materialisation (500 here only because \
+             the fixture has no real audio file — the point is that it tried)"
+        );
+    }
+
+    /// A real, decodable 16 kHz mono WAV on disk, so the audio route can be driven end to end.
+    /// symphonia decodes this in-process — no ffmpeg, nothing environment-dependent.
+    fn write_test_wav(path: &std::path::Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for n in 0..samples {
+            // A ramp rather than silence: a wrong byte offset shows up as a wrong VALUE, so the
+            // range assertions below are checking real content and not just a length.
+            w.write_sample(((n % 1000) as i16).wrapping_mul(30)).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    #[test]
+    fn a_phone_asking_for_part_of_a_clip_gets_exactly_that_part_over_real_http() {
+        // The wire contract, driven through tiny_http rather than asserted about it. Before R1 the
+        // route answered every request with an unconditional 200 full body carrying only a
+        // Content-Type: a Range header was ignored (so a client that trusts 206 reads wrong offsets),
+        // HEAD fell through to 404 (mobile stacks probe with it), and nothing was cacheable, so every
+        // replay re-downloaded 300-500 KB over cellular.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        let wav = tmp.path().join("clip.wav");
+        write_test_wav(&wav, 16_000); // one second
+        let mut s = seg("s1", "دەق");
+        s.audio_path = wav.to_string_lossy().to_string();
+        db.insert_segment(&s).unwrap();
+        drop(db);
+
+        let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let state = Arc::new(Mutex::new(CouchState {
+            reviewers: [("tok".to_string(), "Hawzhin".to_string())].into_iter().collect(),
+            ..CouchState::default()
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let join = spawn_server_loop(0, server.clone(), db_path, state.clone(), shutdown.clone()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/api/audio/s1?t=tok");
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+
+        // Full GET first: the baseline bytes every later assertion is compared against.
+        let full = agent.get(&url).call().unwrap();
+        assert_eq!(full.status(), 200);
+        assert_eq!(full.header("Accept-Ranges"), Some("bytes"), "ranges must be ADVERTISED, not just honoured");
+        let etag = full.header("ETag").expect("a validator, or conditional requests are impossible").to_string();
+        assert_eq!(full.header("Cache-Control"), Some("private, max-age=31536000, immutable"));
+        let mut whole = Vec::new();
+        full.into_reader().read_to_end(&mut whole).unwrap();
+        assert!(whole.len() > 30_000, "a second of 16 kHz 16-bit audio, got {} bytes", whole.len());
+
+        // Safari's opening probe. 206 with a correct Content-Range, and the two bytes must be the
+        // FIRST two — a server that ignores Range answers 200 with everything.
+        let probe = agent.get(&url).set("Range", "bytes=0-1").call().unwrap();
+        assert_eq!(probe.status(), 206, "a Range request must be answered 206, not 200-with-everything");
+        assert_eq!(probe.header("Content-Range"), Some(format!("bytes 0-1/{}", whole.len()).as_str()));
+        let mut two = Vec::new();
+        probe.into_reader().read_to_end(&mut two).unwrap();
+        assert_eq!(two, &whole[0..=1], "the probe must get the first two bytes, not the first two of nothing");
+
+        // A middle slice, which is what seeking produces. Content matters, not just length.
+        let mid = agent.get(&url).set("Range", "bytes=1000-1999").call().unwrap();
+        assert_eq!(mid.status(), 206);
+        assert_eq!(mid.header("Content-Range"), Some(format!("bytes 1000-1999/{}", whole.len()).as_str()));
+        let mut slice = Vec::new();
+        mid.into_reader().read_to_end(&mut slice).unwrap();
+        assert_eq!(slice.len(), 1000);
+        assert_eq!(slice, &whole[1000..=1999], "a seek must return the audio actually at that offset");
+
+        // Conditional re-request: zero bytes on the wire, which is the cellular win.
+        match agent.get(&url).set("If-None-Match", &etag).call() {
+            Ok(r) => {
+                assert_eq!(r.status(), 304, "an unchanged clip must be 304, never re-sent");
+                let mut body = Vec::new();
+                r.into_reader().read_to_end(&mut body).unwrap();
+                assert!(body.is_empty(), "a 304 must not carry the clip it just said was unchanged");
+            }
+            Err(e) => panic!("conditional request failed: {e}"),
+        }
+
+        // HEAD: the length without the body. Used to be a flat 404 while the GET beside it worked.
+        let head = agent.head(&url).call().unwrap();
+        assert_eq!(head.status(), 200, "HEAD must reach the audio route, not fall through to 404");
+        assert_eq!(
+            head.header("Content-Length").and_then(|v| v.parse::<usize>().ok()),
+            Some(whole.len()),
+            "a HEAD is only useful if it reports the real length"
+        );
+        let mut head_body = Vec::new();
+        head.into_reader().read_to_end(&mut head_body).unwrap();
+        assert!(head_body.is_empty(), "a HEAD response must have no body at all");
+
+        // Unsatisfiable must be refused, not silently answered with everything.
+        match agent.get(&url).set("Range", "bytes=99999999-").call() {
+            Err(ureq::Error::Status(416, r)) => {
+                assert_eq!(r.header("Content-Range"), Some(format!("bytes */{}", whole.len()).as_str()))
+            }
+            other => panic!("an unsatisfiable range must be 416 with the real length, got {other:?}"),
+        }
+
+        shutdown.store(true, Ordering::SeqCst);
+        server.unblock();
+        let _ = join.join();
+    }
+
+    #[test]
+    fn the_clip_cache_serves_identical_bytes_and_stays_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let wav = tmp.path().join("clip.wav");
+        write_test_wav(&wav, 8_000);
+        let mut s = seg("s1", "دەق");
+        s.audio_path = wav.to_string_lossy().to_string();
+
+        let fp = audio_fingerprint(&s);
+        let first = cached_audio(fp, &s).expect("materialises on a miss");
+        let second = cached_audio(fp, &s).expect("serves from the cache on a hit");
+        assert_eq!(first, second, "a cache hit must be byte-identical to the miss it replaced");
+        assert!(Arc::ptr_eq(&first, &second), "a hit must return the SAME buffer, not decode again");
+        let _ = &db;
+
+        // Bounded by bytes: force the cap with synthetic entries and confirm the oldest go first and
+        // the newest survives. An unbounded cache on a long review session is a slow memory leak on
+        // the owner's machine, which is the same machine running the desktop app.
+        {
+            let mut cache = lock_audio_cache();
+            cache.clear();
+            cache.push((fp, Arc::new(vec![0u8; 8])));
+        }
+        let big = vec![0u8; AUDIO_CACHE_BYTES / 4];
+        for k in 1..=6u64 {
+            let mut cache = lock_audio_cache();
+            cache.push((k + 1000, Arc::new(big.clone())));
+            let mut total: usize = cache.iter().map(|(_, b)| b.len()).sum();
+            while total > AUDIO_CACHE_BYTES && cache.len() > 1 {
+                total -= cache.remove(0).1.len();
+            }
+        }
+        let cache = lock_audio_cache();
+        let total: usize = cache.iter().map(|(_, b)| b.len()).sum();
+        assert!(total <= AUDIO_CACHE_BYTES, "the cache must stay inside its cap, held {total} bytes");
+        assert!(!cache.iter().any(|(k, _)| *k == fp), "the OLDEST entry is the one evicted");
+        assert_eq!(cache.last().map(|(k, _)| *k), Some(1006), "the newest entry always survives");
+    }
+
+    #[test]
+    fn the_queue_reports_the_whole_backlog_not_just_the_batch_in_hand() {
+        // Without a total the page can only count the batch it holds, so a reviewer working a long
+        // backlog watched a progress bar fill and reset over and over with no way to tell a
+        // nearly-finished corpus from a barely-started one.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let total = QUEUE_BATCH * 3 + 7;
+        for n in 0..total {
+            db.insert_segment(&seg(&format!("p{n:04}"), "دەقی سەرەتایی")).unwrap();
+        }
+        let state = state();
+
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 200);
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = payload["items"].as_array().unwrap().len();
+        assert_eq!(
+            payload["pendingTotal"].as_u64(),
+            Some(total as u64),
+            "pendingTotal must be the whole pending backlog, not the {items} clips in this batch"
+        );
+        assert!(items < total, "the batch is deliberately smaller than the backlog, or this proves nothing");
+
+        // A SECOND reviewer sees the same total. It is a property of the corpus, not of who asked:
+        // a per-reviewer total would make two people report different progress on one backlog.
+        let (_, _, body2, ..) = api_queue(&db, "Hemn", &state);
+        let p2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(p2["pendingTotal"].as_u64(), Some(total as u64), "the backlog total is not per-reviewer");
+        assert!(p2["heldByOthers"].as_u64().unwrap() > 0, "Sara's lease is visible to Hemn");
+
+        // And it SHRINKS as work lands — a total that never moved would be a decoration, not progress.
+        let first = payload["items"][0]["id"].as_str().unwrap();
+        let decision = serde_json::json!({ "id": first, "action": "accept", "text": "دەقی سەرەتایی" });
+        let (dc, ..) = api_decision(&db, decision.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(dc, 200);
+        let (_, _, body3, ..) = api_queue(&db, "Sara", &state);
+        let p3: serde_json::Value = serde_json::from_slice(&body3).unwrap();
+        assert_eq!(p3["pendingTotal"].as_u64(), Some(total as u64 - 1), "a reviewed clip must leave the pending total");
     }
 }

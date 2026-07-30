@@ -951,6 +951,122 @@ test.describe('Couch Review phone page', () => {
     await expect.poll(async () => page.evaluate(`location.search`)).not.toContain('t=');
   });
 
+  test('progress counts the whole backlog, not just the batch in hand', async ({ page }) => {
+    // "Clip 7 of 25" was true of the clips in the page's hands and useless as progress: the server
+    // hands out at most 25 at a time, so a reviewer working a long backlog watched that number fill
+    // and reset over and over, unable to tell a nearly-finished corpus from a barely-started one.
+    // The server now sends the real pending total (R1.5) and the line counts against THAT.
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [
+                { id: 'q1', text: 'یەکەم', durationMs: 1000, speakerId: null },
+                { id: 'q2', text: 'دووەم', durationMs: 1000, speakerId: null },
+              ],
+              heldByOthers: 0,
+              pendingTotal: 407, // a real backlog behind a 2-clip batch
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
+    // The denominator is the corpus, not the batch — 407, never 2.
+    await expect(page.locator('#progress')).toContainText('407');
+    await expect(page.locator('#progress')).not.toContainText('لە 2');
+    // And the position advances within it rather than restarting at every batch boundary.
+    await page.locator('#accept').click();
+    await expect(page.locator('#progress')).toContainText('2');
+    await expect(page.locator('#progress')).toContainText('407');
+  });
+
+  test('a server that sends no total still counts honestly, against the batch', async ({ page }) => {
+    // Belt and braces on the same change: the page is served out of the binary, so page and server
+    // always ship together — but a missing/zero total must degrade to the old batch counting rather
+    // than render "Clip 1 of 0".
+    await page.addInitScript(() => {
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [{ id: 'q1', text: 'یەکەم', durationMs: 1000, speakerId: null }],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
+    await expect(page.locator('#progress')).toHaveText('پارچەی 1 لە 1');
+  });
+
+  test('the Retry button shows it is working, and a double tap costs one fetch', async ({ page }) => {
+    // A reviewer on bad signal taps Retry and NOTHING changes on screen — the failure message stays,
+    // the button looks identical — so they cannot tell a working retry from a dead button, and tap
+    // again. Each tap must be visibly acknowledged, and the extra taps must not multiply requests.
+    //
+    // The de-duplication also covers a latent hazard behind the same guard: `load()` is awaited for
+    // its DATA by refill() and by undo, and an early `return` would have resolved those awaits with
+    // the previous queue still in place. Joining the in-flight promise keeps both honest.
+    await page.addInitScript(() => {
+      const w = window as unknown as { __n: number; __up: boolean; __release?: () => void };
+      w.__n = 0;
+      w.__up = false;
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          w.__n += 1;
+          if (!w.__up) throw new TypeError('Failed to fetch');
+          // Hold the reply open until the test releases it, so "in flight" is a state it can observe.
+          await new Promise<void>((resolve) => {
+            w.__release = resolve;
+          });
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [{ id: 'r1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              heldByOthers: 0,
+              pendingTotal: 1,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#retry')).toBeVisible({ timeout: 5000 });
+    expect(await page.evaluate(`window.__n`)).toBe(1);
+
+    // Two taps in quick succession while the request hangs.
+    await page.evaluate(`window.__up = true`);
+    await page.locator('#retry').click({ force: true });
+    // Acknowledged: disabled and relabelled, so the tap is visibly doing something.
+    await expect(page.locator('#retry')).toBeDisabled();
+    await expect(page.locator('#retry')).toContainText('بارکردنی پارچەکان');
+    await page.locator('#retry').click({ force: true });
+    expect(await page.evaluate(`window.__n`)).toBe(2); // the second tap joined, it did not re-fetch
+
+    // Releasing the held reply lands the clip and returns the button to its resting state.
+    await page.evaluate(`window.__release && window.__release()`);
+    await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
+    await expect(page.locator('#err')).toBeHidden();
+    await expect(page.locator('#retry')).toBeEnabled();
+    await expect(page.locator('#retry')).toContainText('دووبارە');
+  });
+
   for (const scheme of ['light', 'dark'] as const) {
     test(`has zero WCAG 2.2 AA violations while reviewing (${scheme})`, async ({ page }) => {
       // Both themes, because the page renders in whichever the phone is set to and a contrast

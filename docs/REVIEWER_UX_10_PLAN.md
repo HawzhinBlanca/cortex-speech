@@ -75,6 +75,36 @@ exact URL the `<audio>` element just fetched; prefetch fetches a third copy the 
 ≤ 11 audio GETs total (today ≥ 20); repeat-open of a reviewed clip produces 0 audio bytes on the
 wire; all existing 1094 Rust + 74 e2e tests stay green.
 
+### R1 status — shipped 2026-07-30 (iteration 215), items 1/2/3/5/6
+
+Items 1, 2, 3, 5 and 6 are in. Proven by six new Rust tests, two of which fail on pre-R1 code (206 +
+Accept-Ranges; 304-without-decode) and two more under targeted reverts (HEAD routing; `pendingTotal`).
+Real-HTTP coverage drives a decodable 16 kHz WAV through tiny_http, so HEAD's body suppression and
+`Content-Length` are measured rather than read off the crate source. Measured gates: Rust
+`1100 passed / 0 failed` (lib, exit 0), whole-workspace `cargo test` exit 0, clippy `-D warnings`
+exit 0, `cargo fmt --check` exit 0, couch-page Playwright `32 passed` stable 3-for-3, python-policies
+`45/45` exit 0, typecheck `426 files 0 errors` exit 0.
+
+**Item 4 (single-fetch client buffer) is deliberately NOT shipped, and the reason is a real finding,
+not a shortcut.** Item 2 largely subsumes it: the second and third fetches of a clip are the *same URL*
+the `<audio>` element already fetched, so `Cache-Control: private, max-age=31536000, immutable` makes
+them memory-cache hits at zero bytes on the wire — which is the benefit item 4 was scoped to deliver.
+What item 4 would add on top is one fewer cache lookup, against rebuilding the player around blob URLs:
+the one part of this page measured working on a real iPhone (26 clips reviewed). Not worth that risk
+before the R5 device hour, and R2 rebuilds the player anyway. Revisit as part of R2, or drop it.
+
+**Correction to this plan's own R1.3 rationale.** It said each request "re-decodes and re-slices the
+source file". Half right: `audio.rs` already LRU-caches decoded source PCM, so the *decode* was cached.
+What was not is worse and was missed — `pcm_cache_key` opens the source file and blake3-hashes **all of
+it** before that cache can be consulted, then the hit does `cached.clone()` on the entire decoded PCM.
+So every `/api/audio` request re-read 172 MB and memcpy'd ~172 MB more, then re-sliced and re-encoded
+the WAV sample by sample. The byte cache short-circuits all of it; the justification is stronger than
+the plan claimed, for a different reason than the plan gave.
+
+**Not yet measured:** the two wire-level gates above (≤ 11 audio GETs across a 10-clip drill; 0 bytes
+on a repeat open) are real-device numbers and belong to the R5 hour with a phone on cellular. The
+server-side contract they depend on is now proven; the end-to-end counts are not, and are not claimed.
+
 ## Phase R2 — One tap per clip (client, ~2 days)
 
 The Apple-quality core. Today every clip costs a reach-and-tap on the small native player control.

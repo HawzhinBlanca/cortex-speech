@@ -2835,3 +2835,102 @@ the true empty state directly instead of relying on a placeholder that used to s
 
 **Gates (unmasked):** page script parses clean; couch-page **29 passed, stable 3-for-3**;
 `npm run test:e2e` 0 — **76 passed**; python-policies 0 — 45/45; typecheck 0 — 426 files, 0 errors.
+
+## Iteration 215 — R1: transport. Ranges, immutable caching, a clip cache, honest totals
+
+**Plan item R1** of `docs/REVIEWER_UX_10_PLAN.md`, items 1/2/3/5/6. Item 4 deliberately not shipped —
+see the plan's R1 status block for why, and for a correction to the plan's own rationale.
+
+Every `/api/audio` reply carried exactly one header — `Content-Type` — verified live against the
+owner's running server before touching anything:
+
+```
+audio_status=200 bytes=390060 ctype=audio/wav
+audio_headers=Content-Length,Content-Type,Date,Server
+```
+
+No `Accept-Ranges`, no `ETag`, no `Cache-Control`. So a `Range` request was answered with an
+unconditional full body (a client that trusts 206 then reads the wrong offsets), `HEAD` fell through
+to 404 while the `GET` beside it worked, and every replay of a clip a reviewer had already heard cost
+the whole 300–500 KB again over cellular.
+
+**What landed.** `Reply` grew a fourth slot for response headers (every other route passes `vec![]`).
+`/api/audio` now answers single-range `bytes=` requests with 206 + `Content-Range`, refuses
+unsatisfiable ones with 416 + `bytes */len` rather than a misleading 200, advertises `Accept-Ranges`,
+ships `Cache-Control: private, max-age=31536000, immutable` + a strong `ETag`, answers a matching
+`If-None-Match` with 304, and is reachable by `HEAD` as well as `GET`. `private` is not decoration:
+this is biometric audio under GDPR Art. 9 and must never sit in a shared cache.
+
+The ETag is derived from a fingerprint of everything that determines the bytes (id, audio path,
+alignment, duration) rather than from the bytes themselves — which is what makes a 304 free, since it
+can be answered without materialising anything. The same fingerprint keys a 32 MB byte cache, so a
+re-alignment naturally invalidates both at once.
+
+**A finding that made the byte cache more valuable than the plan claimed, for a different reason.**
+The plan said each request "re-decodes and re-slices the source file". Reading `audio.rs` rather than
+trusting that: the decode *is* already LRU-cached. But `pcm_cache_key` opens the source file and
+blake3-hashes **all of it** before the cache can be consulted, and a hit then does `cached.clone()` on
+the entire decoded PCM. So every single `/api/audio` request re-read the whole source (172 MB on the
+owner's corpus), memcpy'd ~172 MB more, then re-sliced and re-encoded the WAV sample by sample. The
+plan's conclusion was right; its reason was wrong, and the real reason is worse.
+
+**Truth fix (item 6), comment-only, behaviour unchanged.** The limiter doc said "120/min sustained
+with a burst of 60". `throttle.rs` computes `tokens += elapsed.as_secs_f64() * rate`, so the rate is
+per **second** — the comment was wrong by 60×, in three places. Corrected, and corrected honestly:
+120/s does *not* throttle a merely chatty page, it bounds a machine-speed runaway. The existing soak
+test's own measurement confirms it (429 first appears at clip 73, which is where a ~0.4-token-per-
+request deficit exhausts a 60-token burst — consistent with per-second, not per-minute).
+
+**`pendingTotal` (item 5)** now travels with the queue, and the page counts against the backlog
+instead of the batch. "Clip 7 of 25" was true of the clips in hand and useless as progress: the server
+hands out at most 25, so a reviewer working a long corpus watched that denominator fill and reset with
+no way to tell nearly-done from barely-started. No new Sorani string — the existing native-reviewed
+`progress` key just gets an honest denominator.
+
+**Self-audit of this loop's own diffs, reported honestly.** The `if (loading) return` guard I added in
+iteration 214 resolves `await load()` **without loading** — and two callers await it for its data:
+`refill()` (drained batch) and undo (needs to find the restored clip). Replaced with promise
+coalescing so concurrent callers join the in-flight load instead of skipping it. **Null result, stated
+plainly: I could not construct a user-reachable path to it.** Every concurrent trigger is gated behind
+`retryable`, which only becomes true after a load has already failed, and in that state neither
+`refill()` nor undo is reachable. It is a latent hazard closed on principle, not a caught defect — the
+seventh finding in this loop's own code, and the first that is not provably live.
+
+The *reachable* half of the same code was real: tapping Retry changed nothing on screen — same label,
+same enabled button, failure message still up — so a reviewer on bad signal could not distinguish a
+working retry from a dead button. Now disabled and relabelled while in flight.
+
+**FAIL-BEFORE (four separate reverts, each with real output).**
+* Pre-R1 `api_audio` (unconditional 200, no headers) → `2 failed`:
+  `a_matching_etag_is_answered_without_ever_touching_the_audio` ("a matching If-None-Match must be
+  answered 304, not re-sent") and `a_phone_asking_for_part_of_a_clip_gets_exactly_that_part_over_real_http`
+  ("ranges must be ADVERTISED, not just honoured").
+* Dispatch reverted to GET-only → the HEAD assertion panics (`agent.head(...)` gets 404).
+* `pendingTotal` removed → "pendingTotal must be the whole pending backlog, not the 25 clips in this batch".
+* Progress reverted to `queue.length` → `Expected substring: "407" / Received string: "پارچەی 1 لە 2"`.
+* Retry affordance removed → `expect(locator).toBeDisabled() failed / Received: enabled`.
+
+Noted for honesty: the double-tap-costs-one-fetch assertion in that last test passes under the old
+guard too (skipping and joining both yield one fetch). It is a regression guard on the coalescing, not
+a proof of it. The discriminating assertions are the affordance ones.
+
+**New tests (6 Rust, 3 Playwright).** The HTTP-level one writes a real decodable 16 kHz WAV and drives
+it through `tiny_http`, so HEAD's body suppression and its `Content-Length` are *measured*, not read
+off the crate source; range slices are compared against the real bytes at those offsets, so a wrong
+offset fails on content rather than length. `parse_range` is pinned across every form a media stack
+sends, including the suffix and clamping cases where an off-by-one would silently serve the wrong audio.
+
+**Gates (unmasked exit codes).** `cargo test --lib` **0** — `1100 passed; 0 failed; 7 ignored`
+(was 1094). Whole-workspace `cargo test` **0** — 25 suites, 1167 passed, zero FAILED. `cargo clippy
+--all-targets --all-features -D warnings` **0**. `cargo fmt --check` **0**. couch-page Playwright
+**32 passed**, stable 3-for-3 (runs 1/2/3 all exit 0). `npm run test:e2e` **0** — **79 passed**
+(was 76). `npm run test:python-policies` **0** — 45/45. `npm run typecheck` **0** — 426 files,
+0 errors.
+
+**Also fixed: a rebuild gate that was reporting red and being ignored.** The previous iteration's
+bundled rebuild logged `build exit=1` while the freshness gate passed. Cause: `npm run tauri build`
+has `"targets": "all"`, so it runs the MSI/NSIS bundlers after linking the exe — and their failure
+masks a perfectly good build. Confirmed the Rust side is clean (a fresh `cargo build --release` fails
+only with `os error 32`, the running app holding the exe lock — not a compile error). The loop's
+rebuild step now uses the existing bundle-free `tauri:build:smoke`, so exit 0 means what it says. The
+installer bundlers are out of scope per the owner's "ship = personal use" decision.
