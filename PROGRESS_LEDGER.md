@@ -2522,3 +2522,42 @@ fine-tune. There is no decode-side shortcut on this stack.
 **Gates (unmasked exits):** fmt 0; clippy 0; `cargo test --lib` 0 — **1089 passed, 7 ignored** (the
 new probe is the 7th). Exe rebuild required by the freshness gate (asr.rs changed, test-only) and run
 after commit.
+
+---
+
+## Iteration 208 — the session-shaped soak: a real defect found the night before real use
+
+The owner starts reviewing tomorrow with 116 pending clips. Every existing soak either capped its
+rounds (the three-reviewer test stops at 4) or used a backlog smaller than QUEUE_BATCH, so "the queue
+actually reaches zero" had never been proven — and both defects that shaped this surface lived PAST
+the first batch. So the highest-value thing to harden was the exact shape of tomorrow's session.
+
+**New `one_reviewer_can_drain_a_backlog_larger_than_a_batch_to_genuine_zero`:** 130 clips, one
+reviewer, real HTTP against real threads and a real SQLite file, an UNBOUNDED round loop (a capped one
+cannot tell "drained" from "gave up"), asserting every clip decided exactly once, nothing handed out
+twice, nothing stranded, and the server itself eventually answering with an empty queue. Measured:
+**130 clips over 7 rounds, all verified, zero duplicates.**
+
+**It failed on the first run at clip 73 with HTTP 429** — and the interesting part was not the test.
+`COUCH_RATE_LIMITER` is 120/min per reviewer with a 60 burst, keyed by reviewer and covering EVERY
+endpoint. A machine-speed drain reaches it, which is a test artifact. But it exposed a genuine client
+defect: **the page treated 429 as a permanent verdict.** 429 is < 500 and not 401, so in `decide()`
+the decision was dropped and the reviewer was left stranded re-submitting the same clip, and in
+`flushOutbox` a throttled replay was discarded. 429 is the canonical "later, not no" — the one status
+that must always be retried. A reviewer moving fast through obvious clips spends three requests each
+(audio, prefetch, decision), so this was reachable in a real session, at exactly the moment they were
+working fastest.
+
+Fixed at both sites: 429 now joins undefined/401/5xx in the hold-and-retry set. Playwright pin
+`a throttled decision is held for retry, not thrown away` — FAIL-BEFORE: outbox length 0 (decision
+destroyed) versus 1 with the fix; it also asserts the reviewer is advanced rather than stranded, is
+told "queued" rather than "saved", and that throttling is NOT recorded as a refused decision, because
+it is not a verdict. The soak now backs off on 429 rather than asserting it away, so it proves the
+drain completes UNDER throttling.
+
+Process note: a `replace_all` on a comment line matched inside a deeper-indented copy of itself
+(the 6-space string is a substring of the 8-space line) and mangled the indentation in `flushOutbox`.
+Caught by re-reading the file, repaired before any gate ran.
+
+**Gates (unmasked exits):** fmt 0; clippy 0; `cargo test --lib` 0 — **1090 passed, 7 ignored**;
+`npm run test:e2e` 0 — **70 passed**; couch-page **23**; python-policies 0 — 44/44.

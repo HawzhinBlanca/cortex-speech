@@ -3125,6 +3125,118 @@ mod tests {
     }
 
     #[test]
+    fn one_reviewer_can_drain_a_backlog_larger_than_a_batch_to_genuine_zero() {
+        // THE SHAPE OF A REAL SESSION, and nothing covered it. Every other soak caps its rounds (the
+        // three-reviewer test stops at 4) or works a backlog smaller than QUEUE_BATCH, so "the queue
+        // actually reaches zero" was assumed, never proven. The owner's library holds 116 pending —
+        // five batches — and the two defects that shaped this surface both lived past the first batch:
+        // the page never refetched (so a reviewer was told the corpus was finished at clip 25), and the
+        // whole batch was leased on ONE timestamp so its tail expired underneath them mid-session.
+        //
+        // 130 clips over real HTTP against real threads and a real SQLite file, driven to genuine
+        // exhaustion with an unbounded round loop, asserting the invariants a long session depends on:
+        // every clip decided EXACTLY once, nothing served twice, nothing stranded, and the server
+        // eventually answering with an empty queue of its own accord.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        const CLIPS: usize = 130;
+        for n in 0..CLIPS {
+            db.insert_segment(&seg(&format!("d{n:03}"), "دەقی سەرەتایی")).unwrap();
+        }
+        drop(db);
+
+        let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let state = Arc::new(Mutex::new(CouchState {
+            reviewers: [("tok-solo".to_string(), "Hawzhin".to_string())].into_iter().collect(),
+            ..CouchState::default()
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let join = spawn_server_loop(0, server.clone(), db_path.clone(), state.clone(), shutdown.clone())
+            .expect("server thread spawns");
+
+        let base = format!("http://127.0.0.1:{port}");
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+        let mut served: Vec<String> = Vec::new();
+        let mut rounds = 0usize;
+        let mut throttled = 0usize;
+        // UNBOUNDED on purpose — a capped loop cannot tell "drained" from "gave up". The guard is a
+        // generous ceiling that only trips if the server stops making progress, which is itself the bug.
+        loop {
+            rounds += 1;
+            assert!(rounds < 100, "queue never drained after {rounds} rounds — {} clips served", served.len());
+            // The limiter is keyed by REVIEWER and covers every endpoint, so the batch fetch is
+            // throttled by the same bucket the submits drain — back off here too, or the drain dies
+            // between batches instead of during one.
+            let queue: serde_json::Value = loop {
+                match agent.get(&format!("{base}/api/queue?t=tok-solo")).call() {
+                    Ok(r) => break r.into_json().unwrap(),
+                    Err(ureq::Error::Status(429, _)) => {
+                        throttled += 1;
+                        std::thread::sleep(Duration::from_millis(600));
+                    }
+                    Err(e) => panic!("queue fetch failed mid-session: {e}"),
+                }
+            };
+            let items = queue["items"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                break; // the server itself says there is nothing left
+            }
+            for item in items {
+                let id = item["id"].as_str().unwrap().to_string();
+                let body = serde_json::json!({ "id": id, "action": "accept", "text": item["text"] }).to_string();
+                // THROTTLING IS PART OF THE TEST, not an obstacle to it. A machine-speed drain burns
+                // the couch limiter's 60-token burst and then rides its 120/min refill, which is
+                // exactly what a phone in a reload loop does — and the first run of this soak hit 429
+                // at clip 73. A 429 means LATER, never NO, so the correct behaviour (client and test
+                // alike) is to wait and re-submit the same decision, and the drain must still finish.
+                let mut code = 0;
+                for attempt in 0..40 {
+                    code = match agent
+                        .post(&format!("{base}/api/decision?t=tok-solo"))
+                        .set("content-type", "application/json")
+                        .send_string(&body)
+                    {
+                        Ok(r) => r.status(),
+                        Err(ureq::Error::Status(c, _)) => c,
+                        Err(e) => panic!("transport failure mid-session: {e}"),
+                    };
+                    if code != 429 {
+                        break;
+                    }
+                    throttled += 1;
+                    let _ = attempt;
+                    std::thread::sleep(Duration::from_millis(600)); // ~1 token back at 120/min
+                }
+                assert_eq!(code, 200, "every submit in a solo session must eventually land; {id} got {code}");
+                served.push(id);
+            }
+        }
+
+        shutdown.store(true, Ordering::SeqCst);
+        server.unblock();
+        let _ = join.join();
+
+        // Spot checks are served ALONGSIDE real work and are already-verified clips, so `served` may
+        // exceed CLIPS — but no clip may appear twice, which is what a re-served or re-leased clip
+        // would look like.
+        eprintln!("[drain] {} clips over {rounds} rounds, {throttled} throttled retries", served.len());
+        let unique: HashSet<&String> = served.iter().collect();
+        assert_eq!(unique.len(), served.len(), "a clip was handed out twice across {rounds} rounds");
+        assert!(rounds > CLIPS / QUEUE_BATCH, "expected multiple batches, only took {rounds} round(s)");
+
+        // THE POINT: every pending clip is now decided. Not "most", not "the first batch".
+        let db = Database::open(&db_path).unwrap();
+        let undecided: Vec<String> =
+            db.get_segments(Some(false)).unwrap().into_iter().filter(|s| s.id.starts_with('d')).map(|s| s.id).collect();
+        assert!(undecided.is_empty(), "{} clip(s) stranded after a full drain: {undecided:?}", undecided.len());
+        let decided = (0..CLIPS)
+            .filter(|n| db.get_segment_by_id(&format!("d{n:03}")).unwrap().map(|s| s.verified).unwrap_or(false))
+            .count();
+        assert_eq!(decided, CLIPS, "every clip in the backlog must end verified");
+    }
+
+    #[test]
     fn three_reviewers_hammering_at_once_never_double_decide_or_lose_a_clip() {
         // P2.6 SOAK. Every other couch test drives one function at a time; this one runs THREE real
         // reviewers concurrently over real HTTP against real threads and a real SQLite file, and

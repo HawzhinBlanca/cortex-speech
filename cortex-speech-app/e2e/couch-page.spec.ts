@@ -453,6 +453,57 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#done')).toBeHidden();
   });
 
+  test('a throttled decision is held for retry, not thrown away', async ({ page }) => {
+    // 429 means LATER, never NO. The couch limiter is 120/min per reviewer with a 60 burst, and a
+    // reviewer moving fast through obvious clips spends three requests each (audio, prefetch,
+    // decision) — so a real session can reach it, and the 130-clip drain soak hit it at clip 73.
+    // The page treated 429 as a permanent verdict: the decision was dropped and the reviewer was
+    // left stranded on the clip, at exactly the moment they were working fastest.
+    await page.addInitScript(() => {
+      (window as unknown as { __throttle: boolean }).__throttle = true;
+      window.fetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/queue')) {
+          return new Response(
+            JSON.stringify({
+              reviewer: 'Sara',
+              items: [
+                { id: 't1', text: 'یەکەم', durationMs: 1000, speakerId: null },
+                { id: 't2', text: 'دووەم', durationMs: 1000, speakerId: null },
+              ],
+              heldByOthers: 0,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (url.includes('/api/decision') && (window as unknown as { __throttle: boolean }).__throttle) {
+          return new Response('rate limit exceeded', { status: 429 });
+        }
+        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+    });
+    await page.goto(PAGE);
+    await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
+
+    await page.locator('#accept').click();
+    // HELD in the outbox, and the reviewer is moved on rather than stranded re-submitting.
+    await expect
+      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .toBe(1);
+    await expect(page.locator('#text')).toHaveValue('دووەم');
+    // Not reported as saved — it is queued, which is the truth.
+    await expect(page.locator('#toast')).toHaveText('لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت');
+    // And NOT counted as a refused decision: throttling is not a verdict.
+    expect(await page.evaluate(`localStorage.getItem('cortex.couch.refused')`)).toBeNull();
+
+    // The limiter refills; the held decision lands on the next flush.
+    await page.evaluate(`window.__throttle = false; dispatchEvent(new Event('online'))`);
+    await expect
+      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .toBe(0);
+    await expect(page.locator('#err')).toBeHidden();
+  });
+
   test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {
     // DATA LOSS, and made MORE reachable by fixing Stop/Start: every outstanding token is regenerated
     // when the owner restarts Couch Review or reissues a link. A reviewer who was offline then

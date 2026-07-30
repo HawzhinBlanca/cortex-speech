@@ -424,8 +424,10 @@
         //                reissuing a link regenerates every token, so a reviewer who was offline
         //                reconnects to a 401 and would otherwise have every queued decision thrown
         //                away silently. A fresh link replays them.
+        //   429        — THROTTLED: "later", not "no". Dropping a rate-limited decision discards work
+        //                the server never rejected — it only asked us to slow down.
         //   5xx        — the server is unwell, not disagreeing.
-        if (e.status === undefined || e.status === 401 || e.status >= 500) return;
+        if (e.status === undefined || e.status === 401 || e.status === 429 || e.status >= 500) return;
         // Everything else (409 taken, 400 invalid) IS a real answer about this decision. Retrying can
         // never change it, so drop it rather than wedging the queue behind something that will never
         // land — but the reviewer's TYPED TEXT is not the server's to discard. Deleting the draft here
@@ -529,9 +531,15 @@
       //                Review or reissues a link (adding a second reviewer does it). Only toasting
       //                here meant every decision made after that moment was dropped: the typed text
       //                survived in the draft, but the accept/reject verdict did not.
+      //   429        — THROTTLED, which is the server saying "later", not "no". The couch limiter is
+      //                120/min per reviewer with a 60 burst; a phone that reloads in a loop, or a
+      //                fast run of accepts on obvious clips (each clip costs an audio fetch, a
+      //                prefetch and a decision), can reach it. Treating the canonical retry-later
+      //                status as a permanent verdict threw the decision away at exactly the moment
+      //                the reviewer was working fastest. Found by the 130-clip drain soak.
       //   5xx        — the server is unwell, not disagreeing.
       // Held decisions replay on the next working link, so the reviewer can keep going meanwhile.
-      if (e.status === undefined || e.status === 401 || e.status >= 500) {
+      if (e.status === undefined || e.status === 401 || e.status === 429 || e.status >= 500) {
         writeOutbox([...readOutbox().filter((q) => q.id !== submission.id), submission]);
         if (e.status === 401) {
           // Say it once, persistently — a toast about a dead link vanishes before it is understood,
