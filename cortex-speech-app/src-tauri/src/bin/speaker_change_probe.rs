@@ -8,18 +8,18 @@
 //! HOW. Segment boundaries are planned by silence alone (`chunking::plan_speech_chunks`), and speaker
 //! labels are assigned to whole chunks AFTERWARDS — so one label per chunk, by construction, however many
 //! people are talking in it. This probe embeds the FIRST HALF and the SECOND HALF of each segment with
-//! CAM++ and takes their cosine similarity. Two halves of one person speaking are near-identical; a
-//! turn-taking exchange is not. The threshold is `MIN_SPEAKER_SIMILARITY` (0.85) — the same number
-//! `diarization::online_cluster` already uses to decide "different person", so this measurement is on the
-//! app's own terms rather than a new one invented for it.
+//! CAM++ and takes their cosine similarity. Its CONTROLS (same-speaker and different-speaker pairs from
+//! other clips) are what make that number interpretable — and on the owner's material they came back
+//! 0.009 apart, i.e. CAM++ does not separate these speakers at all, so the probe reports INCONCLUSIVE
+//! rather than inventing a percentage. `--export <dir>` writes a listening set for a human ear.
 //!
 //! WHAT IT DOES NOT MEASURE. Simultaneous overlap. Two voices talking at once produce a single blended
 //! embedding, and CAM++ has no way to report "both". This finds turn-taking within a clip, which is the
 //! common case; true cross-talk needs an overlap-aware segmentation model (pyannote powerset).
 //!
-//! READ-ONLY. Opens the library `mode=ro` and never writes. Safe to run while the app is up.
+//! READ-ONLY. Opens the library with SQLITE_OPEN_READ_ONLY. Safe to run while the app is up.
 //!
-//! Usage: cargo run --release --bin speaker_change_probe [-- <db_path>]
+//! Usage: speaker_change_probe [<db_path>] [--export <dir>]
 
 use cortex_speech_app_lib::{audio, chunking, diarization::SpeakerEmbeddingService, models};
 use rusqlite::{Connection, OpenFlags};
@@ -45,10 +45,19 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
 }
 
 fn main() -> Result<(), String> {
-    let db_path = std::env::args().nth(1).unwrap_or_else(|| {
-        let base = std::env::var("APPDATA").unwrap_or_default();
-        format!("{base}\\cortex-speech\\cortex-speech.db")
-    });
+    // Parsed together, because taking `args().nth(1)` as the db path swallows `--export` when it comes
+    // first and then tries to open a database called "--export".
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let export_dir = args.iter().position(|a| a == "--export").and_then(|i| args.get(i + 1).cloned());
+    let db_path = args
+        .iter()
+        .enumerate()
+        .find(|(i, a)| !(a.starts_with("--") || (*i > 0 && args[i - 1] == "--export")))
+        .map(|(_, a)| a.clone())
+        .unwrap_or_else(|| {
+            let base = std::env::var("APPDATA").unwrap_or_default();
+            format!("{base}\\cortex-speech\\cortex-speech.db")
+        });
     // Deliberately NOT `Database::open`: that opens read-write and runs `PRAGMA journal_mode=WAL`, which
     // is itself a write, and its `Connection::open` does not enable URI parsing — so a `file:…?mode=ro`
     // string would be taken as a literal filename and quietly create a stray empty database. Opening with
@@ -192,6 +201,16 @@ fn main() -> Result<(), String> {
     // The verdict is relative, never against a borrowed absolute. Compare the within-clip median to the
     // two controls and report which it resembles — and say so plainly when the controls overlap so much
     // that nothing can be concluded.
+    // ── optional: export a listening set ──────────────────────────────────────
+    // The probe cannot settle this on its own (see the verdict above): it uses CAM++'s own labels as
+    // ground truth for CAM++. Only a human ear can break that circle. `--export <dir>` writes a
+    // stratified sample spanning the observed similarity range, so whichever way the answer falls it is
+    // informative: if the low-similarity clips hold two speakers and the high ones do not, the signal
+    // works and the threshold was simply wrong; if there is no relationship, the signal is dead.
+    if let Some(dir) = export_dir.as_deref() {
+        export_listening_set(dir, &sims, &segments)?;
+    }
+
     let med = |v: &[f32]| if v.is_empty() { f32::NAN } else { v[v.len() / 2] };
     let (mw, ms, md) = (med(&within), med(&same), med(&diff));
     println!("\nmedians: within {mw:.3}   same-speaker {ms:.3}   different-speaker {md:.3}");
@@ -225,5 +244,77 @@ fn main() -> Result<(), String> {
             println!("  {id}  cosine {sim:.4}  {:.1}s", *dur as f64 / 1000.0);
         }
     }
+    Ok(())
+}
+
+/// Write a stratified 15-clip listening set plus a manifest, for the human ear that has to break the
+/// probe's circularity.
+///
+/// STRATIFIED, not the 15 worst. Taking only the lowest-similarity clips would guarantee an
+/// uninformative answer: if they all hold two speakers that is equally consistent with the signal
+/// working and with the corpus being full of two-speaker clips at every similarity. Five from the
+/// bottom, five around the median and five from the top makes the two outcomes distinguishable.
+fn export_listening_set(
+    dir: &str,
+    sims: &[(String, f32, i64)],
+    segments: &[(String, String, i64, Option<String>, String)],
+) -> Result<(), String> {
+    let dir = std::path::Path::new(dir);
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+
+    let mut sorted = sims.to_vec();
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let mut picks: Vec<(usize, &(String, f32, i64), &'static str)> = Vec::new();
+    let mid = n / 2;
+    for (k, item) in sorted.iter().enumerate().take(5.min(n)) {
+        picks.push((k, item, "low"));
+    }
+    for k in 0..5 {
+        let i = (mid + k).min(n - 1);
+        picks.push((i, &sorted[i], "mid"));
+    }
+    for k in 0..5 {
+        let i = n.saturating_sub(1 + k);
+        picks.push((i, &sorted[i], "high"));
+    }
+    picks.dedup_by_key(|(i, _, _)| *i);
+
+    let mut manifest = Vec::new();
+    for (rank, (id, sim, dur), band) in &picks {
+        let Some((_, audio_path, _, alignment_json, speaker)) = segments.iter().find(|s| &s.0 == id) else {
+            continue;
+        };
+        let (rate, pcm) = audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
+        let (rate, pcm) = audio::ensure_pcm_16khz(rate, pcm).map_err(|e| e.to_string())?;
+        let (clip, _) =
+            chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref()).map_err(|e| e.to_string())?;
+
+        let name = format!("{band}_{rank:03}_{}.wav", &id[..8]);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(dir.join(&name), spec).map_err(|e| e.to_string())?;
+        for s in &clip {
+            w.write_sample(*s).map_err(|e| e.to_string())?;
+        }
+        w.finalize().map_err(|e| e.to_string())?;
+
+        manifest.push(serde_json::json!({
+            "file": name,
+            "id": id,
+            "similarity": sim,
+            "durationMs": dur,
+            "band": band,
+            "camppLabel": speaker,
+        }));
+    }
+    let path = dir.join("manifest.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    println!("\nexported {} clips + manifest.json to {}", manifest.len(), dir.display());
     Ok(())
 }
