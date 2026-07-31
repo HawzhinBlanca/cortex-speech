@@ -3696,3 +3696,88 @@ reviewer link never dropped for it.
 `cortex-once-admin.ps1` run (a reboot still leaves the review server down); the R5 device hour; native
 Sorani review of the 8 `source: null` strings; the Phase-6 scope amendment and the "unsure" verdict
 decision. And from the diarization work: flagging the 17 known mixed clips, and overlap detection.
+
+## Iteration 227 — which clips, by name; and two claims that did not survive checking
+
+The owner's second request from the diarization work: **flag the mixed clips so he knows before opening
+one.** Iteration 225 established the rate (17/144, 11.8%) but the probe printed only the ten
+lowest-similarity clips — which cannot answer "which ones", while looking like it does.
+
+**The measurement, live and read-only (`SQLITE_OPEN_READ_ONLY`, app running throughout):**
+
+```
+APPLIED TO THE WHOLE LIBRARY: 17 / 144 clips (11.8%) score below 0.59
+of those, still awaiting review: 13
+```
+
+| id | cosine | s | stored label | state |
+|---|---|---|---|---|
+| 0817584d | 0.3054 | 14.5 | SPEAKER_03 | reviewed |
+| f684c691 | 0.4121 | 15.0 | SPEAKER_07 | pending |
+| 97370a88 | 0.4149 | 14.8 | SPEAKER_03 | pending |
+| 6f23f57d | 0.4268 | 14.4 | SPEAKER_07 | pending |
+| 290f5f58 | 0.4275 | 10.6 | SPEAKER_07 | reviewed |
+| e6052156 | 0.4372 | 14.4 | SPEAKER_03 | pending |
+| 2f746f49 | 0.4600 | 12.2 | SPEAKER_07 | reviewed |
+| 420f9c07 | 0.4695 | 13.5 | SPEAKER_03 | pending |
+| 629bfd3b | 0.4853 | 11.2 | SPEAKER_03 | pending |
+| 492f59a8 | 0.5036 | 13.0 | SPEAKER_00 | pending |
+| 22cf0ec7 | 0.5161 | 14.1 | SPEAKER_03 | reviewed |
+| 50c6f552 | 0.5233 | 11.0 | SPEAKER_03 | pending |
+| e614cb77 | 0.5359 | 12.8 | SPEAKER_07 | pending |
+| 4aa82a8b | 0.5559 | 12.0 | SPEAKER_07 | pending |
+| f09609e9 | 0.5591 | 10.7 | SPEAKER_04 | pending |
+| bc7e301e | 0.5593 | 11.3 | SPEAKER_07 | pending |
+| 47f438a1 | 0.5734 | 11.1 | SPEAKER_03 | pending |
+
+**14 of 17 carry SPEAKER_03 or SPEAKER_07** — the corpus's two dominant labels (52 and 35 segments).
+That is exactly the shape a two-person conversation produces when a turn boundary falls inside a
+silence-planned chunk, which is the mechanism this probe exists to detect. The stored label is printed
+*because* the measurement contradicts it: every one of these rows asserts a single speaker where two
+are talking, and `speaker_id` ships in the CSV/JSONL/Parquet/HuggingFace exports and in the dataset-card
+composition stats.
+
+**Deliberately not done: rewriting those labels.** The 0.59 threshold is calibrated on 15 clips the
+owner labelled by ear. Rewriting a live corpus on that basis is his decision, and recording the flag
+durably needs a schema migration — the riskiest change class in this repo (see the STRICT
+`speech_segments` work, still owner-gated). This iteration makes the finding reproducible and
+reversible; it changes no data.
+
+### Two claims that did not survive checking
+
+Both were written up in my head as defects before being verified. Neither is one.
+
+1. **"Wrong speaker labels leak voices across the train/test split."** `export::assign_splits` groups by
+   connected components of the bipartite (recording, speaker) graph, and **all 144 segments share one
+   `audio_path`** — so they form one component and land in one split regardless of any label. The
+   recording-level grouping already defends against this; a mislabelled speaker *within* one recording
+   cannot straddle splits. **No leakage.**
+2. **"The P0.4 provenance trio is not exported."** `export.rs` indeed has no `vad_backend`/`denoised`/
+   `diarized` column — but `export_bundle.rs` reports all three in the bundle's provenance JSON, with
+   tests pinning `applied`/`notApplied`/`notRecorded`. `audio.rs`'s "reported in the export" is
+   accurate. **Not a defect.**
+
+Recorded as plainly as fixes, because the alternative was two confident, wrong entries. (Measured while
+there: `diarized`, `denoised` and `vad_backend` are NULL for all 144 rows — correct, not a bug: these
+segments were imported before migrations v41/v42 added the columns, so "not recorded" is the truth.)
+
+### Root cause, not symptom
+
+Adding `verified` to the probe's row broke two unrelated call sites and a `let Some((..)) =` — the
+segment row was a bare 6-tuple spelled out in three signatures. **Same shape as the `Reply` 3→4 tuple
+breakage earlier in this loop (~39 test destructurings).** Fixed as a named `SegRow`, with the
+speaker/pending lookup moved into the function that prints it, matching how `export_listening_set`
+already resolves rows. Twice is a pattern, so it went to memory rather than just the ledger.
+
+**Two process wins worth keeping:**
+* `cargo check` runs `build.rs`, which copies `onnxruntime.dll` — locked while the app is up
+  (`os error 32`). Pointing `CARGO_TARGET_DIR` at a scratch dir type-checks with the app running and
+  the reviewer link up. That caught the second compile error without spending a restart.
+* The bundled rebuild script's fallback fired for real for the first time: the build failed on my broken
+  edit, and it relaunched the old exe and re-armed the watchdog anyway. **The link came back with a
+  broken build in the tree** — claim 200, queue 200, items 29, pendingTotal 112.
+* Ordering lesson learned the expensive way: run `cargo fmt` **before** the bundled rebuild. Formatting
+  after it re-stales the exe by mtime and buys another restart.
+
+**Gates (unmasked).** `cargo test --lib` **0** — 1107 passed, 0 failed, 7 ignored. `cargo clippy
+--all-targets --all-features -D warnings` **0**. `cargo fmt --check` **0**.
