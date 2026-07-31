@@ -373,41 +373,43 @@ fn region_speech_level(pcm: &[i16], start: usize, end: usize, sample_rate: u32) 
 /// problem. Picking the widest run, and cutting at its CENTRE rather than its edge, puts the boundary
 /// in the middle of a real pause with air on both sides.
 fn find_pause_cut(pcm: &[i16], lo: usize, hi: usize, sample_rate: u32, ref_rms: f64) -> Option<usize> {
+    find_pauses(pcm, lo, hi, sample_rate, ref_rms).first().map(|(centre, _)| *centre)
+}
+
+/// EVERY qualifying pause in [lo, hi) as `(centre, width)`, WIDEST FIRST.
+///
+/// `find_pause_cut` is this with `.first()`. Split out so the widest-run scan has exactly one
+/// implementation and the "all pauses" form is available without duplicating it.
+fn find_pauses(pcm: &[i16], lo: usize, hi: usize, sample_rate: u32, ref_rms: f64) -> Vec<(usize, usize)> {
     let hi = hi.min(pcm.len());
     if hi <= lo || ref_rms <= 0.0 {
-        return None;
+        return Vec::new();
     }
     let frame = ms_to_samples(15, sample_rate).max(1);
     let hop = ms_to_samples(5, sample_rate).max(1); // overlapping frames, so a short pause is not straddled
     let threshold = ref_rms * 10f64.powf(PAUSE_THRESHOLD_DB / 20.0);
     let min_pause = ms_to_samples(MIN_PAUSE_MS, sample_rate).max(1);
-
-    // Widest run wins, tracked as (start, width) rather than compared through an Option — `is_none_or`
-    // is stable only since Rust 1.82 and this crate's MSRV is 1.81.
-    let mut best_start = 0usize;
-    let mut best_width = 0usize;
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let push = |rs: usize, re: usize, out: &mut Vec<(usize, usize)>| {
+        if re - rs >= min_pause {
+            out.push((rs + (re - rs) / 2, re - rs));
+        }
+    };
     let mut run_start: Option<usize> = None;
     let mut c = lo;
     while c < hi {
         if frame_rms(pcm, c, c + frame) < threshold {
             run_start.get_or_insert(c);
         } else if let Some(rs) = run_start.take() {
-            if c - rs > best_width {
-                best_start = rs;
-                best_width = c - rs;
-            }
+            push(rs, c, &mut out);
         }
         c += hop;
     }
-    // A run still open when the band ends still counts — a pause does not have to close inside the
-    // window to be the right place to cut.
     if let Some(rs) = run_start {
-        if hi - rs > best_width {
-            best_start = rs;
-            best_width = hi - rs;
-        }
+        push(rs, hi, &mut out);
     }
-    (best_width >= min_pause).then_some(best_start + best_width / 2)
+    out.sort_by_key(|(_, width)| std::cmp::Reverse(*width)); // widest first
+    out
 }
 
 /// Return the sample index within [lo, hi) at the centre of the lowest-energy short frame —

@@ -176,7 +176,9 @@ fn best_centroid(emb: &[f32], centroids: &[Vec<f32>]) -> (Option<usize>, f32) {
     let mut best_idx = None;
     let mut best_sim = -1.0f32;
     for (i, cen) in centroids.iter().enumerate() {
-        let sim = cosine_similarity(emb, cen);
+        // -1.0 preserves the pre-Option behaviour exactly: below every threshold, so a
+        // verdict-less pair never matches a centroid.
+        let sim = cosine_similarity(emb, cen).unwrap_or(-1.0);
         if sim > best_sim {
             best_sim = sim;
             best_idx = Some(i);
@@ -195,9 +197,16 @@ fn update_centroid(centroid: &mut [f32], sample: &[f32]) {
     l2_normalize(centroid);
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+/// None when there is NO VERDICT: empty or dimension-mismatched embeddings, or a degenerate norm.
+///
+/// This returned a -1.0 sentinel until the speaker-change splitter needed it. -1.0 is numerically
+/// "maximally different", so a caller that cannot tell it apart from a real score treats an ABSENT
+/// embedding (CAM++ not installed) as proof of two speakers and splits the clip. Silence about a clip
+/// is not evidence against it.  restores the old sentinel at its call site, so its
+/// behaviour is byte-for-byte unchanged.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.len() != b.len() || a.is_empty() {
-        return -1.0;
+        return None;
     }
     let mut dot = 0.0f32;
     let mut na = 0.0f32;
@@ -208,9 +217,9 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         nb += y * y;
     }
     if na <= 1e-12 || nb <= 1e-12 {
-        return -1.0;
+        return None;
     }
-    dot / (na.sqrt() * nb.sqrt())
+    Some(dot / (na.sqrt() * nb.sqrt()))
 }
 
 fn l2_normalize(v: &mut [f32]) {
@@ -221,6 +230,28 @@ fn l2_normalize(v: &mut [f32]) {
         }
     }
 }
+
+/// Below this, two embeddings are different people — for the WITHIN-CLIP half-vs-half question only.
+///
+/// NOT WIRED INTO CHUNKING, and that is a measured decision rather than an omission. Splitting chunks on
+/// this signal was built, tested and evaluated against the owner's real recording, and could not be
+/// shown to help: three variants gave 12 -> 10 (while violating the segment-length floor), 12 -> 11, and
+/// 12 -> 14 mixed chunks out of 139. The evaluation is also length-confounded — the threshold below is
+/// calibrated on ~14 s clips with 7 s halves, and a split piece has ~3 s halves whose embeddings are
+/// noisier and score systematically lower — so the comparison cannot be trusted in either direction.
+/// See PROGRESS_LEDGER iteration 225 before attempting it again.
+///
+/// CALIBRATED, not chosen. The owner listened to 15 clips blind — shuffled, with the score, the CAM++
+/// label and the stratification band all hidden until every answer was in. Every clip he heard as
+/// turn-taking scored ≤ 0.428; every clip he heard as one speaker scored ≥ 0.753. Nothing landed in
+/// between, so any threshold in that 0.325-wide empty band classifies the labelled set perfectly and
+/// this is simply its midpoint. Misclassifies 0 of 15. The 15 clips and their answers are recorded in
+/// `src/bin/speaker_change_probe.rs::GROUND_TRUTH` so this number can be re-checked rather than trusted.
+///
+/// Deliberately NOT `MIN_SPEAKER_SIMILARITY` (0.85). That one compares a chunk against an AVERAGED,
+/// re-normalised centroid; this compares two raw embeddings, which never score that high even for one
+/// speaker. Using 0.85 here flagged 100% of the corpus.
+pub const SPEAKER_CHANGE_THRESHOLD: f32 = 0.59;
 
 #[cfg(test)]
 mod tests {

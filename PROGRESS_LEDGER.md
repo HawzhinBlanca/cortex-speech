@@ -3451,3 +3451,69 @@ the Windows console.
 
 **Gates (unmasked).** `cargo clippy --all-targets --all-features -D warnings` **0**.
 `cargo fmt --check` **0**. `npm run test:python-policies` **0** — 45/45.
+
+## Iteration 225 — speaker-aware chunking: built, measured on real audio, NOT shipped
+
+The owner asked to start with speaker-aware splitting and to reality-check it against the goal. Built,
+tested, evaluated on his actual recording — and **reverted, because it could not be shown to help.**
+
+**The design was sound on paper.** Candidate split points are the real pauses (`chunking::find_pauses`,
+from iteration 222), so a speaker split lands mid-silence for free instead of solving word-clipping a
+second time. Fast path first: one half-vs-half comparison per chunk, so the 88% single-speaker case costs
+two embeddings. Injected embedder (as sample INDICES, not slices) so the decision logic is unit-testable
+without synthesising speech a real model would have to agree about. Six tests covered split-at-pause,
+never-split-one-speaker, no-pause-means-no-cut, too-short-to-judge, no-embedder-means-no-change, and
+three-way recursion. All passed.
+
+**Then the reality check, against `Sound_From_AP_Part02.wav` through the real planner.** Three variants:
+
+| variant | chunks | mixed chunks | min duration |
+|---|---|---|---|
+| baseline (silence only) | 139 | 12 | 10607 ms |
+| whole-side compare, 1500 ms half | 155 | **10** | **1547 ms** ← violates the 3000 ms floor |
+| whole-side compare, 3000 ms half | 151 | 11 | 3075 ms |
+| local-window compare, 3000 ms half | 151 | **14** | 3125 ms |
+
+The best result fixed 2 of 12 while emitting chunks **below the library's own configured minimum** — my
+`MIN_SPLIT_HALF_MS = 1500` silently overrode `min_segment_duration_ms`, which is a settings violation
+regardless of the rest. Honouring the setting fixed that and made the primary metric worse.
+
+**The local-window variant was a reasoned hypothesis and it was wrong.** Reasoning: the probe's controls
+showed CAM++ cannot match a speaker ACROSS clips (0.009 apart) while the blind listening pass showed it
+detects a change WITHIN one — so it behaves as a local contrast detector, and comparing whole sides makes
+both operands mixtures for every candidate but the true one. Comparing short windows either side of each
+pause should therefore have been better. Measured: 12 -> 14. Recorded because the reasoning is worth
+having on file even though the prediction failed.
+
+**AND THE EVALUATION IS CONFOUNDED, which is the real reason nothing here can be claimed.** The 0.59
+threshold was calibrated on ~14 s clips whose halves are ~7 s. A split piece is ~6 s, so its halves are
+~3 s — noisier embeddings, systematically lower cosine. Shorter chunks get flagged as "mixed" more often
+regardless of who is speaking. So "12 -> 14" cannot be read as worse any more than "12 -> 10" could have
+been read as better. **The metric cannot compare chunks of different lengths, and every variant changes
+chunk length.** Fixing this needs a length-matched calibration, which needs more ground truth than the
+15 clips that exist.
+
+**Shipping an unproven change to how the entire corpus is cut, on a reliability-first project, is not a
+close call.** `pipeline.rs` was reverted with `git checkout` — the import path is byte-identical to
+before this iteration — and the splitter and its tests were deleted rather than left as dead code. The
+`--replan` probe mode went with the code it existed to evaluate.
+
+**What survives, because both are improvements independent of the splitter:**
+* `chunking::find_pauses` — `find_pause_cut` is now `.first()` of it, so the widest-run scan has one
+  implementation and the all-pauses form exists without duplicating it.
+* `diarization::cosine_similarity` returns `Option<f32>` instead of a `-1.0` sentinel. That sentinel is
+  numerically "maximally different", so any future caller that cannot distinguish it from a real score
+  treats an ABSENT embedding as proof of two speakers. `online_cluster` restores `-1.0` at its own call
+  site, so its behaviour is unchanged.
+* `SPEAKER_CHANGE_THRESHOLD` now carries the negative result in its doc comment, pointing here, so the
+  next person to try this reads the measurements before repeating them.
+
+**Gates (unmasked).** `cargo test --lib` **0** — **1106 passed**; 0 failed; 7 ignored (1112 with the
+splitter, 1106 after removing its 6 tests — back to the iteration-222 count, as it should be).
+`cargo clippy --all-targets --all-features -D warnings` **0**. `cargo fmt --check` **0**.
+`npm run test:python-policies` **0** — 45/45.
+
+**Caught along the way:** I inserted the new method between `#[allow(clippy::too_many_arguments,
+clippy::type_complexity)]` and the `build_segments_from_pcm` it was written for, so clippy failed on a
+function I never touched. Same class as the E0119 from putting a type between a doc comment and its
+`#[derive]` earlier in this loop. Re-attached rather than duplicated.
