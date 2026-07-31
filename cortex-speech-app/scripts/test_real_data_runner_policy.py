@@ -96,6 +96,13 @@ def test_e2e_is_isolated_from_the_production_profile() -> None:
     # 4. The run manifest must come from the isolated DB, never the production %APPDATA% path.
     if "%APPDATA%" in e2e and "cortex-speech.db" in e2e.split("%APPDATA%")[1][:80]:
         raise AssertionError("e2e_real_app.cjs must not read the production %APPDATA% database")
+    # 5. The WebView2 browser profile is the SECOND shared resource and must be isolated too.
+    #    Tauri keys it on the bundle identity, not on CORTEX_APP_DATA_DIR, so a run spawned while the
+    #    owner's own Cortex is open shares the folder. WebView2 then refuses the environment
+    #    (HRESULT 0x8007139F) and silently drops --remote-debugging-port, and this harness times out
+    #    on a port nobody opened. Measured 2026-08-01: FAIL in 92.0s with the app open, PASS with the
+    #    folder isolated. Without this assertion the gate's green depends on machine state.
+    assert_contains(e2e, "WEBVIEW2_USER_DATA_FOLDER: WEBVIEW2_DIR", E2E.name)
 
 
 def test_clear_db_snapshots_before_deleting_and_requires_confirmation() -> None:

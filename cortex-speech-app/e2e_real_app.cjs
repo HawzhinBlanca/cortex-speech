@@ -65,6 +65,18 @@ if (DATA_DIR) {
   DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-e2e-'));
 }
 
+// The WebView2 browser profile is a SECOND shared resource, and isolating only CORTEX_APP_DATA_DIR
+// left it shared. Tauri keys it on the bundle identity (%LOCALAPPDATA%\com.cortex.kurdish-speech
+// \EBWebView), NOT on the data dir — so a run spawned while the owner's own Cortex is open lands in
+// the SAME folder. WebView2 honours WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS only when it CREATES the
+// browser process for a folder; when one already exists it fails the environment with
+// HRESULT 0x8007139F (ERROR_INVALID_STATE) and --remote-debugging-port is silently dropped. This
+// harness then polls for 90s on a port nobody ever opened and reports a launch timeout — a gate whose
+// green depended on whether the owner happened to have the app running.
+// Measured 2026-08-01: FAIL in 92.0s with the app open, PASS (real transcript) with this set.
+const WEBVIEW2_DIR = process.env.WEBVIEW2_USER_DATA_FOLDER || path.join(DATA_DIR, 'webview2');
+fs.mkdirSync(WEBVIEW2_DIR, { recursive: true });
+
 const logFile = path.join(OUT_DIR, 'e2e_real_app_debug.log');
 try { fs.writeFileSync(logFile, ''); } catch (e) { /* non-fatal */ }
 const tee = (orig, tag) => (...args) => {
@@ -115,6 +127,7 @@ function dumpRunManifest() {
 
 async function run() {
   console.log(`==> Isolated profile for this run: ${DATA_DIR}`);
+  console.log(`==> Isolated WebView2 browser profile: ${WEBVIEW2_DIR}`);
   // A STALE debug-port owner (e.g. a previous run that leaked) would make us drive the wrong
   // instance. Never kill by image name — detect and refuse instead.
   const portInUse = await fetch(`http://localhost:${DEBUG_PORT}/json`).then((r) => r.ok, () => false);
@@ -141,6 +154,7 @@ async function run() {
       ...process.env,
       CORTEX_APP_DATA_DIR: DATA_DIR,
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${DEBUG_PORT}`,
+      WEBVIEW2_USER_DATA_FOLDER: WEBVIEW2_DIR,
     },
     cwd: path.dirname(APP_EXE), shell: false, detached: false,
   });
