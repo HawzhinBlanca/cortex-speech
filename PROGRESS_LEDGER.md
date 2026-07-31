@@ -3781,3 +3781,64 @@ already resolves rows. Twice is a pattern, so it went to memory rather than just
 
 **Gates (unmasked).** `cargo test --lib` **0** — 1107 passed, 0 failed, 7 ignored. `cargo clippy
 --all-targets --all-features -D warnings` **0**. `cargo fmt --check` **0**.
+
+## Iteration 228 — the cleanup that passed every gate and deleted nothing
+
+Self-audit of iteration 226's own WebView2 isolation, following the rule that has held all loop: **the
+defects are in what this loop just wrote.**
+
+Isolating the browser profile was right, but it made an existing leak grow faster. Nothing has ever
+removed the harness's per-run profile, and each run now leaves a ~11 MB WebView2 profile on top of the
+DB, media cache and settings. Measured before touching anything: **34 stale `cortex-e2e-*` directories,
+764 MB** on the owner's box.
+
+**The first fix passed every gate and did nothing.** `node --check` **0**, the new policy test **0**, the
+real-app e2e gate **exit 0** — and the leak went **34 → 35**. The only thing that caught it was counting
+directories on disk before and after:
+
+```
+==> Could not remove the disposable profile ...\cortex-e2e-l9TgG7:
+    EPERM, Permission denied
+```
+
+`taskkill /F /T` returns when the kill is **signalled**, not when Windows has released the SQLite
+`-wal`/`-shm`/`cortex.lock` handles and the `msedgewebview2` children. This is the DELETE side of the
+write-then-read flakiness already recorded for this machine. A bounded retry (500 ms to a 15 s deadline)
+fixes it, and is **non-fatal on timeout** — a leaked temp directory must never turn a passing
+verification run into a failure.
+
+Proven by observable effect rather than by the test passing, 3-for-3, owner's app running throughout:
+
+| run | exit | dirs before → after | cleanup line |
+|---|---|---|---|
+| 1 | 0 | 35 → 35 | `Removed the disposable profile …c3BepH` |
+| 2 | 0 | 35 → 35 | 1 |
+| 3 | 0 | 35 → 35 | 1 |
+
+**Three guards, mirroring `Remove-TemporaryFixtureDir` in `scripts/test-real-data.ps1`** — same repo,
+same reasoning, and a recursive delete earns a guard here for the same reason it does there: only a
+directory THIS run minted (never a caller-supplied `CORTEX_APP_DATA_DIR`); only strictly BELOW the temp
+root (equality rejected, or a bare `%TEMP%` would be removable); and **never on the failure path**,
+because the profile is the only copy of that run's DB and a gate that destroys its own evidence is worse
+than one that leaves a directory behind. The failure handler prints where it kept it.
+
+**The policy test needed its own fix.** It matched `rmSync` inside the COMMENT explaining `rmSync`, so it
+failed on prose — brittle enough to block a legitimate future edit. It now strips comment lines first,
+and the guard assertion is proven to bite: replacing the temp-root check with `if (false)` fails it with
+`AssertionError: e2e_real_app.cjs is missing: target === root || !target.startsWith(root + path.sep)`
+(exit 1 → 0 restored).
+
+**The lesson, stated once because it cost two rounds tonight:** a guard test proves the guards EXIST; it
+can never prove the operation WORKED. For cleanup, deletion, or anything whose product is a side effect
+on the world, assert the observable effect. "Tests pass" was necessary and not sufficient here, exactly
+as CLAUDE.md says.
+
+**Not done, deliberately:** the 764 MB already on disk is the owner's to clear
+(`Get-ChildItem $env:TEMP -Directory -Filter 'cortex-e2e-*' | Remove-Item -Recurse -Force`). The fix
+stops the growth without deleting anything that predates it.
+
+**No rebuild needed** — neither file is on `check_exe_freshness.py`'s source surfaces, so the app and the
+reviewer link stayed up for the whole iteration.
+
+**Gates (unmasked).** `node --check` **0**. `npm run test:python-policies` **0** — 45/45. Real-app e2e
+**exit 0 ×3**, each with the disposable profile removed.
