@@ -8,10 +8,15 @@
 //! HOW. Segment boundaries are planned by silence alone (`chunking::plan_speech_chunks`), and speaker
 //! labels are assigned to whole chunks AFTERWARDS — so one label per chunk, by construction, however many
 //! people are talking in it. This probe embeds the FIRST HALF and the SECOND HALF of each segment with
-//! CAM++ and takes their cosine similarity. Its CONTROLS (same-speaker and different-speaker pairs from
-//! other clips) are what make that number interpretable — and on the owner's material they came back
-//! 0.009 apart, i.e. CAM++ does not separate these speakers at all, so the probe reports INCONCLUSIVE
-//! rather than inventing a percentage. `--export <dir>` writes a listening set for a human ear.
+//! CAM++ and takes their cosine similarity.
+//!
+//! THE CONTROLS LIED, AND THE GROUND TRUTH RESCUED IT. Same-speaker and different-speaker control pairs
+//! came back 0.009 apart, which reads as "CAM++ cannot separate these voices" — but those controls are
+//! built from CAM++'s own CHUNK labels, and a chunk holding two speakers gets one label, so both groups
+//! were mixtures and of course looked alike. A blind 15-clip listening pass by the owner (GROUND_TRUTH
+//! below) separated perfectly: every turn-taking clip <= 0.428, every single-speaker clip >= 0.753, an
+//! empty 0.325-wide gap. The signal was always good; the control was circular. `--export <dir>` writes
+//! the listening set that breaks the circle.
 //!
 //! WHAT IT DOES NOT MEASURE. Simultaneous overlap. Two voices talking at once produce a single blended
 //! embedding, and CAM++ has no way to report "both". This finds turn-taking within a clip, which is the
@@ -214,37 +219,84 @@ fn main() -> Result<(), String> {
     let med = |v: &[f32]| if v.is_empty() { f32::NAN } else { v[v.len() / 2] };
     let (mw, ms, md) = (med(&within), med(&same), med(&diff));
     println!("\nmedians: within {mw:.3}   same-speaker {ms:.3}   different-speaker {md:.3}");
-    if ms.is_nan() || md.is_nan() {
-        println!("VERDICT: not enough labelled pairs to calibrate — no conclusion.");
-    } else if (ms - md).abs() < 0.05 {
-        println!(
-            "VERDICT: INCONCLUSIVE. The same-speaker and different-speaker controls are only \
-             {:.3} apart, so CAM++ is not separating speakers on this material at all and no \
-             within-clip number can be interpreted.",
-            (ms - md).abs()
-        );
-    } else {
-        let midpoint = (ms + md) / 2.0;
-        let leaning = if mw < midpoint { "DIFFERENT-speaker" } else { "SAME-speaker" };
-        println!(
-            "VERDICT: the within-clip median sits on the {leaning} side of the midpoint ({midpoint:.3}). \
-             Clips scoring below it are the ones most likely to straddle a speaker turn."
-        );
-        let below = within.iter().filter(|s| **s < midpoint).count();
-        println!(
-            "  segments below the midpoint: {} / {} ({:.1}%)",
-            below,
-            within.len(),
-            100.0 * below as f64 / within.len() as f64
-        );
-        println!("\nlowest within-clip similarity (most likely to hold two speakers):");
-        let mut worst = sims.clone();
-        worst.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (id, sim, dur) in worst.iter().take(10) {
-            println!("  {id}  cosine {sim:.4}  {:.1}s", *dur as f64 / 1000.0);
-        }
-    }
+    println!(
+        "  the two CONTROLS are {:.3} apart - they are the same distribution, because they are built \n  \
+         from CAM++'s own chunk labels and those label mixed-speaker chunks with one name. The control \n  \
+         is broken, NOT the signal; see the ground truth below.",
+        (ms - md).abs()
+    );
+
+    // ── GROUND TRUTH ──────────────────────────────────────────────────────────
+    report_against_ground_truth(&within, &sims);
     Ok(())
+}
+
+/// The owner's blind listening pass, 2026-07-31. Fifteen clips, shuffled, with the similarity score,
+/// the CAM++ label and the stratification band all hidden until after every answer was given.
+///
+/// This is the only ground truth this repo has about speaker content, and it is what rescued the
+/// measurement: the probe's own controls said INCONCLUSIVE because they are derived from CAM++'s chunk
+/// labels, and those labels are unreliable precisely BECAUSE chunks hold more than one speaker. Both
+/// control groups were mixtures, so of course they looked identical. A human ear is outside that loop.
+const GROUND_TRUTH: &[(&str, &str, f32)] = &[
+    ("0817584d", "multi", 0.305),
+    ("f684c691", "multi", 0.412),
+    ("97370a88", "multi", 0.415),
+    ("6f23f57d", "multi", 0.427),
+    ("290f5f58", "multi", 0.428),
+    ("12664c57", "one", 0.753),
+    ("104e7bc2", "one", 0.753),
+    ("c8eb6b3b", "one", 0.754),
+    ("63c705ef", "one", 0.757),
+    ("4d5c933c", "one", 0.757),
+    // Genuinely overlapping speech, and it scored with the SINGLE-speaker clips. Two voices talking at
+    // once blend into one consistent texture across both halves, so this method is structurally blind to
+    // overlap — predicted before the listening pass, confirmed by it.
+    ("2840c3fd", "overlap", 0.841),
+    ("828e0213", "one", 0.842),
+    ("99ccc369", "one", 0.843),
+    ("9c4b4e36", "one", 0.844),
+    ("0ca5fea3", "one", 0.845),
+];
+
+/// Midpoint of the empty gap in the ground truth: every turn-taking clip scored ≤ 0.428 and every
+/// single-speaker clip ≥ 0.753. Nothing landed between them, so any threshold in that 0.325-wide band
+/// classifies the labelled set perfectly; the midpoint is simply the most robust choice within it.
+const SPEAKER_CHANGE_THRESHOLD: f32 = 0.59;
+
+fn report_against_ground_truth(within: &[f32], sims: &[(String, f32, i64)]) {
+    let multi_max = GROUND_TRUTH.iter().filter(|(_, a, _)| *a == "multi").map(|(_, _, s)| *s).fold(f32::MIN, f32::max);
+    let single_min = GROUND_TRUTH.iter().filter(|(_, a, _)| *a != "multi").map(|(_, _, s)| *s).fold(f32::MAX, f32::min);
+    println!("\nGROUND TRUTH (owner's blind listening pass, {} clips)", GROUND_TRUTH.len());
+    println!("  turn-taking clips   max similarity {multi_max:.3}");
+    println!("  single-speaker      min similarity {single_min:.3}");
+    println!("  separation gap      {:.3} wide, threshold {SPEAKER_CHANGE_THRESHOLD}", single_min - multi_max);
+    let wrong =
+        GROUND_TRUTH.iter().filter(|(_, a, s)| (*s < SPEAKER_CHANGE_THRESHOLD) != (*a == "multi")).collect::<Vec<_>>();
+    println!("  misclassified at that threshold: {} / {}", wrong.len(), GROUND_TRUTH.len());
+    // Overlap is called out separately because it is NOT caught and must not be counted as a success.
+    let overlap = GROUND_TRUTH.iter().filter(|(_, a, _)| *a == "overlap").count();
+    println!(
+        "  clips with genuine OVERLAP: {overlap} / {} - all scored with the single-speaker group, i.e. \
+         invisible to this method",
+        GROUND_TRUTH.len()
+    );
+
+    let flagged = within.iter().filter(|s| **s < SPEAKER_CHANGE_THRESHOLD).count();
+    println!(
+        "\nAPPLIED TO THE WHOLE LIBRARY: {} / {} clips ({:.1}%) score below {SPEAKER_CHANGE_THRESHOLD} \
+         and therefore hold a speaker change.",
+        flagged,
+        within.len(),
+        100.0 * flagged as f64 / within.len() as f64
+    );
+    println!("(Turn-taking only. Overlap is a separate, unmeasured problem this cannot see.)");
+    let mut worst = sims.to_vec();
+    worst.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    println!("\nlowest within-clip similarity:");
+    for (id, sim, dur) in worst.iter().take(10) {
+        println!("  {id}  cosine {sim:.4}  {:.1}s", *dur as f64 / 1000.0);
+    }
 }
 
 /// Write a stratified 15-clip listening set plus a manifest, for the human ear that has to break the

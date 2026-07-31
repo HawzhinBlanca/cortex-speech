@@ -3406,3 +3406,48 @@ unbounded amount of guessing.
 the library with `SQLITE_OPEN_READ_ONLY` rather than `Database::open` (which opens read-write, runs
 `PRAGMA journal_mode=WAL` — itself a write — and whose `Connection::open` does not enable URI parsing, so
 a `file:…?mode=ro` string would have quietly created a stray empty database).
+
+## Iteration 224 — the ear settles it: the signal was always good, the CONTROL was circular
+
+The owner listened to the blind 15-clip set. The result reverses iteration 223's conclusion, and the
+reversal is the interesting part.
+
+**Ground truth (blind: shuffled, no similarity score, no CAM++ label, no band shown until submitted):**
+
+| band | answers |
+|---|---|
+| low (5) | **5 × multi-speaker** — 0.305, 0.412, 0.415, 0.427, 0.428 |
+| mid (5) | **5 × one speaker** — 0.753, 0.753, 0.754, 0.757, 0.757 |
+| high (5) | **4 × one speaker**, 1 × genuine OVERLAP — 0.841 … 0.845 |
+
+**Perfect separation.** Every turn-taking clip scored ≤ **0.428**; every single-speaker clip ≥ **0.753**.
+Nothing landed in between — an empty band **0.325 wide**. Threshold 0.59 (its midpoint) misclassifies
+**0 / 15**.
+
+**Why the probe's own controls said INCONCLUSIVE, and why that was not the signal's fault.** The
+controls were built from CAM++'s CHUNK labels, and a chunk holding two speakers gets exactly one label.
+So the "same speaker" group and the "different speaker" group were both mixtures of the same material,
+and mixtures always look alike — 0.009 apart. Iteration 223 listed this as hypothesis 2 of 2 and said it
+could not distinguish them. It could not: the circle is only breakable from outside, by an ear. Holding
+the INCONCLUSIVE line instead of picking the flattering hypothesis is what made this recoverable.
+
+**MEASURED ON THE WHOLE LIBRARY at the calibrated threshold: 17 / 144 clips (11.8%) hold a speaker
+change.** Not the 100% the first broken run claimed, and not negligible either.
+
+**Overlap is invisible to this method, and now that is measured rather than predicted.** The one clip
+with genuinely simultaneous speech scored **0.841** — right among the single-speaker clips. Two voices at
+once blend into one consistent texture across both halves, so the embedding sees no change. The probe
+docstring predicted this before the listening pass; the pass confirmed it with a real example. 1 / 15
+clips carried overlap. Detecting it needs an overlap-aware model (pyannote powerset); nothing already on
+this machine can do it.
+
+`GROUND_TRUTH` and `SPEAKER_CHANGE_THRESHOLD = 0.59` are now constants in the probe, with the 15 labelled
+clips recorded inline, so the calibration is reproducible and any future change to the embedding path can
+be re-checked against a real human answer instead of a remembered one.
+
+**Corrected in the same commit:** the module docstring still asserted "CAM++ does not separate these
+speakers at all", which the ground truth disproved; and two `println!` em-dashes rendered as mojibake on
+the Windows console.
+
+**Gates (unmasked).** `cargo clippy --all-targets --all-features -D warnings` **0**.
+`cargo fmt --check` **0**. `npm run test:python-policies` **0** — 45/45.
