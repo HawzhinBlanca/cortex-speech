@@ -3343,3 +3343,66 @@ future imports only** — the 144 existing segments are already cut and are unto
 rather than suppressed, and one mattered: `is_none_or` is stable only since Rust **1.82** while this
 crate's MSRV is **1.81**, so the widest-run tracking was rewritten without it rather than raising the
 MSRV. `cargo fmt --check` **0**.
+
+## Iteration 223 — the speaker labels do not survive their first control
+
+Third of the three fixes the owner asked for. It was meant to be a cheap win and it turned into the most
+important negative result of the session.
+
+**The plan.** The owner hit a clip holding two speakers. The clean fix — diarize first, then cut on
+speaker boundaries — was refuted by the architecture workflow (`sherpa_onnx::OfflineSpeakerDiarization`
+can `SHERPA_ONNX_EXIT(-1)`, uncatchable from Rust, and a mid-import abort discards the whole file). So
+the cheap alternative: `SpeakerEmbeddingService::compute_embedding` takes an ARBITRARY sample slice, so
+CAM++ — already downloaded, already loaded — can embed a clip's first half and second half and compare
+them. Zero new models, zero downloads, zero licence questions.
+
+**Measure before building.** `src/bin/speaker_change_probe.rs`, read-only, run against the live library.
+
+**FIRST RESULT WAS WRONG, AND SAYING SO IS THE POINT.** It reported "SEGMENTS WITH A SPEAKER CHANGE:
+144 / 144 (100.0%)". A 100% detection rate whose maximum observed similarity (0.845) never once crosses
+the threshold (0.85) is the signature of a broken measurement, not of a corpus where every clip has two
+speakers. The error was mine: 0.85 is `online_cluster`'s threshold for comparing a chunk against an
+AVERAGED, re-normalised centroid — not two raw ~6 s embeddings against each other. Nothing was reported
+to the owner from that run.
+
+**Then the controls, which is what the probe should have had from the start.** Same embeddings, two
+reference distributions: halves of DIFFERENT clips CAM++ gave the SAME label (same person, different
+moment — the realistic ceiling), and halves of clips it gave DIFFERENT labels (the floor).
+
+```
+WITHIN-clip (half vs half)    n=144    min 0.305  p10 0.559  median 0.753  p90 0.817  max 0.845
+SAME speaker, other clip      n=2377   min 0.106  p10 0.318  median 0.647  p90 0.778  max 0.877
+DIFFERENT speaker, other clip n=7919   min 0.066  p10 0.276  median 0.638  p90 0.768  max 0.874
+```
+
+**The same-speaker and different-speaker controls are 0.009 apart.** They are the same distribution.
+CAM++ is not separating speakers on this material, so no within-clip number can be interpreted and the
+probe says INCONCLUSIVE rather than inventing a percentage.
+
+Two hypotheses fit this equally and the probe cannot distinguish them, so neither is claimed:
+  1. CAM++ genuinely does not separate these voices (recording conditions, language, clip length);
+  2. the labels are wrong because chunks contain multiple speakers — which makes BOTH control groups
+     mixtures, and mixtures always look alike. This is circular by construction: the probe uses CAM++'s
+     own labels as ground truth for CAM++.
+
+Also worth noting: the within-clip median (0.753) is HIGHER than either control, which is expected and
+is another reason the first threshold was meaningless — two halves of one clip share channel, room and
+background, so that number is inflated by recording conditions rather than by speaker identity.
+
+**What this actually establishes.** The `SPEAKER_00…07` labels in the corpus are **unvalidated**, and
+this is the first evidence bearing on them either way. It is consistent with the architecture research,
+which found no DER or diarization-accuracy measurement anywhere in `eval.rs`, `wer.rs` or
+`scorecard.rs`. The cheap CAM++ path is refuted: it cannot answer the owner's question, and building the
+chunk-splitter on top of it would have shipped a splitter driven by a signal that does not discriminate.
+
+**OWNER-GATED, and it is small.** Nothing in this repo can settle it without ground truth. The cheapest
+possible: listen to ~15 clips and record, per clip, "one speaker" or "more than one". That calibrates
+the probe, decides whether the labels are salvageable, and decides whether the pyannote-via-`ort` path
+(overlap-aware, MIT, 5.99 MB, ungated) is worth its footprint. Fifteen minutes of listening replaces an
+unbounded amount of guessing.
+
+**Gates (unmasked).** `cargo clippy --all-targets --all-features -D warnings` **0**.
+`cargo fmt --check` **0**. The probe is a read-only measurement binary and adds no library code: it opens
+the library with `SQLITE_OPEN_READ_ONLY` rather than `Database::open` (which opens read-write, runs
+`PRAGMA journal_mode=WAL` — itself a write — and whose `Connection::open` does not enable URI parsing, so
+a `file:…?mode=ro` string would have quietly created a stray empty database).
