@@ -3517,3 +3517,182 @@ splitter, 1106 after removing its 6 tests — back to the iteration-222 count, a
 clippy::type_complexity)]` and the `build_segments_from_pcm` it was written for, so clippy failed on a
 function I never touched. Same class as the E0119 from putting a type between a doc comment and its
 `#[derive]` earlier in this loop. Re-attached rather than duplicated.
+
+## Iteration 226 — the Option contract was half-built; and verify-10 measured, not assumed
+
+**Where "10/10" actually lives.** `docs/REVIEWER_UX_10_PLAN.md` has nothing left in it that is not
+owner-gated, so continuing to polish that plan would be polishing a finished list. The repo's own
+definition of done is `scripts/verify_10.py`, and the last state this ledger recorded for it was
+**RED** (iteration 194, on exe-freshness). Its best *reachable* verdict is
+`GREEN — PERSONAL-USE SHIP-READY`; the literal
+`CORTEX 10/10: ALL GATES GREEN` line is unreachable by construction while 8 legs are owner-descoped
+and 5 owner-gated, and no amount of engineering changes that. So this iteration went after the
+reachable one.
+
+**The defect, and it is mine.** Iteration 225 changed `diarization::cosine_similarity` from a `-1.0`
+sentinel to `Option<f32>`, for a good reason: `-1.0` reads as "maximally different", so a caller that
+cannot tell it from a real score treats an ABSENT embedding as proof of two speakers. But the contract
+was only half built — **a NaN or infinite input still returned `Some(NaN)`.**
+
+That is worse than the sentinel it replaced. Every comparison against NaN is false, in BOTH
+directions: `sim < T` reads "same speaker" and `sim >= T` reads "different speaker" off the identical
+value. Which way a chunk falls then depends on how the caller happened to phrase its comparison, not
+on the audio. A second silent no-verdict value inside a function whose whole point is to have exactly
+one is not a rounding error in the design; it is the design not landing.
+
+Fail-before, measured (only the `is_finite` filter reverted, the test kept):
+
+```
+test diarization::tests::cosine_similarity_has_no_verdict_rather_than_an_uncomparable_one ... FAILED
+assertion `left == right` failed: NaN input has no verdict
+  left: Some(NaN)
+ right: None
+test result: FAILED. 0 passed; 1 failed          exit 101
+--- restore the filter, file byte-identical ---
+test result: ok. 1 passed; 0 failed              exit 0
+```
+
+Three inputs are covered: a NaN sample, an infinite sample, and finite-but-huge samples whose squares
+overflow f32 to Inf (a real path — the quotient there is NaN or a meaningless 0.0, not a score).
+**Production behaviour is unchanged**: `best_centroid` maps `None` to `-1.0`, which is exactly where
+NaN already landed (`NaN > best_sim` is false, and so is `-1.0 > -1.0`), so clustering is
+byte-for-byte as before.
+
+**Three comments left stale by my own iteration 225**, all still describing the `-1.0` return that no
+longer exists. The guards they justify are still load-bearing — a degenerate embedding would otherwise
+be pushed as a permanent phantom centroid that wastes a `max_speakers` slot — so this is a comment fix,
+not a behaviour fix. One doc sentence had lost its subject entirely in an editing accident and named
+the wrong function: it is `best_centroid`, not `online_cluster`, that restores the sentinel. **The
+iteration-225 entry above says `online_cluster` too, and it is wrong there for the same reason.**
+
+**Null result, measured rather than assumed.** `pendingTotal` (iteration 215) is a new reviewer-facing
+count built on `db.get_segments(Some(false))`, which filters on `verified` alone — the exact shape of
+the count-includes-rejected-rows honesty bug this repo has now fixed six times. So it was measured
+against the live library rather than reasoned about:
+
+| | |
+|---|---|
+| total segments | 144 |
+| unverified (what the couch queue serves) | 112 |
+| human-rejected (any of `human_decision`/`verdict`) | 6 |
+| **rejected AND unverified** | **0** |
+| **unverified with a blank draft** | **0** |
+
+`pendingTotal = 112` is honest, and it equals the unverified count exactly. The invariant holds because
+`api_decision` sets `verified = true` for every decision *including* reject (couch.rs:1627), so a
+rejected clip leaves the queue. Reported as plainly as a defect would have been; nothing was fixed here
+and nothing was invented.
+
+### The full sweep, and the one gate it caught
+
+`python scripts/verify_10.py` with `CORTEX_AUDIO` set at the committed FLEURS fixture, exe at HEAD:
+
+```
+kept gates run: 23 - 22 PASS, 1 FAIL, 0 skipped (env/not-built)
+VERDICT: RED - 1 kept gate(s) failed (real-app-e2e). NOT ship-ready.
+```
+
+Zero skips: all 23 actually ran, including `fuzz-smoke` 698.5s (5 targets through WSL, 0 crashes),
+`test-rust` 473.1s, `ignored-real-model` 32.3s, `egress-runtime` 23.2s, `rtf-bench` 21.2s,
+`refinery-lift` 41.9s. A RED with nothing skipped is worth more than an INCOMPLETE: the failure had
+nowhere left to hide.
+
+**A correction I owe this ledger, because I nearly published the opposite.** I read the older line
+"verify-10 has not yet been observed GREEN end to end", took it for the current state, and was one
+sentence from calling today's result the first GREEN on record. **It is not.** `git log -- docs/STATUS.md`
+shows GREEN 23/23 with zero skips from **`5fe085d` (2026-07-26)** onward — `9c437a2`, `4568e2a`,
+`a9b7b45`, `d1f531b`, `4924a88`, `82fc450` — six more before this loop began. That ledger line was true
+when written and was never retracted, which is **exactly** the failure mode `docs/STATUS.md` exists to
+end: a hand-written doc asserting a gate state it did not measure. I trusted the prose over the
+generated file. Today's result is a **restoration** of GREEN from the RED this loop's own work caused,
+not a first — and the lesson is to read `docs/STATUS.md` and `git log`, never a ledger sentence, for
+"where does this gate stand".
+
+**And the failure was in the gate, not the product.**
+
+```
+failed to create webview: WebView2 error:
+  WindowsError(Error { code: HRESULT(0x8007139F),
+  message: "The group or resource is not in the correct state..." })
+==> REAL-DATA RUN FAILED: WebView2 debug port 9222 did not come up within 90s.
+```
+
+`e2e_real_app.cjs` isolates `CORTEX_APP_DATA_DIR` into a disposable profile and refuses the production
+one — a contract this repo already has a policy test for. But the WebView2 browser profile is a SECOND
+shared resource, and it was not isolated. Tauri keys it on the bundle identity
+(`%LOCALAPPDATA%\com.cortex.kurdish-speech\EBWebView`), **not** on the data dir, so a run spawned while
+the owner's own Cortex is open lands in the same folder. WebView2 honours
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` only when it CREATES the browser process for a folder; when one
+already exists it fails the environment with `ERROR_INVALID_STATE` and **silently drops
+`--remote-debugging-port`**. The harness then polls 90 s for a port nobody opened and reports a launch
+timeout — pointing at the app, which was fine.
+
+Confirmed on the machine rather than reasoned about: `EBWebView` under
+`com.cortex.kurdish-speech` last written by the running app, 34 live `msedgewebview2` processes.
+
+**This is why the gate has been a coin toss on machine state.** It passed on 2026-07-29 because the app
+happened to be down for a rebuild. Same class as the watchdog drill before `CORTEX_WATCHDOG_EXE`: a
+verification whose green depends on what else is running is not a verification.
+
+Fix: give the run its own WebView2 folder (`<disposable profile>/webview2`), overridable, created up
+front. Measured with the owner's app **running** both times:
+
+| | |
+|---|---|
+| before | `FAIL real-app-e2e 92.0s` — port never came up |
+| after (env var, proving the mechanism) | exit **0**, real Sorani out of OmniASR |
+| after (harness default, proving the shipped path) | exit **0** |
+
+The transcript the passing run produced, from the real fixture through real VAD + real CTC:
+`بوو پێش هاتنی سوپا هایەتی لەوتەی ساڵی ١ە تووشی کەشەی پیوەست بەنەخۆشەکەن نەبوو`
+
+The isolation contract in `test_real_data_runner_policy.py` gains its fifth leg, and it is a real guard
+— removing the line from the harness fails it:
+`AssertionError: e2e_real_app.cjs is missing: WEBVIEW2_USER_DATA_FOLDER: WEBVIEW2_DIR` (exit 1 → 0).
+
+**No rebuild was needed for this fix** — `e2e_real_app.cjs` and the policy script are not on
+`check_exe_freshness.py`'s source surfaces, so the app and the reviewer link stayed up throughout.
+
+**A trap worth writing down, because it nearly shipped.** The fail-before harness rewrote
+`diarization.rs` with `Set-Content -Encoding utf8`, and **PowerShell 5.1's `utf8` writes a BOM**. The
+script's own "file restored byte-identical" check compared `Get-Content -Raw` strings — which strip the
+BOM — so it reported True while the file on disk had gained three bytes. Only a byte-level check caught
+it (`git diff --numstat` 65/26 → 64/25 after stripping). Same family as the PS 5.1 restricted-header
+trap already recorded in `REVIEWER_UX_10_PLAN.md`: on this box, **verify a PowerShell round-trip at the
+byte level or not at all.** No other `.rs` in `src-tauri/src` carries a BOM (swept).
+
+**And it bit a second time, in the same iteration.** Appending this entry with
+`Get-Content | Add-Content -Encoding utf8` double-encoded every em-dash to `â€”` — `Get-Content`
+without `-Encoding utf8` reads a UTF-8 file as ANSI, and the write then re-encodes the mis-read
+characters. 16 occurrences, all inside the 133 appended lines; `git diff --numstat` showed `133 0`
+(pure additions) and the committed file had zero, so the damage was bounded and the append was redone
+through `[IO.File]::ReadAllText(..., UTF8)` + `AppendAllText`. Twice in one iteration is not bad luck,
+it is the tool: **PowerShell 5.1 is not safe for round-tripping UTF-8 text files here.**
+
+### Closing state
+
+`python scripts/verify_10.py --status-md docs/STATUS.md`, `CORTEX_AUDIO` set, **and the owner's app
+deliberately left RUNNING** — the exact condition that produced the RED:
+
+```
+kept gates run: 23 - 23 PASS, 0 FAIL, 0 skipped (env/not-built)
+owner-descoped: 8   owner-gated pending: 5
+VERDICT: GREEN - PERSONAL-USE SHIP-READY. (Not full-charter 10/10: 8 legs owner-descoped, 5 owner-gated pending.)
+```
+
+`real-app-e2e` **18.4s PASS** where it was 92.0s FAIL an hour earlier, on the same machine, with the
+same app running. That delta is the whole proof.
+
+**Other gates (unmasked).** `cargo test --lib` **0** — 1107 passed, 0 failed, 7 ignored (1106 + the new
+one). `cargo clippy --all-targets --all-features -D warnings` **0**. `cargo fmt --check` **0**.
+`npm run test:python-policies` **0** — 45/45. `node --check` **0**.
+
+**App and link, verified after the rebuild and still up at close:** `EXE FRESHNESS GATE: OK (exe at
+HEAD 4bf3695…)`, claim **200**, queue **200**, items **29**, `pendingTotal` **112**, watchdog re-armed.
+The WebView2 fix needed no rebuild — neither file is a `check_exe_freshness.py` source surface — so the
+reviewer link never dropped for it.
+
+**What is still owner-gated, unchanged by this iteration:** Tailscale Serve → Funnel; one elevated
+`cortex-once-admin.ps1` run (a reboot still leaves the review server down); the R5 device hour; native
+Sorani review of the 8 `source: null` strings; the Phase-6 scope amendment and the "unsure" verdict
+decision. And from the diarization work: flagging the 17 known mixed clips, and overlap detection.
