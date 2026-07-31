@@ -3237,3 +3237,47 @@ scrolls under it, and `touchcancel` resets too.
 **Gates (unmasked).** couch-page Playwright **41 passed**, exit 0, stable 3-for-3.
 `npm run test:e2e` **0** — **88 passed** (was 87). `npm run test:python-policies` **0** — 45/45.
 `npm run typecheck` **0** — 426 files, 0 errors. No Rust change this iteration.
+
+## Iteration 221 — the trim path stops being a whitelist (and the honest correction that it lost nothing yet)
+
+Found while researching the chunking architecture. `rebound_alignment_json` (`chunking.rs`) REBUILT a
+segment's alignment JSON from `SegmentSourceMeta`'s four fields and then re-merged exactly ONE
+whitelisted key, `words`. Every other key was dropped. Its production caller is `update_segment_bounds`
+(`commands/segments_write.rs:275`) — the trim action, which is the reviewer's most-used edit.
+
+The shape is the bug: a whitelist has to be extended by hand every time any writer adds a key, and the
+failure mode is invisible — no error, no log, the key is simply gone the next time someone nudges a
+boundary. It was also the odd one out; `merge_word_timestamps` immediately above it already
+preserves-and-inserts. The history shows why: `words` was itself lost this way once, and the fix at the
+time was to add `words` to the whitelist rather than to delete the whitelist.
+
+**HONEST CORRECTION, and it changes the severity I reported.** I described this to the owner as a "live
+data-loss risk". Measured before touching it, against the real library
+(`%APPDATA%\cortex-speech\cortex-speech.db`, opened `mode=ro`):
+
+```
+segments with alignment_json: 144
+shapes: {'object': 144}
+keys seen: {'chunk_count': 144, 'chunk_index': 144, 'source_end_ms': 144, 'source_start_ms': 144, 'words': 144}
+KEYS THAT rebound_alignment_json WOULD DROP: none
+```
+
+Every key present is on the old whitelist, so **nothing was actually being lost**. It is a latent hazard,
+not live loss, and the ledger says so rather than letting the more alarming first description stand.
+
+**The fix deletes the whitelist rather than extending it.** Parse the existing object, update
+`source_start_ms`/`source_end_ms`, default `chunk_index`/`chunk_count` ONLY when absent, keep everything
+else untouched. Shorter than what it replaces. It also now lifts the legacy bare-array shape (rows that
+predate the object form and ARE a word array) under `words` instead of discarding it — those are the
+oldest segments in the library and would have lost their words on the first trim.
+
+**FAIL-BEFORE:** restoring the whitelist rebuild →
+`assertion left == right failed: an unknown scalar key must survive / left: Null / right: "mms-onnx"`.
+
+The new test deliberately asserts on keys **no current writer produces** (`alignment_backend`,
+`overlap_detected`, a nested object). That is the point: they stand in for whatever gets written next,
+and the assertion is that nobody has to remember to extend a list for them to survive. It also pins the
+legacy-array lift and the absent/unparseable/scalar inputs.
+
+**Gates (unmasked).** `cargo test --lib` **0** — **1103 passed**; 0 failed; 7 ignored (was 1102).
+`cargo clippy --all-targets --all-features -D warnings` **0**. `cargo fmt --check` **0**.

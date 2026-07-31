@@ -46,26 +46,43 @@ pub fn merge_word_timestamps(existing: Option<&str>, words: &[crate::aligner::Wo
     }
 }
 
-/// Rebuild a segment's alignment JSON with NEW source bounds while PRESERVING the merged word-timestamp
-/// array (and chunk_index/chunk_count). SegmentSourceMeta::to_alignment_json carries only the 4 source-meta
-/// fields, so a bounds edit that round-trips through it alone DROPS the `words` array — the exact
-/// flat-overwrite pipeline.rs:2068 forbids ("MERGE its word array back under a `words` key via
-/// merge_word_timestamps"). Word timestamps are absolute source-time positions and stay valid across a
-/// bounds change (a reviewer can re-run alignment to refresh them).
+/// Update a segment's source bounds in its alignment JSON, PRESERVING everything else in the object.
+///
+/// This used to REBUILD the JSON from `SegmentSourceMeta` (4 fields) and then re-merge one whitelisted
+/// key, `words`. That shape drops every key not on the whitelist, and the whitelist has to be extended by
+/// hand each time any writer adds one — a silent-data-loss design where the failure mode is invisible
+/// (no error, no log, the key is simply gone the next time a reviewer nudges a boundary). It is also the
+/// odd one out: `merge_word_timestamps` directly above already preserves-and-inserts.
+///
+/// Measured before changing it, so this is honest about what it fixes: across all 144 segments in the
+/// owner's live library the only keys present are `source_start_ms`, `source_end_ms`, `chunk_index`,
+/// `chunk_count` and `words` — every one of them on the old whitelist. So **no data was being lost
+/// today**; this closes the hazard, it does not recover anything. The trim path
+/// (`update_segment_bounds`) is the reviewer's most-used edit, which is why the hazard is worth closing
+/// before a key gets added rather than after.
+///
+/// Word timestamps are absolute source-time positions and stay valid across a bounds change (a reviewer
+/// can re-run alignment to refresh them).
 pub fn rebound_alignment_json(existing: Option<&str>, start_ms: i64, end_ms: i64) -> String {
-    let mut meta = existing.and_then(SegmentSourceMeta::from_alignment_json).unwrap_or(SegmentSourceMeta {
-        source_start_ms: start_ms,
-        source_end_ms: end_ms,
-        chunk_index: 0,
-        chunk_count: 1,
-    });
-    meta.source_start_ms = start_ms;
-    meta.source_end_ms = end_ms;
-    let meta_json = meta.to_alignment_json();
-    match existing.and_then(word_timestamps_from_alignment) {
-        Some(words) if !words.is_empty() => merge_word_timestamps(Some(&meta_json), &words),
-        _ => meta_json,
-    }
+    let mut obj = match existing.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) {
+        // Legacy shape: a bare array IS the word list. Lift it under `words` so there is exactly one
+        // representation from here on, instead of two the rest of the file has to keep distinguishing.
+        Some(serde_json::Value::Array(words)) => serde_json::json!({ "words": words }),
+        Some(v) if v.is_object() => v,
+        // Absent, unparseable, or a scalar: start clean rather than propagate something no reader can
+        // use. Unparseable JSON cannot be preserved without preserving the corruption with it.
+        _ => serde_json::json!({}),
+    };
+    let Some(map) = obj.as_object_mut() else {
+        return obj.to_string();
+    };
+    map.insert("source_start_ms".to_string(), serde_json::json!(start_ms));
+    map.insert("source_end_ms".to_string(), serde_json::json!(end_ms));
+    // Defaults ONLY when absent: a real chunk_index/chunk_count describes where this segment came from
+    // in its source file and a bounds edit does not change that.
+    map.entry("chunk_index").or_insert(serde_json::json!(0));
+    map.entry("chunk_count").or_insert(serde_json::json!(1));
+    obj.to_string()
 }
 
 /// Extract word-level timestamps from alignment JSON (object with `words` or legacy array).
@@ -478,6 +495,62 @@ mod tests {
         assert_eq!(kept.len(), 2, "both word timestamps must survive a bounds edit, not be dropped");
         assert_eq!(kept[0].word, "سڵاو");
         assert_eq!(kept[1].word, "دنیا");
+    }
+
+    #[test]
+    fn a_bounds_edit_preserves_every_key_not_just_the_ones_we_thought_of() {
+        // The test above pins `words` because `words` is what was lost once. That is a whitelist, and a
+        // whitelist is the bug: the old implementation REBUILT this JSON from SegmentSourceMeta's four
+        // fields and re-merged exactly one key, so anything a future writer added was dropped silently on
+        // the reviewer's most-used edit — no error, no log, the key simply gone the next time someone
+        // nudged a boundary.
+        //
+        // Measured before the change: across all 144 segments in the owner's live library the only keys
+        // present are the four meta fields plus `words`, so nothing was actually being lost yet. This test
+        // exists so it stays that way once something new IS written here.
+        let existing = serde_json::json!({
+            "source_start_ms": 1000,
+            "source_end_ms": 2000,
+            "chunk_index": 2,
+            "chunk_count": 5,
+            "words": [{ "word": "سڵاو", "start": 0.1, "end": 0.4, "confidence": 0.9 }],
+            // Keys no current writer produces. That is the point — they stand in for whatever gets added
+            // next, and the assertion is that nobody has to remember to extend a list for them to survive.
+            "alignment_backend": "mms-onnx",
+            "overlap_detected": true,
+            "nested": { "keep": ["me"] },
+        })
+        .to_string();
+
+        let out = rebound_alignment_json(Some(&existing), 4000, 5000);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("output is valid json");
+
+        assert_eq!(v["source_start_ms"], 4000, "the bounds are what a rebound is FOR");
+        assert_eq!(v["source_end_ms"], 5000);
+        assert_eq!(v["chunk_index"], 2, "provenance of the chunk does not change with its bounds");
+        assert_eq!(v["chunk_count"], 5);
+        assert_eq!(v["words"].as_array().map(Vec::len), Some(1), "the once-lost key still survives");
+        assert_eq!(v["alignment_backend"], "mms-onnx", "an unknown scalar key must survive");
+        assert_eq!(v["overlap_detected"], true, "an unknown bool must survive");
+        assert_eq!(v["nested"]["keep"][0], "me", "an unknown nested object must survive intact");
+
+        // Legacy shape: some rows predate the object form and ARE a bare word array. They must be lifted
+        // into the object rather than thrown away, or the oldest segments in the library lose their words
+        // the first time anyone trims them.
+        let legacy = r#"[{"word":"کۆن","start":0.0,"end":0.5,"confidence":0.7}]"#;
+        let lifted: serde_json::Value = serde_json::from_str(&rebound_alignment_json(Some(legacy), 10, 20)).unwrap();
+        assert_eq!(lifted["words"].as_array().map(Vec::len), Some(1), "a legacy bare array is lifted, not lost");
+        assert_eq!(lifted["source_start_ms"], 10);
+        assert_eq!(lifted["chunk_index"], 0, "absent provenance defaults, present provenance is kept");
+        assert_eq!(lifted["chunk_count"], 1);
+
+        // Absent or unparseable input must still yield usable meta rather than propagating corruption.
+        for input in [None, Some("not json at all"), Some("42")] {
+            let fresh: serde_json::Value = serde_json::from_str(&rebound_alignment_json(input, 7, 9)).unwrap();
+            assert_eq!(fresh["source_start_ms"], 7, "input {input:?} must still produce valid bounds");
+            assert_eq!(fresh["source_end_ms"], 9);
+            assert_eq!(fresh["chunk_count"], 1);
+        }
     }
 
     #[test]
