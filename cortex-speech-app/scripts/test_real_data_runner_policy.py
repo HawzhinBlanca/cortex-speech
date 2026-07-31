@@ -105,6 +105,35 @@ def test_e2e_is_isolated_from_the_production_profile() -> None:
     assert_contains(e2e, "WEBVIEW2_USER_DATA_FOLDER: WEBVIEW2_DIR", E2E.name)
 
 
+def test_e2e_profile_cleanup_is_guarded_and_keeps_evidence_on_failure() -> None:
+    # The harness mints a disposable profile per run and, since the WebView2 isolation, a ~11 MB browser
+    # profile with it. Nothing removed them (measured: 34 dirs / 764 MB), so cleanup was added — and a
+    # recursive delete in a test harness needs the same guards as Remove-TemporaryFixtureDir does in
+    # scripts/test-real-data.ps1: only a directory WE created, only under the temp root, never a
+    # caller-supplied one.
+    e2e = E2E.read_text(encoding="utf-8")
+    # Comment lines are stripped first: the rule is about executable deletes, and a naive substring
+    # scan fails on the comment that EXPLAINS the delete — which is prose, not a second call site.
+    code = [ln.strip() for ln in e2e.splitlines() if not ln.strip().startswith(("//", "*", "/*"))]
+    rm_lines = [ln for ln in code if "rmSync" in ln]
+    if rm_lines != ["fs.rmSync(target, { recursive: true, force: true });"]:
+        raise AssertionError(
+            "Recursive delete must appear exactly once, inside cleanupProfile. Found: " f"{rm_lines}"
+        )
+    assert_contains(e2e, "const DATA_DIR_IS_OURS = !process.env.CORTEX_APP_DATA_DIR;", E2E.name)
+    assert_contains(e2e, "if (!DATA_DIR_IS_OURS) return;", E2E.name)
+    # Must refuse anything that is not strictly BELOW the temp root (equality included, or a bare
+    # tmpdir would be removable).
+    assert_contains(e2e, "target === root || !target.startsWith(root + path.sep)", E2E.name)
+
+    # Evidence rule: cleanup runs on the success path only. If it were also called from the failure
+    # handler, a post-mortem would find the DB it needs already deleted.
+    failure_handler = e2e.split("run().catch(")[-1]
+    if "cleanupProfile()" in failure_handler:
+        raise AssertionError("cleanupProfile must NOT run on the failure path — the profile is the evidence")
+    assert_contains(e2e, "Profile kept for diagnosis", E2E.name)
+
+
 def test_clear_db_snapshots_before_deleting_and_requires_confirmation() -> None:
     clr = CLEAR_DB.read_text(encoding="utf-8")
     # Refuses without explicit confirmation.
@@ -123,6 +152,7 @@ def main() -> None:
     test_package_real_audio_scripts_use_the_checked_runner()
     test_e2e_never_clears_the_real_db_by_default()
     test_e2e_is_isolated_from_the_production_profile()
+    test_e2e_profile_cleanup_is_guarded_and_keeps_evidence_on_failure()
     test_clear_db_snapshots_before_deleting_and_requires_confirmation()
     print("real-data runner policy regression passed")
 

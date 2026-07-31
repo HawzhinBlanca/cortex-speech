@@ -77,6 +77,52 @@ if (DATA_DIR) {
 const WEBVIEW2_DIR = process.env.WEBVIEW2_USER_DATA_FOLDER || path.join(DATA_DIR, 'webview2');
 fs.mkdirSync(WEBVIEW2_DIR, { recursive: true });
 
+// True only when THIS run minted the profile above. A caller-supplied CORTEX_APP_DATA_DIR is never
+// ours to delete, whatever it points at.
+const DATA_DIR_IS_OURS = !process.env.CORTEX_APP_DATA_DIR;
+
+/// Remove the disposable profile — ONLY on success, ONLY when we created it, ONLY under the temp root.
+//
+// Each run leaves a full app profile (DB, media cache, settings) and, since the WebView2 isolation
+// above, a ~11 MB browser profile too. Nothing ever removed them: measured 2026-08-01, 34 stale
+// `cortex-e2e-*` directories totalling 764 MB on the owner's box. Isolating the browser profile made an
+// existing leak grow faster, so the cleanup belongs with it.
+//
+// Kept on FAILURE deliberately: the profile is the only copy of the DB a post-mortem can read, and a
+// gate that destroys its own evidence is worse than one that leaves a directory behind.
+//
+// The three guards mirror `Remove-TemporaryFixtureDir` in scripts/test-real-data.ps1 — same reasoning,
+// same repo, and a recursive delete gets a guard here for the same reason it does there.
+// Windows releases file handles ASYNCHRONOUSLY. `taskkill /F /T` returns as soon as the kill is
+// signalled, not when the app's SQLite handles (`cortex-speech.db-wal`, `-shm`, `cortex.lock`) and its
+// msedgewebview2 children have actually let go — so an immediate delete gets EPERM on the directory
+// itself. Measured 2026-08-01: a single rmSync straight after killApp failed every time, and the leak it
+// was written to fix stayed exactly as it was (34 dirs -> 35). Retry to a deadline instead.
+async function cleanupProfile() {
+  if (!DATA_DIR_IS_OURS) return;
+  const root = path.resolve(os.tmpdir());
+  const target = path.resolve(DATA_DIR);
+  if (target === root || !target.startsWith(root + path.sep)) {
+    console.log(`==> Leaving ${target} in place (outside the temp root — refusing to remove it).`);
+    return;
+  }
+  const deadline = Date.now() + 15000;
+  for (;;) {
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      console.log(`==> Removed the disposable profile ${target}`);
+      return;
+    } catch (e) {
+      if (Date.now() >= deadline) {
+        // Non-fatal: a leaked temp directory must never turn a passing verification run into a failure.
+        console.log(`==> Could not remove the disposable profile ${target}: ${e.message}`);
+        return;
+      }
+      await sleep(500);
+    }
+  }
+}
+
 const logFile = path.join(OUT_DIR, 'e2e_real_app_debug.log');
 try { fs.writeFileSync(logFile, ''); } catch (e) { /* non-fatal */ }
 const tee = (orig, tag) => (...args) => {
@@ -276,10 +322,18 @@ async function run() {
   console.log('==> Closing app...');
   await browser.close();
   killApp();
+  // After killApp: the profile is only removable once the app has released its lock and DB handles.
+  await cleanupProfile();
   console.log('\n=================================================');
   console.log(`  REAL-DATA RUN OK: ${segCount} segments; first transcript ${rawText.length} chars`);
   console.log('  Next: python scripts/build_review_page.py --manifest run.jsonl --out review.html --embed-audio');
   console.log('=================================================');
 }
 
-run().catch((err) => { console.error('==> REAL-DATA RUN FAILED:', err && err.message ? err.message : err); killApp(); process.exit(1); });
+run().catch((err) => {
+  console.error('==> REAL-DATA RUN FAILED:', err && err.message ? err.message : err);
+  killApp();
+  // NOT cleaned up on failure — see cleanupProfile. Say where it is so the post-mortem can find it.
+  console.error(`==> Profile kept for diagnosis: ${DATA_DIR}`);
+  process.exit(1);
+});
