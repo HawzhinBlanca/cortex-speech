@@ -3281,3 +3281,65 @@ legacy-array lift and the absent/unparseable/scalar inputs.
 
 **Gates (unmasked).** `cargo test --lib` **0** — **1103 passed**; 0 failed; 7 ignored (was 1102).
 `cargo clippy --all-targets --all-features -D warnings` **0**. `cargo fmt --check` **0**.
+
+## Iteration 222 — the cut criterion was wrong, not the search window
+
+Second of the three fixes the owner asked for. The chunker's own comment promised it "never slices
+through a word", and measurement says that promise was already kept — but for a narrower reason than
+anyone had checked, and the residual failure was real.
+
+**What was measured first** (`Sound_From_AP_Part02.wav`, 1,799,631 ms, the 144 live rows, 143 internal
+boundaries; DB opened `mode=ro`, WAV read-only, nothing written):
+
+| Measurement | Result |
+|---|---|
+| Cuts landing at speech level | **0 / 143** — every cut ≥37.7 dB below local speech, median −51.7 dB |
+| Gain from widening the energy search to ±1 s | **median 0.0 dB**, p90 2.5 dB |
+| Cuts in a gap ≤100 ms (too short to be a pause) | **23 / 143 (16.1%)** |
+| Chunks starting with ≤30 ms of leading silence | **39 / 143 (27.3%)** |
+| Boundaries where a WIDER silence run existed in the same 4.5 s band | **56 / 143** |
+| Boundaries with a ≥300 ms pause already inside the cap | 106 / 143 (74%) |
+| …allowing +3 s / +5 s overrun | **122 (85%)** / 132 (92%) |
+
+So the "guillotine through a word at full volume" fear was unfounded, and widening the search window —
+the obvious fix — buys **nothing**. The criterion is what is wrong: `find_quietest_cut` took the single
+lowest-energy FRAME, and a 30 ms inter-syllable dip beats a 400 ms real pause two seconds later.
+
+**The change.** `find_pause_cut` marks frames below the region's own speech level (median 15 ms frame
+RMS, −25 dB) and takes the **widest contiguous run**, cutting at its **centre** so there is air on both
+sides. A run must be ≥120 ms to qualify at all, which is precisely what rules out the 16%. When no real
+pause exists inside the cap, the chunk may run up to **3 s** long to reach one (the measured knee: +3 s
+buys 85%, +5 s only 92%) before falling back to the old quietest-frame rule for genuinely continuous
+speech, music or noise.
+
+**The trap, and it is why the third test exists.** Both cap passes had to move from `max_samples` to
+`cap_with_overrun`. Miss either and the safety re-split in `plan_speech_chunks` faithfully undoes every
+overrun `silence_aware_split` just chose — the change compiles, every unit test on the splitter passes,
+and the shipped behaviour is unchanged. `the_overrun_survives_the_final_cap_pass` drives the whole
+planner for exactly that reason.
+
+**FAIL-BEFORE (three tests, all three fail on the old criterion).**
+* `a_wide_pause_beats_a_deeper_but_narrower_dip` →
+  `got 11010ms (11010ms means it chose the 30ms dip — the exact defect this replaced)`.
+  The synthetic dip is DEEPER than the pause (0 vs 50), so a rule that merely tied would not
+  discriminate; the old rule must prefer it and the new one must not.
+* `a_chunk_may_run_slightly_long_to_reach_a_real_pause_but_stays_bounded` →
+  `it must reach past the cap to the real pause, got 10500ms`.
+* `the_overrun_survives_the_final_cap_pass` →
+  `a chunk should have run past the cap; lengths were [10500, 10500, 9000]`.
+
+**Honest limits, unchanged from the research.** n = 1 recording, one speaker set, one edited-broadcast
+style. It is an acoustic-silence measurement, not word verification — nobody listened to confirm that any
+specific clip clips a word, and the DB's word arrays cannot arbitrate because `aligner::align`
+(`aligner.rs:647`) is a stub returning the energy heuristic. `PAUSE_THRESHOLD_DB` and `MIN_PAUSE_MS` are
+calibration knobs set from ONE file and both need re-checking on a second recording. **This affects
+future imports only** — the 144 existing segments are already cut and are untouched.
+
+**It does not fix overlapping speakers.** That is a separate problem and its clean solution was refuted
+(see iteration 223).
+
+**Gates (unmasked).** `cargo test --lib` **0** — **1106 passed**; 0 failed; 7 ignored (was 1103).
+`cargo clippy --all-targets --all-features -D warnings` **0** — two errors on the first run, both fixed
+rather than suppressed, and one mattered: `is_none_or` is stable only since Rust **1.82** while this
+crate's MSRV is **1.81**, so the widest-run tracking was rewritten without it rather than raising the
+MSRV. `cargo fmt --check` **0**.

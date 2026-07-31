@@ -161,6 +161,11 @@ pub fn plan_speech_chunks(
 
     // Safety: enforce the max-duration cap. A last-resort split still cuts on the quietest
     // point so it never slices through a word (the bug that split "کەسایەتی" across chunks).
+    //
+    // The tolerance is `cap_with_overrun`, NOT `max_samples`. `silence_aware_split` is allowed to run a
+    // chunk slightly long to reach a real pause; re-splitting at the bare cap here would faithfully undo
+    // every one of those decisions and leave the change doing nothing at all.
+    let cap = cap_with_overrun(max_samples, sample_rate);
     let mut final_regions = Vec::new();
     for (start, end) in regions {
         let s = start.min(pcm.len());
@@ -168,7 +173,7 @@ pub fn plan_speech_chunks(
         if e <= s {
             continue;
         }
-        if e - s <= max_samples {
+        if e - s <= cap {
             final_regions.push((s, e));
         } else {
             final_regions.extend(silence_aware_split(pcm, sample_rate, s, e, max_samples, min_samples));
@@ -235,7 +240,9 @@ fn split_oversized_regions(
         if e <= s {
             continue;
         }
-        if e - s <= max_samples {
+        // Same tolerance as the final pass in plan_speech_chunks, and for the same reason: a region that
+        // is already within cap+overrun has nothing to gain from being cut again.
+        if e - s <= cap_with_overrun(max_samples, sample_rate) {
             out.push((s, e));
         } else {
             out.extend(silence_aware_split(pcm, sample_rate, s, e, max_samples, min_samples));
@@ -257,6 +264,10 @@ fn silence_aware_split(
 ) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut s = start;
+    // Computed ONCE per region, not per cut: the threshold must describe this passage's speech level,
+    // and recomputing it inside the loop would make it drift with whatever happens to be in each band.
+    let ref_rms = region_speech_level(pcm, start, end, sample_rate);
+    let overrun = ms_to_samples(MAX_OVERRUN_MS, sample_rate);
     while end - s > max_samples {
         // Prefer cutting in the last ~30% of the window, but never sooner than min_samples in.
         let lo = (s + max_samples * 7 / 10).max(s + min_samples).min(end.saturating_sub(1));
@@ -266,7 +277,17 @@ fn silence_aware_split(
             hi = end.saturating_sub(min_samples);
         }
         let hi = hi.clamp(lo + 1, end);
-        let cut = find_quietest_cut(pcm, lo, hi, sample_rate).clamp(s + 1, end);
+        let cut = find_pause_cut(pcm, lo, hi, sample_rate, ref_rms)
+            // No real pause inside the cap. Look a bounded distance FURTHER rather than cutting between
+            // two syllables purely because the clock ran out — a slightly long clip is reviewable, a clip
+            // that starts 20 ms into a word is not. Still bounded, and still leaves min_samples behind.
+            .or_else(|| {
+                let stretched = hi.saturating_add(overrun).min(end.saturating_sub(min_samples));
+                (stretched > hi).then(|| find_pause_cut(pcm, hi, stretched, sample_rate, ref_rms)).flatten()
+            })
+            // Continuous speech, music or noise: nothing here is a pause, so fall back to the old rule.
+            .unwrap_or_else(|| find_quietest_cut(pcm, lo, hi, sample_rate))
+            .clamp(s + 1, end);
         out.push((s, cut));
         s = cut;
     }
@@ -276,8 +297,124 @@ fn silence_aware_split(
     out
 }
 
+/// How far past `max_samples` a chunk may run when its band contains no real pause.
+///
+/// Measured on the owner's corpus (1,799,631 ms of speech, 143 boundaries): a genuine >=300 ms pause is
+/// already inside the normal band for 74% of boundaries, and allowing a bounded overrun lifts that to
+/// **85% at +3 s** and 92% at +5 s. 3 s is the knee — past it the return per second of slack drops off
+/// while the clip gets long enough to be tiring to review. Running slightly long is far cheaper than
+/// cutting between two syllables because the clock ran out.
+const MAX_OVERRUN_MS: u32 = 3000;
+
+/// How far below the region's own speech level a frame must sit to count as silence.
+///
+/// Calibration knob, set from the same measurement: at -25 dB, 21.4% of that file reads as silence,
+/// which matches its audible pause structure. Too shallow and ordinary vowel dips read as pauses; too
+/// deep and only absolute digital silence qualifies, which real recordings rarely contain.
+const PAUSE_THRESHOLD_DB: f64 = -25.0;
+
+/// The narrowest gap that counts as a real pause rather than an inter-syllable dip.
+///
+/// This is the whole point of the change. Measured on the same corpus: **23 of 143 existing cuts (16%)
+/// sit in a gap of 100 ms or less** — far too short to be a pause — because the old rule took the single
+/// quietest FRAME and a 30 ms dip between syllables wins that contest against a 400 ms pause a moment
+/// later. Requiring a run this wide is what rules those out.
+const MIN_PAUSE_MS: u32 = 120;
+
+/// Total length a chunk may reach: the configured cap plus the bounded overrun above.
+///
+/// Every place that re-splits an over-long region must use THIS, not `max_samples` — otherwise the
+/// final cap pass in `plan_speech_chunks` faithfully undoes every overrun `silence_aware_split` just
+/// chose, and the whole change silently does nothing.
+fn cap_with_overrun(max_samples: usize, sample_rate: u32) -> usize {
+    max_samples.saturating_add(ms_to_samples(MAX_OVERRUN_MS, sample_rate))
+}
+
+/// RMS of `pcm[start..end)`. 0.0 for an empty range.
+fn frame_rms(pcm: &[i16], start: usize, end: usize) -> f64 {
+    if end <= start || start >= pcm.len() {
+        return 0.0;
+    }
+    let end = end.min(pcm.len());
+    let mut energy = 0f64;
+    for &v in &pcm[start..end] {
+        energy += (v as f64) * (v as f64);
+    }
+    (energy / (end - start) as f64).sqrt()
+}
+
+/// The region's own speech level, as the MEDIAN 15 ms frame RMS.
+///
+/// Median, not mean: about a fifth of a typical region is silence, and a mean is dragged down by it —
+/// which would drag the silence threshold down with it and make real pauses fail to qualify. Measuring
+/// per region rather than globally is what lets one quiet passage and one loud one both be cut well.
+fn region_speech_level(pcm: &[i16], start: usize, end: usize, sample_rate: u32) -> f64 {
+    let frame = ms_to_samples(15, sample_rate).max(1);
+    let mut rms: Vec<f64> = Vec::new();
+    let mut c = start;
+    while c + frame <= end.min(pcm.len()) {
+        rms.push(frame_rms(pcm, c, c + frame));
+        c += frame;
+    }
+    if rms.is_empty() {
+        return 0.0;
+    }
+    rms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    rms[rms.len() / 2]
+}
+
+/// The centre of the WIDEST run of silence in [lo, hi), or None when nothing there is a real pause.
+///
+/// This replaces "the single quietest frame" as the cut criterion, and the difference is the fix.
+/// Measured on the owner's corpus: no cut ever landed on speech (every one is >=37.7 dB below local
+/// speech, median -51.7 dB), so the old rule was never guillotining a word at full volume — but 16% of
+/// cuts landed in gaps of <=100 ms, and 56 of 143 boundaries had a WIDER silence run available in the
+/// same band. Widening the search window instead buys a median of 0.0 dB: the window was never the
+/// problem. Picking the widest run, and cutting at its CENTRE rather than its edge, puts the boundary
+/// in the middle of a real pause with air on both sides.
+fn find_pause_cut(pcm: &[i16], lo: usize, hi: usize, sample_rate: u32, ref_rms: f64) -> Option<usize> {
+    let hi = hi.min(pcm.len());
+    if hi <= lo || ref_rms <= 0.0 {
+        return None;
+    }
+    let frame = ms_to_samples(15, sample_rate).max(1);
+    let hop = ms_to_samples(5, sample_rate).max(1); // overlapping frames, so a short pause is not straddled
+    let threshold = ref_rms * 10f64.powf(PAUSE_THRESHOLD_DB / 20.0);
+    let min_pause = ms_to_samples(MIN_PAUSE_MS, sample_rate).max(1);
+
+    // Widest run wins, tracked as (start, width) rather than compared through an Option — `is_none_or`
+    // is stable only since Rust 1.82 and this crate's MSRV is 1.81.
+    let mut best_start = 0usize;
+    let mut best_width = 0usize;
+    let mut run_start: Option<usize> = None;
+    let mut c = lo;
+    while c < hi {
+        if frame_rms(pcm, c, c + frame) < threshold {
+            run_start.get_or_insert(c);
+        } else if let Some(rs) = run_start.take() {
+            if c - rs > best_width {
+                best_start = rs;
+                best_width = c - rs;
+            }
+        }
+        c += hop;
+    }
+    // A run still open when the band ends still counts — a pause does not have to close inside the
+    // window to be the right place to cut.
+    if let Some(rs) = run_start {
+        if hi - rs > best_width {
+            best_start = rs;
+            best_width = hi - rs;
+        }
+    }
+    (best_width >= min_pause).then_some(best_start + best_width / 2)
+}
+
 /// Return the sample index within [lo, hi) at the centre of the lowest-energy short frame —
 /// the most silence-like place to cut. Returns `lo` when the range is flat or degenerate.
+///
+/// Kept as the LAST RESORT behind `find_pause_cut`: when a band genuinely contains no pause (continuous
+/// speech, music, noise), something still has to give and the quietest frame is the least-bad choice.
 fn find_quietest_cut(pcm: &[i16], lo: usize, hi: usize, sample_rate: u32) -> usize {
     if hi <= lo {
         return lo;
@@ -650,6 +787,103 @@ mod tests {
         assert!(parts.len() >= 2);
         let cut_ms = samples_to_ms(parts[0].1, sr);
         assert!((cut_ms - 13_000).abs() < 300, "expected the cut at the ~13 s pause, got {cut_ms}ms");
+    }
+
+    /// `len_ms` of tone at `level`, 16 kHz.
+    fn tone(len_ms: u32, level: i16) -> Vec<i16> {
+        vec![level; ms_to_samples(len_ms, 16000)]
+    }
+
+    /// Overwrite [at_ms, at_ms + width_ms) with `level`.
+    fn put(pcm: &mut [i16], at_ms: u32, width_ms: u32, level: i16) {
+        let a = ms_to_samples(at_ms, 16000);
+        let b = (a + ms_to_samples(width_ms, 16000)).min(pcm.len());
+        for s in pcm.iter_mut().take(b).skip(a) {
+            *s = level;
+        }
+    }
+
+    #[test]
+    fn a_wide_pause_beats_a_deeper_but_narrower_dip() {
+        // THE measured defect. The old rule took the single quietest FRAME, so a 30 ms inter-syllable
+        // dip — which can be dead silent — outranked a 400 ms real pause a couple of seconds later.
+        // Across the owner's corpus that put 23 of 143 cuts (16%) into gaps of <=100 ms, and left 39 of
+        // 143 chunks (27%) starting within 30 ms of the next word's onset.
+        //
+        // The dip here is DEEPER than the pause (0 vs 50), so the old quietest-frame rule must prefer
+        // it and the new widest-run rule must not. Anything that merely tied would not discriminate.
+        let sr = 16000;
+        let mut pcm = tone(25_000, 6000);
+        put(&mut pcm, 11_000, 30, 0); // razor-thin, absolutely silent, and WRONG
+        put(&mut pcm, 12_800, 400, 50); // a real breath: quiet, wide, and RIGHT
+
+        let max_samples = ms_to_samples(15_000, sr);
+        let min_samples = ms_to_samples(3_000, sr);
+        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples);
+
+        let cut_ms = samples_to_ms(parts[0].1, sr);
+        assert!(
+            (cut_ms - 13_000).abs() < 250,
+            "the cut must land in the middle of the 400ms pause at ~13s, got {cut_ms}ms \
+             ({}ms means it chose the 30ms dip — the exact defect this replaced)",
+            cut_ms
+        );
+        // Cutting at the CENTRE of the pause, not its edge, is what leaves air on both sides.
+        assert!(cut_ms > 12_800, "a cut at the pause's leading edge clips the outgoing word");
+        assert!(cut_ms < 13_200, "a cut at the pause's trailing edge clips the incoming word");
+    }
+
+    #[test]
+    fn a_chunk_may_run_slightly_long_to_reach_a_real_pause_but_stays_bounded() {
+        // When the cap falls in continuous speech and the nearest real pause is just past it, running a
+        // little long beats cutting between two syllables: a slightly long clip is reviewable, one that
+        // starts 20 ms into a word is not. Measured payoff on the owner's corpus: +3s lifts boundaries
+        // landing on a genuine >=300ms pause from 74% to 85%.
+        let sr = 16000;
+        let mut pcm = tone(30_000, 6000);
+        put(&mut pcm, 16_400, 400, 0); // the only pause, 1.4s PAST the 15s cap
+
+        let max_samples = ms_to_samples(15_000, sr);
+        let min_samples = ms_to_samples(3_000, sr);
+        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples);
+
+        let cut_ms = samples_to_ms(parts[0].1, sr);
+        assert!((cut_ms - 16_600).abs() < 250, "it must reach past the cap to the real pause, got {cut_ms}ms");
+
+        // BOUNDED, and this is the assertion that matters: an unbounded reach would let one bad file
+        // produce a single enormous clip. Every chunk stays inside cap + overrun.
+        let ceiling = cap_with_overrun(max_samples, sr);
+        assert!(
+            parts.iter().all(|(s, e)| e - s <= ceiling),
+            "every chunk must stay within cap+overrun ({}ms); got {:?}",
+            samples_to_ms(ceiling, sr),
+            parts.iter().map(|(s, e)| samples_to_ms(e - s, sr)).collect::<Vec<_>>()
+        );
+        // The invariants the rest of the pipeline depends on survive the overrun.
+        for w in parts.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "chunks must stay contiguous");
+        }
+        assert_eq!(parts.iter().map(|(s, e)| e - s).sum::<usize>(), pcm.len(), "coverage must be total");
+    }
+
+    #[test]
+    fn the_overrun_survives_the_final_cap_pass() {
+        // The easy thing to get wrong: silence_aware_split reaches past the cap for a real pause, and
+        // then the safety re-split in plan_speech_chunks faithfully cuts it back at the bare cap — the
+        // change compiles, every unit test on the splitter passes, and the shipped behaviour is
+        // unchanged. This drives the WHOLE planner and asserts the overrun is still there at the end.
+        let sr = 16000;
+        let mut pcm = tone(30_000, 6000);
+        put(&mut pcm, 16_400, 400, 0);
+        let (chunks, _) = plan_speech_chunks(&pcm, sr, 0.5, 3_000, 15_000).unwrap();
+        let max_samples = ms_to_samples(15_000, sr);
+        assert!(
+            chunks.iter().any(|(s, e)| e - s > max_samples),
+            "a chunk should have run past the cap to reach the pause; lengths were {:?}",
+            chunks.iter().map(|(s, e)| samples_to_ms(e - s, sr)).collect::<Vec<_>>()
+        );
+        let ceiling = cap_with_overrun(max_samples, sr);
+        assert!(chunks.iter().all(|(s, e)| e - s <= ceiling), "...but never past cap+overrun");
     }
 
     #[test]
