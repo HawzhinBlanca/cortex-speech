@@ -33,6 +33,13 @@ use rusqlite::{Connection, OpenFlags};
 /// judge, and reporting a verdict on it would be measuring noise.
 const MIN_HALF_MS: i64 = 1500;
 
+/// One library row, in the only five-plus-one columns this probe reads:
+/// `(id, audio_path, duration_ms, alignment_json, speaker_id, verified)`.
+///
+/// Named rather than repeated inline because it appears in three signatures, and a bare 6-tuple spelled
+/// out in each is how adding `verified` broke two call sites that had nothing to do with the change.
+type SegRow = (String, String, i64, Option<String>, String, i64);
+
 fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.is_empty() || a.len() != b.len() {
         return None;
@@ -86,15 +93,16 @@ fn main() -> Result<(), String> {
         return Err("CAM++ is not present — this probe measures nothing without it".into());
     }
 
-    // Only the four columns this needs, so the probe cannot depend on (or be broken by) the wider schema.
+    // Only the columns this needs (see `SegRow`), so the probe cannot depend on — or be broken by — the
+    // wider schema.
     let mut stmt = conn
         .prepare(
-            "SELECT id, audio_path, duration_ms, alignment_json, COALESCE(speaker_id, '')
+            "SELECT id, audio_path, duration_ms, alignment_json, COALESCE(speaker_id, ''), verified
              FROM speech_segments ORDER BY id",
         )
         .map_err(|e| e.to_string())?;
-    let segments: Vec<(String, String, i64, Option<String>, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+    let segments: Vec<SegRow> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
         .map_err(|e| e.to_string())?
         .filter_map(Result::ok)
         .collect();
@@ -107,7 +115,7 @@ fn main() -> Result<(), String> {
     // Keep each half's embedding, not just the within-clip score. The controls below need them.
     let mut halves: Vec<(String, String, Vec<f32>, Vec<f32>)> = Vec::new();
 
-    for (id, audio_path, duration_ms, alignment_json, speaker) in &segments {
+    for (id, audio_path, duration_ms, alignment_json, speaker, _verified) in &segments {
         if *duration_ms < MIN_HALF_MS * 2 {
             skipped_short += 1;
             continue;
@@ -227,7 +235,7 @@ fn main() -> Result<(), String> {
     );
 
     // ── GROUND TRUTH ──────────────────────────────────────────────────────────
-    report_against_ground_truth(&within, &sims);
+    report_against_ground_truth(&within, &sims, &segments);
     Ok(())
 }
 
@@ -264,7 +272,11 @@ const GROUND_TRUTH: &[(&str, &str, f32)] = &[
 /// classifies the labelled set perfectly; the midpoint is simply the most robust choice within it.
 const SPEAKER_CHANGE_THRESHOLD: f32 = 0.59;
 
-fn report_against_ground_truth(within: &[f32], sims: &[(String, f32, i64)]) {
+fn report_against_ground_truth(within: &[f32], sims: &[(String, f32, i64)], segments: &[SegRow]) {
+    // (stored speaker label, still awaiting review) for a measured clip.
+    let meta = |id: &str| {
+        segments.iter().find(|s| s.0 == id).map_or(("?", false), |(_, _, _, _, spk, ver)| (spk.as_str(), *ver == 0))
+    };
     let multi_max = GROUND_TRUTH.iter().filter(|(_, a, _)| *a == "multi").map(|(_, _, s)| *s).fold(f32::MIN, f32::max);
     let single_min = GROUND_TRUTH.iter().filter(|(_, a, _)| *a != "multi").map(|(_, _, s)| *s).fold(f32::MAX, f32::min);
     println!("\nGROUND TRUTH (owner's blind listening pass, {} clips)", GROUND_TRUTH.len());
@@ -293,7 +305,28 @@ fn report_against_ground_truth(within: &[f32], sims: &[(String, f32, i64)]) {
     println!("(Turn-taking only. Overlap is a separate, unmeasured problem this cannot see.)");
     let mut worst = sims.to_vec();
     worst.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    println!("\nlowest within-clip similarity:");
+
+    // EVERY flagged clip, not a top-10 sample. The owner asked which clips these are so he knows before
+    // opening one, and a truncated list cannot answer that. `speaker` is printed alongside because it is
+    // the field this measurement contradicts: a clip holding a turn between two people still carries one
+    // authoritative SPEAKER_xx in the DB and in every export column.
+    // CSV-ish and greppable on purpose — this output is the deliverable, not a debug aid.
+    println!("\nflagged clips (cosine < {SPEAKER_CHANGE_THRESHOLD}) — id,cosine,seconds,storedSpeaker,pending");
+    for (id, sim, dur) in worst.iter().filter(|(_, s, _)| *s < SPEAKER_CHANGE_THRESHOLD) {
+        let (speaker, pending) = meta(id);
+        println!(
+            "  {id},{sim:.4},{:.1},{speaker},{}",
+            *dur as f64 / 1000.0,
+            if pending { "pending" } else { "reviewed" }
+        );
+    }
+
+    // The pending count is the number that decides whether this is worth acting on: a flagged clip the
+    // owner has already reviewed cost him the friction once and is done.
+    let pending_flagged = worst.iter().filter(|(id, s, _)| *s < SPEAKER_CHANGE_THRESHOLD && meta(id).1).count();
+    println!("\nof those, still awaiting review: {pending_flagged}");
+
+    println!("\nlowest within-clip similarity (including clips ABOVE the threshold, for context):");
     for (id, sim, dur) in worst.iter().take(10) {
         println!("  {id}  cosine {sim:.4}  {:.1}s", *dur as f64 / 1000.0);
     }
@@ -306,11 +339,7 @@ fn report_against_ground_truth(within: &[f32], sims: &[(String, f32, i64)]) {
 /// uninformative answer: if they all hold two speakers that is equally consistent with the signal
 /// working and with the corpus being full of two-speaker clips at every similarity. Five from the
 /// bottom, five around the median and five from the top makes the two outcomes distinguishable.
-fn export_listening_set(
-    dir: &str,
-    sims: &[(String, f32, i64)],
-    segments: &[(String, String, i64, Option<String>, String)],
-) -> Result<(), String> {
+fn export_listening_set(dir: &str, sims: &[(String, f32, i64)], segments: &[SegRow]) -> Result<(), String> {
     let dir = std::path::Path::new(dir);
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 
@@ -334,7 +363,7 @@ fn export_listening_set(
 
     let mut manifest = Vec::new();
     for (rank, (id, sim, dur), band) in &picks {
-        let Some((_, audio_path, _, alignment_json, speaker)) = segments.iter().find(|s| &s.0 == id) else {
+        let Some((_, audio_path, _, alignment_json, speaker, _)) = segments.iter().find(|s| &s.0 == id) else {
             continue;
         };
         let (rate, pcm) = audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
