@@ -62,6 +62,7 @@
     "queued": "Queued — it will send when you are back online",
     "audioMissing": "This clip's audio will not play, so there is nothing to judge. Skip it — the owner will be told.",
     "skip": "Skip this clip",
+    "speakerChange": "more than one speaker",
     "stillSending": "{n} decision(s) have not been sent yet. Keep this page open until they go through.",
     "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
     "editHint": "Listen, and correct the text if needed"
@@ -86,6 +87,7 @@
     "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
     "audioMissing": "دەنگی ئەم پارچەیە لێ نادرێت، بۆیە شتێک نییە بڕیاری لەسەر بدرێت. تێیپەڕێنە — خاوەنەکە ئاگادار دەکرێتەوە.",
     "skip": "تێپەڕاندنی ئەم پارچەیە",
+    "speakerChange": "زیاتر لە یەک قسەکەر",
     "stillSending": "{n} بڕیار هێشتا نەنێردراون. ئەم پەڕەیە کراوە بهێڵەوە تا دەنێردرێن.",
     "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
     "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
@@ -110,6 +112,7 @@
     "queued": null,
     "audioMissing": null,
     "skip": null,
+    "speakerChange": null,
     "stillSending": null,
     "refused": null,
     "editHint": "review.editHint"
@@ -201,6 +204,9 @@
   .transport button { flex: 1; padding: 9px 6px; font-size: 13px; font-weight: 600; }
   .transport button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent-line); color: #f1f5f9; }
   #warn { font-size: 12px; color: var(--warn); text-align: center; }
+  /* Rides on the dim meta line but in the warning colour: it has to survive a glance, because it is
+     information the reviewer needs BEFORE they tap, not after. */
+  .flag { color: var(--warn); }
   textarea { width: 100%; min-height: 34dvh; background: var(--bg); color: var(--ink);
              border: 1px solid var(--line); border-radius: 10px; padding: 12px;
              font-size: var(--tsize); line-height: 1.9; direction: rtl; }
@@ -633,6 +639,18 @@
     // A saved draft is a correction the reviewer already typed; it must win over the server's copy.
     $('text').value = localStorage.getItem(draftKey(seg.id)) ?? seg.text;
     $('meta').textContent = (seg.durationMs / 1000).toFixed(1) + 's' + (seg.speakerId ? ' · ' + seg.speakerId : '');
+    // A clip that spans a turn between two people carries ONE speaker label like any other — chunks are
+    // cut on silence and labelled afterwards — so without this the reviewer meets it as ordinary work
+    // and "Looks good" walks two voices into a single-speaker corpus. Absent field = not measured, and
+    // then nothing is shown: silence here never claims "one speaker".
+    // Appended as a NODE, not innerHTML: speakerId is owner-editable text and this page must not
+    // interpret library content as markup.
+    if (seg.speakerChange) {
+      const flag = document.createElement('span');
+      flag.className = 'flag';
+      flag.textContent = ' · ⚠ ' + t('speakerChange');
+      $('meta').appendChild(flag);
+    }
     prefetchNext();
     // ONE TAP PER CLIP (R2.2). Deciding a clip is the reviewer saying "next", so the next clip should
     // simply start — otherwise every clip costs two taps, a decision and then a reach for the player's

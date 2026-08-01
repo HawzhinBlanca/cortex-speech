@@ -42,6 +42,9 @@ UNREVIEWED_SORANI = {
     "stillSending",
     "audioMissing",
     "skip",
+    # v47 speaker-change badge. New Sorani, NOT yet natively reviewed — it goes on the owner's list
+    # with the other seven.
+    "speakerChange",
 }
 
 

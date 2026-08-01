@@ -1317,6 +1317,29 @@ pub static MIGRATIONS: &[Migration] = &[
              CREATE INDEX IF NOT EXISTS idx_spot_checks_reviewer ON spot_checks(reviewer);",
         ),
     },
+    Migration {
+        version: 47,
+        description: "Within-clip speaker-change score, so a clip holding two speakers can be flagged",
+        // Chunk boundaries are planned by SILENCE alone and the speaker label is attached to the whole
+        // chunk afterwards — so a clip spanning a turn between two people still carries exactly one
+        // authoritative SPEAKER_xx, in the DB and in every export column. 17 of the owner's 144 clips
+        // are like that (`src/bin/speaker_change_probe.rs`, calibrated against his own blind listening
+        // pass). Until now that measurement lived only in the probe's console output: nothing on the
+        // row said so, so a reviewer meeting one on the phone had no way to know before accepting it.
+        //
+        // The SCORE is stored, not a boolean, for the same reason `snr_db` and `clipping_ratio` are
+        // numbers: the threshold is a calibration that can be re-derived, and a stored verdict would
+        // freeze today's 0.59 into the data. Readers compare against
+        // `diarization::SPEAKER_CHANGE_THRESHOLD`, which is where the calibration is documented.
+        //
+        // NULL = NOT MEASURED, and that distinction matters: it must never read as "measured, one
+        // speaker". Every pre-v47 row is NULL, and so is every future import — the import path does
+        // not run this measurement (two extra CAM++ embeddings per chunk), it is filled by the probe.
+        //
+        // Nullable REAL is STRICT-compatible, and ADD COLUMN fires no FK cascade, so no FK-off window.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN speaker_change_score REAL;",
+        down_sql: Some("ALTER TABLE speech_segments DROP COLUMN speaker_change_score;"),
+    },
 ];
 
 #[cfg(test)]

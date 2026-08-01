@@ -1040,6 +1040,19 @@ fn review_text(seg: &SpeechSegment) -> String {
     seg.annotated_transcript.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| seg.raw_transcript.clone())
 }
 
+/// Was this clip MEASURED to span a turn between two people? (Migration v47.)
+///
+/// The reviewer needs this before they decide, not after. Chunks are cut on silence and labelled
+/// afterwards, so a clip holding two speakers still shows exactly one `SPEAKER_xx` — the phone would
+/// otherwise present a two-speaker clip as ordinary work, and "Looks good" would walk it into a
+/// single-speaker corpus with an authoritative-looking wrong label attached.
+///
+/// `None` (not measured) is FALSE here, and the page shows nothing rather than "one speaker". Absence
+/// of a measurement is not evidence of a single speaker, and the badge never claims it is.
+fn holds_a_speaker_change(seg: &SpeechSegment) -> bool {
+    seg.speaker_change_score.is_some_and(|s| (s as f32) < crate::diarization::SPEAKER_CHANGE_THRESHOLD)
+}
+
 /// Pending (unverified) clips, oldest first — the same "work that needs doing" the desktop queue leads
 /// with — MINUS anything another reviewer currently holds, and leased to this reviewer on the way out.
 ///
@@ -1073,6 +1086,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
             "text": review_text(s),
             "durationMs": s.duration_ms,
             "speakerId": s.speaker_id,
+            "speakerChange": holds_a_speaker_change(s),
         }));
     }
     // Drop leases that expired while their holder was away, so the map cannot grow without bound across
@@ -1121,6 +1135,10 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                             "text": seg.raw_transcript,
                             "durationMs": seg.duration_ms,
                             "speakerId": seg.speaker_id,
+                            // Computed exactly as for work clips. A spot check that carried this
+                            // field differently would be spottable, and a reviewer who can spot the
+                            // test is not being tested.
+                            "speakerChange": holds_a_speaker_change(&seg),
                         }),
                     );
                 }
@@ -2199,6 +2217,48 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(payload["items"].as_array().unwrap().is_empty(), "nothing is free for a third reviewer");
         assert_eq!(payload["heldByOthers"], total, "but all {total} pending clips are reported as held");
+    }
+
+    #[test]
+    fn a_clip_measured_to_hold_two_speakers_says_so_before_the_reviewer_decides() {
+        // 17 of the owner's 144 clips span a turn between two people, and every one of them carries a
+        // single authoritative SPEAKER_xx like any other clip — chunks are cut on silence and labelled
+        // afterwards. Without this the phone presents them as ordinary work and "Looks good" walks two
+        // voices into a single-speaker corpus.
+        //
+        // Three rows, because the interesting part is the THIRD: NULL must not read as "one speaker".
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("mixed", "دەق")).unwrap();
+        db.insert_segment(&seg("solo", "دەق")).unwrap();
+        db.insert_segment(&seg("unmeasured", "دەق")).unwrap();
+        // Real values from the probe's own calibration set: 0.4121 is a clip the owner HEARD as
+        // turn-taking, 0.7530 one he heard as a single speaker.
+        db.set_speaker_change_score("mixed", 0.4121).unwrap();
+        db.set_speaker_change_score("solo", 0.7530).unwrap();
+
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state());
+        assert_eq!(code, 200);
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let flag = |id: &str| {
+            payload["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|it| it["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is missing from the queue"))["speakerChange"]
+                .clone()
+        };
+        assert_eq!(flag("mixed"), serde_json::Value::Bool(true), "a measured speaker change must reach the phone");
+        assert_eq!(flag("solo"), serde_json::Value::Bool(false), "a single-speaker clip must not be flagged");
+        // The honesty case: nothing measured this clip, so the page shows nothing. It must NOT be
+        // reported as a clip verified to hold one speaker.
+        assert_eq!(
+            flag("unmeasured"),
+            serde_json::Value::Bool(false),
+            "an unmeasured clip is not flagged — and the badge is the only thing this field drives, so \
+             it also never claims 'one speaker'"
+        );
     }
 
     #[test]

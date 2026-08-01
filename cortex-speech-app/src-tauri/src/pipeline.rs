@@ -2064,6 +2064,12 @@ impl ProcessingPipeline {
                 // v43: a freshly imported clip has had no human decision, so it has no reviewer to
                 // attribute. `record_human_decision_by` fills this in when someone actually decides it.
                 reviewed_by: None,
+                // v47: NOT measured at import, and None says exactly that. Answering it here costs two
+                // extra CAM++ embeddings per chunk on top of the diarization pass, and the calibration
+                // that reads it (0.59) was derived on ~14 s clips — applying it to whatever length the
+                // planner emits would be a threshold used outside the range it was measured on.
+                // `src/bin/speaker_change_probe.rs --persist` fills it for the whole library at once.
+                speaker_change_score: None,
             });
         }
 

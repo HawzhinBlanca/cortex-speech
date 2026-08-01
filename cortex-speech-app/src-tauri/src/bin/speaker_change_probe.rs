@@ -22,11 +22,17 @@
 //! embedding, and CAM++ has no way to report "both". This finds turn-taking within a clip, which is the
 //! common case; true cross-talk needs an overlap-aware segmentation model (pyannote powerset).
 //!
-//! READ-ONLY. Opens the library with SQLITE_OPEN_READ_ONLY. Safe to run while the app is up.
+//! READ-ONLY BY DEFAULT. Opens the library with SQLITE_OPEN_READ_ONLY, so it is safe to run while the
+//! app is up. `--persist` additionally opens a SECOND, read-write connection at the end and stores each
+//! measured score in `speech_segments.speaker_change_score` (Migration v47) — which is what turns this
+//! from a console printout into a flag the phone reviewer actually sees before deciding. Run that form
+//! with the app stopped, so the library has one writer.
 //!
-//! Usage: speaker_change_probe [<db_path>] [--export <dir>]
+//! Usage: speaker_change_probe [<db_path>] [--export <dir>] [--persist]
 
-use cortex_speech_app_lib::{audio, chunking, diarization::SpeakerEmbeddingService, models};
+use cortex_speech_app_lib::db::Database;
+use cortex_speech_app_lib::diarization::{SpeakerEmbeddingService, SPEAKER_CHANGE_THRESHOLD};
+use cortex_speech_app_lib::{audio, chunking, models};
 use rusqlite::{Connection, OpenFlags};
 
 /// CAM++ needs enough audio for a stable embedding; half of a clip shorter than this is too little to
@@ -61,6 +67,7 @@ fn main() -> Result<(), String> {
     // first and then tries to open a database called "--export".
     let args: Vec<String> = std::env::args().skip(1).collect();
     let export_dir = args.iter().position(|a| a == "--export").and_then(|i| args.get(i + 1).cloned());
+    let persist = args.iter().any(|a| a == "--persist");
     let db_path = args
         .iter()
         .enumerate()
@@ -157,6 +164,10 @@ fn main() -> Result<(), String> {
     println!("measured:            {}", sims.len());
     println!("skipped (too short): {skipped_short}");
     println!("skipped (audio):     {skipped_audio}");
+
+    if persist {
+        persist_scores(&db_path, &sims)?;
+    }
 
     // ── THE CONTROLS ──────────────────────────────────────────────────────────
     // An absolute cosine number means nothing on its own. A first pass of this probe reported "100% of
@@ -267,10 +278,36 @@ const GROUND_TRUTH: &[(&str, &str, f32)] = &[
     ("0ca5fea3", "one", 0.845),
 ];
 
-/// Midpoint of the empty gap in the ground truth: every turn-taking clip scored ≤ 0.428 and every
-/// single-speaker clip ≥ 0.753. Nothing landed between them, so any threshold in that 0.325-wide band
-/// classifies the labelled set perfectly; the midpoint is simply the most robust choice within it.
-const SPEAKER_CHANGE_THRESHOLD: f32 = 0.59;
+// SPEAKER_CHANGE_THRESHOLD is imported from `diarization`, not restated here. It used to be declared
+// in both places — two copies of one calibration that had to agree, with nothing making them. The doc
+// comment on the real one carries the derivation from the ground truth above.
+
+/// Store every MEASURED score, so the flag lives on the row instead of in this console output.
+///
+/// EVERY measured clip, not just the ones below the threshold. Writing only the flagged ones would
+/// leave NULL meaning two different things — "not measured" and "measured, one speaker" — and the
+/// phone's badge decides what to show from exactly that distinction.
+///
+/// A SECOND connection, deliberately: the measuring one above is read-only and stays that way. This
+/// one is opened only when `--persist` was asked for, and only after all the measuring is done.
+///
+/// `Database::open` does NOT run migrations (`initialize` does), so on a library that predates v47 the
+/// UPDATE fails with "no such column" instead of a side tool quietly migrating the owner's schema.
+///
+/// ponytail: 144 individual UPDATEs, no transaction. An interruption leaves fewer rows flagged, never
+/// a wrong one — and the fix is to run it again.
+fn persist_scores(db_path: &str, sims: &[(String, f32, i64)]) -> Result<(), String> {
+    let db = Database::open(db_path).map_err(|e| format!("open {db_path} read-write: {e}"))?;
+    let mut written = 0usize;
+    for (id, sim, _) in sims {
+        db.set_speaker_change_score(id, *sim as f64)
+            .map_err(|e| format!("persist {id} (is the library at Migration v47?): {e}"))?;
+        written += 1;
+    }
+    let flagged = sims.iter().filter(|(_, s, _)| *s < SPEAKER_CHANGE_THRESHOLD).count();
+    println!("\npersisted:           {written} scores ({flagged} below {SPEAKER_CHANGE_THRESHOLD}, i.e. flagged)");
+    Ok(())
+}
 
 fn report_against_ground_truth(within: &[f32], sims: &[(String, f32, i64)], segments: &[SegRow]) {
     // (stored speaker label, still awaiting review) for a measured clip.

@@ -63,6 +63,49 @@ fn per_segment_processing_provenance_round_trips_and_stays_unknown_for_legacy_ro
 }
 
 #[test]
+fn the_speaker_change_measurement_survives_every_write_that_is_not_about_it() {
+    // Migration v47. The score is measured by a whole-library pass that takes minutes; anything that
+    // silently drops it costs that pass again, and nothing would say so — the clip just stops being
+    // flagged and goes back to looking like ordinary work on the phone.
+    //
+    // So `speaker_change_score` is deliberately ABSENT from `insert_segment`'s column list: that path's
+    // ON CONFLICT DO UPDATE would otherwise write the caller's `None` over a real measurement on every
+    // ordinary edit. It IS in `insert_segment_full`, which runs as a fresh INSERT after a delete and
+    // must be lossless. This pins both halves of that asymmetry.
+    let db = make_db();
+    let seg = make_segment("sc-keep", "/a.wav");
+    db.insert_segment(&seg).unwrap();
+    assert_eq!(
+        db.get_segment_by_id("sc-keep").unwrap().unwrap().speaker_change_score,
+        None,
+        "an unmeasured clip is NULL — not measured, never a fabricated 'one speaker'"
+    );
+
+    db.set_speaker_change_score("sc-keep", 0.4121).unwrap();
+    assert_eq!(db.get_segment_by_id("sc-keep").unwrap().unwrap().speaker_change_score, Some(0.4121));
+
+    // The edit path re-upserts the row it read BEFORE the measurement landed — the ordinary case, since
+    // nothing outside the probe carries this field.
+    db.insert_segment(&seg).unwrap();
+    assert_eq!(
+        db.get_segment_by_id("sc-keep").unwrap().unwrap().speaker_change_score,
+        Some(0.4121),
+        "an ordinary edit-path upsert must not wipe the measurement it knows nothing about"
+    );
+
+    // ...and the restore path carries it, with a DIFFERENT value so a positional column swap cannot
+    // pass by coincidence.
+    let mut restored = make_segment("sc-restore", "/b.wav");
+    restored.speaker_change_score = Some(0.7530);
+    db.insert_segment_full(&restored).unwrap();
+    assert_eq!(
+        db.get_segment_by_id("sc-restore").unwrap().unwrap().speaker_change_score,
+        Some(0.7530),
+        "insert_segment_full is the lossless restore path and must persist the score"
+    );
+}
+
+#[test]
 fn insert_segment_rejects_unc_audio_path_ntlm_leak_guard() {
     // P1.1: validate_segment is the shared DB write boundary for merge_dataset_json AND every insert
     // path, so a UNC/network audio_path must be rejected here — otherwise a renderer-planted

@@ -408,6 +408,37 @@ mod tests {
     }
 
     #[test]
+    fn undoing_a_delete_brings_back_the_speaker_change_flag_with_the_clip() {
+        // A restore runs as a FRESH insert (the row was physically removed), so every column
+        // `insert_segment_full` omits silently reverts to its schema default. For
+        // `speaker_change_score` that default is NULL — which the phone reads as "not measured" and
+        // shows no badge for. So a delete+undo would quietly UN-FLAG a two-speaker clip and hand it
+        // back to the queue looking like ordinary work, with no error anywhere.
+        //
+        // Measuring it again costs a full CAM++ pass over the whole library, and nothing would tell
+        // the owner it was needed.
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        let mut seg = make_segment("mx1", "دەق");
+        // 0.4121: a clip the owner heard as turn-taking in the blind listening pass.
+        seg.speaker_change_score = Some(0.4121);
+        db.insert_segment_full(&seg).unwrap();
+
+        let snapshot = db.get_segment_by_id("mx1").unwrap().unwrap();
+        assert_eq!(snapshot.speaker_change_score, Some(0.4121), "the score is stored before the delete");
+        db.delete_segment("mx1").unwrap();
+        history.push(Command::DeleteSegments { segments: vec![snapshot] });
+        history.undo(&db).unwrap();
+
+        let restored = db.get_segment_by_id("mx1").unwrap().expect("the clip comes back");
+        assert_eq!(
+            restored.speaker_change_score,
+            Some(0.4121),
+            "restoring a clip must restore the measurement that flags it as holding two speakers"
+        );
+    }
+
+    #[test]
     fn redo_of_unsupported_batch_transcribe_keeps_the_command() {
         let db = setup_db();
         let history = HistoryManager::new(100);

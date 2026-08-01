@@ -71,6 +71,15 @@ pub struct SpeechSegment {
     /// desktop (one human, no token to name them). Written in the same transaction as the verdict by
     /// `record_human_decision_by`, and cleared by `clear_human_decision` along with the decision itself.
     pub reviewed_by: Option<String>,
+    // ── Speaker-change measurement (Migration v47) ─────────────────
+    /// Cosine similarity between CAM++ embeddings of this clip's FIRST and SECOND half. Low means the
+    /// two halves are different people, i.e. the clip spans a turn — which `speaker_id` cannot express,
+    /// since one label is attached to the whole chunk however many people are in it.
+    ///
+    /// `None` = NOT MEASURED, never "measured, one speaker": every pre-v47 row and every import (the
+    /// import path does not run it). Filled by `src/bin/speaker_change_probe.rs --persist`. Compare
+    /// against [`crate::diarization::SPEAKER_CHANGE_THRESHOLD`], where the calibration is documented.
+    pub speaker_change_score: Option<f64>,
 }
 
 /// One reviewer's measured throughput, from the append-only `review_events` trail (Migration v45).
@@ -280,7 +289,7 @@ const SEGMENT_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript
                     agent_confidence, escalated, human_decision, corrected_at, is_gold,
                     alignment_quality, model_version_id, confidence_source, cloud_call,
                     decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
-                    reviewed_by";
+                    reviewed_by, speaker_change_score";
 
 /// Reject structurally-invalid segments at the DB write boundary, before they can
 /// corrupt the downstream split/stats/training-grade math that every later stage
@@ -577,10 +586,10 @@ impl Database {
                  verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
                  human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
                  confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
-                 reviewed_by, updated_at)
+                 reviewed_by, speaker_change_score, updated_at)
              VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                  ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                 COALESCE(?28, 'unknown@pre-registry'), COALESCE(?29, 'unknown'), ?30, ?31, ?32, ?33, ?34, ?35, ?36, datetime('now'))
+                 COALESCE(?28, 'unknown@pre-registry'), COALESCE(?29, 'unknown'), ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, datetime('now'))
              ON CONFLICT(id) DO UPDATE SET
                 created_at=excluded.created_at,
                 audio_path=excluded.audio_path,
@@ -617,6 +626,7 @@ impl Database {
                 diarized=excluded.diarized,
                 vad_backend=excluded.vad_backend,
                 reviewed_by=excluded.reviewed_by,
+                speaker_change_score=excluded.speaker_change_score,
                 updated_at=datetime('now')",
             params![
                 seg.id,
@@ -655,6 +665,10 @@ impl Database {
                 seg.diarized.map(|b| b as i32),
                 seg.vad_backend,
                 seg.reviewed_by,
+                // Restoring a deleted clip must bring its measurement back with it. A fresh INSERT
+                // takes the schema default for anything omitted, so leaving this out would silently
+                // un-flag a two-speaker clip the moment it was deleted and undone.
+                seg.speaker_change_score,
             ],
         )?;
         self.track_write()?;
@@ -2326,6 +2340,23 @@ impl Database {
         Ok(())
     }
 
+    /// Record the within-clip speaker-change measurement (Migration v47).
+    ///
+    /// Writes ONE column. Nothing here may touch the transcript, the verdict or the human decision:
+    /// this is a measurement about the audio, and the tool that produces it runs over the whole
+    /// library at once — a wider write would put every reviewed row in its blast radius.
+    ///
+    /// `updated_at` is deliberately NOT bumped. It means "when did this row's CONTENT last change",
+    /// and re-running a measurement changes nothing a reviewer or an export would read differently.
+    pub fn set_speaker_change_score(&self, segment_id: &str, score: f64) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE speech_segments SET speaker_change_score = ?2 WHERE id = ?1",
+            params![segment_id, score],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
     /// Read a column that an older schema may lack (the jury cols were added by Migration v11 and
     /// alignment_quality by v12). A genuinely ABSENT column (`InvalidColumnIndex`, i.e. a row read
     /// through a pre-migration schema) yields `None`, and a SQL `NULL` yields `None` — both the
@@ -2389,6 +2420,9 @@ impl Database {
             // Reviewer attribution — Migration v43; nullable TEXT. None = not attributed (legacy row,
             // undecided row, or a desktop decision), never a fabricated "owner".
             reviewed_by: Self::optional_col(row, 35)?,
+            // Speaker-change score — Migration v47; nullable REAL. None (absent/NULL) means NOT
+            // MEASURED and must never be read as "measured, one speaker".
+            speaker_change_score: Self::optional_col(row, 36)?,
         })
     }
 
