@@ -47,6 +47,15 @@ SRC_TAURI = APP / "src-tauri"
 MANIFEST = SRC_TAURI / "Cargo.toml"
 EXE = SRC_TAURI / "target" / "release" / "cortex-speech-app.exe"
 
+# real_audio.rs's helpers return an EMPTY set when this is unset (discover_real_audio_files ->
+# Vec::new(), and one test returns early printing "set CORTEX_REAL_AUDIO_DIR"), so the
+# ignored-real-model leg reported "21 passed" while TWELVE of those tests asserted nothing. Measured
+# 2026-08-02: pointing it at the committed fixtures drops that to nine, turning decode-any-format,
+# single-file decode and the pipeline import test into real assertions. The rest need formats the repo
+# does not carry (flac/mov/mp4, the gold podcast) or their own env vars, and stay honestly skipped.
+# setdefault, not assignment: an owner with a richer audio directory keeps theirs.
+os.environ.setdefault("CORTEX_REAL_AUDIO_DIR", str(SRC_TAURI / "tests" / "fixtures"))
+
 # License the project publishes its *redistributable* dataset bundles under.
 # Changing this is a deliberate, reviewed act: it governs the contamination gate.
 EXPORT_LICENSE = "CC-BY-4.0"
@@ -406,6 +415,14 @@ def _probe_real_e2e():
 # Every place a model can legitimately live, mirroring models.rs::model_root_candidates.
 _MODEL_ROOTS = [SRC_TAURI / "models", SRC_TAURI / "target" / "release" / "models"]
 
+def _probe_bench():
+    if not (SRC_TAURI / "benches").is_dir():
+        return "criterion bench targets missing"
+    if not (APP / "docs" / "bench_baseline.json").exists():
+        return "no committed baseline - run `python scripts/bench_gate.py --update --runs 3` with the app running"
+    return None
+
+
 def _probe_ipc_harness(extra=None):
     """Shared probe for the IPC e2e harnesses: the exe, the committed fixture, and any extra model.
 
@@ -537,6 +554,7 @@ GATES = [
     ("lint-js", 1, "cmd", "npm run lint", APP, None, "eslint"),
     ("clippy", 1, "cmd", f'cargo clippy --manifest-path "{MANIFEST}" --all-targets -- -D warnings', REPO_ROOT, None, "Engineering rigor: clippy -D warnings"),
     ("fmt-check", 1, "cmd", f'cargo fmt --manifest-path "{MANIFEST}" --all -- --check', REPO_ROOT, None, "rustfmt"),
+    ("model-integrity", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "fetch_models.py"}" --check', APP, None, "Model integrity: SHA-256 of every PINNED model file. fetch_models.py calls --check 'the CI/dev integrity gate' in its own docstring and nothing ran it - a swapped or truncated model still LOADS and decodes to wrong graphemes, which is the silent-corruption class the runtime pin in asr.rs exists for. Offline, so it is a tier-1 gate, not env-dependent."),
     ("test-frontend", 1, "cmd", "npm test", APP, None, "vitest"),
     ("test-rust", 1, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4', REPO_ROOT, None, "Sorani goldens, wer-vs-jiwer, holdout hash, ONNX manifest, proof-metadata"),
     ("audit", 1, "cmd", "npm audit --omit=dev", APP, None, "npm supply chain"),
@@ -559,6 +577,7 @@ GATES = [
     ("constrained-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_constrained_ipc.cjs"}"', APP, _probe_ipc_harness, "transcribe_segment_constrained on the real exe: non-blank Kurdish, no Latin leak"),
     ("finetuned-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_finetuned_ipc.cjs"}"', APP, lambda: _probe_ipc_harness("finetuned-mms-ckb"), "transcribe_segment_finetuned resolves + loads + decodes the embedded champion model"),
     ("heartbeat-runtime", 3, "cmd", f'node "{APP / "scripts" / "heartbeat_probe.cjs"}"', APP, _probe_ipc_harness, "Main-thread safety PROVEN AT RUNTIME: get_settings latency while slow commands run concurrently. The static test_command_main_thread_policy/test_ui_thread_blocking_audit pin the source shape; this measures the actual UI responsiveness they exist to protect."),
+    ("bench-budget", 3, "cmd", f'"{sys.executable}" "{APP / "scripts" / "bench_gate.py"}"', APP, _probe_bench, "Criterion wall-clock regression budget against a COMMITTED baseline (docs/bench_baseline.json). The charter asks for this via github-action-benchmark on every PR; that CI clause is NOT satisfied here and stays open - this enforces the budget on the reference machine, where the charter's latency numbers are defined. Per-bench thresholds derived from measured run-to-run noise, and benches too noisy to gate are NAMED every run rather than given a pass-anything limit."),
     ("jobs-runtime", 3, "cmd", f'node "{APP / "scripts" / "jobs_probe.cjs"}"', APP, _probe_exe, "Durable Job Supervisor at runtime: a REAL export_dataset run is recorded in get_jobs and reaches 'succeeded' - the run_tracked bracketing proven end to end, not only in unit tests."),
 ]
 
