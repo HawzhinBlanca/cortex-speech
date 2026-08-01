@@ -391,8 +391,15 @@ def _probe_exe():
 def _probe_real_e2e():
     if not EXE.exists():
         return "release exe missing - run `make build-app`"
-    if not os.environ.get("CORTEX_AUDIO"):
-        return "set CORTEX_AUDIO=<absolute wav path> to drive the real app"
+    # This used to skip whenever CORTEX_AUDIO was unset, which made the leg the registration below
+    # calls "THE daily-use reliability gate" the easiest one in the suite to not run: a sweep came
+    # back "22 PASS, 0 FAIL" with it reported SKIP-ENV. The harness now defaults to the committed
+    # FLEURS ckb fixture, so the only honest reason left to skip is that fixture being absent.
+    # CORTEX_AUDIO still overrides it, and the harness prints whichever path it used.
+    if os.environ.get("CORTEX_AUDIO"):
+        return None
+    if not (SRC_TAURI / "tests" / "fixtures" / "fleurs_ckb_sample.wav").exists():
+        return "committed audio fixture missing - set CORTEX_AUDIO=<absolute wav path> instead"
     return None
 
 

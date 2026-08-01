@@ -6,7 +6,8 @@
  * transcript) and a run.jsonl export that feeds scripts/build_review_page.py.
  *
  * Environment:
- *   CORTEX_AUDIO       (required) absolute path to a real audio file to import
+ *   CORTEX_AUDIO       (optional) absolute path to a real audio file to import; default: the
+ *                       committed FLEURS ckb fixture, so this gate runs instead of skipping
  *   CORTEX_APP_EXE     (optional) path to cortex-speech-app.exe; default: repo release build
  *   CORTEX_APP_DATA_DIR (optional) app profile dir for THIS RUN; default: a fresh disposable temp
  *                       dir. The owner's real %APPDATA%\cortex-speech profile is REFUSED — a
@@ -34,7 +35,14 @@ const os = require('os');
 const REPO = __dirname;
 const APP_EXE = process.env.CORTEX_APP_EXE
   || path.join(REPO, 'src-tauri', 'target', 'release', 'cortex-speech-app.exe');
-const AUDIO = process.env.CORTEX_AUDIO;
+// Defaults to the committed FLEURS ckb fixture — real Kurdish speech, attribution beside it in
+// tests/fixtures/ATTRIBUTION.md, and the same file the RTF gate measures on. Requiring the env var
+// made THE daily-use reliability gate report SKIP-ENV whenever an operator forgot it, which is
+// precisely when you most want it to have run: verify-10 came back "22 PASS, 0 FAIL" with this leg
+// silently not executed. Set CORTEX_AUDIO to drive it with your own audio instead; either way the
+// path actually used is printed before the import.
+const DEFAULT_AUDIO = path.join(REPO, 'src-tauri', 'tests', 'fixtures', 'fleurs_ckb_sample.wav');
+const AUDIO = process.env.CORTEX_AUDIO || DEFAULT_AUDIO;
 const OUT_DIR = process.env.CORTEX_OUT || REPO;
 const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9222';
 const LOCALE = process.env.CORTEX_LOCALE === 'ckb' ? 'ckb' : 'en';
@@ -136,8 +144,11 @@ console.error = tee(console.error.bind(console), 'ERR');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function die(msg) { console.error('PRECONDITION FAILED: ' + msg); process.exit(1); }
 
-if (!AUDIO) die('CORTEX_AUDIO is required (absolute path to a real audio file).');
-if (!fs.existsSync(AUDIO)) die('CORTEX_AUDIO does not exist: ' + AUDIO);
+if (!fs.existsSync(AUDIO)) {
+  die(process.env.CORTEX_AUDIO
+    ? 'CORTEX_AUDIO does not exist: ' + AUDIO
+    : 'the committed fixture is missing: ' + AUDIO + ' (set CORTEX_AUDIO to a real audio file instead).');
+}
 if (!fs.existsSync(APP_EXE)) die('App exe not found: ' + APP_EXE + ' (build it or set CORTEX_APP_EXE).');
 
 // Kill ONLY the process tree we spawned (never `taskkill /IM` by image name, which would also kill
