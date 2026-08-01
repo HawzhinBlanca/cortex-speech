@@ -2155,7 +2155,12 @@ impl Database {
             "SELECT audio_path, model_id, audio_content_hash, audio_size_bytes, transcript_path, transcript_text, created_at
              FROM source_transcripts
              WHERE audio_path = ?1
-             ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC",
+             -- model_id breaks the tie, and the tie is the COMMON case: both timestamps have
+             -- one-second granularity, and two reference transcripts for the same clip are written
+             -- back to back. Without it SQLite is free to return them in any order, which made
+             -- everything downstream of this list per-run nondeterministic — including the
+             -- `multi-reference-consensus:a+b` provenance string that gets persisted and exported.
+             ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC, model_id ASC",
         )?;
         let rows = stmt.query_map(params![audio_path], |row| {
             Ok(SourceTranscriptRecord {

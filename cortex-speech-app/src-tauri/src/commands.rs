@@ -3046,7 +3046,22 @@ fn reference_selection_for_segment(
 
     // ── Full consensus: all references commit and agree on the same transcript ──
     if reference_reports_have_commit_consensus(&reports) {
-        let model_ids = reports.iter().filter_map(|report| report.reference_model_id.as_deref()).collect::<Vec<_>>();
+        // SORTED, because this names a SET of models that agreed and a set has no order. It is
+        // persisted on the row and shipped in exports as `referenceModelId`, so an unstable
+        // rendering would make two identical decisions store two different strings: a corpus diff
+        // shows changes nobody made, and any grouping or count by this value splits one category
+        // into two. Caught by the suite failing on `flash+pro` where a previous run gave
+        // `pro+flash` — same code, different SQLite tie-break, so it had never been the ordering
+        // anyone chose.
+        //
+        // The ROOT-CAUSE fix is the `model_id ASC` tiebreaker in `get_source_transcripts_for_audio`,
+        // and that is measured rather than assumed: with neither change the reversed-order test
+        // fails; with the tiebreaker alone both pass; the sort alone was not isolated because the
+        // tiebreaker already covers it. This line stays anyway — the string names a set, so its
+        // canonical form must not depend on why some query happened to order its rows.
+        let mut model_ids =
+            reports.iter().filter_map(|report| report.reference_model_id.as_deref()).collect::<Vec<_>>();
+        model_ids.sort_unstable();
         best.reference_model_id = Some(format!("multi-reference-consensus:{}", model_ids.join("+")));
         best.confidence = reports.iter().map(|report| report.confidence).fold(best.confidence, f64::min);
         best.selected_score = reports.iter().map(|report| report.selected_score).fold(best.selected_score, f64::min);
@@ -4119,6 +4134,41 @@ mod tests {
         assert!(fresh3.escalated, "the segment stays in the human queue");
     }
 
+    /// The provenance string must not depend on the order the references were written.
+    ///
+    /// `agreeing_source_references_preserve_per_model_evidence` below caught the defect by LUCK: it
+    /// asserts one exact string, and the suite happened to fail on the run where SQLite returned the
+    /// two same-second rows the other way round. Passing it five times proves nothing, because
+    /// nothing in the test controls that tie. This one does: same two models, INSERTED IN THE
+    /// OPPOSITE ORDER, must produce the identical canonical value — which cannot hold unless the
+    /// join is sorted, whatever the query hands back.
+    #[test]
+    fn the_consensus_provenance_string_is_canonical_not_insertion_ordered() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio_path = real_source_audio(&dir, "reference-order.wav", 4000);
+        let mut segment = test_segment("seg-reference-order", &audio_path, "wrong local consensus");
+        segment.alignment_json = Some(whole_file_alignment(4000));
+        db.insert_segment(&segment).unwrap();
+        insert_hypothesis(&db, &segment.id, "omniasr-wsl-7b", "correct reference phrase", 0.99);
+        insert_hypothesis(&db, &segment.id, "omniasr-ctc-1b", "wrong local consensus", 0.98);
+        // FLASH FIRST — the reverse of the sibling test.
+        insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-flash", "correct reference phrase");
+        insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-pro", "correct reference phrase");
+
+        run_jury_pipeline_core(&db, &settings_act_confirm(), vec![segment.id.clone()]).unwrap();
+        let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+        let evidence: serde_json::Value =
+            serde_json::from_str(fresh.evidence_json.as_deref().expect("reference evidence json")).unwrap();
+        assert_eq!(
+            evidence.get("referenceModelId").and_then(serde_json::Value::as_str),
+            Some("multi-reference-consensus:gemini-2.5-flash+gemini-2.5-pro"),
+            "the same set of agreeing models must render identically however they were written — a \
+             string that changes between identical runs is not provenance"
+        );
+    }
+
     #[test]
     fn agreeing_source_references_preserve_per_model_evidence() {
         let db = crate::db::Database::open(":memory:").unwrap();
@@ -4141,9 +4191,13 @@ mod tests {
         assert_eq!(fresh.verdict_transcript.as_deref(), Some("correct reference phrase"));
         let evidence: serde_json::Value =
             serde_json::from_str(fresh.evidence_json.as_deref().expect("reference evidence json")).unwrap();
+        // CANONICAL (sorted), not insertion order. This assertion is what caught the defect: the
+        // same binary produced `pro+flash` on one run and `flash+pro` on another, because the two
+        // references are written in the same second and the ORDER BY had no tiebreaker. A provenance
+        // string that changes between identical runs is not provenance.
         assert_eq!(
             evidence.get("referenceModelId").and_then(serde_json::Value::as_str),
-            Some("multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash")
+            Some("multi-reference-consensus:gemini-2.5-flash+gemini-2.5-pro")
         );
         let agreement = evidence.get("referenceAgreement").and_then(serde_json::Value::as_array).unwrap();
         assert_eq!(agreement.len(), 2);
