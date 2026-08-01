@@ -44,34 +44,52 @@ APP = Path(__file__).resolve().parents[1]
 MANIFEST = APP / "src-tauri" / "Cargo.toml"
 BASELINE = APP / "docs" / "bench_baseline.json"
 
-# The charter's number, and the FLOOR for every bench — never the whole story.
+# The charter's number, kept here as the STANDARD — not as anything this machine can enforce.
 #
-# Measured 2026-08-02 on the reference machine, 3 runs of 12 benches, APP RUNNING (the condition a
-# verify-10 sweep is in — see the docstring for why that matters): run-to-run spread was min 1.5%,
-# median 5.6%, MAX 61.3%. For reference the same measurement with the app stopped gave max 25.9%, so
-# roughly half this noise is the app itself, and the gate has to live with it because that is when it
-# runs. A flat 5% budget would fire on that noise nearly every sweep — and a gate that cries wolf gets
-# muted, which is worse than no gate at all.
+# Measured 2026-08-02 on the reference machine, APP RUNNING (the condition a verify-10 sweep is in —
+# see the docstring for why that matters), 5 runs of 12 benches: spread min 4.2%, median 9.2%,
+# max 34.5%. The same 12 benches over only 3 runs read median 5.6%, and over 3 runs with the app
+# STOPPED read median 5.8% / max 25.9% — three numbers for one machine, which is the whole lesson:
+# the spread you measure depends on how many samples you take and what else is running, and the
+# smaller, quieter measurement is the flattering one.
 #
-# So the threshold is per-bench: the charter's 5% where the machine really is that quiet — measured,
-# exactly ONE of the twelve — and 2x the measured spread everywhere else. That honours the budget
-# wherever the hardware permits and states the real number where it does not, instead of applying 5%
-# everywhere and calling the resulting flakes "known". The gate PRINTS the split on every run, so
-# these numbers cannot drift away from what is actually enforced.
+# A flat 5% budget is inside that noise for every bench here, so it would fire on a healthy machine
+# most sweeps. A gate that cries wolf gets muted, which is worse than no gate. The thresholds below
+# are therefore derived per-bench from measured noise, and the gate PRINTS the tightest one it is
+# actually enforcing on every run — so this comment can never quietly drift away from the truth.
 BUDGET = 0.05
-NOISE_MULTIPLIER = 2.0
+# 3x, not 2x, and a 10% floor — both bought with a failure rather than reasoned in advance.
+#
+# The first version used 2x the spread from a 3-run calibration and produced a 1.088x limit for
+# diff/identical_100_words. That bench then measured 1.0897x inside a sweep and FAILED, minutes after
+# measuring 1.09x standalone and passing. Nothing had changed but which other legs had just run. A
+# limit that a healthy machine lands on either side of is a coin flip, not a budget.
+#
+# The error was statistical: max-minus-min over THREE samples is a low estimate of a distribution's
+# spread, and multiplying a low estimate by two keeps it low. More samples (calibrate with --runs 5)
+# and a wider multiplier both push against that, and MIN_THRESHOLD stops the arithmetic ever producing
+# a limit tighter than this machine can actually resolve.
+NOISE_MULTIPLIER = 3.0
 
-# Past this, a "threshold" stops being a budget. Measured app-up, 11 of 12 benches derive a limit of
-# 1.49x or tighter; ONE - audio/waveform_decode_16000_samples, the shortest at ~71us - needs 2.23x,
-# because at that duration scheduler jitter dominates the measurement. Giving it a 2.23x pass-anything
-# limit would let a genuine 2x regression through while LOOKING gated, which is the exact dishonesty
-# this file exists to avoid. So it is reported as NOT ENFORCEABLE, by name, on every single run.
+# No bench is gated tighter than this, whatever the arithmetic says. Which means: the charter's 5% is
+# NOT enforced on any bench here, and pretending otherwise is what the previous version did. On this
+# hardware, with the app running as it is during a sweep, 5% is inside the noise for every one of the
+# twelve. The number is kept as BUDGET above so the gap between what the charter asks and what this
+# machine can measure stays visible instead of being quietly redefined.
+MIN_THRESHOLD = 1.10
+
+# Past this, a "threshold" stops being a budget. On the 5-run app-up calibration, 10 of 12 benches
+# derive a limit of 1.49x or tighter; TWO do not — audio/waveform_decode_16000_samples (the shortest,
+# ~67us, where scheduler jitter dominates) and diff/identical_1000_words. Handing those a 2.04x or
+# 1.67x limit would let a genuine 2x regression through while LOOKING gated, which is the exact
+# dishonesty this file exists to avoid. They are reported as NOT ENFORCED, by name and with their
+# noise figure, on every single run.
 MAX_THRESHOLD = 1.50
 
 
 def threshold_for(name: str, spread: dict[str, float]) -> float | None:
     """Allowed ratio before `name` counts as a regression, or None when the noise makes it unenforceable."""
-    limit = max(1.0 + BUDGET, 1.0 + NOISE_MULTIPLIER * spread.get(name, 0.0))
+    limit = max(MIN_THRESHOLD, 1.0 + NOISE_MULTIPLIER * spread.get(name, 0.0))
     return None if limit > MAX_THRESHOLD else limit
 
 # `cargo bench -- --output-format bencher` emits: "test <name> ... bench:  1234 ns/iter (+/- 56)"
@@ -203,12 +221,13 @@ def main() -> int:
             print(f"  - {n}: {b:,} -> {now:,} ns ({ratio:.2f}x, limit {limit:.2f}x)")
         return 1
     limits = {n: threshold_for(n, base_spread) for n in ref}
-    tight = sum(1 for v in limits.values() if v is not None and v <= 1 + BUDGET + 1e-9)
     gated = sum(1 for v in limits.values() if v is not None)
+    tightest = min((v for v in limits.values() if v is not None), default=float("nan"))
     print(
         f"BENCH GATE: OK - {gated}/{len(ref)} benchmarks gated and within budget "
-        f"({tight} at the charter's {BUDGET:.0%}, the rest at 2x their measured noise; "
-        f"{len(unenforceable)} too noisy on this machine to gate and named above)",
+        f"(tightest limit {tightest:.2f}x; the charter's {BUDGET:.0%} is inside this machine's noise "
+        f"for ALL of them, so none is gated at it; {len(unenforceable)} too noisy to gate at all, "
+        f"named above)",
         flush=True,
     )
     return 0
