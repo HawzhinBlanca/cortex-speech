@@ -371,10 +371,29 @@ fn load_session(data_dir: &Path, db_path: &str) -> Option<RememberedSession> {
     (!out.is_empty()).then_some((out, saved.spot_checks.into_iter().collect()))
 }
 
+/// The port [`start`] and [`resume`] bind: [`COUCH_PORT`], unless `CORTEX_COUCH_PORT` overrides it.
+///
+/// Same reason `start_on_port` exists, one layer further out. That was added so a Rust test could
+/// drive `start()`'s real wiring without binding 8737 while the owner's own Couch Review holds it.
+/// An END-TO-END harness has the identical problem and cannot reach `start_on_port` at all: it goes
+/// through the `start_couch_review` IPC command, which calls this. Without the override, the only
+/// way to test the review path over real HTTP is to shut down the owner's server first — so the
+/// project's most reviewer-facing surface stayed the one with no end-to-end coverage.
+///
+/// Read at start time, not cached: an unparseable or 0 value falls back to the default rather than
+/// failing, because an env var must never be able to stop the owner's phone link from coming up.
+fn configured_port() -> u16 {
+    std::env::var("CORTEX_COUCH_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(COUCH_PORT)
+}
+
 /// Start the couch server for `reviewers` (idempotent: returns the existing session if already running,
 /// WITHOUT re-tokenizing — a running session's links must not be invalidated by a status refresh).
 pub fn start(db_path: String, reviewers: Vec<String>, data_dir: Option<PathBuf>) -> Result<CouchStatus, String> {
-    start_on_port(db_path, reviewers, COUCH_PORT, data_dir)
+    start_on_port(db_path, reviewers, configured_port(), data_dir)
 }
 
 /// Bring back the session the owner last started, if the app was closed without pressing Stop.
@@ -384,7 +403,8 @@ pub fn start(db_path: String, reviewers: Vec<String>, data_dir: Option<PathBuf>)
 /// for a fresh URL. Returns None when there is nothing remembered, which is the normal first-run and
 /// post-Stop state.
 pub fn resume(db_path: String, data_dir: &Path) -> Option<CouchStatus> {
-    resume_on_port(db_path, data_dir, COUCH_PORT)
+    // Same port `start` would use, or the remembered link would come back on a different one.
+    resume_on_port(db_path, data_dir, configured_port())
 }
 
 /// `resume` with the port injected, for the same reason `start_on_port` exists: the resurrection a

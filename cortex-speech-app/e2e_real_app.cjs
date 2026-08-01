@@ -45,6 +45,8 @@ const DEFAULT_AUDIO = path.join(REPO, 'src-tauri', 'tests', 'fixtures', 'fleurs_
 const AUDIO = process.env.CORTEX_AUDIO || DEFAULT_AUDIO;
 const OUT_DIR = process.env.CORTEX_OUT || REPO;
 const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9222';
+// Deliberately NOT the real 8737 — see the spawn env below.
+const COUCH_PORT = Number(process.env.CORTEX_COUCH_PORT || 18737);
 const LOCALE = process.env.CORTEX_LOCALE === 'ckb' ? 'ckb' : 'en';
 // Clearing the DB is OPT-IN (default: keep the existing library). A verification run must never be
 // able to erase the owner's real %APPDATA% library by simply being run — the old opt-out default did.
@@ -212,6 +214,9 @@ async function run() {
       CORTEX_APP_DATA_DIR: DATA_DIR,
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${DEBUG_PORT}`,
       WEBVIEW2_USER_DATA_FOLDER: WEBVIEW2_DIR,
+      // Never 8737: this run must not fight the owner's own Couch Review for the port, and must
+      // never be mistaken for it by a phone that still has the real link open.
+      CORTEX_COUCH_PORT: String(COUCH_PORT),
     },
     cwd: path.dirname(APP_EXE), shell: false, detached: false,
   });
@@ -328,6 +333,8 @@ async function run() {
     throw new Error(`ASR never resolved past the placeholder ${JSON.stringify(rawText)} (7B did not complete) -- refusing to report a placeholder as success.`);
   }
 
+  await reviewOverHttp(page, rawText);
+
   dumpRunManifest();
 
   console.log('==> Closing app...');
@@ -339,6 +346,111 @@ async function run() {
   console.log(`  REAL-DATA RUN OK: ${segCount} segments; first transcript ${rawText.length} chars`);
   console.log('  Next: python scripts/build_review_page.py --manifest run.jsonl --out review.html --embed-audio');
   console.log('=================================================');
+}
+
+/**
+ * Couch Review, over real HTTP, end to end.
+ *
+ * WHY THIS IS HERE. Couch Review is how clips actually get reviewed — multi-reviewer tokens, DPAPI
+ * at rest, leases, spot checks, an offline outbox and a 68 KB phone page — and every test it had
+ * called `api_queue` / `api_decision` as Rust FUNCTIONS. Nothing started the real binary, bound a
+ * real port, claimed a token over the wire, streamed audio bytes, submitted a decision, and read the
+ * library back. The most reviewer-facing surface in the app was the one with no end-to-end coverage.
+ *
+ * It rides in this harness rather than a second one so it inherits what is already hard-won here:
+ * the disposable profile with its refusal to touch the real %APPDATA% library, the WebView2
+ * isolation, and the retrying cleanup. One app, one profile, one place that knows how to kill it.
+ *
+ * Everything below is asserted against the LIBRARY, never against a 200. A server can answer 200 and
+ * persist nothing.
+ */
+async function reviewOverHttp(page, draftText) {
+  console.log('==> Couch Review over real HTTP...');
+  const base = `http://127.0.0.1:${COUCH_PORT}`;
+  const REVIEWER = 'E2E Harness';
+
+  const status = await page.evaluate(
+    (r) => window.__TAURI_INTERNALS__.invoke('start_couch_review', { reviewers: [r] }),
+    REVIEWER,
+  );
+  if (!status || !status.running || !status.reviewers || !status.reviewers.length) {
+    throw new Error('start_couch_review did not return a running session: ' + JSON.stringify(status));
+  }
+  // The token rides in the URL FRAGMENT (#t=...) precisely so it never reaches a server in a request
+  // line; the page POSTs it once to /api/claim and lives on the HttpOnly cookie after that. Drive the
+  // same path a phone does — the ?t= legacy form would skip the half most reviewers actually use.
+  const token = (status.reviewers[0].url.split('#t=')[1] || '').trim();
+  if (!token) throw new Error('no token in the reviewer URL: ' + status.reviewers[0].url);
+  // NEVER print the token: it is a live credential for the review server.
+  console.log(`   session up for ${JSON.stringify(status.reviewers[0].name)} on port ${COUCH_PORT}`);
+
+  const claim = await fetch(`${base}/api/claim`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
+  if (claim.status !== 200) throw new Error(`POST /api/claim -> ${claim.status}, expected 200`);
+  const cookie = (claim.headers.getSetCookie() || []).map((c) => c.split(';')[0]).join('; ');
+  if (!cookie) throw new Error('/api/claim returned no Set-Cookie — the phone would have nothing to ride on');
+
+  const queueRes = await fetch(`${base}/api/queue`, { headers: { cookie } });
+  if (queueRes.status !== 200) throw new Error(`GET /api/queue -> ${queueRes.status}, expected 200`);
+  const queue = await queueRes.json();
+  const item = (queue.items || [])[0];
+  if (!item) throw new Error('the queue served no clips, so nothing here was actually reviewed');
+  // The fields the page renders from. A missing one is a blank line on someone's phone.
+  for (const key of ['id', 'text', 'durationMs', 'speakerChange']) {
+    if (!(key in item)) throw new Error(`queue item is missing ${key}: ${JSON.stringify(item)}`);
+  }
+  if (queue.reviewer !== REVIEWER) {
+    throw new Error(`queue says the reviewer is ${JSON.stringify(queue.reviewer)}, not ${JSON.stringify(REVIEWER)}`);
+  }
+  console.log(`   queue: ${queue.items.length} item(s), pendingTotal ${queue.pendingTotal}`);
+
+  // Audio is the whole point of reviewing: a reviewer who cannot hear the clip cannot judge it.
+  const audio = await fetch(`${base}/api/audio/${encodeURIComponent(item.id)}`, { headers: { cookie } });
+  if (audio.status !== 200) throw new Error(`GET /api/audio -> ${audio.status}, expected 200`);
+  const bytes = Buffer.from(await audio.arrayBuffer());
+  if (bytes.length < 1024 || bytes.subarray(0, 4).toString('latin1') !== 'RIFF') {
+    throw new Error(`/api/audio served ${bytes.length} bytes starting ${JSON.stringify(bytes.subarray(0, 4).toString('latin1'))} — not a WAV`);
+  }
+  console.log(`   audio: ${bytes.length} bytes, RIFF header present`);
+
+  // An unauthenticated request must NOT be served. Checking this here rather than trusting the unit
+  // test means the check runs against the real listener, headers and all.
+  const naked = await fetch(`${base}/api/queue`);
+  if (naked.status === 200) throw new Error('GET /api/queue with NO credential returned 200 — the token gate is open');
+
+  const corrected = draftText + ' ✔';
+  const decision = await fetch(`${base}/api/decision`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ id: item.id, action: 'edit', text: corrected }),
+  });
+  if (decision.status !== 200) {
+    throw new Error(`POST /api/decision -> ${decision.status} ${await decision.text()}, expected 200`);
+  }
+
+  // THE assertion: the library, not the response. Read through the app's own IPC so this sees what
+  // the desktop would show, not a hand-rolled query that could agree with a broken write.
+  const rows = await page.evaluate((id) => window.__TAURI_INTERNALS__.invoke('get_segments', { verified: null })
+    .then((all) => all.filter((s) => s.id === id)), item.id);
+  const row = rows[0];
+  if (!row) throw new Error(`segment ${item.id} vanished from the library after the decision`);
+  if (row.annotatedTranscript !== corrected) {
+    throw new Error(`the correction did not persist: stored ${JSON.stringify(row.annotatedTranscript)}, sent ${JSON.stringify(corrected)}`);
+  }
+  if (!row.verified) throw new Error('a decided clip must leave the review queue (verified stayed false)');
+  if (row.reviewedBy !== REVIEWER) {
+    throw new Error(`decision attributed to ${JSON.stringify(row.reviewedBy)}, expected ${JSON.stringify(REVIEWER)}`);
+  }
+  console.log(`   decision persisted: verified=${row.verified}, reviewedBy=${JSON.stringify(row.reviewedBy)}`);
+
+  await page.evaluate(() => window.__TAURI_INTERNALS__.invoke('stop_couch_review'));
+  // Stopped means STOPPED — a listener left bound would outlive this run and hold the port.
+  const afterStop = await fetch(`${base}/api/queue`, { headers: { cookie } }).then(() => true, () => false);
+  if (afterStop) throw new Error('the server still answered after stop_couch_review');
+  console.log('   server stopped and the port released');
 }
 
 run().catch((err) => {
