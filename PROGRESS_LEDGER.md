@@ -3842,3 +3842,64 @@ reviewer link stayed up for the whole iteration.
 
 **Gates (unmasked).** `node --check` **0**. `npm run test:python-policies` **0** — 45/45. Real-app e2e
 **exit 0 ×3**, each with the disposable profile removed.
+
+## Iteration 230 — the aligner was installed, loaded, and structurally unreachable
+
+Target (1) of the new loop, and it is a **live** defect rather than a latent one: `auto_align` is `true`
+in the owner's settings, so `enqueue_background_alignments` runs on every import.
+
+**The chain, each link measured rather than assumed.** That method spawns a detached `move` thread which
+never captures `self`, so the model root was never in scope — and the path was wired to a free
+`aligner::align()` helper that returned `fallback_align` **unconditionally** and had no channel to report
+`AlignmentQuality` at all. Its call site therefore hardcoded `EnergyHeuristic`.
+
+**The fail-before is the owner's own library:**
+
+| `alignment_quality` | segments |
+|---|---|
+| `energy_heuristic` | **129** |
+| `ctc_forced` | 15 |
+
+The 15 came from the FOREGROUND path (`Pipeline::align` ← `commands/transcribe.rs`), which proves forced
+alignment works on this exact machine, models and corpus. So ~90% of the library carried heuristic word
+timings — and `quality.rs` raises a review-risk reason on exactly `energy_heuristic`, so those clips
+carried a **false risk flag** on top.
+
+**A correction to my own earlier claim.** When I first read this I said `ForcedAligner::align` might have
+NO production caller. It does — `pipeline.rs:3369`, reached from `commands/transcribe.rs:201`. Only the
+BACKGROUND path was bypassing it. Stated here because that claim went to the owner before it was checked.
+
+**The fix.** Resolve the model root before the spawn (that absence is *why* the stub was used), build ONE
+`ForcedAligner` above the per-file loop, and persist the quality the aligner actually achieved. Building
+once matters: `new` loads a ~365 MB ONNX session, so the per-call construction `Pipeline::align` can
+afford for a single clip would make a whole import unusable. `MAX_ALIGN_SECS` is 600 and the owner's
+clips are 10–15 s, so they are well inside the CTC path — verified before claiming the fix helps. A
+missing model is still not an error: `new` succeeds with no session and `align` reports
+`EnergyHeuristic` honestly, which is the correct answer when nothing better exists.
+
+**Both free stubs deleted** rather than left as "convenience wrappers":
+* `align()` — fallback-only, one caller, no quality channel.
+* `score_consistency()` — returned the constant `-5.0` with **zero** callers, one `use` away from being
+  persisted to `ctc_score` as a fake acoustic score. Under this repo's honesty law that is the worst kind
+  of dead code: a fabricated metric waiting for a caller.
+
+**Proofs.**
+* New real-model test pins the MODEL-PRESENT case, which nothing covered — `aligner.rs` pinned only the
+  no-model negative: `[aligner-gate] 2 words, quality=ctc_forced`, `1 passed`, 1.85s.
+* New policy gate (`test_background_alignment_policy.py`) bites on the pre-fix source, and it exists
+  because **nothing in the Rust suite can** — the persist happens inside a spawned thread in a private
+  method: `AssertionError: background alignment calls the free aligner::align() helper, which ignores any
+  loaded model and can only ever produce the energy heuristic` (exit 1 → 0, restored byte-clean).
+
+**Gates (unmasked).** `cargo test --lib` **0** — 1107 passed, 0 failed, 7 ignored. `cargo clippy
+--all-targets --all-features -D warnings` **0**. `cargo fmt --check` **0**. `npm run test:python-policies`
+**0** — **46/46** (was 45; the runner auto-discovers `scripts/test_*.py`).
+
+**Cost of a mis-ordered rebuild, recorded so it stops recurring.** I rebuilt while the changes were still
+uncommitted: the exe bakes HEAD's SHA, so the following commit would have made a perfectly good exe read
+as "NOT HEAD" and turned verify-10 RED. The recipe is fixed and now in memory: **`cargo fmt` → commit →
+bundled rebuild**, with ledger/STATUS commits after (they are not source surfaces, and the gate forgives
+HEAD advancing via non-source commits). Cost one extra stop-app/build/relaunch cycle.
+
+**NOT done, and it is the owner's call:** the 129 already-stamped segments keep their heuristic timings.
+Re-aligning existing rows rewrites his library; the fix only changes what happens from here.
