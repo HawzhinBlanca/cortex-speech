@@ -118,8 +118,14 @@ def test_e2e_profile_cleanup_is_guarded_and_keeps_evidence_on_failure() -> None:
     rm_lines = [ln for ln in code if "rmSync" in ln]
     if rm_lines != ["fs.rmSync(target, { recursive: true, force: true });"]:
         raise AssertionError(
-            "Recursive delete must appear exactly once, inside cleanupProfile. Found: " f"{rm_lines}"
+            "Recursive delete must appear exactly once, inside removeDisposableProfile. Found: " f"{rm_lines}"
         )
+    # It lives in a SHARED helper because two callers need it with different retry policies:
+    # cleanupProfile waits out Windows' asynchronous handle release, while die() fires before
+    # anything is spawned and has nothing to wait for. That second caller is what first tried to add
+    # its own `fs.rmSync` with its own copy of the guards, and this gate caught it. Pinning the
+    # helper's existence stops the next person re-inlining either one.
+    assert_contains(e2e, "function removeDisposableProfile()", E2E.name)
     assert_contains(e2e, "const DATA_DIR_IS_OURS = !process.env.CORTEX_APP_DATA_DIR;", E2E.name)
     assert_contains(e2e, "if (!DATA_DIR_IS_OURS) return;", E2E.name)
     # Must refuse anything that is not strictly BELOW the temp root (equality included, or a bare

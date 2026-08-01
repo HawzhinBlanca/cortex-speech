@@ -89,7 +89,11 @@ def test_every_writer_start_checks_restore_pending() -> None:
     # raised on every run instead of checking anything, which is a broken gate, not a strict one. Keep
     # it exact: a loose `"start_on_port(" in couch` would pass even if `start` grew a real body, which
     # is precisely the bypass this check exists to catch.
-    if "start_on_port(db_path, reviewers, COUCH_PORT, data_dir)" not in couch:
+    # `configured_port()` replaced the bare `COUCH_PORT` when CORTEX_COUCH_PORT was added so an
+    # end-to-end harness could drive the real server without fighting the owner's own for 8737. The
+    # literal is updated to the new body EXACTLY, which is what the note below instructs — `start` is
+    # still a one-line delegate and the guard still lives inside `start_on_port`, under the lock.
+    if "start_on_port(db_path, reviewers, configured_port(), data_dir)" not in couch:
         raise AssertionError(
             "couch::start must delegate to start_on_port so the guarded path is the only way in; if it "
             "grew its own body, this gate is checking a function the app no longer calls. (If you "
@@ -97,7 +101,10 @@ def test_every_writer_start_checks_restore_pending() -> None:
         )
     # `resume` is the OTHER way into a running server — it is what the app calls at launch, unattended,
     # every time the watchdog relaunches. It must reach the guarded function by the same delegate route.
-    if "resume_on_port(db_path, data_dir, COUCH_PORT)" not in couch:
+    # Same `configured_port()` change, and it MUST be the same on both: a resume that came back on a
+    # different port than `start` binds would resurrect the session at a URL the owner's bookmark
+    # does not point at.
+    if "resume_on_port(db_path, data_dir, configured_port())" not in couch:
         raise AssertionError(
             "couch::resume must delegate to resume_on_port, which must reach start_on_port — otherwise "
             "the automatic launch path could start a writer without the restore guard."

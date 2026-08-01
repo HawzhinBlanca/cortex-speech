@@ -108,7 +108,13 @@ const DATA_DIR_IS_OURS = !process.env.CORTEX_APP_DATA_DIR;
 // msedgewebview2 children have actually let go — so an immediate delete gets EPERM on the directory
 // itself. Measured 2026-08-01: a single rmSync straight after killApp failed every time, and the leak it
 // was written to fix stayed exactly as it was (34 dirs -> 35). Retry to a deadline instead.
-async function cleanupProfile() {
+// THE ONE recursive delete in this file, inseparable from its three guards. It is a function rather
+// than inline code because two callers need it with DIFFERENT retry policies — cleanupProfile has to
+// wait out Windows' asynchronous handle release, die() has nothing to wait for — and the alternative
+// was a second `fs.rmSync` with its own copy of the guards. `test_real_data_runner_policy.py` pins
+// that there is exactly one; two delete sites means two places to get the guards right.
+// Throws on failure; the caller decides whether that is worth retrying.
+function removeDisposableProfile() {
   if (!DATA_DIR_IS_OURS) return;
   const root = path.resolve(os.tmpdir());
   const target = path.resolve(DATA_DIR);
@@ -116,16 +122,20 @@ async function cleanupProfile() {
     console.log(`==> Leaving ${target} in place (outside the temp root — refusing to remove it).`);
     return;
   }
+  fs.rmSync(target, { recursive: true, force: true });
+  console.log(`==> Removed the disposable profile ${target}`);
+}
+
+async function cleanupProfile() {
   const deadline = Date.now() + 15000;
   for (;;) {
     try {
-      fs.rmSync(target, { recursive: true, force: true });
-      console.log(`==> Removed the disposable profile ${target}`);
+      removeDisposableProfile();
       return;
     } catch (e) {
       if (Date.now() >= deadline) {
         // Non-fatal: a leaked temp directory must never turn a passing verification run into a failure.
-        console.log(`==> Could not remove the disposable profile ${target}: ${e.message}`);
+        console.log(`==> Could not remove the disposable profile: ${e.message}`);
         return;
       }
       await sleep(500);
@@ -152,9 +162,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // failing to tidy up must never change the exit code the caller is being told about.
 function die(msg) {
   console.error('PRECONDITION FAILED: ' + msg);
-  if (DATA_DIR_IS_OURS && path.resolve(DATA_DIR).startsWith(path.resolve(os.tmpdir()) + path.sep)) {
-    try { fs.rmSync(DATA_DIR, { recursive: true, force: true }); } catch { /* not worth a second error */ }
-  }
+  // Through the SHARED remover, never a second delete of its own: the guards live in one place.
+  // No retry — nothing has been spawned, so no handle is held open to wait for.
+  try { removeDisposableProfile(); } catch { /* tidying up must not mask the precondition above */ }
   process.exit(1);
 }
 
