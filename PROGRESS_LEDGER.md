@@ -4231,3 +4231,156 @@ freshness OK at HEAD; claim **200**, queue **200**, items 29, `pendingTotal` 112
 
 **One owner-gated item closes.** The 17 mixed-speaker clips, the R5 hour, Tailscale, the admin script,
 the 8 Sorani strings, the two verdict decisions and the charter fuzz edit all remain.
+
+## Iteration 237 — the 17 mixed-speaker clips flagged, where the decision is made
+
+Owner instruction: flag them. They were a number in a console printout; nothing on the row said so, and
+nothing the reviewer sees said so.
+
+**Re-measured first, read-only, with the app up.** 17 / 144 (11.8%), 13 still pending — identical to the
+figure from before iteration 236's re-alignment, and the five ground-truth "multi" clips came back at
+their recorded cosines (0.3054 / 0.4121 / 0.4149 / 0.4268 / 0.4275 against 0.305 / 0.412 / 0.415 / 0.427
+/ 0.428). That is an independent second confirmation that the re-align moved no clip boundaries.
+
+**The fail-before is the finding, and it was live rather than staged.** The server was asked for the
+batch it is actually serving:
+
+```
+items 29   keys: durationMs, id, speakerId, text        <- no speakerChange, on any item
+4 of the 13 pending flagged clips were IN that batch
+```
+
+A reviewer opening the link today meets four two-speaker clips presented as ordinary work, each carrying
+one authoritative `SPEAKER_xx` — because chunks are cut on SILENCE and the label is attached to the whole
+chunk afterwards, however many people are in it. "Looks good" walks two voices into a single-speaker
+corpus with a confident wrong label.
+
+**After, on the same live queue:**
+
+| | |
+|---|---|
+| item keys | + `speakerChange` |
+| flagged in the served batch | **4** — `420f9c07`, `47f438a1`, `492f59a8`, `4aa82a8b` |
+| clips whose text / duration / speakerId changed | **0** |
+| `pendingTotal` | 112 → 112 |
+| library | 144 measured, **17 flagged, 13 pending** |
+
+**Migration v47 stores the SCORE, not a verdict.** Same reason `snr_db` and `clipping_ratio` are numbers:
+0.59 is a calibration derived from the owner's blind listening pass and can be re-derived, while a stored
+boolean would freeze today's threshold into the data. Readers compare against
+`diarization::SPEAKER_CHANGE_THRESHOLD` — which the probe had been redefining locally, two copies of one
+number that had to agree with nothing making them; it now imports the one whose doc comment carries the
+derivation.
+
+**NULL means NOT MEASURED and never "measured, one speaker."** Every pre-v47 row is NULL and so is every
+future import — the import path does not run this (two extra CAM++ embeddings per chunk, and the 0.59
+calibration was measured on ~14 s clips, so applying it to whatever length the planner emits would be a
+threshold used outside its measured range). The phone draws nothing for NULL. Absence of a measurement is
+not evidence of a single speaker, and the badge never implies it is; that is the third page test.
+
+**Two write paths, deliberately opposite:**
+* `insert_segment` does NOT carry the column — its upsert would write a caller's `None` over a real
+  measurement on every ordinary edit.
+* `insert_segment_full` DOES — a restore after delete runs as a fresh INSERT, so omitting it would
+  silently un-flag a two-speaker clip on delete+undo, and re-measuring costs a full library pass nobody
+  would know to run.
+
+**Fail-before, both guards broken at once:** all three Rust tests failed (exit 101) — the phone got
+`Bool(false)` for a measured clip, and the restore path came back `None`. Restored byte-identically
+(`git diff --numstat` unchanged).
+
+**Persisted with the app UP, and that is a departure from iteration 236 worth stating.** The re-align
+rewrote `alignment_json`, a column the app itself writes, so it stopped the app. This writes one column
+nothing else writes, `Database::open` sets `busy_timeout=10000`, and stopping the app would have cost 6.5
+minutes of review-server downtime for no gain. A backup-API snapshot was taken anyway.
+
+### The badge is DOM, so a Rust test cannot see it
+
+`tests/couch_page_speaker_change_badge.test.ts` runs the REAL `couch.html` — the same bytes `include_str!`
+embeds — in jsdom and calls the page's own `show()`. Fail-before: `if (false && seg.speakerChange)` fails
+the badge assertion (exit 1); the file restored byte-identically.
+
+Two designs were tried and rejected first, and the comment in the test says so: vitest's ambient jsdom
+does not execute injected scripts, and eval'ing the source instead scopes the page's top-level
+`let queue` to the eval — leaving `show()` reading a queue nothing can assign. A real window running it
+as a classic script is the only form that runs the page rather than a copy of it.
+
+### The first sweep came back INCOMPLETE, and the tool was right
+
+`real-app-e2e` — described in its own registration as *"THE daily-use reliability gate: real exe, real
+audio, real transcript"* — reported `SKIP-ENV`, and the verdict was **INCOMPLETE, 22 PASS, 0 FAIL, 1
+skipped**, with "Green cannot be claimed." My fault, not the gate's: it needs `CORTEX_AUDIO`, and I ran
+the sweep without it. Worth recording precisely because the shape of the output invites the wrong read —
+"22 PASS, 0 FAIL" looks like success, and only the verdict line says otherwise. It said otherwise.
+
+Re-run against the committed FLEURS ckb fixture: **REAL-DATA RUN OK: 1 segments; first transcript 77
+chars**, disposable profile removed. The leg passes; it was never broken, only unasked.
+
+### Second finding: the staleness gate could not see the review page
+
+`check_exe_freshness.py` watched `src` and `src-tauri/src`. Three assets are COMPILED IN and were on
+neither list: `assets/couch.html` (68 KB of reviewer-facing behaviour, its Sorani strings included),
+`assets/couch-icon.png`, `migrations/001_initial.sql`.
+
+Caught live and unforced, on this working tree:
+
+```
+before:  EXE FRESHNESS GATE: OK (exe at HEAD 3708f1b…, newer than all sources)      exit 0
+         ...while couch.html sat 15 minutes newer than the binary
+after:   STALE EXE: source src-tauri\assets\couch.html is newer than the built exe  exit 1
+```
+
+Editing a Sorani string on the review page would have shipped a silently stale exe. `scripts/` needs no
+rebuild, so this cost nothing but the rebuild the widened gate then correctly demanded.
+
+### And a native crash that must not be filed as "flaky" on one sighting
+
+Sweep 2 came back **RED**. `test-rust` aborted:
+
+```
+Running tests\e2e_pipeline.rs
+fatal runtime error: Rust cannot catch foreign exceptions, aborting
+exit code: 0xc0000409, STATUS_STACK_BUFFER_OVERRUN
+```
+
+A C++ exception crossed the FFI boundary out of the native ONNX / sherpa stack. Rust cannot catch it, so
+the process died before the harness flushed a single test name — there is no "which test" in the log.
+
+What is established, and what is not:
+
+* `cargo test --test e2e_pipeline` in isolation: **3 / 3 clean**, 10 passed each, ~17.5 s.
+* Sweep 1 had `test-rust` **PASS 375.5 s** on identical Rust code — the only change between sweeps was a
+  `scripts/` edit, which cannot reach a Rust test. Not caused by this iteration's work.
+* Sweep 3, conditions identical to sweep 2: **PASS 368.9 s**.
+* The signature appears NOWHERE in this ledger or docs. First sighting: **1 abort in 3 full sweeps**.
+
+That is not enough to characterise it, and "intermittent native crash in the ASR stack" is exactly the
+class of thing that gets waved through as flakiness and then bites in real use. Recorded with its exact
+signature so the second sighting is recognised as the second, not the first. Not fixed, not explained,
+and not called flaky.
+
+**Gates.** `cargo fmt --check` **0**; `cargo clippy --all-targets --all-features -D warnings` **0**;
+`cargo test --lib` **1094 passed, 0 failed, 7 ignored**; vitest **40 files / 217 tests, 0 failed** (the
+three new ones among them, confirmed by name in `vitest list` rather than assumed); `npm run typecheck`
+**0 errors 0 warnings**; `npm run lint` **0 errors**; python policies **46/46**.
+
+**verify-10: `23 - 23 PASS, 0 FAIL, 0 skipped` — VERDICT GREEN**, with `real-app-e2e` PASS 19.0 s. Exe at
+HEAD, `claim: 200  queue: 200  items: 29  pendingTotal: 112`, and `speakerChange` present on the payload.
+
+**Owner-gated, and one item grew.** The badge needed a new Sorani string — "زیاتر لە یەک قسەکەر" — which
+is acknowledged as UNREVIEWED in `test_couch_page_i18n.py`. The list the owner has to read natively is
+now **9**, was 8. Not laundered through a `source` claim: sourcing it from a brand-new desktop string
+would have made the policy call it reviewed when nobody had read it.
+
+**What this does NOT do.** The clips are flagged, not resolved — whether each is split, rejected or kept
+is the owner's call, and 4 of the 17 he has already reviewed. The desktop app shows no badge (the phone
+is where the 13 pending ones are served). Nothing counts or gates on the flag: no export summary, no
+validation issue. Overlap stays invisible: the one genuinely simultaneous clip in the ground truth scored
+0.841, among the single-speaker group, and no model on this machine can see it.
+
+One consequence worth stating rather than discovering later, and this is READ FROM THE CODE, not
+measured: `ExportSegmentRecord` holds `#[serde(flatten)] segment: SpeechSegment`, so JSON and JSONL
+exports now carry `speakerChangeScore` alongside `snrDb` / `vadBackend` / `denoised` — honest
+per-segment provenance, and a consumer reading 0.41 learns something true. CSV, Parquet and the
+HuggingFace exporter build explicit column lists and are unchanged. No gate objected, because none
+pins the flattened export schema.
