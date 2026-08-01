@@ -41,6 +41,18 @@ SOURCE_FILES = [
     "src-tauri/Cargo.toml",
     "package.json",
     "index.html",
+    # Same class as the assets above: each of these changes the BINARY without any .rs edit.
+    # Cargo.lock pins the exact dependency versions compiled in, so `cargo update` alone rebuilds a
+    # different exe while Cargo.toml is untouched. capabilities/default.json is the Tauri v2 ACL that
+    # tauri-build compiles into the app — a permission change is a behaviour change. This IS the
+    # Windows build, so tauri.windows.conf.json is as load-bearing as tauri.conf.json beside it.
+    # .cargo/config.toml carries build flags that change codegen, and icon.ico is linked into the
+    # binary's resources.
+    "src-tauri/Cargo.lock",
+    "src-tauri/capabilities/default.json",
+    "src-tauri/tauri.windows.conf.json",
+    "src-tauri/.cargo/config.toml",
+    "src-tauri/icons/icon.ico",
 ]
 
 _SHA_MARKER = re.compile(rb"CORTEX_BUILD_SHA:([0-9a-fA-F]{7,40}|unknown)")
