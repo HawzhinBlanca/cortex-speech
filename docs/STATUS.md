@@ -4,7 +4,7 @@
 
 # Gate status — generated
 
-**Commit:** `e458ef8` · **Mode:** full
+**Commit:** `e466398` · **Mode:** full
 
 **Verdict:** **GREEN — PERSONAL-USE SHIP-READY.** (Not full-charter 10/10: 8 legs owner-descoped, 5 owner-gated pending.)
 
@@ -38,6 +38,8 @@
 | `pipeline-ipc-e2e` | PASS |
 | `constrained-ipc-e2e` | PASS |
 | `finetuned-ipc-e2e` | PASS |
+| `heartbeat-runtime` | PASS |
+| `jobs-runtime` | PASS |
 
 ## Owner-descoped (owner amendment 2026-07-10 — "ship" = personal use)
 
