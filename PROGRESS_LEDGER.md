@@ -4100,3 +4100,66 @@ disturbed, and the app and reviewer link stayed up for the whole iteration.
 **The loop's target (4) is now closed** and the prompt updated so the next iteration does not re-derive
 it. Remaining genuinely-open engineering: the ungated criterion benches. Everything else on the list is
 owner-gated.
+
+## Iteration 235 — a "baseline-regression gate" that could not regress
+
+The stated open item was the ungated criterion benches. Verifying that claim turned up something worse
+in the leg right next to it.
+
+`scripts/verify_10.py` registers `rtf-bench` as **"Latency: RTF on this rig (baseline-regression gate:
+WS4)"**. Its only RTF assertion was:
+
+```rust
+assert!(rtf.is_finite() && rtf > 0.0, "RTF must be a finite positive measurement, got {rtf}");
+```
+
+True of **any** positive number. Proven vacuous by injection rather than argued:
+
+| | injected RTF | assertion | result |
+|---|---|---|---|
+| A | 99.0 | old only | **exit 0 — PASSED** |
+| B | 99.0 | new budget | exit 101 — FAILED, budget fired |
+| C | real 0.1784 | new budget | exit 0 — passed |
+
+**Row A is the finding: a 560× latency regression passed a gate advertised as catching regressions.**
+This is the same vacuous-pass shape the repo guards against explicitly elsewhere — the fuzz leg refuses
+to report a pass on an empty target list for exactly this reason, and the mutation job annotates its
+idle path. This leg had no such guard.
+
+**The original reasoning was sound as far as it went, and is worth preserving rather than dismissing.**
+The doc comment said a hard threshold belongs on a NAMED reference machine (charter M4.1), not the
+default suite — correct, absolute timing is machine-dependent. What it missed: the test is `#[ignore]`,
+so it never runs in the default suite anyway, and its only automated caller **is** verify-10, which is by
+definition the personal-use gate on that named rig. The precondition for asserting was already met.
+
+**The number is the charter's, not one invented here.** `AGENT_CHARTER.md`: *"CTC-300M RTF<=0.3 CPU,
+<=0.1 GPU on the named reference machine"*. Measured on this rig before wiring it, five runs total
+across the proof: **0.1765 / 0.1771 / 0.1775 / 0.1784 / 0.1784** — stable to ±0.6%, **59% of budget with
+1.69× headroom**. The threshold is nowhere near the noise floor, so it fails on a real regression rather
+than on jitter. GPU is deliberately not asserted: this leg runs CPU int8, as its own printed line says.
+
+**Gates.** `cargo fmt --check` **0**; `cargo clippy --all-targets --all-features -D warnings` **0**; full
+sweep `23 - 23 PASS, 0 FAIL, 0 skipped` — `VERDICT: GREEN`, with `rtf-bench` PASS 19.0s under the live
+budget. **No rebuild**: `src-tauri/tests/` is not on `check_exe_freshness.py`'s source surfaces
+(`SOURCE_DIRS` is `src` + `src-tauri/src`), so the app and the reviewer link stayed up throughout.
+
+### The criterion benches: NOT deleted, and not half-wired
+
+The loop asked to decide between wiring them and deleting them. **Deleting is not available**:
+`AGENT_CHARTER.md:67` requires *"criterion benches gated on every PR with a >5% wall-clock regression
+budget via github-action-benchmark against a committed baseline"*, and line 122 repeats it in the
+per-PR protocol. Wiring them properly needs a new CI workflow plus a committed baseline — real
+infrastructure, and owner/infra-gated.
+
+Half-wiring it locally (a `make bench` target nothing enforces) would produce precisely the artefact
+this iteration just spent its time removing: a gate-shaped thing that cannot fail. Surfaced as infra
+work rather than faked.
+
+### Where this leaves the loop
+
+**No non-owner-gated engineering remains.** Everything still open needs the owner: Tailscale
+Serve→Funnel; the elevated `cortex-once-admin.ps1` run (a reboot still leaves the review server down);
+the R5 device hour; native Sorani review of the 8 `source: null` strings; the Phase-6 scope and "unsure"
+verdict decisions; whether to re-align the 129 `energy_heuristic` segments; the 17 mixed-speaker clips;
+the count-agnostic fuzz requirement from iteration 232 pending confirmation; and the criterion-bench CI
+wiring above.
