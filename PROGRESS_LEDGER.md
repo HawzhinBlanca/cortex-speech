@@ -3903,3 +3903,47 @@ HEAD advancing via non-source commits). Cost one extra stop-app/build/relaunch c
 
 **NOT done, and it is the owner's call:** the 129 already-stamped segments keep their heuristic timings.
 Re-aligning existing rows rewrites his library; the fix only changes what happens from here.
+
+## Iteration 231 — target (2) resolved: the COMMENT was wrong, not the UI
+
+`update_segment_bounds` has no frontend caller and no trim control exists anywhere in `src/`. The loop
+asked which of those two facts was the defect. `git log -S` answers it: the frontend wrapper was deleted
+on **2026-07-15 by `1167504`** ("chore(audit): batches 2+3") as one of *"20 dead command wrappers"* — and
+it was **already unused then**. No trim UI has ever shipped.
+
+So the claim in `chunking.rs` — that the trim path is "the reviewer's most-used edit" — was **invented**,
+and invented two weeks AFTER the caller was deleted, in a doc comment written to justify iteration 224's
+hardening change. The hardening itself is still worth having (the whitelist-rebuild really was a
+silent-data-loss shape for whoever wires a trim control later); the traffic claim was not measured and is
+now **retracted in place**, with the function's real status recorded: reachable only from an orphaned IPC
+command. Retracted rather than quietly deleted, because a silently-corrected lie teaches nothing.
+
+### Target (3), the two cuts verification supports
+
+| cut | why |
+|---|---|
+| `features.rs` — 473 lines + 16 unit tests | 80-bin mel-filterbank extractor. Its production consumer was the fbank diarization fallback, deleted earlier for not being speaker-discriminative. After that its ONLY caller was an `#[ignore]d` test that tested `FbankExtractor` **itself**. sherpa-onnx computes its own features for every model this app runs. |
+| `flate2` | Zero references under any name (`GzEncoder`/`ZlibEncoder`/`flate2::`). Its manifest comment claimed "compression ratio for ASR repetition detection"; no such code exists. |
+| `rustfft` | Only `features.rs` used it. |
+
+**CORRECTION to my own ponytail audit, and it matters.** This is a **code cut, not a build cut**. Both
+crates remain in the dependency tree transitively — `flate2` via `png` and `ureq`, `rustfft` via
+`symphonia-core` — so nothing compiles faster and the supply-chain surface is unchanged. Removing them
+from `Cargo.toml` drops a direct declaration this crate no longer earns, and nothing more. The audit's
+"net: -3 deps possible" was wrong in exactly the sense a reader would care about, and is retracted here.
+
+**The lib test count DROPS 1107 → 1091, and that is correct.** `features.rs` carried 16 unit tests and
+they went with the module. Recorded explicitly because a falling test count normally means a regression,
+and a future reader diffing these entries deserves the reason rather than a mystery.
+
+Diff: **-514 / +13** across 6 files.
+
+**Gates (unmasked).** `cargo test --lib` **0** — 1091 passed, 0 failed, 7 ignored. `cargo clippy
+--all-targets --all-features -D warnings` **0**. `cargo fmt --check` **0**. `npm run test:python-policies`
+**0** — 46/46. Exe rebuilt at HEAD; `EXE FRESHNESS GATE: OK`; claim **200**, queue **200**, items 29,
+`pendingTotal` 112.
+
+**NOT done, deliberately deferred:** the 17 orphaned IPC commands (including `update_segment_bounds`
+itself). That is a 597-line sweep across many files where each removal needs its own caller check and may
+strand private helpers; batching it onto the tail of this iteration would be exactly the kind of
+unverified bulk change this loop exists to avoid. It gets its own iteration.
