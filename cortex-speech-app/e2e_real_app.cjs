@@ -144,7 +144,19 @@ console.log = tee(console.log.bind(console), 'LOG');
 console.error = tee(console.error.bind(console), 'ERR');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function die(msg) { console.error('PRECONDITION FAILED: ' + msg); process.exit(1); }
+// A PRECONDITION failure happens before the app is ever spawned, so the profile it would have used is
+// an EMPTY directory — the "keep it for the post-mortem" reasoning in cleanupProfile does not apply,
+// because there is no DB in there to read. Measured 2026-08-01: two 0-file `cortex-e2e-*` directories
+// from two precondition exits minutes earlier, among 40 totalling 865 MB. Nothing is spawned yet, so
+// no handles are held and a plain sync remove is enough; anything unexpected is swallowed, since
+// failing to tidy up must never change the exit code the caller is being told about.
+function die(msg) {
+  console.error('PRECONDITION FAILED: ' + msg);
+  if (DATA_DIR_IS_OURS && path.resolve(DATA_DIR).startsWith(path.resolve(os.tmpdir()) + path.sep)) {
+    try { fs.rmSync(DATA_DIR, { recursive: true, force: true }); } catch { /* not worth a second error */ }
+  }
+  process.exit(1);
+}
 
 if (!fs.existsSync(AUDIO)) {
   die(process.env.CORTEX_AUDIO
@@ -368,6 +380,12 @@ async function reviewOverHttp(page, draftText) {
   console.log('==> Couch Review over real HTTP...');
   const base = `http://127.0.0.1:${COUCH_PORT}`;
   const REVIEWER = 'E2E Harness';
+  // EVERY request here is bounded. Measured the hard way on run 2 of the 3x stability check: the
+  // post-stop probe below is a fetch whose whole purpose is to find NOBODY listening, and a bare
+  // fetch has no timeout — when the closed port dropped the SYN instead of refusing it, the run sat
+  // there forever. The app had already logged "Couch Review stopped"; the harness simply never
+  // returned. A gate that hangs is worse than one that fails: a failure gets reported.
+  const http = (url, opts = {}) => fetch(url, { ...opts, signal: AbortSignal.timeout(20000) });
 
   const status = await page.evaluate(
     (r) => window.__TAURI_INTERNALS__.invoke('start_couch_review', { reviewers: [r] }),
@@ -384,7 +402,7 @@ async function reviewOverHttp(page, draftText) {
   // NEVER print the token: it is a live credential for the review server.
   console.log(`   session up for ${JSON.stringify(status.reviewers[0].name)} on port ${COUCH_PORT}`);
 
-  const claim = await fetch(`${base}/api/claim`, {
+  const claim = await http(`${base}/api/claim`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ token }),
@@ -393,7 +411,7 @@ async function reviewOverHttp(page, draftText) {
   const cookie = (claim.headers.getSetCookie() || []).map((c) => c.split(';')[0]).join('; ');
   if (!cookie) throw new Error('/api/claim returned no Set-Cookie — the phone would have nothing to ride on');
 
-  const queueRes = await fetch(`${base}/api/queue`, { headers: { cookie } });
+  const queueRes = await http(`${base}/api/queue`, { headers: { cookie } });
   if (queueRes.status !== 200) throw new Error(`GET /api/queue -> ${queueRes.status}, expected 200`);
   const queue = await queueRes.json();
   const item = (queue.items || [])[0];
@@ -408,7 +426,7 @@ async function reviewOverHttp(page, draftText) {
   console.log(`   queue: ${queue.items.length} item(s), pendingTotal ${queue.pendingTotal}`);
 
   // Audio is the whole point of reviewing: a reviewer who cannot hear the clip cannot judge it.
-  const audio = await fetch(`${base}/api/audio/${encodeURIComponent(item.id)}`, { headers: { cookie } });
+  const audio = await http(`${base}/api/audio/${encodeURIComponent(item.id)}`, { headers: { cookie } });
   if (audio.status !== 200) throw new Error(`GET /api/audio -> ${audio.status}, expected 200`);
   const bytes = Buffer.from(await audio.arrayBuffer());
   if (bytes.length < 1024 || bytes.subarray(0, 4).toString('latin1') !== 'RIFF') {
@@ -418,11 +436,11 @@ async function reviewOverHttp(page, draftText) {
 
   // An unauthenticated request must NOT be served. Checking this here rather than trusting the unit
   // test means the check runs against the real listener, headers and all.
-  const naked = await fetch(`${base}/api/queue`);
+  const naked = await http(`${base}/api/queue`);
   if (naked.status === 200) throw new Error('GET /api/queue with NO credential returned 200 — the token gate is open');
 
   const corrected = draftText + ' ✔';
-  const decision = await fetch(`${base}/api/decision`, {
+  const decision = await http(`${base}/api/decision`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', cookie },
     body: JSON.stringify({ id: item.id, action: 'edit', text: corrected }),
@@ -448,7 +466,9 @@ async function reviewOverHttp(page, draftText) {
 
   await page.evaluate(() => window.__TAURI_INTERNALS__.invoke('stop_couch_review'));
   // Stopped means STOPPED — a listener left bound would outlive this run and hold the port.
-  const afterStop = await fetch(`${base}/api/queue`, { headers: { cookie } }).then(() => true, () => false);
+  // A timeout counts as NOT answering, which is the outcome this asserts — so the abort above is
+  // the difference between proving the port was released and hanging on the question.
+  const afterStop = await http(`${base}/api/queue`, { headers: { cookie } }).then(() => true, () => false);
   if (afterStop) throw new Error('the server still answered after stop_couch_review');
   console.log('   server stopped and the port released');
 }

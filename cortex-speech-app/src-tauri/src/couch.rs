@@ -383,11 +383,15 @@ fn load_session(data_dir: &Path, db_path: &str) -> Option<RememberedSession> {
 /// Read at start time, not cached: an unparseable or 0 value falls back to the default rather than
 /// failing, because an env var must never be able to stop the owner's phone link from coming up.
 fn configured_port() -> u16 {
-    std::env::var("CORTEX_COUCH_PORT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .filter(|p| *p != 0)
-        .unwrap_or(COUCH_PORT)
+    port_from(std::env::var("CORTEX_COUCH_PORT").ok().as_deref())
+}
+
+/// The parsing half of [`configured_port`], split out so the FALLBACK can be tested. Reading the
+/// variable is the untestable part (process-global, and mutating the environment mid-test is unsound
+/// with other threads running); deciding what a bad value means is the part that matters, because
+/// getting it wrong takes the owner's phone link down rather than merely ignoring a typo.
+fn port_from(raw: Option<&str>) -> u16 {
+    raw.and_then(|v| v.trim().parse::<u16>().ok()).filter(|p| *p != 0).unwrap_or(COUCH_PORT)
 }
 
 /// Start the couch server for `reviewers` (idempotent: returns the existing session if already running,
@@ -2237,6 +2241,23 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(payload["items"].as_array().unwrap().is_empty(), "nothing is free for a third reviewer");
         assert_eq!(payload["heldByOthers"], total, "but all {total} pending clips are reported as held");
+    }
+
+    #[test]
+    fn a_bad_couch_port_override_falls_back_instead_of_taking_the_link_down() {
+        // CORTEX_COUCH_PORT exists so an end-to-end harness can drive the real server without
+        // fighting the owner's own Couch Review for 8737. It is therefore a knob that will sometimes
+        // be set by something other than a careful operator — a stale shell, a copied launch script,
+        // a typo. The safety property is that NONE of those can stop the phone link coming up: the
+        // owner would see Couch Review "start" and then find no page at the URL he has bookmarked.
+        assert_eq!(port_from(None), COUCH_PORT, "unset means the real, memorable port");
+        assert_eq!(port_from(Some("18737")), 18737, "a valid override is honoured");
+        assert_eq!(port_from(Some("  18737  ")), 18737, "surrounding whitespace is not a typo worth punishing");
+        assert_eq!(port_from(Some("")), COUCH_PORT, "an empty value is not a port");
+        assert_eq!(port_from(Some("0")), COUCH_PORT, "port 0 means 'any free port' — the link would be unfindable");
+        assert_eq!(port_from(Some("nonsense")), COUCH_PORT, "garbage falls back rather than failing");
+        assert_eq!(port_from(Some("70000")), COUCH_PORT, "out of u16 range falls back rather than wrapping");
+        assert_eq!(port_from(Some("-1")), COUCH_PORT, "negative falls back rather than wrapping");
     }
 
     #[test]
