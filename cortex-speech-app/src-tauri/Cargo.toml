@@ -67,7 +67,7 @@ symphonia = { version = "0.6", features = ["all"] }
 
 # WAV/FLAC audio export
 hound = "3"
-flacenc = "0.4"
+flacenc = "0.5"
 
 # ONNX Runtime for Silero VAD (dynamic load avoids CRT clash with sherpa-onnx on Windows)
 ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
