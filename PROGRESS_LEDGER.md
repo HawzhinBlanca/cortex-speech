@@ -3947,3 +3947,57 @@ Diff: **-514 / +13** across 6 files.
 itself). That is a 597-line sweep across many files where each removal needs its own caller check and may
 strand private helpers; batching it onto the tail of this iteration would be exactly the kind of
 unverified bulk change this loop exists to avoid. It gets its own iteration.
+
+## Iteration 232 — the deletion that turned verify-10 RED, and why the search was wrong
+
+Iteration 231's `features.rs` cut broke `fuzz-smoke`:
+
+```
+error[E0432]: unresolved import `cortex_speech_app_lib::features`
+ --> fuzz_targets/features.rs:4:28
+=> FAIL   fuzz-smoke   425.9s
+VERDICT: RED - 1 kept gate(s) failed (fuzz-smoke). NOT ship-ready.
+```
+
+**The miss is mine and it is worth naming precisely.** The caller search behind that cut covered `src/`,
+`tests/` and `benches/` and stopped there. `src-tauri/fuzz/` was never looked at. So "the only caller is
+an `#[ignore]d` test of itself" was **wrong — not because the reasoning was wrong, but because the search
+was incomplete.** There was a fifth consumer the whole time.
+
+This is the SECOND incomplete-search miss in this session. The first (`src/**/*.svelte` without globstar,
+while counting uncalled IPC commands) I caught before reporting; this one I did not, and only the gate
+caught it. The rule that generalises, now in the loop prompt: **a deletion claim needs a repo-wide search
+with NO path filter, and the compiler is the only real authority on reachability.** A grep proves
+presence, never absence.
+
+**The resolution was still to delete, not to restore.** The fuzz target's own comment already said it:
+*"FbankExtractor has no production callers at all today (every call site is a test, at 16 kHz)"* — it was
+fuzzing known-dead code. Keeping 473 lines of dead production code alive to satisfy a fuzz-target count
+would be the tail wagging the dog.
+
+**The charter edit, flagged rather than buried.** `AGENT_CHARTER.md` required "5 fuzz targets in CI". That
+number is NOT quietly lowered to 4 — it is made **count-agnostic** ("EVERY fuzz target"), which is
+*stricter*: a fixed count can be satisfied while coverage rots, and it goes stale the moment a target
+legitimately retires with its code. The same wording now appears in `verify_10.py`'s gate description and
+the nightly workflow comment, so the three cannot disagree with each other. **This edits a normative
+document and is the owner's to confirm or revert.**
+
+Also corrected: `CORTEX_APP_FLOW_GUIDE.html` advertised `rustfft (mel features)` in the current
+architecture. That path no longer exists.
+
+**Measured before committing** (not "the tests passed"):
+
+```
+cargo +nightly fuzz list  ->  cache, diff, normalizer, validation      exit 0
+fuzz normalizer exit 0   fuzz diff exit 0
+fuzz validation exit 0   fuzz cache exit 0                             (30s each)
+```
+
+**And the gate itself, after:** `23 - 23 PASS, 0 FAIL, 0 skipped` —
+`VERDICT: GREEN - PERSONAL-USE SHIP-READY`. `fuzz-smoke` **PASS 557.3s** where it was **FAIL 425.9s**.
+
+**No rebuild was needed** — `src-tauri/fuzz/`, `scripts/` and the docs are not on
+`check_exe_freshness.py`'s source surfaces, so the app and the reviewer link stayed up throughout the
+RED and the fix. A `docs/STATUS.md` carrying the RED verdict was deliberately NOT committed; it was
+regenerated after the gate went green, so the generated record never asserts a state that was superseded
+minutes later.
