@@ -558,6 +558,8 @@ GATES = [
     ("pipeline-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_pipeline_ipc.cjs"}"', APP, _probe_ipc_harness, "Import->VAD->ASR over the REAL IPC on a disposable profile, independent of webview rendering"),
     ("constrained-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_constrained_ipc.cjs"}"', APP, _probe_ipc_harness, "transcribe_segment_constrained on the real exe: non-blank Kurdish, no Latin leak"),
     ("finetuned-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_finetuned_ipc.cjs"}"', APP, lambda: _probe_ipc_harness("finetuned-mms-ckb"), "transcribe_segment_finetuned resolves + loads + decodes the embedded champion model"),
+    ("heartbeat-runtime", 3, "cmd", f'node "{APP / "scripts" / "heartbeat_probe.cjs"}"', APP, _probe_ipc_harness, "Main-thread safety PROVEN AT RUNTIME: get_settings latency while slow commands run concurrently. The static test_command_main_thread_policy/test_ui_thread_blocking_audit pin the source shape; this measures the actual UI responsiveness they exist to protect."),
+    ("jobs-runtime", 3, "cmd", f'node "{APP / "scripts" / "jobs_probe.cjs"}"', APP, _probe_exe, "Durable Job Supervisor at runtime: a REAL export_dataset run is recorded in get_jobs and reaches 'succeeded' - the run_tracked bracketing proven end to end, not only in unit tests."),
 ]
 
 # Charter DoD legs descoped by the owner amendment (2026-07-10) — always printed.
