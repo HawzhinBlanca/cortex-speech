@@ -4001,3 +4001,57 @@ fuzz validation exit 0   fuzz cache exit 0                             (30s each
 RED and the fix. A `docs/STATUS.md` carrying the RED verdict was deliberately NOT committed; it was
 regenerated after the gate went green, so the generated record never asserts a state that was superseded
 minutes later.
+
+## Iteration 233 — "17 dead IPC commands" was wrong: 11 of them are load-bearing for gates
+
+Target (3) was to cut the 17 orphaned IPC commands my own ponytail audit found. **The audit was wrong,
+and the correct action this iteration was to cut nothing.**
+
+**What the audit actually measured.** It searched for frontend `invoke(...)` callers and found 17
+commands with none. That is a true statement about the frontend and a false proxy for "dead". Re-run
+repo-wide with **no path filter** — the discipline that cutting `features.rs` cost a RED gate to learn —
+the picture inverts:
+
+| commands | referenced by | cuttable? |
+|---|---|---|
+| 11 of 17 | `test_command_main_thread_policy.py`, `test_ui_thread_blocking_audit.py`, `test_rust_runtime_panic_policy.py`, `test_agentic_pipeline_policy.py`, `test_restore_reservation_gate.py` | **NO — pinned by a gate** |
+| `get_blocking_validation_issues` | sole caller of `export_bundle::blocking_issues` | no — strands real export-gating logic |
+| `get_import_status`, `update_segment_bounds`, `db_wal_checkpoint` | behaviour/comment coupling; `update_segment_bounds` guards the deliberately-hardened `rebound_alignment_json` | not worth a rebuild for ~10 lines |
+| `clear_cache`, `get_cache_info` | nothing (2-line bodies) | yes, but see below |
+
+`test_command_main_thread_policy.py` is a **ratchet**: it pins command names and asserts each exists and
+is `async`. Deleting a pinned command either fails that gate or gets "fixed" by trimming the list —
+silently shrinking a ratchet whose entire purpose is to never shrink. That is weakening a gate by
+accident, which this loop forbids, and I would have done it on the audit's say-so.
+
+**Nothing was cut.** The only genuinely-free cuts left are `clear_cache` and `get_cache_info` — two
+2-line bodies. Cutting them costs a full stop-app → rebuild → relaunch cycle (a real reviewer-link
+outage) to remove ~10 lines. Chasing the audit's headline number at that price would be exactly the
+behaviour the "prefer changes needing no rebuild" rule exists to prevent. Left in place, deliberately.
+
+**What shipped instead: the finding made durable.** A header block in
+`test_command_main_thread_policy.py` records why "no frontend caller" ≠ "dead" in this repo, names the
+three ways a command can be load-bearing, and requires a no-path-filter repo-wide search before any
+command is cut. The next audit — human or agent — reads it before proposing the same 597-line deletion.
+No rebuild: `scripts/` is not an exe-freshness source surface.
+
+### Null result: the nightly mutation job's health is NOT observable from here
+
+Target (4) asked whether the nightly mutation gate is actually healthy. **I cannot tell, and am not
+guessing.** `gh` is not installed on this machine, so the Actions run history is unreachable; that part
+is owner-gated (the Actions tab answers it in seconds).
+
+What I *did* verify by reading `.github/workflows/nightly-real-audio.yml`:
+* The `git diff --relative` fix the ledger records is present — the failure mode where every hunk was
+  rejected with "Diff content doesn't match source file" is closed.
+* The vacuous-pass paths are guarded and annotated: no commits in 24 h emits
+  `::warning ... This is not a pass.`, and an empty core-module diff emits `::notice ... idle`.
+* `set -o pipefail` is set, so a failing `cargo mutants` cannot be masked by the pipeline.
+
+**The honest weakness, stated rather than fixed:** both idle paths `exit 0`, so a quiet day shows a
+GREEN mutation gate with only an annotation to say otherwise. Making idle days RED would be worse (every
+quiet day fails), so this is a designed trade-off, not a defect — but "green" there means "nothing to
+mutate", not "mutants killed", and nobody reading the badge would know.
+
+**Gates.** `npm run test:python-policies` **0** — 46/46. No Rust change, so no rebuild and no other gate
+was disturbed; the app and reviewer link stayed up for the whole iteration.

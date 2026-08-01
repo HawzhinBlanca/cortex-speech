@@ -6,6 +6,19 @@ off the main thread) and offload their blocking body via `run_blocking`/`spawn_b
 
 This is a RATCHET: the list grows as the migration proceeds, and a command may only be added once it
 is genuinely async. Regressing any listed command back to sync fails the gate.
+
+READ THIS BEFORE DELETING ANY COMMAND NAMED BELOW (iteration 233). A dead-code audit found 17 IPC
+commands with no frontend `invoke(...)` caller and proposed cutting all of them — ~597 lines. That was
+WRONG for 11 of the 17, and this file is why: the lists here PIN command names, and the gate asserts each
+one exists and is async. Deleting such a command either fails this gate or, worse, gets "fixed" by
+trimming the list — which silently shrinks a ratchet that exists precisely to never shrink.
+
+So "no frontend caller" does NOT mean "dead" in this repo. A command can be load-bearing for a gate, for
+`test_ui_thread_blocking_audit.py`'s freezer worklist, or as the sole caller of real logic
+(`get_blocking_validation_issues` is the only caller of `export_bundle::blocking_issues`). Before cutting
+any command, search the WHOLE repo with no path filter — scripts/, src-tauri/fuzz/, .github/, docs/ —
+and let the compiler and these gates, not a grep over src/, decide what is reachable. A grep proves
+presence, never absence.
 """
 from pathlib import Path
 
