@@ -403,6 +403,24 @@ def _probe_real_e2e():
     return None
 
 
+# Every place a model can legitimately live, mirroring models.rs::model_root_candidates.
+_MODEL_ROOTS = [SRC_TAURI / "models", SRC_TAURI / "target" / "release" / "models"]
+
+def _probe_ipc_harness(extra=None):
+    """Shared probe for the IPC e2e harnesses: the exe, the committed fixture, and any extra model.
+
+    They now default to that fixture and run against a DISPOSABLE profile (e2e_profile.cjs), so the
+    only honest reasons left to skip are a missing binary or a missing model — not a forgotten env var.
+    """
+    if not EXE.exists():
+        return "release exe missing - run `make build-app`"
+    if not (SRC_TAURI / "tests" / "fixtures" / "fleurs_ckb_sample.wav").exists():
+        return "committed audio fixture missing"
+    if extra is not None and not any((root / extra).exists() for root in _MODEL_ROOTS):
+        return f"{extra} not present in any model root"
+    return None
+
+
 def _probe_silero():
     if (SRC_TAURI / "models" / "silero_vad_v4.onnx").exists():
         return None
@@ -537,6 +555,9 @@ GATES = [
     ("rtf-bench", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --test real_audio -- --ignored omniasr_rtf_on_committed_fleurs_ckb_fixture --nocapture', REPO_ROOT, _probe_rtf, "Latency: RTF on this rig (baseline-regression gate: WS4)"),
     ("refinery-lift", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --test refinery_lift -- --ignored refinery_lift_injected_error_benchmark --nocapture', REPO_ROOT, None, "Refinery: >=30% CER reduction at <=15% escalation (fixed-seed injected-error benchmark, offline T0 path)"),
     ("fairness-gender-age", 3, "cmd", f'"{sys.executable}" "{APP / "scripts" / "fairness_gate.py"}"', REPO_ROOT, None, "WS4: gender/age CER disparity budget on committed corpus metadata (CORDI dialect leg owner-gated)"),
+    ("pipeline-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_pipeline_ipc.cjs"}"', APP, _probe_ipc_harness, "Import->VAD->ASR over the REAL IPC on a disposable profile, independent of webview rendering"),
+    ("constrained-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_constrained_ipc.cjs"}"', APP, _probe_ipc_harness, "transcribe_segment_constrained on the real exe: non-blank Kurdish, no Latin leak"),
+    ("finetuned-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_finetuned_ipc.cjs"}"', APP, lambda: _probe_ipc_harness("finetuned-mms-ckb"), "transcribe_segment_finetuned resolves + loads + decodes the embedded champion model"),
 ]
 
 # Charter DoD legs descoped by the owner amendment (2026-07-10) — always printed.

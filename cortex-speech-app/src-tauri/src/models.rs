@@ -161,6 +161,33 @@ pub fn model_root_candidates() -> Vec<PathBuf> {
     dedupe_paths(roots)
 }
 
+/// The fine-tuned MMS-CTC pair (`finetuned-mms-ckb/{model.onnx,vocab.json}`), searched across EVERY
+/// model root. `None` when it is genuinely absent.
+///
+/// ONE implementation, because there were two and only one of them was fixed. `pipeline.rs` already
+/// searched every candidate root — its comment records why: the CTC-keyed bundled root (e.g.
+/// `target/release/models` holding only CTC + Silero) wins `select_bundled_models_dir` and ORPHANS
+/// every sibling that lives solely in the full repo models dir. `commands.rs::resolve_finetuned_paths`,
+/// behind the `transcribe_segment_finetuned` IPC command, was left on the all-or-nothing
+/// `active_models_dir()` / `bundled_models_dir()` pair and therefore could not find the model at all.
+///
+/// Measured on the owner's box, 2026-08-01: `target/release/models` holds only omniasr-ctc-300m +
+/// Silero, `%APPDATA%\cortex-speech\models` holds only the aligner, and the fine-tuned model sits in
+/// `src-tauri/models/` — so the command returned "fine-tuned model not found" for a 970 MB model that
+/// was present the whole time, while the import path using it worked.
+///
+/// Both files must come from the SAME root: a split onnx/vocab pair would be incoherent.
+pub fn finetuned_model_paths() -> Option<(PathBuf, PathBuf)> {
+    for base in model_root_candidates() {
+        let dir = base.join("finetuned-mms-ckb");
+        let (onnx, vocab) = (dir.join("model.onnx"), dir.join("vocab.json"));
+        if onnx.exists() && vocab.exists() {
+            return Some((onnx, vocab));
+        }
+    }
+    None
+}
+
 fn resolve_file_in(user_dir: Option<&Path>, bundled_dir: &Path, relative: &str) -> PathBuf {
     if let Some(user_dir) = user_dir {
         let candidate = user_dir.join(relative);

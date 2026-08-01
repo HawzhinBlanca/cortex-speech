@@ -152,6 +152,54 @@ def test_clear_db_snapshots_before_deleting_and_requires_confirmation() -> None:
         raise AssertionError("clear_db.py must snapshot the DB (shutil.copy2) BEFORE any DELETE FROM")
 
 
+def test_every_spawning_harness_is_isolated_from_the_production_library() -> None:
+    """EVERY harness that launches the exe, not just e2e_real_app.cjs.
+
+    The profile isolation, the PID-tree kill and the WebView2 folder were built for one harness and
+    its siblings were left behind — `e2e_constrained_ipc`, `e2e_finetuned_ipc` and `e2e_pipeline_ipc`
+    all spawned the app with a bare `{...process.env}`, so they ran against the owner's real
+    %APPDATA% library and imported audio into a corpus holding human review decisions, then killed
+    by IMAGE NAME, taking his own running Cortex with them. Same shape as a guard applied at one call
+    site instead of the shared one, which is why this checks the whole set.
+
+    e2e_real_app.cjs keeps its own (pinned above); the other three share e2e_profile.cjs.
+    """
+    for path in sorted(REPO_ROOT.glob("e2e_*.cjs")):
+        src = path.read_text(encoding="utf-8")
+        code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith(("//", "*", "/*")))
+        if "spawn(APP_EXE" not in code:
+            continue  # connect-only harnesses attach to a running app; they launch nothing
+        if "/IM cortex-speech-app.exe" in code:
+            raise AssertionError(
+                f"{path.name} kills by IMAGE NAME — that takes down the owner's own running Cortex. "
+                "Kill only the spawned PID tree."
+            )
+        if "CORTEX_APP_DATA_DIR" not in code and "launchEnv(" not in code:
+            raise AssertionError(
+                f"{path.name} spawns the app without isolating CORTEX_APP_DATA_DIR — it would import "
+                "into the owner's REAL library. Use e2e_profile.cjs (or e2e_real_app's own guard)."
+            )
+        if "WEBVIEW2_USER_DATA_FOLDER" not in code and "launchEnv(" not in code:
+            raise AssertionError(
+                f"{path.name} spawns the app without isolating the WebView2 profile — it fails "
+                "whenever the owner's app is open (HRESULT 0x8007139F)."
+            )
+
+
+def test_the_shared_profile_guard_refuses_the_production_directory() -> None:
+    """The refusal must live in the shared module, not be re-derived per harness."""
+    guard = (REPO_ROOT / "e2e_profile.cjs").read_text(encoding="utf-8")
+    for needle in (
+        "REFUSED: CORTEX_APP_DATA_DIR points at the REAL profile",
+        "taskkill /F /T /PID",
+        "WEBVIEW2_USER_DATA_FOLDER",
+        "target === root || !target.startsWith(root + path.sep)",
+    ):
+        assert_contains(guard, needle, "e2e_profile.cjs")
+    if "/IM cortex-speech-app.exe" in guard:
+        raise AssertionError("e2e_profile.cjs must never kill by image name")
+
+
 def main() -> None:
     test_mp4_temp_cleanup_is_constrained_to_temp()
     test_recursive_remove_only_exists_inside_safety_helper()
@@ -160,6 +208,8 @@ def main() -> None:
     test_e2e_is_isolated_from_the_production_profile()
     test_e2e_profile_cleanup_is_guarded_and_keeps_evidence_on_failure()
     test_clear_db_snapshots_before_deleting_and_requires_confirmation()
+    test_every_spawning_harness_is_isolated_from_the_production_library()
+    test_the_shared_profile_guard_refuses_the_production_directory()
     print("real-data runner policy regression passed")
 
 

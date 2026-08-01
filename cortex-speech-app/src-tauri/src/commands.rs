@@ -1078,15 +1078,14 @@ fn resolve_finetuned_paths() -> Result<(std::path::PathBuf, std::path::PathBuf),
     if let (Ok(o), Ok(v)) = (std::env::var("CORTEX_FINETUNED_ONNX"), std::env::var("CORTEX_FINETUNED_VOCAB")) {
         return Ok((std::path::PathBuf::from(o), std::path::PathBuf::from(v)));
     }
-    for base in [crate::models::active_models_dir(), crate::models::bundled_models_dir()] {
-        let dir = base.join("finetuned-mms-ckb");
-        let onnx = dir.join("model.onnx");
-        let vocab = dir.join("vocab.json");
-        if onnx.exists() && vocab.exists() {
-            return Ok((onnx, vocab));
-        }
-    }
-    Err("fine-tuned model not found (models/finetuned-mms-ckb/{model.onnx,vocab.json})".to_string())
+    // EVERY model root, not the all-or-nothing active/bundled pair this used to walk. That pair is
+    // keyed on OmniASR-CTC presence, so a partial copy beside the exe wins the root and orphans the
+    // fine-tuned model even when it is sitting in the full repo models dir — which is exactly what it
+    // did here: this command reported "not found" for a 970 MB model that was present, while the
+    // import path (which had already been fixed) loaded it fine. Same search as `pipeline.rs` now,
+    // because it IS the same function.
+    crate::models::finetuned_model_paths()
+        .ok_or_else(|| "fine-tuned model not found (models/finetuned-mms-ckb/{model.onnx,vocab.json})".to_string())
 }
 
 /// P3.4: verify the bundled fine-tuned model's integrity — the DEFINITIVE full model.onnx + vocab.json
