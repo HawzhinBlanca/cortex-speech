@@ -4384,3 +4384,150 @@ exports now carry `speakerChangeScore` alongside `snrDb` / `vadBackend` / `denoi
 per-segment provenance, and a consumer reading 0.41 learns something true. CSV, Parquet and the
 HuggingFace exporter build explicit column lists and are unchanged. No gate objected, because none
 pins the flattened export schema.
+
+## Iteration 238 — Couch Review had no end-to-end test at all
+
+Measured before building anything: **none of the five `e2e_*.cjs` harnesses mentions `8737`, `couch`, or
+`/api/queue`.** The path clips are actually reviewed through — multi-reviewer tokens, DPAPI at rest,
+leases, spot checks, an offline outbox and a 68 KB phone page — was tested only by Rust unit tests
+calling `api_queue` / `api_decision` as FUNCTIONS. Nothing ever started the real binary, bound a real
+port, claimed a token over the wire, streamed audio bytes, submitted a decision and read the library
+back. Iteration 237's `speakerChange` field is served by exactly that path, and the only thing that had
+ever exercised it end to end was me, by hand, in PowerShell, against the live library.
+
+**The blocker was the port, and the fix was already half-written.** `start_on_port` exists because a Rust
+test "cannot bind 8737 while the owner's own server is using it". An end-to-end harness has the identical
+problem and cannot reach that function at all — it goes through the `start_couch_review` IPC command,
+which calls `start()`. `CORTEX_COUCH_PORT` now overrides the bind port for `start()` and `resume()`
+alike (or a remembered link would come back on a different port than `start` uses). Unparseable or `0`
+falls back to 8737: an env var must never be able to stop the owner's phone link coming up.
+
+**It rides in `e2e_real_app.cjs` rather than a sixth harness**, so it inherits what is already hard-won
+there: the disposable profile with its refusal to touch the real `%APPDATA%` library, the WebView2
+isolation, and the retrying cleanup. One app, one profile, one place that knows how to kill it.
+
+```
+session up for "E2E Harness" on port 18737
+queue: 1 item(s), pendingTotal 1
+audio: 263084 bytes, RIFF header present
+decision persisted: verified=true, reviewedBy="E2E Harness"
+server stopped and the port released
+```
+
+Fragment token -> `POST /api/claim` -> `Set-Cookie` -> `GET /api/queue` (asserting every field the page
+renders, `speakerChange` included, and that the server names the right reviewer) -> `GET /api/audio`
+(bytes present, RIFF header) -> an UNAUTHENTICATED `/api/queue` must not be served -> `POST
+/api/decision` -> and then the assertion that matters: **the library**, read back through the app's own
+IPC rather than a hand-rolled query that could agree with a broken write. A server can answer 200 and
+persist nothing.
+
+**Fail-before**, decision POST removed:
+
+```
+REAL-DATA RUN FAILED: the correction did not persist:
+  stored "…کەشەی پیوەست بەنەخۆشەکەن نەبوو"   sent "…نەبوو ✔"
+```
+
+exit 1. Restored byte-identically (`git status` clean).
+
+### The first mutation did not fail, and the code was right
+
+The initial fail-before attempt sent `action: 'accept'` carrying the corrected text, expecting the
+library assertion to catch a mismatch. It passed — because `api_decision` does not take the phone's word
+for what kind of decision was made:
+
+```rust
+let is_edit = text != review_text(&prev).trim();
+(if is_edit { "edit" } else { "accept" }, Some(text))
+```
+
+The verdict is derived from whether the text ACTUALLY changed. A client that mislabels its own action —
+or a reviewer who edits the box and then taps "Looks good" — still lands the right provenance. That is
+stronger than the design assumed here, and the bad mutation was mine, not a gap in the code.
+
+### The 3x rule earned its keep on run 2: the new gate HUNG
+
+Run 1 passed. Run 2 stopped dead, and the app's own log says exactly where:
+
+```
+[App] INFO cortex_speech_app_lib::couch: Couch Review stopped
+```
+
+`stop_couch_review` completed. What never returned was the line after it — a `fetch` whose entire
+purpose is to find NOBODY listening, written with no timeout:
+
+```js
+const afterStop = await fetch(`${base}/api/queue`, …).then(() => true, () => false);
+```
+
+Node's `fetch` has no default timeout. When the closed port DROPPED the SYN instead of refusing it, that
+promise never settled. Run 1 got a fast refusal and passed; run 2 did not. **A gate that hangs is worse
+than one that fails** — a failure gets reported, a hang just stops the loop, and it would have stopped
+verify-10 the same way. One run would have shipped this.
+
+All six requests now go through a bounded helper (`AbortSignal.timeout(20000)`). For the post-stop probe
+a timeout counts as NOT answering, which is the outcome it asserts — so the abort is the difference
+between proving the port was released and hanging on the question.
+
+### The new production function had no test either
+
+`configured_port` went in an hour before with nothing exercising it. Reading the variable is the
+untestable half (process-global, and mutating the environment mid-test is unsound with other threads
+running); deciding what a BAD value means is the half that matters, because getting it wrong takes the
+phone link down rather than merely ignoring a typo — the owner would see Couch Review "start" and find
+nothing at the URL he has bookmarked. Split into `port_from(Option<&str>)` and pinned: unset, valid,
+surrounding whitespace, empty, `0`, garbage, `70000` (out of u16 range), `-1`.
+
+### An empty directory kept "for the post-mortem"
+
+`cleanupProfile` deliberately keeps the disposable profile on failure, because it holds the only copy of
+the DB a post-mortem can read. But a PRECONDITION failure fires before the app is ever spawned, so what
+it kept was an empty directory. Measured on this box: **2 of 40 stale `cortex-e2e-*` directories held 0
+files**, both minutes old, from two precondition exits; the 40 together are **865 MB**.
+
+`die()` now removes the profile when this run minted it and it sits under the temp root. Fail-before /
+after on the same precondition (`CORTEX_AUDIO` pointing at a missing file): **leak 1 -> 0**.
+
+The 865 MB of older profiles is left alone — they predate this session and are not mine to delete.
+
+**Gates.** `cargo fmt --check` **0**; `cargo clippy --all-targets --all-features -D warnings` **0**.
+
+### The sweep went RED on a real defect, not a flake
+
+`verify-10` failed `commands::tests::agreeing_source_references_preserve_per_model_evidence`:
+
+```
+left:  Some("multi-reference-consensus:gemini-2.5-flash+gemini-2.5-pro")
+right: Some("multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash")
+```
+
+The same test had passed standalone twenty minutes earlier, which is exactly what a flake looks like. It
+is not one. `get_source_transcripts_for_audio` ordered by `datetime(updated_at) DESC, datetime(created_at)
+DESC` — and BOTH columns have one-second granularity while two reference transcripts for one clip are
+written back to back. The tie let SQLite return them in either order, so
+`multi-reference-consensus:a+b` — **persisted on the row and shipped in exports as `referenceModelId`** —
+differed between identical runs. A corpus diff would show changes nobody made, and any grouping or count
+by that value splits one category in two. Same class as the seed bug `export.rs` already documents: *"the
+old code shuffled `HashMap` keys, whose iteration order is randomised per run"*.
+
+**Which fix carries it is measured, not assumed:**
+
+| state | reversed-order test |
+|---|---|
+| neither change | **FAILS** (exit 101) — the original bug, reproduced deterministically |
+| `model_id ASC` tiebreaker alone | passes |
+| tiebreaker + sorted join | passes |
+
+So the tiebreaker is the root-cause fix and the sorted join is defence in depth. The comment says that,
+rather than implying both were needed. The join stays sorted anyway: the string names a SET of models
+that agreed, and its canonical form must not depend on why some query happened to order its rows.
+
+**The new test pins the property instead of relying on luck.** The sibling test asserts one exact string
+and only caught this because one run happened to tie the other way — passing it five times proves
+nothing, since nothing in it controls the tie.
+`the_consensus_provenance_string_is_canonical_not_insertion_ordered` writes the same two models in the
+OPPOSITE order and demands the identical value.
+
+Live library unaffected: `source_transcripts` holds **0 rows**.
+
+`cargo test --lib` **1096 passed, 0 failed, 7 ignored**.
