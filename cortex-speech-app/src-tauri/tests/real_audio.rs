@@ -584,11 +584,28 @@ fn omniasr_on_committed_fleurs_ckb_fixture() {
     );
 }
 
-/// RTF (real-time-factor) MEASUREMENT harness on the committed FLEURS fixture.
-/// RTF = inference wall-clock / audio duration; < 1.0 is faster-than-real-time. Opt-in
-/// (`#[ignore]`) because absolute timing is machine-dependent — a hard threshold belongs on a
-/// NAMED reference machine (charter M4.1), not the default suite, so this asserts only that the
-/// RTF is a finite positive measurement and PRINTS the real number to compare against a target.
+/// RTF (real-time-factor) GATE on the committed FLEURS fixture.
+/// RTF = inference wall-clock / audio duration; < 1.0 is faster-than-real-time.
+///
+/// This asserted only `rtf.is_finite() && rtf > 0.0` until iteration 235 — true of ANY positive
+/// number, so a 100× latency regression passed it. Meanwhile `scripts/verify_10.py` registers this
+/// leg as "Latency: RTF on this rig (baseline-regression gate: WS4)". A gate that cannot regress,
+/// advertised as a regression gate, is the vacuous-pass shape this repo builds explicit guards
+/// against elsewhere (the fuzz leg refuses to report a pass on an empty target list for exactly
+/// this reason).
+///
+/// The original reasoning for asserting nothing was sound as far as it went — absolute timing is
+/// machine-dependent and a hard threshold belongs on a NAMED reference machine (charter M4.1). But
+/// this test is `#[ignore]`, so it never runs in the default suite; its only automated caller IS
+/// verify-10, which is by definition the personal-use gate on that named rig. The budget asserted
+/// below is therefore the charter's own number, not one invented here:
+/// `AGENT_CHARTER.md` — "CTC-300M RTF<=0.3 CPU, <=0.1 GPU on the named reference machine".
+///
+/// Measured on this rig before the budget was wired, three consecutive runs:
+/// RTF 0.1775 / 0.1771 / 0.1765 — stable to ±0.6%, i.e. 59% of budget with 1.69× headroom. The
+/// threshold is nowhere near the noise floor, so it fails on a real regression, not on jitter.
+/// GPU is deliberately NOT asserted here: this leg runs CPU int8 (see the printed line).
+///
 /// Run with:
 ///   cargo test --test real_audio -- --ignored omniasr_rtf_on_committed_fleurs_ckb_fixture --nocapture
 /// Skips cleanly when the fixture or model is absent.
@@ -627,6 +644,16 @@ fn omniasr_rtf_on_committed_fleurs_ckb_fixture() {
         per_iter * 1000.0,
     );
     assert!(rtf.is_finite() && rtf > 0.0, "RTF must be a finite positive measurement, got {rtf}");
+    // The charter's CPU budget for CTC-300M. Asserting it is what makes this leg a gate rather than
+    // a print statement — see the note above for the measured headroom on this rig.
+    const RTF_CPU_BUDGET: f64 = 0.30;
+    assert!(
+        rtf <= RTF_CPU_BUDGET,
+        "RTF {rtf:.4} exceeds the charter's CPU budget of {RTF_CPU_BUDGET:.2} for CTC-300M. \
+         This rig measured 0.177 when the budget was wired, so this is a real regression rather \
+         than jitter — unless you are running on hardware slower than the named reference machine, \
+         in which case measure there before changing this number."
+    );
 }
 
 // ── M3: closed-loop gold eval against the REAL OmniASR engine ───────────
