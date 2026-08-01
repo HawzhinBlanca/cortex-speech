@@ -523,7 +523,10 @@ GATES = [
     # Tier 3 — deep proof legs (env-gated; skipped honestly when absent)
     ("egress-runtime", 3, "cmd", f'node "{APP / "scripts" / "egress_probe.cjs"}"', APP, _probe_egress, "Privacy: zero outbound sockets at runtime — egress_probe.cjs proves ZERO external TCP from the backend PID across startup + browse + a REAL offline transcription (import->VAD->CTC ASR, the path where cloud STT/LLM would fire if consent leaked), with an in-run POSITIVE CONTROL that fails loud if the sampler is dead (no vacuous pass). Poll-sampled (200ms) + TCP-only; an airtight kernel/ETW socket trace is a further stretch. SKIP-ENV off the Windows rig / without the exe. Static test_cloud_privacy_policy.py is belt-and-braces."),
     ("ignored-real-model", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored --skip live_transcribe_segments --skip refinery_lift', REPO_ROOT, _probe_silero, "WS3a: the 37 #[ignore] real-model gates (cloud-key test excluded; refinery_lift benchmark+diag excluded — the benchmark has its own dedicated leg)"),
-    ("fuzz-smoke", 3, "fn", _fn_fuzz_smoke, None, _probe_fuzz, "Engineering rigor: 5 fuzz targets, 0 crashes"),
+    # Deliberately count-agnostic: the gate enumerates targets with `cargo fuzz list` and fails loud on an
+    # empty list, so hardcoding a number here only creates a second place to go stale. It said "5" until
+    # the `features` target was removed with the dead FbankExtractor module it fuzzed (iteration 231).
+    ("fuzz-smoke", 3, "fn", _fn_fuzz_smoke, None, _probe_fuzz, "Engineering rigor: every fuzz target, 0 crashes"),
     ("rtf-bench", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --test real_audio -- --ignored omniasr_rtf_on_committed_fleurs_ckb_fixture --nocapture', REPO_ROOT, _probe_rtf, "Latency: RTF on this rig (baseline-regression gate: WS4)"),
     ("refinery-lift", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --test refinery_lift -- --ignored refinery_lift_injected_error_benchmark --nocapture', REPO_ROOT, None, "Refinery: >=30% CER reduction at <=15% escalation (fixed-seed injected-error benchmark, offline T0 path)"),
     ("fairness-gender-age", 3, "cmd", f'"{sys.executable}" "{APP / "scripts" / "fairness_gate.py"}"', REPO_ROOT, None, "WS4: gender/age CER disparity budget on committed corpus metadata (CORDI dialect leg owner-gated)"),

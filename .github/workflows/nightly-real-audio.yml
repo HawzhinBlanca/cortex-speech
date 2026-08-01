@@ -105,7 +105,8 @@ jobs:
           python scripts/scorecard_finetuned.py "$CORTEX_FINETUNED_GOLD" 3000
 
   # ---------------------------------------------------------------------------------------
-  # Fuzz campaign - the charter's "5 fuzz targets, 0 unresolved crashes".
+  # Fuzz campaign - the charter's "every fuzz target, 0 unresolved crashes". Enumerated at runtime by
+  # `cargo fuzz list`; the step below fails loud on an empty list so the campaign cannot pass vacuously.
   #
   # This job is the ONLY place the leg can run. On the owner's windows-msvc rig cargo-fuzz
   # cannot link at all (measured 2026-07-11: ASAN's dynamic-CRT model multiply-defines std::
