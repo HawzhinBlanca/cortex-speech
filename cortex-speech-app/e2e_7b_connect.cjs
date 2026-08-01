@@ -3,6 +3,25 @@
 // audio via IPC, and poll get_segments until the app's own WSL-7B import pass transcribes every segment.
 const { chromium } = require('@playwright/test');
 
+// THIS ONE WRITES TO THE LIVE LIBRARY, and unlike its siblings it cannot be given a disposable
+// profile: it launches nothing. It ATTACHES to an already-running app and imports into whatever
+// library that app has open — normally the real %APPDATA%\cortex-speech one, holding the owner's
+// human review decisions. That is the harness's whole purpose (it drives his real setup against the
+// WSL-7B server), so the fix is not isolation but an explicit acknowledgement: a casual run must not
+// be able to quietly add clips to the corpus.
+//
+// e2e_constrained_ipc / e2e_finetuned_ipc / e2e_pipeline_ipc got disposable profiles instead, via
+// e2e_profile.cjs. Same hazard, different remedy, because those three spawn their own app.
+if (process.env.CORTEX_ALLOW_LIVE_PROFILE !== '1') {
+  console.error(
+    'REFUSED: e2e_7b_connect attaches to an ALREADY-RUNNING app and imports into the library that app\n' +
+      '  has open — normally the REAL one. It cannot use a disposable profile because it launches\n' +
+      '  nothing. Set CORTEX_ALLOW_LIVE_PROFILE=1 to confirm you mean to add clips to that library,\n' +
+      '  or use e2e_pipeline_ipc.cjs, which does the same import->VAD->ASR proof in isolation.',
+  );
+  process.exit(1);
+}
+
 // No hardcoded personal path (repo hygiene): the audio to import is supplied by the environment.
 const AUDIO = process.env.CORTEX_AUDIO;
 if (!AUDIO) {

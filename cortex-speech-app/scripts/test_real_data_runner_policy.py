@@ -168,7 +168,18 @@ def test_every_spawning_harness_is_isolated_from_the_production_library() -> Non
         src = path.read_text(encoding="utf-8")
         code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith(("//", "*", "/*")))
         if "spawn(APP_EXE" not in code:
-            continue  # connect-only harnesses attach to a running app; they launch nothing
+            # A connect-only harness launches nothing, so a disposable profile is not available to it:
+            # it writes to whatever library the app it attached to has open — the REAL one. Isolation
+            # cannot be the remedy, so an explicit acknowledgement is. Without this branch the check
+            # would wave such a harness through as "not spawning, not our problem", which is exactly
+            # how e2e_7b_connect went unnoticed.
+            if "import_audio_file" in code and "CORTEX_ALLOW_LIVE_PROFILE" not in code:
+                raise AssertionError(
+                    f"{path.name} attaches to a running app and imports into its LIVE library without "
+                    "requiring CORTEX_ALLOW_LIVE_PROFILE=1 — a casual run would add clips to the "
+                    "owner's corpus."
+                )
+            continue
         if "/IM cortex-speech-app.exe" in code:
             raise AssertionError(
                 f"{path.name} kills by IMAGE NAME — that takes down the owner's own running Cortex. "

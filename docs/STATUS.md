@@ -4,7 +4,7 @@
 
 # Gate status — generated
 
-**Commit:** `ba55b25` · **Mode:** full
+**Commit:** `e458ef8` · **Mode:** full
 
 **Verdict:** **GREEN — PERSONAL-USE SHIP-READY.** (Not full-charter 10/10: 8 legs owner-descoped, 5 owner-gated pending.)
 
@@ -35,6 +35,9 @@
 | `rtf-bench` | PASS |
 | `refinery-lift` | PASS |
 | `fairness-gender-age` | PASS |
+| `pipeline-ipc-e2e` | PASS |
+| `constrained-ipc-e2e` | PASS |
+| `finetuned-ipc-e2e` | PASS |
 
 ## Owner-descoped (owner amendment 2026-07-10 — "ship" = personal use)
 

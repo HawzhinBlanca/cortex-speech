@@ -4580,3 +4580,97 @@ precisely that. Caught by reading the commit back rather than by the discipline 
 `db.rs` came back with a fresh mtime, newer than a binary built from byte-identical source.
 `exe-freshness` failed and was right to — the gate cannot know the content is unchanged. One rebuild is
 the honest cost of rewriting history in a repo whose staleness gate is mtime-based.
+
+## Iteration 239 — four harnesses ran against the owner's real library, and one of them found a live bug
+
+Started from a one-line audit: which e2e harnesses does any gate actually execute?
+
+```
+e2e_7b_connect        -> NOTHING RUNS IT
+e2e_constrained_ipc   -> NOTHING RUNS IT
+e2e_finetuned_ipc     -> NOTHING RUNS IT
+e2e_pipeline_ipc      -> NOTHING RUNS IT
+e2e_real_app          -> verify_10.py, package.json, ci.yml
+```
+
+Reading them turned up something worse than "unwired". All four spawned or attached to the app with a
+bare `{...process.env}` — **no `CORTEX_APP_DATA_DIR`** — so they ran against the real
+`%APPDATA%\cortex-speech` library and imported audio into a corpus holding 32 human review decisions.
+Three also killed by IMAGE NAME (`taskkill /F /IM`), which takes down the owner's own running Cortex,
+and none isolated the WebView2 profile. `e2e_real_app.cjs` has all three protections and a policy
+pinning them; **they were built for one harness and its four siblings were left behind.**
+
+**One alarm corrected before it stood.** The three spawning harnesses call `python clear_db.py` as a
+"clean slate" step, which looked like a library-wipe. It is not: they pass neither `--yes` nor
+`CORTEX_DB_CLEAR_CONFIRM`, so `clear_db.py` refuses (exit 2) and the `try/catch` swallows it. The
+safety contract living in the dangerous script rather than its callers is exactly why a careless caller
+could not defeat it — defence in depth working as designed. What it also means is that the clean-slate
+step **never once cleaned anything**.
+
+### The fix, and why it is not one shared module for all five
+
+`e2e_profile.cjs` gives the three spawning harnesses a disposable profile with a production refusal,
+WebView2 isolation, a PID-tree kill, a busy-port precondition, retrying cleanup, and offline-engine
+provisioning. `e2e_real_app.cjs` keeps its own: it is the only harness wired into a gate, it works, and
+its guards are pinned literal by literal. Rewriting the one thing that gates the repo so it can share
+code with three that nothing runs is the wrong risk trade, and the module says so.
+
+`e2e_7b_connect` needed a different remedy entirely: it launches nothing, so a disposable profile is
+not available to it — it writes to whatever library the app it attached to has open. Isolation cannot
+be the answer, so an explicit `CORTEX_ALLOW_LIVE_PROFILE=1` acknowledgement is.
+
+**Provisioning was not incidental.** With the profile isolated, `e2e_pipeline_ipc` sat in its
+`get_segments` poll forever: a fresh profile takes the app's default engine, the OmniASR-7B champion,
+which needs the owner's warm WSL server. These harnesses only ever worked because they were borrowing
+his configured profile. Left alone they would have blamed VAD for an import that could not decode.
+
+### The bug the isolation exposed: the champion model was unreachable
+
+`transcribe_segment_finetuned` returned *"fine-tuned model not found
+(models/finetuned-mms-ckb/{model.onnx,vocab.json})"* for a **970 MB model present the whole time**.
+
+`pipeline.rs` had ALREADY been fixed for this, and its comment names the scenario exactly:
+`select_bundled_models_dir` keys the ONE bundled root on OmniASR-CTC presence, so a partial copy beside
+the exe wins and orphans every sibling that lives only in the full repo models dir. Measured here:
+
+| root | contents |
+|---|---|
+| `target/release/models` | omniasr-ctc-300m, onnxruntime.dll, silero_vad_v4.onnx |
+| `%APPDATA%\cortex-speech\models` | mms_aligner.onnx + tokens |
+| `src-tauri/models` | **finetuned-mms-ckb**, campp, denoiser, ctc-1b, aligner |
+
+The import path loaded it; the IPC command could not. **Third time in two iterations** that a fix was
+applied at one site and the identical logic next door was left behind — after the guarded delete and
+the harness isolation. One implementation now: `models::finetuned_model_paths`, called by both.
+Observable: same harness, same machine, before "not found", after a real hypothesis from the champion.
+
+### A gate that rejected its own ground truth
+
+Both IPC harnesses asserted every non-space character of the output be Arabic-script. The committed
+reference, `tests/fixtures/fleurs_ckb_sample.txt`, reads `…ساڵی 1800ــەوە…` — and `1`, `8`, `0` plus a
+left-to-right mark all fail that predicate. Proven by running the old check over the reference file
+rather than arguing about it:
+
+```
+committed ground truth passes the harness assertion: false
+chars it rejects: "180‎"
+```
+
+`e2e_constrained_ipc` passed only because CTC-300M happened to emit Arabic-Indic `١`; the fine-tuned
+model emits Western digits, exactly as the reference does. The check now requires Kurdish script and
+forbids Latin letters — which still fails an English hypothesis, the failure mode it was written for.
+
+### Wired in, so this cannot rot again
+
+All three default to the committed fixture and are registered as verify-10 legs (**23 -> 26**), with
+probes that skip only on a missing binary, fixture or model — never on a forgotten env var. The policy
+now covers **every** harness: a spawning one must isolate and must not kill by image name; a
+connect-only one that imports must demand the live-profile acknowledgement. Fail-before for both
+branches — reverting `e2e_pipeline_ipc` fails on the image-name kill, stripping the `e2e_7b_connect`
+guard fails on "a casual run would add clips to the owner's corpus".
+
+**Gates.** `cargo fmt --check` **0**; `cargo clippy --all-targets --all-features -D warnings` **0**;
+`cargo test --lib` **1096 passed, 0 failed, 7 ignored**; python policies **46/46**; verify-10
+**26 - 26 PASS, 0 FAIL, 0 skipped — GREEN**, the three new legs at 15.3s / 17.3s / 19.2s.
+
+**The live library was never touched:** 144 rows, 17 flagged, 13 pending, before and after.
