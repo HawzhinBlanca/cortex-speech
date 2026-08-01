@@ -4163,3 +4163,71 @@ the R5 device hour; native Sorani review of the 8 `source: null` strings; the Ph
 verdict decisions; whether to re-align the 129 `energy_heuristic` segments; the 17 mixed-speaker clips;
 the count-agnostic fuzz requirement from iteration 232 pending confirmation; and the criterion-bench CI
 wiring above.
+
+## Iteration 236 — the 129 heuristic segments re-aligned, on the owner's word
+
+Owner decision on the item surfaced in iteration 230: re-align the backlog the old stub stamped. Iteration
+230 fixed the code, but a code fix only changes what happens from now on — the already-written rows kept
+their heuristic timings until something re-aligned them.
+
+**The tool** (`src/bin/realign_segments.rs`) is a deliberate one-off, DRY RUN by default, and uses
+`ProcessingPipeline::align` — the production path, which prefers real CTC forced alignment from the
+fine-tuned MMS-CTC model and falls back to the bundled `mms_aligner.onnx`. Settings and models resolve
+exactly as `lib.rs` does them, so it cannot align with a configuration the app could never reproduce.
+
+**Dry run first, app left running (it writes nothing):**
+
+```
+144 segments, 129 not ctc_forced
+result after 392s:  ctc_forced 129 | skipped 0 | no words 0 | align failed 0
+DRY RUN — nothing was written.
+```
+
+**Then the apply, with the app STOPPED so the library never had a second writer**, and a snapshot taken
+through the SQLite **backup API** rather than a file copy — one consistent file, no `-wal`/`-shm`
+juggling, and the script refuses to write at all if the snapshot fails:
+
+`%APPDATA%\cortex-speech\backup-before-realign-20260801-133646\cortex-speech.db` (144 rows).
+
+**Observable effect, verified against the snapshot rather than trusted from the label:**
+
+| | |
+|---|---|
+| `alignment_quality` | 129 `energy_heuristic` + 15 `ctc_forced` → **144 `ctc_forced`, 0 heuristic** |
+| word arrays CHANGED | **129** |
+| word arrays unchanged | 15 — exactly the already-forced ones, untouched |
+| **source offsets moved** | **0** |
+| **transcripts differing** | **0** |
+| verified rows | 32, unchanged |
+| rows with a human decision | 32, unchanged |
+| `pendingTotal` | 112, unchanged |
+
+**A label flip would have satisfied the first row and none of the rest**, which is why the word arrays
+were diffed. One example of what actually changed, first word of `19d21006`:
+
+```
+before  {"word":"بەو","start":0.34,  "end":0.8328, "confidence":0.5}
+after   {"word":"بەو","start":0.8208,"end":0.9409, "confidence":0.9784}
+```
+
+`confidence: 0.5` is the flat constant `fallback_align` writes for every word — the heuristic had no
+opinion. Forced alignment gives 0.978 and moves the word ~0.48 s later. Linear interpolation had placed
+the first word half a second off; that is the size of the error the whole corpus carried.
+
+**Why this was safe by construction, not by care:** `update_segment_alignment` writes
+`alignment_json` + `alignment_quality` + `updated_at` and nothing else, and the new JSON is built with
+`merge_word_timestamps`, which preserves `source_start_ms`/`source_end_ms`. Every reader that slices a
+clip by those offsets — phone playback, dataset audio export, the 7B re-transcribe client, jury acoustic
+scoring — sees identical bytes. The tool also refuses to write an empty word list, since replacing real
+timings with nothing is worse than leaving heuristic ones; that guard was never exercised (0 empty).
+
+**Cost, measured:** 389 s for 129 segments (~3 s each). `ProcessingPipeline::align` re-decodes the source
+per call and all 129 clips come from one 172 MB file, so most of that is redundant decode+hash work. Left
+alone deliberately: this is a one-off, and optimising it would mean diverging from the production path,
+which is the one property that makes its output trustworthy.
+
+**Gates.** `cargo fmt --check` **0**; `cargo clippy --all-targets --all-features -D warnings` **0**; exe
+freshness OK at HEAD; claim **200**, queue **200**, items 29, `pendingTotal` 112, watchdog re-armed.
+
+**One owner-gated item closes.** The 17 mixed-speaker clips, the R5 hour, Tailscale, the admin script,
+the 8 Sorani strings, the two verdict decisions and the charter fuzz edit all remain.
