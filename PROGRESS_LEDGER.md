@@ -4055,3 +4055,48 @@ mutate", not "mutants killed", and nobody reading the badge would know.
 
 **Gates.** `npm run test:python-policies` **0** — 46/46. No Rust change, so no rebuild and no other gate
 was disturbed; the app and reviewer link stayed up for the whole iteration.
+
+## Iteration 234 — target (4) was already done; the loop was carrying a stale worklist
+
+Target (4) listed four "STILL UNTESTED" couch-review scenarios. **All four are covered by named,
+non-vacuous tests that pass today.** Nothing was untested, and the honest output of this iteration is
+that correction rather than four duplicate tests.
+
+| "untested" item | the test that covers it | result |
+|---|---|---|
+| spot-check accounting across many batches | `spot_check_accounting_survives_a_long_multi_batch_session` | ok, 0.37s |
+| lease expiry with a backgrounded page | `a_lease_that_lapsed_while_the_phone_slept_is_reclaimable_but_never_stolen_silently` | ok, 0.09s |
+| spot-check answer across Stop/Start | `a_spot_check_served_before_a_restart_is_still_scored_after_it` | ok, 0.11s |
+| the check-then-act race | `three_reviewers_hammering_at_once_never_double_decide_or_lose_a_clip` | ok, 0.62s |
+
+**Checked for vacuity rather than trusting the names**, because a test named for a scenario need not
+exercise it:
+* the multi-batch one is 88 lines with 10 assertions, forces `work_done >= QUEUE_BATCH * 4` so the
+  session genuinely spans several batches, and asserts both that no check is served twice to the same
+  reviewer and that an answer-key clip never acquires a `reviewed_by`;
+* the lapsed-lease one is 55 lines with 7 assertions covering reclaim-by-holder, availability to a
+  second reviewer after expiry, a 409 on renew once someone else holds it, and that the refused renew
+  does not steal the clip back;
+* the race one uses REAL `std::thread::spawn` concurrency, not a simulated interleaving.
+
+**This is the failure mode the loop prompt itself warns about, and I committed it.** The rule is "verify
+gate state from `docs/STATUS.md` and `git log`, never a ledger sentence" — and the STATE block listing
+these four items was carried forward verbatim across many iterations without ever being re-checked
+against the test module. Had I acted on it, I would have written four duplicate tests and reported them
+as new coverage.
+
+Two supporting facts confirmed while verifying, both by reading the code rather than assuming:
+* Cross-batch spot-check accounting cannot double-count: `list_spot_check_candidates` excludes
+  `id NOT IN (SELECT segment_id FROM spot_checks WHERE reviewer = ?1)`, so a scored clip is never
+  re-served to that reviewer. The served-set is also bounded — an unanswered check is re-served rather
+  than accumulating, because `HashSet::insert` returns false for one already present.
+* The check-then-act class is guarded structurally, not by luck: `api_decision` reads `prev` for its
+  validation but builds the upsert from a **freshly re-read row** (couch.rs:1619), and the collision
+  guard checks and claims under ONE lock. couch.rs:1662 names this explicitly.
+
+**Gates.** The four tests above, run individually: 4/4 ok. No source change, so no rebuild, no other gate
+disturbed, and the app and reviewer link stayed up for the whole iteration.
+
+**The loop's target (4) is now closed** and the prompt updated so the next iteration does not re-derive
+it. Remaining genuinely-open engineering: the ungated criterion benches. Everything else on the list is
+owner-gated.
