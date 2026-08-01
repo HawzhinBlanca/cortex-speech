@@ -423,35 +423,6 @@ fn test_pipeline_process_single_supported_audio() {
     assert!(segment.duration_ms > 0, "Duration should be > 0");
 }
 
-// ── Fbank Feature Extraction on Real Audio ──────────────────────────────
-
-#[test]
-#[ignore]
-fn test_fbank_on_real_audio() {
-    let Some(path) = first_fixture_with_extensions(SUPPORTED_AUDIO_EXTENSIONS) else {
-        eprintln!("[fbank] skip: no supported audio fixture found under {REAL_AUDIO_DIR_ENV}");
-        return;
-    };
-
-    let (_sr, pcm) = audio::decode_to_pcm_with_timeout(&path, std::time::Duration::from_secs(30)).expect("decode");
-
-    let f32_pcm: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-
-    let fbank = cortex_speech_app_lib::features::FbankExtractor::new(16000);
-    let start = Instant::now();
-    let features = fbank.compute(&f32_pcm);
-    let elapsed = start.elapsed();
-
-    eprintln!("[fbank] Shape: ({}, {}), took {:.3}s", features.shape()[0], features.shape()[1], elapsed.as_secs_f64());
-
-    let has_nonzero = features.iter().any(|&v| v.abs() > 1e-6);
-    assert!(has_nonzero, "Real audio fbank should have non-zero values");
-    assert_eq!(features.shape()[1], 80, "Should have 80 mel bins");
-
-    let max_val = features.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-    eprintln!("[fbank] Max absolute value: {max_val:.4}");
-}
-
 // ── Large File Stress Test ──────────────────────────────────────────────
 
 #[test]

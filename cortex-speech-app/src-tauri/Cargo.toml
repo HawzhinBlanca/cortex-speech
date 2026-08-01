@@ -89,14 +89,8 @@ tiny_http = "0.12"
 # SHA256 verification for downloaded models
 sha2 = "0.11"
 
-# Compression ratio for ASR repetition detection
-flate2 = "1"
-
 # Array operations (matches ort's ndarray version)
 ndarray = "0.17"
-
-# FFT for mel filterbank feature extraction
-rustfft = "6"
 parquet = { version = "59.0.0", default-features = false, features = ["arrow", "snap"] }
 arrow-array = "59.0.0"
 arrow-schema = "59.0.0"

@@ -57,9 +57,14 @@ pub fn merge_word_timestamps(existing: Option<&str>, words: &[crate::aligner::Wo
 /// Measured before changing it, so this is honest about what it fixes: across all 144 segments in the
 /// owner's live library the only keys present are `source_start_ms`, `source_end_ms`, `chunk_index`,
 /// `chunk_count` and `words` — every one of them on the old whitelist. So **no data was being lost
-/// today**; this closes the hazard, it does not recover anything. The trim path
-/// (`update_segment_bounds`) is the reviewer's most-used edit, which is why the hazard is worth closing
-/// before a key gets added rather than after.
+/// today**; this closes the hazard, it does not recover anything.
+///
+/// CORRECTION (iteration 231). This comment used to call the trim path (`update_segment_bounds`) "the
+/// reviewer's most-used edit". That was false when written. `update_segment_bounds` has NO caller: its
+/// frontend wrapper was deleted on 2026-07-15 by `1167504` as one of "20 dead command wrappers", and it
+/// was already unused then — no trim UI has ever shipped. So this function is currently reachable only
+/// from an orphaned IPC command. The hazard it closes is still real for whoever wires a trim control
+/// later; the traffic claim was invented, and is retracted rather than quietly dropped.
 ///
 /// Word timestamps are absolute source-time positions and stay valid across a bounds change (a reviewer
 /// can re-run alignment to refresh them).
