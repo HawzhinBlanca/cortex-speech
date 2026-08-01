@@ -4531,3 +4531,52 @@ OPPOSITE order and demands the identical value.
 Live library unaffected: `source_transcripts` holds **0 rows**.
 
 `cargo test --lib` **1096 passed, 0 failed, 7 ignored**.
+
+### Three gates caught this iteration's own work — one per sweep, because the runner stopped at the first
+
+**1. A second recursive delete.** `die()`'s new cleanup added its own `fs.rmSync` with its own copy of
+the guards, and `test_real_data_runner_policy.py` — written earlier in this same session — refused it:
+*"Recursive delete must appear exactly once."* That policy is right, and the reason is the reason it was
+written: two delete sites means two places to get the guards right. The single delete moved into
+`removeDisposableProfile()`, shared by `cleanupProfile` (which retries past Windows' asynchronous handle
+release) and `die()` (which has nothing to wait for). The policy was **strengthened**, not loosened: it
+now also pins that the shared helper exists, so neither caller can be re-inlined.
+
+**2. An exact literal that no longer matched.** `test_restore_reservation_gate.py` pins `couch::start`'s
+one-line body so the restore guard cannot be bypassed by `start` growing a real body, and
+`configured_port()` had replaced the bare `COUCH_PORT`. The gate's own note says *"update this literal to
+its new one-line body — do not loosen it"*, and that is exactly what was done, for `resume` too. `resume`
+matters as much: coming back on a different port than `start` binds would resurrect the session at a URL
+the owner's bookmark does not point at.
+
+**3. The policy runner hid two of them.** `run_python_policies.py` was fail-fast, so a stale-ledger
+failure masked the duplicated delete, which masked the couch literal. **Three verify-10 sweeps were spent
+learning what one run could have said.** Every policy now runs and every failure is named; strictness is
+unchanged — any failure still exits non-zero — only the reporting is. `py_compile` stays fail-fast: it is
+the syntax floor every policy was just executed on, not a policy itself.
+
+Fail-before, two policies broken at once:
+
+```
+Python policy regressions FAILED: 2 of 46
+  - test_gitignore_policy.py
+  - test_workflow_policy.py          exit 1
+```
+
+Previously only the first was ever visible. Both restored, tree clean.
+
+### And a slip of my own: a RED STATUS.md reached a commit
+
+`git add -A` in the jury-fix commit swept in `docs/STATUS.md` reading **RED — 2 kept gate(s) failed**, and
+four later commits inherited it. Nothing had been pushed, so the five unpushed commits were rewritten to
+carry the last status a real run actually produced. Every code change survived the rewrite (verified by
+spot-check, working tree clean afterwards).
+
+The rule exists so the repo never advertises a verdict no run produced, and this would have published
+precisely that. Caught by reading the commit back rather than by the discipline that should have stopped
+`git add -A` in the first place.
+
+**The rewrite then staled the exe, which is worth knowing:** a rebase rewrites the WORKING TREE, so
+`db.rs` came back with a fresh mtime, newer than a binary built from byte-identical source.
+`exe-freshness` failed and was right to — the gate cannot know the content is unchanged. One rebuild is
+the honest cost of rewriting history in a repo whose staleness gate is mtime-based.
