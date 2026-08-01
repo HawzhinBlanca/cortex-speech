@@ -2160,6 +2160,14 @@ impl ProcessingPipeline {
             by_path.entry(s.audio_path.clone()).or_default().push((s.id.clone(), s.alignment_json.clone(), text));
         }
         let db_path = self.db_path.clone();
+        // Resolved HERE because the thread below is `move` and never captures `self`. That is exactly how
+        // this path ended up on `aligner::align` — the free fallback-only stub — instead of the real
+        // aligner the foreground path uses: the model root simply was not reachable inside the closure.
+        // Per-file resolve for the same reason `Pipeline::align` uses it: `resolve_root_for` finds
+        // mms_aligner.onnx in the user dir OR bundled, where the all-or-nothing `resolved_dir()` orphans
+        // a bundled aligner as soon as OmniASR is downloaded into the user dir.
+        let aligner_root = self.model_manager.resolve_root_for("mms_aligner.onnx");
+        let enable_gpu = self.settings.enable_gpu;
 
         // R3: this DETACHED thread is spawned during import (ImportState::Running) but OUTLIVES the
         // ImportGuard, then writes segment alignments (update_segment_alignment) on its OWN connection —
@@ -2174,6 +2182,19 @@ impl ProcessingPipeline {
                 Ok(db) => db,
                 Err(error) => {
                     tracing::warn!("background alignment skipped: could not open db: {error}");
+                    return;
+                }
+            };
+            // ONCE for the whole import, not per segment: `ForcedAligner::new` loads a ~365 MB ONNX
+            // session. `Pipeline::align` can afford to build one per call because it aligns a single
+            // clip; doing that here — across every segment of every file in an import — would not be.
+            // A missing model is NOT an error: `new` succeeds with no session and `align` then reports
+            // EnergyHeuristic honestly, which is the old behaviour and the correct one when there is
+            // genuinely nothing better available.
+            let aligner = match aligner::ForcedAligner::new(&aligner_root, enable_gpu) {
+                Ok(aligner) => aligner,
+                Err(error) => {
+                    tracing::warn!("background alignment skipped: aligner unavailable: {error}");
                     return;
                 }
             };
@@ -2201,8 +2222,8 @@ impl ProcessingPipeline {
                             continue;
                         }
                     };
-                    match crate::aligner::align(&sliced, 16000, &text) {
-                        Ok(words) if !words.is_empty() => {
+                    match aligner.align(&sliced, 16000, &text) {
+                        Ok((words, quality)) if !words.is_empty() => {
                             // MERGE under `words`, preserving source_start_ms/source_end_ms. One
                             // atomic write for timings + quality marker: persisting the timings while
                             // the quality stamp failed (the old swallowed `let _ =`) left heuristic
@@ -2212,7 +2233,12 @@ impl ProcessingPipeline {
                             if let Err(error) = db.update_segment_alignment(
                                 &seg_id,
                                 &merged,
-                                crate::aligner::AlignmentQuality::EnergyHeuristic.as_db_str(),
+                                // The quality the aligner ACTUALLY achieved. This was hardcoded to
+                                // EnergyHeuristic, which was true of the stub but is a provenance lie the
+                                // moment a real alignment happens — and `quality.rs` raises a review-risk
+                                // reason on exactly this value, so the lie cost every background-aligned
+                                // clip a false risk flag.
+                                quality.as_db_str(),
                             ) {
                                 tracing::warn!("background alignment: persist failed for {seg_id}: {error}");
                                 failed += 1;

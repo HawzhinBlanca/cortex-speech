@@ -644,13 +644,19 @@ fn fallback_align(pcm: &[i16], sample_rate: u32, text: &str) -> Vec<WordTimestam
         .collect()
 }
 
-pub fn align(pcm: &[i16], sample_rate: u32, text: &str) -> Result<Vec<WordTimestamp>, Box<dyn std::error::Error>> {
-    Ok(fallback_align(pcm, sample_rate, text))
-}
-
-pub fn score_consistency(_pcm: &[i16], _sample_rate: u32, _text: &str) -> Result<f64, String> {
-    Ok(-5.0)
-}
+// REMOVED: free `align()` and `score_consistency()`.
+//
+// `align()` returned `fallback_align` unconditionally — it could not consult a model even when one was
+// loaded, and its signature had no room to report `AlignmentQuality`, so every caller had to invent one.
+// Its single caller was `pipeline::enqueue_background_alignments`, which consequently hardcoded
+// EnergyHeuristic and stamped that on 129 of the owner's 144 segments while the foreground path proved
+// ctc_forced works on the same machine. It now uses `ForcedAligner::align` like everything else.
+//
+// `score_consistency()` returned the constant `-5.0` and had NO callers at all — a fake acoustic score
+// one `use` away from being persisted to `ctc_score`. `ForcedAligner::score_consistency` is the real one.
+//
+// Both are deleted rather than left as "convenience wrappers": a free function that silently ignores the
+// model is not a convenience, it is a trap that already sprang once.
 
 fn log_sum_exp(a: f32, b: f32) -> f32 {
     if a == f32::NEG_INFINITY {

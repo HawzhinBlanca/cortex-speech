@@ -1143,3 +1143,36 @@ fn end_to_end_review_run() {
     eprintln!("[e2e] clips:    {}", clips_dir.display());
     assert!(!windows.is_empty(), "VAD produced no segments");
 }
+
+// ── Forced Alignment: the MODEL-PRESENT case ────────────────────────────
+
+#[test]
+#[ignore]
+fn forced_aligner_reports_ctc_forced_when_the_model_is_installed() {
+    // The NEGATIVE is already pinned in aligner.rs (no model -> energy_heuristic). The POSITIVE was
+    // not, and it is exactly the case the background alignment path now depends on: that path used a
+    // free `aligner::align()` stub which could never consult a loaded model, so it stamped
+    // energy_heuristic on every clip it touched — 129 of the owner's 144 segments — while the
+    // foreground path produced ctc_forced from the same models on the same machine.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
+    let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+    if !fixture.exists() || !models.join("mms_aligner.onnx").exists() {
+        eprintln!("[aligner-gate] fixture or mms_aligner.onnx missing; skipping");
+        return;
+    }
+
+    let (sample_rate, pcm) = audio::decode_to_pcm(fixture.to_str().unwrap()).expect("decode fixture");
+    let (sample_rate, pcm) = audio::ensure_pcm_16khz(sample_rate, pcm).expect("resample to 16k");
+    assert!(!pcm.is_empty(), "fixture decoded to no audio");
+
+    let aligner = cortex_speech_app_lib::aligner::ForcedAligner::new(&models, false).expect("build ForcedAligner");
+    let (words, quality) = aligner.align(&pcm, sample_rate, "سڵاو جیهان").expect("align");
+
+    eprintln!("[aligner-gate] {} words, quality={}", words.len(), quality.as_db_str());
+    assert_eq!(
+        quality.as_db_str(),
+        "ctc_forced",
+        "a LOADED aligner must force-align; energy_heuristic here means the model was bypassed"
+    );
+    assert!(!words.is_empty(), "forced alignment must yield word timings");
+}
