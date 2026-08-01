@@ -27,7 +27,14 @@ EXE_PATH = APP_ROOT / "src-tauri" / "target" / "release" / "cortex-speech-app.ex
 # Source surfaces whose change must invalidate a stale exe. Frontend (src/**) matters because a
 # bare `cargo build --release` ships a STALE embedded UI; backend (src-tauri/src/**) and the build
 # inputs matter for the compiled binary itself.
-SOURCE_DIRS = ["src", "src-tauri/src"]
+#
+# src-tauri/assets and src-tauri/migrations are here because they are COMPILED IN, not read from
+# disk at runtime: `include_str!("../assets/couch.html")`, `include_bytes!("../assets/couch-icon.png")`
+# and `include_str!("../../migrations/001_initial.sql")`. Editing the phone review page — 68 KB of
+# reviewer-facing behaviour, its Sorani strings included — therefore stales the exe exactly as a .rs
+# edit does, and this gate could not see it. Caught live: couch.html sat 15 minutes newer than the
+# binary while the gate printed "newer than all sources".
+SOURCE_DIRS = ["src", "src-tauri/src", "src-tauri/assets", "src-tauri/migrations"]
 SOURCE_FILES = [
     "src-tauri/build.rs",
     "src-tauri/tauri.conf.json",
