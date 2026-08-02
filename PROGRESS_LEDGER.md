@@ -4987,3 +4987,49 @@ and drops a clause. That is the whole argument for pinning the mirror rather tha
 (8 owner-descoped, 5 owner-gated pending). couch 55/55; lib 1098 passed / 0 failed;
 `couch-page.spec.ts` 41/41; python policies **47/47** (was 46); clippy `-D warnings` clean;
 `bench-budget` PASS 1016.9s with matched sampling. Exe at HEAD, app running, phone link answering.
+
+### Two fault drills existed and nothing ran them
+
+Asked the existence question again — which scripts does no gate, workflow or Makefile reference? Twelve
+came back. Ten are legitimately hand-run tools in the retrain path. Two were **drills**, whose entire
+purpose is to prove a property, sitting unrun: `durability_drill.py` and `export_kill_drill.py`. Same
+shape as the retrain-readiness mirror earlier this iteration, and this pair covers the property daily
+review depends on most — the app dying must never cost work that was already saved.
+
+Ran both before wiring anything, on real binaries and disposable profiles:
+
+```
+durability : 25 hard kills (20 write-phase, 5 boot-phase), 19,463 rows committed,
+             0 journaled edits lost, contiguous id space, integrity_check ok at every verify
+export-kill: 15 mid-export kills, 134 journaled exports all complete, zero torn final files
+```
+
+**Why they get their own cargo target dir.** `tauri_build`/`ort` copy `onnxruntime.dll` next to the
+built artifacts, and the RUNNING app holds it open, so `cargo build --bin durability_writer` against
+`target/` dies with `os error 32` — measured today, exit 101. The app is up during every real sweep, so
+a drill leg failing for that reason would be failing for something it does not test. A sibling dir under
+the already-ignored `target/` has its own copy that nothing holds; proven with the app running (271s +
+221s cold, cached after). I first reached for build.rs as the root cause and was wrong — the copy comes
+from dependency build scripts, not ours.
+
+The build is inside the leg deliberately. A probe that SKIPS turns a reliability gate into a no-op
+exactly when someone forgot to build; a pre-built binary requirement silently proves durability for code
+that is no longer shipped.
+
+**Gates.** verify-10 **GREEN: 32 kept legs, 32 PASS, 0 FAIL, 0 skipped** (was 30). New legs measured in
+the sweep: `durability-drill` 225.0s, `export-kill-drill` 41.1s.
+
+### Pre-flight on the 99 clips waiting for the owner
+
+Read-only, against real files and the LIVE couch server, because the next review session is the thing
+this iteration is for:
+
+- all 99 fetched over real HTTP: **39.4 MB decoded + sliced + WAV-encoded**, every one a 200, a
+  parseable RIFF/WAVE, and a PCM length agreeing with its advertised duration (a short slice would make
+  a reviewer reject a good clip);
+- audio present on disk, no zero-byte files, no non-positive durations, no placeholder or blank drafts;
+- speaker-change safety net **measured on all 99** — none silently unscored — and 0 still-flagged;
+- 0 duplicate drafts inside the queue, 0 drafts identical to already-approved text.
+
+Library health, read-only on the live file: `integrity_check` **ok**, `foreign_key_check` **0
+violations**, **0 orphans** across all eight child tables, WAL 0.58 MB.
