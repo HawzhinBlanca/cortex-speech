@@ -4781,3 +4781,75 @@ the owner-gated list.
 The gate already behaves this way and always did: `_fn_fuzz_smoke` enumerates targets with
 `cargo fuzz list` and FAILS LOUD on an empty list rather than reporting a vacuous pass — so the
 charter now describes what the code does instead of a number that could drift away from it.
+
+## Iteration 195 — the explicit no-verdict, and the 17 flagged clips decided
+
+### The 17 mixed-speaker clips are decided
+
+13 of the 17 clips the speaker-change probe measured were still pending; the other 4 already carried a
+human decision and were left exactly as they were. `src/bin/reject_speaker_change_clips.rs` applies the
+owner's decision in bulk through `record_human_decision` — the same call the desktop and the phone
+make — with a dry run by default.
+
+**It took two writes, and the first version only did one.** The tool printed `rejected 13 clip(s)` and
+the clips came back correctly rejected AND still pending: every one of them would have been served to a
+reviewer again. Nothing in the tool's own output said so. A diff against a backup-API snapshot did:
+
+```
+rows: 144 -> 144            rows changed: 13
+  human_decision / verdict / verified    changed on 13 rows
+  raw_transcript / annotated_transcript
+    / alignment_json / speaker_change_score  changed on  0 rows
+rejected rows: 6 -> 19
+flagged AND still pending: 13 -> 0
+previously-decided flagged clips: 4, of which changed: 0
+```
+
+The real couch path does two writes for exactly this reason (`record_human_decision_by`, then the
+whole-row upsert that sets `verified`) and now so does this. `pendingTotal` on the live phone link went
+112 -> 99.
+
+### R4.4: a reviewer can now say "I cannot judge this"
+
+Someone facing a clip they genuinely cannot call — two people talking over each other, an accent they do
+not have, audio that will not play — had exactly two ways forward, and BOTH write a judgement they
+cannot stand behind: "Looks good" promotes an unheard draft to gold, "Reject" permanently excludes a
+clip that may be perfectly fine. A guess is worse for the corpus than an honest "I don't know", because
+nothing downstream can tell the two apart.
+
+`action: "skip"` writes NOTHING to the row. It records the act in the audit trail, releases the lease,
+and takes the clip out of that reviewer's queue so it reaches somebody who can judge it. The button
+existed but was revealed only on an audio error and only advanced the page locally — so after the batch
+drained, the next refill served the same clip straight back.
+
+Two things it would have broken silently, both closed:
+
+- `reviewer_throughput` counted every audit row as a clip reviewed. A skip would have credited someone
+  for work they explicitly did not do. Now a WHITELIST of decision actions, so the next non-decision
+  event on this trail cannot re-open it.
+- A reviewer who skipped through a small backlog would have been congratulated with "all clips
+  reviewed" over unjudged work. The queue reports `skippedByYou` and the empty state says so.
+
+One new Sorani string (`skippedByYou`); the button reuses the already-listed `skip` text. The
+owner's native-read list goes 9 -> 10.
+
+### What the session's evidence says about method
+
+Three defects in this iteration, and **not one of them was found by reading the diff.**
+
+1. The half-written rejection — found by diffing the live DB against a snapshot, not by the tool's count.
+2. An offline skip deleting the reviewer's typed draft — found by reading the OTHER route to the server
+   after writing the guard on the first one. `decide()` had it; `flushOutboxOnce()` inherited the bug.
+   Now pinned at the source for BOTH routes in `test_frontend_review_guards.py`.
+3. Autoplay-on-skip — found by verify-10's a11y leg, which failed 2 of 88 because an existing spec had
+   already decided this question, with better reasoning than mine: "a skip is the reviewer saying 'I
+   cannot judge this' ... deserves a loaded clip and silence." Reverted to the prior decision rather
+   than rewriting the test to agree with the change.
+
+The third is the one worth keeping. A test that fails because it encodes a deliberate earlier decision
+is not an obstacle to route around — it is the only remaining record of reasoning nobody was around to
+restate. The default when a gate contradicts a change must be to read WHY before touching either.
+
+**Fail-before proofs, unmasked.** skip path: new unit test asserted 200, got 400 (unknown action),
+exit 101. Draft guard: removed -> AssertionError naming `flushOutboxOnce`, exit 1; file restored
+byte-identical (SHA256 compared); pass-after exit 0.
