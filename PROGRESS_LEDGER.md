@@ -4964,3 +4964,26 @@ now says `NONE RECORDED — the model registry has no champion` in words, plus a
 gate is safe but has nothing to defend a retrain with. No number was invented and none was backfilled
 into the registry — transcribing a CER out of prose into a database is precisely the "remembered metric"
 the honesty law forbids. Registering it needs the real eval run, which is owner-gated.
+
+**Measured, on the live library, why that gate is not theoretical.** The 13 clips rejected earlier this
+iteration all became `verified = 1` (that is what takes a clip out of the review queue), so a count site
+missing the reject clause would now *inflate*:
+
+```
+total rows                          : 144
+rejected                            :  19   (13 today + 6 prior)
+rejected AND verified=1             :  19
+naive "verified" count              :  45   <- what a rule without the reject clause reports
+export-eligible (the pinned rule)   :  26   <- gap of exactly 19
+eligible AND rejected   (must be 0) :   0
+eligible AND placeholder (must be 0):   0
+still pending                       :  99
+```
+
+A 73% overstatement of "how much training material do I have", available to anyone who copies the rule
+and drops a clause. That is the whole argument for pinning the mirror rather than trusting the copy.
+
+**Gates at the close of iteration 195.** verify-10 **GREEN: 30 kept legs, 30 PASS, 0 FAIL, 0 skipped**
+(8 owner-descoped, 5 owner-gated pending). couch 55/55; lib 1098 passed / 0 failed;
+`couch-page.spec.ts` 41/41; python policies **47/47** (was 46); clippy `-D warnings` clean;
+`bench-budget` PASS 1016.9s with matched sampling. Exe at HEAD, app running, phone link answering.
