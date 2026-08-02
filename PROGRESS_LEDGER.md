@@ -5033,3 +5033,44 @@ this iteration is for:
 
 Library health, read-only on the live file: `integrity_check` **ok**, `foreign_key_check` **0
 violations**, **0 orphans** across all eight child tables, WAL 0.58 MB.
+
+### Measured: the speaker-change badge does NOT catch what the owner rejects
+
+The owner reviewed 22 clips on the phone and reported rejecting mainly for **two or more people talking**
+and **a transcript too wrong to fix**. Their 14 rejections are the first real labels this badge has ever
+been scored against, so it was scored.
+
+**AUC 0.47 — no signal.** (0.50 is a coin flip.)
+
+```
+speaker_change_score   rejected n=14: q1 0.650  med 0.774  q3 0.794
+                       kept     n=40: q1 0.720  med 0.753  q3 0.778
+
+threshold   rejects flagged   keeps wrongly flagged
+   0.59      1/14   (7%)         3/40   (8%)
+   0.70      5/14  (36%)         6/40  (15%)
+   0.80     12/14  (86%)        36/40  (90%)
+```
+
+Raising the threshold makes it WORSE. At 0.80 it fires on 90% of good clips — a warning that fires on
+almost everything is noise a reviewer learns to ignore inside one session, which is worse than no
+warning at all. The threshold stays at 0.59.
+
+**Why it misses them, and this is a design limit not a bug:** the probe compares a clip's first half
+against its second half. That detects a clean handover at the midpoint. It is structurally blind to two
+people OVERLAPPING, and to a turn near either edge — which is most of what a real conversation does.
+
+**What the badge is still worth:** it was 15/15 correct in the owner's blind listening calibration when
+it fired. High precision, low recall. Trust it when it speaks; never read its silence as "one speaker" —
+which is what the `holds_a_speaker_change` comment already says for the unmeasured case, and now also
+holds for the measured-but-above-threshold case.
+
+**Deliberately NOT built yet:** a sliding-window change-point scan. Calibrating one against 14 labels,
+roughly half of which are the OTHER rejection cause, is building on sand. Revisit at ~100 decisions,
+when there is enough real signal — and evaluate SPLITTING multi-speaker clips at the change point rather
+than discarding them, which converts waste into corpus instead of merely flagging it.
+
+**Also measured, same session:** `agent_confidence` DOES predict rejection (AUC 0.77; rejected median
+0.54 vs kept 0.72). Serving highest-confidence first would make the first 10 clips 10/10 usable against
+a 26% baseline waste rate — but it only DEFERS the waste, it removes none of it, and n=14 makes the
+figure suggestive rather than established. Not acted on.
