@@ -146,6 +146,18 @@ struct CouchState {
     /// Where to re-save the remembered session when the served-set grows: (data_dir, db_path).
     /// None outside a durable session (tests, no data dir) — then nothing is persisted, as before.
     session_store: Option<(PathBuf, String)>,
+    /// reviewer -> the segment ids they explicitly SKIPPED: "I cannot judge this one" (R4.4).
+    ///
+    /// Kept so the queue stops handing a reviewer work they have already declined. Without it the
+    /// button is a treadmill: the clip is still pending, so the very next refill serves it straight
+    /// back, and the only way past it remains a verdict the reviewer cannot stand behind.
+    ///
+    /// ponytail: memory only, deliberately. A restart offers the clip once more, which costs one
+    /// repeated clip — unlike `spot_checks`, where losing an entry MIS-SCORES a reviewer, and which is
+    /// why that one is persisted and this is not. Never pruned either: it is bounded by the pending
+    /// backlog, and the count reported to the page is derived from the live pending rows rather than
+    /// from this map's size, so a stale entry cannot inflate anything.
+    skipped: HashMap<String, HashSet<String>>,
 }
 
 impl CouchState {
@@ -1093,12 +1105,20 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     let mut guard = lock_state(state);
     let mut queue: Vec<serde_json::Value> = Vec::new();
     let mut held_by_others = 0usize;
+    let mut skipped_by_you = 0usize;
     for s in segments.iter() {
         // Someone else's live lease: skip it, but COUNT it. Our own is renewed below (a reviewer
         // reloading the page must get their own in-progress work back, not a fresh batch that
         // abandons it).
         if guard.holder(&s.id, now).is_some_and(|who| who != reviewer) {
             held_by_others += 1;
+            continue;
+        }
+        // This reviewer already said they cannot judge this one (R4.4). Not theirs to be handed
+        // again — but COUNTED, because it is still pending work somebody owes a verdict, and an
+        // empty batch full of these must not draw "🎉 all clips reviewed".
+        if guard.skipped.get(reviewer).is_some_and(|ids| ids.contains(&s.id)) {
+            skipped_by_you += 1;
             continue;
         }
         if queue.len() >= QUEUE_BATCH {
@@ -1194,6 +1214,10 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     //   expire and batches drain, so the imbalance is self-correcting). On a backlog smaller than one
     //   batch that leaves a second reviewer with an EMPTY queue, and "🎉 Queue reviewed" would then be a
     //   flat lie. This count lets the page say "someone else has them" instead.
+    //   `skippedByYou` — how many pending clips THIS reviewer declined to judge. Same class of lie as
+    //   `heldByOthers`, one step further along: a reviewer who skips their way through a small backlog
+    //   would otherwise be congratulated with "🎉 all clips reviewed" over work nobody has judged.
+    //
     //   `pendingTotal` — how much pending work EXISTS, leased or not. The page could previously only
     //   count the batch in its hands, so "clip 7 of 25" was the whole truth it had: a reviewer working
     //   a 400-clip backlog saw a bar that filled up and reset, over and over, with no way to tell a
@@ -1205,6 +1229,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
             "reviewer": reviewer,
             "items": queue,
             "heldByOthers": held_by_others,
+            "skippedByYou": skipped_by_you,
             "pendingTotal": segments.len(),
         }),
     )
@@ -1463,7 +1488,7 @@ fn is_repeat_of_stored_decision(prev: &SpeechSegment, reviewer: &str, decision: 
 #[derive(serde::Deserialize)]
 struct DecisionBody {
     id: String,
-    /// "accept" | "edit" | "bad"
+    /// "accept" | "edit" | "bad" | "skip" (the last writes nothing — see `api_decision`)
     action: String,
     #[serde(default)]
     text: String,
@@ -1483,6 +1508,8 @@ struct DecisionBody {
 /// validation aborts before anything is committed), then the whole-row upsert built from the FRESH
 /// db row — never from the payload — so only `annotated_transcript`/`verified` can change. The decision
 /// is attributed to `reviewer`, and refused outright on a clip another reviewer currently holds.
+///
+/// `action: "skip"` is the one path that writes NOTHING to the corpus — see the block that handles it.
 fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
     let parsed: DecisionBody = match serde_json::from_slice(body) {
         Ok(p) => p,
@@ -1508,6 +1535,49 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         Ok(None) => return err_reply(404, "no such segment"),
         Err(e) => return err_reply(500, &e.to_string()),
     };
+
+    // AUDIT TRAIL (v45), written for every accepted submit including spot checks — a reviewer's
+    // throughput must count the work they actually did, and a check is real work to them. Best-effort
+    // and logged on failure: losing the RECORD of a decision must never cost the DECISION.
+    let audit = |db: &Database, action: &str| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if let Err(e) = db.record_review_event(&parsed.id, reviewer, action, "couch", now_ms) {
+            tracing::warn!("Couch Review audit event not recorded for {}: {e}", parsed.id);
+        }
+    };
+
+    // SKIP — the explicit NO-VERDICT (R4.4), handled before any of the write machinery because it
+    // shares none of it.
+    //
+    // A reviewer who genuinely cannot call a clip — two people talking over each other, an accent they
+    // do not have, audio that will not play — previously had exactly two ways forward, and both write a
+    // judgement they cannot stand behind: "Looks good" promotes an unheard draft to gold, "Reject"
+    // permanently excludes a clip that may be perfectly fine. A guess is worse for the corpus than an
+    // honest "I don't know", because nothing downstream can tell the two apart. So this writes NOTHING
+    // to the row — no decision, no verdict, no attribution, no `verified` — and does only two things:
+    //
+    //   * records the act in the audit trail, so the owner can see which clips defeated a human (a clip
+    //     several reviewers skip is telling you something about the clip), and
+    //   * takes it out of THIS reviewer's queue and releases their lease, so it goes to somebody who
+    //     can judge it instead of being handed straight back on the next refill.
+    //
+    // Nothing to undo, because nothing was written; the clip is simply still pending for everyone else.
+    if parsed.action == "skip" {
+        {
+            let mut guard = lock_state(state);
+            // Only OUR OWN lease. A clip another reviewer currently holds is not ours to hand back —
+            // that would free their in-progress work out from under them.
+            if guard.holder(&parsed.id, Instant::now()).is_some_and(|who| who == reviewer) {
+                guard.leases.remove(&parsed.id);
+            }
+            guard.skipped.entry(reviewer.to_string()).or_default().insert(parsed.id.clone());
+        }
+        audit(db, "skip");
+        return json_reply(200, serde_json::json!({ "ok": true, "skipped": true }));
+    }
 
     let (decision, text): (&str, Option<String>) = match parsed.action.as_str() {
         "accept" | "edit" => {
@@ -1552,18 +1622,6 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             false
         } else {
             guard.spot_checks.contains(&key)
-        }
-    };
-    // AUDIT TRAIL (v45), written for every accepted submit including spot checks — a reviewer's
-    // throughput must count the work they actually did, and a check is real work to them. Best-effort
-    // and logged on failure: losing the RECORD of a decision must never cost the DECISION.
-    let audit = |db: &Database, action: &str| {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        if let Err(e) = db.record_review_event(&parsed.id, reviewer, action, "couch", now_ms) {
-            tracing::warn!("Couch Review audit event not recorded for {}: {e}", parsed.id);
         }
     };
     if was_served_as_check {
@@ -2899,6 +2957,74 @@ mod tests {
         assert_eq!(route_for_test(&db, &state, "tok-hemn").0, 200, "revoking one link must not touch another");
         // ...and the clip she was holding is back in the pool rather than stranded behind her.
         assert_eq!(queue_ids(&db, "Hemn", &state), vec!["rv1"], "a revoked reviewer's held work returns");
+    }
+
+    #[test]
+    fn a_reviewer_who_cannot_judge_a_clip_says_so_instead_of_guessing() {
+        // R4.4. A reviewer facing a clip they genuinely cannot call — two people talking over each
+        // other, an accent they do not have, audio that will not play — had two ways forward, and BOTH
+        // write a judgement they cannot stand behind: "Looks good" promotes an unheard draft to gold,
+        // "Reject" permanently excludes a clip that may be perfectly fine. A guess is worse for the
+        // corpus than an honest "I don't know", because nothing downstream can tell the two apart.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("sk1", "دەق یەک")).unwrap();
+        db.insert_segment(&seg("sk2", "دەق دوو")).unwrap();
+        let state = state();
+        // SORTED, not insertion order. `get_segments` is `created_at DESC, id ASC` and created_at has
+        // one-second resolution, so on a loaded machine these two land in different seconds and come
+        // back newest-first — which is correct, and not what this test is about. (Caught by the full
+        // suite: it passed serially and failed under parallel load.)
+        let mut served = queue_ids(&db, "Sara", &state);
+        served.sort();
+        assert_eq!(served, vec!["sk1", "sk2"]);
+
+        let before = db.get_segment_by_id("sk1").unwrap().unwrap();
+        let skip = serde_json::json!({"id": "sk1", "action": "skip"}).to_string();
+        assert_eq!(api_decision(&db, skip.as_bytes(), "Sara", &state).0, 200);
+
+        // NOTHING reached the row: not the decision, not the verdict, not `verified`, not the name.
+        // A skip is the ABSENCE of a judgement, so the corpus must carry no trace of one.
+        let after = db.get_segment_by_id("sk1").unwrap().unwrap();
+        assert_eq!(after.human_decision, None, "a skip is not a decision");
+        assert_eq!(after.verdict, before.verdict, "a skip does not touch the jury verdict");
+        assert!(!after.verified, "a skipped clip has NOT been reviewed");
+        assert_eq!(after.reviewed_by, None, "nobody judged it, so nobody's name goes on it");
+        assert_eq!(after.annotated_transcript, before.annotated_transcript);
+
+        // It is not handed straight back to the reviewer who could not judge it — otherwise every
+        // refill returns the same wall of clips and the button is a treadmill. The page is also told
+        // how many she skipped, so the empty state cannot claim "🎉 all clips reviewed" over them.
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 200);
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = payload["items"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["sk2"], "a skipped clip stops being Sara's work");
+        assert_eq!(payload["skippedByYou"], 1, "the page must be able to say what happened to it");
+        assert_eq!(
+            payload["pendingTotal"], 2,
+            "skipping does not shrink the backlog — a human still owes it a verdict"
+        );
+
+        // ...and it goes to somebody who CAN judge it, immediately: the lease is released with the
+        // skip rather than left to expire, so the next reviewer does not wait out the TTL.
+        assert_eq!(queue_ids(&db, "Hemn", &state), vec!["sk1"], "the clip is still everyone else's work");
+
+        // The owner can see that a human met this clip and could not call it. That is the signal —
+        // a clip several people skip is telling you something about the clip.
+        let rows: Vec<(String, String, String)> = db
+            .connection()
+            .prepare("SELECT segment_id, reviewer, action FROM review_events ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows, vec![("sk1".to_string(), "Sara".to_string(), "skip".to_string())]);
+
+        // But a skip is NOT throughput. Counting it would credit a reviewer for work they explicitly
+        // did not do, and inflate the one number that says how fast the corpus is really being read.
+        assert!(db.reviewer_throughput().unwrap().is_empty(), "an unjudged clip is not a reviewed clip");
     }
 
     #[test]

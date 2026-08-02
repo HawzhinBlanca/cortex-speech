@@ -1278,9 +1278,17 @@ impl Database {
     ///
     /// Gaps longer than [`REVIEW_SESSION_GAP_MS`] are dropped: a reviewer who closes the page and
     /// returns tomorrow did not spend fourteen hours on one clip.
+    ///
+    /// Counts DECISIONS only. `review_events` is a general audit trail and now also carries `skip` —
+    /// a reviewer saying "I cannot judge this one", which writes nothing to the corpus. Counting those
+    /// would credit somebody for work they explicitly did not do and inflate the one number that says
+    /// how fast the corpus is really being reviewed. A WHITELIST, not `action <> 'skip'`: the next
+    /// non-decision event added to this trail must not silently re-open the hole.
     pub fn reviewer_throughput(&self) -> AppResult<Vec<ReviewerThroughput>> {
         let mut stmt = self.conn.prepare(
-            "SELECT reviewer, segment_id, timestamp_ms FROM review_events ORDER BY reviewer ASC, timestamp_ms ASC",
+            "SELECT reviewer, segment_id, timestamp_ms FROM review_events
+             WHERE action IN ('accept', 'edit', 'reject')
+             ORDER BY reviewer ASC, timestamp_ms ASC",
         )?;
         let rows =
             stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?;

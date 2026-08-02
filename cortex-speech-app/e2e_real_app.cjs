@@ -396,6 +396,13 @@ async function reviewOverHttp(page, draftText) {
   // there forever. The app had already logged "Couch Review stopped"; the harness simply never
   // returned. A gate that hangs is worse than one that fails: a failure gets reported.
   const http = (url, opts = {}) => fetch(url, { ...opts, signal: AbortSignal.timeout(20000) });
+  // Read one row back through the app's OWN IPC, so every assertion below sees what the desktop would
+  // show rather than a hand-rolled query that could happen to agree with a broken write.
+  const segmentById = (pg, id) => pg.evaluate(
+    (sid) => window.__TAURI_INTERNALS__.invoke('get_segments', { verified: null })
+      .then((all) => all.find((s) => s.id === sid) || null),
+    id,
+  );
 
   const status = await page.evaluate(
     (r) => window.__TAURI_INTERNALS__.invoke('start_couch_review', { reviewers: [r] }),
@@ -449,6 +456,45 @@ async function reviewOverHttp(page, draftText) {
   const naked = await http(`${base}/api/queue`);
   if (naked.status === 200) throw new Error('GET /api/queue with NO credential returned 200 — the token gate is open');
 
+  // THE NO-VERDICT PATH (R4.4), over real HTTP against the real library. A reviewer who cannot judge a
+  // clip says so, and the one thing that must be true is that it writes NOTHING — the whole point is to
+  // keep a guess out of the corpus. Asserted through the app's own IPC, not the reply, because a reply
+  // can say "ok" over a write that happened anyway.
+  const preSkip = await segmentById(page, item.id);
+  if (!preSkip) throw new Error(`segment ${item.id} is not in the library before the skip`);
+  const skipped = await http(`${base}/api/decision`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ id: item.id, action: 'skip' }),
+  });
+  if (skipped.status !== 200) {
+    throw new Error(`POST /api/decision action=skip -> ${skipped.status} ${await skipped.text()}, expected 200`);
+  }
+  const postSkip = await segmentById(page, item.id);
+  for (const field of ['humanDecision', 'verdict', 'verified', 'reviewedBy', 'rawTranscript', 'annotatedTranscript']) {
+    if (JSON.stringify(postSkip[field]) !== JSON.stringify(preSkip[field])) {
+      throw new Error(
+        `a skip changed ${field}: ${JSON.stringify(preSkip[field])} -> ${JSON.stringify(postSkip[field])}. ` +
+        'A skip is the ABSENCE of a verdict and must write nothing to the row.',
+      );
+    }
+  }
+  // ...and the clip leaves THIS reviewer's queue while staying pending for everyone, which is the other
+  // half of the contract: without it the next refill hands it straight back and the button is a treadmill.
+  const afterSkip = await (await http(`${base}/api/queue`, { headers: { cookie } })).json();
+  if ((afterSkip.items || []).some((s) => s.id === item.id)) {
+    throw new Error(`the skipped clip ${item.id} was served straight back to the reviewer who skipped it`);
+  }
+  if (afterSkip.skippedByYou !== 1) {
+    throw new Error(`queue reports skippedByYou=${afterSkip.skippedByYou}, expected 1 — the page would claim "all reviewed"`);
+  }
+  if (afterSkip.pendingTotal !== queue.pendingTotal) {
+    throw new Error(`skipping changed pendingTotal ${queue.pendingTotal} -> ${afterSkip.pendingTotal}; an unjudged clip is still pending work`);
+  }
+  console.log(`   skip: nothing written, clip out of this reviewer's queue, backlog still ${afterSkip.pendingTotal}`);
+
+  // The SAME clip, decided for real. A skip must not poison a clip: it is the absence of a verdict,
+  // not a refusal, so the reviewer who skipped it can still come back and judge it.
   const corrected = draftText + ' ✔';
   const decision = await http(`${base}/api/decision`, {
     method: 'POST',
@@ -459,11 +505,8 @@ async function reviewOverHttp(page, draftText) {
     throw new Error(`POST /api/decision -> ${decision.status} ${await decision.text()}, expected 200`);
   }
 
-  // THE assertion: the library, not the response. Read through the app's own IPC so this sees what
-  // the desktop would show, not a hand-rolled query that could agree with a broken write.
-  const rows = await page.evaluate((id) => window.__TAURI_INTERNALS__.invoke('get_segments', { verified: null })
-    .then((all) => all.filter((s) => s.id === id)), item.id);
-  const row = rows[0];
+  // THE assertion: the library, not the response.
+  const row = await segmentById(page, item.id);
   if (!row) throw new Error(`segment ${item.id} vanished from the library after the decision`);
   if (row.annotatedTranscript !== corrected) {
     throw new Error(`the correction did not persist: stored ${JSON.stringify(row.annotatedTranscript)}, sent ${JSON.stringify(corrected)}`);

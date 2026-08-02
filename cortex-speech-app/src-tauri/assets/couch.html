@@ -62,6 +62,7 @@
     "queued": "Queued — it will send when you are back online",
     "audioMissing": "This clip's audio will not play, so there is nothing to judge. Skip it — the owner will be told.",
     "skip": "Skip this clip",
+    "skippedByYou": "You skipped {n} clip(s) — they are still waiting for someone else.",
     "speakerChange": "more than one speaker",
     "stillSending": "{n} decision(s) have not been sent yet. Keep this page open until they go through.",
     "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
@@ -87,6 +88,7 @@
     "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
     "audioMissing": "دەنگی ئەم پارچەیە لێ نادرێت، بۆیە شتێک نییە بڕیاری لەسەر بدرێت. تێیپەڕێنە — خاوەنەکە ئاگادار دەکرێتەوە.",
     "skip": "تێپەڕاندنی ئەم پارچەیە",
+    "skippedByYou": "{n} پارچەت تێپەڕاند — هێشتا چاوەڕێی کەسێکی ترن.",
     "speakerChange": "زیاتر لە یەک قسەکەر",
     "stillSending": "{n} بڕیار هێشتا نەنێردراون. ئەم پەڕەیە کراوە بهێڵەوە تا دەنێردرێن.",
     "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
@@ -112,6 +114,7 @@
     "queued": null,
     "audioMissing": null,
     "skip": null,
+    "skippedByYou": null,
     "speakerChange": null,
     "stillSending": null,
     "refused": null,
@@ -222,6 +225,11 @@
   #accept { background: var(--ok); border-color: var(--ok-line); color: #f1f5f9; }
   #bad    { color: var(--bad); }
   #undo   { flex: 0 0 auto; padding: 14px 16px; }
+  /* The honest exit. Full width so it is a real thumb target, and deliberately quieter than the three
+     verdict buttons above it — always reachable, never the easy thing to tap. It sits outside `.row`,
+     where `flex: 1` does nothing, so the width has to be said explicitly. */
+  #skip   { width: 100%; margin-top: 8px; background: none; border-color: transparent;
+            color: var(--faint); font-weight: 500; }
   #done, #err { text-align: center; padding: 40px 10px; font-size: 16px; }
   #err { color: var(--bad); white-space: pre-wrap; }
   /* Rides above the keyboard for the same reason the action row does: a confirmation the reviewer
@@ -265,11 +273,14 @@
     <button id="accept"></button>
     <button id="save"></button>
   </div>
-  <!-- Only ever revealed when the audio genuinely will not load. Without it a reviewer facing a clip
-       whose file has moved had exactly two ways forward, and BOTH write a verdict they cannot justify:
-       accept, which promotes an unheard ASR draft to gold, or reject, which permanently excludes a
-       clip that may be perfectly fine. Skipping writes nothing. -->
-  <button id="skip" type="button" hidden></button>
+  <!-- ALWAYS available (R4.4), not just when the audio fails to load. Broken audio was only the most
+       obvious way to meet a clip you cannot judge; two people talking over each other, or an accent you
+       do not have, leaves you just as stuck. Without this the reviewer has exactly two ways forward and
+       BOTH write a verdict they cannot justify: accept, which promotes an unheard ASR draft to gold, or
+       reject, which permanently excludes a clip that may be perfectly fine. Skipping writes nothing —
+       it hands the clip to somebody who can judge it. Below the decision row, not in it: a fourth
+       button among three would make the honest exit as prominent as the work. -->
+  <button id="skip" type="button"></button>
 </div>
 <div id="done" aria-live="polite" hidden></div>
 <!-- Undo lives OUTSIDE the card on purpose. Inside it, the button vanished with the card the moment
@@ -374,6 +385,9 @@
 
   // ── rendering ───────────────────────────────────────────────────────────────
   let heldByOthers = 0;
+  // Pending clips THIS reviewer skipped, as of the last load. Not reviewed, not held by anyone —
+  // waiting for somebody else, and the empty state must say so rather than claim they are done.
+  let skippedByYou = 0;
   // Who the SERVER says this link belongs to. Stamped onto every queued decision, because the outbox
   // lives in localStorage — which is per-origin, not per-reviewer. Two people using the same phone, or
   // one person opening a colleague's link, share one outbox, and an unstamped decision flushes under
@@ -451,7 +465,11 @@
     if (unsent) { $('done').textContent = t('stillSending', { n: unsent }); return; }
     // An empty queue does NOT mean the work is finished when other reviewers are holding clips —
     // claiming "all reviewed" there would be a flat lie to whoever loaded last.
-    $('done').textContent = heldByOthers ? t('heldByOthers', { n: heldByOthers }) : '🎉 ' + t('allDone');
+    if (heldByOthers) { $('done').textContent = t('heldByOthers', { n: heldByOthers }); return; }
+    // Nor when the reviewer emptied their own queue by SKIPPING it. Those clips are unjudged and still
+    // pending; "🎉 all clips reviewed" over the top of them is the same lie one step further along.
+    if (skippedByYou) { $('done').textContent = t('skippedByYou', { n: skippedByYou }); return; }
+    $('done').textContent = '🎉 ' + t('allDone');
   }
   // The server hands out at most QUEUE_BATCH clips per fetch and says nothing about the backlog behind
   // them, so "my local array ran out" is NOT "the corpus is finished". Without a refetch the page
@@ -609,8 +627,9 @@
   }
   addEventListener('online', () => void flushOutbox());
 
-  // `autoplay` is true ONLY when the advance came from the reviewer deciding a clip (R2.2). A load, an
-  // undo or a skip must not start audio on its own — those are navigation, not a rhythm.
+  // `autoplay` is true ONLY when the advance came from the reviewer acting on a clip (R2.2) — a
+  // decision, or an explicit skip, both of which mean "next". A load or an undo must not start audio on
+  // its own: those are navigation, not a rhythm.
   function show(autoplay) {
     const seg = queue[i];
     // Drained the batch: go ask for the next one before claiming anything is finished. `exhausted`
@@ -619,7 +638,6 @@
     if (!seg && !exhausted && !refilling) { void refill(); return; }
     $('card').hidden = !seg; $('done').hidden = !!seg;
     $('warn').hidden = true;
-    $('skip').hidden = true; // re-armed per clip; only a real audio error reveals it
     renderProgress();
     if (!seg) {
       // Hiding the card does not stop the <audio> element inside it. The last clip kept playing behind
@@ -712,6 +730,7 @@
       retryable = false;
       clearErr('load');
       queue = res.items; i = 0; heldByOthers = res.heldByOthers || 0;
+      skippedByYou = Number(res.skippedByYou) || 0;
       // The whole pending backlog, not just this batch (R1.5). Absent on an older server, and the
       // progress line falls back to per-batch counting when it is.
       pendingTotal = Number(res.pendingTotal) || 0;
@@ -745,17 +764,24 @@
   }
   async function decide(action) {
     if (busy || !queue[i]) return;
+    // A skip is the ABSENCE of a verdict, so none of what follows a decision applies to it: it is not
+    // work done (counting it would inflate the ✓ tally with clips nobody judged), it must not toast
+    // "Saved" over something that saved nothing, and it must NOT clear the draft — whatever the
+    // reviewer typed before giving up is still theirs if the clip ever comes back to them.
+    const isSkip = action === 'skip';
     busy = true;
-    const btns = ['save','accept','bad','undo'].map($); btns.forEach(b => b.disabled = true);
+    const btns = ['save','accept','bad','skip','undo'].map($); btns.forEach(b => b.disabled = true);
     const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me };
     try {
       await api('/api/decision', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),
       });
-      localStorage.removeItem(draftKey(submission.id));
-      clearRefused(submission.id); // re-reviewing a refused clip must retract the warning about it
-      toast(action === 'bad' ? t('markedBad') : t('saved'));
-      doneThisSession += 1;
+      if (!isSkip) {
+        localStorage.removeItem(draftKey(submission.id));
+        clearRefused(submission.id); // re-reviewing a refused clip must retract the warning about it
+        toast(action === 'bad' ? t('markedBad') : t('saved'));
+        doneThisSession += 1;
+      }
       i += 1; show(true); // the decision IS the "next" gesture — start the next clip (R2.2)
     } catch (e) {
       // HOLD, and move on. None of these is a verdict on the decision itself, so the reviewer must
@@ -953,17 +979,16 @@
   // be fine. Say what happened, and offer the one honest action: move on without judging it.
   $('player').addEventListener('error', () => {
     if (!queue[i]) return;
+    // The skip button is always on screen now; this only NAMES the reason the reviewer is stuck, so
+    // they do not sit waiting for audio that is never going to arrive.
     $('warn').textContent = t('audioMissing');
     $('warn').hidden = false;
-    $('skip').hidden = false;
   });
-  $('skip').onclick = () => {
-    if (!queue[i]) return;
-    // Deliberately writes NOTHING — no decision, no verdict, no attribution. The clip stays pending
-    // and the owner finds it still in the queue, which is the correct signal that a file is missing.
-    i += 1;
-    show();
-  };
+  // Deliberately writes NOTHING to the corpus — no decision, no verdict, no attribution. It goes to the
+  // server all the same (rather than just advancing locally, which is what it used to do): only the
+  // server can release the lease, stop handing the clip back on the next refill, and record that a
+  // human met this clip and could not call it.
+  $('skip').onclick = () => void decide('skip');
   addEventListener('resize', () => void drawWave());
   // Tap to seek — the reason a transcriber wants a waveform at all: jump straight to the word in doubt
   // instead of dragging a scrubber the width of a thumb.
