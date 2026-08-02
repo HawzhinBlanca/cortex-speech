@@ -4944,3 +4944,23 @@ restored byte-identical (SHA256); pass-after exit 0. Python policies 46 -> 47.
 champion record in the live data dir is EMPTY. Step 5 of the retrain path promotes only on beating the
 champion, and there is no champion there to beat. The script is honest about it; the data is missing.
 Writing a number in would be fabrication, so it is surfaced instead.
+
+### The champion this machine cannot name
+
+The readiness report surfaced `champion on frozen gold: {"champions": {}, "schema": 1}`. Followed it:
+`champion.json` is the app's startup MIRROR of the model registry (`registry.rs`), and `model_versions`
+in the live library holds **zero rows**. So the empty object is a true answer about this machine, not a
+missing file.
+
+The obvious worry — that "promote ONLY if it beats the champion" degenerates into "promote" when there
+is no champion — was **checked and is wrong**. `registry::decide_promotion` sets `promote = false` and
+reports "no paired baseline comparison in the challenger scorecard" whenever `vs_baseline` is absent.
+The gate is correct; nothing can be promoted by accident. Worth recording as a non-finding rather than
+leaving it phrased as a near-miss.
+
+What is real is smaller and still worth saying: the champion described in the ledger exists as files on
+disk and a number in prose, and **not** as anything the app can compare a challenger against. The report
+now says `NONE RECORDED — the model registry has no champion` in words, plus a note explaining that the
+gate is safe but has nothing to defend a retrain with. No number was invented and none was backfilled
+into the registry — transcribing a CER out of prose into a database is precisely the "remembered metric"
+the honesty law forbids. Registering it needs the real eval run, which is owner-gated.
