@@ -4858,3 +4858,20 @@ byte-identical (SHA256 compared); pass-after exit 0.
 owner-gated pending). couch unit tests 54/54; lib 1097 passed / 0 failed; `couch-page.spec.ts` 41/41;
 python policies 46/46; clippy `-D warnings` clean. Exe at HEAD, app running, phone link answering
 (claim 200, queue 200, 29 items, pendingTotal 99, `skippedByYou` present in the live payload).
+
+### Follow-up in the same iteration: the skipped spot check
+
+Noticed while designing the skip and deliberately parked, then chased down properly. Two facts, each
+fine alone: the skip filter lives in `api_queue`'s loop over PENDING rows, and spot checks are inserted
+*after* that loop — so the filter never saw them; and the DB-level exclusion is `id NOT IN (SELECT
+segment_id FROM spot_checks WHERE reviewer = ?)`, which lists clips the reviewer was SCORED on, while a
+skip writes no score. Together: the one clip somebody said they could not judge was re-inserted into
+every batch forever.
+
+The fix filters inside `list_spot_check_candidates`, not in the caller, and that difference is the whole
+design: it still returns `limit` candidates, just DIFFERENT ones. Skipping a check costs you that clip,
+never your place in the measurement — otherwise the honest exit doubles as a way to never be tested
+again. Both halves are asserted.
+
+Reading the code said it was real. Reading is not evidence, so it was proved on the real selection path
+first: skip `gold-a`, next batch returns `["w0", "w1", "gold-a", "w2"]`, exit 101.
