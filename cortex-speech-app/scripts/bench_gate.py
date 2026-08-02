@@ -25,10 +25,14 @@ gate was right and the baseline was wrong. So regenerate with the app RUNNING, w
 looks like, and accept the wider thresholds that come with it: a tighter budget measured under
 conditions the gate never sees is not a stricter gate, it is a false one.
 
+MEASURE THE SAME WAY ON BOTH SIDES. The baseline is the FASTEST of N runs, so the comparison takes the
+fastest of N too — see `_resolve_runs`. Sampling once against a best-of-five baseline compares sampling,
+not code, and biased every ratio upward.
+
 Usage:
-  python scripts/bench_gate.py            # measure and compare against the committed baseline
+  python scripts/bench_gate.py            # compare against the baseline, matching its run count
   python scripts/bench_gate.py --update   # re-measure and REWRITE the baseline (deliberate act)
-  python scripts/bench_gate.py --runs 3   # repeat, report spread, and use the FASTEST per bench
+  python scripts/bench_gate.py --runs 3   # override the repeat count (calibration)
 """
 from __future__ import annotations
 
@@ -129,14 +133,50 @@ def measure() -> dict[str, int]:
     return results
 
 
+def _resolve_runs(explicit: int | None, updating: bool) -> int:
+    """How many times to measure — matching the BASELINE's own run count unless told otherwise.
+
+    THE BUG THIS FIXES, and it was mine. The baseline stores the FASTEST of N runs (5, as committed),
+    and the gate sampled ONCE. Best-of-1 against best-of-5 is not a comparison of code; it is a
+    comparison of sampling. A single run is slower than the best of five essentially always, so every
+    ratio is biased upward by construction — and that is exactly what the numbers looked like: on two
+    consecutive sweeps, ALL TWELVE benches read above baseline and not one read below. The failing set
+    also moved between runs (audio/waveform_decode_1600000_samples: 1.91x, then 1.08x on the same
+    commit), which is the other tell.
+
+    Matching the counts makes the ratio mean what it claims. Note what this deliberately does NOT do:
+    the budget and the per-bench thresholds are untouched. This removes a sampling bias; it does not
+    widen a limit. A gate that reds on its own measurement method teaches people to ignore it.
+
+    Read from the baseline rather than hardcoded, so regenerating with a different `--runs` keeps the
+    two sides matched automatically instead of drifting apart again.
+    """
+    if explicit is not None:
+        return max(1, explicit)
+    if updating:
+        return 1  # calibrating a fresh baseline: the caller says how many, one is the honest default
+    try:
+        recorded = int(json.loads(BASELINE.read_text(encoding="utf-8")).get("runs", 1))
+    except (OSError, ValueError, TypeError):
+        return 1  # no readable baseline: the run below fails loudly on that, not here
+    return max(1, recorded)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--update", action="store_true", help="rewrite the committed baseline from this run")
-    ap.add_argument("--runs", type=int, default=1, help="repeat N times; use the fastest per bench")
+    ap.add_argument(
+        "--runs",
+        type=int,
+        default=None,
+        help="repeat N times; use the fastest per bench. Default: MATCH the baseline's own run count "
+        "(see _resolve_runs) — an explicit value is only for calibrating a new baseline.",
+    )
     args = ap.parse_args()
 
+    runs_wanted = _resolve_runs(args.runs, args.update)
     runs: list[dict[str, int]] = []
-    for i in range(max(1, args.runs)):
+    for i in range(runs_wanted):
         runs.append(measure())
         print(f"  run {i + 1}: {len(runs[-1])} benchmarks", flush=True)
 
