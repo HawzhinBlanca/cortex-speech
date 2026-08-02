@@ -47,6 +47,18 @@ SRC_TAURI = APP / "src-tauri"
 MANIFEST = SRC_TAURI / "Cargo.toml"
 EXE = SRC_TAURI / "target" / "release" / "cortex-speech-app.exe"
 
+# A SEPARATE cargo target dir for the fault-drill binaries, and it is not a preference.
+# `tauri_build`/`ort` copy `onnxruntime.dll` next to the built artifacts, and the RUNNING app holds
+# that dll open — so `cargo build --bin durability_writer` against the normal target dir dies with
+# "The process cannot access the file because it is being used by another process. (os error 32)".
+# Measured on 2026-08-02 with the app up: exit 101. The app is up during every real sweep (it is the
+# machine's normal state, and other legs depend on it), so a drill leg building into `target/` would
+# fail for a reason that has nothing to do with what it tests. A sibling dir has its own copy of the
+# dll that nothing holds. Inside `target/`, which is already gitignored. First run pays a full
+# dependency build; after that it is cached like any other target dir.
+DRILL_TARGET = SRC_TAURI / "target" / "drills"
+DRILL_BIN = DRILL_TARGET / "release"
+
 # real_audio.rs's helpers return an EMPTY set when this is unset (discover_real_audio_files ->
 # Vec::new(), and one test returns early printing "set CORTEX_REAL_AUDIO_DIR"), so the
 # ignored-real-model leg reported "21 passed" while TWELVE of those tests asserted nothing. Measured
@@ -494,6 +506,23 @@ def _wsl_fuzz_available():
     return r.returncode == 0
 
 
+def _drill_cmd(bin_name: str, script: str, extra: str) -> str:
+    """Build the drill's writer binary into DRILL_TARGET, then run the drill against it.
+
+    The build is part of the leg deliberately. Requiring it to be pre-built would mean either a probe
+    that SKIPS (turning a reliability gate into a no-op exactly when someone forgot) or a stale binary
+    silently proving durability for code that is no longer shipped. Cargo is a no-op when it is current,
+    so the cost after the first sweep is the drill itself.
+
+    `--release`: these drills race a kill against real write throughput, and a debug writer is slow
+    enough that the kill lands somewhere unrepresentative.
+    """
+    exe = DRILL_BIN / f"{bin_name}.exe" if sys.platform == "win32" else DRILL_BIN / bin_name
+    build = f'cargo build --release --bin {bin_name} --manifest-path "{MANIFEST}" --target-dir "{DRILL_TARGET}"'
+    run = f'"{sys.executable}" "{APP / "scripts" / script}" --exe "{exe}" {extra}'
+    return f"{build} && {run}"
+
+
 def _probe_fuzz():
     if sys.platform == "win32":
         if _wsl_fuzz_available():
@@ -579,6 +608,8 @@ GATES = [
     ("heartbeat-runtime", 3, "cmd", f'node "{APP / "scripts" / "heartbeat_probe.cjs"}"', APP, _probe_ipc_harness, "Main-thread safety PROVEN AT RUNTIME: get_settings latency while slow commands run concurrently. The static test_command_main_thread_policy/test_ui_thread_blocking_audit pin the source shape; this measures the actual UI responsiveness they exist to protect."),
     ("bench-budget", 3, "cmd", f'"{sys.executable}" "{APP / "scripts" / "bench_gate.py"}"', APP, _probe_bench, "Criterion wall-clock regression budget against a COMMITTED baseline (docs/bench_baseline.json). The charter asks for this via github-action-benchmark on every PR; that CI clause is NOT satisfied here and stays open - this enforces the budget on the reference machine, where the charter's latency numbers are defined. Per-bench thresholds derived from measured run-to-run noise, and benches too noisy to gate are NAMED every run rather than given a pass-anything limit."),
     ("jobs-runtime", 3, "cmd", f'node "{APP / "scripts" / "jobs_probe.cjs"}"', APP, _probe_exe, "Durable Job Supervisor at runtime: a REAL export_dataset run is recorded in get_jobs and reaches 'succeeded' - the run_tracked bracketing proven end to end, not only in unit tests."),
+    ("durability-drill", 3, "cmd", _drill_cmd("durability_writer", "durability_drill.py", "--cycles 25"), APP, None, "Crash durability PROVEN, not asserted: 25 hard kills of the real writer (production Database::open_with_retry + insert_segment) across write-phase and boot-phase, verifying integrity_check ok, zero LOST journaled edits, a contiguous id space and a row count that never decreases. The single reliability property daily review depends on - the app dying must never cost work that was saved. It existed and NOTHING ran it (found 2026-08-02 by asking which scripts no gate references); an unrun drill is a claim."),
+    ("export-kill-drill", 3, "cmd", _drill_cmd("export_writer", "export_kill_drill.py", "--cycles 15"), APP, None, "Atomic-write design under real kills: 15 mid-export TerminateProcess cycles proving every JOURNALED export parses complete with the full row count, and that NO final .json is ever torn (atomic temp+fsync+rename in atomic_file.rs is the design under test). Scope honesty: process kill, not power loss. Same find as the durability drill - written, never run."),
 ]
 
 # Charter DoD legs descoped by the owner amendment (2026-07-10) — always printed.
