@@ -634,9 +634,9 @@
   }
   addEventListener('online', () => void flushOutbox());
 
-  // `autoplay` is true ONLY when the advance came from the reviewer acting on a clip (R2.2) — a
-  // decision, or an explicit skip, both of which mean "next". A load or an undo must not start audio on
-  // its own: those are navigation, not a rhythm.
+  // `autoplay` is true ONLY when the advance came from the reviewer deciding a clip (R2.2). A load, an
+  // undo or a skip must not start audio on its own — those are navigation, not a rhythm. A skip in
+  // particular is somebody saying "I cannot judge this": a burst of sound is the last thing they want.
   function show(autoplay) {
     const seg = queue[i];
     // Drained the batch: go ask for the next one before claiming anything is finished. `exhausted`
@@ -789,7 +789,10 @@
         toast(action === 'bad' ? t('markedBad') : t('saved'));
         doneThisSession += 1;
       }
-      i += 1; show(true); // the decision IS the "next" gesture — start the next clip (R2.2)
+      // A DECISION is the "next" gesture and starts the next clip (R2.2). A skip is not: the reviewer
+      // just said they could not judge one, and answering that with a burst of audio is the opposite
+      // of what they need. The clip loads and waits for them.
+      i += 1; show(!isSkip);
     } catch (e) {
       // HOLD, and move on. None of these is a verdict on the decision itself, so the reviewer must
       // not lose it and must not be stranded on the clip:
@@ -820,8 +823,9 @@
         }
         // Queued still counts as decided — the reviewer judged this clip and is moving on, so the
         // rhythm continues. (The 409 path below does NOT autoplay: that is a forced skip, not a
-        // decision, and it deserves the reviewer's attention rather than more audio.)
-        i += 1; show(true);
+        // decision, and it deserves the reviewer's attention rather than more audio. Nor does a
+        // deliberate skip, for the same reason.)
+        i += 1; show(!isSkip);
       } else {
         // The STATUS, not the message (R3.3). `e.message` is raw English from the server, and dropping
         // it inside a Sorani sentence produced exactly the thing this page exists to avoid: the one word

@@ -410,15 +410,10 @@ test.describe('Couch Review phone page', () => {
     });
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('پارچەی تێکچوو', { timeout: 5000 });
-    // NOTE ON THIS ENVIRONMENT: the page is served over file://, so <audio src="/api/audio/..."> is a
-    // real request that always fails — window.fetch is stubbed, media loads are not. The handler
-    // therefore fires for EVERY clip here, which is correct behaviour, so "hidden by default" cannot be
-    // observed asynchronously. The reset is asserted in the SAME TICK as show() instead: show() clears
-    // the flag synchronously and the error event is async, so this reads the reset deterministically.
-    const hiddenRightAfterShow = await page.evaluate(
-      `show(); document.getElementById('skip').hidden`,
-    );
-    expect(hiddenRightAfterShow).toBe(true);
+    // R4.4: the exit is ALWAYS on screen, not revealed only by a failure. Broken audio was just the
+    // most obvious way to meet a clip you cannot judge — two people talking over each other, or an
+    // accent you do not have, leaves a reviewer equally stuck with no honest way forward.
+    await expect(page.locator('#skip')).toBeVisible();
 
     // The <audio> element reports a load failure (a 500 body into src does exactly this).
     await page.evaluate(`
@@ -432,9 +427,16 @@ test.describe('Couch Review phone page', () => {
     await page.locator('#skip').click();
     // Moved on to the next clip...
     await expect(page.locator('#text')).toHaveValue('پارچەی باش');
-    // ...and NOTHING was written about the broken one. That is the whole point.
+    // ...and the only thing said about the broken one is that nobody judged it. The skip DOES reach the
+    // server now — that is what releases the lease, keeps the clip out of this reviewer's next batch,
+    // and records that a human met it and could not call it — but it must be a skip and nothing else.
+    // Stricter than the old "nothing was sent": that would now pass for a request this test never saw.
+    // (The server writing nothing is asserted where it can be: the couch unit test, and the real-HTTP
+    // leg in e2e_real_app.cjs that diffs six columns through the app's own IPC.)
     const sent = (await page.evaluate(`window.__sent`)) as string[];
-    expect(sent.join(' ')).not.toContain('broken');
+    const aboutBroken = sent.filter((s) => s.includes('broken'));
+    expect(aboutBroken).toHaveLength(1);
+    expect(JSON.parse(aboutBroken[0]).action).toBe('skip');
   });
 
   test('a slow first load says so instead of showing a blank page', async ({ page }) => {
@@ -1145,8 +1147,6 @@ test.describe('Couch Review phone page', () => {
     });
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
-    // Reveal skip the way a real audio failure does, then use it.
-    await page.evaluate(`document.getElementById('skip').hidden = false`);
     await page.locator('#skip').click();
     await expect(page.locator('#text')).toHaveValue('دووەم', { timeout: 5000 });
     await page.waitForTimeout(200);
