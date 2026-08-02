@@ -4853,3 +4853,8 @@ restate. The default when a gate contradicts a change must be to read WHY before
 **Fail-before proofs, unmasked.** skip path: new unit test asserted 200, got 400 (unknown action),
 exit 101. Draft guard: removed -> AssertionError naming `flushOutboxOnce`, exit 1; file restored
 byte-identical (SHA256 compared); pass-after exit 0.
+
+**Gates.** verify-10 **GREEN: 30 kept legs, 30 PASS, 0 FAIL, 0 skipped** (8 owner-descoped, 5
+owner-gated pending). couch unit tests 54/54; lib 1097 passed / 0 failed; `couch-page.spec.ts` 41/41;
+python policies 46/46; clippy `-D warnings` clean. Exe at HEAD, app running, phone link answering
+(claim 200, queue 200, 29 items, pendingTotal 99, `skippedByYou` present in the live payload).
