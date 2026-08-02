@@ -28,7 +28,10 @@ if (!AUDIO) {
   console.error('Set CORTEX_AUDIO to the absolute path of the audio file to import (e.g. CORTEX_AUDIO=D:/clips/sample.wav).');
   process.exit(2);
 }
-const PORT = process.env.CORTEX_DEBUG_PORT || '9222';
+// PRIVATE, not 9222 — same latent collision the two verify-10 e2e harnesses hit (see
+// e2e_real_app.cjs). This one is not a gate leg, so nothing had exposed it yet; fixed here rather than
+// left as the last copy of a bug whose two siblings were just repaired.
+const PORT = process.env.CORTEX_DEBUG_PORT || '9251';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const txt = (s) => (s && (s.rawTranscript ?? s.raw_transcript)) || '';
 const dur = (s) => (s && (s.durationMs ?? s.duration_ms)) || 0;

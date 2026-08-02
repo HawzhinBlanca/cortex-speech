@@ -24,7 +24,10 @@ const DEFAULT_AUDIO = path.join(REPO, 'src-tauri', 'tests', 'fixtures', 'fleurs_
 // Defaults to the committed FLEURS ckb fixture so this can run as a GATE rather than only by hand.
 // Requiring the env var is why nothing ever ran it. CORTEX_AUDIO still overrides.
 const AUDIO = process.env.CORTEX_AUDIO || DEFAULT_AUDIO;
-const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9222';
+// PRIVATE, not 9222 — see e2e_real_app.cjs for the full reasoning. Short version: 9222 is the port
+// every other dev tool grabs by default (the Antigravity IDE's browser holds it permanently on this
+// machine), so this leg refused three sweeps in a row without testing anything.
+const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9261';
 // DISPOSABLE profile, never the owner's library — see e2e_profile.cjs. Resolved before any
 // spawn so there is no window in which this harness could launch against %APPDATA%.
 const { dataDir: DATA_DIR, ours: DATA_DIR_IS_OURS } = resolveDisposableProfile('e2e_pipeline_ipc');

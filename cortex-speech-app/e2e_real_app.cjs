@@ -44,7 +44,14 @@ const APP_EXE = process.env.CORTEX_APP_EXE
 const DEFAULT_AUDIO = path.join(REPO, 'src-tauri', 'tests', 'fixtures', 'fleurs_ckb_sample.wav');
 const AUDIO = process.env.CORTEX_AUDIO || DEFAULT_AUDIO;
 const OUT_DIR = process.env.CORTEX_OUT || REPO;
-const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9222';
+// A PRIVATE port, not Chromium's famous 9222 — see the sibling harnesses, which each took their own
+// (constrained 9281, finetuned 9291, heartbeat 9333, jobs 9334, egress 9335). 9222 is the default every
+// other tool on a developer's machine also reaches for: here it is permanently held by the Antigravity
+// IDE's browser (`--remote-debugging-port=9222`). The precondition check then refuses — correctly,
+// since attaching would drive somebody's real browser — and this harness fails in half a second having
+// tested nothing. Found by running verify-10 three times in a row: the four harnesses with private
+// ports passed every sweep, and the two still on 9222 were exactly the two that failed.
+const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9271';
 // Deliberately NOT the real 8737 — see the spawn env below.
 const COUCH_PORT = Number(process.env.CORTEX_COUCH_PORT || 18737);
 const LOCALE = process.env.CORTEX_LOCALE === 'ckb' ? 'ckb' : 'en';
