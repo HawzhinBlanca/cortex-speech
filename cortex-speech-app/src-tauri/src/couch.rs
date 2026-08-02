@@ -1136,6 +1136,10 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // Drop leases that expired while their holder was away, so the map cannot grow without bound across
     // a long session. Cheap: the pending queue is the only thing that can be leased.
     guard.leases.retain(|_, (_, granted)| now.duration_since(*granted) < LEASE_TTL);
+    // Snapshotted under the lock and handed to the spot-check selection below, which runs OUTSIDE it.
+    // Spot checks are inserted after the loop above, so the skip filter in that loop never sees them —
+    // without passing this along, a check somebody skipped was re-inserted into every batch forever.
+    let skipped_by_me = guard.skipped.get(reviewer).cloned().unwrap_or_default();
     drop(guard);
 
     // Salt the batch with spot checks (P2.1). They are NOT leased: two reviewers meeting the same
@@ -1149,7 +1153,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         // something. A reviewer must not be able to coast just because their batches came out short.
         let wanted = queue.len().div_ceil(SPOT_CHECK_EVERY);
         let work_len = queue.len();
-        match db.list_spot_check_candidates(wanted, reviewer) {
+        match db.list_spot_check_candidates(wanted, reviewer, &skipped_by_me) {
             Ok(candidates) => {
                 let mut guard = lock_state(state);
                 let mut grew = false;
@@ -2597,7 +2601,7 @@ mod tests {
         gold_seg(&db, "g2", "دەقی هەڵەی دوو", "دەقی ڕاستی دوو");
         let state = state();
 
-        let candidates = db.list_spot_check_candidates(10, "Sara").unwrap();
+        let candidates = db.list_spot_check_candidates(10, "Sara", &HashSet::new()).unwrap();
         assert_eq!(candidates.len(), 2, "both clips have a human answer that differs from the raw draft");
         // A check is graded only because it was SERVED as one; mark both as served to each reviewer,
         // which is exactly what api_queue records when it salts a batch.
@@ -3025,6 +3029,49 @@ mod tests {
         // But a skip is NOT throughput. Counting it would credit a reviewer for work they explicitly
         // did not do, and inflate the one number that says how fast the corpus is really being read.
         assert!(db.reviewer_throughput().unwrap().is_empty(), "an unjudged clip is not a reviewed clip");
+    }
+
+    #[test]
+    fn a_skipped_spot_check_is_not_handed_back_in_every_batch_forever() {
+        // The skip filter lives in the loop over PENDING rows. Spot checks are inserted after that
+        // loop, from `list_spot_check_candidates` — so the filter never sees them. And the DB-level
+        // exclusion there is `id NOT IN (SELECT segment_id FROM spot_checks WHERE reviewer = ?)`,
+        // which lists clips the reviewer was SCORED on; a skip is the absence of an answer and writes
+        // no score. Both true at once means the one clip a reviewer has said they cannot judge comes
+        // back in every batch, and the button they used to escape it does nothing for this clip.
+        //
+        // The fix must not let anyone DODGE measurement, only avoid re-serving the same clip: with two
+        // answer keys available, skipping one has to yield the other, not zero checks.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        for n in 0..3 {
+            db.insert_segment(&seg(&format!("w{n}"), "کاری ڕاستەقینە")).unwrap();
+        }
+        gold_seg(&db, "gold-a", "دەقی هەڵە", "دەقی ڕاست");
+        gold_seg(&db, "gold-b", "دەقی هەڵەی دوو", "دەقی ڕاستی دوو");
+        let state = state();
+
+        let first = queue_ids(&db, "Sara", &state);
+        let check = ["gold-a", "gold-b"]
+            .into_iter()
+            .find(|g| first.iter().any(|id| id == g))
+            .expect("the batch must carry a spot check to skip");
+
+        let skip = serde_json::json!({"id": check, "action": "skip"}).to_string();
+        assert_eq!(api_decision(&db, skip.as_bytes(), "Sara", &state).0, 200);
+
+        let second = queue_ids(&db, "Sara", &state);
+        assert!(
+            !second.iter().any(|id| id == check),
+            "the spot check Sara said she could not judge was handed straight back: {second:?}"
+        );
+        // ...and she is still being measured, on the OTHER key. Dropping her out of measurement
+        // entirely would turn the honest exit into a way to never be tested again.
+        let other = if check == "gold-a" { "gold-b" } else { "gold-a" };
+        assert!(
+            second.iter().any(|id| id == other),
+            "skipping one check must yield a DIFFERENT one, not none: {second:?}"
+        );
     }
 
     #[test]

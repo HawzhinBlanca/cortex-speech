@@ -533,7 +533,11 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     }
 
     let ids = |limit: usize| -> Vec<String> {
-        db.list_spot_check_candidates(limit, "Sara").unwrap().into_iter().map(|(s, _)| s.id).collect()
+        db.list_spot_check_candidates(limit, "Sara", &std::collections::HashSet::new())
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s.id)
+            .collect()
     };
     assert!(ids(0).is_empty(), "a limit of zero must return NOTHING, not one");
     assert_eq!(ids(1).len(), 1, "a limit of one returns exactly one");
@@ -554,7 +558,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     // score a blind accept as perfect. Asserted against the row that came back rather than a
     // hardcoded string: the answer key must be right for EVERY candidate, not just whichever one
     // happens to sort first.
-    for (seg, expected) in db.list_spot_check_candidates(10, "Sara").unwrap() {
+    for (seg, expected) in db.list_spot_check_candidates(10, "Sara", &std::collections::HashSet::new()).unwrap() {
         assert_ne!(expected, seg.raw_transcript, "{} was graded against its own draft", seg.id);
         assert_eq!(
             Some(expected.as_str()),
@@ -576,7 +580,12 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
 
     // Per REVIEWER, not global: two people meeting the same clip independently is the entire basis of
     // the agreement sample, so Sara's answer must not consume Hemn's.
-    let hemn: Vec<String> = db.list_spot_check_candidates(10, "Hemn").unwrap().into_iter().map(|(s, _)| s.id).collect();
+    let hemn: Vec<String> = db
+        .list_spot_check_candidates(10, "Hemn", &std::collections::HashSet::new())
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s.id)
+        .collect();
     assert!(hemn.contains(&"sc-wrong-1".to_string()), "one reviewer's answer must not exhaust another's pool");
 }
 

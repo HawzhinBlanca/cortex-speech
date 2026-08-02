@@ -1174,7 +1174,23 @@ impl Database {
     /// When a reviewer exhausts the pool they simply stop being measured, which is the honest outcome:
     /// `SpotCheckScore::checks` reports how many they actually answered, and re-testing on answers they
     /// already know would be a bigger number meaning less.
-    pub fn list_spot_check_candidates(&self, limit: usize, reviewer: &str) -> AppResult<Vec<(SpeechSegment, String)>> {
+    ///
+    /// `exclude` is the caller's set of "do not serve this reviewer this clip again" ids — in practice
+    /// the clips they SKIPPED (R4.4). The SQL exclusion above cannot cover those: it lists clips with a
+    /// row in `spot_checks`, i.e. ones the reviewer was SCORED on, and a skip is the absence of an
+    /// answer and writes no score. Without this the one clip somebody said they could not judge was
+    /// re-inserted into every subsequent batch forever, and the skip button did nothing for it.
+    ///
+    /// Filtered here rather than by the caller dropping candidates afterwards, and the difference
+    /// matters: this still returns `limit` candidates, just DIFFERENT ones. Skipping a check must cost
+    /// you that clip, never your place in the measurement — otherwise the honest exit doubles as a way
+    /// to never be tested again.
+    pub fn list_spot_check_candidates(
+        &self,
+        limit: usize,
+        reviewer: &str,
+        exclude: &std::collections::HashSet<String>,
+    ) -> AppResult<Vec<(SpeechSegment, String)>> {
         let query = format!(
             "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments
              WHERE verified = 1 AND raw_transcript <> '' AND (is_gold = 1 OR reviewed_by IS NULL)
@@ -1192,6 +1208,9 @@ impl Database {
                 break;
             }
             let seg = row?;
+            if exclude.contains(&seg.id) {
+                continue; // they already declined this one; find them a different key
+            }
             let Some(expected) = crate::quality::human_verified_text(&seg) else {
                 continue; // a machine verdict is not an answer key
             };
