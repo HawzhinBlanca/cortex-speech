@@ -78,11 +78,18 @@ def main() -> int:
     pending = c.execute(f"SELECT COUNT(*) FROM speech_segments WHERE NOT verified AND NOT {REJECTED}").fetchone()[0]
     pairs = c.execute("SELECT COUNT(*) FROM agent_examples WHERE verified_by_human = 1").fetchone()[0]
 
+    # `champion.json` is the app's startup MIRROR of the model registry, so "no champions" is a real
+    # answer about this machine, not a missing file. Say that in words. Dumping the raw
+    # `{"champions": {}, "schema": 1}` directly above a step that reads "promote ONLY if the measured
+    # CER beats the champion above" invites exactly the wrong reading — that there is a champion object
+    # up there to beat. There is not, and the reader has to know before they act on step 5.
     champion = "unknown (champion.json missing)"
     champ_path = args.db.parent / "champion.json"
     if champ_path.exists():
         try:
-            champion = json.dumps(json.loads(champ_path.read_text(encoding="utf-8")))
+            doc = json.loads(champ_path.read_text(encoding="utf-8"))
+            families = doc.get("champions") or {}
+            champion = json.dumps(doc) if families else "NONE RECORDED — the model registry has no champion"
         except (OSError, ValueError) as e:
             champion = f"unreadable ({e})"
 
@@ -110,6 +117,17 @@ def main() -> int:
         "  4. python scripts/measure_finetuned_cer.py   # frozen gold set — the ONLY promotion evidence\n"
         "  5. promote ONLY if the measured CER beats the champion above; otherwise keep the champion"
     )
+    if champion.startswith("NONE RECORDED"):
+        # Not a warning about the CODE: `decide_promotion` refuses without a paired baseline, so an
+        # empty registry cannot let a worse model through. It is a warning about this MACHINE — step 5
+        # has nothing to compare against, so whatever champion exists as files on disk and as a number
+        # in the ledger is not something the app can check a challenger against.
+        print(
+            "\nNOTE: the model registry on this machine holds no champion, so step 5 has nothing to\n"
+            "      compare a challenger against. The promotion gate refuses without a paired baseline\n"
+            "      (registry::decide_promotion), so nothing can be promoted by accident — but a champion\n"
+            "      that lives only as files and prose is not one this app can defend a retrain against."
+        )
     return 0
 
 
