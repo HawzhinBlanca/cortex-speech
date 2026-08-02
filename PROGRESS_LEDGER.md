@@ -4875,3 +4875,42 @@ again. Both halves are asserted.
 
 Reading the code said it was real. Reading is not evidence, so it was proved on the real selection path
 first: skip `gold-a`, next batch returns `["w0", "w1", "gold-a", "w2"]`, exit 101.
+
+### The bench gate was reporting on its own measurement method
+
+verify-10 went RED on `bench-budget` right after the spot-check fix. Four regressions, in `audio`,
+`diff` and `normalizer` — modules the commit does not touch, and which the benches reach directly
+(`benches/*.rs` import `audio`, `diff`, `normalizer` and nothing else). So the RED could not be the
+change, and the question became what it actually was.
+
+Two tells, both already in the output:
+
+- the failing SET moved between runs on the same commit — `audio/waveform_decode_1600000_samples` read
+  1.91x, then 1.08x;
+- across two consecutive sweeps ALL TWELVE benches read above baseline and **not one read below**.
+
+The second is the signature. The committed baseline stores the FASTEST of 5 runs; the gate defaulted to
+`--runs 1`. Best-of-1 against best-of-5 compares sampling, not code — a single run is slower than the
+best of five essentially always, so every ratio was biased upward by construction. My bug, from when
+this gate was written, and I read past it twice before the "none below" pattern registered.
+
+Matching the counts, same commit, same machine, nothing else changed:
+
+```
+single sample : all 12 above baseline, 1.07x - 1.50x, 2 FAIL
+matched (5)   : 10 of 12 BELOW baseline, 0.82x - 0.88x; worst 1.06x; PASS
+```
+
+That is the whole distribution moving, which is the one thing a sampling mismatch does and a code
+regression cannot. The run count is now read FROM the baseline, so a regeneration with a different
+`--runs` keeps both sides matched instead of drifting apart again.
+
+**The budget and every per-bench threshold are unchanged.** This removed a bias so the ratio means what
+it claims; it did not widen a limit. Worth being explicit about, because "the gate went green after I
+touched the gate" is exactly the shape of a gate being quietly weakened — the distinguishing evidence is
+that unrelated benches moved from 1.32x to 0.83x, which no threshold change would produce. Cost: the leg
+goes ~130s -> ~620s, in line with the 568s it took historically.
+
+**Gates.** verify-10 **GREEN: 30 kept legs, 30 PASS, 0 FAIL, 0 skipped**. couch 55/55; lib 1098 passed /
+0 failed; `couch-page.spec.ts` 41/41; python policies 46/46; clippy `-D warnings` clean. Exe at HEAD,
+app running, phone link answering.
