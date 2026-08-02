@@ -4,9 +4,9 @@
 
 # Gate status — generated
 
-**Commit:** `5b86f3e` · **Mode:** full
+**Commit:** `c1d1f53` · **Mode:** full
 
-**Verdict:** **RED** — 1 kept gate(s) failed (bench-budget). NOT ship-ready.
+**Verdict:** **GREEN — PERSONAL-USE SHIP-READY.** (Not full-charter 10/10: 8 legs owner-descoped, 5 owner-gated pending.)
 
 ## Kept gates
 
@@ -40,7 +40,7 @@
 | `constrained-ipc-e2e` | PASS |
 | `finetuned-ipc-e2e` | PASS |
 | `heartbeat-runtime` | PASS |
-| `bench-budget` | FAIL |
+| `bench-budget` | PASS |
 | `jobs-runtime` | PASS |
 
 ## Owner-descoped (owner amendment 2026-07-10 — "ship" = personal use)
