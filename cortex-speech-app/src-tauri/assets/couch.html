@@ -620,8 +620,15 @@
         continue;
       }
       writeOutbox(readOutbox().filter((q) => q.id !== item.id));
-      localStorage.removeItem(draftKey(item.id));
-      clearRefused(item.id); // it landed after all
+      // A SKIP is not a landing, so neither of these applies to it — the same rule the online path in
+      // decide() follows, and it has to hold here too or the offline route quietly breaks it. Removing
+      // the draft would delete a correction the reviewer typed before giving up on the clip: they were
+      // never told it was saved, the clip is still pending, and their text is the only copy. Clearing
+      // the refused banner would be worse than useless — a skip does not make the earlier work land.
+      if (item.action !== 'skip') {
+        localStorage.removeItem(draftKey(item.id));
+        clearRefused(item.id); // it landed after all
+      }
     }
     renderRefused();
   }

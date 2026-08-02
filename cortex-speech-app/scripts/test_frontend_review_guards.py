@@ -434,7 +434,38 @@ def test_selection_reseats_playback_centrally_for_store_only_selections() -> Non
             )
 
 
+def test_a_skip_never_clears_the_reviewers_draft_on_either_route() -> None:
+    """couch.html: a skip is the ABSENCE of a verdict, so it must not delete the typed correction.
+
+    Two routes reach the server, and both used to end in `localStorage.removeItem(draftKey(...))`:
+    `decide()` when the POST succeeds, and `flushOutboxOnce()` when a decision queued offline replays.
+    A reviewer types a partial correction, cannot judge the clip, and skips — the clip stays PENDING and
+    their text is the only copy of that work. Clearing it destroys a correction nobody was ever told was
+    saved. The online path was written with the guard; the offline one silently broke it, which is why
+    this pins BOTH: an `action === 'skip'` check must gate every draft removal on this page.
+
+    Not unit-testable — the page is a static asset served by `include_str!`, with no mount harness — so
+    it is pinned at the source like the sibling guards above. Fail-before verified: deleting either
+    guard fires this."""
+    page = _read("src-tauri/assets/couch.html")
+    routes = {
+        "decide(": _function_body(page, "async function decide("),
+        "flushOutboxOnce(": _function_body(page, "async function flushOutboxOnce("),
+    }
+    for name, body in routes.items():
+        if "removeItem(draftKey(" not in body:
+            continue  # this route no longer clears a draft at all, which is stronger than the guard
+        if "'skip'" not in body:
+            raise AssertionError(
+                f"couch.html {name} deletes the reviewer's draft with no skip guard. A skip writes NOTHING "
+                f"to the corpus and leaves the clip pending, so the typed correction is the only copy of "
+                f"that work — removing it destroys a correction the reviewer was never told was saved. "
+                f"Gate the removal on the action not being 'skip'."
+            )
+
+
 def main() -> None:
+    test_a_skip_never_clears_the_reviewers_draft_on_either_route()
     test_retranscribe_guards_editor_writes_against_navigation()
     test_submit_guards_editor_writes_against_navigation()
     test_go_draft_persist_uses_targeted_field_update()
