@@ -4674,3 +4674,98 @@ guard fails on "a casual run would add clips to the owner's corpus".
 **26 - 26 PASS, 0 FAIL, 0 skipped — GREEN**, the three new legs at 15.3s / 17.3s / 19.2s.
 
 **The live library was never touched:** 144 rows, 17 flagged, 13 pending, before and after.
+
+## Iteration 240 — a gate that reported "21 passed" while twelve tests asserted nothing
+
+Three items, each RUN before it was wired, because every static audit this session produced a false
+positive and every real find came from executing something.
+
+### 1. The model-integrity check nobody ran
+
+`fetch_models.py --check` calls itself *"the CI/dev integrity gate"* in its own docstring, and nothing
+in `verify_10.py`, any workflow or the Makefile referenced it. Ran it first: **5 files SHA-256
+verified**, green — so it is now a tier-1 leg. A swapped or truncated model still LOADS and decodes to
+the wrong graphemes, which is the silent-corruption class the runtime pin in `asr.rs` exists for.
+
+### 2. `ignored-real-model` was partly vacuous, and this is the third of its family
+
+The leg reports **"21 passed"**. Without `CORTEX_REAL_AUDIO_DIR`, `real_audio.rs`'s
+`discover_real_audio_files()` returns an **empty vec** and one test returns early printing *"set
+CORTEX_REAL_AUDIO_DIR"* — so **twelve of those twenty-one asserted nothing**. Measured both ways
+rather than argued:
+
+| | skip lines |
+|---|---|
+| without the variable (what the leg did) | **12** |
+| pointed at the committed fixtures | **9** |
+
+Three tests — decode-any-format, single-file decode and the pipeline import test — become real
+assertions from a single `os.environ.setdefault`. The other nine need formats the repo does not carry
+(flac, mov, mp4, the gold podcast) or their own env vars, and stay honestly skipped. After the fix the
+leg's log contains **zero** `[...] skip` lines.
+
+Third member of this family, after the fuzz empty-target-list (2026-07-26) and the tautological RTF
+assertion (iteration 235). It survived because both the leg's NAME and its test count looked healthy:
+the count was real, what the tests did with their run was not.
+
+I had predicted this item would yield nothing. The audit was worth more than the wiring would have been.
+
+### 3. The bench budget: four corrections, one retraction, all found by running it
+
+Three criterion benches existed and nothing ran them. `scripts/bench_gate.py` compares against a
+committed baseline and **cannot pass vacuously** — zero parsed benchmarks is a FAIL, and a bench that
+vanished from the run is a FAIL rather than a silent skip. Proven to fire by injecting 3x regressions
+against benches with a 1.05x and a 1.52x limit: both named, exit 1.
+
+Everything else about it was wrong at first, and each error was caught by running it:
+
+1. **`cargo bench` bare also runs the lib's libtest harness**, which rejects `--output-format` and
+   takes the whole run down — the gate would have been red for a reason unrelated to performance.
+   Only the criterion targets are invoked now.
+2. **`build.rs` copies `onnxruntime.dll`** and the running app holds a lock on it: `os error 32`. The
+   benches get their own `CARGO_TARGET_DIR` so the leg runs with the app up, which is what a sweep is.
+3. **The baseline was measured app-STOPPED** because that was the quiet, convenient state. The first
+   real run — app up, as always — reported five regressions of 1.16x to 1.41x with not one line of
+   code changed. The gate was right; the baseline was wrong.
+4. **The thresholds were a coin flip.** 2x the spread from a 3-run calibration gave
+   `diff/identical_100_words` a 1.088x limit; it then measured **1.0897x inside a sweep and FAILED**,
+   minutes after measuring 1.09x standalone and passing.
+
+The same twelve benches on the same machine have now read three different spreads:
+
+| calibration | median | max |
+|---|---|---|
+| 3 runs, app stopped | 5.8% | 25.9% |
+| 3 runs, app running | 5.6% | 61.3% |
+| 5 runs, app running | **9.2%** | 34.5% |
+
+That is the lesson in one table: **the spread you measure depends on how many samples you take and
+what else is running, and the smaller, quieter measurement is the flattering one.** I took the
+flattering one twice.
+
+Settled: 5-run app-up calibration, 3x multiplier, floor 1.10x, cap 1.50x. **10 of 12 gated, tightest
+limit 1.13x.** The two past the cap — the 67 us audio bench where scheduler jitter dominates, and
+`diff/identical_1000_words` — are printed **NOT ENFORCED with their noise figure on every run**,
+rather than handed 2.04x/1.67x limits that would look gated while a real 2x regression sailed through.
+Two stability runs produced byte-identical summaries.
+
+**A CLAIM RETRACTED.** I reported that one bench was gated at the charter's 5%. It is not, and none
+is: 5% is inside this machine's noise for all twelve. `BUDGET = 0.05` stays in the file as the
+STANDARD so the gap between what the charter asks and what this hardware can measure stays visible
+instead of being quietly redefined, and the gate prints the tightest limit it actually enforces so the
+comment can never drift from the truth.
+
+**Still UNMET and named:** `github-action-benchmark` on every PR. That needs CI I can neither run nor
+watch, and a workflow file nobody has seen execute is a claim, not a gate. The committed baseline it
+would consume now exists, so the remaining step is smaller than it was.
+
+### What the session's evidence actually says about method
+
+Every genuine find came from executing something in the condition it really runs in. Every static grep
+audit produced a false positive — the all-or-nothing model root that was correct by construction, the
+insert-path asymmetry that was deliberate and documented, the `#[ignore]` count that matched
+doc-comment prose. The two audits that DID pay (`which harnesses run`, `which npm scripts run`) asked
+an EXISTENCE question, not a correctness one. Existence questions survive a regex; correctness
+questions do not.
+
+**Gates.** `model-integrity` PASS 0.7s; `bench-budget` PASS 568.1s; verify-10 **30 legs**.
