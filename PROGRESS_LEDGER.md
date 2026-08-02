@@ -4769,3 +4769,15 @@ an EXISTENCE question, not a correctness one. Existence questions survive a rege
 questions do not.
 
 **Gates.** `model-integrity` PASS 0.7s; `bench-budget` PASS 568.1s; verify-10 **30 legs**.
+
+### Owner decision 2026-08-02: the count-agnostic fuzz requirement is CONFIRMED
+
+`AGENT_CHARTER.md`'s engineering-rigor line has said "EVERY fuzz target run in CI" since iteration 232,
+replacing a hardcoded "5" that went stale the moment iteration 231 deleted the `features` target along
+with the unused `FbankExtractor` it fuzzed. It was carried as PENDING and nothing was built on it. The
+owner has now confirmed the wording, and the charter line records the confirmation inline. It leaves
+the owner-gated list.
+
+The gate already behaves this way and always did: `_fn_fuzz_smoke` enumerates targets with
+`cargo fuzz list` and FAILS LOUD on an empty list rather than reporting a vacuous pass — so the
+charter now describes what the code does instead of a number that could drift away from it.
