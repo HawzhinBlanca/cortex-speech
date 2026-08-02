@@ -5074,3 +5074,53 @@ than discarding them, which converts waste into corpus instead of merely flaggin
 0.54 vs kept 0.72). Serving highest-confidence first would make the first 10 clips 10/10 usable against
 a 26% baseline waste rate — but it only DEFERS the waste, it removes none of it, and n=14 makes the
 figure suggestive rather than established. Not acted on.
+
+## Overnight run, 2026-08-02/03 — phase 1: the flakiness hunt
+
+### verify-10 was not repeatable, and only repetition could show it
+
+Three sequential 32-leg sweeps, nothing else running. All three RED:
+
+```
+sweep 1: test-e2e+a11y, pipeline-ipc-e2e   exit 1   2845s
+sweep 2: real-app-e2e,  pipeline-ipc-e2e   exit 1   1701s
+sweep 3: real-app-e2e,  pipeline-ipc-e2e   exit 1   1683s
+```
+
+The failing legs took **0.5s** against a normal 15–39s — they never ran:
+`PRECONDITION FAILED: debug port 9222 is already answering`.
+
+Port 9222 is held permanently by the owner's Antigravity IDE browser
+(`--remote-debugging-port=9222 --user-data-dir=…\.gemini\antigravity-browser-profile`). Nothing leaked
+and nothing in the app was broken; this is ordinary desktop tooling. The refusal is CORRECT and stays —
+attaching would drive somebody's real browser. The defect is that a GATE reached for the one port every
+other developer tool also grabs by default.
+
+**The fix was already written in this repo; two files never got it.** Ports were the perfect control:
+
+```
+constrained-ipc  9281 private  PASS x3     real-app-e2e     9222 shared  FAIL
+finetuned-ipc    9291 private  PASS x3     pipeline-ipc-e2e 9222 shared  FAIL x3
+heartbeat-probe  9333 private  PASS x3
+jobs-probe       9334 private  PASS x3
+egress-probe     9335 private  PASS x3
+```
+
+`real_app` → 9271, `pipeline_ipc` → 9261, `e2e_7b_connect` → 9251. The last is not a gate leg so nothing
+had exposed it — fixed anyway, because leaving the final copy of a bug whose two siblings were just
+repaired is how it returns.
+
+**Proof.** Fail-before: three sweeps, exit 1, same message. Pass-after with 9222 STILL held by
+Antigravity: `e2e_pipeline_ipc` ran the whole import → VAD → ASR chain, 77 chars of Kurdish, exit 0.
+Full sweep after the fix: the three legs pass at 22.0s / 39.1s / 14.4s — normal durations, not 0.5s.
+
+**What this says about method.** Every sweep run yesterday passed. A green gate is only worth what its
+REPEATABILITY is worth, and nothing had ever measured that. One extra run per day on a machine with an
+IDE open would have reported RED for a reason unrelated to the code — and the natural response to a
+confusing RED is to stop trusting the gate.
+
+**Still open:** `test-e2e+a11y` crashed once in the three sweeps — exit `3221226505` (`0xC0000409`,
+stack buffer overrun) at 1.5s — then passed in sweeps 2, 3 and the verification sweep. 1 in 4. Separate
+cause from the port collision, being sampled across further sweeps rather than guessed at.
+
+**Gates.** verify-10 **GREEN: 32 kept legs, 32 PASS, 0 FAIL, 0 skipped**.
