@@ -4914,3 +4914,33 @@ goes ~130s -> ~620s, in line with the 568s it took historically.
 **Gates.** verify-10 **GREEN: 30 kept legs, 30 PASS, 0 FAIL, 0 skipped**. couch 55/55; lib 1098 passed /
 0 failed; `couch-page.spec.ts` 41/41; python policies 46/46; clippy `-D warnings` clean. Exe at HEAD,
 app running, phone link answering.
+
+### The retrain-readiness mirror had no gate
+
+Hunted the defect class the ledger records six fixes for — a tally that counts rows the export drops —
+now that 13 clips have just become rejected, which is when such a site would be wrong.
+
+The Rust side is well defended: `stats.rs` is pinned against the real `export_dataset` output by
+`the_dashboards_verified_count_equals_what_the_export_actually_writes`. The gap was in Python.
+`scripts/retrain_readiness.py` answers the one question that spends GPU time using a HAND-COPY of that
+eligibility SQL, and rests its entire safety argument on being a faithful mirror. Nothing enforced the
+mirror, and nothing ran the script — no test, no policy runner, no workflow, no Makefile target.
+
+**Checked before claiming.** The three fragments (`EFFECTIVE`, `REJECTED`, `PLACEHOLDER`) are identical
+modulo whitespace today, so this pins a correct mirror rather than repairing a broken one — worth
+stating plainly instead of dressing a non-finding up as a catch. The risk was future drift, and it is
+one-directional: `stats.rs` gains a rule (it gained the placeholder axis exactly this way), the Python
+keeps the old one, and the owner is told there is more eligible material than the export would publish.
+
+`test_retrain_readiness_policy.py` extracts the rule from `stats.rs` and compares. Extraction failure is
+an assertion, not a skip: a gate that cannot find what it compares against must fail loud rather than
+pass vacuously. Fail-before: one token changed -> FAIL naming `REJECTED` with both sides printed, exit 1;
+restored byte-identical (SHA256); pass-after exit 0. Python policies 46 -> 47.
+
+**First real run of the report**, on the live library: 26 export-eligible clips, 5.5 min eligible audio,
+764 human-gold words, 22 human-verified DPO pairs, 99 still pending. A retrain is not close.
+
+**Owner-visible, not fixed by me:** the report prints `champion on frozen gold: {"champions": {}}` — the
+champion record in the live data dir is EMPTY. Step 5 of the retrain path promotes only on beating the
+champion, and there is no champion there to beat. The script is honest about it; the data is missing.
+Writing a number in would be fabrication, so it is surfaced instead.
