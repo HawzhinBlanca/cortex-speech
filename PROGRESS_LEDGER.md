@@ -5600,3 +5600,62 @@ the restore, and re-applied. `git checkout` restores to HEAD, not to "before my 
 the same thing when the file was clean to begin with.
 
 Policy suite: **48 scripts passed**.
+
+### phase 10: a 0.0% post-jury CER that could not have been anything else
+
+The owner's own product/UX audit (`docs/audits/2026-08-03-…`, now gitignored — its screenshots are of
+the live library and its REPORT.md embeds absolute `C:\Users\…` paths the hygiene gate rejects) flagged
+the Refinery card as untrustworthy: *"5.4% mean CER, 17.8% mean WER, 21.0% CER fine-tuned, 0.0%
+post-jury CER, 'No eval runs yet' … together they undermine trust."*
+
+Two of those are not in conflict — "post-jury CER" and "No eval runs yet" are separate cards answering
+different questions. Chasing the third found something worse than inconsistency.
+
+**The metric could not report anything but zero.** `load_lift_triples` scores
+`(reference, raw, jury)` where the reference is `annotated_transcript` — the human's confirmed text.
+Accepting a clip copies the jury's verdict into it. So an accepted row compares the jury with itself,
+and its char distance is zero whatever the jury produced. It cannot tell "the jury was right" from "the
+reviewer rubber-stamped it".
+
+Measured with the app's own query against the real library:
+
+```
+rows feeding the lift             : 39
+rows where reference == jury text : 39   <- structural zero
+share                             : 39/39 = 100.0%
+```
+
+Every scored row. So `Post-jury CER 0.0% · 95% CI [..]` was arithmetic wearing the clothes of a
+measurement, and `cer_lift = raw - jury = raw - 0` handed the jury 100% of the credit for the raw ASR
+error by construction.
+
+**Fix.** `LabelQualityLift` gains `self_referential_n`, counted over SCORED rows only (`rl > 0`, the
+same exclusion `micro` already applies — a row in neither numerator nor denominator is not evidence
+either way). The card withholds the numbers entirely when that equals `n`, and discloses the count when
+only some rows are affected. Nothing is deleted or recomputed: the honest reading is that this data
+contains no independent evidence about the jury, and the card now says so.
+
+The existing test `label_quality_lift_rewards_jury_corrections` turned out to BE the circular case —
+both its rows have reference identical to jury, and it read that as "the jury restores the reference".
+It now also asserts `self_referential_n == 2`, so the fixture cannot be mistaken for evidence that a
+zero jury CER means a good jury.
+
+**Fail-before, source guard:**
+
+```
+guard removed              AssertionError: RefineryPanel.svelte lost the self-referential guard   exit 1
+branches swapped           expected `{#if …selfReferentialN >= lift.n}` then `{:else if …}`       exit 1
+restored                   frontend review-guard source policy passed                             exit 0
+```
+
+The second case is worth recording: the FIRST version of that guard compared string offsets, which the
+swap does not change — both conditions keep their positions relative to the grid. **It passed the exact
+regression it was written for.** Pinning the two conditions to their roles is what actually holds. That
+is the third decorative-check of the week, and the second I authored myself.
+
+Also recorded: `git checkout --` was used twice to undo a fail-before probe and twice discarded
+uncommitted work alongside it, because HEAD predates the edit. Restoring from a file copy is the
+technique; the lesson had to be learned twice to stick.
+
+Gates: policy suite 48/48, typecheck 427 files 0 errors, vitest 217/217, `cargo fmt` + `clippy
+--all-targets --all-features -D warnings` clean.

@@ -862,6 +862,19 @@ pub struct LabelQualityLift {
     pub cer_lift: f64,
     pub lift_ci_low: f64,
     pub lift_ci_high: f64,
+    /// Scored rows whose reference is CHARACTER-IDENTICAL to the jury hypothesis, so their jury
+    /// distance is zero no matter what the jury did.
+    ///
+    /// This is the honest limit of the whole metric. The reference is the human's confirmed
+    /// transcript, and accepting a clip copies the jury's own output into it — so an accept scores
+    /// the jury against itself and CANNOT tell "the jury was right" from "the reviewer rubber-
+    /// stamped it". Only a row the human wrote differently is independent evidence.
+    ///
+    /// Measured on the owner's library 2026-08-03: 39 of 39 scored rows. A displayed
+    /// "post-jury CER 0.0% (95% CI)" was therefore arithmetic, not measurement, and `cer_lift =
+    /// raw - jury` was the raw ASR error relabelled, crediting the jury with all of it by
+    /// construction. Callers MUST NOT present the jury figure when this equals `n`.
+    pub self_referential_n: usize,
 }
 
 /// Compute the label-quality lift over `(reference, raw_hyp, jury_hyp)` triples. CER flows through
@@ -914,6 +927,12 @@ pub fn compute_label_quality_lift(
     let (raw_micro_cer, jury_micro_cer) = micro(&all);
     let cer_lift = raw_micro_cer - jury_micro_cer;
 
+    // Counted over the SCORED rows only (`rl > 0`), matching `micro`'s own exclusion of empty
+    // references — a row that contributes to neither numerator nor denominator cannot be evidence for
+    // or against the jury either. A zero jury distance here means the reference and the jury verdict
+    // are the same characters, which is what an "accept" produces.
+    let self_referential_n = per.iter().filter(|&&(rl, _, jd)| rl > 0 && jd == 0).count();
+
     let mut lifts: Vec<f64> = Vec::with_capacity(bootstrap_samples);
     if n > 0 && bootstrap_samples > 0 {
         let mut state = seed | 1; // xorshift64 state must be non-zero
@@ -946,6 +965,7 @@ pub fn compute_label_quality_lift(
         cer_lift,
         lift_ci_low: percentile(0.025),
         lift_ci_high: percentile(0.975),
+        self_referential_n,
     }
 }
 
@@ -999,6 +1019,39 @@ mod tests {
         assert!(lift.jury_micro_cer.abs() < 1e-9, "jury matches reference: {}", lift.jury_micro_cer);
         assert!(lift.cer_lift > 0.0, "jury improved labels: lift={}", lift.cer_lift);
         assert!(lift.lift_ci_low <= lift.lift_ci_high, "CI bounds ordered");
+        // ...and BOTH rows are self-referential, which is the honest reading of the three lines
+        // above. This test was written as "the jury restores the reference", but a reference that
+        // equals the jury hypothesis is what an ACCEPT produces, and it forces jury CER to 0
+        // whatever the jury did. Asserting it here so the fixture cannot be mistaken for evidence
+        // that a zero jury CER means a good jury.
+        assert_eq!(lift.self_referential_n, 2, "reference == jury on both rows");
+    }
+
+    #[test]
+    fn label_quality_lift_counts_rows_that_scored_the_jury_against_itself() {
+        // The shape measured on the owner's library on 2026-08-03: every scored row had the human's
+        // confirmed transcript character-identical to the jury verdict, because accepting a clip
+        // copies the jury's output into the reference. Jury CER is then 0 by construction, and
+        // `cer_lift = raw - 0` is the raw ASR error wearing the jury's name.
+        let accepted = ("hello world".to_string(), "hello word".to_string(), "hello world".to_string());
+        // An EDIT is the only independent evidence: the human wrote something the jury did not.
+        let edited = ("good morning".to_string(), "gud mrning".to_string(), "good mrning".to_string());
+
+        let all_accepts = compute_label_quality_lift(&[accepted.clone(), accepted.clone()], 50, 3);
+        assert_eq!(all_accepts.n, 2);
+        assert_eq!(all_accepts.self_referential_n, all_accepts.n, "nothing here measures the jury");
+        assert!(all_accepts.jury_micro_cer.abs() < 1e-9, "forced to zero, not measured");
+
+        let mixed = compute_label_quality_lift(&[accepted, edited], 50, 3);
+        assert_eq!(mixed.n, 2);
+        assert_eq!(mixed.self_referential_n, 1, "only the accepted row is self-referential");
+        assert!(mixed.jury_micro_cer > 0.0, "the edited row lets the jury actually be wrong");
+
+        // Empty references are excluded from scoring, so they cannot be counted as evidence either.
+        let empty_ref = (String::new(), "x".to_string(), String::new());
+        let with_empty = compute_label_quality_lift(&[empty_ref], 0, 1);
+        assert_eq!(with_empty.n, 1, "the row is still reported in n");
+        assert_eq!(with_empty.self_referential_n, 0, "an unscored row is not self-referential evidence");
     }
 
     #[test]

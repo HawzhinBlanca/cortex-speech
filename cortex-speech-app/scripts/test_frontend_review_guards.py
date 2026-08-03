@@ -464,6 +464,57 @@ def test_a_skip_never_clears_the_reviewers_draft_on_either_route() -> None:
             )
 
 
+def test_post_jury_cer_is_withheld_when_every_row_scored_the_jury_against_itself() -> None:
+    """RefineryPanel must not print a post-jury CER that is zero by arithmetic.
+
+    The lift's reference is the human's confirmed transcript, and ACCEPTING a clip copies the jury's
+    own verdict into it — so an accepted row scores the jury against itself and contributes zero jury
+    error whatever the jury produced. Measured on the real library on 2026-08-03: 39 of 39 scored rows.
+    The card was therefore showing "Post-jury CER 0.0%" with a 95% CI as if it were accuracy, and
+    "CER lift = raw - jury" was the raw ASR error wearing the jury's name.
+
+    Pinned at source for the reason this whole file exists: the frontend tests are pure functions and
+    the project has no component-mount harness, so the branch cannot be asserted by rendering it.
+    """
+    src = _read("src/lib/RefineryPanel.svelte")
+
+    # The guard itself: numbers only when at least one row is NOT self-referential.
+    for needle in (
+        "lift.selfReferentialN >= lift.n",
+        'data-testid="refinery-lift-self-referential"',
+    ):
+        if needle not in src:
+            raise AssertionError(
+                f"RefineryPanel.svelte lost the self-referential guard ({needle!r}): a post-jury CER "
+                f"of 0.0% would again be presented as measured accuracy when it is forced arithmetic."
+            )
+
+    # The WITHHOLDING branch must be the `{#if}` and the numbers the `{:else if}`. Swap them and the
+    # numbers render first for every row, with the explanation unreachable — the guard string would
+    # still be in the file, so a mere "is it present" check calls that fine.
+    #
+    # (An earlier version of this check compared string OFFSETS, which the swap does not change: both
+    # branch conditions keep their positions relative to the grid. It passed the very regression it was
+    # written for. Pinning the two conditions to their exact roles is what actually holds.)
+    withhold_branch = "{#if lift && lift.n > 0 && lift.selfReferentialN >= lift.n}"
+    numbers_branch = "{:else if lift && lift.n > 0}"
+    if withhold_branch not in src or numbers_branch not in src:
+        raise AssertionError(
+            "the lift card must WITHHOLD first and show numbers only as the fallback:\n"
+            f"  expected `{withhold_branch}` then `{numbers_branch}`\n"
+            "  swapping them renders the forced-zero CER for every row and makes the explanation dead code"
+        )
+    if src.index(numbers_branch) < src.index(withhold_branch):
+        raise AssertionError("the numbers branch precedes the withholding branch; the guard never runs")
+
+    # And the partial case must still disclose the count rather than showing a quietly diluted figure.
+    if "lift.selfReferentialN > 0" not in src:
+        raise AssertionError(
+            "RefineryPanel.svelte no longer discloses how many rows were accepted verbatim when only "
+            "SOME are self-referential; the displayed lift is then diluted with no way to tell"
+        )
+
+
 def main() -> None:
     test_a_skip_never_clears_the_reviewers_draft_on_either_route()
     test_retranscribe_guards_editor_writes_against_navigation()
@@ -485,6 +536,7 @@ def main() -> None:
     test_keyboard_shortcuts_help_each_uses_a_unique_key()
     test_selection_reseats_playback_centrally_for_store_only_selections()
     test_verify_all_pending_excludes_placeholder_and_empty_rows()
+    test_post_jury_cer_is_withheld_when_every_row_scored_the_jury_against_itself()
     print("frontend review-guard source policy passed")
 
 

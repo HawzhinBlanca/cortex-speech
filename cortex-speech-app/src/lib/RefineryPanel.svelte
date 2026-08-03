@@ -128,7 +128,19 @@
     <!-- Label-quality lift (pending M3.1 backend) -->
     <div class="card" data-testid="refinery-lift">
       <h3 class="card-title">Label-quality lift (raw ASR → post-jury)</h3>
-      {#if lift && lift.n > 0}
+      {#if lift && lift.n > 0 && lift.selfReferentialN >= lift.n}
+        <!-- Every scored clip had its reference COPIED from the jury verdict (that is what accepting a
+             clip does), so the jury was compared with itself and its error is zero whatever it
+             produced. Showing "0.0% post-jury CER (95% CI)" here read as proof the jury was perfect,
+             and the lift beside it was the raw ASR error under the jury's name. Measured on the real
+             library 2026-08-03: 39 of 39 rows. State the limit instead of the arithmetic. -->
+        <p class="muted" data-testid="refinery-lift-self-referential">
+          Not measurable yet — on all {lift.n} verified {lift.n === 1 ? 'clip' : 'clips'} your confirmed
+          transcript is the jury's own output, so its error is zero by arithmetic rather than by
+          measurement. Editing a transcript instead of accepting it produces the independent
+          comparison this needs.
+        </p>
+      {:else if lift && lift.n > 0}
         <div class="lift-grid">
           <div class="lift-cell">
             <span class="lift-label">Raw ASR CER</span>
@@ -147,6 +159,13 @@
         </div>
         <p class="muted">
           n={lift.n} verified segments · 95% CI [{pct(lift.liftCiLow)}, {pct(lift.liftCiHigh)}]
+          {#if lift.selfReferentialN > 0}
+            <!-- The numbers above are real here, but partly diluted: an accepted clip's reference IS
+                 the jury verdict, so those rows can only ever contribute zero jury error. Naming the
+                 count lets the figure be read for what it is instead of taken at face value. -->
+            · {lift.selfReferentialN} of {lift.n} accepted verbatim, so those rows score the jury
+            against its own output
+          {/if}
         </p>
       {:else}
         <p class="muted">

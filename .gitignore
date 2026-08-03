@@ -115,3 +115,9 @@ coverage/
 # between nights) and artifacts/ holds crash reproducers for triage. Neither is source.
 cortex-speech-app/src-tauri/fuzz/corpus/
 cortex-speech-app/src-tauri/fuzz/artifacts/
+
+# Product/UX audit working directories: the screenshots are of the owner's LIVE library, so they
+# carry real transcripts, speaker material and local paths, and REPORT.md embeds absolute
+# C:\Users\... paths that scripts/test_windows_repo_hygiene.py rejects in tracked files. Owner
+# confirmed these are his own 2026-08-03 audit artifacts and are not to be published.
+docs/audits/
