@@ -5407,3 +5407,54 @@ STALE EXE: source src-tauri\src\integration_runner.rs is newer than the built ex
 Relinking needs the running app closed, and the running app is the phone-review server. The commit is
 held locally, unpushed, until the owner can spare the app for ~10 minutes. `cargo fmt` clean,
 `cargo clippy --all-targets --all-features -D warnings` clean.
+
+### phase 6: the probes cleaned up after success and after failure — but not after refusing to start
+
+A temp-dir census after phase 5 turned up something the phase-4 proof had not: dirs matching the
+probes' own patterns, created AFTER the phase-4 fix landed (`dce6b69`, 09:55).
+
+```
+cortex-egress-ctk60F   10:16:34   0 files
+cortex-egress-EMZZbq   10:16:34   0 files
+cortex-egress-tzYMcu   10:16:34   0 files
+```
+
+**Zero files** is the tell. Each probe `mkdtemp`s its profile at module scope, then checks preconditions
+inside `run()`. A `die()` — wrong exe path, debug port already answering — calls `process.exit(1)`
+without touching the directory it just made. Success cleans up. A thrown failure deliberately keeps the
+profile for diagnosis. The refuse-to-start path did neither: it left an empty directory nobody would
+ever look in.
+
+Reproduced deterministically rather than inferred, by occupying the port the probe requires:
+
+```
+BEFORE cortex-egress-* dirs = 148
+PRECONDITION FAILED: debug port 9335 already answering — another instance is running
+AFTER  cortex-egress-* dirs = 149        newest: cortex-egress-8wA5wx   files inside = 0
+```
+
+Fix: an `ownedTemp` list, declared above `die` (so it can be read without a temporal-dead-zone access
+to the consts below it) and appended to at each `mkdtemp`. `die` empties the list before exiting. It is
+deliberately NOT wired into the failure handler — a probe that got far enough to launch the app has
+something worth keeping.
+
+**After, all three, ports occupied:**
+
+```
+egress     exit=1   dirs 149 -> 149   delta=0
+jobs       exit=1   dirs 50  -> 50    delta=0
+heartbeat  exit=1   dirs 0   -> 0     delta=0
+```
+
+Exit 1 is preserved — the refusal still fails loud, it just stops littering. The success and
+caller-supplied-profile paths were re-proved unchanged (6/6 CLEAN / CORRECT).
+
+One false alarm worth recording: the first regression re-run reported `exit=1 ... LEAKED / FAILED` on all
+three. That was the port-occupier fixture from the fail-before still listening, not a regression — every
+probe was correctly refusing to start. Re-run with the ports free: 6/6 green.
+
+**Unexplained and left open:** what invoked three egress probes at 10:16:34 against an occupied 9335.
+The refusal itself is correct behaviour (attaching would drive somebody else's real browser). Recorded,
+not guessed at.
+
+**Reclaimed:** 203 more stale dirs, **848.6 MB** — 1,009 MB total across phases 5 and 6.

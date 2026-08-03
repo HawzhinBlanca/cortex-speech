@@ -29,8 +29,20 @@ const APP_EXE =
   process.env.CORTEX_APP_EXE || path.join(REPO, 'src-tauri', 'target', 'release', 'cortex-speech-app.exe');
 const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9334';
 
+// Temp dirs WE created, registered as they are made. `die()` fires on a PRECONDITION failure — before
+// the app is ever launched — so these are empty and there is nothing in them to diagnose. That is the
+// opposite of the failure handler at the bottom, which deliberately KEEPS profiles for inspection.
+// Declared above `die` so it can reach the list without a temporal-dead-zone read of the consts below.
+const ownedTemp = [];
 const die = (m) => {
   console.error('PRECONDITION FAILED: ' + m);
+  for (const d of ownedTemp) {
+    try {
+      fs.rmSync(d, { recursive: true, force: true });
+    } catch (e) {
+      /* best effort: the exit code is what matters here */
+    }
+  }
   process.exit(1);
 };
 if (!fs.existsSync(APP_EXE)) die(`app exe not found: ${APP_EXE} (build it: cargo build --release ...)`);
@@ -50,6 +62,7 @@ if (DATA_DIR) {
   }
 } else {
   DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-jobs-'));
+  ownedTemp.push(DATA_DIR);
 }
 const OUT = path.join(DATA_DIR, 'jobs_probe_export.jsonl');
 const HF_OUT = path.join(DATA_DIR, 'jobs_probe_hf'); // HF export writes a directory (parent must exist)
@@ -76,6 +89,7 @@ async function run() {
   }
 
   wvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-jobs-wv-'));
+  ownedTemp.push(wvDir);
   appProcess = spawn(APP_EXE, [], {
     env: {
       ...process.env,

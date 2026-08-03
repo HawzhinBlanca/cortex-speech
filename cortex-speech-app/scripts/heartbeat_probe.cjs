@@ -42,8 +42,20 @@ const MAX_MS = Number(process.env.CORTEX_HEARTBEAT_MAX_MS || 300);
 const NUM_SLOW = 8; // concurrent get_waveform decodes to keep the async pool busy
 const PROBE_MS = 4000; // how long to hammer get_settings while the slow load runs
 
+// Temp dirs WE created, registered as they are made. `die()` fires on a PRECONDITION failure — before
+// the app is ever launched — so these are empty and there is nothing in them to diagnose. That is the
+// opposite of the failure handler at the bottom, which deliberately KEEPS profiles for inspection.
+// Declared above `die` so it can reach the list without a temporal-dead-zone read of the consts below.
+const ownedTemp = [];
 const die = (m) => {
   console.error('PRECONDITION FAILED: ' + m);
+  for (const d of ownedTemp) {
+    try {
+      fs.rmSync(d, { recursive: true, force: true });
+    } catch (e) {
+      /* best effort: the exit code is what matters here */
+    }
+  }
   process.exit(1);
 };
 
@@ -64,6 +76,7 @@ if (DATA_DIR) {
   }
 } else {
   DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-heartbeat-'));
+  ownedTemp.push(DATA_DIR);
 }
 
 let appProcess = null;
@@ -92,6 +105,7 @@ async function run() {
   // rapid launches (or with the owner's other WebView2 apps) yields WebView2 error 0x8007139F
   // ("resource not in the correct state") and the window never opens.
   wvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-hb-wv-'));
+  ownedTemp.push(wvDir);
   appProcess = spawn(APP_EXE, [], {
     env: {
       ...process.env,
