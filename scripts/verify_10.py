@@ -679,8 +679,24 @@ def run_gate(name, kind, payload, cwd, probe, timeout=3600):
     )
     if r.returncode == 0:
         return PASS, secs, retried.strip()
+    # A FAILURE ALSO GETS A TIMESTAMPED COPY, because the line above only keeps the LATEST run of each
+    # gate. That is fine for a failure you investigate immediately and useless for the failure that
+    # matters most: the INTERMITTENT one. Measured 2026-08-03 — `test-e2e+a11y` crashed with exit
+    # 3221226505 (0xC0000409, stack buffer overrun) in one sweep of three, and by the time it could be
+    # read the next sweep had already overwritten the log with a passing run. The evidence for the only
+    # unexplained fault of the night was destroyed by the gate's own success.
+    #
+    # Copy, not move: the stable `<gate>.log` path is what the FAIL line prints and what people already
+    # look for, so it keeps meaning "the most recent run".
+    stamped = LOG_DIR / f"{name}.FAIL.{time.strftime('%Y%m%d-%H%M%S')}.log"
+    try:
+        shutil.copyfile(log_path, stamped)
+    except OSError as e:  # never let bookkeeping turn a diagnosable failure into a crash
+        print(f"  (could not keep a timestamped copy of the failure log: {e})", flush=True)
+        stamped = None
     tail = "\n".join(((r.stdout or "") + "\n" + (r.stderr or "")).strip().splitlines()[-12:])
-    return FAIL, secs, f"exit {r.returncode}{retried} - full log: {log_path}\n{tail}"
+    kept = f"\n     kept for post-mortem: {stamped}" if stamped else ""
+    return FAIL, secs, f"exit {r.returncode}{retried} - full log: {log_path}{kept}\n{tail}"
 
 
 def write_status_md(path, head, quick, results, verdict):
