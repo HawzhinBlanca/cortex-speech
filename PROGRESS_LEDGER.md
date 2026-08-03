@@ -5846,3 +5846,45 @@ NOT fixed unilaterally: the fix is words (corpus, date, "on the frozen gold set"
 in English **and Sorani**, and inserting a bracketed CI into an RTL string risks bidirectional rendering
 this agent cannot verify. Queued with the owner's Sorani check, alongside the
 `stats.conformalHeuristicBasis` cause from phase 11.
+
+### phase 14: three library reads answered "your library is empty" when they meant "I could not read it"
+
+Not from the audit — the audit cannot see this one, because on screen it looks like an ordinary empty
+state. Found while chasing a `console.error` that appeared during the header-overflow run.
+
+`getSegments`, `getSegmentsPage` and `getSegmentsSuspectFirst` each validated the IPC payload and, on a
+mismatch, logged to the console and returned an empty collection:
+
+```ts
+console.error('getSegmentsPage: expected page payload, got', typeof data);
+return { items: [], total: 0, nextCursor: null };
+```
+
+That converts a failed read into a successful-looking one. Downstream:
+
+* **ValidationPanel** filters an empty array and shows no signal anomalies — a clean bill of health
+  issued by a read that never happened.
+* **ReviewInbox** finds no unverified clips and reports there is nothing left to review.
+* **segmentStore** renders an empty library.
+
+`console.error` is the only trace, and no user opens a console.
+
+The silence bought nothing. Every one of the four call sites is already inside a `try` with a
+user-visible failure path: `segmentStore` raises a PERSISTENT banner with a Retry plus a toast,
+`ValidationPanel` and `ReviewMode` call `notifications.error`, `ReviewInbox` writes a status line. The
+fallback bypassed all of them. All three now throw with the received type in the message.
+
+This is the same principle `scripts/assert_ran.py` already states about itself — *"a guard that quietly
+disables itself when it stops understanding the output is worse than no guard, because it still looks
+like protection"* — applied to the read path instead of the test path.
+
+**Fail-before:**
+
+```
+silent empty-page fallback restored   AssertionError: getSegmentsPage no longer throws on a
+                                      malformed payload                                    exit 1
+restored                              frontend review-guard source policy passed            exit 0
+```
+
+Gates: typecheck 427 files 0 errors, vitest 217, policy 48/48, Playwright **94 passed** (including the
+six new header-overflow cases).

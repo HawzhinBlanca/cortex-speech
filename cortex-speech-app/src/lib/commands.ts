@@ -169,9 +169,15 @@ export async function getSegmentConsensus(segmentId: string): Promise<SegmentCon
 
 export async function getSegments(verified?: boolean): Promise<SpeechSegment[]> {
   const data = await invoke<SpeechSegment[]>('get_segments', { verified });
+  // THROW, never a benign empty result. Returning [] here turned "the IPC payload was not what this
+  // app understands" into "your library is empty" — a failure that looks exactly like success. Every
+  // caller of these three already has a user-visible error path (segmentStore raises a PERSISTENT
+  // banner with Retry, ValidationPanel and ReviewMode toast, ReviewInbox writes a status line); the
+  // silent fallback bypassed all of them and left console.error, which no user opens, as the only
+  // record. An empty ValidationPanel reads as "no anomalies found" and an empty inbox as "nothing left
+  // to review" — both are clean bills of health issued by a broken read.
   if (!Array.isArray(data)) {
-    console.error('getSegments: expected array, got', typeof data);
-    return [];
+    throw new Error(`get_segments returned ${typeof data}, not a segment array — the library could not be read`);
   }
   return data;
 }
@@ -192,9 +198,15 @@ export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Pro
     limit: options.limit ?? 300,
     cursor: options.cursor ?? null,
   });
+  // THROW, never a benign empty result. Returning [] here turned "the IPC payload was not what this
+  // app understands" into "your library is empty" — a failure that looks exactly like success. Every
+  // caller of these three already has a user-visible error path (segmentStore raises a PERSISTENT
+  // banner with Retry, ValidationPanel and ReviewMode toast, ReviewInbox writes a status line); the
+  // silent fallback bypassed all of them and left console.error, which no user opens, as the only
+  // record. An empty ValidationPanel reads as "no anomalies found" and an empty inbox as "nothing left
+  // to review" — both are clean bills of health issued by a broken read.
   if (!data || !Array.isArray(data.items)) {
-    console.error('getSegmentsPage: expected page payload, got', typeof data);
-    return { items: [], total: 0, nextCursor: null };
+    throw new Error(`get_segments_page returned ${typeof data}, not a page payload — the library could not be read`);
   }
   return data;
 }
@@ -206,9 +218,15 @@ export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Pro
  */
 export async function getSegmentsSuspectFirst(verified?: boolean): Promise<SpeechSegment[]> {
   const data = await invoke<SpeechSegment[]>('get_segments_suspect_first', { verified });
+  // THROW, never a benign empty result. Returning [] here turned "the IPC payload was not what this
+  // app understands" into "your library is empty" — a failure that looks exactly like success. Every
+  // caller of these three already has a user-visible error path (segmentStore raises a PERSISTENT
+  // banner with Retry, ValidationPanel and ReviewMode toast, ReviewInbox writes a status line); the
+  // silent fallback bypassed all of them and left console.error, which no user opens, as the only
+  // record. An empty ValidationPanel reads as "no anomalies found" and an empty inbox as "nothing left
+  // to review" — both are clean bills of health issued by a broken read.
   if (!Array.isArray(data)) {
-    console.error('getSegmentsSuspectFirst: expected array, got', typeof data);
-    return [];
+    throw new Error(`get_segments_suspect_first returned ${typeof data}, not a segment array`);
   }
   return data;
 }

@@ -544,6 +544,42 @@ def test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrat
         )
 
 
+def test_library_reads_fail_loudly_instead_of_reporting_an_empty_library() -> None:
+    """A malformed segments payload must THROW, never resolve to an empty result.
+
+    `getSegments` / `getSegmentsPage` / `getSegmentsSuspectFirst` each used to `console.error` and
+    return `[]` (or an empty page). That converts "the IPC payload was not what this app understands"
+    into "your library is empty" — a failure indistinguishable from success. ValidationPanel then shows
+    no signal anomalies (a clean bill of health from a broken read), ReviewInbox reports nothing left to
+    review, and the segment store renders an empty library.
+
+    The silence was never necessary: all four call sites already sit in `try` blocks with user-visible
+    error paths (segmentStore raises a persistent banner with Retry plus a toast, ValidationPanel and
+    ReviewMode call notifications.error, ReviewInbox writes a status line). The fallback bypassed every
+    one of them and left `console.error` — which no user opens — as the only record.
+    """
+    src = _read("src/lib/commands.ts")
+
+    for fn, marker in (
+        ("getSegments", "get_segments returned "),
+        ("getSegmentsPage", "get_segments_page returned "),
+        ("getSegmentsSuspectFirst", "get_segments_suspect_first returned "),
+    ):
+        if marker not in src:
+            raise AssertionError(
+                f"{fn} no longer throws on a malformed payload. Returning an empty result there reports "
+                f"an empty library instead of a failed read, and every caller's error path is bypassed."
+            )
+
+    # The specific regression: the old shape returned an empty collection right after logging.
+    for bad in ("return { items: [], total: 0, nextCursor: null };",):
+        if bad in src:
+            raise AssertionError(
+                f"commands.ts still contains the silent empty-page fallback {bad!r} — a broken read must "
+                f"not be presented to the user as an empty library"
+            )
+
+
 def main() -> None:
     test_a_skip_never_clears_the_reviewers_draft_on_either_route()
     test_retranscribe_guards_editor_writes_against_navigation()
@@ -567,6 +603,7 @@ def main() -> None:
     test_verify_all_pending_excludes_placeholder_and_empty_rows()
     test_post_jury_cer_is_withheld_when_every_row_scored_the_jury_against_itself()
     test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrated()
+    test_library_reads_fail_loudly_instead_of_reporting_an_empty_library()
     print("frontend review-guard source policy passed")
 
 
