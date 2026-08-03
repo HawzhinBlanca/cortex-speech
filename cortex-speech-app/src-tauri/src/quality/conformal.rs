@@ -272,6 +272,49 @@ mod tests {
     }
 
     #[test]
+    fn a_dataset_with_no_confidence_data_cannot_certify_anything() {
+        // The owner's live library on 2026-08-03: `confidence` and `ctc_score` NULL on all 144 rows.
+        // Both defaults then apply to EVERY segment — nonconformity((1-0.5) + 0.1*5) = 1.0 — so the
+        // score carries no per-segment information at all. Every clip is indistinguishable.
+        //
+        // What that did to the dashboard: no cut point can beat the target (the Hoeffding slack alone
+        // is ~0.29 at n=40 against a 5% target), so `best_k == 0`, the fallback threshold becomes that
+        // same 1.0, and every non-rejected segment passes it. 144 - 27 rejects = 117 rows rendered as
+        // "Certified Segments" in success-cyan. That number was the count of non-rejected segments
+        // wearing a statistical word.
+        let flat: Vec<SpeechSegment> = (0..40)
+            .map(|i| {
+                let mut s = mock_segment(&format!("s{i}"), 0.9, -1.0, true, "ئەمڕۆ هەوا خۆشە", "ئەمڕۆ هەوا زۆر خۆشە");
+                s.confidence = None; // <- the whole point: no posterior, no acoustic score
+                s.ctc_score = None;
+                s
+            })
+            .collect();
+
+        let scores: Vec<f64> = flat.iter().map(compute_nonconformity_score).collect();
+        assert!(
+            scores.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-12),
+            "every segment must score identically when both inputs are missing: {scores:?}"
+        );
+        assert!((scores[0] - 1.0).abs() < 1e-12, "the two defaults produce exactly 1.0, got {}", scores[0]);
+
+        let cert = calibrate_and_certify(&flat, 0.05, 0.95);
+        assert!(
+            !cert.is_calibrated,
+            "a degenerate score set must never report itself calibrated (bound {})",
+            cert.expected_error_bound
+        );
+        // The count itself is left intact — the UI is what must not present it as an achievement, and
+        // `StatsDashboard.svelte` shows "—" whenever `isCalibrated` is false. Pinned here so the
+        // tautology is visible in the test rather than only in a comment.
+        assert_eq!(
+            cert.total_certified,
+            flat.len(),
+            "with a degenerate threshold EVERY segment passes — this is why the count must not be shown"
+        );
+    }
+
+    #[test]
     fn nonconformity_clamps_out_of_range_confidence() {
         // Round-10 audit MEDIUM: an external (WSL) script could emit confidence as a percentage (92.0),
         // which UNCLAMPED yields ((1-92)+0.5).max(0)=0.0 — the SMALLEST (most-certain) nonconformity,

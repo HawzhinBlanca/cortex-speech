@@ -624,7 +624,17 @@
         <div class="bg-cortex-900/40 border border-cortex-800/40 rounded-xl p-3 space-y-2">
           <div class="grid grid-cols-2 gap-2 text-center">
             <div class="bg-cortex-950/40 p-2 rounded-lg border border-cortex-800/20">
-              <div class="text-lg font-bold text-cyan-400">{cert.totalCertified}</div>
+              <!-- An UNCALIBRATED certificate has no defensible certified count, so it shows the same
+                   "—" this panel already uses for the threshold and RefineryPanel uses for a metric over
+                   zero segments (undefined, never 0). Measured on the live library 2026-08-03:
+                   `confidence` and `ctc_score` are NULL on all 144 rows, so every segment scores
+                   nonconformity (1-0.5) + 0.1*5 = 1.0 from the two defaults alone. No cut point beats
+                   the target, the fallback threshold becomes that same 1.0, and EVERY non-rejected
+                   segment passes it — 144 - 27 rejects = the 117 that was rendering here in
+                   success-cyan as "Certified Segments". A tautology, not a certification. -->
+              <div class="text-lg font-bold" class:text-cyan-400={cert.isCalibrated}>
+                {cert.isCalibrated ? cert.totalCertified : '—'}
+              </div>
               <div class="text-[9px] text-cortex-400">{$t('stats.certifiedSegments')}</div>
             </div>
             <div class="bg-cortex-950/40 p-2 rounded-lg border border-cortex-800/20">

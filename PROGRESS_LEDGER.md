@@ -5747,3 +5747,54 @@ calibration (neither is a real posterior) and wrong as provenance.
 
 NOT fixed unilaterally: correcting it means rewriting the sentence in English **and Sorani**, and this
 agent does not write Sorani. Queued with the owner's existing 10-string Sorani check.
+
+### phase 12: "117 Certified Segments" was the count of non-rejected rows
+
+The owner's second audit (deep, `docs/audits/2026-08-03-cortex-deep-audit/`, gitignored with the first)
+confirms the phase-10 fix landed — *"The fabricated post-jury win is gone"* — and flags the next one:
+*"Calling 117 items 'Certified Segments' in the same panel is still too strong."*
+
+It is not too strong. It is vacuous, and the arithmetic says so exactly.
+
+```
+confidence IS NULL   144 / 144
+ctc_score  IS NULL   144 / 144
+```
+
+`compute_nonconformity_score` is `nonconformity(seg.confidence.unwrap_or(0.5), seg.ctc_score)` and
+`nonconformity` uses `ctc_score.unwrap_or(-5.0)`. With both columns empty, EVERY segment scores
+`(1 - 0.5) + 0.1·5 = 1.0` — identical, from two defaults, carrying no per-segment information at all.
+
+What follows is forced. All scores tie, so the only cut point is `k = n`; the Hoeffding slack alone is
+`sqrt(ln(40/0.05) / 80) = 0.289` against a 5% target, so no `k` satisfies the bound, `best_k == 0`, and
+`calibrate_threshold` returns the uncalibrated fallback `sorted[0].0` — which is that same 1.0. Every
+non-rejected segment scores ≤ 1.0 and is therefore "certified": **144 − 27 rejects = 117**, reproduced
+from first principles before any code was touched.
+
+So the panel showed a bold cyan 117 beside its own `n/a (uncalibrated)`. The count of rows that are not
+rejected, wearing a statistical word.
+
+**Fix.** The tile shows `—` while `isCalibrated` is false — this panel's existing idiom for
+undefined-not-zero, already used by the threshold tile beside it and by `RefineryPanel`'s `metric()`.
+Success-cyan is bound to `isCalibrated` too, so an uncalibrated readout cannot look healthy at a glance.
+The payload is unchanged; what was wrong was presenting it as an achievement.
+
+**Fail-before:**
+
+```
+unconditional count restored   AssertionError: StatsDashboard.svelte must withhold the certified
+                               count while the certificate is uncalibrated                    exit 1
+restored                       frontend review-guard source policy passed                     exit 0
+```
+
+Plus a Rust test that pins the tautology itself: 40 segments with no confidence and no ctc_score must
+all score identically, must report `is_calibrated == false`, and must certify ALL of them — the last
+assertion existing precisely to document why the count cannot be shown.
+
+**A process mistake, recorded because it is the second of its kind today.** The sweep gating phase 11
+was still running while these edits were being made — the exact contamination criticised two entries
+above. It was killed rather than read; a verdict over files that changed underneath it is not evidence.
+No orphaned processes, `docs/STATUS.md` untouched (the run never reached its write), phone link 200
+throughout.
+
+Gates: typecheck 427 files 0 errors, lint 0 errors, policy suite 48/48, Rust lib 1101 passed.

@@ -515,6 +515,35 @@ def test_post_jury_cer_is_withheld_when_every_row_scored_the_jury_against_itself
         )
 
 
+def test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrated() -> None:
+    """An uncalibrated conformal certificate has no defensible "certified" count.
+
+    Measured on the live library 2026-08-03: `confidence` and `ctc_score` are NULL on all 144 rows, so
+    every segment scores nonconformity (1-0.5) + 0.1*5 = 1.0 from the two `unwrap_or` defaults alone.
+    No cut point beats the target (the Hoeffding slack alone is ~0.29 at n=40 against 5%), so the
+    fallback threshold becomes that same 1.0 and EVERY non-rejected segment passes it: 144 - 27 rejects
+    = the 117 that rendered as "Certified Segments" in success-cyan, beside the panel's own
+    "n/a (uncalibrated)". A count of non-rejected segments wearing a statistical word.
+
+    The count is left intact in the payload; the UI is what must not present it as an achievement. "—"
+    is this panel's existing idiom for undefined-not-zero (the threshold tile already uses it).
+    """
+    src = _read("src/lib/StatsDashboard.svelte")
+
+    if "cert.isCalibrated ? cert.totalCertified : '—'" not in src:
+        raise AssertionError(
+            "StatsDashboard.svelte must withhold the certified count while the certificate is "
+            "uncalibrated: an uncalibrated threshold certifies whatever passes a fallback, which on a "
+            "dataset with no confidence data is everything."
+        )
+    # Success-cyan is an assertion of its own. Bound to isCalibrated so an uncalibrated readout cannot
+    # look like a healthy one even at a glance.
+    if "class:text-cyan-400={cert.isCalibrated}" not in src:
+        raise AssertionError(
+            "the certified-count tile must only wear success-cyan when the certificate is calibrated"
+        )
+
+
 def main() -> None:
     test_a_skip_never_clears_the_reviewers_draft_on_either_route()
     test_retranscribe_guards_editor_writes_against_navigation()
@@ -537,6 +566,7 @@ def main() -> None:
     test_selection_reseats_playback_centrally_for_store_only_selections()
     test_verify_all_pending_excludes_placeholder_and_empty_rows()
     test_post_jury_cer_is_withheld_when_every_row_scored_the_jury_against_itself()
+    test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrated()
     print("frontend review-guard source policy passed")
 
 
