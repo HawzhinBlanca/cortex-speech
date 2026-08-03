@@ -5124,3 +5124,50 @@ stack buffer overrun) at 1.5s — then passed in sweeps 2, 3 and the verificatio
 cause from the port collision, being sampled across further sweeps rather than guessed at.
 
 **Gates.** verify-10 **GREEN: 32 kept legs, 32 PASS, 0 FAIL, 0 skipped**.
+
+### Phases 2–4: fuzz, drills at scale, and a mutation gate that could not see its riskiest module
+
+**Phase 2 — long fuzz.** The gate budgets 30s per target; each got 1800s.
+
+```
+target      executions    exec/sec   new corpus inputs
+cache        6,807,918      3,780        0
+diff         2,294,465      1,272      596
+normalizer     742,338        412    1,807
+validation 289,431,028    160,705       50
+```
+
+**~299 million executions, zero crashes.** Stated plainly: no bug found. The value is coverage —
+the normalizer gained 1,807 inputs reaching code the 30-second budget had never touched. That corpus is
+gitignored (`.gitignore:116`, 0 files tracked), so the gain is local-only and CI still starts from
+empty every run. NOT committed: reversing a deliberate gitignore unattended is not the assistant's call;
+recorded for the owner (~11 MB unminimized; `cargo fuzz cmin` would cut it).
+
+**Phase 3 — drills at scale.** `DURABILITY DRILL PASS: 300 hard-kill cycles (240 write-phase, 60
+boot-phase), 162,466 rows committed, 0 journaled edits lost, contiguous id space, integrity ok at every
+verify.` Twelve times the gate's 25 cycles, same invariants.
+
+**Phase 4 — the mutation gate could never mutate `couch.rs`.**
+
+`.cargo/mutants.toml` added `src/couch.rs` to `examine_globs` on 2026-07-27, with a six-line comment
+naming it the highest-risk module in scope. The nightly job builds its `--in-diff` input from an
+explicit file list that never included it, so `--in-diff` dropped every couch mutant. The two halves of
+one config had drifted apart with nothing comparing them.
+
+Fail-before on a REAL commit range (`282efd5..HEAD` — the night `couch.rs` gained 298 lines of new
+decision logic):
+
+```
+old filter -> diff 0 bytes      -> "Mutation gate idle: No core-module changes", exit 0
+                                   A VACUOUS PASS, on the exact night the riskiest module was rewritten.
+new filter -> diff 18,390 bytes -> 6 mutants found, 6 caught, 0 survived (8m)
+```
+
+Two things worth separating. The gate defect is real and is fixed (`498e31f`). The *result* — 6 of 6
+caught — is a clean bill for the skip-path tests written the previous evening: they kill every mutation
+in the lines they cover, rather than merely looking thorough. Verified the config itself was never the
+problem: `cargo mutants --list` reads `.cargo/mutants.toml` and enumerates exactly the eight scoped
+files, 1,077 mutants.
+
+Caught by the repo's own `test_workflow_policy.py` mid-edit: the first draft of the fix used an em-dash,
+and workflow YAML must stay ASCII-clean.
