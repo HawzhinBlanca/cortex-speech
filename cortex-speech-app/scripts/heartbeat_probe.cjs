@@ -57,6 +57,8 @@ if (DATA_DIR) {
 }
 
 let appProcess = null;
+// Module scope so cleanupTemp() and the failure handler can both reach it; assigned in run().
+let wvDir = null;
 function killApp() {
   if (appProcess && appProcess.pid) {
     try {
@@ -79,7 +81,7 @@ async function run() {
   // Isolate the WebView2 user-data folder per run — sharing the default one across concurrent /
   // rapid launches (or with the owner's other WebView2 apps) yields WebView2 error 0x8007139F
   // ("resource not in the correct state") and the window never opens.
-  const wvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-hb-wv-'));
+  wvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-hb-wv-'));
   appProcess = spawn(APP_EXE, [], {
     env: {
       ...process.env,
@@ -161,10 +163,37 @@ async function run() {
     );
   }
   console.log(`\nHEARTBEAT OK: main thread stayed responsive (p95 ${result.p95.toFixed(1)}ms <= ${MAX_MS}ms).`);
+  // SETTLE before removing the profile. `taskkill /F /T` returns before Windows has released the
+  // killed tree's file handles, and the app holds SQLite's .db/-wal/-shm open. Measured: without this
+  // the WebView2 folder deleted fine but the data profile failed EPERM every time, so the leak was
+  // only half fixed. rmSync's own maxRetries does not help — it retries the CALL, not the wait for a
+  // handle that is still open when the first attempt is made.
+  await sleep(1500);
+  cleanupTemp();
+}
+
+// Remove the two temp trees this probe creates, but ONLY on success — the same contract the header
+// claims to share with e2e_real_app.cjs, which was never actually implemented here. Measured
+// 2026-08-03: 29 `cortex-heartbeat-*` profiles and 24 `cortex-hb-wv-*` WebView2 folders left behind,
+// 168 MB, one pair per sweep since the probe was written.
+//
+// Kept on FAILURE on purpose, and the path is printed: a failed run is the one whose profile someone
+// needs to open. That is e2e_real_app.cjs's rule too.
+function cleanupTemp() {
+  for (const dir of [DATA_DIR, wvDir]) {
+    // WebView2 can hold files for a moment after the app dies; a leftover directory is untidy, never
+    // a reason to fail a green run.
+    try {
+      if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (e) {
+      console.log(`   (could not remove ${dir}: ${e.message})`);
+    }
+  }
 }
 
 run().catch((err) => {
   console.error('==> HEARTBEAT FAILED:', err && err.message ? err.message : err);
   killApp();
+  console.error(`==> Profiles kept for diagnosis: ${DATA_DIR}${wvDir ? ` and ${wvDir}` : ''}`);
   process.exit(1);
 });
