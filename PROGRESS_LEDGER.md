@@ -5604,8 +5604,8 @@ Policy suite: **48 scripts passed**.
 ### phase 10: a 0.0% post-jury CER that could not have been anything else
 
 The owner's own product/UX audit (`docs/audits/2026-08-03-…`, now gitignored — its screenshots are of
-the live library and its REPORT.md embeds absolute `C:\Users\…` paths the hygiene gate rejects) flagged
-the Refinery card as untrustworthy: *"5.4% mean CER, 17.8% mean WER, 21.0% CER fine-tuned, 0.0%
+the live library and its REPORT.md embeds absolute user-profile paths the hygiene gate rejects in
+tracked files) flagged the Refinery card as untrustworthy: *"5.4% mean CER, 17.8% mean WER, 21.0% CER fine-tuned, 0.0%
 post-jury CER, 'No eval runs yet' … together they undermine trust."*
 
 Two of those are not in conflict — "post-jury CER" and "No eval runs yet" are separate cards answering
@@ -5659,3 +5659,29 @@ technique; the lesson had to be learned twice to stick.
 
 Gates: policy suite 48/48, typecheck 427 files 0 errors, vitest 217/217, `cargo fmt` + `clippy
 --all-targets --all-features -D warnings` clean.
+
+### phase 10a: the ledger entry about forbidden paths contained a forbidden path
+
+The sweep gating phase 10 came back **RED on `python-policies`**, and the offender was this ledger:
+
+```
+test_windows_repo_hygiene.py
+AssertionError: Tracked files must not hardcode a private local profile path (public repo):
+- PROGRESS_LEDGER.md:5607: ... REPORT.md embeds absolute `<the literal path>` paths ...
+```
+
+The sentence explaining that the audit report embeds absolute user-profile paths had written one out.
+The gate is right and stays exactly as it is: a public repo must not carry that string, and prose
+*about* the string is still the string. Rewritten to describe it instead of quoting it. `docs/STATUS.md`
+was restored, never committed — a RED status does not get pushed.
+
+Worth noting how much trouble the scrub itself was. Three attempts failed: a heredoc'd script, then two
+regexes where `chr(92) + '+'` reads as an escaped literal plus rather than one-or-more backslashes, so
+the pattern silently matched nothing and reported "no occurrence". The self-test that finally exposed it
+(`search` on a known-bad probe string) should have been the first thing written, not the fourth. The fix
+that worked replaces the two lines by INDEX — no pattern to get wrong.
+
+Also confirmed while there: the two sweeps overlapped (`bga12kgwl` was still finishing when the phase-10
+sweep started), which is worth remembering because a sweep stamps `docs/STATUS.md` with HEAD **at write
+time, not at run start** — so the older run labelled its result with a commit it had never tested. Its
+green is not evidence for anything and is not being counted.
