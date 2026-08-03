@@ -4,7 +4,7 @@
 
 # Gate status — generated
 
-**Commit:** `f4dc639` · **Mode:** full
+**Commit:** `934c13c` · **Mode:** full
 
 **Verdict:** **GREEN — PERSONAL-USE SHIP-READY.** (Not full-charter 10/10: 8 legs owner-descoped, 5 owner-gated pending.)
 
