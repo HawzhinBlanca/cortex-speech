@@ -410,6 +410,13 @@ pub fn run() {
     // process or buffered lines are dropped on exit, so it is leaked intentionally (one per process).
     let log_dir = data_dir.join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
+    // Clear the orderly-exit marker on every start, so its presence means exactly one thing: the last
+    // run reached RunEvent::Exit. Absent while the app is not running = it died without getting there.
+    // Until this existed the two were indistinguishable — 16 log files across a month contain ZERO
+    // shutdown lines of any kind, so the watchdog's "session expected but app not running" (5 times in
+    // the last week) could not be read as either "the owner closed it" or "it crashed".
+    let exit_marker = log_dir.join("last-exit.txt");
+    let _ = std::fs::remove_file(&exit_marker);
     let (file_writer, guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(&log_dir, "cortex.log"));
     let _ = Box::leak(Box::new(guard));
     {
@@ -835,8 +842,14 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .unwrap_or_else(|e| fatal_app_error(format!("Tauri application runtime error: {e}")))
-        .run(|_app, event| {
+        .run(move |_app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Written SYNCHRONOUSLY, not through `tracing`: the file layer is a
+                // `tracing_appender::non_blocking` whose WorkerGuard is deliberately leaked above, so
+                // nothing flushes it at exit and a line emitted here can be lost with the process. A
+                // diagnostic that is sometimes missing is worse than none, because then "absent" no
+                // longer means "crashed".
+                let _ = std::fs::write(&exit_marker, format!("orderly exit {}\n", chrono::Utc::now().to_rfc3339()));
                 // Best-effort on ORDERLY exit: refuse further supervised starts, then tree-kill the
                 // held champion child. An abnormal app death never reaches this handler — that orphan
                 // case is documented (and adopted-on-next-launch) in engine_runtime's module doc.

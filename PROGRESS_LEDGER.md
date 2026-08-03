@@ -5499,3 +5499,58 @@ already collected and already passing.)
 
 The printed failure is ASCII-only on purpose: the first draft's em-dash rendered as a replacement
 character in the Windows console, and the one line somebody reads at 3am must not be mojibake.
+
+### phase 8: five relaunches in a week, and no way to know whether the app crashed
+
+The watchdog log is the only record of the review server going down:
+
+```
+2026-07-29 13:24:09  session expected but app not running - relaunching
+2026-07-30 13:22:18  session expected but app not running - relaunching
+2026-08-02 00:12:18  session expected but app not running - relaunching
+2026-08-02 14:12:18  session expected but app not running - relaunching
+2026-08-03 11:37:19  session expected but app not running - relaunching   <- this one was the relink
+```
+
+That line reads identically whether the owner closed the window or the process died. And the app logs
+cannot settle it: **16 log files spanning 2026-07-09 to 2026-08-03 contain ZERO shutdown lines of any
+kind.** Every one of them ends mid-startup. The `RunEvent::Exit` handler exists and runs
+`begin_shutdown()`; it just never said so.
+
+Its own comment names the distinction it was failing to make observable:
+
+> An abnormal app death never reaches this handler
+
+So the difference between "closed" and "crashed" was real, load-bearing for the availability story, and
+invisible. Four of those five relaunches remain unattributable and always will.
+
+**The marker.** The app clears `logs\last-exit.txt` at every start and writes it only from
+`RunEvent::Exit`. Present = the app reached shutdown. Absent while not running = it did not. No time
+window, no heuristic: the clear-on-start is what makes absence mean something.
+
+Written with `std::fs::write`, NOT `tracing`. The file layer is a `tracing_appender::non_blocking`
+whose `WorkerGuard` is deliberately leaked (so logging survives the whole process), which means nothing
+flushes it at exit and a line emitted there can die with the process. A diagnostic that is sometimes
+missing is worse than none — then "absent" no longer means "crashed".
+
+**Proof, all three states:**
+
+```
+FAIL-BEFORE  release exe (pre-change), clean smoke exit   exit=0   marker: NO
+A. clean exit, patched exe                                exit=0   marker: orderly exit 2026-08-03T12:24:49.014814300+00:00
+B. hard kill (taskkill /F /T), patched exe                         marker: <ABSENT>
+```
+
+The watchdog now reads the marker at the moment it relaunches, so the attribution lands in the same
+line as the event: `session expected but app not running - relaunching [clean exit (...)]` or
+`[NO exit marker - died without reaching shutdown]`. `test_watchdog_decisions.py` still passes all 8
+branch assertions.
+
+The drill hard-killed only the debug build; the owner's app (PID 6476, started 11:48:29) was untouched
+and the phone link answered 200 throughout — checked, because a process filter that matched too broadly
+is exactly how a drill would take down a live review session.
+
+**Held, not pushed.** `lib.rs` is product source, so the release exe is stale and `exe-freshness` fails
+correctly. Needs one more ~6-minute app-close window. `cargo fmt` clean, `cargo clippy --all-targets
+--all-features -D warnings` clean (checked in an isolated CARGO_TARGET_DIR so the running app was never
+disturbed).

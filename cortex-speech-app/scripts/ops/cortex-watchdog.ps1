@@ -168,7 +168,18 @@ if (-not (Test-Path $session)) {
     try { Set-Content -Path $killCountFile -Value ([string]($kills + 1)) -Encoding utf8 } catch { }
 } else {
     Report 'relaunch (session expected, not running)'
-    Write-Log "session expected but app not running - relaunching"
+    # WHY the app was gone is the whole question, and until the exit marker existed this line could not
+    # answer it: "session expected but app not running" reads identically whether the owner closed the
+    # window or the process died. The app clears logs\last-exit.txt at every start and writes it only
+    # from RunEvent::Exit, so present = it got there, absent = it did not. Five relaunches in the week
+    # of 2026-07-27 are all recorded without this distinction and stay unattributable.
+    $exitMarker = Join-Path $logDir 'last-exit.txt'
+    $how = if (Test-Path $exitMarker) {
+        "clean exit ($((Get-Content $exitMarker -TotalCount 1 -EA SilentlyContinue)))"
+    } else {
+        'NO exit marker - died without reaching shutdown'
+    }
+    Write-Log "session expected but app not running - relaunching [$how]"
 }
 if ($DryRun) { exit 0 }
 if (-not (Test-Path $exe)) {
