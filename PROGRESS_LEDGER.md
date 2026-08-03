@@ -5305,3 +5305,51 @@ explain is how a real bug gets buried, and a gate that reds honestly on it is do
 `heartbeat-runtime` back at 13.4s — **and a green re-run is not evidence the crash is fixed.**
 
 **Gates.** verify-10 **GREEN: 32 kept legs, 32 PASS, 0 FAIL, 0 skipped**.
+
+### phase 4: three probes promised to clean up after themselves and none of them did
+
+`heartbeat_probe.cjs`, `jobs_probe.cjs` and `egress_probe.cjs` each open their header with the same
+sentence — *"a DISPOSABLE `CORTEX_APP_DATA_DIR`, a per-run `WEBVIEW2_USER_DATA_FOLDER`"*. Disposable was
+the claim. Nothing disposed of them. Every run of every probe left **two** directories behind, and the
+gate runs all three on every sweep. This is the same class the repo had already measured once and fixed
+once: `e2e_profile.cjs` carries the note that `e2e_real_app` had left *34 stale profiles totalling
+764 MB* before it got `cleanupProfile`.
+
+**The first fix (`db94f2c`) was wrong, and wrong in the way that matters.** It cleaned only
+`heartbeat_probe`, and it did so with a bespoke twenty-line copy instead of the helper sitting one
+directory up:
+
+- it deleted `DATA_DIR` **unconditionally** — a caller who passes their own `CORTEX_APP_DATA_DIR` would
+  have had that directory destroyed by a tidy-up they never asked for;
+- it waited a fixed 1.5s where `cleanupProfile` retries to a 15s deadline, because Windows releases a
+  killed process tree's handles asynchronously — the exact reason the helper has a deadline at all;
+- it had no tmpdir guard, so a path mistake could point the delete anywhere.
+
+Writing a third copy of a function whose two existing callers already encode two hard-won lessons was
+the actual defect. `dce6b69` deletes the copy and gives all three probes `cleanupProfile(dir, ours)`,
+with `OWNS_DATA_DIR` captured **before** the `mkdtempSync` — afterwards `DATA_DIR` is set either way and
+the distinction (did we create it, or were we handed it?) is unrecoverable.
+
+**Proof, both directions.** "It printed Removed" is not evidence a count fell, so the counts were taken
+before and after each run:
+
+```
+=== 1. NORMAL RUN: must leave nothing ===
+heartbeat_probe.cjs    exit=0  data 0  webview2 0   CLEAN
+jobs_probe.cjs         exit=0  data 0  webview2 0   CLEAN
+egress_probe.cjs       exit=0  data 0  webview2 0   CLEAN
+=== 2. CALLER-SUPPLIED PROFILE: must be left alone ===
+heartbeat_probe.cjs    exit=0  caller's dir survived: True   CORRECT
+jobs_probe.cjs         exit=0  caller's dir survived: True   CORRECT
+egress_probe.cjs       exit=0  caller's dir survived: True   CORRECT
+```
+
+All three were +1/+1 before. The second block is the one `db94f2c` would have failed.
+
+**Deliberately NOT fixed: the `cortex-integration-*` / `cortex-smoke-*` trees.** Those are created by the
+*app* — a per-PID data dir when it starts headless with no `CORTEX_APP_DATA_DIR` — which is correct
+behaviour for the app. Whichever harness launches it without an override owns the cleanup, and naming
+that harness would be a guess. Recorded here instead of patched.
+
+**Gates.** verify-10 at `dce6b69`: **GREEN — 32 kept legs, 32 PASS, 0 FAIL, 0 skipped**; 8 owner-descoped,
+5 owner-gated pending.
