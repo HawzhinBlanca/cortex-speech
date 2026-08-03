@@ -5798,3 +5798,51 @@ No orphaned processes, `docs/STATUS.md` untouched (the run never reached its wri
 throughout.
 
 Gates: typecheck 427 files 0 errors, lint 0 errors, policy suite 48/48, Rust lib 1101 passed.
+
+### phase 13: the top bar was 2067px wide and clipped its own controls at every real screen size
+
+The deep audit's P0 #3: *"At 1024-2560 px and 200% zoom, no header action may leave the viewport. In
+Review mode, Validate/Inbox/Settings currently overflow."* Measured rather than taken on trust, with a
+new `e2e/header-overflow.spec.ts` that reads each action's bounding box against the viewport:
+
+```
+FAIL 1024   FAIL 1280   FAIL 1440   FAIL 1920   pass 2560   FAIL 512 (200% zoom)
+the top bar is 2067px wide inside a 512px viewport and does not scroll
+locale-toggle spans x=-42..27 (viewport 1920)
+```
+
+Worse than reported: it fails at **1920** too — only 2560 fits. And `justify-between` on an overflowing
+row pushes content off BOTH edges, so at 1920 the locale toggle sat at **x = -42**, off the left of the
+screen, with no scroll to reach it. A control that is silently unreachable is worse than a missing one,
+because nothing tells the user it exists.
+
+Fix: `flex-wrap` + `gap-y-2` on the bar, and on the right-hand action group as well — wrapping only the
+outer bar moves the whole ~1500px group to a second line that is still wider than a 1024 viewport.
+Wrapping beats a horizontal scroller or an overflow menu here because nothing ends up hidden.
+
+```
+after: 6 passed (1024, 1280, 1440, 1920, 2560, 200% zoom)
+```
+
+The spec needs no wiring: the gate's `test-e2e+a11y` leg runs bare `playwright test`, which picks up
+everything in `e2e/`.
+
+### Checked and NOT a defect: the 21.0% CER in Settings
+
+The same audit calls the fine-tuned model's `21.0% CER, N=900` an unreconcilable number. A first pass
+over `docs/MEASUREMENTS.md` and the root `docs/EVAL.md` found nothing and nearly produced a much
+stronger claim than the evidence supported. Searching properly found it:
+
+> **2026-06-25 (PUBLISHABLE N=900 FINE-TUNED SCORECARD)**: … `scripts/scorecard_finetuned.py`:
+> **micro CER 21.00%, 95% CI [19.93%, 22.04%]** (3000-sample utterance bootstrap, seed=42) …
+> Full scorecard: `cortex-speech-app/docs/EVAL.md`
+
+So the number is earned, reproducible, and has a CI. The audit is right about the narrower point — the
+UI shows the point estimate with no CI, corpus, date or build, next to Insights' 5.4% / 17.8%, which are
+annotation-drift figures over the owner's own clips and a completely different kind of measurement. Two
+incomparable numbers, no scope labels.
+
+NOT fixed unilaterally: the fix is words (corpus, date, "on the frozen gold set" vs "on your library"),
+in English **and Sorani**, and inserting a bracketed CI into an RTL string risks bidirectional rendering
+this agent cannot verify. Queued with the owner's Sorani check, alongside the
+`stats.conformalHeuristicBasis` cause from phase 11.

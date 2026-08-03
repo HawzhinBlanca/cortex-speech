@@ -1996,9 +1996,16 @@
     </div>
   {/if}
   <!-- Top Bar -->
+  <!-- flex-wrap, and it is load-bearing. Measured 2026-08-03 with e2e/header-overflow.spec.ts: this
+       bar lays out 2067px wide, so on a single non-wrapping row it overflowed at 1024/1280/1440/1920
+       (only 2560 fit). `justify-between` then pushed content off BOTH edges — at 1920 the locale
+       toggle sat at x=-42, i.e. off the left of the screen with no scroll to reach it. A control that
+       is silently unreachable is worse than one that is missing, because nothing tells the user it
+       exists. Wrapping to a second line keeps every action reachable at every width, which a
+       horizontal scroller or an overflow menu would not do as plainly. -->
   <header
     data-testid="top-bar"
-    class="flex items-center justify-between px-4 py-2 glass border-b border-line shrink-0 z-30"
+    class="flex flex-wrap items-center justify-between gap-y-2 px-4 py-2 glass border-b border-line shrink-0 z-30"
   >
     <div class="flex items-center gap-3">
       <h1 class="text-sm font-bold tracking-tight">
@@ -2034,7 +2041,7 @@
       {/if}
     </div>
 
-    <div class="flex items-center gap-2">
+    <div class="flex flex-wrap items-center justify-end gap-2">
       <span class="text-xs text-cortex-500"
         >{$segmentStats.total}
         {$t('segments')} · {$segmentStats.verified}
