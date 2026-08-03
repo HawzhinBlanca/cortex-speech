@@ -249,14 +249,21 @@ jobs:
           # matches package-relative ones, so every hunk is rejected with
           # "Diff content doesn't match source file". Verified locally against a real commit range
           # before this job ever ran on a runner.
-          git diff --relative "$BASE^" HEAD -- src/quality/irt.rs src/quality/conformal.rs \
+          # This list MUST stay in step with examine_globs in .cargo/mutants.toml. It did not:
+          # src/couch.rs was added to examine_globs on 2026-07-27 with a comment calling it the
+          # highest-risk module in the scope ("it decides which reviewer holds which clip ... a
+          # flipped comparison there loses a human's work rather than a number"), and this filter
+          # never got it. --in-diff then drops every couch mutant, so the one module singled out as
+          # most dangerous was the one module this job could not mutate. Found 2026-08-03.
+          git diff --relative "$BASE^" HEAD -- src/couch.rs src/quality/irt.rs src/quality/conformal.rs \
             src/quality/signal_anomaly.rs 'src/diff/*' src/normalizer.rs 'src/normalizer/*' \
             > /tmp/core.diff || true
           if [ ! -s /tmp/core.diff ]; then
             echo "::notice title=Mutation gate idle::No core-module changes in the last 24h."
             exit 0
           fi
-          # examine_globs / --lib scoping / timeouts all come from src-tauri/mutants.toml.
+          # examine_globs / --lib scoping / timeouts all come from src-tauri/.cargo/mutants.toml
+          # (verified read: `cargo mutants --list` enumerates exactly the eight scoped files).
           cargo mutants --in-diff /tmp/core.diff
 
       - name: Upload mutation report
