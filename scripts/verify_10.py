@@ -636,6 +636,17 @@ OWNER_GATED = [
 
 LOG_DIR = Path(tempfile.gettempdir()) / "cortex-verify10"
 
+# Everything this script runs is THE GATE, and a gate must never quietly reuse a resource it did not
+# create. Set for the whole run (subprocesses inherit it) rather than per leg, because that is exactly
+# what it means: any harness that can attach to somebody else's server, browser or port should refuse
+# when it sees this and say why.
+#
+# First consumer: playwright.config.ts, whose `reuseExistingServer` was TRUE locally. DEMONSTRATED
+# 2026-08-03 — an impostor server placed on port 1420 was silently reused and the accessibility spec
+# ran against "not the app". A foreign server makes the leg red; a STALE but valid dev server makes it
+# GREEN about code that is not under test.
+os.environ["CORTEX_GATE"] = "1"
+
 
 def run_gate(name, kind, payload, cwd, probe, timeout=3600):
     """Run one gate; returns (status, seconds, detail). Full cmd output -> LOG_DIR/<gate>.log."""

@@ -29,7 +29,19 @@ export default defineConfig({
   webServer: {
     command: 'npm run dev',
     url: 'http://localhost:1420',
-    reuseExistingServer: !process.env.CI,
+    // Reuse is a LOCAL DEVELOPER convenience: keep `npm run dev` running and tests attach to it.
+    // It is wrong for a GATE. Playwright reuses whatever answers on 1420 without checking what it
+    // is, so `test-e2e+a11y` was green or red about a server it never verified. DEMONSTRATED
+    // 2026-08-03: a trivial impostor server put on 1420 was reused, and the accessibility spec ran
+    // against "not the app". A foreign server makes the leg red (confusing but honest); a STALE but
+    // valid dev server — another branch, a watcher that died — makes it GREEN about code that is not
+    // under test, which is the vacuous pass this project's charter forbids.
+    //
+    // CORTEX_GATE is set by scripts/verify_10.py for everything it runs. With reuse off, Playwright
+    // refuses on a busy port and names the reason, which is exactly what the sibling e2e harnesses
+    // already do (see e2e_profile.cjs refuseIfDebugPortBusy). Interactive `npm run test:e2e` is
+    // untouched.
+    reuseExistingServer: !process.env.CI && !process.env.CORTEX_GATE,
     timeout: 120000,
   },
 });
