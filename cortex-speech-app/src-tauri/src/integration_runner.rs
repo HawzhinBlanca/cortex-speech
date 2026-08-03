@@ -41,7 +41,9 @@ pub fn run(app: &tauri::AppHandle) -> Result<(), String> {
         return Err("integration import produced zero segments".into());
     }
 
-    let export_path = std::env::temp_dir().join(format!("cortex-integration-{}-{}.json", std::process::id(), count));
+    // Into the app data dir, not the TEMP root: the caller owns that dir and disposes of it, so the
+    // export goes with it. Written to the TEMP root it outlived every run — 58 stale files measured.
+    let export_path = crate::get_app_data_dir().join(format!("integration-export-{count}.json"));
     export::export_dataset(&db, &export_path, &ExportFormat::Json).map_err(|e| e.to_string())?;
     if !export_path.exists() {
         return Err("export file was not created".into());

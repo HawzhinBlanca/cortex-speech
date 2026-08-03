@@ -5353,3 +5353,57 @@ that harness would be a guess. Recorded here instead of patched.
 
 **Gates.** verify-10 at `dce6b69`: **GREEN — 32 kept legs, 32 PASS, 0 FAIL, 0 skipped**; 8 owner-descoped,
 5 owner-gated pending.
+
+### phase 5: "naming the owning harness would be a guess" — it took one grep
+
+The previous entry recorded the `cortex-integration-*` / `cortex-smoke-*` trees as unfixable-without-
+guessing. That was wrong, and wrong in a lazy way: the owner is nameable, and finding it cost one search.
+
+`lib.rs::get_app_data_dir` falls back to `TEMP\cortex-{smoke,integration}-<pid>` whenever the app starts
+headless with no `CORTEX_APP_DATA_DIR`. Exactly two harnesses start it that way, both `cargo test`
+integration tests that the `test-rust` leg runs on **every sweep**:
+
+```
+src-tauri/tests/shell_smoke.rs:9        .env("CORTEX_SMOKE_TEST", "1")
+src-tauri/tests/tauri_integration.rs:25 .env("CORTEX_INTEGRATION_TEST", "1")
+```
+
+Neither set a data dir; nothing removed one. `tauri_integration.rs` already wrapped its **fixture** dir in
+`tempfile::TempDir` — the disposable-directory pattern was in the file, one line above the omission.
+
+A third leak sat in the product: `integration_runner.rs` wrote its export to the **TEMP root**, outside
+any data dir, so it would have survived even after the tests were fixed.
+
+**Measured before touching anything:**
+
+```
+cortex-smoke-*            dirs=122   76.0 MB
+cortex-integration-*      dirs=124   84.4 MB
+cortex-integration-*.json files=58
+```
+
+**Fail-before, then after — same two tests, counted around the run:**
+
+```
+BEFORE FIX   smoke-dirs 122 -> 123   integration-dirs 124 -> 125   stray-json 58 -> 59
+             test result: ok. 1 passed   (x2)            DELTA +1 / +1 / +1
+AFTER  FIX   smoke-dirs 123 -> 123   integration-dirs 125 -> 125   stray-json 59 -> 59
+             test result: ok. 1 passed   (x2)            DELTA  0 /  0 /  0
+```
+
+Both tests passed in both runs — which is the point. The leak was never going to redden anything; it
+just grew. 246 stale directories and 58 files (**160.7 MB**) were reclaimed after the fix landed.
+
+Fix: both tests pass a `TempDir` as `CORTEX_APP_DATA_DIR` (deleted on drop), and the integration export
+moves from the TEMP root into the app data dir, so it is disposed of with the dir that owns it.
+
+**Blocked on the owner, not on the work.** `integration_runner.rs` is a product source file, so the
+release exe is now stale and `exe-freshness` FAILS — correctly:
+
+```
+STALE EXE: source src-tauri\src\integration_runner.rs is newer than the built exe. Rebuild.
+```
+
+Relinking needs the running app closed, and the running app is the phone-review server. The commit is
+held locally, unpushed, until the owner can spare the app for ~10 minutes. `cargo fmt` clean,
+`cargo clippy --all-targets --all-features -D warnings` clean.

@@ -2,11 +2,20 @@
 
 use assert_cmd::Command;
 use std::time::Duration;
+use tempfile::TempDir;
 
 #[test]
 fn tauri_shell_smoke_exits_zero() {
+    // Without this the app falls back to `TEMP\cortex-smoke-<pid>` (lib.rs `get_app_data_dir`) and
+    // NOTHING removes it: measured 122 stale dirs / 76 MB on the owner's box, one more every sweep.
+    // `TempDir` deletes on drop, so the dir this test causes is the test's to clean up.
+    let data_dir = TempDir::new().expect("tempdir");
+
     let mut cmd = Command::cargo_bin("cortex-speech-app").expect("binary built");
-    cmd.env("CORTEX_SMOKE_TEST", "1").env("RUST_LOG", "info").timeout(Duration::from_secs(60));
+    cmd.env("CORTEX_SMOKE_TEST", "1")
+        .env("CORTEX_APP_DATA_DIR", data_dir.path())
+        .env("RUST_LOG", "info")
+        .timeout(Duration::from_secs(60));
 
     let output = cmd.output().expect("smoke binary should run");
     let stdout = String::from_utf8_lossy(&output.stdout);
