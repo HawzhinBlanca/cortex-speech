@@ -5206,3 +5206,51 @@ Not a defect in the app and not fixed: the gate runs 15 and is unaffected. Recor
 raises the cycle count knows the cost is O(n^2), not linear.
 
 **Gates.** verify-10 **GREEN: 32 kept legs, 32 PASS, 0 FAIL, 0 skipped**, at `14966be`.
+
+### The a11y gate tested whatever happened to hold port 1420
+
+Same shape as the 9222 collision found hours earlier: a gate trusting a shared fixed port it did not
+create. `playwright.config.ts` set `reuseExistingServer: !process.env.CI`, TRUE locally, so Playwright
+attached to whatever answered on 1420 without ever checking what it was.
+
+Reading the config only SUGGESTED this, and reading is not evidence. Demonstrated instead: a trivial
+impostor server serving `not the app` was placed on 1420, and the accessibility spec ran against it.
+
+Both directions matter and the quiet one is worse:
+
+```
+foreign server         -> leg goes red. Confusing, but honest.
+STALE but valid server -> leg goes GREEN about code that is not under test
+                          (another branch, or a watcher that died) = a vacuous pass.
+```
+
+`CORTEX_GATE` is now set by `verify_10.py` for everything it runs, meaning exactly one thing: this is
+the gate, never quietly reuse a resource you did not create. It is the generalisation of what the e2e
+harnesses already do in `refuseIfDebugPortBusy`.
+
+Measured, all three cases:
+
+```
+port free  + gate                       -> 88 passed, 20.7s, exit 0   (was 22s; no cost)
+port busy  + gate                       -> "Error: http://localhost:1420 is already used ..."
+port busy, interactive npm run test:e2e -> reuses; local convenience deliberately preserved
+```
+
+### Honest negative: the 0xC0000409 crash did not reproduce
+
+Chasing it through 45-minute sweeps costs one observation each; the leg alone costs 22s. Ran it
+directly **40 times: 40 clean, 0 failures**, every run's output kept.
+
+So it is NOT diagnosed and NOT fixed, and nothing here should be read as closing it. Two things did
+change: failure logs now survive (so the next occurrence is finally diagnosable), and both port defects
+that were live during the sweep where it fired have been removed — the failing sweep was also the sweep
+where 9222 refusals were happening. That is a hypothesis about a shared cause, not a finding.
+
+### The pattern across the whole run
+
+Four of the five findings are one defect wearing different clothes: **a gate trusting a resource it did
+not create, or a config half-applied.** 9222, 1420, the mutation filter that had drifted from its own
+`examine_globs`, and a log path that promised durability it could not deliver. Each was individually
+green. None survived being run twice, or run against the thing it was written for.
+
+**Gates.** verify-10 **GREEN: 32 kept legs, 32 PASS, 0 FAIL, 0 skipped**; a11y leg 21.8s.
