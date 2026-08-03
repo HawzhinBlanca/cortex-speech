@@ -5254,3 +5254,54 @@ not create, or a config half-applied.** 9222, 1420, the mutation filter that had
 green. None survived being run twice, or run against the thing it was written for.
 
 **Gates.** verify-10 **GREEN: 32 kept legs, 32 PASS, 0 FAIL, 0 skipped**; a11y leg 21.8s.
+
+### The two biggest test legs passed while running zero tests
+
+MEASURED, not suspected:
+
+```
+cargo test --lib -- <filter matching nothing>
+  test result: ok. 0 passed; 0 failed; 1105 filtered out    exit 0
+npx vitest run -t <matching nothing>                        exit 0
+```
+
+Both harnesses exit 0 on an empty run, so `test-rust` (1,193 tests across 35 binaries) and
+`test-frontend` (217) would have reported PASS if discovery ever broke — a stray filter, a renamed
+module, a cfg excluding the test tree. Green with nothing behind it, on the two legs carrying the most
+weight. `_fn_fuzz_smoke` already guards this exact class on an empty `cargo fuzz list`; these two simply
+had no floor.
+
+`scripts/assert_ran.py` wraps them: the command's own failure is reported first (never masked), then a
+minimum count. Floors from real measurements with headroom — 1100 against 1193, 200 against 217. The
+subtle part is the checker's OWN vacuity: if it cannot FIND the count line it FAILS rather than skipping
+the check, because a guard that silently stops understanding its input still looks like protection.
+
+Proven: zero tests → FAIL exit 1 (was a silent PASS); no count line → FAIL exit 1; real run → 217 ran,
+floor 200, exit 0. Live in the sweep: `assert_ran: 1193 test(s) ran (floor 1100) across 35 binaries`.
+
+### STILL OPEN: an undiagnosed 0xC0000409 in the Node/Playwright probes
+
+The fix above for preserved failure logs earned itself back within hours. The crash recurred — this time
+on `heartbeat-runtime`, not `test-e2e+a11y` — and for the first time the evidence survived:
+
+```
+$ node scripts\heartbeat_probe.cjs
+(exit 3221226505, 4.7s)
+--- stdout ---  ==> Heartbeat probe. profile=...cortex-heartbeat-35jtZ5 ...
+--- stderr ---  (empty)
+```
+
+What is now known: it is NOT specific to one leg; it hits Node/Playwright probes generally; stderr is
+empty and Windows Error Reporting logs nothing (consistent with a controlled abort, not an unhandled
+exception); and it happens only inside a FULL SWEEP — the a11y leg ran 40 times standalone, 40 clean.
+
+Ruled out by measurement, not assumption: orphaned WebView2 processes (0 orphans; the 31 present belong
+to WhatsApp, M365Copilot and SearchHost) and disk pressure (583 GB free).
+
+**Deliberately NOT done: adding this code to `run_gate`'s retry.** That retry exists and is correct, but
+it is scoped to ONE named, understood flake (LNK1104) and announces itself. Retrying a crash nobody can
+explain is how a real bug gets buried, and a gate that reds honestly on it is doing its job. The RED
+`docs/STATUS.md` from that sweep was restored, never committed; the re-run went GREEN 32/32 with
+`heartbeat-runtime` back at 13.4s — **and a green re-run is not evidence the crash is fixed.**
+
+**Gates.** verify-10 **GREEN: 32 kept legs, 32 PASS, 0 FAIL, 0 skipped**.
