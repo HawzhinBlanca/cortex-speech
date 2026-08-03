@@ -25,6 +25,12 @@ const { chromium } = require('@playwright/test');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+// The SHARED disposable-profile cleanup, not a local copy. It refuses to delete anything outside
+// tmpdir, retries to a 15s deadline because Windows releases the killed tree's handles
+// asynchronously, and is non-fatal. Its own comment records the measurement that produced it: 34
+// stale profiles totalling 764 MB left by e2e_real_app. This probe claimed the same contract in its
+// header and never implemented it; writing a third copy would have been the actual mistake.
+const { cleanupProfile } = require('../e2e_profile.cjs');
 
 const REPO = __dirname.replace(/[\\/]scripts$/, '');
 const APP_EXE =
@@ -47,6 +53,10 @@ if (!fs.existsSync(AUDIO)) die(`heartbeat audio not found: ${AUDIO}`);
 // ── Profile isolation: never the production library. ──
 const PROD = process.env.APPDATA ? path.join(process.env.APPDATA, 'cortex-speech') : null;
 const norm = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
+// Captured BEFORE the mkdtemp below, because after it DATA_DIR is set either way and the distinction
+// is unrecoverable: did WE create this directory, or did the caller hand it to us? Only the first may
+// be deleted.
+const OWNS_DATA_DIR = !process.env.CORTEX_APP_DATA_DIR;
 let DATA_DIR = process.env.CORTEX_APP_DATA_DIR;
 if (DATA_DIR) {
   if (PROD && (norm(DATA_DIR) === norm(PROD) || norm(DATA_DIR).startsWith(norm(PROD) + path.sep))) {
@@ -163,32 +173,15 @@ async function run() {
     );
   }
   console.log(`\nHEARTBEAT OK: main thread stayed responsive (p95 ${result.p95.toFixed(1)}ms <= ${MAX_MS}ms).`);
-  // SETTLE before removing the profile. `taskkill /F /T` returns before Windows has released the
-  // killed tree's file handles, and the app holds SQLite's .db/-wal/-shm open. Measured: without this
-  // the WebView2 folder deleted fine but the data profile failed EPERM every time, so the leak was
-  // only half fixed. rmSync's own maxRetries does not help — it retries the CALL, not the wait for a
-  // handle that is still open when the first attempt is made.
-  await sleep(1500);
-  cleanupTemp();
-}
-
-// Remove the two temp trees this probe creates, but ONLY on success — the same contract the header
-// claims to share with e2e_real_app.cjs, which was never actually implemented here. Measured
-// 2026-08-03: 29 `cortex-heartbeat-*` profiles and 24 `cortex-hb-wv-*` WebView2 folders left behind,
-// 168 MB, one pair per sweep since the probe was written.
-//
-// Kept on FAILURE on purpose, and the path is printed: a failed run is the one whose profile someone
-// needs to open. That is e2e_real_app.cjs's rule too.
-function cleanupTemp() {
-  for (const dir of [DATA_DIR, wvDir]) {
-    // WebView2 can hold files for a moment after the app dies; a leftover directory is untidy, never
-    // a reason to fail a green run.
-    try {
-      if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-    } catch (e) {
-      console.log(`   (could not remove ${dir}: ${e.message})`);
-    }
-  }
+  // Cleaned on SUCCESS only: a failed run is the one whose profile someone needs to open, and the
+  // failure handler prints where it is. Same rule as e2e_real_app.cjs.
+  //
+  // `OWNS_DATA_DIR` is the whole point of the second argument. A caller may hand us their own
+  // CORTEX_APP_DATA_DIR, and deleting a directory we did not create would be destroying somebody's
+  // data to tidy up after ourselves. The WebView2 folder is unconditionally ours — this probe
+  // mkdtemps it every run.
+  await cleanupProfile(DATA_DIR, OWNS_DATA_DIR);
+  await cleanupProfile(wvDir, true);
 }
 
 run().catch((err) => {

@@ -43,6 +43,11 @@ const net = require('net');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+// The SHARED disposable-profile cleanup, not a local copy. It refuses to delete anything outside
+// tmpdir, retries to a 15s deadline because Windows releases the killed tree's handles
+// asynchronously, and is non-fatal. Its own comment records the measurement that produced it: 34
+// stale profiles totalling 764 MB left by e2e_real_app.
+const { cleanupProfile } = require('../e2e_profile.cjs');
 
 const REPO = __dirname.replace(/[\\/]scripts$/, '');
 const APP_EXE =
@@ -78,6 +83,11 @@ if (!fs.existsSync(APP_EXE)) die(`app exe not found: ${APP_EXE} (build it: cargo
 // ── Profile isolation: never the production library. ──
 const PROD = process.env.APPDATA ? path.join(process.env.APPDATA, 'cortex-speech') : null;
 const norm = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
+// Captured BEFORE the mkdtemp below: afterwards DATA_DIR is set either way and the distinction is
+// unrecoverable. Did WE create this directory, or did the caller hand it to us? Only the first may be
+// deleted -- removing a caller's own CORTEX_APP_DATA_DIR to tidy up after ourselves would be
+// destroying their data.
+const OWNS_DATA_DIR = !process.env.CORTEX_APP_DATA_DIR;
 let DATA_DIR = process.env.CORTEX_APP_DATA_DIR;
 if (DATA_DIR) {
   if (PROD && (norm(DATA_DIR) === norm(PROD) || norm(DATA_DIR).startsWith(norm(PROD) + path.sep))) {
@@ -88,6 +98,8 @@ if (DATA_DIR) {
 }
 
 let appProcess = null;
+// Module scope so the cleanup and the failure handler can both reach it; assigned in the run.
+let wvDir = null;
 function killApp() {
   if (appProcess && appProcess.pid) {
     try {
@@ -200,7 +212,7 @@ async function run() {
     die(`debug port ${DEBUG_PORT} already answering — another instance is running; set CORTEX_DEBUG_PORT.`);
   }
 
-  const wvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-egress-wv-'));
+  wvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-egress-wv-'));
   appProcess = spawn(APP_EXE, [], {
     env: {
       ...process.env,
@@ -355,10 +367,16 @@ async function run() {
       `(covering startup + a ${(WORKLOAD_MS / 1000) | 0}s get_settings/get_jobs/get_waveform workload ${legDesc}). ` +
       `Scope: TCP, poll-sampled every ${SAMPLE_MS}ms; airtight kernel/ETW trace still a stretch (see header).`,
   );
+  // Cleaned on SUCCESS only: a failed run is the one whose profile someone needs to open, and the
+  // failure handler prints where it is. Same rule as e2e_real_app.cjs. OWNS_DATA_DIR guards the case
+  // where the caller supplied their own CORTEX_APP_DATA_DIR -- that directory is not ours to delete.
+  await cleanupProfile(DATA_DIR, OWNS_DATA_DIR);
+  await cleanupProfile(wvDir, true);
 }
 
 run().catch((err) => {
   console.error('==> EGRESS PROBE FAILED:', err && err.message ? err.message : err);
+  console.error(`==> Profiles kept for diagnosis: ${DATA_DIR}${wvDir ? ` and ${wvDir}` : ''}`);
   killApp();
   process.exit(1);
 });
