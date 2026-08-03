@@ -5458,3 +5458,44 @@ The refusal itself is correct behaviour (attaching would drive somebody else's r
 not guessed at.
 
 **Reclaimed:** 203 more stale dirs, **848.6 MB** — 1,009 MB total across phases 5 and 6.
+
+### phase 7: the availability watchdog could be switched off and nothing would ever say so
+
+Relinking the exe (owner said "close it") failed at first with `Access is denied` — the app was already
+running again. `CortexWatchdog`, a scheduled task that probes port 8737 every 5 minutes and relaunches
+the app when the review server is unreachable, had done exactly its job within ~80 seconds. The
+watchdog script documents its own pause switch, so that was used rather than inventing one:
+
+```
+schtasks /change /tn CortexWatchdog /disable   ->   relink   ->   /enable
+```
+
+**The gap that exposed.** The watchdog is the entire availability story for the phone review, and
+turning it off is a one-liner that leaves no trace. `docs/REMOTE_PUBLIC_LINKS_PLAN.md` documents the
+disable step; nothing anywhere notices when the matching re-enable never happens. The only reason it is
+on right now is that this agent remembered. A crash, an interrupted session, or a sweep that died in
+between would have left the owner's link with no healer and no warning — found out whenever it next
+failed, which is precisely when it matters.
+
+`scripts/test_watchdog_enabled.py` fails on the one state that is unambiguously wrong: the task EXISTS
+and is Disabled. Absent is NOT a failure — a clean checkout, CI, a non-Windows box and a machine that
+never opted into the availability stack all legitimately have no watchdog, and reddening on those
+trains people to ignore the gate. `Get-ScheduledTask`'s State enum is read rather than parsing
+`schtasks /query`, whose display text Windows localizes; a check that silently stops matching on a
+non-English machine would report healthy forever.
+
+**Fail-before, restored after:**
+
+```
+1. watchdog ON    WATCHDOG GATE: OK (CortexWatchdog state=Ready)                      exit 0
+2. disabled       WATCHDOG GATE: FAIL - CortexWatchdog is registered but DISABLED.    exit 1
+3. re-enabled     WATCHDOG GATE: OK (CortexWatchdog state=Ready)                      exit 0
+```
+
+No wiring was needed: `run_python_policies.py` globs `scripts/test_*.py`, so the leg went from **47 to
+48 policy test scripts passed** on its own. (That glob was checked, not assumed — the suspicion that a
+test could exist and never run is what started this, and it turned out `test_watchdog_decisions.py` was
+already collected and already passing.)
+
+The printed failure is ASCII-only on purpose: the first draft's em-dash rendered as a replacement
+character in the Windows console, and the one line somebody reads at 3am must not be mojibake.
