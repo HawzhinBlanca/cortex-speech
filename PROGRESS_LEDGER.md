@@ -5171,3 +5171,38 @@ files, 1,077 mutants.
 
 Caught by the repo's own `test_workflow_policy.py` mid-edit: the first draft of the fix used an em-dash,
 and workflow YAML must stay ASCII-clean.
+
+### The gate destroyed the evidence for its own only unexplained failure
+
+`run_gate` writes each leg's full output to `LOG_DIR/<gate>.log`, under a comment promising "every
+failure stays diagnosable after the run". The path is fixed, so that promise expires the moment the
+gate runs again — and the failure it expires for is the INTERMITTENT one, the single case where the log
+is the only evidence that will ever exist.
+
+Measured: `test-e2e+a11y` crashed with exit `3221226505` (`0xC0000409`, stack buffer overrun) in one
+sweep of three. Two further sweeps then overwrote the log with passing runs. **That fault is still
+unexplained specifically because the gate's own success deleted the proof.**
+
+A failure now also gets `LOG_DIR/<gate>.FAIL.<timestamp>.log`. Copy rather than move — the stable path
+is what the FAIL line prints and what people look for, so it keeps meaning "most recent run" — and
+best-effort, because bookkeeping must never turn a diagnosable failure into a crash.
+
+Proven on the real `run_gate`, reproducing the exact destroying sequence:
+
+```
+failing run                        -> stamped copy created (1)
+later PASSING run of the same gate -> stable <gate>.log records exit 0; the failure is GONE from it
+                                   -> timestamped copy still present (1); the evidence survives
+```
+
+### Honest non-finding: the export kill drill is quadratic in cycles
+
+Ran it at 400 cycles against the gate's 15. Throughput decayed measurably — 24 exports/min at 05:29,
+19/min three minutes later — because each cycle re-verifies every export accumulated so far. At 15
+cycles this is invisible (41s); at 400 it had not finished in 90 minutes. Stopped at ~297 cycles, 20x
+the gate's count, with no failure (it exits non-zero per cycle on failure and did not).
+
+Not a defect in the app and not fixed: the gate runs 15 and is unaffected. Recorded so that anyone who
+raises the cycle count knows the cost is O(n^2), not linear.
+
+**Gates.** verify-10 **GREEN: 32 kept legs, 32 PASS, 0 FAIL, 0 skipped**, at `14966be`.
