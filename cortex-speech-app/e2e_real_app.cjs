@@ -13,7 +13,7 @@
  *                       dir. The owner's real %APPDATA%\cortex-speech profile is REFUSED — a
  *                       verification run must be incapable of touching the production library.
  *   CORTEX_OUT         (optional) output dir for debug log + run.jsonl; default: repo root
- *   CORTEX_DEBUG_PORT  (optional) WebView2 remote-debug port; default 9222
+ *   CORTEX_DEBUG_PORT  (optional) WebView2 remote-debug port; default 9271 (private, see below)
  *   CORTEX_LOCALE      (optional) 'en' | 'ckb'; default 'en'
  *   CORTEX_ASR_ENGINE  (optional) engine to provision in the DISPOSABLE profile before import:
  *                       'CTC300M' (default: fully offline, runnable on any dev box), 'CTC1B',
