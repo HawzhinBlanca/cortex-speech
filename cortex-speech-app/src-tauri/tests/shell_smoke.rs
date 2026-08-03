@@ -38,4 +38,20 @@ fn tauri_shell_smoke_exits_zero() {
         "smoke startup used the stale CTC1B default/fallback path\n{}",
         combined
     );
+
+    // The orderly-exit marker, asserted end-to-end on the REAL binary. This run is a clean exit
+    // (`CORTEX_SMOKE_TEST` reaches `RunEvent::Exit` via `handle.exit(0)`), so the marker must be there.
+    //
+    // It matters because the watchdog reads exactly this file to tell "the owner closed it" from "it
+    // died": absent-while-not-running is the ONLY evidence of an abnormal death, and 16 log files
+    // spanning a month proved the logs cannot supply it. Verified by hand when it was written, which is
+    // not a gate — delete the `fs::write` in lib.rs and nothing else in the suite notices.
+    //
+    // Asserting the marker's CONTENT, not just its presence: an empty or truncated file is still a
+    // file, and the watchdog prints this line to the owner.
+    let marker = data_dir.path().join("logs").join("last-exit.txt");
+    let recorded = std::fs::read_to_string(&marker).unwrap_or_else(|e| {
+        panic!("no orderly-exit marker at {} after a CLEAN exit ({e}) — the watchdog cannot then distinguish a crash from the owner closing the window\n{combined}", marker.display())
+    });
+    assert!(recorded.starts_with("orderly exit "), "exit marker exists but does not say what it is: {recorded:?}");
 }

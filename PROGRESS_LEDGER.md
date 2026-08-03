@@ -5554,3 +5554,49 @@ is exactly how a drill would take down a live review session.
 correctly. Needs one more ~6-minute app-close window. `cargo fmt` clean, `cargo clippy --all-targets
 --all-features -D warnings` clean (checked in an isolated CARGO_TARGET_DIR so the running app was never
 disturbed).
+
+### phase 9: three fixes shipped today with hand proofs and no gate — my own debt, paid
+
+`CLAUDE.md` is explicit: *"A fix without a regression gate is incomplete."* Phases 6, 7 and 8 each ended
+with a measurement pasted into this ledger and nothing in the suite that would notice the fix being
+undone. Delete the `fs::write` in `lib.rs` and 1,193 Rust tests still pass. Remove one
+`ownedTemp.push` and every probe still exits 0 on the happy path. That is the same shape as the two
+vacuous passes found earlier this week, authored by the fix for them.
+
+**1. The orderly-exit marker, asserted end-to-end on the real binary.** `shell_smoke.rs` already
+launches the real exe and exits cleanly — and since phase 5 it has a disposable `CORTEX_APP_DATA_DIR`,
+which is exactly what makes the marker findable. It now reads the file and checks its CONTENT, not just
+its presence: an empty file is still a file, and the watchdog prints that line to the owner.
+
+```
+FAIL-BEFORE  fs::write removed   panicked: no orderly-exit marker ... after a CLEAN exit    FAILED
+AFTER        restored            test result: ok. 1 passed
+```
+
+**2. Every probe temp dir must be registered.** Counted, not pinned by literal: the failure mode is
+ADDING a temp dir and forgetting to register it, which is precisely how the third one appeared. A
+substring check passes with two of three registered.
+
+```
+FAIL-BEFORE  one ownedTemp.push removed
+             jobs_probe.cjs creates 2 temp dir(s) but registers 1                            exit 1
+AFTER        restored                                                                        exit 0
+```
+
+**3. The watchdog gate could disable itself.** `task_state()` returned `None` for both "not registered"
+and "could not ask", and `None` meant SKIP. On the one machine that actually has a watchdog, a broken
+query and a healthy watchdog looked identical — the self-disabling guard this repo keeps finding,
+reintroduced inside the fix for it. Broken queries now raise and FAIL.
+
+```
+FAIL-BEFORE  cmdlet renamed to break the query
+             WATCHDOG GATE: FAIL - could not read CortexWatchdog's state                     exit 1
+AFTER        restored                                                                        exit 0
+```
+
+One slip worth recording: restoring #3's fail-before with `git checkout --` also discarded the
+uncommitted improvement, because HEAD predated it. Caught by re-reading the file rather than trusting
+the restore, and re-applied. `git checkout` restores to HEAD, not to "before my probe" — those are only
+the same thing when the file was clean to begin with.
+
+Policy suite: **48 scripts passed**.

@@ -41,22 +41,34 @@ def skip(reason: str) -> int:
     return 0
 
 
+class QueryBroke(Exception):
+    """The query itself failed — which is NOT the same as the task being absent."""
+
+
 def task_state() -> str | None:
-    """The task's State, or None when it is not registered / cannot be queried.
+    """The task's State, or None when it is not registered. Raises QueryBroke if it could not ask.
 
     `Get-ScheduledTask` is preferred over parsing `schtasks /query` because its State is a CIM enum
     name (Ready/Running/Disabled) rather than display text, which `schtasks` localizes — a check that
     silently stops matching on a non-English Windows would report healthy forever.
+
+    The absent-vs-broken split is the whole reason this is not one line. Both produce empty output, and
+    folding them together would turn every future breakage — cmdlet missing, PowerShell unavailable,
+    access denied — into a quiet SKIP on the one machine that actually has a watchdog to protect. That
+    is the self-disabling guard this repo keeps finding; it does not get to be introduced by the fix
+    for it.
     """
     ps = shutil.which("powershell") or shutil.which("pwsh")
     if not ps:
-        return None
+        raise QueryBroke("neither powershell nor pwsh is on PATH, so the task state cannot be read")
     r = subprocess.run(
         [ps, "-NoProfile", "-Command", f"(Get-ScheduledTask -TaskName '{TASK}' -ErrorAction SilentlyContinue).State"],
         capture_output=True,
         text=True,
         errors="replace",
     )
+    if r.returncode != 0:
+        raise QueryBroke(f"the state query exited {r.returncode}: {(r.stderr or r.stdout).strip()[:300]}")
     state = r.stdout.strip()
     return state or None
 
@@ -65,7 +77,17 @@ def main() -> int:
     if sys.platform != "win32":
         return skip(f"{sys.platform} is not Windows; {TASK} is a Task Scheduler entry")
 
-    state = task_state()
+    try:
+        state = task_state()
+    except QueryBroke as e:
+        print(
+            f"\nWATCHDOG GATE: FAIL - could not read {TASK}'s state, so this check cannot vouch for it.\n"
+            f"  {e}\n"
+            f"  Reported as a failure, not a skip: on the machine that HAS a watchdog, a broken query\n"
+            f"  and a healthy watchdog would otherwise look identical."
+        )
+        return 1
+
     if state is None:
         return skip(f"{TASK} is not registered on this machine (clean checkout / CI / availability stack not set up)")
 

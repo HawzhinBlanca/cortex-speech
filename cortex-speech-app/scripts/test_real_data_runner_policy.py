@@ -211,6 +211,43 @@ def test_the_shared_profile_guard_refuses_the_production_directory() -> None:
         raise AssertionError("e2e_profile.cjs must never kill by image name")
 
 
+def test_every_probe_temp_dir_is_registered_for_the_refuse_to_start_path() -> None:
+    """Each `mkdtempSync` in a probe must be registered so `die()` can remove it.
+
+    The probes clean up after success (`cleanupProfile`) and deliberately KEEP the profile after a
+    thrown failure, so somebody can open it. The third exit — refusing to start on a failed
+    precondition — did neither, because the profile is made at module scope and `die()` calls
+    `process.exit(1)` straight past it. Measured: occupying the probe's debug port took
+    `cortex-egress-*` from 148 to 149 directories, the new one containing zero files.
+
+    Counting rather than pinning a literal, because the failure mode is ADDING a temp dir and
+    forgetting to register it — the exact way the third one appeared. A substring check would still
+    pass with two of three registered.
+    """
+    for name in ("heartbeat_probe.cjs", "jobs_probe.cjs", "egress_probe.cjs"):
+        text = (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        made = text.count("mkdtempSync(")
+        registered = text.count("ownedTemp.push(")
+        if made != registered:
+            raise AssertionError(
+                f"{name} creates {made} temp dir(s) but registers {registered}: an unregistered one "
+                f"survives every precondition failure. Add `ownedTemp.push(<dir>)` after each mkdtempSync."
+            )
+        if not made:
+            raise AssertionError(f"{name} no longer creates a disposable profile — this check has gone vacuous")
+        for needle in (
+            "const ownedTemp = [];",  # must be declared ABOVE die(), or reading it there is a TDZ error
+            "for (const d of ownedTemp) {",
+            "fs.rmSync(d, { recursive: true, force: true })",
+        ):
+            assert_contains(text, needle, name)
+        # The success path must still distinguish "ours" from a caller-supplied CORTEX_APP_DATA_DIR:
+        # deleting a directory we did not create is destroying somebody's data to tidy up after
+        # ourselves. Pinned here because the probes' own proof script is not part of any gate.
+        assert_contains(text, "cleanupProfile(DATA_DIR, OWNS_DATA_DIR)", name)
+        assert_contains(text, "cleanupProfile(wvDir, true)", name)
+
+
 def main() -> None:
     test_mp4_temp_cleanup_is_constrained_to_temp()
     test_recursive_remove_only_exists_inside_safety_helper()
@@ -221,6 +258,7 @@ def main() -> None:
     test_clear_db_snapshots_before_deleting_and_requires_confirmation()
     test_every_spawning_harness_is_isolated_from_the_production_library()
     test_the_shared_profile_guard_refuses_the_production_directory()
+    test_every_probe_temp_dir_is_registered_for_the_refuse_to_start_path()
     print("real-data runner policy regression passed")
 
 
