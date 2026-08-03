@@ -583,6 +583,26 @@ fn compute_wer_cer_metrics(
             continue;
         };
 
+        // A REJECTED clip is not evidence about ASR quality. `record_human_decision` leaves the
+        // transcripts populated on a reject, so a clip the reviewer discarded still satisfies the
+        // annotated-non-empty test above and folds its error into the headline mean WER/CER — over a row
+        // `export_dataset` drops. `is_human_rejected`'s own docstring says this predicate exists so "the
+        // plain JSON/JSONL/CSV/Parquet exports AND QUALITY COUNTS honor a reject exactly the same way";
+        // this count was the one that did not. (Measured on the live library 2026-08-03: 27 rejects, 0
+        // of them currently carrying an annotation — latent, not yet firing, and one reject-after-edit
+        // away from firing.)
+        if is_human_rejected(seg) {
+            continue;
+        }
+
+        // A placeholder HYPOTHESIS means the ASR never produced output for this clip. Scoring it
+        // against a real reference yields ~100% error, which reads as "the engine was completely
+        // wrong" when the truth is "the engine did not run". That is a fabricated measurement, and
+        // an inflated mean is exactly the direction nobody double-checks.
+        if is_placeholder_transcript(hypothesis_transcript(seg)) {
+            continue;
+        }
+
         annotated_count += 1;
         let hypothesis = hypothesis_transcript(seg);
         let wer = wer::compute_wer(reference, hypothesis);
@@ -935,6 +955,39 @@ mod tests {
         assert!(!is_effective_placeholder(&edited), "a human-corrected placeholder is real text");
         // Real ASR text is never a placeholder.
         assert!(!is_effective_placeholder(&seg("r", "ئەمڕۆ باشە", 4000)));
+    }
+
+    #[test]
+    fn mean_wer_cer_ignores_rows_the_export_drops() {
+        // One good row: the human tidied a small ASR error. This is the only row that should count.
+        let mut good = seg("good", "ئەمڕۆ هەوا خۆشە", 4000);
+        good.annotated_transcript = Some("ئەمڕۆ هەوا زۆر خۆشە".to_string());
+
+        // A REJECTED clip keeps its transcripts (record_human_decision leaves them populated), so it
+        // still looks annotated. It is not evidence about ASR quality — the reviewer discarded it, and
+        // export_dataset drops it.
+        let mut rejected = seg("rej", "پۆلیس و هێزی ئەمنی هاتن", 4000);
+        rejected.annotated_transcript = Some("ئەمڕۆ هەوا زۆر خۆشە".to_string());
+        rejected.human_decision = Some("reject".to_string());
+
+        // A PLACEHOLDER hypothesis means the engine never produced output. Scored, it reads as ~100%
+        // error — the engine looking "completely wrong" when it simply did not run.
+        let mut pending = seg("pend", "[Pending WSL 7B ASR]", 4000);
+        pending.annotated_transcript = Some("ئەمڕۆ هەوا زۆر خۆشە".to_string());
+
+        let only_good = compute_quality_from_segments(std::slice::from_ref(&good));
+        let with_junk = compute_quality_from_segments(&[good, rejected, pending]);
+
+        assert_eq!(only_good.annotated_segment_count, 1);
+        assert_eq!(
+            with_junk.annotated_segment_count, 1,
+            "a rejected clip and a never-transcribed clip must not be counted as annotated evidence"
+        );
+        assert_eq!(
+            with_junk.mean_cer, only_good.mean_cer,
+            "the headline mean CER must not move when rows the export drops are added"
+        );
+        assert_eq!(with_junk.mean_wer, only_good.mean_wer, "same for mean WER");
     }
 
     #[test]

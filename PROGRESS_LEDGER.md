@@ -5685,3 +5685,65 @@ Also confirmed while there: the two sweeps overlapped (`bga12kgwl` was still fin
 sweep started), which is worth remembering because a sweep stamps `docs/STATUS.md` with HEAD **at write
 time, not at run start** — so the older run labelled its result with a commit it had never tested. Its
 green is not evidence for anything and is not being counted.
+
+### phase 11: the headline mean WER/CER counted rows the export throws away
+
+Same hunt as phase 10, next number along. `compute_wer_cer_metrics` scores every segment with a
+non-empty `annotated_transcript` and applies no other filter. Two kinds of row slip through:
+
+**Rejected clips.** `record_human_decision` leaves the transcripts populated on a reject, so a clip the
+reviewer discarded still looks annotated and folds its error into the dashboard's mean WER/CER — over a
+row `export_dataset` drops. This is not an inference; `is_human_rejected`'s own docstring states the
+intent the function was not honouring:
+
+> this shared predicate lets the plain JSON/JSONL/CSV/Parquet exports **and quality counts** honor a
+> reject exactly the same way
+
+**Placeholder hypotheses.** When the ASR never produced output the raw transcript is
+`[Pending WSL 7B ASR]`. Scored against a real reference that is ~100% error, which reads as "the engine
+was completely wrong" when the truth is "the engine did not run" — a fabricated measurement, biased in
+the direction nobody double-checks.
+
+**Measured on the live library before touching anything — both are LATENT, not firing:**
+
+```
+total segments                          : 144
+counted by mean WER/CER (annotated<>'')  : 40
+  ...of those, HUMAN-REJECTED           : 0     <- export drops these
+human-rejected overall                  : 27
+scored rows with a placeholder/blank hypothesis : 0
+```
+
+Recorded plainly: today this changes no number the owner sees. 27 rejects exist and none currently
+carries an annotation, so the dataset is one reject-after-an-edit away from the mean silently moving.
+This is the seventh time this exact class (a tally counting rows the export drops) has been fixed here;
+the previous six were also found before they fired.
+
+**Fail-before, both guards removed at once:**
+
+```
+assertion `left == right` failed: a rejected clip and a never-transcribed clip must not be
+counted as annotated evidence                                                        FAILED
+restored                                                                             1 passed
+```
+
+The test asserts the mean does not MOVE when the junk rows are added, rather than pinning a magic
+number — a fixture that hardcodes 0.037 passes for the wrong reasons the moment the CER routine changes.
+
+Full lib suite 1100 passed / 7 ignored, `cargo fmt` and `clippy --all-targets --all-features -D
+warnings` clean.
+
+### Handed to the owner, not guessed at: a disclosure that names the wrong cause
+
+`stats.conformalHeuristicBasis` fires correctly (no calibration confidence is a real posterior) but
+explains it with:
+
+> The local engine emits no token posteriors, so certification reflects the acoustic (CTC) score
+
+Every one of the owner's 144 segments has `confidence_source = external_provider`. The confidences came
+from a cloud provider, not the local CTC engine, so the app is stating a specific and wrong cause for
+its own uncertainty. The Rust side lumps `external_provider` in with `heuristic`, which is right for
+calibration (neither is a real posterior) and wrong as provenance.
+
+NOT fixed unilaterally: correcting it means rewriting the sentence in English **and Sorani**, and this
+agent does not write Sorani. Queued with the owner's existing 10-string Sorani check.
