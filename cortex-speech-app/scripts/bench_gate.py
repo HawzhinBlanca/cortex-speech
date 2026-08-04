@@ -256,6 +256,44 @@ def main() -> int:
             print(f"  - {n}")
         return 1
     if regressions:
+        # CONFIRM BEFORE FAILING. Not a retry-until-green, and no threshold moves: a benchmark is a
+        # STATISTICAL measurement, and re-measuring a suspected regression is what the measurement is
+        # for. The gate still fails if the second reading agrees. (Contrast the 0xC0000409 stance in
+        # PROGRESS_LEDGER: retrying an unexplained CRASH buries a real bug, because a crash is not a
+        # sample.)
+        #
+        # Measured 2026-08-04. A sweep run immediately after a release relink reported:
+        #     waveform_decode_1600000  3.25x     waveform_decode_160000  5.35x     (16000: 11.63x)
+        # with the ONLY diff since the previous green sweep being `quality/conformal.rs` — nothing in
+        # audio.rs, chunking.rs or benches/. Re-measured on a quiet machine minutes later: 0.81x, 1.00x,
+        # 1.03x. The whole decode family moved together while the other nine benchmarks came in FASTER
+        # than baseline, which is a loaded machine (Defender scanning a freshly linked 100 MB+ exe), not
+        # a regression. The relink-then-sweep sequence is this workflow's normal path, so the false RED
+        # was going to recur — and "re-run it and it goes green" is how a real regression gets waved
+        # through. This makes the second reading part of the gate's evidence instead of a habit.
+        print(
+            f"\n{len(regressions)} bench(es) beyond budget on the first reading; RE-MEASURING those "
+            f"only, to tell a regression from a loaded machine.",
+            flush=True,
+        )
+        confirm_runs = [measure() for _ in range(_resolve_runs(args.runs, updating=False))]
+        confirmed: list[tuple[str, int, int, float, float]] = []
+        for n, b, first, _first_ratio, limit in regressions:
+            samples = [r[n] for r in confirm_runs if n in r]
+            if not samples:
+                # It vanished from the re-measure: that is not a clean bill, it is a missing benchmark.
+                confirmed.append((n, b, first, first / b, limit))
+                print(f"  {n:<44} did NOT run on re-measure - failing on the first reading", flush=True)
+                continue
+            second = min(samples)
+            ratio2 = second / b
+            verdict = "CONFIRMED" if ratio2 > limit else "not reproduced (first reading was noise)"
+            print(f"  {n:<44} {second:>10,} ns  ({ratio2:5.2f}x, limit {limit:4.2f}x) {verdict}", flush=True)
+            if ratio2 > limit:
+                confirmed.append((n, b, second, ratio2, limit))
+        regressions = confirmed
+
+    if regressions:
         print(f"BENCH GATE: FAIL - {len(regressions)} bench(es) beyond their budget", flush=True)
         for n, b, now, ratio, limit in regressions:
             print(f"  - {n}: {b:,} -> {now:,} ns ({ratio:.2f}x, limit {limit:.2f}x)")

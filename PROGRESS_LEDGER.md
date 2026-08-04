@@ -6137,3 +6137,56 @@ The phase-12 test's assertion CHANGED rather than weakened: it used to pin `tota
 flat.len()` to document the tautology; it now pins `== 0`, because the tautology is gone.
 
 Full lib suite 1104 passed, `clippy --all-targets --all-features -D warnings` clean, policy 48/48.
+
+### phase 20: a RED that was the machine, and the habit that would have buried a real one
+
+The sweep gating phase 19 failed:
+
+```
+audio/waveform_decode_1600000_samples   411,878 ns vs 126,831  (3.25x, limit 1.36x) REGRESSION
+audio/waveform_decode_160000_samples    345,729 ns vs  64,627  (5.35x, limit 1.23x) REGRESSION
+```
+
+`docs/STATUS.md` restored, never committed.
+
+**What ruled out the code, before any re-run.** The entire diff between the last green sweep and this
+one is `quality/conformal.rs` plus the ledger:
+
+```
+git diff --stat a43dcfa..df6e01b -- audio.rs chunking.rs benches/   ->  (empty)
+```
+
+A 3-5x decode regression cannot come from a change to conformal scoring. Corroborating: all THREE
+members of the decode family moved together (the third reads 11.63x and is already marked "NOT ENFORCED
+- 35% run-to-run noise on this machine"), while the other nine benchmarks came in FASTER than baseline.
+That is a loaded machine, not a regression. The release exe had been linked minutes earlier and
+Defender real-time protection is on — a freshly written 100 MB+ binary gets scanned.
+
+Re-measured on a quiet machine: **0.81x, 1.00x, 1.03x.** Not reproduced.
+
+**The dangerous part is what comes next.** "Re-run it and it goes green" is exactly how a real
+regression gets waved through, and this workflow's normal path — relink, then immediately sweep —
+guarantees the false RED recurs. Leaving it as a habit would have made every future bench RED
+negotiable.
+
+So the second reading is now part of the gate's evidence rather than a private decision:
+`bench_gate.py` re-measures ONLY the benchmarks that exceeded budget and fails if the second reading
+agrees. **No threshold moves.** A benchmark is a statistical measurement and re-measuring a suspected
+regression is what the measurement is for — the opposite of the 0xC0000409 stance two dozen entries
+above, where retrying an unexplained CRASH was refused precisely because a crash is not a sample.
+
+A benchmark that vanishes on re-measure fails on the first reading; a missing benchmark is not a clean
+bill.
+
+**Proved in the direction that matters — that it cannot wave a real regression through.** The baseline
+for `normalizer/1000_words` was doctored to a quarter of its true value, a regression no machine state
+can un-see:
+
+```
+1 bench(es) beyond budget on the first reading; RE-MEASURING those only ...
+  normalizer/1000_words   3,695,207 ns  (3.50x, limit 1.24x) CONFIRMED
+BENCH GATE: FAIL - 1 bench(es) beyond their budget          exit 1
+```
+
+Baseline restored byte-clean (`git diff` empty). The noise direction is evidenced by the live pair
+above rather than by a simulation: 3.25x then 0.81x, same code, minutes apart.
