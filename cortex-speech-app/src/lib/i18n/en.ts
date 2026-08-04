@@ -9,7 +9,7 @@ export const en: Record<string, string> = {
   transcribeConstrained: 'Kurdish-only',
   transcribeConstrainedTitle: 'Transcribe with constrained Kurdish-script decode (guarantees Kurdish output)',
   transcribeFinetuned: 'Fine-tuned',
-  transcribeFinetunedTitle: 'Transcribe with the fine-tuned Kurdish model (measured 21.0% CER, N=900)',
+  transcribeFinetunedTitle: 'Transcribe with the fine-tuned Kurdish model (21.0% CER [19.9-22.0], N=900 gold clips, measured 2026-06-25)',
   'scribe.transcribe': 'Scribe (cloud)',
   'scribe.transcribeTitle': 'Re-transcribe this segment with ElevenLabs Scribe (cloud STT)',
   'scribe.vote': '+ Scribe vote',
@@ -658,6 +658,8 @@ export const en: Record<string, string> = {
   'stats.heuristic': 'Heuristic',
   'stats.conformalHeuristicBasis':
     'Confidence basis: heuristic. The local engine emits no token posteriors, so certification reflects the acoustic (CTC) score, not a calibrated confidence — treat as indicative.',
+  'stats.conformalNoConfidence':
+    'This engine returns no per-clip confidence, so nothing here can be certified and no risk bound can be calculated. Reviewing more clips will not change that.',
   'stats.certifiedSegments': 'Certified Segments',
   // Waveform
   'waveform.timelineZoom': 'Timeline Zoom',
@@ -708,7 +710,7 @@ export const en: Record<string, string> = {
     'Each name gets its own private link, and every decision is stored under that name. Reviewers are handed different clips, so two people never review the same one at the same time.',
   'settings.useFinetuned': 'Use fine-tuned model',
   'settings.useFinetunedHint':
-    'Best local Sorani accuracy (measured 21.0% CER, N=900) — runs on CPU, no setup. Overrides the engine below.',
+    'Best local Sorani accuracy (21.0% CER [19.9-22.0], N=900 gold clips, measured 2026-06-25) — runs on CPU, no setup. Overrides the engine below.',
   'settings.externalAsrScript': 'External ASR Provider Script',
   'settings.localApiEndpoint': 'Local API Endpoint',
   'settings.modelName': 'Model Name',

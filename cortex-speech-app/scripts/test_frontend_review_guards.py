@@ -580,6 +580,53 @@ def test_library_reads_fail_loudly_instead_of_reporting_an_empty_library() -> No
             )
 
 
+def test_the_uncalibrated_panel_names_the_real_cause_when_there_is_no_confidence_at_all() -> None:
+    """"Verify at least 10 segments" must not be shown when verifying cannot possibly help.
+
+    Two different reasons make the certificate uncalibrated, and they need different answers:
+      * too little verified data  -> reviewing more clips fixes it;
+      * the engine returns NO per-clip confidence -> reviewing more clips changes nothing, ever.
+
+    Measured on the live library 2026-08-04: 67 clips verified, and 0/144 carry a confidence or a
+    ctc_score, because the cloud engine returns none (`pipeline.rs`: "Scribe returns no per-segment
+    confidence"). The panel showed the first message for the second situation - work that cannot help.
+
+    Worth pinning because the no-confidence branch only became reachable when `has_scoreable_confidence`
+    started excluding those clips: that exclusion also zeroed the provenance counters, which silently
+    removed the only note that had explained anything. A guard here is what stops the next change
+    quietly restoring the wrong advice.
+    """
+    src = _read("src/lib/StatsDashboard.svelte")
+
+    if "cert.calibrationNoConfidence > 0" not in src:
+        raise AssertionError(
+            "StatsDashboard.svelte no longer distinguishes 'no confidence data' from 'too few verified "
+            "clips', so an uncalibrated panel tells the owner to verify more segments when that cannot help"
+        )
+    if "stats.conformalNoConfidence" not in src:
+        raise AssertionError("the no-confidence explanation string is not rendered")
+
+    # ORDER IS THE WHOLE POINT: the specific cause must be the `{#if}` and the generic fallback the
+    # `{:else if}`. Reversed, the fallback always wins and the specific message is dead code that still
+    # reads as present in a grep.
+    #
+    # Pinned as EXACT branch text, not by comparing string offsets. An offset comparison passed the
+    # swapped arrangement during its own fail-before: swapping only the CONDITIONS leaves the
+    # no-confidence expression sitting on the `{:else if}` line, which is still earlier in the file than
+    # the fallback TEXT inside that branch's body. Comparing a condition's position against a message's
+    # position measures nothing. (Third time this exact offset-comparison mistake has been caught here.)
+    specific_branch = (
+        "{#if cert.calibrationNoConfidence > 0 && cert.calibrationRealPosterior + cert.calibrationHeuristic === 0}"
+    )
+    generic_branch = "{:else if !cert.isCalibrated}"
+    if specific_branch not in src or generic_branch not in src:
+        raise AssertionError(
+            "the uncalibrated panel must test the SPECIFIC cause first: expected "
+            f"`{specific_branch}` as the opening branch, then `{generic_branch}` as the fallback. "
+            "Reversed, 'verify at least 10 segments' always wins and the real reason never shows."
+        )
+
+
 def main() -> None:
     test_a_skip_never_clears_the_reviewers_draft_on_either_route()
     test_retranscribe_guards_editor_writes_against_navigation()
@@ -604,6 +651,7 @@ def main() -> None:
     test_post_jury_cer_is_withheld_when_every_row_scored_the_jury_against_itself()
     test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrated()
     test_library_reads_fail_loudly_instead_of_reporting_an_empty_library()
+    test_the_uncalibrated_panel_names_the_real_cause_when_there_is_no_confidence_at_all()
     print("frontend review-guard source policy passed")
 
 

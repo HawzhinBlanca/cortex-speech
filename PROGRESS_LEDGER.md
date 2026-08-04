@@ -6348,3 +6348,61 @@ After: **eslint clean, 0 warnings.** typecheck 427 files 0 errors, vitest 217 pa
 
 A warning nobody intends to fix teaches everyone to scroll past the warnings, which is how a real one
 gets missed. Zero is the only count that keeps the signal.
+
+### phase 25: the owner's Sorani pass, and the panel stops giving advice that cannot work
+
+**The 10 phone-page strings are approved.** The owner read all ten and passed every one — the last
+un-reviewed Sorani on the review page. That item is closed.
+
+**Two new strings, drafted here and rendering-checked rather than assumed.**
+
+`stats.conformalNoConfidence` (A) and the fine-tuned accuracy label (B) now carry, in both locales, the
+interval/corpus/date the deep audit asked for:
+
+```
+before  Transcribe with the fine-tuned Kurdish model (measured 21.0% CER, N=900)
+after   Transcribe with the fine-tuned Kurdish model (21.0% CER [19.9-22.0], N=900 gold clips,
+        measured 2026-06-25)
+```
+
+**The bidi worry was unfounded, and it took a measurement to find that out.** The concern raised to the
+owner was that a bracketed CI and an ISO date would flip inside RTL text. Two attempts to check it by
+eye were WRONG in opposite directions: the first render was mojibake (page served with no charset, so
+Chromium decoded UTF-8 as Latin-1) and told us nothing; reading glyph order off the second screenshot
+suggested the range and date were reversed. Measuring the laid-out client rects in Chromium settles it —
+each run read in its OWN direction:
+
+```
+tokens, RTL reading order:   ٢١٫٠٪ | ١٩٫٩٪ | ٢٢٫٠٪ | N=900 | ٢٠٢٦-٠٦-٢٥
+date, arabic digits, RTL:    ٢٠٢٦ - ٠٦ - ٢٥   = 2026-06-25   correct
+date, latin in dir="ltr":    2026 - 06 - 25   = 2026-06-25   correct
+```
+
+Nothing flips. B keeps Arabic-Indic digits, matching the numeral style already shipping in ckb.ts.
+
+**A regression this agent introduced, now fixed.** `has_scoreable_confidence` (phase 19) excludes
+no-confidence clips BEFORE the provenance counters, so on the owner's library both counters went to
+zero — which silently removed the only note explaining why nothing certified, leaving the generic
+fallback: *"Uncalibrated fallback. Verify at least 10 segments."* He has **67** verified clips and
+**0/144** carry a confidence or ctc_score, because the cloud engine returns none. The panel was sending
+him to do work that cannot help. `calibration_no_confidence` now counts those exclusions and the panel
+names the real cause.
+
+**A FOURTH decorative check, same offset-comparison mistake as the RefineryPanel guard.** The ordering
+assertion compared the position of a CONDITION against the position of a MESSAGE, so swapping only the
+two conditions left the no-confidence expression earlier in the file than the fallback text inside its
+own branch — and the fail-before passed. Pinning the exact branch text catches it:
+
+```
+AFTER                    passed
+conditions swapped       AssertionError: ... expected `{#if cert.calibrationNoConfidence > 0 ...}`
+                         as the opening branch                                            exit 1
+branch removed           AssertionError: no longer distinguishes 'no confidence data' ...  exit 1
+restored                 passed
+```
+
+(And the repair itself broke the file first: `\n` escapes in a heredoc became real newlines inside
+string literals. Caught by the very next run.)
+
+Gates: lib suite 1105 passed, clippy clean, typecheck 427 files 0 errors, eslint 0 warnings, policy
+suite 48/48, i18n key sets identical.

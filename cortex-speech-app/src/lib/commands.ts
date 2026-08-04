@@ -1129,6 +1129,10 @@ export interface ConformalCertificate {
    * imply a calibrated-posterior guarantee it does not have. */
   calibrationRealPosterior: number;
   calibrationHeuristic: number;
+  /** Clips excluded because they carry NEITHER a confidence nor a ctc_score - the absence of any
+   *  signal, as opposed to a non-posterior one. When this is the whole calibration set, nothing can be
+   *  certified and no amount of reviewing changes it. */
+  calibrationNoConfidence: number;
 }
 
 export async function getDatasetCertificate(

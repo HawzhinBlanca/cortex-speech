@@ -676,7 +676,17 @@
             </div>
           </div>
 
-          {#if !cert.isCalibrated}
+          {#if cert.calibrationNoConfidence > 0 && cert.calibrationRealPosterior + cert.calibrationHeuristic === 0}
+            <!-- The reason nothing certified is that NOTHING HAS A CONFIDENCE, not that too few clips are
+                 verified. Saying "verify at least 10 segments" here sends the owner to do work that cannot
+                 help: measured 2026-08-04, his library has 67 verified clips and 0/144 carry a confidence
+                 or a ctc_score, because the cloud engine returns none (pipeline.rs: "Scribe returns no
+                 per-segment confidence"). Naming the real cause is the difference between an honest empty
+                 state and a wild goose chase. -->
+            <p class="text-[9px] text-amber-400/90 leading-tight" data-testid="conformal-no-confidence">
+              {$t('stats.conformalNoConfidence')}
+            </p>
+          {:else if !cert.isCalibrated}
             <p class="text-[9px] text-amber-400/90 leading-tight">
               ⚠️ Uncalibrated fallback. Verify at least 10 segments to enable statistical risk
               bounds.

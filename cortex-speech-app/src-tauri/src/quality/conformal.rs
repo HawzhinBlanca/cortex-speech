@@ -19,6 +19,14 @@ pub struct ConformalCertificate {
     /// threshold/certification (the score also uses the real ctc_score); it just surfaces the basis.
     pub calibration_real_posterior: usize,
     pub calibration_heuristic: usize,
+    /// Clips that would otherwise have calibrated, excluded because they carry NEITHER a confidence nor
+    /// a ctc_score. Distinct from `calibration_heuristic` (a non-posterior score IS a score); this is the
+    /// absence of any signal, which `has_scoreable_confidence` refuses to invent a 1.0 for.
+    ///
+    /// Surfaced because the UI must be able to say WHY nothing certified. Without it the panel falls
+    /// back to "verify at least 10 segments", which on a library like the owner's — 67 verified clips,
+    /// every one from a cloud engine that returns no confidence — is advice that cannot work.
+    pub calibration_no_confidence: usize,
 }
 
 /// The nonconformity score from a (confidence, ctc) pair: S = (1 - confidence) + 0.1·(-ctc).
@@ -160,6 +168,7 @@ pub fn calibrate_and_certify(
     // the fallback.
     let mut calibration_real_posterior = 0usize;
     let mut calibration_heuristic = 0usize;
+    let mut calibration_no_confidence = 0usize;
     let cal_scored: Vec<(f64, f64)> = all_segments
         .iter()
         .filter_map(|s| {
@@ -174,6 +183,7 @@ pub fn calibrate_and_certify(
             // No measured confidence and no acoustic score => the nonconformity would be a constant
             // manufactured from two defaults. Calibrating on that is calibrating on nothing.
             if !has_scoreable_confidence(s) {
+                calibration_no_confidence += 1;
                 return None;
             }
             let ref_text = s.annotated_transcript.as_deref()?.trim();
@@ -226,6 +236,7 @@ pub fn calibrate_and_certify(
         is_calibrated,
         calibration_real_posterior,
         calibration_heuristic,
+        calibration_no_confidence,
     }
 }
 
