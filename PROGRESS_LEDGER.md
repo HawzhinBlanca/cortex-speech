@@ -6190,3 +6190,63 @@ BENCH GATE: FAIL - 1 bench(es) beyond their budget          exit 1
 
 Baseline restored byte-clean (`git diff` empty). The noise direction is evidenced by the live pair
 above rather than by a simulation: 3.25x then 0.81x, same code, minutes apart.
+
+### phase 21: the first real gold evaluation — a measured accuracy record, and what it is NOT
+
+Owner instruction: "download the gold audio and run the eval". Both done. The audit's P0 #1 asks for a
+canonical accuracy record; this is the first one this app has ever produced.
+
+**Provenance (charter: every number carries its command, dataset and model).**
+
+```
+command    node <scratch>/run_gold_eval.cjs   ->  IPC import_gold_segments + run_gold_eval_asr
+corpus     google/fleurs ckb_IQ test, fetched with scripts/build_fleurs_ckb_manifest.py
+           922 recordings of 348 distinct sentences, 332 MB, 0 skipped
+eval set   the COMMITTED frozen record docs/eval/fleurs_ckb_iq_frozen.rel.tsv
+           sha256 4063da0309b11046069bb40f865a75f56053199b28fd37580c4312049c4dd3ce
+           348 rows = ONE recording per sentence, 0 re-recordings, 0 of its clips missing from the fetch
+engine     omniasr-ctc-300m (the ACTIVE local engine; run_gold_eval_asr refuses a mislabelled engine)
+exe        HEAD 49f258b
+run id     20933d16-cf52-4302-85d5-2d6bca52e0fd     run at 2026-08-04 07:54:01
+N          348
+CER        12.58%  (micro; macro 12.578%)
+WER        52.05%  (micro; macro 52.002%)
+```
+
+**Why 348 and not 922.** FLEURS ckb_IQ ships multiple recordings of the same sentence; the fetch names
+them `<id>.wav`, `<id>.1.wav`, ... Scoring all 922 would weight some sentences 3x and understate the
+CI, so the eval used the frozen one-per-sentence record the repo already guards with
+`test_frozen_eval_manifest_integrity.py`.
+
+**What this number is NOT, stated because it is easy to misuse.** It is the STOCK CTC-300M on FLEURS
+ckb_IQ. It is **not comparable** to the two numbers already in this ledger — 29.40% CER for stock
+CTC-300M (N=400) and 21.00% CER for the fine-tuned model (N=900) — both measured on DIFFERENT sets.
+Placing 12.58% beside either is exactly the "never mix ... without scope labels" the audit objects to.
+
+The one comparison on the same corpus family is unflattering and is reported anyway: ElevenLabs Scribe
+publishes **32.1% WER on FLEURS-ckb**; this offline engine scored **52.05% WER** here. Expected for a
+300M offline CTC against a cloud model, and not a reason to omit it.
+
+**P0 #1 is substantially, not fully, met.** Present: dataset, N, model, build, date, CER/WER, run ID,
+exclusions. **Missing: the confidence interval and the dialect/noise/speaker slices.** The app's eval
+path computes micro/macro only — the bootstrap CI lives in `scripts/scorecard_finetuned.py`, which needs
+jiwer + transformers + onnxruntime and measures a DIFFERENT code path than the app runs. Recorded as
+open rather than claimed.
+
+**Safety around the owner's live library.** The eval writes `gold_segments` and `eval_runs` into the
+real profile — that is the point (the panel must show a real run), so it was done deliberately and with
+a backup taken first, app cleanly closed: `Desktop\cortex-library-backup-20260804-103931` (db + wal +
+shm). After the run: 144 segments and 67 decisions intact, `eval_runs` 1, `gold_segments` 348.
+
+**A repo defect the fetch exposed.** `build_fleurs_ckb_manifest.py` downloaded the whole corpus and then
+died: `datasets` >= 4 decodes audio through **torchcodec**, pulling a PyTorch runtime (GBs) purely to
+turn a 16 kHz WAV into samples. soundfile is already a hard dependency there (it WRITES the clips), so
+the fetch now decodes the raw bytes in-process and hands `write_manifest` — the unit-tested core —
+exactly the shape it documents. Smoke-tested at `--limit 5` (5 rows, 0 skipped) before the full run. No
+gate would have caught this: a 1-2 GB one-time fetch cannot sit in a sweep, and saying so is more honest
+than inventing a test that would not have run either.
+
+**Corpus never reaches git.** The clips are covered by `*.wav`, but the GENERATED manifest was not
+ignored and carries the corpus references plus absolute local paths, against the ledger's own
+"eval-only corpus; no audio/refs committed". `.gitignore` now excludes
+`cortex-speech-app/scripts/fleurs_ckb_iq/`; the committed portable record stays tracked.

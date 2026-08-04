@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import sys
+import pathlib
 from pathlib import Path
 
 # Reuse the CV22 builder's tested path/reference helpers (same scripts/ dir).
@@ -76,6 +77,35 @@ def write_manifest(examples, out_dir: Path, wsl: bool = False, limit: int | None
     return len(rows), skipped
 
 
+def _decode_with_soundfile(ds):
+    """Yield FLEURS-shaped examples, decoding the audio with soundfile instead of datasets' decoder.
+
+    `datasets` >= 4 decodes an Audio column through **torchcodec**, and raises
+    `ImportError: To support decoding audio data, please install 'torchcodec'` otherwise — which pulls a
+    full PyTorch runtime (GBs) purely to turn a 16 kHz WAV into samples. Measured 2026-08-04: this is
+    what stopped the one-time fetch dead after the download had already completed.
+
+    soundfile is ALREADY a hard dependency here (`write_manifest` writes the clips with it), so the
+    bytes are decoded in-process and `write_manifest` — the unit-tested core — is handed exactly the
+    shape it documents. Nothing about the corpus changes; only who decodes it.
+    """
+    import io
+
+    import soundfile as sf
+
+    for ex in ds:
+        audio = ex.get("audio") or {}
+        raw = audio.get("bytes")
+        if raw is None and audio.get("path"):
+            raw = pathlib.Path(audio["path"]).read_bytes()
+        if not raw:
+            # An example with no audio is SKIPPED by write_manifest (and counted), never fabricated.
+            yield {**ex, "audio": {}}
+            continue
+        array, sample_rate = sf.read(io.BytesIO(raw), dtype="float32")
+        yield {**ex, "audio": {"array": array, "sampling_rate": int(sample_rate)}}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build a frozen FLEURS ckb_IQ eval manifest (TSV).")
     ap.add_argument("--output-dir", default="scripts/fleurs_ckb_iq", help="dir for clips/ + the manifest")
@@ -86,15 +116,17 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        from datasets import load_dataset
+        from datasets import Audio, load_dataset
     except ImportError:
         print("error: `pip install datasets soundfile` to build the FLEURS manifest", file=sys.stderr)
         return 2
 
     print(f"downloading google/fleurs {args.config} {args.split} (~1-2 GB, one-time)…", file=sys.stderr)
     ds = load_dataset("google/fleurs", args.config, split=args.split)
+    # Hand back the RAW bytes and decode them ourselves — see _decode_with_soundfile.
+    ds = ds.cast_column("audio", Audio(decode=False))
     out_dir = Path(args.output_dir)
-    n, skipped = write_manifest(ds, out_dir, wsl=args.wsl_paths, limit=args.limit)
+    n, skipped = write_manifest(_decode_with_soundfile(ds), out_dir, wsl=args.wsl_paths, limit=args.limit)
     print(f"wrote {n} rows to {out_dir / MANIFEST_NAME} ({skipped} skipped: empty audio or reference)")
     if n == 0:
         print("WARNING: 0 rows — check the FLEURS config/split", file=sys.stderr)
