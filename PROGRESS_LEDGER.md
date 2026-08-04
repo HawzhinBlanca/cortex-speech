@@ -5888,3 +5888,56 @@ restored                              frontend review-guard source policy passed
 
 Gates: typecheck 427 files 0 errors, vitest 217, policy 48/48, Playwright **94 passed** (including the
 six new header-overflow cases).
+
+### phase 15: the gate could be corrupted by a second copy of itself — twice, today
+
+Not from any audit. This one has two incidents behind it, both self-inflicted on 2026-08-03:
+
+* A sweep was launched while an earlier one was still finishing. They fight over the same fixed debug
+  ports, so the loser's probes die on `PRECONDITION FAILED: debug port already answering` — a leg
+  failing for a reason that has nothing to do with the code. **Three empty `cortex-egress-*` profiles
+  timestamped 10:16:34 went unexplained for hours**; this is what they were.
+* `docs/STATUS.md` is stamped with HEAD at **write** time, not run start. The earlier sweep therefore
+  labelled its verdict with a commit it had never tested. A green attributed to the wrong code is
+  exactly the claim this repo exists to prevent, and the gate was generating it.
+
+The second time it happened the run was killed and discarded rather than read, which was right but is
+not a fix: the next tired hand does the same thing.
+
+`single_instance()` refuses to start while a live sweep holds the lock. Refusing is **not a pass** — it
+exits 2 (INCOMPLETE), never 0. A stale lock (the holder is gone: killed run, crash) is taken over
+rather than blocking forever, because a gate nobody can start is its own outage. `--static` is
+deliberately exempt: it runs no legs, opens no ports and writes no STATUS.md.
+
+**Proved against a real second sweep, not a simulation:**
+
+```
+1. live incumbent      REFUSING TO START: another verify-10 sweep is already running (pid 62416)
+                       exit=2          STATUS.md touched: 0
+2. stale lock (dead)   (taking over a stale verify-10 lock from dead pid 999999)   -> proceeds
+3. own pid re-entry    silent, no false "stale" claim
+4. clean run           lock removed
+```
+
+Two flaws in the first cut of this work, both caught by running it rather than reading it: the exit
+code was read through a `| tail` so it reported 0 when the process returned 2, and the refusal message
+mojibaked its em-dash on the Windows console — the same defect fixed in the watchdog gate hours
+earlier. Case 3 was worse than cosmetic: re-entering under our own pid printed "taking over a stale
+lock from dead pid <ours>", a small lie in the one message somebody reads when the gate behaves oddly.
+
+### Checked and NOT changed: the write path
+
+Hunted the same silent-failure class as phase 14 on the WRITE side, where the stakes are the owner's
+data rather than a wrong screen. It is already hardened:
+
+* autosave failures reach `notifications.error` via `onError`;
+* a rejected settings write ROLLS BACK local + store to the last-persisted state and toasts — the
+  comment there already names the consent mismatch as safety-critical;
+* the close-request handler falls back from `destroy()` to `close()` and surfaces it if both fail.
+
+One genuinely silent path remains: if registering the close-request flush throws, the app runs with no
+flush-on-close and only logs it. Deliberately left alone — autosave debounces at **1000 ms**, so the
+exposure is at most one second of typing, and a user-facing error for that would be noise. Recorded
+rather than "fixed" so the next pass does not re-litigate it.
+
+Policy suite 48/48.

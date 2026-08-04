@@ -31,6 +31,7 @@ and bug-free. Distribution legs are descoped (printed below, never dropped);
 no honesty/privacy/reliability/correctness gate is waived.
 """
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -838,6 +839,77 @@ def aggregate_main(quick, status_md=None):
     sys.exit(code)
 
 
+RUN_LOCK = LOG_DIR / "verify10.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this PID exists. Windows has no os.kill(pid, 0) semantics worth trusting."""
+    if sys.platform == "win32":
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, errors="replace"
+        )
+        return str(pid) in out.stdout
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError) as e:
+        return isinstance(e, PermissionError)  # EPERM means it exists but is not ours
+    return True
+
+
+@contextlib.contextmanager
+def single_instance():
+    """Refuse to start while another sweep is already running.
+
+    WHY. Two sweeps in flight corrupt each other and the record, and it happened TWICE on 2026-08-03:
+
+      * They fight over the same fixed debug ports (9271/9333/9334/9335 ...). The loser's probe hits
+        `PRECONDITION FAILED: debug port already answering` and dies — a leg failing for a reason that
+        has nothing to do with the code. Three empty `cortex-egress-*` profiles at 10:16:34 were exactly
+        this, and went unexplained for hours.
+      * `docs/STATUS.md` is stamped with HEAD at WRITE time, not at run start. The earlier run therefore
+        labelled its verdict with a commit it had never tested — a green attributed to the wrong code,
+        which is precisely the kind of claim this whole repo exists to prevent.
+
+    Refusing is not a pass: it exits 2 (INCOMPLETE), never 0. A stale lock (the PID is gone — killed
+    run, crash) is taken over rather than blocking forever, because a gate nobody can start is its own
+    outage.
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if RUN_LOCK.exists():
+        try:
+            holder = int(RUN_LOCK.read_text(encoding="utf-8").strip().split()[0])
+        except (ValueError, OSError, IndexError):
+            holder = -1
+        ours = holder == os.getpid()
+        if holder > 0 and not ours and _pid_alive(holder):
+            print(
+                f"\nREFUSING TO START: another verify-10 sweep is already running (pid {holder}).\n"
+                f"  Two sweeps fight over the same debug ports and both write docs/STATUS.md, which is\n"
+                # ASCII only: the Windows console renders an em-dash as a replacement character, and a
+                # refusal message somebody reads mid-run must not be mojibake.
+                f"  stamped with HEAD at write time (not run start), so the earlier one would label its\n"
+                f"  verdict with a commit it never tested. Wait for it, or stop it, then re-run.\n"
+                f"  Lock: {RUN_LOCK}",
+                flush=True,
+            )
+            sys.exit(2)
+        # Only call it STALE when it actually is. Re-entering under our own pid is not a dead holder,
+        # and a message that says otherwise is a small lie in the one place someone looks when the
+        # gate behaves oddly.
+        if not ours:
+            print(f"(taking over a stale verify-10 lock from dead pid {holder})", flush=True)
+    RUN_LOCK.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    try:
+        yield
+    finally:
+        # Only remove OUR lock: a takeover race must not delete the winner's.
+        try:
+            if RUN_LOCK.exists() and RUN_LOCK.read_text(encoding="utf-8").strip().split()[0] == str(os.getpid()):
+                RUN_LOCK.unlink()
+        except OSError:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--static", action="store_true", help="historical 4-gate governance check (CI contract)")
@@ -850,9 +922,12 @@ def main():
     )
     args = ap.parse_args()
     if args.static:
+        # The static governance check runs no legs, opens no ports and writes no STATUS.md, so it is
+        # not what the lock protects against and must stay runnable alongside a sweep.
         static_main()
     else:
-        aggregate_main(quick=args.quick, status_md=args.status_md)
+        with single_instance():
+            aggregate_main(quick=args.quick, status_md=args.status_md)
 
 
 if __name__ == "__main__":
