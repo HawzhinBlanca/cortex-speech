@@ -6406,3 +6406,96 @@ string literals. Caught by the very next run.)
 
 Gates: lib suite 1105 passed, clippy clean, typecheck 427 files 0 errors, eslint 0 warnings, policy
 suite 48/48, i18n key sets identical.
+
+## Iteration 241 — audit #10's latency evidence, and three probes that failed before one told the truth
+
+P2 #10 asks for published p50/p95 on import, first transcript, search, review-save and export **on long
+files**. The repo already measures RTF, twelve microbenchmarks and durability under hard kill — none of
+which is the number a human experiences. `scripts/latency_probe.cjs` measures that number through the
+REAL IPC on the REAL exe, with a disposable profile, timing each `invoke` in-page so the sample is the
+IPC hop + backend work + reply and nothing else.
+
+**Three runs failed first, and every failure was the harness, not the app.**
+
+1. *No engine provisioned.* A fresh disposable profile has no ASR engine selected, and
+   `import_audio_file` only SPAWNS the decode/VAD worker before returning Ok — a failed preflight
+   surfaces on the event channel, never in the invoke's result. The probe polled 12 minutes for clips
+   that could never arrive. Its preserved profile showed `speech_segments: 0` and jobs rows for exports
+   only. That reads exactly like *"import silently does nothing"*, which would have been a serious and
+   WRONG bug report. Fixed by calling `provisionEngine` first, as `e2e_real_app.cjs` already did.
+
+2. *A stray `node -c ""` in the launch command* blocked on stdin, and the `;` chain meant the probe never
+   started at all. The background task reported `running` for 1h49m — its shell genuinely was running.
+   Caught only by noticing that no second `cortex-speech-app.exe` and no `cortex-latency-*` profile
+   existed. Taking "status: running" at face value would have meant waiting indefinitely.
+
+3. *Rate limited.* `export_dataset` and `update_segment_fields` sit behind `STRICT_RATE_LIMITER`
+   (burst 5, refill 10/s — `throttle.rs`). Twelve iterations with zero think time drained the bucket:
+   exports `.0`–`.4` on disk, `.5` missing, `.6` back again. **This is the limiter working, not a
+   defect** — the editor autosaves on a 1 s debounce (`autosave.ts`), so a reviewer produces ~1 call/s
+   per key against a limit of 10 and cannot reach it. Raising the limit to make the probe pass would
+   have weakened a working guard to flatter a measurement. The probe now paces 250 ms BETWEEN samples,
+   never inside a timed region.
+
+**Two honesty defects in the probe's own output, fixed before publishing.** The import happens once per
+run, so `import_enqueue` and `import_to_first_clip` have n=1 — and the first table printed that single
+observation under `p50` and `p95` columns, dressing one measurement up as a characterised distribution.
+They now print in a separate block labelled *no percentile is defined*. Separately, the first run used
+the 8-second committed fixture, which answers none of what #10 asks: a 3.3 ms library page over a
+handful of clips from one short import says nothing about a real session.
+
+**Measured 2026-08-04**, exe built at `61069e5` (only `docs/STATUS.md` differs at HEAD `bf52116`, so the
+binary is code-identical to HEAD). Audio: 30.2 min, 57.9 MB, 16 kHz mono Sorani, 153 gold FLEURS clips
+concatenated, sha256 `1034ccb8a190f016db13860587f7441b00e0e4296a206d42a2129f78ca4cd1ef`. The library
+settled at **135 segments** before sampling began — a page latency is meaningless without saying how
+many rows it paged, and sampling while VAD is still emitting clips measures a moving target.
+
+```
+  operation             n     p50        p95        min        max
+  library_page         12      7.7ms     12.5ms      6.9ms     12.5ms
+  search               12      3.9ms      9.2ms      2.7ms      9.2ms
+  review_save          12      3.2ms      8.6ms      2.8ms      8.6ms
+  waveform             12     60.7ms    277.4ms     53.2ms    277.4ms
+  export_jsonl         12     15.1ms     18.1ms     11.6ms     18.1ms
+
+  single observations — one import per run, so NO percentile is defined:
+  import_enqueue            4.8ms   (n=1)
+  import_to_first_clip  235070.7ms  (n=1)
+```
+
+Reproduce — the long file is built under `%TEMP%` and never enters the repo:
+
+Run from `cortex-speech-app/scripts/fleurs_ckb_iq/clips`:
+
+```python
+import wave, glob, os
+out = os.path.join(os.environ['TEMP'], 'long_ckb_30min.wav')
+target, tot = 30 * 60 * 16000, 0
+w = wave.open(out, 'wb'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+for f in sorted(glob.glob('*.wav')):
+    if tot >= target:
+        break
+    with wave.open(f) as r:
+        assert (r.getframerate(), r.getnchannels(), r.getsampwidth()) == (16000, 1, 2), f
+        w.writeframes(r.readframes(r.getnframes())); tot += r.getnframes()
+w.close()
+```
+
+```
+CORTEX_AUDIO="$TEMP/long_ckb_30min.wav" npm run test:latency
+```
+
+**The finding: no progressive availability on long imports.** 3 min 55 s before the first reviewable
+clip from a 30-minute file, against 4 s for 8 s of audio — it scales with file length. Both import paths
+(`pipeline.rs` `process_single_file` and `process_single_file_streaming`) accumulate every segment in
+memory and call `persist_segments` ONCE at the end; "streaming" there means streaming *decode* (bounded
+memory), not progressive *persistence*. The UI does receive phase and progress events throughout that
+window (`commands.rs` forwards every pipeline event except the terminal one), so it is not a blank
+screen. Making persistence progressive is not a small change: whole-file speaker clustering needs every
+embedding before any label exists, so clips would have to be inserted unlabelled and back-filled.
+**Owner-gated redesign, same class as #4–#8 — not started.**
+
+The probe is REPORTED, NOT GATED, deliberately. An end-to-end latency budget on a developer desktop
+reds on background load rather than on regressions — the cry-wolf failure `bench-budget`'s
+confirm-re-measure exists to avoid — and a gate people learn to re-run is worse than no gate. Publish
+the evidence; gate the microbenchmarks that are actually stable.

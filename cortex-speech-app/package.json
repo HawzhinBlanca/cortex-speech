@@ -18,6 +18,7 @@
     "test:heartbeat": "node scripts/heartbeat_probe.cjs",
     "test:jobs": "node scripts/jobs_probe.cjs",
     "test:egress": "node scripts/egress_probe.cjs",
+    "test:latency": "node scripts/latency_probe.cjs",
     "fetch-models": "python scripts/fetch_models.py",
     "verify-models": "python scripts/fetch_models.py --check",
     "tauri:build:smoke": "npm run build && cargo build --release --manifest-path src-tauri/Cargo.toml --bin cortex-speech-app",
