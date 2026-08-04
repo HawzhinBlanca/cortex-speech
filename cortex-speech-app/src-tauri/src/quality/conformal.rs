@@ -43,6 +43,26 @@ pub fn compute_nonconformity_score(seg: &SpeechSegment) -> f64 {
     nonconformity(seg.confidence.unwrap_or(0.5), seg.ctc_score)
 }
 
+/// Whether a segment carries ANY measured confidence signal to score.
+///
+/// `compute_nonconformity_score` defaults a missing confidence to 0.5 and a missing ctc_score to -5.0,
+/// which is fine as a per-call fallback and ruinous as a population. A clip with NEITHER scores exactly
+/// `(1 - 0.5) + 0.1*5 = 1.0` — a constant manufactured from two defaults, identical for every such clip
+/// and carrying no information about any of them.
+///
+/// That is not hypothetical. `pipeline.rs` says of the cloud STT path: *"Scribe returns no per-segment
+/// confidence, so `confidence` stays [None]"*, and on the owner's library ALL 144 clips came from an
+/// external provider — 0/144 have a confidence, 0/144 a ctc_score. Every one scored 1.0, no cut point
+/// could beat the target, the fallback threshold became that same 1.0, and every non-rejected clip
+/// "certified": 117 of them, on a number nobody measured.
+///
+/// A certificate over fabricated scores is worse than no certificate, so such rows now calibrate
+/// nothing and certify nothing. They are not errors and not excluded from the library — they simply
+/// carry no evidence, and the honest count of what a no-confidence dataset certifies is zero.
+pub fn has_scoreable_confidence(seg: &SpeechSegment) -> bool {
+    seg.confidence.is_some() || seg.ctc_score.is_some()
+}
+
 /// Number of acoustic-condition (SNR) buckets the conformal threshold is calibrated within. A single
 /// global threshold is invalid across studio/field/noisy conditions, so the T0 gate calibrates a
 /// separate threshold per bucket (sparse buckets fall back to the global one).
@@ -151,6 +171,11 @@ pub fn calibrate_and_certify(
             if !s.verified || crate::quality::is_human_rejected(s) {
                 return None;
             }
+            // No measured confidence and no acoustic score => the nonconformity would be a constant
+            // manufactured from two defaults. Calibrating on that is calibrating on nothing.
+            if !has_scoreable_confidence(s) {
+                return None;
+            }
             let ref_text = s.annotated_transcript.as_deref()?.trim();
             if ref_text.is_empty() {
                 return None;
@@ -173,7 +198,13 @@ pub fn calibrate_and_certify(
     // nonconformity gate and be vouched as good over the reviewer's explicit rejection.
     let certified_segment_ids: Vec<String> = all_segments
         .iter()
-        .filter(|seg| !crate::quality::is_human_rejected(seg) && compute_nonconformity_score(seg) <= threshold)
+        .filter(|seg| {
+            // Same rule on the certify side: a clip with no confidence signal cannot be vouched for by
+            // a threshold, because the score it would be compared against was invented, not measured.
+            !crate::quality::is_human_rejected(seg)
+                && has_scoreable_confidence(seg)
+                && compute_nonconformity_score(seg) <= threshold
+        })
         .map(|seg| seg.id.clone())
         .collect();
 
@@ -304,14 +335,60 @@ mod tests {
             "a degenerate score set must never report itself calibrated (bound {})",
             cert.expected_error_bound
         );
-        // The count itself is left intact — the UI is what must not present it as an achievement, and
-        // `StatsDashboard.svelte` shows "—" whenever `isCalibrated` is false. Pinned here so the
-        // tautology is visible in the test rather than only in a comment.
+        // CHANGED, not weakened. This assertion used to read `total_certified == flat.len()` and
+        // documented the tautology: with every score a manufactured 1.0, the fallback threshold was
+        // also 1.0 and all 40 "certified". Hiding that count in the UI treated the symptom.
+        // `has_scoreable_confidence` treats the cause: a clip with neither a confidence nor a ctc_score
+        // has nothing to score, so it calibrates nothing and certifies nothing. Zero is the honest
+        // count of what a no-confidence dataset certifies, and it is now the count the payload carries.
         assert_eq!(
-            cert.total_certified,
-            flat.len(),
-            "with a degenerate threshold EVERY segment passes — this is why the count must not be shown"
+            cert.total_certified, 0,
+            "a clip with no measured confidence must not be certified against an invented score"
         );
+        assert_eq!(cert.calibration_real_posterior + cert.calibration_heuristic, 0, "and none of it calibrates");
+    }
+
+    #[test]
+    fn a_scoreable_dataset_still_refuses_to_certify_the_clips_that_have_no_confidence() {
+        // The case the all-empty test CANNOT see. There, the calibration guard alone empties the set,
+        // `calibrate_threshold` takes its <10 cold-start path and returns 0.35, and the manufactured
+        // 1.0 fails that anyway — so removing the CERTIFY-side guard changed nothing and the fail-before
+        // passed. A guard that is only ever redundant is not a guard.
+        //
+        // So: calibrate on 40 real clips whose scores run ABOVE 1.0, at a loose target the Hoeffding
+        // slack can actually meet (~0.29 at n=40, hence 0.5 rather than 0.05). The threshold then lands
+        // at or above the 1.0 that a no-confidence clip manufactures, and only the certify-side guard
+        // keeps such clips out.
+        let mut segs: Vec<SpeechSegment> = (0..40)
+            .map(|i| {
+                // ctc -8.0 => nonconformity (1-0.5) + 0.8 = 1.3, comfortably above the fabricated 1.0.
+                let mut s = mock_segment(&format!("real{i}"), 0.5, -8.0, true, "ئەمڕۆ باشە", "ئەمڕۆ باشە");
+                s.raw_transcript = "ئەمڕۆ باشە".to_string(); // CER 0 keeps the empirical risk low
+                s
+            })
+            .collect();
+        // Two clips from a provider that returns no confidence at all (the owner's whole library).
+        for i in 0..2 {
+            let mut blind = mock_segment(&format!("blind{i}"), 0.5, -5.0, true, "ئەمڕۆ باشە", "ئەمڕۆ باشە");
+            blind.confidence = None;
+            blind.ctc_score = None;
+            segs.push(blind);
+        }
+
+        let cert = calibrate_and_certify(&segs, 0.5, 0.95);
+        assert!(cert.is_calibrated, "the 40 real clips must calibrate, or this test proves nothing");
+        assert!(
+            cert.threshold >= 1.0,
+            "the threshold must reach the fabricated score for the guard to be load-bearing (got {})",
+            cert.threshold
+        );
+        for i in 0..2 {
+            assert!(
+                !cert.certified_segment_ids.contains(&format!("blind{i}")),
+                "a clip with no measured confidence certified against an invented score"
+            );
+        }
+        assert_eq!(cert.total_certified, 40, "only the clips that carry a real signal are certified");
     }
 
     #[test]

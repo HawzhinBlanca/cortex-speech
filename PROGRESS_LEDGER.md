@@ -6091,3 +6091,49 @@ is `scripts/build_fleurs_ckb_manifest.py`, ~1–2 GB, one-time, and a download n
 go-ahead. Surfaced rather than silently skipped.
 
 Full lib suite 1103 passed, `cargo fmt` and `clippy --all-targets --all-features -D warnings` clean.
+
+### phase 19: the certificate scored 144 clips on a number nobody measured
+
+Phase 12 hid the "117 Certified Segments" tile while the certificate is uncalibrated. That treated the
+symptom. This is the cause, and `pipeline.rs` names it in its own comment:
+
+> Scribe returns no per-segment confidence, so `confidence` stays [None]
+
+Every clip in the owner's library came from that path — `confidence_source = external_provider` on all
+144, and `confidence` / `ctc_score` NULL on all 144. `compute_nonconformity_score` defaults a missing
+confidence to 0.5 and a missing ctc_score to -5.0, so **every clip scored exactly
+`(1 - 0.5) + 0.1·5 = 1.0`** — a constant manufactured from two fallbacks, identical for all of them.
+
+Not a missing writer: the pipeline persists a confidence whenever the engine returns one (288 of 432
+`segment_hypotheses` rows carry one, and `agent_confidence` is set on 143/144). The cloud STT engine
+simply returns none, and the per-call fallback that is sensible in isolation becomes ruinous as a
+population.
+
+`has_scoreable_confidence` now excludes a clip with NEITHER signal from BOTH the calibration set and
+the certified set. Such a clip is not an error and is not removed from the library — it carries no
+evidence, and **zero is the honest count of what a no-confidence dataset certifies.**
+
+Checked before changing anything: `certified_segment_ids` has no consumer in the UI, the exports or any
+gate, so the fabricated certification was never reaching a dataset decision.
+
+**A decorative guard, caught by running the fail-before rather than trusting it.** The first attempt
+reused the all-empty fixture: removing the certify-side guard changed nothing, because the calibration
+guard alone empties the set, `calibrate_threshold` takes its `<10` cold-start path and returns 0.35,
+and the manufactured 1.0 fails that anyway. **The fail-before PASSED.** A guard that is only ever
+redundant is not a guard.
+
+The replacement calibrates on 40 real clips whose scores run above 1.0, at a target the Hoeffding slack
+can actually meet (0.5, since the slack alone is ~0.29 at n=40), so the threshold reaches the fabricated
+score and only the certify-side guard keeps the blind clips out:
+
+```
+AFTER                              1 passed
+certify-side guard removed ONLY    FAILED  (a clip with no measured confidence certified
+                                            against an invented score)
+restored                           1 passed
+```
+
+The phase-12 test's assertion CHANGED rather than weakened: it used to pin `total_certified ==
+flat.len()` to document the tautology; it now pins `== 0`, because the tautology is gone.
+
+Full lib suite 1104 passed, `clippy --all-targets --all-features -D warnings` clean, policy 48/48.
