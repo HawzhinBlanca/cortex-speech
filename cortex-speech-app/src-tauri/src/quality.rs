@@ -703,8 +703,22 @@ fn find_duplicate_transcripts(segments: &[SpeechSegment]) -> (usize, usize, Vec<
     let mut by_hash: HashMap<String, Vec<&SpeechSegment>> = HashMap::new();
 
     for seg in segments {
+        // Same membership rule as every other quality tally: this is a signal about the dataset that
+        // will SHIP, so rows `export_dataset` drops cannot raise an alarm about it.
+        if is_human_rejected(seg) {
+            continue;
+        }
         let text = effective_transcript(seg);
         if text.trim().is_empty() {
+            continue;
+        }
+        // Placeholders are not duplicate transcripts, they are ABSENT ones — and they are absent in
+        // exactly the same words. Every clip stalled at "[Pending WSL 7B ASR]" carries that identical
+        // string, so a stuck import (an incident `is_effective_placeholder`'s own docstring records as
+        // having happened) would hash them into one enormous "duplicate transcripts" group and send
+        // the owner hunting a data problem that does not exist. The real problem in that case is the
+        // stall, which the placeholder counters already report.
+        if is_placeholder_transcript(text) {
             continue;
         }
         let hash = transcript_hash(text);
@@ -988,6 +1002,28 @@ mod tests {
             "the headline mean CER must not move when rows the export drops are added"
         );
         assert_eq!(with_junk.mean_wer, only_good.mean_wer, "same for mean WER");
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_rejects_and_never_groups_placeholders() {
+        // Two genuinely identical shipping transcripts: a real duplicate, and the only one that counts.
+        let a = seg("a", "ئەمڕۆ هەوا زۆر خۆشە", 4000);
+        let b = seg("b", "ئەمڕۆ هەوا زۆر خۆشە", 4100);
+
+        // Two clips stalled at the same placeholder. They are not duplicate transcripts, they are
+        // absent ones — and a stuck import makes hundreds of them, all carrying this exact string.
+        let p1 = seg("p1", "[Pending WSL 7B ASR]", 4000);
+        let p2 = seg("p2", "[Pending WSL 7B ASR]", 4200);
+
+        // Two rejected clips that happen to share text: dropped by export, so not a shipping problem.
+        let mut r1 = seg("r1", "پۆلیس و هێزی ئەمنی هاتن", 4000);
+        r1.human_decision = Some("reject".to_string());
+        let mut r2 = seg("r2", "پۆلیس و هێزی ئەمنی هاتن", 4000);
+        r2.human_decision = Some("reject".to_string());
+
+        let (groups, members, _detail) = find_duplicate_transcripts(&[a, b, p1, p2, r1, r2]);
+        assert_eq!(groups, 1, "only the real duplicate pair is a duplicate group");
+        assert_eq!(members, 2, "placeholders and rejects must not be counted as duplicate segments");
     }
 
     #[test]

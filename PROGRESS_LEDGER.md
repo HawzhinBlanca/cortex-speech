@@ -5941,3 +5941,51 @@ exposure is at most one second of typing, and a user-facing error for that would
 rather than "fixed" so the next pass does not re-litigate it.
 
 Policy suite 48/48.
+
+### phase 16: a stalled import would have been reported as a duplicate-transcript problem
+
+Eighth site of the recurring class (a tally counting rows the export drops), found by enumerating every
+function that aggregates over `&[SpeechSegment]` and checking each one's membership rule rather than
+waiting for a symptom.
+
+`find_duplicate_transcripts` hashed the effective transcript of every segment, skipping only empty text.
+Two consequences:
+
+* **Placeholders all share one string.** Every clip stalled at `[Pending WSL 7B ASR]` carries that exact
+  text, so a stuck import hashes them into ONE enormous "duplicate transcripts" group. That is not a
+  duplicate-content problem, it is an absent-content problem, and it would send the owner hunting a
+  data-quality issue that does not exist while the real fault — the stall — is reported elsewhere. Not
+  hypothetical: `is_effective_placeholder`'s own docstring records "a stuck-placeholder incident".
+* **Rejected clips** counted toward a signal about the dataset that will ship, over rows `export_dataset`
+  drops — the same rule already applied in export, conformal calibration, the lift triples, and (as of
+  phase 11) the mean WER/CER.
+
+**Measured on the live library before changing anything:**
+
+```
+duplicate groups reported        : 0
+segments counted as duplicates   : 0
+  ...of those HUMAN-REJECTED     : 0
+  ...of those PLACEHOLDER text   : 0
+```
+
+Latent again — nothing the owner sees moves today. Recorded plainly rather than dressed up.
+
+**Fail-before, both guards removed:**
+
+```
+assertion `left == right` failed: only the real duplicate pair is a duplicate group   FAILED
+restored                                                                              2 passed
+```
+
+**Checked and deliberately NOT changed:** `find_duration_outliers`. A duration outlier is a property of
+the AUDIO, and a rejected clip with a suspicious length is still worth seeing — the reject may even be
+because of it. Excluding there would hide evidence rather than remove noise, so the same rule does not
+transfer. Written down so a future sweep does not "fix" it for symmetry.
+
+Also checked and left alone: `couch::save_session`'s three `let _ =` call sites. They are not silent —
+`save_session` emits `tracing::warn!` on every failure path, and each call site carries a comment
+explaining why the Result is advisory there ("a session that fails to persist still serves every link it
+just issued... Only `revoke` treats this as an error worth raising"). The reasoning holds.
+
+Full lib suite 1102 passed, `cargo fmt` and `clippy --all-targets --all-features -D warnings` clean.
