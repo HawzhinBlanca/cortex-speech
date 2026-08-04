@@ -648,6 +648,26 @@ LOG_DIR = Path(tempfile.gettempdir()) / "cortex-verify10"
 # GREEN about code that is not under test.
 os.environ["CORTEX_GATE"] = "1"
 
+# CAPTURE THE NEXT 0xC0000409 INSTEAD OF LOSING IT.
+#
+# Twice now a Node leg has died with exit 3221226505 (STATUS_STACK_BUFFER_OVERRUN) inside a full sweep
+# and NEVER standalone (43 clean runs): `heartbeat-runtime` at 4.7s with its first line printed, and
+# `finetuned-ipc-e2e` at 0.6s with stdout completely EMPTY — dead before its own first console.log, i.e.
+# during Node/V8 startup or module load, not in the test body. stderr was empty both times and Windows
+# Error Reporting logged nothing, so there has been nothing to diagnose from.
+#
+# `--report-on-fatalerror` makes Node write a JSON diagnostic report (native + JS stacks, heap and
+# resource-usage counters, loaded libraries, the OS error) when V8 or the runtime dies fatally — which
+# is exactly the class 0xC0000409 belongs to, since a CRT/V8 abort() on Windows surfaces as fastfail.
+# Costs nothing on a healthy run: no report is written unless the process dies fatally.
+#
+# Deliberately NOT a retry. The crash still reds the leg honestly; this only means the next one leaves
+# evidence. Same stance as the preserved timestamped FAIL logs, which caught this crash's only other
+# recorded instance.
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+_node_report_opts = f"--report-on-fatalerror --report-directory={LOG_DIR}"
+os.environ["NODE_OPTIONS"] = (os.environ.get("NODE_OPTIONS", "") + " " + _node_report_opts).strip()
+
 
 def run_gate(name, kind, payload, cwd, probe, timeout=3600):
     """Run one gate; returns (status, seconds, detail). Full cmd output -> LOG_DIR/<gate>.log."""

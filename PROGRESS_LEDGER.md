@@ -6289,3 +6289,41 @@ redundant certify-side guard, and this one — every single time by RUNNING the 
 reading it. That is the entire argument for the practice.
 
 Full lib suite 1105 passed, `clippy --all-targets --all-features -D warnings` clean.
+
+### phase 23: the 0xC0000409 crash — instrumented, not fixed, and one inference retracted
+
+Owner asked for it fixed. It is not fixed, and this entry says so.
+
+**Second occurrence** (sweep gating `df6e01b`): `finetuned-ipc-e2e`, exit 3221226505, **0.6s**, stdout
+empty. First was `heartbeat-runtime`, 4.7s, first line printed. Still never standalone — 3 more clean
+runs today on the exact leg that crashed, on top of the previous 40.
+
+**RETRACTED: "it died before printing its first line, so the crash is at Node startup."** Node's stdout
+to a PIPE is buffered, and `run_gate` captures through a pipe — so buffered output is simply lost when
+the process dies abnormally. An empty stdout is therefore evidence of an abnormal death, NOT evidence
+of when it happened. The 0.6s duration still points early, but the stronger claim was wrong and is
+withdrawn.
+
+**Reproduction attempted and FAILED.** The hypothesis was resource pressure during Playwright's module
+load (a heavy require tree, and a sweep has many processes alive):
+
+```
+rapid repeated `require('@playwright/test')` + e2e_profile        0/25 non-zero
+same, with 8 concurrent memory-churning node processes            0/25 non-zero
+```
+
+50 clean. Memory pressure at module load is not the mechanism. (The machine has 256 GB, so a system OOM
+was always implausible; this rules out the per-process V8 path too.)
+
+**What was done instead: make the next one diagnosable.** `verify_10.py` now exports
+`NODE_OPTIONS=--report-on-fatalerror --report-directory=<LOG_DIR>`. Node writes a JSON diagnostic report
+— native and JS stacks, heap and resource counters, loaded libraries, the OS error — when V8 or the
+runtime dies fatally, which is the class 0xC0000409 belongs to (a CRT/V8 `abort()` on Windows surfaces
+as `__fastfail`). Nothing is written on a healthy run.
+
+Explicitly NOT a retry: the leg still reds honestly. This is the same stance as the preserved
+timestamped FAIL logs, which are the only reason either occurrence has any record at all.
+
+**Honest status: an open, unreproduced, undiagnosed defect at roughly 2 occurrences in ~20 sweeps.**
+Claiming it fixed because a later sweep goes green would be exactly the reasoning this ledger refuses
+elsewhere.
