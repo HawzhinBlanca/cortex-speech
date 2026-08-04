@@ -5989,3 +5989,49 @@ explaining why the Result is advisory there ("a session that fails to persist st
 just issued... Only `revoke` treats this as an error worth raising"). The reasoning holds.
 
 Full lib suite 1102 passed, `cargo fmt` and `clippy --all-targets --all-features -D warnings` clean.
+
+### phase 17: a pass that found almost nothing, written down so it is not re-walked
+
+Four areas probed with a specific failure in mind. Three hypotheses were wrong, and reading beat
+guessing every time. Recorded because an unwritten non-finding gets re-investigated by the next pass.
+
+**`couch::save_session`'s discarded Results — not silent.** Three `let _ = save_session(...)` call
+sites looked like the swallow-an-error class. They are not: `save_session` emits `tracing::warn!` on
+every failure path, and each call site carries the reasoning ("a session that fails to persist still
+serves every link it just issued... Only `revoke` treats this as an error worth raising"). The failure
+only bites on the NEXT restart, where the reviewer meets the link-expired banner, which is a designed,
+understandable path. Left alone.
+
+**Restore-over-a-hot-WAL — structurally impossible here.** The feared bug is a raw file swap leaving a
+stale `-wal` that SQLite replays over the restored pages, resurrecting exactly what the owner restored
+to escape. `Database::restore` does not swap files: it drives `sqlite3_backup` INTO the live open
+connection, so SQLite owns the WAL throughout. It also integrity-checks the snapshot first and refuses
+a snapshot from a newer schema. The concurrency window is separately fenced by `RESTORE_PENDING` and
+pinned at every writer-start site by `test_restore_reservation_gate.py`. Nothing to add — and no new
+drill was written, because building a gate for a gap with no evidence is how a suite gets slower
+without getting stronger.
+
+**The write path — already hardened.** Autosave failures reach `notifications.error`; a rejected
+settings write rolls back local + store to the last-persisted state and toasts (its comment already
+names the consent mismatch as safety-critical); the close handler falls back from `destroy()` to
+`close()` and surfaces it if both fail. One genuinely silent path remains — a throw while REGISTERING
+the close-request flush is logged only — and is deliberately left: autosave debounces at **1000 ms**,
+so the exposure is at most one second of typing.
+
+**0xC0000409 — still one occurrence, still unexplained.** Every preserved log since the failure-log
+fix was searched: the ONLY hit is the original `heartbeat-runtime.FAIL.20260803-080631.log`. It has not
+recurred across roughly fifteen full sweeps today. That is a measured base rate, not a diagnosis, and
+the leg still reds honestly if it happens again.
+
+**The preserved-failure-log fix earned itself twice more.** Alongside the crash evidence, the stamped
+logs held `test-rust.FAIL.20260803-232756.log` — a failure never seen live, from the sweep that was
+killed for overlapping this agent's edits:
+
+```
+error[E0425]: cannot find function `seg` in this scope
+assert_ran: command failed (exit 101) -- reporting that, not the count.
+```
+
+That was a transient half-edited test (`seg` before it became `mock_segment`), not a product defect —
+which independently confirms the decision to kill and discard that run rather than read its verdict.
+And `assert_ran.py` behaved exactly as written: the command's own failure reported ahead of any count.
