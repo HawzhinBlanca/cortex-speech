@@ -68,6 +68,7 @@ Run the relevant gates and paste the real output. A fix without a regression gat
 ## Working agreement
 
 - One logical change per commit, **Conventional Commits**, on a **branch** (never straight to `main`); end commit messages with the `Co-Authored-By: Claude` trailer per the charter.
+- Fast-forward `main` with `git push origin <branch>:main` — **never** by checking `main` out. A checkout rewrites every file that differs between the two commits, including tracked build inputs like `package.json`, which bumps their mtime past the built exe and reds `exe-freshness` for no real reason. Measured 2026-08-04: a green sweep went RED immediately after a push, costing a 7-minute relink and a full re-sweep. The ref-push updates the remote and leaves the working tree untouched.
 - Save final deliverables into the repo (the selected folder) and share them with `present_files`.
 - Don't weaken, skip, or delete a quality gate to make something pass. Don't scope-creep — log out-of-scope ideas instead of implementing them.
 
