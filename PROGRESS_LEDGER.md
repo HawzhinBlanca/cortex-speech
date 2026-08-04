@@ -6250,3 +6250,42 @@ than inventing a test that would not have run either.
 ignored and carries the corpus references plus absolute local paths, against the ledger's own
 "eval-only corpus; no audio/refs committed". `.gitignore` now excludes
 `cortex-speech-app/scripts/fleurs_ckb_iq/`; the committed portable record stays tracked.
+
+### phase 22: the accuracy record gets its confidence interval — and a third decorative test caught
+
+P0 #1 asks a published accuracy record to carry a CI, and phase 21 landed a bare point estimate
+(`CER 12.58%`, N=348). A point estimate at that N invites exactly the false-precision comparison the
+same audit objects to.
+
+`bootstrap_micro_ci` resamples whole UTTERANCES with replacement (Bisani & Ney ratio-of-sums) — the
+unit of independence is the clip, not the character, so a per-character bootstrap would badly
+understate the interval. Each replicate recomputes `sum(distance)/sum(ref_len)` over the resampled
+clips, matching how the headline micro rate is computed, clamp included. 3000 replicates, seed 42 —
+the same constants `scripts/scorecard_finetuned.py` used, so an interval from the app and one from the
+published scorecard are directly comparable. When there is nothing to resample the keys are ABSENT
+rather than null-filled: a `[0, 0]` on an empty run would be a fabricated interval.
+
+**A THIRD decorative check, and this one was mine twice over.** The fail-before passed, twice:
+
+1. The first sabotage never landed — `str.replace` reports nothing when it matches nothing, so the
+   "proof" ran against unmodified code. Now every sabotage asserts its target exists AND that the
+   replacement is present before the test runs.
+2. With the sabotage verified in the file, the test STILL passed. The fixture gave every clip
+   `ref_len = 20`, so `sum(ref_len)` is constant under resampling and the micro rate can only take a
+   handful of discrete values — the 2.5/97.5 percentiles land on the same ones whatever the seed. A
+   coarse fixture had made the determinism assertion decorative.
+
+Fixed by varying the denominator, after which the guard is load-bearing:
+
+```
+AFTER                                   1 passed
+seed defeated (verified in the file)    assertion failed: the bootstrap must be deterministic
+                                        under a fixed seed                              FAILED
+restored (SALT occurrences: 0)          1 passed
+```
+
+Three decorative guards have now been caught this way — the string-offset ordering check, the
+redundant certify-side guard, and this one — every single time by RUNNING the fail-before rather than
+reading it. That is the entire argument for the practice.
+
+Full lib suite 1105 passed, `clippy --all-targets --all-features -D warnings` clean.

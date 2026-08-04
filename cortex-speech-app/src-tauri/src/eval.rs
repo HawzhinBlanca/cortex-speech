@@ -655,12 +655,33 @@ pub fn run_gold_eval(
         }
     };
 
-    let meta = serde_json::json!({
+    // Utterance bootstrap over the SAME pairs the micro rates are built from, so the interval
+    // describes the number actually reported rather than a differently-filtered population.
+    let word_pairs: Vec<(usize, usize)> =
+        seg_details.iter().filter(|(_, w, _)| w.ref_len > 0).map(|(_, w, _)| (w.distance, w.ref_len)).collect();
+    let char_pairs: Vec<(usize, usize)> =
+        seg_details.iter().filter(|(_, _, c)| c.ref_len > 0).map(|(_, _, c)| (c.distance, c.ref_len)).collect();
+    let wer_ci = bootstrap_micro_ci(&word_pairs, EVAL_BOOTSTRAP_SAMPLES, EVAL_BOOTSTRAP_SEED);
+    let cer_ci = bootstrap_micro_ci(&char_pairs, EVAL_BOOTSTRAP_SAMPLES, EVAL_BOOTSTRAP_SEED);
+
+    let mut meta = serde_json::json!({
         "micro_wer": micro_wer,
         "micro_cer": micro_cer,
         "macro_wer": macro_wer,
         "macro_cer": macro_cer,
+        "bootstrap_samples": EVAL_BOOTSTRAP_SAMPLES,
+        "bootstrap_seed": EVAL_BOOTSTRAP_SEED,
     });
+    // Absent rather than null-filled when there is nothing to resample: a CI that reads [0, 0] on an
+    // empty run would be a fabricated interval, which is worse than no interval.
+    if let (Some(m), Some((lo, hi))) = (meta.as_object_mut(), wer_ci) {
+        m.insert("micro_wer_ci_low".into(), lo.into());
+        m.insert("micro_wer_ci_high".into(), hi.into());
+    }
+    if let (Some(m), Some((lo, hi))) = (meta.as_object_mut(), cer_ci) {
+        m.insert("micro_cer_ci_low".into(), lo.into());
+        m.insert("micro_cer_ci_high".into(), hi.into());
+    }
     let meta_str = serde_json::to_string(&meta).ok();
 
     let run = EvalRun {
@@ -822,6 +843,59 @@ pub fn load_eval_run_and_recompute(
 /// it is fully unit-testable without loading any model. Segments whose transcription
 /// fails are logged and skipped — never silently scored as an empty hypothesis, which
 /// would understate WER/CER.
+/// Seeded utterance-bootstrap 95% CI on a MICRO (ratio-of-sums) rate.
+///
+/// P0 #1 of the 2026-08-03 deep audit asks a published accuracy record to carry a confidence interval,
+/// and this path reported micro/macro only — so the first real gold run (`omniasr-ctc-300m`, N=348,
+/// CER 12.58%) landed as a bare point estimate. A point estimate at N=348 without a CI invites exactly
+/// the false-precision comparison the same audit objects to.
+///
+/// Resamples whole UTTERANCES with replacement (Bisani & Ney): the unit of independence is the clip,
+/// not the character, so a per-character bootstrap would badly understate the interval. Each replicate
+/// recomputes `sum(distance) / sum(ref_len)` over the resampled clips, matching how the headline micro
+/// rate is computed — including its `.min(1.0)` clamp.
+///
+/// Deterministic: same xorshift64 generator and seeding discipline as `compute_label_quality_lift`, so
+/// a re-run of the same data reproduces the interval exactly. Zero-reference clips are already excluded
+/// by the caller (they contribute to neither numerator nor denominator), so they cannot enter here.
+fn bootstrap_micro_ci(pairs: &[(usize, usize)], samples: usize, seed: u64) -> Option<(f64, f64)> {
+    let n = pairs.len();
+    if n == 0 || samples == 0 {
+        return None;
+    }
+    let mut state = seed | 1; // xorshift64 state must be non-zero
+    let mut rates: Vec<f64> = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let (mut dist, mut refl) = (0usize, 0usize);
+        for _ in 0..n {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let (d, r) = pairs[(state % n as u64) as usize];
+            dist += d;
+            refl += r;
+        }
+        if refl > 0 {
+            rates.push((dist as f64 / refl as f64).min(1.0));
+        }
+    }
+    if rates.is_empty() {
+        return None;
+    }
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let at = |q: f64| -> f64 {
+        let idx = ((q * (rates.len() as f64 - 1.0)).round() as usize).min(rates.len() - 1);
+        rates[idx]
+    };
+    Some((at(0.025), at(0.975)))
+}
+
+/// Bootstrap replicates for the eval CI. 3000 matches `scripts/scorecard_finetuned.py`, so an interval
+/// from this path and one from the published scorecard are directly comparable.
+const EVAL_BOOTSTRAP_SAMPLES: usize = 3000;
+/// Fixed so the interval is reproducible from the run id alone; same value the published scorecard used.
+const EVAL_BOOTSTRAP_SEED: u64 = 42;
+
 pub fn run_gold_eval_with_transcriber<F>(db: &Database, model_id: &str, mut transcribe: F) -> AppResult<EvalRunResult>
 where
     F: FnMut(&GoldSegment) -> AppResult<String>,
@@ -1884,6 +1958,36 @@ mod tests {
             result.run.wer,
             result.run.cer
         );
+    }
+
+    #[test]
+    fn the_eval_ci_is_seeded_reproducible_and_brackets_the_point_estimate() {
+        // A published accuracy record without a CI invites false precision (deep audit P0 #1). These are
+        // the three properties that make the interval usable rather than decorative.
+        // VARY ref_len, not just the distance. A fixture where every clip has the same denominator makes
+        // sum(ref_len) constant under resampling, so the micro rate can only take a handful of discrete
+        // values and the 2.5/97.5 percentiles land on the same ones whatever the seed — which made the
+        // determinism assertion below pass even with the seed deliberately defeated. Caught by running
+        // the fail-before; a coarse fixture is how a test becomes decorative.
+        let pairs: Vec<(usize, usize)> = (0..60).map(|i| ((i * 7) % 11 + 1, (i * 13) % 37 + 8)).collect();
+        let point = pairs.iter().map(|p| p.0).sum::<usize>() as f64 / pairs.iter().map(|p| p.1).sum::<usize>() as f64;
+
+        let (lo, hi) = bootstrap_micro_ci(&pairs, 2000, 42).expect("a CI over 60 clips");
+        assert!(lo < point && point < hi, "the interval must bracket the point estimate: {lo} < {point} < {hi}");
+        assert!(hi - lo > 0.0, "a degenerate zero-width interval is not an interval");
+
+        // Same seed, same data => byte-identical interval, so a run id reproduces its own numbers.
+        let again = bootstrap_micro_ci(&pairs, 2000, 42).unwrap();
+        assert_eq!((lo, hi), again, "the bootstrap must be deterministic under a fixed seed");
+
+        // Resampling is over UTTERANCES: a corpus where every clip is identical has no variance to find.
+        let flat: Vec<(usize, usize)> = vec![(2, 20); 40];
+        let (flo, fhi) = bootstrap_micro_ci(&flat, 500, 42).unwrap();
+        assert!((flo - fhi).abs() < 1e-12, "identical clips cannot produce a spread: {flo}..{fhi}");
+
+        // Nothing to resample must yield NO interval rather than a fabricated [0,0].
+        assert!(bootstrap_micro_ci(&[], 1000, 42).is_none(), "an empty run has no CI");
+        assert!(bootstrap_micro_ci(&pairs, 0, 42).is_none(), "zero replicates is not a CI");
     }
 
     #[test]
