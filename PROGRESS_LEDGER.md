@@ -6327,3 +6327,24 @@ timestamped FAIL logs, which are the only reason either occurrence has any recor
 **Honest status: an open, unreproduced, undiagnosed defect at roughly 2 occurrences in ~20 sweeps.**
 Claiming it fixed because a later sweep goes green would be exactly the reasoning this ledger refuses
 elsewhere.
+
+### phase 24: the warning count is now actually zero
+
+Owner asked for "any other bugs or warnings" after the crash work. Measured across the three surfaces
+that emit them:
+
+```
+cargo build --all-targets   0 warnings
+npm audit --omit=dev        0 vulnerabilities
+eslint src/                 4 warnings   <- the only outstanding ones
+```
+
+Four dead type imports: `GoldSegment`, `FewShotExample`, `T0GateReport` in `commands.ts` and `derived`
+in `historyStore.ts`. Checked before deleting rather than trusting eslint — each appears exactly ONCE
+in its own file (the import itself), is referenced by no other file, and `commands.ts`'s three
+`export type` lines re-export none of them. So removal cannot break a downstream import.
+
+After: **eslint clean, 0 warnings.** typecheck 427 files 0 errors, vitest 217 passed.
+
+A warning nobody intends to fix teaches everyone to scroll past the warnings, which is how a real one
+gets missed. Zero is the only count that keeps the signal.

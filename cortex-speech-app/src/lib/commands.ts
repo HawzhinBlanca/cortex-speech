@@ -1156,15 +1156,7 @@ export async function getActiveLearningQueue(
 
 // ── Phase 1 — Gold-Set Eval Harness ────────────────────────────────────────
 
-import type {
-  GoldSegment,
-  EvalRun,
-  EvalRunResult,
-  EscalationTrendPoint,
-  LabelQualityLift,
-  FewShotExample,
-  T0GateReport,
-} from './types';
+import type { EvalRun, EvalRunResult, EscalationTrendPoint, LabelQualityLift } from './types';
 
 export async function runGoldEval(
   modelId: string,

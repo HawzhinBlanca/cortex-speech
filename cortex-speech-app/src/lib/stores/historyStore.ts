@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { writable, derived } from 'svelte/store';
+import { writable } from 'svelte/store';
 import { isTauriRuntime } from '../runtime';
 
 export interface HistoryState {
