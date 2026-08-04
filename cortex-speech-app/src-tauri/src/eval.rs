@@ -865,15 +865,21 @@ pub struct LabelQualityLift {
     /// Scored rows whose reference is CHARACTER-IDENTICAL to the jury hypothesis, so their jury
     /// distance is zero no matter what the jury did.
     ///
-    /// This is the honest limit of the whole metric. The reference is the human's confirmed
-    /// transcript, and accepting a clip copies the jury's own output into it — so an accept scores
-    /// the jury against itself and CANNOT tell "the jury was right" from "the reviewer rubber-
-    /// stamped it". Only a row the human wrote differently is independent evidence.
+    /// This is the honest limit of the whole metric, and it is structural rather than situational.
     ///
-    /// Measured on the owner's library 2026-08-03: 39 of 39 scored rows. A displayed
-    /// "post-jury CER 0.0% (95% CI)" was therefore arithmetic, not measurement, and `cer_lift =
-    /// raw - jury` was the raw ASR error relabelled, crediting the jury with all of it by
-    /// construction. Callers MUST NOT present the jury figure when this equals `n`.
+    /// CORRECTED 2026-08-04. The first version of this doc blamed ACCEPTING a clip ("an accept copies
+    /// the jury's output into the reference"). That was wrong. `corrections.rs` is the single source of
+    /// truth on the column's meaning: *"verdict_transcript ... is the human's ANSWER (the
+    /// reference/target the evidence is scored AGAINST), never the model draft"*. `load_lift_triples`
+    /// passes that column as the JURY hypothesis, so this metric compares the human's answer with the
+    /// human's answer — for every decided row, regardless of what the reviewer did.
+    ///
+    /// Measured on the owner's library: 39 of 39 scored rows self-referential, INCLUDING 34 of the 35
+    /// clips the reviewer edited. Editing cannot make it measurable; the advice that it would was wrong.
+    ///
+    /// The post-jury text is not persisted anywhere — `segment_hypotheses` stores per-ENGINE drafts, not
+    /// the jury's consensus — so a raw-vs-post-jury lift cannot be computed from what this schema keeps.
+    /// Callers MUST NOT present the jury figure when this equals `n`, which on real data is always.
     pub self_referential_n: usize,
 }
 
@@ -973,6 +979,12 @@ pub fn compute_label_quality_lift(
 /// the human's correction (`annotated_transcript`) is the ground-truth reference, `raw_transcript`
 /// is the raw ASR hypothesis, and `verdict_transcript` is the post-jury label. Only segments that
 /// carry all three (non-empty) are included — a real measured lift needs ground truth + both hyps.
+/// NOTE (2026-08-04): the third column, `verdict_transcript`, is documented in `corrections.rs` as
+/// "the human's ANSWER ... never the model draft". It is therefore NOT an independent jury hypothesis,
+/// and the lift computed from these triples compares the human's answer with itself on every decided
+/// row. The metric is retained (and the UI withholds it) rather than silently deleted, because the
+/// honest fix is to persist the jury's verdict separately from the human's — a schema decision, not a
+/// calculation change.
 pub fn load_lift_triples(db: &Database) -> AppResult<Vec<(String, String, String)>> {
     let conn = db.connection();
     let mut stmt = conn.prepare(
@@ -984,13 +996,20 @@ pub fn load_lift_triples(db: &Database) -> AppResult<Vec<(String, String, String
         // guard a rejected clip inflates LabelQualityLift.n and folds its char distances into the MEASURED
         // raw/jury micro-CER + lift + CI, crediting the jury for "improving" a label on a clip that never
         // ships (export_dataset drops it via is_human_rejected).
-        "SELECT annotated_transcript, raw_transcript, verdict_transcript \
+        // v48: `jury_transcript`, NOT `verdict_transcript`. The latter is whichever verdict is current
+        // and a human decision overwrites it with the reviewer's own correction — so reading it here
+        // compared the human's answer with the human's answer and returned zero on every decided row,
+        // forever, whatever the reviewer did. `jury_transcript` is written only by
+        // `write_segment_verdict`, so it keeps the MACHINE's text and gives this metric a genuinely
+        // independent side. Rows where the jury never committed a verdict (it escalated instead) are
+        // excluded rather than defaulted: no machine text means nothing to score, not a score of zero.
+        "SELECT annotated_transcript, raw_transcript, jury_transcript \
          FROM speech_segments \
          WHERE human_decision IS NOT NULL AND TRIM(human_decision) <> '' \
            AND human_decision NOT IN ('reject', 'human_reject') \
            AND COALESCE(verdict, '') <> 'human_reject' \
            AND annotated_transcript IS NOT NULL AND TRIM(annotated_transcript) <> '' \
-           AND verdict_transcript IS NOT NULL AND TRIM(verdict_transcript) <> '' \
+           AND jury_transcript IS NOT NULL AND TRIM(jury_transcript) <> '' \
            AND raw_transcript IS NOT NULL AND TRIM(raw_transcript) <> ''",
     )?;
     let rows =
@@ -1118,11 +1137,17 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-            // verdict / verdict_transcript / human_decision are jury/decision columns that insert_segment
-            // omits by design, so set them here — including verdict_transcript (the post-jury label).
+            // verdict / jury_transcript / human_decision are jury/decision columns that insert_segment
+            // omits by design, so set them here. v48: the post-jury text is `jury_transcript` — the
+            // MACHINE's own output, written only by write_segment_verdict. `verdict_transcript` is set
+            // too, to the human's answer, exactly as the real decision path leaves it: this fixture then
+            // reproduces the shape that made the metric self-referential, and the query must be reading
+            // the jury column to survive it.
             db.connection()
                 .execute(
-                    "UPDATE speech_segments SET human_decision=?2, verdict=?3, verdict_transcript='دەقی ڕاست' WHERE id=?1",
+                    "UPDATE speech_segments \
+                     SET human_decision=?2, verdict=?3, jury_transcript='خاوی جوری', verdict_transcript='دەقی ڕاست' \
+                     WHERE id=?1",
                     params![id, decision, verdict],
                 )
                 .unwrap();
@@ -1130,6 +1155,39 @@ mod tests {
         let triples = load_lift_triples(&db).unwrap();
         assert_eq!(triples.len(), 1, "only the accepted clip is a lift triple; the rejected one is excluded");
         assert_eq!(triples[0].0, "دەقی ڕاست", "the surviving triple is the accepted clip's human reference");
+        // The whole point of v48: the jury side must be the MACHINE's text, not the human's answer.
+        // Reading `verdict_transcript` here would make this equal `triples[0].0` and the metric would
+        // report a perfect jury on every decided row for ever.
+        assert_eq!(triples[0].2, "خاوی جوری", "the jury side comes from jury_transcript, not the human's answer");
+        assert_ne!(triples[0].0, triples[0].2, "reference and jury hypothesis must be independent texts");
+    }
+
+    #[test]
+    fn a_human_edit_cannot_overwrite_the_machines_recorded_verdict() {
+        // The defect v48 closes, end to end through the real write paths. `write_segment_verdict` records
+        // the machine's text; the reviewer then edits the clip. Before v48 the edit replaced the only
+        // copy of the machine's answer, which is why 34 of the owner's 35 edited clips scored the jury
+        // against itself.
+        let db = open_mem_db();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "s1".to_string(),
+            audio_path: "/clips/s1.wav".to_string(),
+            raw_transcript: "خاو".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        db.write_segment_verdict("s1", "jury_edit", Some("دەقی جوری"), None, None, None, false).unwrap();
+        db.record_human_decision("s1", "edit", Some("دەقی مرۆڤ"), None).unwrap();
+
+        let (jury, human): (Option<String>, Option<String>) = db
+            .connection()
+            .query_row("SELECT jury_transcript, verdict_transcript FROM speech_segments WHERE id='s1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(human.as_deref(), Some("دەقی مرۆڤ"), "the human's edit is the current verdict text");
+        assert_eq!(jury.as_deref(), Some("دەقی جوری"), "the machine's verdict SURVIVED the human's edit");
     }
 
     #[test]

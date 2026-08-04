@@ -6035,3 +6035,59 @@ assert_ran: command failed (exit 101) -- reporting that, not the count.
 That was a transient half-edited test (`seg` before it became `mock_segment`), not a product defect —
 which independently confirms the decision to kill and discard that run rather than read its verdict.
 And `assert_ran.py` behaved exactly as written: the command's own failure reported ahead of any count.
+
+### phase 18: the jury's verdict is now kept where a human edit cannot erase it (migration v48)
+
+Owner instruction: "record the jury verdict separately, then rerun the eval".
+
+**The defect, stated correctly this time.** `verdict_transcript` holds whichever verdict is CURRENT:
+`write_segment_verdict` writes the machine's text, then `record_human_decision_by` overwrites it with
+the reviewer's correction. `corrections.rs` states the end result as settled fact — *"verdict_transcript
+... is the human's ANSWER (the reference/target the evidence is scored AGAINST), never the model
+draft"*. `load_lift_triples` passed that column as the JURY hypothesis, so the label-quality lift
+compared the human's answer with the human's answer on every decided row.
+
+Phase 10 blamed ACCEPTING a clip and told the reviewer that editing would fix it. Both wrong, and
+measured wrong: **34 of the 35 clips the owner had edited are self-referential too**. The product was
+giving him work that could not help. Corrected in the card, in `LabelQualityLift`'s doc, and here.
+
+**v48** adds `jury_transcript`, written only by `write_segment_verdict` and by no human path.
+`load_lift_triples` now reads it, and excludes rows where the jury never committed one — no machine
+text means nothing to score, not a score of zero.
+
+**No backfill, deliberately.** On decided rows the machine's text was overwritten and is gone; on the
+77 undecided rows `verdict_transcript` is EMPTY. Copying the current column would either duplicate the
+human's answer (re-creating the exact defect) or copy nothing. NULL is the truth for every existing row.
+
+**Fail-before, through the real write paths:**
+
+```
+jury column write reverted   assertion failed: the machine's verdict SURVIVED the human's edit
+                             left: None   right: Some("دەقی جوری")                       FAILED
+restored                                                                                 1 passed
+```
+
+The reject-exclusion test's fixture now sets `jury_transcript` AND `verdict_transcript` to different
+texts, so it reproduces the shape that made the metric self-referential — the query only survives it by
+reading the jury column. Two new assertions pin that the two sides are independent texts.
+
+**What this will and will not do on the owner's library — measured, not assumed.**
+
+```
+decision_verdicts.auto_accept_verdict:  144  T1_ESCALATE   (all 144)
+verdict distribution:                    77  escalated · 34 human_edit · 27 human_reject · 5 human_accept
+undecided rows carrying a machine verdict: 0
+```
+
+**The jury escalated every single clip and never committed a verdict of its own.** So the new column
+will stay empty until the jury actually commits one, which needs the T0 gate to calibrate — and
+`min_calibration_n` at the shipped constants is ~2,334 perfect clips PER SNR BUCKET, already recorded
+here as unreachable at one user's volumes. The schema is now correct and the metric honest; the data to
+fill it does not exist yet and no amount of reviewing creates it.
+
+**"Rerun the eval" — cannot run, and why.** `gold_segments` = 0 and `eval_runs` = 0. The frozen
+348-clip manifest is committed but the FLEURS ckb_IQ audio is not (1 sample clip on disk); fetching it
+is `scripts/build_fleurs_ckb_manifest.py`, ~1–2 GB, one-time, and a download needs the owner's
+go-ahead. Surfaced rather than silently skipped.
+
+Full lib suite 1103 passed, `cargo fmt` and `clippy --all-targets --all-features -D warnings` clean.

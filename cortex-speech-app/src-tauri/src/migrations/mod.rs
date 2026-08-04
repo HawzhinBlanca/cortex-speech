@@ -1340,6 +1340,32 @@ pub static MIGRATIONS: &[Migration] = &[
         up_sql: "ALTER TABLE speech_segments ADD COLUMN speaker_change_score REAL;",
         down_sql: Some("ALTER TABLE speech_segments DROP COLUMN speaker_change_score;"),
     },
+    Migration {
+        version: 48,
+        description: "Keep the machine's verdict text where a human decision cannot overwrite it",
+        // `verdict_transcript` holds whichever verdict is CURRENT: the machine writes it, and then
+        // `record_human_decision_by` overwrites it with the reviewer's correction. `corrections.rs`
+        // states the consequence as settled fact — "verdict_transcript ... is the human's ANSWER ...
+        // never the model draft" — and that is exactly why the label-quality lift could never work:
+        // `load_lift_triples` passed that column as the JURY hypothesis, so it compared the human's
+        // answer with the human's answer and returned zero on every decided row, forever. Measured on
+        // the owner's library 2026-08-04: 39 of 39 scored rows self-referential, INCLUDING 34 of the 35
+        // clips he had edited.
+        //
+        // This column is written ONLY by `write_segment_verdict` (the machine) and never by any human
+        // path, so the two texts stay distinguishable and the lift finally has an independent side.
+        //
+        // NO BACKFILL, deliberately. The pre-existing machine verdicts are not recoverable: on decided
+        // rows they were overwritten, and on the 77 undecided rows `verdict_transcript` is EMPTY because
+        // every clip in this library carries `T1_ESCALATE` — the jury escalated all 144 and never
+        // committed a verdict of its own. Copying the current column here would therefore either
+        // duplicate the human's answer (re-creating the exact defect) or copy nothing. NULL means
+        // "no machine verdict recorded", which is the truth for every existing row.
+        //
+        // Nullable TEXT is STRICT-compatible, and ADD COLUMN fires no FK cascade, so no FK-off window.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN jury_transcript TEXT;",
+        down_sql: Some("ALTER TABLE speech_segments DROP COLUMN jury_transcript;"),
+    },
 ];
 
 #[cfg(test)]

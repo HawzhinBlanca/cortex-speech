@@ -129,16 +129,21 @@
     <div class="card" data-testid="refinery-lift">
       <h3 class="card-title">Label-quality lift (raw ASR → post-jury)</h3>
       {#if lift && lift.n > 0 && lift.selfReferentialN >= lift.n}
-        <!-- Every scored clip had its reference COPIED from the jury verdict (that is what accepting a
-             clip does), so the jury was compared with itself and its error is zero whatever it
-             produced. Showing "0.0% post-jury CER (95% CI)" here read as proof the jury was perfect,
-             and the lift beside it was the raw ASR error under the jury's name. Measured on the real
-             library 2026-08-03: 39 of 39 rows. State the limit instead of the arithmetic. -->
+        <!-- CORRECTED 2026-08-04. The first version of this branch blamed accepting a clip, and told the
+             reviewer that editing instead would fix it. Both were wrong, and the codebase says so in
+             `corrections.rs`: "verdict_transcript ... is the human's ANSWER (the reference/target the
+             evidence is scored AGAINST), never the model draft". `load_lift_triples` passes that column
+             as the JURY hypothesis, so the metric compares the human's answer with the human's answer —
+             for every row, always, whatever the reviewer does. Measured: 34 of 35 EDITED clips are
+             self-referential too, so editing changes nothing.
+             The post-jury text is not persisted anywhere (segment_hypotheses holds per-ENGINE drafts,
+             not the jury consensus), so this card cannot be computed as specified. Say only what is
+             true and do not send the reviewer to do work that cannot help. -->
         <p class="muted" data-testid="refinery-lift-self-referential">
-          Not measurable yet — on all {lift.n} verified {lift.n === 1 ? 'clip' : 'clips'} your confirmed
-          transcript is the jury's own output, so its error is zero by arithmetic rather than by
-          measurement. Editing a transcript instead of accepting it produces the independent
-          comparison this needs.
+          Not measurable — the stored “post-jury” text for a decided clip is the human's own answer, so
+          this compares that answer with itself and can only ever report zero. It is not a statement
+          about the jury's accuracy, and no amount of reviewing changes it: measuring the jury needs its
+          verdict recorded separately from the human's, which this library does not yet do.
         </p>
       {:else if lift && lift.n > 0}
         <div class="lift-grid">

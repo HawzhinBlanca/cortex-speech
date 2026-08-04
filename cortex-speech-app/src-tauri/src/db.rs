@@ -2653,6 +2653,12 @@ impl Database {
                 "UPDATE speech_segments
                  SET verdict              = ?2,
                      verdict_transcript   = ?3,
+                     -- v48: the SAME text, kept where no human path can overwrite it. `verdict_transcript`
+                     -- is whichever verdict is current and `record_human_decision_by` replaces it with the
+                     -- reviewer's correction, which is why the label-quality lift compared the human's
+                     -- answer with itself on every decided row. This column is written here and nowhere
+                     -- else, so the machine's own output survives the human's.
+                     jury_transcript      = ?3,
                      rationale            = ?4,
                      evidence_json        = ?5,
                      agent_confidence     = COALESCE(?6, agent_confidence),
