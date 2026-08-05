@@ -318,10 +318,13 @@ export const en: Record<string, string> = {
   validate: 'Validate',
   'validation.title': 'Dataset Curation Panel',
   'validation.total': 'Total segments',
-  'validation.passed': 'Passed',
+  'validation.passed': 'Passed checks',
   'validation.errors': 'Errors',
   'validation.warnings': 'Warnings',
-  'validation.allClear': 'No issues found — dataset looks good!',
+  // Audit 2026-08-05 #6: this used to read "dataset looks good!" while the same corpus had 0
+  // exportable rows. Validation checks integrity, NOT export eligibility — the readiness verdict is
+  // a different question with a different answer, and this panel must not answer it.
+  'validation.allClear': 'No validation issues found. This is not export readiness — see the readiness verdict in Insights.',
   'validation.rerun': 'Re-run validation',
   'validation.failed': 'Validation failed',
   'validation.goToSegment': 'Go to segment',

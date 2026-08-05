@@ -276,8 +276,12 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
         .filter(|s| !failed_ids.contains(s.id.as_str()) && !missing_paths.contains(s.audio_path.as_str()))
         .count();
 
+    // Audit 2026-08-05 #6: this subtitle read "All 144 segments passed validation" on a corpus with
+    // ZERO exportable rows, which a reader takes as a publication verdict. It is not one. Validation
+    // answers "is this data internally sound"; export eligibility is a different question answered by
+    // training_grade_for_segment and the rights gate. Naming what was checked keeps the sentence true.
     let summary = if errors.is_empty() && warnings.is_empty() {
-        format!("All {} segments passed validation", segments.len())
+        format!("All {} segments passed validation checks", segments.len())
     } else {
         let mut parts = Vec::new();
         if !errors.is_empty() {
@@ -286,7 +290,7 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
         if !warnings.is_empty() {
             parts.push(format!("{} warning(s)", warnings.len()));
         }
-        format!("{} — {} passed", parts.join(", "), passed)
+        format!("{} — {} passed validation checks", parts.join(", "), passed)
     };
 
     Ok(ValidationReport {

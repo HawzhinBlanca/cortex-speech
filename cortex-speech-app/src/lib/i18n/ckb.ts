@@ -319,10 +319,13 @@ export const ckb: Record<string, string> = {
   validate: 'پشکنین',
   'validation.title': 'پانێڵی باشترکردنی داتاسێت',
   'validation.total': 'کۆی بەشەکان',
-  'validation.passed': 'سەرکەوتوو',
+  'validation.passed': 'سەرکەوتوو لە پشکنین',
   'validation.errors': 'هەڵەکان',
   'validation.warnings': 'ئاگادارییەکان',
-  'validation.allClear': 'هیچ کێشەیەک نەدۆزرایەوە — داتاسێت باشە!',
+  // Audit 2026-08-05 #6, see en.ts. The first clause is the ORIGINAL verified Sorani, kept verbatim;
+  // only the overclaiming "داتاسێت باشە!" is replaced, composed from vocabulary already established in
+  // this file (ئامادە / هەناردە). Flagged for the owner (native Sorani) to confirm the phrasing.
+  'validation.allClear': 'هیچ کێشەیەک نەدۆزرایەوە — بەڵام ئەمە مانای ئامادەبوون بۆ هەناردە نییە.',
   'validation.rerun': 'دووبارە پشکنین',
   'validation.failed': 'پشکنین سەرکەوتوو نەبوو',
   'validation.goToSegment': 'بڕۆ بۆ بەش',

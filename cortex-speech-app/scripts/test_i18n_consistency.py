@@ -85,10 +85,47 @@ def test_every_referenced_literal_key_is_defined() -> None:
         )
 
 
+def test_validation_strings_never_claim_export_readiness() -> None:
+    """Validation checks integrity; it does NOT decide whether a dataset may be published.
+
+    Audit 2026-08-05 #6 found `validation.allClear` reading "dataset looks good!" on a corpus with
+    ZERO exportable rows — validation passing was being presented as a publication verdict. The
+    readiness verdict lives in Insights and is computed from training grades and the rights gate.
+    This pins the separation so a future reassuring rewrite cannot re-merge the two claims.
+
+    Scoped to `validation.*` VALUES, deliberately, and parsed rather than grepped. `stats.ready`
+    legitimately says "Ready to export" — that IS the readiness verdict, computed from training
+    grades and the rights gate, and banning the phrase everywhere would gag the one string entitled
+    to use it. Matching parsed values also means this file's own explanatory comments cannot trip it,
+    which a raw substring scan did on its first run.
+    """
+    banned = ("looks good", "ready to export", "ready for export", "good to go", "all good")
+    entry = re.compile(r"""(?m)^\s+'(validation\.[^']+)'\s*:\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")""")
+    for locale in ("en.ts", "ckb.ts"):
+        text = (SRC / "lib" / "i18n" / locale).read_text(encoding="utf-8")
+        checked = 0
+        for match in entry.finditer(text):
+            key = match.group(1)
+            value = (match.group(2) or match.group(3) or "").lower()
+            checked += 1
+            for phrase in banned:
+                if phrase in value:
+                    raise AssertionError(
+                        f"{locale} '{key}' contains '{phrase}': validation reports INTEGRITY, and must "
+                        "not present passing checks as export readiness (audit 2026-08-05 #6). The "
+                        "readiness verdict lives in Insights."
+                    )
+        # A guard that silently stops matching its own input is worse than none — the same reasoning
+        # the vitest/cargo floors in verify_10 exist for.
+        if checked < 5:
+            raise AssertionError(f"{locale}: only {checked} validation.* strings parsed — the matcher stopped working")
+
+
 def main() -> None:
     test_no_duplicate_keys_within_a_locale()
     test_en_and_ckb_have_identical_key_sets()
     test_every_referenced_literal_key_is_defined()
+    test_validation_strings_never_claim_export_readiness()
     print("i18n consistency policy regression passed")
 
 
