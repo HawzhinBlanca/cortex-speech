@@ -6677,3 +6677,33 @@ segments and 67 decisions intact.
 markdown file embedding absolute user-profile paths that the hygiene gate rejects in tracked files.
 Reset, unstaged, and the folder added to `.gitignore` beside the existing `docs/audits/` entry, which
 exists for exactly this reason. Files untouched on disk.
+
+## Iteration 244 — production release provenance and fail-closed publication
+
+The 2026-08-05 production audit confirmed that a `v*` tag could publish Windows installers after
+printing only a warning when Authenticode credentials were absent. The same matrix also let every
+platform builder write to the GitHub Release independently, creating an avoidable publication race
+and exposing a repository-write token to build and test steps.
+
+The release path now fails before upload when either Windows signing secret is absent, requires at
+least one installer, verifies every signature with `signtool /pa`, and removes the temporary PFX in a
+`finally` block. All platforms remain build smoke checks, while the supported Windows bundle gets a
+deterministic, streaming SHA-256 manifest and a SHA-pinned GitHub/Sigstore build-provenance
+attestation. Builders retain read-only repository access; one dependent publisher downloads the
+supported signed bundle and updates the release after every build
+finishes. Static policy regressions pin the signing, permission, ordering, checksum, and attestation
+contracts.
+
+The audit also found two stale Vite E2E mock contracts: training-grade readiness fell through to an
+invalid payload and Tauri window metadata was absent, producing repeated console errors and a
+load-sensitive accessibility timeout. The mock now returns the real readiness shape, supplies window
+metadata, and exercises the successful media-grant path. The prior readiness-state change's Python
+policy was updated to protect the new neutral `not_required` state rather than an obsolete test name.
+
+Verification on this checkout: frontend unit tests 217/217; Playwright 94/94 including axe WCAG 2.2
+AA; Rust `--all-targets` 1,114 library tests plus every integration target and the soak test passed
+(expected live/model tests remained ignored); all three benchmark harnesses completed; build,
+Svelte/TypeScript checks, ESLint, rustfmt and clippy `-D warnings` passed; npm audit found zero
+production vulnerabilities; cargo-deny passed advisories, bans, licenses and sources. Public signing,
+GitHub-hosted attestation, installer verification, and notarization still require the owner-held
+credentials/platform release run and are not claimed from local tests.

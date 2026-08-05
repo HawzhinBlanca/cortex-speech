@@ -152,6 +152,37 @@ def test_release_runs_the_governance_gate() -> None:
     assert_contains(workflow("release.yml"), "verify_10.py", "release.yml")
 
 
+def test_release_fails_closed_on_signing_and_attests_artifacts() -> None:
+    """A public tag must never degrade to an unsigned Windows download, and every published
+    artifact must carry both an offline-verifiable digest and GitHub build provenance."""
+    release = workflow_steps_text("release.yml")
+    assert_contains(release, "id-token: write", "release.yml")
+    assert_contains(release, "attestations: write", "release.yml")
+    assert_contains(release, "refusing to publish unsigned Windows installers", "release.yml")
+    if "Installers UNSIGNED" in release or "exit 0" in release:
+        raise AssertionError("release.yml must fail closed when Windows signing credentials are missing")
+    assert_contains(release, "scripts/generate_release_checksums.py", "release.yml")
+    assert_contains(release, "actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26", "release.yml")
+    assert_contains(release, "needs: build", "release.yml")
+    assert_contains(release, "actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53", "release.yml")
+    assert_contains(release, "pattern: cortex-speech-windows-latest", "release.yml")
+    if release.count("if: runner.os == 'Windows'") < 4:
+        raise AssertionError("only the supported signed Windows bundle may enter the public release path")
+
+    checksums = release.find("scripts/generate_release_checksums.py")
+    attestation = release.find("actions/attest@")
+    upload = release.find("actions/upload-artifact@")
+    publish = release.find("softprops/action-gh-release@")
+    if min(checksums, attestation, upload, publish) < 0 or not (checksums < attestation < upload < publish):
+        raise AssertionError("release checksums and provenance must be generated before upload and publication")
+
+    build_job = release.find("  build:")
+    publish_job = release.find("  publish:")
+    write_permission = release.find("      contents: write")
+    if min(build_job, publish_job, write_permission) < 0 or not (build_job < publish_job < write_permission):
+        raise AssertionError("repository write permission must be scoped to the serialized publish job")
+
+
 def test_nightly_real_audio_fails_on_real_regressions_but_skips_missing_fixtures() -> None:
     nightly = workflow("nightly-real-audio.yml")
     if "continue-on-error" in nightly:
@@ -173,6 +204,7 @@ def main() -> None:
     test_playwright_browser_install_precedes_e2e()
     test_provisioning_precedes_every_compiling_cargo_step()
     test_release_runs_the_governance_gate()
+    test_release_fails_closed_on_signing_and_attests_artifacts()
     test_nightly_real_audio_fails_on_real_regressions_but_skips_missing_fixtures()
     print("workflow policy regression passed")
 

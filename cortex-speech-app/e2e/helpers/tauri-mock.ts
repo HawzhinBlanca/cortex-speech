@@ -133,6 +133,31 @@ export async function installTauriMock(page: Page): Promise<void> {
             return mockQuality;
           case 'get_dataset_certificate':
             return mockCertificate;
+          case 'register_media_asset':
+            return { id: 'e2e-audio-grant' };
+          case 'get_media_asset_url':
+            // Valid empty WAV. Keeping playback on a data URL exercises the successful grant path
+            // without leaking test requests to the Vite server or flooding logs with expected 404s.
+            return 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+          case 'get_waveform':
+            return [0.1, 0.35, 0.8, 0.4, 0.15];
+          case 'get_audio_duration':
+            return 1.5;
+          case 'get_training_grade_breakdown':
+            // Match the fail-closed readiness contract. Falling through to null/object stubs makes
+            // the Insights panel log an error on every E2E page load and leaves the accessibility
+            // scan racing a permanently degraded render.
+            return {
+              summary: {
+                totalSegments: 1,
+                trainingReadySegments: 0,
+                goldSegments: 0,
+                silverSegments: 0,
+                reviewSegments: 1,
+                rejectedSegments: 0,
+              },
+              reasonCounts: { not_human_or_high_confidence_agent_verified: 1 },
+            };
           case 'get_configured_providers':
             // Names only, never key values — matches the real configured_providers() contract.
             return ['elevenlabs'];
@@ -323,6 +348,12 @@ export async function installTauriMock(page: Page): Promise<void> {
           default:
             return null;
         }
+      },
+      // @tauri-apps/api/window reads these labels before registering the close-request handler.
+      // Without them Vite E2E emits a TypeError on every mount, hiding real console regressions.
+      metadata: {
+        currentWindow: { label: 'main' },
+        currentWebview: { windowLabel: 'main', label: 'main' },
       },
     };
 

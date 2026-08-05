@@ -12,10 +12,14 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -73,35 +77,60 @@ jobs:
       - run: cargo deny --manifest-path src-tauri/Cargo.toml check
       - name: Build Tauri app
         run: npm run tauri build
-      - name: Code-sign installers (Authenticode) when a cert is provided
+      - name: Code-sign and verify Windows installers (Authenticode)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
-          if (-not $env:WINDOWS_CERT_BASE64) {
-            Write-Output "::warning title=Installers UNSIGNED::No WINDOWS_CERT_BASE64 secret - the MSI/NSIS are NOT code-signed and Windows SmartScreen will warn 'unknown publisher'. Add an Authenticode (EV/OV) cert as a base64 secret (+ WINDOWS_CERT_PASSWORD) to sign + timestamp."
-            exit 0
+          if (-not $env:WINDOWS_CERT_BASE64 -or -not $env:WINDOWS_CERT_PASSWORD) {
+            throw "Public releases require WINDOWS_CERT_BASE64 and WINDOWS_CERT_PASSWORD; refusing to publish unsigned Windows installers."
           }
           $pfx = Join-Path $env:RUNNER_TEMP cert.pfx
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
-          $st = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1).FullName
-          $installers = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -Include *.msi,*-setup.exe
-          foreach ($f in $installers) {
-            & $st sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f.FullName
-            if ($LASTEXITCODE -ne 0) { throw "signing failed for $($f.Name)" }
-            & $st verify /pa $f.FullName
-            if ($LASTEXITCODE -ne 0) { throw "verify failed for $($f.Name)" }
-            Write-Output "signed + verified: $($f.Name)"
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
+            $st = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1).FullName
+            if (-not $st) { throw "signtool.exe was not found" }
+            $installers = @(Get-ChildItem "src-tauri/target/release/bundle" -Recurse -Include *.msi,*-setup.exe)
+            if ($installers.Count -eq 0) { throw "Tauri produced no Windows installers to sign" }
+            foreach ($f in $installers) {
+              & $st sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f.FullName
+              if ($LASTEXITCODE -ne 0) { throw "signing failed for $($f.Name)" }
+              & $st verify /pa $f.FullName
+              if ($LASTEXITCODE -ne 0) { throw "verify failed for $($f.Name)" }
+              Write-Output "signed + verified: $($f.Name)"
+            }
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
           }
-          Remove-Item $pfx -Force
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Generate release checksums
+        if: runner.os == 'Windows'
+        run: python scripts/generate_release_checksums.py src-tauri/target/release/bundle --output SHA256SUMS-${{ matrix.os }}
+      - name: Attest release artifacts
+        if: runner.os == 'Windows'
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: cortex-speech-app/src-tauri/target/release/bundle/**/*
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cortex-speech-${{ matrix.os }}
           path: cortex-speech-app/src-tauri/target/release/bundle/**
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        if: startsWith(github.ref, 'refs/tags/')
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download attested platform bundles
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          files: cortex-speech-app/src-tauri/target/release/bundle/**
+          pattern: cortex-speech-windows-latest
+          path: release-assets
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: release-assets/**
           generate_release_notes: true

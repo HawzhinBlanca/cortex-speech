@@ -1,5 +1,10 @@
 # Cross-Platform Build & Bundle Status
 
+The release matrix currently treats macOS and Linux as build smoke checks. The
+public release job intentionally publishes only the supported, signed Windows
+bundle. Do not enable publication for another platform until its checklist here
+is complete and verified on a clean runner.
+
 Target: full Windows / macOS / Linux support. This file tracks what is wired,
 what is verified, and what still needs platform-specific work before a release on
 each OS. Nothing here has been validated by an actual `tauri build` on macOS or

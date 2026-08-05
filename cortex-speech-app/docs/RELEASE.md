@@ -35,8 +35,9 @@ Use this before tagging a production release (`v*`). Windows Pro is the primary 
 ## Code signing (Windows Authenticode)
 
 The release workflow (`.github/workflows/release.yml`) signs + timestamps the MSI and NSIS
-installers when a certificate is provided, and skips with a loud `::warning::` (unsigned, SmartScreen
-will warn "unknown publisher") when it is not. To enable signed releases:
+installers and **fails closed** before upload or publication when either signing secret is absent.
+Unsigned Windows artifacts may be built locally for development, but a `v*` public release cannot
+publish them. To enable releases:
 
 1. Obtain an **Authenticode (EV or OV) code-signing certificate** as a password-protected `.pfx`.
 2. Add two repository secrets: **`WINDOWS_CERT_BASE64`** (`base64 -w0 cert.pfx`) and
@@ -45,7 +46,21 @@ will warn "unknown publisher") when it is not. To enable signed releases:
    `signtool sign /f cert.pfx /p <pw> /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 <installer>`
    then `signtool verify /pa <installer>` on each artifact.
 
-- [ ] Release installers are Authenticode-signed + timestamped (or the unsigned warning is a conscious choice).
+- [ ] Release installers are Authenticode-signed + timestamped; `signtool verify /pa` succeeds.
+
+## Integrity and provenance
+
+The public channel currently publishes only the supported, signed Windows bundle; macOS and Linux
+remain build smoke checks until `CROSS_PLATFORM.md` is complete. The Windows bundle gets a deterministic
+`SHA256SUMS-windows-latest` file before upload. The release workflow also creates a GitHub/Sigstore
+build-provenance attestation for every bundled file using a SHA-pinned `actions/attest` action. Both
+steps run before GitHub artifact upload. A separate publisher waits for every platform build, downloads
+only the attested Windows bundle, and updates the release once; repository write permission is not
+available to build or test steps.
+
+- [ ] Verify a downloaded file against its platform's `SHA256SUMS-<platform>` entry.
+- [ ] Verify GitHub provenance with `gh attestation verify <artifact> --repo HawzhinBlanca/cortex-speech`.
+- [ ] Confirm the attestation names the expected tag commit and release workflow run.
 
 ## Security gate
 
