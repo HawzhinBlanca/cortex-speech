@@ -104,6 +104,13 @@ jobs:
           } finally {
             Remove-Item $pfx -Force -ErrorAction SilentlyContinue
           }
+      # SBOM before checksums and attestation, so it is itself covered by both. Generated from the
+      # LOCKFILES (package-lock.json + Cargo.lock), not the installed node_modules: `npm sbom` refuses
+      # on this project because a clean `npm ci` yields a tree npm itself calls invalid. See the
+      # module docstring in generate_sbom.py.
+      - name: Generate CycloneDX SBOM
+        if: runner.os == 'Windows'
+        run: python scripts/generate_sbom.py --output src-tauri/target/release/bundle/cortex-speech.cdx.json
       - name: Generate release checksums
         if: runner.os == 'Windows'
         run: python scripts/generate_release_checksums.py src-tauri/target/release/bundle --output SHA256SUMS-${{ matrix.os }}

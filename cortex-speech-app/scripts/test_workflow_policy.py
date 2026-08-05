@@ -169,12 +169,18 @@ def test_release_fails_closed_on_signing_and_attests_artifacts() -> None:
     if release.count("if: runner.os == 'Windows'") < 4:
         raise AssertionError("only the supported signed Windows bundle may enter the public release path")
 
+    assert_contains(release, "scripts/generate_sbom.py", "release.yml")
+    sbom = release.find("scripts/generate_sbom.py")
     checksums = release.find("scripts/generate_release_checksums.py")
     attestation = release.find("actions/attest@")
     upload = release.find("actions/upload-artifact@")
     publish = release.find("softprops/action-gh-release@")
-    if min(checksums, attestation, upload, publish) < 0 or not (checksums < attestation < upload < publish):
-        raise AssertionError("release checksums and provenance must be generated before upload and publication")
+    # The SBOM is written INTO the bundle, so it must precede the checksum manifest and the
+    # attestation or it ships uncovered by either — an SBOM nobody can verify came from this build.
+    if min(sbom, checksums, attestation, upload, publish) < 0 or not (
+        sbom < checksums < attestation < upload < publish
+    ):
+        raise AssertionError("SBOM, checksums and provenance must be generated before upload and publication")
 
     build_job = release.find("  build:")
     publish_job = release.find("  publish:")
