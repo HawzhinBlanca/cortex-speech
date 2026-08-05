@@ -73,6 +73,11 @@
   }
 
   function stageTone(status: string): string {
+    // `not_required` is NEUTRAL, never emerald. An optional dependency the owner switched off is a
+    // valid configuration, but it is not proven coverage, and painting both the same green meant a
+    // reviewer could not tell them apart at a glance (deep audit 2026-08-05). Not amber either — this
+    // is not a degradation to fix, so it must not read as a warning.
+    if (status === 'not_required') return 'text-cortex-300 bg-cortex-800/40 border-cortex-700/40';
     if (status === 'ready') return 'text-emerald-300 bg-emerald-950/30 border-emerald-800/40';
     if (status === 'completed') return 'text-emerald-300 bg-emerald-950/30 border-emerald-800/40';
     if (status === 'running') return 'text-amber-300 bg-amber-950/30 border-amber-800/40';

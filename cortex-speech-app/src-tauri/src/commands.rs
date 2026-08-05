@@ -179,11 +179,21 @@ fn build_agentic_readiness(
     if !settings.jury_cloud_opt_in {
         // Cloud whole-file references are an OPTIONAL enhancement the user has deliberately left off
         // (offline-first). The jury runs local multi-model consensus fine without them, so this is the
-        // chosen, fully-functional configuration — "ready", NOT a degradation that nags on every import.
+        // chosen, fully-functional configuration — NOT a degradation that should nag on every import.
+        //
+        // But it is not "ready" either, and saying so was a green tick the feature had not earned: a
+        // reviewer scanning the panel could not tell "source references are covering your data" from
+        // "source references are off", because both printed `ready` in the same emerald. Deep-audit
+        // 2026-08-05 named this exactly — "not required in this mode is not the same state as ready".
+        //
+        // `not_required` keeps the non-nagging intent (the aggregate below treats anything that is
+        // neither blocked nor degraded as ready, so the overall verdict is unchanged) while refusing to
+        // claim coverage that does not exist. Pinned by
+        // `disabled_cloud_reports_not_required_not_ready_but_keeps_the_overall_verdict_ready`.
         checks.push(readiness_check(
             "source_reference",
             "Whole-file source references",
-            "ready",
+            "not_required",
             "Offline mode: cloud whole-file references are off by choice (an optional cross-check; whether local consensus can run is reported by the hypothesis-coverage check). Enable jury cloud opt-in to add Gemini whole-file references.",
         ));
     } else if settings.llm_api_key.trim().is_empty() {
@@ -3924,7 +3934,7 @@ mod tests {
     }
 
     #[test]
-    fn agentic_readiness_offline_source_reference_is_ready_not_blocked() {
+    fn agentic_readiness_offline_source_reference_is_not_required_not_blocked() {
         let readiness = build_agentic_readiness(
             &crate::settings::AppSettings::default(), // cloud off, no models
             &[],
@@ -3934,15 +3944,60 @@ mod tests {
             }),
         );
 
-        // Cloud whole-file references are OPTIONAL — with cloud off (offline by choice), the source-
-        // reference check is "ready" (local consensus is the chosen, functional mode), so it does NOT
-        // nag on every import. Overall is still blocked ONLY because hypothesis coverage is missing.
-        assert!(readiness.checks.iter().any(|check| check.id == "source_reference" && check.status == "ready"));
+        // Cloud whole-file references are OPTIONAL — with cloud off (offline by choice) the check must
+        // NOT nag, and must NOT claim coverage either. It previously said "ready", which painted a
+        // switched-off dependency the same emerald as proven coverage (deep audit 2026-08-05). It is
+        // now `not_required`: neither a warning nor a green tick.
+        assert!(
+            readiness.checks.iter().any(|c| c.id == "source_reference" && c.status == "not_required"),
+            "an optional dependency that is OFF must report not_required, never ready"
+        );
+        assert!(
+            !readiness.checks.iter().any(|c| c.id == "source_reference" && c.status == "ready"),
+            "a disabled cloud cross-check must not claim readiness"
+        );
         assert_eq!(readiness.status, "blocked");
         assert!(!readiness.ready);
         assert!(readiness.checks.iter().any(|check| check.id == "hypothesis_coverage" && check.status == "blocked"));
         assert!(readiness.available_hypothesis_models.is_empty());
         assert_eq!(readiness.required_hypothesis_models, quality::MIN_HYPOTHESIS_MODELS_FOR_TRAINING_READY_MACHINE);
+    }
+
+    /// The whole risk of introducing `not_required` is that it silently becomes a nag: if the
+    /// aggregate treated an unknown status as not-ready, switching cloud OFF would flip the overall
+    /// verdict and pester the owner on every import — the exact outcome the original "ready" was
+    /// chosen to avoid. This pins that the new state is visible per-check WITHOUT changing the verdict.
+    #[test]
+    fn disabled_cloud_reports_not_required_not_ready_but_keeps_the_overall_verdict_ready() {
+        let settings = crate::settings::AppSettings {
+            jury_cloud_opt_in: false, // the state under test
+            external_asr_script_path: "/root/cortex_env/omniasr.py".to_string(),
+            ..crate::settings::AppSettings::default()
+        };
+        let model_status = vec![
+            downloaded_model_status(models::OMNIASR_CTC_300M_MODEL),
+            downloaded_model_status(models::OMNIASR_CTC_300M_TOKENS),
+        ];
+        let readiness = build_agentic_readiness(
+            &settings,
+            &model_status,
+            &serde_json::json!({
+                "available": true,
+                "script": "/root/cortex_env/omniasr.py",
+                "message": "WSL is available; provider script will be used for external ASR"
+            }),
+        );
+
+        assert!(
+            readiness.checks.iter().any(|c| c.id == "source_reference" && c.status == "not_required"),
+            "checks: {:?}",
+            readiness.checks.iter().map(|c| (&c.id, &c.status)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            readiness.status, "ready",
+            "not_required must not degrade the overall verdict — that would nag on every import"
+        );
+        assert!(readiness.ready, "the aggregate `ready` flag must stay true for an off-by-choice option");
     }
 
     #[test]
