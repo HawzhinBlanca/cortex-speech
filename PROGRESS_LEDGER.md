@@ -6591,3 +6591,89 @@ Phase markers added to the probe, and the first instrumented run already narrows
 takes **8.2 s** to come up, so both crash times (4.7 s, 6.7 s) fall inside the
 `spawned, waiting for debug port` window — a `fetch()` poll loop against a not-yet-listening port.
 Still NOT a retry: the leg reds honestly, and the next occurrence will name its phase.
+
+## Iteration 243 — a gate that stops lying about a crash, and rights that attach to the recording
+
+Two owner asks: "fix the crash", then "fix #6 per-clip rights schema".
+
+**The crash is NOT fixed, and was not even reproduced.** 60 heartbeat runs under 12 CPU burners with a
+rotating debug port came back 60/60 clean — with the 43 prior standalone runs that is 103 clean runs
+outside a sweep. CPU pressure alone is ruled out as the trigger.
+
+What the evidence now establishes, each independently:
+
+- the process that exits 3221226505 is **node.exe, the harness** — not the app under test;
+- it dies **before measuring anything** (phase markers put both heartbeat deaths inside the 8.2 s
+  debug-port wait, a `fetch()` poll against a port that is not listening yet);
+- `--report-on-fatalerror` wrote **no report**, and two of the three crashes PREDATE that flag existing
+  (added 2026-08-04 13:00; crashes 08-03 08:06 and 08-04 10:07), so it is neither cause nor cure;
+- Windows Error Reporting logged **nothing** across four days — an access violation or stack overflow
+  would have written an Application Error 1000. Its absence fits a native `__fastfail`, which bypasses
+  the reporting path.
+
+So the leg produced NO measurement, and reporting that as "the app failed its responsiveness gate" was
+itself a false claim about the app. `run_gate` now re-runs ONCE on `ABNORMAL_EXIT_CODES` and stamps
+`<gate>.CRASH.<ts>.log` for the dead attempt FIRST, so an occurrence stays counted even when the retry
+passes. Same shape as the `LNK1104` AV-file-lock retry already directly above it.
+
+This REVERSES the "deliberately NOT a retry" stance recorded in `verify_10.py`. That stance was written
+when the cause was unknown and the crash might have been the app dying. It is not the app.
+
+Deliberately narrow, and tested as such: a probe that RAN and exceeded its threshold exits 1 and never
+reaches the path. `test_abnormal_exit_retry_policy.py` drives `run_gate` for real and pins BOTH halves.
+
+```
+BASELINE (unmodified)              exit=0  policy passed
+retry removed entirely             exit=1  OS-terminated gate ran 1 time, expected 2
+retry widened to ALL failures      exit=1  ordinary failing gate ran 2 times
+crash evidence no longer kept      exit=1  no CRASH log kept
+RESTORED                           exit=0  policy passed
+```
+
+Two earlier versions of that fixture silently exercised NOTHING: Python CLAMPS a large exit value to
+0xFFFFFFFF (measured — `SystemExit(3221226505)` yields returncode 4294967295), and wrapping `cmd /c
+exit` in Python clamps it again on the way out. The payload is now a `.cmd` that carries the code
+directly. A speculative `net.Socket` replacement for the `fetch()` poll was written and DISCARDED: it
+addresses only two of the three occurrences, and with 103 clean runs a real fix and a useless one look
+identical — shipping it would have let us believe the crash was solved.
+
+**#6 — rights now attach to the recording (migration v49).** The only `license` column in this schema
+was on `model_versions`; rights for the AUDIO lived at dataset level and nowhere per recording. Voice
+is Article 9 biometric data: lawful basis, permitted use and the ability to honour a withdrawal attach
+to the individual recording.
+
+Six nullable TEXT columns on `speech_segments` — licence, consent basis, permitted use, attribution,
+provenance, revoked-at. Stored per SEGMENT though the unit is the RECORDING: a join keyed on
+`audio_path` orphans the moment `relink_audio` rewrites that path, and the export iterates segments so
+enforcement needs the values where the decision is made. `set_recording_rights` covers every segment of
+one audio path in a single statement.
+
+NO BACKFILL. All 144 clips become rights-UNKNOWN, which is the truth — inventing "CC-BY-4.0" because
+the EVAL corpus happens to be CC-BY would be fabricated provenance.
+
+`RecordingRights::disposition()` is the one place that decides, failing closed at every step:
+`Revoked > Unknown > PrivateOnly > Redistributable`. A licence string alone is not consent to republish
+a voice — `permitted_use` must NAME redistribution.
+
+Enforcement scoped on evidence, not preference:
+
+- **Withdrawal is honoured on EVERY path**, local JSON/JSONL/CSV/Parquet included. A revocation that
+  only blocked publishing while clips kept flowing into local tables would not be a withdrawal.
+- **Undeclared rights still export.** Wiring `permits_redistribution()` as a hard refusal was tried
+  first and **blocked 18 HuggingFace export tests** — i.e. it would block this entire undeclared
+  library the moment the migration lands, silently redefining a working command. That is an owner
+  decision, not a schema-change side effect. The predicate exists and is tested for the caller that
+  genuinely publishes.
+
+Speaker identity deliberately absent: `speaker_id` already carries a pseudonymous label, and a
+real-identity column would create the re-identification risk this schema exists to bound. UI not
+included — three IPC commands are the surface.
+
+Verified against the LIVE library after the relink: schema_version 49, all six columns present, 144
+segments and 67 decisions intact.
+
+**A staging mistake, caught and undone.** The first rights commit used `git add -A` and swept in an
+`audit-2026-08-05/` folder this agent did not create — 16 screenshots of the live library plus a
+markdown file embedding absolute user-profile paths that the hygiene gate rejects in tracked files.
+Reset, unstaged, and the folder added to `.gitignore` beside the existing `docs/audits/` entry, which
+exists for exactly this reason. Files untouched on disk.
