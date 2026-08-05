@@ -692,6 +692,7 @@ pub fn run() {
             commands::get_dataset_stats,
             commands::get_speakers,
             commands::get_dataset_quality,
+            commands::get_training_grade_breakdown,
             commands::get_settings,
             commands::update_settings,
             commands::get_cache_info,

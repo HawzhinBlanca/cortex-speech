@@ -1,5 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SpeechSegment, SegmentsPage, WordTimestamp, DatasetStats, SpeakerStat } from './types';
+import type {
+  SpeechSegment,
+  SegmentsPage,
+  WordTimestamp,
+  DatasetStats,
+  SpeakerStat,
+} from './types';
 import type { AppSettings } from './stores/settingsStore';
 import {
   mapBackendToFrontend,
@@ -94,7 +100,10 @@ export async function transcribeSegmentConstrained(
   alignmentJson?: string | null,
 ): Promise<{ text: string; rawTranscript: string }> {
   // Pass alignmentJson so constrained decode transcribes only THIS segment's clip, not the whole file.
-  return invoke('transcribe_segment_constrained', { audioPath, alignmentJson: alignmentJson ?? null });
+  return invoke('transcribe_segment_constrained', {
+    audioPath,
+    alignmentJson: alignmentJson ?? null,
+  });
 }
 
 /**
@@ -106,7 +115,10 @@ export async function transcribeSegmentFinetuned(
   alignmentJson?: string | null,
 ): Promise<{ text: string; rawTranscript: string }> {
   // Pass alignmentJson so the fine-tuned model transcribes only THIS segment's clip, not the whole file.
-  return invoke('transcribe_segment_finetuned', { audioPath, alignmentJson: alignmentJson ?? null });
+  return invoke('transcribe_segment_finetuned', {
+    audioPath,
+    alignmentJson: alignmentJson ?? null,
+  });
 }
 
 export async function batchTranscribe(ids: string[]): Promise<{ status: string }> {
@@ -153,8 +165,10 @@ export interface SegmentConsensus {
  * invented) so the review badge always names exactly what produced the draft. */
 export function engineLabel(modelId: string): string {
   const id = (modelId || '').toLowerCase();
-  if (id.includes('wsl-7b') || id.includes('omniasr-7b') || id === 'omniasr-llm-7b') return 'OmniASR-7B Champion';
-  if (id.includes('finetuned') || id.includes('mms-ckb') || id.includes('mms_ctc')) return 'Fine-tuned MMS-1B';
+  if (id.includes('wsl-7b') || id.includes('omniasr-7b') || id === 'omniasr-llm-7b')
+    return 'OmniASR-7B Champion';
+  if (id.includes('finetuned') || id.includes('mms-ckb') || id.includes('mms_ctc'))
+    return 'Fine-tuned MMS-1B';
   if (id.includes('ctc-1b') || id.includes('ctc_1b')) return 'OmniASR-CTC 1B (base)';
   if (id.includes('ctc-300m') || id.includes('ctc_300m')) return 'OmniASR-CTC 300M (base)';
   if (id.includes('scribe')) return 'ElevenLabs Scribe (cloud)';
@@ -177,7 +191,9 @@ export async function getSegments(verified?: boolean): Promise<SpeechSegment[]> 
   // record. An empty ValidationPanel reads as "no anomalies found" and an empty inbox as "nothing left
   // to review" — both are clean bills of health issued by a broken read.
   if (!Array.isArray(data)) {
-    throw new Error(`get_segments returned ${typeof data}, not a segment array — the library could not be read`);
+    throw new Error(
+      `get_segments returned ${typeof data}, not a segment array — the library could not be read`,
+    );
   }
   return data;
 }
@@ -206,7 +222,9 @@ export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Pro
   // record. An empty ValidationPanel reads as "no anomalies found" and an empty inbox as "nothing left
   // to review" — both are clean bills of health issued by a broken read.
   if (!data || !Array.isArray(data.items)) {
-    throw new Error(`get_segments_page returned ${typeof data}, not a page payload — the library could not be read`);
+    throw new Error(
+      `get_segments_page returned ${typeof data}, not a page payload — the library could not be read`,
+    );
   }
   return data;
 }
@@ -257,7 +275,9 @@ export async function restoreSegmentSnapshot(segment: SpeechSegment): Promise<vo
 
 export async function updateSegmentFields(
   segmentId: string,
-  fields: Partial<Pick<SpeechSegment, 'annotatedTranscript' | 'speakerId' | 'alignmentJson' | 'verified'>>,
+  fields: Partial<
+    Pick<SpeechSegment, 'annotatedTranscript' | 'speakerId' | 'alignmentJson' | 'verified'>
+  >,
 ): Promise<boolean> {
   return invoke<boolean>('update_segment_fields', { segmentId, fields });
 }
@@ -677,7 +697,10 @@ export async function transcribeWithScribe(
   alignmentJson?: string | null,
 ): Promise<string> {
   // Pass alignmentJson so Scribe transcribes only THIS segment's clip, not the whole source file.
-  return invoke<string>('transcribe_audio_with_scribe', { audioPath, alignmentJson: alignmentJson ?? null });
+  return invoke<string>('transcribe_audio_with_scribe', {
+    audioPath,
+    alignmentJson: alignmentJson ?? null,
+  });
 }
 
 /**
@@ -849,6 +872,31 @@ export async function getDatasetQuality(): Promise<DatasetQuality> {
   return invoke<DatasetQuality>('get_dataset_quality');
 }
 
+/**
+ * Library-wide training grade + the reasons behind it.
+ *
+ * `trainingReadySegments` is what an export would ACTUALLY write — it comes from the same
+ * `training_grade_for_segment` the export gates on. Readiness must never be derived from the
+ * verified count instead: a fully-reviewed library still exports nothing when, say, no word aligner
+ * is installed and every clip carries `energy_heuristic_alignment`. `reasonCounts` is what turns
+ * that dead end into an actionable blocker.
+ */
+export interface TrainingGradeBreakdown {
+  summary: {
+    totalSegments: number;
+    trainingReadySegments: number;
+    goldSegments: number;
+    silverSegments: number;
+    reviewSegments: number;
+    rejectedSegments: number;
+  };
+  reasonCounts: Record<string, number>;
+}
+
+export async function getTrainingGradeBreakdown(): Promise<TrainingGradeBreakdown> {
+  return invoke<TrainingGradeBreakdown>('get_training_grade_breakdown');
+}
+
 export async function getSettings(): Promise<AppSettings> {
   const raw = await invoke<BackendSettings>('get_settings');
   return mapBackendToFrontend(raw);
@@ -999,7 +1047,9 @@ export async function computeDiff(
 /** Back up the live library to `dest` on a DEDICATED connection (the UI stays responsive), then
  * verify the WRITTEN file (integrity check + segment count) — a disaster copy that is itself bad
  * must fail now, not at the disaster. */
-export async function dbBackup(dest: string): Promise<{ integrityOk: boolean; segmentCount: number }> {
+export async function dbBackup(
+  dest: string,
+): Promise<{ integrityOk: boolean; segmentCount: number }> {
   return invoke('db_backup', { dest });
 }
 

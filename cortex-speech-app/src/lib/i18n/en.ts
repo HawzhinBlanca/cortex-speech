@@ -7,9 +7,11 @@ export const en: Record<string, string> = {
   openFile: 'Add file',
   transcribe: 'Transcribe',
   transcribeConstrained: 'Kurdish-only',
-  transcribeConstrainedTitle: 'Transcribe with constrained Kurdish-script decode (guarantees Kurdish output)',
+  transcribeConstrainedTitle:
+    'Transcribe with constrained Kurdish-script decode (guarantees Kurdish output)',
   transcribeFinetuned: 'Fine-tuned',
-  transcribeFinetunedTitle: 'Transcribe with the fine-tuned Kurdish model (21.0% CER [19.9-22.0], N=900 gold clips, measured 2026-06-25)',
+  transcribeFinetunedTitle:
+    'Transcribe with the fine-tuned Kurdish model (21.0% CER [19.9-22.0], N=900 gold clips, measured 2026-06-25)',
   'scribe.transcribe': 'Scribe (cloud)',
   'scribe.transcribeTitle': 'Re-transcribe this segment with ElevenLabs Scribe (cloud STT)',
   'scribe.vote': '+ Scribe vote',
@@ -130,7 +132,8 @@ export const en: Record<string, string> = {
   'review.consensusAgree': '{n} models · {pct}% agree',
   'review.useDraft': 'Use draft',
   'review.modelsAlsoSaid': 'Other models: {alts}',
-  'review.consensusHint': 'Voted across all ASR models — amber words are where they disagreed; check those first.',
+  'review.consensusHint':
+    'Voted across all ASR models — amber words are where they disagreed; check those first.',
   'review.draftBy': 'Draft by',
   'review.notHumanVerified': '— machine draft, not human-verified.',
   'review.retranscribe': 'Re-transcribe:',
@@ -151,7 +154,8 @@ export const en: Record<string, string> = {
   'asr.tryAgain': 'Try 7B again',
   'asr.useOfflineModel': 'Use offline model',
   'review.markBad': 'Mark bad',
-  'review.markBadTitle': 'Flag this clip as bad — excluded from export, kept so you can re-transcribe later.',
+  'review.markBadTitle':
+    'Flag this clip as bad — excluded from export, kept so you can re-transcribe later.',
   'review.markedBad': 'Marked bad — excluded from export. Backspace to undo.',
   'review.undone': 'Decision undone — the clip is back in the queue.',
   'review.searchScope':
@@ -160,12 +164,15 @@ export const en: Record<string, string> = {
   'review.undoFailed': 'Undo failed',
   'review.undoLast': 'Undo review',
   'review.retranscribeVerifiedTitle': 'Replace a verified transcript?',
-  'review.retranscribeVerifiedMessage': 'This clip is human-verified. Re-transcribing replaces your reviewed text with a fresh machine draft and reopens the clip. You can restore it with Undo review.',
+  'review.retranscribeVerifiedMessage':
+    'This clip is human-verified. Re-transcribing replaces your reviewed text with a fresh machine draft and reopens the clip. You can restore it with Undo review.',
   'review.retranscribeVerifiedConfirm': 'Re-transcribe anyway',
-  'review.undoLastTitle': 'Reopen the last clip you saved (clears its decision so you can correct and re-save it). Shortcut: Backspace',
+  'review.undoLastTitle':
+    'Reopen the last clip you saved (clears its decision so you can correct and re-save it). Shortcut: Backspace',
   'review.cloudCheck': '🔍 Gemini check',
   'review.cloudChecking': 'Asking Gemini…',
-  'review.cloudCheckTitle': 'Gemini 2.5 Pro listens to this clip and checks the draft verbatim — including repeated words the local ASR often drops. Advisory: you still decide.',
+  'review.cloudCheckTitle':
+    'Gemini 2.5 Pro listens to this clip and checks the draft verbatim — including repeated words the local ASR often drops. Advisory: you still decide.',
   'review.cloudCheckUse': 'Use this text',
   'review.cloudCheckAgrees': 'Gemini agrees with the draft',
   'review.cloudCheckEscalated': 'Gemini could not reach a confident verdict — trust your ears',
@@ -178,17 +185,20 @@ export const en: Record<string, string> = {
   'review.kbdHint':
     'Keys: A accept · E edit · X mark bad · Space play/pause · R replay · N/P next/prev · Backspace undo · Ctrl+Enter save & next',
   'review.suspectFirst': 'Suspect first',
-  'review.suspectFirstHint': 'Review the riskiest clips first: escalated, then lowest-confidence, then newest',
+  'review.suspectFirstHint':
+    'Review the riskiest clips first: escalated, then lowest-confidence, then newest',
   'review.suspectFirstFailed': 'Could not load the suspect-first order',
   'review.allDone': 'All clips reviewed!',
   'review.allDoneHint': 'Every clip has been verified. Import more audio to continue.',
   'review.completeTitle': '✓ All {n} clips reviewed',
-  'review.completeHint': 'Your transcripts are verified. Export the dataset, or go back to re-check any clip.',
+  'review.completeHint':
+    'Your transcripts are verified. Export the dataset, or go back to re-check any clip.',
   'review.exportDataset': 'Export dataset',
   'review.reviewAgain': 'Review from start',
   'review.backToLibrary': 'Back to library',
   'reviewCorrect.label': 'Review & Correct',
-  'reviewCorrect.tooltip': 'Fix transcripts one clip at a time — play, edit, Ctrl+Enter to save & continue',
+  'reviewCorrect.tooltip':
+    'Fix transcripts one clip at a time — play, edit, Ctrl+Enter to save & continue',
   'reviewCorrect.cta': '{n} clips are ready for you to review and correct.',
   'reviewCorrect.ctaOne': '1 clip is ready for you to review and correct.',
   'reviewCorrect.start': 'Start reviewing',
@@ -238,7 +248,8 @@ export const en: Record<string, string> = {
   'inbox.band.low': 'AI has low confidence ({pct}%) — careful review needed 🔴',
   'inbox.status.running': '⏳ Running Jury Pipeline…',
   'inbox.status.noUnverified': 'ℹ️ No unverified segments to run jury on.',
-  'inbox.status.juryFinished': '⚡ Jury finished! T0 accepted: {t0}, T1 committed: {t1}, T2 committed: {t2}, Escalated: {esc}',
+  'inbox.status.juryFinished':
+    '⚡ Jury finished! T0 accepted: {t0}, T1 committed: {t1}, T2 committed: {t2}, Escalated: {esc}',
   'inbox.status.juryFailed': '❌ Jury pipeline failed: {err}',
   'inbox.status.loadFailed': 'Failed to load queue: {err}',
   'inbox.status.accepted': '✅ Accepted',
@@ -357,7 +368,8 @@ export const en: Record<string, string> = {
   'diff.removed': 'removed',
   'diff.changed': 'changed',
   ready: 'Ready',
-  'import.interrupted': 'An import of {dir} was interrupted ({done}/{total} files done). Resume it?',
+  'import.interrupted':
+    'An import of {dir} was interrupted ({done}/{total} files done). Resume it?',
   'import.resume': 'Resume',
   'import.discard': 'Discard',
   'import.resumeStarted': 'Resuming import — already-done files are skipped.',
@@ -432,7 +444,8 @@ export const en: Record<string, string> = {
   'jobs.running': '{count} running',
   'jobs.failed': 'A task failed',
   'jobs.interrupted': 'A task was interrupted',
-  'jobs.tooltip': 'Background tasks (exports and other long operations). A crash leaves an interrupted task, recovered on next start.',
+  'jobs.tooltip':
+    'Background tasks (exports and other long operations). A crash leaves an interrupted task, recovered on next start.',
   'agenticReadiness.blocked': 'Agentic readiness blocked',
   'agenticReadiness.degraded': 'Agentic readiness degraded',
   'agenticReadiness.checkFailed': 'Agentic readiness check failed',
@@ -451,7 +464,8 @@ export const en: Record<string, string> = {
   'stats.uniqueSpeakers': 'Unique Speakers',
   'stats.reviewSpeed': 'Median s/segment',
   'stats.dbSize': 'Database size',
-  'stats.audioMissing': '{n} source audio file(s) missing — playback and re-transcribe are broken for them.',
+  'stats.audioMissing':
+    '{n} source audio file(s) missing — playback and re-transcribe are broken for them.',
   'stats.relink': 'Relink…',
   'stats.relinking': 'Relinking…',
   'stats.relinkDone': 'Relinked {n} file(s); {m} still missing.',
@@ -489,8 +503,30 @@ export const en: Record<string, string> = {
   'stats.loop0OverTriggers': 'LOOP-0 over-triggers — must be 0 to enable firing',
   'stats.loop0WouldFire': 'would fire',
   'stats.noEvidenceYet': 'no evidence yet',
-  'stats.conformalProgress': 'Auto-accept calibration progress - needs ~{n} perfect verified clips per bucket at the 5% CER gate',
+  'stats.conformalProgress':
+    'Auto-accept calibration progress - needs ~{n} perfect verified clips per bucket at the 5% CER gate',
   'stats.c4Precision': 'Auto-accept precision vs human review',
+  // P0 #7 — the decision layer. "Ready" means an export would actually write rows, which is NOT the
+  // same as "everything is reviewed": a fully-verified library still exports nothing when every clip
+  // carries a blocking grade reason. The wording says export, never "done".
+  'stats.ready': 'Ready to export',
+  'stats.notReady': 'Not ready to export',
+  'stats.readinessUnknown': 'Readiness unknown',
+  'stats.readyExplain':
+    'Clips an export would write, graded by the same rule the export uses. Reviewing every clip does not by itself make them exportable.',
+  'stats.blockers': 'Blockers',
+  'stats.nextAction': 'Next:',
+  'stats.blockerAudioMissing': '{n} source audio files missing',
+  'stats.blockerPendingReview': '{n} clips still awaiting review',
+  'stats.blockerEmptyTranscripts': '{n} clips have no transcript',
+  'stats.blockerQualityGate': '{n} clips exceed the WER/CER thresholds',
+  'stats.blockerNothingReady': 'Nothing is exportable — {n} clips blocked by',
+  'stats.blockerNoAccuracyRecord': 'No gold evaluation has been run',
+  'stats.accuracyTitle': 'Accuracy record',
+  'stats.accuracyNone': 'No accuracy record yet — run a gold evaluation to establish one.',
+  'stats.cerLabel': 'CER',
+  'stats.werLabel': 'WER',
+  'stats.advanced': 'Advanced & diagnostics',
   'stats.tools': 'Dataset & model tools',
   'stats.exportFinetunePack': 'Export fine-tune pack',
   'stats.exportGoldEvalSet': 'Export gold eval set',
@@ -584,16 +620,19 @@ export const en: Record<string, string> = {
     'Auto-backup has failed {count} times in a row — your library is not being snapshotted. Check free disk space and the logs folder.',
   'notifications.snapshotStale':
     'Auto-snapshots have not succeeded for {minutes} minutes - the safety net may be stalled; check free disk space and the log',
-  'notifications.lowDisk': 'Low disk space: {gb} GB free. Snapshots, exports, and the database can start failing.',
+  'notifications.lowDisk':
+    'Low disk space: {gb} GB free. Snapshots, exports, and the database can start failing.',
   'notifications.missingModels': 'Missing required model(s): {models}.',
-  'notifications.previousCrash': 'The previous session crashed: {summary}. Full details are in the logs folder.',
+  'notifications.previousCrash':
+    'The previous session crashed: {summary}. Full details are in the logs folder.',
   'notifications.undone': 'Undo: {what}',
   'notifications.redone': 'Redo: {what}',
   'notifications.lastActionReverted': 'Last action reverted',
   'notifications.lastActionReapplied': 'Last action reapplied',
   'notifications.undoFailedDetail': 'Undo failed: {error}',
   'notifications.redoFailedDetail': 'Redo failed: {error}',
-  'editor.noWordTimestamps': "No word timestamps available. Click 'Align' to align the text with audio.",
+  'editor.noWordTimestamps':
+    "No word timestamps available. Click 'Align' to align the text with audio.",
   'notifications.transcriptionComplete': 'Transcription complete',
   'notifications.textNormalized': 'Text normalized',
   'notifications.normalizationFailed': 'Normalization failed',
@@ -692,8 +731,10 @@ export const en: Record<string, string> = {
   'settings.couchWifiUrl': 'Same Wi-Fi:',
   'settings.couchTailscaleUrl': 'From anywhere (Tailscale — your devices only, encrypted):',
   'settings.couchStop': 'Stop',
-  'settings.couchHint': 'Serve a review page to your phone over your home network only. Off by default; a new random access token every session; audio never leaves your network.',
-  'settings.couchRunningHint': 'Open this URL on your phone (same Wi-Fi). Stop the server when done — the link stops working immediately.',
+  'settings.couchHint':
+    'Serve a review page to your phone over your home network only. Off by default; a new random access token every session; audio never leaves your network.',
+  'settings.couchRunningHint':
+    'Open this URL on your phone (same Wi-Fi). Stop the server when done — the link stops working immediately.',
   'settings.couchFailed': 'Couch Review failed',
   'settings.couchReviewers': 'Reviewer names (comma-separated)',
   'settings.couchReviewersPlaceholder': 'e.g. Sara, Hemn — leave blank to review alone',

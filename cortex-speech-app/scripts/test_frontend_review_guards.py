@@ -627,6 +627,81 @@ def test_the_uncalibrated_panel_names_the_real_cause_when_there_is_no_confidence
         )
 
 
+def test_readiness_verdict_is_sourced_from_the_export_rule_not_the_verified_count() -> None:
+    """Insights' "ready to export" must come from the SAME rule the export gates on.
+
+    These two disagree exactly when it matters. Measured on the live library 2026-08-05: 67 of 144
+    clips human-verified, and `training_ready` is 0 for all of them, because no word aligner is
+    installed so every clip carries `energy_heuristic_alignment`. A verdict derived from the verified
+    count would show a healthy, well-reviewed dataset whose export writes zero rows — the "a tally
+    counts rows the export drops" bug this repo has already fixed six times, inverted.
+
+    So the verdict must read `breakdown.summary.trainingReadySegments` (from
+    `get_training_grade_breakdown`, which calls `quality::training_grade_for_segment`) and must NOT
+    be re-based on `verifiedCount` / `verificationRate` by a later refactor.
+    """
+    src = _read("src/lib/StatsDashboard.svelte")
+
+    if "getTrainingGradeBreakdown()" not in src:
+        raise AssertionError(
+            "StatsDashboard.svelte no longer loads get_training_grade_breakdown, so its readiness "
+            "verdict cannot agree with what an export would actually write"
+        )
+
+    start = src.find("const verdict = $derived")
+    if start == -1:
+        raise AssertionError("the readiness verdict derivation is gone — this gate would pass vacuously")
+    verdict_src = src[start : start + 400]
+
+    if "breakdown.summary.trainingReadySegments" not in verdict_src:
+        raise AssertionError(
+            "the readiness verdict no longer reads trainingReadySegments — it must be sourced from the "
+            f"export's own grade rule, not approximated. Got: {verdict_src[:200]!r}"
+        )
+    for forbidden in ("verifiedCount", "verificationRate"):
+        if forbidden in verdict_src:
+            raise AssertionError(
+                f"the readiness verdict reads `{forbidden}`. A fully-verified library still exports "
+                "nothing when every clip carries a blocking grade reason, so this would show 'ready' "
+                "over an export that writes zero rows"
+            )
+
+
+def test_readiness_is_unknown_not_ready_when_its_inputs_failed_to_load() -> None:
+    """A headline that defaults to green when its own inputs failed is worse than no headline.
+
+    `breakdown` stays null when `get_training_grade_breakdown` throws (the load is deliberately
+    tolerant, so one failed panel cannot blank the whole dashboard). The verdict must render that as
+    'unknown'. If a refactor makes null fall through to the ready/not-ready comparison, a backend
+    error becomes a claim about the dataset.
+    """
+    src = _read("src/lib/StatsDashboard.svelte")
+
+    start = src.find("const verdict = $derived")
+    if start == -1:
+        raise AssertionError("the readiness verdict derivation is gone — this gate would pass vacuously")
+    verdict_src = src[start : start + 400]
+
+    if "breakdown === null" not in verdict_src:
+        raise AssertionError(
+            "the readiness verdict no longer special-cases a failed load, so a backend error renders as "
+            "a verdict about the data"
+        )
+
+    # Pinned as EXACT branch text, whitespace-normalized — NOT by comparing string offsets. An offset
+    # comparison is wrong here and silently so: the declaration is
+    # `$derived<'ready' | 'notReady' | 'unknown'>(...)`, so both literals also occur in the TYPE
+    # PARAMETER, ahead of every branch body. Ordering by `.find()` therefore compares the annotation,
+    # not the logic. (Caught by this file's own fail-before, which is the third time an offset
+    # comparison has produced a decorative guard in this repo.)
+    normalized = " ".join(verdict_src.split())
+    if "breakdown === null ? 'unknown' :" not in normalized:
+        raise AssertionError(
+            "a null breakdown must resolve to 'unknown' as the FIRST ternary arm; otherwise a failed "
+            f"load falls through to the ready/not-ready comparison. Got: {normalized[:220]!r}"
+        )
+
+
 def main() -> None:
     test_a_skip_never_clears_the_reviewers_draft_on_either_route()
     test_retranscribe_guards_editor_writes_against_navigation()
@@ -652,6 +727,8 @@ def main() -> None:
     test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrated()
     test_library_reads_fail_loudly_instead_of_reporting_an_empty_library()
     test_the_uncalibrated_panel_names_the_real_cause_when_there_is_no_confidence_at_all()
+    test_readiness_verdict_is_sourced_from_the_export_rule_not_the_verified_count()
+    test_readiness_is_unknown_not_ready_when_its_inputs_failed_to_load()
     print("frontend review-guard source policy passed")
 
 

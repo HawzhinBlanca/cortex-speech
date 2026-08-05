@@ -10,7 +10,7 @@ use crate::settings::AppSettings;
 use crate::wer;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Minimum average word alignment confidence below which a segment is flagged.
 pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.6;
@@ -39,6 +39,14 @@ pub struct TrainingGradeSummary {
     pub silver_segments: usize,
     pub review_segments: usize,
     pub rejected_segments: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingGradeBreakdown {
+    pub summary: TrainingGradeSummary,
+    /// How many segments carry each grade reason, e.g. `energy_heuristic_alignment -> 144`.
+    pub reason_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -213,7 +221,23 @@ pub fn compute_quality_from_segments_with_settings(
 }
 
 pub fn training_grade_summary(segments: &[SpeechSegment]) -> TrainingGradeSummary {
+    training_grade_breakdown(segments).summary
+}
+
+/// The grade counts PLUS why each clip landed where it did.
+///
+/// A bare "0 training-ready" is a dead end: it tells the owner nothing is exportable without saying
+/// what to fix. The reason tally turns that into an actionable blocker — on a library with no word
+/// aligner, `energy_heuristic_alignment` dominates and names the real cause, which is a missing model
+/// rather than anything the reviewer could fix by reviewing harder.
+///
+/// Computed with the SAME [`training_grade_for_segment`] the export gates on, in ONE pass that also
+/// produces the summary, so a readiness shown in the UI can never disagree with what an export would
+/// actually write. [`training_grade_summary`] delegates here rather than repeating the match — two
+/// copies of that bucketing is exactly how a count starts lying.
+pub fn training_grade_breakdown(segments: &[SpeechSegment]) -> TrainingGradeBreakdown {
     let mut summary = TrainingGradeSummary { total_segments: segments.len(), ..TrainingGradeSummary::default() };
+    let mut reason_counts: BTreeMap<String, usize> = BTreeMap::new();
     for seg in segments {
         let report = training_grade_for_segment(seg);
         if report.training_ready {
@@ -226,8 +250,11 @@ pub fn training_grade_summary(segments: &[SpeechSegment]) -> TrainingGradeSummar
             TRAINING_GRADE_REJECT => summary.rejected_segments += 1,
             _ => summary.review_segments += 1,
         }
+        for reason in report.reasons {
+            *reason_counts.entry(reason).or_insert(0) += 1;
+        }
     }
-    summary
+    TrainingGradeBreakdown { summary, reason_counts }
 }
 
 /// True when a human explicitly REJECTED this segment's draft — the review "mark bad" action, or a
@@ -1105,6 +1132,65 @@ mod tests {
         assert_eq!(pending_wsl.grade, TRAINING_GRADE_REJECT);
         assert!(!pending_wsl.training_ready);
         assert!(pending_wsl.reasons.contains(&"placeholder_transcript".to_string()));
+    }
+
+    /// The whole reason the Insights readiness verdict calls `training_grade_breakdown` instead of
+    /// counting verified clips: on a library with no word aligner, EVERY clip can be human-verified
+    /// and STILL export nothing. A dashboard that derived "ready" from the verified count would show
+    /// a green, fully-reviewed library whose export writes zero rows — the "a tally counts rows the
+    /// export drops" bug, inverted. This pins the disagreement, so a future refactor cannot quietly
+    /// re-base readiness on `verified`.
+    #[test]
+    fn readiness_disagrees_with_the_verified_count_when_alignment_is_heuristic() {
+        let verified_but_heuristic = |id: &str| {
+            let mut s = seg(id, "دەقی ڕاست", 5000);
+            s.verified = true;
+            s.human_decision = Some("accept".to_string());
+            s.clipping_ratio = Some(0.0);
+            s.rms_db = Some(-20.0);
+            s.snr_db = Some(25.0);
+            // What a missing mms_aligner.onnx leaves behind: real timings, guessed from energy.
+            s.alignment_json = Some("{\"words\":[]}".to_string());
+            s.alignment_quality = Some("energy_heuristic".to_string());
+            s
+        };
+        let segs = vec![verified_but_heuristic("a"), verified_but_heuristic("b")];
+
+        let breakdown = training_grade_breakdown(&segs);
+
+        assert_eq!(segs.iter().filter(|s| s.verified).count(), 2, "both clips ARE human-verified");
+        assert_eq!(
+            breakdown.summary.training_ready_segments, 0,
+            "yet nothing is exportable — readiness must not be read off `verified`"
+        );
+        assert_eq!(breakdown.summary.review_segments, 2, "they grade REVIEW, not GOLD");
+        assert_eq!(
+            breakdown.reason_counts.get("energy_heuristic_alignment"),
+            Some(&2),
+            "and the reason names the real cause (a missing aligner), not the reviewer's effort: {:?}",
+            breakdown.reason_counts
+        );
+    }
+
+    /// `training_grade_summary` must stay a thin delegate. Two copies of the grade bucketing is how a
+    /// count starts lying, so this pins that both surfaces report identically.
+    #[test]
+    fn training_grade_summary_agrees_with_the_breakdown_it_delegates_to() {
+        let mut gold = seg("g", "دەقی ڕاست", 5000);
+        gold.verified = true;
+        gold.human_decision = Some("accept".to_string());
+        gold.clipping_ratio = Some(0.0);
+        gold.rms_db = Some(-20.0);
+        gold.snr_db = Some(25.0);
+        let segs = vec![gold, seg("blank", " ", 5000)];
+
+        assert_eq!(training_grade_summary(&segs), training_grade_breakdown(&segs).summary);
+        assert_eq!(training_grade_breakdown(&segs).summary.training_ready_segments, 1);
+        assert_eq!(
+            training_grade_breakdown(&segs).reason_counts.get("blank_transcript"),
+            Some(&1),
+            "the rejected clip's reason is tallied"
+        );
     }
 
     #[test]

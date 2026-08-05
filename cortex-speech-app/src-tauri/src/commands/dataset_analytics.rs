@@ -35,6 +35,27 @@ pub async fn get_dataset_quality(state: State<'_, AppState>) -> Result<quality::
     .await
 }
 
+/// Library-wide training grade + the reasons behind it, for the Insights readiness verdict.
+///
+/// The dashboard's "ready / not ready" MUST agree with what an export would actually write, so this
+/// reuses `quality::training_grade_breakdown` — the same `training_grade_for_segment` the export
+/// gates on — rather than approximating readiness from the verified count. Those two disagree
+/// exactly when it matters most: a library can be 100% human-verified and still export zero rows
+/// (e.g. every clip carries `energy_heuristic_alignment` because no word aligner is installed).
+#[tauri::command]
+pub async fn get_training_grade_breakdown(
+    state: State<'_, AppState>,
+) -> Result<quality::TrainingGradeBreakdown, String> {
+    RATE_LIMITER.check("get_training_grade_breakdown")?;
+    let db = state.db_arc();
+    run_blocking(move || {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let segments = db.get_segments(None).map_err(|e| e.to_string())?;
+        Ok(quality::training_grade_breakdown(&segments))
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn validate_dataset_cmd(state: State<'_, AppState>) -> Result<crate::validation::ValidationReport, String> {
     // Rate-limited like its read siblings: this runs a full-dataset validation scan under the db lock,
