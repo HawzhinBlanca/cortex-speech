@@ -1366,6 +1366,48 @@ pub static MIGRATIONS: &[Migration] = &[
         up_sql: "ALTER TABLE speech_segments ADD COLUMN jury_transcript TEXT;",
         down_sql: Some("ALTER TABLE speech_segments DROP COLUMN jury_transcript;"),
     },
+    Migration {
+        version: 49,
+        description: "Per-recording rights: license, consent basis, permitted use, provenance, revocation",
+        // Deep-audit #6. Until now the ONLY `license` column in this schema was on `model_versions` —
+        // rights for the AUDIO were tracked at dataset level (ATTRIBUTION.md, the export license gate)
+        // and nowhere per recording. A voice recording is Article 9 biometric data: the lawful basis,
+        // the permitted use and the ability to honour a withdrawal all attach to the INDIVIDUAL
+        // recording, and none of that is expressible in a repo-level markdown file.
+        //
+        // STORED PER SEGMENT, though the semantics are per RECORDING. Two reasons, both practical:
+        // a join keyed on `audio_path` orphans the moment `relink_audio` rewrites that path (the row
+        // keeps its rights here, automatically), and the export iterates segments, so enforcement needs
+        // the values on the row it is deciding about. `set_recording_rights` writes every segment
+        // sharing an audio_path in one statement, so the per-recording semantics are preserved at the
+        // API even though storage is per row.
+        //
+        // NO BACKFILL and no defaults, deliberately. Every existing row becomes rights-UNKNOWN, which
+        // is the truth: this library's provenance was never recorded per clip, and inventing
+        // "CC-BY-4.0" for 144 clips because the eval corpus happened to be CC-BY would be exactly the
+        // fabricated-provenance lie the honesty law forbids. Unknown blocks REDISTRIBUTION and permits
+        // local personal export, which is the honest gradient — see `rights_disposition_for_segment`.
+        //
+        // `rights_revoked_at` is the revocation lineage: non-NULL means a withdrawal was recorded, and
+        // that outranks every other field on every path, including local export. A withdrawal that only
+        // stops future publishes is not a withdrawal.
+        //
+        // Nullable TEXT throughout: STRICT-compatible, and ADD COLUMN fires no FK cascade.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN rights_license TEXT;\n\
+                 ALTER TABLE speech_segments ADD COLUMN rights_consent_basis TEXT;\n\
+                 ALTER TABLE speech_segments ADD COLUMN rights_permitted_use TEXT;\n\
+                 ALTER TABLE speech_segments ADD COLUMN rights_attribution TEXT;\n\
+                 ALTER TABLE speech_segments ADD COLUMN rights_source TEXT;\n\
+                 ALTER TABLE speech_segments ADD COLUMN rights_revoked_at TEXT;",
+        down_sql: Some(
+            "ALTER TABLE speech_segments DROP COLUMN rights_license;\n\
+             ALTER TABLE speech_segments DROP COLUMN rights_consent_basis;\n\
+             ALTER TABLE speech_segments DROP COLUMN rights_permitted_use;\n\
+             ALTER TABLE speech_segments DROP COLUMN rights_attribution;\n\
+             ALTER TABLE speech_segments DROP COLUMN rights_source;\n\
+             ALTER TABLE speech_segments DROP COLUMN rights_revoked_at;",
+        ),
+    },
 ];
 
 #[cfg(test)]

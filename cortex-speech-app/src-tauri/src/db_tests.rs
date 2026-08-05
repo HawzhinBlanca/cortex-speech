@@ -20,6 +20,118 @@ fn make_segment(id: &str, audio_path: &str) -> SpeechSegment {
     }
 }
 
+/// Migration v49 / audit #6. The DEFAULT must fail closed: an existing library has no recorded
+/// rights, and "nothing recorded" must never read as "permission granted".
+#[test]
+fn undeclared_rights_are_unknown_and_never_permit_redistribution() {
+    let db = make_db();
+    db.insert_segments_batch(&[make_segment("r-unknown", "/a.wav")]).unwrap();
+
+    let rights = db.rights_for_segment("r-unknown").unwrap();
+    assert_eq!(rights, RecordingRights::default(), "a legacy row records nothing");
+    assert_eq!(rights.disposition(), RightsDisposition::Unknown);
+    assert!(!rights.permits_redistribution(), "unknown rights MUST NOT permit republishing a voice");
+    assert!(!rights.is_revoked(), "unknown is not the same as withdrawn");
+
+    // A missing segment must also fail closed rather than error into a permissive default.
+    let absent = db.rights_for_segment("no-such-segment").unwrap();
+    assert!(!absent.permits_redistribution());
+}
+
+/// A licence alone is NOT consent to republish someone's voice: `permitted_use` must name it.
+#[test]
+fn a_licence_without_a_permitted_use_is_private_only() {
+    let db = make_db();
+    db.insert_segments_batch(&[make_segment("r-priv", "/b.wav")]).unwrap();
+    db.set_recording_rights(
+        "/b.wav",
+        &RecordingRights {
+            license: Some("CC-BY-4.0".into()),
+            consent_basis: Some("explicit_consent".into()),
+            permitted_use: Some("train".into()), // train, but NOT redistribute
+            attribution: Some("Speaker A".into()),
+            source: Some("owner recording 2026-08".into()),
+            revoked_at: None,
+        },
+    )
+    .unwrap();
+
+    let rights = db.rights_for_segment("r-priv").unwrap();
+    assert_eq!(rights.disposition(), RightsDisposition::PrivateOnly);
+    assert!(!rights.permits_redistribution(), "'train' does not imply 'redistribute'");
+
+    // Naming it flips exactly one thing.
+    db.set_recording_rights(
+        "/b.wav",
+        &RecordingRights { permitted_use: Some("train,redistribute".into()), ..rights.clone() },
+    )
+    .unwrap();
+    assert!(db.rights_for_segment("r-priv").unwrap().permits_redistribution());
+}
+
+/// Rights are declared per RECORDING: one call covers every clip cut from that file, and touches no
+/// other recording's clips.
+#[test]
+fn declaring_rights_covers_every_segment_of_that_recording_and_no_others() {
+    let db = make_db();
+    db.insert_segments_batch(&[
+        make_segment("s1", "/same.wav"),
+        make_segment("s2", "/same.wav"),
+        make_segment("s3", "/other.wav"),
+    ])
+    .unwrap();
+
+    let n = db
+        .set_recording_rights(
+            "/same.wav",
+            &RecordingRights {
+                license: Some("CC-BY-4.0".into()),
+                consent_basis: Some("public_dataset_licence".into()),
+                permitted_use: Some("redistribute".into()),
+                ..RecordingRights::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(n, 2, "both clips of the recording are covered by one declaration");
+    assert!(db.rights_for_segment("s1").unwrap().permits_redistribution());
+    assert!(db.rights_for_segment("s2").unwrap().permits_redistribution());
+    assert_eq!(
+        db.rights_for_segment("s3").unwrap().disposition(),
+        RightsDisposition::Unknown,
+        "a different recording is untouched — consent does not spread across files"
+    );
+}
+
+/// Withdrawal outranks everything, and re-declaring a licence must not resurrect it.
+#[test]
+fn revocation_outranks_a_full_licence_and_survives_a_rights_rewrite() {
+    let db = make_db();
+    db.insert_segments_batch(&[make_segment("r-rev", "/c.wav")]).unwrap();
+    let full = RecordingRights {
+        license: Some("CC-BY-4.0".into()),
+        consent_basis: Some("explicit_consent".into()),
+        permitted_use: Some("train,redistribute".into()),
+        ..RecordingRights::default()
+    };
+    db.set_recording_rights("/c.wav", &full).unwrap();
+    assert!(db.rights_for_segment("r-rev").unwrap().permits_redistribution());
+
+    assert_eq!(db.revoke_recording("/c.wav").unwrap(), 1);
+    let revoked = db.rights_for_segment("r-rev").unwrap();
+    assert_eq!(revoked.disposition(), RightsDisposition::Revoked);
+    assert!(revoked.is_revoked());
+    assert!(!revoked.permits_redistribution(), "a withdrawn recording is never redistributable");
+
+    // THE POINT: re-declaring the same full rights must not un-revoke it. A withdrawal that a later
+    // metadata edit could silently undo is not a withdrawal.
+    db.set_recording_rights("/c.wav", &full).unwrap();
+    assert!(
+        db.rights_for_segment("r-rev").unwrap().is_revoked(),
+        "re-declaring a licence resurrected a withdrawn recording"
+    );
+}
+
 #[test]
 fn per_segment_processing_provenance_round_trips_and_stays_unknown_for_legacy_rows() {
     // P0.4 (H3): denoised/diarized are persisted per segment (Migration v41) so a future export reads

@@ -143,6 +143,21 @@ fn is_training_ready_for_huggingface_export(
     if !grade.training_ready {
         return Ok(false);
     }
+    // RIGHTS GATE (migration v49, audit #6). Checked BEFORE the expensive hypothesis/coverage work
+    // below, because no amount of corroboration makes a clip usable when consent does not.
+    //
+    // WITHDRAWN CONSENT ONLY, deliberately — not "undeclared". This export writes a local HuggingFace
+    // dataset directory, which is a training-set preparation step; publishing it to the Hub is a
+    // separate, later act. Refusing every undeclared recording here would block the owner's entire
+    // existing library (144 clips, none declared) the moment this migration lands, silently redefining
+    // what a working command does. `permits_redistribution()` exists and is tested for the caller that
+    // genuinely publishes; wiring it HERE is an owner decision, not one to smuggle in with a schema
+    // change.
+    //
+    // A withdrawal carries no such ambiguity: it must be honoured on every path, and it is.
+    if db.rights_for_segment(&segment.id)?.is_revoked() {
+        return Ok(false);
+    }
     if grade.grade == quality::TRAINING_GRADE_SILVER {
         if !ready_agentic_segment_ids.contains(&segment.id) {
             return Ok(false);
@@ -332,6 +347,24 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     let pending_excluded = before_pending - segments.len();
     if pending_excluded > 0 {
         tracing::warn!("dataset export excluded {pending_excluded} not-yet-transcribed (placeholder) segment(s)");
+    }
+    // REVOKED CONSENT OUTRANKS EVERYTHING (migration v49, audit #6). This is the LOCAL export path —
+    // the permissive one, which deliberately still writes rights-unknown rows so a personal library
+    // keeps working. A withdrawal is different in kind from a missing licence: a withdrawal that only
+    // blocked publishing, while the clip kept flowing into every local JSON/JSONL/CSV/Parquet table,
+    // would not be a withdrawal at all. Dropped here, before any counting or writing, so no total in
+    // this file can include a revoked recording.
+    let before_revoked = segments.len();
+    let mut revoked_ids = Vec::new();
+    for seg in &segments {
+        if db.rights_for_segment(&seg.id)?.is_revoked() {
+            revoked_ids.push(seg.id.clone());
+        }
+    }
+    let segments: Vec<SpeechSegment> = segments.into_iter().filter(|s| !revoked_ids.contains(&s.id)).collect();
+    let revoked_excluded = before_revoked - segments.len();
+    if revoked_excluded > 0 {
+        tracing::warn!("dataset export excluded {revoked_excluded} segment(s) whose consent was withdrawn");
     }
     let total_duration: i64 = segments.iter().map(|s| s.duration_ms).sum();
     let verified = segments.iter().filter(|s| s.verified).count();

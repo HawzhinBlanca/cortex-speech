@@ -33,6 +33,53 @@ fn sanitized_clip_filename_blocks_path_traversal() {
     assert!(a.starts_with("rec_a_b_") && b.starts_with("rec_a_b_"), "{a:?} {b:?}");
 }
 
+/// Migration v49 / audit #6: a WITHDRAWN recording must vanish from the LOCAL export too.
+///
+/// This is the permissive path — it deliberately still writes rights-unknown rows so a personal
+/// library keeps working. Withdrawal is different in kind: a revocation that only blocked publishing,
+/// while the clip kept flowing into every local JSON/JSONL/CSV/Parquet table, would not be one.
+#[test]
+fn a_withdrawn_recording_is_dropped_from_the_local_export() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+
+    let keep = SpeechSegment {
+        id: "keep".to_string(),
+        audio_path: "/kept.wav".to_string(),
+        raw_transcript: "دەقی یەکەم".to_string(),
+        duration_ms: 1000,
+        verified: true,
+        ..SpeechSegment::default()
+    };
+    let drop = SpeechSegment {
+        id: "withdrawn".to_string(),
+        audio_path: "/withdrawn.wav".to_string(),
+        raw_transcript: "دەقی دووەم".to_string(),
+        duration_ms: 1000,
+        verified: true,
+        ..SpeechSegment::default()
+    };
+    db.insert_segments_batch(&[keep, drop]).unwrap();
+
+    // Fail-before shape: BOTH rows export while consent stands.
+    let before = NamedTempFile::new().unwrap();
+    export_dataset(&db, before.path(), &ExportFormat::Jsonl).unwrap();
+    let text = std::fs::read_to_string(before.path()).unwrap();
+    assert!(text.contains("دەقی یەکەم") && text.contains("دەقی دووەم"), "both rows export before withdrawal");
+
+    db.revoke_recording("/withdrawn.wav").unwrap();
+
+    let after = NamedTempFile::new().unwrap();
+    export_dataset(&db, after.path(), &ExportFormat::Jsonl).unwrap();
+    let text = std::fs::read_to_string(after.path()).unwrap();
+    assert!(text.contains("دەقی یەکەم"), "the consenting recording still exports");
+    assert!(
+        !text.contains("دەقی دووەم"),
+        "a withdrawn recording was still written to the LOCAL export — a withdrawal that only blocks \
+         publishing is not a withdrawal"
+    );
+}
+
 fn insert_machine_silver_segment_with_hf_coverage(
     db: &Database,
     wav_path: &std::path::Path,
@@ -1174,6 +1221,69 @@ fn export_huggingface_skips_rows_not_ready_for_training() {
 
     assert!(all_metadata.contains("hf-ready"));
     assert!(!all_metadata.contains("hf-reject"));
+}
+
+/// Migration v49 / audit #6: a withdrawal is honoured on the TRAINING-SET path too.
+///
+/// The HuggingFace gate deliberately does NOT refuse merely-undeclared recordings (that would block
+/// an entire existing library the moment the migration lands — an owner decision, not a schema-change
+/// side effect). A withdrawal carries no such ambiguity, and this pins that it is enforced here.
+#[test]
+fn hf_export_drops_a_withdrawn_recording_but_keeps_an_undeclared_one() {
+    let db_tmp = NamedTempFile::new().unwrap();
+    let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut paths = Vec::new();
+    for name in ["hf-kept.wav", "hf-withdrawn.wav"] {
+        let p = tmp_dir.path().join(name);
+        let mut w = hound::WavWriter::create(&p, spec).unwrap();
+        for _ in 0..16000 {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+        paths.push(p);
+    }
+
+    let mut kept = sample_segment("hf-kept");
+    kept.audio_path = paths[0].to_string_lossy().to_string();
+    db.insert_segment(&kept).unwrap();
+
+    let mut withdrawn = sample_segment("hf-withdrawn");
+    withdrawn.audio_path = paths[1].to_string_lossy().to_string();
+    db.insert_segment(&withdrawn).unwrap();
+
+    let settings =
+        crate::settings::AppSettings { hf_speaker_disjoint: false, ..crate::settings::AppSettings::default() };
+    let read_all = |dir: &std::path::Path| {
+        ["train", "validation", "test"]
+            .iter()
+            .map(|s| std::fs::read_to_string(dir.join(format!("data/{s}/metadata.csv"))).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // Fail-before: BOTH export while consent stands, and both are merely UNDECLARED — proving the
+    // gate does not refuse undeclared rows.
+    let before_dir = tempfile::tempdir().unwrap();
+    export_huggingface_dataset(&db, before_dir.path(), &settings).unwrap();
+    let before = read_all(before_dir.path());
+    assert!(before.contains("hf-kept") && before.contains("hf-withdrawn"), "undeclared rows still export");
+
+    db.revoke_recording(&paths[1].to_string_lossy()).unwrap();
+
+    let after_dir = tempfile::tempdir().unwrap();
+    export_huggingface_dataset(&db, after_dir.path(), &settings).unwrap();
+    let after = read_all(after_dir.path());
+    assert!(after.contains("hf-kept"), "the untouched recording still exports");
+    assert!(!after.contains("hf-withdrawn"), "a withdrawn recording reached the training-set export");
 }
 
 #[test]

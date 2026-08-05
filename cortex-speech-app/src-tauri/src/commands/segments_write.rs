@@ -16,6 +16,74 @@ use crate::validation::input as validate;
 use crate::AppState;
 use tauri::State;
 
+/// Declare rights for one source RECORDING — every segment cut from it (migration v49, audit #6).
+///
+/// The unit of consent is the recording, so this takes an audio path rather than a segment id, and
+/// returns how many segments it actually covered.
+///
+/// Until a recording is declared its clips are rights-UNKNOWN, which today still EXPORTS: the gates
+/// enforce withdrawal everywhere, and `RecordingRights::permits_redistribution` is available (and
+/// tested) for a caller that genuinely publishes, but wiring it as a hard refusal would block an
+/// entire undeclared library the moment the migration lands. That is an owner decision, deliberately
+/// not smuggled in with a schema change.
+#[tauri::command]
+pub fn set_recording_rights(
+    audio_path: String,
+    rights: crate::db::RecordingRights,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    STRICT_RATE_LIMITER.check("set_recording_rights")?;
+    let validated = validate::validate_file_path(&audio_path)?;
+    for (name, value) in [
+        ("Licence", &rights.license),
+        ("Consent basis", &rights.consent_basis),
+        ("Permitted use", &rights.permitted_use),
+        ("Attribution", &rights.attribution),
+        ("Provenance", &rights.source),
+    ] {
+        if let Some(v) = value {
+            validate::validate_text(v, 2000, name)?;
+        }
+    }
+    // `revoked_at` is deliberately NOT settable here: withdrawal has its own command, so a rights
+    // edit can never quietly un-revoke a recording by omitting the field.
+    let db = state.lock_db();
+    db.set_recording_rights(&validated, &rights).map_err(|e| e.to_string())
+}
+
+/// Record a withdrawal of consent for a recording. Irreversible from this API by design.
+///
+/// Once stamped, every export path drops these clips — the local JSON/JSONL/CSV/Parquet tables as
+/// well as the redistribution ones. A withdrawal that only blocked publishing would not be one.
+#[tauri::command]
+pub fn revoke_recording_consent(audio_path: String, state: State<'_, AppState>) -> Result<usize, String> {
+    STRICT_RATE_LIMITER.check("revoke_recording_consent")?;
+    let validated = validate::validate_file_path(&audio_path)?;
+    let db = state.lock_db();
+    let n = db.revoke_recording(&validated).map_err(|e| e.to_string())?;
+    tracing::warn!("consent withdrawn for {validated}: {n} segment(s) excluded from every export");
+    Ok(n)
+}
+
+/// Every distinct source recording, its clip count, and its declared rights.
+#[tauri::command]
+pub fn list_recording_rights(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    RATE_LIMITER.check("list_recording_rights")?;
+    let db = state.lock_db();
+    let rows = db.list_recording_rights().map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(path, count, rights)| {
+            serde_json::json!({
+                "audioPath": path,
+                "segmentCount": count,
+                "disposition": format!("{:?}", rights.disposition()),
+                "rights": rights,
+            })
+        })
+        .collect())
+}
+
 #[tauri::command]
 pub fn update_segment(segment: SpeechSegment, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("update_segment")?;

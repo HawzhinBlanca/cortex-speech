@@ -121,6 +121,11 @@ cortex-speech-app/src-tauri/fuzz/artifacts/
 # user-profile paths that scripts/test_windows_repo_hygiene.py rejects in tracked files. Owner
 # confirmed these are his own 2026-08-03 audit artifacts and are not to be published.
 docs/audits/
+# Same class, same reasons (2026-08-05): a top-level audit folder of live-library screenshots plus
+# DEEP_BRUTAL_AUDIT_CURRENT.md, which embeds absolute C:\Users\... paths the hygiene gate rejects in
+# tracked files. Caught only because a `git add -A` swept it into a commit that had to be undone —
+# ignoring it means the next careless add cannot repeat that.
+audit-2026-08-05/
 
 # Downloaded FLEURS ckb_IQ eval corpus (scripts/build_fleurs_ckb_manifest.py, ~1-2 GB, one-time).
 # The clips are covered by *.wav, but the GENERATED manifest is not: it carries the corpus references

@@ -144,6 +144,85 @@ pub struct SegmentsPage {
     pub next_cursor: Option<String>,
 }
 
+/// Rights attached to one source RECORDING (migration v49, deep-audit #6).
+///
+/// A voice recording is Article 9 biometric data: the lawful basis, the permitted use and the ability
+/// to honour a withdrawal attach to the individual recording, and none of that is expressible in a
+/// repo-level ATTRIBUTION.md. Every field is Optional and every default is None, because "unknown" is
+/// the truthful state for a library whose provenance was never recorded per clip — and because the
+/// default must FAIL CLOSED at the redistribution gate rather than assume permission.
+///
+/// Speaker identity deliberately does NOT live here: `speech_segments.speaker_id` already carries a
+/// pseudonymous label (`SPEAKER_00`), and adding a real-identity column would create the re-
+/// identification risk this schema exists to bound.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingRights {
+    /// The licence the RECORDING is held under, e.g. "CC-BY-4.0" or "owner-private".
+    pub license: Option<String>,
+    /// The Article 9 lawful basis, e.g. "explicit_consent" / "public_dataset_licence".
+    pub consent_basis: Option<String>,
+    /// What the basis actually permits, e.g. "train" / "train,redistribute" / "private_only".
+    pub permitted_use: Option<String>,
+    /// The credit line the licence requires, carried into every export manifest.
+    pub attribution: Option<String>,
+    /// Where the recording came from — provenance, not a file path.
+    pub source: Option<String>,
+    /// Revocation lineage. Non-NULL means consent was withdrawn; it outranks every field above.
+    pub revoked_at: Option<String>,
+}
+
+/// What the recorded rights permit. Ordered by severity — `Revoked` outranks everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightsDisposition {
+    /// Consent withdrawn. Excluded from EVERY export path, including local personal ones.
+    Revoked,
+    /// Nothing recorded. Local personal export is allowed; redistribution is not.
+    Unknown,
+    /// A licence and basis are recorded, but they do not permit redistribution.
+    PrivateOnly,
+    /// Recorded, and the permitted use explicitly includes redistribution.
+    Redistributable,
+}
+
+impl RecordingRights {
+    /// The single place that decides what these fields permit.
+    ///
+    /// Fails closed at every step: no revocation check can be skipped, and absent fields never grant
+    /// permission. `permitted_use` must NAME redistribution — a licence string alone is not consent to
+    /// republish someone's voice.
+    pub fn disposition(&self) -> RightsDisposition {
+        if self.revoked_at.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            return RightsDisposition::Revoked;
+        }
+        let declared = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if !declared(&self.license) || !declared(&self.consent_basis) {
+            return RightsDisposition::Unknown;
+        }
+        let permits = self
+            .permitted_use
+            .as_deref()
+            .unwrap_or("")
+            .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .any(|t| matches!(t.trim().to_ascii_lowercase().as_str(), "redistribute" | "publish"));
+        if permits {
+            RightsDisposition::Redistributable
+        } else {
+            RightsDisposition::PrivateOnly
+        }
+    }
+
+    /// True only for a recording that may leave this machine.
+    pub fn permits_redistribution(&self) -> bool {
+        self.disposition() == RightsDisposition::Redistributable
+    }
+
+    /// True when the recording must not appear in ANY export, local ones included.
+    pub fn is_revoked(&self) -> bool {
+        self.disposition() == RightsDisposition::Revoked
+    }
+}
+
 /// P3.3: which distinct source audio files are missing on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2076,6 +2155,103 @@ impl Database {
             params![hyp.segment_id, hyp.model_id, transcript, hyp.confidence],
         )?;
         Ok(())
+    }
+
+    /// The rights attached to the recording this segment came from (migration v49, audit #6).
+    ///
+    /// Read as its own row lookup rather than as fields on [`SpeechSegment`]: that struct is already
+    /// wide, and every past widening broke every destructuring insert site. The export gate that needs
+    /// this already runs a per-segment query for hypotheses, so this costs the same shape it already
+    /// pays.
+    pub fn rights_for_segment(&self, segment_id: &str) -> AppResult<RecordingRights> {
+        let rights = self.conn.query_row(
+            "SELECT rights_license, rights_consent_basis, rights_permitted_use,
+                    rights_attribution, rights_source, rights_revoked_at
+             FROM speech_segments WHERE id = ?1",
+            params![segment_id],
+            |r| {
+                Ok(RecordingRights {
+                    license: r.get(0)?,
+                    consent_basis: r.get(1)?,
+                    permitted_use: r.get(2)?,
+                    attribution: r.get(3)?,
+                    source: r.get(4)?,
+                    revoked_at: r.get(5)?,
+                })
+            },
+        );
+        match rights {
+            Ok(v) => Ok(v),
+            // A missing row is UNKNOWN rights, never "permitted": the default must fail closed.
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(RecordingRights::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Declare rights for a RECORDING — every segment cut from that source file, in one statement.
+    ///
+    /// Storage is per row (see migration v49) but the unit of consent is the recording, so the API
+    /// takes an audio path. Returns the number of segments updated so a caller can report what it
+    /// actually covered rather than what it attempted.
+    ///
+    /// Deliberately does NOT clear `rights_revoked_at`: re-declaring a licence must not silently
+    /// resurrect a withdrawn recording. Un-revoking is a separate, explicit act.
+    pub fn set_recording_rights(&self, audio_path: &str, rights: &RecordingRights) -> AppResult<usize> {
+        Ok(self.conn.execute(
+            "UPDATE speech_segments
+                SET rights_license = ?2, rights_consent_basis = ?3, rights_permitted_use = ?4,
+                    rights_attribution = ?5, rights_source = ?6, updated_at = datetime('now')
+              WHERE audio_path = ?1",
+            params![
+                audio_path,
+                rights.license,
+                rights.consent_basis,
+                rights.permitted_use,
+                rights.attribution,
+                rights.source,
+            ],
+        )?)
+    }
+
+    /// Record a withdrawal of consent for a recording. Stamps every segment cut from it.
+    ///
+    /// This is the revocation lineage: once stamped, `rights_disposition` returns `Revoked` and every
+    /// export path — including plain local export — must drop the row. A withdrawal that only blocks
+    /// future publishing is not a withdrawal.
+    pub fn revoke_recording(&self, audio_path: &str) -> AppResult<usize> {
+        Ok(self.conn.execute(
+            "UPDATE speech_segments
+                SET rights_revoked_at = COALESCE(rights_revoked_at, datetime('now')),
+                    updated_at = datetime('now')
+              WHERE audio_path = ?1",
+            params![audio_path],
+        )?)
+    }
+
+    /// Every distinct source recording plus its rights, for the operator view.
+    pub fn list_recording_rights(&self) -> AppResult<Vec<(String, usize, RecordingRights)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT audio_path, COUNT(*), rights_license, rights_consent_basis, rights_permitted_use,
+                    rights_attribution, rights_source, rights_revoked_at
+             FROM speech_segments GROUP BY audio_path ORDER BY audio_path",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    RecordingRights {
+                        license: r.get(2)?,
+                        consent_basis: r.get(3)?,
+                        permitted_use: r.get(4)?,
+                        attribution: r.get(5)?,
+                        source: r.get(6)?,
+                        revoked_at: r.get(7)?,
+                    },
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn get_hypotheses_for_segment(&self, segment_id: &str) -> AppResult<Vec<SegmentHypothesis>> {
