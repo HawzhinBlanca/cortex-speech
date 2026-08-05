@@ -14,8 +14,13 @@ installGlobalErrorTrap();
 // where window.__TAURI_INTERNALS__ already exists.
 // ---------------------------------------------------------------------------
 if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
+  // `_trend$` added 2026-08-05: `get_escalation_rate_trend` matched NOTHING here, so it fell through
+  // to the final `null` and RefineryPanel's `trend.length === 0` threw "Cannot read properties of null
+  // (reading 'length')" on every Insights load in dev preview. An ErrorBoundary caught it, which is
+  // why it never surfaced as a page error and was easy to miss — the panel just rendered a retry
+  // button. Commands that return a Vec must default to [], not null.
   const listKinds =
-    /(^get_segments$|^list_|_reports$|_events$|_runs$|_history$|^search_|_queue$|^get_speakers$)/;
+    /(^get_segments$|^list_|_reports$|_events$|_runs$|_history$|_trend$|^search_|_queue$|^get_speakers$)/;
   const objKinds =
     /(^get_settings$|^app_health$|^db_info$|^import_status$|readiness$|^models_status$|_info$|^get_stats$|^compute_stats$)/;
 
@@ -40,8 +45,10 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     const words = ws.map((word, i) => {
       const jitter = ((i * 37) % 100) / 100; // deterministic pseudo-random in [0,1)
       let c: number;
-      if (jitter < 0.18) c = Math.min(segConf, 0.5); // a few low → red
-      else if (jitter < 0.45) c = Math.min(0.82, segConf); // some mid → amber
+      if (jitter < 0.18)
+        c = Math.min(segConf, 0.5); // a few low → red
+      else if (jitter < 0.45)
+        c = Math.min(0.82, segConf); // some mid → amber
       else c = Math.min(0.99, segConf + 0.1); // most high → neutral
       return {
         word,
@@ -108,6 +115,35 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
   const mockInvoke = async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
     if (cmd.startsWith('plugin:')) return null;
     if (cmd === 'get_segments') return sampleSegments();
+    // The library actually reads through get_segments_PAGE; the mock only ever answered the
+    // unpaginated sibling, so this command fell through to the object catch-all below and returned
+    // `{}`. That used to render as a silently EMPTY library in dev preview, and once the read guards
+    // started throwing on a malformed payload it became a hard failure instead. Answer the real shape.
+    if (cmd === 'get_segments_page') {
+      const items = sampleSegments();
+      return { items, total: items.length, nextCursor: null };
+    }
+    // Same class: the readiness verdict and the accuracy card call these, and `{}` / `null` from the
+    // catch-alls crashed the Insights panel on `.summary`. Mock the real shapes so dev preview shows
+    // the decision layer rather than an error.
+    if (cmd === 'get_training_grade_breakdown') {
+      const items = sampleSegments();
+      const ready = items.filter((s) => s.verified).length;
+      return {
+        summary: {
+          totalSegments: items.length,
+          trainingReadySegments: ready,
+          goldSegments: ready,
+          silverSegments: 0,
+          reviewSegments: items.length - ready,
+          rejectedSegments: 0,
+        },
+        reasonCounts: {
+          human_verified: ready,
+          not_human_or_high_confidence_agent_verified: items.length - ready,
+        },
+      };
+    }
     if (cmd === 'get_waveform') return sampleWaveform();
     if (cmd === 'get_audio_duration') return 6.2;
     if (cmd === 'get_stats' || cmd === 'compute_stats' || cmd === 'get_dataset_stats')
@@ -127,10 +163,24 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
       const segs = sampleSegments();
       const warnings = segs
         .filter((s) => s.snrDb < 10)
-        .map((s) => ({ severity: 'Warning', category: 'audio_quality', segmentId: s.id, field: 'snrDb', message: `Low SNR: ${s.snrDb} dB`, details: s.audioPath }));
+        .map((s) => ({
+          severity: 'Warning',
+          category: 'audio_quality',
+          segmentId: s.id,
+          field: 'snrDb',
+          message: `Low SNR: ${s.snrDb} dB`,
+          details: s.audioPath,
+        }));
       const errors = segs
         .filter((s) => s.confidence < 0.5)
-        .map((s) => ({ severity: 'Error', category: 'transcript', segmentId: s.id, field: 'confidence', message: `Very low confidence: ${Math.round(s.confidence * 100)}%`, details: null }));
+        .map((s) => ({
+          severity: 'Error',
+          category: 'transcript',
+          segmentId: s.id,
+          field: 'confidence',
+          message: `Very low confidence: ${Math.round(s.confidence * 100)}%`,
+          details: null,
+        }));
       return {
         totalSegments: segs.length,
         totalAudioFiles: segs.length,

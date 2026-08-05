@@ -894,7 +894,24 @@ export interface TrainingGradeBreakdown {
 }
 
 export async function getTrainingGradeBreakdown(): Promise<TrainingGradeBreakdown> {
-  return invoke<TrainingGradeBreakdown>('get_training_grade_breakdown');
+  const data = await invoke<TrainingGradeBreakdown>('get_training_grade_breakdown');
+  // THROW on a malformed payload, exactly like the library reads above. A caller that receives `{}`
+  // and reads `.summary.trainingReadySegments` dies with a TypeError instead of showing "readiness
+  // unknown" — which is what happened: the dev IPC mock has no case for this command, so it fell
+  // through to the object catch-all and returned `{}`, crashing the whole Insights panel on every
+  // load in dev. The readiness verdict already renders a null as "unknown"; making a bad shape reach
+  // it as null is the difference between a degraded panel and a dead one.
+  if (
+    !data ||
+    typeof data !== 'object' ||
+    !data.summary ||
+    typeof data.summary.totalSegments !== 'number'
+  ) {
+    throw new Error(
+      `get_training_grade_breakdown returned ${typeof data} without a summary — readiness cannot be computed`,
+    );
+  }
+  return data;
 }
 
 export async function getSettings(): Promise<AppSettings> {
