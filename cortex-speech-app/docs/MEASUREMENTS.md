@@ -10,9 +10,31 @@ recorded, never a placeholder number.
 
 ## 2026-07-10 — Same-set three-engine scorecard, FLEURS ckb_IQ **test** (N=922)
 
-The first apples-to-apples engine comparison on a **known-disjoint, boundary-aligned** gold set:
-identical set (N=922 rows = 348 distinct clips; see duplication correction below), identical
-NFC+lower+whitespace (space-KEPT) normalization for all engines.
+Same-set engine comparison on a **boundary-aligned** gold set: identical set (N=922 rows = 348
+distinct clips; see duplication correction below).
+
+> **Normalization correction (2026-08-05, audit H1).** This section previously claimed "identical
+> NFC+lower+whitespace (space-KEPT) normalization for all engines". **That was wrong**, and the code
+> proves it. The 7B and MMS-1B rows were scored by Python harnesses whose `norm()` is NFC + lowercase
+> + whitespace-collapse only. The stock-300M row was scored by the **Rust** harness
+> (`cargo test --test real_audio ckb_scorecard_on_gold`), whose `wer::normalize_for_metrics` ALSO
+> applies `normalize_hamza`, `remove_diacritics` and `normalize_numbers` before comparing.
+>
+> Direction matters and is stated plainly: extra folding makes matching **more forgiving**, so
+> stock-300M's 11.34% is *flattered* relative to the strict basis. The champion's −4.3 pt lead is
+> therefore **understated**, not inflated — the headline is not puffed up by this defect.
+>
+> What IS damaged: the MAPSSWE p-value pairing champion-7B against stock-300M (§ C1 below) is
+> computed across two different normalizations, so it measures the normalizers as well as the
+> engines and **is not interpretable as stated**. It is retained for the record and flagged, not
+> silently deleted — the run really happened. A sound champion-vs-stock significance test needs both
+> engines re-scored on ONE basis; that is a re-run on the rig, owner-gated.
+>
+> The 7B-vs-SeamlessM4T-v2 comparison is unaffected: both are Python scorecards on the strict basis.
+>
+> Prevention, not just correction: every scorecard now stamps a `norm_basis` column into its TSV and
+> `norm_basis` into its JSON, and `scripts/mapsswe_compare.py` **refuses** to pair two TSVs whose
+> bases differ. Pinned by `scripts/test_eval_basis_policy.py`.
 
 ### Frozen eval set
 - google/fleurs `ckb_iq` **test** split, all 922 rows with non-empty audio+reference (0 skipped),
@@ -72,8 +94,11 @@ NFC+lower+whitespace (space-KEPT) normalization for all engines.
 ### C1 engine decision (M1.3) — recorded
 
 **The OmniASR-7B champion remains the default engine, now on measured evidence:** best CER on the
-known-disjoint same-set benchmark (−4.3 pts vs stock, 38% relative; −2.3 pts vs fine-tuned 1B, 25%
-relative), 100%-Arabic-script output, coherent proper-noun handling (verified in real-app e2e).
+same-set benchmark (−4.3 pts vs stock, 38% relative; −2.3 pts vs fine-tuned 1B, 25% relative),
+100%-Arabic-script output, coherent proper-noun handling (verified in real-app e2e). The −4.3 pt
+stock margin is measured **across two normalization bases** (see the correction above) and is
+therefore a lower bound on the true gap, not a paired result; the decision does not rest on its
+significance test.
 Same-set external context: ElevenLabs Scribe v1 publishes 32.1% WER on FLEURS-ckb; the champion's
 32.93% [31.89, 33.98] is statistically on par — with the caveat that this normalization counts digit
 verbalization/format as errors, which penalizes the champion's style. Trade-off accepted by policy:
@@ -105,9 +130,17 @@ MAPSSWE char: champion7b  7.03% vs stock300m  11.34%  mean diff/seg = -5.312  z 
 baseline ci_low on both metrics (CER 7.55% < 12.02% ✓; WER 33.98% < 41.17% ✓) vs SeamlessM4T-v2.
 
 ### Honest caveats
-- The CV22-ckb champion number (5.04% CER, 2026-07-09) predates this record and keeps its
-  unverified-disjointness caveat; **7.03% on FLEURS is the honest headline** until disjointness on
-  CV22 is proven.
+- **Training-set overlap with the 7B LoRA is UNVERIFIABLE on both sets** (audit H5, restored
+  2026-08-05). `FINAL_READINESS_10.md` §M1.1 requires this caveat to be *"permanent … stated, never
+  hidden"*, because the LoRA's training manifest lives on an offline drive and cannot be checked
+  against these clips. This section previously called the FLEURS set **"known-disjoint"**, which
+  asserted precisely what the plan says cannot be established. Using the official FLEURS **test**
+  split makes overlap *unlikely* — that is the standard split contract, and it is the reason the set
+  was chosen — but "unlikely by construction" is not "verified", and only the latter licenses a SOTA
+  claim. Until that manifest is available, every number here carries this caveat.
+- The CV22-ckb champion number (5.04% CER, 2026-07-09) predates this record and carries the same
+  caveat; **7.03% on FLEURS is the honest headline** because FLEURS is a public, citable test split,
+  not because its disjointness was proven.
 - FLEURS is read speech; no conversational Sorani number exists yet anywhere (that requires the
   app-gold set from the owner's review marathon — SHIP_FINAL_PLAN §B #37/#41).
 - Digit/punctuation normalization is the strict space-kept basis shared by all three engines here;

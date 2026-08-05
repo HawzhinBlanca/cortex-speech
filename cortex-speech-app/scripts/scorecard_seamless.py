@@ -28,6 +28,11 @@ def norm(s: str) -> str:
     return " ".join(unicodedata.normalize("NFC", s or "").strip().lower().split())
 
 
+# Stamped into the TSV so a comparison can prove both engines were scored the same way (audit H1).
+# This harness has no alternate basis; the constant names the one it uses.
+NORM_BASIS = "nfc_lower_space_kept"
+
+
 def edit_distance(a, b) -> int:
     prev = list(range(len(b) + 1))
     for i, ca in enumerate(a, 1):
@@ -63,7 +68,10 @@ def main() -> int:
         # their row entirely, so without a clip id a comparison silently misaligns when the two engines skip
         # DIFFERENT clips (equal row counts, mismatched clips). Both scorecards iterate the same manifest, so
         # the manifest index is the shared, tab-safe key.
-        f.write("clip_index\tchar_dist\tchar_ref_len\tword_dist\tword_ref_len\n")
+        # norm_basis stamps WHICH normalization produced these counts, so mapsswe_compare.py can refuse
+        # a cross-basis pairing (audit H1). This scorecard has no CER_STRIP switch — norm() here is
+        # always the strict space-kept basis — but the stamp must be present for the check to work.
+        f.write("clip_index\tchar_dist\tchar_ref_len\tword_dist\tword_ref_len\tnorm_basis\n")
         for i, row in enumerate(rows):
             wav, ref = row[0], row[1]
             try:
@@ -82,7 +90,7 @@ def main() -> int:
             wd, wr = word_pair(r, h)
             per_clip.append((cd, cr))
             word_clip.append((wd, wr))
-            f.write(f"{i}\t{cd}\t{cr}\t{wd}\t{wr}\n")
+            f.write(f"{i}\t{cd}\t{cr}\t{wd}\t{wr}\t{NORM_BASIS}\n")
             if (i + 1) % 25 == 0:
                 print(f"  ...{i + 1}/{len(rows)}", flush=True)
 

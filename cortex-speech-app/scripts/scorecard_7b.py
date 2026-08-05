@@ -62,6 +62,13 @@ def norm_fair(s: str) -> str:
 
 _NORM = norm_fair if os.environ.get("CORTEX_CER_STRIP") == "1" else norm
 
+# THE BASIS IS PART OF THE MEASUREMENT. Two runs of this script can differ by more than a CER point
+# purely from which normalizer was active, and without a stamp the TSV/JSON are byte-indistinguishable
+# — a number could not be traced to how it was produced, and two engines scored on different bases
+# could be compared as if they were comparable (audit H1, 2026-07-24). Every artifact this script
+# writes now carries the basis, and mapsswe_compare.py REFUSES to pair TSVs whose bases differ.
+NORM_BASIS = "nfc_lower_space_kept_punct_digits_stripped" if _NORM is norm_fair else "nfc_lower_space_kept"
+
 
 def edit_distance(a, b) -> int:
     prev = list(range(len(b) + 1))
@@ -198,14 +205,18 @@ def main() -> int:
         # clip_index (manifest row index) first, so mapsswe_compare.py pairs two engines' TSVs by CLIP, not
         # by row position — skipped clips drop their row, so without an id a comparison silently misaligns
         # when the two engines skip DIFFERENT clips. Both scorecards key on the same manifest index.
-        f.write("clip_index\tchar_dist\tchar_ref_len\tword_dist\tword_ref_len\n")
+        # norm_basis is a COLUMN, not a `# comment` header: mapsswe_compare.load() reads line 1 as the
+        # header, so a comment line would be parsed as column names and break every existing comparison.
+        # Repeating the constant per row also makes each row self-describing if the file is ever split.
+        f.write("clip_index\tchar_dist\tchar_ref_len\tword_dist\tword_ref_len\tnorm_basis\n")
         for idx, ((d, r), (wd, wr)) in zip(scored_indices, zip(per_clip, word_clip)):
-            f.write(f"{idx}\t{d}\t{r}\t{wd}\t{wr}\n")
+            f.write(f"{idx}\t{d}\t{r}\t{wd}\t{wr}\t{NORM_BASIS}\n")
     out_json = os.path.join(os.path.dirname(os.path.abspath(manifest)), "omni7b_eval_summary.json")
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "n": n,
+                "norm_basis": NORM_BASIS,
                 "micro_cer": micro,
                 "ci_lo": lo,
                 "ci_hi": hi,
@@ -228,7 +239,15 @@ def main() -> int:
     print(f"  OmniASR-7B (warm server) micro CER = {micro*100:.2f}%   95% CI [{lo*100:.2f}%, {hi*100:.2f}%]   N={n}")
     print(f"  OmniASR-7B (warm server) micro WER = {wer*100:.2f}%   95% CI [{wlo*100:.2f}%, {whi*100:.2f}%]   N={n}")
     print(f"  throughput = {throughput:.2f} clips/s ({mean_proc_s:.3f} s/clip; {total_proc_s:.1f}s total)")
-    print(f"  (fine-tuned MMS-1B: 21.00% [19.93, 22.04] N=900; stock CTC-300M: 29.40% N=400)")
+    print(f"  normalization basis = {NORM_BASIS}")
+    # The comparators come from OTHER runs on OTHER sets, and they were measured on the strict basis.
+    # Printing them beside a CER_STRIP number invites exactly the cross-basis comparison audit H1
+    # flagged, so they are shown only when this run shares their basis — and always labelled with it.
+    if NORM_BASIS == "nfc_lower_space_kept":
+        print("  (other runs, same basis, DIFFERENT sets — not a paired comparison:")
+        print("     fine-tuned MMS-1B 21.00% [19.93, 22.04] N=900 · stock CTC-300M 29.40% N=400)")
+    else:
+        print("  (comparator figures withheld: they were measured on nfc_lower_space_kept, not this basis)")
     print(f"  per-clip -> {out_tsv}")
     print("=" * 60)
     if n < 100:

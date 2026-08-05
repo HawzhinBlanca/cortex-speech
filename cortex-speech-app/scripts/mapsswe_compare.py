@@ -17,22 +17,29 @@ import sys
 def load(path):
     """Each row -> (clip_index, char_dist, char_ref_len, word_dist, word_ref_len). clip_index is the manifest
     row index the scorecards now emit so two engines' TSVs can be paired by CLIP; it is None for a legacy TSV
-    that predates the column."""
+    that predates the column.
+
+    Also returns the run's `norm_basis` (None for a legacy TSV that predates the column) so `main` can
+    refuse a cross-basis comparison — see the check there."""
     rows = []
+    basis = None
     with open(path, encoding="utf-8") as f:
         header = f.readline().rstrip("\n").split("\t")
         idx = {c: i for i, c in enumerate(header)}
         has_id = "clip_index" in idx
+        has_basis = "norm_basis" in idx
         for line in f:
             p = line.rstrip("\n").split("\t")
             if len(p) < len(header):
                 continue
             clip = int(p[idx["clip_index"]]) if has_id else None
+            if has_basis:
+                basis = p[idx["norm_basis"]]
             rows.append(
                 (clip, int(p[idx["char_dist"]]), int(p[idx["char_ref_len"]]),
                  int(p[idx["word_dist"]]), int(p[idx["word_ref_len"]]))
             )
-    return rows
+    return rows, basis
 
 
 def mapsswe(diffs):
@@ -72,9 +79,27 @@ def main():
     if len(sys.argv) < 3:
         print(__doc__)
         return 2
-    a, b = load(sys.argv[1]), load(sys.argv[2])
+    (a, a_basis), (b, b_basis) = load(sys.argv[1]), load(sys.argv[2])
     la = sys.argv[3] if len(sys.argv) > 3 else "A"
     lb = sys.argv[4] if len(sys.argv) > 4 else "B"
+
+    # CROSS-BASIS REFUSAL (audit H1). A matched-pairs test on error counts produced by two DIFFERENT
+    # text normalizations measures the normalizers as much as the engines, and its p-value does not
+    # mean what it says. This exact defect shipped: the pinned champion-vs-stock comparison paired a
+    # Python NFC+lower scorecard against the Rust harness's `normalize_for_metrics`, which also folds
+    # hamza, strips diacritics and normalizes numbers. Refuse rather than print an unsound p.
+    if a_basis is not None and b_basis is not None and a_basis != b_basis:
+        print(f"CROSS-BASIS REFUSAL: {la} scored on '{a_basis}' but {lb} on '{b_basis}'.")
+        print("  A matched-pairs p-value across two normalizations is not interpretable. Re-score")
+        print("  both engines on one basis, then compare.")
+        return 1
+    if a_basis is None or b_basis is None:
+        # A legacy TSV predates the stamp, so equality CANNOT be established. Say so — silence here
+        # would let the cross-basis case slip through unnoticed on exactly the old files that caused it.
+        print(f"WARNING: normalization basis unknown for {la if a_basis is None else lb} (legacy TSV without")
+        print("  a norm_basis column) — this comparison is UNVERIFIED for basis equality. Re-score to confirm.")
+    else:
+        print(f"normalization basis (both): {a_basis}")
 
     a_has_id = bool(a) and all(r[0] is not None for r in a)
     b_has_id = bool(b) and all(r[0] is not None for r in b)
