@@ -6499,3 +6499,95 @@ The probe is REPORTED, NOT GATED, deliberately. An end-to-end latency budget on 
 reds on background load rather than on regressions — the cry-wolf failure `bench-budget`'s
 confirm-re-measure exists to avoid — and a gate people learn to re-run is worse than no gate. Publish
 the evidence; gate the microbenchmarks that are actually stable.
+
+## Iteration 242 — the dashboard leads with a decision, and two accuracy claims are withdrawn
+
+Owner go-ahead for deep-audit #7, then "fix H1 and H5". Three fixes and one crash finding.
+
+**#7 — Insights leads with a verdict, diagnostics move behind Advanced.** The panel answers one
+question first (can I export a training set?), then names the blockers, the next action, and one
+canonical accuracy record. Conformal certificate, inference internals, intelligence report, duration
+histogram, top speakers and dataset tools moved into a collapsed native `<details>` — keyboard-
+operable and screen-reader-exposed with no JS, which the accessibility gate needs anyway.
+
+The verdict is sourced from `get_training_grade_breakdown`, which runs the SAME
+`training_grade_for_segment` the export gates on, so it can never disagree with what an export would
+write. `training_grade_summary` now delegates to it: two copies of the grade bucketing is how a count
+starts lying.
+
+**A claim in that commit was withdrawn before it shipped.** The first draft said "measured on the
+live library: training_ready = 0, no word aligner installed, every clip carries
+`energy_heuristic_alignment`". That was never measured. A read-only census the same day shows the
+opposite premise — all 144 clips carry `alignment_quality = 'ctc_forced'`, so the aligner IS present
+and working. The design still holds; the sentence did not. Amended out of the unpushed commit.
+
+Live census, 2026-08-05, read-only against the real profile: 144 segments · 0.5 h audio ·
+`human_decision` 77 undecided / 35 edit / 5 accept / 27 reject (so verified-GOOD is 40, not 67) ·
+`confidence` and `ctc_score` NULL on all 144 · 144/144 jury verdicts `T1_ESCALATE` · `is_gold` 0.
+Two eval runs, byte-identical (a deterministic re-run, not independent corroboration).
+
+**The a11y gate caught a real coverage loss.** Moving those panels into a collapsed `<details>` made
+`axe.spec.ts` red: it used `conformal-cert` becoming visible as its settle signal. Repointing that
+wait at an always-visible element would have gone green while SILENTLY narrowing the gate — axe does
+not analyze hidden content, so every rule covering those four panels would have stopped running. The
+disclosure is opened instead, preserving the coverage the original wait was written for ("and
+actually covers that panel"). 94 e2e pass, and the new markup has zero WCAG 2.2 AA violations in en
+and ckb/RTL with the section expanded.
+
+**H1 — "identical normalization for all engines" was false.** `MEASUREMENTS.md` introduced the pinned
+three-engine table with that claim. The 7B and MMS-1B rows came from Python harnesses (`norm()` =
+NFC + lower + whitespace). The stock-300M row came from the RUST harness
+(`cargo test --test real_audio ckb_scorecard_on_gold`), whose `wer::normalize_for_metrics` also
+applies `normalize_hamza`, `remove_diacritics` and `normalize_numbers`.
+
+Direction, stated rather than buried: extra folding is MORE forgiving, so stock-300M's 11.34% is
+flattered and the champion's −4.3 pt lead is UNDERSTATED. 7.03% is not puffed up by this. What is
+damaged is the MAPSSWE p-value pairing champion-7B against stock-300M (z = −26.26, p = 5.8e-152):
+computed across two normalizations, it measures the normalizers too and is not interpretable as
+stated. Flagged and retained — the run really happened.
+
+Prevention rather than documentation: every scorecard stamps `norm_basis` (derived from the ACTIVE
+normalizer) into stdout, its JSON summary and a per-row TSV column; `mapsswe_compare.py` REFUSES
+(exit 1) to pair two TSVs whose bases differ and warns when a legacy TSV cannot prove its basis. The
+stamp is a COLUMN, not a `#` comment — mapsswe's loader reads line 1 as its header.
+
+**H5 — the mandated permanent caveat had gone missing.** `FINAL_READINESS_10.md` §M1.1 requires:
+*"Both carry a permanent caveat: training-set overlap with the 7B LoRA is unverifiable (its manifest
+is on the offline drive) — stated, never hidden."* `MEASUREMENTS.md` instead called the set
+"known-disjoint". Restored. Using the official FLEURS **test** split makes overlap unlikely by
+construction — that is why it was chosen — but unlikely is not verified, and only verified licenses a
+SOTA claim.
+
+Fail-before, `scripts/test_eval_basis_policy.py` (suite 48 → 49):
+
+```
+BASELINE (unmodified)                        exit=0  policy passed
+scorecard stamp removed                      exit=1  no norm_basis in JSON summary
+stamp decoupled from active normalizer       exit=1  stamp can disagree with basis used
+cross-basis refusal disabled                 exit=1  ACCEPTED two different bases
+legacy unknown-basis warning removed         exit=1  did not warn basis unverified
+H5 disjointness claim reinstated             exit=1  asserts 'known-disjoint'
+H1 cross-basis p-value flag removed          exit=1  unsound test would read as sound
+RESTORED                                     exit=0  policy passed
+```
+
+TWO of those guards were decorative and their own fail-before caught it. The cross-basis check first
+asserted the string `CROSS-BASIS REFUSAL` was present — which also appears in the COMMENT above the
+branch, so deleting the refusal left the gate green; it now RUNS the script against fixture TSVs and
+asserts the exit code. The H5 check first banned the substring outright, forbidding the correction
+text that cites the retired phrase; it now distinguishes a bare assertion from a quoted citation.
+
+**0xC0000409, third occurrence — and the instrumentation did NOT capture it.** `heartbeat-runtime`
+died with exit 3221226505 (STATUS_STACK_BUFFER_OVERRUN) at 6.7 s inside the sweep, banner printed and
+nothing else. Prior instances: `heartbeat-runtime` 2026-08-03 at 4.7 s, `finetuned-ipc-e2e`
+2026-08-04 at 0.6 s. All three are Node probe processes that spawn the app and connect over CDP; none
+reproduces standalone.
+
+`--report-on-fatalerror` was added for exactly this and wrote NO report. That disproves the recorded
+hypothesis (a V8/CRT abort Node could intercept) and points at a hard OS fastfail terminating the
+process before Node's handler runs.
+
+Phase markers added to the probe, and the first instrumented run already narrows it: the debug port
+takes **8.2 s** to come up, so both crash times (4.7 s, 6.7 s) fall inside the
+`spawned, waiting for debug port` window — a `fetch()` poll loop against a not-yet-listening port.
+Still NOT a retry: the leg reds honestly, and the next occurrence will name its phase.

@@ -32,6 +32,27 @@ const os = require('os');
 // header and never implemented it; writing a third copy would have been the actual mistake.
 const { cleanupProfile } = require('../e2e_profile.cjs');
 
+// PHASE MARKERS for the 0xC0000409 hunt. This leg has died with exit 3221226505
+// (STATUS_STACK_BUFFER_OVERRUN) twice inside a full sweep — 2026-08-03 at 4.7s and 2026-08-05 at 6.7s
+// — and never standalone. Both times stdout held ONLY the banner, so "somewhere in the first seven
+// seconds" was all the evidence there was.
+//
+// `--report-on-fatalerror` was added to catch it and did NOT fire on the 2026-08-05 occurrence: no
+// report was written. That disproves the original hypothesis (a V8/CRT abort Node could intercept)
+// and points at a hard OS fastfail terminating the process before Node's handler runs.
+//
+// These markers are unbuffered and flush per line, so whatever the next crash is, the last line
+// printed names the phase it died in: spawn, port-wait, CDP connect, or app-root wait. Cheap, and it
+// narrows a four-way guess to one. NOT a retry — the leg still reds honestly.
+const T0 = Date.now();
+const phase = (name) => {
+  try {
+    fs.writeSync(1, `    [phase ${((Date.now() - T0) / 1000).toFixed(1)}s] ${name}\n`);
+  } catch (e) {
+    /* never let instrumentation break the probe */
+  }
+};
+
 const REPO = __dirname.replace(/[\\/]scripts$/, '');
 const APP_EXE =
   process.env.CORTEX_APP_EXE || path.join(REPO, 'src-tauri', 'target', 'release', 'cortex-speech-app.exe');
@@ -97,6 +118,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function run() {
   console.log(`==> Heartbeat probe. profile=${DATA_DIR}  audio=${path.basename(AUDIO)}  threshold=${MAX_MS}ms`);
+  phase('start');
   if (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json`).then((r) => r.ok, () => false)) {
     die(`debug port ${DEBUG_PORT} already answering — another instance is running; close it or set CORTEX_DEBUG_PORT.`);
   }
@@ -104,6 +126,7 @@ async function run() {
   // Isolate the WebView2 user-data folder per run — sharing the default one across concurrent /
   // rapid launches (or with the owner's other WebView2 apps) yields WebView2 error 0x8007139F
   // ("resource not in the correct state") and the window never opens.
+  phase('webview-dir');
   wvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-hb-wv-'));
   ownedTemp.push(wvDir);
   appProcess = spawn(APP_EXE, [], {
@@ -120,6 +143,7 @@ async function run() {
     stdio: 'ignore',
   });
 
+  phase('spawned, waiting for debug port');
   let pages = null;
   for (let i = 0; i < 90; i++) {
     try {
@@ -135,10 +159,13 @@ async function run() {
   }
   if (!pages) throw new Error(`WebView2 debug port ${DEBUG_PORT} did not come up within 90s.`);
 
+  phase('debug port up, connecting CDP');
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${DEBUG_PORT}`);
   const ctx = browser.contexts()[0];
   const page = ctx.pages().find((p) => p.url().includes('localhost') || p.url().includes('1420')) || ctx.pages()[0];
+  phase('CDP connected, waiting for app-root');
   await page.waitForSelector('[data-testid="app-root"]', { timeout: 45000 });
+  phase('app-root ready, measuring');
 
   const result = await page.evaluate(
     async ({ audio, numSlow, probeMs }) => {
