@@ -18,6 +18,7 @@
     segmentSourceFilename,
     segmentChunkLabel,
   } from './alignment';
+  import { reviewProgress } from './reviewProgress';
   import { wordPlayBounds, replaceWordToken } from './wordEdit';
   import { isPlaceholderTranscript } from './segmentQuality';
   import type { SpeechSegment, WordTimestamp } from './types';
@@ -93,9 +94,15 @@
     cursorRestored = true;
   });
   const current = $derived(queue[index] ?? null);
-  const reviewedCount = $derived($segments.filter((s) => s.verified).length);
-  // Every clip verified — surface the "you're done, here's what's next" completion banner.
-  const allReviewed = $derived($segments.length > 0 && reviewedCount === $segments.length);
+  // Audit 2026-08-05: the position counter above counts the QUEUE while the progress text counted the
+  // whole CORPUS, so an active search silently split the denominator and the two lines contradicted
+  // each other on screen. One call now produces both. `progress.allReviewed` stays corpus-scoped on
+  // purpose — a fully-reviewed SEARCH SUBSET must never fire the completion banner. See
+  // reviewProgress.ts, where that rule is unit-tested.
+  const progress = $derived(reviewProgress(queue, $segments));
+  // Hoisted so the label is computed once instead of twice per render, and so the chunk position gets
+  // a NOUN in the markup below: bare "61/144" beside "Clip 1 of 144" read as a third progress counter.
+  const chunkLabel = $derived(current ? segmentChunkLabel(current.alignmentJson) : null);
 
   let editText = $state('');
   let waveformData = $state<number[]>([]);
@@ -458,7 +465,6 @@
   }
 
   const dirty = $derived(current ? editText.trim() !== originalText(current).trim() : false);
-  const pct = $derived($segments.length ? Math.round((reviewedCount / $segments.length) * 100) : 0);
 
   async function submit(acceptAsIs: boolean) {
     const seg = current;
@@ -818,7 +824,7 @@
     <div class="mx-auto flex max-w-3xl flex-col gap-5 px-4 py-6">
       <!-- Completion banner: every clip verified → surface the next steps (export / done). The clips
            stay below so the reviewer can still scrub back and re-check any of them. -->
-      {#if allReviewed}
+      {#if progress.allReviewed}
         <div class="card border border-emerald-700/40 bg-emerald-950/20 p-5 text-center" data-testid="review-complete">
           <div class="text-lg font-semibold text-emerald-300">
             {$t('review.completeTitle').replace('{n}', String($segments.length))}
@@ -881,20 +887,32 @@
           </div>
         </div>
         <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-surface-3">
-          <div class="h-full rounded-full bg-accent transition-all duration-300" style="width: {pct}%"></div>
+          <div
+            class="h-full rounded-full bg-accent transition-all duration-300"
+            style="width: {progress.percent}%"
+          ></div>
         </div>
         <div class="mt-1 flex items-center justify-between gap-3 text-xs text-subtle">
           <!-- True-10 audit: source-file orientation — in a hundreds-of-clips sitting the reviewer
-               had no idea WHICH recording the current clip came from. -->
-          <span class="truncate" dir="ltr" title={current.audioPath} data-testid="review-source-file">
-            {segmentSourceFilename(current.audioPath)}{segmentChunkLabel(current.alignmentJson)
-              ? ` · ${segmentChunkLabel(current.alignmentJson)}`
-              : ''}
+               had no idea WHICH recording the current clip came from.
+               2026-08-05: the chunk position is its own span with a NOUN. It used to render as a bare
+               "61/144" glued to the filename, one line under "Clip 1 of 144" and opposite
+               "67 of 144 reviewed" — three unlabelled fractions sharing a denominator by coincidence.
+               dir="ltr" stays on the FILENAME only; the CKB noun must not be forced into an LTR run. -->
+          <span class="flex min-w-0 items-center gap-1.5">
+            <span class="truncate" dir="ltr" title={current.audioPath} data-testid="review-source-file">
+              {segmentSourceFilename(current.audioPath)}
+            </span>
+            {#if chunkLabel}
+              <span class="shrink-0" data-testid="review-chunk-label"
+                >{$t('chunk')} <span dir="ltr">{chunkLabel}</span></span
+              >
+            {/if}
           </span>
           <span class="shrink-0">
             {$t('review.reviewedCount')
-              .replace('{done}', String(reviewedCount))
-              .replace('{total}', String($segments.length))}
+              .replace('{done}', String(progress.done))
+              .replace('{total}', String(progress.total))}
           </span>
         </div>
       </div>
