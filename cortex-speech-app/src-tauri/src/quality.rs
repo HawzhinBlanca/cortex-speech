@@ -334,7 +334,24 @@ pub fn training_grade_for_segment(seg: &SpeechSegment) -> TrainingGradeReport {
     }
 
     let jury_accepted = decision_is(seg.verdict.as_deref(), &["auto_accept", "jury_accept", "jury_edit"]);
-    let confidence = seg.agent_confidence.or(seg.confidence).unwrap_or(0.0);
+    // AUDIT 2026-08-05. `seg.confidence` is evidence ONLY when it came from real model posteriors.
+    // The shipped offline engine (OmniASR CTC via sherpa-onnx) exposes no token log-probs — its result
+    // JSON always carries `ys_log_probs: []` — so asr::confidence_from_asr_result stamps a CONSTANT
+    // 0.90 on every non-empty transcript and labels it `heuristic`. Feeding that constant into the
+    // `>= 0.85` promotion test below made the clause VACUOUSLY TRUE for every clip on the default
+    // path: a gate that reads as if it discriminates and filters nothing.
+    //
+    // Fails closed on `None`/legacy `unknown` too. A confidence whose provenance was never recorded
+    // is not evidence that it was calibrated, and this decision promotes a clip into a training set
+    // with no human ever having read it.
+    //
+    // `agent_confidence` is untouched — that is a jury/agent judgement, already range-guarded in
+    // jury::t2_listener, and it is the signal this branch was actually written for.
+    let engine_confidence = match seg.confidence_source.as_deref() {
+        Some(src) if src == crate::asr::ConfidenceSource::RealPosterior.as_db_value() => seg.confidence,
+        _ => None,
+    };
+    let confidence = seg.agent_confidence.or(engine_confidence).unwrap_or(0.0);
     let has_multi_agent_evidence = has_training_ready_machine_evidence(seg, text);
     if jury_accepted && confidence >= 0.85 && !has_review_risk && has_multi_agent_evidence {
         reasons.push("high_confidence_jury_accept".to_string());
@@ -1256,6 +1273,75 @@ mod tests {
         let report = training_grade_for_segment(&s);
 
         assert_eq!(report.grade, TRAINING_GRADE_GOLD, "reasons: {:?}", report.reasons);
+        assert!(report.training_ready);
+    }
+
+    /// Builds the exact shape that USED to sail through: a jury-accepted clip with full multi-agent
+    /// evidence and clean audio, whose only confidence is the engine's. The caller picks the
+    /// provenance, which is the single thing under test.
+    fn jury_row_whose_only_confidence_is_the_engines(source: Option<&str>) -> SpeechSegment {
+        let mut s = seg("jury", "raw transcript", 5000);
+        s.verdict = Some("jury_accept".to_string());
+        s.verdict_transcript = Some("jury selected transcript".to_string());
+        s.agent_confidence = None; // the ONLY confidence is the engine's
+        s.confidence = Some(0.90); // exactly what asr.rs stamps on every non-empty transcript
+        s.confidence_source = source.map(str::to_string);
+        s.evidence_json = Some(
+            serde_json::json!({
+                "referenceModelId": "gemini-2.5-pro",
+                "selectedModelId": "omniasr-wsl-7b",
+                "selectedTranscript": "jury selected transcript",
+                "shouldCommit": true
+            })
+            .to_string(),
+        );
+        s.clipping_ratio = Some(0.0);
+        s.rms_db = Some(-18.0);
+        s.snr_db = Some(30.0);
+        s
+    }
+
+    #[test]
+    fn heuristic_engine_confidence_cannot_promote_a_clip_no_human_ever_read() {
+        // asr.rs stamps a CONSTANT 0.90 with source "heuristic" on every non-empty transcript the
+        // shipped OmniASR CTC path produces, because that engine exposes no token posteriors. If that
+        // constant counted, `confidence >= 0.85` would be true for EVERY clip in the corpus and the
+        // clause would filter nothing while appearing to.
+        let s = jury_row_whose_only_confidence_is_the_engines(Some("heuristic"));
+        let report = training_grade_for_segment(&s);
+        assert_ne!(
+            report.grade, TRAINING_GRADE_SILVER,
+            "a constant heuristic confidence must not promote to SILVER: {:?}",
+            report.reasons
+        );
+        assert!(!report.training_ready, "reasons: {:?}", report.reasons);
+    }
+
+    #[test]
+    fn unrecorded_confidence_provenance_fails_closed() {
+        // Legacy rows predate confidence_source, and 'unknown' is what the COALESCE in db.rs writes.
+        // Neither is evidence the number was calibrated, and this branch promotes into a training set
+        // with no human in the loop — so both fail closed rather than being given the benefit of doubt.
+        for source in [None, Some("unknown")] {
+            let s = jury_row_whose_only_confidence_is_the_engines(source);
+            let report = training_grade_for_segment(&s);
+            assert!(
+                !report.training_ready,
+                "confidence_source {source:?} must not be training_ready: {:?}",
+                report.reasons
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_model_posterior_still_promotes() {
+        // The guard must gate on PROVENANCE, not disable the branch. An engine that genuinely emits
+        // per-token posteriors (ConfidenceSource::RealPosterior) is exactly what it was written for.
+        let s = jury_row_whose_only_confidence_is_the_engines(Some(
+            crate::asr::ConfidenceSource::RealPosterior.as_db_value(),
+        ));
+        let report = training_grade_for_segment(&s);
+        assert_eq!(report.grade, TRAINING_GRADE_SILVER, "reasons: {:?}", report.reasons);
         assert!(report.training_ready);
     }
 
