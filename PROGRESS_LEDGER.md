@@ -6707,3 +6707,50 @@ Svelte/TypeScript checks, ESLint, rustfmt and clippy `-D warnings` passed; npm a
 production vulnerabilities; cargo-deny passed advisories, bans, licenses and sources. Public signing,
 GitHub-hosted attestation, installer verification, and notarization still require the owner-held
 credentials/platform release run and are not claimed from local tests.
+
+## Iteration 245 — two vacuous gates, and a RED verdict that measurement dissolved
+
+Three fixes from the 2026-08-05 deep audit, each with a fail-before proof, plus the resolution of a
+bench failure that turned out to be an artefact of how it was measured.
+
+**Counters (`76c90bf`).** The audit read `Clip 1 of 144`, `61/144` and `67 of 144 reviewed` as three
+different positions. Two were genuinely inconsistent, not merely worded badly: the position counter
+counted `queue.length` while the progress text counted `$segments.length`, and review mode scopes its
+queue to an active curate search — so the moment the reviewer searched, the two lines described
+different sets. Both now come from one `reviewProgress(queue, $segments)` call. The middle fraction
+was `segmentChunkLabel` — position INSIDE the source recording — rendered bare in the same text
+weight; the owner's corpus is a single 144-chunk recording, so its denominator collides with the
+queue total by coincidence. It now renders with the existing `chunk` key. What deliberately did NOT
+move: `allReviewed` stays corpus-scoped, because scoping it to the queue would make a fully-reviewed
+SEARCH SUBSET announce that the dataset is finished. The math left the component so that rule has a
+real test. Sabotaging it to `total > 0 && done === total` fails exactly one test and nothing else.
+
+**Confidence gate (`b4b1d6e`).** The audit said the constant 0.90 heuristic "must not drive
+unattended acceptance". It already did. `training_grade_for_segment` read
+`agent_confidence.or(confidence)` and promoted to SILVER on `confidence >= 0.85`, consulting nothing
+about provenance. The shipped OmniASR CTC path exposes no token posteriors, so every non-empty
+transcript carries a constant 0.90 — the clause was VACUOUSLY TRUE for the entire corpus, a gate that
+reads as a quality bar and filters nothing. Engine confidence now counts only with
+`ConfidenceSource::RealPosterior`, compared through `as_db_value()` so it cannot drift from the
+writer in asr.rs. Fails closed on `None` and legacy `'unknown'`. `agent_confidence` is untouched.
+Measured blast radius: all 144 live segments have `confidence` NULL, so no stored row re-grades —
+this closes the hole ahead of the next import, it does not rewrite history.
+
+**Policy pin (`679aa70`).** `11332d2` renamed a readiness test and left the policy pinning the old
+name; the sweep caught it exactly as designed.
+
+**bench-budget was not a regression.** The 2026-08-05 sweep failed with
+`audio/waveform_decode_160000_samples` at 1.41x against a 1.23x limit, CONFIRMED on the gate's own
+re-measure. Re-run alone on an idle machine: **1.14x, within budget, BENCH GATE: OK**, with every
+other benchmark at 0.80–0.87x. The cause was concurrency, not code — a second agent session ran the
+full Rust suite and all three benchmark harnesses between 22:43 and 22:55 while the sweep was
+measuring wall-clock, which `docs/bench_baseline.json` warns against in its own comment. Recorded
+because the honest reading is "this gate is contention-sensitive and its RED was an artefact", NOT
+"benches are noisy, ignore them". It is still the only bench above 1.0x and is worth watching.
+
+That same concurrent session also left eight tracked files uncommitted mid-sweep, which is why the
+sweep's `python-policies` leg failed against a tree that had already changed underneath it. Its work
+is committed at `113cb38`, attributed to it rather than claimed.
+
+Not claimed: no full sweep has passed since these commits. `docs/STATUS.md` still records the RED.
+The CycloneDX/SPDX SBOM and the publication-boundary rights gate remain open.
