@@ -661,9 +661,23 @@ os.environ["CORTEX_GATE"] = "1"
 # is exactly the class 0xC0000409 belongs to, since a CRT/V8 abort() on Windows surfaces as fastfail.
 # Costs nothing on a healthy run: no report is written unless the process dies fatally.
 #
-# Deliberately NOT a retry. The crash still reds the leg honestly; this only means the next one leaves
-# evidence. Same stance as the preserved timestamped FAIL logs, which caught this crash's only other
-# recorded instance.
+# STANCE CHANGED 2026-08-05, on evidence rather than convenience. This said "deliberately NOT a
+# retry" when the cause was unknown and the crash might have been the app dying. It is not: the
+# process that exits 3221226505 is node.exe, the harness, and it dies BEFORE the probe measures
+# anything (phase markers put the two heartbeat deaths inside the 8.2s debug-port wait). A leg that
+# produced no measurement is not evidence that the app failed its gate, so reporting it as a red gate
+# was itself a false claim.
+#
+# `run_gate` now re-runs ONCE on ABNORMAL_EXIT_CODES and stamps a `<gate>.CRASH.<ts>.log` for the dead
+# attempt first, so the occurrence stays counted even when the retry passes. The report flag below
+# stays: it costs nothing, and it did NOT fire on the 2026-08-05 crash — which is itself the finding
+# that ruled out a V8/CRT abort Node could intercept.
+# Exit codes that mean "the OS killed this process", NOT "this test failed". A failing gate exits 1
+# (or its own small code); these are NTSTATUS values surfaced as a process exit code, so the leg
+# produced no verdict at all. Only the one actually observed is listed — adding speculative codes
+# would widen a retry path on no evidence.
+ABNORMAL_EXIT_CODES = frozenset({3221226505})  # 0xC0000409 STATUS_STACK_BUFFER_OVERRUN
+
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 _node_report_opts = f"--report-on-fatalerror --report-directory={LOG_DIR}"
 os.environ["NODE_OPTIONS"] = (os.environ.get("NODE_OPTIONS", "") + " " + _node_report_opts).strip()
@@ -709,6 +723,49 @@ def run_gate(name, kind, payload, cwd, probe, timeout=3600):
         encoding="utf-8",
         errors="replace",
     )
+    # OS-LEVEL ABNORMAL TERMINATION — not a test failure, and not a verdict about the app.
+    #
+    # Measured three times (2026-08-03 heartbeat-runtime 4.7s, 2026-08-04 finetuned-ipc-e2e 0.6s,
+    # 2026-08-05 heartbeat-runtime 6.7s): a Node probe process died with exit 3221226505
+    # (0xC0000409 STATUS_STACK_BUFFER_OVERRUN) ONLY inside a full sweep, never in 103 standalone runs,
+    # always before it measured anything. The process that dies is node.exe — the harness — not the
+    # app under test. `--report-on-fatalerror` wrote no report and Windows Error Reporting logged
+    # nothing, which is consistent with a native fastfail that bypasses both.
+    #
+    # Reporting that as "the app failed its responsiveness gate" is a FALSE CLAIM: there is no
+    # measurement to fail. So re-run once — exactly like the LNK1104 branch above — but stamp a
+    # CRASH copy of the dead attempt FIRST, so an occurrence can never become invisible merely
+    # because the retry passed. That preservation is the point: the crash stays counted.
+    #
+    # Deliberately narrow. A probe that RAN and exceeded its threshold exits 1 and never reaches
+    # here, so this cannot turn a real regression green.
+    if r.returncode in ABNORMAL_EXIT_CODES and not retried:
+        crash_log = LOG_DIR / f"{name}.CRASH.{time.strftime('%Y%m%d-%H%M%S')}.log"
+        try:
+            shutil.copyfile(log_path, crash_log)
+        except OSError as e:  # bookkeeping must never turn a diagnosable crash into a gate crash
+            print(f"  (could not keep the crash log: {e})", flush=True)
+            crash_log = None
+        print(
+            f"  !! {name}: harness process terminated by the OS (exit {r.returncode}) before producing"
+            f" any verdict — re-running once. Evidence kept: {crash_log}",
+            flush=True,
+        )
+        retried = f" [OS-terminated (exit {r.returncode}) with no verdict; re-ran once — see {crash_log}]"
+        try:
+            r = subprocess.run(
+                payload, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            return FAIL, time.perf_counter() - t0, f"timed out after {timeout}s (on the post-crash re-run)"
+        secs = time.perf_counter() - t0
+        log_path.write_text(
+            f"$ {payload}\n(exit {r.returncode}, {secs:.1f}s){retried}\n\n--- stdout ---{r.stdout or ''}"
+            f"\n--- stderr ---\n{r.stderr or ''}",
+            encoding="utf-8",
+            errors="replace",
+        )
+
     if r.returncode == 0:
         return PASS, secs, retried.strip()
     # A FAILURE ALSO GETS A TIMESTAMPED COPY, because the line above only keeps the LATEST run of each
