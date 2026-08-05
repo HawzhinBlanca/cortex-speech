@@ -7,6 +7,29 @@ use super::*;
 use crate::db::{SegmentHypothesis, SourceTranscriptRecord, SpeechSegment};
 use tempfile::TempDir;
 
+/// Declare full redistribution rights on a source recording.
+///
+/// A PRODUCTION bundle is the artifact that leaves the machine, so it refuses clips whose rights are
+/// undeclared (audit 2026-08-05 #3). Every production-success fixture therefore has to say what it is
+/// permitted to do, exactly as a real operator must. Deliberately NOT folded into the shared segment
+/// helpers: rights are what is under test in `production_export_blocks_clips_without_declared_
+/// redistribution_rights`, and granting them by default in a helper would silence that gate for every
+/// test at once.
+fn declare_redistribution_rights(db: &Database, audio_path: &str) {
+    db.set_recording_rights(
+        audio_path,
+        &crate::db::RecordingRights {
+            license: Some("CC-BY-4.0".into()),
+            consent_basis: Some("explicit_written_consent".into()),
+            permitted_use: Some("train,redistribute".into()),
+            attribution: Some("test speaker".into()),
+            source: Some("unit-test fixture".into()),
+            revoked_at: None,
+        },
+    )
+    .unwrap();
+}
+
 fn json_string_values_contain(value: &serde_json::Value, needle: &str) -> bool {
     match value {
         serde_json::Value::String(text) => text.contains(needle),
@@ -350,6 +373,7 @@ fn production_export_allows_human_gold_without_hypothesis_coverage() {
         ..SpeechSegment::default()
     })
     .unwrap();
+    declare_redistribution_rights(&db, &audio.to_string_lossy());
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");
@@ -430,6 +454,93 @@ fn production_export_blocks_machine_ready_rows_not_covered_by_latest_agentic_pro
     assert!(!out.join("manifest.json").exists(), "blocked production export must not write bundle files");
 }
 
+/// The gate itself: a clip good enough to publish, with nothing said about whether it MAY be.
+#[test]
+fn production_export_blocks_clips_without_declared_redistribution_rights() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let (audio_path, segment_id) = insert_machine_silver_segment_with_coverage(&db, &tmp, "rights-undeclared");
+    for model_id in ["gemini-2.5-pro", "gemini-2.5-flash"] {
+        insert_current_identity_source_reference(&db, &audio_path, model_id);
+    }
+    record_ready_agentic_promotion_report(&db, &audio_path, &segment_id, "run-rights-undeclared");
+    // Every OTHER production gate is satisfied — deliberately. If this test only proved that a
+    // half-finished clip is blocked it would prove nothing about rights.
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+    let err = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), true, usize::MAX).unwrap_err();
+
+    let err_text = err.to_string();
+    assert!(err_text.contains("no declared redistribution rights"), "{err_text}");
+    assert!(err_text.contains(segment_id.as_str()), "must name the offending clip: {err_text}");
+    assert!(!out.join("manifest.json").exists(), "blocked production export must not write bundle files");
+}
+
+/// A licence is not consent to republish a voice, and `train` is not `redistribute`. Both are the
+/// plausible near-misses an operator actually produces, so both are pinned.
+#[test]
+fn production_export_blocks_rights_that_stop_short_of_redistribution() {
+    for (label, rights) in [
+        (
+            "licence and consent but permitted_use omits redistribution",
+            crate::db::RecordingRights {
+                license: Some("CC-BY-4.0".into()),
+                consent_basis: Some("explicit_written_consent".into()),
+                permitted_use: Some("train".into()),
+                attribution: None,
+                source: None,
+                revoked_at: None,
+            },
+        ),
+        (
+            "permitted_use names redistribution but no consent basis is recorded",
+            crate::db::RecordingRights {
+                license: Some("CC-BY-4.0".into()),
+                consent_basis: None,
+                permitted_use: Some("redistribute".into()),
+                attribution: None,
+                source: None,
+                revoked_at: None,
+            },
+        ),
+    ] {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let (audio_path, segment_id) = insert_machine_silver_segment_with_coverage(&db, &tmp, "rights-partial");
+        for model_id in ["gemini-2.5-pro", "gemini-2.5-flash"] {
+            insert_current_identity_source_reference(&db, &audio_path, model_id);
+        }
+        record_ready_agentic_promotion_report(&db, &audio_path, &segment_id, "run-rights-partial");
+        db.set_recording_rights(&audio_path, &rights).unwrap();
+
+        let models = ModelManager::new(tmp.path().join("models"));
+        let out = tmp.path().join("bundle");
+        let err = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), true, usize::MAX).unwrap_err();
+        assert!(err.to_string().contains("no declared redistribution rights"), "{label}: {err}");
+    }
+}
+
+/// The gate is scoped to PUBLICATION. Local dataset preparation must keep working on undeclared
+/// clips, or this change would silently redefine what the owner's everyday export command does.
+#[test]
+fn local_export_still_works_without_declared_rights() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let (audio_path, _segment_id) = insert_machine_silver_segment_with_coverage(&db, &tmp, "rights-local-only");
+    for model_id in ["gemini-2.5-pro", "gemini-2.5-flash"] {
+        insert_current_identity_source_reference(&db, &audio_path, model_id);
+    }
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+    let result = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+    assert!(Path::new(&result.manifest_path).exists(), "a local bundle must not need publication rights");
+}
+
 #[test]
 fn production_export_allows_machine_ready_rows_with_ready_agentic_promotion_report() {
     let db = Database::open(":memory:").unwrap();
@@ -441,6 +552,7 @@ fn production_export_allows_machine_ready_rows_with_ready_agentic_promotion_repo
     }
     let agent_report =
         record_ready_agentic_promotion_report(&db, &audio_path, &segment_id, "run-ready-agentic-production");
+    declare_redistribution_rights(&db, &audio_path);
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");

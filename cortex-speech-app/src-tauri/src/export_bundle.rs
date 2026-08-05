@@ -349,6 +349,39 @@ pub fn export_dataset_bundle(
                 source_reference_identity_blockers.join("; ")
             )));
         }
+        // RIGHTS GATE (audit 2026-08-05 item #3: "undeclared redistribution rights do not prevent
+        // local export ... public publication needs an explicit rights-completeness gate").
+        //
+        // `production` IS the publication boundary. A production bundle is the artifact that leaves
+        // this machine; a local bundle (production=false) is dataset PREPARATION and stays governed by
+        // the revocation-only rule in export.rs, which is why that deliberately narrower gate is
+        // unchanged. Voice is biometric data under GDPR Art. 9 — an undeclared recording is not
+        // "probably fine", it is unanswered, and `disposition()` already fails closed on it.
+        //
+        // BLOCKS rather than silently dropping the undeclared clips. A production bundle that quietly
+        // shipped 40 of 144 rows would present a count the operator never agreed to — the exact class
+        // of dishonest tally this repo has had to fix repeatedly. The message names the count and the
+        // fields to set so it is actionable rather than merely refusing.
+        //
+        // Placed LAST among the production gates on purpose: the earlier ones each name a specific
+        // repairable defect, and firing ahead of them would replace those diagnostics with this one
+        // message for every blocked export. Ordering does not change WHAT is publishable.
+        let mut undeclared: Vec<String> = Vec::new();
+        for segment in &segments {
+            if !db.rights_for_segment(&segment.id)?.permits_redistribution() {
+                undeclared.push(segment.id.clone());
+            }
+        }
+        if !undeclared.is_empty() {
+            return Err(AppError::Validation(format!(
+                "Production export blocked: {} of {} clips have no declared redistribution rights. \
+                 Set a license, a consent basis, and a permitted_use naming 'redistribute' (or \
+                 'publish') on each source recording, then retry: {}",
+                undeclared.len(),
+                segments.len(),
+                segment_id_preview(&undeclared)
+            )));
+        }
     }
 
     std::fs::create_dir_all(output_dir)?;
