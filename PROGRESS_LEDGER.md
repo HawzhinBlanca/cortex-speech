@@ -6754,3 +6754,42 @@ is committed at `113cb38`, attributed to it rather than claimed.
 
 Not claimed: no full sweep has passed since these commits. `docs/STATUS.md` still records the RED.
 The CycloneDX/SPDX SBOM and the publication-boundary rights gate remain open.
+
+## Iteration 246 — the publication boundary, an SBOM, and a lockfile npm cannot resolve
+
+**Rights gate (`56d8855`).** Audit #3: "undeclared redistribution rights do not prevent local
+export; public publication needs an explicit rights-completeness gate."
+`RecordingRights::permits_redistribution()` was written, tested, and had NO production caller. It has
+one now. `export_dataset_bundle`'s existing `production: bool` IS the publication boundary — it
+already refuses on validation errors, zero training-ready rows, missing hypothesis coverage and stale
+source-reference identity — so the rights check joined those rather than being invented somewhere
+new. Local export (`production=false`) is untouched and stays revocation-only; wiring redistribution
+rights there would block the owner's entire 144-clip library and silently redefine an everyday
+command, the objection recorded in export.rs:149-158 when that narrower gate was written.
+`local_export_still_works_without_declared_rights` pins the boundary so it cannot quietly widen.
+BLOCKS rather than dropping, because a production bundle that shipped 40 of 144 rows would present a
+count the operator never agreed to. Fail-before: deleting the gate makes the export SUCCEED and write
+a complete 18-file publishable bundle. Consequence, stated plainly: a production bundle of the
+current library is now blocked until rights are declared. That is intended for biometric data under
+GDPR Art. 9, and it is an opt-in path, not the default export.
+
+**SBOM (`b7cb908`).** Audit #5. 1,142 components (498 npm + 644 cargo), every one with a real hash
+from the lockfile that resolved it. No licences are declared — neither lockfile records them reliably
+and guessing one in a compliance artifact is the confident-unverified claim the honesty law forbids;
+`cargo deny check licenses` still owns that. Written into the bundle BEFORE the checksum manifest and
+attestation so it is covered by both, with that ordering pinned in `test_workflow_policy.py`.
+
+**Finding, NOT fixed: the committed lockfile resolves to a tree npm itself calls invalid.** A clean
+`npm ci` yields `picomatch@2.3.2` where `svelte-check`'s `fdir@6.5.0` requires `^3 || ^4`.
+Reproduced from the committed lockfile in a scratch copy, so it is not local drift. `npm install`
+does not fix it; `npm install --package-lock-only` produces a byte-identical lockfile; a targeted
+`overrides` entry (`svelte-check > fdir > picomatch: ^4`) changes the reported constraint but npm
+still hoists 2.3.2. Consequence: `npm sbom` exits ESBOMPROBLEMS and refuses, which is why the SBOM
+is generated from the lockfiles instead. It does NOT break the build — svelte-check runs clean
+(typecheck 429 files, 0 errors) — so this is latent, not active. Left unfixed deliberately: repairing
+it means moving dependency versions (root `picomatch@2` is pinned there by lint-staged's micromatch
+and tailwind's chokidar), and that is not a change to make unattended overnight. It needs an owner
+decision.
+
+Not claimed: the release workflow is static content. Signing, attestation, installer execution and
+the SBOM step RUNNING on a real runner still need a tag run with owner-held credentials.
