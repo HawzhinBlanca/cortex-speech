@@ -6994,3 +6994,47 @@ tests still pass, so they are checking a different property rather than echoing 
 Remaining from iteration 251, unchanged and still open: the non-production bundle count mismatch, the
 couch spot-check graded against an absent answer key, the jury agreement-confidence-on-audio-escalated
 rows, and `api_undo`'s missing lease-holder check.
+
+## Iteration 253 — four findings from the external review, closed with evidence
+
+External assessment 2026-08-06 rated the app 8–8.5/10, "strong personal-use release / controlled
+pilot, still not general public-production". Its four in-code correctness findings are now closed;
+each was re-verified by reading the code before acting, and each has a fail-before proof.
+
+**#1 revocation was contingent on free disk space (`f30774f`).** `71340a4` made a withdrawal reach
+in-flight pipeline clones, but `commands::update_settings` applied it only AFTER a successful save.
+On a full or read-only disk the save fails, the command returns Err, and egress stayed enabled for the
+running import. Fixed asymmetrically rather than by reordering: GRANTING still commits only after the
+save (enabling cloud on a change that will not survive a restart is the mirror hazard, and
+`revoke_consent_now` cannot grant — pinned), WITHDRAWING takes effect first. The residual divergence
+is deliberate and one-directional: after a failed save the UI can show cloud ON while egress is
+stopped, never the reverse. BOTH ways of breaking the ordering — deleting the call and moving it after
+the save — left the crate compiling and every other gate green, including the cloud-privacy gate,
+which is exactly why the guard is a source-shape test on the ORDER.
+
+**#4 spot check graded against an absent answer key (`3a08d01`).** The guard tested `!prev.verified`,
+strictly weaker than the predicate that minted the key. The desktop "mark bad" strips the answer while
+KEEPING verified, so `human_verified_text` returns None and `.unwrap_or_default()` scored the reviewer
+against "" — a fabricated 1.00 CER for a correct transcription, averaged into spot_check_report, with
+an HTTP reply byte-identical to success. Now carries the KEY rather than a bool, so "no key, no grade"
+is structural. Fail-before is exact because the block runs before the already-reviewed guard: old code
+returns 200 having graded; fixed code records nothing and falls through to an honest 409.
+
+**#3 undo stole an active lease (`5e39034`).** `api_undo` inserted unconditionally, unlike api_renew
+and api_decision which both refuse when `holder() != reviewer`. Reachable from the write-two failure
+state already pinned in this file: Sara's undo took Hemn's lease and HIS save was then 409'd over a
+conflict the undo manufactured — and per couch.html a 409 discards the queued decision, so his typed
+correction was lost. `holder()` already expires stale entries, so it is the right predicate. The
+companion test passes BOTH before and after, proving the fix does not overcorrect into "never grant",
+which would reintroduce the queue-grabs-it-back problem the line existed to prevent.
+
+**#7 bundle closure evidence (`3f5edf4`).** Logically fixed by be64cf5, not demonstrated. The new test
+compares the manifest, dataset.json's rows, its embedded metadata total, and the dataset card against
+one another, and scans EVERY file for the withdrawn content. Removing the filter fails it naming
+`training_grade_details.json` — an artifact a count-only assertion would never have caught. #7 is now
+closed in this ledger.
+
+Still open and NOT claimed: jury confidence conflating agreement with acoustic quality (#2, needs
+separate fields — a schema change), fingerprint persistence (#5), the npm lockfile (#6), and
+cancellation of an HTTP request already in flight, which means a withdrawal stops the NEXT call rather
+than aborting one mid-transfer.
