@@ -1816,7 +1816,36 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
     }
     // The clip is pending again and this reviewer is about to see it — hold it for them so a second
     // reviewer's queue cannot grab the clip out from under the person mid-correction.
-    lock_state(state).leases.insert(id.clone(), (reviewer.to_string(), Instant::now()));
+    //
+    // But only if it is actually free. This used to `insert` unconditionally, unlike api_renew and
+    // api_decision's collision guard, which both refuse when `holder() != reviewer` (external review
+    // 2026-08-06 #3). The theft is reachable from the write-two failure state that
+    // `an_interrupted_decision_is_finished_on_replay_and_never_recorded_twice` already pins: Sara's
+    // submit 500s leaving the row unverified with reviewed_by='Sara' and an undo entry; her lease
+    // lapses; Hemn's queue legitimately leases the clip and he starts typing; Sara taps undo. The old
+    // line handed her Hemn's lease, and his save was then refused 409 — "another reviewer is working
+    // on this clip" — over a conflict the undo itself had just manufactured.
+    //
+    // `holder` is the right predicate and already expires stale entries, so this grants exactly when
+    // the lease is absent, expired, or already hers, and never takes one that is someone else's.
+    {
+        let mut guard = lock_state(state);
+        let now = Instant::now();
+        let current = guard.holder(&id, now).map(str::to_string);
+        match current {
+            Some(other) if other != reviewer => {
+                // The undo itself stands — it is her own past decision being reversed. Only the lease
+                // claim is refused, so if she does try to save she gets an HONEST 409 against a lease
+                // Hemn really holds, rather than him getting a fabricated one.
+                tracing::info!(
+                    "Couch Review: undo by {reviewer} left {id} leased to {other} — not stealing an active lease"
+                );
+            }
+            _ => {
+                guard.leases.insert(id.clone(), (reviewer.to_string(), now));
+            }
+        }
+    }
     json_reply(200, serde_json::json!({ "id": id }))
 }
 
@@ -2140,6 +2169,61 @@ mod tests {
         assert!(
             !lock_state(&state).spot_checks.contains(&("g1".to_string(), "Sara".to_string())),
             "the stale pair must be dropped so it cannot swallow this clip again"
+        );
+    }
+
+    #[test]
+    fn an_undo_never_takes_a_lease_another_reviewer_is_holding() {
+        // api_renew and api_decision both refuse when holder() != reviewer; api_undo used to insert
+        // unconditionally, so it could hand Sara a lease Hemn legitimately held — and Hemn's save was
+        // then refused 409 over a conflict the undo had just created.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق")).unwrap();
+        let state = state();
+
+        // Sara decided it, so she has something to undo.
+        lock_state(&state).leases.insert("s1".to_string(), ("Sara".to_string(), Instant::now()));
+        let body = serde_json::json!({"id": "s1", "action": "accept", "text": "دەق"});
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "precondition: Sara's decision landed");
+
+        // Her lease lapses and Hemn's queue legitimately takes the clip.
+        lock_state(&state).leases.insert("s1".to_string(), ("Hemn".to_string(), Instant::now()));
+
+        let (code, ..) = api_undo(&db, "Sara", &state);
+        assert_eq!(code, 200, "the undo itself stands — it is her own decision being reversed");
+        assert_eq!(
+            lock_state(&state).holder("s1", Instant::now()),
+            Some("Hemn"),
+            "the lease must stay with the reviewer who legitimately holds it"
+        );
+
+        // And the consequence that actually bites: Hemn can still save his work.
+        let body = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوەی هێمن"});
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Hemn", &state);
+        assert_eq!(code, 200, "the legitimate holder must not be 409'd by someone else's undo");
+    }
+
+    #[test]
+    fn an_undo_reclaims_a_lease_that_is_free_or_already_the_reviewers_own() {
+        // The other half: refusing to steal must not stop a reviewer reclaiming a clip nobody holds,
+        // which is the whole point of the line — so the queue cannot grab it back mid-correction.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق")).unwrap();
+        let state = state();
+        lock_state(&state).leases.insert("s1".to_string(), ("Sara".to_string(), Instant::now()));
+        let body = serde_json::json!({"id": "s1", "action": "accept", "text": "دەق"});
+        assert_eq!(api_decision(&db, body.to_string().as_bytes(), "Sara", &state).0, 200);
+
+        lock_state(&state).leases.remove("s1"); // nobody holds it now
+        let (code, ..) = api_undo(&db, "Sara", &state);
+        assert_eq!(code, 200);
+        assert_eq!(
+            lock_state(&state).holder("s1", Instant::now()),
+            Some("Sara"),
+            "an unheld clip must be reclaimed for the reviewer who just reopened it"
         );
     }
 
