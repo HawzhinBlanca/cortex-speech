@@ -83,7 +83,7 @@ pub fn export_audio_segments(
         segment_ids.iter().filter_map(|id| db.get_segment_by_id(id).ok().flatten()).collect();
     let loaded_ids: std::collections::HashSet<String> = requested.iter().map(|s| s.id.clone()).collect();
     let allowed_ids: std::collections::HashSet<String> =
-        crate::export::exclude_holdout_segments(db, requested)?.into_iter().map(|s| s.id).collect();
+        crate::export::exclude_unexportable_segments(db, requested)?.into_iter().map(|s| s.id).collect();
     let holdout_excluded: std::collections::HashSet<String> = loaded_ids.difference(&allowed_ids).cloned().collect();
 
     let mut succeeded = 0usize;
@@ -95,7 +95,7 @@ pub fn export_audio_segments(
 
     for id in segment_ids {
         if holdout_excluded.contains(id) {
-            // Intentional fail-closed exclusion; exclude_holdout_segments already logged the reason.
+            // Intentional fail-closed exclusion; exclude_unexportable_segments already logged the reason.
             skipped_holdout += 1;
             continue;
         }
@@ -427,6 +427,48 @@ mod tests {
         let reader = hound::WavReader::open(path).unwrap();
         let spec = reader.spec();
         (spec.sample_rate, reader.duration())
+    }
+
+    /// A withdrawn recording's VOICE must never be written to disk. Until 2026-08-06 this exporter
+    /// made no rights call at all: it wrote the WAV/FLAC plus every transcript column into
+    /// metadata.csv for a recording whose consent had been revoked. Voice is biometric data under
+    /// GDPR Art. 9, and revocation is the one instruction the rights schema exists to obey.
+    #[test]
+    fn a_revoked_recording_is_never_written_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let keep = tmp.path().join("keep.wav");
+        let gone = tmp.path().join("withdrawn.wav");
+        make_wav_file(&keep);
+        make_wav_file(&gone);
+        insert_test_segment(&db, "keep-1", &keep);
+        insert_test_segment(&db, "revoked-1", &gone);
+        db.revoke_recording(&gone.to_string_lossy()).unwrap();
+
+        let out = tmp.path().join("audio_out");
+        fs::create_dir_all(&out).unwrap();
+        let options = AudioExportOptions {
+            output_dir: out.to_string_lossy().to_string(),
+            format: AudioExportFormat::Wav,
+            sample_rate: 16000,
+            include_metadata: true,
+        };
+        let ids: Vec<String> = ["keep-1", "revoked-1"].iter().map(|s| s.to_string()).collect();
+        let result = export_audio_segments(&db, &ids, &options).unwrap();
+
+        assert_eq!(result.succeeded, 1, "only the consenting clip may export");
+        // The audio itself must not be on disk under any name.
+        let written: Vec<String> =
+            fs::read_dir(&out).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        assert!(
+            !written.iter().any(|f| f.contains("withdrawn") || f.contains("revoked")),
+            "a withdrawn recording's audio was written: {written:?}"
+        );
+        // And its transcript must not survive in the sidecar either.
+        let metadata = fs::read_to_string(out.join("metadata.csv")).unwrap();
+        assert!(!metadata.contains("revoked-1"), "withdrawn transcript leaked into metadata.csv");
     }
 
     #[test]

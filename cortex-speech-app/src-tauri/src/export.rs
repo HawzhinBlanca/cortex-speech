@@ -257,16 +257,42 @@ fn ready_agentic_huggingface_segment_ids(db: &Database) -> AppResult<BTreeSet<St
     Ok(report.segment_ids.into_iter().collect())
 }
 
-/// Remove any segment that matches a held-out gold clip (by audio_path OR content hash) from an
-/// export set, so a TRAINING export can't leak the eval set's reference transcripts. EVERY
-/// training-corpus export must run this — the plain JSON/JSONL/CSV/Parquet export and the production
-/// bundle that wraps it, not just the HuggingFace export — or a clip registered as a holdout (the
-/// WER/CER eval reference) that also exists as an ordinary training-ready segment leaks into the
-/// published training data and contaminates the very eval set the promotion gate measures against.
-/// Fail-closed, identical to the HF/DPO guard: a path match excludes a held-out clip even when its
-/// file is missing (its content can no longer be re-hashed); a hash match also catches the same
-/// content at any path.
-pub(crate) fn exclude_holdout_segments(db: &Database, segments: Vec<SpeechSegment>) -> AppResult<Vec<SpeechSegment>> {
+/// Remove every segment that must never leave this machine, whatever the caller is writing.
+///
+/// TWO independent exclusions, because both were being missed one caller at a time:
+///
+/// 1. HELD-OUT GOLD (by audio_path OR content hash) — so a TRAINING export cannot leak the eval
+///    set's reference transcripts and contaminate the very set the promotion gate measures against.
+///    Fail-closed: a path match excludes a held-out clip even when its file is missing (its content
+///    can no longer be re-hashed); a hash match catches the same content at any path.
+///
+/// 2. WITHDRAWN CONSENT — added 2026-08-06 after an adversarial sweep found revocation was consulted
+///    in exactly THREE places (`is_training_ready_for_huggingface_export`, `export_dataset`'s row
+///    loop, and the production bundle's rights gate) while `export_audio_segments` and
+///    `eval::export_finetune_pack` wrote a withdrawn recording's ACTUAL VOICE — WAV/FLAC clips plus
+///    its transcripts — to disk with no rights call at all. Voice is biometric data under GDPR
+///    Art. 9; a withdrawal is the one instruction the whole rights schema exists to obey.
+///
+///    Commit 56d8855 claimed "a withdrawal must be honoured on every path, and it is". That was
+///    false: it was verified on the paths that commit touched and generalised from them. It is true
+///    now, and it is true HERE rather than at five call sites, because a rule enforced per-caller is
+///    a rule that gets missed by the sixth caller.
+///
+/// The name says "unexportable", not "holdout", so it cannot quietly under-describe what it drops
+/// the next time a reason is added.
+pub(crate) fn exclude_unexportable_segments(
+    db: &Database,
+    segments: Vec<SpeechSegment>,
+) -> AppResult<Vec<SpeechSegment>> {
+    let mut kept = Vec::with_capacity(segments.len());
+    for seg in segments {
+        if db.rights_for_segment(&seg.id)?.is_revoked() {
+            tracing::info!(segment_id = %seg.id, "export: dropping segment with withdrawn consent");
+            continue;
+        }
+        kept.push(seg);
+    }
+    let segments = kept;
     let holdout = crate::jury::learning::holdout_content_hashes(db)?;
     let holdout_paths = crate::jury::learning::holdout_audio_paths(db)?;
     // All VAD chunks of one recording share a single audio_path. Memoize path -> held_out so a source
@@ -333,7 +359,7 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     // (JSON/JSONL/CSV/Parquet) — including the production bundle that delegates through here — never
     // publish the eval set's reference transcripts; closes the eval-on-train leak the HF export
     // already guards against.
-    let segments = exclude_holdout_segments(db, db.get_segments(None)?)?;
+    let segments = exclude_unexportable_segments(db, db.get_segments(None)?)?;
     // A human-REJECTED clip ("mark bad" in review) is kept in the library but is bad data the reviewer
     // discarded — never publish it, and never count it as verified. The HuggingFace/training path
     // already drops it via training_grade_for_segment; do the same here so the plain JSON/JSONL/CSV/
@@ -753,7 +779,7 @@ pub fn export_huggingface_dataset(
     // the plain export, DPO, and LM-corpus exports use. Without it, a clip registered as a holdout
     // (for WER/CER eval) that ALSO exists as a normal training-ready segment leaks into data/train,
     // contaminating the very eval set the promotion gate measures against.
-    let segments = exclude_holdout_segments(db, db.get_segments(None)?)?;
+    let segments = exclude_unexportable_segments(db, db.get_segments(None)?)?;
 
     let ready_agentic_segment_ids = ready_agentic_huggingface_segment_ids(db)?;
     let required_source_reference_models = settings.source_reference_models();

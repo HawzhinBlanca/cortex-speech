@@ -746,7 +746,7 @@ fn exclude_holdout_excludes_a_missing_audio_segment_fail_closed() {
     seg.audio_path = tmp_dir.path().join("moved_away.wav").to_string_lossy().to_string();
     db.insert_segment(&seg).unwrap();
 
-    let kept = exclude_holdout_segments(&db, vec![seg]).unwrap();
+    let kept = exclude_unexportable_segments(&db, vec![seg]).unwrap();
     assert!(
         kept.is_empty(),
         "a missing-audio segment must be excluded fail-closed when a content-hash holdout is registered"

@@ -303,7 +303,7 @@ pub fn export_dataset_bundle(
     // source_transcripts/*.txt + source_reference_manifest.json + training_grade_details.json, and the
     // manifest counts still include it — re-contaminating the exact eval set the promotion gate measures
     // against.
-    let segments = export::exclude_holdout_segments(db, db.get_segments(None)?)?;
+    let segments = export::exclude_unexportable_segments(db, db.get_segments(None)?)?;
     // Drop human-REJECTED clips ("mark bad") from the whole bundle the same way the plain export and the
     // training path do — a discarded draft must never be published or counted as verified/training-ready.
     let segments: Vec<crate::db::SpeechSegment> =

@@ -347,7 +347,7 @@ struct FinetuneRow<'a> {
 /// WAV clip per row under `clips/`. Two guards, both load-bearing:
 ///
 /// 1. HOLDOUT leak guard: gold holdout clips are excluded (path AND content hash, via
-///    `exclude_holdout_segments`) so training never contaminates the eval set the promotion gate
+///    `exclude_unexportable_segments`) so training never contaminates the eval set the promotion gate
 ///    measures against.
 /// 2. RUBRIC guard (B1): every candidate must be `training_ready` per
 ///    `quality::training_grade_for_segment` (GOLD/SILVER only). `verified=true` alone is NOT
@@ -367,7 +367,7 @@ pub fn export_finetune_pack(
     let verified = db.get_segments(Some(true))?;
     let total_verified = verified.len();
     // THE LEAK GUARD: drop any verified segment whose audio is a holdout gold clip.
-    let kept = crate::export::exclude_holdout_segments(db, verified)?;
+    let kept = crate::export::exclude_unexportable_segments(db, verified)?;
     let excluded_holdout = total_verified - kept.len();
 
     // THE RUBRIC GUARD (B1): only training-ready (GOLD/SILVER) rows may ship, and the shipped
