@@ -6859,3 +6859,30 @@ naive one-line check would happily accept. Fail-before verified against the orig
 
 Not in scope, not started: the same audit paragraph asks for sticky primary actions and
 sentence-level screen-reader summaries of the consensus words. Both are review-surface redesigns.
+
+## Iteration 249 — the sibling I missed, found by grepping my own fix
+
+`b554515` fixed the failed-waveform-reads-as-silence bug in ReviewMode. Grepping the CLASS afterwards
+found `App.svelte`'s curate view doing exactly the same thing — `} catch { waveformData = []; }`, no
+toast, no state, a flat strip indistinguishable from quiet audio. Fixed at `3a95c88`, and the guard
+now pins BOTH sites and names which one regressed.
+
+Recording this because the miss is the lesson: I fixed the instance the audit pointed at and moved on.
+The ledger already holds six separate count-honesty fixes and two blank-transcript fixes, each found
+one at a time, before shared guards were written. The habit that catches these is grepping the class
+immediately after fixing an instance, not waiting for the next audit to find the next copy.
+
+Curate deserves it as much as review — it is the DEFAULT view, it is where a clip is first inspected,
+and it has its own Verify button. Accepting a clip from a flat strip believed to be silence is the
+same wrong outcome from either surface.
+
+Two other swallows examined in the same sweep and deliberately NOT changed:
+
+- `ensureWordTimings` catch — a documented best-effort degradation with an honest VISIBLE fallback
+  (whole-clip playback, labelled by `review.playingWholeClip`). The user is told what they are getting.
+  Not a defect.
+- `loadConsensus` catch — on failure `draftModels = []` silently hides the "Draft by <engine>"
+  provenance badge. Real, but a different shape from the waveform bug: it REMOVES information rather
+  than asserting something false, and the consensus card is legitimately absent on single-engine clips
+  anyway, so its absence carries no false claim. Judged milder and left for a decision made awake
+  rather than fixed at 05:30 on my own judgement. Named here so it is not silently skipped.
