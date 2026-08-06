@@ -565,7 +565,11 @@ export const en: Record<string, string> = {
   'stats.verifyModelOk': 'Model integrity verified — checksums match.',
   'stats.verifyModelFailed': 'Model integrity check failed',
   'stats.buildSha': 'Build',
-  'stats.fingerprints': 'Audio fingerprints',
+  // Audit 2026-08-05 #4 read "Audio fingerprints: 0" beside "Total segments: 144" and concluded
+  // legacy data was never backfilled. It is not a corpus statistic at all — the fingerprint map is
+  // in-memory and starts empty every launch, so this counts what THIS SESSION has imported. The
+  // label has to say so; it sits in the corpus-stats grid next to genuine corpus numbers.
+  'stats.fingerprints': 'Audio fingerprints (this session)',
   'stats.qualityTitle': 'Dataset Quality',
   'stats.emptyTranscripts': 'Empty transcripts',
   'stats.lowConfidence': 'Low confidence',

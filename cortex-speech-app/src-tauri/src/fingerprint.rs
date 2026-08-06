@@ -4,7 +4,19 @@ use std::sync::{Mutex, MutexGuard};
 
 /// Audio fingerprinting using spectral energy peaks.
 /// Tracks which source file each fingerprint came from so re-importing the same
-/// file is allowed while duplicate content from different paths is still rejected.
+/// file is allowed while duplicate content from different paths is rejected.
+///
+/// SCOPE — this map is IN-MEMORY and lives exactly as long as the process. It is constructed empty
+/// in `lib.rs` at startup and nothing rehydrates it; no migration has ever created a column to
+/// rehydrate it FROM. So the rejection above holds WITHIN a single run only: restart the app,
+/// re-import the same audio under a different path, and it is accepted silently.
+///
+/// `get_fingerprint_count` therefore reports what this session has imported, NOT corpus coverage —
+/// the 2026-08-05 audit read its 0 next to a 144-clip corpus as evidence that legacy rows were never
+/// backfilled, which is why the UI label now says "(this session)".
+///
+/// Making duplicate detection durable needs a persisted fingerprint per segment plus a backfill over
+/// existing rows. Deliberately not done as a side effect of a labelling fix.
 pub struct AudioFingerprint {
     known: Mutex<HashMap<u64, String>>,
 }
@@ -170,6 +182,31 @@ impl AudioFingerprint {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Pins the SCOPE limit documented on the struct, so nobody reads the duplicate-rejection tests
+    /// below as a durable guarantee. A fresh `AudioFingerprint` is what `lib.rs` builds at every app
+    /// start, and it knows nothing — so the same content under a new path is accepted after a
+    /// restart. This test exists to make that visible, not to bless it: when fingerprints are
+    /// persisted it should FAIL and be replaced by its opposite.
+    #[test]
+    fn duplicate_detection_does_not_survive_a_restart() {
+        let pcm: Vec<i16> = (0..16_000).map(|i| (i as i16).wrapping_mul(100)).collect();
+        let first_run = AudioFingerprint::new();
+        first_run.register(&pcm, 16000, Some(Path::new(r"C:\audio\original.wav")));
+        assert!(
+            first_run.check_duplicate(&pcm, 16000, Some(Path::new(r"C:\audio\copy.wav"))),
+            "within one run, the same content under a different path IS a duplicate"
+        );
+
+        // What the next launch actually gets: lib.rs calls AudioFingerprint::new() and nothing
+        // rehydrates it, because no migration ever created a column to rehydrate from.
+        let after_restart = AudioFingerprint::new();
+        assert_eq!(after_restart.count(), 0, "the map is in-memory only");
+        assert!(
+            !after_restart.check_duplicate(&pcm, 16000, Some(Path::new(r"C:\audio\copy.wav"))),
+            "KNOWN GAP: cross-session duplicate detection does not exist — see the struct docs"
+        );
+    }
 
     #[test]
     fn reimport_same_source_is_not_duplicate() {

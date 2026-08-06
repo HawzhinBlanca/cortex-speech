@@ -15,7 +15,9 @@ export const ckb: Record<string, string> = {
   'scribe.voteExists': 'ئەم بەشە پێشتر دەنگی سکرایبی هەیە.',
   'scribe.voteFailed': 'زیادکردنی دەنگی سکرایب سەرکەوتوو نەبوو',
   diagnostics: 'دەستنیشانکردن',
-  'stats.fingerprints': 'پەنجەمۆری دەنگ',
+  // See en.ts: a per-session counter, not corpus coverage. Composed from vocabulary already in this
+  // file; flagged for owner review.
+  'stats.fingerprints': 'پەنجەمۆری دەنگ (ئەم دانیشتنە)',
   transcribeConstrained: 'تەنها کوردی',
   transcribeConstrainedTitle:
     'نووسینەوە بە دیکۆدی بەربەستکراوی پیتی کوردی (دەرئەنجامی کوردی دەستەبەر دەکات)',
