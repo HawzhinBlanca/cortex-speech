@@ -4,7 +4,12 @@
   import type { DatasetStats, SpeechSegment } from './types';
   import { segments } from './stores/segmentStore';
   import { notifications } from './stores/notificationStore';
-  import { isVerifiedGood, isHumanRejected } from './segmentQuality';
+  import {
+    isVerifiedGood,
+    isHumanRejected,
+    isPlaceholderTranscript,
+    effectiveTranscript,
+  } from './segmentQuality';
   import { t } from './i18n';
   import { isTauriRuntime } from './runtime';
 
@@ -128,11 +133,18 @@
     // "Verified" = human-confirmed GOOD. Exclude human-rejected clips ("mark bad"), which carry
     // verified=true only to leave the review queue — counting them here would inflate the metric.
     const verifiedCount = items.filter((segment) => isVerifiedGood(segment)).length;
-    const totalChars = items.reduce((sum, segment) => {
-      const text =
-        segment.normalizedTranscript || segment.annotatedTranscript || segment.rawTranscript || '';
-      return sum + text.length;
-    }, 0);
+    // Mirrors compute_stats (stats.rs): the char total describes the SAME population as verifiedCount
+    // and pendingCount above — rejected and placeholder clips excluded — and uses the same effective
+    // transcript. Measured 2026-08-06, the old version overstated the live corpus by 7994 characters
+    // (18.7%) by counting clips marked bad, and read a THIRD field order (normalized first) that
+    // disagreed with both the backend and the effective-transcript rule.
+    const countedForChars = items.filter(
+      (segment) => !isHumanRejected(segment) && !isPlaceholderTranscript(effectiveTranscript(segment)),
+    );
+    const totalChars = countedForChars.reduce(
+      (sum, segment) => sum + effectiveTranscript(segment).length,
+      0,
+    );
     const speakerDurations = new Map<
       string,
       { segmentCount: number; totalDurationSeconds: number }
@@ -162,7 +174,8 @@
       verificationRate: items.length ? (verifiedCount / items.length) * 100 : 0,
       uniqueSpeakers: speakerDurations.size,
       totalChars,
-      avgCharsPerSegment: items.length ? totalChars / items.length : 0,
+      // Divided by the rows the sum covers, not by all items — see compute_stats.
+      avgCharsPerSegment: countedForChars.length ? totalChars / countedForChars.length : 0,
       durationHistogram: {
         under5s: durationSeconds.filter((duration) => duration < 5).length,
         under10s: durationSeconds.filter((duration) => duration >= 5 && duration < 10).length,

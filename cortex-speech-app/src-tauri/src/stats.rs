@@ -159,13 +159,21 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
     );
     // Neither verified nor pending, exactly like a reject: it has no usable text either way.
     let excluded = format!("({REJECTED} OR {placeholder})");
+    // 2026-08-06: the char sum used to run over EVERY row with `COALESCE(annotated, normalized, raw)`
+    // — a third transcript-selection rule, in the same query as two counters that correctly exclude.
+    // MEASURED on the live 144-clip library: 42679 chars over 144 rows versus 34685 over the 117 the
+    // export keeps. 7994 characters, 18.7%, from clips marked bad. (The averages happened to land at
+    // 296.4 vs 296.5 because the rejected clips are average length — coincidence, not correctness, and
+    // reading it as "no impact" is the comfortable mistake.) Now uses EFFECTIVE over the same rows the
+    // verified/pending counters use, so all three describe one population.
     let sql = format!(
         "SELECT
             COUNT(*),
             COALESCE(SUM(duration_ms), 0),
             COALESCE(SUM(CASE WHEN verified AND NOT {excluded} THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN NOT verified AND NOT {REJECTED} THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(LENGTH(CAST(COALESCE(annotated_transcript, normalized_transcript, raw_transcript) AS BLOB))), 0),
+            COALESCE(SUM(CASE WHEN NOT {excluded} THEN LENGTH(CAST({EFFECTIVE} AS BLOB)) ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN NOT {excluded} THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN duration_ms BETWEEN 0 AND 4999 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN duration_ms BETWEEN 5000 AND 9999 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN duration_ms BETWEEN 10000 AND 14999 THEN 1 ELSE 0 END), 0),
@@ -173,21 +181,48 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
             COALESCE(SUM(CASE WHEN duration_ms < 0 OR duration_ms >= 30000 THEN 1 ELSE 0 END), 0)
          FROM speech_segments"
     );
-    let (total, total_duration_ms, verified_count, pending_count, total_chars, u5, u10, u15, u30, o30) = conn
-        .query_row(&sql, [], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, i64>(7)?,
-                r.get::<_, i64>(8)?,
-                r.get::<_, i64>(9)?,
-            ))
-        })?;
+    // Named before widening: this tuple grew from 10 to 11 columns when `counted_rows` was added, and
+    // a positional tuple is exactly where an off-by-one silently reassigns every later field.
+    struct Aggregate {
+        total: i64,
+        total_duration_ms: i64,
+        verified_count: i64,
+        pending_count: i64,
+        total_chars: i64,
+        counted_rows: i64,
+        u5: i64,
+        u10: i64,
+        u15: i64,
+        u30: i64,
+        o30: i64,
+    }
+    let Aggregate {
+        total,
+        total_duration_ms,
+        verified_count,
+        pending_count,
+        total_chars,
+        counted_rows,
+        u5,
+        u10,
+        u15,
+        u30,
+        o30,
+    } = conn.query_row(&sql, [], |r| {
+        Ok(Aggregate {
+            total: r.get(0)?,
+            total_duration_ms: r.get(1)?,
+            verified_count: r.get(2)?,
+            pending_count: r.get(3)?,
+            total_chars: r.get(4)?,
+            counted_rows: r.get(5)?,
+            u5: r.get(6)?,
+            u10: r.get(7)?,
+            u15: r.get(8)?,
+            u30: r.get(9)?,
+            o30: r.get(10)?,
+        })
+    })?;
 
     if total == 0 {
         return Ok(DatasetStats { db_size_bytes: size_bytes, ..Default::default() });
@@ -197,6 +232,7 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
     let verified_count = verified_count as usize;
     let pending_count = pending_count as usize;
     let total_chars = total_chars as usize;
+    let counted_rows = counted_rows as usize;
     let total_duration_seconds = total_duration_ms as f64 / 1000.0;
 
     // Speaker tallies via GROUP BY (NULL speaker → "unknown", matching the old fallback).
@@ -230,7 +266,9 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
         verification_rate: verified_count as f64 / total as f64 * 100.0,
         unique_speakers,
         total_chars,
-        avg_chars_per_segment: total_chars as f64 / total as f64,
+        // Divided by the rows the sum actually covers, NOT by `total`. Dividing an excluded-rows sum
+        // by an all-rows count would trade one wrong number for a subtler one.
+        avg_chars_per_segment: if counted_rows > 0 { total_chars as f64 / counted_rows as f64 } else { 0.0 },
         duration_histogram: DurationHistogram {
             under_5s: u5 as usize,
             under_10s: u10 as usize,
@@ -393,6 +431,53 @@ mod tests {
         assert_eq!(st.pending_count, 1, "a rejected clip must NOT count as pending either");
         assert_eq!(st.verified_count + st.pending_count, 2, "rejected is excluded from BOTH buckets");
         assert!((st.verification_rate - 100.0 / 3.0).abs() < 1e-9, "1 of 3 segments verified-good");
+    }
+
+    #[test]
+    fn char_totals_describe_the_same_population_as_the_verified_and_pending_counters() {
+        // Same class as the counter above, on a third axis, and it was live: MEASURED 2026-08-06 the
+        // dashboard reported 42679 chars over the owner's 144 clips where the export-consistent figure
+        // is 34685 over 117 — 7994 characters of text from clips marked bad, an 18.7% overstatement of
+        // how much transcript the corpus actually holds.
+        //
+        // The average is asserted too, and deliberately: on the live corpus the rejected clips were
+        // average length, so avg_chars barely moved (296.4 -> 296.5) while the total was badly wrong.
+        // A test that only checked the average would have called this clean.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&seg("keep1", 1000, true, Some("A"), "abcd")).unwrap(); // 4 bytes
+        db.insert_segment(&seg("keep2", 1000, false, Some("A"), "ef")).unwrap(); // 2 bytes, pending
+        db.insert_segment(&seg("bad", 1000, true, Some("A"), "ZZZZZZZZZZ")).unwrap(); // 10 bytes, rejected
+        db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='bad'", []).unwrap();
+
+        let st = compute_stats(&db).unwrap();
+        assert_eq!(st.total_segments, 3, "total_segments is corpus-wide and stays so");
+        assert_eq!(st.total_chars, 6, "a rejected clip's 10 characters must not be counted as corpus text");
+        assert!(
+            (st.avg_chars_per_segment - 3.0).abs() < 1e-9,
+            "average must divide by the 2 rows the sum covers, not by all 3: got {}",
+            st.avg_chars_per_segment
+        );
+    }
+
+    #[test]
+    fn char_totals_use_the_effective_transcript_the_rest_of_this_file_uses() {
+        // The old sum read COALESCE(annotated, normalized, raw) — a THIRD selection rule, differing
+        // from EFFECTIVE (which prefers verdict_transcript on a human decision) and from the
+        // frontend's own order. A human edit stored in verdict_transcript was therefore measured as
+        // whatever stale text sat in annotated/raw.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&seg("edited", 1000, true, Some("A"), "old")).unwrap(); // raw = 3 bytes
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET verdict_transcript='corrected', human_decision='edit' WHERE id='edited'",
+                [],
+            )
+            .unwrap();
+
+        let st = compute_stats(&db).unwrap();
+        assert_eq!(st.total_chars, 9, "must measure the human's 'corrected' (9), not the stale raw 'old' (3)");
     }
 
     #[test]

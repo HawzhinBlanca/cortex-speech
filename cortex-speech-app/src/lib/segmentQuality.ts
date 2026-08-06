@@ -35,6 +35,30 @@ export function isPlaceholderTranscript(text: string | null | undefined): boolea
 }
 
 /**
+ * The transcript a segment is actually JUDGED by — the single mirror of the Rust `EFFECTIVE`
+ * expression in `stats.rs` and of `quality::effective_transcript`.
+ *
+ * Before this existed the frontend carried three different orders for "the transcript": stats used
+ * `normalized || annotated || raw`, the backend SQL used `annotated, normalized, raw`, and the real
+ * rule prefers `verdictTranscript` when a human decided. So a human edit stored in verdictTranscript
+ * was measured as whatever stale text sat in annotated/raw. One helper, one order.
+ */
+export function effectiveTranscript(
+  seg: Pick<
+    SpeechSegment,
+    'rawTranscript' | 'normalizedTranscript' | 'annotatedTranscript' | 'verdictTranscript' | 'humanDecision' | 'verdict'
+  >,
+): string {
+  const nonEmpty = (t: string | null | undefined) => (t ?? '').trim();
+  const humanDecided =
+    ['accept', 'edit', 'human_accept', 'human_edit'].includes((seg.humanDecision ?? '').toLowerCase()) ||
+    ['human_accept', 'human_edit'].includes((seg.verdict ?? '').toLowerCase());
+  const verdictText = nonEmpty(seg.verdictTranscript);
+  if (humanDecided && verdictText) return verdictText;
+  return nonEmpty(seg.annotatedTranscript) || verdictText || nonEmpty(seg.normalizedTranscript) || nonEmpty(seg.rawTranscript);
+}
+
+/**
  * True when a segment carries at least one REAL transcript — a non-empty, non-placeholder string in any of
  * its transcript fields — i.e. actual content that could ship, not just an ASR placeholder or blanks. Used
  * to keep "verified" COUNTS honest: batch_verify sets verified=true with NO content guard, so "Verify all
