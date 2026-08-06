@@ -131,6 +131,11 @@ jobs:
       - name: npm audit
         run: npm audit --omit=dev
 
+      # A clean audit only says "no known CVE in what resolved". It says nothing about whether the
+      # tree resolved correctly: on 2026-08-06 the audit was green while npm ls exited ELSPROBLEMS.
+      - name: npm dependency tree is valid
+        run: npm ls --all
+
       - name: cargo deny
         run: cargo deny --manifest-path src-tauri/Cargo.toml check
 

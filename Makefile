@@ -78,9 +78,10 @@ python-policies:
 test-e2e:
 	cd cortex-speech-app && npm run test:e2e
 
-## audit: npm supply-chain audit (prod deps), mirrors CI
+## audit: npm supply-chain audit (prod deps) + dependency-tree validity, mirrors CI
 audit:
 	cd cortex-speech-app && npm audit --omit=dev
+	cd cortex-speech-app && npm ls --all
 
 ## deny: cargo supply-chain / license gate, mirrors CI
 deny:
