@@ -2945,17 +2945,137 @@ fn audio_fingerprint_round_trips_through_sqlite_including_the_high_bit() {
     })
     .unwrap();
 
-    let fp: u64 = 0xF000_0000_0000_00FF; // high bit set — past i64::MAX
-    let updated = db.set_audio_fingerprint("/audio/rec.wav", fp).unwrap();
+    let identity = crate::fingerprint::AudioIdentity {
+        spectral: 0xF000_0000_0000_00FF, // high bit set — past i64::MAX
+        content: "a".repeat(64),
+    };
+    let updated = db.set_audio_identity("/audio/rec.wav", &identity).unwrap();
     assert_eq!(updated, 2, "every chunk of the recording is stamped, keyed on audio_path");
 
-    let loaded = db.load_audio_fingerprints().unwrap();
+    let loaded = db.load_audio_identities().unwrap();
     assert_eq!(loaded.len(), 1, "DISTINCT: one recording, not one row per chunk");
-    assert_eq!(loaded[0], (fp, "/audio/rec.wav".to_string()), "the high bit must survive the round trip");
+    assert_eq!(loaded[0].spectral, identity.spectral, "the high bit must survive the round trip");
+    assert_eq!(
+        loaded[0].content.as_deref(),
+        Some(identity.content.as_str()),
+        "v51: the content hash travels WITH the bucket, or a restart loses the ability to reject"
+    );
+    assert_eq!(loaded[0].audio_path, "/audio/rec.wav");
 
     // The untouched recording stays NULL and is simply absent — not defaulted to 0, which register
-    // deliberately refuses to store as a content key.
-    assert!(!loaded.iter().any(|(_, p)| p == "/audio/other.wav"), "a NULL fingerprint must not appear");
+    // deliberately refuses to store as a bucket key.
+    assert!(!loaded.iter().any(|r| r.audio_path == "/audio/other.wav"), "a NULL fingerprint must not appear");
+}
+
+/// The SQL prefilter in `PendingWork::Transcript` must be a SUPERSET of `is_placeholder_transcript`.
+///
+/// P1.3 replaced a whole-library read + Rust filter with a SQL narrow + the SAME Rust filter. That is
+/// only safe while SQL never excludes a row Rust would have accepted. The failure mode if they drift is
+/// the nasty kind: a new placeholder string added to the Rust list would make those clips invisible to
+/// the 7B driver forever, and nothing would report an error — the backlog would just silently look
+/// empty. So the two are compared here directly, through real SQLite, rather than by eye.
+///
+/// The reverse direction is deliberately NOT asserted: SQL is allowed to over-select (a short real
+/// transcript, a line starting with '['), because Rust rejects those a moment later at no cost.
+#[test]
+fn sql_placeholder_prefilter_is_a_superset_of_the_rust_predicate() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+
+    // Every string the Rust authority calls "awaiting 7B", plus real transcripts that must NOT be.
+    let awaiting =
+        ["", "   ", "[Pending WSL 7B ASR]", "[ASR unavailable: model load failed]", "n/a", "N/A", "null", "NULL"];
+    let real = ["سڵاو، چۆنی باشی؟", "This is a real transcript that a human wrote."];
+
+    for (i, text) in awaiting.iter().chain(real.iter()).enumerate() {
+        db.insert_segment(&SpeechSegment {
+            id: format!("s{i:02}"),
+            raw_transcript: (*text).to_string(),
+            audio_path: format!("/audio/{i}.wav"),
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+    }
+
+    let selected: std::collections::HashSet<String> =
+        db.get_pending_segments(PendingWork::Transcript).unwrap().into_iter().map(|s| s.raw_transcript).collect();
+
+    for text in awaiting {
+        assert!(
+            crate::quality::is_placeholder_transcript(text) || text.trim().is_empty(),
+            "fixture {text:?} is not actually a placeholder — fix the fixture, not the assertion"
+        );
+        assert!(
+            selected.contains(text),
+            "SQL prefilter DROPPED {text:?}, which the Rust authority treats as awaiting 7B. Those \
+             clips would never be transcribed again and nothing would report it. Widen the WHERE in \
+             PendingWork::Transcript."
+        );
+    }
+    for text in real {
+        assert!(!crate::quality::is_placeholder_transcript(text));
+    }
+    // And the narrowing is real: a genuine transcript is not dragged in as work.
+    assert!(!selected.contains(real[0]), "SQL must still narrow — a real transcript is not a target");
+}
+
+/// The two score backfills must ask for their backlog, not the library.
+#[test]
+fn pending_work_selects_only_rows_missing_the_score() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    for id in ["done", "todo"] {
+        db.insert_segment(&SpeechSegment {
+            id: id.into(),
+            raw_transcript: "real text".into(),
+            audio_path: format!("/audio/{id}.wav"),
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+    }
+    db.connection()
+        .execute("UPDATE speech_segments SET ctc_score = 0.9, signal_anomaly_score = 0.1 WHERE id = 'done'", [])
+        .unwrap();
+
+    for work in [PendingWork::CtcScore, PendingWork::SignalAnomaly] {
+        let pending = db.get_pending_segments(work).unwrap();
+        assert_eq!(pending.len(), 1, "{work:?}: only the unfinished row");
+        assert_eq!(pending[0].id, "todo", "{work:?}: and it is the right one");
+    }
+}
+
+/// A v50-era row — bucket present, content hash NULL — must load, and must be UNABLE to reject.
+///
+/// This is the honest coverage gap v51 leaves behind, and it has to be a real database fact rather than
+/// a comment: rehydrating such a row as if it proved identity would restore exactly the false-reject
+/// bug the content hash exists to kill.
+#[test]
+fn a_v50_era_row_loads_with_no_content_hash_and_cannot_reject() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    db.insert_segment(&SpeechSegment {
+        id: "legacy".into(),
+        audio_path: "/audio/legacy.wav".into(),
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    // Exactly what v50 wrote: the bucket column only.
+    db.connection()
+        .execute("UPDATE speech_segments SET audio_fingerprint = 4242 WHERE audio_path = '/audio/legacy.wav'", [])
+        .unwrap();
+
+    let loaded = db.load_audio_identities().unwrap();
+    assert_eq!(loaded.len(), 1, "the row still participates — it is loaded, not skipped");
+    assert_eq!(loaded[0].content, None, "and it is honestly unhashed");
+
+    let map = crate::fingerprint::AudioFingerprint::new();
+    assert_eq!(map.rehydrate(loaded), 1);
+    let pcm: Vec<i16> = (0..16_000).map(|i| (i as i16).wrapping_mul(13)).collect();
+    // Whatever bucket this audio lands in, an unhashed entry may never be the reason it is refused.
+    assert!(
+        !map.check_duplicate(&pcm, 16000, Some(std::path::Path::new("/audio/fresh.wav"))),
+        "an unhashed legacy row must never reject a legitimate import"
+    );
 }
 
 /// Suspect-first must put the clips the jury DISTRUSTED first, not last (external review #2).

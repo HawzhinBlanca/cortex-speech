@@ -1569,13 +1569,14 @@ impl ProcessingPipeline {
             );
         }
 
-        let fp = self
+        let identity = self
             .fingerprint
             .check_and_register(&pcm, sample_rate, Some(path))
             .map_err(|e| AppError::Validation(e.into()))?;
         // v50: the value used to be computed here and thrown away as `_fp`, which is why duplicate
         // detection could not survive a restart. Stamped onto the rows AFTER persist_segments below,
-        // once they exist — see the set_audio_fingerprint call there.
+        // once they exist — see the set_audio_identity call there. v51: BOTH tiers travel together, so
+        // the rejection rule after a restart is the same cryptographic one it is during this run.
 
         let (chunk_ranges, vad_backend) = chunking::plan_speech_chunks(
             &pcm,
@@ -1631,9 +1632,9 @@ impl ProcessingPipeline {
         // re-importing this recording under a different path is rejected then too. Best-effort: a failed
         // stamp must not fail an import whose audio and transcripts are already committed — it only costs
         // this recording its place in cross-session dedup, and a WARN says so.
-        if fp != 0 {
-            if let Err(e) = db.set_audio_fingerprint(&path.to_string_lossy(), fp) {
-                tracing::warn!("audio fingerprint not persisted for {}: {e}", path.display());
+        if identity.spectral != 0 {
+            if let Err(e) = db.set_audio_identity(&path.to_string_lossy(), &identity) {
+                tracing::warn!("audio identity not persisted for {}: {e}", path.display());
             }
         }
         self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
@@ -1704,6 +1705,12 @@ impl ProcessingPipeline {
         // still recovers (#132's intent, at file granularity).
         let mut diarization_rebuild_tried = false;
         let mut denoiser_rebuild_tried = false;
+        // v51: accumulate ONE whole-recording identity across the windows. Before this, the streaming
+        // path fingerprinted each window, discarded every value, and persisted nothing — so a long file
+        // (the only kind that reaches this path) never participated in cross-session duplicate detection
+        // at all. blake3 streams, so this costs no extra memory and yields exactly the digest the
+        // non-streaming path would have computed for the same canonical PCM.
+        let mut recording_identity = crate::fingerprint::StreamingIdentity::new();
         for (w_idx, window) in windows.into_iter().enumerate() {
             if let Some(token) = cancel {
                 token.check()?;
@@ -1715,8 +1722,15 @@ impl ProcessingPipeline {
             } else {
                 let (sr, p) = audio::ensure_pcm_16khz(window.sample_rate, window.pcm)?;
                 sample_rate_seen = sr;
-                // Fingerprint only freshly-decoded audio, never the carried-over tail.
+                // Fingerprint only freshly-decoded audio, never the carried-over tail — pushing a carry
+                // twice would change the whole-file digest and break the equality with the
+                // non-streaming path.
+                //
+                // The per-window check stays: it fails fast, before the ASR cost, when this session has
+                // already seen the same audio. The accumulated whole-file identity below is what gets
+                // PERSISTED, so the next session catches it too.
                 self.fingerprint.check_and_register(&p, sr, Some(path)).map_err(|e| AppError::Validation(e.into()))?;
+                recording_identity.push(&p, sr);
                 (sr, p)
             };
 
@@ -1852,6 +1866,16 @@ impl ProcessingPipeline {
         }
 
         let mut persisted = self.persist_segments(db, segments)?;
+        // v51: stamp the whole-recording identity now that the rows exist, exactly as the non-streaming
+        // sibling does. Best-effort — a failed stamp must not fail an import whose audio and transcripts
+        // are already committed; it only costs this recording its place in cross-session dedup.
+        let identity = recording_identity.finish();
+        if identity.spectral != 0 {
+            self.fingerprint.register_identity(&identity, Some(path));
+            if let Err(e) = db.set_audio_identity(&path.to_string_lossy(), &identity) {
+                tracing::warn!("audio identity not persisted for {}: {e}", path.display());
+            }
+        }
         self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
         // Deferred to here so both see the real transcript and alignment doesn't clobber offsets.
         self.shadow_log_loop0(db, &persisted);

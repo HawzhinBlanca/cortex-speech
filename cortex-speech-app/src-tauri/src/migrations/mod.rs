@@ -1438,6 +1438,37 @@ pub static MIGRATIONS: &[Migration] = &[
              ALTER TABLE speech_segments DROP COLUMN audio_fingerprint;",
         ),
     },
+    Migration {
+        version: 51,
+        description: "Cryptographic content hash per recording — the DEFINITIVE duplicate key (v50's spectral value is demoted to a candidate index)",
+        // External review 2026-08-06 P1.1. v50 made the spectral fingerprint durable, which fixed its
+        // TIME scope but not its SEMANTICS: a 64-bit fold of eight band energies was still being used as
+        // a definitive content key, so a collision returned Err("Duplicate audio content") and REFUSED a
+        // legitimate recording at import. Losing real speech to defend against a duplicate that is not
+        // one is the wrong trade for a dataset tool.
+        //
+        // This column holds blake3 over canonical decoded PCM + sample rate. From v51 on, a rejection
+        // requires a match HERE; audio_fingerprint only decides which rows are worth comparing.
+        //
+        // TEXT, not BLOB: a 64-char hex digest is greppable in a sqlite3 shell and in an export, and the
+        // 32 bytes saved per recording are irrelevant next to the audio itself.
+        //
+        // NO BACKFILL, exactly as v49 and v50 — computing this requires DECODING the audio, which a
+        // schema migration may not do. A NULL here means "content never hashed", and the map treats it
+        // as unable to prove identity, so a pre-v51 row can never cause a rejection until
+        // `backfill_fingerprints` writes its real hash. That is a deliberate, narrow LOSS of dedup
+        // coverage for legacy rows, chosen because the alternative is keeping the false-reject bug for
+        // them. Prefer a duplicate over discarding legitimate audio.
+        //
+        // Partial index for the same reason as v50: only non-NULL rows are dedup candidates.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN audio_content_hash TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_segments_audio_content_hash
+                     ON speech_segments(audio_content_hash) WHERE audio_content_hash IS NOT NULL;",
+        down_sql: Some(
+            "DROP INDEX IF EXISTS idx_segments_audio_content_hash;
+             ALTER TABLE speech_segments DROP COLUMN audio_content_hash;",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -1548,9 +1579,10 @@ mod tests {
             .unwrap();
         // Counted, not >=: the point of this assertion is that the v40 table RECREATE rebuilt every
         // index rather than silently dropping one, so a loosened comparison would defeat it. Raised
-        // 10 -> 11 by v50's partial index on audio_fingerprint. If you add an index to
-        // speech_segments, raise this deliberately — do not relax it.
-        assert_eq!(idx, 11, "all 11 indexes must be recreated");
+        // 10 -> 11 by v50's partial index on audio_fingerprint, and 11 -> 12 by v51's partial index on
+        // audio_content_hash. If you add an index to speech_segments, raise this deliberately — do not
+        // relax it.
+        assert_eq!(idx, 12, "all 12 indexes must be recreated");
 
         // (5) FTS still finds a segment by transcript (triggers recreated + index rebuilt).
         let hits = db.search_segments("کوردی").unwrap();

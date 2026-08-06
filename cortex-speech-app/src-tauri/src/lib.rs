@@ -583,13 +583,26 @@ pub fn run() {
     // Best-effort by design: a failed read must not block startup. It costs this session cross-run
     // dedup — exactly the behaviour that shipped before v50 — and says so loudly rather than degrading
     // silently. Rows predating v50 have a NULL fingerprint and are simply absent until backfilled.
-    match db.load_audio_fingerprints() {
+    //
+    // v51: a row that has a spectral bucket but no content hash (imported between v50 and v51) IS
+    // loaded, but can never reject an import, because a value that cannot distinguish content must not
+    // discard a legitimate recording. The count is reported separately so the gap is visible in the log
+    // rather than implied by silence.
+    match db.load_audio_identities() {
         Ok(known) => {
+            let unhashed = known.iter().filter(|k| k.content.is_none()).count();
             let n = fingerprint.rehydrate(known);
-            tracing::info!("Audio dedup: rehydrated {n} recording fingerprint(s) from the library");
+            tracing::info!("Audio dedup: rehydrated {n} recording identity/identities from the library");
+            if unhashed > 0 {
+                tracing::warn!(
+                    "Audio dedup: {unhashed} recording(s) predate v51 and have no content hash — they \
+                     cannot prove a duplicate and will never reject an import. Run \
+                     `backfill_fingerprints --apply` to close the gap."
+                );
+            }
         }
         Err(e) => {
-            tracing::warn!("Audio dedup: could not rehydrate fingerprints ({e}) — within-run dedup only");
+            tracing::warn!("Audio dedup: could not rehydrate identities ({e}) — within-run dedup only");
         }
     }
 

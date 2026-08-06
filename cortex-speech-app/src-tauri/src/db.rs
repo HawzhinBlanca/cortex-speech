@@ -1,4 +1,19 @@
 use crate::error::{AppError, AppResult};
+use crate::fingerprint::{AudioIdentity, StoredAudioIdentity};
+
+/// Which background pass's backlog [`Database::get_pending_segments`] should return.
+///
+/// An enum rather than a caller-supplied SQL fragment: the three predicates are fixed, and a
+/// `&str` parameter here would be an injection-shaped API for no gain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingWork {
+    /// No real transcript yet — empty or an ASR placeholder. The 7B refinement driver's targets.
+    Transcript,
+    /// No forced-alignment CTC score yet.
+    CtcScore,
+    /// No signal-anomaly score yet.
+    SignalAnomaly,
+}
 use rusqlite::{backup, params, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -1554,6 +1569,49 @@ impl Database {
         Ok(segments)
     }
 
+    /// The backlog one background pass still has to process.
+    ///
+    /// External review 2026-08-06 P1.3. Each of these three passes used to call `get_segments(None)` —
+    /// materialising the WHOLE library — and then `continue` past every row that was already done. The
+    /// work list is a WHERE clause; reading the corpus to find it is the O(corpus) read the policy gate
+    /// exists to retire.
+    ///
+    /// What bounds this is the BACKLOG, not a page size: these passes must process every unfinished row,
+    /// so a `LIMIT` here would silently drop work rather than bound it. The bound is that a finished row
+    /// is never read at all — after the first run the result is empty, where the old code still paid for
+    /// the whole library every time.
+    ///
+    /// Ordering matches `get_segments` (created_at, then a unique tiebreak) so a capped or interrupted
+    /// run resumes deterministically instead of picking an arbitrary SQLite row order.
+    pub fn get_pending_segments(&self, work: PendingWork) -> AppResult<Vec<SpeechSegment>> {
+        let where_sql = match work {
+            // A SUPERSET of what `quality::is_placeholder_transcript` accepts, deliberately: SQL narrows
+            // cheaply and Rust stays the single authority on what a placeholder IS. Widening in the
+            // permissive direction can only cost an extra row that Rust then rejects; it can never drop a
+            // real target. `db_tests::sql_placeholder_prefilter_is_a_superset_of_the_rust_predicate`
+            // pins that relationship so the two cannot drift apart.
+            PendingWork::Transcript => {
+                "TRIM(COALESCE(raw_transcript, '')) = ''
+                 OR TRIM(raw_transcript) LIKE '[%'
+                 OR LENGTH(TRIM(raw_transcript)) <= 4"
+            }
+            PendingWork::CtcScore => "ctc_score IS NULL",
+            PendingWork::SignalAnomaly => "signal_anomaly_score IS NULL",
+        };
+        let query = format!(
+            "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments
+              WHERE {where_sql}
+              ORDER BY created_at ASC, audio_path ASC, id ASC"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map([], Self::map_row)?;
+        let mut segments = Vec::new();
+        for row in rows {
+            segments.push(row?);
+        }
+        Ok(segments)
+    }
+
     pub fn get_segments_page(
         &self,
         verified: Option<bool>,
@@ -2233,34 +2291,49 @@ impl Database {
     /// This is the revocation lineage: once stamped, `rights_disposition` returns `Revoked` and every
     /// export path — including plain local export — must drop the row. A withdrawal that only blocks
     /// future publishing is not a withdrawal.
-    /// Persist the spectral fingerprint for every segment of one source recording (migration v50).
+    /// Persist BOTH identity tiers for every segment of one source recording (v50 spectral + v51 hash).
     ///
     /// Keyed on `audio_path` like `set_recording_rights`: all VAD chunks of one recording share it, and
     /// the identity being recorded is the RECORDING's, not the chunk's.
     ///
-    /// `fp as i64` is a bit-cast, not a numeric conversion — SQLite integers are i64 and the
-    /// fingerprint is a u64, so the top bit round-trips only because both directions cast rather than
-    /// convert. `load_audio_fingerprints` casts back the same way.
-    pub fn set_audio_fingerprint(&self, audio_path: &str, fingerprint: u64) -> AppResult<usize> {
+    /// Both columns in ONE statement deliberately: a caller that could write the spectral value without
+    /// the content hash would re-create the pre-v51 state on the next restart, where a rehydrated entry
+    /// has a bucket key but nothing able to prove identity.
+    ///
+    /// `spectral as i64` is a bit-cast, not a numeric conversion — SQLite integers are i64 and the
+    /// value is a u64, so the top bit round-trips only because both directions cast rather than
+    /// convert. `load_audio_identities` casts back the same way.
+    pub fn set_audio_identity(&self, audio_path: &str, identity: &AudioIdentity) -> AppResult<usize> {
         Ok(self.conn.execute(
-            "UPDATE speech_segments SET audio_fingerprint = ?2 WHERE audio_path = ?1",
-            params![audio_path, fingerprint as i64],
+            "UPDATE speech_segments SET audio_fingerprint = ?2, audio_content_hash = ?3
+              WHERE audio_path = ?1",
+            params![audio_path, identity.spectral as i64, identity.content],
         )?)
     }
 
-    /// Every stored (fingerprint, audio_path) pair, for rehydrating the in-memory dedup map at startup.
+    /// Every stored recording identity, for rehydrating the in-memory dedup map at startup.
     ///
-    /// DISTINCT because a recording is many chunks sharing one path and one fingerprint; without it a
-    /// 144-chunk file would return 144 identical rows. Rows whose fingerprint was never computed (every
-    /// row predating v50, until the backfill runs) are skipped by the WHERE, not defaulted to 0 — a
-    /// zero fingerprint is the degenerate silent-window value `register` deliberately refuses to store.
-    pub fn load_audio_fingerprints(&self) -> AppResult<Vec<(u64, String)>> {
+    /// DISTINCT because a recording is many chunks sharing one path and one identity; without it a
+    /// 144-chunk file would return 144 identical rows. Rows whose spectral value was never computed
+    /// (every row predating v50, until the backfill runs) are skipped by the WHERE, not defaulted to 0 —
+    /// a zero value is the degenerate silent-window bucket `register` deliberately refuses to store.
+    ///
+    /// `content` is `None` for v50-era rows: they have a bucket key but were never hashed. The dedup map
+    /// keeps them and never lets them reject, because a value that cannot distinguish content must not
+    /// be allowed to discard a legitimate recording. `backfill_fingerprints` closes that gap.
+    pub fn load_audio_identities(&self) -> AppResult<Vec<StoredAudioIdentity>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT audio_fingerprint, audio_path FROM speech_segments
+            "SELECT DISTINCT audio_fingerprint, audio_content_hash, audio_path FROM speech_segments
              WHERE audio_fingerprint IS NOT NULL",
         )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)))?
+            .query_map([], |r| {
+                Ok(StoredAudioIdentity {
+                    spectral: r.get::<_, i64>(0)? as u64,
+                    content: r.get::<_, Option<String>>(1)?,
+                    audio_path: r.get::<_, String>(2)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }

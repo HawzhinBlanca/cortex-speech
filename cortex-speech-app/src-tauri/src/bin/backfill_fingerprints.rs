@@ -1,15 +1,19 @@
-//! Backfill `audio_fingerprint` for recordings imported before migration v50, and REPORT any
+//! Backfill recording identity for recordings imported before migration v50/v51, and REPORT any
 //! duplicate content already sitting in the library.
 //!
-//! Why this is a separate pass rather than part of the migration: computing a fingerprint requires
-//! DECODING the audio. A schema migration may not do that, and inventing a value would be worse than
-//! the honest NULL v50 leaves behind. Until this runs, pre-v50 rows simply do not participate in
-//! duplicate detection — exactly as protected as they were before, uncovered rather than regressed.
+//! Two columns are filled, and the distinction matters (external review 2026-08-06, P1.1):
+//!   - `audio_fingerprint`  (v50) — a 64-bit spectral bucket key. A CANDIDATE signal only.
+//!   - `audio_content_hash` (v51) — blake3 over canonical decoded PCM. The DEFINITIVE key.
+//!
+//! A recording with a bucket but no content hash — anything imported between v50 and v51 — can never
+//! prove a duplicate, so it never rejects an import. That is deliberate: the spectral value was
+//! demoted precisely because a collision on it used to REFUSE legitimate audio. This pass is what
+//! closes that coverage gap, by decoding the audio a schema migration is not allowed to touch.
 //!
 //! IT NEVER DELETES ANYTHING. Not a row, not a file, not in `--apply` mode. A duplicate found here is
 //! a fact about a library the owner already curated — possibly two legitimate copies, possibly a real
 //! double-import, and only the owner knows which. The tool's job is to make it visible; deciding is
-//! theirs. `--apply` writes fingerprints and nothing else.
+//! theirs. `--apply` writes identities and nothing else.
 //!
 //! Dry run by default, mirroring realign_segments.rs:
 //!   cargo run --release --bin backfill_fingerprints
@@ -33,26 +37,42 @@ fn main() -> Result<(), String> {
 
     let db_path = data_dir.join("cortex-speech.db");
     println!("db    : {}", db_path.display());
-    println!("mode  : {}\n", if apply { "APPLY (writes fingerprints only)" } else { "DRY RUN (writes nothing)" });
+    println!("mode  : {}\n", if apply { "APPLY (writes identities only)" } else { "DRY RUN (writes nothing)" });
 
     let db = Database::open(db_path.to_string_lossy().as_ref()).map_err(|e| format!("open db: {e}"))?;
 
-    // Already-stored fingerprints participate in collision detection from the start, so a backfilled
-    // recording that matches one imported after v50 is reported too — not just backfill-vs-backfill.
-    let mut seen: BTreeMap<u64, String> = BTreeMap::new();
-    for (fp, path) in db.load_audio_fingerprints().map_err(|e| e.to_string())? {
-        seen.insert(fp, path);
+    // Keyed on the CONTENT hash, not the spectral bucket: two recordings are the same recording when
+    // their audio is byte-identical, and never merely because their loudness envelopes collided. A
+    // stored row with no content hash yet cannot key anything, so it is counted and then backfilled
+    // below like any other pending row.
+    let stored = db.load_audio_identities().map_err(|e| e.to_string())?;
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    let mut legacy_unhashed = 0usize;
+    for row in &stored {
+        match row.content.as_deref() {
+            Some(hash) => {
+                seen.insert(hash.to_string(), row.audio_path.clone());
+            }
+            None => legacy_unhashed += 1,
+        }
     }
-    println!("already fingerprinted : {} recording(s)", seen.len());
+    println!("already hashed        : {} recording(s)", seen.len());
+    if legacy_unhashed > 0 {
+        println!("v50-era (bucket only) : {legacy_unhashed} recording(s) — cannot prove a duplicate until hashed");
+    }
 
-    // One entry per RECORDING. All VAD chunks of a source share its audio_path and its fingerprint, so
+    // One entry per RECORDING. All VAD chunks of a source share its audio_path and its identity, so
     // decoding once per path instead of once per row is the difference between 144 decodes and 1.
+    //
+    // A row is pending when EITHER column is missing: a v50-era row already has its bucket but is still
+    // unable to reject anything until its content hash exists.
     let pending: Vec<String> = {
         let conn = db.connection();
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT audio_path FROM speech_segments
-                 WHERE audio_fingerprint IS NULL AND TRIM(COALESCE(audio_path,'')) <> ''
+                 WHERE (audio_fingerprint IS NULL OR audio_content_hash IS NULL)
+                   AND TRIM(COALESCE(audio_path,'')) <> ''
                  ORDER BY audio_path",
             )
             .map_err(|e| e.to_string())?;
@@ -87,22 +107,22 @@ fn main() -> Result<(), String> {
                 continue;
             }
         };
-        let fp = AudioFingerprint::fingerprint(&pcm, sample_rate);
-        if fp == 0 {
-            // Digital silence or a sub-16ms clip. `register` refuses to store this as a content key
-            // because every later silent window would collide with it; so does this.
+        let identity = AudioFingerprint::identify(&pcm, sample_rate);
+        if identity.spectral == 0 {
+            // Digital silence or a sub-16ms clip. `register` refuses to store this bucket because every
+            // later silent window would land in it; so does this.
             degenerate += 1;
             continue;
         }
-        if let Some(other) = seen.get(&fp) {
-            if other != path {
-                duplicates.push((other.clone(), path.clone()));
+        match seen.get(&identity.content) {
+            Some(other) if other != path => duplicates.push((other.clone(), path.clone())),
+            Some(_) => {}
+            None => {
+                seen.insert(identity.content.clone(), path.clone());
             }
-        } else {
-            seen.insert(fp, path.clone());
         }
         if apply {
-            match db.set_audio_fingerprint(path, fp) {
+            match db.set_audio_identity(path, &identity) {
                 Ok(rows) => done += rows.min(1),
                 Err(e) => eprintln!("  write failed: {path} ({e})"),
             }
@@ -112,7 +132,7 @@ fn main() -> Result<(), String> {
     }
 
     println!("\n─── summary ───");
-    println!("fingerprinted : {done}{}", if apply { "" } else { " (dry run — nothing written)" });
+    println!("identified    : {done}{}", if apply { "" } else { " (dry run — nothing written)" });
     println!("source missing: {missing}");
     println!("undecodable   : {undecodable}");
     println!("silent/too short (no content key): {degenerate}");
@@ -120,18 +140,19 @@ fn main() -> Result<(), String> {
     if duplicates.is_empty() {
         println!("\nNo duplicate audio content found.");
     } else {
-        println!("\n⚠ {} recording(s) share content with another recording:", duplicates.len());
+        println!("\n⚠ {} recording(s) are byte-identical to another recording:", duplicates.len());
         for (first, dup) in &duplicates {
             println!("    {dup}\n      matches {first}");
         }
         println!(
-            "\nNOTHING WAS DELETED, and this tool never will. These may be two legitimate copies or a\n\
-             real double-import — only you can tell. Review them in the app and mark bad or delete\n\
-             there if you decide they are redundant."
+            "\nNOTHING WAS DELETED, and this tool never will. These are cryptographically identical —\n\
+             not a spectral near-match — but they may still be two legitimate copies rather than a\n\
+             double-import. Only you can tell. Review them in the app and mark bad or delete there if\n\
+             you decide they are redundant."
         );
     }
     if !apply {
-        println!("\nRe-run with --apply to write the fingerprints.");
+        println!("\nRe-run with --apply to write the identities.");
     }
     Ok(())
 }
