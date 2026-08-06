@@ -42,11 +42,29 @@ BY_DESIGN = {
 }
 
 TO_RETIRE = {
-    "commands/dataset_analytics.rs": "analytics should aggregate in SQL rather than materialise the corpus",
+    # Three whole-corpus STATISTICS (training-grade breakdown, conformal certificate, annotation-drift
+    # scorecard). Naively "aggregate it in SQL" is the wrong retirement here and would trade this bug for
+    # a worse one: each statistic is computed by a shared Rust policy function — the same
+    # `training_grade_for_segment` the EXPORT gates on — so a SQL reimplementation would fork the policy
+    # and let the dashboard and the export disagree about what is training-ready. The correct retirement
+    # is a STREAMING read (fold row-by-row into the counters/score vector instead of collecting a Vec of
+    # full rows), which bounds memory while leaving exactly one implementation of the rule.
+    "commands/dataset_analytics.rs": "fold over a streaming read; do NOT reimplement the grading policy in SQL",
     "commands/segments_read.rs": "get_active_learning_queue needs its conformal threshold computed in SQL",
-    "commands.rs": "the WSL refinement driver should select its targets with a WHERE clause",
-    "couch.rs": "the phone queue reads all pending rows; it should page like the desktop library does",
+    # api_queue needs every pending row to report honest `held_by_others` / `skipped_by_you` counts, and
+    # those depend on IN-MEMORY lease state, so no SQL aggregate can produce them. But it only needs the
+    # ID of a row it is merely counting — the full record (transcript + alignment JSON) is needed for the
+    # <= QUEUE_BATCH clips it actually hands out. Retirement is: select pending IDs, filter/count on
+    # those, then hydrate the batch with the existing `get_segments_by_ids`.
+    "couch.rs": "count on pending IDs, hydrate only the QUEUE_BATCH it hands out (get_segments_by_ids exists)",
 }
+
+# Retired, kept as a record so the list cannot quietly regrow into them:
+#   commands.rs (2026-08-06) — the 7B refinement driver, the CTC-score backfill and the signal-anomaly
+#   backfill each read the whole library and then `continue`d past every row that was already done. All
+#   three now ask for their backlog via `Database::get_pending_segments(PendingWork::_)`. The 7B
+#   predicate keeps `segment_awaits_wsl7b` as its authority and uses SQL only as a deliberate superset;
+#   `db_tests::sql_placeholder_prefilter_is_a_superset_of_the_rust_predicate` pins that they cannot drift.
 
 ALLOWED = {**BY_DESIGN, **TO_RETIRE}
 

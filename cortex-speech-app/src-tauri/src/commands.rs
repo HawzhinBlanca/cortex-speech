@@ -2199,8 +2199,11 @@ fn run_wsl_refinement_loop(
     // destructive quarantine must not be reachable from a live worker, and the DB was integrity-checked
     // at boot. `open` sets WAL + busy_timeout for contention.
     let db = crate::db::Database::open(db_path).map_err(|e| e.to_string())?;
-    let segments = db.get_segments(None).map_err(|e| e.to_string())?;
-    let targets = select_wsl_refinement_targets(&segments, limit_files, limit_segments, test_one);
+    // P1.3: the backlog, not the library. This used to read every segment ever imported and then throw
+    // away every one that already had a transcript. The SQL prefilter is a deliberate SUPERSET of
+    // `segment_awaits_wsl7b`, which stays the authority below — see PendingWork::Transcript.
+    let candidates = db.get_pending_segments(crate::db::PendingWork::Transcript).map_err(|e| e.to_string())?;
+    let targets = select_wsl_refinement_targets(&candidates, limit_files, limit_segments, test_one);
 
     if targets.is_empty() {
         emit_or_log(
@@ -2377,9 +2380,11 @@ pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize
     let models_dir = state.lock_model_manager().models_dir.clone();
     let db = state.db_arc();
     run_blocking(move || {
+        // P1.3: `WHERE ctc_score IS NULL` instead of reading the whole library and `continue`-ing past
+        // every row that already has one. After the first pass this returns nothing at all.
         let segments = {
             let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.get_segments(None).map_err(|e| e.to_string())?
+            db.get_pending_segments(crate::db::PendingWork::CtcScore).map_err(|e| e.to_string())?
         };
 
         let aligner = aligner::ForcedAligner::new(&models_dir, settings_gpu).map_err(|e| e.to_string())?;
@@ -2390,10 +2395,6 @@ pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize
 
         let mut count = 0;
         for seg in &segments {
-            if seg.ctc_score.is_some() {
-                continue;
-            }
-
             let text = seg.raw_transcript.clone();
             if text.trim().is_empty() {
                 continue;
@@ -2458,19 +2459,16 @@ pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result
     let models_dir = state.lock_model_manager().models_dir.clone();
     let db = state.db_arc();
     run_blocking(move || {
+        // P1.3: `WHERE signal_anomaly_score IS NULL` — see the CTC sibling above.
         let segments = {
             let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.get_segments(None).map_err(|e| e.to_string())?
+            db.get_pending_segments(crate::db::PendingWork::SignalAnomaly).map_err(|e| e.to_string())?
         };
 
         let detector = quality::signal_anomaly::SignalAnomalyDetector::new(&models_dir).map_err(|e| e.to_string())?;
 
         let mut count = 0;
         for seg in &segments {
-            if seg.signal_anomaly_score.is_some() {
-                continue;
-            }
-
             let audio_path = seg.audio_path.clone();
             if !std::path::Path::new(&audio_path).exists() {
                 continue;
