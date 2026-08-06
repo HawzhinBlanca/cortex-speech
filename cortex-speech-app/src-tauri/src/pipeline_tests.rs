@@ -1247,3 +1247,49 @@ fn withdrawing_cloud_consent_does_not_disable_local_refinement() {
 
     assert!(in_flight.llm_refinement_permitted(), "revoking CLOUD consent must not disable purely-local refinement");
 }
+
+#[test]
+fn revocation_takes_effect_even_when_the_settings_save_fails() {
+    // The privacy asymmetry (external review 2026-08-06). commands::update_settings persists BEFORE
+    // committing, so a full or read-only disk returns Err and never reaches update_settings' commit.
+    // A PREFERENCE staying at its old value there is correct. A WITHDRAWAL doing so is not: the
+    // running import would keep uploading with only a save error to show for it.
+    //
+    // This reproduces the failed-save path exactly — revoke_consent_now runs, update_settings never
+    // does — and asserts egress has already stopped.
+    // No `mut`: revoke_consent_now takes &self, which is exactly why it can run through the pipeline
+    // lock without a mutable borrow — update_settings needs &mut, a withdrawal does not.
+    let stored = pipeline_with(all_cloud_on());
+    let in_flight = stored.clone();
+    assert!(in_flight.consent.cloud_stt(), "precondition: consent granted");
+
+    let mut off = all_cloud_on();
+    off.cloud_llm_opt_in = false;
+    off.cloud_stt_opt_in = false;
+    off.jury_cloud_opt_in = false;
+    stored.revoke_consent_now(&off); // ... and then the save fails, so update_settings is NOT called.
+
+    assert!(!in_flight.consent.cloud_stt(), "a withdrawal must not wait for a successful disk write");
+    assert!(!in_flight.consent.cloud_llm());
+    assert!(!in_flight.consent.jury_cloud());
+    assert!(
+        in_flight.scribe_api_key_if_enabled().is_none(),
+        "egress must already be stopped even though the settings save failed"
+    );
+    // The divergence is one-directional: the SNAPSHOT still says opted-in (disk and get_settings
+    // report the old value, and the user is shown the save error), while egress is off. Safer than
+    // displayed — never the reverse.
+    assert!(stored.settings.cloud_stt_opt_in, "the un-saved snapshot legitimately still reads opted-in");
+}
+
+#[test]
+fn revoke_consent_now_never_grants() {
+    // Turning an opt-in ON must still go through update_settings, which commits only after a
+    // successful persist — otherwise a grant that never reached disk would enable cloud egress for a
+    // session and silently vanish on the next launch.
+    let stored = pipeline_with(AppSettings::default()); // all cloud OFF
+    stored.revoke_consent_now(&all_cloud_on());
+    assert!(!stored.consent.cloud_stt(), "revoke_consent_now must never turn consent ON");
+    assert!(!stored.consent.cloud_llm());
+    assert!(!stored.consent.jury_cloud());
+}

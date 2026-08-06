@@ -340,6 +340,12 @@ impl AppState {
         self.lock_pipeline().update_settings(settings);
     }
 
+    /// Stop cloud egress for any opt-in `next` turns OFF, without waiting for the save to succeed.
+    /// Withdrawals only — see `ProcessingPipeline::revoke_consent_now`.
+    pub fn revoke_pipeline_consent_now(&self, next: &AppSettings) {
+        self.lock_pipeline().revoke_consent_now(next);
+    }
+
     /// True while an import or batch worker may be WRITING. The restore gate (true-10 audit
     /// 2026-07-09): restoring mid-import let the worker keep upserting pre-restore segments into the
     /// just-restored library through its own pipeline connection, and a batch finishing AFTER

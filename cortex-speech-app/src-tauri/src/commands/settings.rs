@@ -37,6 +37,18 @@ pub fn update_settings(mut settings: AppSettings, state: State<'_, AppState>) ->
         settings.merge_session_secret_from(&current);
         state.lock_data_dir().clone().map(|d| d.join("settings.json"))
     };
+    // WITHDRAWALS TAKE EFFECT BEFORE THE SAVE (external review 2026-08-06). Persist-first below is
+    // right for a preference and for GRANTING consent, but a revocation must not be contingent on
+    // free disk space: with a full or read-only disk the save fails, this function returns Err, and
+    // without this line the running import would have kept uploading audio to the cloud with only a
+    // save error to show for it.
+    //
+    // The residual divergence is deliberate and one-directional. If the save then fails, disk and
+    // `get_settings()` still report the OLD (opted-in) value while egress is already stopped — the UI
+    // can show cloud ON while nothing is being sent, never the reverse. Bounded to "safer than
+    // displayed", and the returned error is what tells the user the next launch may not remember it.
+    // `revocation_takes_effect_even_when_the_settings_save_fails` pins exactly that.
+    state.revoke_pipeline_consent_now(&settings);
     // Persist FIRST, before committing to memory/pipeline. A save failure (e.g. a cloud-consent
     // toggle that never reached disk) must be SURFACED, not swallowed — otherwise the user believes
     // the change stuck while it silently reverts on the next launch (a privacy hazard for the cloud
@@ -99,6 +111,34 @@ mod tests {
     /// plaintext `save_key`. Wiring `set_api_key` to `save_key` (the plaintext path) is the exact
     /// regression this guards; a source-invariant check because the command needs full AppState to call.
     /// Fail-before: the pre-fix line `ApiKeys::save_key(&data_dir, ...)` trips the second assertion.
+    /// A withdrawal must reach the running pipeline BEFORE the save that can fail (external review
+    /// 2026-08-06). The pipeline_tests unit tests prove `revoke_consent_now` behaves correctly; only
+    /// this pins that `update_settings` actually CALLS it, and calls it before `save`.
+    ///
+    /// Fail-before verified BOTH ways: deleting the call, and moving it after the save. Neither broke
+    /// compilation and neither was caught by any other gate — which is exactly why the ordering needs
+    /// a source-shape guard rather than trusting the comment above it.
+    #[test]
+    fn a_consent_withdrawal_reaches_the_pipeline_before_the_save_that_may_fail() {
+        let src = include_str!("settings.rs");
+        let prod = src.split("mod tests").next().unwrap_or(src);
+        let revoke = prod.find("state.revoke_pipeline_consent_now(&settings)");
+        let save = prod.find("settings.save(&path)");
+        let (revoke, save) = match (revoke, save) {
+            (Some(r), Some(s)) => (r, s),
+            _ => panic!(
+                "update_settings must call revoke_pipeline_consent_now and settings.save — a missing \
+                 revocation lets a full or read-only disk keep cloud egress running after the user \
+                 switched it off"
+            ),
+        };
+        assert!(
+            revoke < save,
+            "the withdrawal must be applied BEFORE the persist: after it, a failed save returns Err \
+             and the running import keeps uploading"
+        );
+    }
+
     #[test]
     fn set_api_key_persists_via_dpapi_protected_store_not_plaintext() {
         // Scan ONLY the production region — everything before `mod tests` — so this assertion's own

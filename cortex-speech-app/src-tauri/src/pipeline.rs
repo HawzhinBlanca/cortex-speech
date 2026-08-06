@@ -711,6 +711,30 @@ impl ProcessingPipeline {
         }
     }
 
+    /// Apply only the WITHDRAWALS in `next` to the shared live consent, right now.
+    ///
+    /// Never grants: turning an opt-in ON still goes through `update_settings`, which commits only
+    /// after a successful persist, so consent can never be enabled by a change that will not survive
+    /// a restart.
+    ///
+    /// This exists because persistence and safety want opposite orderings (external review
+    /// 2026-08-06). `commands::update_settings` deliberately saves BEFORE committing, so a failed
+    /// save leaves memory, pipeline and disk consistent at the old value. Correct for a preference —
+    /// and wrong for a withdrawal: on a full or read-only disk the user's revocation would never
+    /// reach the running import and audio would keep going to the cloud, with only a save error to
+    /// show for it. A stop instruction must not be contingent on free disk space.
+    pub fn revoke_consent_now(&self, next: &AppSettings) {
+        if !next.cloud_llm_opt_in {
+            self.consent.cloud_llm.store(false, Ordering::SeqCst);
+        }
+        if !next.cloud_stt_opt_in {
+            self.consent.cloud_stt.store(false, Ordering::SeqCst);
+        }
+        if !next.jury_cloud_opt_in {
+            self.consent.jury_cloud.store(false, Ordering::SeqCst);
+        }
+    }
+
     pub fn update_settings(&mut self, settings: AppSettings) {
         // Consent FIRST, and through the shared Arc so it reaches clones already running an import.
         // The snapshot swap below is visible only to this instance; that is fine for preferences and
