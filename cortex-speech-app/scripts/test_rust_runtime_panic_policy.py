@@ -1636,8 +1636,21 @@ def test_global_rate_limiter_recovers_poisoned_lock() -> None:
 
 def test_audio_fingerprint_cache_recovers_poisoned_lock() -> None:
     fingerprint = (REPO_ROOT / "src-tauri/src/fingerprint.rs").read_text(encoding="utf-8")
-    if "fn lock_known(&self) -> MutexGuard<'_, HashMap<u64, String>>" not in fingerprint:
+    # Matched on the SIGNATURE, not the full generic type. This pinned
+    # `MutexGuard<'_, HashMap<u64, String>>` verbatim and fired when v51 changed the map's VALUE to
+    # `Vec<KnownRecording>` (a spectral bucket may hold several distinct recordings) — a legitimate
+    # design change, with the invariant this gate actually protects fully intact. A guard that fails on
+    # a type it was never about trains people to edit the guard, which is how a real one gets weakened.
+    if "fn lock_known(&self) -> MutexGuard<" not in fingerprint:
         raise AssertionError("AudioFingerprint must centralize cache locking behind lock_known()")
+    # The real invariant, and STRONGER than the old string match: exactly one place takes the lock.
+    # Counted like the AsrPool sibling above. `fp.known.lock()` in the poison test uses a different
+    # receiver and is deliberately not counted.
+    direct_lock_count = fingerprint.count("self.known.lock()")
+    if direct_lock_count != 1:
+        raise AssertionError(
+            f"self.known.lock() must only appear inside AudioFingerprint::lock_known(), found {direct_lock_count}"
+        )
     if "Recovering poisoned audio fingerprint cache" not in fingerprint:
         raise AssertionError("AudioFingerprint must warn when recovering a poisoned cache")
     if "poisoned.into_inner()" not in fingerprint:

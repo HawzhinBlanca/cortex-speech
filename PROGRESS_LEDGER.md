@@ -7075,3 +7075,89 @@ already in the library, remain open.
 
 The v40 STRICT-recreate test's index count moved 10 -> 11. Raised deliberately rather than relaxed to
 `>=`: that assertion exists to prove the table recreate rebuilt every index.
+
+## Iteration 255 — the external re-audit's P0/P1/P2 head: identity, backlog reads, and the fold
+
+Source: `docs/TRUE_10_REMAINING_2026-08-06.md`. Seven commits. What was actually closed, and what was
+deliberately not.
+
+**P0.2 — `npm audit` was green while the installed tree was invalid.** `npm ls --all` exited
+`ELSPROBLEMS` at the same commit the audit called clean. A clean audit only says "no known CVE in what
+resolved"; it says nothing about whether the tree resolved at all. Root cause was HOISTING, not a bad
+version: `fdir@6.5.0` declares `picomatch ^3 || ^4` as an OPTIONAL peer, npm hoisted picomatch@2.3.2 to
+the root for micromatch/anymatch/readdirp, and the hoisted copy could not satisfy it. Declaring
+picomatch ^4 top-level moves v4 to the root and nests v2 under its real consumers, whose resolved
+versions are unchanged — NOT an override forcing micromatch onto a major it does not support.
+`npm ls --all` now runs beside `npm audit` in the verifier gate, the Makefile target and both CI
+workflows.
+
+**P1.1 — a spectral collision could discard legitimate audio (migration v51).** v50 made the 64-bit
+fingerprint durable, which fixed its TIME scope and not its SEMANTICS. Eight per-band mean energies
+XOR-folded into a u64 was the definitive content key; the shifts discard most of each band's ~30
+significant bits, so two unrelated clips at the same level in the same room can collide — and when they
+did, import returned `Err("Duplicate audio content")` and REFUSED the second recording. Two tiers now:
+the spectral value is a candidate BUCKET, blake3 over canonical PCM + sample rate is the definitive key,
+and only a cryptographic match may reject. Prefer a duplicate over silent loss of legitimate speech.
+
+The honest gap, stated rather than hidden: a v50-era row has a bucket but NO content hash. It loads, it
+counts, and it can NEVER reject an import — a value that cannot distinguish content must not discard a
+recording. Startup WARNs the count and names the backfill; `backfill_fingerprints` now fills both
+columns and reports duplicates on the CONTENT hash, so its report means "byte-identical", not "similar
+loudness".
+
+**Two defects found reviewing my own work in the same session, both real:**
+- The streaming path's whole-file identity was persisted but never CHECKED. Its per-window checks
+  compare window hashes, which by construction never equal the whole-file hash, so a long recording
+  re-imported in a LATER session sailed past every one of them. Cross-session dedup LOOKED implemented
+  and did nothing for exactly the files that path exists to handle. `register_identity` is now private:
+  there is no public "register without checking" entry point, because that API existed for one commit
+  and was immediately used wrongly.
+- `content_hash` fed blake3 one sample at a time. MEASURED on a 90 s 16 kHz window (1,440,000 samples):
+  195.4 ms per-sample vs 4.5 ms blocked, same digest byte-for-byte — ~8 seconds of pure hashing added to
+  importing a one-hour recording, on a path the user waits on. Blocked through a 4 KiB stack buffer.
+  Still explicit `to_le_bytes`, never a slice transmute: this digest is PERSISTED and compared across
+  runs, so it must not silently acquire a dependency on host endianness.
+
+**P1.3 — `commands.rs` retired from the unbounded-read backlog (1 of 4).** The 7B refinement driver, the
+CTC-score backfill and the signal-anomaly backfill each read the WHOLE library and then `continue`d past
+every row already done. The work list is a WHERE clause. All three now use
+`Database::get_pending_segments(PendingWork::_)`; after the first pass the result is empty, where the old
+code still paid for the whole corpus every time. The 7B predicate keeps `segment_awaits_wsl7b` as its
+sole authority and uses SQL only as a deliberate SUPERSET —
+`sql_placeholder_prefilter_is_a_superset_of_the_rust_predicate` compares the two through real SQLite,
+because under-selecting would make those clips invisible to the driver forever with nothing reporting an
+error.
+
+NOT retired, with sharper reasons recorded in the policy rather than the backlog shrinking by
+reclassification: `dataset_analytics.rs` needs a STREAMING fold and must NOT reimplement the grading
+policy in SQL (that would fork the rule the export gates on, which is the P1.2 drift bug in a new
+place); `couch.rs` should count on pending IDs and hydrate only the QUEUE_BATCH it hands out;
+`segments_read.rs` is P1.4's conformal threshold.
+
+**P2.2 — the four review decisions fell below the fold at 1280x720.** Deciding a clip and moving on is
+the hot path of the product, and accept / save & next / mark bad audio / undo were all off-screen.
+Mark-bad was worse: grouped with the re-transcribe TOOLS, so the four were never visible together at
+all. One sticky bar reusing `ReviewInbox`'s `.verb-bar` pattern. `sticky`, not `fixed` — sticky keeps
+its space in the flow, so it can never sit on top of the waveform, the transcript or a 200%-zoom
+reflow. The keyboard hint moved INSIDE the bar, because a sticky element overlays whatever follows it.
+
+**P0.1 — a killed sweep now leaves a durable record.** "A result that ran but cannot be retrieved is
+operationally indistinguishable from no result." The summary printed only after the LAST gate, so a
+caller that gave a ~40-minute sweep a ~30-minute timeout discarded every gate that had already passed.
+`verify_10.py` appends one fsync'd JSON line per gate AS IT FINISHES. It proved itself the same hour:
+the sweep's stdout was pipe-buffered and unreadable while the JSONL gave live per-gate status.
+
+**Environment, no longer assumed.** The WSL OmniASR-7B champion is up on both 3090 Tis (17.5 GB each)
+and was preflighted the way the audit asks — a real Sorani transcript from a committed FLEURS fixture
+through the actual line protocol, not an open-port check.
+
+**Two gates caught this work, and both were right to.** The v40 STRICT-recreate index count moved
+11 -> 12 for v51's partial index (raised deliberately, never relaxed to `>=`). The runtime-panic policy
+pinned `lock_known`'s full generic type and fired when the map's VALUE became `Vec<KnownRecording>`; it
+now matches the signature and COUNTS `self.known.lock()` occurrences instead — the invariant it is
+actually about, and stronger than the string it replaced.
+
+NOT done and not claimed: P1.2's versioned risk contract (the `snr < 5 / clipping > 0.1` threshold still
+lives in three hand-synced copies — `jury/mod.rs`, the suspect-first SQL and `ReviewInbox.svelte`),
+P1.4's calibrated active learning, P2.1/P2.3, and every P3/P4/P5 leg that needs human annotators,
+speaker-disjoint evaluation or a signing identity.
