@@ -6886,3 +6886,41 @@ Two other swallows examined in the same sweep and deliberately NOT changed:
   than asserting something false, and the consensus card is legitimately absent on single-engine clips
   anyway, so its absence carries no false claim. Judged milder and left for a decision made awake
   rather than fixed at 05:30 on my own judgement. Named here so it is not silently skipped.
+
+## Iteration 250 — swept the count-honesty class; one live instance found and measured
+
+Following the waveform-sibling lesson from iteration 249, swept the OTHER recurring class in this
+repo: tallies that count rows the export drops. Six prior fixes of that class are in this ledger, so
+the sweep was overdue rather than speculative.
+
+Most of it holds up. `stats.rs` guards `verified_count` and `pending_count` with explicit REJECTED
+and placeholder predicates, documents the SQL-mirror risk, and pins itself against the REAL export
+path via `the_dashboards_verified_count_equals_what_the_export_actually_writes` rather than against a
+second copy of the rules. `quality.rs` and `validation/mod.rs` attribute by segment id. That is the
+right shape.
+
+One live instance found: `total_chars` / `avg_chars_per_segment`. MEASURED on a copy of the live DB
+(144 segments):
+
+    shipped            rows=144  chars=42679  avg=296.4
+    export-consistent  rows=117  chars=34685  avg=296.5
+    delta              7994 chars (18.7%) from 27 human-rejected rows
+
+The averages coinciding is chance — the rejected clips happen to be average length. It is not
+evidence of no impact, and recording it that way would be the kind of comfortable reading this
+ledger exists to prevent.
+
+The char SUM sits in the SAME query as the two counters that DO exclude rejects, and uses
+`COALESCE(annotated, normalized, raw)` rather than the `EFFECTIVE` expression defined twenty lines
+above it. The frontend `buildLocalStats` repeats the omission with a THIRD selection order
+(`normalized || annotated || raw`), directly between `verifiedCount` and `pendingCount`, both of
+which carry comments explaining why they exclude rejects.
+
+NOT fixed here, deliberately. Excluding rejects gives totalChars a denominator (117) different from
+the `totalSegments` (144) displayed beside it — which is precisely the mixed-denominator defect
+`76c90bf` fixed in ReviewMode this same night. Choosing between "exclude and relabel the tile" and
+"keep corpus-wide and say so" is a product-semantics call, and making it unattended risks
+reintroducing the bug I had just removed. Raised as a task with the measurement and both options.
+
+Also examined and left alone: `total_duration_ms` and `COUNT(*)` are corpus-wide by design and are
+labelled as such, so they are consistent rather than inflated.
