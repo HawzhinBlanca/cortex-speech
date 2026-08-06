@@ -6793,3 +6793,42 @@ decision.
 
 Not claimed: the release workflow is static content. Signing, attestation, installer execution and
 the SBOM step RUNNING on a real runner still need a tag run with owner-held credentials.
+
+## Iteration 247 — two labels that claimed more than the data, and an audit finding corrected
+
+**Validation wording (`a7a6ae0`).** Audit #6. The `passed` COUNT was already right — Round-18 fixed
+it to attribute failures by segment id. The words around it were not: `validation.allClear` said
+"dataset looks good!" on a corpus where nothing was exportable, and the backend subtitle said "All
+144 segments passed validation". Both now name what was checked, and allClear points at the readiness
+verdict in Insights, which is the surface entitled to answer that question. The guard is scoped to
+`validation.*` VALUES and parses them; two drafts were thrown away first — a raw substring scan
+matched the commit's own explanatory comment (failing before anything was sabotaged), and it flagged
+`stats.ready: 'Ready to export'`, which is precisely the string allowed to say that. It also refuses
+to pass if it parses fewer than 5 validation strings, so a matcher that stops understanding its input
+fails loudly.
+
+**Fingerprints (`699118b`) — the audit's diagnosis was wrong, and the truth is worse in one way.**
+Audit #4 read "0 audio fingerprints" beside a 144-clip corpus and concluded legacy data was never
+backfilled, recommending a blocking migration task. There is nothing to backfill TO: `AudioFingerprint`
+is an in-memory `Mutex<HashMap<u64, String>>`, built empty by `lib.rs:571` at every launch, and NO
+migration among the 49 has ever created a fingerprint column. The stat reports what the current
+session imported; it read 0 because that session had imported nothing, and it sat in the corpus-stats
+grid where every neighbouring number is corpus-wide.
+
+Better than reported: no data missing, no migration pending. WORSE than reported, and absent from the
+audit: cross-session duplicate detection DOES NOT EXIST. `check_and_register` compares only within one
+run, so a restart plus a re-import under a different path is accepted silently. The struct's doc
+comment asserted "duplicate content from different paths is still rejected" with no scope qualifier —
+a guarantee the code does not provide. `duplicate_detection_does_not_survive_a_restart` now pins the
+gap by building the same fresh map `lib.rs` builds at startup and watching the duplicate sail through.
+It is written to FAIL when fingerprints are persisted, so the next author is told to replace it rather
+than left to find an obsolete test.
+
+Not fixed, deliberately: durable detection needs a persisted per-segment fingerprint plus a backfill
+over existing rows — a schema migration on the live library, not a side effect of a labelling fix, and
+not unattended work. Raised as a task with the full diagnosis, alongside the npm lockfile defect from
+iteration 246.
+
+Sweeps this cycle: GREEN 32/32 at 43d12ee (pushed d6a6677) and GREEN 32/32 at a7a6ae0 (pushed
+00efc01). Both on an idle machine with `.month-loop.lock` held, after the 2026-08-05 contention that
+made a bench reading untrustworthy.
