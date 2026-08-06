@@ -591,26 +591,34 @@ def test_a_failed_waveform_decode_is_not_rendered_as_a_silent_clip() -> None:
 
     Same failure-looking-like-success class as the library read guards in commands.ts, and fixed the
     same way — the existing user-visible error path is used instead of swallowing.
-    """
-    src = _read("src/lib/ReviewMode.svelte")
-    body = _function_body(src, "  async function loadWaveform(")
 
-    if "waveformError" not in body:
-        raise AssertionError(
-            "loadWaveform no longer records waveformError — an empty waveform is indistinguishable "
-            "from a silent clip, so a failed decode would silently read as quiet audio"
-        )
-    if "notifications.error" not in body:
-        raise AssertionError(
-            "loadWaveform's catch no longer surfaces the failure. Swallowing it leaves the reviewer "
-            "looking at a flat strip with no indication the audio could not be read."
-        )
-    # The success path must CLEAR the error, or one bad clip poisons every later clip in the queue.
-    if "waveformError = null" not in body:
-        raise AssertionError("loadWaveform must clear waveformError on success, or the notice becomes sticky")
-    # And the template has to actually branch on it, or the flag is dead state.
-    if 'data-testid="review-waveform-error"' not in src:
-        raise AssertionError("ReviewMode renders no distinct failed-waveform state — the flag is not reaching the UI")
+    BOTH waveform call sites are covered. ReviewMode was fixed first; grepping the class afterwards
+    found the identical swallow in App.svelte's curate view. Fixing one caller and leaving the other
+    is how a class of bug survives its own fix, so the guard pins both or it pins nothing.
+    """
+    for component, testid in (
+        ("src/lib/ReviewMode.svelte", "review-waveform-error"),
+        ("src/App.svelte", "curate-waveform-error"),
+    ):
+        src = _read(component)
+        body = _function_body(src, "  async function loadWaveform(")
+
+        if "waveformError" not in body:
+            raise AssertionError(
+                f"{component}: loadWaveform no longer records waveformError — an empty waveform is "
+                "indistinguishable from a silent clip, so a failed decode reads as quiet audio"
+            )
+        if "notifications.error" not in body:
+            raise AssertionError(
+                f"{component}: loadWaveform's catch no longer surfaces the failure. Swallowing it leaves "
+                "the reviewer looking at a flat strip with no indication the audio could not be read."
+            )
+        # The success path must CLEAR the error, or one bad clip poisons every later clip.
+        if "waveformError = null" not in body:
+            raise AssertionError(f"{component}: loadWaveform must clear waveformError on success, or the notice sticks")
+        # And the template has to actually branch on it, or the flag is dead state.
+        if f'data-testid="{testid}"' not in src:
+            raise AssertionError(f"{component} renders no distinct failed-waveform state — the flag never reaches the UI")
 
 
 def test_the_uncalibrated_panel_names_the_real_cause_when_there_is_no_confidence_at_all() -> None:

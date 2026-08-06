@@ -105,6 +105,9 @@
   };
 
   let waveformData = $state<number[]>([]);
+  // Non-null ONLY when the decode failed — an empty array alone cannot distinguish "unreadable" from
+  // "quiet". See loadWaveform.
+  let waveformError = $state<string | null>(null);
   let currentTime = $state(0);
   let playerDuration = $state(0);
   let isAudioPlaying = $state(false);
@@ -1884,13 +1887,22 @@
 
   async function loadWaveform(path: string, alignmentJson?: string | null) {
     if (!tauriAvailable) {
+      // Browser preview, not a failure — no waveform backend exists to fail.
       waveformData = [];
+      waveformError = null;
       return;
     }
     try {
       waveformData = await api.getWaveform(path, 200, alignmentJson);
-    } catch {
+      waveformError = null;
+    } catch (e) {
+      // Sibling of the ReviewMode fix (audit 2026-08-05 #5, commit b554515). An empty array renders
+      // identically to genuinely quiet audio, so a FAILED decode read as "this clip is silent" with
+      // nothing said. Found by grepping for the class after fixing the review-mode instance — fixing
+      // one caller and leaving the other is how a class-of-bug survives its own fix.
       waveformData = [];
+      waveformError = String(e);
+      notifications.error($t('review.waveformFailed'), { detail: waveformError });
     }
   }
 
@@ -2750,13 +2762,33 @@
           <ReviewMode onExport={handleExport} onDone={() => (viewMode = 'curate')} />
         {:else if $selectedSegment}
           <div class="card overflow-hidden">
-            <Waveform
-              waveform={waveformData}
-              currentTime={chunkClipPosition}
-              duration={chunkClipLength}
-              wordTimestamps={$wordTimestamps}
-              {onSeek}
-            />
+            {#if waveformError}
+              <!-- Say which it is: unreadable audio, not a quiet clip. Same reasoning as ReviewMode. -->
+              <div
+                class="flex items-center justify-between gap-3 p-3 text-xs text-amber-300"
+                data-testid="curate-waveform-error"
+                role="status"
+              >
+                <span class="min-w-0 truncate">{$t('review.waveformFailed')}</span>
+                <button
+                  type="button"
+                  class="btn btn-secondary shrink-0 !text-xs"
+                  onclick={() =>
+                    $selectedSegment &&
+                    loadWaveform($selectedSegment.audioPath, $selectedSegment.alignmentJson)}
+                >
+                  {$t('retry')}
+                </button>
+              </div>
+            {:else}
+              <Waveform
+                waveform={waveformData}
+                currentTime={chunkClipPosition}
+                duration={chunkClipLength}
+                wordTimestamps={$wordTimestamps}
+                {onSeek}
+              />
+            {/if}
           </div>
 
           <ErrorBoundary>
