@@ -1189,15 +1189,6 @@
             {cloudChecking ? $t('review.cloudChecking') : $t('review.cloudCheck')}
           </button>
         {/if}
-        <button
-          type="button"
-          class="btn btn-secondary ms-auto !text-xs !text-rose-300 hover:!text-rose-200"
-          onclick={markBad}
-          disabled={saving || retranscribing}
-          title={$t('review.markBadTitle')}
-        >
-          {$t('review.markBad')}
-        </button>
       </div>
 
       <!-- Cloud watcher verdict: Gemini's audio-grounded reading of THIS clip. Advisory only — the
@@ -1233,8 +1224,17 @@
         </div>
       {/if}
 
-      <!-- Actions -->
-      <div class="flex flex-wrap items-center gap-2">
+      <!-- Decisive actions. STICKY (external review 2026-08-06, P2.2): at 1280x720 this row sat below
+           the fold behind the waveform + word-diff + retranscribe tools, so the reviewer had to scroll
+           to every single decision. ReviewInbox's .verb-bar already proved the pattern; this reuses it.
+           Mark-bad lives here rather than up with the retranscribe tools because it is one of the four
+           decisions a reviewer makes about a clip (accept / save / bad audio / undo), not a tool. -->
+      <div
+        class="review-action-bar flex flex-wrap items-center gap-2"
+        role="group"
+        aria-label={$t('review.actionsLabel')}
+        data-testid="review-action-bar"
+      >
         <button
           type="button"
           class="btn btn-secondary"
@@ -1252,6 +1252,15 @@
           title={$t('review.undoLastTitle')}
         >
           ↩ {$t('review.undoLast')}
+        </button>
+        <button
+          type="button"
+          class="btn btn-secondary !text-rose-300 hover:!text-rose-200"
+          onclick={markBad}
+          disabled={saving || retranscribing}
+          title={$t('review.markBadTitle')}
+        >
+          {$t('review.markBad')}
         </button>
         <div class="flex flex-1 flex-wrap justify-end gap-2">
           <button
@@ -1271,15 +1280,33 @@
             {$t('review.saveNext')}
           </button>
         </div>
+        <!-- Inside the bar, not after it: a sticky element overlays whatever follows it, so a hint left
+             outside would be the one thing the bar covers. -->
+        <p class="w-full text-center text-[11px] text-subtle">
+          {$t('review.kbdHint')}
+        </p>
       </div>
-      <p class="text-center text-[11px] text-subtle">
-        {$t('review.kbdHint')}
-      </p>
     </div>
   </div>
 {/if}
 
 <style>
+  /* The four decisions (accept / save / bad audio / undo) stay on screen at every viewport.
+     `sticky`, not `fixed`: it keeps its space in the flow, so it can never sit on top of the waveform,
+     the transcript, or a 200%-zoom reflow — it only pins itself once it would scroll out of view.
+     Opaque background + top border so the content scrolling beneath it stays readable, and
+     safe-area padding so Windows scaling / an inset-bottom display cannot clip the buttons. */
+  .review-action-bar {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    background: var(--surface-1);
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+    margin-inline: -1rem; /* bleed to the container's px-4 so the backdrop covers the full width */
+    padding-inline: 1rem;
+  }
   .review-word {
     border-radius: 0.375rem;
     padding: 0.05rem 0.4rem;

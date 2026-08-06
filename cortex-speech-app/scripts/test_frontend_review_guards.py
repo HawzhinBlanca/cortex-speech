@@ -743,8 +743,64 @@ def test_readiness_is_unknown_not_ready_when_its_inputs_failed_to_load() -> None
         )
 
 
+def test_review_decisions_stay_on_screen_in_one_sticky_bar() -> None:
+    """ReviewMode's four DECISIONS (accept / save & next / mark bad audio / undo) must live together in
+    a sticky action bar.
+
+    External review 2026-08-06 P2.2: at 1280x720 the action row sat below the fold behind the waveform,
+    the word-level diff and the retranscribe tools, so a reviewer scrolled for every single decision on
+    every single clip — the hot path of the entire product. Mark-bad was in a different row again, up
+    with the re-transcribe TOOLS, so the four decisions were never visible together at all.
+
+    Pinned at the source for the same reason as the async-race guards above: the failure is a layout
+    fact about a mounted component at a specific viewport, which this project's pure-function frontend
+    tests cannot observe. What CAN regress silently is someone dropping the sticky positioning or
+    moving a decision back out of the bar, and that is exactly what this catches.
+    """
+    src = _read("src/lib/ReviewMode.svelte")
+
+    if "position: sticky;" not in src or ".review-action-bar" not in src:
+        raise AssertionError(
+            "ReviewMode's action bar is no longer sticky — the accept/save/bad-audio/undo decisions fall "
+            "below the fold at 1280x720. ReviewInbox's .verb-bar is the reference pattern."
+        )
+    # `fixed` would leave the flow and could then cover the waveform or a 200%-zoom reflow; `sticky`
+    # keeps its space and only pins once it would scroll away.
+    if "position: fixed" in src:
+        raise AssertionError(
+            "the review action bar must be `sticky`, not `fixed` — a fixed bar leaves the flow and can "
+            "sit on top of the waveform, the transcript, or a zoomed/reflowed layout"
+        )
+
+    bar_start = src.find('data-testid="review-action-bar"')
+    if bar_start == -1:
+        raise AssertionError('the sticky bar lost its data-testid="review-action-bar" hook')
+    # The bar's markup runs to the end of the template (</div> chain before <style>).
+    bar = src[bar_start : src.find("<style>", bar_start)]
+    for decision, handler in (
+        ("accept as-is", "submit(true)"),
+        ("save & next", "submit(false)"),
+        ("mark bad audio", "onclick={markBad}"),
+        ("undo", "undoLast()"),
+    ):
+        if handler not in bar:
+            raise AssertionError(
+                f"the {decision!r} decision ({handler}) is no longer inside the sticky action bar — all "
+                "four review decisions belong together and on screen, not scattered among the tools"
+            )
+
+    # A sticky element overlays whatever follows it in flow. The keyboard hint used to sit AFTER the
+    # row, so making the row sticky would have made the bar cover the one thing that documents the
+    # shortcuts. It has to be inside.
+    if "review.kbdHint" not in bar:
+        raise AssertionError(
+            "the keyboard-shortcut hint moved back outside the sticky bar, where the bar covers it"
+        )
+
+
 def main() -> None:
     test_a_skip_never_clears_the_reviewers_draft_on_either_route()
+    test_review_decisions_stay_on_screen_in_one_sticky_bar()
     test_retranscribe_guards_editor_writes_against_navigation()
     test_submit_guards_editor_writes_against_navigation()
     test_go_draft_persist_uses_targeted_field_update()

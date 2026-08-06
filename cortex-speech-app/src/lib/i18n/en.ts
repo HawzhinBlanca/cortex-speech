@@ -185,6 +185,7 @@ export const en: Record<string, string> = {
   'review.reset': 'Original',
   'review.kbdHint':
     'Keys: A accept · E edit · X mark bad · Space play/pause · R replay · N/P next/prev · Backspace undo · Ctrl+Enter save & next',
+  'review.actionsLabel': 'Review actions',
   'review.suspectFirst': 'Suspect first',
   'review.suspectFirstHint':
     'Review the riskiest clips first: escalated, then lowest-confidence, then newest',

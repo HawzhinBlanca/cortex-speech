@@ -190,6 +190,7 @@ export const ckb: Record<string, string> = {
   'review.reset': 'بنەڕەت',
   'review.kbdHint':
     'کلیلەکان: A پەسەندکردن · E دەستکاری · X خراپ · Space لێدان/وەستان · R دووبارە · N/P دواتر/پێشتر · Backspace گەڕاندنەوە · Ctrl+Enter پاشەکەوت و دواتر',
+  'review.actionsLabel': 'کردارەکانی پێداچوونەوە',
   'review.suspectFirst': 'گومانلێکراوەکان پێش',
   'review.suspectFirstHint':
     'یەکەم مەترسیدارترین پارچەکان پێداچوونەوە: بەرزکراوەکان، دواتر کەمترین دڵنیایی، دواتر نوێترین',
