@@ -1168,3 +1168,82 @@ fn scribe_segments_carry_cloud_call_provenance() {
         "the Scribe model must be recorded as the row's model_version_id"
     );
 }
+
+/// A pipeline as a long import actually holds it: cloned from the stored instance, then run on.
+fn pipeline_with(settings: AppSettings) -> super::ProcessingPipeline {
+    super::ProcessingPipeline::new(
+        ":memory:".to_string(),
+        Arc::new(SoraniNormalizer::new()),
+        Arc::new(TranscriptCache::new(8)),
+        Arc::new(AudioFingerprint::new()),
+        Arc::new(settings),
+        Arc::new(ModelManager::new(std::path::PathBuf::from("models"))),
+    )
+}
+
+fn all_cloud_on() -> AppSettings {
+    AppSettings { cloud_llm_opt_in: true, cloud_stt_opt_in: true, jury_cloud_opt_in: true, ..AppSettings::default() }
+}
+
+#[test]
+fn revoking_cloud_consent_reaches_an_import_already_in_flight() {
+    // THE DEFECT (audit 2026-08-06). Every long entry point does `state.lock_pipeline().clone()`
+    // and runs on that clone, while update_settings replaced `self.settings` on the STORED instance.
+    // An Arc swap is invisible through a clone taken earlier, so an import started before the user
+    // switched cloud off kept uploading audio and transcripts for every remaining file — while the
+    // save succeeded, get_settings said off, and the toggle rendered off.
+    let mut stored = pipeline_with(all_cloud_on());
+    let in_flight = stored.clone(); // the worker's copy, taken BEFORE the user changes anything
+
+    assert!(in_flight.consent.cloud_stt(), "precondition: the clone starts with consent granted");
+
+    // The user switches every cloud toggle OFF mid-import.
+    let mut off = all_cloud_on();
+    off.cloud_llm_opt_in = false;
+    off.cloud_stt_opt_in = false;
+    off.jury_cloud_opt_in = false;
+    stored.update_settings(off);
+
+    // The WORKER's clone must observe it. Before the fix all three of these still said "allowed".
+    assert!(!in_flight.consent.cloud_stt(), "cloud STT consent must reach the in-flight clone");
+    assert!(!in_flight.consent.cloud_llm(), "cloud LLM consent must reach the in-flight clone");
+    assert!(!in_flight.consent.jury_cloud(), "jury cloud consent must reach the in-flight clone");
+    assert!(
+        in_flight.scribe_api_key_if_enabled().is_none(),
+        "a withdrawn cloud-STT consent must stop the key ever being read"
+    );
+}
+
+#[test]
+fn granting_consent_mid_run_does_not_retroactively_enable_a_run_started_without_it() {
+    // Fail-safe in BOTH directions. The user started this import understanding no data would leave
+    // the machine; switching cloud on later must not silently upload the rest of it. The snapshot
+    // and the live flag are ANDed, so the snapshot keeps this run offline.
+    let mut stored = pipeline_with(AppSettings::default()); // all cloud OFF
+    let in_flight = stored.clone();
+    stored.update_settings(all_cloud_on());
+
+    assert!(
+        in_flight.scribe_api_key_if_enabled().is_none(),
+        "a run begun without consent must stay offline even after consent is granted"
+    );
+}
+
+#[test]
+fn withdrawing_cloud_consent_does_not_disable_local_refinement() {
+    // Local refinement sends nothing anywhere. Gating it on cloud consent would break offline work
+    // for no privacy gain, so llm_refinement_permitted applies the live check only to cloud paths.
+    let mut stored = pipeline_with(AppSettings {
+        llm_mode: crate::settings::LlmMode::Local,
+        llm_endpoint: "http://127.0.0.1:11434".to_string(),
+        ..AppSettings::default()
+    });
+    let in_flight = stored.clone();
+    assert!(in_flight.llm_refinement_permitted(), "local refinement is permitted to begin with");
+
+    let mut revoked = stored.settings.as_ref().clone();
+    revoked.cloud_llm_opt_in = false;
+    stored.update_settings(revoked);
+
+    assert!(in_flight.llm_refinement_permitted(), "revoking CLOUD consent must not disable purely-local refinement");
+}

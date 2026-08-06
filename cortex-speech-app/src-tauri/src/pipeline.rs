@@ -13,6 +13,7 @@ use crate::settings::AppSettings;
 use serde::Serialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use uuid::Uuid;
@@ -611,6 +612,57 @@ fn multi_model_hypothesis_stage(db: &Database, file: impl Into<String>, segments
     )
 }
 
+/// The three cloud opt-ins, held so that REVOKING one reaches work already in flight.
+///
+/// Why this is separate from `settings` (audit 2026-08-06). Every long-running entry point does
+/// `state.lock_pipeline().clone()` and then runs on that clone (commands.rs:482, 580, 644, 1132),
+/// while `update_settings` REPLACES `self.settings` on the stored instance. An `Arc` swap is not
+/// visible through a clone taken earlier, so a directory import started before the user switched
+/// cloud OFF kept uploading audio and transcripts for every remaining file — the save succeeded,
+/// `get_settings` said off, the toggle rendered off, and the egress continued. That directly
+/// contradicts the fail-safe consent doctrine this crate states at commands.rs:1877.
+///
+/// Only CONSENT lives here, deliberately. A model choice or VAD threshold changed mid-import should
+/// NOT retroactively apply — the import is one coherent unit and the snapshot is correct for it.
+/// Withdrawing consent is not a preference, it is a stop instruction, and it has to be obeyed at the
+/// moment of the call rather than at the moment the run began.
+///
+/// Read with the snapshot, never instead of it: each gate is `snapshot_allows && still_consented`.
+/// So revoking mid-run halts egress immediately, while GRANTING mid-run does not retroactively
+/// enable a run the user started under a no-cloud understanding. Fail-safe in both directions.
+#[derive(Debug, Default)]
+pub struct LiveConsent {
+    cloud_llm: AtomicBool,
+    cloud_stt: AtomicBool,
+    jury_cloud: AtomicBool,
+}
+
+impl LiveConsent {
+    fn from_settings(settings: &AppSettings) -> Self {
+        let consent = Self::default();
+        consent.apply(settings);
+        consent
+    }
+
+    fn apply(&self, settings: &AppSettings) {
+        // SeqCst, not Relaxed: this is a safety stop, and the cost is irrelevant next to a network
+        // call. A worker must never read a stale `true` after the user has switched cloud off.
+        self.cloud_llm.store(settings.cloud_llm_opt_in, Ordering::SeqCst);
+        self.cloud_stt.store(settings.cloud_stt_opt_in, Ordering::SeqCst);
+        self.jury_cloud.store(settings.jury_cloud_opt_in, Ordering::SeqCst);
+    }
+
+    fn cloud_llm(&self) -> bool {
+        self.cloud_llm.load(Ordering::SeqCst)
+    }
+    fn cloud_stt(&self) -> bool {
+        self.cloud_stt.load(Ordering::SeqCst)
+    }
+    fn jury_cloud(&self) -> bool {
+        self.jury_cloud.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Clone)]
 pub struct ProcessingPipeline {
     db_path: String,
@@ -618,6 +670,8 @@ pub struct ProcessingPipeline {
     cache: Arc<TranscriptCache>,
     fingerprint: Arc<AudioFingerprint>,
     settings: Arc<AppSettings>,
+    /// Shared by every clone (Arc, never replaced) so a withdrawal reaches in-flight work.
+    consent: Arc<LiveConsent>,
     model_manager: Arc<ModelManager>,
     asr_pool: Arc<asr::AsrPool>,
     import_status: Arc<Mutex<ImportStatus>>,
@@ -643,6 +697,7 @@ impl ProcessingPipeline {
         Self {
             db_path,
             _normalizer: normalizer,
+            consent: Arc::new(LiveConsent::from_settings(&settings)),
             cache,
             fingerprint,
             settings,
@@ -657,6 +712,10 @@ impl ProcessingPipeline {
     }
 
     pub fn update_settings(&mut self, settings: AppSettings) {
+        // Consent FIRST, and through the shared Arc so it reaches clones already running an import.
+        // The snapshot swap below is visible only to this instance; that is fine for preferences and
+        // was the bug for consent.
+        self.consent.apply(&settings);
         self.settings = Arc::new(settings);
     }
 
@@ -1025,7 +1084,8 @@ impl ProcessingPipeline {
         path: &Path,
         db: &Database,
     ) -> AppResult<Vec<SourceTranscriptRecord>> {
-        if !self.settings.jury_cloud_opt_in {
+        // Snapshot AND live consent: a withdrawal after this import began must stop the upload.
+        if !self.settings.jury_cloud_opt_in || !self.consent.jury_cloud() {
             return Ok(Vec::new());
         }
         if self.settings.llm_api_key.trim().is_empty() {
@@ -2624,7 +2684,9 @@ impl ProcessingPipeline {
     /// key is configured. Mirrors the cloud-LLM opt-in gate; the key lives in `secrets.env` next to
     /// the database and is never read unless the user has explicitly opted in (privacy by default).
     fn scribe_api_key_if_enabled(&self) -> Option<String> {
-        if !self.settings.cloud_stt_opt_in {
+        // Snapshot AND live consent — see LiveConsent. Returning None here means the key is never
+        // even read from disk, so a mid-import withdrawal stops the upload at the source.
+        if !self.settings.cloud_stt_opt_in || !self.consent.cloud_stt() {
             return None;
         }
         let data_dir = std::path::Path::new(&self.db_path).parent()?;
@@ -3125,7 +3187,13 @@ impl ProcessingPipeline {
     /// refinement without going through `build_refiner`, this guard still blocks cloud use
     /// when the user has not opted in.
     fn llm_refinement_permitted(&self) -> bool {
-        self.settings.effective_llm_mode() != crate::settings::LlmMode::None
+        if self.settings.effective_llm_mode() == crate::settings::LlmMode::None {
+            return false;
+        }
+        // The live check applies ONLY to a path that actually leaves the machine. Local refinement
+        // sends nothing anywhere, so gating it on cloud consent would break offline work for no
+        // privacy gain — the withdrawal is about egress, not about refinement.
+        !self.llm_refinement_uses_cloud() || self.consent.cloud_llm()
     }
 
     fn llm_refinement_uses_cloud(&self) -> bool {
