@@ -403,6 +403,23 @@ fn validate_segment(seg: &SpeechSegment) -> AppResult<()> {
 
 use crate::normalizer::learning_text_key;
 
+/// Suspect-first review ordering (external review 2026-08-06 #2).
+///
+/// `agent_confidence` on an escalated row is the IRT model-AGREEMENT confidence, and agreement is not
+/// trustworthiness. A clip escalated because its AUDIO is poor — `has_hard_distrust_veto`'s snr < 5 dB
+/// or clipping > 0.1 — can carry 0.97 there because every recognizer confidently agreed on the same
+/// garbage. Ordering by that value alone sent exactly the clips the gate refused to trust to the BACK
+/// of a queue whose whole purpose is riskiest-first.
+///
+/// So acoustic quality is ranked BEFORE agreement rather than being collapsed into it. The signals stay
+/// separate — this reads them separately instead of averaging them into a single number that means
+/// neither thing. No new column: snr_db and clipping_ratio are already on the row, which is why the
+/// data to do this properly was there all along.
+///
+/// Order: escalated first; within that, poor audio first; then genuine disagreement (low agreement);
+/// then newest.
+const SUSPECT_FIRST_ORDER: &str = "escalated DESC,      (CASE WHEN COALESCE(snr_db, 99.0) < 5.0 OR COALESCE(clipping_ratio, 0.0) > 0.1 THEN 0 ELSE 1 END) ASC,      COALESCE(agent_confidence, 0.5) ASC,      datetime(created_at) DESC, id ASC";
+
 fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String>]) -> Option<String> {
     let corrected_key = learning_text_key(corrected);
     candidates.iter().filter_map(|candidate| candidate.as_deref()).find_map(|candidate| {
@@ -1575,9 +1592,7 @@ impl Database {
             "activeLearning" | "active_learning" => {
                 "ABS(((1.0 - COALESCE(confidence, 0.5)) + (0.1 * -COALESCE(ctc_score, -5.0))) - 0.35) ASC, id ASC"
             }
-            "suspectFirst" | "suspect_first" => {
-                "escalated DESC, COALESCE(agent_confidence, 0.5) ASC, datetime(created_at) DESC, id ASC"
-            }
+            "suspectFirst" | "suspect_first" => SUSPECT_FIRST_ORDER,
             _ => "datetime(created_at) DESC, id ASC",
         };
 
@@ -1612,7 +1627,7 @@ impl Database {
             query.push_str(&format!(" WHERE verified = {}", if v { 1 } else { 0 }));
         }
         // Priority: escalated (jury doubts) first, then low agent confidence (suspicious), then chronological.
-        query.push_str(" ORDER BY escalated DESC, COALESCE(agent_confidence, 0.5) ASC, created_at DESC, id ASC");
+        query.push_str(&format!(" ORDER BY {SUSPECT_FIRST_ORDER}"));
 
         let mut stmt = self.conn.prepare(&query)?;
         let rows = stmt.query_map([], Self::map_row)?;

@@ -247,6 +247,8 @@ export const ckb: Record<string, string> = {
   'inbox.flagTitle': 'نیشانکردن بۆ خولی دووەم (f)',
   'inbox.undoTitle': 'گەڕانەوە (⌫)',
   'inbox.reviewActions': 'کردارەکانی پێداچوونەوە',
+  // See en.ts: agreement is not trustworthiness when the audio is bad. Flagged for owner review.
+  'inbox.band.poorAudio': 'دەنگی خراپ — ڕێککەوتنی {pct}% لێرەدا مانای متمانەپێکراوی نییە',
   'inbox.band.unknown': 'دڵنیایی نەزانراو',
   'inbox.band.veryConfident': 'AI زۆر دڵنیایە ({pct}%) — تەماشایەکی خێرا 👀',
   'inbox.band.fairlySure': 'AI تا ڕادەیەک دڵنیایە ({pct}%) — گوێگرتنێکی خێرا 👂',

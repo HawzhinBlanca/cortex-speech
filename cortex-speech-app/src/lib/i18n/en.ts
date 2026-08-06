@@ -242,6 +242,7 @@ export const en: Record<string, string> = {
   'inbox.flagTitle': 'Flag for second pass (f)',
   'inbox.undoTitle': 'Undo (⌫)',
   'inbox.reviewActions': 'Review actions',
+  'inbox.band.poorAudio': 'Noisy audio — {pct}% model agreement is not reliability here',
   'inbox.band.unknown': 'Unknown confidence',
   'inbox.band.veryConfident': 'AI is very confident ({pct}%) — quick glance 👀',
   'inbox.band.fairlySure': 'AI is fairly sure ({pct}%) — quick listen 👂',

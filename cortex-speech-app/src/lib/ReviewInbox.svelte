@@ -96,12 +96,28 @@
   // ── Confidence bands ─────────────────────────────────────────────────────────
   type Translate = (key: string, params?: Record<string, string>) => string;
   // `tr` ($t) is passed in from the template so the band labels stay reactive to a locale change.
+  /// Poor audio, by the same thresholds `has_hard_distrust_veto` uses in the jury (snr < 5 dB or
+  /// clipping > 0.1). Kept identical on purpose: two definitions of "bad audio" that drift apart would
+  /// show a green chip on a clip the gate refused to trust.
+  function hasPoorAudio(seg: { snrDb?: number | null; clippingRatio?: number | null }): boolean {
+    return (seg.snrDb != null && seg.snrDb < 5) || (seg.clippingRatio != null && seg.clippingRatio > 0.1);
+  }
+
   function confidenceBand(
     conf: number | null | undefined,
     tr: Translate,
+    poorAudio = false,
   ): { label: string; icon: string; color: string } {
     const pct = (c: number) => ({ pct: String(Math.round(c * 100)) });
     if (conf == null) return { label: tr('inbox.band.unknown'), icon: '❓', color: 'var(--text-subtle)' };
+    // External review 2026-08-06 #2: `agentConfidence` is model AGREEMENT, and agreement is not
+    // trustworthiness. Every recognizer can confidently agree on the same garbage when the audio is
+    // bad — which is exactly why the jury vetoes those clips. Rendering that as a green "97%" told the
+    // reviewer the opposite of what the gate concluded, so acoustic quality is stated instead of
+    // being averaged into one number that means neither thing.
+    if (poorAudio) {
+      return { label: tr('inbox.band.poorAudio', pct(conf)), icon: '🔊', color: 'var(--warning)' };
+    }
     if (conf >= 0.9)
       return { label: tr('inbox.band.veryConfident', pct(conf)), icon: '✅', color: 'var(--success)' };
     if (conf >= 0.75)
@@ -518,7 +534,7 @@
         <div class="rail-header">{$t('inbox.queue', { n: String(queue.length) })}</div>
         <ul class="rail-list">
           {#each queue as seg, i}
-            {@const band = confidenceBand(seg.agentConfidence, $t)}
+            {@const band = confidenceBand(seg.agentConfidence, $t, hasPoorAudio(seg))}
             <li class="rail-row">
               <button
                 type="button"
@@ -542,7 +558,7 @@
 
       <!-- Focus Card -->
       {#if current}
-        {@const band = confidenceBand(current.agentConfidence, $t)}
+        {@const band = confidenceBand(current.agentConfidence, $t, hasPoorAudio(current))}
         <article class="focus-card" aria-label={$t('inbox.segmentQueue')}>
           <!-- Segment ID + meta -->
           <div class="card-meta">

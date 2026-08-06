@@ -2957,3 +2957,43 @@ fn audio_fingerprint_round_trips_through_sqlite_including_the_high_bit() {
     // deliberately refuses to store as a content key.
     assert!(!loaded.iter().any(|(_, p)| p == "/audio/other.wav"), "a NULL fingerprint must not appear");
 }
+
+/// Suspect-first must put the clips the jury DISTRUSTED first, not last (external review #2).
+///
+/// `agent_confidence` on an escalated row is model AGREEMENT. When the audio is bad, every recognizer
+/// can confidently agree on the same garbage — which is precisely why has_hard_distrust_veto refuses
+/// to auto-accept it. Ordering on agreement alone therefore sent the least trustworthy clips to the
+/// BACK of a riskiest-first queue.
+#[test]
+fn suspect_first_ranks_poor_audio_ahead_of_high_agreement() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    // agent_confidence and `escalated` are written by write_segment_verdict, the real path — NOT by
+    // insert_segment, which silently drops them. A fixture that cannot reproduce the production shape
+    // proves nothing (same trap as the human_decision fixture in 3a08d01).
+    let mk = |id: &str, snr: f64, clip: f64| SpeechSegment {
+        id: id.into(),
+        audio_path: format!("/audio/{id}.wav"),
+        snr_db: Some(snr),
+        clipping_ratio: Some(clip),
+        ..SpeechSegment::default()
+    };
+    // The exact shape the review described: noisy audio, 0.97 agreement.
+    db.insert_segment(&mk("noisy", 2.0, 0.0)).unwrap();
+    db.insert_segment(&mk("clipped", 30.0, 0.5)).unwrap();
+    // Clean audio the models genuinely disagreed about.
+    db.insert_segment(&mk("disputed", 30.0, 0.0)).unwrap();
+    // Clean audio, high agreement — the genuinely least suspect row.
+    db.insert_segment(&mk("clean", 30.0, 0.0)).unwrap();
+    for (id, conf) in [("noisy", 0.97), ("clipped", 0.95), ("disputed", 0.20), ("clean", 0.99)] {
+        db.write_segment_verdict(id, "escalated", None, None, None, Some(conf), true).unwrap();
+    }
+
+    let order: Vec<String> = db.get_segments_suspect_first(None).unwrap().into_iter().map(|s| s.id).collect();
+
+    let pos = |id: &str| order.iter().position(|x| x == id).unwrap();
+    assert!(pos("noisy") < pos("disputed"), "poor-SNR audio must outrank a disagreement: {order:?}");
+    assert!(pos("clipped") < pos("disputed"), "clipped audio must outrank a disagreement: {order:?}");
+    assert!(pos("disputed") < pos("clean"), "within clean audio, low agreement still comes first: {order:?}");
+    assert_eq!(order.last().unwrap(), "clean", "the least suspect clip is last: {order:?}");
+}
