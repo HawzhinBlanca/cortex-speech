@@ -637,6 +637,36 @@ OWNER_GATED = [
 
 LOG_DIR = Path(tempfile.gettempdir()) / "cortex-verify10"
 
+# Append-only per-gate run record (external review 2026-08-06, P0.1): "a result that ran but cannot be
+# retrieved is operationally indistinguishable from no result."
+#
+# The summary table is printed only after the LAST gate, so a caller that gave a ~40-minute sweep a
+# ~30-minute timeout threw away every gate that had already passed — the work was done and the evidence
+# was not. This file is written as each gate FINISHES, so a killed, timed-out or crashed run still leaves
+# a durable, ordered record of exactly how far it got and what each leg cost.
+#
+# JSONL and append-only on purpose: a partial last line is the only damage a kill can do, and every line
+# before it stays parseable. Best-effort — evidence bookkeeping must never be the thing that fails a
+# sweep, so a write error is reported once and the run continues.
+RUN_LOG = LOG_DIR / "runs.jsonl"
+_run_log_broken = False
+
+
+def record_run_event(**fields):
+    """Append one JSON line to RUN_LOG. Never raises."""
+    global _run_log_broken
+    if _run_log_broken:
+        return
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with RUN_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(fields, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())  # a record that is still in a buffer when the process is killed is not a record
+    except OSError as exc:
+        _run_log_broken = True
+        print(f"  (run-log unavailable: {exc} — the sweep continues; only its durable record is lost)")
+
 # Everything this script runs is THE GATE, and a gate must never quietly reuse a resource it did not
 # create. Set for the whole run (subprocesses inherit it) rather than per leg, because that is exactly
 # what it means: any harness that can attach to somebody else's server, browser or port should refuse
@@ -840,11 +870,23 @@ def aggregate_main(quick, status_md=None):
     head = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True
     ).stdout.strip() or "?"
+    run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{head}"
     print("=" * 68)
     print(" CORTEX VERIFY-10 - PERSONAL-USE FULL-CHARTER GATE")
     print(f" repo: {REPO_ROOT}   HEAD: {head}   mode: {'quick (tiers 0-1)' if quick else 'full'}")
     print(f" per-gate logs: {LOG_DIR}")
+    print(f" run record:    {RUN_LOG}   (run_id {run_id})")
     print("=" * 68)
+    record_run_event(
+        run_id=run_id,
+        event="run_start",
+        at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        commit=head,
+        mode="quick" if quick else "full",
+        platform=sys.platform,
+        python=sys.version.split()[0],
+        gates_planned=len(GATES),
+    )
 
     results = []
     for name, tier, kind, payload, cwd, probe, charter in GATES:
@@ -856,6 +898,20 @@ def aggregate_main(quick, status_md=None):
         results.append((name, status, secs, detail))
         line = f"  => {status}   {name}   {secs:.1f}s"
         print(line if not detail else f"{line}\n     {detail}")
+        # Written HERE, not with the summary below: this is the whole point. A sweep killed at gate 20
+        # must still be able to prove what gates 1-19 did.
+        record_run_event(
+            run_id=run_id,
+            event="gate",
+            at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            commit=head,
+            gate=name,
+            tier=tier,
+            status=status,
+            seconds=round(secs, 2),
+            detail=detail,
+            log=str(LOG_DIR / f"{name}.log"),
+        )
 
     print("\n" + "-" * 68)
     for name, status, secs, detail in results:
@@ -911,6 +967,19 @@ def aggregate_main(quick, status_md=None):
         console = "CORTEX 10/10: ALL GATES GREEN"
 
     print(console)
+    record_run_event(
+        run_id=run_id,
+        event="run_end",
+        at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        commit=head,
+        exit_code=code,
+        verdict=console,
+        passed=len(passes),
+        failed=fails,
+        skipped=skips,
+        total_seconds=round(sum(s for _, _, s, _ in results), 1),
+        status_md=str(status_md) if status_md else None,
+    )
     if status_md:
         write_status_md(status_md, head, quick, results, verdict)
     sys.exit(code)
