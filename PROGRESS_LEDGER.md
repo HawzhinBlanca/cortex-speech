@@ -6924,3 +6924,45 @@ reintroducing the bug I had just removed. Raised as a task with the measurement 
 
 Also examined and left alone: `total_duration_ms` and `COUNT(*)` are corpus-wide by design and are
 labelled as such, so they are consistent rather than inflated.
+
+## Iteration 251 — an adversarial sweep found a withdrawn voice still shipping, and a false claim of mine
+
+Ran a 10-agent read-only hunt (5 lenses, each paired with a refuter told to assume the report wrong)
+over subsystems tonight's work had not touched: couch, jury/IRT, the export family, eval metrics, and
+cloud-consent enforcement. Findings below are ones I re-verified myself before acting — the agents
+located them, they did not license them.
+
+**SEVERE, fixed (`be64cf5`): `export_audio_segments` and `eval::export_finetune_pack` wrote the audio
+and transcripts of recordings whose consent had been WITHDRAWN.** A grep of `is_revoked` /
+`rights_for_segment` across `src-tauri/src` returns three sites only; those two exporters had none.
+Biometric data under GDPR Art. 9, written to disk after a withdrawal.
+
+**And a correction I owe.** `56d8855`'s message asserted "A withdrawal carries no such ambiguity: it
+must be honoured on every path, and it is." It was not. I verified the paths that commit touched and
+generalised. The claim was false when I wrote it and stayed false for seven commits.
+
+Fixed inside the shared filter every export path already calls, not at five call sites — a rule
+enforced per-caller is one the sixth caller skips, which is how this happened. Renamed
+`exclude_holdout_segments` -> `exclude_unexportable_segments`: the old name under-described what it
+drops, and that mis-naming is precisely why five dutiful callers still leaked. Fail-before verified —
+removing the filter writes the withdrawn WAV back.
+
+**Open, verified, NOT fixed** (recorded so they are not lost, not deferred silently):
+
+1. Non-production bundle ships revoked transcripts, and its manifest/dataset-card counts disagree
+   with its own data files (`export_bundle.rs:306-318` missing the filter its siblings have).
+   Partially addressed by the shared filter above — needs re-measuring against the count sites.
+2. A cloud opt-in revoked MID-RUN never reaches a running worker: `ProcessingPipeline` holds settings
+   by value in an `Arc` that `update_settings` REPLACES rather than mutates, so an in-flight import
+   keeps uploading audio after the user turns cloud off. Contradicts the fail-safe doctrine stated at
+   `commands.rs:1877-1881`. Needs `Arc<Mutex<..>>`/ArcSwap — a concurrency change, owner-gated.
+3. `couch.rs:1621` grades a spot check whose answer key was removed against `""`, fabricating a 1.00
+   CER (accept/edit) or 0.00 (reject) for a reviewer, averaged into `spot_check_report` with no
+   filter. Guard tests `verified` where it should test `human_verified_text(&prev).is_none()`.
+4. `jury/mod.rs:331` writes the IRT AGREEMENT confidence onto rows escalated for poor AUDIO, so a
+   distrusted clip sorts to the BACK of the riskiest-first queue and renders a green "97% confident"
+   chip in the inbox.
+5. `couch.rs:1805` `api_undo` claims a lease with no holder check, unlike its two siblings; a
+   legitimate holder is then 409'd on a conflict the undo created.
+
+Items 2-5 are real and re-verified but each needs either a concurrency redesign or a product call.
