@@ -6966,3 +6966,31 @@ removing the filter writes the withdrawn WAV back.
    legitimate holder is then 409'd on a conflict the undo created.
 
 Items 2-5 are real and re-verified but each needs either a concurrency redesign or a product call.
+
+## Iteration 252 — a stop instruction that never reached the worker
+
+`71340a4`. From the iteration-251 sweep, re-verified by reading the code first.
+
+Every long entry point runs on `state.lock_pipeline().clone()`; `update_settings` swapped the `Arc`
+on the STORED instance only. A clone taken earlier keeps the old pointer. So an import started before
+the user switched cloud off kept uploading audio and transcripts for every remaining file — while the
+save succeeded, `get_settings` reported off, and the toggle rendered off. The user has every reason
+to believe they stopped it.
+
+Consent is now a shared `Arc<LiveConsent>` (three atomics, never replaced) applied BEFORE the snapshot
+swap. Only consent moved: the other 77 `self.settings` reads keep the snapshot, because a model or
+threshold changed mid-import should not retroactively apply — the import is one coherent unit. A
+withdrawal is not a preference, it is a stop instruction, and it is honoured at the moment of the
+call. Retyping the field would have touched all 80 sites for no privacy gain.
+
+Fail-safe both ways, and tested that way: revoking mid-run halts egress; GRANTING mid-run does not
+retroactively enable a run the user began understanding nothing would leave the machine. The live
+check applies only where the path actually uses cloud — local refinement is untouched, pinned by its
+own test.
+
+Fail-before: deleting the single propagation line fails the revocation test while both fail-safe
+tests still pass, so they are checking a different property rather than echoing the fix.
+
+Remaining from iteration 251, unchanged and still open: the non-production bundle count mismatch, the
+couch spot-check graded against an absent answer key, the jury agreement-confidence-on-audio-escalated
+rows, and `api_undo`'s missing lease-holder check.
