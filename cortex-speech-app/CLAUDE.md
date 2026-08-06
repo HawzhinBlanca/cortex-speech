@@ -19,6 +19,26 @@ Cortex Speech is an **offline-first desktop app** (Tauri v2 + Svelte 5 + Rust) f
 - Storage: SQLite + FTS5 search. ~102 Tauri IPC commands. EN/CKB (RTL) localized UI.
 - Workflow: import -> VAD chunk -> ASR -> (optional refine) -> review/annotate -> validate -> verify -> export (JSON/JSONL/CSV/Parquet/HuggingFace/WAV).
 
+## Model lock (owner rule, 2026-08-06 — CRUCIAL)
+
+**Never change the AI models.** The Sorani-adapted **OmniASR-7B champion** and the embedded
+**fine-tuned MMS-1B** are fixed infrastructure. Do NOT propose replacing either because a newer model
+exists — small, Kurdish-ADAPTED models do Sorani well, while the headline general models do not
+support `ckb` at all.
+
+Verified by the owner 2026-08-06 and explicitly killed: **Qwen3-ASR** (30 languages, Kurdish not among
+them) and **Voxtral Transcribe 2** (13 languages, Kurdish not among them). A swap also invalidates
+every measured CER on the frozen eval set, so it is never a cheap experiment.
+
+Exactly two things are permitted, and nothing else without the owner raising it first:
+
+1. Benchmarking Meta **OmniASR v2's 300M/1B CTC variants** as faster LOCAL FALLBACKS — same family,
+   not a replacement for the champion.
+2. Keeping **VibeVoice/BitNet** on a research watchlist; there is no published `ckb` evidence yet.
+
+Cloud judge/STT is locked separately: Gemini 2.5 Pro only, plus ElevenLabs Scribe for STT (see the
+cloud-ASR policy above).
+
 ## The one law: honesty (non-negotiable)
 
 This project's entire credibility rests on real, never fabricated, results.
