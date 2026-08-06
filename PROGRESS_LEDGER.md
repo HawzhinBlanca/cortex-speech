@@ -6832,3 +6832,30 @@ iteration 246.
 Sweeps this cycle: GREEN 32/32 at 43d12ee (pushed d6a6677) and GREEN 32/32 at a7a6ae0 (pushed
 00efc01). Both on an idle machine with `.month-loop.lock` held, after the 2026-08-05 contention that
 made a bench reading untrustworthy.
+
+## Iteration 248 — a blank waveform was a failed read wearing a silent clip's face
+
+Audit #5 reported "the top waveform was blank during inspection" as a cosmetic gripe alongside
+fatigue and layout notes. It is not cosmetic. `loadWaveform`'s catch set `waveformData = []` and said
+nothing, and an empty array renders exactly like genuinely quiet audio — a flat strip. A failed
+decode therefore presented itself to the reviewer as "this clip is silent", with no toast, no
+message, nothing in the UI to distinguish "we could not read your file" from "your file is quiet".
+
+The consequence is specific to WHERE it happens: review mode is where clips are verified. A reviewer
+can accept a clip whose waveform they believe they inspected and never actually saw. That is the same
+failure-looking-like-success class as the commands.ts read guards ("an empty ValidationPanel reads as
+no anomalies found"), and the fix is the same shape — the component already had five handlers using
+`notifications.error`, and this catch was the one bypassing that path.
+
+`waveformError` now records the failure, the toast fires, and the strip is replaced in place by a
+message that says the audio could not be READ and explicitly not that it is silent, with a Retry.
+Success clears the flag so one bad clip cannot poison the rest of the queue. The existing
+last-call-wins stale-response guard is untouched, so a late failure from an abandoned clip still
+returns early rather than raising a toast about a clip the reviewer has already left.
+
+The guard pins four properties rather than one — flag recorded, failure surfaced, flag CLEARED on
+success, template actually branching on it. A flag the UI never reads would be dead state that a
+naive one-line check would happily accept. Fail-before verified against the original silent catch.
+
+Not in scope, not started: the same audit paragraph asks for sticky primary actions and
+sentence-level screen-reader summaries of the consensus words. Both are review-surface redesigns.
