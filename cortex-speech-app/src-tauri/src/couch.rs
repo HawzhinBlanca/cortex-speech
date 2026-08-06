@@ -1615,21 +1615,35 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // real. Grading that against a key that no longer exists recorded a bogus score, returned a reply
     // deliberately indistinguishable from success, and wrote NOTHING to the corpus. The clip stayed
     // unverified, came back in the next batch, and was swallowed again every single time.
-    let was_served_as_check = {
+    // Carries the ANSWER KEY, not a bool: a check with no key cannot be graded, and returning the key
+    // itself makes that structural instead of a comment (external review 2026-08-06).
+    //
+    // The staleness test used to be `!prev.verified`, which is strictly weaker than the predicate that
+    // MINTED the key — `list_spot_check_candidates` requires `human_verified_text(&seg).is_some()`.
+    // Anything that strips the human answer while leaving `verified = 1` left the pair live, and the
+    // grader then did `.unwrap_or_default()`, scoring the reviewer against "". That is reachable
+    // through the ordinary desktop "mark bad": it writes human_decision='reject' / verdict='human_reject'
+    // while KEEPING verified, and for a key whose answer lived in verdict_transcript
+    // `human_verified_text` then returns None. compute_cer("", submitted) is 1.0 for any non-empty
+    // answer, so a reviewer who transcribed the clip CORRECTLY was recorded at a fabricated 1.00 CER
+    // (or 0.00 for a reject) and averaged into spot_check_report with no filter — while the HTTP reply
+    // was byte-identical to a real success. Test the key, not its artefact.
+    let expected_key: Option<String> = {
         let mut guard = lock_state(state);
         let key = (parsed.id.clone(), reviewer.to_string());
-        if guard.spot_checks.contains(&key) && !prev.verified {
-            // No longer an answer key. Drop the stale pair so it cannot swallow this clip again, and
-            // treat the submit as what it is: real work.
-            guard.spot_checks.remove(&key);
-            tracing::info!("Couch Review: stale spot check for {} dropped — the clip is no longer verified", parsed.id);
-            false
+        if !guard.spot_checks.contains(&key) {
+            None
+        } else if let Some(answer) = crate::quality::human_verified_text(&prev) {
+            Some(answer.to_string())
         } else {
-            guard.spot_checks.contains(&key)
+            // The answer key is gone — the thing that made this a check. Drop the stale pair so it
+            // cannot swallow this clip again, and treat the submit as what it is: real work.
+            guard.spot_checks.remove(&key);
+            tracing::info!("Couch Review: stale spot check for {} dropped — the human answer key is gone", parsed.id);
+            None
         }
     };
-    if was_served_as_check {
-        let expected = crate::quality::human_verified_text(&prev).unwrap_or_default().to_string();
+    if let Some(expected) = expected_key {
         let submitted = text.as_deref().unwrap_or_default();
         if let Err(e) = db.record_spot_check(&parsed.id, reviewer, decision, submitted, &expected) {
             // Losing a score must not cost the reviewer their place in the queue: answer normally and
@@ -2067,6 +2081,62 @@ mod tests {
         assert!(row.verified, "the review must actually LAND, not be graded and discarded");
         assert_eq!(row.annotated_transcript.as_deref(), Some("ڕاستکراوەی سارا"));
         assert_eq!(row.reviewed_by.as_deref(), Some("Sara"), "real work must be attributed");
+        assert!(
+            !lock_state(&state).spot_checks.contains(&("g1".to_string(), "Sara".to_string())),
+            "the stale pair must be dropped so it cannot swallow this clip again"
+        );
+    }
+
+    #[test]
+    fn a_check_whose_answer_key_was_stripped_is_not_graded_against_the_empty_string() {
+        // The sibling above covers UN-VERIFYING. This is the case the old `!prev.verified` guard let
+        // through: the desktop "mark bad" writes human_decision='reject' / verdict='human_reject' and
+        // KEEPS verified = true, so the artefact survives while the human answer key does not.
+        // `human_verified_text` then returns None, the old grader did `.unwrap_or_default()`, and
+        // compute_cer("", submitted) is 1.0 for any non-empty answer — a reviewer who transcribed the
+        // clip CORRECTLY was recorded at a fabricated 1.00 CER and averaged into spot_check_report,
+        // with an HTTP reply byte-identical to a real success.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        let mut gold = seg("g1", "دەقی خاو");
+        gold.verified = true;
+        db.insert_segment(&gold).unwrap();
+        // Through the REAL decision path, so the key lives in verdict_transcript exactly as a human
+        // edit leaves it — the shape `list_spot_check_candidates` admits and the one "mark bad" strips.
+        db.record_human_decision("g1", "edit", Some("دەقی ڕاست"), None).unwrap();
+        let state = state();
+        assert!(
+            crate::quality::human_verified_text(&db.get_segment_by_id("g1").unwrap().unwrap()).is_some(),
+            "precondition: this clip really is a usable answer key"
+        );
+        lock_state(&state).spot_checks.insert(("g1".to_string(), "Sara".to_string()));
+
+        // Marked bad at the desktop: the answer key is gone, `verified` is not.
+        db.record_human_decision("g1", "reject", None, None).unwrap();
+        let after = db.get_segment_by_id("g1").unwrap().unwrap();
+        assert!(after.verified, "the artefact the OLD guard tested is still true");
+        assert!(
+            crate::quality::human_verified_text(&after).is_none(),
+            "but the answer key — the thing that made this a check — is gone"
+        );
+
+        // Hold the lease as api_queue would have when it served her the clip.
+        lock_state(&state).leases.insert("g1".to_string(), ("Sara".to_string(), std::time::Instant::now()));
+
+        let body = serde_json::json!({"id": "g1", "action": "edit", "text": "ڕاستکراوەی سارا"});
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        // The spot-check block runs BEFORE the already-reviewed guard at the end of api_decision, so
+        // the contrast is exact: the old code graded against "" and returned 200 from inside that
+        // block; the fixed code records nothing and falls through to the honest 409 this clip
+        // deserves — it really was decided at the desktop and cannot be reviewed again.
+        assert_eq!(code, 409, "a clip decided at the desktop is refused, not silently graded");
+
+        // NOT graded: no fabricated score may exist for this reviewer.
+        let report = db.spot_check_report().unwrap();
+        assert!(
+            report.iter().all(|s| s.checks == 0),
+            "a check with no answer key must not be scored at all: {report:?}"
+        );
         assert!(
             !lock_state(&state).spot_checks.contains(&("g1".to_string(), "Sara".to_string())),
             "the stale pair must be dropped so it cannot swallow this clip again"
