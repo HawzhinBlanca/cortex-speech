@@ -164,6 +164,9 @@ export const ckb: Record<string, string> = {
     'پێداچوونەوەی بەشێکی گەڕان: {n} لە {m} پارچە — گەڕانەکە پاک بکەرەوە بۆ پێداچوونەوەی هەموو.',
   'review.searchScopeEmpty':
     'هیچ پارچەیەک لەگەڵ گەڕانی ئێستا ناگونجێت — پاکی بکەرەوە بۆ پێداچوونەوەی هەموو.',
+  // See en.ts: the point is that a flat strip here means UNREADABLE, not quiet. Composed from
+  // vocabulary already in this file; flagged for owner review.
+  'review.waveformFailed': 'نەتوانرا دەنگی ئەم پارچەیە بخوێنرێتەوە — شەپۆل بەردەست نییە، بێدەنگ نییە.',
   'review.undoFailed': 'گەڕاندنەوە سەرکەوتوو نەبوو',
   'review.undoLast': 'گەڕاندنەوەی پێداچوونەوە',
   'review.retranscribeVerifiedTitle': 'دەقی پشتڕاستکراو بگۆڕدرێت؟',

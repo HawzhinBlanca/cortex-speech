@@ -161,6 +161,7 @@ export const en: Record<string, string> = {
   'review.searchScope':
     'Reviewing a search subset: {n} of {m} clips — clear the search to review everything.',
   'review.searchScopeEmpty': 'No clips match the current search — clear it to review everything.',
+  'review.waveformFailed': "Couldn't read this clip's audio — the waveform is unavailable, not silent.",
   'review.undoFailed': 'Undo failed',
   'review.undoLast': 'Undo review',
   'review.retranscribeVerifiedTitle': 'Replace a verified transcript?',

@@ -106,6 +106,9 @@
 
   let editText = $state('');
   let waveformData = $state<number[]>([]);
+  // Non-null ONLY when the decode failed. Distinguishes "could not read the audio" from a genuinely
+  // quiet clip, which an empty array alone cannot.
+  let waveformError = $state<string | null>(null);
   let currentTime = $state(0);
   let playerDuration = $state(0);
   let playing = $state(false);
@@ -459,8 +462,17 @@
       const data = await api.getWaveform(seg.audioPath, 240, seg.alignmentJson);
       if (seq !== waveformLoadSeq) return; // a newer clip started loading; this response is stale
       waveformData = data;
-    } catch {
-      if (seq === waveformLoadSeq) waveformData = [];
+      waveformError = null;
+    } catch (e) {
+      if (seq !== waveformLoadSeq) return;
+      // Audit 2026-08-05 #5 saw "the top waveform was blank during inspection". This catch used to
+      // set [] and say nothing, so a FAILED decode rendered exactly like a silent clip: a reviewer
+      // reads a flat strip as "this audio is quiet", not as "the app could not read your file". Same
+      // failure-looking-like-success class the read guards in commands.ts exist for, and the reviewer
+      // may then verify a clip they never actually saw the shape of.
+      waveformData = [];
+      waveformError = String(e);
+      notifications.error($t('review.waveformFailed'), { detail: waveformError });
     }
   }
 
@@ -919,17 +931,36 @@
 
       <!-- Waveform -->
       <div class="card overflow-hidden">
-        <Waveform
-          waveform={waveformData}
-          currentTime={clipPosition}
-          duration={clipLength}
-          {playing}
-          wordTimestamps={words}
-          onSeek={(time) => {
-            clearWordOverride(); // a manual scrub leaves word-playback mode; play on to the span end
-            currentTime = range.startTime + time;
-          }}
-        />
+        {#if waveformError}
+          <!-- A flat strip and a failed decode look identical, and the reviewer would read the flat
+               strip as "quiet audio". Say which one it is, in place, and offer the retry. -->
+          <div
+            class="flex items-center justify-between gap-3 p-3 text-xs text-amber-300"
+            data-testid="review-waveform-error"
+            role="status"
+          >
+            <span class="min-w-0 truncate">{$t('review.waveformFailed')}</span>
+            <button
+              type="button"
+              class="btn btn-secondary shrink-0 !text-xs"
+              onclick={() => current && loadWaveform(current)}
+            >
+              {$t('retry')}
+            </button>
+          </div>
+        {:else}
+          <Waveform
+            waveform={waveformData}
+            currentTime={clipPosition}
+            duration={clipLength}
+            {playing}
+            wordTimestamps={words}
+            onSeek={(time) => {
+              clearWordOverride(); // a manual scrub leaves word-playback mode; play on to the span end
+              currentTime = range.startTime + time;
+            }}
+          />
+        {/if}
       </div>
 
       <!-- Honest playback-scope hint: are we playing just the words, or the whole clip? -->

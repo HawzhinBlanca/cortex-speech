@@ -580,6 +580,39 @@ def test_library_reads_fail_loudly_instead_of_reporting_an_empty_library() -> No
             )
 
 
+def test_a_failed_waveform_decode_is_not_rendered_as_a_silent_clip() -> None:
+    """A blank waveform must say "unreadable", never impersonate quiet audio.
+
+    `loadWaveform`'s catch set `waveformData = []` and said nothing. An empty array and a genuinely
+    silent clip render identically — a flat strip — so a failed decode read to the reviewer as "this
+    audio is quiet". The 2026-08-05 audit hit exactly this ("the top waveform was blank during
+    inspection") and had no way to tell which it was. Worse than cosmetic: the reviewer can go on to
+    VERIFY a clip whose shape they never actually saw.
+
+    Same failure-looking-like-success class as the library read guards in commands.ts, and fixed the
+    same way — the existing user-visible error path is used instead of swallowing.
+    """
+    src = _read("src/lib/ReviewMode.svelte")
+    body = _function_body(src, "  async function loadWaveform(")
+
+    if "waveformError" not in body:
+        raise AssertionError(
+            "loadWaveform no longer records waveformError — an empty waveform is indistinguishable "
+            "from a silent clip, so a failed decode would silently read as quiet audio"
+        )
+    if "notifications.error" not in body:
+        raise AssertionError(
+            "loadWaveform's catch no longer surfaces the failure. Swallowing it leaves the reviewer "
+            "looking at a flat strip with no indication the audio could not be read."
+        )
+    # The success path must CLEAR the error, or one bad clip poisons every later clip in the queue.
+    if "waveformError = null" not in body:
+        raise AssertionError("loadWaveform must clear waveformError on success, or the notice becomes sticky")
+    # And the template has to actually branch on it, or the flag is dead state.
+    if 'data-testid="review-waveform-error"' not in src:
+        raise AssertionError("ReviewMode renders no distinct failed-waveform state — the flag is not reaching the UI")
+
+
 def test_the_uncalibrated_panel_names_the_real_cause_when_there_is_no_confidence_at_all() -> None:
     """"Verify at least 10 segments" must not be shown when verifying cannot possibly help.
 
@@ -726,6 +759,7 @@ def main() -> None:
     test_post_jury_cer_is_withheld_when_every_row_scored_the_jury_against_itself()
     test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrated()
     test_library_reads_fail_loudly_instead_of_reporting_an_empty_library()
+    test_a_failed_waveform_decode_is_not_rendered_as_a_silent_clip()
     test_the_uncalibrated_panel_names_the_real_cause_when_there_is_no_confidence_at_all()
     test_readiness_verdict_is_sourced_from_the_export_rule_not_the_verified_count()
     test_readiness_is_unknown_not_ready_when_its_inputs_failed_to_load()
