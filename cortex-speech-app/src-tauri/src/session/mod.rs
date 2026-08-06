@@ -54,9 +54,24 @@ impl SessionState {
     }
 
     pub fn from_db(db: &Database) -> AppResult<Self> {
-        let segments = db.get_segments(None)?;
-        let verified_count = segments.iter().filter(|s| s.verified).count();
-        Ok(Self { segment_count: segments.len(), verified_count, ..Self::new() })
+        // Two COUNTs, so ask for two counts. This used to materialise every SpeechSegment in the
+        // library — every transcript, alignment JSON and evidence blob — to call `.len()` and one
+        // `.filter().count()` on them (external review 2026-08-06 #6). At 144 clips that is invisible;
+        // it is also the read that runs at BOOT, so it scales the startup cost with the corpus.
+        //
+        // `verified` is counted raw here on purpose: this is the session-restore breadcrumb, not a
+        // dashboard statistic. compute_stats owns the reject/placeholder-aware figure the UI shows,
+        // and quietly making these two disagree would be worse than either.
+        let (segment_count, verified_count) = db.connection().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN verified THEN 1 ELSE 0 END), 0) FROM speech_segments",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        Ok(Self {
+            segment_count: segment_count.max(0) as usize,
+            verified_count: verified_count.max(0) as usize,
+            ..Self::new()
+        })
     }
 }
 
@@ -291,6 +306,38 @@ fn now_epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// from_db now asks SQL for two counts instead of materialising every segment to call `.len()`
+    /// (external review #6). Same numbers, and the rejected clip is the case worth pinning: this is
+    /// the session breadcrumb, so `verified` is counted RAW here — compute_stats owns the
+    /// reject-aware figure the dashboard shows, and the two are allowed to differ on purpose.
+    #[test]
+    fn from_db_counts_match_a_full_scan_including_a_rejected_clip() {
+        use crate::db::{Database, SpeechSegment};
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        for (id, verified) in [("a", true), ("b", false), ("c", true)] {
+            db.insert_segment(&SpeechSegment {
+                id: id.into(),
+                audio_path: format!("/audio/{id}.wav"),
+                verified,
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        }
+        db.record_human_decision("c", "reject", None, None).unwrap();
+
+        let scanned = db.get_segments(None).unwrap();
+        let state = super::SessionState::from_db(&db).unwrap();
+        assert_eq!(state.segment_count, scanned.len(), "total must equal a full scan");
+        assert_eq!(
+            state.verified_count,
+            scanned.iter().filter(|s| s.verified).count(),
+            "verified must equal the same raw predicate the scan used"
+        );
+        assert_eq!(state.segment_count, 3);
+        assert_eq!(state.verified_count, 2, "the rejected clip keeps verified=true — raw, by design here");
+    }
+
     use super::*;
     use tempfile::TempDir;
 
