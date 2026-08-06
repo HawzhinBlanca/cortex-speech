@@ -301,20 +301,40 @@ impl AudioFingerprint {
         id
     }
 
-    /// Register an identity that was computed elsewhere — the streaming path's
-    /// [`StreamingIdentity::finish`], which never holds the whole file to hand to [`register`](Self::register).
-    pub fn register_identity(&self, id: &AudioIdentity, source: Option<&Path>) {
+    /// Check and register an identity that was computed elsewhere — the streaming path's
+    /// [`StreamingIdentity::finish`], which never holds the whole file to hand to
+    /// [`check_and_register`](Self::check_and_register).
+    ///
+    /// Same rejection rule as its whole-buffer sibling, and it must be CHECKED rather than merely
+    /// registered: a streamed recording's per-window checks compare window hashes, which cannot match
+    /// the whole-file hash that gets persisted, so registering this without testing it would persist an
+    /// identity nothing ever consults — cross-session dedup for long files would look implemented and
+    /// silently do nothing.
+    pub fn check_and_register_identity(&self, id: &AudioIdentity, source: Option<&Path>) -> Result<(), &'static str> {
         // Never store a degenerate bucket key — see check_and_register.
         if id.spectral == 0 {
-            return;
+            return Ok(());
         }
         let source_key = Self::source_key(source);
         let mut map = self.lock_known();
         let bucket = map.entry(id.spectral).or_default();
+        if Self::is_proven_duplicate(bucket, &id.content, &source_key) {
+            return Err("Duplicate audio content");
+        }
         match bucket.iter_mut().find(|k| k.source == source_key) {
             Some(existing) => existing.content = Some(id.content.clone()),
             None => bucket.push(KnownRecording { content: Some(id.content.clone()), source: source_key }),
         }
+        Ok(())
+    }
+
+    /// PRIVATE on purpose. There is deliberately NO public "register without checking" entry point for a
+    /// precomputed identity: the streaming path briefly had one, and using it instead of
+    /// [`check_and_register_identity`](Self::check_and_register_identity) made cross-session dedup for
+    /// long files look implemented while doing nothing. An API that cannot be called wrongly beats a
+    /// comment asking callers not to.
+    fn register_identity(&self, id: &AudioIdentity, source: Option<&Path>) {
+        let _ = self.check_and_register_identity(id, source);
     }
 
     /// Load stored recording identities into the map at startup (v50 spectral + v51 content hash).
@@ -514,6 +534,56 @@ mod tests {
             map.check_and_register(&pcm, 16000, Some(source)).expect("re-import is never a duplicate");
         }
         assert_eq!(map.count(), 1, "one file is one recording however many times it is imported");
+    }
+
+    /// A windowed import must produce the SAME content hash as a whole-buffer one.
+    ///
+    /// If these ever diverge, a recording's identity would depend on which import path handled it, and
+    /// the same audio would be two different recordings.
+    #[test]
+    fn a_windowed_identity_equals_the_whole_buffer_identity() {
+        let whole: Vec<i16> = (0..48_000).map(|i| ((i * 13) % 9000) as i16).collect();
+        let mut streaming = StreamingIdentity::new();
+        for window in whole.chunks(7_000) {
+            streaming.push(window, 16000);
+        }
+        assert_eq!(
+            streaming.finish().content,
+            AudioFingerprint::content_hash(&whole, 16000),
+            "the same canonical PCM must hash the same whether it arrived in one piece or many"
+        );
+    }
+
+    /// A streamed recording re-imported in a LATER session must still be caught.
+    ///
+    /// The bug this pins: the streaming path's per-window checks compare WINDOW hashes, which can never
+    /// equal the whole-file hash that is persisted. Persisting the whole-file identity without also
+    /// CHECKING it left cross-session dedup looking implemented while doing nothing at all for long
+    /// files — the only kind that reach that path.
+    #[test]
+    fn a_streamed_recording_is_caught_on_reimport_after_a_restart() {
+        let whole: Vec<i16> = (0..48_000).map(|i| ((i * 13) % 9000) as i16).collect();
+        let mut first_run = StreamingIdentity::new();
+        for window in whole.chunks(7_000) {
+            first_run.push(window, 16000);
+        }
+        let id = first_run.finish();
+
+        // Next launch: a fresh map plus what the library stored for that recording.
+        let after_restart = AudioFingerprint::new();
+        after_restart.rehydrate([stored(id.spectral, Some(&id.content), r"C:\audio\long.wav")]);
+
+        // The same audio arrives again under a different path, windowed exactly as before.
+        let mut second_run = StreamingIdentity::new();
+        for window in whole.chunks(7_000) {
+            second_run.push(window, 16000);
+        }
+        assert!(
+            after_restart
+                .check_and_register_identity(&second_run.finish(), Some(Path::new(r"C:\audio\copy.wav")))
+                .is_err(),
+            "a streamed duplicate must be rejected across sessions, not merely re-registered"
+        );
     }
 
     #[test]

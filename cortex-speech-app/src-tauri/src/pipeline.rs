@@ -1840,6 +1840,20 @@ impl ProcessingPipeline {
             return Err(AppError::Validation("No speech chunks produced".into()));
         }
 
+        // The whole-recording duplicate check, BEFORE anything is persisted. It has to happen here and
+        // not next to the stamp below: the per-window checks inside the loop compare WINDOW hashes,
+        // which by construction never equal the whole-file hash that gets persisted, so a streamed
+        // recording re-imported in a LATER session would sail past every one of them. Registering the
+        // identity without testing it would leave cross-session dedup looking implemented while doing
+        // nothing for exactly the long files this path exists to handle.
+        //
+        // Late is not free — the ASR work for this file is already spent — but the harm being prevented
+        // is duplicate ROWS in the library, and those have not been written yet.
+        let identity = recording_identity.finish();
+        self.fingerprint
+            .check_and_register_identity(&identity, Some(path))
+            .map_err(|e| AppError::Validation(e.into()))?;
+
         let chunk_count = segments.len() as u32;
         for (idx, seg) in segments.iter_mut().enumerate() {
             if let Some(meta) = seg.alignment_json.as_deref().and_then(chunking::SegmentSourceMeta::from_alignment_json)
@@ -1867,11 +1881,10 @@ impl ProcessingPipeline {
 
         let mut persisted = self.persist_segments(db, segments)?;
         // v51: stamp the whole-recording identity now that the rows exist, exactly as the non-streaming
-        // sibling does. Best-effort — a failed stamp must not fail an import whose audio and transcripts
-        // are already committed; it only costs this recording its place in cross-session dedup.
-        let identity = recording_identity.finish();
+        // sibling does. Already checked and registered in memory above. Best-effort — a failed stamp
+        // must not fail an import whose audio and transcripts are already committed; it only costs this
+        // recording its place in cross-session dedup.
         if identity.spectral != 0 {
-            self.fingerprint.register_identity(&identity, Some(path));
             if let Err(e) = db.set_audio_identity(&path.to_string_lossy(), &identity) {
                 tracing::warn!("audio identity not persisted for {}: {e}", path.display());
             }
