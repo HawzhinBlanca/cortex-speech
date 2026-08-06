@@ -2218,6 +2218,38 @@ impl Database {
     /// This is the revocation lineage: once stamped, `rights_disposition` returns `Revoked` and every
     /// export path — including plain local export — must drop the row. A withdrawal that only blocks
     /// future publishing is not a withdrawal.
+    /// Persist the spectral fingerprint for every segment of one source recording (migration v50).
+    ///
+    /// Keyed on `audio_path` like `set_recording_rights`: all VAD chunks of one recording share it, and
+    /// the identity being recorded is the RECORDING's, not the chunk's.
+    ///
+    /// `fp as i64` is a bit-cast, not a numeric conversion — SQLite integers are i64 and the
+    /// fingerprint is a u64, so the top bit round-trips only because both directions cast rather than
+    /// convert. `load_audio_fingerprints` casts back the same way.
+    pub fn set_audio_fingerprint(&self, audio_path: &str, fingerprint: u64) -> AppResult<usize> {
+        Ok(self.conn.execute(
+            "UPDATE speech_segments SET audio_fingerprint = ?2 WHERE audio_path = ?1",
+            params![audio_path, fingerprint as i64],
+        )?)
+    }
+
+    /// Every stored (fingerprint, audio_path) pair, for rehydrating the in-memory dedup map at startup.
+    ///
+    /// DISTINCT because a recording is many chunks sharing one path and one fingerprint; without it a
+    /// 144-chunk file would return 144 identical rows. Rows whose fingerprint was never computed (every
+    /// row predating v50, until the backfill runs) are skipped by the WHERE, not defaulted to 0 — a
+    /// zero fingerprint is the degenerate silent-window value `register` deliberately refuses to store.
+    pub fn load_audio_fingerprints(&self) -> AppResult<Vec<(u64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT audio_fingerprint, audio_path FROM speech_segments
+             WHERE audio_fingerprint IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn revoke_recording(&self, audio_path: &str) -> AppResult<usize> {
         Ok(self.conn.execute(
             "UPDATE speech_segments

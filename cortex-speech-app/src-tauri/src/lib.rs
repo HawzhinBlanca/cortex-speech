@@ -575,6 +575,23 @@ pub fn run() {
     let normalizer = Arc::new(SoraniNormalizer::new());
     let cache = Arc::new(TranscriptCache::new(1000));
     let fingerprint = Arc::new(AudioFingerprint::new());
+    // v50: rehydrate the dedup map from the library BEFORE the pipeline is built, so the very first
+    // import of a session already knows every recording seen in previous ones. Without this the map
+    // started empty every launch and cross-session duplicate detection did not exist (external review
+    // 2026-08-06 #4).
+    //
+    // Best-effort by design: a failed read must not block startup. It costs this session cross-run
+    // dedup — exactly the behaviour that shipped before v50 — and says so loudly rather than degrading
+    // silently. Rows predating v50 have a NULL fingerprint and are simply absent until backfilled.
+    match db.load_audio_fingerprints() {
+        Ok(known) => {
+            let n = fingerprint.rehydrate(known);
+            tracing::info!("Audio dedup: rehydrated {n} recording fingerprint(s) from the library");
+        }
+        Err(e) => {
+            tracing::warn!("Audio dedup: could not rehydrate fingerprints ({e}) — within-run dedup only");
+        }
+    }
 
     let pipeline = ProcessingPipeline::new(
         db_path.to_string_lossy().to_string(),

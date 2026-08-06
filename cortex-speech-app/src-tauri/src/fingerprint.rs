@@ -6,17 +6,18 @@ use std::sync::{Mutex, MutexGuard};
 /// Tracks which source file each fingerprint came from so re-importing the same
 /// file is allowed while duplicate content from different paths is rejected.
 ///
-/// SCOPE — this map is IN-MEMORY and lives exactly as long as the process. It is constructed empty
-/// in `lib.rs` at startup and nothing rehydrates it; no migration has ever created a column to
-/// rehydrate it FROM. So the rejection above holds WITHIN a single run only: restart the app,
-/// re-import the same audio under a different path, and it is accepted silently.
+/// SCOPE — the map is in memory, but it is no longer only in memory. Migration v50 stores the
+/// fingerprint on the segment rows, and `lib.rs` calls `rehydrate` at startup with
+/// `Database::load_audio_fingerprints`, so duplicate detection now survives a restart: re-importing
+/// the same audio under a different path is rejected in a later session, not only the same one.
 ///
-/// `get_fingerprint_count` therefore reports what this session has imported, NOT corpus coverage —
-/// the 2026-08-05 audit read its 0 next to a 144-clip corpus as evidence that legacy rows were never
-/// backfilled, which is why the UI label now says "(this session)".
+/// The one remaining gap is honest and bounded: rows imported BEFORE v50 have a NULL fingerprint and
+/// do not participate until a backfill pass computes theirs (computing one requires decoding the
+/// audio, which a schema migration may not do). A NULL row is exactly as protected as it was before —
+/// no regression, just not yet covered.
 ///
-/// Making duplicate detection durable needs a persisted fingerprint per segment plus a backfill over
-/// existing rows. Deliberately not done as a side effect of a labelling fix.
+/// `get_fingerprint_count` still reports what THIS SESSION holds in the map, which after rehydration
+/// is "every recording the library knows about" rather than "what you imported since launching".
 pub struct AudioFingerprint {
     known: Mutex<HashMap<u64, String>>,
 }
@@ -169,6 +170,27 @@ impl AudioFingerprint {
         self.lock_known().insert(hash, Self::source_key(source));
     }
 
+    /// Load previously-stored (fingerprint, source path) pairs into the map at startup (v50).
+    ///
+    /// This is what makes duplicate detection survive a restart. `lib.rs` builds an empty
+    /// `AudioFingerprint` and then calls this with `Database::load_audio_fingerprints`, so the map the
+    /// first import of a session consults already knows every recording the library has seen.
+    ///
+    /// Additive, never clearing: a caller that rehydrates mid-session must not drop what this run has
+    /// already registered.
+    pub fn rehydrate(&self, known: impl IntoIterator<Item = (u64, String)>) -> usize {
+        let mut map = self.lock_known();
+        let before = map.len();
+        for (fp, source) in known {
+            // Skip the degenerate value `register` refuses to store, so a legacy 0 cannot become a
+            // content key that every silent window then collides with.
+            if fp != 0 {
+                map.entry(fp).or_insert(source);
+            }
+        }
+        map.len() - before
+    }
+
     pub fn clear(&self) {
         self.lock_known().clear();
     }
@@ -183,29 +205,47 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// Pins the SCOPE limit documented on the struct, so nobody reads the duplicate-rejection tests
-    /// below as a durable guarantee. A fresh `AudioFingerprint` is what `lib.rs` builds at every app
-    /// start, and it knows nothing — so the same content under a new path is accepted after a
-    /// restart. This test exists to make that visible, not to bless it: when fingerprints are
-    /// persisted it should FAIL and be replaced by its opposite.
+    /// The replacement for `duplicate_detection_does_not_survive_a_restart`, which was written to FAIL
+    /// once fingerprints were persisted (v50) so whoever did the work would be told to invert it rather
+    /// than find an obsolete test. This is that inversion.
     #[test]
-    fn duplicate_detection_does_not_survive_a_restart() {
+    fn duplicate_detection_survives_a_restart_once_fingerprints_are_rehydrated() {
         let pcm: Vec<i16> = (0..16_000).map(|i| (i as i16).wrapping_mul(100)).collect();
         let first_run = AudioFingerprint::new();
-        first_run.register(&pcm, 16000, Some(Path::new(r"C:\audio\original.wav")));
-        assert!(
-            first_run.check_duplicate(&pcm, 16000, Some(Path::new(r"C:\audio\copy.wav"))),
-            "within one run, the same content under a different path IS a duplicate"
-        );
+        let fp = first_run.register(&pcm, 16000, Some(Path::new(r"C:udio\original.wav")));
 
-        // What the next launch actually gets: lib.rs calls AudioFingerprint::new() and nothing
-        // rehydrates it, because no migration ever created a column to rehydrate from.
+        // What the next launch gets: a fresh map (lib.rs builds one) PLUS what the library stored.
         let after_restart = AudioFingerprint::new();
-        assert_eq!(after_restart.count(), 0, "the map is in-memory only");
+        assert_eq!(after_restart.count(), 0, "a fresh map still starts empty");
+        let loaded = after_restart.rehydrate([(fp, r"C:udio\original.wav".to_string())]);
+        assert_eq!(loaded, 1, "the stored recording is loaded");
+
         assert!(
-            !after_restart.check_duplicate(&pcm, 16000, Some(Path::new(r"C:\audio\copy.wav"))),
-            "KNOWN GAP: cross-session duplicate detection does not exist — see the struct docs"
+            after_restart.check_duplicate(&pcm, 16000, Some(Path::new(r"C:udio\copy.wav"))),
+            "the same content under a NEW path must now be caught across sessions"
         );
+        assert!(
+            !after_restart.check_duplicate(&pcm, 16000, Some(Path::new(r"C:udio\original.wav"))),
+            "re-importing the SAME file is still allowed — that is not a duplicate"
+        );
+    }
+
+    #[test]
+    fn rehydrate_is_additive_and_refuses_the_degenerate_zero_key() {
+        let map = AudioFingerprint::new();
+        let pcm: Vec<i16> = (0..16_000).map(|i| (i as i16).wrapping_mul(77)).collect();
+        let live = map.register(&pcm, 16000, Some(Path::new(r"C:udio	his_run.wav")));
+
+        // A 0 fingerprint is the silent/degenerate value register REFUSES to store; loading one from an
+        // older row must not turn it into a content key that every silent window then collides with.
+        let loaded =
+            map.rehydrate([(0u64, r"C:udio\silence.wav".to_string()), (12345u64, r"C:udio\old.wav".to_string())]);
+        assert_eq!(loaded, 1, "only the real fingerprint is taken; the 0 is dropped");
+        assert_eq!(map.count(), 2, "rehydrate must ADD to what this run registered, never replace it");
+
+        // And what this run registered is still there and still its own path.
+        assert!(!map.check_duplicate(&pcm, 16000, Some(Path::new(r"C:udio	his_run.wav"))));
+        assert_ne!(live, 0);
     }
 
     #[test]

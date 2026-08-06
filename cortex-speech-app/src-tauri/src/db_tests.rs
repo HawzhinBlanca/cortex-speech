@@ -2920,3 +2920,40 @@ fn relink_refuses_a_candidate_already_owned_by_a_present_segment() {
     );
     assert_eq!(result.still_missing, 1, "the refused path stays honestly missing");
 }
+
+/// v50 end-to-end: the fingerprint survives the DB round trip, including the top bit.
+///
+/// `fp as i64` / `as u64` are BIT-CASTS. A numeric conversion would saturate or reject a fingerprint
+/// above i64::MAX — half of all possible values — so this pins a u64 with the high bit set. Half the
+/// corpus silently failing to dedup would be invisible without it.
+#[test]
+fn audio_fingerprint_round_trips_through_sqlite_including_the_high_bit() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    for id in ["c1", "c2"] {
+        db.insert_segment(&SpeechSegment {
+            id: id.into(),
+            audio_path: "/audio/rec.wav".into(),
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+    }
+    db.insert_segment(&SpeechSegment {
+        id: "other".into(),
+        audio_path: "/audio/other.wav".into(),
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+
+    let fp: u64 = 0xF000_0000_0000_00FF; // high bit set — past i64::MAX
+    let updated = db.set_audio_fingerprint("/audio/rec.wav", fp).unwrap();
+    assert_eq!(updated, 2, "every chunk of the recording is stamped, keyed on audio_path");
+
+    let loaded = db.load_audio_fingerprints().unwrap();
+    assert_eq!(loaded.len(), 1, "DISTINCT: one recording, not one row per chunk");
+    assert_eq!(loaded[0], (fp, "/audio/rec.wav".to_string()), "the high bit must survive the round trip");
+
+    // The untouched recording stays NULL and is simply absent — not defaulted to 0, which register
+    // deliberately refuses to store as a content key.
+    assert!(!loaded.iter().any(|(_, p)| p == "/audio/other.wav"), "a NULL fingerprint must not appear");
+}

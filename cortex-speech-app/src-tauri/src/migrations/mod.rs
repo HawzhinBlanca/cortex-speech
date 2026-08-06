@@ -1408,6 +1408,36 @@ pub static MIGRATIONS: &[Migration] = &[
              ALTER TABLE speech_segments DROP COLUMN rights_revoked_at;",
         ),
     },
+    Migration {
+        version: 50,
+        description: "Durable audio fingerprint per segment so duplicate detection survives a restart",
+        // External review 2026-08-06 #4. `AudioFingerprint` was an in-memory Mutex<HashMap> built empty
+        // by lib.rs at every launch, and NO migration had ever created a column to rehydrate it from —
+        // so `check_and_register` compared only against files imported in the SAME run. Restart the app,
+        // re-import the same audio under a different path, and it was accepted silently as new content.
+        //
+        // The value was already being computed at the right moment and thrown away: pipeline.rs read
+        // `let _fp = self.fingerprint.check_and_register(...)`. This column gives it somewhere to live.
+        //
+        // INTEGER, not TEXT: the fingerprint is a u64 spectral hash. SQLite integers are i64, so it is
+        // stored as `fp as i64` and read back with `as u64` — a lossless bit-cast in both directions,
+        // NOT a numeric conversion, so the top bit round-trips.
+        //
+        // NO BACKFILL, exactly as v49. Computing a fingerprint requires DECODING the audio, which is
+        // not something a schema migration may do — and inventing a value would be worse than NULL.
+        // Existing rows are honestly unknown until the backfill pass runs over them; a NULL simply does
+        // not participate in dedup, which is the same protection those rows have today.
+        //
+        // The index is partial: only non-NULL rows are dedup candidates, so a library of legacy NULLs
+        // costs nothing to carry.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN audio_fingerprint INTEGER;
+                 CREATE INDEX IF NOT EXISTS idx_segments_audio_fingerprint
+                     ON speech_segments(audio_fingerprint) WHERE audio_fingerprint IS NOT NULL;",
+        down_sql: Some(
+            "DROP INDEX IF EXISTS idx_segments_audio_fingerprint;
+             ALTER TABLE speech_segments DROP COLUMN audio_fingerprint;",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -1516,7 +1546,11 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(idx, 10, "all 10 indexes must be recreated");
+        // Counted, not >=: the point of this assertion is that the v40 table RECREATE rebuilt every
+        // index rather than silently dropping one, so a loosened comparison would defeat it. Raised
+        // 10 -> 11 by v50's partial index on audio_fingerprint. If you add an index to
+        // speech_segments, raise this deliberately — do not relax it.
+        assert_eq!(idx, 11, "all 11 indexes must be recreated");
 
         // (5) FTS still finds a segment by transcript (triggers recreated + index rebuilt).
         let hits = db.search_segments("کوردی").unwrap();

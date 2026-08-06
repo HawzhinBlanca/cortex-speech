@@ -1569,10 +1569,13 @@ impl ProcessingPipeline {
             );
         }
 
-        let _fp = self
+        let fp = self
             .fingerprint
             .check_and_register(&pcm, sample_rate, Some(path))
             .map_err(|e| AppError::Validation(e.into()))?;
+        // v50: the value used to be computed here and thrown away as `_fp`, which is why duplicate
+        // detection could not survive a restart. Stamped onto the rows AFTER persist_segments below,
+        // once they exist — see the set_audio_fingerprint call there.
 
         let (chunk_ranges, vad_backend) = chunking::plan_speech_chunks(
             &pcm,
@@ -1624,6 +1627,15 @@ impl ProcessingPipeline {
             None, // non-streaming: the whole file is one call, so diarization clusters in-place
         )?;
         let mut persisted = self.persist_segments(db, segments)?;
+        // v50: persist the fingerprint now that the rows exist, so the NEXT session rehydrates it and
+        // re-importing this recording under a different path is rejected then too. Best-effort: a failed
+        // stamp must not fail an import whose audio and transcripts are already committed — it only costs
+        // this recording its place in cross-session dedup, and a WARN says so.
+        if fp != 0 {
+            if let Err(e) = db.set_audio_fingerprint(&path.to_string_lossy(), fp) {
+                tracing::warn!("audio fingerprint not persisted for {}: {e}", path.display());
+            }
+        }
         self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
         // Deferred to AFTER the 7B pass so both evaluate the real transcript, not the placeholder, and
         // so alignment does not clobber the slice offsets the pass depends on. See persist_segments.

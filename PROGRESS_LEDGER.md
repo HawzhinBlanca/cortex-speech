@@ -7038,3 +7038,40 @@ Still open and NOT claimed: jury confidence conflating agreement with acoustic q
 separate fields — a schema change), fingerprint persistence (#5), the npm lockfile (#6), and
 cancellation of an HTTP request already in flight, which means a withdrawal stops the NEXT call rather
 than aborting one mid-transfer.
+
+## Iteration 254 — #6 partly, #4 landed: duplicate detection now survives a restart
+
+**#6 (`ae8d344`).** Retired `SessionState::from_db`, which materialised every segment — transcripts,
+alignment JSON, evidence blobs — to compute two counts, at BOOT, so startup scaled with the corpus.
+Two SQL counts now. `verified` is counted RAW there deliberately (session breadcrumb, not the
+dashboard figure compute_stats owns) and the test pins that with a rejected clip present.
+
+The larger contribution is `test_unbounded_segment_reads_policy.py`, which CLOSES the set of
+whole-library reads: BY DESIGN (an export or validation report is defined over the corpus) vs
+TO RETIRE (the real backlog). It found `session/mod.rs` and `validation/mod.rs`, both missed by my own
+grep. 7 by design, 4 to retire. `get_active_learning_queue` is the hard one and no cursor helps it.
+
+**#4 (this iteration).** Migration v50 adds `audio_fingerprint INTEGER` with a partial index, and the
+mechanism is wired end to end:
+
+- pipeline.rs had `let _fp = check_and_register(...)` — the fingerprint was computed on every import
+  and THROWN AWAY. That is why nothing survived a restart. It is now stamped onto the recording's rows
+  after persist_segments, best-effort so a failed stamp cannot fail an import already committed.
+- lib.rs rehydrates the map from the library BEFORE the pipeline is built, so the first import of a
+  session already knows every recording previous sessions saw.
+- `duplicate_detection_does_not_survive_a_restart` was written to FAIL once this landed. It has been
+  replaced by its inverse, as intended.
+
+`fp as i64` / `as u64` are BIT-CASTS, and the round-trip test uses a fingerprint with the high bit set
+(past i64::MAX) — a numeric conversion would saturate half of all possible values and half the corpus
+would silently stop deduping.
+
+NOT done and not claimed: rows imported before v50 have a NULL fingerprint and do not participate
+until a backfill pass computes theirs (computing one requires DECODING the audio, which a schema
+migration may not do). Those rows are exactly as protected as they were before — no regression, just
+not yet covered. The owner's 144 are all in this state. The backfill binary, modelled on
+`realign_segments.rs`, and the question of what to REPORT (never delete) if it finds duplicates
+already in the library, remain open.
+
+The v40 STRICT-recreate test's index count moved 10 -> 11. Raised deliberately rather than relaxed to
+`>=`: that assertion exists to prove the table recreate rebuilt every index.
