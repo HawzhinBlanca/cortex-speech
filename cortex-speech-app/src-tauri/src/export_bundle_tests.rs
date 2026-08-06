@@ -455,6 +455,86 @@ fn production_export_blocks_machine_ready_rows_not_covered_by_latest_agentic_pro
 }
 
 /// The gate itself: a clip good enough to publish, with nothing said about whether it MAY be.
+/// Closure evidence for the non-production bundle (external review 2026-08-06 #7). `be64cf5` moved
+/// the revocation filter into `exclude_unexportable_segments`, which `export_dataset_bundle` calls at
+/// line 306 — so this is LOGICALLY fixed. That is not the same as demonstrated, and the review was
+/// right to ask for proof before it leaves the open ledger.
+///
+/// The specific hazard is a count that disagrees with the bytes: the manifest, the dataset card and
+/// the training-grade artifacts each iterate the segment list, while dataset.{json,jsonl,csv,parquet}
+/// are written by export_dataset, which filters independently. If one side drops a revoked row and
+/// the other does not, the bundle ships a headline count for rows its own data files do not contain —
+/// the "tally counts rows the export drops" class, six times fixed elsewhere in this repo.
+#[test]
+fn a_revoked_clip_is_absent_from_the_bundles_data_files_manifest_and_card_alike() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+
+    let keep = tmp.path().join("keep.wav");
+    let revoked = tmp.path().join("revoked.wav");
+    std::fs::write(&keep, b"audio").unwrap();
+    std::fs::write(&revoked, b"audio").unwrap();
+    for (id, path, text) in [("keep-1", &keep, "دەقی مانەوە"), ("revoked-1", &revoked, "دەقی سڕاوە")]
+    {
+        db.insert_segment(&SpeechSegment {
+            id: id.into(),
+            audio_path: path.to_string_lossy().to_string(),
+            raw_transcript: text.into(),
+            annotated_transcript: Some(text.to_string()),
+            duration_ms: 1200,
+            speaker_id: Some("spk1".into()),
+            verified: true,
+            clipping_ratio: Some(0.0),
+            rms_db: Some(-20.0),
+            snr_db: Some(20.0),
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+    }
+    db.revoke_recording(&revoked.to_string_lossy()).unwrap();
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+    // NON-production: the path the review flagged, and the one an owner uses day to day.
+    export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+
+    // 1. The withdrawn transcript must not appear in ANY artifact the bundle wrote.
+    for entry in std::fs::read_dir(&out).unwrap().flatten() {
+        if entry.path().is_file() {
+            let body = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            assert!(
+                !body.contains("دەقی سڕاوە") && !body.contains("revoked-1"),
+                "withdrawn content leaked into {:?}",
+                entry.file_name()
+            );
+        }
+    }
+
+    // 2. The manifest headline must equal what the data files actually contain — not merely be small.
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let dataset: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("dataset.json")).unwrap()).unwrap();
+    let rows = dataset["segments"].as_array().expect("dataset.json carries a segments array").len();
+    assert_eq!(rows, 1, "only the consenting clip may be written");
+    assert_eq!(
+        manifest["segmentCount"].as_u64(),
+        Some(rows as u64),
+        "manifest count must match the rows in dataset.json, not the pre-filter list"
+    );
+    // dataset.json states its own total in its metadata envelope too — three numbers, one population.
+    let embedded = dataset["metadata"]["totalSegments"]
+        .as_u64()
+        .or_else(|| dataset["metadata"]["total_segments"].as_u64())
+        .expect("dataset.json metadata carries a total-segments count");
+    assert_eq!(embedded, rows as u64, "dataset.json's embedded total must match its own rows");
+
+    // 3. And the card, which is the human-facing claim.
+    let card = std::fs::read_to_string(out.join("dataset_card.md")).unwrap();
+    assert!(card.contains(&rows.to_string()), "dataset card must state the shipped count: {card}");
+}
+
 #[test]
 fn production_export_blocks_clips_without_declared_redistribution_rights() {
     let db = Database::open(":memory:").unwrap();
