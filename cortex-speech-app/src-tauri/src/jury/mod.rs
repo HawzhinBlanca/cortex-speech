@@ -71,6 +71,32 @@ pub struct T0GateReport {
     pub decisions: Vec<T0Decision>,
 }
 
+/// Version of the T0 routing POLICY whose decisions are recorded in `evidence_json`.
+///
+/// Bump this whenever the routing rule changes — a new veto, a removed one, a different nonconformity
+/// formula. Without it, a stored reason set is uninterpretable the moment the policy moves: you cannot
+/// tell "this clip had no `low_snr`" from "the policy did not check `low_snr` yet".
+pub const T0_POLICY_VERSION: &str = "t0-2026-08-07";
+
+/// Machine-stable reason codes. Stable STRINGS, not an enum, because they are persisted into
+/// `evidence_json` and read back by tooling that must keep understanding old rows — renaming a variant
+/// would silently reinterpret history. Kept together so the vocabulary is greppable in one place.
+pub mod reason {
+    /// Signal-to-noise ratio below `quality::POOR_AUDIO_SNR_DB`.
+    pub const LOW_SNR: &str = "low_snr";
+    /// Clipping ratio above `quality::POOR_AUDIO_CLIPPING_RATIO`.
+    pub const CLIPPING: &str = "clipping";
+    /// Fewer than two DISTINCT recognizers contributed a non-empty hypothesis, so the "consensus" is a
+    /// degenerate single-model prior.
+    pub const SINGLE_RECOGNIZER: &str = "single_recognizer";
+    /// Nonconformity exceeded the calibrated conformal threshold — the recognizers genuinely disagreed.
+    pub const MODEL_DISAGREEMENT: &str = "model_disagreement";
+    /// This clip's acoustic (SNR) bucket has no conformal calibration, so no threshold could be applied
+    /// and the gate failed CLOSED. Not a statement about the audio or the models — a statement about
+    /// the evidence available to judge them.
+    pub const UNCALIBRATED_BUCKET: &str = "uncalibrated_bucket";
+}
+
 /// Hard distrust vetoes that block an auto-accept no matter how high the IRT agreement is: poor audio
 /// quality (low SNR / clipping) or a single distinct recognizer. With <2 distinct voters the IRT
 /// "consensus" is a degenerate single-hypothesis prior, and a lone model's confidence is the most
@@ -79,11 +105,23 @@ pub struct T0GateReport {
 /// confidence on audio/consensus the gate explicitly distrusted. (NOTE: 300M and 1B are architecturally
 /// KIN, so two-of-them agreement can still be a correlated confident error — adding an architecturally
 /// INDEPENDENT recognizer's vote is the follow-up that fully closes that hole.)
-fn has_hard_distrust_veto(seg: &SpeechSegment, hyps: &[SegmentHypothesis]) -> bool {
+///
+/// Returns WHICH vetoes fired, not merely whether one did (external review 2026-08-06, P1.2). This
+/// function always knew the difference between "the audio is unusable" and "only one model spoke" and
+/// collapsed both into a bool, so every escalated row recorded that it was escalated and nothing about
+/// why — and those two call for opposite reviewer actions. Empty result means no veto.
+fn hard_distrust_reasons(seg: &SpeechSegment, hyps: &[SegmentHypothesis]) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
     // P1.2: the thresholds live in ONE place now (quality::POOR_AUDIO_*), shared with the suspect-first
     // SQL ordering. This site is the authority on what the rule MEANS; it no longer also owns a private
-    // copy of the numbers.
-    let poor_quality = crate::quality::has_poor_audio(seg.snr_db, seg.clipping_ratio);
+    // copy of the numbers. Reported SEPARATELY here — a clip failed by clipping needs re-recording, a
+    // clip failed by SNR may just need a denoise pass.
+    if seg.snr_db.is_some_and(|snr| snr < crate::quality::POOR_AUDIO_SNR_DB) {
+        reasons.push(reason::LOW_SNR);
+    }
+    if seg.clipping_ratio.is_some_and(|clip| clip > crate::quality::POOR_AUDIO_CLIPPING_RATIO) {
+        reasons.push(reason::CLIPPING);
+    }
     // Count only voters that actually CONTRIBUTED to the consensus. fit_irt_consensus drops
     // empty-transcript hypotheses before building the consensus + irt_confidence, so an empty "" from
     // one model (common when 300M and 1B disagree on whether a low-energy span contains speech) must
@@ -97,7 +135,16 @@ fn has_hard_distrust_veto(seg: &SpeechSegment, hyps: &[SegmentHypothesis]) -> bo
         ids.dedup();
         ids.len()
     };
-    poor_quality || distinct_voters < 2
+    if distinct_voters < 2 {
+        reasons.push(reason::SINGLE_RECOGNIZER);
+    }
+    reasons
+}
+
+/// Whether any hard veto fired. Derived from [`hard_distrust_reasons`] so the routing decision and the
+/// recorded explanation can never disagree about it.
+fn has_hard_distrust_veto(seg: &SpeechSegment, hyps: &[SegmentHypothesis]) -> bool {
+    !hard_distrust_reasons(seg, hyps).is_empty()
 }
 
 /// Evaluate a single segment against the IRT consensus and conformal threshold.
@@ -304,9 +351,23 @@ pub fn run_t0_gate(
         // condition. (Under ActAuto the gate is bypassed downstream anyway; this hardens the default
         // ActConfirm path, where the threshold actually has teeth.)
         let bucket = conformal::snr_bucket(seg.snr_db);
+        // P1.2: assemble the machine-stable WHY alongside the routing decision. Every escalation used to
+        // write rationale=NULL and evidence_json=NULL, so a reviewer opening an escalated clip saw
+        // `escalated=1, agent_confidence=0.73` and could not tell bad audio from a lone recognizer from
+        // genuine disagreement from an uncalibrated bucket — four causes that call for four different
+        // actions. Computed from the SAME inputs the decision used, so the record cannot describe a
+        // decision that was not made.
+        let mut reason_codes: Vec<&'static str> = hard_distrust_reasons(seg, &seg_hyps);
+        let nonconformity = conformal::nonconformity(irt_confidence, seg.ctc_score);
         let base_decision = if bucket_calibrated[bucket] {
+            if nonconformity > bucket_thresholds[bucket] {
+                reason_codes.push(reason::MODEL_DISAGREEMENT);
+            }
             t0_gate_segment(seg, &seg_hyps, &consensus, irt_confidence, bucket_thresholds[bucket])
         } else {
+            // A DIFFERENT statement from the others: not about the audio or the models, but about the
+            // evidence available to judge them. The gate fails closed and says so.
+            reason_codes.push(reason::UNCALIBRATED_BUCKET);
             T0Decision::EscalateToT1 {
                 segment_id: seg.id.clone(),
                 hypotheses: seg_hyps.clone(),
@@ -330,7 +391,25 @@ pub fn run_t0_gate(
                     // ordering (COALESCE(agent_confidence, 0.5) ASC) saw a constant and silently
                     // degraded to recency — "riskiest-first" was nominal. With the real confidence
                     // persisted, the most-disagreed-on clips genuinely surface first.
-                    write_verdict(db, &seg.id, Verdict::Escalated, None, None, None, Some(irt_confidence))?;
+                    //
+                    // P1.2: and the WHY travels with it. evidence_json is an already-persisted,
+                    // already-exported column, so this needs no migration. `low_snr`/`clipping` are
+                    // recorded AS THEY WERE at decision time — that is history, and deliberately a
+                    // different question from the live review badge, which derives from the row's
+                    // current values. calibrationBucket + threshold pin the moving conformal threshold
+                    // this clip was judged against; without them a decision made last month cannot be
+                    // reconstructed at all, because the threshold recalibrates as the corpus grows.
+                    let evidence = serde_json::json!({
+                        "reasonCodes": reason_codes,
+                        "policyVersion": T0_POLICY_VERSION,
+                        "calibrationBucket": bucket,
+                        "bucketCalibrated": bucket_calibrated[bucket],
+                        "threshold": bucket_calibrated[bucket].then(|| bucket_thresholds[bucket]),
+                        "nonconformity": nonconformity,
+                        "irtConfidence": irt_confidence,
+                    })
+                    .to_string();
+                    write_verdict(db, &seg.id, Verdict::Escalated, None, None, Some(&evidence), Some(irt_confidence))?;
                 }
                 escalated += 1;
             }
@@ -688,6 +767,80 @@ mod tests {
         }
     }
 
+    /// The four escalation causes must be DISTINGUISHABLE, and each must fire only on its own cause.
+    ///
+    /// P1.2. `has_hard_distrust_veto` returned a bool, so "the audio is unusable", "only one model
+    /// spoke" and "the models genuinely disagreed" were the same fact on the row: escalated=1 with a
+    /// NULL rationale. Those call for opposite reviewer actions — re-record, get another recognizer, or
+    /// actually listen and adjudicate — so a queue that cannot tell them apart cannot be triaged.
+    ///
+    /// Asserted as SETS, so a code leaking into a case it does not describe fails just as loudly as a
+    /// missing one. A reason vocabulary that over-reports is exactly as useless as one that under-reports.
+    #[test]
+    fn hard_distrust_reasons_separate_bad_audio_from_a_lone_recognizer() {
+        let two_voters = vec![make_hyp("s1", "asr-300m", "کوردستان"), make_hyp("s1", "asr-1b", "کوردستان")];
+
+        // Clean audio, two recognizers: nothing to say.
+        let clean = make_seg("s1", "کوردستان");
+        assert!(hard_distrust_reasons(&clean, &two_voters).is_empty(), "a clean clip must veto nothing");
+        assert!(!has_hard_distrust_veto(&clean, &two_voters));
+
+        // Low SNR alone.
+        let mut noisy = make_seg("s1", "کوردستان");
+        noisy.snr_db = Some(crate::quality::POOR_AUDIO_SNR_DB - 1.0);
+        assert_eq!(hard_distrust_reasons(&noisy, &two_voters), vec![reason::LOW_SNR]);
+
+        // Clipping alone — a DIFFERENT remedy from low SNR (re-record vs denoise), so a different code.
+        let mut clipped = make_seg("s1", "کوردستان");
+        clipped.clipping_ratio = Some(crate::quality::POOR_AUDIO_CLIPPING_RATIO + 0.05);
+        assert_eq!(hard_distrust_reasons(&clipped, &two_voters), vec![reason::CLIPPING]);
+
+        // One distinct recognizer, on clean audio: not an audio problem at all.
+        let lone = vec![make_hyp("s1", "asr-300m", "کوردستان")];
+        assert_eq!(hard_distrust_reasons(&clean, &lone), vec![reason::SINGLE_RECOGNIZER]);
+
+        // An empty hypothesis does not count as a voter (the invariant the veto exists to enforce), so
+        // this is still a lone recognizer rather than two.
+        let one_empty = vec![make_hyp("s1", "asr-300m", "کوردستان"), make_hyp("s1", "asr-1b", "   ")];
+        assert_eq!(
+            hard_distrust_reasons(&clean, &one_empty),
+            vec![reason::SINGLE_RECOGNIZER],
+            "an empty transcript must not be counted as a second voter"
+        );
+
+        // Several causes at once are all reported — a clip can be both unusable AND under-witnessed,
+        // and collapsing that to one reason would hide half of what is wrong with it.
+        let mut both = make_seg("s1", "کوردستان");
+        both.snr_db = Some(crate::quality::POOR_AUDIO_SNR_DB - 1.0);
+        both.clipping_ratio = Some(crate::quality::POOR_AUDIO_CLIPPING_RATIO + 0.05);
+        assert_eq!(
+            hard_distrust_reasons(&both, &lone),
+            vec![reason::LOW_SNR, reason::CLIPPING, reason::SINGLE_RECOGNIZER]
+        );
+
+        // The bool the router uses stays exactly the complement of "no reasons", so the routing decision
+        // and the recorded explanation can never disagree.
+        for (seg, hyps) in [(&clean, &two_voters), (&noisy, &two_voters), (&clean, &lone), (&both, &lone)] {
+            assert_eq!(
+                has_hard_distrust_veto(seg, hyps),
+                !hard_distrust_reasons(seg, hyps).is_empty(),
+                "the veto bool must be derived from the reasons, never computed separately"
+            );
+        }
+    }
+
+    /// An unmeasured signal is not a veto. Absence of a measurement is not evidence of bad audio.
+    #[test]
+    fn an_unmeasured_snr_or_clipping_never_vetoes() {
+        let seg = make_seg("s1", "کوردستان"); // snr_db: None, clipping_ratio: None
+        let two = vec![make_hyp("s1", "asr-300m", "x"), make_hyp("s1", "asr-1b", "x")];
+        assert!(seg.snr_db.is_none() && seg.clipping_ratio.is_none(), "fixture must actually be unmeasured");
+        assert!(
+            hard_distrust_reasons(&seg, &two).is_empty(),
+            "an unmeasured clip must not be reported as low_snr or clipping"
+        );
+    }
+
     #[test]
     fn test_t0_gate_auto_accept() {
         let seg = make_seg("s1", "کوردستان");
@@ -1010,5 +1163,37 @@ mod tests {
         assert_eq!(report.auto_accepted, 0, "no calibrated bucket → nothing may auto-accept");
         assert_eq!(report.escalated, 1, "the segment fails closed to human review");
         assert!(matches!(report.decisions[0], T0Decision::EscalateToT1 { .. }));
+
+        // P1.2: and the row must now SAY WHY. Before this, every escalation wrote evidence_json=NULL, so
+        // this clip — escalated purely because no bucket was calibrated — was indistinguishable on the
+        // row from one escalated for unusable audio or for genuine model disagreement. Read back through
+        // the real database, because an evidence string that never survives the write is not evidence.
+        let stored = db.get_segment_by_id("s-uncal").unwrap().unwrap();
+        let evidence: serde_json::Value =
+            serde_json::from_str(stored.evidence_json.as_deref().expect("an escalation must record why"))
+                .expect("evidence_json must be valid JSON for tooling to read it back");
+
+        let codes: Vec<&str> =
+            evidence["reasonCodes"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+        assert_eq!(
+            codes,
+            vec![reason::UNCALIBRATED_BUCKET],
+            "this clip has clean audio and two voters — the ONLY honest reason is the uncalibrated bucket"
+        );
+        assert_eq!(evidence["bucketCalibrated"], serde_json::json!(false));
+        assert_eq!(
+            evidence["threshold"],
+            serde_json::Value::Null,
+            "there is no threshold to record when no bucket was calibrated — recording one would invent it"
+        );
+        assert_eq!(
+            evidence["policyVersion"],
+            serde_json::json!(T0_POLICY_VERSION),
+            "without the policy version a stored reason set is uninterpretable once the rule moves"
+        );
+        // The moving conformal threshold is the reason this has to be persisted at all: it recalibrates
+        // as the corpus grows, so these two cannot be recovered from the row afterwards.
+        assert!(evidence["nonconformity"].is_number());
+        assert!(evidence["irtConfidence"].is_number());
     }
 }
