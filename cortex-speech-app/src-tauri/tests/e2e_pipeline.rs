@@ -13,6 +13,64 @@ use cortex_speech_app_lib::settings::{AppSettings, AsrModelSize};
 use std::sync::Arc;
 use tempfile::TempDir;
 
+/// Names the test in flight so the NEXT 0xC0000409 abort says which one it was.
+///
+/// This binary has died twice to `fatal runtime error: Rust cannot catch foreign exceptions` /
+/// STATUS_STACK_BUFFER_OVERRUN — a C++ exception escaping the native ONNX/sherpa stack across the FFI
+/// boundary. Both times the log recorded only "Running tests\e2e_pipeline.rs" and nothing else, so
+/// after two occurrences it is still unknown WHICH test was executing. The process dies before libtest
+/// can attribute anything, and it has never reproduced standalone (10/10 clean immediately after the
+/// most recent one), so a diagnostic that needs reproduction is worthless here — it has to be armed
+/// during the sweep where the crash actually happens.
+///
+/// Two mechanisms, because either alone is insufficient:
+///
+///   1. A process-wide MUTEX makes this binary's tests serial, so exactly one is ever in flight. Scoped
+///      to THIS binary on purpose: `--test-threads=1` on the whole gate was MEASURED at 365 s vs 140 s
+///      for the lib suite alone (2.6x), which is ~14 minutes added to every sweep to instrument one
+///      file. The mutex costs this binary a few seconds and nothing else anything.
+///   2. An explicitly FLUSHED breadcrumb file. libtest's own "test <name> ... " line is written without
+///      a trailing newline, and stdout to a pipe is line-buffered — the exact trap the ledger already
+///      documented for Node — so on an abort that line can be lost with everything else in the buffer.
+///      A flushed file survives, because the abort cannot unwind what is already on disk.
+///
+/// On a clean run every START is followed by its END. After an abort the last START stands alone, and
+/// that is the answer. Best-effort throughout: a diagnostic that could fail a healthy test would be
+/// worse than no diagnostic.
+fn crash_breadcrumb(test_name: &'static str) -> impl Drop {
+    use std::io::Write;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn note(line: &str) {
+        // Beside the other sweep artifacts, so a crash investigation finds it with the FAIL/CRASH logs.
+        let path = std::env::temp_dir().join("cortex-verify10").join("e2e_pipeline.breadcrumb.log");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
+        }
+    }
+
+    struct Breadcrumb {
+        name: &'static str,
+        _guard: MutexGuard<'static, ()>,
+    }
+    impl Drop for Breadcrumb {
+        fn drop(&mut self) {
+            note(&format!("END   {}", self.name));
+        }
+    }
+
+    // A poisoned lock means an EARLIER test panicked, which is not a reason to stop naming this one.
+    let guard = SERIAL.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner());
+    note(&format!("START {test_name}"));
+    Breadcrumb { name: test_name, _guard: guard }
+}
+
 fn setup_pipeline() -> (ProcessingPipeline, String, TempDir) {
     let tmp = TempDir::new().unwrap();
     let models_dir = tmp.path().join("models");
@@ -44,6 +102,7 @@ fn setup_pipeline() -> (ProcessingPipeline, String, TempDir) {
 
 #[test]
 fn test_e2e_import_produces_segments() {
+    let _crash_breadcrumb = crash_breadcrumb("test_e2e_import_produces_segments");
     let dir = TempDir::new().unwrap();
     fixtures::create_test_wav(&dir.path().join("test1.wav"), 1.0, 16000, 440.0).unwrap();
     fixtures::create_test_wav(&dir.path().join("test2.wav"), 0.5, 16000, 880.0).unwrap();
@@ -75,6 +134,7 @@ fn test_e2e_import_produces_segments() {
 
 #[test]
 fn test_e2e_vad_detects_speech() {
+    let _crash_breadcrumb = crash_breadcrumb("test_e2e_vad_detects_speech");
     let tmp = TempDir::new().unwrap();
     let wav_path = tmp.path().join("speech.wav");
     fixtures::create_test_wav(&wav_path, 2.0, 16000, 440.0).unwrap();
@@ -90,6 +150,7 @@ fn test_e2e_vad_detects_speech() {
 
 #[test]
 fn test_e2e_vad_silent_fallback() {
+    let _crash_breadcrumb = crash_breadcrumb("test_e2e_vad_silent_fallback");
     let tmp = TempDir::new().unwrap();
     let wav_path = tmp.path().join("silence.wav");
     fixtures::create_silent_wav(&wav_path, 1.0, 16000).unwrap();
@@ -104,6 +165,7 @@ fn test_e2e_vad_silent_fallback() {
 
 #[test]
 fn test_e2e_asr_no_models() {
+    let _crash_breadcrumb = crash_breadcrumb("test_e2e_asr_no_models");
     let tmp = TempDir::new().unwrap();
     let mut asr = KurdishAsrService::new(tmp.path(), false).unwrap();
     assert!(!asr.is_available(), "ASR should not be available without models");
@@ -114,6 +176,7 @@ fn test_e2e_asr_no_models() {
 
 #[test]
 fn test_e2e_normalizer_sorani() {
+    let _crash_breadcrumb = crash_breadcrumb("test_e2e_normalizer_sorani");
     let normalizer = SoraniNormalizer::new();
 
     let input = "ئەم تاقیکردنەیە";
@@ -123,6 +186,7 @@ fn test_e2e_normalizer_sorani() {
 
 #[test]
 fn test_e2e_alignment() {
+    let _crash_breadcrumb = crash_breadcrumb("test_e2e_alignment");
     let tmp = TempDir::new().unwrap();
     let wav_path = tmp.path().join("align.wav");
     fixtures::create_test_wav(&wav_path, 1.0, 16000, 440.0).unwrap();
@@ -144,6 +208,7 @@ fn test_e2e_alignment() {
 
 #[test]
 fn test_e2e_model_manager_status() {
+    let _crash_breadcrumb = crash_breadcrumb("test_e2e_model_manager_status");
     let tmp = TempDir::new().unwrap();
     let mgr = ModelManager::new(tmp.path().to_path_buf());
     mgr.ensure_dir().unwrap();
@@ -157,6 +222,7 @@ fn test_e2e_model_manager_status() {
 
 #[test]
 fn test_e2e_decode_timeout() {
+    let _crash_breadcrumb = crash_breadcrumb("test_e2e_decode_timeout");
     let tmp = TempDir::new().unwrap();
     let wav_path = tmp.path().join("normal.wav");
     fixtures::create_test_wav(&wav_path, 0.5, 16000, 440.0).unwrap();
@@ -167,6 +233,7 @@ fn test_e2e_decode_timeout() {
 
 #[test]
 fn test_e2e_health_check() {
+    let _crash_breadcrumb = crash_breadcrumb("test_e2e_health_check");
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("health.db");
     let db_path_str = db_path.to_str().unwrap().to_string();
@@ -184,6 +251,7 @@ fn test_e2e_health_check() {
 
 #[test]
 fn test_e2e_mixed_audio_formats() {
+    let _crash_breadcrumb = crash_breadcrumb("test_e2e_mixed_audio_formats");
     let dir = TempDir::new().unwrap();
     fixtures::create_test_wav(&dir.path().join("16k.wav"), 0.3, 16000, 440.0).unwrap();
     fixtures::create_test_wav(&dir.path().join("44k.wav"), 0.2, 44100, 880.0).unwrap();
