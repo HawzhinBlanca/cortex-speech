@@ -10,8 +10,12 @@ use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
 
+#[path = "fixtures/mod.rs"]
+mod fixtures;
+
 #[test]
 fn test_user_podcast_file() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("user_data_test", "test_user_podcast_file");
     let Some(path) = std::env::var_os("CORTEX_USER_PODCAST_FILE").map(PathBuf::from) else {
         println!("Set CORTEX_USER_PODCAST_FILE to run this real-data test; skipping gracefully");
         return;
@@ -101,6 +105,7 @@ fn test_user_podcast_file() {
 
 #[test]
 fn user_dataset_export_path_stays_under_target() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("user_data_test", "user_dataset_export_path_stays_under_target");
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert_eq!(user_dataset_export_path(project_root), project_root.join("target").join("user_dataset_output.json"));
 }

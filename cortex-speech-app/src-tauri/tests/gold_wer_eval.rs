@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 
+#[path = "fixtures/mod.rs"]
+mod fixtures;
+
 #[derive(serde::Deserialize)]
 struct GoldRow {
     audio_filepath: String,
@@ -36,6 +39,7 @@ fn head(s: &str, n: usize) -> String {
 #[test]
 #[ignore]
 fn gold_wer_real_omniasr() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("gold_wer_eval", "gold_wer_real_omniasr");
     let manifest = match std::env::var("CORTEX_GOLD_MANIFEST") {
         Ok(m) => m,
         Err(_) => {
@@ -199,6 +203,8 @@ fn gold_wer_real_omniasr() {
 /// not a wild regression (a generous ceiling, not a tight bound masquerading as statistical confidence).
 #[test]
 fn finetuned_gold_regression_on_committed_fleurs_fixture() {
+    let _crash_breadcrumb =
+        fixtures::crash_breadcrumb("gold_wer_eval", "finetuned_gold_regression_on_committed_fleurs_fixture");
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let model_dir = manifest_dir.join("models").join("finetuned-mms-ckb");
     let onnx = model_dir.join("model.onnx");
@@ -282,6 +288,7 @@ fn finetuned_gold_regression_on_committed_fleurs_fixture() {
 #[test]
 #[ignore]
 fn compare_300m_vs_1b() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("gold_wer_eval", "compare_300m_vs_1b");
     let manifest = match std::env::var("CORTEX_GOLD_MANIFEST") {
         Ok(m) => m,
         Err(_) => {
@@ -382,6 +389,7 @@ fn compare_300m_vs_1b() {
 #[test]
 #[ignore]
 fn whole_file_wer_real_omniasr() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("gold_wer_eval", "whole_file_wer_real_omniasr");
     let audio_path = match std::env::var("CORTEX_WHOLE_AUDIO") {
         Ok(a) => a,
         Err(_) => {
@@ -447,6 +455,7 @@ fn whole_file_wer_real_omniasr() {
 #[test]
 #[ignore]
 fn pipeline_whole_file_wer() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("gold_wer_eval", "pipeline_whole_file_wer");
     let audio_path = match std::env::var("CORTEX_WHOLE_AUDIO") {
         Ok(a) => a,
         Err(_) => {
@@ -520,6 +529,7 @@ fn pipeline_whole_file_wer() {
 #[test]
 #[ignore]
 fn verbatim_wer_from_worksheet() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("gold_wer_eval", "verbatim_wer_from_worksheet");
     let tsv = match std::env::var("CORTEX_VERBATIM_TSV") {
         Ok(t) => t,
         Err(_) => {

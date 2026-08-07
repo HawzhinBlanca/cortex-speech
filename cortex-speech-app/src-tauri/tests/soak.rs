@@ -44,6 +44,7 @@ fn setup_pipeline() -> (ProcessingPipeline, String, TempDir) {
 
 #[test]
 fn soak_import_many_minutes_of_synthetic_audio() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("soak", "soak_import_many_minutes_of_synthetic_audio");
     let audio_dir = TempDir::new().unwrap();
     // 12 × 30s clips ≈ 6 minutes total — fast but exercises chunking + DB batching.
     for i in 0..12 {

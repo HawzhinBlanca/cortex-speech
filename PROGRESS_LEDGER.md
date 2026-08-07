@@ -7453,3 +7453,36 @@ full sweep.
 
 Two sweeps redded honestly to learn this (20260807T152120 and 20260807T172029), both preserved. Neither
 was papered over with a re-run, and the second one is the one that paid.
+
+## Iteration 261 — complete instrumentation coverage, decided by measurement not caution
+
+Iteration 260 armed two binaries and named six more as deliberately unarmed, on the reasoning that
+instrumenting eight files against a crash seen three times was speculative. That reasoning was checked
+rather than kept, and the numbers overturned it.
+
+**Measured cost of arming everything:** `reliability` is the only binary with a large live test count
+(23) and serialising it costs **+3 s** (19.6 s vs 16.7 s). Every other candidate runs 1-2 live tests, the
+rest being `#[ignore]`d. So complete coverage costs seconds, not the minutes the caution assumed — and
+"cheap enough to be worth it" is a measurement, not a judgement call.
+
+**And the ignored tests are the ones that matter most.** `real_audio` (21 ignored) and `batch_asr`
+(1 ignored) run under the `ignored-real-model` gate against REAL models — the heaviest native ONNX/sherpa
+usage in the entire suite, and therefore the likeliest place for a C++ exception to escape. Leaving them
+unarmed would have left the blind spot exactly where the crash is most likely.
+
+All 69 tests across all 8 native-path binaries are now armed: e2e_pipeline 10, pipeline_integration 4,
+batch_asr 1, gold_wer_eval 6, real_audio 22, reliability 23, soak 1, user_data_test 2.
+
+**A bug in the first arming pass, found by checking coverage instead of trusting the script.** The
+original regex keyed on the function NAME (`fn test_*`), so it silently missed every test not following
+that convention — `gold_wer_real_omniasr`, `soak_import_many_minutes_of_synthetic_audio`,
+`user_dataset_export_path_stays_under_target`, and 9 of real_audio's 22. It reported "armed 0" for two
+files and nobody would have noticed until a crash in one of them produced nothing. Rewritten to key on
+the `#[test]` ATTRIBUTE and made idempotent, then verified by counting armed-vs-total per binary rather
+than trusting the reported number.
+
+That is the same failure shape this session keeps finding in its own work: trusting a proxy (a naming
+convention) instead of the thing itself (the attribute that actually defines a test).
+
+Still not fixed and still not claimed as fixed. What this buys: the next occurrence, in any of the eight,
+names its binary and its test instead of costing a sweep and yielding nothing.

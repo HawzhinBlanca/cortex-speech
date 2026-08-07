@@ -75,6 +75,7 @@ fn create_pipeline(db_path: &str) -> ProcessingPipeline {
 
 #[test]
 fn test_session_survives_crash() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_session_survives_crash");
     let tmp = TempDir::new().unwrap();
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
@@ -106,6 +107,7 @@ fn test_session_survives_crash() {
 
 #[test]
 fn test_corrupt_database_detection_valid() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_corrupt_database_detection_valid");
     let (db, _path) = setup_db();
     db.insert_segment(&make_seg("valid_1", "/a.wav", "test")).unwrap();
     db.wal_checkpoint().unwrap();
@@ -116,6 +118,7 @@ fn test_corrupt_database_detection_valid() {
 
 #[test]
 fn test_corrupt_database_detection_corrupted() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_corrupt_database_detection_corrupted");
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap().to_string();
 
@@ -154,6 +157,7 @@ fn test_corrupt_database_detection_corrupted() {
 
 #[test]
 fn test_concurrent_instance_prevention() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_concurrent_instance_prevention");
     let tmp = TempDir::new().unwrap();
 
     let lock1 = InstanceLock::try_lock(tmp.path());
@@ -172,6 +176,7 @@ fn test_concurrent_instance_prevention() {
 
 #[test]
 fn test_rate_limiter_basic() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_rate_limiter_basic");
     let mut limiter = RateLimiter::new(5);
 
     for i in 0..5 {
@@ -187,6 +192,7 @@ fn test_rate_limiter_basic() {
 
 #[test]
 fn test_rate_limiter_burst_exact() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_rate_limiter_burst_exact");
     let mut limiter = RateLimiter::new(3);
 
     assert!(limiter.check("test").is_ok(), "burst token 1");
@@ -199,6 +205,7 @@ fn test_rate_limiter_burst_exact() {
 
 #[test]
 fn test_audio_decode_normal() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_audio_decode_normal");
     let tmp = TempDir::new().unwrap();
     let wav_path = tmp.path().join("normal.wav");
     fixtures::create_test_wav(&wav_path, 0.5, 16000, 440.0).unwrap();
@@ -211,6 +218,7 @@ fn test_audio_decode_normal() {
 
 #[test]
 fn test_audio_decode_long_silent_file() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_audio_decode_long_silent_file");
     let tmp = TempDir::new().unwrap();
     let long_wav = tmp.path().join("long_silent.wav");
     fixtures::create_silent_wav(&long_wav, 60.0, 16000).unwrap();
@@ -223,6 +231,7 @@ fn test_audio_decode_long_silent_file() {
 
 #[test]
 fn test_audio_decode_with_timeout_wrapper() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_audio_decode_with_timeout_wrapper");
     let tmp = TempDir::new().unwrap();
     let wav_path = tmp.path().join("timeout_test.wav");
     fixtures::create_silent_wav(&wav_path, 120.0, 16000).unwrap();
@@ -246,6 +255,7 @@ fn test_audio_decode_with_timeout_wrapper() {
 
 #[test]
 fn test_pipeline_import_rollback() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_pipeline_import_rollback");
     let dir = TempDir::new().unwrap();
     fixtures::create_test_wav(&dir.path().join("rollback_1.wav"), 0.5, 16000, 440.0).unwrap();
     fixtures::create_test_wav(&dir.path().join("rollback_2.wav"), 0.3, 16000, 880.0).unwrap();
@@ -276,6 +286,7 @@ fn test_pipeline_import_rollback() {
 
 #[test]
 fn test_pipeline_import_empty_directory() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_pipeline_import_empty_directory");
     let dir = TempDir::new().unwrap();
 
     let (_db, db_path) = setup_db();
@@ -290,6 +301,7 @@ fn test_pipeline_import_empty_directory() {
 
 #[test]
 fn test_cancellation_token_basic() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_cancellation_token_basic");
     let token = CancellationToken::new();
 
     assert!(!token.is_cancelled(), "New token should not be cancelled");
@@ -303,6 +315,7 @@ fn test_cancellation_token_basic() {
 
 #[test]
 fn test_cancellation_token_clone_independent() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_cancellation_token_clone_independent");
     let original = CancellationToken::new();
     let cloned = original.child_token();
 
@@ -317,6 +330,7 @@ fn test_cancellation_token_clone_independent() {
 
 #[test]
 fn test_cancellation_token_new_independent() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_cancellation_token_new_independent");
     let token1 = CancellationToken::new();
     let token2 = CancellationToken::new();
 
@@ -331,6 +345,7 @@ fn test_cancellation_token_new_independent() {
 
 #[test]
 fn test_health_check() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_health_check");
     let (_db, path) = setup_db();
     let (model_mgr, _models_tmp) = setup_model_mgr();
 
@@ -351,6 +366,7 @@ fn test_health_check() {
 
 #[test]
 fn test_health_check_with_data() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_health_check_with_data");
     let (_db, path) = setup_db();
     let (model_mgr, _models_tmp) = setup_model_mgr();
 
@@ -368,6 +384,7 @@ fn test_health_check_with_data() {
 
 #[test]
 fn test_multi_threaded_lock_ordering_same_order() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_multi_threaded_lock_ordering_same_order");
     let lock_a = Arc::new(Mutex::new(()));
     let lock_b = Arc::new(Mutex::new(()));
 
@@ -405,6 +422,8 @@ fn test_multi_threaded_lock_ordering_same_order() {
 
 #[test]
 fn test_multi_threaded_lock_ordering_opposite_order() {
+    let _crash_breadcrumb =
+        fixtures::crash_breadcrumb("reliability", "test_multi_threaded_lock_ordering_opposite_order");
     let lock_a = Arc::new(Mutex::new(()));
     let lock_b = Arc::new(Mutex::new(()));
     let barrier = Arc::new(Barrier::new(2));
@@ -445,6 +464,7 @@ fn test_multi_threaded_lock_ordering_opposite_order() {
 
 #[test]
 fn test_concurrent_db_access_no_deadlock() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_concurrent_db_access_no_deadlock");
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap().to_string();
     let db = Arc::new(Mutex::new(Database::open(&path).unwrap()));
@@ -488,6 +508,7 @@ fn test_concurrent_db_access_no_deadlock() {
 
 #[test]
 fn test_instance_lock_drop_releases() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_instance_lock_drop_releases");
     let tmp = TempDir::new().unwrap();
 
     {
@@ -499,6 +520,7 @@ fn test_instance_lock_drop_releases() {
 
 #[test]
 fn test_rate_limiter_zero_rate() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_rate_limiter_zero_rate");
     let mut limiter = RateLimiter::new(0);
     assert!(limiter.check("test").is_err(), "Zero rate should never allow");
     std::thread::sleep(Duration::from_millis(500));
@@ -507,6 +529,8 @@ fn test_rate_limiter_zero_rate() {
 
 #[test]
 fn test_cancellation_token_multiple_cancel_idempotent() {
+    let _crash_breadcrumb =
+        fixtures::crash_breadcrumb("reliability", "test_cancellation_token_multiple_cancel_idempotent");
     let token = CancellationToken::new();
     token.cancel();
     token.cancel();
@@ -517,6 +541,7 @@ fn test_cancellation_token_multiple_cancel_idempotent() {
 
 #[test]
 fn test_health_check_empty_db_fields() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("reliability", "test_health_check_empty_db_fields");
     let (_db, path) = setup_db();
     let (model_mgr, _models_tmp) = setup_model_mgr();
     let db = Database::open(&path).unwrap();

@@ -94,6 +94,7 @@ fn setup_pipeline() -> (ProcessingPipeline, String, TempDir) {
 #[test]
 #[ignore]
 fn test_decode_mp4_small() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_decode_mp4_small");
     let Some(path) = first_fixture_with_extensions(&["mp4"]) else {
         eprintln!("[mp4] skip: no mp4 fixture found under {REAL_AUDIO_DIR_ENV}");
         return;
@@ -128,6 +129,7 @@ fn test_decode_mp4_small() {
 #[test]
 #[ignore]
 fn test_decode_mp4_batch_small() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_decode_mp4_batch_small");
     let files: Vec<PathBuf> = fixture_files_with_extensions(&["mp4"]).into_iter().take(10).collect();
 
     if files.is_empty() {
@@ -162,6 +164,7 @@ fn test_decode_mp4_batch_small() {
 #[test]
 #[ignore]
 fn test_decode_any_supported_audio() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_decode_any_supported_audio");
     let Some(path) = first_fixture_with_extensions(SUPPORTED_AUDIO_EXTENSIONS) else {
         eprintln!("[decode any] skip: no supported audio fixture found under {REAL_AUDIO_DIR_ENV}");
         return;
@@ -188,6 +191,7 @@ fn test_decode_any_supported_audio() {
 #[test]
 #[ignore]
 fn test_decode_flac_small() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_decode_flac_small");
     let Some(path) = first_fixture_with_extensions(&["flac"]) else {
         eprintln!("[flac] skip: no flac fixture found under {REAL_AUDIO_DIR_ENV}");
         return;
@@ -219,6 +223,7 @@ fn test_decode_flac_small() {
 #[test]
 #[ignore]
 fn test_decode_mov_small() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_decode_mov_small");
     let Some(path) = first_fixture_with_extensions(&["mov"]) else {
         eprintln!("[mov] skip: no mov fixture found under {REAL_AUDIO_DIR_ENV}");
         return;
@@ -250,6 +255,7 @@ fn test_decode_mov_small() {
 #[test]
 #[ignore]
 fn test_decode_mov_batch() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_decode_mov_batch");
     let files: Vec<PathBuf> = fixture_files_with_extensions(&["mov"]).into_iter().take(10).collect();
 
     if files.is_empty() {
@@ -286,6 +292,7 @@ fn test_decode_mov_batch() {
 #[test]
 #[ignore]
 fn test_vad_on_real_kurdish_audio() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_vad_on_real_kurdish_audio");
     let path = fixture_path("A1-0001_PODCAST-001.mp4");
     if !path.exists() {
         return;
@@ -318,6 +325,7 @@ fn test_vad_on_real_kurdish_audio() {
 #[test]
 #[ignore]
 fn test_normalizer_on_kurdish_text() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_normalizer_on_kurdish_text");
     let normalizer = SoraniNormalizer::new();
 
     let test_cases = vec![
@@ -344,6 +352,7 @@ fn test_normalizer_on_kurdish_text() {
 #[test]
 #[ignore]
 fn test_pipeline_import_supported_audio_directory() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_pipeline_import_supported_audio_directory");
     let Some(dir) = real_audio_root() else {
         eprintln!("[real_audio] skip: set {REAL_AUDIO_DIR_ENV} to run pipeline import test");
         return;
@@ -396,6 +405,7 @@ fn test_pipeline_import_supported_audio_directory() {
 #[test]
 #[ignore]
 fn test_pipeline_process_single_supported_audio() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_pipeline_process_single_supported_audio");
     let Some(path) = first_fixture_with_extensions(SUPPORTED_AUDIO_EXTENSIONS) else {
         eprintln!("[single file] skip: no supported audio fixture found under {REAL_AUDIO_DIR_ENV}");
         return;
@@ -428,6 +438,7 @@ fn test_pipeline_process_single_supported_audio() {
 #[test]
 #[ignore]
 fn test_decode_large_flac() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_decode_large_flac");
     let Some(path) = first_fixture_with_extensions(&["flac"]) else {
         eprintln!("[large flac] skip: no flac fixture found under {REAL_AUDIO_DIR_ENV}");
         return;
@@ -464,6 +475,7 @@ fn omniasr_fixture() -> String {
 #[test]
 #[ignore]
 fn test_omniasr_on_real_audio() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_omniasr_on_real_audio");
     let path = fixture_path(&omniasr_fixture());
     if !path.exists() {
         return;
@@ -536,6 +548,7 @@ fn test_omniasr_on_real_audio() {
 /// asserts the real OmniASR produces a non-blank Kurdish (Arabic-script) transcript (no-fabrication).
 #[test]
 fn omniasr_on_committed_fleurs_ckb_fixture() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "omniasr_on_committed_fleurs_ckb_fixture");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
     if !fixture.exists() {
         eprintln!("[fleurs-gate] committed fixture missing; skipping");
@@ -612,6 +625,7 @@ fn omniasr_on_committed_fleurs_ckb_fixture() {
 #[test]
 #[ignore]
 fn omniasr_rtf_on_committed_fleurs_ckb_fixture() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "omniasr_rtf_on_committed_fleurs_ckb_fixture");
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
     let model_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
     if !fixture.exists() || !model_dir.join("omniasr-ctc-300m/model.int8.onnx").exists() {
@@ -661,6 +675,7 @@ fn omniasr_rtf_on_committed_fleurs_ckb_fixture() {
 #[test]
 #[ignore]
 fn test_gold_eval_real_asr_closes_the_loop() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_gold_eval_real_asr_closes_the_loop");
     // End-to-end proof of M3: `run_gold_eval_with_transcriber` drives the real OmniASR
     // engine over a gold clip and scores the produced hypothesis — an honest CER from
     // audio, never caller-supplied text. Runs in the nightly real-audio job (the WER/CER
@@ -716,6 +731,7 @@ fn test_gold_eval_real_asr_closes_the_loop() {
 #[test]
 #[ignore]
 fn ckb_language_hint_ab() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "ckb_language_hint_ab");
     use cortex_speech_app_lib::asr::{AsrLoadConfig, KurdishAsrService};
     use cortex_speech_app_lib::audio;
 
@@ -759,6 +775,7 @@ fn ckb_language_hint_ab() {
 #[test]
 #[ignore]
 fn ckb_scorecard_on_gold() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "ckb_scorecard_on_gold");
     use cortex_speech_app_lib::asr::{AsrLoadConfig, KurdishAsrService};
     use cortex_speech_app_lib::{audio, wer};
 
@@ -858,6 +875,7 @@ fn ckb_scorecard_on_gold() {
 #[test]
 #[ignore]
 fn transcribe_file_with_finetuned() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "transcribe_file_with_finetuned");
     let Ok(clip) = std::env::var("CORTEX_TRANSCRIBE_FILE") else {
         eprintln!("CORTEX_TRANSCRIBE_FILE not set; skipping");
         return;
@@ -935,6 +953,7 @@ fn transcribe_file_with_finetuned() {
 #[test]
 #[ignore]
 fn pipeline_routes_to_finetuned_when_enabled() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "pipeline_routes_to_finetuned_when_enabled");
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
     let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/finetuned-mms-ckb/model.onnx");
     if !fixture.exists() || !model.exists() {
@@ -979,6 +998,7 @@ fn pipeline_routes_to_finetuned_when_enabled() {
 #[test]
 #[ignore]
 fn import_routes_to_finetuned_when_enabled() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "import_routes_to_finetuned_when_enabled");
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
     let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/finetuned-mms-ckb/model.onnx");
     if !fixture.exists() || !model.exists() {
@@ -1067,6 +1087,7 @@ fn write_wav_16k_mono(path: &Path, pcm: &[i16]) -> std::io::Result<()> {
 #[test]
 #[ignore]
 fn end_to_end_review_run() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "end_to_end_review_run");
     let Ok(clip_path) = std::env::var("CORTEX_TRANSCRIBE_FILE") else {
         eprintln!("CORTEX_TRANSCRIBE_FILE not set; skipping");
         return;
@@ -1147,6 +1168,8 @@ fn end_to_end_review_run() {
 #[test]
 #[ignore]
 fn forced_aligner_reports_ctc_forced_when_the_model_is_installed() {
+    let _crash_breadcrumb =
+        fixtures::crash_breadcrumb("real_audio", "forced_aligner_reports_ctc_forced_when_the_model_is_installed");
     // The NEGATIVE is already pinned in aligner.rs (no model -> energy_heuristic). The POSITIVE was
     // not, and it is exactly the case the background alignment path now depends on: that path used a
     // free `aligner::align()` stub which could never consult a loaded model, so it stamped

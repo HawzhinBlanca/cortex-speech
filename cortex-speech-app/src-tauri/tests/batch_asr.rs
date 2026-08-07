@@ -4,6 +4,9 @@ use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+#[path = "fixtures/mod.rs"]
+mod fixtures;
+
 const REAL_AUDIO_DIR_ENV: &str = "CORTEX_REAL_AUDIO_DIR";
 
 fn collect_audio_files(dir: &Path) -> Vec<PathBuf> {
@@ -30,6 +33,7 @@ fn collect_audio_files(dir: &Path) -> Vec<PathBuf> {
 #[test]
 #[ignore]
 fn test_batch_asr_sample() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("batch_asr", "test_batch_asr_sample");
     let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new("warn")).try_init();
 
     let Some(chosen) = std::env::var_os(REAL_AUDIO_DIR_ENV).map(PathBuf::from).filter(|p| p.is_dir()) else {
