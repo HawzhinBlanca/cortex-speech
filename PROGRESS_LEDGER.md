@@ -7370,3 +7370,50 @@ what these gates exist to reject.
 Six consecutive complete GREEN sweeps preceded this: c4fb8aa, 39e22b8, e54d07c, 8bfbf5d, 1c01ec6,
 22ae99b. The 22ae99b run is the one that matters for the rename — v52 applied against a real database
 through real-app-e2e, 25 hard kills in durability-drill and 15 mid-export kills, not only unit tests.
+
+## Iteration 259 — 0xC0000409 is TWO populations, and only one of them was ever instrumented
+
+Sweep `20260807T152120-103fd9a` came back **RED** on `test-rust`:
+
+```
+Running tests\e2e_pipeline.rs
+fatal runtime error: Rust cannot catch foreign exceptions, aborting
+exit code: 0xc0000409, STATUS_STACK_BUFFER_OVERRUN
+```
+
+Not caused by this session's work — the commits in flight touched jury reason codes, a Python policy and
+this ledger, none of which go near the ONNX path — and `cargo test --test e2e_pipeline` passes 10/10
+standalone immediately after. But "not mine" is not "not real", and re-running until green is exactly the
+move this project refuses.
+
+**The finding: the crash has two distinct populations, and the ledger has been treating them as one.**
+
+  1. NODE HARNESS deaths — `heartbeat-runtime` (x2), `finetuned-ipc-e2e`, `test-e2e+a11y`. The process
+     that dies is `node.exe`, the harness, before it measures anything. `run_gate` re-runs these ONCE,
+     after stamping a timestamped CRASH copy, because reporting "the app failed its responsiveness gate"
+     when no measurement exists would be a false claim.
+  2. APP NATIVE-STACK deaths — `test-rust` / `e2e_pipeline`, today and at the very first sighting
+     (ledger line 4342). What dies is the app's OWN test binary: a C++ exception out of sherpa-onnx
+     crossing the FFI boundary, which Rust cannot catch. This IS a verdict about the app.
+
+The retry correctly did NOT fire today: `test-rust` exited 4294967295 (-1), because cargo surfaces the
+child binary's abnormal death as an ordinary failure, and only 3221226505 is in ABNORMAL_EXIT_CODES. The
+gate redded honestly, which is the designed behaviour working.
+
+**And the gap that follows from the split:** phase 23's instrumentation is
+`NODE_OPTIONS=--report-on-fatalerror`. That is Node-only. It cannot capture population 2 at all — so the
+MORE serious population, the one that is a statement about the shipped app rather than the test harness,
+has never had any instrumentation. Every reproduction attempt logged in phase 23 (50 clean runs, memory
+pressure at module load ruled out) was aimed at population 1.
+
+**A correction to something this session said earlier.** The retry was described as "a gate whose green
+depends on silently re-running an OS-level crash". That was unfair and is withdrawn: it preserves a
+CRASH log first, prints a loud warning, stamps `[OS-terminated ... re-ran once]` into the gate result,
+fires once, and only on abnormal exit codes. Nothing about it is silent, and it cannot turn a real
+regression green — a probe that RAN and exceeded its threshold exits 1 and never reaches that branch.
+
+**Not fixed, and not claimed as fixed.** What is newly established is the population split and the
+instrumentation gap, not a cause. Naming the failing test inside `e2e_pipeline` would need that binary
+run single-threaded so libtest prints a name before the abort — a permanent cost on the longest gate, for
+a crash seen twice in this population over weeks. That is an owner call, not something to spend the
+sweep budget on unilaterally.
