@@ -95,6 +95,35 @@ pub mod reason {
     /// and the gate failed CLOSED. Not a statement about the audio or the models — a statement about
     /// the evidence available to judge them.
     pub const UNCALIBRATED_BUCKET: &str = "uncalibrated_bucket";
+
+    // ── T1/T2 stage reasons ──────────────────────────────────────────────────────────────────────
+    // Not statements about the CLIP at all, which is exactly why they need their own codes: a clip held
+    // by the autonomy dial needs a settings change, one missing audio needs a file, and neither needs a
+    // reviewer to listen harder.
+    /// The Autonomy Dial forbade a machine commit (Observe/Propose), so a decidable clip was STAGED for
+    /// a human rather than escalated on its merits. The operator's setting, not the clip's quality.
+    pub const POLICY_HOLD: &str = "policy_hold";
+    /// The segment's audio could not be read or encoded for the judge, so no judgement was possible.
+    pub const MISSING_AUDIO: &str = "missing_audio";
+    /// The T2 listener panel reached no majority.
+    pub const T2_NO_MAJORITY: &str = "t2_no_majority";
+    /// T1 could not resolve the disagreement and T2 was unavailable to try (cloud opt-in off).
+    /// Distinct from T2_NO_MAJORITY: T2 declined to answer versus T2 answering "no consensus".
+    pub const T1_UNRESOLVED: &str = "t1_unresolved";
+}
+
+/// One escalation's machine-readable record, for the T1/T2 sites in `commands.rs`.
+///
+/// The prose `rationale` those sites already write is KEPT and this sits beside it: prose carries the
+/// specifics (which models, which error) that a fixed vocabulary cannot, while the codes carry what can
+/// be counted, filtered and translated. Neither replaces the other — a reason vocabulary that swallowed
+/// the detail would be a downgrade, and prose alone is what P1.2 is about.
+pub fn escalation_evidence(reason_codes: &[&str]) -> String {
+    serde_json::json!({
+        "reasonCodes": reason_codes,
+        "policyVersion": T0_POLICY_VERSION,
+    })
+    .to_string()
 }
 
 /// Hard distrust vetoes that block an auto-accept no matter how high the IRT agreement is: poor audio
@@ -827,6 +856,57 @@ mod tests {
                 "the veto bool must be derived from the reasons, never computed separately"
             );
         }
+    }
+
+    /// The reason vocabulary must stay stable, distinct, and machine-readable.
+    ///
+    /// P1.2. These strings are PERSISTED into evidence_json and read back by tooling that has to keep
+    /// understanding rows written months ago. Three ways that breaks quietly, all pinned here:
+    ///   - a value changes, and every stored row silently means something else;
+    ///   - two codes collide, and two different causes become indistinguishable after the fact;
+    ///   - escalation_evidence stops emitting valid JSON, and nothing can read any of it.
+    #[test]
+    fn the_reason_vocabulary_is_stable_and_distinct() {
+        // Pinned by VALUE. A rename here is a data migration, not a refactor — old rows keep the old
+        // string. If you are changing one of these, bump T0_POLICY_VERSION and mean it.
+        assert_eq!(reason::LOW_SNR, "low_snr");
+        assert_eq!(reason::CLIPPING, "clipping");
+        assert_eq!(reason::SINGLE_RECOGNIZER, "single_recognizer");
+        assert_eq!(reason::MODEL_DISAGREEMENT, "model_disagreement");
+        assert_eq!(reason::UNCALIBRATED_BUCKET, "uncalibrated_bucket");
+        assert_eq!(reason::POLICY_HOLD, "policy_hold");
+        assert_eq!(reason::MISSING_AUDIO, "missing_audio");
+        assert_eq!(reason::T2_NO_MAJORITY, "t2_no_majority");
+        assert_eq!(reason::T1_UNRESOLVED, "t1_unresolved");
+
+        let all = [
+            reason::LOW_SNR,
+            reason::CLIPPING,
+            reason::SINGLE_RECOGNIZER,
+            reason::MODEL_DISAGREEMENT,
+            reason::UNCALIBRATED_BUCKET,
+            reason::POLICY_HOLD,
+            reason::MISSING_AUDIO,
+            reason::T2_NO_MAJORITY,
+            reason::T1_UNRESOLVED,
+        ];
+        let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len(), "two reason codes collided — distinct causes must stay distinct");
+
+        // T2 answering "no consensus" and T2 never being consulted are different facts about different
+        // remedies: one needs adjudication, the other needs a setting turned on. Easiest pair to
+        // conflate, so asserted explicitly rather than left to the set check above.
+        assert_ne!(reason::T2_NO_MAJORITY, reason::T1_UNRESOLVED);
+
+        // The wire format tooling actually parses.
+        let evidence = escalation_evidence(&[reason::POLICY_HOLD, reason::MISSING_AUDIO]);
+        let parsed: serde_json::Value = serde_json::from_str(&evidence).expect("evidence must be valid JSON");
+        assert_eq!(parsed["reasonCodes"], serde_json::json!(["policy_hold", "missing_audio"]));
+        assert_eq!(
+            parsed["policyVersion"],
+            serde_json::json!(T0_POLICY_VERSION),
+            "a stored reason set without its policy version cannot be interpreted once the rule moves"
+        );
     }
 
     /// An unmeasured signal is not a veto. Absence of a measurement is not evidence of bad audio.

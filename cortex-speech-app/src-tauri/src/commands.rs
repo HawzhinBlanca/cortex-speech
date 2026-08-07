@@ -3442,8 +3442,19 @@ pub fn run_jury_pipeline_core_via(
                 Some(report) => format!("{} Staged for human review (autonomy dial: Propose).", report.rationale),
                 None => "Staged for human review: autonomy dial 'Propose' disables machine commits".to_string(),
             };
-            db.write_segment_verdict(seg_id, "escalated", None, Some(&staged_rationale), None, None, true)
-                .map_err(|e| e.to_string())?;
+            // P1.2: `policy_hold` — this clip was NOT escalated on its merits. The autonomy dial forbade
+            // a machine commit, so a decidable clip was staged for a human. That needs a settings
+            // change, not a reviewer listening harder, and prose alone cannot be counted or filtered.
+            db.write_segment_verdict(
+                seg_id,
+                "escalated",
+                None,
+                Some(&staged_rationale),
+                Some(&crate::jury::escalation_evidence(&[crate::jury::reason::POLICY_HOLD])),
+                None,
+                true,
+            )
+            .map_err(|e| e.to_string())?;
             still_escalated += 1;
             continue;
         }
@@ -3518,8 +3529,19 @@ pub fn run_jury_pipeline_core_via(
                         Ok(encoded) => encoded,
                         Err(e) => {
                             tracing::warn!("T2: cannot prepare segment audio for {seg_id}: {e}");
-                            db.write_segment_verdict(seg_id, "escalated", None, Some(&e.to_string()), None, None, true)
-                                .map_err(|e| e.to_string())?;
+                            // P1.2: `missing_audio` — no judgement was possible because the audio could
+                            // not be read. The prose keeps the specific IO error; the code makes the
+                            // class countable, and this class is fixed by finding a file.
+                            db.write_segment_verdict(
+                                seg_id,
+                                "escalated",
+                                None,
+                                Some(&e.to_string()),
+                                Some(&crate::jury::escalation_evidence(&[crate::jury::reason::MISSING_AUDIO])),
+                                None,
+                                true,
+                            )
+                            .map_err(|e| e.to_string())?;
                             still_escalated += 1;
                             continue;
                         }
@@ -3567,8 +3589,18 @@ pub fn run_jury_pipeline_core_via(
                     } else {
                         // T2 failed or no majority — human inbox
                         let reason = t2.error.unwrap_or_else(|| "T2 no majority".into());
-                        db.write_segment_verdict(seg_id, "escalated", None, Some(&reason), None, None, true)
-                            .map_err(|e| e.to_string())?;
+                        // P1.2: T2 answered, and its answer was "no consensus" — deliberately a
+                        // different code from T1_UNRESOLVED below, where T2 never got to answer at all.
+                        db.write_segment_verdict(
+                            seg_id,
+                            "escalated",
+                            None,
+                            Some(&reason),
+                            Some(&crate::jury::escalation_evidence(&[crate::jury::reason::T2_NO_MAJORITY])),
+                            None,
+                            true,
+                        )
+                        .map_err(|e| e.to_string())?;
                         still_escalated += 1;
                     }
                 } else {
@@ -3577,8 +3609,20 @@ pub fn run_jury_pipeline_core_via(
                         || "T1 could not resolve; T2 disabled (cloud opt-in off)".to_string(),
                         |report| format!("{} T1 could not resolve; T2 disabled (cloud opt-in off)", report.rationale),
                     );
-                    db.write_segment_verdict(seg_id, "escalated", None, Some(&reason), None, None, true)
-                        .map_err(|e| e.to_string())?;
+                    // P1.2: T1 could not resolve AND T2 was never consulted, because cloud opt-in is
+                    // off. Recorded as T1_UNRESOLVED rather than T2_NO_MAJORITY: the panel declining to
+                    // answer is a different fact from the panel answering "no consensus", and only one
+                    // of them is fixed by turning a setting on.
+                    db.write_segment_verdict(
+                        seg_id,
+                        "escalated",
+                        None,
+                        Some(&reason),
+                        Some(&crate::jury::escalation_evidence(&[crate::jury::reason::T1_UNRESOLVED])),
+                        None,
+                        true,
+                    )
+                    .map_err(|e| e.to_string())?;
                     still_escalated += 1;
                 }
             }
