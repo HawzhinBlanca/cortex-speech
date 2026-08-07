@@ -1097,41 +1097,41 @@ fn holds_a_speaker_change(seg: &SpeechSegment) -> bool {
 /// other's at worst). Batches are small so the first reviewer to load cannot lease the entire backlog,
 /// and leases expire so a closed browser tab never strands work.
 fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
-    let segments = match db.get_segments(Some(false)) {
-        Ok(s) => s,
+    // P1.3: IDs, not whole rows. This walked EVERY pending segment's full record — transcript,
+    // alignment JSON, evidence JSON, the lot — to hand out at most QUEUE_BATCH of them. The counts
+    // below genuinely need every pending row (they depend on in-memory LEASE state, which no SQL
+    // aggregate can see), but a row that is only being COUNTED does not need anything except its id.
+    // The <= 25 clips actually served are hydrated after the lock is released.
+    let pending_ids = match db.pending_segment_ids() {
+        Ok(ids) => ids,
         Err(e) => return err_reply(500, &e.to_string()),
     };
+    let pending_total = pending_ids.len();
     let now = Instant::now();
     let mut guard = lock_state(state);
-    let mut queue: Vec<serde_json::Value> = Vec::new();
+    let mut serving: Vec<String> = Vec::new();
     let mut held_by_others = 0usize;
     let mut skipped_by_you = 0usize;
-    for s in segments.iter() {
+    for id in pending_ids {
         // Someone else's live lease: skip it, but COUNT it. Our own is renewed below (a reviewer
         // reloading the page must get their own in-progress work back, not a fresh batch that
         // abandons it).
-        if guard.holder(&s.id, now).is_some_and(|who| who != reviewer) {
+        if guard.holder(&id, now).is_some_and(|who| who != reviewer) {
             held_by_others += 1;
             continue;
         }
         // This reviewer already said they cannot judge this one (R4.4). Not theirs to be handed
         // again — but COUNTED, because it is still pending work somebody owes a verdict, and an
         // empty batch full of these must not draw "🎉 all clips reviewed".
-        if guard.skipped.get(reviewer).is_some_and(|ids| ids.contains(&s.id)) {
+        if guard.skipped.get(reviewer).is_some_and(|ids| ids.contains(&id)) {
             skipped_by_you += 1;
             continue;
         }
-        if queue.len() >= QUEUE_BATCH {
+        if serving.len() >= QUEUE_BATCH {
             continue; // keep counting what is left, but hand out no more this round
         }
-        guard.leases.insert(s.id.clone(), (reviewer.to_string(), now));
-        queue.push(serde_json::json!({
-            "id": s.id,
-            "text": review_text(s),
-            "durationMs": s.duration_ms,
-            "speakerId": s.speaker_id,
-            "speakerChange": holds_a_speaker_change(s),
-        }));
+        guard.leases.insert(id.clone(), (reviewer.to_string(), now));
+        serving.push(id);
     }
     // Drop leases that expired while their holder was away, so the map cannot grow without bound across
     // a long session. Cheap: the pending queue is the only thing that can be leased.
@@ -1141,6 +1141,32 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // without passing this along, a check somebody skipped was re-inserted into every batch forever.
     let skipped_by_me = guard.skipped.get(reviewer).cloned().unwrap_or_default();
     drop(guard);
+
+    // Hydrate ONLY what is being served — at most QUEUE_BATCH rows — and do it OUTSIDE the state lock,
+    // which the whole-library read never was. `get_segments_by_ids` re-imposes its own global ordering,
+    // so the rows are indexed by id and re-emitted in `serving` order; handing a reviewer the same
+    // clips in a different order than they were leased would be a silent behaviour change.
+    let rows = match db.get_segments_by_ids(&serving) {
+        Ok(rows) => rows,
+        Err(e) => return err_reply(500, &e.to_string()),
+    };
+    let by_id: std::collections::HashMap<&str, &SpeechSegment> = rows.iter().map(|s| (s.id.as_str(), s)).collect();
+    // filter_map, not unwrap: a clip can be deleted between the id query and this fetch. Serving one
+    // fewer clip is correct; panicking on a race in the reviewer's request path is not. Its lease simply
+    // expires.
+    let mut queue: Vec<serde_json::Value> = serving
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()))
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "text": review_text(s),
+                "durationMs": s.duration_ms,
+                "speakerId": s.speaker_id,
+                "speakerChange": holds_a_speaker_change(s),
+            })
+        })
+        .collect();
 
     // Salt the batch with spot checks (P2.1). They are NOT leased: two reviewers meeting the same
     // known-answer clip is the point — independent measurement — not a collision. They also carry no
@@ -1234,7 +1260,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
             "items": queue,
             "heldByOthers": held_by_others,
             "skippedByYou": skipped_by_you,
-            "pendingTotal": segments.len(),
+            "pendingTotal": pending_total,
         }),
     )
 }
@@ -4797,6 +4823,38 @@ mod tests {
         // The refusal must not have quietly handed her the lease back as a side effect.
         let holder = lock_state(&state).holder("s2", Instant::now()).map(str::to_string);
         assert_eq!(holder.as_deref(), Some("Hemn"), "a refused renew must not steal the clip back");
+    }
+
+    #[test]
+    fn the_queue_serves_clips_in_the_order_it_leased_them() {
+        // P1.3: api_queue used to read every pending row IN ORDER and build the payload in the same
+        // pass, so the served order could not disagree with the leased order. It now selects IDs first
+        // and hydrates the batch with get_segments_by_ids — which re-imposes its OWN global ordering
+        // and would hand the reviewer a differently-ordered batch than the one it leased, silently
+        // changing which clip is "clip 1 of 25". The re-index by id is what prevents that, and this is
+        // what proves the re-index is actually doing something.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        for n in 0..QUEUE_BATCH {
+            db.insert_segment(&seg(&format!("q{n:04}"), "دەقی سەرەتایی")).unwrap();
+        }
+        let state = state();
+
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 200);
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let served: Vec<String> =
+            payload["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
+
+        // The order the SELECT hands them out in is the order the reviewer must see them in.
+        let expected: Vec<String> = db.pending_segment_ids().unwrap().into_iter().take(QUEUE_BATCH).collect();
+        assert_eq!(served, expected, "the served batch must be in the order the clips were leased");
+
+        // Every served clip carries its real text, i.e. the batch was genuinely hydrated rather than
+        // emitted from ids alone.
+        for item in payload["items"].as_array().unwrap() {
+            assert_eq!(item["text"].as_str(), Some("دەقی سەرەتایی"), "a served clip must carry its transcript");
+        }
     }
 
     #[test]

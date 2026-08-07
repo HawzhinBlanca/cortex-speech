@@ -1586,6 +1586,27 @@ impl Database {
         Ok(segments)
     }
 
+    /// The IDs of every pending (unverified) clip, in the same order `get_segments(Some(false))` returns.
+    ///
+    /// External review 2026-08-06 P1.3, for the couch-review queue. That queue must walk EVERY pending
+    /// row — its `heldByOthers` / `skippedByYou` / `pendingTotal` counts depend on in-memory lease state,
+    /// so no SQL aggregate can produce them — but it only needs the ID of a row it is merely COUNTING.
+    /// The full record (transcript, alignment JSON, evidence JSON) is needed for the <= QUEUE_BATCH
+    /// clips it actually hands out, and those are hydrated with `get_segments_by_ids`.
+    ///
+    /// Ordering is byte-identical to `get_segments` on purpose: this replaced a whole-row read, and a
+    /// different ORDER BY would silently change WHICH clips a reviewer is handed.
+    pub fn pending_segment_ids(&self) -> AppResult<Vec<String>> {
+        let mut stmt =
+            self.conn.prepare("SELECT id FROM speech_segments WHERE verified = 0 ORDER BY created_at DESC, id ASC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
     /// The backlog one background pass still has to process.
     ///
     /// External review 2026-08-06 P1.3. Each of these three passes used to call `get_segments(None)` —

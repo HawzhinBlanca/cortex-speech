@@ -51,15 +51,17 @@ TO_RETIRE = {
     # full rows), which bounds memory while leaving exactly one implementation of the rule.
     "commands/dataset_analytics.rs": "fold over a streaming read; do NOT reimplement the grading policy in SQL",
     "commands/segments_read.rs": "get_active_learning_queue needs its conformal threshold computed in SQL",
-    # api_queue needs every pending row to report honest `held_by_others` / `skipped_by_you` counts, and
-    # those depend on IN-MEMORY lease state, so no SQL aggregate can produce them. But it only needs the
-    # ID of a row it is merely counting — the full record (transcript + alignment JSON) is needed for the
-    # <= QUEUE_BATCH clips it actually hands out. Retirement is: select pending IDs, filter/count on
-    # those, then hydrate the batch with the existing `get_segments_by_ids`.
-    "couch.rs": "count on pending IDs, hydrate only the QUEUE_BATCH it hands out (get_segments_by_ids exists)",
 }
 
 # Retired, kept as a record so the list cannot quietly regrow into them:
+#   couch.rs (2026-08-07) — api_queue read every pending row's FULL record (transcript, alignment JSON,
+#   evidence JSON) to hand out at most QUEUE_BATCH=25 of them. Its heldByOthers / skippedByYou /
+#   pendingTotal counts genuinely need every pending row — they depend on IN-MEMORY lease state, which
+#   no SQL aggregate can see — but a row that is only being COUNTED needs nothing except its id. It now
+#   walks `Database::pending_segment_ids` and hydrates only the served batch via `get_segments_by_ids`,
+#   outside the state lock. `the_queue_serves_clips_in_the_order_it_leased_them` pins the re-index that
+#   keeps the served order equal to the leased order, since get_segments_by_ids imposes its own.
+#
 #   commands.rs (2026-08-06) — the 7B refinement driver, the CTC-score backfill and the signal-anomaly
 #   backfill each read the whole library and then `continue`d past every row that was already done. All
 #   three now ask for their backlog via `Database::get_pending_segments(PendingWork::_)`. The 7B
