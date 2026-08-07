@@ -76,7 +76,7 @@ fn insert_machine_silver_segment_with_coverage(db: &Database, tmp: &TempDir, seg
         verdict_transcript: Some("reference candidate".into()),
         rationale: Some("multi-reference consensus committed agent text".into()),
         evidence_json: Some(evidence_json.clone()),
-        agent_confidence: Some(0.92),
+        agreement_score: Some(0.92),
         escalated: false,
         human_decision: None,
         corrected_at: None,
@@ -301,7 +301,7 @@ fn production_export_blocks_machine_ready_rows_without_hypothesis_coverage() {
             })
             .to_string(),
         ),
-        agent_confidence: Some(0.92),
+        agreement_score: Some(0.92),
         escalated: false,
         human_decision: None,
         corrected_at: None,
@@ -739,7 +739,7 @@ fn bundle_excludes_holdout_gold_from_all_artifacts() {
         verdict_transcript: None,
         rationale: None,
         evidence_json: None,
-        agent_confidence: None,
+        agreement_score: None,
         escalated: false,
         human_decision: None,
         corrected_at: None,
@@ -1115,7 +1115,7 @@ fn draft_export_preserves_agent_import_provenance() {
             })
             .to_string(),
         ),
-        agent_confidence: Some(0.92),
+        agreement_score: Some(0.92),
         escalated: false,
         human_decision: None,
         corrected_at: None,
@@ -1455,7 +1455,7 @@ fn draft_export_includes_self_learning_preference_artifacts() {
             })
             .to_string(),
         ),
-        agent_confidence: Some(0.90),
+        agreement_score: Some(0.90),
         escalated: false,
         human_decision: None,
         corrected_at: None,
@@ -1563,7 +1563,7 @@ fn re_export_into_reused_dir_removes_stale_learning_preferences_orphan() {
             })
             .to_string(),
         ),
-        agent_confidence: Some(0.90),
+        agreement_score: Some(0.90),
         escalated: false,
         human_decision: None,
         corrected_at: None,

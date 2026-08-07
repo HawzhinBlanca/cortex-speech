@@ -2171,7 +2171,7 @@ impl ProcessingPipeline {
                 verdict_transcript: None,
                 rationale: None,
                 evidence_json: None,
-                agent_confidence: None,
+                agreement_score: None,
                 escalated: false,
                 human_decision: None,
                 corrected_at: None,
@@ -2572,7 +2572,7 @@ impl ProcessingPipeline {
     fn mark_wsl_primary_unavailable(&self, db: &Database, seg: &mut SpeechSegment, reason: &str) -> AppResult<()> {
         let rationale = format!("WSL 7B primary ASR unavailable before jury: {reason}");
         tracing::warn!("{} ({})", rationale, seg.id);
-        // Explicit lowest confidence (0.0), NOT None: a None here becomes COALESCE(agent_confidence, 0.5)
+        // Explicit lowest confidence (0.0), NOT None: a None here becomes COALESCE(agreement_score, 0.5)
         // in the suspect-first queue, tying these unresolved-primary clips (empty/failed 7B, unknown
         // quality — exactly the ones most needing attention) at the 0.5 plateau to sort by id. 0.0 sorts
         // them to the very front.

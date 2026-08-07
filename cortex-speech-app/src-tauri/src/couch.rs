@@ -1787,7 +1787,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
 /// fix the human took back). The row-restore itself MUST go through `insert_segment_full`, not
 /// `insert_segment`: `prev` is the exact pre-decision snapshot, and a clip served to the couch queue can
 /// carry jury state (a jury-ESCALATED clip is unverified, so it is in `get_segments(false)`) — verdict,
-/// verdict_transcript, rationale, evidence_json, agent_confidence, escalated, is_gold. `insert_segment`
+/// verdict_transcript, rationale, evidence_json, agreement_score, escalated, is_gold. `insert_segment`
 /// writes a 17-column subset that OMITS every one of those, so it would leave them at whatever
 /// `clear_human_decision` set (jury verdict/evidence NULLed, is_gold from the undone accept still set) —
 /// silently dropping the pre-decision jury verdict on undo. `insert_segment_full` rewrites the whole row
@@ -3728,7 +3728,7 @@ mod tests {
         // verified=false, human_decision=NULL) is served by the couch queue (get_segments(Some(false)) =
         // unverified). Phone-reviewing it then UNDOING must restore the pre-decision row EXACTLY — including
         // the jury verdict and the gold flag. The old undo ran clear_human_decision (nulls verdict/
-        // rationale/evidence/agent_confidence) + insert_segment (a 17-col subset that OMITS every jury/
+        // rationale/evidence/agreement_score) + insert_segment (a 17-col subset that OMITS every jury/
         // decision column AND is_gold), so undo CLEARED the jury's escalation verdict rather than restoring
         // it, and left is_gold=1 that the now-undone accept had set. The restore must go through
         // insert_segment_full so the row returns to its pre-decision snapshot losslessly.

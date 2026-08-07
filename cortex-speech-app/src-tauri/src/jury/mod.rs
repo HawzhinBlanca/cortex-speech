@@ -353,7 +353,7 @@ pub fn run_t0_gate(
         let bucket = conformal::snr_bucket(seg.snr_db);
         // P1.2: assemble the machine-stable WHY alongside the routing decision. Every escalation used to
         // write rationale=NULL and evidence_json=NULL, so a reviewer opening an escalated clip saw
-        // `escalated=1, agent_confidence=0.73` and could not tell bad audio from a lone recognizer from
+        // `escalated=1, agreement_score=0.73` and could not tell bad audio from a lone recognizer from
         // genuine disagreement from an uncalibrated bucket — four causes that call for four different
         // actions. Computed from the SAME inputs the decision used, so the record cannot describe a
         // decision that was not made.
@@ -387,8 +387,8 @@ pub fn run_t0_gate(
                 // Observe is pure observation: it stages nothing and commits no verdict.
                 if !matches!(autonomy, crate::settings::AutonLevel::Observe) {
                     // True-10 audit: carry the IRT confidence on the ESCALATED verdict too. Every
-                    // escalated row used to write agent_confidence=None, so the suspect-first
-                    // ordering (COALESCE(agent_confidence, 0.5) ASC) saw a constant and silently
+                    // escalated row used to write agreement_score=None, so the suspect-first
+                    // ordering (COALESCE(agreement_score, 0.5) ASC) saw a constant and silently
                     // degraded to recency — "riskiest-first" was nominal. With the real confidence
                     // persisted, the most-disagreed-on clips genuinely surface first.
                     //
@@ -432,7 +432,7 @@ pub fn write_verdict(
     transcript: Option<&str>,
     rationale: Option<&str>,
     evidence_json: Option<&str>,
-    agent_confidence: Option<f64>,
+    agreement_score: Option<f64>,
 ) -> AppResult<()> {
     // Never let this MACHINE verdict overwrite a HUMAN decision. The T0/T1/T2 jury runs on a SEPARATE
     // WAL connection from the human path (record_human_decision), snapshots its segments once, then can
@@ -452,7 +452,7 @@ pub fn write_verdict(
                  verdict_transcript = ?3,
                  rationale         = ?4,
                  evidence_json     = ?5,
-                 agent_confidence  = ?6,
+                 agreement_score  = ?6,
                  escalated         = ?7,
                  updated_at        = datetime('now')
              WHERE id = ?1
@@ -464,7 +464,7 @@ pub fn write_verdict(
                 transcript,
                 rationale,
                 evidence_json,
-                agent_confidence,
+                agreement_score,
                 (verdict == Verdict::Escalated) as i32,
             ],
         )?;
@@ -628,10 +628,10 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
 pub fn get_escalation_queue(db: &Database, limit: usize) -> AppResult<Vec<EscalatedItem>> {
     let mut stmt = db.connection().prepare(
         "SELECT id, raw_transcript, normalized_transcript, audio_path,
-                confidence, agent_confidence, rationale, evidence_json
+                confidence, agreement_score, rationale, evidence_json
          FROM speech_segments
          WHERE escalated = 1 AND (human_decision IS NULL OR human_decision = '')
-         ORDER BY COALESCE(agent_confidence, 0.5) ASC, id ASC
+         ORDER BY COALESCE(agreement_score, 0.5) ASC, id ASC
          LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit as i64], |row| {
@@ -641,7 +641,7 @@ pub fn get_escalation_queue(db: &Database, limit: usize) -> AppResult<Vec<Escala
             normalized_transcript: row.get(2)?,
             audio_path: row.get(3)?,
             asr_confidence: row.get(4)?,
-            agent_confidence: row.get(5)?,
+            agreement_score: row.get(5)?,
             rationale: row.get(6)?,
             evidence_json: row.get(7)?,
         })
@@ -702,7 +702,7 @@ pub struct EscalatedItem {
     pub normalized_transcript: Option<String>,
     pub audio_path: String,
     pub asr_confidence: Option<f64>,
-    pub agent_confidence: Option<f64>,
+    pub agreement_score: Option<f64>,
     pub rationale: Option<String>,
     pub evidence_json: Option<String>,
 }
@@ -757,7 +757,7 @@ mod tests {
             verdict_transcript: None,
             rationale: None,
             evidence_json: None,
-            agent_confidence: None,
+            agreement_score: None,
             escalated: false,
             human_decision: None,
             corrected_at: None,

@@ -27,7 +27,7 @@ fn make_seg(id: &str, path: &str, text: &str) -> SpeechSegment {
         verdict_transcript: None,
         rationale: None,
         evidence_json: None,
-        agent_confidence: None,
+        agreement_score: None,
         escalated: false,
         human_decision: None,
         corrected_at: None,

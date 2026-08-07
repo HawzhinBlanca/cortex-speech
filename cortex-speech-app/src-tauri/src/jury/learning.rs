@@ -53,7 +53,7 @@ struct LearningRow {
     duration_ms: i64,
     speaker_id: Option<String>,
     confidence: Option<f64>,
-    agent_confidence: Option<f64>,
+    agreement_score: Option<f64>,
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
@@ -82,7 +82,7 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
                 ss.duration_ms,
                 ss.speaker_id,
                 ss.confidence,
-                ss.agent_confidence
+                ss.agreement_score
          FROM agent_examples ae
          JOIN speech_segments ss ON ae.segment_id = ss.id
          WHERE ss.is_gold = 0 AND ae.verified_by_human = 1
@@ -103,7 +103,7 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
             duration_ms: row.get(9)?,
             speaker_id: row.get(10)?,
             confidence: row.get(11)?,
-            agent_confidence: row.get(12)?,
+            agreement_score: row.get(12)?,
         })
     })?;
 
@@ -293,7 +293,7 @@ fn build_learning_prompt(db: &Database, row: &LearningRow) -> AppResult<String> 
     // The model already gets the text to correct from raw_asr / normalized_asr / the Hypotheses block below.
     push_field(&mut prompt, "jury_rationale", row.rationale.as_deref());
     push_field(&mut prompt, "asr_confidence", row.confidence.map(|v| format!("{v:.3}")).as_deref());
-    push_field(&mut prompt, "agent_confidence", row.agent_confidence.map(|v| format!("{v:.3}")).as_deref());
+    push_field(&mut prompt, "agreement_score", row.agreement_score.map(|v| format!("{v:.3}")).as_deref());
 
     if let Some(evidence) = row
         .evidence_json
@@ -725,7 +725,7 @@ mod tests {
             verdict_transcript: Some("agent wrong text".to_string()),
             rationale: Some("reference-aware agent selected a weak candidate".to_string()),
             evidence_json: Some("{\"referenceCommitted\":false}".to_string()),
-            agent_confidence: Some(0.77),
+            agreement_score: Some(0.77),
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).expect("insert segment");
@@ -922,7 +922,7 @@ mod tests {
             rationale: Some("multi-reference consensus committed agent text".to_string()),
             evidence_json: Some(evidence.clone()),
             duration_ms: 2100,
-            agent_confidence: Some(0.88),
+            agreement_score: Some(0.88),
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).expect("insert segment");

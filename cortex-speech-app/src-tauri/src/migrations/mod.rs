@@ -1469,6 +1469,34 @@ pub static MIGRATIONS: &[Migration] = &[
              ALTER TABLE speech_segments DROP COLUMN audio_content_hash;",
         ),
     },
+    Migration {
+        version: 52,
+        description: "Rename agent_confidence -> agreement_score: the number is AGREEMENT, never correctness",
+        // External review 2026-08-06 P1.2: "`agent_confidence` is agreement in some flows, while the UI
+        // and older code can still read 'confidence' as correctness."
+        //
+        // Those are opposite claims on bad audio. Every recognizer can confidently agree on the same
+        // garbage — which is precisely why has_hard_distrust_veto refuses to auto-accept such a clip —
+        // so a HIGH value here is compatible with a completely wrong transcript. A field named
+        // "confidence" invites exactly the reading the jury already rejected, and it invited it once
+        // already: 6028824 had to stop the review UI rendering this as a green confidence badge.
+        //
+        // The name now states what the number IS, so the next reader cannot make that inference from
+        // the schema alone.
+        //
+        // RENAME COLUMN, not add-copy-drop: it preserves the data, the column's position (so
+        // SEGMENT_SELECT_COLUMNS' index-based map_row is unaffected), and every value's history. SQLite
+        // has supported it since 3.25 and rusqlite bundles far newer.
+        //
+        // The earlier migrations that CREATE and re-list `agent_confidence` (v11, and the two table
+        // recreates) are deliberately left alone. They are history: they describe what actually ran on
+        // this database. Editing them would make the chain describe a past that did not happen, and a
+        // database already at v51 would never replay them anyway.
+        //
+        // No index references this column, so nothing else moves.
+        up_sql: "ALTER TABLE speech_segments RENAME COLUMN agent_confidence TO agreement_score;",
+        down_sql: Some("ALTER TABLE speech_segments RENAME COLUMN agreement_score TO agent_confidence;"),
+    },
 ];
 
 #[cfg(test)]
@@ -1516,7 +1544,17 @@ mod tests {
             .unwrap();
 
         // Re-run the real recreate through the real FK-off path (what a live upgrade does).
+        //
+        // v40's INSERT…SELECT names `agent_confidence` explicitly, and v52 renamed that column to
+        // `agreement_score`. A LIVE upgrade never hits this: it applies v40 while the column still has
+        // its old name and only reaches v52 afterwards. This test replays v40 AFTER the whole chain, so
+        // it has to put the schema back into the state v40 would actually see — otherwise it fails on
+        // an ordering that cannot occur in production. The re-apply of every post-v40 migration below
+        // runs v52 again and restores the HEAD name.
         let v40 = MIGRATIONS.iter().find(|m| m.version == 40).expect("v40 exists");
+        db.connection()
+            .execute_batch("ALTER TABLE speech_segments RENAME COLUMN agreement_score TO agent_confidence;")
+            .expect("put the column back to its pre-v52 name so v40 replays against the schema it expects");
         {
             let conn = db.connection();
             run_with_foreign_keys_off(conn, || {

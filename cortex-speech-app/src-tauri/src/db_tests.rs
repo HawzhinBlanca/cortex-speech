@@ -499,8 +499,8 @@ fn write_segment_verdict_is_atomic_with_its_decision_log() {
 
 #[test]
 fn suspect_first_ranks_escalated_by_real_confidence_not_recency() {
-    // True-10 audit: escalated rows used to carry agent_confidence=None, collapsing the second
-    // sort key (COALESCE(agent_confidence, 0.5) ASC) to a constant — "suspect-first" silently
+    // True-10 audit: escalated rows used to carry agreement_score=None, collapsing the second
+    // sort key (COALESCE(agreement_score, 0.5) ASC) to a constant — "suspect-first" silently
     // degraded to recency. With the jury now persisting the IRT confidence on escalation, the
     // most-doubted clip genuinely ranks first; a legacy None row slots at the 0.5 midpoint.
     let db = make_db();
@@ -867,7 +867,10 @@ fn v35_repairs_divergent_segments_fts_so_segment_writes_succeed() {
     // Re-apply the repair migration (rewind past v35 so run_migrations re-runs it). v36's
     // proof-metadata ALTERs are not idempotent, so undo them first (its down_sql) or the
     // re-run fails on "duplicate column name". Same for v39's RENAME COLUMN — re-running it on an
-    // already-renamed schema fails with "no such column: ood_score" — so undo it too.
+    // already-renamed schema fails with "no such column: ood_score" — so undo it too. And the same for
+    // v52's rename: the replay passes back through v40, whose INSERT…SELECT names `agent_confidence`
+    // explicitly, so the column has to be under its pre-v52 name for that leg exactly as it would be
+    // during a real upgrade. v52 re-runs at the end of the replay and restores the HEAD name.
     db.connection()
         .execute_batch(
             "DROP INDEX IF EXISTS idx_segments_confidence_source;
@@ -876,7 +879,8 @@ fn v35_repairs_divergent_segments_fts_so_segment_writes_succeed() {
                  ALTER TABLE speech_segments DROP COLUMN decoder_config_hash;
                  ALTER TABLE speech_segments DROP COLUMN cloud_call;
                  ALTER TABLE speech_segments DROP COLUMN confidence_source;
-                 ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score;",
+                 ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score;
+                 ALTER TABLE speech_segments RENAME COLUMN agreement_score TO agent_confidence;",
         )
         .unwrap();
     db.connection().execute("DELETE FROM schema_migrations WHERE version >= 35", []).unwrap();
@@ -2252,8 +2256,17 @@ fn restore_of_an_older_snapshot_migrates_it_forward_to_head() {
         old.initialize().unwrap();
         old.connection()
             .execute_batch(&format!(
+                // Same reasoning as the ood_score rename directly above, for v52: a genuine pre-v37
+                // snapshot carries `agent_confidence`, because v52 (which renames it to
+                // agreement_score) had not run yet. Without renaming it back, this synthesis produces
+                // a database with HEAD's column names and an old version number — and the replay then
+                // fails inside v40, whose INSERT…SELECT names `agent_confidence` explicitly. That
+                // failure would be an artifact of the synthesis, not of the upgrade path: a REAL old
+                // snapshot replays v40 while the column still has its old name, and only reaches v52
+                // afterwards.
                 "DROP TABLE IF EXISTS jobs; \
                      ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score; \
+                     ALTER TABLE speech_segments RENAME COLUMN agreement_score TO agent_confidence; \
                      DELETE FROM schema_migrations WHERE version >= {JOBS_MIGRATION};"
             ))
             .unwrap();
@@ -2544,20 +2557,20 @@ fn source_transcript_upsert_roundtrips_latest_reference() {
 fn escalation_write_with_no_confidence_preserves_the_persisted_irt_confidence() {
     // True-10 audit 2026-07-09 (suspect-first regression): run_t0_gate persists the real IRT
     // confidence on an escalated verdict, then the T1/T2 escalation paths (cloud-off,
-    // audio-prep failure, no-majority) re-write "escalated" with agent_confidence=None moments
+    // audio-prep failure, no-majority) re-write "escalated" with agreement_score=None moments
     // later. The unconditional overwrite NULLed the confidence and both suspect-first orderings
-    // (COALESCE(agent_confidence, 0.5)) collapsed to recency. COALESCE in the UPDATE must keep
+    // (COALESCE(agreement_score, 0.5)) collapsed to recency. COALESCE in the UPDATE must keep
     // the earlier signal; a caller WITH a signal must still win.
     let db = make_db();
     db.insert_segment(&make_segment("esc", "/audio/esc.wav")).unwrap();
     db.write_segment_verdict("esc", "escalated", None, None, None, Some(0.83), true).unwrap();
     db.write_segment_verdict("esc", "escalated", None, Some("cloud off"), None, None, true).unwrap();
     let seg = db.get_segment_by_id("esc").unwrap().unwrap();
-    assert_eq!(seg.agent_confidence, Some(0.83), "a None re-write must not destroy the IRT confidence");
+    assert_eq!(seg.agreement_score, Some(0.83), "a None re-write must not destroy the IRT confidence");
     // A later write that CARRIES a signal still replaces it.
     db.write_segment_verdict("esc", "escalated", None, None, None, Some(0.41), true).unwrap();
     let seg = db.get_segment_by_id("esc").unwrap().unwrap();
-    assert_eq!(seg.agent_confidence, Some(0.41));
+    assert_eq!(seg.agreement_score, Some(0.41));
 }
 
 #[test]
@@ -2796,7 +2809,7 @@ fn list_recent_jobs_returns_newest_first_and_respects_limit() {
 fn merge_dataset_json_preserves_review_provenance_on_newly_created_rows() {
     // DATA-LOSS regression: SpeechSegment deserializes every jury / human-review / gold column, but the
     // merge's INSERT path used its own 21-column statement that silently DROPPED verdict,
-    // verdict_transcript, rationale, evidence_json, agent_confidence, escalated, human_decision,
+    // verdict_transcript, rationale, evidence_json, agreement_score, escalated, human_decision,
     // corrected_at, is_gold, alignment_quality and created_at for NEW ids. Merging a reviewed dataset
     // into another library therefore stripped the human work product — the merged rows then graded as
     // unreviewed machine drafts. The INSERT path must be the lossless full-column insert
@@ -2965,6 +2978,52 @@ fn audio_fingerprint_round_trips_through_sqlite_including_the_high_bit() {
     // The untouched recording stays NULL and is simply absent — not defaulted to 0, which register
     // deliberately refuses to store as a bucket key.
     assert!(!loaded.iter().any(|r| r.audio_path == "/audio/other.wav"), "a NULL fingerprint must not appear");
+}
+
+/// Migration v52 must RENAME the agreement column, never recreate it — the values have to survive.
+///
+/// P1.2. `agent_confidence` became `agreement_score` because the old name invited exactly the reading
+/// the jury rejects: every recognizer can confidently agree on the same garbage, so a HIGH value is
+/// compatible with a completely wrong transcript. That is a naming fix, and a naming fix that silently
+/// dropped a corpus of agreement scores would be a catastrophic way to achieve it — the suspect-first
+/// ordering reads this column, so a wiped column degrades the review queue to recency with nothing
+/// reporting it (the exact failure 6028824's predecessor had).
+///
+/// Exercised through the real migration chain on a fresh database, and asserted on a value written and
+/// read back by the production path.
+#[test]
+fn renaming_the_agreement_column_preserves_its_values() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap(); // runs every migration, v52 included
+
+    db.insert_segment(&SpeechSegment {
+        id: "s1".into(),
+        audio_path: "/audio/a.wav".into(),
+        raw_transcript: "دەق".into(),
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    // write_segment_verdict is the production path — insert_segment silently drops jury fields.
+    db.write_segment_verdict("s1", "escalated", None, None, None, Some(0.73), true).unwrap();
+
+    let back = db.get_segment_by_id("s1").unwrap().unwrap();
+    assert_eq!(back.agreement_score, Some(0.73), "the agreement value must survive the rename");
+
+    // The new name is the one the schema actually carries, and the old one is gone — a column left
+    // behind under both names would let two code paths drift onto different columns.
+    let cols: Vec<String> = db
+        .connection()
+        .prepare("SELECT name FROM pragma_table_info('speech_segments')")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(cols.iter().any(|c| c == "agreement_score"), "agreement_score must exist after v52");
+    assert!(
+        !cols.iter().any(|c| c == "agent_confidence"),
+        "agent_confidence must be GONE, not duplicated — two names for one number is how they drift"
+    );
 }
 
 /// The SQL prefilter in `PendingWork::Transcript` must be a SUPERSET of `is_placeholder_transcript`.
@@ -3230,7 +3289,7 @@ fn suspect_first_sql_and_the_jury_veto_agree_on_poor_audio() {
 
 /// Suspect-first must put the clips the jury DISTRUSTED first, not last (external review #2).
 ///
-/// `agent_confidence` on an escalated row is model AGREEMENT. When the audio is bad, every recognizer
+/// `agreement_score` on an escalated row is model AGREEMENT. When the audio is bad, every recognizer
 /// can confidently agree on the same garbage — which is precisely why has_hard_distrust_veto refuses
 /// to auto-accept it. Ordering on agreement alone therefore sent the least trustworthy clips to the
 /// BACK of a riskiest-first queue.
@@ -3238,7 +3297,7 @@ fn suspect_first_sql_and_the_jury_veto_agree_on_poor_audio() {
 fn suspect_first_ranks_poor_audio_ahead_of_high_agreement() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
-    // agent_confidence and `escalated` are written by write_segment_verdict, the real path — NOT by
+    // agreement_score and `escalated` are written by write_segment_verdict, the real path — NOT by
     // insert_segment, which silently drops them. A fixture that cannot reproduce the production shape
     // proves nothing (same trap as the human_decision fixture in 3a08d01).
     let mk = |id: &str, snr: f64, clip: f64| SpeechSegment {

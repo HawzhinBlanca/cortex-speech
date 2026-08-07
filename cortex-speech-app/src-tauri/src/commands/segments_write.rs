@@ -288,7 +288,7 @@ pub fn write_segment_verdict(
     transcript: Option<String>,
     rationale: Option<String>,
     evidence_json: Option<String>,
-    agent_confidence: Option<f64>,
+    agreement_score: Option<f64>,
     escalated: bool,
 ) -> Result<(), String> {
     RATE_LIMITER.check("write_segment_verdict")?;
@@ -312,7 +312,7 @@ pub fn write_segment_verdict(
         transcript.as_deref(),
         rationale.as_deref(),
         evidence_json.as_deref(),
-        agent_confidence,
+        agreement_score,
         escalated,
     )
     .map_err(|e| e.to_string())

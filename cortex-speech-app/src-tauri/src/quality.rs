@@ -367,13 +367,13 @@ pub fn training_grade_for_segment(seg: &SpeechSegment) -> TrainingGradeReport {
     // is not evidence that it was calibrated, and this decision promotes a clip into a training set
     // with no human ever having read it.
     //
-    // `agent_confidence` is untouched — that is a jury/agent judgement, already range-guarded in
+    // `agreement_score` is untouched — that is a jury/agent judgement, already range-guarded in
     // jury::t2_listener, and it is the signal this branch was actually written for.
     let engine_confidence = match seg.confidence_source.as_deref() {
         Some(src) if src == crate::asr::ConfidenceSource::RealPosterior.as_db_value() => seg.confidence,
         _ => None,
     };
-    let confidence = seg.agent_confidence.or(engine_confidence).unwrap_or(0.0);
+    let confidence = seg.agreement_score.or(engine_confidence).unwrap_or(0.0);
     let has_multi_agent_evidence = has_training_ready_machine_evidence(seg, text);
     if jury_accepted && confidence >= 0.85 && !has_review_risk && has_multi_agent_evidence {
         reasons.push("high_confidence_jury_accept".to_string());
@@ -1333,7 +1333,7 @@ mod tests {
         let mut s = seg("jury", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
         s.verdict_transcript = Some("jury selected transcript".to_string());
-        s.agent_confidence = None; // the ONLY confidence is the engine's
+        s.agreement_score = None; // the ONLY confidence is the engine's
         s.confidence = Some(0.90); // exactly what asr.rs stamps on every non-empty transcript
         s.confidence_source = source.map(str::to_string);
         s.evidence_json = Some(
@@ -1400,7 +1400,7 @@ mod tests {
         let mut s = seg("jury", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
         s.verdict_transcript = Some("jury selected transcript".to_string());
-        s.agent_confidence = Some(0.92);
+        s.agreement_score = Some(0.92);
         s.evidence_json = Some(
             serde_json::json!({
                 "referenceModelId": "gemini-2.5-pro",
@@ -1428,7 +1428,7 @@ mod tests {
         let mut s = seg("stale-reference-evidence", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
         s.verdict_transcript = Some("current promoted transcript".to_string());
-        s.agent_confidence = Some(0.96);
+        s.agreement_score = Some(0.96);
         s.evidence_json = Some(
             serde_json::json!({
                 "referenceModelId": "gemini-2.5-pro",
@@ -1455,7 +1455,7 @@ mod tests {
         let mut s = seg("weak-jury", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
         s.verdict_transcript = Some("jury selected transcript".to_string());
-        s.agent_confidence = Some(0.97);
+        s.agreement_score = Some(0.97);
         s.evidence_json = Some(
             serde_json::json!([
                 {"tool": "lexicon", "result": "looks plausible", "supportsHypothesis": true}
@@ -1479,7 +1479,7 @@ mod tests {
         let mut s = seg("reference-conflict", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
         s.verdict_transcript = Some("jury selected transcript".to_string());
-        s.agent_confidence = Some(0.97);
+        s.agreement_score = Some(0.97);
         s.evidence_json = Some(
             serde_json::json!({
                 "referenceModelId": "gemini-2.5-pro",
@@ -1515,7 +1515,7 @@ mod tests {
         let mut s = seg("t2-jury", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
         s.verdict_transcript = Some("t2 selected transcript".to_string());
-        s.agent_confidence = Some(0.9);
+        s.agreement_score = Some(0.9);
         s.evidence_json =
             Some(serde_json::json!({"t2Transcript": "t2 selected transcript", "t2Evidence": []}).to_string());
         s.clipping_ratio = Some(0.0);
@@ -1534,7 +1534,7 @@ mod tests {
         let mut s = seg("stale-t2-evidence", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
         s.verdict_transcript = Some("current t2 transcript".to_string());
-        s.agent_confidence = Some(0.93);
+        s.agreement_score = Some(0.93);
         s.evidence_json =
             Some(serde_json::json!({"t2Transcript": "older t2 transcript", "t2Evidence": []}).to_string());
         s.clipping_ratio = Some(0.0);
@@ -1603,7 +1603,7 @@ mod tests {
         let mut silver = seg("silver", "raw", 5000);
         silver.verdict = Some("jury_accept".to_string());
         silver.verdict_transcript = Some("jury trusted".to_string());
-        silver.agent_confidence = Some(0.9);
+        silver.agreement_score = Some(0.9);
         silver.evidence_json = Some(
             serde_json::json!({
                 "referenceModelId": "gemini-2.5-pro",

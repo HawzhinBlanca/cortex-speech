@@ -4169,7 +4169,7 @@ mod tests {
         run_jury_pipeline_core(&db2, &observe, vec![seg2.id.clone()]).unwrap();
         let fresh2 = db2.get_segment_by_id(&seg2.id).unwrap().unwrap();
         assert_eq!(fresh2.rationale.as_deref(), Some("original rationale"), "Observe must not rewrite verdicts");
-        assert_eq!(fresh2.agent_confidence, Some(0.42), "Observe must not NULL the staged IRT confidence");
+        assert_eq!(fresh2.agreement_score, Some(0.42), "Observe must not NULL the staged IRT confidence");
 
         // ── Propose: an already-staged segment keeps its confidence (riskiest-first ordering). ──
         let propose = crate::settings::AppSettings {
@@ -4179,7 +4179,7 @@ mod tests {
         run_jury_pipeline_core(&db2, &propose, vec![seg2.id.clone()]).unwrap();
         let fresh3 = db2.get_segment_by_id(&seg2.id).unwrap().unwrap();
         assert_eq!(
-            fresh3.agent_confidence,
+            fresh3.agreement_score,
             Some(0.42),
             "Propose must not clobber an already-staged segment's IRT confidence"
         );

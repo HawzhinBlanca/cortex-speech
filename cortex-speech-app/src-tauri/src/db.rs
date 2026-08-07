@@ -49,7 +49,7 @@ pub struct SpeechSegment {
     pub verdict_transcript: Option<String>,
     pub rationale: Option<String>,
     pub evidence_json: Option<String>,
-    pub agent_confidence: Option<f64>,
+    pub agreement_score: Option<f64>,
     pub escalated: bool,
     pub human_decision: Option<String>,
     pub corrected_at: Option<String>,
@@ -380,7 +380,7 @@ const SEGMENT_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript
                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
                     confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
                     verdict, verdict_transcript, rationale, evidence_json,
-                    agent_confidence, escalated, human_decision, corrected_at, is_gold,
+                    agreement_score, escalated, human_decision, corrected_at, is_gold,
                     alignment_quality, model_version_id, confidence_source, cloud_call,
                     decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
                     reviewed_by, speaker_change_score";
@@ -420,7 +420,7 @@ use crate::normalizer::learning_text_key;
 
 /// Suspect-first review ordering (external review 2026-08-06 #2).
 ///
-/// `agent_confidence` on an escalated row is the IRT model-AGREEMENT confidence, and agreement is not
+/// `agreement_score` on an escalated row is the IRT model-AGREEMENT confidence, and agreement is not
 /// trustworthiness. A clip escalated because its AUDIO is poor — `has_hard_distrust_veto`'s snr < 5 dB
 /// or clipping > 0.1 — can carry 0.97 there because every recognizer confidently agreed on the same
 /// garbage. Ordering by that value alone sent exactly the clips the gate refused to trust to the BACK
@@ -445,7 +445,7 @@ static SUSPECT_FIRST_ORDER: std::sync::LazyLock<String> = std::sync::LazyLock::n
     format!(
         "escalated DESC, \
          (CASE WHEN COALESCE(snr_db, 99.0) < {snr} OR COALESCE(clipping_ratio, 0.0) > {clip} THEN 0 ELSE 1 END) ASC, \
-         COALESCE(agent_confidence, 0.5) ASC, \
+         COALESCE(agreement_score, 0.5) ASC, \
          datetime(created_at) DESC, id ASC",
         snr = crate::quality::POOR_AUDIO_SNR_DB,
         clip = crate::quality::POOR_AUDIO_CLIPPING_RATIO,
@@ -689,7 +689,7 @@ impl Database {
 
     /// Resurrect a HARD-DELETED segment from a full in-memory snapshot, persisting EVERY column the
     /// snapshot carries — including the jury / human-review / gold-provenance fields (verdict,
-    /// verdict_transcript, rationale, evidence_json, agent_confidence, escalated, human_decision,
+    /// verdict_transcript, rationale, evidence_json, agreement_score, escalated, human_decision,
     /// corrected_at, is_gold) and `created_at` that [`insert_segment`] deliberately omits.
     ///
     /// [`insert_segment`]'s 17-column subset is correct for the normal edit path, where the row still
@@ -711,7 +711,7 @@ impl Database {
                 (id, created_at, audio_path, raw_transcript, normalized_transcript,
                  annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence,
                  ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
-                 verdict, verdict_transcript, rationale, evidence_json, agent_confidence, escalated,
+                 verdict, verdict_transcript, rationale, evidence_json, agreement_score, escalated,
                  human_decision, corrected_at, is_gold, alignment_quality, model_version_id,
                  confidence_source, cloud_call, decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
                  reviewed_by, speaker_change_score, updated_at)
@@ -739,7 +739,7 @@ impl Database {
                 verdict_transcript=excluded.verdict_transcript,
                 rationale=excluded.rationale,
                 evidence_json=excluded.evidence_json,
-                agent_confidence=excluded.agent_confidence,
+                agreement_score=excluded.agreement_score,
                 escalated=excluded.escalated,
                 human_decision=excluded.human_decision,
                 corrected_at=excluded.corrected_at,
@@ -778,7 +778,7 @@ impl Database {
                 verdict_transcript_nfc,
                 seg.rationale,
                 seg.evidence_json,
-                seg.agent_confidence,
+                seg.agreement_score,
                 seg.escalated as i32,
                 seg.human_decision,
                 seg.corrected_at,
@@ -2791,7 +2791,7 @@ impl Database {
             verdict_transcript: Self::optional_col(row, 18)?,
             rationale: Self::optional_col(row, 19)?,
             evidence_json: Self::optional_col(row, 20)?,
-            agent_confidence: Self::optional_col(row, 21)?,
+            agreement_score: Self::optional_col(row, 21)?,
             escalated: Self::optional_col::<i32>(row, 22)?.unwrap_or(0) != 0,
             human_decision: Self::optional_col(row, 23)?,
             corrected_at: Self::optional_col(row, 24)?,
@@ -2994,14 +2994,14 @@ impl Database {
         transcript: Option<&str>,
         rationale: Option<&str>,
         evidence_json: Option<&str>,
-        agent_confidence: Option<f64>,
+        agreement_score: Option<f64>,
         escalated: bool,
     ) -> AppResult<()> {
-        // agent_confidence uses COALESCE(?6, existing): a machine verdict that carries NO confidence
+        // agreement_score uses COALESCE(?6, existing): a machine verdict that carries NO confidence
         // signal must never destroy a previously persisted one. The T1/T2 escalation paths (cloud-off,
         // audio-prep failure, no-majority) all write None moments after run_t0_gate persisted the real
         // IRT confidence for the same segment — the unconditional overwrite NULLed it, and both
-        // suspect-first orderings (COALESCE(agent_confidence, 0.5)) collapsed back to recency: the one
+        // suspect-first orderings (COALESCE(agreement_score, 0.5)) collapsed back to recency: the one
         // live review-speed feature was silently nominal (true-10 audit 2026-07-09). No caller has a
         // legitimate "clear the confidence" case; callers that HAVE a signal pass Some and still win.
         // SAVEPOINT (write-path audit, Week 2): the verdict UPDATE and its decision-log INSERT are one
@@ -3021,13 +3021,13 @@ impl Database {
                      jury_transcript      = ?3,
                      rationale            = ?4,
                      evidence_json        = ?5,
-                     agent_confidence     = COALESCE(?6, agent_confidence),
+                     agreement_score     = COALESCE(?6, agreement_score),
                      escalated            = ?7,
                      updated_at           = datetime('now')
                  WHERE id = ?1
                    AND (human_decision IS NULL OR human_decision = '')
                    AND (verdict IS NULL OR verdict NOT IN ('human_accept', 'human_edit', 'human_reject'))",
-                params![segment_id, verdict, transcript, rationale, evidence_json, agent_confidence, escalated as i32],
+                params![segment_id, verdict, transcript, rationale, evidence_json, agreement_score, escalated as i32],
             )?;
             if affected == 0 {
                 // Either the row is gone or a human already decided it — in both cases the machine verdict
@@ -3079,7 +3079,7 @@ impl Database {
                  verdict_transcript = NULL,
                  rationale          = NULL,
                  evidence_json      = NULL,
-                 agent_confidence   = NULL,
+                 agreement_score   = NULL,
                  escalated          = 1,
                  updated_at         = datetime('now')
              WHERE id = ?1",
@@ -3483,14 +3483,14 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Return escalated segments ordered riskiest-first (lowest agent_confidence).
+    /// Return escalated segments ordered riskiest-first (lowest agreement_score).
     pub fn get_escalation_queue(&self, limit: usize) -> AppResult<Vec<SpeechSegment>> {
         let query = format!(
             "SELECT {SEGMENT_SELECT_COLUMNS}
              FROM speech_segments
              WHERE escalated = 1
                AND (human_decision IS NULL OR human_decision = '')
-             ORDER BY COALESCE(agent_confidence, 0.5) ASC, id ASC
+             ORDER BY COALESCE(agreement_score, 0.5) ASC, id ASC
              LIMIT ?1"
         );
         let mut stmt = self.conn.prepare(&query)?;

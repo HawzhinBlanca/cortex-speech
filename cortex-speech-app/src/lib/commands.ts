@@ -1358,7 +1358,7 @@ export async function writeSegmentVerdict(
   transcript?: string | null,
   rationale?: string | null,
   evidenceJson?: string | null,
-  agentConfidence?: number | null,
+  agreementScore?: number | null,
   escalated?: boolean,
 ): Promise<void> {
   return invoke<void>('write_segment_verdict', {
@@ -1367,7 +1367,7 @@ export async function writeSegmentVerdict(
     transcript: transcript ?? null,
     rationale: rationale ?? null,
     evidenceJson: evidenceJson ?? null,
-    agentConfidence: agentConfidence ?? null,
+    agreementScore: agreementScore ?? null,
     escalated: escalated ?? false,
   });
 }

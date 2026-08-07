@@ -110,7 +110,7 @@
   ): { label: string; icon: string; color: string } {
     const pct = (c: number) => ({ pct: String(Math.round(c * 100)) });
     if (conf == null) return { label: tr('inbox.band.unknown'), icon: '❓', color: 'var(--text-subtle)' };
-    // External review 2026-08-06 #2: `agentConfidence` is model AGREEMENT, and agreement is not
+    // External review 2026-08-06 #2: `agreementScore` is model AGREEMENT, and agreement is not
     // trustworthiness. Every recognizer can confidently agree on the same garbage when the audio is
     // bad — which is exactly why the jury vetoes those clips. Rendering that as a green "97%" told the
     // reviewer the opposite of what the gate concluded, so acoustic quality is stated instead of
@@ -534,7 +534,7 @@
         <div class="rail-header">{$t('inbox.queue', { n: String(queue.length) })}</div>
         <ul class="rail-list">
           {#each queue as seg, i}
-            {@const band = confidenceBand(seg.agentConfidence, $t, hasPoorAudio(seg))}
+            {@const band = confidenceBand(seg.agreementScore, $t, hasPoorAudio(seg))}
             <li class="rail-row">
               <button
                 type="button"
@@ -558,7 +558,7 @@
 
       <!-- Focus Card -->
       {#if current}
-        {@const band = confidenceBand(current.agentConfidence, $t, hasPoorAudio(current))}
+        {@const band = confidenceBand(current.agreementScore, $t, hasPoorAudio(current))}
         <article class="focus-card" aria-label={$t('inbox.segmentQueue')}>
           <!-- Segment ID + meta -->
           <div class="card-meta">

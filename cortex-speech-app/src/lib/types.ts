@@ -25,7 +25,7 @@ export interface SpeechSegment {
   verdictTranscript?: string | null;
   rationale?: string | null;
   evidenceJson?: string | null;
-  agentConfidence?: number | null;
+  agreementScore?: number | null;
   escalated?: boolean;
   humanDecision?: string | null;
   correctedAt?: string | null;

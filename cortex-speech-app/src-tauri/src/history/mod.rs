@@ -345,7 +345,7 @@ mod tests {
         seg.verdict = Some("human_accept".to_string());
         seg.human_decision = Some("human_edit".to_string());
         seg.is_gold = true;
-        seg.agent_confidence = Some(0.9);
+        seg.agreement_score = Some(0.9);
         seg.rationale = Some("reviewed".to_string());
         db.insert_segment_full(&seg).unwrap();
 
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(restored.verdict.as_deref(), Some("human_accept"), "verdict must survive undo of delete");
         assert_eq!(restored.human_decision.as_deref(), Some("human_edit"), "human_decision must survive");
         assert!(restored.is_gold, "is_gold must survive undo of delete");
-        assert_eq!(restored.agent_confidence, Some(0.9), "agent_confidence must survive");
+        assert_eq!(restored.agreement_score, Some(0.9), "agreement_score must survive");
     }
 
     #[test]
@@ -497,7 +497,7 @@ mod tests {
             verdict_transcript: Some("dîtina rast a mirov".to_string()),
             rationale: Some("human corrected the failed ASR".to_string()),
             evidence_json: Some("{\"src\":\"human\"}".to_string()),
-            agent_confidence: Some(0.91),
+            agreement_score: Some(0.91),
             escalated: true,
             human_decision: Some("edit".to_string()),
             corrected_at: Some("2020-01-03 09:00:00".to_string()),
@@ -527,7 +527,7 @@ mod tests {
         assert_eq!(restored.corrected_at.as_deref(), Some("2020-01-03 09:00:00"));
         assert!(restored.is_gold, "gold-anchor status must survive undo");
         assert!(restored.escalated, "escalated flag must survive undo");
-        assert_eq!(restored.agent_confidence, Some(0.91));
+        assert_eq!(restored.agreement_score, Some(0.91));
         assert_eq!(restored.rationale.as_deref(), Some("human corrected the failed ASR"));
         assert_eq!(restored.evidence_json.as_deref(), Some("{\"src\":\"human\"}"));
         assert_eq!(
