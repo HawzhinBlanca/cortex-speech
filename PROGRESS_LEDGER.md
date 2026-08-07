@@ -7238,3 +7238,76 @@ instead — stricter than the string it replaced.
 decision. And `npm run tauri build` exits non-zero on this rig at the NSIS BUNDLING step (os error 32,
 the 512 MB installer still being written) even when the exe compiles and links correctly — harmless
 while `signed-installer` is descoped, and a trap the moment it is not.
+
+## Iteration 257 — escalations now say why, and four consecutive GREEN sweeps
+
+Continuing `docs/TRUE_10_REMAINING_2026-08-06.md`.
+
+**P1.2 core CLOSED: escalated clips record WHY.** Every T0 escalation wrote
+`write_verdict(..., None /*rationale*/, None /*evidence_json*/, ...)`. The row recorded THAT a clip was
+escalated and its agreement score, and nothing else — a reviewer opening one saw
+`escalated=1, agent_confidence=0.73, rationale=NULL`. Four genuinely different causes collapsed into
+that same empty record: `low_snr`/`clipping` (a bool), `single_recognizer` (the same bool),
+`model_disagreement` (nonconformity over threshold), and `uncalibrated_bucket` — a separate fail-closed
+branch that was not even in the audit's own list of codes, and which is not a statement about the audio
+or the models but about the evidence available to judge them. They call for opposite reviewer actions,
+so a queue that cannot tell them apart cannot be triaged.
+
+NO MIGRATION: `evidence_json` was already persisted, already threaded through `write_verdict`, already
+parsed by `export.rs`. A new column would have been schema for data that already had a home.
+
+`has_hard_distrust_veto` is now DERIVED from `hard_distrust_reasons` rather than computed beside it, so
+the routing decision and the recorded explanation cannot disagree — the test asserts that relationship
+instead of trusting it. Codes are `const &str`, not an enum: they are persisted and read back, and
+renaming an enum variant would silently reinterpret history. `low_snr` and `clipping` are SEPARATE
+because clipping means re-record while low SNR may only need a denoise pass. `threshold` is null when
+the bucket is uncalibrated rather than a borrowed number — there was no threshold, and recording one
+would invent evidence for a decision that did not use it. `policyVersion` and the threshold must be
+stored because the conformal threshold RECALIBRATES as the corpus grows: without them, "this clip had
+no low_snr" is indistinguishable from "the policy did not check low_snr yet".
+
+The distinction to keep: stored codes answer "why was this DECIDED"; the live review badge answers
+"what is TRUE now". A clip escalated for low_snr whose audio was later replaced should still show why it
+was escalated while the badge shows clean. Making the badge read stored codes would be the three-copy
+threshold bug in reverse.
+
+**P2.3, the real defect.** `type Blocker = { ...; action?: 'relink' | 'review' }` and `pendingReview`
+had carried `action: 'review'` since it was written, but the template only ever branched on `'relink'`.
+The one blocker a reviewer can always act on rendered as a dead sentence: the readiness card named the
+problem and offered no way to fix it. A dropped-INTENT bug — data model and template each made sense
+alone and disagreed only with each other, so nothing failed. It survived because StatsDashboard took no
+props at all and had no route out of itself. The gate now compares declared actions against
+branched-on actions in BOTH directions (an unreachable branch is the mirror-image bug). Fail-before 4/4,
+including a literal replay of the shipped bug.
+
+NOT claimed: the other four blockers still have no action. Honest deep-linking needs their exact
+filtered clips and no such filter API exists; sending the reviewer to the generic queue and calling it a
+deep link would be the gesture this audit exists to catch.
+
+**Documentation/governance.** Six planning docs dated 2026-06-17 to 2026-07-24 read as live plans with
+nothing marking them overtaken. Each now leads with the canonical hierarchy — the gate, its GENERATED
+STATUS.md, this dated re-audit, this ledger — archived rather than deleted, because the reasoning is why
+later decisions were made.
+
+**Four consecutive GREEN sweeps** at c4fb8aa, 39e22b8, e54d07c, 8bfbf5d — 32 PASS / 0 FAIL / 0 skipped
+each. P0.1 asked for a result the named machine can REPRODUCE; four agreeing runs at four commits is a
+property of the build rather than a lucky green.
+
+**Five defects found reviewing this session's own work, none caught by any gate, all mine.** A streamed
+recording's identity persisted but never CHECKED; `content_hash` feeding blake3 two bytes at a time
+(195.4 ms vs 4.5 ms per 90 s window, same digest); a runtime-panic policy pinning a generic type it was
+never about; a sweep script that polled for `cargo.exe` before the build had spawned it and would have
+swept a STALE binary; and a monitor that read `runs.jsonl` before it was archived and reported the
+PREVIOUS run's GREEN as fresh evidence. One shape underneath all five: trusting a proxy — a process
+name, a file's contents, a bool that had discarded what it knew — instead of checking the thing itself.
+The freshness guard caught the fourth and `run_id` caught the fifth, and both exist only because P0.1
+demanded reproducible evidence.
+
+**Outside every audit category, recorded so it is not rediscovered:** `heartbeat-runtime` passed on a
+RE-RUN after an OS kill (exit 3221226505 = 0xC0000409, STATUS_STACK_BUFFER_OVERRUN) produced no verdict.
+The gate refusing to score a crashed run is correct, but the ledger records that same signature at phase
+23 as "instrumented, not fixed". Still live, still intermittent, currently visible only because a retry
+absorbs it. And `npm run tauri build` now fails 4/4 at the NSIS bundling step (os error 32) while the exe
+itself compiles, links and passes exe-freshness — makensis DOES complete the 488 MB installer and the
+handle is taken immediately after close. Harmless while `signed-installer` is descoped; a release blocker
+the day it is not.
