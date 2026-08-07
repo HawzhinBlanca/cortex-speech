@@ -7417,3 +7417,39 @@ instrumentation gap, not a cause. Naming the failing test inside `e2e_pipeline` 
 run single-threaded so libtest prints a name before the abort — a permanent cost on the longest gate, for
 a crash seen twice in this population over weeks. That is an owner call, not something to spend the
 sweep budget on unilaterally.
+
+## Iteration 260 — the crash is not binary-specific, and the diagnostic proved it by being wrong
+
+Owner asked for the single-threaded diagnostic. It was built, armed on `e2e_pipeline`, and immediately
+disproved the assumption it was built on.
+
+**What was measured before building it.** `--test-threads=1` on the whole `test-rust` gate costs
+365 s vs 140 s for the lib suite alone (2.6x) — roughly +14 minutes on every sweep to instrument one
+file. So the serialisation was scoped to the crashing binary with a mutex (+14.5 s: 31 s vs 16.5 s), and
+paired with an explicitly FLUSHED breadcrumb file, because libtest writes `test <name> ... ` WITHOUT a
+trailing newline and stdout to a pipe is line-buffered — the same trap this ledger already documented for
+Node. Verified under a real SIGKILL, not argued: four completed START/END pairs and exactly one dangling
+START naming the in-flight test.
+
+**Then the next sweep redded on `test-rust` again — and the breadcrumb said `e2e_pipeline` finished
+cleanly.** The abort was in `pipeline_integration.rs`, same signature, different binary.
+
+That is the finding. The crash is NOT an `e2e_pipeline` bug. It is in the shared native ONNX/sherpa path
+and lands on whichever test binary happens to be exercising it when the C++ exception escapes. Three
+occurrences in population 2 now: `e2e_pipeline` twice, `pipeline_integration` once. Arming a single file
+did not narrow the problem — it MOVED the blind spot, and the only reason that is now known rather than
+suspected is that the instrumented binary could prove its own innocence.
+
+**Response:** the helper moved into `tests/fixtures/mod.rs` and labels every entry `binary::test`, so a
+shared log answers both questions. `pipeline_integration` is armed alongside `e2e_pipeline`. Six more
+binaries touch the ASR path (`batch_asr`, `gold_wer_eval`, `real_audio`, `reliability`, `soak`,
+`user_data_test`) and are NOT yet armed — named here so the next occurrence in one of them is
+recognised as coverage rather than mystery.
+
+**Still not fixed, and still not claimed as fixed.** What is established: the population split
+(iteration 259), the instrumentation gap, and now that population 2 is a property of the native stack
+rather than of one test file. What is not established: which call throws, or why it only happens inside a
+full sweep.
+
+Two sweeps redded honestly to learn this (20260807T152120 and 20260807T172029), both preserved. Neither
+was papered over with a re-run, and the second one is the one that paid.

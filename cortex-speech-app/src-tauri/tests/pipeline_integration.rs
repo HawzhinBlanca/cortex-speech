@@ -44,6 +44,7 @@ fn setup_db() -> (Database, String) {
 
 #[test]
 fn test_import_directory_with_wav_files() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("pipeline_integration", "test_import_directory_with_wav_files");
     let dir = TempDir::new().unwrap();
 
     // Create several WAV files with different characteristics
@@ -105,6 +106,7 @@ fn test_import_directory_with_wav_files() {
 
 #[test]
 fn test_full_pipeline_import_to_delete() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("pipeline_integration", "test_full_pipeline_import_to_delete");
     let dir = TempDir::new().unwrap();
 
     // Import phase: create WAV files
@@ -149,6 +151,7 @@ fn test_full_pipeline_import_to_delete() {
 
 #[test]
 fn test_import_directory_empty() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("pipeline_integration", "test_import_directory_empty");
     let dir = TempDir::new().unwrap();
 
     let (_db, db_path) = setup_db();
@@ -163,6 +166,7 @@ fn test_import_directory_empty() {
 
 #[test]
 fn test_import_directory_skips_non_audio() {
+    let _crash_breadcrumb = fixtures::crash_breadcrumb("pipeline_integration", "test_import_directory_skips_non_audio");
     let dir = TempDir::new().unwrap();
 
     std::fs::write(dir.path().join("doc.pdf"), b"%PDF-1.4 dummy").unwrap();
