@@ -41,9 +41,7 @@ BY_DESIGN = {
     "validation/mod.rs": "a validation report is a statement about every row in the corpus",
 }
 
-TO_RETIRE = {
-    "commands/segments_read.rs": "get_active_learning_queue needs its conformal threshold computed in SQL",
-}
+TO_RETIRE: dict[str, str] = {}
 
 # Retired, kept as a record so the list cannot quietly regrow into them:
 #   commands/dataset_analytics.rs (2026-08-07) — three whole-corpus STATISTICS (training-grade
@@ -118,15 +116,36 @@ def test_no_new_unbounded_segment_read_appears() -> None:
 
 
 def test_the_backlog_is_named_rather_than_implied() -> None:
-    """TO_RETIRE must not silently empty out into 'everything is by design'."""
-    if not TO_RETIRE:
-        raise AssertionError(
-            "TO_RETIRE is empty. If every unbounded read really is by design, say so in the ledger "
-            "and delete this assertion deliberately — do not let the backlog vanish by attrition."
-        )
+    """TO_RETIRE must not silently empty out into 'everything is by design'.
+
+    The emptiness assertion that used to live here has been DELETED DELIBERATELY, which is exactly what
+    it instructed whoever emptied the list to do. It existed to stop the backlog vanishing by attrition —
+    entries quietly dropped until nothing remained and the gate looked satisfied. That is not what
+    happened. All four entries were retired by completion on 2026-08-06/07, each with a commit and a
+    regression test:
+
+      commands.rs                   -> get_pending_segments(PendingWork::_), with a SQL-superset gate
+                                       pinning the prefilter against the Rust authority
+      couch.rs                      -> leases on pending IDs, hydrates only the served batch, with a test
+                                       pinning served order == leased order
+      commands/dataset_analytics.rs -> for_each_segment folds, with a streamed-vs-collected equivalence
+                                       test over a deliberately non-degenerate fixture
+      commands/segments_read.rs     -> one streaming pass + light (id, score) pairs, with a test pinning
+                                       the ranking byte-for-byte against collect-then-sort
+
+    The `stale` check in the test above is what keeps this honest now: every BY_DESIGN entry must still
+    genuinely read the whole library, so the exception list cannot rot into blessing paths that no longer
+    exist. And a NEW unbounded read still fails `unexpected` — the population can only grow deliberately.
+
+    If a future site is genuinely unbounded-for-now, put it back in TO_RETIRE with its reason. An empty
+    dict is a claim that there is no backlog, and that claim is only as good as the four commits above.
+    """
     overlap = set(BY_DESIGN) & set(TO_RETIRE)
     if overlap:
         raise AssertionError(f"a site cannot be both by-design and to-retire: {sorted(overlap)}")
+    # The teeth that remain: BY_DESIGN must not be empty either, or the whole policy is vacuous.
+    if not BY_DESIGN:
+        raise AssertionError("BY_DESIGN is empty — this gate would then assert nothing at all")
 
 
 def main() -> None:

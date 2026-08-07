@@ -56,7 +56,7 @@ pub async fn get_training_grade_breakdown(
         // implementation the export also gates on. Only the row's lifetime shrinks. State is O(distinct
         // reasons); it used to be O(corpus) full records.
         let mut tally = quality::TrainingGradeTally::default();
-        db.for_each_segment(|seg| tally.push(&seg)).map_err(|e| e.to_string())?;
+        db.for_each_segment(None, |seg| tally.push(&seg)).map_err(|e| e.to_string())?;
         Ok(tally.finish())
     })
     .await
@@ -103,7 +103,7 @@ pub async fn get_dataset_certificate(
         let tally = {
             let db = db.lock().unwrap_or_else(|p| p.into_inner());
             let mut tally = crate::quality::conformal::ConformalTally::default();
-            db.for_each_segment(|seg| tally.push(&seg)).map_err(|e| e.to_string())?;
+            db.for_each_segment(None, |seg| tally.push(&seg)).map_err(|e| e.to_string())?;
             tally
         };
         Ok(tally.finish(target_error, confidence_level))
@@ -125,7 +125,7 @@ pub async fn compute_annotation_drift_scorecard(
         // P1.3: folded from a stream. Only the (small) per-clip error records survive a push, which is
         // all the bootstrap needs; the transcripts they were computed from do not.
         let mut tally = crate::scorecard::AnnotationDriftTally::default();
-        db.for_each_segment(|seg| tally.push(&seg)).map_err(|e| e.to_string())?;
+        db.for_each_segment(None, |seg| tally.push(&seg)).map_err(|e| e.to_string())?;
         Ok(tally.finish(Default::default()))
     })
     .await

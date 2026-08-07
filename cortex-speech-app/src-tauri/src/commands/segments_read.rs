@@ -148,27 +148,56 @@ pub async fn get_active_learning_queue(
     RATE_LIMITER.check("get_active_learning_queue")?;
     let db = state.db_arc();
     run_blocking(move || {
-        let segments = {
+        // P1.3, last site. This read the WHOLE library as full records — transcripts, alignment JSON,
+        // evidence JSON — to compute one threshold and then return at most `limit` clips.
+        //
+        // The audit filed this under "compute the conformal threshold in SQL", but that conflates two
+        // separable problems. The SELECTION RULE here really is naive (rank by distance to one
+        // threshold) and fixing it needs the frozen human-labelled calibration split that does not exist
+        // until the Gold Marathon — that is P1.4 and it stays open. The MEMORY SHAPE is independent of
+        // that and fixable now, so it is fixed now, and the ranking below is byte-for-byte what it was.
+        //
+        // ONE streaming pass does both jobs: the tally accumulates the certificate, and every unverified
+        // row's nonconformity is captured as it goes by. `q_hat` is not known until the pass ends, but it
+        // is a GLOBAL constant applied afterwards, so the per-segment score is all that must be carried.
+        //
+        // What survives the pass is `(id, score)` per unverified row — tens of bytes — instead of the
+        // full record. Only the `limit` clips actually returned are hydrated, exactly as couch.rs does.
+        let (q_hat, mut scored) = {
             let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.get_segments(None).map_err(|e| e.to_string())?
+            let mut tally = quality::conformal::ConformalTally::default();
+            let mut scored: Vec<(String, f64)> = Vec::new();
+            db.for_each_segment(None, |seg| {
+                if !seg.verified {
+                    scored.push((seg.id.clone(), quality::conformal::compute_nonconformity_score(&seg)));
+                }
+                tally.push(&seg);
+            })
+            .map_err(|e| e.to_string())?;
+            (tally.finish(target_error, confidence_level).threshold, scored)
         };
 
-        let cert = quality::conformal::calibrate_and_certify(&segments, target_error, confidence_level);
-        let q_hat = cert.threshold;
+        // Identical ordering to the Vec<(SpeechSegment, f64)> sort this replaces: uncertainty is
+        // `-(score - q_hat).abs()` sorted DESCENDING, and `sort_by` is STABLE, so ties keep corpus
+        // order. Both properties are preserved deliberately — this change is about memory, not ranking.
+        scored.sort_by(|a, b| {
+            let (ua, ub) = (-(a.1 - q_hat).abs(), -(b.1 - q_hat).abs());
+            ub.partial_cmp(&ua).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(limit);
 
-        let mut candidates: Vec<(SpeechSegment, f64)> = segments
-            .into_iter()
-            .filter(|s| !s.verified)
-            .map(|s| {
-                let score = quality::conformal::compute_nonconformity_score(&s);
-                let uncertainty = -(score - q_hat).abs();
-                (s, uncertainty)
-            })
-            .collect();
-
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        Ok(candidates.into_iter().take(limit).map(|(s, _)| s).collect())
+        // Hydrate only what is returned, then re-impose the ranked order: get_segments_by_ids applies its
+        // own global ordering, and handing back a differently-ordered queue would silently change which
+        // clip a reviewer is asked to judge first — the whole point of an active-learning queue.
+        let ids: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
+        let rows = {
+            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?
+        };
+        let by_id: std::collections::HashMap<&str, &SpeechSegment> = rows.iter().map(|s| (s.id.as_str(), s)).collect();
+        // filter_map, not unwrap: a clip can be deleted between the scan and the fetch. Returning one
+        // fewer is correct; panicking on a race in a read command is not.
+        Ok(ids.iter().filter_map(|id| by_id.get(id.as_str()).map(|s| (*s).clone())).collect())
     })
     .await
 }

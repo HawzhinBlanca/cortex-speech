@@ -2980,6 +2980,88 @@ fn audio_fingerprint_round_trips_through_sqlite_including_the_high_bit() {
     assert!(!loaded.iter().any(|r| r.audio_path == "/audio/other.wav"), "a NULL fingerprint must not appear");
 }
 
+/// The streamed active-learning queue must rank identically to collect-then-sort.
+///
+/// P1.3, last site. `get_active_learning_queue` materialised the whole corpus as full records to compute
+/// one threshold and return at most `limit` clips. It now makes ONE streaming pass — the tally
+/// accumulates the certificate while every unverified row's nonconformity is captured alongside it —
+/// then sorts the light `(id, score)` pairs and hydrates only what it returns.
+///
+/// This is a MEMORY change, not a ranking change, and the distinction is the whole risk: the order here
+/// decides which clip a reviewer is asked to judge first. So the streamed order is compared against the
+/// original algorithm computed directly from a collected `Vec`, on the same corpus, including the
+/// stable-sort tie behaviour that keeps equal-uncertainty clips in corpus order.
+///
+/// The SELECTION RULE itself is untouched and still naive — ranking by distance to a single threshold is
+/// P1.4's problem and needs the Gold Marathon's calibration split. Fixing the memory shape does not make
+/// the ranking good; it makes it affordable.
+#[test]
+fn streamed_active_learning_ranking_matches_collect_then_sort() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+
+    // Mixed verified/unverified with varied confidence + ctc_score, so nonconformity actually spreads
+    // and ties genuinely occur (every 5th clip shares a score with another).
+    for i in 0..40 {
+        db.insert_segment(&SpeechSegment {
+            id: format!("s{i:03}"),
+            audio_path: format!("/audio/{}.wav", i / 4),
+            raw_transcript: format!("دەق {i}"),
+            annotated_transcript: (i % 3 != 0).then(|| format!("دەقی {i}")),
+            verified: i % 4 == 0,
+            confidence: Some(0.3 + ((i % 5) as f64) / 10.0),
+            ctc_score: Some(-1.0 - ((i % 5) as f64)),
+            confidence_source: Some("real_posterior".into()),
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+    }
+
+    let (target_error, confidence_level, limit) = (0.05_f64, 0.95_f64, 7_usize);
+
+    // ── Reference: the original algorithm, over a collected Vec. ──
+    let collected = db.get_segments(None).unwrap();
+    let q_hat_ref =
+        crate::quality::conformal::calibrate_and_certify(&collected, target_error, confidence_level).threshold;
+    let mut ref_pairs: Vec<(SpeechSegment, f64)> = collected
+        .into_iter()
+        .filter(|s| !s.verified)
+        .map(|s| {
+            let score = crate::quality::conformal::compute_nonconformity_score(&s);
+            (s, -(score - q_hat_ref).abs())
+        })
+        .collect();
+    ref_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let expected: Vec<String> = ref_pairs.into_iter().take(limit).map(|(s, _)| s.id).collect();
+
+    // ── Streamed: one pass, light pairs, hydrate the tail. ──
+    let mut tally = crate::quality::conformal::ConformalTally::default();
+    let mut scored: Vec<(String, f64)> = Vec::new();
+    db.for_each_segment(None, |seg| {
+        if !seg.verified {
+            scored.push((seg.id.clone(), crate::quality::conformal::compute_nonconformity_score(&seg)));
+        }
+        tally.push(&seg);
+    })
+    .unwrap();
+    let q_hat = tally.finish(target_error, confidence_level).threshold;
+    assert_eq!(q_hat, q_hat_ref, "the streamed certificate must produce the same threshold");
+    scored.sort_by(|a, b| {
+        let (ua, ub) = (-(a.1 - q_hat).abs(), -(b.1 - q_hat).abs());
+        ub.partial_cmp(&ua).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let actual: Vec<String> = scored.into_iter().take(limit).map(|(id, _)| id).collect();
+
+    assert_eq!(actual, expected, "streamed ranking diverged from collect-then-sort");
+
+    // Non-vacuity: comparing two empty or trivially-ordered queues would prove nothing.
+    assert_eq!(actual.len(), limit, "the fixture must produce a full page of candidates");
+    assert!(
+        actual.iter().collect::<std::collections::BTreeSet<_>>().len() == limit,
+        "the queue must not repeat a clip"
+    );
+}
+
 /// Migration v52 must RENAME the agreement column, never recreate it — the values have to survive.
 ///
 /// P1.2. `agent_confidence` became `agreement_score` because the old name invited exactly the reading
@@ -3199,7 +3281,7 @@ fn streaming_the_corpus_statistics_equals_collecting_them_first() {
 
     // 1. Training-grade breakdown — the readiness verdict the export gates on.
     let mut tally = crate::quality::TrainingGradeTally::default();
-    db.for_each_segment(|seg| tally.push(&seg)).unwrap();
+    db.for_each_segment(None, |seg| tally.push(&seg)).unwrap();
     assert_eq!(
         serde_json::to_value(tally.finish()).unwrap(),
         serde_json::to_value(crate::quality::training_grade_breakdown(&collected)).unwrap(),
@@ -3210,7 +3292,7 @@ fn streaming_the_corpus_statistics_equals_collecting_them_first() {
     //    threshold. Certified id ORDER is part of the value, so this also pins that the captured
     //    certify-side input preserved corpus order.
     let mut tally = crate::quality::conformal::ConformalTally::default();
-    db.for_each_segment(|seg| tally.push(&seg)).unwrap();
+    db.for_each_segment(None, |seg| tally.push(&seg)).unwrap();
     assert_eq!(
         serde_json::to_value(tally.finish(0.05, 0.95)).unwrap(),
         serde_json::to_value(crate::quality::conformal::calibrate_and_certify(&collected, 0.05, 0.95)).unwrap(),
@@ -3220,7 +3302,7 @@ fn streaming_the_corpus_statistics_equals_collecting_them_first() {
     // 3. Annotation-drift scorecard — seeded bootstrap, so equality here also proves the two saw the
     //    same clips in the same order (a reordering would resample differently).
     let mut tally = crate::scorecard::AnnotationDriftTally::default();
-    db.for_each_segment(|seg| tally.push(&seg)).unwrap();
+    db.for_each_segment(None, |seg| tally.push(&seg)).unwrap();
     assert_eq!(
         serde_json::to_value(tally.finish(Default::default())).unwrap(),
         serde_json::to_value(crate::scorecard::annotation_drift_scorecard(&collected, Default::default())).unwrap(),

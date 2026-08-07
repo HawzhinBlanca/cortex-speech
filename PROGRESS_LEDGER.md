@@ -7486,3 +7486,44 @@ convention) instead of the thing itself (the attribute that actually defines a t
 
 Still not fixed and still not claimed as fixed. What this buys: the next occurrence, in any of the eight,
 names its binary and its test instead of costing a sweep and yielding nothing.
+
+## Iteration 262 — the unbounded-read backlog reaches zero, by completion
+
+`commands/segments_read.rs` was the last entry, and it had been recorded as blocked. It was not — the
+audit conflated two separable problems and the block only applied to one of them.
+
+`get_active_learning_queue` read the WHOLE library as full records (transcripts, alignment JSON,
+evidence JSON) to compute one conformal threshold and return at most `limit` clips. The audit filed it
+under "compute the threshold in SQL". But the SELECTION RULE and the MEMORY SHAPE are independent:
+
+  - the rule really is naive — rank by distance to a single threshold — and fixing it needs the frozen
+    human-labelled calibration split that does not exist until the Gold Marathon. That is P1.4 and it
+    STAYS OPEN.
+  - the memory shape needs none of that, and is now fixed.
+
+ONE streaming pass does both jobs: the `ConformalTally` accumulates the certificate while every
+unverified row's nonconformity is captured alongside it. `q_hat` is not known until the pass ends, but it
+is a GLOBAL constant applied afterwards, so the per-segment score is all that must be carried. What
+survives the pass is `(id, score)` per unverified row — tens of bytes — and only the `limit` clips
+actually returned are hydrated, the same shape couch.rs already uses.
+
+`streamed_active_learning_ranking_matches_collect_then_sort` compares the streamed order against the
+ORIGINAL algorithm computed from a collected Vec on the same corpus, including the stable-sort tie
+behaviour that keeps equal-uncertainty clips in corpus order. That equivalence is the entire risk: this
+order decides which clip a reviewer is asked to judge first. Fixing the memory shape does not make the
+ranking good — it makes it affordable.
+
+**The emptiness assertion in the policy gate was deleted DELIBERATELY, which is what it asked for.** It
+existed to stop the backlog vanishing by attrition — entries quietly dropped until the gate looked
+satisfied. That is not what happened here. Four entries, four commits, four regression tests:
+
+  commands.rs                   get_pending_segments(PendingWork::_) + SQL-superset gate
+  couch.rs                      lease on IDs, hydrate the batch, served-order == leased-order test
+  commands/dataset_analytics.rs for_each_segment folds + streamed-vs-collected equivalence test
+  commands/segments_read.rs     one streaming pass + ranking-equivalence test
+
+The gate keeps its teeth: a NEW unbounded read still fails (verified by injecting one), and every
+BY_DESIGN entry must still genuinely read the whole library or the `stale` check fires. 7 by design,
+0 to retire.
+
+P1.3 is complete. P1.4 remains open and is honestly blocked on data, not effort.

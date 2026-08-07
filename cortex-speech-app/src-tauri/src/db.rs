@@ -1601,9 +1601,16 @@ impl Database {
     ///
     /// Same ORDER BY as `get_segments`, so a fold that is order-sensitive sees exactly what the
     /// collect-then-iterate version saw.
-    pub fn for_each_segment(&self, mut f: impl FnMut(SpeechSegment)) -> AppResult<()> {
+    /// `verified` filters exactly like [`get_segments`], so a streaming caller sees the same rows in the
+    /// same order as the collecting one it replaced.
+    pub fn for_each_segment(&self, verified: Option<bool>, mut f: impl FnMut(SpeechSegment)) -> AppResult<()> {
+        let where_sql = match verified {
+            Some(true) => " WHERE verified = 1",
+            Some(false) => " WHERE verified = 0",
+            None => "",
+        };
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments ORDER BY created_at DESC, id ASC"
+            "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments{where_sql} ORDER BY created_at DESC, id ASC"
         ))?;
         let rows = stmt.query_map([], Self::map_row)?;
         for row in rows {
