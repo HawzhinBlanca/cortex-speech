@@ -892,8 +892,62 @@ def test_every_declared_readiness_blocker_action_is_actually_rendered() -> None:
         )
 
 
+def test_reason_code_vocabulary_matches_rust() -> None:
+    """The UI's reason-code list must equal `jury::reason` exactly, in both directions.
+
+    P1.2. The codes are PERSISTED by Rust and RENDERED by TypeScript, and neither can import the other.
+    Drift is silent and asymmetric:
+      - a code in Rust but not the UI renders as a raw untranslated string (visible, recoverable);
+      - a code in the UI but not Rust is a label for something that is never written (dead, misleading);
+      - a code RENAMED on one side only makes every stored row mean something else.
+
+    Also checks both locales, because the reviewer reads Sorani: an untranslated code would surface
+    English internals in the RTL UI, which is the whole reason the codes have human labels at all.
+
+    Note on the regex: `[A-Z_]+` is WRONG here and was caught doing exactly this damage during
+    development — it silently skipped T2_NO_MAJORITY and T1_UNRESOLVED because they contain digits, and
+    reported a drift that did not exist. Const names may contain digits; the pattern must say so.
+    """
+    rust = _read("src-tauri/src/jury/mod.rs")
+    block = re.search(r"pub mod reason \{(.*?)\n\}", rust, re.DOTALL)
+    if not block:
+        raise AssertionError("jury::reason module not found — this gate would pass vacuously")
+    rust_codes = set(re.findall(r'pub const [A-Z0-9_]+: &str = "([a-z0-9_]+)"', block.group(1)))
+    if not rust_codes:
+        raise AssertionError("no reason codes parsed from Rust — this gate would pass vacuously")
+
+    ts = _read("src/lib/reasonCodes.ts")
+    ts_block = re.search(r"KNOWN_REASON_CODES = \[(.*?)\]", ts, re.DOTALL)
+    if not ts_block:
+        raise AssertionError("KNOWN_REASON_CODES not found in reasonCodes.ts")
+    ts_codes = set(re.findall(r"'([a-z0-9_]+)'", ts_block.group(1)))
+
+    missing_in_ui = sorted(rust_codes - ts_codes)
+    if missing_in_ui:
+        raise AssertionError(
+            f"reason code(s) {missing_in_ui} are written by Rust but unknown to the UI — they will "
+            "render as raw untranslated strings. Add them to KNOWN_REASON_CODES and to both locales."
+        )
+    phantom = sorted(ts_codes - rust_codes)
+    if phantom:
+        raise AssertionError(
+            f"the UI declares reason code(s) {phantom} that Rust never writes — a label for something "
+            "that cannot happen. Remove them, or add the constant to jury::reason."
+        )
+
+    for locale in ("en", "ckb"):
+        src = _read(f"src/lib/i18n/{locale}.ts")
+        untranslated = sorted(c for c in rust_codes if f"'reason.{c}'" not in src)
+        if untranslated:
+            raise AssertionError(
+                f"reason code(s) {untranslated} have no {locale} translation — a Sorani reviewer would "
+                "read English internals in an RTL screen"
+            )
+
+
 def main() -> None:
     test_a_skip_never_clears_the_reviewers_draft_on_either_route()
+    test_reason_code_vocabulary_matches_rust()
     test_review_decisions_stay_on_screen_in_one_sticky_bar()
     test_poor_audio_thresholds_match_the_rust_authority()
     test_every_declared_readiness_blocker_action_is_actually_rendered()

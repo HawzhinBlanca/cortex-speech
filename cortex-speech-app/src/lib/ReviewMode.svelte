@@ -21,6 +21,7 @@
   import { reviewProgress } from './reviewProgress';
   import { wordPlayBounds, replaceWordToken } from './wordEdit';
   import { isPlaceholderTranscript } from './segmentQuality';
+  import { parseEscalationEvidence, reasonLabelKey, reasonTone } from './reasonCodes';
   import type { SpeechSegment, WordTimestamp } from './types';
   import type { SegmentConsensus } from './commands';
 
@@ -100,6 +101,9 @@
   // purpose — a fully-reviewed SEARCH SUBSET must never fire the completion banner. See
   // reviewProgress.ts, where that rule is unit-tested.
   const progress = $derived(reviewProgress(queue, $segments));
+  // Null whenever the current clip carries no decision record — never escalated, or decided before the
+  // codes existed. The template renders nothing in that case rather than asserting "no reasons".
+  const escalationReasons = $derived(parseEscalationEvidence(current?.evidenceJson));
   // Hoisted so the label is computed once instead of twice per render, and so the chunk position gets
   // a NOUN in the markup below: bare "61/144" beside "Clip 1 of 144" read as a third progress counter.
   const chunkLabel = $derived(current ? segmentChunkLabel(current.alignmentJson) : null);
@@ -904,6 +908,32 @@
             style="width: {progress.percent}%"
           ></div>
         </div>
+
+        <!-- WHY this clip needs a human, from the jury's own record (P1.2). These are the reason codes
+             the T0/T1/T2 gates persisted at decision time, NOT a fresh inference from the row's current
+             values — the audio badge elsewhere answers "what is true now", this answers "why was this
+             decided". A clip escalated for low_snr whose audio was later replaced still says so here.
+             Absent record renders NOTHING: most clips were never escalated, and rows decided before the
+             codes existed have no record. "No reasons" would be a claim the data cannot support. -->
+        {#if escalationReasons}
+          <div class="mt-2 flex flex-wrap items-center gap-1.5" data-testid="escalation-reasons">
+            <span class="text-[11px] uppercase tracking-wider text-subtle">
+              {$t('reason.whyEscalated')}
+            </span>
+            {#each escalationReasons.reasonCodes as code (code)}
+              {@const key = reasonLabelKey(code)}
+              <span
+                class="reason-chip reason-{reasonTone(code)}"
+                title={escalationReasons.policyVersion ?? undefined}
+              >
+                <!-- An unknown code renders VERBATIM rather than being dropped: if the backend gained a
+                     code this build does not know, an untranslated string is a prompt to add it, while a
+                     silently shorter list hides the new information entirely. -->
+                {key ? $t(key) : code}
+              </span>
+            {/each}
+          </div>
+        {/if}
         <div class="mt-1 flex items-center justify-between gap-3 text-xs text-subtle">
           <!-- True-10 audit: source-file orientation — in a hundreds-of-clips sitting the reviewer
                had no idea WHICH recording the current clip came from.
@@ -1291,6 +1321,36 @@
 {/if}
 
 <style>
+  /* Escalation reason chips. Tinted by SEVERITY, not by uniform alarm: `policy_hold` and
+     `uncalibrated_bucket` are neutral because they describe the operator's setting and the evidence
+     available, not a fault in the clip — colouring them like bad audio would tell the reviewer to
+     distrust a recording nothing is wrong with. Colour is never the only cue: every chip carries its
+     own words, so this reads correctly in monochrome and to a screen reader. */
+  .reason-chip {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 9999px;
+    padding: 1px 8px;
+    font-size: 0.6875rem;
+    line-height: 1.4;
+    border: 1px solid transparent;
+  }
+  .reason-danger {
+    background: color-mix(in srgb, var(--danger) 16%, transparent);
+    border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+    color: var(--text);
+  }
+  .reason-warning {
+    background: color-mix(in srgb, var(--warning) 16%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 40%, transparent);
+    color: var(--text);
+  }
+  .reason-neutral {
+    background: var(--surface-3);
+    border-color: var(--border);
+    color: var(--text-muted, var(--text));
+  }
+
   /* The four decisions (accept / save / bad audio / undo) stay on screen at every viewport.
      `sticky`, not `fixed`: it keeps its space in the flow, so it can never sit on top of the waveform,
      the transcript, or a 200%-zoom reflow — it only pins itself once it would scroll out of view.
