@@ -136,7 +136,33 @@ def test_t2_audio_cloud_calls_require_jury_opt_in() -> None:
     assert_contains(commands, "let cloud_opt_in = settings.jury_cloud_opt_in;", COMMANDS_RS.name)
     assert_contains(commands, "if cloud_opt_in && !api_key.trim().is_empty()", COMMANDS_RS.name)
     assert_contains(commands, '"T1 could not resolve; T2 disabled (cloud opt-in off)".to_string()', COMMANDS_RS.name)
-    assert_contains(commands, 'db.write_segment_verdict(seg_id, "escalated", None, Some(&reason)', COMMANDS_RS.name)
+    # The cloud-OFF path must still reach a verdict locally: escalate to the human inbox, never call out.
+    #
+    # This used to match the single-line call `db.write_segment_verdict(seg_id, "escalated", None,
+    # Some(&reason)`. That broke when the call gained an evidence_json argument and rustfmt wrapped it —
+    # a formatting change, with the privacy behaviour identical. Matching source LAYOUT made this gate
+    # brittle in the one direction that matters least and silent in the direction that matters most: the
+    # old string would have gone on passing if someone had inserted a cloud call beside it.
+    #
+    # Pinned on the semantics instead, which is strictly stronger. `reason::T1_UNRESOLVED` is written
+    # ONLY on the cloud-disabled branch, so its presence proves that branch still escalates, and the
+    # absence check below proves it does so without egress.
+    assert_contains(commands, "crate::jury::reason::T1_UNRESOLVED", COMMANDS_RS.name)
+    cloud_off_branch = commands.split("Cloud disabled — escalate to human inbox", 1)
+    if len(cloud_off_branch) != 2:
+        raise AssertionError(
+            "the cloud-disabled escalation branch in commands.rs is no longer findable — re-point this "
+            "check rather than deleting it, or the no-egress guarantee stops being verified"
+        )
+    tail = cloud_off_branch[1][:1200]
+    if 'write_segment_verdict(' not in tail or '"escalated"' not in tail:
+        raise AssertionError("the cloud-disabled branch must still escalate the segment to a human")
+    for forbidden in ("t2_listener::", "reqwest", "api_key", "segment_audio_as_wav_base64"):
+        if forbidden in tail:
+            raise AssertionError(
+                f"the cloud-disabled branch references {forbidden!r} — with jury cloud opt-in OFF this "
+                "path must reach a local verdict without touching any cloud transport or segment audio"
+            )
     assert_contains(commands, "if !cloud_opt_in", COMMANDS_RS.name)
     assert_contains(commands, "Cloud opt-in is required for T2", COMMANDS_RS.name)
     # A judge API key is required before any T2 cloud call. Substring (not the Gemini-specific wording)

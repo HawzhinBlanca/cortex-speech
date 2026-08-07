@@ -7311,3 +7311,62 @@ absorbs it. And `npm run tauri build` now fails 4/4 at the NSIS bundling step (o
 itself compiles, links and passes exe-freshness — makensis DOES complete the 488 MB installer and the
 handle is taken immediately after close. Harmless while `signed-installer` is descoped; a release blocker
 the day it is not.
+
+## Iteration 258 — the agreement rename, the full reason vocabulary, and a privacy gate made stronger
+
+Closing out `docs/TRUE_10_REMAINING_2026-08-06.md` P1.2.
+
+**`agent_confidence` -> `agreement_score` (migration v52).** The old name invited exactly the reading the
+jury rejects: every recognizer can confidently agree on the same garbage, so a HIGH value is fully
+compatible with a wrong transcript — which is why `has_hard_distrust_veto` refuses to auto-accept such a
+clip. 6028824 had already had to stop the review UI rendering this as a green confidence badge; the name
+now states what the number IS so the next reader cannot make that inference from the schema alone.
+86 occurrences across 16 files, plus an integration test the first pass missed.
+
+`migrations/mod.rs` was deliberately NOT rewritten. v11 created the column and two table-recreate
+migrations re-list it; those describe what actually ran on this database, and editing them would make the
+chain describe a past that did not happen. v52 does `RENAME COLUMN` — preserving the data, the column's
+ORDINAL position (so the index-based `map_row` is unaffected) and every value's history.
+
+Three migration tests failed, and the failure was worth having. All three synthesize an "old" database by
+creating one at HEAD and selectively reverting, which leaves HEAD's column names under an old version
+number; replaying v40 then fails because its INSERT...SELECT names `agent_confidence` explicitly. BOTH
+real upgrade paths were traced and hold — a DB at v51 renames at v52 and never replays v40; a DB at v30
+replays v40 while the column still has its old name and reaches v52 after. So the fix belonged in the
+synthesis, and the repo already had the precedent: the same test renames `signal_anomaly_score` back to
+`ood_score` to be "a faithful pre-v39 snapshot rather than a records-only fake". No assertion was
+weakened. Fragility recorded for whoever renames a column next: v40's hardcoded 34-column INSERT...SELECT
+means ANY future rename breaks replay-from-synthesized-old.
+
+**The reason vocabulary is complete — nine codes across both jury stages.** T0 records `low_snr`,
+`clipping`, `single_recognizer`, `model_disagreement`, `uncalibrated_bucket`; T1/T2 now record
+`policy_hold`, `missing_audio`, `t2_no_majority`, `t1_unresolved`. The last four are not statements about
+the CLIP at all, which is why they need their own codes: a `policy_hold` needs a dial change, a
+`missing_audio` needs a file, and a reviewer listening harder fixes neither. `t2_no_majority` vs
+`t1_unresolved` is the pair most easily conflated and is deliberately split — a panel ANSWERING "no
+consensus" is a different fact from a panel never being consulted, and only one is fixed by turning a
+setting on.
+
+Prose `rationale` is kept at every site. It carries the specific IO error or model set a fixed vocabulary
+cannot; codes carry what can be counted, filtered and translated. Neither replaces the other. Codes are
+pinned BY LITERAL VALUE in test: they are persisted, so a rename is a data migration, not a refactor.
+
+**A privacy gate was made STRONGER, not accommodated.** `test_cloud_privacy_policy.py` matched the exact
+single-line source of the cloud-OFF escalation call. Adding an `evidence_json` argument made rustfmt wrap
+it, and the gate failed on a formatting change with the privacy behaviour identical. The tempting move
+was to relax the string. Instead it now pins SEMANTICS: `reason::T1_UNRESOLVED` (written only on the
+cloud-disabled branch) proves that branch still escalates, and an explicit absence check proves it does so
+without touching `t2_listener::`, `reqwest`, `api_key` or `segment_audio_as_wav_base64`. Fail-before 4/4 —
+including egress smuggled into the cloud-off branch, WHICH THE OLD ASSERTION WOULD HAVE PASSED. Matching
+source layout was brittle in the direction that mattered least and silent in the direction that mattered
+most.
+
+**Process error, twice now.** The ledger-staleness gate turned two sweeps RED (4136883 and c638e6e)
+because the entry was written after launching the sweep instead of before. Each cost a full ~50-minute
+re-run. In both cases the shortcut — re-running only the failed gate and combining it with the other 31 —
+was available and refused: "31 from one run plus 1 from another" is composite evidence, which is exactly
+what these gates exist to reject.
+
+Six consecutive complete GREEN sweeps preceded this: c4fb8aa, 39e22b8, e54d07c, 8bfbf5d, 1c01ec6,
+22ae99b. The 22ae99b run is the one that matters for the rename — v52 applied against a real database
+through real-app-e2e, 25 hard kills in durability-drill and 15 mid-export kills, not only unit tests.
