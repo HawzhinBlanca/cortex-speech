@@ -2756,7 +2756,9 @@
           </div>
         {/if}
         {#if viewMode === 'insights'}
-          <StatsDashboard />
+          <!-- P2.3: the readiness card's "N clips still awaiting review" blocker becomes a button that
+               actually goes there, instead of naming a problem and leaving the reviewer to find it. -->
+          <StatsDashboard onOpenReview={() => (viewMode = 'review')} />
           <RefineryPanel />
         {:else if viewMode === 'review'}
           <ReviewMode onExport={handleExport} onDone={() => (viewMode = 'curate')} />

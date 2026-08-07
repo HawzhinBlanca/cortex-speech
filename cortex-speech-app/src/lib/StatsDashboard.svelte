@@ -13,6 +13,14 @@
   import { t } from './i18n';
   import { isTauriRuntime } from './runtime';
 
+  // External review 2026-08-06, P2.3: "every blocker should have a deterministic next action".
+  // `pendingReview` has declared `action: 'review'` since it was written, and the template only ever
+  // rendered a button for `action: 'relink'` — so the one blocker a reviewer can always act on rendered
+  // as a dead sentence, and the readiness card told them what was wrong while offering no way to fix it.
+  // The component had no route out (it takes no props), which is why the action was droppable in the
+  // first place. This is that route.
+  let { onOpenReview }: { onOpenReview?: () => void } = $props();
+
   let stats = $state<DatasetStats | null>(null);
   let audioHealth = $state<import('./commands').AudioHealth | null>(null);
   let relinking = $state(false);
@@ -635,6 +643,15 @@
                   onclick={relinkMissingAudio}
                 >
                   {relinking ? $t('stats.relinking') : $t('stats.relink')}
+                </button>
+              {:else if b.action === 'review' && onOpenReview}
+                <button
+                  type="button"
+                  class="btn btn-secondary !text-[11px] shrink-0"
+                  data-testid="blocker-review-btn"
+                  onclick={onOpenReview}
+                >
+                  {$t('stats.blockerOpenReview')}
                 </button>
               {/if}
             </div>

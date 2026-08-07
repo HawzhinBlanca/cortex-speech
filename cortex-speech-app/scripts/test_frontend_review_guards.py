@@ -849,10 +849,54 @@ def test_poor_audio_thresholds_match_the_rust_authority() -> None:
         )
 
 
+def test_every_declared_readiness_blocker_action_is_actually_rendered() -> None:
+    """Every `action:` a readiness blocker declares must have a branch that renders a control for it.
+
+    External review 2026-08-06 P2.3: "every blocker should have a deterministic next action". The
+    Blocker type declared `action?: 'relink' | 'review'` and `pendingReview` had carried
+    `action: 'review'` since it was written — but the template only ever branched on `'relink'`, so the
+    one blocker a reviewer can always act on rendered as a dead sentence. The readiness card named the
+    problem and offered no way to fix it, which is the exact opposite of what that card is for.
+
+    This is a DROPPED-INTENT class of bug, not a typo: the data model and the template disagreed, and
+    neither side was wrong on its own, so nothing failed. Adding a third action later is the obvious way
+    to reintroduce it. So the two are compared directly — the union of declared actions must equal the
+    set the template branches on.
+    """
+    src = _read("src/lib/StatsDashboard.svelte")
+
+    m = re.search(r"type Blocker = \{[^}]*action\?:\s*([^;}]+)", src)
+    if not m:
+        raise AssertionError(
+            "the Blocker type no longer declares `action?:` in the shape this gate reads — "
+            "re-point the check rather than deleting it, or dropped actions become invisible again"
+        )
+    declared = set(re.findall(r"'([a-zA-Z]+)'", m.group(1)))
+    if not declared:
+        raise AssertionError("no blocker actions parsed — this gate would pass vacuously")
+
+    rendered = set(re.findall(r"b\.action === '([a-zA-Z]+)'", src))
+
+    unrendered = sorted(declared - rendered)
+    if unrendered:
+        raise AssertionError(
+            f"blocker action(s) {unrendered} are declared but never rendered — a blocker that names a "
+            "problem and offers no control is a dead end. Add an `{:else if b.action === ...}` branch, "
+            "or drop the action from the Blocker type."
+        )
+    phantom = sorted(rendered - declared)
+    if phantom:
+        raise AssertionError(
+            f"the template branches on blocker action(s) {phantom} that the Blocker type does not "
+            "declare — that branch is unreachable and the control never appears"
+        )
+
+
 def main() -> None:
     test_a_skip_never_clears_the_reviewers_draft_on_either_route()
     test_review_decisions_stay_on_screen_in_one_sticky_bar()
     test_poor_audio_thresholds_match_the_rust_authority()
+    test_every_declared_readiness_blocker_action_is_actually_rendered()
     test_retranscribe_guards_editor_writes_against_navigation()
     test_submit_guards_editor_writes_against_navigation()
     test_go_draft_persist_uses_targeted_field_update()

@@ -477,6 +477,7 @@ export const ckb: Record<string, string> = {
   'stats.dbSize': 'قەبارەی بنکەدراوە',
   'stats.audioMissing': '{n} فایلی دەنگی سەرچاوە نەماون — لێدان و دووبارە نووسینەوەیان تێکچووە.',
   'stats.relink': 'دووبارە بەستنەوە…',
+  'stats.blockerOpenReview': 'ئێستا پێداچوونەوە بکە',
   'stats.relinking': 'دووبارە دەبەسترێتەوە…',
   'stats.relinkDone': '{n} فایل دووبارە بەسترایەوە؛ {m} هێشتا نەماون.',
   'stats.relinkFailed': 'دووبارە بەستنەوە سەرکەوتوو نەبوو',

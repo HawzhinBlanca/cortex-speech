@@ -473,6 +473,7 @@ export const en: Record<string, string> = {
   'stats.audioMissing':
     '{n} source audio file(s) missing — playback and re-transcribe are broken for them.',
   'stats.relink': 'Relink…',
+  'stats.blockerOpenReview': 'Review now',
   'stats.relinking': 'Relinking…',
   'stats.relinkDone': 'Relinked {n} file(s); {m} still missing.',
   'stats.relinkFailed': 'Relink failed',
