@@ -3078,6 +3078,65 @@ fn a_v50_era_row_loads_with_no_content_hash_and_cannot_reject() {
     );
 }
 
+/// The suspect-first SQL and the jury veto must agree on what "poor audio" IS, at the boundary.
+///
+/// P1.2. Both used to carry their own hand-typed `< 5.0` / `> 0.1`, so moving the jury's threshold left
+/// the review queue ordering on the old rule — the queue would quietly stop leading with the clips the
+/// gate had just started distrusting, and no test would notice. They now share
+/// `quality::POOR_AUDIO_*`; this proves the SHARING is real rather than two constants that happen to be
+/// equal today, by exercising values placed exactly on either side of the boundary.
+#[test]
+fn suspect_first_sql_and_the_jury_veto_agree_on_poor_audio() {
+    use crate::quality::{has_poor_audio, POOR_AUDIO_CLIPPING_RATIO, POOR_AUDIO_SNR_DB};
+
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+
+    // (id, snr, clipping) straddling both thresholds, plus the unmeasured case.
+    let cases: [(&str, Option<f64>, Option<f64>); 6] = [
+        ("snr_below", Some(POOR_AUDIO_SNR_DB - 0.5), None),
+        ("snr_at", Some(POOR_AUDIO_SNR_DB), None), // `<` is strict: AT the threshold is NOT poor
+        ("snr_above", Some(POOR_AUDIO_SNR_DB + 0.5), None),
+        ("clip_above", None, Some(POOR_AUDIO_CLIPPING_RATIO + 0.05)),
+        ("clip_at", None, Some(POOR_AUDIO_CLIPPING_RATIO)), // `>` is strict: AT is NOT poor
+        ("unmeasured", None, None),                         // absence of a measurement is never evidence of bad audio
+    ];
+    for (id, snr, clip) in cases {
+        db.insert_segment(&SpeechSegment {
+            id: id.into(),
+            audio_path: format!("/audio/{id}.wav"),
+            snr_db: snr,
+            clipping_ratio: clip,
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+    }
+
+    // Ask SQLite the same question the ORDER BY asks, using the very string the queue orders by.
+    let case_expr = SUSPECT_FIRST_ORDER
+        .split("(CASE")
+        .nth(1)
+        .and_then(|rest| rest.split(") ASC").next())
+        .expect("the suspect-first order must still contain its poor-audio CASE arm");
+    let sql = format!("SELECT id, (CASE{case_expr}) FROM speech_segments");
+    let mut stmt = db.connection().prepare(&sql).unwrap();
+    let sql_says: Vec<(String, i64)> =
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(sql_says.len(), 6);
+
+    for (id, sql_rank) in sql_says {
+        let (_, snr, clip) = cases.iter().find(|(c, _, _)| *c == id).copied().unwrap();
+        // The CASE yields 0 for poor audio (sorts first), 1 otherwise.
+        let sql_poor = sql_rank == 0;
+        assert_eq!(
+            sql_poor,
+            has_poor_audio(snr, clip),
+            "{id}: the suspect-first SQL and quality::has_poor_audio disagree (snr={snr:?}, clip={clip:?}). \
+             A drift here shows a reassuring badge on a clip the jury refused to trust."
+        );
+    }
+}
+
 /// Suspect-first must put the clips the jury DISTRUSTED first, not last (external review #2).
 ///
 /// `agent_confidence` on an escalated row is model AGREEMENT. When the audio is bad, every recognizer

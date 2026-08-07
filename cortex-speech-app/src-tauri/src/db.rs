@@ -433,7 +433,24 @@ use crate::normalizer::learning_text_key;
 ///
 /// Order: escalated first; within that, poor audio first; then genuine disagreement (low agreement);
 /// then newest.
-const SUSPECT_FIRST_ORDER: &str = "escalated DESC,      (CASE WHEN COALESCE(snr_db, 99.0) < 5.0 OR COALESCE(clipping_ratio, 0.0) > 0.1 THEN 0 ELSE 1 END) ASC,      COALESCE(agent_confidence, 0.5) ASC,      datetime(created_at) DESC, id ASC";
+/// P1.2: BUILT from `quality::POOR_AUDIO_*` rather than repeating the numbers. This string used to
+/// carry its own hand-typed `< 5.0` / `> 0.1`, so changing the jury's veto thresholds silently left the
+/// review queue ordering on the old rule — the queue would stop leading with the clips the gate had
+/// just started distrusting, and nothing would report it.
+///
+/// The COALESCE defaults are deliberately "fine" values (99.0 dB SNR, 0.0 clipping) so an UNMEASURED
+/// row sorts as unremarkable rather than as poor audio, matching `quality::has_poor_audio` treating
+/// `None` as not-poor. Absence of a measurement is not evidence of bad audio.
+static SUSPECT_FIRST_ORDER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "escalated DESC, \
+         (CASE WHEN COALESCE(snr_db, 99.0) < {snr} OR COALESCE(clipping_ratio, 0.0) > {clip} THEN 0 ELSE 1 END) ASC, \
+         COALESCE(agent_confidence, 0.5) ASC, \
+         datetime(created_at) DESC, id ASC",
+        snr = crate::quality::POOR_AUDIO_SNR_DB,
+        clip = crate::quality::POOR_AUDIO_CLIPPING_RATIO,
+    )
+});
 
 fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String>]) -> Option<String> {
     let corrected_key = learning_text_key(corrected);
@@ -1650,7 +1667,7 @@ impl Database {
             "activeLearning" | "active_learning" => {
                 "ABS(((1.0 - COALESCE(confidence, 0.5)) + (0.1 * -COALESCE(ctc_score, -5.0))) - 0.35) ASC, id ASC"
             }
-            "suspectFirst" | "suspect_first" => SUSPECT_FIRST_ORDER,
+            "suspectFirst" | "suspect_first" => SUSPECT_FIRST_ORDER.as_str(),
             _ => "datetime(created_at) DESC, id ASC",
         };
 
@@ -1685,7 +1702,7 @@ impl Database {
             query.push_str(&format!(" WHERE verified = {}", if v { 1 } else { 0 }));
         }
         // Priority: escalated (jury doubts) first, then low agent confidence (suspicious), then chronological.
-        query.push_str(&format!(" ORDER BY {SUSPECT_FIRST_ORDER}"));
+        query.push_str(&format!(" ORDER BY {}", *SUSPECT_FIRST_ORDER));
 
         let mut stmt = self.conn.prepare(&query)?;
         let rows = stmt.query_map([], Self::map_row)?;

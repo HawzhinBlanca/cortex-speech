@@ -80,8 +80,10 @@ pub struct T0GateReport {
 /// KIN, so two-of-them agreement can still be a correlated confident error — adding an architecturally
 /// INDEPENDENT recognizer's vote is the follow-up that fully closes that hole.)
 fn has_hard_distrust_veto(seg: &SpeechSegment, hyps: &[SegmentHypothesis]) -> bool {
-    let poor_quality =
-        seg.snr_db.map(|snr| snr < 5.0).unwrap_or(false) || seg.clipping_ratio.map(|clip| clip > 0.1).unwrap_or(false);
+    // P1.2: the thresholds live in ONE place now (quality::POOR_AUDIO_*), shared with the suspect-first
+    // SQL ordering. This site is the authority on what the rule MEANS; it no longer also owns a private
+    // copy of the numbers.
+    let poor_quality = crate::quality::has_poor_audio(seg.snr_db, seg.clipping_ratio);
     // Count only voters that actually CONTRIBUTED to the consensus. fit_irt_consensus drops
     // empty-transcript hypotheses before building the consensus + irt_confidence, so an empty "" from
     // one model (common when 300M and 1B disagree on whether a low-energy span contains speech) must

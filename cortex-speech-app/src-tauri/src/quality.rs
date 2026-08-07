@@ -517,6 +517,34 @@ fn evidence_transcript_matches(candidate: Option<&serde_json::Value>, transcript
     !expected.is_empty() && expected == actual
 }
 
+/// THE definition of "this clip's audio is too poor to trust a recognizer on".
+///
+/// External review 2026-08-06, P1.2. These two numbers were written out by hand in three independent
+/// places — `jury::has_hard_distrust_veto` (the authority that vetoes auto-accept), the suspect-first
+/// SQL ordering in `db.rs`, and `hasPoorAudio()` in `ReviewInbox.svelte` — each carrying a comment
+/// saying it was "kept identical on purpose". Three hand-synced copies of a rule is three chances to
+/// drift, and the drift is not cosmetic: if the UI's copy and the jury's copy disagree, the review
+/// screen shows a reassuring green agreement badge on precisely the clip the gate refused to trust.
+///
+/// The two Rust sites now share these constants. The TypeScript copy cannot import them, so
+/// `test_frontend_review_guards.py::test_poor_audio_thresholds_match_the_rust_authority` parses BOTH
+/// files and fails if the numbers diverge — the copy stays, but it can no longer drift silently.
+///
+/// Changing a value here changes the jury veto, the review queue order and the UI band together, which
+/// is the entire point.
+pub const POOR_AUDIO_SNR_DB: f64 = 5.0;
+pub const POOR_AUDIO_CLIPPING_RATIO: f64 = 0.1;
+
+/// True when a clip's measured audio quality is poor by [`POOR_AUDIO_SNR_DB`] / [`POOR_AUDIO_CLIPPING_RATIO`].
+///
+/// `None` is NOT poor: an unmeasured clip is unknown, and absence of a measurement must never be
+/// reported as evidence of bad audio. That matches what the SQL does with its COALESCE defaults
+/// (99.0 dB SNR, 0.0 clipping — both deliberately "fine" so an unmeasured row sorts as unremarkable).
+pub fn has_poor_audio(snr_db: Option<f64>, clipping_ratio: Option<f64>) -> bool {
+    snr_db.is_some_and(|snr| snr < POOR_AUDIO_SNR_DB)
+        || clipping_ratio.is_some_and(|clip| clip > POOR_AUDIO_CLIPPING_RATIO)
+}
+
 /// True when a stored "transcript" is actually a failure/placeholder marker (ASR error,
 /// pending status, or an explicit n/a), not real speech content. Used to keep such markers
 /// out of training/export and out of the transcript cache.

@@ -9,6 +9,7 @@ check fails the moment the guard is removed or the mutator's structure regresses
 verified (removing the guard fires the assertion).
 """
 
+import re
 from pathlib import Path
 
 
@@ -798,9 +799,60 @@ def test_review_decisions_stay_on_screen_in_one_sticky_bar() -> None:
         )
 
 
+def test_poor_audio_thresholds_match_the_rust_authority() -> None:
+    """The review UI's "poor audio" numbers must equal `quality::POOR_AUDIO_*`.
+
+    P1.2. `snr < 5 dB` / `clipping > 0.1` was written out by hand in THREE independent places — the
+    jury veto that refuses to auto-accept, the suspect-first SQL that orders the review queue, and
+    `hasPoorAudio()` in ReviewInbox.svelte — each with a comment saying it was "kept identical on
+    purpose". The two Rust sites now share a constant and a unit test proves they agree at the
+    boundary. TypeScript cannot import a Rust const, so this is the seam that remains, and it is the
+    worst one to lose: if the UI's copy drifts above the jury's, the review screen shows a reassuring
+    green agreement badge on exactly the clip the gate refused to trust — the failure mode the
+    2026-08-06 "agreement is not trustworthiness" fix already had to correct once.
+
+    The copy stays. It can no longer drift SILENTLY.
+    """
+    rust = _read("src-tauri/src/quality.rs")
+    svelte = _read("src/lib/ReviewInbox.svelte")
+
+    def rust_const(name: str) -> float:
+        m = re.search(rf"pub const {name}: f64 = ([0-9.]+);", rust)
+        if not m:
+            raise AssertionError(
+                f"quality.rs no longer defines {name} — this gate would pass vacuously. If the "
+                "constant moved, point this check at its new home rather than deleting it."
+            )
+        return float(m.group(1))
+
+    snr_rust = rust_const("POOR_AUDIO_SNR_DB")
+    clip_rust = rust_const("POOR_AUDIO_CLIPPING_RATIO")
+
+    m = re.search(
+        r"seg\.snrDb\s*<\s*([0-9.]+)\).*?seg\.clippingRatio\s*>\s*([0-9.]+)\)",
+        svelte,
+        re.DOTALL,
+    )
+    if not m:
+        raise AssertionError(
+            "ReviewInbox.svelte's hasPoorAudio() no longer has the shape this gate reads "
+            "(seg.snrDb < N ... seg.clippingRatio > N). If it now takes the verdict from the backend "
+            "instead of recomputing it, DELETE this check — that is strictly better than syncing."
+        )
+    snr_ts, clip_ts = float(m.group(1)), float(m.group(2))
+
+    if (snr_ts, clip_ts) != (snr_rust, clip_rust):
+        raise AssertionError(
+            f"poor-audio thresholds have DRIFTED: quality.rs says snr<{snr_rust} / clip>{clip_rust}, "
+            f"ReviewInbox.svelte says snr<{snr_ts} / clip>{clip_ts}. The review UI would disagree with "
+            "the jury veto about which clips are untrustworthy."
+        )
+
+
 def main() -> None:
     test_a_skip_never_clears_the_reviewers_draft_on_either_route()
     test_review_decisions_stay_on_screen_in_one_sticky_bar()
+    test_poor_audio_thresholds_match_the_rust_authority()
     test_retranscribe_guards_editor_writes_against_navigation()
     test_submit_guards_editor_writes_against_navigation()
     test_go_draft_persist_uses_targeted_field_update()
