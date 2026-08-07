@@ -7527,3 +7527,58 @@ BY_DESIGN entry must still genuinely read the whole library or the `stale` check
 0 to retire.
 
 P1.3 is complete. P1.4 remains open and is honestly blocked on data, not effort.
+
+## Iteration 263 — branch protection as code, and the first credential audit this repo has ever had
+
+**Branch protection: could not apply, did not fake.** No `gh` CLI on this machine and no
+GH_TOKEN/GITHUB_TOKEN; the only credential lives in Windows Credential Manager, and extracting a stored
+secret to drive the API is not something to do quietly. The GitHub connector needs an OAuth flow a
+headless session cannot run. So the part that IS mine to do is checked in:
+`scripts/setup_branch_protection.sh`, dry-run against a stubbed `gh` with the emitted JSON verified
+field by field.
+
+Hand-clicked protection is invisible — it lives in a settings page, nobody can review it, nobody can
+tell when it drifted. As code it is auditable and reproducible on a fork or a restored repo.
+
+Two decisions recorded rather than buried. `required_approving_review_count = 0`, because GitHub will
+not let you approve your own PR and `1` makes `main` permanently unmergeable by its only maintainer —
+so this enforces "the gates passed", NOT "somebody else looked", and that distinction is stated in the
+script. And `enforce_admins = true`, without which the protection is theatre; the consequence is that
+the direct `git push origin <branch>:main` this repo documents STOPS WORKING, including for me, after
+37 fast-forwards this session with nothing enforcing anything. The script deliberately does not touch
+verify_10.py's OWNER_GATED list: configuring the thing and claiming the gate are different acts.
+
+**The repo had NO credential scanning of any kind.** Privacy policies cover consent and egress,
+`test_windows_repo_hygiene.py` covers hardcoded profile PATHS, the DPAPI tests cover keys AT REST —
+nothing looked for a key that had been committed. On a PUBLIC repo, "caught later" means "caught after
+it was published, indexed and scraped".
+
+FIRST FULL AUDIT, at 40f8f32: **4052 blobs, reachable AND unreachable, 1677 commits back to
+2026-06-17 — zero credentials.** No AWS/GitHub/OpenAI/OpenRouter/Google/Slack/ElevenLabs keys, no
+private-key blocks, no JWTs. The real Windows username appears in NO blob, ever — the hygiene gate has
+been doing its job. The one `sk-...` string in history is a fixture inside the DPAPI test asserting
+"the plaintext key must never be on disk", i.e. the test proving keys are not stored.
+
+PII found and already remediated: four files once carried `/Users/hawzh/` machine paths; all four are
+gone from the working tree (two deleted outright, two cleaned) and survive only in history. NOT
+rewriting history for it: that would break every commit SHA — including the eleven `chore(status)`
+commits whose entire value is naming the exact commit a GREEN sweep verified — to remove a username
+already public in the repository's own name.
+
+`test_secret_hygiene.py` is now a policy (auto-discovered; the suite is 54, was 53). Tracked-tree mode
+runs in 1 s so it gates every sweep; `--history` does the exhaustive 4052-blob pass in 41 s on demand.
+
+**Two bugs in my own tooling, both found by checking rather than trusting.** The first scanner HUNG:
+`git rev-list --objects` returns TREES as well as blobs, and skipping a non-blob without draining its
+payload desynchronises `cat-file --batch` so the next header parses object data. And the coverage line
+said "scanned 3979 of 8434", which needed explaining rather than reporting — chasing it is what
+surfaced the unreachable-object gap and closed it. An audit that quietly scans less than it claims is
+worse than no audit.
+
+Fail-before on the gate found a real weakness too: the AWS and Google patterns pinned EXACT lengths, so
+a key of any other length slipped through. For a scanner that is the dangerous direction — over-matching
+costs a glance, under-matching costs a leak — so both are length-tolerant now. 8/8 real-shaped keys
+caught, 3/3 placeholders correctly ignored.
+
+**P5.6 is NOT closed.** Its history-and-secrets half is clean and now permanently gated; signed
+commits/tags, Scorecard >= 8 and the self-hosted runner are untouched, and the leg stays descoped.
