@@ -154,70 +154,124 @@ pub fn min_calibration_n(target_error: f64, delta: f64) -> usize {
 
 /// Calibrates the conformal threshold using verified segments as the calibration set.
 /// If there are fewer than 10 verified segments, it falls back to a default heuristic.
+/// Running tally behind [`calibrate_and_certify`], so the certificate can be folded from a STREAM
+/// instead of a materialised `Vec<SpeechSegment>` (P1.3).
+///
+/// The original made TWO passes over the corpus — one to calibrate, one to certify against the
+/// resulting threshold — which a single stream cannot do. So the second pass's INPUT is captured during
+/// the first: `certifiable` keeps `(id, nonconformity)` for the clips that pass the
+/// not-rejected + has-scoreable-confidence rule, and the threshold comparison happens in `finish`.
+///
+/// That is not a memory cheat. `certified_segment_ids` is itself O(corpus) ids, so the output already
+/// forces ids to be held; what this drops is everything ELSE on the row — transcripts, alignment JSON,
+/// evidence JSON — which is the part that actually dominates.
+///
+/// Every membership rule below is copied verbatim from the two passes it replaces, comments included,
+/// because each one is a correctness decision rather than a filter.
+#[derive(Debug, Default)]
+pub struct ConformalTally {
+    cal_scored: Vec<(f64, f64)>,
+    certifiable: Vec<(String, f64)>,
+    calibration_real_posterior: usize,
+    calibration_heuristic: usize,
+    calibration_no_confidence: usize,
+}
+
+impl ConformalTally {
+    pub fn push(&mut self, s: &SpeechSegment) {
+        // ── certify-side membership (was the second pass) ──
+        // A clip with no confidence signal cannot be vouched for by a threshold, because the score it
+        // would be compared against was invented, not measured. And NEVER a human-rejected clip: 'mark
+        // bad' keeps verified=true + the draft, so it would otherwise pass the nonconformity gate and be
+        // vouched as good over the reviewer's explicit rejection.
+        if !crate::quality::is_human_rejected(s) && has_scoreable_confidence(s) {
+            self.certifiable.push((s.id.clone(), compute_nonconformity_score(s)));
+        }
+
+        // ── calibration-side membership (was the first pass) ──
+        // 'mark bad' sets verified=true (to leave the review queue) and KEEPS the machine draft as
+        // annotated_transcript, so a human-REJECTED clip satisfies the verified+non-empty-reference
+        // membership. It must NOT calibrate the certificate (its ~0 CER tightens the error bound over
+        // data the human discarded) — matching every sibling gate (export/export_bundle/jury) and the
+        // db.rs C3 count, which apply this exact exclusion.
+        if !s.verified || crate::quality::is_human_rejected(s) {
+            return;
+        }
+        // No measured confidence and no acoustic score => the nonconformity would be a constant
+        // manufactured from two defaults. Calibrating on that is calibrating on nothing.
+        if !has_scoreable_confidence(s) {
+            self.calibration_no_confidence += 1;
+            return;
+        }
+        let Some(ref_text) = s.annotated_transcript.as_deref().map(str::trim) else {
+            return;
+        };
+        if ref_text.is_empty() {
+            return;
+        }
+        if s.confidence_source.as_deref() == Some("real_posterior") {
+            self.calibration_real_posterior += 1;
+        } else {
+            self.calibration_heuristic += 1;
+        }
+        let cer = compute_cer(ref_text, &s.raw_transcript).min(1.0); // bound to [0,1] for Hoeffding
+        self.cal_scored.push((compute_nonconformity_score(s), cer));
+    }
+
+    pub fn finish(self, target_error: f64, confidence_level: f64) -> ConformalCertificate {
+        let ConformalTally {
+            cal_scored,
+            certifiable,
+            calibration_real_posterior,
+            calibration_heuristic,
+            calibration_no_confidence,
+        } = self;
+        let cal_n = cal_scored.len();
+        let (threshold, bound, is_calibrated) = calibrate_threshold(&cal_scored, target_error, confidence_level);
+
+        let certified_segment_ids: Vec<String> =
+            certifiable.into_iter().filter(|(_, score)| *score <= threshold).map(|(id, _)| id).collect();
+
+        build_certificate(
+            target_error,
+            confidence_level,
+            threshold,
+            certified_segment_ids,
+            bound,
+            is_calibrated,
+            cal_n,
+            calibration_real_posterior,
+            calibration_heuristic,
+            calibration_no_confidence,
+        )
+    }
+}
+
 pub fn calibrate_and_certify(
     all_segments: &[SpeechSegment],
     target_error: f64,     // e.g., 0.05 for 5% CER
     confidence_level: f64, // e.g., 0.95 for 95% confidence
 ) -> ConformalCertificate {
-    // Build the (nonconformity, cer) calibration set from verified segments with a non-empty
-    // reference, scored on the segment's own confidence (this is the seg.confidence-based DATASET
-    // certificate; the IRT-based T0 gate calibrates separately via calibrate_threshold).
-    // Provenance of the calibration confidences — a fact surfaced for honesty, computed over the SAME
-    // membership rule as cal_scored (verified + non-empty reference). `real_posterior` requires the exact
-    // token stored by asr::ConfidenceSource; anything else (heuristic, legacy `unknown`, or missing) is
-    // the fallback.
-    let mut calibration_real_posterior = 0usize;
-    let mut calibration_heuristic = 0usize;
-    let mut calibration_no_confidence = 0usize;
-    let cal_scored: Vec<(f64, f64)> = all_segments
-        .iter()
-        .filter_map(|s| {
-            // 'mark bad' sets verified=true (to leave the review queue) and KEEPS the machine draft as
-            // annotated_transcript, so a human-REJECTED clip satisfies the verified+non-empty-reference
-            // membership. It must NOT calibrate the certificate (its ~0 CER tightens the error bound over
-            // data the human discarded) — matching every sibling gate (export/export_bundle/jury) and the
-            // db.rs C3 count, which apply this exact exclusion. (round-25 hunt: conformal was the lone omission.)
-            if !s.verified || crate::quality::is_human_rejected(s) {
-                return None;
-            }
-            // No measured confidence and no acoustic score => the nonconformity would be a constant
-            // manufactured from two defaults. Calibrating on that is calibrating on nothing.
-            if !has_scoreable_confidence(s) {
-                calibration_no_confidence += 1;
-                return None;
-            }
-            let ref_text = s.annotated_transcript.as_deref()?.trim();
-            if ref_text.is_empty() {
-                return None;
-            }
-            if s.confidence_source.as_deref() == Some("real_posterior") {
-                calibration_real_posterior += 1;
-            } else {
-                calibration_heuristic += 1;
-            }
-            let cer = compute_cer(ref_text, &s.raw_transcript).min(1.0); // bound to [0,1] for Hoeffding
-            Some((compute_nonconformity_score(s), cer))
-        })
-        .collect();
+    let mut tally = ConformalTally::default();
+    for seg in all_segments {
+        tally.push(seg);
+    }
+    tally.finish(target_error, confidence_level)
+}
 
-    let cal_n = cal_scored.len();
-    let (threshold, bound, is_calibrated) = calibrate_threshold(&cal_scored, target_error, confidence_level);
-
-    // Certify every segment whose nonconformity is at or below the calibrated threshold — but NEVER a
-    // human-rejected clip: 'mark bad' keeps verified=true + the draft, so it would otherwise pass the
-    // nonconformity gate and be vouched as good over the reviewer's explicit rejection.
-    let certified_segment_ids: Vec<String> = all_segments
-        .iter()
-        .filter(|seg| {
-            // Same rule on the certify side: a clip with no confidence signal cannot be vouched for by
-            // a threshold, because the score it would be compared against was invented, not measured.
-            !crate::quality::is_human_rejected(seg)
-                && has_scoreable_confidence(seg)
-                && compute_nonconformity_score(seg) <= threshold
-        })
-        .map(|seg| seg.id.clone())
-        .collect();
-
+#[allow(clippy::too_many_arguments)]
+fn build_certificate(
+    target_error: f64,
+    confidence_level: f64,
+    threshold: f64,
+    certified_segment_ids: Vec<String>,
+    bound: f64,
+    is_calibrated: bool,
+    cal_n: usize,
+    calibration_real_posterior: usize,
+    calibration_heuristic: usize,
+    calibration_no_confidence: usize,
+) -> ConformalCertificate {
     let expected_error_bound = if is_calibrated {
         bound
     } else if cal_n < 10 {

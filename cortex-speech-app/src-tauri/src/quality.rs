@@ -235,26 +235,48 @@ pub fn training_grade_summary(segments: &[SpeechSegment]) -> TrainingGradeSummar
 /// produces the summary, so a readiness shown in the UI can never disagree with what an export would
 /// actually write. [`training_grade_summary`] delegates here rather than repeating the match — two
 /// copies of that bucketing is exactly how a count starts lying.
-pub fn training_grade_breakdown(segments: &[SpeechSegment]) -> TrainingGradeBreakdown {
-    let mut summary = TrainingGradeSummary { total_segments: segments.len(), ..TrainingGradeSummary::default() };
-    let mut reason_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for seg in segments {
+/// Running tally behind [`training_grade_breakdown`], so the corpus-wide breakdown can be folded from a
+/// STREAM instead of a materialised `Vec<SpeechSegment>` (P1.3).
+///
+/// The grading itself is untouched and still goes through `training_grade_for_segment` — the same
+/// function the export gates on. Only the row's lifetime shrinks: it now lives for one `push` instead of
+/// for the whole corpus. State is O(distinct reasons), not O(segments).
+#[derive(Debug, Default)]
+pub struct TrainingGradeTally {
+    summary: TrainingGradeSummary,
+    reason_counts: BTreeMap<String, usize>,
+}
+
+impl TrainingGradeTally {
+    pub fn push(&mut self, seg: &SpeechSegment) {
+        self.summary.total_segments += 1;
         let report = training_grade_for_segment(seg);
         if report.training_ready {
-            summary.training_ready_segments += 1;
+            self.summary.training_ready_segments += 1;
         }
         match report.grade.as_str() {
-            TRAINING_GRADE_GOLD => summary.gold_segments += 1,
-            TRAINING_GRADE_SILVER => summary.silver_segments += 1,
-            TRAINING_GRADE_REVIEW => summary.review_segments += 1,
-            TRAINING_GRADE_REJECT => summary.rejected_segments += 1,
-            _ => summary.review_segments += 1,
+            TRAINING_GRADE_GOLD => self.summary.gold_segments += 1,
+            TRAINING_GRADE_SILVER => self.summary.silver_segments += 1,
+            TRAINING_GRADE_REVIEW => self.summary.review_segments += 1,
+            TRAINING_GRADE_REJECT => self.summary.rejected_segments += 1,
+            _ => self.summary.review_segments += 1,
         }
         for reason in report.reasons {
-            *reason_counts.entry(reason).or_insert(0) += 1;
+            *self.reason_counts.entry(reason).or_insert(0) += 1;
         }
     }
-    TrainingGradeBreakdown { summary, reason_counts }
+
+    pub fn finish(self) -> TrainingGradeBreakdown {
+        TrainingGradeBreakdown { summary: self.summary, reason_counts: self.reason_counts }
+    }
+}
+
+pub fn training_grade_breakdown(segments: &[SpeechSegment]) -> TrainingGradeBreakdown {
+    let mut tally = TrainingGradeTally::default();
+    for seg in segments {
+        tally.push(seg);
+    }
+    tally.finish()
 }
 
 /// True when a human explicitly REJECTED this segment's draft — the review "mark bad" action, or a

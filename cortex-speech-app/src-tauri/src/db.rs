@@ -1586,6 +1586,32 @@ impl Database {
         Ok(segments)
     }
 
+    /// Stream every segment through a callback, one row at a time, without materialising the corpus.
+    ///
+    /// External review 2026-08-06 P1.3, for the corpus-wide STATISTICS in `commands/dataset_analytics.rs`.
+    /// Those are whole-corpus by definition — a training-grade breakdown that skipped rows would be
+    /// wrong, not slow — so the fix is not a WHERE clause and it is emphatically NOT reimplementing the
+    /// grading rule in SQL: `training_grade_for_segment` is the same function the EXPORT gates on, and a
+    /// second SQL copy of it would let the dashboard and the export disagree about what is training-ready.
+    /// That is the P1.2 drift bug wearing a different hat.
+    ///
+    /// So the row is what gets bounded, not the rule. Each caller folds into a small accumulator
+    /// (counters, or a `(f64, f64)` per eligible clip) while the full record — transcript, alignment
+    /// JSON, evidence JSON — lives only for the duration of one callback.
+    ///
+    /// Same ORDER BY as `get_segments`, so a fold that is order-sensitive sees exactly what the
+    /// collect-then-iterate version saw.
+    pub fn for_each_segment(&self, mut f: impl FnMut(SpeechSegment)) -> AppResult<()> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments ORDER BY created_at DESC, id ASC"
+        ))?;
+        let rows = stmt.query_map([], Self::map_row)?;
+        for row in rows {
+            f(row?);
+        }
+        Ok(())
+    }
+
     /// The IDs of every pending (unverified) clip, in the same order `get_segments(Some(false))` returns.
     ///
     /// External review 2026-08-06 P1.3, for the couch-review queue. That queue must walk EVERY pending

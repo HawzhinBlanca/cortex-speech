@@ -3078,6 +3078,97 @@ fn a_v50_era_row_loads_with_no_content_hash_and_cannot_reject() {
     );
 }
 
+/// Folding the three corpus-wide statistics from a STREAM must give byte-identical answers to
+/// collecting the corpus first.
+///
+/// P1.3. `dataset_analytics.rs` stopped calling `get_segments(None)` and now folds
+/// `Database::for_each_segment` into TrainingGradeTally / ConformalTally / AnnotationDriftTally. Every
+/// existing test for those statistics exercises the SLICE entry point, so they prove the tallies are
+/// right without proving the thing that actually changed: that streaming sees the same rows, in the
+/// same order, and reaches the same result. A silent divergence here would move the Insights dashboard
+/// and the readiness verdict off the export's rule while every unit test stayed green.
+///
+/// Compared as serialized JSON so a newly added field is covered automatically rather than needing this
+/// assertion to be remembered.
+#[test]
+fn streaming_the_corpus_statistics_equals_collecting_them_first() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+
+    // Deliberately varied, so the membership rules each tally applies actually branch: verified and
+    // not, human-rejected, annotated and bare, real_posterior and heuristic confidence, and one with no
+    // confidence signal at all (which conformal must count separately rather than score).
+    for i in 0..24 {
+        let verified = i % 2 == 0;
+        let annotated = i % 3 != 0;
+        db.insert_segment(&SpeechSegment {
+            id: format!("s{i:03}"),
+            audio_path: format!("/audio/{}.wav", i / 4),
+            raw_transcript: format!("خاڵی ژمارە {i}"),
+            annotated_transcript: annotated.then(|| format!("خاڵی ژمارەی {i}")),
+            verified,
+            confidence: (i % 7 != 0).then(|| 0.5 + (i as f64 % 5.0) / 12.0),
+            ctc_score: (i % 5 != 0).then(|| -1.0 - (i as f64 % 3.0)),
+            snr_db: Some(3.0 + (i as f64 % 20.0)),
+            clipping_ratio: Some((i as f64 % 4.0) / 20.0),
+            confidence_source: Some(if i % 4 == 0 { "real_posterior".into() } else { "heuristic".into() }),
+            human_decision: (i % 8 == 0).then(|| "reject".to_string()),
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+    }
+
+    let collected = db.get_segments(None).unwrap();
+    assert_eq!(collected.len(), 24, "the fixture must actually be in the database");
+
+    // A comparison of two EMPTY results is a vacuous pass, so the fixture is asserted to exercise each
+    // statistic non-trivially before the equivalence assertions below are allowed to mean anything.
+    let grade_probe = crate::quality::training_grade_breakdown(&collected);
+    let cert_probe = crate::quality::conformal::calibrate_and_certify(&collected, 0.05, 0.95);
+    let drift_probe = crate::scorecard::annotation_drift_scorecard(&collected, Default::default());
+    assert!(grade_probe.summary.total_segments > 0, "fixture graded nothing");
+    assert!(
+        grade_probe.reason_counts.values().sum::<usize>() > 0,
+        "fixture produced no grading reasons — the reason-count fold would be untested"
+    );
+    assert!(cert_probe.total_certified > 0, "fixture certified nothing — the threshold fold would be untested");
+    assert!(
+        cert_probe.calibration_heuristic + cert_probe.calibration_real_posterior > 0,
+        "fixture calibrated on nothing"
+    );
+    assert!(drift_probe.num_segments > 0, "fixture had no annotated clips — the drift fold would be untested");
+
+    // 1. Training-grade breakdown — the readiness verdict the export gates on.
+    let mut tally = crate::quality::TrainingGradeTally::default();
+    db.for_each_segment(|seg| tally.push(&seg)).unwrap();
+    assert_eq!(
+        serde_json::to_value(tally.finish()).unwrap(),
+        serde_json::to_value(crate::quality::training_grade_breakdown(&collected)).unwrap(),
+        "streamed training-grade breakdown diverged from the collected one"
+    );
+
+    // 2. Conformal certificate — the one that made TWO passes, the second gated on the first's
+    //    threshold. Certified id ORDER is part of the value, so this also pins that the captured
+    //    certify-side input preserved corpus order.
+    let mut tally = crate::quality::conformal::ConformalTally::default();
+    db.for_each_segment(|seg| tally.push(&seg)).unwrap();
+    assert_eq!(
+        serde_json::to_value(tally.finish(0.05, 0.95)).unwrap(),
+        serde_json::to_value(crate::quality::conformal::calibrate_and_certify(&collected, 0.05, 0.95)).unwrap(),
+        "streamed conformal certificate diverged from the collected one"
+    );
+
+    // 3. Annotation-drift scorecard — seeded bootstrap, so equality here also proves the two saw the
+    //    same clips in the same order (a reordering would resample differently).
+    let mut tally = crate::scorecard::AnnotationDriftTally::default();
+    db.for_each_segment(|seg| tally.push(&seg)).unwrap();
+    assert_eq!(
+        serde_json::to_value(tally.finish(Default::default())).unwrap(),
+        serde_json::to_value(crate::scorecard::annotation_drift_scorecard(&collected, Default::default())).unwrap(),
+        "streamed annotation-drift scorecard diverged from the collected one"
+    );
+}
+
 /// The suspect-first SQL and the jury veto must agree on what "poor audio" IS, at the boundary.
 ///
 /// P1.2. Both used to carry their own hand-typed `< 5.0` / `> 0.1`, so moving the jury's threshold left

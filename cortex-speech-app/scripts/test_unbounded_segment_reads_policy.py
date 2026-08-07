@@ -42,18 +42,21 @@ BY_DESIGN = {
 }
 
 TO_RETIRE = {
-    # Three whole-corpus STATISTICS (training-grade breakdown, conformal certificate, annotation-drift
-    # scorecard). Naively "aggregate it in SQL" is the wrong retirement here and would trade this bug for
-    # a worse one: each statistic is computed by a shared Rust policy function — the same
-    # `training_grade_for_segment` the EXPORT gates on — so a SQL reimplementation would fork the policy
-    # and let the dashboard and the export disagree about what is training-ready. The correct retirement
-    # is a STREAMING read (fold row-by-row into the counters/score vector instead of collecting a Vec of
-    # full rows), which bounds memory while leaving exactly one implementation of the rule.
-    "commands/dataset_analytics.rs": "fold over a streaming read; do NOT reimplement the grading policy in SQL",
     "commands/segments_read.rs": "get_active_learning_queue needs its conformal threshold computed in SQL",
 }
 
 # Retired, kept as a record so the list cannot quietly regrow into them:
+#   commands/dataset_analytics.rs (2026-08-07) — three whole-corpus STATISTICS (training-grade
+#   breakdown, conformal certificate, annotation-drift scorecard). "Aggregate it in SQL" would have been
+#   the WRONG retirement and would have traded this bug for a worse one: each is computed by a shared
+#   Rust policy function — the same `training_grade_for_segment` the EXPORT gates on — so a SQL copy
+#   would fork the rule and let the dashboard and the export disagree about what is training-ready.
+#   Retired instead by bounding the ROW, not the rule: `Database::for_each_segment` streams, and each
+#   command folds into a small accumulator (TrainingGradeTally / ConformalTally / AnnotationDriftTally)
+#   that keeps counters and per-clip scores while the transcripts and JSON blobs live for one callback.
+#   The conformal case needed care — it made two passes, the second gated on the first's threshold — so
+#   the second pass's input is captured during the first rather than re-reading the corpus.
+#
 #   couch.rs (2026-08-07) — api_queue read every pending row's FULL record (transcript, alignment JSON,
 #   evidence JSON) to hand out at most QUEUE_BATCH=25 of them. Its heldByOthers / skippedByYou /
 #   pendingTotal counts genuinely need every pending row — they depend on IN-MEMORY lease state, which

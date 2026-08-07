@@ -7161,3 +7161,80 @@ NOT done and not claimed: P1.2's versioned risk contract (the `snr < 5 / clippin
 lives in three hand-synced copies — `jury/mod.rs`, the suspect-first SQL and `ReviewInbox.svelte`),
 P1.4's calibrated active learning, P2.1/P2.3, and every P3/P4/P5 leg that needs human annotators,
 speaker-disjoint evaluation or a signing identity.
+
+## Iteration 256 — GREEN 32/32 twice, and the unbounded-read backlog down to one
+
+Continuing `docs/TRUE_10_REMAINING_2026-08-06.md`.
+
+**P0.1 CLOSED, and reproduced.** Two full sweeps, both 32 PASS / 0 FAIL / 0 skipped: `c4fb8aa`
+(3693.3 s) and `39e22b8` (after P1.2 + the couch retirement). The reproduction is the point — the audit
+asked for a result a rerun on the named machine can produce again, not one lucky green.
+
+`ignored-real-model` was the ONE kept gate with no current passing evidence. It failed for an
+environmental reason: nothing was listening on 127.0.0.1:8799. The WSL OmniASR-7B champion now loads one
+replica per GPU on both 3090 Tis and the leg passes in ~45 s. Preflighted the way the audit asks — a
+real Sorani transcript from a committed FLEURS clip through the actual line protocol, not an open-port
+check. `start_7b_server.ps1` warns its nohup detach dies under a non-interactive runner; a headless
+session must hold the `wsl -- bash -lc "exec python ..."` child alive itself, which is what was done.
+
+**P1.2, first slice.** `snr < 5 dB` / `clipping > 0.1` existed in THREE hand-written copies — the jury
+veto, the suspect-first SQL, and `hasPoorAudio()` in ReviewInbox.svelte — each with a comment saying it
+was "kept identical on purpose". The drift is not cosmetic: if the UI's copy rises above the jury's, the
+review screen shows a reassuring green agreement badge on exactly the clip the gate refused to trust,
+which is the failure 6028824 already had to correct once. The two Rust sites now share
+`quality::POOR_AUDIO_*` and SUSPECT_FIRST_ORDER is BUILT from them.
+`suspect_first_sql_and_the_jury_veto_agree_on_poor_audio` pulls the CASE arm out of the live SQL string,
+runs it through SQLite and compares against `has_poor_audio` at values exactly on either side of both
+thresholds — two constants that merely happen to be equal today would pass a weaker test. TypeScript
+cannot import a Rust const, so the third copy is GATED rather than synced; 5/5 drift mutations caught,
+including a vacuous-pass guard, and the gate tells the next reader to DELETE it if the UI ever takes the
+verdict from the backend.
+
+NOT done: the rest of P1.2 — persisted distinct agreement/acoustic/alignment/OOD risk, machine-stable
+reason codes, policy and calibration versions, and renaming `agent_confidence`.
+
+**P1.3: three of four retired (was zero).**
+
+- `commands.rs` — three background passes read the whole library then `continue`d past every finished
+  row. Now `get_pending_segments(PendingWork::_)`. The 7B predicate keeps `segment_awaits_wsl7b` as its
+  sole authority and uses SQL only as a deliberate SUPERSET, pinned by
+  `sql_placeholder_prefilter_is_a_superset_of_the_rust_predicate` through real SQLite — under-selecting
+  would make those clips invisible to the driver forever with nothing reporting it.
+- `couch.rs` — `api_queue` walked every pending row's FULL record to hand out at most 25. Its
+  heldByOthers/skippedByYou/pendingTotal counts genuinely need every pending row (they depend on
+  IN-MEMORY lease state, which no SQL aggregate can see), but a row being merely COUNTED needs nothing
+  but its id. Now leases on ids and hydrates the served batch OUTSIDE the state lock.
+  `the_queue_serves_clips_in_the_order_it_leased_them` pins the re-index, because `get_segments_by_ids`
+  imposes its own ordering and would otherwise change which clip is "clip 1 of 25". All 58 couch tests
+  pass untouched.
+- `commands/dataset_analytics.rs` — and here "aggregate it in SQL", which the audit suggested, was the
+  WRONG retirement. Each of the three statistics is computed by a shared Rust policy function; the
+  training-grade one is literally the function the EXPORT gates on, so a SQL copy would fork the rule and
+  let the dashboard disagree with what an export writes. Retired by bounding the ROW, not the rule:
+  `for_each_segment` streams and each command folds into a small accumulator. The conformal case made
+  TWO passes with the second gated on the first's threshold, so the second pass's input is captured
+  during the first rather than re-reading the corpus.
+
+Every pre-existing test for those statistics exercises the SLICE entry point and stayed green without
+touching what actually changed, so
+`streaming_the_corpus_statistics_equals_collecting_them_first` compares streamed vs collected as
+serialized JSON over a varied 24-segment fixture — and asserts the fixture is non-degenerate first,
+because comparing two empty results is a vacuous pass. The seeded bootstrap means equality also proves
+both saw the same clips in the same order.
+
+Left: `segments_read.rs` alone, and it is P1.4's problem — `get_active_learning_queue` calibrates its
+threshold from the corpus. Doing that honestly needs a frozen human-labelled calibration split, which
+does not exist until the Gold Marathon, so it is NOT something to fake now.
+
+**Three defects found reviewing this session's own work, none caught by a gate.** A streamed recording's
+identity was persisted but never CHECKED (cross-session dedup looked implemented and did nothing for
+long files); `content_hash` fed blake3 two bytes at a time (195.4 ms vs 4.5 ms per 90 s window, same
+digest — ~8 s added to importing a one-hour recording); and a runtime-panic policy pinned `lock_known`'s
+full generic type and fired on a legitimate design change, so it now counts `self.known.lock()` sites
+instead — stricter than the string it replaced.
+
+**Two things flagged for the owner rather than silently changed.** `api_queue`'s doc comment says
+"oldest first" while its SQL is `created_at DESC`; which clips a reviewer meets first is a product
+decision. And `npm run tauri build` exits non-zero on this rig at the NSIS BUNDLING step (os error 32,
+the 512 MB installer still being written) even when the exe compiles and links correctly — harmless
+while `signed-installer` is descoped, and a trap the moment it is not.

@@ -423,21 +423,49 @@ pub struct AnnotationDriftScorecard {
 
 /// Build the annotation-drift scorecard from the dataset's segments. Segments without a
 /// (non-blank) human annotation are skipped — they have no reference to score against.
+/// Running tally behind [`annotation_drift_scorecard`], so the corpus-wide drift can be folded from a
+/// STREAM instead of a materialised `Vec<SpeechSegment>` (P1.3).
+///
+/// The per-clip error computation is unchanged. What shrinks is the row's lifetime: a segment's
+/// transcripts, alignment JSON and evidence JSON live for one `push`, and only the (small) error
+/// records survive — which is what the bootstrap needs anyway.
+#[derive(Debug, Default)]
+pub struct AnnotationDriftTally {
+    word_errs: Vec<SegmentError>,
+    char_errs: Vec<SegmentError>,
+}
+
+impl AnnotationDriftTally {
+    pub fn push(&mut self, seg: &crate::db::SpeechSegment) {
+        let reference = match seg.annotated_transcript.as_deref() {
+            Some(r) if !r.trim().is_empty() => r,
+            _ => return,
+        };
+        self.word_errs.push(word_error(reference, &seg.raw_transcript));
+        self.char_errs.push(char_error(reference, &seg.raw_transcript));
+    }
+
+    pub fn finish(self, opts: ScorecardOptions) -> AnnotationDriftScorecard {
+        finish_drift(self.word_errs, self.char_errs, opts)
+    }
+}
+
 pub fn annotation_drift_scorecard(
     segments: &[crate::db::SpeechSegment],
     opts: ScorecardOptions,
 ) -> AnnotationDriftScorecard {
-    let mut word_errs = Vec::new();
-    let mut char_errs = Vec::new();
+    let mut tally = AnnotationDriftTally::default();
     for seg in segments {
-        let reference = match seg.annotated_transcript.as_deref() {
-            Some(r) if !r.trim().is_empty() => r,
-            _ => continue,
-        };
-        word_errs.push(word_error(reference, &seg.raw_transcript));
-        char_errs.push(char_error(reference, &seg.raw_transcript));
+        tally.push(seg);
     }
+    tally.finish(opts)
+}
 
+fn finish_drift(
+    word_errs: Vec<SegmentError>,
+    char_errs: Vec<SegmentError>,
+    opts: ScorecardOptions,
+) -> AnnotationDriftScorecard {
     AnnotationDriftScorecard {
         num_segments: word_errs.len(),
         micro_wer: micro_rate(&word_errs),

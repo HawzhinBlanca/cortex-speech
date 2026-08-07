@@ -50,8 +50,14 @@ pub async fn get_training_grade_breakdown(
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        let segments = db.get_segments(None).map_err(|e| e.to_string())?;
-        Ok(quality::training_grade_breakdown(&segments))
+        // P1.3: folded from a stream. The breakdown is corpus-wide BY DESIGN — skipping rows would be
+        // wrong, not slow — so the fix is not a WHERE clause, and it is deliberately not a SQL
+        // reimplementation of the grading rule either: `training_grade_for_segment` stays the one
+        // implementation the export also gates on. Only the row's lifetime shrinks. State is O(distinct
+        // reasons); it used to be O(corpus) full records.
+        let mut tally = quality::TrainingGradeTally::default();
+        db.for_each_segment(|seg| tally.push(&seg)).map_err(|e| e.to_string())?;
+        Ok(tally.finish())
     })
     .await
 }
@@ -92,11 +98,15 @@ pub async fn get_dataset_certificate(
     RATE_LIMITER.check("get_dataset_certificate")?;
     let db = state.db_arc();
     run_blocking(move || {
-        let segments = {
+        // P1.3: folded from a stream. See get_training_grade_breakdown — same reasoning, and the
+        // membership rules stay in conformal.rs rather than being restated in SQL.
+        let tally = {
             let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.get_segments(None).map_err(|e| e.to_string())?
+            let mut tally = crate::quality::conformal::ConformalTally::default();
+            db.for_each_segment(|seg| tally.push(&seg)).map_err(|e| e.to_string())?;
+            tally
         };
-        Ok(crate::quality::conformal::calibrate_and_certify(&segments, target_error, confidence_level))
+        Ok(tally.finish(target_error, confidence_level))
     })
     .await
 }
@@ -112,8 +122,11 @@ pub async fn compute_annotation_drift_scorecard(
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        let segments = db.get_segments(None).map_err(|e| e.to_string())?;
-        Ok(crate::scorecard::annotation_drift_scorecard(&segments, Default::default()))
+        // P1.3: folded from a stream. Only the (small) per-clip error records survive a push, which is
+        // all the bootstrap needs; the transcripts they were computed from do not.
+        let mut tally = crate::scorecard::AnnotationDriftTally::default();
+        db.for_each_segment(|seg| tally.push(&seg)).map_err(|e| e.to_string())?;
+        Ok(tally.finish(Default::default()))
     })
     .await
 }
