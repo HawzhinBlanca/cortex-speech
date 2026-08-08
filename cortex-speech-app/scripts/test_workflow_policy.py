@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 
@@ -66,16 +68,69 @@ def test_workflow_permissions_are_explicit() -> None:
         assert_contains(text, expected, name)
 
 
+MAX_TIMEOUT_MINUTES = 180
+
+
+def _job_timeouts(text: str, name: str) -> dict[str, int | None]:
+    """Job id -> its timeout-minutes (None when it has none).
+
+    Text-based on purpose. This suite runs on the Linux and macOS CI runners too, and pulling in
+    PyYAML to read three files would trade a real portability risk for a small convenience -- on
+    2026-08-08 two Windows-only policies were exactly what kept both Build Smoke gates red for over
+    a week. Job ids are the keys at two-space indent inside the top-level `jobs:` block, their
+    properties sit at four, and the `on:`/`permissions:`/`env:` blocks are excluded by starting the
+    scan at `jobs:` and stopping at the next column-0 key.
+    """
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.rstrip() == "jobs:"), None)
+    if start is None:
+        raise AssertionError(f"{name}: no top-level `jobs:` block")
+
+    jobs: dict[str, int | None] = {}
+    current: str | None = None
+    for line in lines[start + 1 :]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            break
+        if indent == 2 and line.rstrip().endswith(":"):
+            current = line.strip().rstrip(":")
+            jobs.setdefault(current, None)
+        elif current and indent == 4 and line.strip().startswith("timeout-minutes:"):
+            jobs[current] = int(line.split(":", 1)[1].strip())
+    return jobs
+
+
 def test_workflow_jobs_have_timeouts() -> None:
-    expectations = {
-        "ci.yml": ["timeout-minutes: 90", "timeout-minutes: 45"],
-        "nightly-real-audio.yml": ["timeout-minutes: 75"],
-        "release.yml": ["timeout-minutes: 120"],
-    }
-    for name, expected_values in expectations.items():
-        text = workflow(name)
-        for expected in expected_values:
-            assert_contains(text, expected, name)
+    """EVERY job carries a timeout, and none is absurdly long.
+
+    This used to pin exact values ("timeout-minutes: 75"), which made it a change-detector rather
+    than the policy its name claims. Two problems with that. It broke whenever a timeout moved for a
+    legitimate reason -- raising the nightly's 75, which had been killing the soak mid-run every
+    night, tripped it. And it was far too weak in the direction that matters: it only asked whether
+    those strings appeared ANYWHERE in the file, so a NEWLY ADDED job with no timeout at all sailed
+    through. That is the real hazard - an untimed job hangs until GitHub's six-hour ceiling.
+
+    So: assert the invariant per job, and cap it, which keeps "just raise the timeout" from being a
+    silent way to hide something that hangs.
+    """
+    for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+        jobs = _job_timeouts(path.read_text(encoding="utf-8"), path.name)
+        if not jobs:
+            raise AssertionError(f"{path.name}: parsed no jobs at all - the scan is broken")
+        for job, minutes in sorted(jobs.items()):
+            if minutes is None:
+                raise AssertionError(
+                    f"{path.name}: job `{job}` has no timeout-minutes. Without one a wedged step "
+                    f"runs until GitHub's 6-hour ceiling and burns a runner for nothing."
+                )
+            if minutes > MAX_TIMEOUT_MINUTES:
+                raise AssertionError(
+                    f"{path.name}: job `{job}` allows {minutes} min, over the "
+                    f"{MAX_TIMEOUT_MINUTES} min cap. If a job genuinely needs longer, make the work "
+                    f"smaller or split the job - do not raise the ceiling to hide a hang."
+                )
 
 
 def test_cargo_deny_install_is_pinned() -> None:
