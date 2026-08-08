@@ -40,6 +40,20 @@ jobs:
     defaults:
       run:
         working-directory: cortex-speech-app
+    env:
+      # POINT ort AT THE RUNTIME. `ort` is built with load-dynamic, so it dlopen()s ONNX Runtime on
+      # first use - and when the library is ABSENT it does not fail, it BLOCKS FOREVER. That is what
+      # killed this job every night: 6 of 1160 lib tests hang (all VAD/chunking), the pipeline hangs
+      # at plan_speech_chunks, and the runner is cancelled at the timeout having printed nothing.
+      #
+      # `fetch_models.py` now provisions libonnxruntime.so on Linux, but nothing here would FIND it:
+      # tauri-build copies only the files listed in bundle.resources into the target dir, and the
+      # app's own models::init_ort_dylib_path() runs at startup, not inside `cargo test`. So the
+      # tests need the path stated explicitly, exactly as the app sets it for itself at runtime.
+      #
+      # A/B measured 2026-08-08 on one Linux binary: unset -> the Silero VAD test was killed at 45 s;
+      # set -> the same test passed in 0.24 s.
+      ORT_DYLIB_PATH: ${{ github.workspace }}/cortex-speech-app/src-tauri/models/libonnxruntime.so
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
