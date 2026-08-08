@@ -7582,3 +7582,100 @@ caught, 3/3 placeholders correctly ignored.
 
 **P5.6 is NOT closed.** Its history-and-secrets half is clean and now permanently gated; signed
 commits/tags, Scorecard >= 8 and the self-hosted runner are untouched, and the leg stays descoped.
+
+## Iteration 264 — protection applied, and three gates that were red or vacuous for over a week
+
+**Branch protection is live**, closing what 263 could only prepare. `gh` 2.97.0 installed, owner
+authenticated (the OAuth device flow is interactive and stays the owner's to run — the code `gh` prints
+in the TERMINAL is the one the browser asks for, which is where two attempts went wrong). Applied and
+verified three independent ways: the API read-back, the PUBLIC `protected` flag (`false` this morning,
+`true` now), and a real push refused —
+
+    remote: error: GH006: Protected branch update failed for refs/heads/main.
+    remote: - Changes must be made through a pull request.
+    ! [remote rejected] codex/newbranch -> main (protected branch hook declined)
+
+A settings page saying "protected" is not proof; a rejected push is.
+
+**Checked the gates BEFORE requiring them, and that is what stopped a self-inflicted lockout.** Of the
+four contexts the script pins, `Linux Build Smoke` and `macOS Build Smoke` had passed **0 of the last
+8 runs** and `Windows Release Gate` 3 of 8. Applying protection as written — with `enforce_admins` —
+would have made `main` permanently unmergeable for everyone. The script's footer treats lockout as a
+recovery scenario; here it was the guaranteed first outcome.
+
+Both Build Smoke gates died at the same step, `npm run test:python-policies`, which passes on Windows.
+Two policies were Windows-only:
+
+- **`generate_release_checksums.py` sorted Path OBJECTS.** `PurePath.__lt__` compares case-INSENSITIVELY
+  on Windows and case-SENSITIVELY on POSIX, so the same bundle produced different manifests depending on
+  the builder — in a module whose first word is "deterministic". Measured:
+  Windows `['app.tar.gz', 'msi/cortex.msi', 'SHA256SUMS']`, Linux `['SHA256SUMS', 'app.tar.gz', ...]`.
+  No shipped manifest is wrong (`release.yml` runs it under `if: runner.os == 'Windows'`), but a manifest
+  whose bytes depend on the builder cannot back a reproducibility claim. Now keyed on the relative POSIX
+  string — the exact text each line carries.
+  The old test asserted the WINDOWS order, so it **encoded the bug instead of catching it**. The new
+  guard pins names the two sort rules disagree about; fail-before on Windows shows the pre-fix sort
+  yields `['apple.bin', 'nested/Inner.bin', 'Zebra.bin']` and both assertions reject it.
+- **`test_watchdog_decisions.py` drives a `.ps1` and copies `powershell.exe`** to build its decoy.
+  Neither exists on Linux/macOS, so it could only ever fail there. Skips now, as its sibling
+  `test_watchdog_enabled.py` already did — honest here precisely because the subject is ABSENT, not
+  unverified.
+
+54/54 on Windows and 54/54 on Linux after; Linux was 52/54. Real evidence, not prediction: run #655 came
+back `completed/success` with all four contexts green, and only then was protection applied. That also
+settled the single `Rust tests` failure at `8118933` as intermittent — that commit changes one line of
+`docs/STATUS.md`.
+
+**The nightly has failed 10 of 10 nights, back to at least 2026-07-30, and nobody was reading it.**
+Three separate faults, found only because authenticated `gh` could finally read CI logs:
+
+1. **The mutation gate has never tested a single mutant.** cargo-mutants copies the PACKAGE to `$TMPDIR`,
+   so `frontendDist "../dist"` resolved to `/tmp/dist` and `tauri::generate_context!` panicked at compile
+   time. `outcomes.json`: `total_mutants 0` against "Found 16 mutants to test"; caught/missed/timeout/
+   unviable all 0 bytes. So the charter's **"0 surviving mutants in irt/conformal/ood/diff/normalizer"
+   has been VACUOUS** — not passing, never running. The fix was already written down: the Makefile's
+   `mutants` target has used `--in-place` since it was added, with a comment saying it is REQUIRED for
+   exactly this reason. CI simply never got the flag.
+2. **The real-audio job is killed at its timeout inside the soak test.** I nearly "fixed" the cache for
+   this — it does always miss, and `Post Cache` is skipped because `actions/cache` will not save on a
+   failing job, so it can never warm. The timings killed that theory: compilation was **2m 45s**. The
+   soak ran ~70 minutes without finishing.
+3. **The real-audio suite itself never runs** — that step takes 0 seconds for want of `CORTEX_REAL_AUDIO_DIR`
+   fixtures. The workflow is honest about it (it emits a warning annotation), but "Nightly Real Audio"
+   currently exercises no real audio. Owner-gated: it needs fixtures on a runner.
+
+**The soak, and three wrong answers before the right one.** What is measured: on this rig the import
+takes **174.9 s for 12 clips, and the per-file cost is FLAT** — 28.2 s for the first (it pays for model
+load) then 13.2 s each for the remaining eleven. Nothing accumulates. The modified test still passes
+here at 175.4 s against its unchanged 300 s bound, clippy clean.
+
+What is NOT known: why the same test is killed at the timeout in CI. Three attempts to answer it from
+this machine, and the discipline is in discarding them rather than in having had them:
+
+1. *"The cache always misses."* True — `Post Cache` is skipped because `actions/cache` will not save on a
+   failing job, so it can never warm. Killed by the timings: compilation was 2m 45s of a 75-minute job.
+2. *"Wall time scales with cores; a 4-core runner needs ~15 min."* Written into this ledger before the
+   measurement came back, and wrong: it assumed total CPU work is constant across hosts.
+3. *"It does not converge on a small host — 9,502 CPU-seconds, unfinished at 40 minutes."* Also wrong,
+   and this one was my own instrument. `available_parallelism()` reports **64 on this box whatever
+   affinity mask the process is given**, because Windows splits >64 logical CPUs into processor GROUPS
+   and reports one group. So pinning to 4 CPUs never made the code believe it had 4 — it built 64-wide
+   pools and then contended on four. Both pinned runs measured the harness. The tell was visible twice
+   before I read it: 133 threads at 128 cores, 136 at "4", and 136 again with the workload cut to a
+   quarter. A thread count that ignores every variable you are changing is the instrument telling you it
+   is not connected.
+
+So the honest position is that the CI cost must be measured IN CI. What shipped serves exactly that: the
+callback was `|_| {}`, which is why the job printed **nothing between "running 1 test" and being killed
+69 minutes later** — a hang and slow work are indistinguishable from silence. It now prints per-file
+progress, and that output is what exposed both the sequential per-file processing and my own broken
+emulation within one run of reading it. The budget scales below 18 cores purely so CI fails with a
+legible assertion instead of an opaque timeout; it is a hedge, not a model, and says so.
+
+**A policy test that was a change-detector, not a policy.** `test_workflow_jobs_have_timeouts` pinned
+exact strings ("timeout-minutes: 75"), so it broke on a legitimate change AND — far worse — would have
+passed for a NEWLY ADDED job with no timeout at all, since it only asked whether those strings appeared
+anywhere in the file. An untimed job hangs to GitHub's six-hour ceiling. It now parses each job (text
+only; adding PyYAML would have re-introduced the very portability class fixed above) and asserts every
+job has a timeout under a 180-minute cap, so "just raise it" cannot quietly hide a hang. Fail-before
+confirms it catches both an untimed job and an over-cap one.
