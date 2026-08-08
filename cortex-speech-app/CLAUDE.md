@@ -88,7 +88,25 @@ Run the relevant gates and paste the real output. A fix without a regression gat
 ## Working agreement
 
 - One logical change per commit, **Conventional Commits**, on a **branch** (never straight to `main`); end commit messages with the `Co-Authored-By: Claude` trailer per the charter.
-- Fast-forward `main` with `git push origin <branch>:main` — **never** by checking `main` out. A checkout rewrites every file that differs between the two commits, including tracked build inputs like `package.json`, which bumps their mtime past the built exe and reds `exe-freshness` for no real reason. Measured 2026-08-04: a green sweep went RED immediately after a push, costing a 7-minute relink and a full re-sweep. The ref-push updates the remote and leaves the working tree untouched.
+- **`main` is a protected branch as of 2026-08-08, admins included.** The direct
+  `git push origin <branch>:main` this file used to prescribe is now REJECTED BY THE SERVER, for
+  everyone. Land work through a pull request instead:
+  ```
+  git push origin <branch>
+  gh pr create --base main --head <branch> --fill
+  gh pr merge --squash --auto      # merges itself once the four required checks go green
+  ```
+  Required: `Provenance & License Gate`, `Windows Release Gate`, `Linux Build Smoke`,
+  `macOS Build Smoke` — and the PR must be up to date with `main` first (`strict`).
+- **Still never check `main` out.** That half of the old rule is unchanged and still bites: a checkout
+  rewrites every file that differs between the two commits, including tracked build inputs like
+  `package.json`, which bumps their mtime past the built exe and reds `exe-freshness` for no real
+  reason. Measured 2026-08-04: a green sweep went RED immediately after a push, costing a 7-minute
+  relink and a full re-sweep. Use `git fetch origin` and read `origin/main`; never `git checkout main`.
+- Squash and rebase merges both REWRITE commit SHAs, so a long-lived branch diverges from `main` after
+  every merge. Re-point it with `git fetch origin && git reset --hard origin/main` once the PR has
+  landed and the tree is identical — do NOT merge `main` back in, which creates a merge commit that
+  `required_linear_history` then rejects.
 - Save final deliverables into the repo (the selected folder) and share them with `present_files`.
 - Don't weaken, skip, or delete a quality gate to make something pass. Don't scope-creep — log out-of-scope ideas instead of implementing them.
 
