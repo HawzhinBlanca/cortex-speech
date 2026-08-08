@@ -69,14 +69,29 @@ def test_en_and_ckb_have_identical_key_sets() -> None:
 def test_every_referenced_literal_key_is_defined() -> None:
     defined = set(key_list(EN))
     missing: dict[str, list[str]] = {}
+    seen_refs = 0
     for path in SRC.rglob("*"):
         if path.suffix not in (".svelte", ".ts") or path.name.endswith(".test.ts"):
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         for m in REF_RE.finditer(text):
             key = m.group(1)
+            seen_refs += 1
             if key not in defined:
                 missing.setdefault(key, []).append(str(path.relative_to(REPO_ROOT)))
+    # The same floor the other two checks in this file already carry, which this one lacked. If
+    # REF_RE ever stops matching -- a refactor to a different translator call form, a rename of `t`
+    # -- this loop finds nothing, reports nothing, and passes while inspecting zero references. A
+    # guard that silently stops matching its own input is worse than none.
+    #
+    # MEASURED 2026-08-08: 847 literal references across 26 files, 626 distinct keys, all defined.
+    # The floor is set well under that so an ordinary refactor does not trip it; it exists to catch
+    # the matcher breaking, not to pin a count.
+    if seen_refs < 200:
+        raise AssertionError(
+            f"only {seen_refs} literal translator references matched across src/ (expected many "
+            f"hundreds) -- REF_RE has stopped matching the code, so this gate is checking nothing."
+        )
     if missing:
         lines = [f"  '{k}'  <- {', '.join(sorted(set(v))[:3])}" for k, v in sorted(missing.items())]
         raise AssertionError(
