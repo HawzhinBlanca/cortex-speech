@@ -764,6 +764,12 @@ pub struct SileroVad {
 
 impl SileroVad {
     pub fn new(model_path: &Path, sample_rate: u32, threshold: f32) -> AppResult<Self> {
+        // The FIRST ort use in the import pipeline, and the one measured hanging: with no ONNX
+        // Runtime present this builder blocks forever rather than failing (see
+        // models::ensure_ort_runtime_loadable). ort's load is process-wide and one-time, so probing
+        // here also covers every session built afterwards; on a healthy install it is a cached
+        // atomic read.
+        crate::models::ensure_ort_runtime_loadable().map_err(AppError::Onnx)?;
         let session = Session::builder()
             .map_err(|e| AppError::Onnx(format!("VAD session builder: {e}")))?
             .commit_from_file(model_path)

@@ -442,6 +442,15 @@ pub fn run() {
     }
 
     models::init_ort_dylib_path();
+    // Say so AT STARTUP if the runtime cannot load, rather than letting the first transcription
+    // freeze with no message. A missing or corrupt onnxruntime library makes `ort` block forever
+    // instead of failing, so without this the symptom is an app that simply stops responding
+    // mid-import. Logged rather than fatal: everything that does not touch ONNX (review, export,
+    // search, the whole DB side) still works, and taking the app away entirely would be a worse
+    // answer than telling the owner what is broken.
+    if let Err(error) = models::ensure_ort_runtime_loadable() {
+        tracing::error!("{error}");
+    }
 
     // The data dir exists and tracing now has a file sink — let the panic hook write crash dumps there.
     let _ = CRASH_DIR.set(data_dir.clone());
