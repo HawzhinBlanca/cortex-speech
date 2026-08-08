@@ -30,7 +30,13 @@ jobs:
   real-audio:
     name: Real audio + ASR (optional fixtures)
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # 75 was not enough and the job was killed mid-soak every night since at least 2026-07-30,
+    # printing nothing that explained why. The soak's wall time is dominated by CTC inference and
+    # scales inversely with cores: 192s on the owner's 128-core rig, ~15 min pinned to 4 CPUs, and
+    # measurably worse than that here for a reason not yet identified (the run was cancelled at 69
+    # minutes still going). Raised so the job can COMPLETE and say where the time went - the test
+    # now prints per-file progress, which is the evidence this decision was missing.
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: cortex-speech-app
