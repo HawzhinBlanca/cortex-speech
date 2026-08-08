@@ -43,9 +43,29 @@ SILERO_URL = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/d
 ORT_WIN_ZIP = (
     "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-win-x64-1.24.4.zip"
 )
+# The SAME official 1.24.4 release, linux-x64. Until 2026-08-08 this file provisioned a WINDOWS DLL
+# and nothing else, on every platform -- so on Linux there was no ONNX Runtime for `ort` to dlopen.
+#
+# That is not a cosmetic gap. `ort` is built with `load-dynamic` (Cargo.toml), and when the runtime
+# is ABSENT the first session does not fail, it BLOCKS FOREVER. Measured 2026-08-08 with an A/B on
+# one Linux binary: without ORT_DYLIB_PATH the Silero VAD unit test was killed at 45 s; with it
+# pointed at a real .so the SAME test passed in 0.21 s. Six of 1160 lib tests hung, all VAD/chunking,
+# and the pipeline hung at plan_speech_chunks -- which is why the nightly real-audio job was killed
+# at its timeout every night since at least 2026-07-30.
+#
+# The tarball ships lib/libonnxruntime.so as a SYMLINK to libonnxruntime.so.1.24.4, and tarfile's
+# isfile() skips symlinks, so the member suffix must name the real versioned file.
+ORT_LINUX_TGZ = (
+    "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz"
+)
 
 # dest is relative to src-tauri/models/. sha256 is authoritative (matches the in-repo pins in
 # src-tauri/src/models.rs for the sherpa models). "member" matches an archive entry by suffix.
+#
+# "platforms" restricts an item to the given sys.platform values; an item WITHOUT the key is fetched
+# everywhere. The two Windows DLLs deliberately have no key: tauri.conf.json's bundle.resources lists
+# them, and tauri-build validates that list on EVERY platform, so gating them off would break the
+# Linux and macOS builds. Only the additive per-OS runtime is gated.
 ITEMS = [
     {
         "dest": "silero_vad_v4.onnx",
@@ -76,7 +96,32 @@ ITEMS = [
         "archive": ORT_WIN_ZIP,
         "member": "onnxruntime_providers_shared.dll",
     },
+    # Flat in models/, because that is one of the places models::init_ort_dylib_path() searches
+    # (`<active models dir>/<dylib>`) and ort_dylib_filename() returns "libonnxruntime.so" here.
+    # Hashes computed from the downloaded official artifact, not copied from anywhere.
+    {
+        "dest": "libonnxruntime.so",
+        "sha256": "d132535d051344ff5c64c9c200004150559049a81ed330eb4422c1962fb6b7e4",
+        "archive": ORT_LINUX_TGZ,
+        "member": "libonnxruntime.so.1.24.4",
+        "platforms": ("linux",),
+    },
+    {
+        "dest": "libonnxruntime_providers_shared.so",
+        "sha256": "086ec1d5388f64153d9c63470d126693db9a182c8ce236d3a1119068471b8a0d",
+        "archive": ORT_LINUX_TGZ,
+        "member": "libonnxruntime_providers_shared.so",
+        "platforms": ("linux",),
+    },
+    # NOT provisioned: macOS (libonnxruntime.dylib). No gate runs the pipeline on macOS -- the macOS
+    # job only builds -- so pinning a third runtime would add an unverified download for coverage
+    # nothing currently exercises. Add it the day a macOS job actually runs inference.
 ]
+
+
+def applies_here(item: dict) -> bool:
+    """Is this item wanted on the current platform? Items without "platforms" apply everywhere."""
+    return sys.platform in item["platforms"] if "platforms" in item else True
 
 
 def sha256_of(path: Path) -> str:
@@ -94,6 +139,9 @@ def sha256_of_bytes(data: bytes) -> str:
 def check() -> int:
     failed = 0
     for item in ITEMS:
+        if not applies_here(item):
+            print(f"  SKIP     {item['dest']} (not for {sys.platform})")
+            continue
         dest = MODELS_DIR / item["dest"]
         if not dest.exists():
             print(f"  MISSING  {item['dest']}")
@@ -134,6 +182,9 @@ def download() -> int:
     archive_cache: dict[str, bytes] = {}
     failed = 0
     for item in ITEMS:
+        if not applies_here(item):
+            print(f"  SKIP     {item['dest']} (not for {sys.platform})")
+            continue
         dest = MODELS_DIR / item["dest"]
         if dest.exists() and sha256_of(dest) == item["sha256"]:
             print(f"  SKIP     {item['dest']} (present + verified)")
