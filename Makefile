@@ -36,7 +36,8 @@ coverage:
 ## normalizer). --in-place is REQUIRED: cargo-mutants' copied tree has no ../dist, which
 ## tauri::generate_context! demands. Commit first - an interrupted run can leave a mutated source
 ## file behind (recover with `git checkout -- src/`). A full sweep is 844 mutants; nightly CI runs
-## --in-diff instead. Scope/timeouts live in src-tauri/mutants.toml.
+## --in-diff instead. Scope/timeouts live in src-tauri/.cargo/mutants.toml (there is no
+## src-tauri/mutants.toml; cargo-mutants reads either, and this repo uses the .cargo/ one).
 mutants:
 	cd cortex-speech-app/src-tauri && cargo mutants --in-place
 
