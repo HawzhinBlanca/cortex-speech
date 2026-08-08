@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 static USER_MODELS_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -1219,6 +1220,87 @@ pub fn init_ort_dylib_path() {
             "{dylib} not found next to exe, in models dir, or cwd; ORT will fall back to the system loader search"
         );
     }
+}
+
+/// How long the first ONNX Runtime load may take before we call it wedged.
+///
+/// Generous on purpose: this budget is only ever spent ONCE, and only on a machine where the load is
+/// already going wrong. A cold read of a ~22 MB shared library on a slow disk is seconds, not
+/// minutes, so 45 s cannot false-fire on a healthy install while still turning an infinite hang into
+/// a message somebody can act on.
+const ORT_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Fail FAST when the ONNX Runtime shared library cannot be loaded, instead of hanging forever.
+///
+/// WHY THIS EXISTS. `ort` is built with `load-dynamic` (Cargo.toml), so it dlopen()s the runtime on
+/// first use. When that library is ABSENT the call does not return an error -- it BLOCKS FOREVER,
+/// and `init_ort_dylib_path` above deliberately falls through to "the system loader search" when it
+/// finds nothing, which is precisely the path that wedges.
+///
+/// MEASURED 2026-08-08, A/B on one Linux binary with one variable changed: with ORT_DYLIB_PATH unset
+/// the Silero VAD unit test was killed at 45 s having never returned; with it pointed at a real
+/// libonnxruntime.so the SAME test passed in 0.21 s. The wedged process held two threads in
+/// futex_wait_queue at 0.0% CPU, no sockets, and ONNX Runtime never appeared in its memory maps.
+/// Six of 1160 lib tests hung, all of them VAD/chunking, and the import pipeline hung at
+/// plan_speech_chunks -- which is why the nightly job was cancelled at its timeout every night for
+/// over a week, printing nothing that explained why.
+///
+/// This is NOT a Linux problem. The same freeze is what a Windows user gets if `onnxruntime.dll`
+/// goes missing or is corrupted: an app that stops responding mid-import with no message at all.
+///
+/// HOW. The first load runs on a worker thread with a deadline, so a wedged loader costs a bounded
+/// wait instead of the process. The result is cached, so a healthy install pays for exactly one
+/// `SessionBuilder` construction and every later call is an atomic read.
+///
+/// A load that reports an ERROR is deliberately NOT turned into a failure here -- callers already
+/// map those to actionable messages, and this guard exists for the case where nothing is reported at
+/// all. Narrowing it to the hang keeps it from changing behaviour on any machine that works today.
+///
+/// The probe thread is intentionally left running if it never reports: it is blocked inside the
+/// dynamic loader and cannot be cancelled. One parked thread is a far better outcome than an
+/// application that never answers again.
+///
+/// KNOWN LIMIT, measured rather than assumed. That parked thread also stalls PROCESS EXIT, because
+/// it holds the loader lock that exit handlers need. Verified on Linux: the VAD test now reports
+/// `FAILED ... finished in 45.00s` with the message below, and the binary then had to be killed at
+/// its outer 120 s cap. So this converts "hangs forever, says nothing" into "says exactly what is
+/// wrong, then needs killing" -- a large improvement and not a complete one. Removing the stall
+/// means never entering the wedged loader at all, which needs a load attempt that can be abandoned;
+/// worth doing if this is ever hit on a machine that matters, not worth pre-building for a state no
+/// healthy install reaches.
+pub fn ensure_ort_runtime_loadable() -> Result<(), String> {
+    static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
+    PROBE
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            if let Err(error) = std::thread::Builder::new().name("ort-runtime-probe".to_string()).spawn(move || {
+                // Constructing a builder is what forces the runtime load; no model is touched.
+                let _ = tx.send(ort::session::Session::builder().map(|_| ()).map_err(|e| e.to_string()));
+            }) {
+                // Cannot probe, so do not pretend to have. Let the caller proceed unblocked.
+                tracing::warn!("could not start the ONNX Runtime probe thread: {error}");
+                return Ok(());
+            }
+            match rx.recv_timeout(ORT_RUNTIME_PROBE_TIMEOUT) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => {
+                    // Reported a real error: the caller's own mapping is more specific than ours.
+                    tracing::warn!("ONNX Runtime reported an error while loading: {error}");
+                    Ok(())
+                }
+                Err(_) => Err(format!(
+                    "ONNX Runtime ({}) did not finish loading within {:?} and is not going to. \
+                     This is what a MISSING or corrupt runtime looks like: `ort` is built with \
+                     load-dynamic and blocks forever rather than failing. Fix it by restoring the \
+                     library - run `npm run fetch-models` - or point ORT_DYLIB_PATH at a copy. \
+                     Looked next to the executable, in the active models directory, and in the \
+                     working directory.",
+                    ort_dylib_filename(),
+                    ORT_RUNTIME_PROBE_TIMEOUT,
+                )),
+            }
+        })
+        .clone()
 }
 
 #[cfg(test)]
