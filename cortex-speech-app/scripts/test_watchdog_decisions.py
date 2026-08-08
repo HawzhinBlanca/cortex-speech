@@ -106,6 +106,19 @@ def start_decoy(dir_: Path) -> tuple[subprocess.Popen[bytes], Path]:
 
 
 def main() -> int:
+    # The subject is a PowerShell script driven by a Windows Task Scheduler entry, and this drill
+    # copies `System32\WindowsPowerShell\v1.0\powershell.exe` to build its decoy. None of that exists
+    # on Linux or macOS, so the drill could only ever fail there — which it did, on every CI run,
+    # taking `Linux Build Smoke` and `macOS Build Smoke` down with it.
+    #
+    # Skipping matches how `test_watchdog_enabled.py` already treats the same subject, and skipping is
+    # honest here in a way it usually is not: the thing under test is ABSENT on this platform, not
+    # unverified on it. The Windows sweep still drills every branch, which is the machine that has a
+    # watchdog to protect.
+    if sys.platform != "win32":
+        print(f"SKIP: {sys.platform} is not Windows; cortex-watchdog.ps1 is a Task Scheduler entry")
+        return 0
+
     if not SCRIPT.exists():
         print(f"watchdog script missing: {SCRIPT}", file=sys.stderr)
         return 1
