@@ -264,7 +264,24 @@ jobs:
           fi
           # examine_globs / --lib scoping / timeouts all come from src-tauri/.cargo/mutants.toml
           # (verified read: `cargo mutants --list` enumerates exactly the eight scoped files).
-          cargo mutants --in-diff /tmp/core.diff
+          #
+          # --in-place is REQUIRED, for exactly the reason the Makefile's `mutants` target already
+          # documents: cargo-mutants copies the PACKAGE to $TMPDIR and builds there, so
+          # tauri.conf.json's frontendDist "../dist" resolves to /tmp/dist and
+          # tauri::generate_context! panics at compile time. The provisioning step above does build
+          # cortex-speech-app/dist - which only helps a package that stays put. The local target had
+          # the flag from the start; this job never got it.
+          #
+          # Measured on run 31238862396 (2026-08-08): baseline exited 101 with "The `frontendDist`
+          # configuration is set to `\"../dist\"` but this path doesn't exist", cargo-mutants reported
+          # "cargo build failed in an unmutated tree, so no mutants were tested", and outcomes.json
+          # recorded total_mutants: 0 against "Found 16 mutants to test". This job had failed every
+          # night since at least 2026-07-30, so the charter's "0 surviving mutants" leg has been
+          # VACUOUS for that whole period - not passing, never running.
+          #
+          # Mutating the source tree is safe on a disposable runner; the dirty-checkout risk the
+          # Makefile warns about applies to a developer's working copy, not to a fresh CI clone.
+          cargo mutants --in-place --in-diff /tmp/core.diff
 
       - name: Upload mutation report
         if: always()
