@@ -164,9 +164,40 @@ def worker(srv: socket.socket, tag: str) -> None:
     )
     print(f"[{tag}] Pipeline ready.", flush=True)
 
+    def load_any(audio_path: str):
+        """torchaudio first; ffmpeg for anything its backend cannot open.
+
+        MEASURED 2026-08-10: a 25-clip podcast source in an .mp4 container failed EVERY 7B request with
+        "Error opening ...: Format not recognised" — libsndfile, torchaudio's soundfile backend, handles
+        no MPEG-4/AAC. The app's own import path decodes it fine, so those clips imported, chunked and
+        transcribed locally, and then silently could not be re-transcribed by the champion: the review
+        queue ended up 462 clips at 7B quality and 25 at the weaker engine, with nothing saying so.
+
+        A container the rest of the app accepts must not be a container the champion refuses. ffmpeg is
+        already a hard dependency of the import path, so this adds no new one.
+        """
+        try:
+            return torchaudio.load(audio_path)
+        except Exception as exc:  # noqa: BLE001 - any backend failure is a decode failure here
+            print(f"[{tag}] torchaudio could not open {audio_path} ({exc}); decoding via ffmpeg", flush=True)
+            proc = subprocess.run(
+                ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", audio_path,
+                 "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", "16000", "-"],
+                capture_output=True,
+            )
+            if proc.returncode != 0 or not proc.stdout:
+                # FAIL, never a silent empty clip: an empty tensor would transcribe to "" and the
+                # caller treats "" as a transient server-under-load result.
+                raise RuntimeError(
+                    f"ffmpeg could not decode {audio_path}: "
+                    f"{(proc.stderr or b'').decode('utf-8', 'replace').strip()[:200]}"
+                ) from exc
+            samples = torch.frombuffer(bytearray(proc.stdout), dtype=torch.float32)
+            return samples.unsqueeze(0), 16000
+
     def transcribe(audio_path: str, start_ms=None, end_ms=None) -> str:
         """Resample to 16 kHz mono (OmniASR requirement), optionally clip [start_ms,end_ms), transcribe."""
-        wav, sr = torchaudio.load(audio_path)  # (channels, samples)
+        wav, sr = load_any(audio_path)  # (channels, samples)
         if start_ms is not None and end_ms is not None and end_ms > start_ms:
             a = max(0, int(start_ms / 1000.0 * sr))
             b = min(wav.size(1), int(end_ms / 1000.0 * sr))
