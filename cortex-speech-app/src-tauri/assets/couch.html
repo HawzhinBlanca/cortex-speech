@@ -210,8 +210,15 @@
   /* Rides on the dim meta line but in the warning colour: it has to survive a glance, because it is
      information the reviewer needs BEFORE they tap, not after. */
   .flag { color: var(--warn); }
+  /* font-family MUST be explicit: a textarea does NOT inherit it, and every browser's UA default is
+     monospace. A monospaced Arabic-script face forces cursive, wildly-varying-width Kurdish letters
+     into identical advance cells, so the joins render stretched and gappy — it reads like tatweel
+     padding that is not in the text (verified 2026-08-10: tatweel count 0 in the data, fontFamily
+     computed to "monospace" on the live page). Reviewers judge these clips by eye; unreadable script
+     is a correctness problem, not a cosmetic one. */
   textarea { width: 100%; min-height: 34dvh; background: var(--bg); color: var(--ink);
              border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+             font-family: inherit;
              font-size: var(--tsize); line-height: 1.9; direction: rtl; }
   .meta { font-size: 11px; color: var(--faint); }
   .row { display: flex; gap: 8px; }
