@@ -177,9 +177,27 @@
     }
   }
 
+  // A key typed into either field is DISCARDED by every exit path unless that field's OWN "Save key"
+  // button was pressed — and the panel's bottom-right Save is the bigger, bluer, more obvious button.
+  // Worse, the bottom Save routes through update_settings, whose load() SCRUBS llm_api_key, so the
+  // trap is silent: no error, no toast, and the key is simply gone.
+  //
+  // Measured 2026-08-10: the owner pasted a Gemini key, pressed Save, and it never reached
+  // secrets.env — GEMINI_API_KEY stayed empty while the panel looked like it had accepted the key.
+  //
+  // Fixed at the convergence point rather than by relabelling one button: EVERY path that leaves the
+  // panel flushes pending key inputs through the encrypted store first, so whichever button the user
+  // reaches for does the right thing. Awaited in save() (which then closes the panel); fire-and-forget
+  // in onDestroy, where the component is already going away and there is nothing left to await for.
+  async function flushPendingKeys() {
+    if (openrouterKeyInput.trim()) await saveOpenrouterKey();
+    if (geminiKeyInput.trim()) await saveGeminiKey();
+  }
+
   onDestroy(() => {
     // Cancel must discard: don't persist unsaved edits when the user explicitly cancelled.
     if (cancelled) return;
+    void flushPendingKeys();
     applySourceReferenceModelsInput();
     // Close-to-save for theme/sliders (they have no per-field auto-save). Route through saveQuietly so
     // this path gets the SAME NaN coercion + rollback-on-failure + error toast as every other persist.
@@ -281,6 +299,9 @@
         showSettings.set(false);
         return;
       }
+      // BEFORE update_settings: its load() scrubs llm_api_key, so a key still sitting in an input when
+      // the user presses Save would otherwise be dropped without a word. See flushPendingKeys.
+      await flushPendingKeys();
       await api.updateSettings(localSettings);
       notifications.success($t('settingsSaved'));
       showSettings.set(false);
