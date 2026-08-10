@@ -2027,8 +2027,17 @@ mod tests {
             panic!("poison VAD cache");
         }));
 
-        *lock_vad_cache() = None;
-        assert!(lock_vad_cache().is_none());
+        // ONE guard for the write AND the check. Taking the lock twice opens a window in which any
+        // other test in the parallel suite that constructs a VAD repopulates this global, and the
+        // assertion then fails for a reason that has nothing to do with poison recovery. Observed
+        // 2026-08-09: green when run alone, red inside the full 1157-test run.
+        //
+        // What is being asserted is unchanged and is what the name promises: after a panic while the
+        // lock was held, the lock is USABLE again and a write through it takes effect. The value of a
+        // process-wide cache at some later instant was never this test's property to own.
+        let mut cache = lock_vad_cache();
+        *cache = None;
+        assert!(cache.is_none(), "a poisoned lock must still be usable, and a write through it must land");
     }
 }
 
