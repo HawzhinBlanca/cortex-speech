@@ -7746,3 +7746,49 @@ wipes — checked before each, because the first instinct was to move the whole 
 have detached the frozen eval basis behind every measured CER in this repo.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 266 — the review session went live, and the save button that discarded the key
+
+**Two reviewers are working over the public internet, verified end to end from a browser.** The
+session is up for Lamo and Sewa on the Funnel host; 15 checks pass against the public URL, not
+localhost: shell 200, `/api/queue` and `/api/audio/<id>` 401 without the cookie, a REAL token in
+`?t=` still 401, claim 200 with `HttpOnly; SameSite=Strict`, an unknown token refused identically,
+and a 373 KB clip actually streaming to the reviewer.
+
+Backend checks were not enough on their own — last iteration a dead `queryToken` reference rendered
+the reviewer page blank while every API check passed. So the page was loaded in a real browser this
+time: "Cortex · Lamo", clip 1 of 494, RTL intact, the audio element carrying a real 11.7 s duration,
+zero console errors, and the token gone from the address bar (claimed into the cookie and stripped by
+`history.replaceState`, so a screenshot cannot leak it).
+
+**The Gemini key had a SECOND way to be lost, and it was the obvious one.** With the field rewired to
+the encrypted store behind its own "Save key" button, the panel then had two save buttons — and the
+bottom-right one, bigger and blue and the one anybody reaches for, still routed through
+`update_settings`, whose `load()` scrubs `llm_api_key`. Measured: key pasted, Save pressed,
+`GEMINI_API_KEY` still empty. Same trap on the OpenRouter field.
+
+Fixed at the convergence point rather than by relabelling a button: `flushPendingKeys()` runs from
+`save()` (before `updateSettings`, since that is the scrubbing path) and from `onDestroy` (the
+✕/Escape route), so every exit persists a pending key through `save_key_protected`. Fail-before, all
+four mutations caught: flush deleted from `save()`, flush moved after `updateSettings`, flush deleted
+from `onDestroy`, and flush rewritten to assign into `localSettings`. Panel restored byte-identical.
+
+**The new gate reported success while executing nothing.** `test_settings_key_persistence_policy.py`
+had no `__main__` block, so `run_python_policies` ran it, got exit 0, and counted it among "55 policy
+test scripts passed" — a vacuous gate, which is worse than no gate because it reports a safety it is
+not providing. This is the same class as the i18n reference check that passed having inspected zero
+references. It self-runs now, and its helper no longer overruns into `onDestroy` (which made the
+encrypted-store check fail against correct code).
+
+**An OpenRouter key is sitting in plaintext.** `OPENROUTER_API_KEY` is 73 raw characters in
+`secrets.env`, not a `dpapi:` blob — it never went through `set_api_key`, which encrypts. Reported to
+the owner rather than silently rewritten: a credential store is theirs to change. Gemini is now a
+358-char DPAPI blob, and it was verified by calling `CryptUnprotectData` directly — the exact Win32
+entry point `dpapi.rs` uses — rather than trusting .NET's wrapper to be format-compatible with it.
+
+Gates: typecheck 431 files 0 errors, eslint clean, 236 frontend tests, python policies green. The fix
+is source-only so far — rebuilding restarts the app, and the couch server lives in that process, so it
+was deliberately deferred rather than dropped under two people mid-review. Reviewer page is served by
+Rust from `couch.html` and is unaffected by the frontend bundle either way.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
