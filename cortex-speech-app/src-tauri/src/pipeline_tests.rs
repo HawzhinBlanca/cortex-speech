@@ -1349,3 +1349,59 @@ fn revoke_consent_now_never_grants() {
     assert!(!stored.consent.cloud_llm());
     assert!(!stored.consent.jury_cloud());
 }
+
+/// The 7B gate must admit EXACTLY its permit count concurrently — no more, no fewer.
+///
+/// Both directions are failures with teeth. Admitting more than the server has replicas puts the
+/// extra requests in the socket queue, where they burn their client timeout waiting and get
+/// misreported as "server not running" — the cumulative-timeout blowout the gate exists to prevent.
+/// Admitting fewer wastes a GPU: measured 2026-08-11, the one-permit version held a 2-replica server
+/// to 23.1 s/clip with both cards under 20%.
+///
+/// Fail-before: reverting `acquire()` to a plain exclusive Mutex drives observed concurrency to 1 and
+/// trips the lower assertion.
+#[test]
+fn the_7b_gate_admits_exactly_its_permit_count_at_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // SAFETY: single-threaded at this point; the worker threads below start after it is set.
+    std::env::set_var("CORTEX_7B_CONCURRENCY", "2");
+    assert_eq!(super::wsl_7b_concurrency(), 2, "the env var must reach the gate");
+
+    let in_flight = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                let _permit = super::WSL_7B_GATE.acquire();
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // Long enough that every thread overlaps if the gate lets them.
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+
+    let observed = peak.load(Ordering::SeqCst);
+    assert!(observed <= 2, "gate admitted {observed} at once, above its 2 permits — requests would queue and time out");
+    assert_eq!(observed, 2, "gate never admitted 2 at once, so a second replica would sit idle");
+    assert_eq!(in_flight.load(Ordering::SeqCst), 0, "every permit must be returned on drop");
+
+    std::env::remove_var("CORTEX_7B_CONCURRENCY");
+}
+
+/// An unusable CORTEX_7B_CONCURRENCY must fall back to 1 — the SAFE end. Over-admitting reintroduces
+/// the cumulative-timeout failure; under-admitting is merely slower.
+#[test]
+fn seven_b_concurrency_falls_back_to_one_for_every_unusable_value() {
+    assert_eq!(super::parse_wsl_7b_concurrency(None), 1);
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("")), 1);
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("0")), 1, "zero would admit nobody and deadlock");
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("-2")), 1);
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("two")), 1);
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("9")), 1, "above the cap -> 1, never uncapped");
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("2")), 2);
+    assert_eq!(super::parse_wsl_7b_concurrency(Some(" 4 ")), 4);
+}

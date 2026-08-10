@@ -286,12 +286,73 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
     Ok((raw_transcript, confidence))
 }
 
-/// Serializes ALL WSL-7B client spawns process-wide. The champion server is a single-threaded accept
-/// loop, so concurrent app-side callers (an import's per-segment pass, the batch refinement loop, a UI
-/// re-transcribe) would queue on the socket and blow through their client/app timeouts CUMULATIVELY —
-/// misread as "server not running" and rolling back a HEALTHY import. Serializing here means each
-/// request waits its turn, then gets its FULL fresh timeout budget once it actually runs.
-static WSL_7B_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Bounds concurrent WSL-7B client spawns process-wide.
+///
+/// WHY A BOUND AT ALL: concurrent app-side callers (an import's per-segment pass, the batch loop, a
+/// UI re-transcribe) queue on the server socket and blow through their client/app timeouts
+/// CUMULATIVELY — misread as "server not running" and rolling back a HEALTHY import. Each admitted
+/// request gets its FULL fresh timeout budget once it actually runs.
+///
+/// WHY NOT ONE: this was a plain Mutex, admitting exactly one request, on the premise that "the
+/// champion server is a single-threaded accept loop". That stopped being true — `cortex_7b_server.py`
+/// PRE-FORKS one full replica per GPU, all accept()ing on a shared socket, precisely so two requests
+/// can run at once (it chose processes over threads because two replica THREADS measured only 1.10x
+/// on 2 GPUs, GIL-bound). A one-permit gate meant the second GPU could never receive work: measured
+/// 2026-08-11, a batch with 8 workers still ran 23.1 s/clip — the 7B's own serial time — with both
+/// cards at 19% and 12%.
+///
+/// Default 1 keeps the previous behaviour exactly; set CORTEX_7B_CONCURRENCY to the server's replica
+/// count. Never set it ABOVE that: extra admitted requests just queue on the socket, which is the
+/// cumulative-timeout failure this gate exists to prevent.
+static WSL_7B_GATE: Wsl7bGate = Wsl7bGate::new();
+
+/// Permitted concurrent 7B requests. Clamped to 1..=8; anything unusable falls back to 1, the safe
+/// end — an over-admitting gate reintroduces the timeout blowout, an under-admitting one is merely slow.
+fn wsl_7b_concurrency() -> usize {
+    parse_wsl_7b_concurrency(std::env::var("CORTEX_7B_CONCURRENCY").ok().as_deref())
+}
+
+fn parse_wsl_7b_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok()).filter(|n| (1..=8).contains(n)).unwrap_or(1)
+}
+
+/// A counting semaphore over `wsl_7b_concurrency()` permits (std has none; Mutex + Condvar is the
+/// stdlib spelling). The limit is read on each acquire so the env var takes effect without a restart.
+struct Wsl7bGate {
+    in_flight: std::sync::Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+impl Wsl7bGate {
+    const fn new() -> Self {
+        Self { in_flight: std::sync::Mutex::new(0), released: std::sync::Condvar::new() }
+    }
+
+    /// Blocks until a permit is free. Poison-tolerant like every other lock in this crate.
+    fn acquire(&self) -> Wsl7bPermit<'_> {
+        let limit = wsl_7b_concurrency();
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *in_flight >= limit {
+            in_flight = self.released.wait(in_flight).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *in_flight += 1;
+        Wsl7bPermit { gate: self }
+    }
+}
+
+/// Releases its permit on drop, so an early return or a panic mid-request cannot leak one and
+/// permanently shrink the gate.
+struct Wsl7bPermit<'a> {
+    gate: &'a Wsl7bGate,
+}
+
+impl Drop for Wsl7bPermit<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.gate.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        self.gate.released.notify_one();
+    }
+}
 
 /// The port the OmniASR-7B warm server listens on inside WSL. SINGLE source of truth — shared by the
 /// preflight probe AND passed to the client via `CORTEX_7B_PORT`, so the app, client, and server can't
@@ -400,9 +461,9 @@ pub(crate) fn run_wsl_segment_transcript_with_script(
     db_path: &str,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> AppResult<(String, Option<f64>)> {
-    // Hold the process-wide gate for the whole spawn+wait so cross-path 7B calls never collide on the
-    // single-threaded server. Poison-tolerant like every other lock in this crate.
-    let _gate = WSL_7B_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Hold a permit for the whole spawn+wait so no more 7B calls are in flight than the server has
+    // replicas to serve them. Released on drop, including on an early return.
+    let _gate = WSL_7B_GATE.acquire();
 
     let mut cmd = std::process::Command::new("wsl");
     // Pass the DB path + port to the client via `env` (WSL does not propagate Windows env into Linux),
