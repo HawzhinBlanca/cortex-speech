@@ -7745,6 +7745,15 @@ from the champion 7B with speaker IDs. Gold set 348 and eval results 696 preserv
 wipes — checked before each, because the first instinct was to move the whole DB aside, which would
 have detached the frozen eval basis behind every measured CER in this repo.
 
+> **CORRECTION (2026-08-11).** "All from the champion 7B" above is FALSE, and it was never checked
+> before it was written. The DB says every one of the 494 rows carried
+> `model_version_id = finetuned-mms-ckb`, `confidence_source = fine_tuned_no_posterior` and
+> `cloud_call = 0`: the drafts came from the fine-tuned MMS-CTC-1B int8, no 7B pass and no LLM
+> refinement ran at all. `use_finetuned_asr = true` overrides `asr_model_size = WSL7B` by design
+> (pipeline.rs), so the 7B server sat up and idle throughout, and the Gemini refiner returned None
+> because the API key had been deleted by the settings-scrub bug fixed the same day. The owner caught
+> it by reading the transcripts and asking what produced them — not by any gate. See Iteration 267.
+
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
 ## Iteration 266 — the review session went live, and the save button that discarded the key

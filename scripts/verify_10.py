@@ -216,6 +216,81 @@ def check_repo_integrity():
     return ok
 
 
+def check_branch_protection():
+    """`main` is protected on the REMOTE, verified against GitHub — not taken on trust.
+
+    This was OWNER_GATED as "item 49: repo-admin clicks" — an item whose only evidence was that
+    somebody said they had clicked. Protection can also be silently weakened later (a context renamed,
+    admins exempted, force-push re-allowed) and nothing here would have noticed. It is an API call;
+    there is no reason for it to be a manual claim.
+
+    Anti-vacuity: an empty required-contexts list FAILS. A branch that is "protected" while requiring
+    no checks is not protected, and answering 200 is not the same as being safe. Every required
+    context must also still name a real job in .github/workflows, so a renamed job that quietly stops
+    gating merges is caught rather than sitting there as a permanently-pending phantom.
+    """
+    print("==> Checking branch protection on origin/main (GitHub API)...")
+    ok = True
+    try:
+        raw = subprocess.run(
+            ["gh", "api", "repos/{owner}/{repo}/branches/main/protection"],
+            capture_output=True, text=True, cwd=REPO_ROOT, timeout=60,
+        )
+    except Exception as exc:  # network/gh blew up mid-call
+        print(f"  [ERR] could not query branch protection: {exc}")
+        return False
+    if raw.returncode != 0:
+        print(f"  [ERR] gh api failed: {(raw.stderr or raw.stdout).strip()[:200]}")
+        return False
+    try:
+        data = json.loads(raw.stdout)
+    except json.JSONDecodeError as exc:
+        print(f"  [ERR] branch protection response was not JSON: {exc}")
+        return False
+
+    checks = data.get("required_status_checks") or {}
+    contexts = checks.get("contexts") or []
+    if not contexts:
+        print("  [ERR] main requires ZERO status checks — 'protected' but nothing gates a merge.")
+        ok = False
+    else:
+        print(f"  [OK]  required status checks: {sorted(contexts)}")
+        workflows = "\n".join(
+            path.read_text(encoding="utf-8", errors="replace")
+            for path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+        )
+        for context in sorted(contexts):
+            if context in workflows:
+                continue
+            print(f"  [ERR] required context {context!r} names no job in .github/workflows — "
+                  "a merge would wait forever on a check nothing can report.")
+            ok = False
+
+    for label, value, want in (
+        ("strict (branch must be up to date)", checks.get("strict"), True),
+        ("enforce_admins", (data.get("enforce_admins") or {}).get("enabled"), True),
+        ("required_linear_history", (data.get("required_linear_history") or {}).get("enabled"), True),
+        ("allow_force_pushes", (data.get("allow_force_pushes") or {}).get("enabled"), False),
+        ("allow_deletions", (data.get("allow_deletions") or {}).get("enabled"), False),
+    ):
+        if value is want:
+            print(f"  [OK]  {label} = {value}")
+        else:
+            print(f"  [ERR] {label} = {value!r}, expected {want!r}")
+            ok = False
+    return ok
+
+
+def _probe_branch_protection():
+    """SKIP honestly without gh or without auth — never a silent pass."""
+    if not shutil.which("gh"):
+        return "gh CLI not installed (branch protection is a REMOTE fact; nothing local can prove it)"
+    status = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    if status.returncode != 0:
+        return "gh is not authenticated (`gh auth login`) - cannot read branch protection"
+    return None
+
+
 def check_required_files():
     print("==> Checking required repository assets...")
     required = [
@@ -579,6 +654,7 @@ GATES = [
     ("ledger-schema", 0, "fn", check_provenance_ledger, None, None, "Data governance: ledger schema-valid"),
     ("license-compat", 0, "fn", check_license_compatibility, None, None, "Data governance: contamination gate"),
     # Tier 1 — CI-equivalent code gates (minutes)
+    ("branch-protection", 1, "fn", check_branch_protection, None, _probe_branch_protection, "Git+integrity: main is protected on the remote, admins included (was OWNER_GATED item 49 - clicks done 2026-08-08, now machine-verified every sweep)"),
     ("python-policies", 1, "cmd", "npm run test:python-policies", APP, None, "honesty/privacy/CI/dataset policy tests"),
     ("typecheck", 1, "cmd", "npm run typecheck", APP, None, "svelte-check + tsc"),
     ("lint-js", 1, "cmd", "npm run lint", APP, None, "eslint"),
@@ -630,7 +706,6 @@ OWNER_GATED = [
     ("iaa-kappa-ceiling", "item 44: recruit >=2 independent Sorani annotators"),
     ("cordi-dialect-fairness", "item 53: CORDI corpus agreement"),
     ("refinery-lift-in-product", "item 37: Gold Marathon (>=500 real review decisions)"),
-    ("branch-protection", "item 49: repo-admin clicks"),
     ("asosoft-600-licensing", "WS1 tail: eval-use license verification"),
 ]
 
