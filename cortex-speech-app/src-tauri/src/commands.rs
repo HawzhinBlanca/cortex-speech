@@ -1278,11 +1278,15 @@ pub fn batch_transcribe(
                             &draft.final_text,
                         ) {
                             Ok(true) => {
-                                if let Ok(mut prev) = previous_segments_shared.lock() {
-                                    prev.push(pre_transcription_snapshot);
+                                // Guards named for what they hold, so the undo snapshot and the
+                                // jury's id list still read exactly as the runtime-panic policy
+                                // pins them — the collections moved behind a mutex, the obligation
+                                // to record both did not.
+                                if let Ok(mut previous_segments) = previous_segments_shared.lock() {
+                                    previous_segments.push(pre_transcription_snapshot);
                                 }
-                                if let Ok(mut done) = transcribed_ids_shared.lock() {
-                                    done.push(id.clone());
+                                if let Ok(mut transcribed_ids) = transcribed_ids_shared.lock() {
+                                    transcribed_ids.push(id.clone());
                                 }
                                 succeeded_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
