@@ -150,6 +150,33 @@
     }
   }
 
+  // GEMINI KEY — same route as OpenRouter, and it did not exist before 2026-08-10.
+  //
+  // The Gemini field used to bind to localSettings.llmApiKey and persist through saveQuietly, i.e. into
+  // settings.json. AppSettings::load then SCRUBS that field (clears it and rewrites the file) so a
+  // plaintext key never survives on disk — so the key was written and then deleted, while
+  // llmApiKeyConfigured stayed true and the UI reported a key that no longer existed. Measured: an
+  // import failed 3/3 with "Gemini API key is required" while the field looked configured.
+  //
+  // set_api_key already accepted 'gemini'; nothing in the UI ever called it. This does.
+  let geminiKeyInput = $state('');
+  let savingGeminiKey = $state(false);
+  async function saveGeminiKey() {
+    if (!tauriAvailable || savingGeminiKey) return;
+    savingGeminiKey = true;
+    try {
+      configuredProviders = await api.setApiKey('gemini', geminiKeyInput.trim());
+      geminiKeyInput = '';
+      notifications.success(
+        configuredProviders.includes('gemini') ? 'Gemini key saved to secrets.env' : 'Gemini key cleared',
+      );
+    } catch (e) {
+      notifications.error('Failed to save Gemini key', { detail: String(e) });
+    } finally {
+      savingGeminiKey = false;
+    }
+  }
+
   onDestroy(() => {
     // Cancel must discard: don't persist unsaved edits when the user explicitly cancelled.
     if (cancelled) return;
@@ -836,20 +863,37 @@
                 </span>
               </label>
               <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">{$t('settings.geminiApiKey')}</span>
-                <input
-                  type="password"
-                  class="input w-full"
-                  bind:value={localSettings.llmApiKey}
-                  onblur={saveQuietly}
-                  onchange={saveQuietly}
-                  placeholder="AIzaSy..."
-                />
-                <span class="text-[10px] text-subtle">
-                  The key is used for this session and is not written to settings.json.
-                  {#if localSettings.llmApiKeyConfigured}
-                    A cloud key was previously configured.
+                <span class="text-sm text-muted">
+                  {$t('settings.geminiApiKey')}
+                  {#if configuredProviders.includes('gemini')}
+                    <span class="ms-2 text-[10px] text-emerald-400">● key saved</span>
+                  {:else}
+                    <span class="ms-2 text-[10px] text-amber-400">○ no key yet</span>
                   {/if}
+                </span>
+                <div class="flex gap-2">
+                  <input
+                    type="password"
+                    class="input flex-1"
+                    bind:value={geminiKeyInput}
+                    placeholder="AIzaSy..."
+                    autocomplete="off"
+                    onkeydown={(e) => {
+                      if (e.key === 'Enter') void saveGeminiKey();
+                    }}
+                  />
+                  <button
+                    type="button"
+                    class="btn-secondary text-xs px-3"
+                    disabled={savingGeminiKey}
+                    onclick={() => void saveGeminiKey()}
+                  >
+                    {savingGeminiKey ? 'Saving…' : 'Save key'}
+                  </button>
+                </div>
+                <span class="text-[10px] text-subtle">
+                  Saved to secrets.env, DPAPI-encrypted. The badge above reads the SAVED providers, not
+                  this box — it is the only honest signal that a key survived.
                 </span>
               </label>
               <label class="flex flex-col gap-1 mt-2">
@@ -1054,19 +1098,41 @@
               </div>
             {/if}
 
-            <!-- API key (shared with LLM) -->
+            <!-- API key (shared with LLM) — same secrets.env route as the AI Post-Processing tab. -->
             {#if localSettings.juryCloudOptIn}
               <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">{$t('settings.geminiApiKey')}</span>
-                <input
-                  type="password"
-                  class="input w-full"
-                  bind:value={localSettings.llmApiKey}
-                  onblur={saveQuietly}
-                  placeholder="AIzaSy…"
-                />
+                <span class="text-sm text-muted">
+                  {$t('settings.geminiApiKey')}
+                  {#if configuredProviders.includes('gemini')}
+                    <span class="ms-2 text-[10px] text-emerald-400">● key saved</span>
+                  {:else}
+                    <span class="ms-2 text-[10px] text-amber-400">○ no key yet</span>
+                  {/if}
+                </span>
+                <div class="flex gap-2">
+                  <input
+                    type="password"
+                    class="input flex-1"
+                    bind:value={geminiKeyInput}
+                    placeholder="AIzaSy…"
+                    autocomplete="off"
+                    onkeydown={(e) => {
+                      if (e.key === 'Enter') void saveGeminiKey();
+                    }}
+                  />
+                  <button
+                    type="button"
+                    class="btn-secondary text-xs px-3"
+                    disabled={savingGeminiKey}
+                    onclick={() => void saveGeminiKey()}
+                  >
+                    {savingGeminiKey ? 'Saving…' : 'Save key'}
+                  </button>
+                </div>
                 <span class="text-[10px] text-subtle"
-                  >Shared with the AI Post-Processing tab. Not written to disk.</span
+                  >Shared with the AI Post-Processing tab. Saved to secrets.env (DPAPI-encrypted) — the
+                  old field wrote to settings.json, which is scrubbed on load, so keys entered there were
+                  silently lost.</span
                 >
               </label>
 

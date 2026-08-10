@@ -328,7 +328,11 @@
   void ensureClaimed(); // fire early so the cookie usually exists before the first queue fetch
   // Strip the credential from the visible address and this history entry either way: a token on
   // screen is a token anyone glancing at the phone can photograph, and history survives the session.
-  if ((fragToken || queryToken) && window.history?.replaceState) {
+  // Also strip a legacy `?t=` if one is present in the address: the server no longer honours it, but
+  // leaving it on screen is still a token anyone glancing at the device can photograph, and it still
+  // survives in history. `queryToken` used to gate this; that variable is gone with the query-auth
+  // path, and referencing it here threw at load and left the whole page uninitialised.
+  if (window.history?.replaceState && (fragToken || new URLSearchParams(location.search).has('t'))) {
     const clean = new URL(location.href);
     clean.searchParams.delete('t');
     history.replaceState(null, '', clean.pathname + clean.search);

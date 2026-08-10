@@ -1025,6 +1025,32 @@ impl ProcessingPipeline {
         Path::new(&self.db_path).parent().map(|dir| dir.join("source_transcripts"))
     }
 
+    /// The Gemini key for the whole-file reference transcript, read from the ENCRYPTED store.
+    ///
+    /// NOT `settings.llm_api_key`, which is where this used to look. `AppSettings::load` deliberately
+    /// CLEARS that field and rewrites settings.json, so a plaintext key never survives on disk (P0.3).
+    /// The consequence was that the field is empty on every run after the one where it was typed, so
+    /// `ensure_source_reference_transcripts` failed with "Gemini API key is required" no matter what the
+    /// owner did — and `llm_api_key_configured` stayed true, so the UI reported a key that was gone.
+    /// Measured 2026-08-10: an import of three files failed 3/3 on exactly that error while
+    /// secrets.env held a working OpenRouter key and an EMPTY GEMINI_API_KEY.
+    ///
+    /// `secrets.env` via ApiKeys is where every other cloud path already looks (scribe_api_key_if_enabled
+    /// above, the jury, OpenRouter), so this makes the reference transcript agree with the rest of the
+    /// crate instead of being the one caller reading a field that is guaranteed empty.
+    ///
+    /// The in-memory settings field is still honoured as a fallback: within the single session where
+    /// the owner has just typed a key, it holds the value before any reload scrubs it, and refusing it
+    /// there would be a surprising "I just entered it" failure.
+    fn jury_cloud_api_key(&self) -> Option<String> {
+        let from_store =
+            Path::new(&self.db_path).parent().and_then(|data_dir| crate::api_keys::ApiKeys::load(data_dir).gemini);
+        from_store.or_else(|| {
+            let typed = self.settings.llm_api_key.trim();
+            (!typed.is_empty()).then(|| typed.to_string())
+        })
+    }
+
     fn reusable_source_reference_record(
         &self,
         db: &Database,
@@ -1112,12 +1138,14 @@ impl ProcessingPipeline {
         if !self.settings.jury_cloud_opt_in || !self.consent.jury_cloud() {
             return Ok(Vec::new());
         }
-        if self.settings.llm_api_key.trim().is_empty() {
+        let Some(api_key) = self.jury_cloud_api_key() else {
             return Err(AppError::Other(
-                "Gemini API key is required for whole-file reference transcript when jury cloud opt-in is enabled"
+                "Gemini API key is required for whole-file reference transcript when jury cloud opt-in \
+                 is enabled. Save it from Settings (it goes to secrets.env, DPAPI-encrypted); note that \
+                 settings.json is NOT a place a key can live - AppSettings::load scrubs it by design."
                     .to_string(),
             ));
-        }
+        };
 
         let audio_path = path.to_string_lossy().to_string();
         let output_dir = self
@@ -1152,12 +1180,7 @@ impl ProcessingPipeline {
                 }
             }
 
-            match crate::agentic::generate_whole_file_reference_transcript(
-                path,
-                &model,
-                &self.settings.llm_api_key,
-                &output_dir,
-            ) {
+            match crate::agentic::generate_whole_file_reference_transcript(path, &model, &api_key, &output_dir) {
                 Ok(artifact) => {
                     let identity =
                         current_identity.as_ref().cloned().or_else(|| source_audio_identity(path).ok()).ok_or_else(

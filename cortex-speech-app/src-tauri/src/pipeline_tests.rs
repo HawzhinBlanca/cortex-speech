@@ -440,6 +440,62 @@ fn fire_loop0_if_enabled_method_uses_the_pipelines_own_db() {
     );
 }
 
+#[test]
+fn the_gemini_key_comes_from_the_encrypted_store_not_the_scrubbed_setting() {
+    // REGRESSION, and it made the feature unusable rather than merely awkward.
+    //
+    // `ensure_source_reference_transcripts` read `settings.llm_api_key`. `AppSettings::load` CLEARS
+    // that field and rewrites settings.json, so a plaintext key never survives on disk (P0.3) - which
+    // means the field is empty on every run after the one where it was typed. The whole-file reference
+    // therefore failed with "Gemini API key is required" no matter what the owner entered, while
+    // `llm_api_key_configured` stayed true so the UI reported a key that was gone. Measured 2026-08-10:
+    // an import failed 3/3 on exactly that error, with secrets.env holding an EMPTY GEMINI_API_KEY
+    // because no UI path had ever written one.
+    //
+    // Every other cloud path (scribe, jury, OpenRouter) reads secrets.env via ApiKeys. This pins that
+    // the reference transcript now agrees with them.
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let data_dir = dir.path();
+
+    // Nothing anywhere -> None, so the caller can say so instead of calling Gemini with "".
+    assert_eq!(pipeline.jury_cloud_api_key(), None, "no key anywhere must resolve to None");
+
+    // A key in the ENCRYPTED store is found. Plaintext in secrets.env is a supported form
+    // (parse_env_file reads both), which keeps this test independent of DPAPI availability.
+    //
+    // SETTLE LOOP, not decoration. Writing a file and immediately reading it back through other code
+    // is a known flake on this box: it passes when run alone and fails under the full 1159-test suite,
+    // which is exactly what this test did on its first full run. The repo's resolve_file_in tests carry
+    // the same loop for the same reason. Reading through jury_cloud_api_key (not fs::read) means the
+    // wait ends when the code under test can actually see the key.
+    std::fs::write(data_dir.join("secrets.env"), "GEMINI_API_KEY=AIzaFromTheStore\n").unwrap();
+    let mut seen = None;
+    for _ in 0..500 {
+        seen = pipeline.jury_cloud_api_key();
+        if seen.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(
+        seen.as_deref(),
+        Some("AIzaFromTheStore"),
+        "the store is where every other cloud path looks, and now this one too"
+    );
+
+    // BEFORE THE FIX this whole test is unreachable: the code read settings.llm_api_key, which is
+    // "" on a default AppSettings, so it would have returned None here and failed the import.
+    let typed = AppSettings { llm_api_key: "AIzaJustTyped".to_string(), ..AppSettings::default() };
+    let (typed_pipeline, typed_dir) = test_pipeline_with_settings(typed);
+    assert_eq!(
+        typed_pipeline.jury_cloud_api_key().as_deref(),
+        Some("AIzaJustTyped"),
+        "a key typed in THIS session must still work before any reload scrubs it - refusing it would \
+         be a surprising 'I just entered it' failure"
+    );
+    drop(typed_dir);
+}
+
 fn test_pipeline_with_settings(settings: AppSettings) -> (super::ProcessingPipeline, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db.sqlite").to_string_lossy().to_string();
