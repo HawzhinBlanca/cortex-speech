@@ -1113,6 +1113,15 @@ pub async fn verify_finetuned_model_integrity() -> Result<String, String> {
     .await
 }
 
+/// Worker count for a batch transcription, from `CORTEX_BATCH_CONCURRENCY`.
+///
+/// Anything absent, unparseable, zero, negative or absurd falls back to 1 — the strictly serial
+/// behaviour this command had before concurrency existed. A bad value must never silently become a
+/// 32-way fan-out at an ASR server, so the fallback is the SAFE end, not the fast one.
+fn parse_batch_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok()).filter(|n| (1..=32).contains(n)).unwrap_or(1)
+}
+
 #[tauri::command]
 pub fn batch_transcribe(
     ids: Vec<String>,
@@ -1153,17 +1162,39 @@ pub fn batch_transcribe(
             }),
         );
 
-        let mut succeeded = 0u32;
-        let mut failed = 0u32;
-        let mut skipped = 0u32;
-        let mut previous_segments: Vec<crate::db::SpeechSegment> = Vec::new();
-        let mut transcribed_ids: Vec<String> = Vec::new();
-        let mut cancelled = false;
+        // CONCURRENCY (2026-08-11). This loop was strictly serial, which is invisible for a local ONNX
+        // batch and disastrous for the 7B+cloud path: measured 22.2 s in the WSL 7B and 52.1 s in
+        // Gemini refinement per clip — ~74 s of almost pure WAITING — putting 487 clips at ~8 hours
+        // with BOTH GPUs at 10-18%. Neither stage is throughput-bound.
+        //
+        // A bounded pool is enough; no explicit two-stage pipeline is needed. The 7B server is two
+        // pre-forked replicas (one per GPU) each serving ONE request at a time, so its accept queue
+        // self-throttles ASR to 2 however many workers ask, while the remaining workers overlap in the
+        // network-bound refinement. Throughput then lands at 2 clips per ~22 s instead of 1 per ~74 s.
+        //
+        // Default 1 — byte-identical behaviour to before for every local batch, opt in via
+        // CORTEX_BATCH_CONCURRENCY for the 7B+cloud path. Writes are NOT parallelised: every
+        // update_batch_transcription_if_unreviewed still runs under the single app_state.lock_db()
+        // mutex, and the pipeline's own connections are WAL with busy_timeout=10s.
+        let concurrency = parse_batch_concurrency(std::env::var("CORTEX_BATCH_CONCURRENCY").ok().as_deref());
+        if concurrency > 1 {
+            tracing::info!("Batch transcribe running {concurrency} clips concurrently");
+        }
+
+        let next_index = std::sync::atomic::AtomicUsize::new(0);
+        let done_count = std::sync::atomic::AtomicUsize::new(0);
+        let succeeded_n = std::sync::atomic::AtomicU32::new(0);
+        let failed_n = std::sync::atomic::AtomicU32::new(0);
+        let skipped_n = std::sync::atomic::AtomicU32::new(0);
+        let cancelled_flag = std::sync::atomic::AtomicBool::new(false);
+        let previous_segments_shared: std::sync::Mutex<Vec<crate::db::SpeechSegment>> =
+            std::sync::Mutex::new(Vec::new());
+        let transcribed_ids_shared: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
         // Pre-fetch all target segments in a SINGLE DB lock (one WHERE IN query)
         // instead of re-locking on every loop iteration. For a 500-segment batch
         // this drops mutex acquisitions from 500 → 1 for the read phase.
-        let mut seg_map: std::collections::HashMap<String, crate::db::SpeechSegment> = {
+        let seg_map: std::collections::HashMap<String, crate::db::SpeechSegment> = {
             if let Some(app_state) = app_clone.try_state::<AppState>() {
                 let db = app_state.lock_db();
                 match db.get_segments_by_ids(&ids) {
@@ -1179,8 +1210,15 @@ pub fn batch_transcribe(
         };
         // Normalizer Arc cloned once, reused across iterations.
         let normalizer_arc = app_clone.try_state::<AppState>().map(|s| Arc::clone(&s.normalizer));
+        // Shared across workers: each claims its own segment, so no two ever transcribe the same id.
+        let seg_map = std::sync::Mutex::new(seg_map);
 
-        for (i, id) in ids.iter().enumerate() {
+        let run_worker = || loop {
+            let i = next_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if i >= ids.len() {
+                break;
+            }
+            let id = &ids[i];
             // Real backpressure (the old call discarded its result): under genuine memory pressure
             // (<1 GiB available) warn loudly and pause briefly so the OS can reclaim, instead of
             // marching a heavy ASR loop into an OOM kill mid-batch.
@@ -1195,7 +1233,7 @@ pub fn batch_transcribe(
             }
 
             if cancel.is_cancelled() {
-                cancelled = true;
+                cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 break;
             }
 
@@ -1205,7 +1243,7 @@ pub fn batch_transcribe(
             // Use the pre-fetched normalizer (avoids re-cloning Arc on every iteration).
             let normalizer = normalizer_arc.as_ref().unwrap_or_else(|| &app_state.normalizer);
 
-            let seg = seg_map.remove(id.as_str());
+            let seg = seg_map.lock().ok().and_then(|mut map| map.remove(id.as_str()));
 
             if let Some(seg) = seg {
                 // Capture full snapshot BEFORE transcription for complete undo.
@@ -1220,7 +1258,7 @@ pub fn batch_transcribe(
                         tracing::info!(
                             "Batch transcribe skipped {id}: empty transcript (silent clip) — existing transcript kept"
                         );
-                        skipped += 1;
+                        skipped_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     Ok(draft) => {
                         let normalized = normalizer.normalize(&draft.final_text);
@@ -1240,40 +1278,65 @@ pub fn batch_transcribe(
                             &draft.final_text,
                         ) {
                             Ok(true) => {
-                                previous_segments.push(pre_transcription_snapshot);
-                                transcribed_ids.push(id.clone());
-                                succeeded += 1;
+                                if let Ok(mut prev) = previous_segments_shared.lock() {
+                                    prev.push(pre_transcription_snapshot);
+                                }
+                                if let Ok(mut done) = transcribed_ids_shared.lock() {
+                                    done.push(id.clone());
+                                }
+                                succeeded_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
                             Ok(false) => {
                                 // Row became human-verified/reviewed after the batch began — skip
                                 // rather than overwrite the curator's confirmed label.
                                 tracing::info!("Batch transcribe skipped {id}: human-reviewed since batch start");
-                                skipped += 1;
+                                skipped_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
                             Err(error) => {
                                 tracing::error!("Batch transcribe DB update failed for {id}: {error}");
-                                failed += 1;
+                                failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
                         }
                     }
                     Err(e) => {
                         tracing::error!("Batch transcribe failed for {id}: {e}");
-                        failed += 1;
+                        failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
             } else {
-                failed += 1;
+                failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
 
+            // Completion COUNT, not the claim index: with workers in flight the highest claimed index
+            // runs ahead of what is actually finished, and a progress bar must never report work that
+            // has not happened.
+            let current = done_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             emit_or_log(
                 &app_clone,
                 "batch-progress",
                 serde_json::json!({
-                    "type": "progress", "current": i + 1, "total": total,
+                    "type": "progress", "current": current, "total": total,
                     "file": id, "status": "transcribing", "operation": "transcribe"
                 }),
             );
+        };
+
+        if concurrency == 1 {
+            run_worker();
+        } else {
+            std::thread::scope(|scope| {
+                for _ in 0..concurrency {
+                    scope.spawn(run_worker);
+                }
+            });
         }
+
+        let succeeded = succeeded_n.load(std::sync::atomic::Ordering::SeqCst);
+        let failed = failed_n.load(std::sync::atomic::Ordering::SeqCst);
+        let skipped = skipped_n.load(std::sync::atomic::Ordering::SeqCst);
+        let cancelled = cancelled_flag.load(std::sync::atomic::Ordering::SeqCst);
+        let previous_segments = previous_segments_shared.into_inner().unwrap_or_default();
+        let transcribed_ids = transcribed_ids_shared.into_inner().unwrap_or_default();
 
         if !previous_segments.is_empty() {
             if let Some(app_state) = app_clone.try_state::<AppState>() {
@@ -4471,5 +4534,28 @@ mod tests {
         assert_eq!(report["humanInbox"].as_u64(), Some(1));
         assert_eq!(fresh.verdict.as_deref(), Some("escalated"));
         assert!(fresh.rationale.as_deref().unwrap_or("").contains("T2 disabled"));
+    }
+
+    /// A bad CORTEX_BATCH_CONCURRENCY must fall back to SERIAL, never to a wide fan-out.
+    ///
+    /// This knob decides how many clips are pushed at the ASR server at once. The failure that
+    /// matters is not "too slow" — it is a typo silently turning into 32 concurrent requests at a
+    /// two-replica server, or a 0 that spawns no workers and hangs the batch forever. Every
+    /// unusable value therefore resolves to 1, which is exactly the behaviour this command had
+    /// before concurrency existed.
+    #[test]
+    fn batch_concurrency_falls_back_to_serial_for_every_unusable_value() {
+        assert_eq!(parse_batch_concurrency(None), 1, "absent -> serial");
+        assert_eq!(parse_batch_concurrency(Some("")), 1, "empty -> serial");
+        assert_eq!(parse_batch_concurrency(Some("0")), 1, "zero would spawn no workers and hang");
+        assert_eq!(parse_batch_concurrency(Some("-4")), 1, "negative -> serial");
+        assert_eq!(parse_batch_concurrency(Some("eight")), 1, "unparseable -> serial");
+        assert_eq!(parse_batch_concurrency(Some("33")), 1, "above the cap -> serial, never uncapped");
+        assert_eq!(parse_batch_concurrency(Some("999999")), 1, "absurd -> serial");
+
+        assert_eq!(parse_batch_concurrency(Some("1")), 1);
+        assert_eq!(parse_batch_concurrency(Some("8")), 8, "a sane value is honoured");
+        assert_eq!(parse_batch_concurrency(Some(" 8 ")), 8, "surrounding whitespace is tolerated");
+        assert_eq!(parse_batch_concurrency(Some("32")), 32, "the cap itself is allowed");
     }
 }
