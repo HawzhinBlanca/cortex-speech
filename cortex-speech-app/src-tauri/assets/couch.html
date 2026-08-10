@@ -295,10 +295,13 @@
 <script>
   // The token arrives in the URL FRAGMENT (#t=...), which the browser never sends to any server —
   // so a link pasted into a chat app hands its preview bot the empty shell, never a credential.
-  // ?t= is still read as the legacy transition form for links sent before the fragment change.
+  //
+  // The legacy ?t= form is GONE, on both sides. The server no longer accepts a query token at all
+  // (couch.rs token_from_request), so continuing to read one here would only put a credential back
+  // into URLs, history and proxy logs to buy an authentication that can no longer succeed. Removing
+  // it is the prerequisite for exposing this server publicly; a pre-fragment link now gets the bare
+  // shell, which is the correct answer to a link that leaked the moment it was pasted.
   const fragToken = new URLSearchParams(location.hash.replace(/^#/, '')).get('t') || '';
-  const queryToken = new URLSearchParams(location.search).get('t') || '';
-  const token = queryToken; // only a QUERY token still needs to ride requests (legacy links)
   // A fragment token is presented to the server exactly once, in a POST body, and comes back as the
   // HttpOnly cookie every later request rides on. Fire-and-forget BEFORE load(): claimed is awaited
   // by load() via this promise so the first /api/queue never races the cookie.
@@ -412,12 +415,11 @@
     $('toast').classList.remove('show', 'sticky');
     if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
   });
-  // The token rides the query only while we HAVE one. After the first load it has been stripped from
-  // the URL (P3.8) and lives in the HttpOnly cookie, so `token` is "" — and sending `?t=` empty made
-  // the server treat the query as a supplied-but-wrong credential, shadowing the very cookie that
-  // would have authenticated the request. A reviewer who closed the tab and came back was locked out
-  // while the browser was faithfully sending everything needed to let them in.
-  const withToken = (path) => (token ? path + (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(token) : path);
+  // No credential is ever appended to a URL here. The HttpOnly cookie minted by /api/claim carries
+  // every request, including `<audio src>`, which cannot set a header but does send cookies. The old
+  // withToken() helper appended `?t=` when the page happened to hold a query token; both it and the
+  // server's query path are gone, so a token can no longer reach a URL bar, a history entry or a
+  // proxy log by any route.
   async function api(path, opts) {
     // 15s timeout: a stalled cellular fetch otherwise hangs "Loading clips..." forever. An abort
     // throws with NO status, which every caller already treats as "never arrived" — retryable.
@@ -425,7 +427,7 @@
     const timer = setTimeout(() => ctl.abort(), 15000);
     let r;
     try {
-      r = await fetch(withToken(path), { ...opts, signal: ctl.signal });
+      r = await fetch(path, { ...opts, signal: ctl.signal });
     } finally {
       clearTimeout(timer);
     }
@@ -655,7 +657,7 @@
       renderEmptyState();
       return;
     }
-    const audioUrl = withToken('/api/audio/' + encodeURIComponent(seg.id));
+    const audioUrl = '/api/audio/' + encodeURIComponent(seg.id);
     $('player').src = audioUrl;
     void loadWave(audioUrl);
     $('player').playbackRate = speed;
@@ -701,7 +703,7 @@
   function prefetchNext() {
     const next = queue[i + 1];
     if (!next) return;
-    prefetched = new Audio(withToken('/api/audio/' + encodeURIComponent(next.id)));
+    prefetched = new Audio('/api/audio/' + encodeURIComponent(next.id));
     prefetched.preload = 'auto';
     prefetched.load();
   }

@@ -907,39 +907,30 @@ fn respond_with_cookie(
 /// The cookie the server sets so the token stops travelling in the URL (P3.8).
 const COUCH_COOKIE: &str = "cortex_couch";
 
-/// Resolve the session token from a request: the `?t=` query FIRST (how a shared link always
-/// arrives), then the `Cookie` header (how every request after the first one carries it).
+/// Resolve the session token from a request: the `Cookie` header, and NOTHING ELSE.
 ///
-/// Why bother: a token in the query string lands in browser history, in the phone's address bar for
-/// anyone glancing over, and in the logs of anything that ever proxies the request. The page strips
-/// `?t=` from the visible URL after the first load, and the cookie carries it from then on —
-/// including for `<audio src>`, which cannot send a custom header but does send cookies.
+/// The `?t=` query form used to be accepted here as well, because that is how a shared link arrived
+/// before the fragment bootstrap existed. Removing it is the last step of
+/// docs/REMOTE_PUBLIC_LINKS_PLAN.md phase 2, and it is a PREREQUISITE for exposing this server to the
+/// public internet rather than a tidy-up.
+///
+/// The threat is not hypothetical and not a tail risk. A link pasted into WhatsApp or Telegram IS
+/// fetched by that platform's preview bot within seconds. While `?t=` authenticated, that fetch
+/// succeeded and handed the platform a durable credential to special-category biometric audio —
+/// recorded in the plan as "the certain token leak". A fragment is never transmitted by any browser,
+/// so the bot sees the bare shell; but that protection was only ever as strong as the server's
+/// refusal to accept the query form, and until now the server did accept it.
+///
+/// Nothing legitimate is lost. A `#t=` link claims its token ONCE via POST /api/claim and rides the
+/// HttpOnly cookie from then on — including for `<audio src>`, which cannot set a header but does
+/// send cookies. Only a pre-fragment legacy link stops working, which is exactly the link that must
+/// stop working. Reissuing a session regenerates every token anyway.
 fn token_from_request(request: &tiny_http::Request) -> Option<String> {
-    if let Some(t) = token_from_url(request.url()) {
-        return Some(t.to_string());
-    }
     let cookies = request.headers().iter().find(|h| h.field.equiv("Cookie"))?;
     cookies.value.as_str().split(';').find_map(|kv| {
         let (name, value) = kv.split_once('=')?;
         (name.trim() == COUCH_COOKIE).then(|| value.trim().to_string())
     })
-}
-
-/// Extract `t` from a raw request URL's query string.
-///
-/// An EMPTY `t=` counts as ABSENT, not as a token that happens to be the empty string. That
-/// distinction is the whole reason a returning reviewer can get back in: the page strips `?t=` from
-/// the URL after the first load (P3.8), so on a return visit its `token` variable is `""` and every
-/// request goes out as `?t=`. Treating that as a supplied-but-wrong token made the query shadow the
-/// perfectly good session cookie sitting in the same request, so the server answered 401 while
-/// holding the credential that would have let them in — the cookie mechanism could never actually be
-/// used for the one job it was added to do.
-///
-/// A NON-empty wrong token still fails, and must: someone presenting an explicit credential is
-/// making a claim, and silently falling back to a cookie there would let a revoked link keep working.
-fn token_from_url(url: &str) -> Option<&str> {
-    let query = url.split_once('?')?.1;
-    query.split('&').find_map(|kv| kv.strip_prefix("t=")).filter(|t| !t.is_empty())
 }
 
 /// One request header by name, case-insensitively (tiny_http's `equiv` does the casing, and requires
@@ -1918,25 +1909,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn token_from_url_parses_only_the_t_param() {
-        assert_eq!(token_from_url("/?t=abc"), Some("abc"));
-        assert_eq!(token_from_url("/api/queue?x=1&t=abc"), Some("abc"));
-        assert_eq!(token_from_url("/api/queue"), None);
-        assert_eq!(token_from_url("/api/queue?token=abc"), None);
-        // AN EMPTY `t=` IS ABSENT, NOT A TOKEN. This is what locked a returning reviewer out: the
-        // page strips `?t=` from the URL after the first load, so on a return visit its token is ""
-        // and every request goes out as `?t=`. Read as a supplied-but-wrong credential, the query
-        // shadowed the valid session cookie in the SAME request and the server answered 401 while
-        // holding what would have let them in. Measured on the wire before the fix:
-        //   cookie, no t=     -> 200
-        //   cookie + empty t= -> 401
-        assert_eq!(token_from_url("/api/queue?t="), None, "an empty t= must fall through to the cookie");
-        assert_eq!(token_from_url("/api/queue?t=&x=1"), None);
-        // ...but a non-empty WRONG token must still be honoured as a claim and fail. Falling back to
-        // the cookie there would let a revoked link keep working by simply carrying a stale cookie.
-        assert_eq!(token_from_url("/api/queue?t=wrong"), Some("wrong"));
-    }
+    // REMOVED with token_from_url itself: the query-string credential path. What it pinned - that an
+    // empty `t=` falls through to the cookie while a non-empty wrong one is honoured as a failing
+    // claim - describes a mechanism the server no longer has. The cookie is now the only credential,
+    // which makes both of those questions unaskable. `a_valid_token_in_the_query_string_is_worthless`
+    // replaces it and asserts the property that actually matters now.
 
     #[test]
     fn review_text_prefers_annotated_over_raw() {
@@ -2910,21 +2887,107 @@ mod tests {
         assert_eq!(route_for_test(&db, &state, "t-b").0, 200, "one bad tab must not starve anyone else");
     }
 
+    /// The session cookie header value — the ONLY credential the server accepts.
+    ///
+    /// Every test below presents its token this way because that is the only way a real reviewer's
+    /// browser can present one: the fragment is claimed once via POST /api/claim and lives in an
+    /// HttpOnly cookie from then on. These call sites used to put the token in `?t=`, which the
+    /// server honoured; when that path was removed the tests had to move with it, or they would have
+    /// gone on proving a door that no longer exists.
+    fn cookie_for(token: &str) -> String {
+        format!("{COUCH_COOKIE}={token}")
+    }
+
     /// Drive `handle_request`'s auth + throttle path without a live socket, by issuing a real request
     /// against a loopback server and handing it to the handler exactly as an accept thread would.
+    ///
+    /// Presents the token as the COOKIE, because that is now the only credential the server accepts
+    /// and therefore the only shape a real reviewer's request ever has. This used to send `?t=`; when
+    /// the query form was removed these tests would have gone on passing a credential the product no
+    /// longer honours, and a harness that authenticates by a route real traffic cannot use tests
+    /// nothing.
     fn route_for_test(db: &Database, state: &Mutex<CouchState>, token: &str) -> Reply {
         let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
-        let url = format!("http://127.0.0.1:{port}/api/queue?t={token}");
+        let url = format!("http://127.0.0.1:{port}/api/queue");
+        let cookie = format!("{COUCH_COOKIE}={token}");
         let client = std::thread::spawn(move || {
             let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build();
-            let _ = agent.get(&url).call();
+            let _ = agent.get(&url).set("Cookie", &cookie).call();
         });
         let mut request = server.recv().unwrap();
         let (reply, cookie) = handle_request(&mut request, db, state);
         let _ = respond_with_cookie(request, reply.clone(), cookie);
         let _ = client.join();
         reply
+    }
+
+    #[test]
+    fn a_valid_token_in_the_query_string_is_worthless() {
+        // The last step of REMOTE_PUBLIC_LINKS_PLAN phase 2, and the prerequisite for Funnel.
+        //
+        // WHAT THIS BUYS. A chat platform's preview bot fetches any pasted link within seconds. While
+        // `?t=` authenticated, that fetch returned the reviewer's queue AND a Set-Cookie, handing the
+        // platform a durable credential to biometric audio. The token here is the REAL one, presented
+        // exactly as a careless paste would present it, and it must buy nothing at all.
+        //
+        // Fail-before: with the query branch still in token_from_request this returns 200 with the
+        // clip list, which is the leak the plan calls "certain, not tail-risk".
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەقی تاقیکردنەوە")).unwrap();
+        drop(db);
+
+        let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let state = Arc::new(Mutex::new(CouchState {
+            reviewers: HashMap::from([("goodtoken".to_string(), "Sara".to_string())]),
+            ..CouchState::default()
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let join = spawn_server_loop(0, server.clone(), db_path, state, shutdown.clone()).unwrap();
+        let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // Data route with a VALID token in the query: refused.
+        //
+        // Reported as a STATUS rather than matched as a Result: under the full 1157-test suite this
+        // request can lose its race with the shared runtime and come back as a transport timeout,
+        // and `matches!(.., Status(401))` turned that into "the leak is open" - the most alarming
+        // possible message for what was really a slow machine. A timeout is not evidence either way,
+        // so it says so.
+        let data = agent.get(&format!("{base}/api/queue?t=goodtoken")).call();
+        let code = match data {
+            Ok(r) => r.status(),
+            Err(ureq::Error::Status(c, _)) => c,
+            Err(other) => {
+                panic!("no verdict: the request never completed ({other}) - rerun, do not read this as a pass")
+            }
+        };
+        assert_eq!(code, 401, "a valid token in the QUERY must not open the data - that is the preview-bot leak");
+
+        // The page shell with the same query token: served (it is public), but it must not mint the
+        // cookie, or the bot walks away with a session anyway.
+        let shell = agent.get(&format!("{base}/?t=goodtoken")).call().expect("the shell stays public");
+        assert_eq!(shell.status(), 200);
+        assert!(
+            shell.header("set-cookie").is_none(),
+            "a query token must never mint a session cookie - the bot would keep it for a week"
+        );
+
+        // And the legitimate path still works, so this is a closed door and not a broken lock.
+        let claim = agent
+            .post(&format!("{base}/api/claim"))
+            .send_json(ureq::json!({ "token": "goodtoken" }))
+            .expect("the fragment claim is how a real reviewer gets in");
+        let cookie = claim.header("set-cookie").expect("claim mints the cookie").to_string();
+        let jar = cookie.split(';').next().unwrap().to_string();
+        let ok = agent.get(&format!("{base}/api/queue")).set("Cookie", &jar).call().expect("cookie opens the data");
+        assert_eq!(ok.status(), 200);
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = agent.get(&format!("{base}/")).call();
+        let _ = join.join();
     }
 
     #[test]
@@ -3007,7 +3070,7 @@ mod tests {
     }
 
     #[test]
-    fn a_returning_reviewer_is_let_in_by_their_cookie_even_though_the_page_sends_an_empty_token() {
+    fn a_returning_reviewer_is_let_in_by_their_cookie_alone() {
         // THE REPORTED BUG: "I close the browser on my iPhone and go back and it doesn't open."
         //
         // Every piece worked in isolation, which is why nothing caught it. The server accepted the
@@ -3046,25 +3109,30 @@ mod tests {
         };
         let cookie = format!("{COUCH_COOKIE}=goodtoken");
 
-        // The first visit: the token is in the URL.
-        assert_eq!(status(format!("{base}/api/queue?t=goodtoken"), None), 200);
-        // The RETURN visit, exactly as the page issues it — empty t=, cookie present.
+        // The return visit, exactly as the page now issues it: no token in the URL at all, cookie
+        // present. This is the reported bug's fix and it still holds.
         assert_eq!(
-            status(format!("{base}/api/queue?t="), Some(&cookie)),
+            status(format!("{base}/api/queue"), Some(&cookie)),
             200,
-            "a returning reviewer must be let in by their cookie; the page sends an empty t= because \
-             it stripped the token from the URL on the first load"
+            "a returning reviewer must be let in by their cookie alone"
         );
-        // Cookie alone (no query at all) keeps working.
-        assert_eq!(status(format!("{base}/api/queue"), Some(&cookie)), 200);
-        // And the gate is NOT loosened: no credential, or an explicit WRONG one, still fails.
-        assert_eq!(status(format!("{base}/api/queue?t="), None), 401, "an empty token alone is not a way in");
-        assert_eq!(
-            status(format!("{base}/api/queue?t=revoked"), Some(&cookie)),
-            401,
-            "an explicit wrong token must not silently fall back to a cookie — that would let a \
-             revoked link keep working"
-        );
+        // A leftover empty `?t=` changes nothing either way - the query is not read at all now.
+        assert_eq!(status(format!("{base}/api/queue?t="), Some(&cookie)), 200);
+        // And the gate is NOT loosened: no credential still fails.
+        assert_eq!(status(format!("{base}/api/queue"), None), 401, "no credential is not a way in");
+        assert_eq!(status(format!("{base}/api/queue?t="), None), 401, "nor is an empty token");
+
+        // REVOCATION, asserted where it now lives: in the COOKIE. A revoked reviewer's browser keeps
+        // sending the cookie it was given, and that cookie must stop opening anything.
+        let revoked = format!("{COUCH_COOKIE}=revoked");
+        assert_eq!(status(format!("{base}/api/queue"), Some(&revoked)), 401, "a revoked token in the cookie is dead");
+
+        // DROPPED with the query path: the old assertion that a wrong token in `?t=` must not fall
+        // back to a valid cookie. That guarded a real hazard while URLs carried credentials - a
+        // revoked link could otherwise ride someone's stale cookie. With the query ignored entirely
+        // the hazard is gone rather than unguarded: a URL token is not a credential any more, and the
+        // holder of a valid cookie is simply themselves. Recorded rather than silently deleted,
+        // because "this assertion disappeared" and "this protection disappeared" are different facts.
 
         shutdown.store(true, Ordering::SeqCst);
         server.unblock();
@@ -3354,11 +3422,12 @@ mod tests {
             .and_then(|p| p.parse().ok())
             .unwrap_or_else(|| panic!("the issued URL must carry a real port: {}", sara.url));
         assert_ne!(bound_port, 0, "an issued link must never advertise port 0");
-        let url = format!("http://127.0.0.1:{bound_port}/api/queue?t={token}");
-        let code = agent.get(&url).call().map(|r| r.status()).unwrap_or_else(|e| match e {
-            ureq::Error::Status(c, _) => c,
-            other => panic!("the issued link did not reach the server: {other}"),
-        });
+        let url = format!("http://127.0.0.1:{bound_port}/api/queue");
+        let code =
+            agent.get(&url).set("Cookie", &cookie_for(&token)).call().map(|r| r.status()).unwrap_or_else(|e| match e {
+                ureq::Error::Status(c, _) => c,
+                other => panic!("the issued link did not reach the server: {other}"),
+            });
         assert_eq!(code, 200, "a token issued by start() must authenticate against the running server");
 
         // Two reviewers were named, so each must have a DISTINCT token — one shared credential would
@@ -3369,8 +3438,11 @@ mod tests {
         let stopped = stop().expect("stop succeeds");
         assert!(!stopped.running && stopped.reviewers.is_empty(), "stop reports a stopped server");
         assert!(!is_running(), "and the fence agrees");
-        // The token dies with the session: stopping revokes every link at once.
-        let after = agent.get(&url).call();
+        // The token dies with the session: stopping revokes every link at once. Presenting the SAME
+        // credential that worked above is what makes this an assertion about the token rather than
+        // about an anonymous request - drop the cookie here and the 401 would be trivially true and
+        // prove nothing.
+        let after = agent.get(&url).set("Cookie", &cookie_for(&token)).call();
         assert!(
             matches!(after, Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Transport(_))),
             "a stopped server must not keep honouring its tokens: {after:?}"
@@ -3905,8 +3977,13 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
         let fetch = || -> Vec<String> {
-            let q: serde_json::Value =
-                agent.get(&format!("{base}/api/queue?t=tok")).call().unwrap().into_json().unwrap();
+            let q: serde_json::Value = agent
+                .get(&format!("{base}/api/queue"))
+                .set("Cookie", &cookie_for("tok"))
+                .call()
+                .unwrap()
+                .into_json()
+                .unwrap();
             q["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect()
         };
 
@@ -3916,7 +3993,8 @@ mod tests {
         for id in first.iter().take(5) {
             let body = serde_json::json!({ "id": id, "action": "accept", "text": "دەقی سەرەتایی" }).to_string();
             let status = agent
-                .post(&format!("{base}/api/decision?t=tok"))
+                .post(&format!("{base}/api/decision"))
+                .set("Cookie", &cookie_for("tok"))
                 .set("content-type", "application/json")
                 .send_string(&body)
                 .map(|r| r.status())
@@ -3983,7 +4061,8 @@ mod tests {
         let submit = |port: u16, id: &str| -> u16 {
             let body = serde_json::json!({ "id": id, "action": "accept", "text": "دەقی سەرەتایی" }).to_string();
             match agent
-                .post(&format!("http://127.0.0.1:{port}/api/decision?t=tok"))
+                .post(&format!("http://127.0.0.1:{port}/api/decision"))
+                .set("Cookie", &cookie_for("tok"))
                 .set("content-type", "application/json")
                 .send_string(&body)
             {
@@ -3994,8 +4073,13 @@ mod tests {
         };
 
         let (server, port, shutdown, join) = boot(db_path.clone());
-        let queue: serde_json::Value =
-            agent.get(&format!("http://127.0.0.1:{port}/api/queue?t=tok")).call().unwrap().into_json().unwrap();
+        let queue: serde_json::Value = agent
+            .get(&format!("http://127.0.0.1:{port}/api/queue"))
+            .set("Cookie", &cookie_for("tok"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
         let held: Vec<String> =
             queue["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
         assert!(held.len() >= 10, "need a real batch to interrupt, got {}", held.len());
@@ -4090,7 +4174,7 @@ mod tests {
             // throttled by the same bucket the submits drain — back off here too, or the drain dies
             // between batches instead of during one.
             let queue: serde_json::Value = loop {
-                match agent.get(&format!("{base}/api/queue?t=tok-solo")).call() {
+                match agent.get(&format!("{base}/api/queue")).set("Cookie", &cookie_for("tok-solo")).call() {
                     Ok(r) => break r.into_json().unwrap(),
                     Err(ureq::Error::Status(429, _)) => {
                         throttled += 1;
@@ -4114,7 +4198,8 @@ mod tests {
                 let mut code = 0;
                 for attempt in 0..40 {
                     code = match agent
-                        .post(&format!("{base}/api/decision?t=tok-solo"))
+                        .post(&format!("{base}/api/decision"))
+                        .set("Cookie", &cookie_for("tok-solo"))
                         .set("content-type", "application/json")
                         .send_string(&body)
                     {
@@ -4204,7 +4289,7 @@ mod tests {
                     let (mut accepted, mut throttled) = (0usize, 0usize);
                     for _round in 0..4 {
                         let queue: serde_json::Value =
-                            match agent.get(&format!("{base}/api/queue?t={token}")).call() {
+                            match agent.get(&format!("{base}/api/queue")).set("Cookie", &cookie_for(&token)).call() {
                                 Ok(r) => r.into_json().unwrap(),
                                 Err(_) => continue,
                             };
@@ -4221,7 +4306,7 @@ mod tests {
                             // closure whose Err variant is 272 bytes, and the two flags are all this
                             // loop needs from the response.
                             let post = || match agent
-                                .post(&format!("{base}/api/decision?t={token}"))
+                                .post(&format!("{base}/api/decision")).set("Cookie", &cookie_for(&token))
                                 .send_string(&body)
                             {
                                 Ok(r) => (r.status() == 200, false),
@@ -4329,8 +4414,13 @@ mod tests {
             .build();
 
         let base = format!("http://127.0.0.1:{port}");
-        let status_of_url = |url: String| -> u16 {
-            agent.get(&url).call().map(|r| r.status()).unwrap_or_else(|e| match e {
+        // Token is passed as the COOKIE, never in the URL - the server accepts nothing else.
+        let status_of_url = |url: String, token: Option<&str>| -> u16 {
+            let mut req = agent.get(&url);
+            if let Some(t) = token {
+                req = req.set("Cookie", &cookie_for(t));
+            }
+            req.call().map(|r| r.status()).unwrap_or_else(|e| match e {
                 ureq::Error::Status(c, _) => c,
                 other => panic!("{url} transport error (timeout/hang?): {other}"),
             })
@@ -4339,22 +4429,36 @@ mod tests {
         // phase 2 (fragment links): it embeds nothing, and gating it would force the token back into
         // a server-visible part of the URL. The dedicated shell/claim test pins that side.
         for path in ["/api/queue", "/api/audio/s1"] {
-            assert_eq!(status_of_url(format!("{base}{path}")), 401, "{path} must be token-gated");
+            assert_eq!(status_of_url(format!("{base}{path}"), None), 401, "{path} must be token-gated");
         }
-        assert_eq!(status_of_url(format!("{base}/")), 200, "the empty shell is public by design");
+        assert_eq!(status_of_url(format!("{base}/"), None), 200, "the empty shell is public by design");
         // An unrecognised token has no reviewer, so it has no way in either.
-        assert_eq!(status_of_url(format!("{base}/api/queue?t=notatoken")), 401, "an unknown token resolves to nobody");
+        assert_eq!(
+            status_of_url(format!("{base}/api/queue"), Some("notatoken")),
+            401,
+            "an unknown token resolves to nobody"
+        );
 
         // With a token: the page serves, and the queue identifies WHICH reviewer it answered.
-        assert_eq!(status_of_url(format!("{base}/?t=saratoken123")), 200);
-        let sara: serde_json::Value =
-            agent.get(&format!("{base}/api/queue?t=saratoken123")).call().unwrap().into_json().unwrap();
+        assert_eq!(status_of_url(format!("{base}/"), Some("saratoken123")), 200);
+        let sara: serde_json::Value = agent
+            .get(&format!("{base}/api/queue"))
+            .set("Cookie", &cookie_for("saratoken123"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
         assert_eq!(sara["reviewer"], "Sara", "the token, not the request, decides the identity");
         let sara_ids: Vec<&str> = sara["items"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
         assert!(!sara_ids.is_empty());
 
-        let hemn: serde_json::Value =
-            agent.get(&format!("{base}/api/queue?t=hemntoken456")).call().unwrap().into_json().unwrap();
+        let hemn: serde_json::Value = agent
+            .get(&format!("{base}/api/queue"))
+            .set("Cookie", &cookie_for("hemntoken456"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
         assert_eq!(hemn["reviewer"], "Hemn");
         let hemn_ids: Vec<&str> = hemn["items"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
         for id in &sara_ids {
@@ -4364,7 +4468,8 @@ mod tests {
         // A phone decision over real HTTP verifies the row in the real db file, under the right name.
         let mine = sara_ids[0];
         let resp = agent
-            .post(&format!("{base}/api/decision?t=saratoken123"))
+            .post(&format!("{base}/api/decision"))
+            .set("Cookie", &cookie_for("saratoken123"))
             .send_string(&serde_json::json!({"id": mine, "action": "accept", "text": "دەقی تاقیکردنەوە"}).to_string())
             .unwrap();
         assert_eq!(resp.status(), 200);
@@ -4379,12 +4484,15 @@ mod tests {
         // found exactly that. Each route is asserted to be WIRED, by a status only its own handler
         // can produce.
         let post = |path: &str, body: &str| -> u16 {
-            agent.post(&format!("{base}{path}?t=saratoken123")).send_string(body).map(|r| r.status()).unwrap_or_else(
-                |e| match e {
+            agent
+                .post(&format!("{base}{path}"))
+                .set("Cookie", &cookie_for("saratoken123"))
+                .send_string(body)
+                .map(|r| r.status())
+                .unwrap_or_else(|e| match e {
                     ureq::Error::Status(c, _) => c,
                     other => panic!("{path} transport error: {other}"),
-                },
-            )
+                })
         };
         // /api/renew reaches api_renew: a bad id is its 400, a missing route would be 404.
         assert_eq!(post("/api/renew", &serde_json::json!({"id": "../etc"}).to_string()), 400, "/api/renew is wired");
@@ -4395,7 +4503,7 @@ mod tests {
         // P3.8: the page response plants an HttpOnly cookie, and the token then works from the
         // COOKIE ALONE — which is what lets the page strip `?t=` out of the visible URL and out of
         // browser history. Proven end to end rather than asserted: no query param, cookie only.
-        let page = agent.get(&format!("{base}/?t=saratoken123")).call().unwrap();
+        let page = agent.get(&format!("{base}/")).set("Cookie", &cookie_for("saratoken123")).call().unwrap();
         let cookie = page.header("Set-Cookie").unwrap_or_default().to_string();
         assert!(cookie.starts_with("cortex_couch=saratoken123"), "the page must plant the session cookie: {cookie}");
         assert!(cookie.contains("HttpOnly"), "the token must be unreadable from page JavaScript: {cookie}");
@@ -4413,16 +4521,17 @@ mod tests {
         // A BAD id gives api_audio's own 400 — a deleted guard would give the router's 404 instead,
         // and asserting only "404 for an unknown id" cannot tell those two apart (it did not).
         assert_eq!(
-            status_of_url(format!("{base}/api/audio/..%2Fetc?t=saratoken123")),
+            status_of_url(format!("{base}/api/audio/..%2Fetc"), Some("saratoken123")),
             400,
             "/api/audio is wired — this 400 comes from its id validation, not from the router"
         );
         // And an unrelated GET must still reach the router's 404, not be swallowed by a widened guard.
-        assert_eq!(status_of_url(format!("{base}/nonsense?t=saratoken123")), 404, "unknown paths stay 404");
+        assert_eq!(status_of_url(format!("{base}/nonsense"), Some("saratoken123")), 404, "unknown paths stay 404");
         // And the body cap rejects an over-sized payload with ITS OWN message, so a truncating `take`
         // (which would leave a short body to fail later as bad json) is distinguishable from a refusal.
         let huge = "x".repeat(MAX_BODY_BYTES + 4096);
-        let resp = agent.post(&format!("{base}/api/decision?t=saratoken123")).send_string(&huge);
+        let resp =
+            agent.post(&format!("{base}/api/decision")).set("Cookie", &cookie_for("saratoken123")).send_string(&huge);
         match resp {
             Err(ureq::Error::Status(400, r)) => assert!(
                 r.into_string().unwrap_or_default().contains("body too large"),
@@ -4571,11 +4680,12 @@ mod tests {
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let join = spawn_server_loop(0, server.clone(), db_path, state.clone(), shutdown.clone()).unwrap();
-        let url = format!("http://127.0.0.1:{port}/api/audio/s1?t=tok");
+        let url = format!("http://127.0.0.1:{port}/api/audio/s1");
+        let jar = cookie_for("tok");
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
 
         // Full GET first: the baseline bytes every later assertion is compared against.
-        let full = agent.get(&url).call().unwrap();
+        let full = agent.get(&url).set("Cookie", &jar).call().unwrap();
         assert_eq!(full.status(), 200);
         assert_eq!(full.header("Accept-Ranges"), Some("bytes"), "ranges must be ADVERTISED, not just honoured");
         let etag = full.header("ETag").expect("a validator, or conditional requests are impossible").to_string();
@@ -4586,7 +4696,7 @@ mod tests {
 
         // Safari's opening probe. 206 with a correct Content-Range, and the two bytes must be the
         // FIRST two — a server that ignores Range answers 200 with everything.
-        let probe = agent.get(&url).set("Range", "bytes=0-1").call().unwrap();
+        let probe = agent.get(&url).set("Cookie", &jar).set("Range", "bytes=0-1").call().unwrap();
         assert_eq!(probe.status(), 206, "a Range request must be answered 206, not 200-with-everything");
         assert_eq!(probe.header("Content-Range"), Some(format!("bytes 0-1/{}", whole.len()).as_str()));
         let mut two = Vec::new();
@@ -4594,7 +4704,7 @@ mod tests {
         assert_eq!(two, &whole[0..=1], "the probe must get the first two bytes, not the first two of nothing");
 
         // A middle slice, which is what seeking produces. Content matters, not just length.
-        let mid = agent.get(&url).set("Range", "bytes=1000-1999").call().unwrap();
+        let mid = agent.get(&url).set("Cookie", &jar).set("Range", "bytes=1000-1999").call().unwrap();
         assert_eq!(mid.status(), 206);
         assert_eq!(mid.header("Content-Range"), Some(format!("bytes 1000-1999/{}", whole.len()).as_str()));
         let mut slice = Vec::new();
@@ -4603,7 +4713,7 @@ mod tests {
         assert_eq!(slice, &whole[1000..=1999], "a seek must return the audio actually at that offset");
 
         // Conditional re-request: zero bytes on the wire, which is the cellular win.
-        match agent.get(&url).set("If-None-Match", &etag).call() {
+        match agent.get(&url).set("Cookie", &jar).set("If-None-Match", &etag).call() {
             Ok(r) => {
                 assert_eq!(r.status(), 304, "an unchanged clip must be 304, never re-sent");
                 let mut body = Vec::new();
@@ -4614,7 +4724,7 @@ mod tests {
         }
 
         // HEAD: the length without the body. Used to be a flat 404 while the GET beside it worked.
-        let head = agent.head(&url).call().unwrap();
+        let head = agent.head(&url).set("Cookie", &jar).call().unwrap();
         assert_eq!(head.status(), 200, "HEAD must reach the audio route, not fall through to 404");
         assert_eq!(
             head.header("Content-Length").and_then(|v| v.parse::<usize>().ok()),
@@ -4626,7 +4736,7 @@ mod tests {
         assert!(head_body.is_empty(), "a HEAD response must have no body at all");
 
         // Unsatisfiable must be refused, not silently answered with everything.
-        match agent.get(&url).set("Range", "bytes=99999999-").call() {
+        match agent.get(&url).set("Cookie", &jar).set("Range", "bytes=99999999-").call() {
             Err(ureq::Error::Status(416, r)) => {
                 assert_eq!(r.header("Content-Range"), Some(format!("bytes */{}", whole.len()).as_str()))
             }
