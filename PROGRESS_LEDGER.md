@@ -7801,3 +7801,68 @@ was deliberately deferred rather than dropped under two people mid-review. Revie
 Rust from `couch.html` and is unaffected by the frontend bundle either way.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 267 — the review set was drafted by the wrong engine, and nothing said so
+
+**The owner found this by reading the transcripts, not from any gate.** He asked why they looked poor.
+The DB answered: every one of the 494 rows was `model_version_id = finetuned-mms-ckb`,
+`confidence_source = fine_tuned_no_posterior`, `cloud_call = 0`. No 7B pass and no LLM refinement had
+run at all, while the 7B server sat up and idle on both GPUs and `asr_model_size` said `WSL7B`.
+
+`use_finetuned_asr = true` overrides the configured engine by design (pipeline.rs), and the Gemini
+refiner returned None because the API key had been deleted by the settings-scrub bug fixed the same
+day. Two independent silent downgrades stacked on one queue. Iteration 265's claim that the queue was
+"all from the champion 7B" was written without checking and is corrected in place above.
+
+Measured on identical FLEURS ckb clips (docs/MEASUREMENTS.md): 7B champion 7.03% CER [6.53, 7.55]
+N=922 vs fine-tuned MMS-CTC-1B 9.32% — and that 9.32% is the fp32 reference while the app runs the
+int8 build, whose own recorded baseline is 21.00%.
+
+**The champion refused every .mp4, so the fix half-worked and hid it.** Re-running on the 7B left
+462 clips converted and 25 still on the weaker engine:
+
+    Error opening '.../A1-0032_PODCAST-001.mp4': Format not recognised
+
+libsndfile — torchaudio's soundfile backend — handles no MPEG-4/AAC, while the app's own import path
+decodes it fine. So those clips imported, chunked and transcribed locally, then silently could not be
+re-transcribed by the champion. A review set at two different quality levels, with nothing on screen
+saying which clip came from where, is exactly what corrupts a measurement later. ffmpeg fallback
+added (already a hard import-path dependency); 462 -> 487 on the real audio that had failed.
+
+**Serial-by-default cost ~8 hours and left both GPUs idle.** 22.2 s in the 7B and 52.1 s in
+refinement per clip, one clip at a time, with the cards at 18% and 9%. Two fixes, each defaulting to
+the old behaviour and opted into by env:
+
+    serial                       74.0 s/clip   ~8 h     GPUs 18% / 9%
+    + concurrent batch           23.1 s/clip   2.7 h    GPUs 19% / 12%
+    + WSL_7B_GATE given permits  13.7 s/clip   89 min   GPUs 25% / 39%
+
+The second was a STALE COMMENT: the gate admitted one request because "the champion server is a
+single-threaded accept loop", which stopped being true when the server started pre-forking one replica
+per GPU. The bound is still needed (surplus requests queue and burn their client timeouts, which reads
+as "server down" and rolls back a healthy import), so it is a counting semaphore now, not no gate.
+
+**Final queue state, verified:** 487 on `omniasr-wsl-7b`, 482 Gemini-refined, 7 rows left on the old
+engine because a human had already corrected them (`update_asr_transcript_if_unreviewed` refuses those,
+and they were excluded from the batch as well — human text is gold, no model output overwrites it).
+0 blank transcripts, 494/494 speaker IDs, gold 348 and eval 696 preserved.
+
+**Two things measured and NOT fixed, reported instead.** Under `jury_autonomy_level = propose` the
+jury runs but leaves an already-staged row's verdict and IRT confidence untouched by design — so after
+a re-transcription those scores still describe the previous text, and they drive riskiest-first review
+ordering. And 59 of 487 refinements failed with "Invalid response format from Local LLM": with an
+OpenRouter key present, `LlmMode::Gemini` routes through OpenRouter's OpenAI-compatible endpoint, so
+the label is wrong and ~12% of clips kept raw 7B text. Neither is data loss; both are the owner's call.
+
+**`branch-protection` is no longer owner-gated.** It was item 49, "repo-admin clicks", whose only
+evidence was that somebody said they had clicked — and nothing would have noticed protection being
+weakened later. It is an API call: 4 required contexts, strict, enforce_admins, linear history, no
+force pushes, no deletions, all verified against the live remote every sweep. OWNER_GATED 5 -> 4.
+
+**The kappa gate was blocked on tooling, not only on annotators.** `agreement_kappa.py` reads a TSV of
+two rater columns and nothing produced one, so item 44 required hand-assembling a file out of SQLite.
+`spot_checks` already holds one row per (segment, reviewer) because Couch Review serves spot checks
+unleased on purpose. The extractor refuses to emit anything misleading: zero overlap (guarded twice,
+independent of the floor), below --min-items, or more than two raters pooled into two columns.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
