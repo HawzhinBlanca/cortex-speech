@@ -7679,3 +7679,70 @@ anywhere in the file. An untimed job hangs to GitHub's six-hour ceiling. It now 
 only; adding PyYAML would have re-introduced the very portability class fixed above) and asserts every
 job has a timeout under a 180-minute cap, so "just raise it" cannot quietly hide a hang. Fail-before
 confirms it catches both an untimed job and an over-cap one.
+
+## Iteration 265 — a review session that could not be reached, and a key that was being deleted
+
+**The couch server is public, and the credential no longer travels.** Tailscale Funnel is on for
+`<this-pc>.<tailnet>.ts.net`, which is what lets two reviewers on laptops with nothing installed reach
+the queue — the shipped "from anywhere" link is a tailnet CGNAT address and would have needed Tailscale
+on their machines. (Hostname redacted: this repo is public, and test_windows_repo_hygiene is right that
+a device name adds nothing to the evidence. It caught this entry on the first run.)
+
+That was gated on closing the query-token leak FIRST, which is the order REMOTE_PUBLIC_LINKS_PLAN
+prescribes and the reason it was done before flipping Funnel rather than after. `token_from_request`
+now reads the HttpOnly cookie and nothing else; `couch.html` no longer reads or appends a query token
+anywhere. Verified from the public internet, not just locally:
+
+    GET /                      -> 200      (shell is public by design)
+    GET /api/queue             -> 401      (no credential)
+    GET /api/queue?t=<REAL>    -> 401      <- the leak, closed
+    POST /api/claim {token}    -> 200 + Set-Cookie
+    GET /api/queue (cookie)    -> 200, reviewer=Lamo / reviewer=Sewa
+
+35 test call sites authenticated with `?t=` and would have gone on proving a door the product no
+longer has; they present cookies now. Two tests changed SUBJECT rather than syntax and are recorded in
+the code rather than deleted quietly: the empty-vs-wrong query-token unit test (a question that is
+unaskable once the query is unread), and the returning-reviewer test's "a wrong token must not fall
+back to a cookie" assertion — a hazard that is GONE rather than unguarded, with revocation now
+asserted where it actually lives, in the cookie.
+
+**A `couch.html` reference I removed took the whole page down, and only a test caught it.** Deleting
+`queryToken` left one live use of it in the address-stripping branch. The script threw at load, so
+`queue` was never initialised and the page rendered nothing — a total outage of the reviewer UI,
+invisible to typecheck and to eslint, caught by `couch_page_speaker_change_badge.test.ts` failing with
+"Cannot access 'queue' before initialization". Three tests that look like they are about a speaker
+badge were the only thing standing between a security fix and a dead review page.
+
+**The Gemini key was being DELETED by design, and the UI reported it as configured.** Measured
+2026-08-10: an import failed 3/3 with "Gemini API key is required" while Settings showed a key. Two
+independent defects, either one fatal:
+
+  * `AppSettings::load` CLEARS `llm_api_key` and rewrites settings.json (P0.3: a plaintext key must
+    never persist). The Settings field wrote there. So the key was stored, scrubbed on next load, and
+    gone — while `llm_api_key_configured` stayed true, which is the worst possible signal: the UI
+    reporting a credential that no longer exists.
+  * `ensure_source_reference_transcripts` read that same scrubbed field, so even a correctly stored
+    key would not have been used. Every other cloud path (scribe, jury, OpenRouter) already read
+    secrets.env via `ApiKeys`; this was the one caller reading a field guaranteed empty.
+
+Both fixed: the pipeline reads `ApiKeys::load(data_dir).gemini` (falling back to the in-session typed
+value, so "I just entered it" still works), and the UI's two Gemini fields now call `set_api_key`,
+which the backend already accepted for `"gemini"` and which nothing had ever called. The badge reads
+CONFIGURED PROVIDERS rather than the input box — the only honest signal that a key survived.
+Fail-before: with the settings-only read restored the new test fails; file restored byte-identical.
+
+**Two more measurement lessons, both cheap and both mine.** The new key test passed alone and failed in
+the full suite — the Windows write-then-read visibility flake this repo has now hit five times; it
+carries the settle loop the `resolve_file_in` tests already use. And `models_status` reported 4 of 7
+models missing while the pipeline was using them: `target/release/models` held a PARTIAL copy, which
+wins the bundled-root selection and orphans every sibling that exists only in the repo models dir —
+the exact hazard models.rs documents. 494 of 494 segments carrying speaker IDs is what proved CAM++ was
+running while the panel called it missing. Hardlinked; 7/7 now.
+
+Queue for the session: 494 clips, 0 blank, 3-10 s chunks (a 10 s cap reaches for a pause sooner and is
+easier to verify by ear; the chunker splits at the quietest point, so it does not slice words), all
+from the champion 7B with speaker IDs. Gold set 348 and eval results 696 preserved across two queue
+wipes — checked before each, because the first instinct was to move the whole DB aside, which would
+have detached the frozen eval basis behind every measured CER in this repo.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
