@@ -16,6 +16,36 @@ pub struct LlmRefiner {
     pub model: String,
 }
 
+/// Is this refinement error worth another attempt?
+///
+/// TRANSIENT = the same request could succeed shortly: rate limiting, provider-side 5xx, a timeout or
+/// dropped connection, and "no message content", which is how an overloaded OpenRouter reply arrives
+/// once the JSON parses but carries no choice.
+///
+/// NOT transient: 401/403 (a bad key stays bad), 404 and "model" errors (an unknown model id will not
+/// appear), and content refusals. Retrying those only delays an honest stop.
+fn is_transient(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    if e.contains("401") || e.contains("403") || e.contains("unauthorized") || e.contains("api key") {
+        return false;
+    }
+    if e.contains("404") || e.contains("not a valid model") || e.contains("no endpoints found") {
+        return false;
+    }
+    e.contains("429")
+        || e.contains("rate limit")
+        || e.contains("timed out")
+        || e.contains("timeout")
+        || e.contains("connection")
+        || e.contains("temporarily")
+        || e.contains("overloaded")
+        || e.contains("no message content")
+        || e.contains(" 500")
+        || e.contains(" 502")
+        || e.contains(" 503")
+        || e.contains(" 504")
+}
+
 impl LlmRefiner {
     pub fn new(
         mode: &crate::settings::LlmMode,
@@ -76,10 +106,42 @@ impl LlmRefiner {
         self.call_provider(&user_content)
     }
 
+    /// Attempts per refinement call: the first try plus 3 retries.
+    const MAX_ATTEMPTS: u32 = 4;
+
     fn call_provider(&self, user_content: &str) -> Result<String, String> {
-        match self.provider {
-            LlmProvider::Local => self.call_openai_compatible(user_content),
-            LlmProvider::Gemini => self.call_gemini(user_content),
+        // Retry transient provider failures before giving up, because the caller HARD STOPS on the
+        // error (owner rule 2026-08-11) and halting a 487-clip run on one rate-limit reply would be
+        // brittle, not strict.
+        //
+        // Measured 2026-08-10: 59 of 487 clips failed refinement during a run with 8 concurrent
+        // workers — a ~12% failure rate that appeared only once the batch became concurrent, which is
+        // the signature of provider rate limiting rather than bad input. There was no retry anywhere:
+        // API_AGENT is a bare ureq agent.
+        //
+        // Exponential backoff (1s, 2s, 4s) and only for TRANSIENT classes. A 401, an unknown model or
+        // a refusal is not going to change on the third ask, and retrying it just delays an honest
+        // stop by seven seconds.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let result = match self.provider {
+                LlmProvider::Local => self.call_openai_compatible(user_content),
+                LlmProvider::Gemini => self.call_gemini(user_content),
+            };
+            match result {
+                Ok(text) => return Ok(text),
+                Err(e) if attempt < Self::MAX_ATTEMPTS && is_transient(&e) => {
+                    let wait = std::time::Duration::from_secs(1 << (attempt - 1));
+                    tracing::warn!(
+                        "LLM refinement attempt {attempt}/{} failed transiently ({e}); retrying in {:?}",
+                        Self::MAX_ATTEMPTS,
+                        wait
+                    );
+                    std::thread::sleep(wait);
+                }
+                Err(e) => return Err(if attempt > 1 { format!("{e} (after {attempt} attempts)") } else { e }),
+            }
         }
     }
 
@@ -221,6 +283,40 @@ pub fn build_ger_user_prompt(primary: &str, hypotheses: &[String], few_shot: &[(
 
 #[cfg(test)]
 mod tests {
+
+    /// The retry classifier decides whether a HARD STOP fires. Both directions are real failures:
+    /// treating a permanent error as transient delays an honest stop and burns quota; treating a rate
+    /// limit as permanent halts a 487-clip run on one throttled reply.
+    #[test]
+    fn transient_errors_retry_and_permanent_ones_stop_immediately() {
+        for permanent in [
+            "openrouter.ai returned no message content: 401 Unauthorized",
+            "Local LLM request failed: status code 403",
+            "openrouter.ai returned no message content: not a valid model id",
+            "request failed: status code 404",
+            "Gemini API Key is missing. Please configure it in settings.",
+        ] {
+            assert!(!super::is_transient(permanent), "must NOT retry: {permanent}");
+        }
+
+        for transient in [
+            "Local LLM request failed: status code 429",
+            "openrouter.ai returned no message content: rate limit exceeded",
+            "request failed: status code 503",
+            "Local LLM request failed: connection closed",
+            "Local LLM request failed: read timed out",
+            "openrouter.ai returned no message content: {}",
+        ] {
+            assert!(super::is_transient(transient), "must retry: {transient}");
+        }
+    }
+
+    /// A 401 that merely mentions a rate limit in prose must still be permanent — the permanent
+    /// checks run FIRST for exactly this reason.
+    #[test]
+    fn a_permanent_error_wins_over_a_transient_sounding_phrase() {
+        assert!(!super::is_transient("401 Unauthorized (you may also be rate limited)"));
+    }
     use super::*;
 
     #[test]
