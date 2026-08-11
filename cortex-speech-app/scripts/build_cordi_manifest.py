@@ -45,7 +45,14 @@ SEED = 42
 
 
 def to_wsl(path: Path) -> str:
-    text = str(path).replace("\\", "/")
+    """Absolute Windows path -> /mnt/<drive>/... .
+
+    RESOLVE FIRST. Measured 2026-08-11: invoked with a relative --cordi, every row came out as
+    "../datasets/cordi/segments/95/447.ogg", which the drive-letter test skips and which resolves to
+    nothing inside WSL. The scorecard would then have scored an empty or partial set and still printed
+    a CER — a fabricated dialect number, produced by a path bug.
+    """
+    text = str(Path(path).resolve()).replace("\\", "/")
     if len(text) > 1 and text[1] == ":":
         return f"/mnt/{text[0].lower()}{text[2:]}"
     return text
@@ -127,6 +134,11 @@ def main() -> int:
             for clip, text in sample:
                 location = to_wsl(clip) if args.wsl else str(clip)
                 handle.write(f"{location}\t{text}\n")
+        if args.wsl:
+            # Anti-vacuity: a manifest of unreachable paths scores as silence, not as an error.
+            bad = [p for p, _ in sample if not to_wsl(p).startswith("/mnt/")]
+            if bad:
+                raise SystemExit(f"--wsl produced {len(bad)} non-/mnt path(s), e.g. {to_wsl(bad[0])}")
         written.append((dialect, len(sample), len(pool), path))
         print(f"  {dialect:12} {len(sample):4} sampled of {len(pool):6} available -> {path.name}")
 
