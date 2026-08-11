@@ -133,3 +133,12 @@ audit-2026-08-05/
 # audio/refs committed". The portable, reference-only record that IS committed is
 # cortex-speech-app/docs/eval/fleurs_ckb_iq_frozen.rel.tsv - a different file, with relative paths.
 cortex-speech-app/scripts/fleurs_ckb_iq/
+
+# Third-party corpora live on disk, never in git. CORDI alone is 3.94 GiB / 186,739 files, and it is
+# CC BY-SA 4.0 from upstream — this repo evaluates against it and does not redistribute it.
+# PROVENANCE.md beside the data IS tracked: the licence, hash and origin are the part that must survive.
+datasets/**
+# Directories must stay re-included or git never descends into them, and then the negations below
+# can never match: "it is not possible to re-include a file if a parent directory is excluded".
+!datasets/**/
+!datasets/**/*.md
