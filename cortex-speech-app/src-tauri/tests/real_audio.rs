@@ -967,7 +967,15 @@ fn pipeline_routes_to_finetuned_when_enabled() {
     db.initialize().unwrap();
     drop(db);
 
-    let settings = AppSettings { use_finetuned_asr: true, ..AppSettings::default() };
+    // CHAMPION SUPREMACY (owner rule 2026-08-11): AppSettings::default() selects WSL7B, and the
+    // champion now outranks use_finetuned_asr — so this test must SELECT a non-champion engine to
+    // exercise the fine-tuned path at all. Asserting the old behaviour here would be asserting the
+    // silent downgrade the rule exists to forbid; see champion_selected_refuses_to_downgrade below.
+    let settings = AppSettings {
+        use_finetuned_asr: true,
+        asr_model_size: cortex_speech_app_lib::settings::AsrModelSize::CTC300M,
+        ..AppSettings::default()
+    };
     let pipeline = ProcessingPipeline::new(
         db_path,
         Arc::new(SoraniNormalizer::new()),
@@ -1012,7 +1020,14 @@ fn import_routes_to_finetuned_when_enabled() {
     db.initialize().unwrap();
 
     // Fine-tuned ON, diarization OFF (isolates the ASR routing from the speaker-embedding model).
-    let settings = AppSettings { use_finetuned_asr: true, enable_diarization: false, ..AppSettings::default() };
+    let settings = AppSettings {
+        use_finetuned_asr: true,
+        enable_diarization: false,
+        // See the sibling routing test: the champion outranks the flag, so the fine-tuned path is
+        // only reachable when a non-champion engine is selected.
+        asr_model_size: cortex_speech_app_lib::settings::AsrModelSize::CTC300M,
+        ..AppSettings::default()
+    };
     let pipeline = ProcessingPipeline::new(
         db_path.clone(),
         Arc::new(SoraniNormalizer::new()),
@@ -1196,4 +1211,50 @@ fn forced_aligner_reports_ctc_forced_when_the_model_is_installed() {
         "a LOADED aligner must force-align; energy_heuristic here means the model was bypassed"
     );
     assert!(!words.is_empty(), "forced alignment must yield word timings");
+}
+
+/// CHAMPION SUPREMACY (owner rule 2026-08-11). Selecting WSL7B must OUTRANK use_finetuned_asr.
+///
+/// Measured 2026-08-10: a 494-clip review queue was drafted 494/494 by the smaller fine-tuned model
+/// while asr_model_size said WSL7B and the champion sat idle on both GPUs, because the flag silently
+/// won. Nothing surfaced it. The correct behaviour is to REFUSE — an error the owner can act on beats
+/// a quietly worse dataset that looks finished.
+#[test]
+#[ignore = "real-model: needs the champion selected without a client script"]
+fn champion_selected_refuses_to_downgrade_to_the_finetuned_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("sup.db").to_string_lossy().to_string();
+    let db = Database::open(&db_path).unwrap();
+    db.initialize().unwrap();
+    drop(db);
+
+    // Champion selected AND the fine-tuned flag on: the flag must lose.
+    let settings = AppSettings {
+        use_finetuned_asr: true,
+        asr_model_size: cortex_speech_app_lib::settings::AsrModelSize::WSL7B,
+        ..AppSettings::default()
+    };
+    let pipeline = ProcessingPipeline::new(
+        db_path,
+        Arc::new(SoraniNormalizer::new()),
+        Arc::new(TranscriptCache::new(10)),
+        Arc::new(AudioFingerprint::new()),
+        Arc::new(settings),
+        Arc::new(ModelManager::new(tmp.path().to_path_buf())),
+    );
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
+    if !fixture.exists() {
+        eprintln!("[champion-supremacy] fixture absent; skipping");
+        return;
+    }
+    let result = pipeline.transcribe(None, fixture.to_str().unwrap(), None, None);
+    let error = match result {
+        Err(e) => e.to_string(),
+        Ok(draft) => panic!(
+            "champion was selected but a draft came back anyway (raw: {:?}) — the smaller model              silently served the request, which is the exact downgrade this rule forbids",
+            draft.raw_text
+        ),
+    };
+    assert!(error.contains("E_ASR_7B_UNAVAILABLE"), "refusal must name the champion as unavailable, got: {error}");
 }

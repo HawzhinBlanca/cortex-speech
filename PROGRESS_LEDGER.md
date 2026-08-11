@@ -7866,3 +7866,70 @@ unleased on purpose. The extractor refuses to emit anything misleading: zero ove
 independent of the floor), below --min-items, or more than two raters pooled into two columns.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 268 — the champion is no longer optional, and failure is no longer survivable
+
+**The owner's rule, in code and in law.** After finding the queue drafted 494/494 by the smaller model
+while the champion idled, the owner ruled: use the 7B champion every time, never fall back to a
+smaller model, and HARD STOP on any failure. Written into CLAUDE.md and enforced in three places.
+
+`should_use_wsl_primary_asr` no longer consults `use_finetuned_asr` — selecting WSL7B outranks the
+flag. `batch_transcribe` cancels on the first failure and emits `type: "halted"` with the cause,
+never `"completed"`. And a failed refinement is now a failure: both paths used to log "Falling back to
+raw transcript" and store the unrefined draft as finished, which is exactly how 59 of 487 clips
+silently kept raw text.
+
+**The hard stop proved itself before it was ever tested on purpose.** Its first act was to halt a
+487-clip run at clip 1 because the champion server was down — 0 succeeded, nothing written. Under the
+previous code that run would have produced 487 inferior transcripts and reported success. It also
+exposed that the batch accepted the job before preflighting, so the preflight moved ahead of
+`try_start_batch`.
+
+**Retry, because strict must not mean brittle.** With the hard stop in place, a single throttled reply
+would halt a whole run. There was no retry anywhere — `API_AGENT` is a bare ureq agent — and the 59
+failures were ~12% of a run using 8 concurrent workers, the signature of provider rate limiting
+introduced by our own concurrency change. Now 4 attempts with 1s/2s/4s backoff for TRANSIENT classes
+only; a 401 or an unknown model still stops immediately. The permanent checks run first so a 401 that
+mentions rate limiting in prose stays permanent.
+
+**Re-run under the rules, and it held:** 487/487 champion-drafted, 487/487 Gemini-refined,
+**72 transient failures absorbed and zero silent degradations**. 0 blank, 494/494 speaker IDs, the 7
+human-corrected rows untouched, gold 348 and eval 696 preserved. Jury verdicts refreshed
+(2026-08-11 10:56) so they no longer describe deleted text, then autonomy returned to `propose` so
+every clip stays in the human queue.
+
+**First real dialect measurement — and it is RED.** CORDI (CC BY-SA 4.0, 3.94 GiB, sha256
+`ff0ea0cb…`, 186,126 clips) scored through `scorecard_7b.py`, 60 clips per variety:
+
+    Mehabad  27.63% [22.56, 33.38]    Sine     36.31% [31.00, 43.65]
+    Silemani 29.81% [23.12, 37.79]    Hewler   39.19% [33.50, 46.30]
+    Kalar    31.24% [25.83, 38.17]    Serdest  42.42% [36.71, 48.95]
+
+max-min disparity **14.79 pts** against a 10.00 pt budget. Not noise: Mehabad and Serdest have
+non-overlapping CIs. Two artifacts ruled out rather than assumed — `text == text_original` for all
+12,683 utterances checked (so the references are the dialectal transcriptions), and the absolute CERs
+are NOT comparable to the 7.03% FLEURS headline because CORDI is spontaneous film dialogue with music
+and overlap. The disparity is the within-domain comparison and it is fair. Recorded as a measurement;
+whether it becomes a blocking gate is the owner's call, because raising `budget_pts` to make it pass
+would be weakening a gate to fit the data.
+
+**Two owner-gated legs retired, on evidence.** `branch-protection` became a real gate (4 required
+contexts, admins, linear history, no force-push, verified against the live remote; 9/9 weakenings
+caught). `asosoft-600-licensing` was descoped: neither the site nor the GitHub repo carries a LICENSE
+file, terms text, or a contact address — there was nothing to verify and nobody to ask. OWNER_GATED
+5 → 3.
+
+**Failures found by the sweep, all fixed.** `RUSTSEC-2026-0253` (unsound `LruCache::pop()`) published
+today against our direct `lru 0.16.4`; bumped to 0.18 and `advisories ok`. Two real-model tests
+asserted that `use_finetuned_asr` diverts the champion — the behaviour the owner just banned — so they
+now select a non-champion engine, and a new test pins the refusal itself.
+
+**Mistakes worth recording.** A fail-before harness restored `pipeline.rs` with the wrong line endings
+(content intact, verified byte-wise). A watcher grepped the whole log and re-reported an old
+HARD-STOPPED entry as a fresh alarm — a false alarm is as damaging as a missed one. `2>&1` on cargo
+under PowerShell 5.1 turned build output into a terminating error and left the app stopped mid-session.
+And the CORDI manifest builder emitted RELATIVE paths that resolve to nothing inside WSL: the scorecard
+would have scored an empty set and still printed a per-dialect CER — a fabricated accuracy number
+produced by a path bug. It now refuses any path that did not become `/mnt/...`.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
