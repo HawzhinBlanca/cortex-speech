@@ -875,18 +875,29 @@ impl ProcessingPipeline {
         asr::select_available_model_size(&model_dir, &self.settings.asr_model_size)
     }
 
+    /// CHAMPION SUPREMACY (owner rule, 2026-08-11 — see AGENT_CHARTER "The champion is not optional").
+    ///
+    /// When the owner selects WSL7B, the OmniASR-7B champion drafts EVERY clip. `use_finetuned_asr`
+    /// no longer diverts it to the smaller embedded model, because that is a silent downgrade of the
+    /// one thing accuracy depends on.
+    ///
+    /// Measured 2026-08-10, which is why this changed: a 494-clip review queue was drafted 494/494 by
+    /// `finetuned-mms-ckb` while `asr_model_size` said WSL7B and the champion sat up and idle on both
+    /// GPUs. Nothing in the UI, the DB or any gate said so — the owner found it by reading the
+    /// transcripts. Measured gap on identical FLEURS ckb clips: 7.03% CER vs 9.32% (and the app runs
+    /// the int8 build, whose own baseline is 21.00%).
+    ///
+    /// The smaller engines remain available as EXPLICIT choices (pick CTC300M/CTC1B, or call
+    /// `transcribe_segment_finetuned`) — they are optional extras, never an automatic substitute.
     fn should_use_wsl_primary_asr(&self) -> bool {
         self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
             && self.settings.external_asr_script_path().is_some()
-            // ENGINE TRUTH (true-10 audit 2026-07-09): use_finetuned_asr is documented as
-            // "overriding asr_model_size" — when the override is EFFECTIVE (flag on AND the model
-            // present), the fine-tuned engine is the primary drafter, so the 7B pass must not run:
-            // it re-attributed the fine-tuned text as an "omniasr-wsl-7b" hypothesis (wrong badge,
-            // double vote for one engine in the jury) and hard-required a server that never
-            // transcribes. Mirrors wsl7b_primary_unresolved below: with the flag on but the model
-            // ABSENT, the 7B remains the primary and this stays true (never a silent stock
-            // downgrade — the F2 contract).
-            && !(self.settings.use_finetuned_asr && Self::finetuned_model_paths().is_some())
+    }
+
+    /// True when the fine-tuned engine may act as the PRIMARY drafter: the flag is on and the owner
+    /// has not selected the champion. Selecting WSL7B outranks the flag (champion supremacy).
+    fn finetuned_override_active(&self) -> bool {
+        self.settings.use_finetuned_asr && self.settings.asr_model_size != crate::settings::AsrModelSize::WSL7B
     }
 
     /// F2 — the no-silent-downgrade guard. True when the selected primary engine is WSL 7B but no
@@ -898,7 +909,7 @@ impl ProcessingPipeline {
     fn wsl7b_primary_unresolved(&self) -> bool {
         self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
             && self.settings.external_asr_script_path().is_none()
-            && !(self.settings.use_finetuned_asr && Self::finetuned_model_paths().is_some())
+            && !(self.finetuned_override_active() && Self::finetuned_model_paths().is_some())
     }
 
     /// F6 — fast preflight before an import that will drive the WSL 7B primary: confirm the warm
@@ -2110,7 +2121,7 @@ impl ProcessingPipeline {
             // below AND whether a fine-tuned miss is a genuine STOCK downgrade (it is NOT when the 7B is the
             // primary drafter — the miss falls to the 7B champion, not stock local CTC).
             let wsl_primary = self.should_use_wsl_primary_asr();
-            let finetuned_text: Option<String> = if self.settings.use_finetuned_asr {
+            let finetuned_text: Option<String> = if self.finetuned_override_active() {
                 // F2: every attempted chunk is counted; a fall-through TO STOCK increments the fallback
                 // counter so the import completion can report the downgrade LOUDLY (a log-only
                 // warn here left a whole import drafted at stock ~29.4% CER instead of the selected
@@ -2974,7 +2985,7 @@ impl ProcessingPipeline {
         // fine-tuned MMS-CTC engine (best local Sorani quality) regardless of asr_model_size. Any
         // failure (model absent / inference error / empty output) falls through to the configured
         // engine below, so transcription never breaks.
-        if self.settings.use_finetuned_asr {
+        if self.finetuned_override_active() {
             if let Some((onnx, vocab)) = Self::finetuned_model_paths() {
                 match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_pcm) {
                     Ok(raw_text) if !raw_text.trim().is_empty() => {

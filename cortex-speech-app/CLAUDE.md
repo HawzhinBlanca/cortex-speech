@@ -39,6 +39,39 @@ Exactly two things are permitted, and nothing else without the owner raising it 
 Cloud judge/STT is locked separately: Gemini 2.5 Pro only, plus ElevenLabs Scribe for STT (see the
 cloud-ASR policy above).
 
+## The champion is not optional — and failure is a HARD STOP (owner rule, 2026-08-11)
+
+Two rules, one purpose: never let the app quietly produce a worse result than it claims.
+
+**1. The champion drafts everything.** When `asr_model_size = WSL7B`, the **OmniASR-7B champion**
+transcribes EVERY clip. Nothing may divert it to a smaller model — not `use_finetuned_asr`, not a
+decode error, not a busy server. The smaller engines (fine-tuned MMS, CTC-300M/1B) are **explicit
+optional extras**: the owner may select one deliberately, and they may serve as *hypotheses* for the
+jury. They are never an automatic substitute.
+
+*Why this is a rule:* measured 2026-08-10, a 494-clip review queue was drafted **494/494 by
+`finetuned-mms-ckb`** while `asr_model_size` said WSL7B and the champion sat up and idle on both GPUs.
+No UI, DB field or gate said so; the owner found it by reading the transcripts. Measured gap on
+identical FLEURS ckb clips: **7.03% CER vs 9.32%** — and the app runs the int8 build, whose own
+baseline is 21.00%.
+
+**2. Stop on the first failure. Never degrade, never continue.** If any stage fails for any clip —
+ASR, refinement, alignment, decode — the run **halts** and reports the cause. Do not skip the clip,
+do not fall back to a smaller model, do not finish the remaining work and present a tally.
+
+*Why this is a rule:* the same run had 25 clips whose container the champion could not decode. Each
+failed, was counted, and the batch ran to "completion" — leaving 462 clips at champion quality and 25
+at a weaker engine, invisibly mixed. **A partly-drafted dataset that looks finished is worse than a
+run that stopped**, because the mixed provenance silently poisons every measurement taken from it.
+
+Enforced in code (`should_use_wsl_primary_asr`, `finetuned_override_active`, the hard stop in
+`batch_transcribe`) and pinned by `scripts/test_champion_supremacy_policy.py`. A batch that stops
+emits `type: "halted"` with `haltedBy`, never `"completed"`.
+
+**3. This applies to agents too.** Do not report a run as done when part of it failed. Do not average
+away, round off, or narrate past a failure. If something did not work, say exactly what, stop, and
+hand it back — an honest halt is always acceptable; a flattering "finished" is never.
+
 ## The one law: honesty (non-negotiable)
 
 This project's entire credibility rests on real, never fabricated, results.

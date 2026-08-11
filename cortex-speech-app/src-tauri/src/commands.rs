@@ -1113,6 +1113,15 @@ pub async fn verify_finetuned_model_integrity() -> Result<String, String> {
     .await
 }
 
+/// Record the FIRST failure only, so the reported cause is the one that actually stopped the run.
+fn record_first_failure(slot: &std::sync::Mutex<Option<String>>, message: String) {
+    if let Ok(mut guard) = slot.lock() {
+        if guard.is_none() {
+            *guard = Some(message);
+        }
+    }
+}
+
 /// Worker count for a batch transcription, from `CORTEX_BATCH_CONCURRENCY`.
 ///
 /// Anything absent, unparseable, zero, negative or absurd falls back to 1 — the strictly serial
@@ -1190,6 +1199,9 @@ pub fn batch_transcribe(
         let previous_segments_shared: std::sync::Mutex<Vec<crate::db::SpeechSegment>> =
             std::sync::Mutex::new(Vec::new());
         let transcribed_ids_shared: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        // The FIRST failure, kept verbatim: it is the one that explains the stop, and later workers
+        // finishing their in-flight clip must not overwrite it with a downstream symptom.
+        let first_failure: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
         // Pre-fetch all target segments in a SINGLE DB lock (one WHERE IN query)
         // instead of re-locking on every loop iteration. For a 500-segment batch
@@ -1305,10 +1317,28 @@ pub fn batch_transcribe(
                     Err(e) => {
                         tracing::error!("Batch transcribe failed for {id}: {e}");
                         failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        record_first_failure(&first_failure, format!("segment {id}: {e}"));
                     }
                 }
             } else {
                 failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                record_first_failure(&first_failure, format!("segment {id}: not found in the database"));
+            }
+
+            // HARD STOP (owner rule, 2026-08-11 — AGENT_CHARTER "Stop on the first failure").
+            //
+            // This loop used to count a failure and carry on. Measured 2026-08-10: 25 clips whose
+            // source container the champion could not decode failed one by one, the batch ran to
+            // "completion", and the review queue ended up 462 clips at champion quality and 25 at a
+            // weaker engine — with no error surfaced anywhere. A partly-drafted dataset that LOOKS
+            // finished is worse than a run that stopped: the mixed provenance is invisible and
+            // silently poisons every measurement taken from it afterwards.
+            //
+            // So the first failure cancels the batch. Everything already written stays written and is
+            // reported; the run is reported as FAILED, never as done.
+            if first_failure.lock().map(|f| f.is_some()).unwrap_or(false) {
+                cancel.cancel();
+                break;
             }
 
             // Completion COUNT, not the claim index: with workers in flight the highest claimed index
@@ -1365,13 +1395,25 @@ pub fn batch_transcribe(
             }
         }
 
+        // A run that stopped on a failure is reported as HALTED, with the first cause named. It must
+        // never arrive at the UI as an ordinary "completed" — that is precisely how a half-drafted
+        // dataset gets mistaken for a finished one.
+        let halted_by = first_failure.into_inner().ok().flatten();
+        if let Some(reason) = &halted_by {
+            tracing::error!(
+                "Batch transcribe HARD-STOPPED after {succeeded} succeeded, {skipped} skipped: {reason}. \
+                 Remaining clips were NOT transcribed; the dataset is incomplete, not finished."
+            );
+        }
         emit_or_log(
             &app_clone,
             "batch-progress",
             serde_json::json!({
-                "type": "completed", "total": total,
+                "type": if halted_by.is_some() { "halted" } else { "completed" },
+                "total": total,
                 "succeeded": succeeded, "failed": failed, "skipped": skipped,
-                "cancelled": cancelled, "operation": "transcribe"
+                "cancelled": cancelled, "operation": "transcribe",
+                "haltedBy": halted_by,
             }),
         );
     });
