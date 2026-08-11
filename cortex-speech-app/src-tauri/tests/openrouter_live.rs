@@ -6,17 +6,26 @@
 //!
 //! The key is read from the local secrets file and NEVER printed; only the model output is shown.
 
+/// Read the key through the PRODUCTION loader, not by hand-parsing `secrets.env`.
+///
+/// This used to strip `NAME=` off the raw line and use whatever followed. That works only while every
+/// value happens to be plaintext. `secrets.env` values may also be `dpapi:<base64>` — DPAPI-encrypted
+/// at rest, which is what `set_api_key` writes — and the hand-parser handed the CIPHERTEXT to
+/// OpenRouter as a bearer token. Measured 2026-08-11: encrypting the stored OpenRouter key (same value,
+/// verified byte-identical by hash) turned this test red with `status code 401`, while the app itself
+/// kept refining fine because every production path goes through `ApiKeys`.
+///
+/// A test that re-implements credential loading is testing a file format, not the product — and it
+/// fails on the day the product improves.
 fn read_key(name: &str) -> Option<String> {
-    let path = std::path::Path::new(&std::env::var("APPDATA").ok()?).join("cortex-speech").join("secrets.env");
-    for line in std::fs::read_to_string(path).ok()?.lines() {
-        if let Some(rest) = line.trim().strip_prefix(&format!("{name}=")) {
-            let v = rest.trim().trim_matches('"').trim_matches('\'').to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
+    let data_dir = std::path::Path::new(&std::env::var("APPDATA").ok()?).join("cortex-speech");
+    let keys = cortex_speech_app_lib::api_keys::ApiKeys::load(&data_dir);
+    match name {
+        "OPENROUTER_API_KEY" => keys.openrouter,
+        "GEMINI_API_KEY" => keys.gemini,
+        "ELEVENLABS_API_KEY" => keys.elevenlabs,
+        _ => None,
     }
-    None
 }
 
 #[test]

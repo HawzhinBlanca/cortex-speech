@@ -6,19 +6,15 @@
 //!
 //! The key is read from the local secrets file and NEVER printed; only the transcription is shown.
 
+/// Read the key through the PRODUCTION loader, not by hand-parsing `secrets.env`.
+///
+/// `secrets.env` values may be plaintext OR `dpapi:<base64>` — DPAPI-encrypted at rest, which is what
+/// `set_api_key` writes. A hand-parser returns the CIPHERTEXT and sends it as a bearer token. Its twin
+/// in openrouter_live.rs did exactly that the day its key was encrypted and failed with `401`; this
+/// one is currently masked only because no ElevenLabs key is set. `ApiKeys::load` handles both.
 fn read_elevenlabs_key() -> Option<String> {
-    let path = std::path::Path::new(&std::env::var("APPDATA").ok()?).join("cortex-speech").join("secrets.env");
-    let contents = std::fs::read_to_string(path).ok()?;
-    for line in contents.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("ELEVENLABS_API_KEY=") {
-            let v = rest.trim().trim_matches('"').trim_matches('\'').to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
+    let data_dir = std::path::Path::new(&std::env::var("APPDATA").ok()?).join("cortex-speech");
+    cortex_speech_app_lib::api_keys::ApiKeys::load(&data_dir).elevenlabs
 }
 
 #[test]
