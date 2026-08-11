@@ -4,9 +4,9 @@
 
 # Gate status — generated
 
-**Commit:** `c3ff74f` · **Mode:** full
+**Commit:** `f4e327d` · **Mode:** full
 
-**Verdict:** **GREEN — PERSONAL-USE SHIP-READY.** (Not full-charter 10/10: 8 legs owner-descoped, 5 owner-gated pending.)
+**Verdict:** **GREEN — PERSONAL-USE SHIP-READY.** (Not full-charter 10/10: 8 legs owner-descoped, 4 owner-gated pending.)
 
 ## Kept gates
 
@@ -17,6 +17,7 @@
 | `required-files` | PASS |
 | `ledger-schema` | PASS |
 | `license-compat` | PASS |
+| `branch-protection` | PASS |
 | `python-policies` | PASS |
 | `typecheck` | PASS |
 | `lint-js` | PASS |
@@ -65,5 +66,4 @@
 | `iaa-kappa-ceiling` | item 44: recruit >=2 independent Sorani annotators |
 | `cordi-dialect-fairness` | item 53: CORDI corpus agreement |
 | `refinery-lift-in-product` | item 37: Gold Marathon (>=500 real review decisions) |
-| `branch-protection` | item 49: repo-admin clicks |
 | `asosoft-600-licensing` | WS1 tail: eval-use license verification |
