@@ -691,6 +691,7 @@ GATES = [
 
 # Charter DoD legs descoped by the owner amendment (2026-07-10) — always printed.
 DESCOPED = [
+    ("asosoft-600-eval-set", "Eval corpus: owner decision 2026-08-11 — AsoSoft publishes NO licence file and NO terms beyond \"research and non-commercial use\", and no contact address; evaluation rests on FLEURS ckb + CORDI (CC BY-SA 4.0) instead"),
     ("signed-installer", "Distribution: signtool verify /pa"),
     ("slsa-provenance", "Distribution: gh attestation verify"),
     ("signed-auto-updater", "Distribution (incl. updater clause of the egress bullet)"),
@@ -706,7 +707,6 @@ OWNER_GATED = [
     ("iaa-kappa-ceiling", "item 44: recruit >=2 independent Sorani annotators"),
     ("cordi-dialect-fairness", "item 53: CORDI corpus agreement"),
     ("refinery-lift-in-product", "item 37: Gold Marathon (>=500 real review decisions)"),
-    ("asosoft-600-licensing", "WS1 tail: eval-use license verification"),
 ]
 
 
