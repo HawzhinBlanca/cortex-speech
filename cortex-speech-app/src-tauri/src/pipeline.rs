@@ -918,6 +918,16 @@ impl ProcessingPipeline {
     /// `/dev/tcp` open bounded by `timeout`. Without this, a down/hung server is only discovered
     /// per-segment after a 300 s transcription timeout — up to ~5 minutes of spinner before the
     /// fail-hard rollback. This turns that into a ~2-second, actionable failure at import start.
+    /// Public preflight for any caller about to drive the PRIMARY engine over a batch.
+    ///
+    /// `batch_transcribe` accepted a 487-clip job and hard-stopped on clip 1 because the champion
+    /// server was down (measured 2026-08-11). The stop was correct, but the caller had already been
+    /// told "started". Checking here makes an unreachable champion an immediate, actionable refusal
+    /// instead of a halt after the first write. A no-op when the champion is not the primary.
+    pub fn preflight_primary_engine(&self) -> AppResult<()> {
+        self.wsl_7b_server_preflight()
+    }
+
     fn wsl_7b_server_preflight(&self) -> AppResult<()> {
         if !self.should_use_wsl_primary_asr() {
             return Ok(());

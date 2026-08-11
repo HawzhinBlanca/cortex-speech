@@ -1143,6 +1143,15 @@ pub fn batch_transcribe(
     }
     let total = ids.len();
 
+    // PREFLIGHT before claiming the job (owner rule 2026-08-11). Measured 2026-08-11: a 487-clip run
+    // was accepted, then HARD-STOPPED on the very first clip because the champion server was not
+    // running — the right outcome, but the caller had already been told "started". Failing here
+    // returns the reason immediately and leaves the queue untouched, rather than after a write cycle.
+    {
+        let pipeline = state.lock_pipeline().clone();
+        pipeline.preflight_primary_engine().map_err(|e| e.to_string())?;
+    }
+
     state.try_start_batch()?;
 
     let cancel = state.ensure_cancel_token()?;
