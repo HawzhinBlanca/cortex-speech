@@ -1,0 +1,66 @@
+{
+  "metric": "micro_cer",
+  "unit": "percent",
+  "model": "OmniASR-7B champion (base + Kurdish LoRA), warm WSL server",
+  "date": "2026-08-11",
+  "seed": 42,
+  "normalization": "nfc_lower_space_kept (scorecard_7b.py)",
+  "n_floor": 50,
+  "budget_pts": 10.0,
+  "groups": {
+    "dialect": {
+      "Mehabad": {
+        "n": 60,
+        "cer": 27.63
+      },
+      "Silemani": {
+        "n": 60,
+        "cer": 29.81
+      },
+      "Kalar": {
+        "n": 60,
+        "cer": 31.24
+      },
+      "Sine": {
+        "n": 60,
+        "cer": 36.31
+      },
+      "Hewler": {
+        "n": 60,
+        "cer": 39.19
+      },
+      "Serdest": {
+        "n": 60,
+        "cer": 42.42
+      }
+    }
+  },
+  "confidence_intervals": {
+    "Mehabad": [
+      22.56,
+      33.38
+    ],
+    "Silemani": [
+      23.12,
+      37.79
+    ],
+    "Kalar": [
+      25.83,
+      38.17
+    ],
+    "Sine": [
+      31.0,
+      43.65
+    ],
+    "Hewler": [
+      33.5,
+      46.3
+    ],
+    "Serdest": [
+      36.71,
+      48.95
+    ]
+  },
+  "provenance": "scripts/scorecard_7b.py over per-dialect manifests from scripts/build_cordi_manifest.py (CORDI CC BY-SA 4.0, sha256 ff0ea0cb..., 305 synched films, 60 clips/dialect sampled seed=42 from 140,655 usable utterances). 2000-resample utterance bootstrap, same basis as the 7.03% FLEURS headline.",
+  "note": "DOMAIN DIFFERS from the 7.03% FLEURS figure: CORDI is spontaneous dialectal speech from films and TV with music and overlap, FLEURS is read speech. The absolute CERs are therefore not comparable to 7.03%; the DISPARITY BETWEEN DIALECTS is what this scorecard measures. text == text_original for all 12,683 utterances checked, so the references are the dialectal transcriptions and the gap is not a standardisation artifact."
+}
