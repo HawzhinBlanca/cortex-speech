@@ -3166,8 +3166,13 @@ impl ProcessingPipeline {
                             accept_refinement(&raw_transcript, &refined)
                         }
                         Err(e) => {
-                            tracing::warn!("LLM Refinement failed: {}. Falling back to raw transcript.", e);
-                            raw_transcript.clone()
+                            // HARD STOP (owner rule 2026-08-11): a configured refiner that FAILS is a
+                            // failure, not an invitation to ship the unrefined draft. Measured
+                            // 2026-08-10: 59 of 487 clips silently kept raw text this way, so the
+                            // dataset was part refined and part not with nothing recording which.
+                            return Err(AppError::Other(format!(
+                                "LLM refinement failed for segment {id}: {e}. Refinement is enabled, so this                                  clip is NOT complete — the run is stopped rather than storing an unrefined                                  draft as if it were finished."
+                            )));
                         }
                     }
                 } else {
@@ -3246,8 +3251,10 @@ impl ProcessingPipeline {
                     accept_refinement(&raw_text, &refined)
                 }
                 Err(e) => {
-                    tracing::warn!("LLM Refinement failed: {}. Falling back to raw transcript.", e);
-                    raw_text.clone()
+                    // HARD STOP (owner rule 2026-08-11), same contract as the champion path above.
+                    return Err(AppError::Other(format!(
+                        "LLM refinement failed: {e}. Refinement is enabled, so this clip is NOT complete —                          the run is stopped rather than storing an unrefined draft as if it were finished."
+                    )));
                 }
             }
         } else {

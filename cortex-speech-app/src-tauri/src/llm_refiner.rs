@@ -111,7 +111,18 @@ impl LlmRefiner {
         if let Some(content) = body["choices"][0]["message"]["content"].as_str() {
             Ok(content.trim().to_string())
         } else {
-            Err("Invalid response format from Local LLM".to_string())
+            // Say WHAT came back instead of "invalid format". Measured 2026-08-10: 59 clips failed
+            // here and the message named neither the provider nor the reason, so diagnosing it meant
+            // reading pipeline source to discover the request had gone to OpenRouter at all. The
+            // provider's own `error.message` is the useful field; the endpoint host names who
+            // answered. Truncated, and run through redact_api_key, because a provider error body can
+            // echo the request.
+            let provider = self.endpoint.split('/').nth(2).unwrap_or("the LLM endpoint");
+            let detail = body["error"]["message"]
+                .as_str()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| body.to_string().chars().take(300).collect());
+            Err(format!("{provider} returned no message content: {}", redact_api_key(&detail, &self.api_key)))
         }
     }
 
