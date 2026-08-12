@@ -8169,3 +8169,33 @@ covering the new audio path. A gate going red is a gate working.
 **Verified:** cargo --lib 1169/0, clippy --all-targets clean, python policies 61/61.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 275 — the listening-QC was dead across 283 decisions
+
+**Hunt result (loop iteration 1).** The hidden spot-check mechanism — the ONLY instrument that
+measures whether a reviewer is listening rather than tapping accept — has been structurally
+incapable of firing. Measured on the live corpus: **0 answer keys against 283 human decisions and 4
+active reviewers.**
+
+Cause, and it is by design colliding with practice: `list_spot_check_candidates` mints keys only
+from `is_gold = 1 OR reviewed_by IS NULL`. The `reviewed_by IS NULL` arm exists so a peer's fresh
+correction never becomes the key another reviewer is graded against — correct. But every decision in
+this corpus arrived from the phone, which stamps `reviewed_by` unconditionally, and nothing is
+flagged `is_gold`. So the population is empty by construction. Nothing errored, no counter moved,
+and `spot_checks` still holds 5 rows from an earlier era — the QC LOOKED alive. Same shape as the
+vacuous-gate class this repo keeps finding, and it silently spanned every decision made to date.
+
+NOT caused by the gold-provenance law (iteration 271): the clause predates it. An earlier attempt to
+widen it to `reviewed_by <> requesting_reviewer` was reverted when the pin test showed that would
+promote peer corrections to answer keys — the right call, and it left this defect standing.
+
+**New gate `scripts/check_spot_check_pool.py`** (verify-10 tier-1 leg `spot-check-pool`): mirrors the
+candidate query + `human_verified_text` + the wrong-draft requirement, and FAILS on an empty or
+too-thin pool. Currently RED by design — exit 1, "ZERO answer keys". It is red because the system is
+wrong, not because the gate is.
+
+**The fix is an owner action, not code:** adjudicate a batch at the DESKTOP (which leaves
+`reviewed_by` NULL) or flag adjudicated clips `is_gold = 1`, so keys exist. This is the same
+mechanism the blueprint's double-pass + adjudication stage would replenish continuously.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
