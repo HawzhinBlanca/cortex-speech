@@ -58,7 +58,14 @@ pub fn transcribe_audio(
         // temperature 0 for reproducibility. NO thinkingConfig: gemini-2.5-pro REJECTS
         // `thinkingBudget: 0` with "Budget 0 is invalid. This model only works in thinking mode"
         // (measured 2026-08-12), so the model's own default is the only valid setting for it.
-        "generationConfig": { "temperature": 0 }
+        //
+        // maxOutputTokens is REQUIRED because of that: thinking tokens are drawn from the same
+        // budget, so at the default a transcription returns finishReason MAX_TOKENS with EMPTY text
+        // (measured repeatedly on this gold set). Left unset, the clips likeliest to exhaust the
+        // budget are the long ones — so the failures would not be random, and dropping them would
+        // bias a measured CER OPTIMISTICALLY. 8192 leaves ample room for thinking plus a
+        // one-utterance transcript.
+        "generationConfig": { "temperature": 0, "maxOutputTokens": 8192 }
     });
 
     let request = crate::http::API_AGENT.post(&generate_content_url(model)).set("Content-Type", "application/json");
