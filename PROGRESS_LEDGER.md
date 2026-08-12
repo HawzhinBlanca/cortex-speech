@@ -8116,3 +8116,18 @@ minted only under the gold-provenance law). Nothing else from the 27 confirmed f
 reachable.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 273 — the full sweep on the deployed app: 34/34 GREEN
+
+`python scripts/verify_10.py` on the deployed exe (HEAD 965aacb), machine idle, reviewers paused:
+**kept gates run: 34 — 34 PASS, 0 FAIL, 0 skipped.** Includes both new provenance gates
+(review-serving-provenance on the LIVE db, machine-never-writes-annotated + verbatim-training-text
+in the policy suite), the real-exe e2e legs, egress-runtime, fuzz (933.9s), bench-budget (1511.5s),
+and both crash drills. Verdict line verbatim: "GREEN - PERSONAL-USE SHIP-READY. (Not full-charter
+10/10: 9 legs owner-descoped, 3 owner-gated pending.)" The 9 descoped legs are the distribution
+items the owner ruled out of "ship" on 2026-07-10; the 3 owner-gated legs (iaa-kappa-ceiling,
+cordi-dialect-fairness, refinery-lift-in-product) are the ones that need HUMANS reviewing — the
+reviewers returning is itself the path to them. Log:
+%LOCALAPPDATA%\Temp\cortex-verify10\runs.jsonl + the session sweep log.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
