@@ -1075,8 +1075,12 @@ impl Database {
     /// back (the old `insert_segment` path) reverted the human's `verified` flag and overwrote their
     /// edited annotation — a silent lost update. This targeted write instead:
     ///   • updates ONLY the ASR-derived columns (raw / normalized / confidence),
-    ///   • seeds `annotated_transcript` solely when it is still empty, via COALESCE against the CURRENT
-    ///     row (never the stale snapshot), so an in-flight human annotation is preserved,
+    ///   • NEVER touches `annotated_transcript` — that field is human-only, by law. This function
+    ///     used to seed it with the machine draft via `COALESCE(annotated_transcript, seed)`, and
+    ///     because every serving path ranks annotated first on presence alone, that first machine
+    ///     seed outranked every later champion re-draft FOREVER: the 2026-08-12 incident, where 348
+    ///     review clips served a stale machine paraphrase while fresh champion text sat invisible.
+    ///     Pinned by scripts/test_machine_never_writes_annotated_policy.py.
     ///   • never touches `verified`, and
     ///   • skips any row a human has verified or reviewed since the batch began.
     /// Returns Ok(true) if the row was updated, Ok(false) if it was skipped as human-owned.
@@ -1090,11 +1094,9 @@ impl Database {
         confidence_source: Option<&str>,
         model_version_id: Option<&str>,
         cloud_call: bool,
-        annotated_seed: &str,
     ) -> AppResult<bool> {
         let raw_nfc = to_nfc(raw_transcript);
         let normalized_nfc = normalized_transcript.map(to_nfc);
-        let annotated_nfc = to_nfc(annotated_seed);
         let rows_changed = self.conn.execute(
             "UPDATE speech_segments
              SET raw_transcript        = ?2,
@@ -1103,7 +1105,6 @@ impl Database {
                  confidence_source     = COALESCE(?5, 'unknown'),
                  model_version_id      = COALESCE(?6, 'unknown@pre-registry'),
                  cloud_call            = ?7,
-                 annotated_transcript  = COALESCE(annotated_transcript, ?8),
                  updated_at            = datetime('now')
              WHERE id = ?1
                AND verified = 0
@@ -1117,7 +1118,6 @@ impl Database {
                 confidence_source,
                 model_version_id,
                 cloud_call as i32,
-                annotated_nfc,
             ],
         )?;
         self.track_write()?;

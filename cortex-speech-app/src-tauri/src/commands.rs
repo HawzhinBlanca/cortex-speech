@@ -1285,9 +1285,10 @@ pub fn batch_transcribe(
                         let normalized = normalizer.normalize(&draft.final_text);
                         // Guarded targeted write (NOT a full insert_segment of the stale snapshot): a
                         // human may have verified/edited this row since the batch prefetched it. This
-                        // writes only the ASR fields, seeds the annotation solely when still empty
-                        // (against the CURRENT row), never touches `verified`, and skips human-owned
-                        // rows — so a concurrent curator decision can never be silently lost.
+                        // writes only the ASR fields — never `annotated_transcript` (human-only, by
+                        // law; the old seed-when-empty machine write is the 348-row 2026-08-12
+                        // incident) — never touches `verified`, and skips human-owned rows, so a
+                        // concurrent curator decision can never be silently lost.
                         match app_state.lock_db().update_batch_transcription_if_unreviewed(
                             id,
                             &draft.raw_text,
@@ -1296,7 +1297,6 @@ pub fn batch_transcribe(
                             draft.confidence_source.as_deref(),
                             draft.model_version_id.as_deref(),
                             draft.cloud_call,
-                            &draft.final_text,
                         ) {
                             Ok(true) => {
                                 // Guards named for what they hold, so the undo snapshot and the

@@ -7986,3 +7986,41 @@ should be jury evidence only, never reviewer-facing or export-facing text for a 
 that is a policy change beyond this fix.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 270 — the writer was not dead, and iteration 269 said it was
+
+**Correction of the record.** Iteration 269 attributed the 348 poisoned rows to "an old code path …
+never cleaned from the data." A nine-path adversarial audit (42 agents, every claimed defect
+independently verified against the real code; 27 confirmed, 6 refuted —
+docs/TEXT_PROVENANCE_AUDIT_2026-08-12.md) proved the writer was LIVE:
+`db.rs::update_batch_transcription_if_unreviewed` seeded `annotated_transcript` with the machine
+draft via `COALESCE(annotated_transcript, seed)` on every batch run — `db_tests.rs` even pinned the
+seeding as intended ("annotation seeded when empty"). The very next batch_transcribe would have
+re-poisoned all 348 cleaned rows. Five desktop handlers (App.svelte champion/constrained/
+finetuned/Scribe re-transcribe, ReviewMode doRetranscribe) wrote machine `result.text` into the
+same human-only field.
+
+**Fixed, fail-before verified.** New sandbox-safe policy gate
+`scripts/test_machine_never_writes_annotated_policy.py`: function-scoped so the LEGAL human writers
+(submit/draft persisting editText) stay legal — pre-fix it flagged exactly the 6 machine sites with
+0 false positives; post-fix 0 violations. The batch persist path no longer mentions the annotated
+column; the five handlers write raw/normalized only, and NULL `normalized_transcript` unless
+recomputed so stale text cannot outrank the fresh draft at the `annotated ?? normalized ?? raw`
+precedence. The Rust pin flipped and was renamed for what it now proves
+(`…_and_never_writes_annotation`); first run of the renamed filter reported "0 tests ran, 1171
+filtered out" — a vacuous pass caught by reading the count line, per the standing rule.
+
+**Gates actually run:** `test_machine_never_writes_annotated_policy.py` FAIL(6)→PASS,
+`check_review_serving_provenance.py` PASS, full python-policies 60/60, vitest 238/238, typecheck 0
+errors, `cargo test --lib batch_transcription_update` 1 passed (scratch target dir; the running app
+was never stopped). NOT run this iteration: clippy, full cargo test, the full verify-10 sweep — the
+Rust/Svelte fixes are committed but NOT DEPLOYED; the running exe still carries the seeding writer
+until the next rebuild+restart window, so batch_transcribe must not be run before then.
+
+**Audit remainder:** 20 confirmed defects remain open, grouped in
+docs/TEXT_PROVENANCE_AUDIT_2026-08-12.md — the largest cluster is `verified=1` alone fabricating
+human provenance (bulk Verify All Pending exports machine drafts as human gold; Curate ^D can bless
+an unseen jury verdict; the spot-check answer key trusts machine-seeded text). Those are grading
+semantics redesigns and owner decisions, not quick patches.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

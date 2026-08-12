@@ -2,10 +2,12 @@
 
 Why this gate exists (incident, 2026-08-12): the phone review server's ``review_text()`` rightly
 prefers ``annotated_transcript`` — the field reserved for a HUMAN's typed correction — over the raw
-champion draft. An old code path (fixed in ``batch_processor.rs`` but never cleaned from the data) had
-written MACHINE text into that field on 348 rows, so reviewers were served a stale machine paraphrase
-while every fresh champion + refinement draft sat invisible in ``raw_transcript`` /
-``normalized_transcript``. Words the speaker never said reached human reviewers labeled as the draft.
+champion draft. Machine writers had filled that field on 348 rows (the batch persist path seeded it
+via ``COALESCE(annotated_transcript, machine_draft)`` — a LIVE writer at the time, removed and
+pinned by ``test_machine_never_writes_annotated_policy.py``; the desktop re-transcribe handlers did
+the same), so reviewers were served a stale machine paraphrase while every fresh champion +
+refinement draft sat invisible in ``raw_transcript`` / ``normalized_transcript``. Words the speaker
+never said reached human reviewers labeled as the draft.
 
 The law this gate enforces, on the LIVE database, at the serving path's own precedence:
 

@@ -209,7 +209,10 @@
       const updated: SpeechSegment = {
         ...freshRow(seg.id, seg),
         rawTranscript: result.rawTranscript,
-        annotatedTranscript: text,
+        // Machine output never enters the human-only annotation field (by law — the 2026-08-12
+        // incident class); the old normalized text describes the deleted draft and must not
+        // outrank the fresh raw at the annotated ?? normalized ?? raw precedence — clear it.
+        normalizedTranscript: null,
         verified: false,
       };
       // Re-transcribing a reviewed clip is destructive (gold replaced, clip reopened): snapshot the

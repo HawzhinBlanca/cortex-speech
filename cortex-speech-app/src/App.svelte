@@ -1110,8 +1110,11 @@
     try {
       const result = await api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id);
       const rawTranscript = result.rawTranscript;
-      const annotatedTranscript = result.text;
-      let normalizedTranscript = seg.normalizedTranscript;
+      // Machine output never enters the human-only annotation field (by law — the 2026-08-12
+      // incident class; pinned by test_machine_never_writes_annotated_policy.py). The old
+      // normalized text describes the DELETED draft, so it must not outrank the fresh raw at the
+      // annotated ?? normalized ?? raw display precedence — null unless recomputed here.
+      let normalizedTranscript: string | null = null;
       if ($settings.autoNormalize) {
         // Best-effort: a normalize failure (rate limit, validation) must never discard the
         // just-succeeded multi-second GPU transcription — save the raw result and say what failed.
@@ -1126,7 +1129,6 @@
         // align stamps) during the multi-second ASR await — never upsert the stale pre-await copy.
         ...($segments.find((s) => s.id === seg.id) ?? seg),
         rawTranscript,
-        annotatedTranscript,
         normalizedTranscript,
         // A re-transcription is machine output — reset verified so it isn't kept as human-verified.
         verified: false,
@@ -1190,7 +1192,9 @@
         // the multi-second ASR await — speaker autosave, background align stamps).
         ...($segments.find((s) => s.id === seg.id) ?? seg),
         rawTranscript: result.rawTranscript,
-        annotatedTranscript: result.text,
+        // Machine output never enters the human-only annotation field (by law); the old normalized
+        // text describes the deleted draft and must not outrank the fresh raw — clear it.
+        normalizedTranscript: null,
         // A re-transcription is machine output — reset verified so it isn't kept as human-verified.
         verified: false,
       };
@@ -1229,7 +1233,9 @@
         // freshRow-by-id: same stale-spread guard as the other transcribe handlers.
         ...($segments.find((s) => s.id === seg.id) ?? seg),
         rawTranscript: result.rawTranscript,
-        annotatedTranscript: result.text,
+        // Machine output never enters the human-only annotation field (by law); the old normalized
+        // text describes the deleted draft and must not outrank the fresh raw — clear it.
+        normalizedTranscript: null,
         // A re-transcription is machine output — reset verified so it isn't kept as human-verified.
         verified: false,
       };
@@ -1271,7 +1277,9 @@
       await api.updateSegment({
         ...($segments.find((s) => s.id === seg.id) ?? seg),
         rawTranscript: text,
-        annotatedTranscript: text,
+        // Machine output never enters the human-only annotation field (by law); the old normalized
+        // text describes the deleted draft and must not outrank the fresh raw — clear it.
+        normalizedTranscript: null,
         verified: false,
       });
       await loadSegments();

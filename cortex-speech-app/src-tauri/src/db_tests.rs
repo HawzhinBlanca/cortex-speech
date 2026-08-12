@@ -1528,7 +1528,7 @@ fn consensus_batch_preserves_human_reviewed_transcripts() {
 }
 
 #[test]
-fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
+fn batch_transcription_update_preserves_human_review_and_never_writes_annotation() {
     // Round-9 audit HIGH (lost update): batch_transcribe wrote the whole STALE snapshot back via
     // insert_segment, reverting a concurrent human verify/edit. The guarded targeted write must
     // (a) refuse to touch a human-verified/reviewed row, (b) never revert `verified`, (c) seed the
@@ -1551,7 +1551,6 @@ fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
             Some("heuristic"),
             Some("omniasr-ctc-300m"),
             false,
-            "fresh asr",
         )
         .expect("update verified");
     assert!(!updated, "a verified row must be skipped, not updated");
@@ -1560,7 +1559,10 @@ fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
     assert_eq!(after.annotated_transcript.as_deref(), Some("human gold"), "human annotation preserved");
     assert_eq!(after.raw_transcript, "old asr", "human-owned row's raw must not be clobbered");
 
-    // (c): a fresh unreviewed row with no annotation IS updated and seeds the annotation.
+    // (c): a fresh unreviewed row IS updated — and annotated_transcript stays EMPTY. The old
+    // behaviour ("annotation seeded when empty") wrote the machine draft into the human-only field,
+    // where the couch/editor precedence served it forever over every later champion re-draft — the
+    // 348-row 2026-08-12 incident. Machine text lands in raw/normalized ONLY.
     let mut fresh = make_segment("fresh-1", "/b.wav");
     fresh.raw_transcript = "old".to_string();
     fresh.annotated_transcript = None;
@@ -1574,19 +1576,18 @@ fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
             Some("heuristic"),
             Some("omniasr-ctc-300m"),
             false,
-            "new asr",
         )
         .expect("update fresh");
     assert!(updated, "an unreviewed row is updated");
     let after = db.get_segment_by_id("fresh-1").unwrap().unwrap();
     assert_eq!(after.raw_transcript, "new asr");
-    assert_eq!(after.annotated_transcript.as_deref(), Some("new asr"), "annotation seeded when empty");
+    assert_eq!(after.annotated_transcript, None, "machine text must NEVER enter the human-only field");
     assert_eq!(after.confidence_source.as_deref(), Some("heuristic"));
     assert_eq!(after.model_version_id.as_deref(), Some("omniasr-ctc-300m"));
     assert!(!after.cloud_call);
 
     // (d): an unverified row the user annotated (without verifying) keeps that annotation; only
-    // the ASR fields refresh — the seed is ignored because COALESCE reads the CURRENT row.
+    // the ASR fields refresh — the batch write never mentions the annotated column at all.
     let mut annotated = make_segment("annot-1", "/c.wav");
     annotated.raw_transcript = "old".to_string();
     annotated.annotated_transcript = Some("user typed".to_string());
@@ -1600,12 +1601,11 @@ fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
             Some("real_posterior"),
             Some("omniasr-ctc-1b"),
             false,
-            "seed ignored",
         )
         .expect("update annotated");
     assert!(updated, "an unverified annotated row still refreshes ASR");
     let after = db.get_segment_by_id("annot-1").unwrap().unwrap();
-    assert_eq!(after.annotated_transcript.as_deref(), Some("user typed"), "existing annotation preserved (COALESCE)");
+    assert_eq!(after.annotated_transcript.as_deref(), Some("user typed"), "existing annotation preserved");
     assert_eq!(after.raw_transcript, "new asr", "raw ASR refreshed on an unverified row");
     assert_eq!(after.confidence_source.as_deref(), Some("real_posterior"));
     assert_eq!(after.model_version_id.as_deref(), Some("omniasr-ctc-1b"));
