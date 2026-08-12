@@ -48,11 +48,28 @@ fn app_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// One clip -> one transcript, through the AUDITED client in `gemini_api` (key in the header, never
-/// the URL; provider errors redacted) rather than a request assembled here.
-fn transcribe(api_key: &str, model: &str, wav: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(wav).map_err(|e| format!("read {}: {e}", wav.display()))?;
-    cortex_speech_app_lib::gemini_api::transcribe_audio(api_key, model, &bytes, "audio/wav", PROMPT)
+/// The two live routes to a Gemini-class audio model. Both go through an AUDITED client (key in a
+/// header, provider errors redacted) — never a request assembled in this binary.
+enum Route {
+    /// generativelanguage.googleapis.com with the direct GEMINI_API_KEY.
+    Direct { key: String, model: String },
+    /// OpenRouter's OpenAI-compatible endpoint with OPENROUTER_API_KEY, carrying audio as an
+    /// `input_audio` part. MEASURED 2026-08-12: the direct key's billing project returns
+    /// "prepayment credits are depleted" on every model while this route works, so it is the one
+    /// that can actually produce the number. `google/gemini-2.5-pro` is repo-approved.
+    OpenRouter { refiner: cortex_speech_app_lib::llm_refiner::LlmRefiner },
+}
+
+impl Route {
+    fn transcribe(&self, wav: &Path) -> Result<String, String> {
+        let bytes = std::fs::read(wav).map_err(|e| format!("read {}: {e}", wav.display()))?;
+        match self {
+            Route::Direct { key, model } => {
+                cortex_speech_app_lib::gemini_api::transcribe_audio(key, model, &bytes, "audio/wav", PROMPT)
+            }
+            Route::OpenRouter { refiner } => refiner.transcribe_audio(&bytes, "wav", PROMPT),
+        }
+    }
 }
 
 fn main() -> Result<(), String> {
@@ -72,7 +89,17 @@ fn main() -> Result<(), String> {
         .unwrap_or_else(|| "gemini-2.5-pro".to_string());
 
     let keys = ApiKeys::load(&app_data_dir());
-    let api_key = keys.gemini.ok_or("GEMINI_API_KEY is not configured (set it in the app's Settings)")?;
+    let use_openrouter = args.iter().any(|a| a == "--openrouter");
+    let route = if use_openrouter {
+        let key = keys.openrouter.ok_or("OPENROUTER_API_KEY is not configured (set it in the app's Settings)")?;
+        let model = if model == "gemini-2.5-pro" { "google/gemini-2.5-pro".to_string() } else { model.clone() };
+        let refiner = cortex_speech_app_lib::llm_refiner::LlmRefiner::for_openrouter(key, model, String::new())
+            .ok_or("OpenRouter key is empty")?;
+        Route::OpenRouter { refiner }
+    } else {
+        let key = keys.gemini.ok_or("GEMINI_API_KEY is not configured (set it in the app's Settings)")?;
+        Route::Direct { key, model: model.clone() }
+    };
 
     // Resume: skip clips already scored, so an interrupted or rate-limited run continues instead of
     // paying twice for the same audio.
@@ -103,6 +130,7 @@ fn main() -> Result<(), String> {
         None => rows,
     };
 
+    println!("route    : {}", if use_openrouter { "openrouter" } else { "direct gemini" });
     println!("model    : {model}");
     println!("manifest : {} ({} rows, {} already done)", manifest.display(), rows.len(), done.len());
 
@@ -123,7 +151,7 @@ fn main() -> Result<(), String> {
         let mut attempt = 0;
         let hypothesis = loop {
             attempt += 1;
-            match transcribe(&api_key, &model, Path::new(path)) {
+            match route.transcribe(Path::new(path)) {
                 Ok(text) => break Some(text),
                 Err(e) => {
                     // Billing/quota 429s are PERMANENT for this run (measured: "prepayment credits

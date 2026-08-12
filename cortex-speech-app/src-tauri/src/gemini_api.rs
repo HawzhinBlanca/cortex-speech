@@ -55,7 +55,10 @@ pub fn transcribe_audio(
                 { "inline_data": { "mime_type": mime_type, "data": b64 } }
             ]
         }],
-        "generationConfig": { "temperature": 0, "thinkingConfig": { "thinkingBudget": 0 } }
+        // temperature 0 for reproducibility. NO thinkingConfig: gemini-2.5-pro REJECTS
+        // `thinkingBudget: 0` with "Budget 0 is invalid. This model only works in thinking mode"
+        // (measured 2026-08-12), so the model's own default is the only valid setting for it.
+        "generationConfig": { "temperature": 0 }
     });
 
     let request = crate::http::API_AGENT.post(&generate_content_url(model)).set("Content-Type", "application/json");

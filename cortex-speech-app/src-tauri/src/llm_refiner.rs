@@ -158,6 +158,59 @@ impl LlmRefiner {
         }
     }
 
+    /// Transcribe audio through the OpenAI-compatible endpoint (OpenRouter), which carries audio to
+    /// Gemini 2.5 Pro via the `input_audio` content part.
+    ///
+    /// Lives HERE, beside `call_openai_compatible`, because this module is what the cloud-privacy
+    /// gate audits: the key goes in the `Authorization` header and every provider error is passed
+    /// through `redact_api_key` before it can reach a log or a UI. A caller assembling its own
+    /// request would sit outside both guarantees.
+    ///
+    /// Measured need (2026-08-12): the DIRECT Gemini key's billing project reports "prepayment
+    /// credits are depleted" (HTTP 429) on every model, while the OpenRouter key works — so this is
+    /// the live path to Gemini-class audio. `temperature: 0` keeps a benchmark reproducible; an
+    /// EMPTY reply is an error, never an empty transcript (scoring "" as a transcription would
+    /// fabricate a CER).
+    pub fn transcribe_audio(&self, audio_bytes: &[u8], format: &str, prompt: &str) -> Result<String, String> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
+        let payload = json!({
+            "model": self.model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": prompt },
+                    { "type": "input_audio", "input_audio": { "data": b64, "format": format } }
+                ]
+            }],
+            "temperature": 0
+        });
+
+        let mut req = crate::http::API_AGENT.post(&self.endpoint).set("Content-Type", "application/json");
+        if !self.api_key.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", self.api_key));
+        }
+        let resp = req.send_json(payload).map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let detail = r.into_string().unwrap_or_default();
+                let msg = serde_json::from_str::<Value>(&detail)
+                    .ok()
+                    .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| detail.chars().take(300).collect());
+                redact_api_key(&format!("audio transcription failed: status {code}: {msg}"), &self.api_key)
+            }
+            other => redact_api_key(&format!("audio transcription failed: {other}"), &self.api_key),
+        })?;
+
+        let body: Value = resp.into_json().map_err(|e| format!("bad json: {e}"))?;
+        let text = body["choices"][0]["message"]["content"].as_str().unwrap_or_default().trim().to_string();
+        if text.is_empty() {
+            let reason = body["choices"][0]["finish_reason"].as_str().unwrap_or("no message content");
+            return Err(format!("empty transcript (finish_reason: {reason})"));
+        }
+        Ok(text)
+    }
+
     fn call_openai_compatible(&self, user_content: &str) -> Result<String, String> {
         let model_name = if self.model.trim().is_empty() { "omniASR_LLM_7B_v2" } else { &self.model };
 
