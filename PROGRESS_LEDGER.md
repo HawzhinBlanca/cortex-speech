@@ -7933,3 +7933,56 @@ would have scored an empty set and still printed a per-dialect CER — a fabrica
 produced by a path bug. It now refuses any path that did not become `/mnt/...`.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 269 — the reviewers were served text no engine had just produced, and no gate looked
+
+**The owner caught it, again, by reading transcripts.** Words changed, words "corrected," words that
+read like translations. Measured cause: `review_text()` in couch.rs serves `annotated_transcript` —
+the field reserved for a HUMAN's typed correction — before the raw champion draft. An old code path
+(the one `batch_processor.rs:177-182` documents banning, because it graded pure ASR output as
+human-verified GOLD) had left machine text in that field on **348 of 494** rows. The champion re-draft
+of 2026-08-11 wrote `raw_transcript` and `normalized_transcript` — fields the couch page never shows
+when `annotated_transcript` is set. So the fresh champion + refinement work sat invisible while the
+phone served a stale machine paraphrase, and iteration 268's "reviewers get champion quality" claim
+was FALSE at the serving path while true at the write path. Provenance check on the served text of
+the 348 untouched rows: 45 matched the champion draft, 22 the Gemini refinement, **281 matched
+neither** — text from a superseded refinement pass, heh-form fingerprint (747× U+0647, 1× U+06BE)
+matching neither current engine's output.
+
+**Also measured while diagnosing: the Gemini refinement REWRITES, it does not correct.** Against the
+champion on 492 refined clips: median 11.1% of characters changed, p90 30.3%, max 60%. Concrete:
+`مەعاشی سابت` → `مووچەیەکی سابتیان` (the spoken loanword replaced by the "proper" word — a
+translation), digits `2000` spelled out as `دوو ھەزار`, punctuation 9 → 892 marks, every ه → ھ. For
+a VERBATIM ASR corpus that is fabrication with fluent grammar — the most dangerous kind, because a
+skimming reviewer accepts it.
+
+**Fix, executed live with reviewers quiet 44 min (leases 15-min, all expired), no restart, links
+intact.** WAL-safe `sqlite3 .backup` to `cortex-speech.db.bak-annotated-clear-20260812`, then one
+targeted UPDATE clearing `annotated_transcript` on rows with no review event, no human_decision,
+verified=0: **348 rows cleared**. Human work byte-identical before/after: 145 decisions, 145
+verified, 189 review events, 130 corrections. Serving-path re-verification: 349 unverified clips in
+queue → 348 serve champion-verbatim (raw == stored `omniasr-wsl-7b` hypothesis), 1 serves
+human-touched text, 0 unexplained.
+
+**The permanent gate — verified fail-before on the live data.**
+`cortex-speech-app/scripts/check_review_serving_provenance.py`, registered as verify-10 tier-1 leg
+`review-serving-provenance`. Two invariants at the serving path's own precedence: (1)
+`annotated_transcript` non-empty ⇒ human evidence on that row (review event, human_decision, or
+verified); (2) every untouched row's `raw_transcript` byte-matches its stored champion hypothesis —
+a missing hypothesis FAILS (hard-stop law: an undrafted clip may not look drafted). Run BEFORE the
+fix: `FAIL [human-field]: 348 rows`, exit 1. After: both invariants PASS, exit 0. Deliberately named
+`check_*`, not `test_*` — the policy-suite namespace is sandbox-safe static checks, and a live-DB
+gate there would red the suite off-rig (the vacuous-skip alternative is worse).
+
+**Law added to CLAUDE.md honesty section:** verify at the SERVING path, never the write path. Three
+incidents now share this shape (494/494 wrong engine; 25 silently-degraded clips; this). A
+nine-path adversarially-verified audit of every transcript consumer/writer (couch serve, decision
+handlers, desktop UI, Rust + script exports, grading, jury writers, pipeline writers, precedence
+map) is running; findings land next iteration.
+
+**Still open, owner's call:** (a) the 45 `accept` decisions predating the fix approved the stale
+text — re-queue or keep; (b) the refinement-as-rewriter finding argues `normalized_transcript`
+should be jury evidence only, never reviewer-facing or export-facing text for a verbatim corpus —
+that is a policy change beyond this fix.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

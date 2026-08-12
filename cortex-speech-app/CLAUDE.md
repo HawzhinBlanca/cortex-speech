@@ -80,6 +80,14 @@ This project's entire credibility rests on real, never fabricated, results.
 - **Nothing is "done" until it is USER-OBSERVABLE or MEASURED on real audio.** "Tests pass" / "clippy clean" are necessary, not sufficient. Lead with the honest reality, then the progress.
 - Don't claim a feature works until its real positive test passes. If a result is bad, report the bad result — the honest number is always shippable; a flattering fake one never is.
 - If you cannot verify something here, say so plainly and hand it to the user's machine. Do not imply verification you did not do.
+- **Verify at the SERVING path, never the write path.** Any claim about what a reviewer, the UI, or an
+  export receives must be checked by reading the exact row/field/precedence the serving code reads —
+  not by confirming what some writer wrote. Three incidents, one shape (2026-08-10 the 494/494
+  finetuned drafts; 2026-08-10 the 25 silently-degraded clips; 2026-08-12 stale machine text served
+  from `annotated_transcript` while fresh champion drafts sat invisible): every one passed its
+  write-path checks and lied at the point of consumption. `annotated_transcript` is **human-only by
+  law** — machine code never writes it; `scripts/check_review_serving_provenance.py` (verify-10 gate
+  `review-serving-provenance`) enforces both invariants on the live database every sweep.
 
 ## Environment realities (read before acting)
 
