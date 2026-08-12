@@ -216,15 +216,16 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
     });
 
     // Priority mirrors the codebase's canonical "text the human confirmed": the committed
-    // verdict_transcript first, then the human's typed annotation, then the normalized/raw ASR draft.
+    // verdict_transcript first, then the human's typed annotation, then the VERBATIM raw draft.
     // annotated_transcript was OMITTED (round-24 hunt #8) — a segment whose fix lives only in
     // annotated_transcript (inbox-accept and legacy accepts leave verdict_transcript NULL) exported
     // the SUPERSEDED ASR draft as human-confirmed LM text, exactly the text the human replaced.
-    // Matches record_human_decision's loop0_draft_text (annotated ▸ normalized ▸ raw) and quality.rs's
-    // effective_transcript (annotated over normalized).
+    // The normalized rung was removed (VERBATIM LAW 2026-08-12): it holds the LLM-refined
+    // paraphrase, and a decided row whose verdict+annotated are empty would export machine
+    // paraphrase labeled human-confirmed. Matches record_human_decision's loop0_draft_text
+    // (annotated ▸ raw) and quality.rs's training_transcript_with_source.
     let mut stmt = db.connection().prepare(
-        "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(annotated_transcript, ''),
-                         NULLIF(normalized_transcript, ''), raw_transcript),
+        "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(annotated_transcript, ''), raw_transcript),
                 audio_path
          FROM speech_segments
          WHERE is_gold = 0 AND human_decision IN ('accept', 'edit')

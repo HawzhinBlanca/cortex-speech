@@ -1319,6 +1319,12 @@ impl Database {
         reviewer: &str,
         exclude: &std::collections::HashSet<String>,
     ) -> AppResult<Vec<(SpeechSegment, String)>> {
+        // `reviewed_by IS NULL` keeps OWNER-desktop decisions (which pass no annotator name) as
+        // keys while excluding a phone peer's fresh correction — grading one reviewer against
+        // another's guess would mark them wrong for disagreeing. Machine-text keys are impossible
+        // a layer down: `human_verified_text` (gold-provenance law, 2026-08-12) returns None
+        // unless a REAL human decision produced the text, so flag-only verifies and reject rows
+        // can never become answer keys regardless of what this WHERE admits.
         let query = format!(
             "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments
              WHERE verified = 1 AND raw_transcript <> '' AND (is_gold = 1 OR reviewed_by IS NULL)
@@ -3239,6 +3245,19 @@ impl Database {
             },
         )?;
 
+        // Accept-what-you-SEE, enforced at the shared root (text-provenance audit defect #22): an
+        // accept arriving with no text used to keep the PRIOR verdict_transcript via COALESCE — a
+        // machine jury proposal the reviewer may never have seen then graded as "human_verified"
+        // gold. Snapshot what the serving law actually showed them (annotated ▸ verbatim raw).
+        // Empty snapshot stays None (blank-transcript law: never persist a blank over anything).
+        let accept_snapshot: Option<String> = if decision == "accept" && corrected_transcript.is_none() {
+            let seen = crate::corrections::loop0_draft_text(annotated_transcript.as_deref(), &raw_transcript);
+            Some(to_nfc(seen.trim())).filter(|t| !t.is_empty())
+        } else {
+            None
+        };
+        let corrected_transcript = corrected_transcript.or(accept_snapshot.as_deref());
+
         let rejected_learning_transcript = if decision == "edit" {
             corrected_transcript.and_then(|fix| {
                 rejected_transcript_for_learning(
@@ -3287,12 +3306,8 @@ impl Database {
         // Snapshot the memories BEFORE the capture/upsert below so the memory born from THIS edit cannot
         // confirm itself. Gold is excluded to match the capture path: gold human-decisions are the firing
         // eval set (see `firing_error_delta`), and tuning the store on them would leak.
-        let finalized_text = crate::corrections::loop0_draft_text(
-            annotated_transcript.as_deref(),
-            normalized_transcript.as_deref(),
-            &raw_transcript,
-        )
-        .to_string();
+        let finalized_text =
+            crate::corrections::loop0_draft_text(annotated_transcript.as_deref(), &raw_transcript).to_string();
         let confidence_reference: Option<String> = match decision {
             "edit" => corrected_transcript.map(str::to_string),
             "accept" => Some(finalized_text.clone()),

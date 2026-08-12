@@ -264,8 +264,12 @@ pub fn firing_error_delta(gold: &[(String, String)], memories: &[MemoryEntry], c
 /// different texts — which would make the shadow gate measure a different distribution than the evidence
 /// updates on, quietly invalidating the go-live decision. (Distinct from `training_transcript_with_source`,
 /// which DOES prefer the human verdict because it selects the final SHIPPED text, not the original draft.)
-pub fn loop0_draft_text<'a>(annotated: Option<&'a str>, normalized: Option<&'a str>, raw: &'a str) -> &'a str {
-    annotated.or(normalized).unwrap_or(raw)
+pub fn loop0_draft_text<'a>(annotated: Option<&'a str>, raw: &'a str) -> &'a str {
+    // VERBATIM LAW (2026-08-12): the draft the aligner/LOOP-0 works against is the human's typed
+    // text else the champion's verbatim output — never the LLM-refined paraphrase column, which was
+    // measured rewriting 11% of characters. Aligning words the speaker never said produces
+    // confidently wrong timings.
+    annotated.unwrap_or(raw)
 }
 
 /// The Beta(1,1)-posterior mean confidence of a memory given its firing-outcome evidence:
@@ -627,13 +631,13 @@ mod tests {
     // --- evidence-based confidence (Beta(1,1) posterior over confirm/override) ---
 
     #[test]
-    fn loop0_draft_text_prefers_annotated_then_normalized_then_raw() {
+    fn loop0_draft_text_prefers_annotated_then_verbatim_raw() {
         // The single source of truth shared by shadow_log_loop0 and record_human_decision: the memory's
-        // draft is annotated ▸ normalized ▸ raw. It has no verdict slot by construction (the human's
-        // answer is the reference, never the draft), so shadow and evidence can't drift onto different text.
-        assert_eq!(loop0_draft_text(Some("ann"), Some("norm"), "raw"), "ann");
-        assert_eq!(loop0_draft_text(None, Some("norm"), "raw"), "norm");
-        assert_eq!(loop0_draft_text(None, None, "raw"), "raw");
+        // draft is annotated ▸ raw (VERBATIM LAW — normalized holds LLM paraphrase and is banned as
+        // draft text). It has no verdict slot by construction (the human's answer is the reference,
+        // never the draft), so shadow and evidence can't drift onto different text.
+        assert_eq!(loop0_draft_text(Some("ann"), "raw"), "ann");
+        assert_eq!(loop0_draft_text(None, "raw"), "raw");
     }
 
     #[test]

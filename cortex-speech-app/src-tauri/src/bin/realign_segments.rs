@@ -80,13 +80,8 @@ fn main() -> Result<(), String> {
     let started = std::time::Instant::now();
 
     for (i, seg) in targets.iter().enumerate() {
-        // The SAME text selection the background aligner uses: annotated > normalized > raw.
-        let text = corrections::loop0_draft_text(
-            seg.annotated_transcript.as_deref(),
-            seg.normalized_transcript.as_deref(),
-            &seg.raw_transcript,
-        )
-        .to_string();
+        // The SAME text selection the background aligner uses: annotated > raw (VERBATIM LAW).
+        let text = corrections::loop0_draft_text(seg.annotated_transcript.as_deref(), &seg.raw_transcript).to_string();
         if text.trim().is_empty() {
             skipped_empty += 1;
             continue;

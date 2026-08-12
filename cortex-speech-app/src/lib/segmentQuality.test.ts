@@ -41,7 +41,6 @@ describe('hasRealTranscript', () => {
 describe('effectiveTranscript', () => {
   const base = {
     rawTranscript: 'raw',
-    normalizedTranscript: 'normalized',
     annotatedTranscript: null,
     verdictTranscript: null,
     humanDecision: null,
@@ -68,19 +67,19 @@ describe('effectiveTranscript', () => {
     ).toBe('annotated');
   });
 
-  it('falls back through annotated, verdict, normalized, raw in that order', () => {
+  it('falls back through annotated then verbatim raw — machine text never surfaces (VERBATIM LAW)', () => {
     expect(effectiveTranscript({ ...base, annotatedTranscript: 'annotated' })).toBe('annotated');
-    expect(effectiveTranscript({ ...base, verdictTranscript: 'machine' })).toBe('machine');
-    expect(effectiveTranscript(base)).toBe('normalized');
-    expect(effectiveTranscript({ ...base, normalizedTranscript: null })).toBe('raw');
+    // An undecided machine verdict is evidence, not the transcript: the champion's verbatim raw wins.
+    expect(effectiveTranscript({ ...base, verdictTranscript: 'machine' })).toBe('raw');
+    expect(effectiveTranscript(base)).toBe('raw');
   });
 
   it('treats whitespace-only fields as absent rather than selecting them', () => {
-    expect(effectiveTranscript({ ...base, annotatedTranscript: '   ' })).toBe('normalized');
+    expect(effectiveTranscript({ ...base, annotatedTranscript: '   ' })).toBe('raw');
   });
 
   it('returns an empty string when nothing is present', () => {
     // rawTranscript is `string`, not `string | null` — an absent raw transcript is '' by contract.
-    expect(effectiveTranscript({ ...base, rawTranscript: '', normalizedTranscript: null })).toBe('');
+    expect(effectiveTranscript({ ...base, rawTranscript: '' })).toBe('');
   });
 });

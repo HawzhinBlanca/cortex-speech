@@ -2361,11 +2361,7 @@ impl ProcessingPipeline {
             }
         };
         for seg in segments {
-            let text = crate::corrections::loop0_draft_text(
-                seg.annotated_transcript.as_deref(),
-                seg.normalized_transcript.as_deref(),
-                &seg.raw_transcript,
-            );
+            let text = crate::corrections::loop0_draft_text(seg.annotated_transcript.as_deref(), &seg.raw_transcript);
             let would_fire = loop0_would_fire(&memories, text);
             if let Err(error) = db.record_loop0_shadow(&seg.id, would_fire) {
                 tracing::warn!("LOOP-0 shadow log write failed for {}: {error}", seg.id);
@@ -2391,16 +2387,13 @@ impl ProcessingPipeline {
         }
         // Group by source file so each recording is decoded ONCE (a VAD-chunked file yields many
         // segments sharing one audio_path). Carry each segment's source-offset alignment_json + its
-        // finalized text (annotated ▸ normalized ▸ raw — the real 7B transcript post-pass).
+        // finalized text (annotated ▸ raw — the VERBATIM 7B transcript; aligning the LLM-refined
+        // paraphrase would time words the speaker never said).
         let mut by_path: std::collections::HashMap<String, Vec<(String, Option<String>, String)>> =
             std::collections::HashMap::new();
         for s in segments {
-            let text = crate::corrections::loop0_draft_text(
-                s.annotated_transcript.as_deref(),
-                s.normalized_transcript.as_deref(),
-                &s.raw_transcript,
-            )
-            .to_string();
+            let text =
+                crate::corrections::loop0_draft_text(s.annotated_transcript.as_deref(), &s.raw_transcript).to_string();
             by_path.entry(s.audio_path.clone()).or_default().push((s.id.clone(), s.alignment_json.clone(), text));
         }
         let db_path = self.db_path.clone();

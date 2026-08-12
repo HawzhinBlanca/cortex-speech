@@ -1507,6 +1507,8 @@ mod tests {
         })
         .unwrap();
         db.update_verified("keep", true).unwrap();
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        db.record_human_decision("keep", "accept", None, None).unwrap();
         // LEAK: a holdout gold entry + a verified segment on the SAME audio path.
         import_gold_segments(
             &db,
@@ -1521,6 +1523,8 @@ mod tests {
         })
         .unwrap();
         db.update_verified("leak", true).unwrap();
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        db.record_human_decision("leak", "accept", None, None).unwrap();
 
         let out = tempfile::TempDir::new().unwrap();
         let ledger = out.path().join("corpus_ledger.jsonl");
@@ -1590,6 +1594,8 @@ mod tests {
         })
         .unwrap();
         db.update_verified("intact", true).unwrap();
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        db.record_human_decision("intact", "accept", None, None).unwrap();
         // Sibling chunk whose offsets were clobbered to a bare word array: must be SKIPPED,
         // never shipped as the whole recording.
         db.insert_segment(&crate::db::SpeechSegment {
@@ -1601,6 +1607,8 @@ mod tests {
         })
         .unwrap();
         db.update_verified("clobbered", true).unwrap();
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        db.record_human_decision("clobbered", "accept", None, None).unwrap();
 
         let out = tempfile::TempDir::new().unwrap();
         let result = export_finetune_pack(&db, out.path(), None).unwrap();
@@ -1648,6 +1656,8 @@ mod tests {
         })
         .unwrap();
         db.update_verified("good", true).unwrap();
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        db.record_human_decision("good", "accept", None, None).unwrap();
 
         // MARK-BAD: human rejected it; the review flow still sets verified=true to clear the queue.
         db.insert_segment(&crate::db::SpeechSegment {
@@ -1659,6 +1669,8 @@ mod tests {
         })
         .unwrap();
         db.update_verified("markbad", true).unwrap();
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        db.record_human_decision("markbad", "reject", None, None).unwrap();
         db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='markbad'", []).unwrap();
 
         // SEVERE AUDIO: verified but the clip is badly clipped — rubric grade REJECT.
@@ -1672,6 +1684,8 @@ mod tests {
         })
         .unwrap();
         db.update_verified("clipped", true).unwrap();
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        db.record_human_decision("clipped", "accept", None, None).unwrap();
 
         let out = tempfile::TempDir::new().unwrap();
         let result = export_finetune_pack(&db, out.path(), None).unwrap();
@@ -1720,6 +1734,8 @@ mod tests {
             })
             .unwrap();
             db.update_verified(id, true).unwrap();
+            // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+            db.record_human_decision(id, "accept", None, None).unwrap();
         }
 
         let out = tempfile::TempDir::new().unwrap();

@@ -8024,3 +8024,52 @@ an unseen jury verdict; the spot-check answer key trusts machine-seeded text). T
 semantics redesigns and owner decisions, not quick patches.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 271 — gold requires a human decision, and the transcript is verbatim everywhere
+
+**Two owner rules landed together (owner, 2026-08-12: "we wanna be sure we get the exact
+transcription of the audio and not get corrected/translated/changed by other models. this is
+training dataset for ai should be exact audio to text").**
+
+**Rule 1 — gold provenance.** `verified`/`is_gold` alone never mint human provenance again. The
+single source of truth is `training_transcript_with_source`: "human_verified" exists iff a real
+human decision (accept/edit/human_*) produced the text — the text captured at decision time, else
+the typed annotation, else the raw draft the accept was made against. `training_grade_for_segment`
+now derives `human_verified` FROM that source label, so grade and label cannot drift. Kills audit
+defects #7 (^D blessing an unseen jury verdict), #8 (bulk Verify-All exporting machine drafts as
+human gold), #15, #10, #1 (spot-check keys: `human_verified_text` now refuses flag-only rows —
+NOTE: the audit's suggested `reviewed_by`-based SQL fix was WRONG and was reverted after the pin
+test showed desktop decisions legitimately carry `reviewed_by = NULL`; the key tightening lives in
+the quality layer where all callers route). #22 fixed at the shared root: an accept arriving with
+no text now snapshots what the serving law showed (annotated ▸ raw) instead of COALESCE-keeping a
+machine jury proposal as the human's answer. Measured data impact on the live db: exactly 6
+verified-no-decision rows demote to REVIEW; all 139 decided-with-text rows keep gold.
+
+**Rule 2 — the VERBATIM LAW.** The transcript every consumer serves, exports, grades, aligns, or
+displays is: human-decided verdict ▸ annotated ▸ champion raw — never `normalized_transcript` (the
+LLM refinement, measured rewriting a median 11.1% of characters: loanwords translated, digits
+verbalized) and never an undecided machine jury verdict. Changed in one sweep, mirrors kept
+byte-consistent: `quality::training_transcript_with_source`, `stats.rs::EFFECTIVE` (SQL mirror),
+`scripts/retrain_readiness.py` (script mirror), `corrections::loop0_draft_text` (aligner/LOOP-0 —
+timings are no longer computed against words the speaker never said), `jury/learning.rs` LM-corpus
+SQL, frontend `segmentQuality.effectiveTranscript`, ReviewMode `originalText`, App card list,
+DiffView base, and the desktop align-after-transcribe text. SILVER semantics tightened for free:
+machine-consensus rows are training-ready only when the jury/t2 evidence certifies the RAW text
+the export now actually ships (`evidence_transcript_matches` against raw). Refined text remains
+stored as jury EVIDENCE only.
+
+**Gates, all fail-before or count-verified:** new `test_verbatim_training_text_policy.py`
+(11 violations pre-fix → 0; function-scoped, with the `?? ''` labeled-column exemption). Full
+suites after the pin flips: **cargo --lib 1164 passed / 0 failed** (37 → 23 → 4 → 1 → 0 across the
+fixture surgery — the export/eval fixtures minted gold via the bare flag, exactly the fabrication
+the law bans, and `insert_segment` silently DROPS `human_decision`, so fixtures switched to
+`insert_segment_full`), clippy --all-targets clean, vitest 238/238, typecheck 0 errors, python
+policies **61/61** (both mirror scripts re-copied per their own instructions). Two vacuous-pass
+traps caught during the work: a `| tail` pipe masking cargo's exit code (37 failures read as
+EXIT=0), and a renamed test filter matching zero tests ("0 passed" read as green).
+
+**Deployment:** committed and REBUILT this window (reviewers paused by the owner); the running app
+now enforces both laws. The refinement setting stays available but its output can no longer reach
+a reviewer, an export, or an aligner.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

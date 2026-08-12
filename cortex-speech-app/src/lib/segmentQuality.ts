@@ -44,10 +44,7 @@ export function isPlaceholderTranscript(text: string | null | undefined): boolea
  * was measured as whatever stale text sat in annotated/raw. One helper, one order.
  */
 export function effectiveTranscript(
-  seg: Pick<
-    SpeechSegment,
-    'rawTranscript' | 'normalizedTranscript' | 'annotatedTranscript' | 'verdictTranscript' | 'humanDecision' | 'verdict'
-  >,
+  seg: Pick<SpeechSegment, 'rawTranscript' | 'annotatedTranscript' | 'verdictTranscript' | 'humanDecision' | 'verdict'>,
 ): string {
   const nonEmpty = (t: string | null | undefined) => (t ?? '').trim();
   const humanDecided =
@@ -55,7 +52,9 @@ export function effectiveTranscript(
     ['human_accept', 'human_edit'].includes((seg.verdict ?? '').toLowerCase());
   const verdictText = nonEmpty(seg.verdictTranscript);
   if (humanDecided && verdictText) return verdictText;
-  return nonEmpty(seg.annotatedTranscript) || verdictText || nonEmpty(seg.normalizedTranscript) || nonEmpty(seg.rawTranscript);
+  // VERBATIM LAW (2026-08-12): human text else the champion's verbatim raw — never an undecided
+  // machine verdict, never the LLM-refined paraphrase (measured rewriting 11% of characters).
+  return nonEmpty(seg.annotatedTranscript) || nonEmpty(seg.rawTranscript);
 }
 
 /**

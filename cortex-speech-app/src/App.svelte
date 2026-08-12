@@ -1140,7 +1140,9 @@
       // the stale quality from `seg` clobber a fresh ctc_forced stamp. Best-effort: a failed align
       // keeps the successfully saved transcript.
       if ($settings.autoAlign) {
-        const alignText = normalizedTranscript ?? result.text;
+        // VERBATIM LAW: align against the champion's verbatim output — timing the refined
+        // paraphrase would stamp confident word timings onto words the speaker never said.
+        const alignText = result.rawTranscript;
         if (alignText?.trim()) {
           try {
             const ts = await api.alignSegment(seg.audioPath, alignText, seg.alignmentJson, seg.id);
@@ -1865,7 +1867,7 @@
     const seg = $selectedSegment;
     if (!seg) return;
     if (!requireDesktopRuntime()) return;
-    const text = seg.annotatedTranscript ?? seg.normalizedTranscript ?? seg.rawTranscript;
+    const text = seg.annotatedTranscript ?? seg.rawTranscript; // VERBATIM LAW: human else champion-raw
     if (!text) return;
     startOperation('align');
     isProcessing.set(true);
@@ -2602,10 +2604,7 @@
                         </span>
                       {/if}
                       <span class="text-[11px] text-cortex-500 truncate mt-0.5" dir="rtl" lang="ckb">
-                        {item.annotatedTranscript ??
-                          item.normalizedTranscript ??
-                          item.rawTranscript ??
-                          '...'}
+                        {item.annotatedTranscript ?? item.rawTranscript ?? '...'}
                       </span>
                     </div>
                   </div>
@@ -3105,7 +3104,7 @@
             </div>
 
             <DiffView
-              raw={$selectedSegment.normalizedTranscript ?? $selectedSegment.rawTranscript ?? ''}
+              raw={$selectedSegment.rawTranscript ?? ''}
               annotated={$selectedSegment.annotatedTranscript ?? ''}
             />
 

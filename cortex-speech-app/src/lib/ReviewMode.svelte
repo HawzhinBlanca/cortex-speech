@@ -416,7 +416,9 @@
   }
 
   function originalText(seg: SpeechSegment): string {
-    return seg.annotatedTranscript ?? seg.normalizedTranscript ?? seg.rawTranscript ?? '';
+    // VERBATIM LAW (2026-08-12): the reviewer corrects the human draft else the champion's verbatim
+    // output — never the LLM-refined paraphrase column.
+    return seg.annotatedTranscript ?? seg.rawTranscript ?? '';
   }
 
   // Rebuild an upsert payload from the FRESHEST store copy of the row. update_segment writes the

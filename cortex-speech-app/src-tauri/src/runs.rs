@@ -1005,7 +1005,7 @@ mod tests {
         let segment = SpeechSegment {
             id: "seg-report".to_string(),
             audio_path: audio_path.clone(),
-            raw_transcript: "raw candidate".to_string(),
+            raw_transcript: "final candidate".to_string(),
             duration_ms: 2000,
             ..SpeechSegment::default()
         };
@@ -1262,7 +1262,7 @@ mod tests {
         let segment = SpeechSegment {
             id: "seg-weak-coverage".to_string(),
             audio_path: audio_path.clone(),
-            raw_transcript: "raw candidate".to_string(),
+            raw_transcript: "final candidate".to_string(),
             duration_ms: 2000,
             ..SpeechSegment::default()
         };

@@ -31,14 +31,14 @@ import sys
 from pathlib import Path
 
 # Copied from stats.rs (see module doc for why this exact shape and no other).
+# VERBATIM LAW (2026-08-12): human-decided verdict -> annotated -> champion raw; machine text
+# (undecided jury verdicts, LLM-refined normalized) never surfaces as THE transcript.
 EFFECTIVE = """TRIM(CASE
         WHEN TRIM(COALESCE(verdict_transcript,'')) <> ''
              AND (LOWER(COALESCE(human_decision,'')) IN ('accept','edit','human_accept','human_edit')
                   OR LOWER(COALESCE(verdict,'')) IN ('human_accept','human_edit'))
             THEN verdict_transcript
         WHEN TRIM(COALESCE(annotated_transcript,'')) <> '' THEN annotated_transcript
-        WHEN TRIM(COALESCE(verdict_transcript,'')) <> '' THEN verdict_transcript
-        WHEN TRIM(COALESCE(normalized_transcript,'')) <> '' THEN normalized_transcript
         ELSE COALESCE(raw_transcript,'') END)"""
 REJECTED = "(COALESCE(human_decision,'') IN ('reject','human_reject') OR COALESCE(verdict,'') = 'human_reject')"
 PLACEHOLDER = f"""(substr({EFFECTIVE}, 1, 8) = '[Pending'

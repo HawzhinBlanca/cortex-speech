@@ -143,14 +143,15 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
     // substr(), not LIKE: SQLite's LIKE is case-INSENSITIVE for ASCII while Rust's `starts_with` is
     // not, so LIKE would exclude a '[pending…' row that the export keeps — drift in the other
     // direction. `n/a` and `null` DO compare case-insensitively, matching eq_ignore_ascii_case.
+    // VERBATIM LAW (2026-08-12): human-decided verdict → annotated → champion raw. Machine text
+    // (jury verdicts without a human decision, LLM-refined normalized) never surfaces as THE
+    // transcript — mirrors the updated quality::training_transcript_with_source exactly.
     const EFFECTIVE: &str = "TRIM(CASE
             WHEN TRIM(COALESCE(verdict_transcript,'')) <> ''
                  AND (LOWER(COALESCE(human_decision,'')) IN ('accept','edit','human_accept','human_edit')
                       OR LOWER(COALESCE(verdict,'')) IN ('human_accept','human_edit'))
                 THEN verdict_transcript
             WHEN TRIM(COALESCE(annotated_transcript,'')) <> '' THEN annotated_transcript
-            WHEN TRIM(COALESCE(verdict_transcript,'')) <> '' THEN verdict_transcript
-            WHEN TRIM(COALESCE(normalized_transcript,'')) <> '' THEN normalized_transcript
             ELSE COALESCE(raw_transcript,'') END)";
     let placeholder = format!(
         "(substr({EFFECTIVE}, 1, 8) = '[Pending'
