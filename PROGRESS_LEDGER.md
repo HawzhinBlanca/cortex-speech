@@ -8131,3 +8131,41 @@ reviewers returning is itself the path to them. Log:
 %LOCALAPPDATA%\Temp\cortex-verify10\runs.jsonl + the session sweep log.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 274 — blueprint step 1 shipped; step 2 blocked on billing, and the attempt found a live defect
+
+**Step 1 (done): the verbatim conventions.** `docs/SORANI_VERBATIM_CONVENTIONS_v1.md` — a versioned
+Sorani style guide covering the rules reviewers were previously left to guess: repetitions/stutters
+kept, fillers kept, LOANWORDS WRITTEN AS SPOKEN (مەعاش stays مەعاش, never "corrected" to مووچە —
+the exact substitution the Gemini refiner made), numbers as spoken, no invented punctuation, no
+grammar fixes, dialect preserved, reject-don't-guess. Research basis: transcription policy left
+implicit makes up to 60% of measured error style-mismatch noise (arXiv 2607.18934). Includes the
+20-clip calibration protocol and states the guide changes when a reviewer is right.
+
+**Step 2 (BLOCKED, honestly): Gemini-as-ASR benchmark.** Built
+`src-tauri/src/bin/gemini_asr_bench.rs` — transcribes the frozen FLEURS ckb manifest (922 clips,
+sha256 c040242390ba… verified) and writes ONLY a hypothesis TSV; scoring stays in the existing
+scorecard so the champion's 7.03% and Gemini's number share one normalization + seed-42 bootstrap by
+construction, not by hope. Pilot run: **0 of 12 transcribed — HTTP 429 "Your prepayment credits are
+depleted."** The owner's Gemini key has no credits. No number was produced and none is claimed;
+the benchmark is ready to run the moment billing is restored.
+
+**Defect the failed pilot exposed (fixed):** `llm_refiner::is_transient` treated EVERY 429 as
+retryable, including billing/quota exhaustion — which no backoff can fix. In a live batch that is
+4 attempts and 7 s of wasted backoff PER CLIP, and the run then reports a retry exhaustion instead
+of "you are out of credits." Billing/quota 429s are now permanent (checked before the 429 rule, like
+the other permanent classes), mirrored in the bench binary as a hard stop. Fail-before verified: the
+guard removed → `transient_errors_retry_and_permanent_ones_stop_immediately` FAILS on the real
+provider string; restored byte-identical (sha 9ccabe81aff4474b before and after) → passes.
+
+**Privacy gate caught a shortcut, and the fix strengthened it.** The bench binary first reached for
+`gemini_api`'s `pub(crate)` helpers by widening them to `pub`;
+`test_cloud_privacy_policy.py` pins that declaration and went red. Widening lib surface so a
+benchmark could hand-assemble a cloud request was the wrong answer: the audio call now lives INSIDE
+the audited module as `gemini_api::transcribe_audio` (key in the `x-goog-api-key` header, never the
+URL; provider errors redacted), the binary is a thin driver, and the gate gained two assertions
+covering the new audio path. A gate going red is a gate working.
+
+**Verified:** cargo --lib 1169/0, clippy --all-targets clean, python policies 61/61.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

@@ -252,6 +252,12 @@ def test_cloud_error_paths_redact_secrets() -> None:
     assert_contains(gemini_api, 'pub(crate) const API_KEY_HEADER: &str = "x-goog-api-key";', GEMINI_API_RS.name)
     assert_contains(gemini_api, "request.set(API_KEY_HEADER, api_key)", GEMINI_API_RS.name)
     assert_contains(gemini_api, "assert!(!url.contains(\"?key=\"));", GEMINI_API_RS.name)
+    # The AUDIO path (whole-file references, the T2 audio panel, the ckb ASR benchmark) must route
+    # through this same audited client — a caller that assembled its own request would sit outside
+    # this file's key-in-header / redaction guarantees, which is precisely how a key reaches a query
+    # string. Pin both halves: the audio entry point exists here, and it redacts provider errors.
+    assert_contains(gemini_api, "pub fn transcribe_audio(", GEMINI_API_RS.name)
+    assert_contains(gemini_api, "crate::secret_redaction::redact_api_key(", GEMINI_API_RS.name)
 
 
 def test_release_docs_keep_cloud_privacy_gate() -> None:

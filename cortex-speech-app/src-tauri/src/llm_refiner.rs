@@ -32,6 +32,19 @@ fn is_transient(error: &str) -> bool {
     if e.contains("404") || e.contains("not a valid model") || e.contains("no endpoints found") {
         return false;
     }
+    // A 429 is USUALLY throttling, but the billing/quota family is permanent for this run: no amount
+    // of backoff refills a depleted balance. MEASURED 2026-08-12 on the real API — "Your prepayment
+    // credits are depleted" arrives as HTTP 429, so the blanket 429 rule below spent 4 attempts and
+    // 7 s of backoff PER CLIP before failing, and reported it as a retry exhaustion rather than as
+    // the billing problem it is. Checked before the 429 rule, like the other permanent classes.
+    if e.contains("credits are depleted")
+        || e.contains("insufficient credit")
+        || e.contains("quota exceeded")
+        || e.contains("exceeded your current quota")
+        || e.contains("billing")
+    {
+        return false;
+    }
     e.contains("429")
         || e.contains("rate limit")
         || e.contains("timed out")
@@ -290,6 +303,11 @@ mod tests {
     #[test]
     fn transient_errors_retry_and_permanent_ones_stop_immediately() {
         for permanent in [
+            // Billing/quota exhaustion arrives as 429 but no backoff can fix it (measured on the
+            // real Gemini API, 2026-08-12): retrying burns 7 s per clip and hides the real cause.
+            "generativelanguage.googleapis.com status 429: Your prepayment credits are depleted.",
+            "Local LLM request failed: status code 429 - quota exceeded",
+            "openrouter.ai returned no message content: You exceeded your current quota, please check your billing",
             "openrouter.ai returned no message content: 401 Unauthorized",
             "Local LLM request failed: status code 403",
             "openrouter.ai returned no message content: not a valid model id",
