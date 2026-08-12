@@ -8199,3 +8199,39 @@ wrong, not because the gate is.
 mechanism the blueprint's double-pass + adjudication stage would replenish continuously.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 276 — MEASURED: the champion drafts alone; Gemini fusion is not a win
+
+The owner's question ("champion + Gemini, then human — true?") now has a number instead of an
+opinion. All engines scored by ONE code path (`scorecard_gemini.py` imports `scorecard_7b`'s `_NORM`,
+`edit_distance` and the seed-42 bootstrap), paired on the IDENTICAL 890 clips.
+
+| draft | CER | 95% CI | WER |
+|---|---|---|---|
+| **champion alone** | **7.02%** | [6.45, 7.65] | 32.70% |
+| Gemini 2.5 Pro alone | 9.58% | [8.83, 10.37] | 33.43% |
+| fusion (Gemini overrides on disagreement) | 7.32% | [6.75, 7.94] | 31.70% |
+| fusion (ROVER, ties keep champion) | 7.02% | — | 32.70% (0 clips changed) |
+
+MAPSSWE matched-pairs, N=890: champion beats Gemini on CER at **p=2.4e-30**. Champion beats the
+fused draft on CER at p=5.4e-4 — while the fused draft beats the champion on WER at p=2.5e-4. Real
+trade, both directions significant: Gemini recovers whole words the champion mangles, but when it is
+wrong it is wrong by more characters.
+
+**Decision: the champion drafts alone.** CER is the metric this project publishes and the basis of
+the 7.03% claim; adopting fusion would move the headline the wrong way for a 3%-relative WER gain,
+while adding a cloud dependency to every clip. Practical seal: gemini-2.5-pro is capped at **1000
+requests/day** (the run hard-stopped at 890/922 on that quota), so it could never draft a corpus of
+this size regardless of quality.
+
+Honest scope: measured on FLEURS = READ speech; the ranking on spontaneous dialectal audio is
+untested. Only two engines voted, so ROVER had no tiebreaker (0 changes by construction). Gemini's
+number is under this project's verbatim prompt, which is the task that matters here.
+
+Three traps the harness caught rather than swallowed: (a) the champion ran in WSL and Gemini on
+Windows, so joining on raw paths gave ZERO overlap — the zero-overlap guard refused instead of
+scoring an empty set; (b) an early 27-clip read showed Gemini at 7.78%, which the full 890 corrected
+to 9.58% — small-n optimism, flagged at the time; (c) the daily-quota 429 hard-stopped instead of
+retrying, per the fix in iteration 274.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
