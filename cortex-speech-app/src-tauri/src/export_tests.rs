@@ -80,6 +80,36 @@ fn a_withdrawn_recording_is_dropped_from_the_local_export() {
     );
 }
 
+#[test]
+fn the_shared_export_filter_drops_rejected_and_placeholder_rows() {
+    // Audit #11/#12: export_audio applied neither filter, so a human-REJECTED clip (verified is
+    // deliberately true on it) and a placeholder-only clip both shipped in the audio export while
+    // every other exporter dropped them. Enforced at the shared root so no caller can miss it.
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+
+    let mut good = sample_segment("keep-good");
+    good.audio_path = "/keep.wav".into();
+    let mut rejected = sample_segment("drop-rejected");
+    rejected.audio_path = "/rej.wav".into();
+    let mut placeholder = sample_segment("drop-placeholder");
+    placeholder.audio_path = "/ph.wav".into();
+    placeholder.raw_transcript = "[Pending WSL 7B ASR]".into();
+    placeholder.normalized_transcript = None;
+    placeholder.annotated_transcript = None;
+    placeholder.human_decision = None;
+    for s in [&good, &rejected, &placeholder] {
+        db.insert_segment_full(s).unwrap();
+    }
+    db.record_human_decision("drop-rejected", "reject", None, None).unwrap();
+    let rejected = db.get_segment_by_id("drop-rejected").unwrap().unwrap();
+    let placeholder = db.get_segment_by_id("drop-placeholder").unwrap().unwrap();
+
+    let kept = exclude_unexportable_segments(&db, vec![good, rejected, placeholder]).unwrap();
+    let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, vec!["keep-good"], "rejected + placeholder rows must never leave the app: {ids:?}");
+}
+
 fn insert_machine_silver_segment_with_hf_coverage(
     db: &Database,
     wav_path: &std::path::Path,

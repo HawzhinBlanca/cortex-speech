@@ -1275,7 +1275,7 @@ export interface FinetunePackResult {
   /** P5.5: pins the exact rows this pack contains — the corpus-ledger key. */
   manifestSha256: string;
   totalVerified: number;
-  excludedHoldout: number;
+  excludedUnexportable: number;
   /** Rows the training-grade rubric refused (mark-bad, severe audio, placeholder) — the B1 guard. */
   excludedNotTrainingReady: number;
   emitted: number;

@@ -8073,3 +8073,46 @@ now enforces both laws. The refinement setting stays available but its output ca
 a reviewer, an export, or an aligner.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 272 — the brutal pass: every reachable audit defect closed before the reviewers return
+
+**Owner ask:** one last brutal reality check for a true 10/10 before recalling the reviewers. A
+10/10 claim cannot stand over open confirmed defects, so this window closes every remaining
+text-provenance-audit finding reachable from the review pipeline:
+
+- **#2/#3 (undo fence):** undo now refuses unless the row still carries the exact `updated_at`
+  fingerprint captured when the decision's final write landed — `reviewed_by` alone let every
+  non-decision writer (batch normalize, refine loop, desktop edit, champion re-draft) be silently
+  reverted. New `UndoEntry` carries the stamp; `db.segment_row_stamp` is the fingerprint reader.
+- **#4 (serve/decide race):** the queue stamps each clip with `rowVersion` (the row's `updated_at`
+  at serve time), couch.html echoes it on every decision, and a decision against a replaced draft
+  is refused 409 — never recorded, never minted into a DPO pair. Replays finishing an
+  already-recorded decision are exempt (their write one legitimately moved the stamp); a page from
+  before this deploy sends nothing and is fenced by the existing verified/lease guards only.
+- **#17/#18 (jury):** `write_verdict` gains the `AND verified = 0` guard its siblings had, and
+  writes `jury_transcript` for parity with `db::write_segment_verdict` — the machine's own proposal
+  now survives a later human decision on both machine-verdict writers.
+- **#24 (consensus):** `update_segment_consensus_batch` gains the missing `AND verified = 0`.
+- **#11/#12 (export):** rejected + placeholder rows are dropped in `exclude_unexportable_segments`
+  — the shared root, per that function's own "a rule enforced per-caller gets missed by the sixth
+  caller" doctrine — so export_audio can no longer ship them. The finetune-pack counter that
+  silently absorbed the new drops was renamed `excluded_unexportable` end to end (Rust field, JSON
+  key, TS type, dashboard) rather than left lying as "holdout".
+- **#20 (champion law in tooling):** `batch_processor` HARD-STOPS at startup when the configured
+  primary engine is the WSL 7B champion — it drafts with the offline CTC engine and would have
+  silently downgraded the whole queue.
+
+**Proof:** mutation fail-before on BOTH couch fences (fences neutered with `if false &&` → both new
+tests FAIL → file restored byte-identical, sha256 2ad04b9624bd1c43 before and after). Five new
+regression tests, each discriminating by construction (0-changed/None-verdict asserts cannot pass
+against the old code). Full suites: **cargo --lib 1169 passed / 0 failed**, clippy --all-targets
+clean (exit captured directly this time, not through a pipe), vitest 238/238, typecheck 0 errors,
+python policies 61/61.
+
+**Remaining open, disclosed:** #21 (desktop `update_segment` whole-row upsert has no freshness
+check — desktop-only, the owner's own surface, same-second granularity caveat applies) and #13/#14
+collapsed to informational (the scripts trust `transcriptSource`, which since iteration 271 is
+minted only under the gold-provenance law). Nothing else from the 27 confirmed findings remains
+reachable.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

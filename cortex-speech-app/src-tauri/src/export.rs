@@ -290,6 +290,19 @@ pub(crate) fn exclude_unexportable_segments(
             tracing::info!(segment_id = %seg.id, "export: dropping segment with withdrawn consent");
             continue;
         }
+        // Text-provenance audit #11/#12: enforced HERE, at the shared root, for the same reason as
+        // the withdrawal rule above — export_audio applied neither filter, so a human-REJECTED clip
+        // (bad data the reviewer discarded; `verified` is deliberately true on it) and a
+        // placeholder-only clip both shipped in the audio export while every other exporter dropped
+        // them.
+        if crate::quality::is_human_rejected(&seg) {
+            tracing::info!(segment_id = %seg.id, "export: dropping human-rejected segment");
+            continue;
+        }
+        if crate::quality::is_effective_placeholder(&seg) {
+            tracing::info!(segment_id = %seg.id, "export: dropping placeholder-only segment");
+            continue;
+        }
         kept.push(seg);
     }
     let segments = kept;

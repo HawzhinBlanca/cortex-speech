@@ -791,7 +791,9 @@
     const isSkip = action === 'skip';
     busy = true;
     const btns = ['save','accept','bad','skip','undo'].map($); btns.forEach(b => b.disabled = true);
-    const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me };
+    // rowVersion: the row fingerprint this clip was SERVED with — the server refuses the decision
+    // if the draft changed in between, so what gets recorded is always judged-as-seen.
+    const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me, rowVersion: queue[i].rowVersion };
     try {
       await api('/api/decision', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),

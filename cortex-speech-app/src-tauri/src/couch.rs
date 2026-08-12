@@ -115,13 +115,26 @@ const ACCEPT_POLL: Duration = Duration::from_millis(250);
 static COUCH_RATE_LIMITER: crate::throttle::GlobalRateLimiter =
     crate::throttle::GlobalRateLimiter::new_with_burst(120, 60);
 
+/// One undoable phone decision: the pre-decision snapshot to restore, plus the row's
+/// post-decision `updated_at` fingerprint — the staleness fence `api_undo` compares before
+/// restoring (text-provenance audit #2/#3: the old fence keyed only on `reviewed_by`, which no
+/// non-decision writer touches, so a batch normalize / desktop edit / champion re-draft between
+/// decision and undo was silently reverted to the snapshot).
+struct UndoEntry {
+    seg_id: String,
+    prev: SpeechSegment,
+    /// `None` until the decision's final row write lands: an entry with no stamp is a decision
+    /// whose write never completed, and restoring over an unverifiable state is not a safe inverse.
+    decided_stamp: Option<String>,
+}
+
 /// Per-session state shared by the accept threads. One mutex: the critical sections are map lookups,
 /// held for microseconds, while the slow work (DB writes, WAV encoding) happens outside it.
 #[derive(Default)]
 struct CouchState {
     /// Pre-decision row snapshots, keyed by reviewer name — so undo is per-person and can never
     /// retract someone else's work.
-    undo: HashMap<String, Vec<(String, SpeechSegment)>>,
+    undo: HashMap<String, Vec<UndoEntry>>,
     /// segment id -> (reviewer who holds it, when it was granted). Entries older than [`LEASE_TTL`]
     /// are ignored and pruned, so a lease needs no explicit release on disconnect.
     leases: HashMap<String, (String, Instant)>,
@@ -1155,6 +1168,9 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 "durationMs": s.duration_ms,
                 "speakerId": s.speaker_id,
                 "speakerChange": holds_a_speaker_change(s),
+                // The row's change-fingerprint at serve time; the page echoes it on the decision so
+                // a draft replaced by a background writer in between is refused, never recorded.
+                "rowVersion": db.segment_row_stamp(&s.id).ok().flatten(),
             })
         })
         .collect();
@@ -1204,6 +1220,8 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                             // field differently would be spottable, and a reviewer who can spot the
                             // test is not being tested.
                             "speakerChange": holds_a_speaker_change(&seg),
+                            // Same field as work clips for the same indistinguishability reason.
+                            "rowVersion": db.segment_row_stamp(&seg.id).ok().flatten(),
                         }),
                     );
                 }
@@ -1523,6 +1541,14 @@ struct DecisionBody {
     /// review corpus cannot be wrong about.
     #[serde(default)]
     reviewer: Option<String>,
+    /// The row's `updated_at` as it was when the clip was SERVED (text-provenance audit #4). The
+    /// queue payload carries it and the page echoes it back, so a decision made against a draft
+    /// that a background writer replaced in between is refused rather than recorded — the accept/
+    /// edit classification and the DPO pair are only meaningful against the text the reviewer saw.
+    /// Optional for one deploy generation: a page from before this field exists sends nothing and
+    /// is fenced only by the existing verified/lease guards.
+    #[serde(default, rename = "rowVersion")]
+    row_version: Option<String>,
 }
 
 /// Record one phone decision through the exact desktop path: `record_human_decision_by` FIRST (its
@@ -1684,6 +1710,25 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         return json_reply(200, serde_json::json!({ "ok": true, "duplicate": true }));
     }
 
+    // SERVE/DECIDE VERSION FENCE (text-provenance audit #4). The queue stamped this clip's
+    // `updated_at` into the payload; if the row changed between serve and submit (batch
+    // re-transcribe, refine loop, desktop edit — all of which target exactly the unverified rows
+    // the couch serves), the reviewer judged text that no longer exists: recording it would
+    // misclassify accept-vs-edit against the NEW row and mint a DPO pair anti-training the fresher
+    // draft. Refuse; the page reloads and serves the current text. Skipped for a replay finishing
+    // an already-recorded decision — its write one landed, so the stamp has legitimately moved.
+    if !already_recorded {
+        if let Some(served_stamp) = parsed.row_version.as_deref() {
+            match db.segment_row_stamp(&parsed.id) {
+                Ok(Some(current)) if current != served_stamp => {
+                    return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
+                }
+                Ok(_) => {}
+                Err(e) => return err_reply(500, &e.to_string()),
+            }
+        }
+    }
+
     // THE LATE-SUBMIT GUARD. The lease is RELEASED the moment a clip is decided — correctly, since it
     // is no longer pending work — which leaves an already-decided clip unprotected by the collision
     // check below. A stale page could then submit onto it minutes later and silently replace another
@@ -1722,7 +1767,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         // entry pushed by the original attempt is the true one and is deliberately left in place.
         if !already_recorded {
             let stack = guard.undo.entry(reviewer.to_string()).or_default();
-            stack.push((prev.id.clone(), prev.clone()));
+            stack.push(UndoEntry { seg_id: prev.id.clone(), prev: prev.clone(), decided_stamp: None });
             // Bounded HERE, at the only site that grows it: the pushes in api_undo are restorations of
             // an entry just popped, so they cannot exceed what the stack already held.
             let overflow = stack.len().saturating_sub(UNDO_DEPTH);
@@ -1763,6 +1808,21 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     if let Err(e) = db.insert_segment(&updated) {
         return err_reply(500, &e.to_string());
     }
+    // Stamp the undo entry with the row's POST-decision fingerprint, now that the final write has
+    // landed — api_undo refuses to restore unless the row still carries exactly this stamp, which
+    // is what makes undo safe against every intervening writer, not only re-reviews. On a resumed
+    // half-written decision the original attempt's entry (stamp still None) is the one completed.
+    let decided_stamp = db.segment_row_stamp(&parsed.id).ok().flatten();
+    {
+        let mut guard = lock_state(state);
+        if let Some(entry) = guard
+            .undo
+            .get_mut(reviewer)
+            .and_then(|stack| stack.iter_mut().rev().find(|e| e.seg_id == parsed.id && e.decided_stamp.is_none()))
+        {
+            entry.decided_stamp = decided_stamp;
+        }
+    }
     // Decided, so the lease has served its purpose — release it rather than waiting out the TTL. (The
     // clip also leaves the pending queue, so this is housekeeping, not correctness.)
     lock_state(state).leases.remove(&parsed.id);
@@ -1787,19 +1847,22 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
 /// whichever decision happened to be last — usually someone else's, with no indication to either of them.
 fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
     let popped = lock_state(state).undo.get_mut(reviewer).and_then(|stack| stack.pop());
-    let Some((id, prev)) = popped else {
+    let Some(entry) = popped else {
         return err_reply(409, "nothing to undo");
     };
+    let id = entry.seg_id.clone();
     // STALENESS FENCE. `prev` is a whole-row snapshot taken at decision time and never refreshed, and
-    // the restore below rewrites EVERY column from it. If anyone touched the clip in between — the
-    // owner correcting it at the desktop, most obviously, since a decided clip is visible and editable
-    // there — undo silently destroys that work and reverts the row to a state the other person never
-    // agreed to. api_decision guards this exact class by re-reading the fresh row before it writes;
-    // the undo path simply did not. Refuse instead, and keep the entry so nothing is lost either way.
+    // the restore below rewrites EVERY column from it. If ANYONE touched the clip in between, undo
+    // silently destroys that work and reverts the row to a state nobody agreed to. The fence is the
+    // row's `updated_at` fingerprint captured when the decision's final write landed: `reviewed_by`
+    // alone was not enough (audit #2/#3) — batch normalize, the refine loop, a desktop edit and a
+    // champion re-draft all rewrite text columns WITHOUT touching `reviewed_by`, so every one of
+    // them slipped past the old fence and was reverted. Refuse instead, and keep the entry so
+    // nothing is lost either way; the reviewed_by check stays first purely for its better message.
     match db.get_segment_by_id(&id) {
         Ok(Some(fresh)) if fresh.reviewed_by.as_deref() != Some(reviewer) => {
             let owner = fresh.reviewed_by.clone();
-            lock_state(state).undo.entry(reviewer.to_string()).or_default().push((id, prev));
+            lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
             return match owner {
                 Some(other) => {
                     err_reply(409, &format!("{other} has reviewed this clip since — undo would erase their work"))
@@ -1809,18 +1872,31 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
                 }
             };
         }
-        Ok(Some(_)) => {}
+        Ok(Some(_)) => {
+            let fresh_stamp = match db.segment_row_stamp(&id) {
+                Ok(stamp) => stamp,
+                Err(e) => {
+                    lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
+                    return err_reply(500, &e.to_string());
+                }
+            };
+            if entry.decided_stamp.is_none() || fresh_stamp != entry.decided_stamp {
+                lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
+                return err_reply(409, "this clip has been changed since the decision — undo would erase that change");
+            }
+        }
         Ok(None) => {
-            lock_state(state).undo.entry(reviewer.to_string()).or_default().push((id, prev));
+            lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
             return err_reply(404, "no such segment");
         }
         Err(e) => {
-            lock_state(state).undo.entry(reviewer.to_string()).or_default().push((id, prev));
+            lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
             return err_reply(500, &e.to_string());
         }
     }
+    let prev = entry.prev.clone();
     if let Err(e) = db.clear_human_decision(&id) {
-        lock_state(state).undo.entry(reviewer.to_string()).or_default().push((id, prev));
+        lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
         return err_reply(500, &e.to_string());
     }
     if let Err(e) = db.insert_segment_full(&prev) {
@@ -1828,7 +1904,7 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
         // committed, so dropping it here left the clip permanently half-undone: unverified columns
         // cleared, the retracted edit still sitting in annotated_transcript, and nothing anywhere able
         // to put it back. Push it back so a retry — or the next reviewer's ↩ — can still complete it.
-        lock_state(state).undo.entry(reviewer.to_string()).or_default().push((id, prev));
+        lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
         return err_reply(500, &e.to_string());
     }
     // The clip is pending again and this reviewer is about to see it — hold it for them so a second
@@ -1863,7 +1939,11 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
             }
         }
     }
-    json_reply(200, serde_json::json!({ "id": id }))
+    // The restore rewrote the row, so the page's served rowVersion is stale by construction. Hand
+    // back the fresh fingerprint so the immediate re-decision (the whole point of undo) is not
+    // refused by the serve/decide fence it would otherwise trip.
+    let row_version = db.segment_row_stamp(&id).ok().flatten();
+    json_reply(200, serde_json::json!({ "id": id, "rowVersion": row_version }))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -2079,6 +2159,82 @@ mod tests {
         // become "nothing to undo" on the next press.
         let (code, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 409, "still refused, and still present rather than swallowed");
+    }
+
+    #[test]
+    fn undo_refuses_when_any_writer_touched_the_row_since_not_only_a_re_review() {
+        // Audit #2/#3: the old fence keyed ONLY on reviewed_by, which no non-decision writer touches
+        // — batch normalize, the refine loop, a desktop text edit and a champion re-draft all rewrite
+        // transcript columns while leaving reviewed_by intact, so undo silently reverted every one of
+        // them. The fence is now the row's updated_at fingerprint captured post-decision.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
+        let state = state();
+
+        let body = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوەی سارا"});
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200);
+
+        // A reviewed_by-PRESERVING writer touches the row (what batch normalize does). The sentinel
+        // updated_at makes the change deterministic — datetime('now') has 1 s granularity, so a real
+        // writer inside the same second would be invisible to a wall-clock-based assertion.
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET normalized_transcript='نوێ', updated_at='2030-01-01 00:00:00' WHERE id='s1'",
+                [],
+            )
+            .unwrap();
+
+        let (code, _, msg, ..) = api_undo(&db, "Sara", &state);
+        assert_eq!(code, 409, "undo must refuse: a background writer touched the row since the decision");
+        assert!(
+            String::from_utf8_lossy(&msg).contains("changed since the decision"),
+            "the refusal names the reason: {msg:?}"
+        );
+        let row = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert_eq!(row.normalized_transcript.as_deref(), Some("نوێ"), "the later write must survive");
+        assert_eq!(row.reviewed_by.as_deref(), Some("Sara"), "the decision itself is untouched by the refusal");
+
+        // Kept, not consumed: a refused undo must not become \"nothing to undo\".
+        let (code, ..) = api_undo(&db, "Sara", &state);
+        assert_eq!(code, 409);
+    }
+
+    #[test]
+    fn a_decision_against_a_replaced_draft_is_refused_not_recorded() {
+        // Audit #4: the queue stamps each clip with the row's updated_at (rowVersion) and the page
+        // echoes it back. If a background re-draft replaced the text between serve and submit, the
+        // reviewer judged text that no longer exists — recording it would misclassify accept-vs-edit
+        // against the NEW row and mint a DPO pair anti-training the fresher draft.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەقی کۆن")).unwrap();
+        let state = state();
+        let served = db.segment_row_stamp("s1").unwrap().expect("row exists");
+
+        // A batch re-draft lands after the clip was served.
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET raw_transcript='دەقی نوێی چامپیۆن', updated_at='2030-01-01 00:00:00' WHERE id='s1'",
+                [],
+            )
+            .unwrap();
+
+        let body = serde_json::json!({"id": "s1", "action": "accept", "text": "دەقی کۆن", "rowVersion": served});
+        let (code, _, msg, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 409, "a stale-version decision must be refused: {msg:?}");
+        let row = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert!(!row.verified, "nothing may be recorded for a refused decision");
+        assert_eq!(row.human_decision, None);
+
+        // With the CURRENT version the same decision is accepted.
+        let fresh = db.segment_row_stamp("s1").unwrap().unwrap();
+        let body =
+            serde_json::json!({"id": "s1", "action": "accept", "text": "دەقی نوێی چامپیۆن", "rowVersion": fresh});
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200);
+        assert!(db.get_segment_by_id("s1").unwrap().unwrap().verified);
     }
 
     #[test]

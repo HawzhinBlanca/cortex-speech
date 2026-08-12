@@ -1612,6 +1612,26 @@ fn batch_transcription_update_preserves_human_review_and_never_writes_annotation
 }
 
 #[test]
+fn consensus_batch_never_touches_a_flag_verified_row() {
+    // Audit #24: the guard checked human_decision/verdict but not `verified`, unlike its sibling
+    // update_batch_transcription_if_unreviewed — so a clip the human deliberately closed out with
+    // the verify flag (no decision recorded) still had its transcripts rewritten by machine
+    // consensus.
+    let db = make_db();
+    let mut s = make_segment("cv-1", "/cv.wav");
+    s.raw_transcript = "دەقی داخراو".to_string();
+    db.insert_segment(&s).unwrap();
+    db.update_verified("cv-1", true).unwrap();
+
+    let changed = db
+        .update_segment_consensus_batch(&[("cv-1".to_string(), "دەقی مەکینە".to_string(), "norm".to_string(), 0.9)])
+        .unwrap();
+    assert_eq!(changed, 0, "a verified row must be skipped by machine consensus");
+    let after = db.get_segment_by_id("cv-1").unwrap().unwrap();
+    assert_eq!(after.raw_transcript, "دەقی داخراو", "the closed-out transcript must survive");
+}
+
+#[test]
 fn human_edit_does_not_write_no_op_correction_ledger_row() {
     // Round-9 audit LOW: when the model was already right (no candidate differs from the fix),
     // wrong_side falls back to raw_transcript, so the corrections ledger used to record a row whose

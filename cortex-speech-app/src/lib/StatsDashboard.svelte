@@ -306,7 +306,7 @@
       notifications.success(
         $t('stats.finetunePackDone')
           .replace('{n}', String(r.emitted))
-          .replace('{h}', String(r.excludedHoldout))
+          .replace('{h}', String(r.excludedUnexportable))
           .replace('{r}', String(r.excludedNotTrainingReady))
           .replace('{s}', String(r.skipped)),
       );

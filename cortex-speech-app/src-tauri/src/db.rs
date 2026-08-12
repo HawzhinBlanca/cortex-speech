@@ -2639,6 +2639,17 @@ impl Database {
         Ok(())
     }
 
+    /// The row's `updated_at` — the cheap change-fingerprint the couch serve/decide/undo fences
+    /// compare. Deliberately NOT a field on `SpeechSegment` (widening that struct breaks every
+    /// full-literal constructor); fetched exactly where a fence needs it.
+    pub fn segment_row_stamp(&self, segment_id: &str) -> AppResult<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row("SELECT updated_at FROM speech_segments WHERE id = ?1", params![segment_id], |row| row.get(0))
+            .optional()?)
+    }
+
     /// Returns the number of rows actually changed — human-reviewed rows are skipped by the guard,
     /// so this can be less than `updates.len()`; callers must report THIS, not the attempted count.
     pub fn update_segment_consensus_batch(&self, updates: &[(String, String, String, f64)]) -> AppResult<usize> {
@@ -2659,6 +2670,7 @@ impl Database {
                      confidence_source = 'irt_consensus',
                      updated_at = datetime('now')
                  WHERE id = ?1
+                   AND verified = 0
                    AND (human_decision IS NULL OR human_decision = '')
                    AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
             )?;
@@ -3029,8 +3041,9 @@ impl Database {
                      -- v48: the SAME text, kept where no human path can overwrite it. `verdict_transcript`
                      -- is whichever verdict is current and `record_human_decision_by` replaces it with the
                      -- reviewer's correction, which is why the label-quality lift compared the human's
-                     -- answer with itself on every decided row. This column is written here and nowhere
-                     -- else, so the machine's own output survives the human's.
+                     -- answer with itself on every decided row. Written ONLY by the machine-verdict
+                     -- writers (here and jury::write_verdict), never by the human-decision path, so
+                     -- the machine's own output survives the human's.
                      jury_transcript      = ?3,
                      rationale            = ?4,
                      evidence_json        = ?5,

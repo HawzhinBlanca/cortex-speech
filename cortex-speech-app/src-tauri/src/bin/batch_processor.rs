@@ -24,6 +24,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = app_data_dir.join("cortex-speech.db");
     info!("Using Database at: {}", db_path.display());
 
+    // CHAMPION LAW (owner rule 2026-08-11; text-provenance audit #20): this tool drafts with the
+    // bundled offline CTC engine and overwrites raw_transcript on EVERY unverified row. When the
+    // configured primary engine is the WSL 7B champion, running it would silently downgrade the
+    // whole queue to a weaker engine — the exact incident the law exists to prevent. Hard stop.
+    let settings = cortex_speech_app_lib::settings::AppSettings::load(&app_data_dir.join("settings.json"));
+    if settings.asr_model_size == cortex_speech_app_lib::settings::AsrModelSize::WSL7B {
+        return Err("HARD STOP: the configured primary engine is the WSL 7B champion. batch_processor \
+                    drafts with the offline CTC engine and would overwrite champion-quality drafts with \
+                    weaker ones. Use the app's batch_transcribe (champion + hard-stop path) instead."
+            .into());
+    }
+
     // Same single-instance lock as the app and batch_importer (the Week-2 write-path audit found this
     // tool claimed parity but took no lock): never write the live DB concurrently with the running
     // app — WAL would prevent corruption, but the repo's cross-process discipline is the InstanceLock.

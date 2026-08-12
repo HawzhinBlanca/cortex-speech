@@ -323,7 +323,7 @@ pub struct FinetunePackResult {
     pub manifest_sha256: String,
     pub total_verified: usize,
     /// Verified segments dropped because their audio is a HOLDOUT gold clip (the eval-set leak guard).
-    pub excluded_holdout: usize,
+    pub excluded_unexportable: usize,
     /// Verified segments the training-grade rubric refused (the B1 guard): human-rejected (mark-bad
     /// carries verified=true only to leave the review queue), severe audio issues, placeholder text,
     /// or any other non-training-ready grade. Without this filter a REJECTED clip's bad draft would
@@ -368,7 +368,7 @@ pub fn export_finetune_pack(
     let total_verified = verified.len();
     // THE LEAK GUARD: drop any verified segment whose audio is a holdout gold clip.
     let kept = crate::export::exclude_unexportable_segments(db, verified)?;
-    let excluded_holdout = total_verified - kept.len();
+    let excluded_unexportable = total_verified - kept.len();
 
     // THE RUBRIC GUARD (B1): only training-ready (GOLD/SILVER) rows may ship, and the shipped
     // sentence is the rubric's own transcript — the single source of truth shared with the CSV/HF
@@ -463,7 +463,7 @@ pub fn export_finetune_pack(
         "manifestSha256": manifest_sha256,
         "emitted": emitted,
         "skipped": skipped,
-        "excludedHoldout": excluded_holdout,
+        "excludedUnexportable": excluded_unexportable,
         "excludedNotTrainingReady": excluded_not_training_ready,
         "totalVerified": total_verified,
         "selectionPolicy": "training_ready (GOLD/SILVER) via quality::training_grade_for_segment; holdout-excluded; canonical Sorani orthography; variant-aware dedup",
@@ -488,7 +488,7 @@ pub fn export_finetune_pack(
         manifest_path: manifest_path.to_string_lossy().into_owned(),
         manifest_sha256,
         total_verified,
-        excluded_holdout,
+        excluded_unexportable,
         excluded_not_training_ready,
         emitted,
         skipped,
@@ -1530,7 +1530,7 @@ mod tests {
         let ledger = out.path().join("corpus_ledger.jsonl");
         let result = export_finetune_pack(&db, out.path(), Some(&ledger)).unwrap();
         assert_eq!(result.total_verified, 2);
-        assert_eq!(result.excluded_holdout, 1, "the holdout-matching segment is excluded (leak guard)");
+        assert_eq!(result.excluded_unexportable, 1, "the holdout-matching segment is excluded (leak guard)");
         assert_eq!(result.emitted, 1, "only the non-holdout verified segment is emitted");
 
         let manifest = std::fs::read_to_string(out.path().join("finetune_manifest.jsonl")).unwrap();
@@ -1549,7 +1549,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(out.path().join("pack_provenance.json")).unwrap()).unwrap();
         assert_eq!(prov["manifestSha256"], result.manifest_sha256.as_str());
         assert_eq!(prov["emitted"], 1);
-        assert_eq!(prov["excludedHoldout"], 1);
+        assert_eq!(prov["excludedUnexportable"], 1);
         let ledger_text = std::fs::read_to_string(&ledger).unwrap();
         let ledger_line: serde_json::Value = serde_json::from_str(ledger_text.lines().next().unwrap()).unwrap();
         assert_eq!(ledger_line["manifestSha256"], result.manifest_sha256.as_str(), "ledger mirrors provenance");
@@ -1690,8 +1690,8 @@ mod tests {
         let out = tempfile::TempDir::new().unwrap();
         let result = export_finetune_pack(&db, out.path(), None).unwrap();
         assert_eq!(result.total_verified, 3);
-        assert_eq!(result.excluded_holdout, 0);
-        assert_eq!(result.excluded_not_training_ready, 2, "mark-bad + severe-clipping both refused");
+        assert_eq!(result.excluded_unexportable, 1, "mark-bad is dropped by the shared filter now (audit #11)");
+        assert_eq!(result.excluded_not_training_ready, 1, "severe-clipping refused by the rubric");
         assert_eq!(result.emitted, 1, "only the rubric-clean row ships");
 
         let manifest = std::fs::read_to_string(out.path().join("finetune_manifest.jsonl")).unwrap();
