@@ -521,6 +521,26 @@ pub fn assign_splits(
         path.rsplit(['/', '\\']).next().unwrap_or(path)
     }
 
+    /// `SPEAKER_00`, `SPEAKER_01`, ... is a diarizer's PER-RECORDING index, not a person. The
+    /// numbering restarts for every file, so the same label names a different human in every
+    /// recording — and the app has no global speaker identity to say otherwise (that needs CAM++
+    /// embeddings clustered across files, which nothing does yet).
+    ///
+    /// MEASURED 2026-08-13 on the live library: `SPEAKER_00` appeared in 141 of 144 recordings.
+    /// Union-ing on it as if it were an identity chained every recording into ONE connected
+    /// component holding 100% of the audio, so the greedy fill put everything in `train` and
+    /// emitted EMPTY validation and test splits — silently, with `hf_speaker_disjoint = true`
+    /// looking like it was protecting the dataset. Scoping the label to its recording restores
+    /// 145 components with the largest at 46.7%, which an 80/10/10 split can actually satisfy.
+    ///
+    /// A real speaker id (anything not matching this shape) still unions globally: that is where
+    /// speaker-disjointness has meaning, and this must not weaken it.
+    fn is_generic_diarizer_label(label: &str) -> bool {
+        label
+            .strip_prefix("SPEAKER_")
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    }
+
     // Group into leakage-safe units. With speaker_disjoint, a unit is a connected component of the
     // bipartite (recording, speaker) graph (built by union-find): each component keeps every source
     // recording INTACT (no multi-speaker recording straddles two splits) AND is speaker-disjoint (no
@@ -533,7 +553,11 @@ pub fn assign_splits(
             let r = uf.node(&format!("r:{}", source_name(&seg.audio_path)));
             let spk = seg.speaker_id.as_deref().unwrap_or("").trim();
             if !spk.is_empty() {
-                let s = uf.node(&format!("s:{spk}"));
+                let s = if is_generic_diarizer_label(spk) {
+                    uf.node(&format!("s:{}:{spk}", source_name(&seg.audio_path)))
+                } else {
+                    uf.node(&format!("s:{spk}"))
+                };
                 uf.union(r, s);
             }
         }
@@ -865,6 +889,27 @@ pub fn export_huggingface_dataset(
             "validation" => val_segs.push(seg.clone()),
             "test" => test_segs.push(seg.clone()),
             _ => train_segs.push(seg.clone()),
+        }
+    }
+
+    // A split the owner ASKED for must not come out empty. Grouping is leakage-safe by design, so a
+    // group too large to fit anywhere but `train` silently starves validation and test — which is
+    // exactly what unstable diarizer labels did (see `is_generic_diarizer_label`): a dataset with no
+    // holdout at all, exported without a word. Fail here instead. An export that stops is
+    // recoverable; a training run against a dataset with no test set is not, because nothing about
+    // the resulting numbers announces that they were measured on training data.
+    for (name, ratio, segs) in
+        [("validation", settings.hf_val_ratio, &val_segs), ("test", settings.hf_test_ratio, &test_segs)]
+    {
+        if ratio > 0.0 && segs.is_empty() && !segments.is_empty() {
+            return Err(crate::error::AppError::Other(format!(
+                "Export stopped: the {name} split came out EMPTY while {:.0}% was requested. \
+                 {} segments fell into leakage-safe groups too large to divide — most often because \
+                 speaker labels are per-recording diarizer indices rather than real identities. \
+                 Check speaker_id values, or set hf_speaker_disjoint = false to group by recording only.",
+                ratio * 100.0,
+                segments.len()
+            )));
         }
     }
 

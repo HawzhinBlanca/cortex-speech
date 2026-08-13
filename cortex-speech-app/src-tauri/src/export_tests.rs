@@ -355,6 +355,66 @@ fn assign_splits_reproducible_and_no_recording_leakage() {
 }
 
 #[test]
+fn diarizer_speaker_indices_do_not_collapse_every_recording_into_one_split() {
+    use std::collections::HashMap;
+    // MEASURED on the live library 2026-08-13, which is the shape this reproduces: a diarizer numbers
+    // speakers PER RECORDING, so `SPEAKER_00` appeared in 141 of 144 recordings while naming a
+    // different human in each. Union-ing on it as an identity chained every recording into ONE
+    // component holding 100% of the audio: everything went to `train` and validation and test came
+    // out EMPTY — with hf_speaker_disjoint = true, i.e. while the setting meant to protect the
+    // dataset was what destroyed the holdout, silently.
+    let mk = |id: &str, src: &str, spk: &str| SpeechSegment {
+        id: id.to_string(),
+        audio_path: format!("/data/{src}"),
+        speaker_id: Some(spk.to_string()),
+        duration_ms: 5000,
+        ..SpeechSegment::default()
+    };
+    let mut segs = Vec::new();
+    for r in 0..20 {
+        let src = format!("episode{r:02}.wav");
+        for i in 0..6 {
+            // Every recording contains a SPEAKER_00 and a SPEAKER_01, as real diarizer output does.
+            segs.push(mk(&format!("{src}-{i}"), &src, if i % 2 == 0 { "SPEAKER_00" } else { "SPEAKER_01" }));
+        }
+    }
+
+    let assigned = assign_splits(&segs, 0.8, 0.1, 0.1, 42, true);
+    let mut per_split: HashMap<&str, usize> = HashMap::new();
+    for (_, split) in &assigned {
+        *per_split.entry(*split).or_default() += 1;
+    }
+    assert_eq!(assigned.len(), segs.len(), "every segment must be assigned");
+    // The point of the test: a requested split must not be starved out of existence.
+    for split in ["train", "validation", "test"] {
+        assert!(
+            per_split.get(split).copied().unwrap_or(0) > 0,
+            "{split} split is EMPTY — per-recording diarizer labels collapsed the corpus into one \
+             group again; splits were {per_split:?}"
+        );
+    }
+
+    // A REAL speaker id must still bind recordings together, or this fix would have bought a working
+    // split by throwing away the disjointness it exists to provide.
+    let mut named: Vec<SpeechSegment> = Vec::new();
+    for (src, spk) in [("a.wav", "Hawzhin"), ("b.wav", "Hawzhin"), ("c.wav", "Sewa"), ("d.wav", "Rubar")] {
+        for i in 0..6 {
+            named.push(mk(&format!("{src}-{i}"), src, spk));
+        }
+    }
+    let d = assign_splits(&named, 0.8, 0.1, 0.1, 42, true);
+    let split_of: HashMap<&str, &str> = d.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+    let mut spk_split: HashMap<&str, &str> = HashMap::new();
+    for s in &named {
+        let spk = s.speaker_id.as_deref().unwrap();
+        let split = split_of[s.id.as_str()];
+        if let Some(prev) = spk_split.insert(spk, split) {
+            assert_eq!(prev, split, "named speaker {spk} leaked across splits");
+        }
+    }
+}
+
+#[test]
 fn multi_speaker_recording_stays_in_one_split_under_speaker_disjoint() {
     use std::collections::{HashMap, HashSet};
     // Round-10 audit HIGH: in speaker-disjoint mode the OLD grouping keyed purely on speaker, so a
