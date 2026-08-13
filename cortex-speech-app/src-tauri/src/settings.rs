@@ -14,6 +14,25 @@ pub struct AppSettings {
     pub max_segment_duration_ms: u32,
     pub num_asr_threads: u32,
     pub enable_gpu: bool,
+    /// Run the three EXTRA local engines (CTC-300M, CTC-1B, fine-tuned MMS) on every imported clip
+    /// to store their hypotheses beside the champion's.
+    ///
+    /// Their only live consumer is the jury's auto-accept scoring. The consensus card that also read
+    /// them was removed 2026-08-13 (measured: an ability-weighted blend of engines at 19-40% CER
+    /// against a champion at 10.6%, and the same fusion changed 0 of 135 clips on the owner's audio),
+    /// and the accept-provenance gate needs only the champion's own hypothesis.
+    ///
+    /// What they cost, MEASURED on the 2026-08-13 import: this sherpa-onnx build has no GPU support
+    /// ("Fallback to cpu!"), so TWO billion-parameter models decode every clip on the CPU — 156,000
+    /// CPU-seconds and ~13.6 cores pinned for 2.28 hours of audio, sustaining 2.5 clips/minute while
+    /// the champion sat on the GPU at 5% utilisation. That is 84 minutes of wall clock per audio-hour,
+    /// against roughly 6 for the champion alone. On a 34-hour corpus the difference is 47 hours of
+    /// import versus about 6, with the app closed and every reviewer locked out for the duration.
+    ///
+    /// Defaults to TRUE so nothing changes for anyone who has not decided otherwise; a corpus that is
+    /// reviewed clip-by-clip by humans gets nothing from auto-accept and should turn it off.
+    #[serde(default = "default_multi_engine_hypotheses")]
+    pub multi_engine_hypotheses: bool,
     pub language: String,
     pub export_format: ExportFormat,
     pub auto_normalize: bool,
@@ -218,6 +237,10 @@ fn default_assign_speaker_from_filename() -> bool {
     true
 }
 
+fn default_multi_engine_hypotheses() -> bool {
+    true
+}
+
 /// ASR backend identifier (OmniASR CTC via sherpa-onnx is the only engine).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum AsrProvider {
@@ -321,6 +344,7 @@ impl Default for AppSettings {
             max_segment_duration_ms: 15000,
             num_asr_threads: 4,
             enable_gpu: true,
+            multi_engine_hypotheses: default_multi_engine_hypotheses(),
             language: "ckb".to_string(),
             export_format: ExportFormat::default(),
             auto_normalize: true,

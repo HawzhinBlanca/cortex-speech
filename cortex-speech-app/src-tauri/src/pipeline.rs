@@ -3539,6 +3539,14 @@ impl ProcessingPipeline {
     }
 
     pub fn populate_hypotheses(&self, db: &Database, segment_id: &str, f32_pcm: &[f32]) -> AppResult<()> {
+        // Guarded HERE rather than at the five call sites: one shared gate cannot be forgotten by a
+        // sixth caller, and every caller wants the same answer. See `multi_engine_hypotheses` for
+        // what these three engines cost when sherpa-onnx has no GPU (measured: 2.5 clips/minute).
+        // The champion's own hypothesis is written by the transcribe path, not here, so turning this
+        // off never leaves a clip without the transcript a reviewer is served.
+        if !self.settings.multi_engine_hypotheses {
+            return Ok(());
+        }
         let model_dir = self.model_manager.resolved_dir();
 
         // 1. OmniASR 300M
