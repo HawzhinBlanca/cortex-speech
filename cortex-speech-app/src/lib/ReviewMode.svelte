@@ -1,7 +1,12 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import { get } from 'svelte/store';
-  import { segments, selectedSegmentId, searchScopedSegments, searchQuery } from './stores/segmentStore';
+  import {
+    segments,
+    selectedSegmentId,
+    searchScopedSegments,
+    searchQuery,
+  } from './stores/segmentStore';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import { settings } from './stores/settingsStore';
@@ -23,7 +28,6 @@
   import { isPlaceholderTranscript } from './segmentQuality';
   import { parseEscalationEvidence, reasonLabelKey, reasonTone } from './reasonCodes';
   import type { SpeechSegment, WordTimestamp } from './types';
-  import type { SegmentConsensus } from './commands';
 
   interface Props {
     // Pro next-steps surfaced when the whole queue is reviewed (wired by App to its export / exit).
@@ -119,26 +123,25 @@
   let saving = $state(false);
   let lastLoadedId = $state<string | null>(null);
 
-  // Offline best-of-N consensus draft (ability-weighted vote across this clip's ASR hypotheses) + the
-  // per-word agreement that drives the disagreement highlight. Only shown when 2+ models voted.
-  let consensus = $state<SegmentConsensus | null>(null);
-  // Engines that actually produced this clip's draft, recorded (never inferred). Shown as an honest
-  // provenance badge even for a single-engine clip (e.g. only the OmniASR-7B Champion ran), where the
-  // multi-model consensus card below is intentionally hidden.
+  // Engines that actually produced this clip's draft, recorded (never inferred) and shown as an
+  // honest provenance badge.
+  //
+  // The multi-model CONSENSUS card this call also used to feed was removed (2026-08-13): it was an
+  // ability-weighted vote across engines measured at 19-40% CER on this corpus against a champion at
+  // 10.6%, and the same fusion changed 0 of 135 clips when measured on the owner's own reviewed
+  // audio. Its "Use draft" button was therefore a one-tap downgrade of the champion's text. The
+  // per-clip model list it returns is still honest and still shown.
   let draftModels = $state<string[]>([]);
   let consensusSeq = 0;
   async function loadConsensus(seg: SpeechSegment) {
     const seq = ++consensusSeq;
-    consensus = null;
     draftModels = [];
     try {
       const c = await api.getSegmentConsensus(seg.id);
       if (seq !== consensusSeq) return;
       draftModels = c.models ?? [];
-      consensus = c.words.length > 0 && c.modelCount >= 2 ? c : null;
     } catch {
       if (seq === consensusSeq) {
-        consensus = null;
         draftModels = [];
       }
     }
@@ -227,7 +230,7 @@
       notifications.success($t('review.retranscribed'));
       // The DB/store write above targets seg by id and is correct even if the reviewer navigated away
       // during the multi-second ASR await. But everything below mutates the CURRENTLY shown editor
-      // (editText/lastLoadedOriginal/draftModels/consensus/alignment) — if navigation changed `current`
+      // (editText/lastLoadedOriginal/draftModels/alignment) — if navigation changed `current`
       // mid-flight, applying seg's draft here would put seg's MACHINE text into another clip's editor,
       // and a subsequent Save would persist it as THAT clip's human-verified gold: a wrong-segment gold
       // corruption (THE ONE LAW). Bail; seg's clip reloads its fresh draft + re-aligns when reopened.
@@ -240,12 +243,11 @@
       lastLoadedOriginal = text;
       // The owner just produced this draft with the chosen engine, so name it on the provenance badge
       // immediately (honest — it's exactly what was used). A single-engine re-transcribe has no
-      // multi-model consensus, so hide that card. The fine-tuned button always runs the MMS-1B; the
+      // The fine-tuned button always runs the MMS-1B; the
       // champion button runs the CONFIGURED primary engine (pipeline.transcribe), so read it from
       // settings rather than assuming the 7B — otherwise a user who switched the primary would get a
       // badge naming a model that never ran.
       draftModels = [engine === 'finetuned' ? 'finetuned-mms-ckb' : primaryEngineId()];
-      consensus = null;
       await ensureWordTimings(updated);
     } catch (e) {
       // Champion (7B) down: offer retry-or-offline rather than a dead-end. Never a silent downgrade.
@@ -256,7 +258,10 @@
           confirmLabel: $t('asr.tryAgain'),
           danger: false,
           onConfirm: () => void doRetranscribe('champion'),
-          secondary: { label: $t('asr.useOfflineModel'), onClick: () => void doRetranscribe('finetuned') },
+          secondary: {
+            label: $t('asr.useOfflineModel'),
+            onClick: () => void doRetranscribe('finetuned'),
+          },
         });
       } else {
         notifications.error($t('review.retranscribeFailed'), { detail: String(e) });
@@ -345,9 +350,6 @@
     }
   }
 
-  // A word is "contested" (worth a second look) when under two-thirds weighted agreement.
-  const CONTESTED = 0.67;
-
   // Word-level alignment for the current clip (forced or heuristic). When present it
   // powers the listen-strip: tap a word to hear it, colour the low-confidence ones so
   // the reviewer's eye lands on likely errors, and karaoke-highlight the active word.
@@ -399,7 +401,8 @@
     // was installed. Idempotent: without an aligner the backend re-persists the same heuristic, and
     // alignAttempted stops per-session repeats either way.
     const hasRealTimings =
-      parseWordTimestamps(seg.alignmentJson).length > 0 && seg.alignmentQuality !== 'energy_heuristic';
+      parseWordTimestamps(seg.alignmentJson).length > 0 &&
+      seg.alignmentQuality !== 'energy_heuristic';
     if (hasRealTimings || alignAttempted.has(seg.id)) return;
     const text = originalText(seg);
     if (!text.trim() || text.includes('[Pending') || text.includes('[ASR unavailable')) return;
@@ -537,7 +540,9 @@
       // aligner. The backend re-reads the fresh row under the db lock (no TOCTOU).
       await api.updateSegmentFields(seg.id, { annotatedTranscript: text, verified: true });
       segments.update((list) =>
-        list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text, verified: true } : s)),
+        list.map((s) =>
+          s.id === seg.id ? { ...s, annotatedTranscript: text, verified: true } : s,
+        ),
       );
       editCache.delete(seg.id); // persisted — drop the in-progress copy
       notifications.success($t('saved'));
@@ -591,7 +596,9 @@
       saving = true;
       try {
         await api.updateSegmentFields(seg.id, { annotatedTranscript: text });
-        segments.update((list) => list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)));
+        segments.update((list) =>
+          list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)),
+        );
       } catch (e) {
         notifications.error($t('notifications.saveFailed'), { detail: String(e) });
       } finally {
@@ -623,7 +630,9 @@
       // whole-row-clobber class). A field update never touches alignmentJson, so it is clobber-safe
       // even mid-align and needs NO `aligning` guard — which would instead LOSE this edit, since
       // editCache dies with the component and teardown cannot re-stash it.
-      segments.update((list) => list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)));
+      segments.update((list) =>
+        list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)),
+      );
       // Fire-and-forget: teardown cannot await. Surface a failure — the notification store outlives
       // this component — so a lost draft is never silent.
       api.updateSegmentFields(seg.id, { annotatedTranscript: text }).catch((e) => {
@@ -661,7 +670,9 @@
   // away already moved focus correctly, and yanking it back would fight the reviewer.
   let stripEl = $state<HTMLElement | undefined>();
   function refocusChip(i: number) {
-    void tick().then(() => stripEl?.querySelector<HTMLButtonElement>(`[data-chip="${i}"]`)?.focus());
+    void tick().then(() =>
+      stripEl?.querySelector<HTMLButtonElement>(`[data-chip="${i}"]`)?.focus(),
+    );
   }
 
   // Single tap / Enter / Space on a word chip = hear EXACTLY that word. Listen-only: it never opens
@@ -730,9 +741,11 @@
     const tokens: Array<{ start: number; len: number; word: string }> = [];
     const re = /\S+/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) tokens.push({ start: m.index, len: m[0].length, word: m[0] });
+    while ((m = re.exec(text)) !== null)
+      tokens.push({ start: m.index, len: m[0].length, word: m[0] });
     const wanted = chipText(w, i);
-    const target = tokens[i] && tokens[i].word === wanted ? tokens[i] : tokens.find((t) => t.word === wanted);
+    const target =
+      tokens[i] && tokens[i].word === wanted ? tokens[i] : tokens.find((t) => t.word === wanted);
     if (target) editEl.setSelectionRange(target.start, target.start + target.len);
   }
   function replay() {
@@ -846,14 +859,22 @@
       <!-- Completion banner: every clip verified → surface the next steps (export / done). The clips
            stay below so the reviewer can still scrub back and re-check any of them. -->
       {#if progress.allReviewed}
-        <div class="card border border-emerald-700/40 bg-emerald-950/20 p-5 text-center" data-testid="review-complete">
+        <div
+          class="card border border-emerald-700/40 bg-emerald-950/20 p-5 text-center"
+          data-testid="review-complete"
+        >
           <div class="text-lg font-semibold text-emerald-300">
             {$t('review.completeTitle').replace('{n}', String($segments.length))}
           </div>
           <p class="mt-1 text-sm text-subtle">{$t('review.completeHint')}</p>
           <div class="mt-4 flex flex-wrap justify-center gap-2">
             {#if onExport}
-              <button type="button" class="btn btn-primary !text-sm" data-testid="review-complete-export" onclick={onExport}>
+              <button
+                type="button"
+                class="btn btn-primary !text-sm"
+                data-testid="review-complete-export"
+                onclick={onExport}
+              >
                 {$t('review.exportDataset')}
               </button>
             {/if}
@@ -947,7 +968,12 @@
                "67 of 144 reviewed" — three unlabelled fractions sharing a denominator by coincidence.
                dir="ltr" stays on the FILENAME only; the CKB noun must not be forced into an LTR run. -->
           <span class="flex min-w-0 items-center gap-1.5">
-            <span class="truncate" dir="ltr" title={current.audioPath} data-testid="review-source-file">
+            <span
+              class="truncate"
+              dir="ltr"
+              title={current.audioPath}
+              data-testid="review-source-file"
+            >
               {segmentSourceFilename(current.audioPath)}
             </span>
             {#if chunkLabel}
@@ -964,74 +990,125 @@
         </div>
       </div>
 
-      <!-- Waveform -->
+      <!-- THE AUDIO BLOCK: waveform + scope hint + transport, one card, immediately above the
+           correction box. Owner feedback 2026-08-13 — these were three separate cards with the
+           editor far below, so listening and correcting could not be done without scrolling. -->
       <div class="card overflow-hidden">
-        {#if waveformError}
-          <!-- A flat strip and a failed decode look identical, and the reviewer would read the flat
+        <div class="overflow-hidden">
+          {#if waveformError}
+            <!-- A flat strip and a failed decode look identical, and the reviewer would read the flat
                strip as "quiet audio". Say which one it is, in place, and offer the retry. -->
-          <div
-            class="flex items-center justify-between gap-3 p-3 text-xs text-amber-300"
-            data-testid="review-waveform-error"
-            role="status"
-          >
-            <span class="min-w-0 truncate">{$t('review.waveformFailed')}</span>
-            <button
-              type="button"
-              class="btn btn-secondary shrink-0 !text-xs"
-              onclick={() => current && loadWaveform(current)}
+            <div
+              class="flex items-center justify-between gap-3 p-3 text-xs text-amber-300"
+              data-testid="review-waveform-error"
+              role="status"
             >
-              {$t('retry')}
-            </button>
-          </div>
-        {:else}
-          <Waveform
-            waveform={waveformData}
-            currentTime={clipPosition}
-            duration={clipLength}
-            {playing}
-            wordTimestamps={words}
-            onSeek={(time) => {
-              clearWordOverride(); // a manual scrub leaves word-playback mode; play on to the span end
-              currentTime = range.startTime + time;
-            }}
-          />
-        {/if}
-      </div>
+              <span class="min-w-0 truncate">{$t('review.waveformFailed')}</span>
+              <button
+                type="button"
+                class="btn btn-secondary shrink-0 !text-xs"
+                onclick={() => current && loadWaveform(current)}
+              >
+                {$t('retry')}
+              </button>
+            </div>
+          {:else}
+            <Waveform
+              waveform={waveformData}
+              currentTime={clipPosition}
+              duration={clipLength}
+              {playing}
+              wordTimestamps={words}
+              onSeek={(time) => {
+                clearWordOverride(); // a manual scrub leaves word-playback mode; play on to the span end
+                currentTime = range.startTime + time;
+              }}
+            />
+          {/if}
+        </div>
 
-      <!-- Honest playback-scope hint: are we playing just the words, or the whole clip? -->
-      <div class="flex items-center gap-2 px-1 text-xs text-subtle" aria-live="polite">
-        {#if aligning}
-          <span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-t-transparent"
-          ></span>
-          <span>{$t('review.aligningWords')}</span>
-        {:else if hasWords}
-          <span class="text-accent">●</span>
-          <span>{$t('review.playingWordsOnly').replace('{sec}', (playEnd - playStart).toFixed(1))}</span>
-        {:else}
-          <span>{$t('review.playingWholeClip').replace('{sec}', clipLength.toFixed(1))}</span>
-        {/if}
-      </div>
+        <!-- Honest playback-scope hint: are we playing just the words, or the whole clip? -->
+        <div
+          class="flex items-center gap-2 border-t border-subtle px-3 py-2 text-xs text-subtle"
+          aria-live="polite"
+        >
+          {#if aligning}
+            <span
+              class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-t-transparent"
+            ></span>
+            <span>{$t('review.aligningWords')}</span>
+          {:else if hasWords}
+            <span class="text-accent">●</span>
+            <span
+              >{$t('review.playingWordsOnly').replace(
+                '{sec}',
+                (playEnd - playStart).toFixed(1),
+              )}</span
+            >
+          {:else}
+            <span>{$t('review.playingWholeClip').replace('{sec}', clipLength.toFixed(1))}</span>
+          {/if}
+        </div>
 
-      <!-- Audio player — bounded to the SPOKEN SPAN (first→last word) when word timings exist, so Play
+        <!-- Audio player — bounded to the SPOKEN SPAN (first→last word) when word timings exist, so Play
            hears the exact words and not the silence/music the VAD chunk padded around them; otherwise
            the whole clip. -->
-      <!-- True-10 audit: honor the autoplay setting (it was hardcoded off here while honored in
+        <!-- True-10 audit: honor the autoplay setting (it was hardcoded off here while honored in
            curate mode) — with it on, advancing to the next clip auto-plays the bounded spoken span,
            removing one keypress + wait per clip, hundreds of times per review sitting. -->
-      <!-- start/endTime honour the transient tap-a-word override so a tapped word plays (and loops)
+        <!-- start/endTime honour the transient tap-a-word override so a tapped word plays (and loops)
            exactly itself; otherwise the full spoken span. -->
-      <AudioPlayer
-        audioPath={current.audioPath}
-        clipKey={current.id}
-        startTime={wordStartOverride ?? playStart}
-        endTime={wordEndOverride ?? playEnd}
-        displayStart={playStart}
-        displayEnd={playEnd}
-        bind:currentTime
-        bind:duration={playerDuration}
-        bind:playing
-        autoplay={$settings.autoplaySegments}
-      />
+        <AudioPlayer
+          audioPath={current.audioPath}
+          clipKey={current.id}
+          startTime={wordStartOverride ?? playStart}
+          endTime={wordEndOverride ?? playEnd}
+          displayStart={playStart}
+          displayEnd={playEnd}
+          bind:currentTime
+          bind:duration={playerDuration}
+          bind:playing
+          autoplay={$settings.autoplaySegments}
+        />
+      </div>
+
+      <!-- Transcript: big, directly editable -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <div class="text-xs font-semibold uppercase tracking-wider text-muted">
+              {$t('transcript')}
+            </div>
+            <p class="mt-0.5 text-xs text-subtle">{$t('review.editHint')}</p>
+            {#if draftModels.length > 0}
+              <p class="mt-1 text-[11px] text-subtle" dir="ltr">
+                {$t('review.draftBy')}
+                <span class="font-medium text-muted"
+                  >{draftModels.map((m) => api.engineLabel(m)).join(', ')}</span
+                >
+                {$t('review.notHumanVerified')}
+              </p>
+            {/if}
+          </div>
+          {#if dirty}
+            <button
+              type="button"
+              class="ring-focus shrink-0 rounded-token px-2 py-1 text-xs text-subtle transition-colors hover:text-default"
+              onclick={resetToOriginal}
+            >
+              {$t('review.reset')}
+            </button>
+          {/if}
+        </div>
+        <textarea
+          bind:value={editText}
+          bind:this={editEl}
+          dir="rtl"
+          spellcheck="false"
+          class="input font-kurdish mt-3 min-h-[150px] w-full resize-none text-2xl leading-loose"
+          placeholder={$t('editTranscript')}
+        ></textarea>
+      </div>
 
       <!-- Listen-strip: tap a word to hear it; low-confidence words are highlighted -->
       {#if words.length > 0}
@@ -1075,7 +1152,8 @@
                     e.stopPropagation();
                     if (e.key === 'Enter') {
                       e.preventDefault();
-                      if (commitWordEdit(i, w, (e.target as HTMLInputElement).value)) refocusChip(i);
+                      if (commitWordEdit(i, w, (e.target as HTMLInputElement).value))
+                        refocusChip(i);
                     } else if (e.key === 'Escape') {
                       cancelWordEdit(i);
                       refocusChip(i);
@@ -1087,10 +1165,9 @@
                 <button
                   type="button"
                   data-chip={i}
-                  class="review-word {editedChips[i] ? 'word-edited' : confClass(w.confidence)} {i ===
-                  activeWordIndex
-                    ? 'word-active'
-                    : ''}"
+                  class="review-word {editedChips[i]
+                    ? 'word-edited'
+                    : confClass(w.confidence)} {i === activeWordIndex ? 'word-active' : ''}"
                   onclick={() => playWord(w)}
                   ondblclick={() => startWordEdit(w, i)}
                   onkeydown={(e) => {
@@ -1115,86 +1192,12 @@
       <!-- Consensus draft: an offline best-of-N vote across this clip's ASR models. Contested words
            (the models disagreed) are highlighted so the eye lands on likely errors first; "Use draft"
            starts the edit from a transcript better than any single model. -->
-      {#if consensus && consensus.words.length > 0}
-        <div class="card space-y-2 p-4">
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-xs font-semibold uppercase tracking-wider text-muted">
-              {$t('review.consensusDraft')}
-              <span class="ms-1 font-normal normal-case text-subtle">
-                {$t('review.consensusAgree')
-                  .replace('{n}', String(consensus.modelCount))
-                  .replace('{pct}', String(Math.round(consensus.meanAgreement * 100)))}
-              </span>
-            </div>
-            <button
-              type="button"
-              class="btn btn-secondary shrink-0 !text-xs"
-              onclick={() => {
-                if (consensus) {
-                  editText = consensus.draft;
-                  editedChips = {}; // the draft replaces the transcript — drop stale chip fixes
-                }
-              }}
-            >
-              {$t('review.useDraft')}
-            </button>
-          </div>
-          <div class="font-kurdish flex flex-wrap gap-1 text-lg leading-loose" dir="rtl">
-            {#each consensus.words as w, i (i)}
-              <span
-                class="rounded-token px-1.5 {w.agreement < CONTESTED
-                  ? 'bg-amber-500/20 text-amber-200'
-                  : 'text-default'}"
-                title={w.alternatives.length
-                  ? $t('review.modelsAlsoSaid').replace('{alts}', w.alternatives.join('  /  '))
-                  : ''}>{w.text}</span
-              >
-            {/each}
-          </div>
-          <p class="text-[11px] text-subtle">{$t('review.consensusHint')}</p>
-        </div>
-      {/if}
-
-      <!-- Transcript: big, directly editable -->
-      <div class="card p-5">
-        <div class="flex items-center justify-between gap-3">
-          <div>
-            <div class="text-xs font-semibold uppercase tracking-wider text-muted">
-              {$t('transcript')}
-            </div>
-            <p class="mt-0.5 text-xs text-subtle">{$t('review.editHint')}</p>
-            {#if draftModels.length > 0}
-              <p class="mt-1 text-[11px] text-subtle" dir="ltr">
-                {$t('review.draftBy')}
-                <span class="font-medium text-muted">{draftModels.map((m) => api.engineLabel(m)).join(', ')}</span>
-                {$t('review.notHumanVerified')}
-              </p>
-            {/if}
-          </div>
-          {#if dirty}
-            <button
-              type="button"
-              class="ring-focus shrink-0 rounded-token px-2 py-1 text-xs text-subtle transition-colors hover:text-default"
-              onclick={resetToOriginal}
-            >
-              {$t('review.reset')}
-            </button>
-          {/if}
-        </div>
-        <textarea
-          bind:value={editText}
-          bind:this={editEl}
-          dir="rtl"
-          spellcheck="false"
-          class="input font-kurdish mt-3 min-h-[150px] w-full resize-none text-2xl leading-loose"
-          placeholder={$t('editTranscript')}
-        ></textarea>
-      </div>
-
       <!-- Fix-the-draft tools: the current transcript is wrong -> re-transcribe with a better engine,
            or flag the clip bad (excluded from export, kept + reversible). -->
       <div class="flex flex-wrap items-center gap-2">
-        <span class="text-[11px] uppercase tracking-wider text-subtle">{$t('review.retranscribe')}</span>
+        <span class="text-[11px] uppercase tracking-wider text-subtle"
+          >{$t('review.retranscribe')}</span
+        >
         <button
           type="button"
           class="btn btn-secondary !text-xs"

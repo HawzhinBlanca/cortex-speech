@@ -8330,3 +8330,33 @@ reason (the champion's own text as its own reference scores 0 by construction).
 `local_asr_dump` harness, and four engines now measured on both domains.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 279 — Review UI: audio against the text box, one section fewer
+
+**Owner feedback while reviewing:** the waveform and play button sat far above the correction area,
+and three text sections competed for the screen.
+
+**Reordered.** The audio is now ONE card (waveform + playback-scope hint + transport) sitting
+directly above the editor, so listening and correcting no longer require scrolling between them.
+New order: audio -> transcript editor -> listen strip -> fix-the-draft tools. Previously the editor
+sat below the waveform, the hint, the player, the listen strip AND the consensus card — roughly
+600px down, on a laptop screen usually out of view while the play button was in view.
+
+**One section removed, on evidence.** Of the three text sections, the CONSENSUS DRAFT card is gone.
+It rendered an ability-weighted vote across this clip's ASR hypotheses — precisely the fusion
+measured in iteration 278 as changing 0 of 135 clips on the owner's own audio, built from engines at
+19-40% CER against a champion at 10.6%. Its "Use draft" button therefore replaced the champion's
+text with a measurably worse blend: not merely clutter, a one-tap downgrade. The now-dead
+`CONTESTED` threshold and `SegmentConsensus` type import went with it; `loadConsensus` is KEPT
+because the same call feeds the honest "drafted by <engine>" provenance badge.
+
+**The listen strip STAYS**, moved below the editor. Tapping a word to hear exactly that word is the
+core verbatim interaction and the reviewer's only tool for the champion-standardization case the
+owner caught by ear (سێری vs سەیری) — the disagreement display that was supposed to help with that
+measured as noise and was reverted, which makes the ear the remaining instrument.
+
+**Verified:** typecheck 0 errors, eslint clean, vitest 232/232. NOT yet visible to anyone: the
+frontend is bundled into the exe, so this lands on the next rebuild — deliberately deferred while
+the owner is mid-review rather than interrupting a session to ship a layout change.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
