@@ -8609,3 +8609,43 @@ the duration of any import, because placeholders legitimately have no champion h
 knowing before treating a mid-import gate run as a finding.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 284 — the import is latency-bound on the champion, and two speed hypotheses died
+
+**Older non-Hawleri material: READY.** All 471 pending clips pass every readiness condition — audio
+on disk, champion draft, champion hypothesis stored, speaker, duration, real `ctc_forced` alignment,
+nothing machine-written in the human field, zero cloud calls. **0 blocking defects.** 107 measure
+below -35 dB and will be held back from training by the volume gate, reported rather than processed
+until they look acceptable.
+
+**Import throughput, measured rather than assumed — and the first number was wrong.**
+
+The "55 clips/min" reported earlier measured segment CREATION. Segments are created carrying the
+`[Pending WSL 7B ASR]` placeholder and the champion fills them afterwards, so that number described
+an intermediate, not the outcome. **The real rate is 8.5 clips/min**, both before and after the
+concurrency change.
+
+Three hypotheses, each measured, two dead:
+
+1. **Only one GPU works.** TRUE and real: `CORTEX_7B_CONCURRENCY` defaults to 1, and pipeline.rs's
+   own comment records this exact failure from 2026-08-11. Measured 43% / 3% across the two cards.
+   Setting it to 2 changed the rate by nothing — because the gate LIMITS concurrency, it does not
+   CREATE it. The importer's per-clip loop is serial, so the second permit is never filled and the
+   second GPU never receives work.
+2. **A process is spawned per clip.** TRUE (the app runs `wsl` -> a fresh `cortex_7b_client.py` for
+   every clip) but NOT the cost: measured `wsl` spawn 0.11 s, `wsl` + python3 0.11 s, + sqlite/socket
+   imports 0.13 s. Discarded before any code was touched.
+3. **The champion call itself.** Measured: **4.62 s for one round trip** on a ~9 s clip. That is the
+   cost. A 7B decoding a short clip is latency-bound, which is also why both cards read as near-idle
+   while being the bottleneck — nvidia-smi is sampling the gaps.
+
+**The fix is real parallelism in the importer's per-clip loop** — two clips in flight would use both
+cards and roughly halve wall clock. NOT done: it is a change to the champion path, whose client
+failure contract exists specifically to stop a silent blank reaching the DB, and rewriting it
+unattended at 3am is how that contract gets broken. Owner's call, with the number attached.
+
+**Consequence for the 34-hour corpus:** at 8.5 clips/min it is ~27 hours of import, not the ~6 stated
+earlier. About 5-6 episodes land per overnight window. Reviewers are unaffected — 471 clips are
+queued and ready.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
