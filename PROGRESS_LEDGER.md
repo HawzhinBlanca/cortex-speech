@@ -8464,3 +8464,49 @@ clips that were never decided. **20 of the 36 have already been redone** against
 text. Last human decision 16:17 local; no activity for ~83 minutes when this was written.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 281 — the listening-QC fired, and one reviewer is an outlier on two instruments
+
+Measured during the evening idle window (reviewers stopped at 16:17 local, 22 clips pending).
+
+**Spot-check scorecard.** `noticed` is the blind-accept signal: the reviewer was served a clip whose
+answer is already known and a draft that differs from it, and `noticed` records whether they changed
+it rather than tapping accept.
+
+| reviewer | checks | noticed | mean CER vs the known answer |
+|---|---:|---:|---:|
+| Sewa | 16 | 14 (88%) | 0.102 |
+| Hawzhin | 5 | 5 (100%) | 0.045 |
+| **Rubar** | **4** | **1 (25%)** | 0.069 |
+| Lamo | 2 | 1 (50%) | 0.080 |
+
+**Second, independent instrument — the real corpus.** Share of each reviewer's decisions where the
+final text is byte-identical to the draft they were handed:
+
+| reviewer | decisions | accept | edit | reject | text unchanged |
+|---|---:|---:|---:|---:|---:|
+| Sewa | 152 | 39 | 106 | 7 | 30% |
+| **Rubar** | **266** | **133** | 130 | 3 | **51%** |
+| Lamo | 27 | 2 | 19 | 6 | 30% |
+
+Rubar hands the draft back untouched on half his clips against 30% for both peers, and on the
+known-answer clips he changed 1 of 4 — leaving 5.2%, 5.8% and 13.7% CER against text a human had
+already established. The 20 requeued clips he redid today came back 19 accepts with ZERO character
+change and 1 edit.
+
+**Held against this, honestly.** Four checks is a small sample and this file's own docstring says to
+interpret nothing from a handful — the finding is a signal, not a verdict. The 33 laundered accepts
+were NOT his fault: the app served him refiner-polished text, and polished text is exactly what a
+careful reviewer would accept. And under the verbatim law, accepting the champion's raw output
+unchanged is often CORRECT, because what the refiner used to "fix" was frequently the speaker's own
+disfluency. None of that explains 1-of-4 on clips where the answer was already known.
+
+**Why it matters more than the numbers suggest:** Rubar has made 266 of the corpus's decisions —
+more than Sewa and Lamo combined. The dataset's quality is dominated by the reviewer with the
+weakest listening signal.
+
+**The instrument is not exhausted:** answer keys are owner-desktop decisions, excluded per reviewer
+only once used, so Rubar can still receive up to 18 more checks. The cheap next measurement is more
+of his own clips, not an argument about these four.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
