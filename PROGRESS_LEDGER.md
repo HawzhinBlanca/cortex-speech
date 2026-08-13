@@ -8489,14 +8489,14 @@ final text is byte-identical to the draft they were handed:
 | **Rubar** | **266** | **133** | 130 | 3 | **51%** |
 | Lamo | 27 | 2 | 19 | 6 | 30% |
 
-Rubar hands the draft back untouched on half his clips against 30% for both peers, and on the
-known-answer clips he changed 1 of 4 — leaving 5.2%, 5.8% and 13.7% CER against text a human had
-already established. The 20 requeued clips he redid today came back 19 accepts with ZERO character
+Rubar hands the draft back untouched on half her clips against 30% for both peers, and on the
+known-answer clips she changed 1 of 4 — leaving 5.2%, 5.8% and 13.7% CER against text a human had
+already established. The 20 requeued clips she redid today came back 19 accepts with ZERO character
 change and 1 edit.
 
 **Held against this, honestly.** Four checks is a small sample and this file's own docstring says to
 interpret nothing from a handful — the finding is a signal, not a verdict. The 33 laundered accepts
-were NOT his fault: the app served him refiner-polished text, and polished text is exactly what a
+were NOT her fault: the app served her refiner-polished text, and polished text is exactly what a
 careful reviewer would accept. And under the verbatim law, accepting the champion's raw output
 unchanged is often CORRECT, because what the refiner used to "fix" was frequently the speaker's own
 disfluency. None of that explains 1-of-4 on clips where the answer was already known.
@@ -8507,7 +8507,7 @@ weakest listening signal.
 
 **The instrument is not exhausted:** answer keys are owner-desktop decisions, excluded per reviewer
 only once used, so Rubar can still receive up to 18 more checks. The cheap next measurement is more
-of his own clips, not an argument about these four.
+of her own clips, not an argument about these four.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
@@ -8548,13 +8548,13 @@ after the earlier scorecard and changed none of them:
 | Lamo | 2 | 1 (50%) | 27 |
 
 **Do NOT read `mean_cer` as a quality ranking** — Sewa's is HIGHER than Rubar's (0.102 vs 0.049)
-while she notices 88% and he notices 14%. The answer keys are owner-desktop decisions, and a reviewer
+while Sewa notices 88% and Rubar notices 14%. The answer keys are owner-desktop decisions, and a reviewer
 writing true verbatim can legitimately diverge from a key that was standardized. `noticed` is the
 robust signal because it measures engagement, not agreement.
 
 **The exposure, stated plainly:** Rubar decided 288 of 494 clips — 58% of the corpus, more than every
-other reviewer combined — and he is the one reviewer whose listening signal is weak. The cheap next
-measurement is a blind second pass: route a sample of his 153 accepts through Sewa and measure the
+other reviewer combined — and she is the one reviewer whose listening signal is weak. The cheap next
+measurement is a blind second pass: route a sample of her 153 accepts through Sewa and measure the
 disagreement rate. That also builds the double-pass adjudication tier the charter still lacks.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
