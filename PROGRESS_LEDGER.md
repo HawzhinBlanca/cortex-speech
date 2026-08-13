@@ -8558,3 +8558,54 @@ measurement is a blind second pass: route a sample of her 153 accepts through Se
 disagreement rate. That also builds the double-pass adjudication tier the charter still lacks.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 283 — the whole original corpus was silently imported a second time
+
+**Found at 02:30 by the pass-1 readiness sweep**, not by a gate — no gate covered this.
+
+**What happened.** The 34-hour Hawleri source folder was deduplicated by decoded-audio hash before
+import — correctly, 3.57 h on disk collapsing to 2.28 h of unique audio. The question never asked was
+whether the LIBRARY already held those recordings. It did. Verified by decoded-audio SHA, three
+sources came back a second time:
+
+| already in the library | re-imported copy |
+|---|---|
+| `Lamofull2_00086400_A01.flac` — 429 clips, **429 reviewed** | `.wav` — 428, none reviewed |
+| `Lamofull00086400_A02.flac` — 40 clips, **40 reviewed** | `Lamofull00086400_A01.wav` — 40, none reviewed |
+| `A1-0032_PODCAST-001.mp4` — 25 clips, **25 reviewed** | `.wav` — 25, none reviewed |
+
+**493 duplicate clips against 494 already-reviewed ones — the entire original corpus, doubled.** Note
+the second row: the names differ (`A01` vs `A02`), so a filename comparison misses it entirely; only
+the decoded audio matches. What it would have cost: the same speech in train AND test, making any
+accuracy measured across that split partly a memory test with nothing in the number to say so, plus
+reviewers judging the same audio twice.
+
+**Removed** under `BEGIN IMMEDIATE` with a pre-flight assertion that none of the 493 carried a human
+decision (rollback if any did — the surviving copy must be the reviewed one). Backup first:
+`cortex-speech.db.bak-dedupe-reimport-20260814`. Cascade clean: 0 orphan hypotheses. Library 1854 →
+**1361 clips, 867 pending**.
+
+**Two candidate gates were built and BOTH rejected on measurement**, which is the part worth keeping:
+
+1. *`(duration_ms, raw_transcript)` collisions.* Caught the incident (188 colliding clips on the true
+   pair) and then FAILED on a clean library — 4 false pairs between recordings proven distinct by
+   hash. Same speaker, VAD durations clamped to the same bounds, short common phrases. A gate that
+   cries wolf gets ignored, so this one was deleted rather than shipped.
+2. *Reusing `audio_fingerprint` / `audio_content_hash`.* Both are per-SOURCE-FILE and computed from
+   the file as stored: a FLAC and its 16 kHz WAV conversion get different values. Measured on the
+   live rows: **0 shared values** between the two copies of the same recording. Neither field can see
+   the format change that caused the incident.
+
+What shipped instead is `scripts/check_import_folder_is_new.py` — decode and compare, run ONCE before
+an import rather than every sweep, which is exactly where that cost is affordable. Fail-before
+verified against the folder that caused this: exit 1, naming `Lamofull00086400_A01.wav` as the same
+audio as `Lamofull00086400_A02.flac` with 40 reviewed clips.
+
+**Also observed:** `[Pending WSL 7B ASR]` placeholder rows are servable to reviewers — the couch queue
+filters on `verified = 0` and nothing else. During a normal import the app is closed so nobody can
+hit them, but an INTERRUPTED import leaves them behind. 36 such rows were left by killing the stalled
+importer and were removed with the duplicates. The `champion-fallback` invariant also reads RED for
+the duration of any import, because placeholders legitimately have no champion hypothesis yet — worth
+knowing before treating a mid-import gate run as a finding.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
