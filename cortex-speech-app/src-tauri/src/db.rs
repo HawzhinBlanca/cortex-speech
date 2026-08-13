@@ -1635,9 +1635,30 @@ impl Database {
     ///
     /// Ordering is byte-identical to `get_segments` on purpose: this replaced a whole-row read, and a
     /// different ORDER BY would silently change WHICH clips a reviewer is handed.
+    /// Ids the review queue may hand out.
+    ///
+    /// A clip whose draft is still a PLACEHOLDER is excluded. `api_decision` already refuses to
+    /// verify `[...]` text, so serving one could only ever waste the reviewer's time — but the real
+    /// cost is worse than that: if they type the transcript themselves instead, the clip is finished
+    /// without the champion ever drafting it, so it permanently has no baseline and no CER can be
+    /// measured against it. What the queue SERVES now agrees with what the decide path ACCEPTS.
+    ///
+    /// This matters because placeholders exist for a whole import: segments are created carrying
+    /// `[Pending WSL 7B ASR]` and filled in afterwards at ~8.5 clips/minute. Normally the app is
+    /// closed for imports and nobody can reach them; an INTERRUPTED import leaves them behind, which
+    /// is exactly what happened on 2026-08-14 (36 orphaned placeholder rows).
+    ///
+    /// Matched in SQL as `[...]` — the same shape the decide guard rejects — so the two cannot
+    /// disagree. `quality::is_placeholder_transcript` remains the authority on what a placeholder
+    /// IS; this is the cheap narrowing that keeps the id-only query fast (P1.3).
     pub fn pending_segment_ids(&self) -> AppResult<Vec<String>> {
-        let mut stmt =
-            self.conn.prepare("SELECT id FROM speech_segments WHERE verified = 0 ORDER BY created_at DESC, id ASC")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM speech_segments
+             WHERE verified = 0
+               AND TRIM(COALESCE(raw_transcript, '')) <> ''
+               AND NOT (TRIM(raw_transcript) LIKE '[%]')
+             ORDER BY created_at DESC, id ASC",
+        )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut ids = Vec::new();
         for row in rows {

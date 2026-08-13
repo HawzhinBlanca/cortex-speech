@@ -3428,3 +3428,31 @@ fn suspect_first_ranks_poor_audio_ahead_of_high_agreement() {
     assert!(pos("disputed") < pos("clean"), "within clean audio, low agreement still comes first: {order:?}");
     assert_eq!(order.last().unwrap(), "clean", "the least suspect clip is last: {order:?}");
 }
+
+#[test]
+fn review_queue_never_serves_a_clip_the_champion_has_not_drafted() {
+    // MEASURED 2026-08-14: an interrupted import left 36 rows carrying `[Pending WSL 7B ASR]`, and
+    // the queue's only filter was `verified = 0`, so a reviewer could be handed one. `api_decision`
+    // already refuses to VERIFY `[...]` text, so the reviewer would hit a 400 — but the worse path is
+    // the one that succeeds: they type the transcript themselves, the clip is finished without the
+    // champion ever drafting it, and it has no baseline for any CER measurement, permanently.
+    let db = make_db();
+    let mut drafted = make_segment("drafted", "a.wav");
+    drafted.raw_transcript = "دەقێکی ڕاستەقینە".to_string();
+    let mut pending = make_segment("pending", "b.wav");
+    pending.raw_transcript = "[Pending WSL 7B ASR]".to_string();
+    let mut unavailable = make_segment("unavailable", "c.wav");
+    unavailable.raw_transcript = "[ASR unavailable: server down]".to_string();
+    let mut blank = make_segment("blank", "d.wav");
+    blank.raw_transcript = "   ".to_string();
+    for seg in [&drafted, &pending, &unavailable, &blank] {
+        db.insert_segment(seg).unwrap();
+    }
+
+    let served = db.pending_segment_ids().unwrap();
+
+    assert!(served.contains(&"drafted".to_string()), "a real draft must still be served: {served:?}");
+    for hidden in ["pending", "unavailable", "blank"] {
+        assert!(!served.contains(&hidden.to_string()), "{hidden} must never reach a reviewer: {served:?}");
+    }
+}
