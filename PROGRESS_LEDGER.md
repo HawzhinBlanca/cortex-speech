@@ -8510,3 +8510,51 @@ only once used, so Rubar can still receive up to 18 more checks. The cheap next 
 of his own clips, not an argument about these four.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 282 — the queue reached zero: 494/494 decided, and what the finished corpus actually is
+
+**Every clip is decided. 0 pending.** 494 segments: 278 edits, 199 accepts, 17 rejects.
+
+**The export, run through the real `export_dataset` command on the live app** (not a SQL
+approximation of it):
+
+| | |
+|---|---:|
+| rows exported | 477 (the 17 rejects correctly dropped) |
+| `transcriptSource` | **477/477 human_verified**, 0 raw_asr |
+| training grade | 454 gold · 18 review · 5 reject |
+| training-ready | **454 clips = 1.15 hours** |
+| blank transcripts | 0 |
+
+Everything held out of training is held out for AUDIO, not for process: 18 `low_rms_volume`, 5
+`near_silence`. No provenance, blank, or placeholder failures remain.
+
+**All three provenance invariants PASS on the finished corpus**, including the accept-provenance
+invariant added today — so no accept in the shipped dataset freezes text an ASR engine did not
+produce. Spot-check pool healthy (22 keys).
+
+**State the size honestly: 1.15 hours is a small ASR corpus.** It is clean, verbatim and
+human-decided, which is what it was built to be, but nobody should call 454 clips a fine-tuning set
+without saying how small it is.
+
+**The QC signal got STRONGER, not weaker, with more data.** Rubar received 3 more known-answer clips
+after the earlier scorecard and changed none of them:
+
+| reviewer | checks | noticed | decisions owned |
+|---|---:|---:|---:|
+| Sewa | 16 | 14 (88%) | 152 |
+| Hawzhin | 5 | 5 (100%) | 27 (desktop) |
+| **Rubar** | **7** | **1 (14%)** | **288** |
+| Lamo | 2 | 1 (50%) | 27 |
+
+**Do NOT read `mean_cer` as a quality ranking** — Sewa's is HIGHER than Rubar's (0.102 vs 0.049)
+while she notices 88% and he notices 14%. The answer keys are owner-desktop decisions, and a reviewer
+writing true verbatim can legitimately diverge from a key that was standardized. `noticed` is the
+robust signal because it measures engagement, not agreement.
+
+**The exposure, stated plainly:** Rubar decided 288 of 494 clips — 58% of the corpus, more than every
+other reviewer combined — and he is the one reviewer whose listening signal is weak. The cheap next
+measurement is a blind second pass: route a sample of his 153 accepts through Sewa and measure the
+disagreement rate. That also builds the double-pass adjudication tier the charter still lacks.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
