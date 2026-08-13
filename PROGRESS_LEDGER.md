@@ -8409,3 +8409,31 @@ the remediation destroys 36 human decisions and is the owner's call. `npm run te
 human_verified`. Any dataset built before the requeue carries them.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+**Remediated same day, on the owner's go.** Backup first
+(`cortex-speech.db.bak-requeue-laundered-20260813`, 6,279,168 bytes, taken with the sqlite backup API
+because reviewers were deciding clips during the write and a file copy would have torn). The target
+set was recomputed INSIDE a `BEGIN IMMEDIATE` transaction rather than reused from the measurement 20
+minutes earlier — in that gap the reviewers had turned 180 accepts into 196, and acting on the stale
+list would have missed or mis-hit rows. Under the lock: still exactly 36, and all 36 already carried
+the champion's own transcript in `raw_transcript` (asserted before the write, with a rollback on
+mismatch, so clearing a decision could not expose some other engine's leftovers).
+
+Cleared on those rows: `verified`, `is_gold`, `human_decision`, `verdict`, `verdict_transcript`,
+`annotated_transcript`, `reviewed_by`, `corrected_at`. **Kept deliberately:** `review_events` (the
+audit trail of who decided what and when — deleting it would erase the evidence of this incident)
+and `decision_verdicts` (a MACHINE verdict feeding the C4 auto-accept-precision denominator;
+deleting it would silently move a measured number).
+
+**Verified at the serving path, not the write path:** pending 6 → 42 (+36 exactly);
+`review-serving-provenance` all three invariants PASS (exit 0); `check_spot_check_pool` healthy (22
+answer keys, 436 human decisions, 4 active reviewers). On the LIVE couch API with a real reviewer
+token: `pendingTotal 42`, and **25 of the 36 requeued clips are already in a reviewer's batch, all 25
+serving text byte-equal to the champion's own transcript, none blank** (the other 11 sit behind the
+25-clip batch cap).
+
+**Corrected, for the record:** the "122 pending" figure reported earlier today is stale. The
+reviewers have decided all but 42 of the 494 clips — 436 human decisions and climbing during this
+very remediation.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
