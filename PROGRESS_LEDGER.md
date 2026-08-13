@@ -8649,3 +8649,36 @@ earlier. About 5-6 episodes land per overnight window. Reviewers are unaffected 
 queued and ready.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 285 — a servable placeholder, and 107 good clips held back by a level defect I introduced
+
+**Fixed: the review queue could serve a clip the champion had not drafted.** `pending_segment_ids`
+filtered on `verified = 0` and nothing else. `api_decision` already refuses to VERIFY `[...]` text, so
+the visible outcome is a 400 — but the path that SUCCEEDS is the damaging one: the reviewer types the
+transcript themselves, the clip is finished without the champion ever drafting it, and it permanently
+has no baseline for any CER measurement. Demonstrated on the live DB mid-import: the old query offers
+**867** clips, the new one **695** — 172 undrafted clips it stops reaching a reviewer right now.
+Matched on the same `[...]` shape the decide guard rejects, so serving and deciding cannot drift
+apart. Test covers all four cases. NOT YET BUILT: any build into `target/release` fails while the
+importer holds `onnxruntime.dll`, so this must be compiled after the import stops and BEFORE the app
+is handed back — stopping an import mid-file is precisely what creates placeholders.
+
+**Found: 107 clips (22.7% of the older pending material) sit below -35 dB, and it is my defect.** The
+quiet clips are not scattered — they concentrate in whole source files: `A1-0037_Sound01` 10/10,
+`A1-0042_Sound01 (2)` 9/9, `A1-0031_PODCAST-001` 6/6, `A1-0049_Sound02` 10/11. That is a per-FILE
+level problem, and the cause is that the first staging pass converted those files with `-ac 1 -ar
+16000` and NO gain correction. The Hawleri batch got proper EBU R128 normalization; this batch did
+not.
+
+**Measured before treating it as damage:** the champion coped. Quiet clips produce **0 empty drafts**
+and a median 12.63 chars/sec against 14.27 for normal-level clips — an 11% gap that is within
+speech-rate variation. A clip at -45.8 dB returned a clean Kurdish sentence. The audio is fine for a
+human to review and fine for training; only the `low_rms_volume` gate holds it back.
+
+**The gate is NOT being relaxed.** Weakening a quality gate to make data pass is the one move this
+project forbids outright. The fix belongs at the cause: re-prep those source files with the same
+static-gain normalization used for the Hawleri episodes and re-import them. They carry no human
+decisions, so nothing is lost — but it costs champion time at 8.5 clips/min and it changes the
+corpus, so it waits for the owner rather than happening overnight.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
