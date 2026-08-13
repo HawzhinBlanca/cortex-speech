@@ -46,12 +46,6 @@ export async function importAudioFile(path: string): Promise<{ status: string; s
   return invoke('import_audio_file', { path });
 }
 
-export interface ImportStatus {
-  running: boolean;
-  current: number;
-  total: number;
-  file: string;
-}
 
 export async function cancelOperation(): Promise<void> {
   return invoke<void>('cancel_operation');
@@ -436,23 +430,6 @@ export interface AgentStageEvent {
   createdAt: string;
 }
 
-export interface BlockingValidationIssues {
-  blocked: boolean;
-  errorCount: number;
-  warningCount: number;
-  warningThreshold: number;
-  errors: ValidationIssue[];
-  warnings: ValidationIssue[];
-}
-
-export interface BundleExportResult {
-  outputDir: string;
-  production: boolean;
-  manifestPath: string;
-  files: string[];
-  validation: BlockingValidationIssues;
-}
-
 export interface MediaGrant {
   id: string;
   path: string;
@@ -812,26 +789,6 @@ export async function restoreDbFromSnapshot(name: string): Promise<void> {
 /** Complete speaker list (not the truncated top-10 dashboard summary) for the speaker manager. */
 export async function getSpeakers(): Promise<SpeakerStat[]> {
   return invoke<SpeakerStat[]>('get_speakers');
-}
-
-export interface ConfidenceInterval {
-  point: number;
-  lower: number;
-  upper: number;
-  confidence: number;
-}
-
-/** How much human reviewers had to change the raw ASR output (reference = human
- *  annotation, hypothesis = raw ASR), with bootstrap confidence intervals. */
-export interface AnnotationDriftScorecard {
-  numSegments: number;
-  microWer: number;
-  microCer: number;
-  werCi: ConfidenceInterval;
-  cerCi: ConfidenceInterval;
-  bootstrapResamples: number;
-  confidence: number;
-  seed: number;
 }
 
 export interface DatasetQuality {
@@ -1228,13 +1185,6 @@ export async function getActiveLearningQueue(
 // ── Phase 1 — Gold-Set Eval Harness ────────────────────────────────────────
 
 import type { EvalRun, EvalRunResult, EscalationTrendPoint, LabelQualityLift } from './types';
-
-export async function runGoldEval(
-  modelId: string,
-  hypotheses: [string, string][],
-): Promise<EvalRunResult> {
-  return invoke<EvalRunResult>('run_gold_eval', { modelId, hypotheses });
-}
 
 /** The honest-CER entrypoint: runs the real ASR over the gold set (no caller-supplied hypotheses). */
 export async function runGoldEvalAsr(modelId?: string | null): Promise<EvalRunResult> {

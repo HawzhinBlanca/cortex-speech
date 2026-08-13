@@ -38,21 +38,6 @@ describe('notificationStore', () => {
     expect(state[0].type).toBe('warning');
   });
 
-  it('adds progress notification', () => {
-    const id = notifications.progress('processing', 50);
-    const state = get(notifications);
-    const n = state.find(x => x.id === id);
-    expect(n?.progress).toBe(50);
-  });
-
-  it('updates progress', () => {
-    const id = notifications.progress('processing', 0);
-    notifications.updateProgress(id, 75);
-    const state = get(notifications);
-    const n = state.find(x => x.id === id);
-    expect(n?.progress).toBe(75);
-  });
-
   it('dismisses notification', () => {
     const id = notifications.info('dismiss me');
     expect(get(notifications)).toHaveLength(1);

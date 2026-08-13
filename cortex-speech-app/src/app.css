@@ -542,10 +542,6 @@
       box-shadow var(--dur-2) var(--ease),
       transform var(--dur-2) var(--ease);
   }
-  .card-hover:hover {
-    border-color: var(--border-strong);
-    transform: translateY(-1px);
-  }
   .panel {
     background: var(--surface-1);
     border: 1px solid var(--border-soft);
@@ -596,33 +592,12 @@
     color: var(--warning);
     border-color: color-mix(in srgb, var(--warning) 30%, transparent);
   }
-  .badge-danger {
-    background: var(--danger-soft);
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 30%, transparent);
-  }
-  .badge-info {
-    background: var(--info-soft);
-    color: var(--info);
-    border-color: color-mix(in srgb, var(--info) 30%, transparent);
-  }
-  .badge-neutral {
-    background: var(--surface-3);
-    color: var(--text-muted);
-    border-color: var(--border);
-  }
-
   /* Status dot */
   .dot {
     width: 0.5rem;
     height: 0.5rem;
     border-radius: 9999px;
     box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04);
-  }
-
-  .divider {
-    height: 1px;
-    background: var(--border-soft);
   }
 
   /* ---- Range slider ---- */
@@ -650,19 +625,6 @@
     transform: scale(1.18);
   }
 
-  /* ---- Loading skeleton ---- */
-  .skeleton {
-    background: linear-gradient(
-      100deg,
-      var(--surface-2) 30%,
-      var(--surface-3) 50%,
-      var(--surface-2) 70%
-    );
-    background-size: 200% 100%;
-    animation: shimmer 1.4s var(--ease) infinite;
-    border-radius: var(--r-sm);
-  }
-
   .panel-collapsed {
     width: 0 !important;
     min-width: 0 !important;
@@ -684,9 +646,6 @@
     backdrop-filter: blur(16px) saturate(140%);
     -webkit-backdrop-filter: blur(16px) saturate(140%);
   }
-  .text-balance {
-    text-wrap: balance;
-  }
   .tnum {
     font-variant-numeric: tabular-nums;
   }
@@ -699,12 +658,6 @@
   .animate-fade-in {
     animation: fade-in var(--dur-2) var(--ease-out) both;
   }
-  .animate-slide-up {
-    animation: slide-up var(--dur-3) var(--ease-out) both;
-  }
-  .animate-scale-in {
-    animation: scale-in var(--dur-2) var(--ease-out) both;
-  }
   .animate-progress-indeterminate {
     animation: progress-indeterminate 1.15s var(--ease) infinite;
   }
@@ -716,34 +669,6 @@
   }
   to {
     opacity: 1;
-  }
-}
-@keyframes slide-up {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-@keyframes scale-in {
-  from {
-    opacity: 0;
-    transform: scale(0.97);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
-@keyframes shimmer {
-  from {
-    background-position: 200% 0;
-  }
-  to {
-    background-position: -200% 0;
   }
 }
 @keyframes progress-indeterminate {

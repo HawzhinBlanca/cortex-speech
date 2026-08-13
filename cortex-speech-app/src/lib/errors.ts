@@ -1,5 +1,5 @@
 import { get } from 'svelte/store';
-import { settingsTab, showSettings } from './stores/settingsStore';
+import { openSettings } from './stores/settingsStore';
 import { t } from './i18n';
 
 export type ErrorAction = {
@@ -25,9 +25,8 @@ export function isModelError(message: string): boolean {
   return MODEL_PATTERNS.some((pattern) => pattern.test(message));
 }
 
-export function openModelsSettings(): void {
-  settingsTab.set('models');
-  showSettings.set(true);
+function openModelsSettings(): void {
+  openSettings('models');
 }
 
 export function parseActionableError(error: unknown): ActionableError {

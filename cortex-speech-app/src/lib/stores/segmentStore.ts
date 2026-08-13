@@ -108,7 +108,6 @@ export const wordTimestamps = writable<WordTimestamp[]>([]);
 export const filterVerified = writable<boolean | null>(null);
 export const searchQuery = writable('');
 export const searchResults = writable<SpeechSegment[] | null>(null);
-export const searchLoading = writable(false);
 export type SortOrder =
   | 'newest'
   | 'oldest'

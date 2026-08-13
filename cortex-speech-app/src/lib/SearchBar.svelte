@@ -2,17 +2,12 @@
   import { onDestroy } from 'svelte';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
-  import {
-    searchQuery,
-    searchResults,
-    searchLoading,
-    filterVerified,
-    sortOrder,
-  } from './stores/segmentStore';
+  import { searchQuery, searchResults, filterVerified, sortOrder } from './stores/segmentStore';
   import { t } from './i18n';
   import { isTauriRuntime } from './runtime';
 
   let query = $state('');
+  let loading = $state(false);
   let debounceTimer: ReturnType<typeof setTimeout>;
   let searchGeneration = 0;
   const tauriAvailable = isTauriRuntime();
@@ -35,14 +30,14 @@
   async function fetchSearchResults(trimmed: string, gen: number) {
     if (!trimmed) {
       searchResults.set(null);
-      searchLoading.set(false);
+      loading = false;
       return;
     }
 
-    searchLoading.set(true);
+    loading = true;
     if (!tauriAvailable) {
       searchResults.set(null);
-      searchLoading.set(false);
+      loading = false;
       return;
     }
 
@@ -55,7 +50,7 @@
       searchResults.set(null);
       notifications.error($t('searchFailed'), { detail: String(e) });
     } finally {
-      if (gen === searchGeneration) searchLoading.set(false);
+      if (gen === searchGeneration) loading = false;
     }
   }
 
@@ -68,7 +63,7 @@
       const gen = ++searchGeneration;
       if (!trimmed) {
         searchResults.set(null);
-        searchLoading.set(false);
+        loading = false;
         return;
       }
       fetchSearchResults(trimmed, gen);
@@ -82,7 +77,7 @@
     searchQuery.set('');
     lastPushed = '';
     searchResults.set(null);
-    searchLoading.set(false);
+    loading = false;
   }
 
   function setVerified(value: boolean | null) {
@@ -112,10 +107,10 @@
       placeholder={$t('searchPlaceholder')}
       bind:value={query}
       oninput={handleInput}
-      aria-busy={$searchLoading}
+      aria-busy={loading}
     />
     {#if query}
-      {#if $searchLoading}
+      {#if loading}
         <svg
           class="absolute right-8 top-1/2 -translate-y-1/2 w-4 h-4 text-cortex-400 animate-spin"
           fill="none"

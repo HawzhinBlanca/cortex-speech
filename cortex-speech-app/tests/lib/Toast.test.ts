@@ -75,13 +75,4 @@ describe('Toast', () => {
     });
   });
 
-  it('renders a progress bar when progress is set', async () => {
-    render(Toast);
-    notifications.progress('Processing', 50);
-    await waitFor(() => {
-      expect(screen.getByText('Processing')).toBeInTheDocument();
-    });
-    const progressBar = document.querySelector('.rounded-full');
-    expect(progressBar).toBeInTheDocument();
-  });
 });

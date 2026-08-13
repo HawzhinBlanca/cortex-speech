@@ -205,7 +205,6 @@ export const en: Record<string, string> = {
   'reviewCorrect.ctaOne': '1 clip is ready for you to review and correct.',
   'reviewCorrect.start': 'Start reviewing',
   'reviewCorrect.dismiss': 'Dismiss',
-  'reviewCorrect.allDone': 'All clips reviewed — nice work!',
 
   // ── Review Inbox (escalation adjudication panel) ──
   'inbox.runJury': 'Run Jury',
@@ -284,7 +283,6 @@ export const en: Record<string, string> = {
   localeToggle: 'Switch language',
   models: 'AI Models',
   'models.downloadAll': 'Download All',
-  'models.downloaded': 'Downloaded',
   'models.notDownloaded': 'Not downloaded',
   'pipeline.importing': 'Importing...',
   'pipeline.referenceTranscribing': 'Building reference transcript...',
@@ -298,7 +296,6 @@ export const en: Record<string, string> = {
   'pipeline.progressCount': '{done}/{total} chunks',
   'pipeline.elapsed': 'elapsed {time}',
   'pipeline.eta': '~{time} left',
-  'inference.title': 'Inference Stats',
   'inference.vad': 'VAD',
   'inference.asr': 'ASR',
   'inference.calls': 'calls',
@@ -392,7 +389,6 @@ export const en: Record<string, string> = {
   'batchVerify.selected': 'Verify Selected',
   'batchVerify.progress': 'Verifying {n}...',
   'batchVerify.status': '{current}/{total}',
-  'batchVerify.success': 'Verified {count} segment(s)',
   'batchVerify.failed': 'Batch verify failed',
   'batchVerify.noSelection': 'Select a segment first',
   'batchVerify.nothingToVerify': 'No pending segments to verify',
@@ -633,8 +629,6 @@ export const en: Record<string, string> = {
   'agentReport.loadFailed': 'Failed to load agent report',
   'agentReport.stageLoadFailed': 'Failed to load agent stage log',
   'shortcuts.none': 'No shortcuts registered',
-  'shortcuts.closeHint': 'Press {key} to close',
-  'shortcuts.esc': 'Esc',
   'notifications.loadSegmentsFailed': 'Failed to load segments',
   'notifications.undoInReview': 'Press Backspace to undo the last review decision',
   'notifications.snapshotFailing':
@@ -742,8 +736,6 @@ export const en: Record<string, string> = {
   'wsl.startFailed': 'Failed to start WSL refinement process',
   'wsl.cancelFailed': 'Failed to cancel WSL refinement',
   'wsl.logsCopied': 'Console logs copied to clipboard',
-  'wsl.batchComplete': 'WSL Local 7B ASR Batch transcription complete!',
-  'wsl.batchCancelled': 'WSL Local 7B ASR transcription was cancelled.',
   'wsl.stillRunning': 'Refinement is still running. Please cancel or wait for it to complete.',
   // Settings panel labels
   'settings.autoplaySegments': 'Autoplay Segments on Selection',

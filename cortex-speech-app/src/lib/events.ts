@@ -34,12 +34,6 @@ export interface PipelineError {
   error: string;
 }
 
-export interface PipelineComplete {
-  total: number;
-  succeeded: number;
-  failed: number;
-}
-
 export interface ImportComplete {
   total: number;
   succeeded: number;
@@ -186,11 +180,6 @@ export async function startEventListeners() {
     notifications.error(tr('events.processingError', { file }), { detail: error });
   });
   unlisteners.push(unlistenError);
-
-  const unlistenComplete = await listen<PipelineComplete>('pipeline-complete', () => {
-    // Legacy event — import-complete drives segment refresh.
-  });
-  unlisteners.push(unlistenComplete);
 
   const unlistenImportComplete = await listen<ImportComplete>('import-complete', (event) => {
     void refreshAfterImport(event.payload);

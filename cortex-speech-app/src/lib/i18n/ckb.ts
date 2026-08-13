@@ -210,7 +210,6 @@ export const ckb: Record<string, string> = {
   'reviewCorrect.ctaOne': '١ پارچە ئامادەیە بۆ پێداچوونەوە و ڕاستکردنەوەت.',
   'reviewCorrect.start': 'دەستبکە بە پێداچوونەوە',
   'reviewCorrect.dismiss': 'داخستن',
-  'reviewCorrect.allDone': 'هەموو پارچەکان پێداچوونەوەیان بۆ کرا — کارێکی باش!',
 
   // ── سندوقی پێداچوونەوە (پانێڵی بڕیاردان) ──
   'inbox.runJury': 'جووری بەڕێوەببە',
@@ -290,7 +289,6 @@ export const ckb: Record<string, string> = {
   localeToggle: 'گۆڕینی زمان',
   models: 'مۆدێلی AI',
   'models.downloadAll': 'داگرتنی هەموو',
-  'models.downloaded': 'داگردراوە',
   'models.notDownloaded': 'داگردراو نییە',
   'pipeline.importing': 'هاوردەکردن...',
   'pipeline.referenceTranscribing': 'دروستکردنی نووسینەوەی سەرچاوە...',
@@ -304,7 +302,6 @@ export const ckb: Record<string, string> = {
   'pipeline.progressCount': '{done}/{total} پارچە',
   'pipeline.elapsed': 'تێپەڕیو {time}',
   'pipeline.eta': '~{time} ماوە',
-  'inference.title': 'ئامارەکانی دەرکەوتن',
   'inference.vad': 'VAD',
   'inference.asr': 'ASR',
   'inference.calls': 'بانگکردنەکان',
@@ -397,7 +394,6 @@ export const ckb: Record<string, string> = {
   'batchVerify.selected': 'پشتڕاستکردنی هەڵبژێردراو',
   'batchVerify.progress': 'پشتڕاستکردنی {n}...',
   'batchVerify.status': '{current}/{total}',
-  'batchVerify.success': '{count} بەش پشتڕاست کرا',
   'batchVerify.failed': 'پشتڕاستکردنی کۆمەڵی سەرکەوتوو نەبوو',
   'batchVerify.noSelection': 'سەرەتا بەشێک هەڵبژێرە',
   'batchVerify.nothingToVerify': 'هیچ بەشی چاوەڕوان نییە',
@@ -633,8 +629,6 @@ export const ckb: Record<string, string> = {
   'agentReport.loadFailed': 'بارکردنی ڕاپۆرتی ئەیجێنت سەرکەوتوو نەبوو',
   'agentReport.stageLoadFailed': 'بارکردنی تۆماری قۆناغی ئەیجێنت سەرکەوتوو نەبوو',
   'shortcuts.none': 'هیچ کورتکراوەیەک تۆمار نەکراوە',
-  'shortcuts.closeHint': '{key} بگرە بۆ داخستن',
-  'shortcuts.esc': 'Esc',
   'notifications.loadSegmentsFailed': 'بارکردنی بەشەکان سەرکەوتوو نەبوو',
   'notifications.undoInReview': 'بۆ گەڕاندنەوەی دوایین بڕیاری پێداچوونەوە، Backspace دابگرە',
   'notifications.snapshotFailing':
@@ -743,8 +737,6 @@ export const ckb: Record<string, string> = {
   'wsl.startFailed': 'دەستپێکردنی پرۆسەی باشترکردنی WSL سەرکەوتوو نەبوو',
   'wsl.cancelFailed': 'هەڵوەشاندنەوەی باشترکردنی WSL سەرکەوتوو نەبوو',
   'wsl.logsCopied': 'تۆمارەکانی تێرمیناڵ کۆپی کران بۆ کلیپبۆرد',
-  'wsl.batchComplete': 'نووسینەوەی کۆمەڵی WSL Local 7B ASR تەواو بوو!',
-  'wsl.batchCancelled': 'نووسینەوەی WSL Local 7B ASR هەڵوەشێندرایەوە.',
   'wsl.stillRunning':
     'باشترکردن هێشتا کار دەکات. تکایە هەڵیوەشێنەرەوە یان چاوەڕێ بکە تا تەواو دەبێت.',
   // Settings panel labels
