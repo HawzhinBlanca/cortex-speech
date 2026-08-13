@@ -8360,3 +8360,52 @@ frontend is bundled into the exe, so this lands on the next rebuild — delibera
 the owner is mid-review rather than interrupting a session to ship a layout change.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 280 — the 348-row clear left 36 laundered accepts, and the gate could not see them
+
+**The sweep was GREEN and the data was not.** The full 35-gate `verify-10` finished GREEN
+(35/35 PASS, 0 FAIL, VERDICT: GREEN — PERSONAL-USE SHIP-READY) on the same live database that was,
+at that moment, holding 36 rows of LLM-refiner text labeled `human_verified`. Both statements are
+true, which is the finding: no gate covered this class until this iteration.
+
+**Measured, on the live DB (read-only), 2026-08-13.** Of 180 `accept` decisions, **36 freeze text
+that matches NO ASR hypothesis on file** — not the champion `omniasr-wsl-7b`, not
+`finetuned-mms-ckb`, not `omniasr-ctc-300m`, not `omniasr-ctc-1b`. All 36 are pre-fix (before the
+2026-08-12 11:54 clear); 33 by Rubar, 3 by Lamo. Character divergence from the champion's own
+transcript: median 5.2%, max 14.2%. Split by era, the control is clean: **0 of 31 post-fix accepts**
+diverge, which is what proves the accept path copies the served text verbatim — so a diverging
+accept means the text served was never the champion's.
+
+Sample (id `3330566c`, Rubar, 2026-08-11):
+
+* champion RAW: `خێزانەکەمان بێ بە کۆمەڵگاکە بێ بە مامۆستایانی ئاینی بێت کە...`
+* APPROVED:     `خێزانەکەمان، کۆمەڵگاکە، یان مامۆستایانی ئایینی، کە...`
+
+Inserted commas, `بێ بە` → `یان`, `ئاینی` → `ئایینی`. Elsewhere `زیای ناکردووە` → `زیادی نەکردبوو`
+— repaired grammar. This is refiner output, and under the verbatim law it is now the training text.
+
+**Why the existing gate passed it.** Invariant 1 says a populated `annotated_transcript` requires
+human EVIDENCE on the row, and accepts a recorded `human_decision` as that evidence. A decision is
+evidence a human clicked a button. It is not evidence a human authored the words. Pre-fix, the
+machine wrote the paraphrase into the human-only field, the reviewer was shown it, clicked accept —
+and the click retroactively made the row look legitimately human. The 2026-08-12 clear removed the
+machine text only from rows that had NOT yet been decided; every row a reviewer had already accepted
+kept it, permanently, in `verdict_transcript`.
+
+**Fixed: invariant 3 in `check_review_serving_provenance.py` (verify-10 gate
+`review-serving-provenance`).** An accept may only freeze text some ASR engine actually produced —
+the stored text, read at the export's own precedence (`verdict ▸ annotated ▸ raw`, mirroring
+`quality::training_transcript_with_source`), must match one of that segment's own hypotheses.
+Whitespace-normalized so spacing is not a finding. Edits are deliberately exempt: an edit is a human
+typing, and its text is expected to match no engine.
+
+**Fail-before / pass-after, both run:** live DB → `FAIL [accept-provenance]: 36 accepts freeze text
+no ASR engine produced`, exit 1. Same gate against a consistent copy with those 36 requeued →
+`PASS [accept-provenance]`, exit 0, all three invariants hold. The live database was NOT modified;
+the remediation destroys 36 human decisions and is the owner's call. `npm run test:python-policies`:
+62 policy scripts passed.
+
+**Still true and not yet fixed:** those 36 rows export today as `transcript_source =
+human_verified`. Any dataset built before the requeue carries them.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
