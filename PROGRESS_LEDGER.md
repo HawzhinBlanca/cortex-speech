@@ -8437,3 +8437,30 @@ reviewers have decided all but 42 of the 494 clips — 436 human decisions and c
 very remediation.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+**Self-inflicted, found and corrected the same session: the requeue wrote LOCAL time into a UTC
+column.** Every app writer stamps `updated_at = datetime('now')`, which SQLite evaluates in **UTC**.
+The remediation script above used Python's `datetime.now()` — local, UTC+3 on this machine — so the
+36 requeued rows carried a timestamp about three hours in the FUTURE relative to every other row in
+the table.
+
+Impact, stated precisely rather than dramatically: `segment_row_stamp` (the rowVersion serve/decide
+fence) compares the stamp for EQUALITY, so the fence was never wrong and no decision could be
+mis-accepted. What it did corrupt is every time-ordered read of those rows — "recently modified"
+ordering, any incremental/backlog pass keyed on `updated_at`, and the displayed last-changed time —
+for as long as it took real time to catch up.
+
+Corrected with the shape of the defect, not the shape of the incident: `UPDATE ... SET updated_at =
+datetime('now') WHERE updated_at > datetime('now')` — a row stamped in the future is the bug, whoever
+wrote it. **16 rows** still carried it; the other 20 had already been re-reviewed, and the app's own
+UTC write had overwritten them. Zero future-stamped rows remain, and all three provenance invariants
+still PASS on the live DB.
+
+The lesson generalizes past this script: any direct write to this database must use
+`datetime('now')`, never a Python-side clock, or it silently disagrees with every row the app wrote.
+
+**Reviewer progress at this point:** 22 clips pending — 16 of the requeued 36, plus the 6 escalated
+clips that were never decided. **20 of the 36 have already been redone** against the champion's own
+text. Last human decision 16:17 local; no activity for ~83 minutes when this was written.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
