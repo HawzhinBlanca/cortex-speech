@@ -111,26 +111,6 @@ pub async fn get_dataset_certificate(
     .await
 }
 
-/// Compute the annotation-drift scorecard for the current dataset: how much human
-/// reviewers had to change the raw ASR output (micro WER/CER with bootstrap CIs). Reads
-/// the live segments directly — unlike `build_scorecard` it needs no held-out eval run.
-#[tauri::command]
-pub async fn compute_annotation_drift_scorecard(
-    state: State<'_, AppState>,
-) -> Result<crate::scorecard::AnnotationDriftScorecard, String> {
-    RATE_LIMITER.check("compute_annotation_drift_scorecard")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        // P1.3: folded from a stream. Only the (small) per-clip error records survive a push, which is
-        // all the bootstrap needs; the transcripts they were computed from do not.
-        let mut tally = crate::scorecard::AnnotationDriftTally::default();
-        db.for_each_segment(None, |seg| tally.push(&seg)).map_err(|e| e.to_string())?;
-        Ok(tally.finish(Default::default()))
-    })
-    .await
-}
-
 /// Measured raw-ASR vs post-jury label-quality lift (M3.1) over human-verified segments.
 #[tauri::command]
 pub async fn get_label_quality_lift(state: State<'_, AppState>) -> Result<crate::eval::LabelQualityLift, String> {

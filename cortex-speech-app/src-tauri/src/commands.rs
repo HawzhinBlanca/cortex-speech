@@ -1681,24 +1681,6 @@ pub async fn import_model_checkpoint(
     .await
 }
 
-#[tauri::command]
-pub fn get_blocking_validation_issues(
-    warning_threshold: Option<usize>,
-    state: State<'_, AppState>,
-) -> Result<crate::export_bundle::BlockingValidationIssues, String> {
-    RATE_LIMITER.check("get_blocking_validation_issues")?;
-    let db = state.lock_db();
-    let settings = state.lock_settings();
-    crate::export_bundle::blocking_issues(&db, &settings, warning_threshold.unwrap_or(0)).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn get_import_status(state: State<'_, AppState>) -> Result<crate::pipeline::ImportStatus, String> {
-    RATE_LIMITER.check("get_import_status")?;
-    let pipeline = state.lock_pipeline();
-    Ok(pipeline.import_status())
-}
-
 /// The complete speaker list (not the truncated top-10 dashboard summary) so the speaker-management
 /// panel can rename every speaker, including low-frequency ones.
 #[tauri::command]
@@ -2017,12 +1999,6 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
     // (undo/redo history was already cleared above, right after the DB swap.)
     tracing::info!("database and config restored from auto-snapshot {name}");
     Ok(())
-}
-
-#[tauri::command]
-pub fn db_wal_checkpoint(state: State<'_, AppState>) -> Result<(), String> {
-    let db = state.lock_db();
-    db.wal_checkpoint().map_err(|e| e.to_string())
 }
 
 #[tauri::command]

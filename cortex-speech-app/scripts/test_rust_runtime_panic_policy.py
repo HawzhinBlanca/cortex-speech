@@ -129,10 +129,10 @@ FORBIDDEN_RUNTIME_PATTERNS = {
         "self.store.lock().map",
         "if let Ok(mut store) = self.store.lock()",
     ],
-    "src-tauri/src/perf/mod.rs": [
-        "NonZeroUsize::new(capacity.max(1)).unwrap()",
-        "if let Ok(mut cache) = self.cache.lock()",
-        "self.cache.lock().map",
+    "src-tauri/src/commands/batch.rs": [
+        "NonZeroUsize::new(2000).unwrap()",
+        "if let Ok(mut cache) = NORMALIZER_CACHE.lock()",
+        "NORMALIZER_CACHE.lock().map",
     ],
     "src-tauri/src/history/mod.rs": [
         "Lock error",
@@ -1675,20 +1675,19 @@ def test_transcript_cache_recovers_poisoned_lock_and_never_zero_capacity() -> No
         raise AssertionError("cache.rs must keep a unit test for zero-capacity cache behavior")
 
 
-def test_memoizer_recovers_poisoned_lock_and_never_zero_capacity() -> None:
-    perf = (REPO_ROOT / "src-tauri/src/perf/mod.rs").read_text(encoding="utf-8")
-    if "fn lock_cache(&self) -> MutexGuard<'_, LruCache<K, V>>" not in perf:
-        raise AssertionError("Memoizer must centralize cache locking behind lock_cache()")
-    if "Recovering poisoned memoizer cache" not in perf:
-        raise AssertionError("Memoizer must warn when recovering a poisoned cache")
-    if "poisoned.into_inner()" not in perf:
-        raise AssertionError("Memoizer must recover poisoned cache locks with poisoned.into_inner()")
-    if "NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN)" not in perf:
-        raise AssertionError("Memoizer must construct non-zero capacity without unwrap()")
-    if "test_memoizer_recovers_poisoned_cache" not in perf:
-        raise AssertionError("perf/mod.rs must keep a unit test for poisoned memoizer recovery")
-    if "test_memoizer_zero_capacity_keeps_one_entry" not in perf:
-        raise AssertionError("perf/mod.rs must keep a unit test for zero-capacity memoizer behavior")
+def test_normalizer_cache_recovers_poisoned_lock() -> None:
+    # ponytail-audit round 2 (2026-08-13): the generic Memoizer<K,V> in perf/mod.rs had exactly one
+    # instantiation (NORMALIZER_CACHE in batch.rs) and was inlined there — this test follows it to
+    # its new home instead of asserting a deleted file back into existence.
+    batch = (REPO_ROOT / "src-tauri/src/commands/batch.rs").read_text(encoding="utf-8")
+    if "Recovering poisoned normalizer cache" not in batch:
+        raise AssertionError("NORMALIZER_CACHE must warn when recovering a poisoned cache")
+    if "poisoned.into_inner()" not in batch:
+        raise AssertionError("NORMALIZER_CACHE must recover poisoned cache locks with poisoned.into_inner()")
+    if "NonZeroUsize::new(2000).unwrap_or(NonZeroUsize::MIN)" not in batch:
+        raise AssertionError("NORMALIZER_CACHE must construct non-zero capacity without unwrap()")
+    if "normalize_cached_recovers_a_poisoned_lock" not in batch:
+        raise AssertionError("batch.rs must keep a unit test for poisoned normalizer-cache recovery")
 
 
 def test_history_manager_recovers_poisoned_stacks() -> None:
@@ -2298,7 +2297,7 @@ def main() -> None:
     test_global_rate_limiter_recovers_poisoned_lock()
     test_audio_fingerprint_cache_recovers_poisoned_lock()
     test_transcript_cache_recovers_poisoned_lock_and_never_zero_capacity()
-    test_memoizer_recovers_poisoned_lock_and_never_zero_capacity()
+    test_normalizer_cache_recovers_poisoned_lock()
     test_history_manager_recovers_poisoned_stacks()
     test_inference_metrics_recover_poisoned_locks()
     test_pcm_cache_recovers_poisoned_lock()

@@ -4,7 +4,6 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod agentic;
-pub mod align_text;
 pub mod aligner;
 pub mod api_keys;
 pub mod asr;
@@ -51,7 +50,6 @@ pub mod media;
 pub mod migrations;
 pub mod models;
 pub mod normalizer;
-pub mod perf;
 pub mod pipeline;
 pub mod quality;
 pub mod registry;
@@ -725,7 +723,6 @@ pub fn run() {
             commands::export_agreement_sample,
             commands::transcribe_audio_with_scribe,
             commands::add_scribe_votes,
-            commands::get_blocking_validation_issues,
             commands::register_media_asset,
             commands::get_media_asset_url,
             commands::check_agentic_readiness,
@@ -733,7 +730,6 @@ pub fn run() {
             commands::rename_speaker,
             commands::get_audio_duration,
             commands::get_waveform,
-            commands::get_import_status,
             commands::get_dataset_stats,
             commands::get_speakers,
             commands::get_dataset_quality,
@@ -743,8 +739,6 @@ pub fn run() {
             commands::list_recording_rights,
             commands::get_settings,
             commands::update_settings,
-            commands::get_cache_info,
-            commands::clear_cache,
             commands::get_fingerprint_count,
             commands::undo,
             commands::redo,
@@ -773,7 +767,6 @@ pub fn run() {
             commands::restore_db_from_snapshot,
             commands::get_audio_health,
             commands::relink_audio,
-            commands::db_wal_checkpoint,
             commands::models_status,
             commands::models_download,
             commands::models_download_all,
@@ -781,7 +774,6 @@ pub fn run() {
             commands::get_inference_stats,
             commands::run_wsl_refinement,
             commands::cancel_wsl_refinement,
-            commands::run_consensus_refinery,
             commands::compute_acoustic_scores,
             commands::get_dataset_certificate,
             commands::compute_signal_anomaly_scores,
@@ -792,7 +784,6 @@ pub fn run() {
             commands::run_gold_eval_local,
             commands::run_gold_eval_asr,
             commands::build_scorecard,
-            commands::compute_annotation_drift_scorecard,
             commands::list_eval_runs,
             commands::get_label_quality_lift,
             commands::list_gold_segments,
@@ -809,7 +800,6 @@ pub fn run() {
             // Phase 1+2: Full pipeline + T2 direct
             commands::run_jury_pipeline,
             commands::run_t2_for_segment,
-            commands::update_segment_bounds,
         ])
         .setup(|app| {
             use tauri::Manager;

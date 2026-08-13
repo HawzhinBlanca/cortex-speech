@@ -12,8 +12,34 @@ use super::{emit_or_log, STRICT_RATE_LIMITER};
 use crate::db::SpeechSegment;
 use crate::validation::input as validate;
 use crate::AppState;
-use std::sync::Arc;
+use lru::LruCache;
+use rayon::prelude::*;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, LazyLock, Mutex};
 use tauri::{Manager, State};
+
+/// Process-wide normalizer memoizer: normalization is pure per (config, text), so identical
+/// transcripts across a batch normalize once. Sole caller is `batch_normalize` below — inlined
+/// rather than a generic cache type (ponytail-audit round 2, 2026-08-13: the old generic
+/// `Memoizer<K,V>` in perf/mod.rs had exactly one instantiation).
+static NORMALIZER_CACHE: LazyLock<Mutex<LruCache<String, String>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(2000).unwrap_or(NonZeroUsize::MIN))));
+
+/// Lock held across `compute` on a miss (matches the prior Memoizer exactly): the first caller to
+/// see a given cache_key does the normalization while holding the lock, so concurrent workers on
+/// the same never-seen key serialize onto it rather than duplicating the work.
+fn normalize_cached(cache_key: String, compute: impl FnOnce() -> String) -> String {
+    let mut cache = NORMALIZER_CACHE.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("Recovering poisoned normalizer cache");
+        poisoned.into_inner()
+    });
+    if let Some(value) = cache.get(&cache_key) {
+        return value.clone();
+    }
+    let value = compute();
+    cache.put(cache_key, value.clone());
+    value
+}
 
 #[tauri::command]
 pub fn batch_verify(
@@ -276,12 +302,14 @@ pub fn batch_normalize(
         // config's normalization for the same text after the user toggled auto_normalize /
         // verbalize_numbers (digit handling differs), persisting the wrong normalized_transcript.
         let (auto_norm, verbalize) = (settings.auto_normalize, settings.verbalize_numbers);
-        let results = crate::perf::parallel_batch(&segments, |seg| {
-            let cache_key = format!("{}|{}|{}", auto_norm as u8, verbalize as u8, seg.raw_transcript);
-            let normalized =
-                crate::perf::NORMALIZER_CACHE.memoize(&cache_key, |_| normalizer.normalize(&seg.raw_transcript));
-            (seg.id.clone(), normalized)
-        });
+        let results: Vec<(String, String)> = segments
+            .par_iter()
+            .map(|seg| {
+                let cache_key = format!("{}|{}|{}", auto_norm as u8, verbalize as u8, seg.raw_transcript);
+                let normalized = normalize_cached(cache_key, || normalizer.normalize(&seg.raw_transcript));
+                (seg.id.clone(), normalized)
+            })
+            .collect();
 
         let mut succeeded = 0u32;
         let mut failed = prefetch_failed_ids.len() as u32;
@@ -357,4 +385,24 @@ pub fn batch_normalize(
     });
 
     Ok(serde_json::json!({ "status": "started" }))
+}
+
+#[cfg(test)]
+mod normalizer_cache_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_cached_recovers_a_poisoned_lock() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = NORMALIZER_CACHE.lock().expect("lock normalizer cache");
+            panic!("poison normalizer cache");
+        }));
+
+        // A poisoned std::sync::Mutex stays poisoned forever; the cache must recover via
+        // unwrap_or_else(|poisoned| poisoned.into_inner()) rather than propagate the panic to
+        // every subsequent batch-normalize call for the rest of the process lifetime.
+        let value = normalize_cached("poison-recovery-key".to_string(), || "recovered".to_string());
+        assert_eq!(value, "recovered");
+        assert_eq!(normalize_cached("poison-recovery-key".to_string(), || "stale".to_string()), "recovered");
+    }
 }
