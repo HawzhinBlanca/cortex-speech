@@ -8280,3 +8280,53 @@ another session's refactor under this message.
 python policies 62/62.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 278 — the benchmark lied about the domain; the display was measured and REVERTED
+
+**The FLEURS number does not transfer, and that reverses two conclusions.** Every engine scored
+through the shared scorer on 889 clips both ways — the frozen FLEURS gold set (READ speech) and the
+owner's OWN reviewed clips (spontaneous dialectal, verbatim human answers):
+
+| engine | FLEURS CER | owner's edited clips |
+|---|---|---|
+| champion (7B) | 6.95% | **10.59%** |
+| omniasr-ctc-1b | 8.13% | **39.99%** |
+| omniasr-ctc-300m | 11.59% | 23.42% |
+| finetuned-mms-ckb | — | 19.05% |
+| gemini-2.5-pro | 9.50% | (no stored per-clip hypotheses) |
+
+CTC-1B looks like an 8% engine on read speech and is a **40%** engine on real dialectal audio — a 5x
+collapse. FLEURS references were WRITTEN first and then read aloud, so they are standard orthography
+by construction: a benchmark that rewards standardizing cannot evaluate a verbatim corpus.
+
+Consequence 1: **4-engine ROVER fusion beat the champion on FLEURS** — 6.57% vs 6.95% CER
+(MAPSSWE p=2.7e-28) and 30.32% vs 32.63% WER (p=5.9e-57), closure-verified, a genuine result. On the
+owner's domain the same fusion changed **0 of 135 clips**, because any weight large enough to let a
+20-40% engine outvote a 10% one imports its errors. **The champion drafts alone** — now on
+domain-matched evidence rather than the earlier guess.
+
+Consequence 2: **the disagreement display was built, measured, and reverted.** Against the owner's
+own corrections (179 clips, 4458 champion words, 20.6% base rate of words the human changed):
+
+| flagging rule | words flagged | precision | lift |
+|---|---|---|---|
+| no engine produced it (as built) | 36.6% | 32.1% | 1.56x |
+| no STRONG engine produced it | 40.2% | 31.2% | 1.52x |
+| >=2 others agree on a replacement | 2.6% | 37.6% | 1.83x |
+| ALL others agree on a replacement | 0.6% | 46.2% | 2.24x |
+
+The best rule is a coin flip firing once per seven clips; the shipped rule flags a THIRD of every
+clip and is wrong two times in three. A warning that cries wolf trains reviewers to ignore it,
+including when it is right — so this is worse than nothing and it does not ship. Reverted in full
+(couch.rs, couch.html, the i18n acknowledgement). The champion's standardization tendency is real
+and still unaddressed; these engines are simply too weak on this domain to detect it.
+
+Honest bias note on the owner-domain numbers: the references are the reviewers' corrections, typed
+while looking at the CHAMPION's draft, so the champion is flattered by anchoring — the draft-free
+slice the blueprint calls for is what would remove it. Accept rows were excluded for exactly this
+reason (the champion's own text as its own reference scores 0 by construction).
+
+**Kept from this line of work:** the per-engine model resolution fix (real user-facing bug), the
+`local_asr_dump` harness, and four engines now measured on both domains.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
