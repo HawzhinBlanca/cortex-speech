@@ -848,8 +848,35 @@ impl ProcessingPipeline {
             tracing::info!("WSL 7B model selected: skipping local ONNX ASR pool warm-up.");
             return Ok(());
         }
-        let model_dir = self.model_manager.resolved_dir();
+        let model_dir = self.asr_model_root();
         self.asr_pool.warmup(&model_dir, &self.asr_config())
+    }
+
+    /// The models ROOT that actually contains the SELECTED OmniASR engine.
+    ///
+    /// Per-file, like the CAMPP/denoiser sites below and for the identical reason (round-26):
+    /// `resolved_dir()` flips all-or-nothing between the user dir and the bundled dir, so a user dir
+    /// holding SOME models orphans every model that lives only in the other root. MEASURED
+    /// 2026-08-13: `%APPDATA%/cortex-speech/models/omniasr-ctc-1b/` existed but was EMPTY while the
+    /// 1 GB bundled copy sat beside the exe — selecting CTC-1B failed with "ASR service unavailable
+    /// (models missing?)" even though the model was present on disk. The engine was offered in the
+    /// UI and could not load.
+    fn asr_model_root(&self) -> std::path::PathBuf {
+        self.root_for_size(&self.active_local_asr_model_size())
+    }
+
+    /// The models root that actually contains THIS engine's weights.
+    fn root_for_size(&self, size: &crate::settings::AsrModelSize) -> std::path::PathBuf {
+        let (model_path, _) = asr::omniasr_model_paths(std::path::Path::new(""), size);
+        let relative = model_path.to_string_lossy().replace('\\', "/");
+        self.model_manager.resolve_root_for(relative.trim_start_matches('/'))
+    }
+
+    /// Is this engine installed in EITHER root? Probing one root for several engines is the same
+    /// all-or-nothing mistake one level down: a bundled-only engine reads as absent and the app
+    /// silently downgrades to a weaker one.
+    fn size_present(&self, size: &crate::settings::AsrModelSize) -> bool {
+        asr::omniasr_model_present(&self.root_for_size(size), size)
     }
 
     fn asr_config(&self) -> asr::AsrLoadConfig {
@@ -862,17 +889,32 @@ impl ProcessingPipeline {
     }
 
     fn active_local_asr_model_size(&self) -> crate::settings::AsrModelSize {
-        let model_dir = self.model_manager.resolved_dir();
-        if self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
-            if asr::omniasr_model_present(&model_dir, &crate::settings::AsrModelSize::CTC1B) {
-                return crate::settings::AsrModelSize::CTC1B;
+        use crate::settings::AsrModelSize;
+        // Each engine is probed in the root that CONTAINS it (round-26 per-file rule). Asking one
+        // root about several engines reports a bundled-only engine as absent and downgrades
+        // silently — measured 2026-08-13 with an empty user-dir CTC-1B beside a 1 GB bundled copy.
+        if self.settings.asr_model_size == AsrModelSize::WSL7B {
+            if self.size_present(&AsrModelSize::CTC1B) {
+                return AsrModelSize::CTC1B;
             }
-            if asr::omniasr_model_present(&model_dir, &crate::settings::AsrModelSize::CTC300M) {
-                return crate::settings::AsrModelSize::CTC300M;
-            }
-            return crate::settings::AsrModelSize::CTC300M;
+            return AsrModelSize::CTC300M;
         }
-        asr::select_available_model_size(&model_dir, &self.settings.asr_model_size)
+        if self.size_present(&self.settings.asr_model_size) {
+            return self.settings.asr_model_size.clone();
+        }
+        let fallback = match self.settings.asr_model_size {
+            AsrModelSize::CTC1B => AsrModelSize::CTC300M,
+            _ => AsrModelSize::CTC1B,
+        };
+        if self.size_present(&fallback) {
+            tracing::warn!(
+                "Requested ASR model {:?} is not installed in either models root; falling back to {:?}",
+                self.settings.asr_model_size,
+                fallback
+            );
+            return fallback;
+        }
+        self.settings.asr_model_size.clone()
     }
 
     /// CHAMPION SUPREMACY (owner rule, 2026-08-11 — see AGENT_CHARTER "The champion is not optional").
@@ -1007,7 +1049,7 @@ impl ProcessingPipeline {
     where
         F: FnOnce(&mut asr::KurdishAsrService) -> R,
     {
-        let model_dir = self.model_manager.resolved_dir();
+        let model_dir = self.asr_model_root();
         self.asr_pool.with_service(&model_dir, &self.asr_config(), f)
     }
 

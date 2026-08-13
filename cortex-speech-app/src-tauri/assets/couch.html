@@ -64,6 +64,7 @@
     "skip": "Skip this clip",
     "skippedByYou": "You skipped {n} clip(s) — they are still waiting for someone else.",
     "speakerChange": "more than one speaker",
+    "checkWords": "⚠ listen closely to:",
     "stillSending": "{n} decision(s) have not been sent yet. Keep this page open until they go through.",
     "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
     "editHint": "Listen, and correct the text if needed"
@@ -90,6 +91,7 @@
     "skip": "تێپەڕاندنی ئەم پارچەیە",
     "skippedByYou": "{n} پارچەت تێپەڕاند — هێشتا چاوەڕێی کەسێکی ترن.",
     "speakerChange": "زیاتر لە یەک قسەکەر",
+    "checkWords": "⚠ بە وردی گوێ بگرە لە:",
     "stillSending": "{n} بڕیار هێشتا نەنێردراون. ئەم پەڕەیە کراوە بهێڵەوە تا دەنێردرێن.",
     "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
     "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
@@ -116,6 +118,7 @@
     "skip": null,
     "skippedByYou": null,
     "speakerChange": null,
+    "checkWords": null,
     "stillSending": null,
     "refused": null,
     "editHint": "review.editHint"
@@ -274,6 +277,7 @@
   </div>
   <textarea id="text" lang="ckb" dir="rtl" spellcheck="false"></textarea>
   <div class="meta" id="meta"></div>
+  <div class="meta" id="checkwords" lang="ckb" dir="rtl" style="display:none"></div>
   <div id="warn" aria-live="polite" hidden></div>
   <div class="row" id="actions">
     <button id="bad"></button>
@@ -689,6 +693,17 @@
       flag.textContent = ' · ⚠ ' + t('speakerChange');
       $('meta').appendChild(flag);
     }
+    // WORDS NO OTHER ENGINE HEARD. The champion is an LLM-based ASR and was measured writing the
+    // standard written form where the acoustic engines agreed on the pronounced one (سێری ->
+    // سەیری). That reads as correct Kurdish, so a skimming reviewer has no reason to doubt it —
+    // which is exactly why it needs pointing at. The words are listed, never replaced: the reviewer
+    // decides against the audio. Rendered from the SERVED text by index, as text nodes (library
+    // content is never interpreted as markup).
+    const flagged = Array.isArray(seg.unsupportedWords) ? seg.unsupportedWords : [];
+    const words = (seg.text || '').split(/\s+/).filter(Boolean);
+    const listed = flagged.map((i) => words[i]).filter(Boolean);
+    $('checkwords').textContent = listed.length ? t('checkWords') + ' ' + listed.join('  ·  ') : '';
+    $('checkwords').style.display = listed.length ? '' : 'none';
     prefetchNext();
     // ONE TAP PER CLIP (R2.2). Deciding a clip is the reviewer saying "next", so the next clip should
     // simply start — otherwise every clip costs two taps, a decision and then a reach for the player's

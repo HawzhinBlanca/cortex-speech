@@ -1074,6 +1074,49 @@ fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
+/// Words in the served draft that NO other engine produced anywhere in this clip.
+///
+/// The champion is an LLM-based ASR, and it was MEASURED (2026-08-13) writing the standard written
+/// form where all three acoustic engines agreed on the pronounced one — `سێری` -> `سەیری`,
+/// `خۆدە` -> `خۆت`. For a VERBATIM corpus that is the dangerous error class, because the result
+/// reads as correct Kurdish: a reviewer skimming has no reason to doubt it. The acoustic engines
+/// carry no language model, so they are the only instrument that can see it.
+///
+/// Deliberately a bag-of-words membership test, not an alignment: "no other engine produced this
+/// word ANYWHERE in the clip" is order-independent, needs no diff, and cannot mis-pair words the
+/// way a wrong alignment would. It flags a word for ATTENTION — it never proposes a replacement,
+/// because a machine choosing the word is the thing this project has banned.
+///
+/// Returns word indices into the served text. Empty when no hypotheses are stored (older clips), so
+/// the feature degrades to today's behaviour rather than failing.
+fn unsupported_word_indices(db: &Database, segment_id: &str, served: &str) -> Vec<usize> {
+    let hyps = match db.get_hypotheses_for_segment(segment_id) {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+    // Only OTHER engines count: the champion agreeing with itself proves nothing.
+    let others: Vec<std::collections::HashSet<String>> = hyps
+        .iter()
+        .filter(|h| h.model_id != "omniasr-wsl-7b" && !h.transcript.trim().is_empty())
+        .map(|h| h.transcript.split_whitespace().map(crate::db::to_nfc).collect())
+        .collect();
+    if others.is_empty() {
+        return Vec::new();
+    }
+    served
+        .split_whitespace()
+        .enumerate()
+        .filter_map(|(i, word)| {
+            let w = crate::db::to_nfc(word);
+            if others.iter().any(|set| set.contains(&w)) {
+                None
+            } else {
+                Some(i)
+            }
+        })
+        .collect()
+}
+
 /// The review text shown/edited on the phone: same precedence as the desktop editor
 /// (human-curated annotated transcript when present, else the raw draft).
 fn review_text(seg: &SpeechSegment) -> String {
@@ -1171,6 +1214,9 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 // The row's change-fingerprint at serve time; the page echoes it on the decision so
                 // a draft replaced by a background writer in between is refused, never recorded.
                 "rowVersion": db.segment_row_stamp(&s.id).ok().flatten(),
+                // Word positions no OTHER engine produced — where the champion may have
+                // standardized what was actually said. Attention only; never a replacement.
+                "unsupportedWords": unsupported_word_indices(db, &s.id, &review_text(s)),
             })
         })
         .collect();
@@ -1220,8 +1266,10 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                             // field differently would be spottable, and a reviewer who can spot the
                             // test is not being tested.
                             "speakerChange": holds_a_speaker_change(&seg),
-                            // Same field as work clips for the same indistinguishability reason.
+                            // Same fields as work clips for the same indistinguishability reason: a
+                            // spot check that carried them differently would be spottable.
                             "rowVersion": db.segment_row_stamp(&seg.id).ok().flatten(),
+                            "unsupportedWords": unsupported_word_indices(db, &seg.id, &seg.raw_transcript),
                         }),
                     );
                 }
@@ -2159,6 +2207,40 @@ mod tests {
         // become "nothing to undo" on the next press.
         let (code, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 409, "still refused, and still present rather than swallowed");
+    }
+
+    #[test]
+    fn unsupported_words_flag_only_what_no_other_engine_produced() {
+        // The signal exists because the champion (an LLM-based ASR) was measured writing the
+        // standard form where the acoustic engines agreed on the pronounced one. It must flag the
+        // champion-only word and NOTHING else — a display that cries wolf on ordinary words gets
+        // ignored, and one that stays silent on the standardized word is useless.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "من سەیری کردم")).unwrap();
+        for (model, text) in [
+            ("omniasr-ctc-300m", "من سێری کردم"),
+            ("omniasr-ctc-1b", "من سێری کردم"),
+            ("finetuned-mms-ckb", "من سێری کردم"),
+            // The champion's own hypothesis must NOT count as support for itself.
+            ("omniasr-wsl-7b", "من سەیری کردم"),
+        ] {
+            db.insert_hypothesis(&crate::db::SegmentHypothesis {
+                segment_id: "s1".into(),
+                model_id: model.into(),
+                transcript: text.into(),
+                confidence: None,
+            })
+            .unwrap();
+        }
+
+        let flagged = unsupported_word_indices(&db, "s1", "من سەیری کردم");
+        assert_eq!(flagged, vec![1], "only the champion-only word is flagged: {flagged:?}");
+
+        // No stored hypotheses -> no claim. Older clips must degrade to today's behaviour rather
+        // than flagging every word as unsupported.
+        db.insert_segment(&seg("s2", "هیچ گریمانەیەک نییە")).unwrap();
+        assert!(unsupported_word_indices(&db, "s2", "هیچ گریمانەیەک نییە").is_empty());
     }
 
     #[test]

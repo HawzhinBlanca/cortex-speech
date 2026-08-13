@@ -2121,6 +2121,28 @@ def test_bundled_only_models_resolve_per_file_not_all_or_nothing() -> None:
             "the campp speaker model and mms_aligner must resolve per-file via resolve_root_for."
         )
 
+    # The ASR ENGINES are the same class, and were the one place still using the all-or-nothing root.
+    # MEASURED 2026-08-13: `%APPDATA%/cortex-speech/models/omniasr-ctc-1b/` existed but was EMPTY, so
+    # resolved_dir() flipped to the user root and CTC-1B failed to load — "ASR service unavailable
+    # (models missing?)" on all 922 clips — while its 1 GB bundled copy sat beside the exe. The
+    # engine was offered in the UI and could not run. Both the LOADER and the availability PROBE must
+    # be per-file: probing one root for several engines reports a bundled-only engine as absent and
+    # silently downgrades to a weaker one.
+    for bad in (
+        "self.asr_pool.warmup(&self.model_manager.resolved_dir()",
+        "self.asr_pool.with_service(&self.model_manager.resolved_dir()",
+    ):
+        if bad in src:
+            raise AssertionError(
+                f"the ASR pool is loaded from all-or-nothing resolved_dir() ({bad}) — a bundled-only "
+                "engine will fail to load. Route it through root_for_size/asr_model_root."
+            )
+    if "fn root_for_size" not in src or "fn size_present" not in src:
+        raise AssertionError(
+            "pipeline must resolve each ASR engine's root PER ENGINE (root_for_size) and probe "
+            "availability per engine (size_present); one root for several engines is the same bug."
+        )
+
 
 def test_wsl_refinement_loop_refuses_blank_draft() -> None:
     """The WSL-7B batch refinement loop persists via update_asr_transcript_if_unreviewed, which writes

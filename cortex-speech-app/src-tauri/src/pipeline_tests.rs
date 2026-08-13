@@ -521,7 +521,13 @@ fn wsl_without_script_uses_local_asr_fallback() {
     let (pipeline, _dir) = test_pipeline_with_settings(settings);
 
     assert!(!pipeline.should_use_wsl_primary_asr());
-    let has_1b = crate::models::ModelManager::new(pipeline.model_manager.resolved_dir()).omniasr_ctc_1b_present();
+    // Probe PER FILE, exactly as production now does. Computing the expectation from the
+    // all-or-nothing `resolved_dir()` baked the resolver bug into the test: with an empty user dir
+    // and a bundled CTC-1B present, it predicted CTC300M while the app correctly selected CTC1B.
+    let has_1b = crate::asr::omniasr_model_present(
+        &pipeline.model_manager.resolve_root_for("omniasr-ctc-1b/model.int8.onnx"),
+        &AsrModelSize::CTC1B,
+    );
     let expected_size = if has_1b { AsrModelSize::CTC1B } else { AsrModelSize::CTC300M };
     let expected_id = if has_1b { "omniasr-ctc-1b" } else { "omniasr-ctc-300m" };
     assert_eq!(pipeline.active_local_asr_model_size(), expected_size);

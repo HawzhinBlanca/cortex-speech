@@ -49,6 +49,10 @@ UNREVIEWED_SORANI = {
     # the empty-state line that stops "🎉 all clips reviewed" appearing over clips the reviewer
     # skipped. One new string was the honest floor — the alternative was letting the page lie.
     "skippedByYou",
+    # Disagreement display (2026-08-13): lists the draft's words that NO other engine produced, so a
+    # reviewer's ear goes where the champion may have standardized what was said (measured: سێری ->
+    # سەیری). New Sorani — "⚠ بە وردی گوێ بگرە لە:" — NOT yet natively reviewed; on the owner's list.
+    "checkWords",
 }
 
 

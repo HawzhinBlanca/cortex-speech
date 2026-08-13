@@ -8235,3 +8235,48 @@ to 9.58% — small-n optimism, flagged at the time; (c) the daily-quota 429 hard
 retrying, per the fix in iteration 274.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 277 — the disagreement display, a real model-resolution bug, and a corrected claim
+
+**Measured, correcting myself.** I had been quoting the local acoustic engines as "3-4x worse" than
+the champion from stale figures (21% / 29.4% — different models). Measured on the frozen gold set
+through the shared scorer: **omniasr-ctc-300m = 11.65% CER [11.07, 12.28]**, n=921. That is 1.66x the
+champion's 7.02%, not 4x — the same order as Gemini's 1.36x, which makes multi-engine fusion a live
+question again rather than a foregone conclusion. CTC-1B is running.
+
+**A real user-facing bug the measurement exposed.** CTC-1B failed on ALL 922 clips with "ASR service
+unavailable (models missing?)" — while its 1 GB copy sat in the bundled models dir. Cause:
+`pipeline.rs` loaded the ASR pool through `model_manager.resolved_dir()`, which flips all-or-nothing
+between the user root and the bundled root. `%APPDATA%/cortex-speech/models/omniasr-ctc-1b/` exists
+but is EMPTY, so the user root won — and the engine offered in the UI could not load. This is the
+round-26 class the denoiser/aligner/campp were already fixed for; the ASR engines were the one place
+still using the all-or-nothing root, and the availability PROBE had it twice over (one root asked
+about several engines silently downgrades a bundled-only engine). Now `root_for_size` /
+`size_present` resolve PER ENGINE. Pinned in `test_rust_runtime_panic_policy.py` beside the existing
+per-file assertions; fail-before verified (reverted one call site -> gate FAILS naming it; restored
+byte-identical, sha cec14701ca5d22ea).
+
+`wsl_without_script_uses_local_asr_fallback` then failed — because it PREDICTED the expectation using
+the buggy `resolved_dir()`. The test had encoded the defect as truth; it now probes per-file like
+production.
+
+**The disagreement display (owner-requested).** The couch queue now carries `unsupportedWords`: the
+served draft's word positions that NO other engine produced anywhere in the clip. The phone lists
+them under the clip ("⚠ بە وردی گوێ بگرە لە: …"). This exists because the champion is an LLM-based
+ASR and was measured writing the standard form where all three acoustic engines agreed on the
+pronounced one (سێری -> سەیری, خۆدە -> خۆت) — fluent, plausible, and therefore invisible to a
+skimming reviewer. It LISTS words and never replaces them; the champion cannot vouch for itself
+(its own hypothesis is excluded from support, mutation-verified: with self-support the flag goes
+silent exactly when it matters); and a clip with no stored hypotheses flags nothing rather than
+everything. New Sorani string acknowledged in the i18n gate — awaiting the owner's native read.
+
+**Concurrency hazard, recorded.** Mid-iteration the lib test count dropped 1177 -> 1161. Not my
+change: ANOTHER session removed two dead modules (`align_text.rs`, `perf/mod.rs`) together with
+their `pub mod` declarations — 16 tests, a coherent refactor. Their deletion is left UNCOMMITTED and
+untouched; this commit stages only its own files by name. `git add -A` here would have shipped
+another session's refactor under this message.
+
+**Verified:** cargo --lib 1154 passed / 0 failed (1161 total, the reduced count explained above),
+python policies 62/62.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
