@@ -8714,3 +8714,42 @@ existing clips first (all undecided, so nothing human is lost) and spending cham
 clips/min. It changes the corpus, so it waits for the owner.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 287 — the handover, and an "APP IS UP" that was not true
+
+**Final overnight state:** 3,767 clips / 9.20 h in the library, **3,273 reviewable / 7.95 h**, 494
+already decided, 8 of 32 Hawleri episodes imported, 24 prepped and waiting. All five reviewer links
+verified by CLAIMING each one over the live API and checking the server returned that reviewer's own
+name; queue serves 29 clips with 0 blanks and 0 placeholders; audio streams HTTP 200.
+
+**The incident, in order.**
+
+At 07:30 the handover stopped the importer, deleted 99 leftover placeholders, rebuilt, and re-enabled
+the watchdog. The app relaunched at 07:42 and I reported **"APP IS UP"** from a process check. It was
+not up. Its log:
+
+    CORTEX_STARTUP_FAIL: Another instance is already running.
+    Failed to remove stale Windows instance lock file cortex.lock
+
+The app had died into an error dialog — 37 MB resident, 0.14 s CPU, no log output after startup. A
+RUNNING PROCESS IS NOT A WORKING APP, which is the same write-path/serving-path error this project has
+now been bitten by four times. What caught it was refusing to call the links good until one returned a
+reviewer's name; a fingerprint comparison or a process check would both have passed.
+
+**Root cause was mine.** `TaskStop` on the original overnight chain killed its wrapper but left the
+detached shell alive. It waited all night on `while running; do sleep 60; done`, saw the handover kill
+the importer at 07:30:35, and started its own import of `_batch_rest` 22 seconds later — holding
+`cortex.lock` against the app, and re-importing `KBHP-EP08`, already imported. **348 duplicate clips**,
+removed with the usual decision guard (0 carried one). EP08 back to its correct 348.
+
+**Also learned:** the watchdog launches the app WITHOUT the CDP debug port, so the Playwright/IPC
+harness used all week is unavailable on a watchdog-started app. Every verification after a watchdog
+relaunch has to go through the HTTP API instead — which is closer to what a reviewer actually does,
+and is why the link test was possible at all.
+
+**Second build outcome:** `cortex-speech-app.exe` rebuilt at 07:37:38 and carries the queue guard and
+the split fix. `batch_importer.exe` failed to relink (`Access is denied` — its file handle had not been
+released seconds after the kill) and is one commit behind on app-side changes it does not use. Rebuild
+before the next import.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
