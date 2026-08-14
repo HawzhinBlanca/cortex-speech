@@ -898,12 +898,34 @@ pub fn export_huggingface_dataset(
     // holdout at all, exported without a word. Fail here instead. An export that stops is
     // recoverable; a training run against a dataset with no test set is not, because nothing about
     // the resulting numbers announces that they were measured on training data.
-    for (name, ratio, segs) in
-        [("validation", settings.hf_val_ratio, &val_segs), ("test", settings.hf_test_ratio, &test_segs)]
-    {
-        if ratio > 0.0 && segs.is_empty() && !segments.is_empty() {
+    // Fire on the COLLAPSE, not on scarcity. An empty split is ordinary arithmetic when there are
+    // fewer clips than splits — a 2-segment fixture asking for 80/10/10 must leave one empty, and the
+    // first version of this guard broke 18 export tests by calling that a failure. The defect it
+    // exists for looks different: with plenty of clips, EVERY one lands in a single split because the
+    // leakage-safe grouping collapsed (measured 2026-08-14: 100% of the corpus in one component when
+    // per-recording diarizer labels were treated as speaker identities).
+    // The denominator is independent RECORDINGS, not segments. Grouping never splits a recording, so
+    // the number of distinct recordings is the ceiling on how many groups can exist — with fewer
+    // recordings than splits, an empty split is arithmetic no matter how well the grouping worked.
+    // (Second correction: `segments.len()` as the denominator still failed a 3-segment/2-recording
+    // fixture, because three clips cut from two recordings can only ever fill two splits.)
+    let requested_splits = 1 + usize::from(settings.hf_val_ratio > 0.0) + usize::from(settings.hf_test_ratio > 0.0);
+    let distinct_recordings = segments
+        .iter()
+        .map(|s| s.audio_path.rsplit(['/', '\\']).next().unwrap_or(s.audio_path.as_str()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let populated_splits =
+        usize::from(!train_segs.is_empty()) + usize::from(!val_segs.is_empty()) + usize::from(!test_segs.is_empty());
+    if requested_splits > 1 && distinct_recordings >= requested_splits && populated_splits == 1 {
+        let (name, ratio) = if val_segs.is_empty() && settings.hf_val_ratio > 0.0 {
+            ("validation", settings.hf_val_ratio)
+        } else {
+            ("test", settings.hf_test_ratio)
+        };
+        {
             return Err(crate::error::AppError::Other(format!(
-                "Export stopped: the {name} split came out EMPTY while {:.0}% was requested. \
+                "Export stopped: every clip landed in ONE split — the {name} split is empty while {:.0}% was requested. \
                  {} segments fell into leakage-safe groups too large to divide — most often because \
                  speaker labels are per-recording diarizer indices rather than real identities. \
                  Check speaker_id values, or set hf_speaker_disjoint = false to group by recording only.",

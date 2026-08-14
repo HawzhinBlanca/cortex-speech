@@ -2086,3 +2086,47 @@ fn hf_export_failure_midway_preserves_the_prior_dataset() {
         "a failed export must clean up its staging tree, not litter the user's export directory"
     );
 }
+
+#[test]
+fn export_refuses_a_dataset_where_every_clip_collapsed_into_one_split() {
+    // A guard that has only been shown NOT to false-fire is not yet a guard. This forces the exact
+    // failure it exists for: plenty of independent recordings, but a grouping that merges them all,
+    // so train takes everything and the requested validation/test splits come out EMPTY. Shipping
+    // that is worse than failing, because a model then trains and "evaluates" on the same audio and
+    // nothing in the resulting numbers says so.
+    //
+    // The collapse is forced with a REAL shared speaker name (not a SPEAKER_nn diarizer index, which
+    // is now scoped per recording): six recordings that genuinely share one speaker are one
+    // leakage-safe component, which is correct behaviour — and undividable.
+    let db = crate::db::Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let audio_dir = tempfile::tempdir().unwrap();
+    for i in 0..6 {
+        let wav_path = audio_dir.path().join(format!("rec{i}.wav"));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for _ in 0..16000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let mut seg = sample_segment(&format!("collapse-{i}"));
+        seg.audio_path = wav_path.to_string_lossy().to_string();
+        seg.speaker_id = Some("Hawzhin".to_string()); // one real person across every recording
+        db.insert_segment_full(&seg).unwrap();
+    }
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let settings =
+        crate::settings::AppSettings { hf_speaker_disjoint: true, ..crate::settings::AppSettings::default() };
+    let result = export_huggingface_dataset(&db, out_dir.path(), &settings);
+
+    let err = result.expect_err("an export with empty validation AND test splits must FAIL, not ship");
+    let msg = err.to_string();
+    assert!(msg.contains("ONE split"), "the error must name the collapse: {msg}");
+    assert!(msg.contains("hf_speaker_disjoint"), "the error must tell the owner which setting to look at: {msg}");
+}

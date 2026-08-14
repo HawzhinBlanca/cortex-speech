@@ -306,6 +306,20 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
 /// cumulative-timeout failure this gate exists to prevent.
 static WSL_7B_GATE: Wsl7bGate = Wsl7bGate::new();
 
+/// What one segment's champion attempts concluded — decided WITHOUT the shared `Database`, so a
+/// whole wave of them can run at once. `transcribe` opens its OWN connection per call, which is
+/// what makes this safe: each thread writes through its own SQLite handle rather than sharing the
+/// caller's.
+enum ChampionAttempt {
+    /// A usable transcript came back and `transcribe` stored it.
+    Drafted,
+    /// Reachable server, no words after every retry — a silent/music chunk. Escalate THIS segment
+    /// only; never roll the file back, or the good transcripts for its other chunks are discarded.
+    Empty(String),
+    /// The client exited non-zero: server down, hung, or errored. Fatal for a force-7B import.
+    Infra(String),
+}
+
 /// Permitted concurrent 7B requests. Clamped to 1..=8; anything unusable falls back to 1, the safe
 /// end — an over-admitting gate reintroduces the timeout blowout, an under-admitting one is merely slow.
 fn wsl_7b_concurrency() -> usize {
@@ -2554,12 +2568,6 @@ impl ProcessingPipeline {
             return Ok(0);
         }
 
-        // The warm 7B server can transiently fail or return an empty result for a clip (e.g. while
-        // still under load right after launch), which would otherwise leave that segment stuck at its
-        // "[Pending WSL 7B ASR]" placeholder for good (observed in stress testing: 1 of 3 segments).
-        // Retry a few times before giving up so an import reliably transcribes every segment; only
-        // escalate after the retries are exhausted, rather than silently shipping a pending segment.
-        const MAX_ATTEMPTS: usize = 3;
         // FORCE-USE the Champion (fail-hard): if the 7B server is unreachable/hung/errored — an
         // INFRASTRUCTURE failure, i.e. the client process exits non-zero (its honest failure contract),
         // as opposed to a REACHABLE server legitimately returning an empty transcript for a silent clip —
@@ -2568,15 +2576,29 @@ impl ProcessingPipeline {
         // "[Pending WSL 7B ASR]" placeholders or silently-downgraded output the owner never asked for.
         let import_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
         let mut updated = 0usize;
-        for seg in segments.iter_mut() {
-            // Honor cancellation between segments: each WSL transcription can ride a 300s timeout, so
-            // without this a cancelled import of an N-segment file would keep running for up to N*300s.
+
+        // Run the champion calls a WAVE at a time instead of one clip at a time.
+        //
+        // MEASURED 2026-08-14: one round trip is 4.62 s on a ~9 s clip and the whole import sustained
+        // 8.5 clips/min with both GPUs near idle — the cost is latency, not compute. `WSL_7B_GATE` was
+        // built to admit several calls at once and the server pre-forks one replica per GPU, but until
+        // now NOTHING ever issued two calls concurrently, so the gate limited a concurrency that never
+        // existed and the second card never received work. Setting CORTEX_7B_CONCURRENCY=2 changed the
+        // rate by nothing, which is what proved the loop was the bottleneck.
+        //
+        // Only the CALL is parallel. Every database touch — refresh, provenance, escalation, rollback —
+        // stays on this thread, in the original order, so the rollback contract and the "escalate this
+        // segment only" rule behave exactly as before. `transcribe` opens its own connection per call,
+        // so the concurrent phase never shares `db`.
+        let wave_size = wsl_7b_concurrency().max(1);
+        let mut start = 0usize;
+        while start < segments.len() {
+            let end = (start + wave_size).min(segments.len());
+
+            // Cancellation is checked once per WAVE rather than per segment; `transcribe` also polls
+            // the flag inside each in-flight call, so a cancel still lands within ~50 ms.
             if let Some(token) = cancel {
                 if let Err(cancel_err) = token.check() {
-                    // Roll back THIS file's just-created segments (a mix of transcribed + still-placeholder
-                    // rows) before propagating the cancel, so re-importing the same file cannot duplicate
-                    // every segment. Matches the infra-failure rollback and the F6 "nothing half-imported"
-                    // promise. Earlier files in a directory import are already committed and untouched.
                     tracing::info!("WSL 7B import cancelled; rolling back {} segment(s)", import_ids.len());
                     if let Err(e) = db.delete_segments_batch(&import_ids) {
                         tracing::error!("failed to roll back {} segment(s) after cancel: {e}", import_ids.len());
@@ -2584,26 +2606,56 @@ impl ProcessingPipeline {
                     return Err(cancel_err);
                 }
             }
-            let mut last_problem: Option<String> = None;
-            let mut infra_failure = false;
-            for attempt in 1..=MAX_ATTEMPTS {
-                match self.transcribe(
-                    Some(seg.id.as_str()),
-                    &seg.audio_path,
-                    seg.alignment_json.as_deref(),
-                    cancel.map(|t| t.as_atomic()),
-                ) {
-                    Ok(_draft) => {
+
+            // PHASE A — concurrent, no shared DB.
+            let flag = cancel.map(|t| t.as_atomic());
+            let jobs: Vec<(String, String, Option<String>)> = segments[start..end]
+                .iter()
+                .map(|s| (s.id.clone(), s.audio_path.clone(), s.alignment_json.clone()))
+                .collect();
+            let outcomes: Vec<ChampionAttempt> = std::thread::scope(|scope| {
+                let handles: Vec<_> = jobs
+                    .iter()
+                    .map(|(id, path, aj)| scope.spawn(move || self.attempt_champion(id, path, aj.as_deref(), flag)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        // A panicked worker must not be read as success. Treat it as an infrastructure
+                        // failure so the import halts and rolls back, per the force-champion contract.
+                        h.join().unwrap_or_else(|_| ChampionAttempt::Infra("champion worker panicked".to_string()))
+                    })
+                    .collect()
+            });
+
+            // PHASE B — sequential, in the original segment order.
+            for (offset, outcome) in outcomes.into_iter().enumerate() {
+                let seg = &mut segments[start + offset];
+                let problem: Option<String> = match outcome {
+                    ChampionAttempt::Infra(reason) => {
+                        tracing::error!(
+                            "WSL 7B import cancelled (server unavailable: {reason}); rolling back {} segment(s)",
+                            import_ids.len()
+                        );
+                        if let Err(e) = db.delete_segments_batch(&import_ids) {
+                            tracing::error!(
+                                "failed to roll back {} placeholder segment(s) after 7B cancel: {e}",
+                                import_ids.len()
+                            );
+                        }
+                        return Err(AppError::Validation(format!(
+                            "OmniASR 7B server is not running — start it (e.g. wsl python cortex_7b_server.py from scripts/) and re-import. \
+                             The import was cancelled and its {} segment(s) were rolled back. ({reason})",
+                            import_ids.len()
+                        )));
+                    }
+                    ChampionAttempt::Empty(reason) => Some(reason),
+                    ChampionAttempt::Drafted => {
                         if let Err(e) = self.refresh_segment_from_db(db, seg) {
-                            // A DB hiccup mid-pass otherwise left a partial import (some transcribed, some
-                            // still placeholder) with no rollback; a re-import would then duplicate it.
                             tracing::error!(
                                 "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
                                 import_ids.len()
                             );
-                            // A failed rollback must be LOUD (matches the cancel/infra siblings above):
-                            // the log just promised a rollback, and if the delete also fails the
-                            // placeholders survive — re-importing the file then duplicates them.
                             if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
                                 tracing::error!(
                                     "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
@@ -2612,12 +2664,12 @@ impl ProcessingPipeline {
                             }
                             return Err(e);
                         }
-                        let usable = !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
-                        if usable {
-                            // Record the Champion's output as its hypothesis so the review provenance badge
-                            // can honestly name "OmniASR-7B Champion" as the producing engine — the primary
-                            // raw_transcript otherwise carries no model id. Best-effort: a provenance-write
-                            // failure must not fail the (successful) transcription.
+                        // Re-verify against the STORED row. The concurrent phase judged usability from
+                        // the returned draft (it cannot read the DB); if the row disagrees, believe the
+                        // row and escalate rather than count a clip that has no text.
+                        let stored_ok =
+                            !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
+                        if stored_ok {
                             if let Err(e) = insert_hypothesis_checked(
                                 db,
                                 &seg.id,
@@ -2628,85 +2680,97 @@ impl ProcessingPipeline {
                                 tracing::warn!("could not record omniasr-wsl-7b provenance for {}: {e}", seg.id);
                             }
                             updated += 1;
-                            last_problem = None;
-                            infra_failure = false;
-                            break;
-                        }
-                        // Reachable server but no words back — could be a genuinely silent clip. NOT an
-                        // infrastructure failure: escalate only this segment after retries, never cancel.
-                        last_problem = Some("7B returned an empty transcript".to_string());
-                        infra_failure = false;
-                    }
-                    Err(error) => {
-                        let msg = error.to_string();
-                        if msg.contains(WSL_7B_EMPTY_RESULT_MARKER) {
-                            // A legit-but-EMPTY 7B result reaches here as an Err ONLY because transcribe()
-                            // converts Ok("") -> Err to stop the re-transcribe IPCs from blank-overwriting a
-                            // stored transcript. For the IMPORT pass that is NOT an infrastructure failure —
-                            // the server is reachable and simply produced no words for a silent/music/noise
-                            // chunk. Treat it EXACTLY like the Ok-arm usable=false path: escalate only THIS
-                            // segment after retries, never roll the whole file back (which would discard the
-                            // good transcripts already computed for the file's other chunks). Two in-code
-                            // contracts (parse_wsl_segment_result + the Ok-arm comment) require this.
-                            last_problem = Some("7B returned an empty transcript".to_string());
-                            infra_failure = false;
+                            None
                         } else {
-                            // The client exited non-zero: server not running / unreachable / hung / errored.
-                            // Fatal for a force-7B import. A 5-minute per-attempt timeout means the server is
-                            // HUNG, not transiently flaky — another full-timeout attempt only triples the
-                            // stall, so stop fast. Quick failures (connection refused) still retry briefly in
-                            // case the server is mid-launch.
-                            let hung = msg.contains("timed out");
-                            last_problem = Some(msg);
-                            infra_failure = true;
-                            if hung {
-                                break;
-                            }
+                            Some("7B reported a draft but the stored row is still empty".to_string())
                         }
                     }
-                }
-                if attempt < MAX_ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
-                }
-            }
-            if infra_failure {
-                let reason = last_problem.unwrap_or_else(|| "7B server unreachable".to_string());
-                tracing::error!(
-                    "WSL 7B import cancelled (server unavailable: {reason}); rolling back {} segment(s)",
-                    import_ids.len()
-                );
-                if let Err(e) = db.delete_segments_batch(&import_ids) {
-                    tracing::error!(
-                        "failed to roll back {} placeholder segment(s) after 7B cancel: {e}",
-                        import_ids.len()
-                    );
-                }
-                return Err(AppError::Validation(format!(
-                    "OmniASR 7B server is not running — start it (e.g. wsl python cortex_7b_server.py from scripts/) and re-import. \
-                     The import was cancelled and its {} segment(s) were rolled back. ({reason})",
-                    import_ids.len()
-                )));
-            }
-            if let Some(reason) = last_problem {
-                tracing::warn!("WSL 7B import: segment {} failed after {MAX_ATTEMPTS} attempts: {reason}", seg.id);
-                if let Err(e) = self.mark_wsl_primary_unavailable(db, seg, &reason) {
-                    tracing::error!(
-                        "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
-                        import_ids.len()
-                    );
-                    // Same loud-rollback contract as the sibling sites: a swallowed delete failure
-                    // here leaves placeholder rows the promised rollback never removed.
-                    if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
+                };
+
+                if let Some(reason) = problem {
+                    tracing::warn!("WSL 7B import: segment {} failed after retries: {reason}", seg.id);
+                    if let Err(e) = self.mark_wsl_primary_unavailable(db, seg, &reason) {
                         tracing::error!(
-                            "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
+                            "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
                             import_ids.len()
                         );
+                        if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
+                            tracing::error!(
+                                "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
+                                import_ids.len()
+                            );
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
             }
+
+            start = end;
         }
         Ok(updated)
+    }
+
+    /// The retry loop for ONE segment, with no shared-DB access anywhere in it.
+    ///
+    /// Usability is judged from the returned draft rather than by re-reading the row, because the
+    /// re-read needs the shared connection. The caller re-verifies against the DB in its sequential
+    /// phase and downgrades to `Empty` if the stored row disagrees — so this cannot report success
+    /// for a row that did not actually get text.
+    fn attempt_champion(
+        &self,
+        segment_id: &str,
+        audio_path: &str,
+        alignment_json: Option<&str>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> ChampionAttempt {
+        // The warm 7B server can transiently fail or return an empty result for a clip (e.g. while
+        // still under load right after launch), which would otherwise leave that segment stuck at its
+        // "[Pending WSL 7B ASR]" placeholder for good (observed in stress testing: 1 of 3 segments).
+        // Retry a few times before giving up so an import reliably transcribes every segment; only
+        // escalate after the retries are exhausted, rather than silently shipping a pending segment.
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_problem = String::from("7B produced no result");
+        let mut infra = false;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.transcribe(Some(segment_id), audio_path, alignment_json, cancel) {
+                Ok(draft) => {
+                    let usable = !draft.raw_text.trim().is_empty() && !draft.raw_text.contains("[Pending");
+                    if usable {
+                        return ChampionAttempt::Drafted;
+                    }
+                    last_problem = "7B returned an empty transcript".to_string();
+                    infra = false;
+                }
+                Err(error) => {
+                    let msg = error.to_string();
+                    if msg.contains(WSL_7B_EMPTY_RESULT_MARKER) {
+                        // transcribe() turns Ok("") into Err so the re-transcribe IPCs cannot
+                        // blank-overwrite a stored transcript. For an IMPORT that is not an
+                        // infrastructure failure — the server answered, the clip simply had no words.
+                        last_problem = "7B returned an empty transcript".to_string();
+                        infra = false;
+                    } else {
+                        // A 5-minute per-attempt timeout means the server is HUNG, not flaky: another
+                        // full-timeout attempt only triples the stall. Quick failures (connection
+                        // refused) still retry briefly in case the server is mid-launch.
+                        let hung = msg.contains("timed out");
+                        last_problem = msg;
+                        infra = true;
+                        if hung {
+                            break;
+                        }
+                    }
+                }
+            }
+            if attempt < MAX_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        }
+        if infra {
+            ChampionAttempt::Infra(last_problem)
+        } else {
+            ChampionAttempt::Empty(last_problem)
+        }
     }
 
     fn mark_wsl_primary_unavailable(&self, db: &Database, seg: &mut SpeechSegment, reason: &str) -> AppResult<()> {
