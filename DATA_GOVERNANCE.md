@@ -13,6 +13,32 @@ Central Kurdish is a resource-constrained and politically sensitive minority lan
 
 ---
 
+## 🎙️ Owner-Supplied Recordings — Rights Declaration (2026-08-14, standing)
+
+The owner declares, as a standing warranty over his own material:
+
+> For every audio and voice recording I supply to this app I hold **full permission and total
+> authority**. Every speaker has agreed to unrestricted use of their voice for this application and
+> its datasets, anywhere. **No royalty or licensing obligation applies.**
+
+**Operational effect.** Rights clearance for owner-supplied recordings is SETTLED. Work is never
+blocked pending consent paperwork, and the question is not re-raised on each import. The rights
+columns (`rights_license`, `rights_consent_basis`, `rights_permitted_use`, `rights_attribution`)
+remain populated because an export may need to STATE its provenance — they record what is true, they
+do not gate the work.
+
+**Scope, stated precisely so the declaration keeps its force.** This covers material the owner
+supplies. It does not extend to third-party corpora: FLEURS, Common Voice and any future external
+dataset keep their own licences, and the contamination gate continues to apply to them. Nor does it
+override the Right to Erasure above — if a speaker later asks for removal, that request is honoured
+regardless of the original agreement, because a takedown is about a person's current wishes, not
+about whether permission once existed.
+
+This is the owner's declaration about his own recordings, recorded as his declaration. It is not a
+legal opinion and no part of this repository asserts it as an independent finding of fact.
+
+---
+
 ## 📂 Source Corpora License & Consent Ledger
 
 All ingested and benchmarked datasets must be audited against this provenance ledger before training, validation, or distribution.
