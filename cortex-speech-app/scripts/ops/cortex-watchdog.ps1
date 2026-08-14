@@ -120,13 +120,17 @@ $maxConsecutiveKills = 3
 # the app at 5 minutes, three times in a row, and the app never once got far enough to serve. A
 # watchdog that shortens startup until startup can never finish is a denial of service on its own app.
 #
-# 20 minutes is deliberately far beyond the ~8 measured: being slow to notice a genuinely wedged app
-# costs one extra check cycle, while being too impatient costs the app entirely. The kill path still
-# works for anything older than this.
+# 45 minutes, and the number is deliberately generous. MEASURED startup to couch: 8m16s at ~500 clips
+# (2026-08-14) and 18m11s at 14,828 clips (2026-08-15) — it scales with the library and the library
+# only grows. A first draft of this fix used 20 minutes, which the very next measurement nearly
+# invalidated; picking a bound two minutes above the observed value is how this bug gets reintroduced.
+# The asymmetry decides it: being slow to notice a genuinely wedged app costs ONE extra check cycle of
+# downtime, while being too impatient costs the app entirely and repeatedly. The kill path still works
+# for anything older than this.
 # Overridable so the decision tests can exercise BOTH sides: 0 makes every process instantly
 # "old enough" to reach the kill path, which is the only way to test the kill path without waiting
 # 20 real minutes.
-$startupGraceMinutes = if ($env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN) { [double]$env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN } else { 20 }
+$startupGraceMinutes = if ($env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN) { [double]$env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN } else { 45 }
 
 if ($alive) {
     if (Test-Path $killCountFile) { Remove-Item $killCountFile -Force -ErrorAction SilentlyContinue }

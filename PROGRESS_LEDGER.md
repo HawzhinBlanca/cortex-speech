@@ -8788,10 +8788,21 @@ from one that is still STARTING:
 
 Measured startup to couch on a healthy run: **8m16s** — already over the interval, and longer now at
 14,828 clips. The app never once reached the point of serving. A watchdog that shortens startup until
-startup cannot finish is a denial of service on its own app. Fixed with a **20-minute startup grace**
+startup cannot finish is a denial of service on its own app. Fixed with a **45-minute startup grace**
 keyed on process age, overridable via `CORTEX_WATCHDOG_STARTUP_GRACE_MIN` so the decision drill can
 exercise BOTH sides, plus a regression case asserting the exact inputs that took the app down
 (session present + process alive + port dead + young) now report `starting-up`.
+
+**The grace was set twice, and the second time is the lesson.** It was first written at 20 minutes,
+"far beyond the ~8 measured". The very next clean start — uninterrupted, watchdog off — took
+**18m11s** to reach couch at 14,828 clips. A bound picked two minutes above the observed value is how
+this bug gets reintroduced the next time the corpus grows, so the grace is now 45 minutes on an
+explicit asymmetry: noticing a wedged app late costs ONE check cycle; being impatient costs the app
+entirely, repeatedly, which is exactly what happened.
+
+**Measured startup to couch: 8m16s at ~500 clips, 18m11s at 14,828 clips.** Startup scales with the
+library. Worth knowing before the next import: the app is unavailable for ~20 minutes after any
+restart, and that window will keep growing.
 
 **Also corrected, twice, in the same shape:** "APP IS UP" was reported from a process check while the
 app was dead in an error dialog, and again while it was wedged with flat CPU and no log output. A
