@@ -3456,3 +3456,28 @@ fn review_queue_never_serves_a_clip_the_champion_has_not_drafted() {
         assert!(!served.contains(&hidden.to_string()), "{hidden} must never reach a reviewer: {served:?}");
     }
 }
+
+#[test]
+fn review_queue_serves_the_oldest_work_first() {
+    // MEASURED 2026-08-14: importing 27 hours of new podcast audio put 6,823 fresh clips in front of
+    // the 537 remaining clips of the original corpus, because the queue was newest-first. The owner's
+    // instruction was the opposite — finish the old material before starting the new dialect — and a
+    // review queue is FIFO anyway: adding audio must never delay work already in progress.
+    let db = make_db();
+    for (id, created) in
+        [("old-1", "2026-08-01 10:00:00"), ("mid-1", "2026-08-10 10:00:00"), ("new-1", "2026-08-14 10:00:00")]
+    {
+        let mut seg = make_segment(id, &format!("{id}.wav"));
+        seg.raw_transcript = "دەقی ڕاست".to_string();
+        seg.created_at = Some(created.to_string());
+        db.insert_segment_full(&seg).unwrap();
+    }
+
+    let served = db.pending_segment_ids().unwrap();
+
+    assert_eq!(
+        served,
+        vec!["old-1".to_string(), "mid-1".to_string(), "new-1".to_string()],
+        "the queue must hand out the oldest pending clip first: {served:?}"
+    );
+}

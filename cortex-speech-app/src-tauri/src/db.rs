@@ -1651,13 +1651,20 @@ impl Database {
     /// Matched in SQL as `[...]` — the same shape the decide guard rejects — so the two cannot
     /// disagree. `quality::is_placeholder_transcript` remains the authority on what a placeholder
     /// IS; this is the cheap narrowing that keeps the id-only query fast (P1.3).
+    ///
+    /// OLDEST FIRST, deliberately (2026-08-14). This was newest-first, which quietly buries the work
+    /// the owner actually wants finished: after importing 27 hours of new podcast audio the queue
+    /// would have served the NEW material first and left the 537 clips of the original corpus behind
+    /// 6,823 newer ones. A review queue is FIFO — an import must go to the BACK of the line, so
+    /// adding more audio can never delay finishing what is already in progress. (The desktop library
+    /// view keeps newest-first; that is a browsing order, not a work order.)
     pub fn pending_segment_ids(&self) -> AppResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT id FROM speech_segments
              WHERE verified = 0
                AND TRIM(COALESCE(raw_transcript, '')) <> ''
                AND NOT (TRIM(raw_transcript) LIKE '[%]')
-             ORDER BY created_at DESC, id ASC",
+             ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut ids = Vec::new();
