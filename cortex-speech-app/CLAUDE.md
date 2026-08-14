@@ -116,18 +116,15 @@ After a run, present results **both** ways so the user can approve 100%:
 
 - Default is **fully offline**. Cloud LLM and cloud STT are **off by default** and require explicit opt-in (`cloud_llm_opt_in`, `cloud_stt_opt_in`, `jury_cloud_opt_in`). `settings.effective_llm_mode()` downgrades cloud -> none when not opted in; `pipeline.rs` enforces it in both `llm_refinement_permitted()` and `build_refiner()`. **Never** send audio/transcript to a provider without acknowledged consent, and never make cloud load-bearing in the default path.
 - Treat **voice as biometric** (GDPR Art. 9): enforce consent + license + attribution before any publish/train/redistribute step.
-- **Owner's rights declaration (2026-08-14, standing).** The owner warrants that for every audio and
-  voice recording used in this app he holds **full permission and total authority**: every speaker has
-  agreed to unrestricted use of their voice for this application and its datasets, anywhere, and **no
-  royalty or licensing obligation applies**. Treat rights clearance as SETTLED for owner-supplied
-  material — do not re-litigate it, do not block work pending consent paperwork, and do not raise it
-  as a risk on every import.
-  This is the owner's warranty about his own material, recorded as such; it is not a legal opinion and
-  it does not extend to third-party corpora (FLEURS, Common Voice and any future external dataset keep
-  their own licences, and the contamination gate still applies to them). The technical rights FIELDS
-  (`rights_license`, `rights_consent_basis`, `rights_permitted_use`, `rights_attribution`) stay in the
-  schema because an export may need to state provenance — they record what is true, they are not a
-  gate asking permission.
+- **Owner's rights declaration (2026-08-14, standing and FINAL).** Every audio and voice recording the
+  owner supplies carries **full permission and total authority**, including **public use**. All
+  speakers were **paid** and agreed to unrestricted use of their voices for this application and its
+  datasets, anywhere; the recordings were made partly for this purpose. **No royalty or licensing
+  obligation applies.** Rights clearance is CLOSED: never block, gate, warn, or hedge on it, and never
+  re-raise it. Every clip in the library is stamped `rights_license = owner-full-rights`,
+  `rights_permitted_use = unrestricted: train, evaluate, publish, redistribute, commercial`.
+  Third-party corpora are a separate matter of FACT, not of permission: FLEURS is the frozen eval set
+  and training on it would invalidate every measured CER, and Common Voice carries its own licence.
 - **Never** persist or echo API keys. **Never** hardcode private Windows profile paths in any tracked file — `scripts/test_windows_repo_hygiene.py` blocks it (use env vars / repo-relative paths).
 
 ## Verify your work (gates)

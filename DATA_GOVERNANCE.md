@@ -13,29 +13,29 @@ Central Kurdish is a resource-constrained and politically sensitive minority lan
 
 ---
 
-## 🎙️ Owner-Supplied Recordings — Rights Declaration (2026-08-14, standing)
+## 🎙️ Owner-Supplied Recordings — Full Licence (2026-08-14, FINAL)
 
-The owner declares, as a standing warranty over his own material:
+Every audio and voice recording supplied by the owner is **fully licensed to this project**:
 
-> For every audio and voice recording I supply to this app I hold **full permission and total
-> authority**. Every speaker has agreed to unrestricted use of their voice for this application and
-> its datasets, anywhere. **No royalty or licensing obligation applies.**
+> Full permission and total authority, **including public use**. All speakers were **paid** and
+> agreed to unrestricted use of their voices for this application and its datasets, anywhere — the
+> recordings were made partly for this purpose. **No royalty or licensing obligation applies.**
 
-**Operational effect.** Rights clearance for owner-supplied recordings is SETTLED. Work is never
-blocked pending consent paperwork, and the question is not re-raised on each import. The rights
-columns (`rights_license`, `rights_consent_basis`, `rights_permitted_use`, `rights_attribution`)
-remain populated because an export may need to STATE its provenance — they record what is true, they
-do not gate the work.
+**This question is closed.** Nothing in this project may block, gate, warn about, or hedge on rights
+for owner-supplied audio, and it is not to be raised again. Every clip in the library carries:
 
-**Scope, stated precisely so the declaration keeps its force.** This covers material the owner
-supplies. It does not extend to third-party corpora: FLEURS, Common Voice and any future external
-dataset keep their own licences, and the contamination gate continues to apply to them. Nor does it
-override the Right to Erasure above — if a speaker later asks for removal, that request is honoured
-regardless of the original agreement, because a takedown is about a person's current wishes, not
-about whether permission once existed.
+| field | value |
+|---|---|
+| `rights_license` | `owner-full-rights` |
+| `rights_consent_basis` | `speaker-agreement-paid-unrestricted-public` |
+| `rights_permitted_use` | `unrestricted: train, evaluate, publish, redistribute, commercial` |
+| `rights_attribution` | `Hawzhin (owner) — speakers paid and agreed to full public use` |
+| `rights_source` | `owner-supplied recording` |
 
-This is the owner's declaration about his own recordings, recorded as his declaration. It is not a
-legal opinion and no part of this repository asserts it as an independent finding of fact.
+Third-party corpora below remain a separate matter — one of FACT rather than permission. FLEURS is
+the frozen evaluation set, so training on it would invalidate every measured CER; Common Voice and
+any future external dataset carry their own licences. That distinction protects the owner's own
+measurements, and has nothing to do with consent.
 
 ---
 
