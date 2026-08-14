@@ -8682,3 +8682,35 @@ decisions, so nothing is lost — but it costs champion time at 8.5 clips/min an
 corpus, so it waits for the owner rather than happening overnight.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 286 — 55 under-levelled files re-prepped, and a "fix" that measured as no fix at all
+
+**Measured the cause directly instead of inferring it from clip stats.** Of the 145 older staged
+files, **55 measure below -26 LUFS** — the worst at **-49.2 LUFS with a true peak of -27 dBTP**. That
+is not quiet recording; it is 25-30 dB of headroom left unused, and it is my defect: this batch was
+converted with `-ac 1 -ar 16000` and no gain while the Hawleri episodes got a proper EBU R128 pass.
+
+**Re-levelled all 55** with the same static-gain rule (measure, one volume multiplier, never a
+limiter, never turn a file down for a peak-margin policy). Output -29.0 .. -19.8 LUFS, max true peak
+-1.43 dBTP. **14 remain below -26 LUFS** — high crest factor, no headroom to reach the target without
+dynamics processing, reported rather than forced.
+
+**The part worth recording is the correction.** The first pass applied up to +25 dB to my own 16-bit
+16 kHz intermediates, and a file at -49 dBFS occupies roughly 8 of 16 bits — so amplifying it should
+amplify quantization noise. I redid all 55 from the 48 kHz masters on that reasoning, then MEASURED
+both:
+
+    noise floor from the 16-bit intermediate : -42.11 dBFS
+    noise floor from the 48 kHz master       : -42.11 dBFS
+    difference                               :  -0.00 dB
+
+**No difference at all.** The recording's own noise floor sits about 30 dB above where 16-bit
+quantization noise lives, so quantization was never the limiting factor. The theory was sound and the
+effect was absent. Recorded because a plausible improvement that measurement cannot find is exactly
+the kind of thing that otherwise gets banked as a win.
+
+**Prepared, NOT imported.** `_relevelled_16k/` holds the 55 files. Importing them means deleting their
+existing clips first (all undecided, so nothing human is lost) and spending champion time at 8.5
+clips/min. It changes the corpus, so it waits for the owner.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
