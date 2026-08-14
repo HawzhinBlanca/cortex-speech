@@ -113,6 +113,21 @@ foreach ($attempt in 1..3) {
 $killCountFile = Join-Path $logDir 'watchdog-kills.txt'
 $maxConsecutiveKills = 3
 
+# STARTUP GRACE. A freshly launched app that has not opened 8737 YET is indistinguishable from a
+# wedged one by port alone — and the difference is the whole decision. Startup work scales with the
+# library: measured 2026-08-14 it took 8m16s to reach couch, and on 2026-08-15, after the library
+# tripled to 14,828 clips, it exceeded the 5-minute check interval entirely. The watchdog then killed
+# the app at 5 minutes, three times in a row, and the app never once got far enough to serve. A
+# watchdog that shortens startup until startup can never finish is a denial of service on its own app.
+#
+# 20 minutes is deliberately far beyond the ~8 measured: being slow to notice a genuinely wedged app
+# costs one extra check cycle, while being too impatient costs the app entirely. The kill path still
+# works for anything older than this.
+# Overridable so the decision tests can exercise BOTH sides: 0 makes every process instantly
+# "old enough" to reach the kill path, which is the only way to test the kill path without waiting
+# 20 real minutes.
+$startupGraceMinutes = if ($env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN) { [double]$env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN } else { 20 }
+
 if ($alive) {
     if (Test-Path $killCountFile) { Remove-Item $killCountFile -Force -ErrorAction SilentlyContinue }
     Report 'alive'
@@ -153,6 +168,14 @@ if (-not (Test-Path $session)) {
     # start failure (something else holding 8737), and load_session refuses a session whose db_path
     # moved — both leave the file on disk with the port dead and the app running, forever. Killing
     # then never helps and the app dies every five minutes, losing in-flight work each time.
+    # Youngest instance decides: if ANY matching process is still inside its startup grace, the port
+    # being closed is expected, not evidence of a wedge.
+    $youngestMin = ($proc | ForEach-Object { ((Get-Date) - $_.StartTime).TotalMinutes } | Measure-Object -Minimum).Minimum
+    if ($youngestMin -lt $startupGraceMinutes) {
+        Report ("starting-up ({0:N1} min old, grace {1} min)" -f $youngestMin, $startupGraceMinutes)
+        Write-Log ("port not open yet but the app is only {0:N1} min old (grace {1} min) - leaving it alone to finish starting" -f $youngestMin, $startupGraceMinutes)
+        exit 0
+    }
     $kills = 0
     if (Test-Path $killCountFile) { $kills = [int]((Get-Content $killCountFile -TotalCount 1).Trim()) }
     if ($kills -ge $maxConsecutiveKills) {

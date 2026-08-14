@@ -8753,3 +8753,49 @@ released seconds after the kill) and is one commit behind on app-side changes it
 before the next import.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 288 — 34 hours imported, the champion loop parallelised, and a watchdog that killed its own app
+
+**The corpus is in.** All 32 Hawleri episodes imported (25/25 in the final run, 0 failures).
+**14,828 clips / 9.20 h stored; 14,334 reviewable / 35.25 h pending.** Verified on the full library:
+0 blank drafts, 0 placeholders, 0 machine text in the human field, 0 missing audio, 0 non-champion
+drafts, **0 transcripts disagreeing with their stored champion hypothesis**, and — hashing all 179
+distinct source recordings — **0 duplicate audio**. All three provenance invariants PASS.
+
+**Champion calls now run a wave at a time (2.9x, measured).** `WSL_7B_GATE` admitted several calls
+but NOTHING ever issued two, so the gate limited a concurrency that did not exist and the second GPU
+never got work — which is why `CORTEX_7B_CONCURRENCY=2` changed the rate by nothing. Only the CALL is
+parallel; every DB touch stays on one thread in the original order, so the force-champion rollback
+contract is unchanged. Measured on short clips 8.5 -> 24.5 clips/min with GPUs at 87%/30% (from
+43%/3%); on the long episodes 13-15 clips/min sustained. **Correction:** the 24.5 figure is
+short-clip; the earlier "55 clips/min" was segment CREATION, not transcription, and was wrong.
+
+**Queue now serves OLDEST first.** It was newest-first, which put 6,823 fresh Hawleri clips ahead of
+the 537 remaining clips of the original corpus — the opposite of the owner's instruction, and wrong
+generally: a review queue is FIFO, so an import must never delay work already in progress.
+
+**Rights: closed.** Owner declares full permission and total authority over every recording he
+supplies, speakers paid and agreed to public use, no royalties. All 13,807 clips stamped
+`rights_license = owner-full-rights`. Nothing may block, gate, warn or hedge on it again.
+
+**THE WATCHDOG WAS KILLING THE APP.** After the library tripled, app startup exceeded the watchdog's
+5-minute check interval, and its "port dead + process alive = wedged" rule cannot tell a wedged app
+from one that is still STARTING:
+
+    01:57  session expected but port dead - killing wedged pid (attempt 1/3)
+    02:02  session expected but port dead - killing wedged pid (attempt 2/3)
+    02:07  session expected but port dead - killing wedged pid (attempt 3/3)
+
+Measured startup to couch on a healthy run: **8m16s** — already over the interval, and longer now at
+14,828 clips. The app never once reached the point of serving. A watchdog that shortens startup until
+startup cannot finish is a denial of service on its own app. Fixed with a **20-minute startup grace**
+keyed on process age, overridable via `CORTEX_WATCHDOG_STARTUP_GRACE_MIN` so the decision drill can
+exercise BOTH sides, plus a regression case asserting the exact inputs that took the app down
+(session present + process alive + port dead + young) now report `starting-up`.
+
+**Also corrected, twice, in the same shape:** "APP IS UP" was reported from a process check while the
+app was dead in an error dialog, and again while it was wedged with flat CPU and no log output. A
+running process is not a working app. Both were caught by refusing to call the links good until one
+returned a reviewer's name.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
