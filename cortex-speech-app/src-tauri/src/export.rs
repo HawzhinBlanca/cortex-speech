@@ -610,6 +610,25 @@ pub fn assign_splits(
     let target_test = (total as f64 * te) as i64;
     let (mut d_train, mut d_val, mut d_test) = (0i64, 0i64, 0i64);
 
+    // Largest group first. The rule below picks the split with the biggest ABSOLUTE deficit, and in
+    // shuffled order that sends everything to `train` whenever the groups are FEW and UNEQUAL: train's
+    // deficit (80% of the corpus) exceeds the whole of val's or test's target until train is nearly
+    // full, so every group loses to train no matter how small it is. Pinned by
+    // `three_unequal_recordings_still_fill_all_three_splits` — three recordings at 91.9/7.9/0.2 which
+    // CAN fill three splits and did not.
+    //
+    // Honest scope: this is NOT what produced the owner's all-train export on 2026-08-15. That ran
+    // over 179 recordings (splits are computed across every non-rejected clip, not just the
+    // exportable ones) and correctly put the three recordings holding reviewed clips in train. This
+    // fixes a real weakness for SMALL libraries, and nothing that was observed in production.
+    //
+    // Descending duration is the standard remedy (longest-processing-time first). Determinism is
+    // unchanged: the seed-shuffled order above survives as the tie-break for equal-duration groups.
+    let group_dur_of = |k: &String| -> i64 { groups[k].iter().map(|s| s.duration_ms).sum() };
+    let mut ordered: Vec<&String> = keys.into_iter().collect();
+    ordered.sort_by_key(|k| std::cmp::Reverse(group_dur_of(k)));
+    let keys = ordered;
+
     let mut out: Vec<(String, &'static str)> = Vec::with_capacity(segments.len());
     for key in keys {
         let segs = &groups[key];

@@ -2130,3 +2130,133 @@ fn export_refuses_a_dataset_where_every_clip_collapsed_into_one_split() {
     assert!(msg.contains("ONE split"), "the error must name the collapse: {msg}");
     assert!(msg.contains("hf_speaker_disjoint"), "the error must tell the owner which setting to look at: {msg}");
 }
+
+/// The HuggingFace export against a REAL corpus, at real scale. `#[ignore]`d and opt-in: it needs a
+/// COPY of a populated library, given as `CORTEX_SCALE_DB`.
+///
+/// Why it exists: every other hf_* test here runs on 2-6 synthetic segments, so the export, the
+/// leakage-safe grouping and the empty-split guard had never met production scale. On 2026-08-15 the
+/// live corpus reached 14,828 clips across 179 recordings — the size at which the grouping either
+/// works or silently collapses everything into `train`. Attempting this through the app was a dead
+/// end: a second GUI instance cannot create a WebView2 (fixed user-data folder), so it must run
+/// headless, here.
+///
+///   set CORTEX_SCALE_DB=<copy of cortex-speech.db>
+///   cargo test --release --lib hf_export_at_real_corpus_scale -- --ignored --nocapture
+/// Distinct source recordings among the rows the export actually assigned a split to.
+fn assigned_recordings(db: &crate::db::Database) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for seg in db.get_segments(None).unwrap_or_default() {
+        if seg.split.is_some() {
+            seen.insert(seg.audio_path.rsplit(['/', '\\']).next().unwrap_or(&seg.audio_path).to_string());
+        }
+    }
+    seen.into_iter().collect()
+}
+
+#[test]
+#[ignore]
+fn hf_export_at_real_corpus_scale() {
+    use std::collections::{HashMap, HashSet};
+    let Ok(db_path) = std::env::var("CORTEX_SCALE_DB") else {
+        eprintln!("CORTEX_SCALE_DB not set — skipping (this test needs a copy of a real library)");
+        return;
+    };
+    let db = crate::db::Database::open(&db_path).expect("open the corpus copy");
+    let segments = db.get_segments(None).expect("read segments");
+    println!("corpus under test: {} segments", segments.len());
+    assert!(segments.len() > 1000, "this is a SCALE test; {} segments is a fixture", segments.len());
+
+    let out = tempfile::tempdir().unwrap();
+    let settings =
+        crate::settings::AppSettings { hf_speaker_disjoint: true, ..crate::settings::AppSettings::default() };
+    let started = std::time::Instant::now();
+    export_huggingface_dataset(&db, out.path(), &settings).expect("export must succeed at scale");
+    println!("export took {:.1}s", started.elapsed().as_secs_f64());
+
+    // Every requested split populated — the collapse this guard exists for leaves val/test empty.
+    let rows = db
+        .connection()
+        .prepare("SELECT split, COUNT(*) FROM speech_segments WHERE split IS NOT NULL GROUP BY split")
+        .and_then(|mut s| {
+            s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map(|it| it.filter_map(Result::ok).collect::<Vec<_>>())
+        })
+        .expect("read split assignments");
+    let by_split: HashMap<String, i64> = rows.into_iter().collect();
+    println!("splits: {by_split:?}");
+
+    // WHAT THIS CAN AND CANNOT ASSERT. Splits are computed over every NON-REJECTED clip (see
+    // `exclude_unexportable_segments`), but only rows actually WRITTEN keep their split — and only
+    // human-decided clips are written. So on a corpus that is mostly unreviewed, the written rows can
+    // legitimately all carry one split: MEASURED 2026-08-15, 14,828 clips across 179 recordings, of
+    // which 454 were exportable and all three of their source recordings happened to land in `train`.
+    // That is review coverage, not a collapse, and asserting "all three splits populated" here would
+    // fail honestly-correct behaviour every time. The collapse case is covered by
+    // `export_refuses_a_dataset_where_every_clip_collapsed_into_one_split` and the production guard.
+    //
+    // What IS asserted: the export completes at scale, and no source recording straddles two splits —
+    // the leakage property, which must hold no matter how the material is distributed.
+    let split_count: i64 = by_split.values().sum();
+    assert!(split_count > 0, "the export wrote no splits at all: {by_split:?}");
+    println!(
+        "{} rows carry a split; exportable clips come from {} recording(s)",
+        split_count,
+        assigned_recordings(&db).len()
+    );
+
+    // No source recording may straddle two splits: that is the leak the grouping prevents, and the
+    // property most worth re-checking when the corpus grows.
+    let assigned = db.get_segments(None).expect("re-read");
+    let mut split_of_recording: HashMap<String, String> = HashMap::new();
+    let mut straddlers: HashSet<String> = HashSet::new();
+    for seg in &assigned {
+        let Some(split) = seg.split.as_deref() else { continue };
+        let rec = seg.audio_path.rsplit(['/', '\\']).next().unwrap_or(&seg.audio_path).to_string();
+        match split_of_recording.get(&rec) {
+            Some(prev) if prev != split => {
+                straddlers.insert(rec);
+            }
+            None => {
+                split_of_recording.insert(rec, split.to_string());
+            }
+            _ => {}
+        }
+    }
+    assert!(straddlers.is_empty(), "{} recording(s) leaked across splits: {straddlers:?}", straddlers.len());
+    println!("{} recordings, none straddling a split", split_of_recording.len());
+}
+
+#[test]
+fn three_unequal_recordings_still_fill_all_three_splits() {
+    use std::collections::HashMap;
+    // The exact shape of the owner's exportable corpus on 2026-08-15: three recordings holding
+    // 91.9% / 7.9% / 0.2% of the duration, every clip labelled by a per-recording diarizer index.
+    // The export produced train=454, validation=0, test=0 on this input; 91.9/7.9/0.2 is plainly
+    // achievable, so this test pins the achievable outcome rather than the observed one.
+    let mk = |id: &str, src: &str, spk: &str, dur: i64| SpeechSegment {
+        id: id.to_string(),
+        audio_path: format!("/data/{src}"),
+        speaker_id: Some(spk.to_string()),
+        duration_ms: dur,
+        ..SpeechSegment::default()
+    };
+    let mut segs = Vec::new();
+    for i in 0..415 {
+        segs.push(mk(&format!("big-{i}"), "big.flac", &format!("SPEAKER_0{}", i % 8), 9150));
+    }
+    for i in 0..38 {
+        segs.push(mk(&format!("mid-{i}"), "mid.flac", &format!("SPEAKER_0{}", i % 8), 8680));
+    }
+    segs.push(mk("tiny-0", "tiny.mp4", "SPEAKER_00", 6000));
+
+    let assigned = assign_splits(&segs, 0.8, 0.1, 0.1, 42, true);
+    let mut per: HashMap<&str, usize> = HashMap::new();
+    for (_, s) in &assigned {
+        *per.entry(*s).or_default() += 1;
+    }
+    println!("three-recording split: {per:?}");
+    for name in ["train", "validation", "test"] {
+        assert!(per.get(name).copied().unwrap_or(0) > 0, "{name} is EMPTY: {per:?}");
+    }
+}
