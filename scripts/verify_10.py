@@ -532,6 +532,23 @@ def _probe_silero():
     return "models missing - run `cd cortex-speech-app && npm run fetch-models`"
 
 
+def _probe_champion_7b():
+    """The champion server lives in WSL, outside the tree, so its absence is machine state.
+
+    Split out of `ignored-real-model` on 2026-08-17. `wsl_7b_preflight_passes_when_server_up` failed
+    there because the server was down, which turned the whole leg RED — taking six real-model tests
+    that had genuinely PASSED down with it and burying the sweep's actual failures under an
+    environmental one. A leg that cannot run must say SKIP-ENV, and the other six must keep running.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(2.0)
+        if probe.connect_ex(("127.0.0.1", 8799)) != 0:
+            return "OmniASR-7B champion server not up on 127.0.0.1:8799 (`wsl python scripts/cortex_7b_server.py`)"
+    return None
+
+
 def _probe_rtf():
     if (SRC_TAURI / "models" / "omniasr-ctc-300m" / "model.int8.onnx").exists():
         return None
@@ -657,6 +674,7 @@ GATES = [
     ("branch-protection", 1, "fn", check_branch_protection, None, _probe_branch_protection, "Git+integrity: main is protected on the remote, admins included (was OWNER_GATED item 49 - clicks done 2026-08-08, now machine-verified every sweep)"),
     ("python-policies", 1, "cmd", "npm run test:python-policies", APP, None, "honesty/privacy/CI/dataset policy tests"),
     ("spot-check-pool", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_spot_check_pool.py"}"', APP, None, "The listening-QC must be ABLE TO FIRE. MEASURED 2026-08-13: the answer-key pool was ZERO across 283 human decisions — every key must be gold-flagged or desktop-decided (reviewed_by NULL), and every decision had come from the phone, which stamps reviewed_by by design. Nothing errored and spot_checks still showed 5 stale rows, so the QC looked alive while being structurally incapable of firing. A mechanism that cannot fire is indistinguishable from one that finds nothing, which is why this is a gate and not a report."),
+    ("reviewer-queues-live", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_reviewer_queues_live.py"}"', APP, None, "Every reviewer holding a live link has clips they are ALLOWED to review. MEASURED 2026-08-17: two independent bugs made five of eight reviewers' queues empty while the owner was paying them, and each hid the other. The 1,031 recovered clips were relinked into D:\\Kurdish Corpora\\sorani\\ZarPodcast while dialect.rs still mapped only their pre-recovery path, so they were UNMAPPED and the dialect check fails closed; meanwhile the roster file carried a \"_comment\" string, which a strict HashMap<String, Vec<String>> parse rejects outright, and that failure path is \"unrestricted\" — so the protection was simultaneously off for everyone. Every row, every JSON file and every Rust function read correctly in isolation; only computing what each NAMED reviewer would actually be served exposes it. supervision-live cannot: the server answers 200 for an empty queue."),
     ("review-serving-provenance", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_review_serving_provenance.py"}"', APP, None, "Honesty at the SERVING path, on the LIVE db: annotated_transcript is human-only, and every untouched clip serves the champion's own transcript. MEASURED 2026-08-12: 348 rows held machine text in the human field, so the phone review page served a stale paraphrase while the fresh champion drafts sat invisible — reviewers corrected words the speaker never said. Write-path checks passed the whole time; only reading the row the server actually serves catches this class."),
     ("typecheck", 1, "cmd", "npm run typecheck", APP, None, "svelte-check + tsc"),
     ("lint-js", 1, "cmd", "npm run lint", APP, None, "eslint"),
@@ -674,7 +692,8 @@ GATES = [
     ("real-app-e2e", 2, "cmd", f'node "{APP / "e2e_real_app.cjs"}"', APP, _probe_real_e2e, "THE daily-use reliability gate: real exe, real audio, real transcript"),
     # Tier 3 — deep proof legs (env-gated; skipped honestly when absent)
     ("egress-runtime", 3, "cmd", f'node "{APP / "scripts" / "egress_probe.cjs"}"', APP, _probe_egress, "Privacy: zero outbound sockets at runtime — egress_probe.cjs proves ZERO external TCP from the backend PID across startup + browse + a REAL offline transcription (import->VAD->CTC ASR, the path where cloud STT/LLM would fire if consent leaked), with an in-run POSITIVE CONTROL that fails loud if the sampler is dead (no vacuous pass). Poll-sampled (200ms) + TCP-only; an airtight kernel/ETW socket trace is a further stretch. SKIP-ENV off the Windows rig / without the exe. Static test_cloud_privacy_policy.py is belt-and-braces."),
-    ("ignored-real-model", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored --skip live_transcribe_segments --skip refinery_lift', REPO_ROOT, _probe_silero, "WS3a: the 37 #[ignore] real-model gates (cloud-key test excluded; refinery_lift benchmark+diag excluded — the benchmark has its own dedicated leg)"),
+    ("ignored-real-model", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored --skip live_transcribe_segments --skip refinery_lift --skip wsl_7b_preflight', REPO_ROOT, _probe_silero, "WS3a: the 37 #[ignore] real-model gates (cloud-key test excluded; refinery_lift benchmark+diag excluded — the benchmark has its own dedicated leg; the 7B preflight excluded — it needs an external WSL server and has its own leg, so its absence cannot red the six tests that run on models in this tree)"),
+    ("champion-7b-preflight", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored wsl_7b_preflight', REPO_ROOT, _probe_champion_7b, "The champion's preflight against the REAL OmniASR-7B server. The champion drafts every clip (owner rule 2026-08-11), so the check that it is reachable before an import starts is the difference between a halt and a library half-drafted by a weaker engine."),
     # Deliberately count-agnostic: the gate enumerates targets with `cargo fuzz list` and fails loud on an
     # empty list, so hardcoding a number here only creates a second place to go stale. It said "5" until
     # the `features` target was removed with the dead FbankExtractor module it fuzzed (iteration 231).

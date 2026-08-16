@@ -1501,7 +1501,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         // something. A reviewer must not be able to coast just because their batches came out short.
         let wanted = queue.len().div_ceil(SPOT_CHECK_EVERY);
         let work_len = queue.len();
-        match db.list_spot_check_candidates(wanted, reviewer, &skipped_by_me) {
+        match db.list_spot_check_candidates(wanted, reviewer, &skipped_by_me, allowed_dialects.as_deref()) {
             Ok(candidates) => {
                 let mut guard = lock_state(state);
                 let mut grew = false;
@@ -2014,7 +2014,13 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             tracing::warn!("Couch Review spot-check not recorded for {}: {e}", parsed.id);
         }
         audit(db, decision);
-        return json_reply(200, serde_json::json!({ "ok": true }));
+        // A spot check is audited like any other decision (see `audit` above — it IS work to the
+        // reviewer), so it moves the audio total too. Without this the badge would freeze on roughly
+        // every eighth clip, which is the one pattern that would teach a reviewer to spot the checks.
+        return json_reply(
+            200,
+            serde_json::json!({ "ok": true, "reviewedMs": db.reviewed_audio_ms(reviewer).unwrap_or(0) }),
+        );
     }
 
     // A dropped RESPONSE (not a dropped request) means the write landed and the page never heard so.
@@ -2027,7 +2033,12 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // one would double the learning pair. It is an interrupted write to be FINISHED, below.
     let already_recorded = is_repeat_of_stored_decision(&prev, reviewer, decision, text.as_deref());
     if already_recorded && prev.verified {
-        return json_reply(200, serde_json::json!({ "ok": true, "duplicate": true }));
+        // Carries the total as well: this is the RETRY path after a dropped response, which is
+        // exactly when a reviewer is least sure their work registered.
+        return json_reply(
+            200,
+            serde_json::json!({ "ok": true, "duplicate": true, "reviewedMs": db.reviewed_audio_ms(reviewer).unwrap_or(0) }),
+        );
     }
 
     // SERVE/DECIDE VERSION FENCE (text-provenance audit #4). The queue stamped this clip's
@@ -2154,7 +2165,13 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // clip also leaves the pending queue, so this is housekeeping, not correctness.)
     lock_state(state).leases.remove(&parsed.id);
     audit(db, decision);
-    json_reply(200, serde_json::json!({ "ok": true }))
+    // The reviewer's audio total, refreshed HERE rather than waiting for the next queue fetch. This
+    // is the number they are paid on, and it used to move only when a batch refilled — so a reviewer
+    // could finish twenty clips and watch it sit still, which reads as "my work is not being
+    // counted". The decision is already committed at this point, so the total includes the clip they
+    // just finished. Best-effort: a progress badge must never be able to fail a saved decision.
+    let reviewed_ms = db.reviewed_audio_ms(reviewer).unwrap_or(0);
+    json_reply(200, serde_json::json!({ "ok": true, "reviewedMs": reviewed_ms }))
 }
 
 /// Undo the LAST phone decision: retract the learning pair the decision produced, then restore the
@@ -3262,7 +3279,7 @@ mod tests {
         gold_seg(&db, "g2", "دەقی هەڵەی دوو", "دەقی ڕاستی دوو");
         let state = state();
 
-        let candidates = db.list_spot_check_candidates(10, "Sara", &HashSet::new()).unwrap();
+        let candidates = db.list_spot_check_candidates(10, "Sara", &HashSet::new(), None).unwrap();
         assert_eq!(candidates.len(), 2, "both clips have a human answer that differs from the raw draft");
         // A check is graded only because it was SERVED as one; mark both as served to each reviewer,
         // which is exactly what api_queue records when it salts a batch.
@@ -3839,6 +3856,53 @@ mod tests {
         assert!(
             second.iter().any(|id| id == other),
             "skipping one check must yield a DIFFERENT one, not none: {second:?}"
+        );
+    }
+
+    #[test]
+    fn every_decision_answers_with_the_reviewers_updated_audio_total() {
+        // The badge is the number the reviewer is PAID on, and it used to refresh only when a batch
+        // refilled — so someone could finish twenty clips watching it sit still, which reads as work
+        // not being counted. Every reply that follows real work must carry the fresh total, including
+        // the two paths that return early: a spot check (audited as real work, so it moves the total
+        // — miss it and the badge freezes on roughly every eighth clip) and a duplicate retry (the
+        // dropped-response case, when a reviewer is least sure their save landed).
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        for (id, ms) in [("r1", 9000), ("r2", 21000)] {
+            let mut s = seg(id, "دەق");
+            s.duration_ms = ms;
+            db.insert_segment(&s).unwrap();
+        }
+        let state = state();
+        let total_of = |reply: Reply| -> i64 {
+            assert_eq!(reply.0, 200);
+            serde_json::from_slice::<serde_json::Value>(&reply.2).unwrap()["reviewedMs"]
+                .as_i64()
+                .expect("every decision reply carries reviewedMs")
+        };
+
+        let first = serde_json::json!({"id": "r1", "action": "accept", "text": "دەق"}).to_string();
+        assert_eq!(total_of(api_decision(&db, first.as_bytes(), "Sara", &state)), 9_000);
+        let second = serde_json::json!({"id": "r2", "action": "bad"}).to_string();
+        assert_eq!(
+            total_of(api_decision(&db, second.as_bytes(), "Sara", &state)),
+            30_000,
+            "a reject is reviewed audio too — they listened in order to decide"
+        );
+        assert_eq!(
+            total_of(api_decision(&db, first.as_bytes(), "Sara", &state)),
+            30_000,
+            "the retry path answers with the total as well, and does not double-count"
+        );
+
+        // And the spot-check path, which returns before any of the machinery above.
+        gold_seg(&db, "r-gold", "دەقی هەڵە", "دەقی ڕاست");
+        lock_state(&state).spot_checks.insert(("r-gold".to_string(), "Sara".to_string()));
+        let check = serde_json::json!({"id": "r-gold", "action": "accept", "text": "دەقی ڕاست"}).to_string();
+        assert!(
+            total_of(api_decision(&db, check.as_bytes(), "Sara", &state)) > 30_000,
+            "a spot check is audited as work, so it must move the badge like anything else"
         );
     }
 

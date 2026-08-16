@@ -824,9 +824,14 @@
     // if the draft changed in between, so what gets recorded is always judged-as-seen.
     const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me, rowVersion: queue[i].rowVersion };
     try {
-      await api('/api/decision', {
+      const saved = await api('/api/decision', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),
       });
+      // The audio total comes back WITH the decision, so the badge moves on every save instead of
+      // only when a batch refills. A reviewer paid per hour of audio watched that number sit still
+      // through twenty clips, which reads as work not being counted. Guarded so an older server that
+      // does not send it leaves the last known value alone rather than flashing back to zero.
+      if (saved && saved.reviewedMs != null) reviewedMs = Number(saved.reviewedMs) || 0;
       if (!isSkip) {
         sessionStorage.removeItem(draftKey(submission.id));
         clearRefused(submission.id); // re-reviewing a refused clip must retract the warning about it

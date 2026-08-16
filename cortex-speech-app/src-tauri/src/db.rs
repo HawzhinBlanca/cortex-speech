@@ -1506,6 +1506,7 @@ impl Database {
         limit: usize,
         reviewer: &str,
         exclude: &std::collections::HashSet<String>,
+        allowed_dialects: Option<&[String]>,
     ) -> AppResult<Vec<(SpeechSegment, String)>> {
         // `reviewed_by IS NULL` keeps OWNER-desktop decisions (which pass no annotator name) as
         // keys while excluding a phone peer's fresh correction — grading one reviewer against
@@ -1546,6 +1547,14 @@ impl Database {
             // eighth item — which is exactly what the reviewers reported: the first few clips play,
             // then one errors.
             if !std::path::Path::new(&seg.audio_path).is_file() {
+                continue;
+            }
+            // Spot checks are injected AFTER the queue's own dialect filter, on this separate path —
+            // so without this they were the one way a reviewer could still be handed a dialect they
+            // do not speak, and the worst possible one: a check is SCORED, so an honest reviewer
+            // fails a test they had no way to pass and reads as a blind-accepter. The queue and the
+            // measurement have to agree about who may judge what.
+            if !crate::dialect::reviewer_may_judge(allowed_dialects, &seg.audio_path) {
                 continue;
             }
             // Only a clip whose raw draft is WRONG can distinguish listening from tapping.
@@ -2352,10 +2361,31 @@ impl Database {
         Ok(count)
     }
 
+    /// Pages copied per backup step, and the pause between steps. See [`Self::backup`].
+    const BACKUP_PAGES_PER_STEP: std::os::raw::c_int = 4096;
+    const BACKUP_STEP_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
+
+    /// SQLite online backup — safe against a live database, unlike a file copy.
+    ///
+    /// The pacing is load-bearing and was pathological. It used to be `(5, 250ms)` — the literal
+    /// rusqlite doc example — which copies 5 pages, sleeps a quarter second, and repeats. At 4 KB
+    /// pages that is 80 KB/s, so the 84 MB library took ~21,600 pages / 5 × 250 ms = **18 minutes**.
+    ///
+    /// MEASURED 2026-08-17. Three consequences, none of them obvious from this function:
+    ///   * `take_snapshot` runs SYNCHRONOUSLY on the startup path, so every launch held the review
+    ///     port shut for ~16 minutes. That is the entire cold start — the watchdog's startup grace
+    ///     was raised to 45 minutes twice to accommodate it, treating the symptom both times.
+    ///   * The periodic snapshot timer is 10 minutes, i.e. SHORTER than one snapshot took, so a copy
+    ///     was essentially always in flight against the database reviewers were writing to.
+    ///   * A backup restarts from scratch when the source is written mid-copy, so the slower it is,
+    ///     the likelier it is to never finish on a busy library.
+    ///
+    /// 4096 pages (~16 MB) per step holds the source lock for a few milliseconds at a time, which is
+    /// what stepping is actually for, and finishes an 84 MB database in well under a second.
     pub fn backup<P: AsRef<Path>>(&self, dest: P) -> AppResult<()> {
         let mut dest_conn = Connection::open(dest.as_ref())?;
         let backup = backup::Backup::new(&self.conn, &mut dest_conn)?;
-        backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
+        backup.run_to_completion(Self::BACKUP_PAGES_PER_STEP, Self::BACKUP_STEP_PAUSE, None)?;
         Ok(())
     }
 
@@ -2388,7 +2418,9 @@ impl Database {
             )));
         }
         let backup = backup::Backup::new(&src_conn, &mut self.conn)?;
-        backup.run_to_completion(5, std::time::Duration::from_millis(250), None)?;
+        // Same pacing as `backup`, and for the same reason: a restore is the recovery path, where
+        // 18 minutes of apparent hang is when someone concludes it is broken and interrupts it.
+        backup.run_to_completion(Self::BACKUP_PAGES_PER_STEP, Self::BACKUP_STEP_PAUSE, None)?;
         drop(backup); // release the &mut self.conn borrow before re-migrating self
                       // Bring the restored DB up to the current schema IN PLACE. The newer-schema case was refused
                       // above, so the source is at an OLDER (or equal) version; without this, a restored old snapshot

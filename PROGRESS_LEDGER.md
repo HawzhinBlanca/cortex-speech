@@ -8810,3 +8810,58 @@ running process is not a working app. Both were caught by refusing to call the l
 returned a reviewer's name.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 289 — five reviewers had empty queues, and the 20-minute cold start was one line
+
+Overnight reliability session. The brief was "get to a true trustworthy reliable system to start real
+work", so the measurement that mattered was not whether the tree is correct but whether a named
+reviewer opening their link tonight can actually work. Two of the four things found are answers to
+questions earlier iterations asked and got wrong.
+
+**FIVE OF EIGHT REVIEWERS HAD A QUEUE OF ZERO, and two independent bugs hid each other.** The 1,031
+recovered clips were relinked into `D:\Kurdish Corpora\sorani\ZarPodcast`, but `dialect.rs` still
+mapped only their pre-recovery path (`SoraniVoice_PC_`), so all 535 pending Sorani clips were
+UNMAPPED — and the dialect check fails closed, so every Sorani-only reviewer (Alle, Roza, Sabat,
+Lamo, Sewa) was served nothing. Simultaneously the roster file itself was inert: it shipped with a
+`"_comment"` string explaining how to edit it, and a strict `HashMap<String, Vec<String>>` parse
+rejects that outright, whose failure path is "unrestricted" — so the dialect protection was OFF for
+everyone from the moment it was installed, including the three reviewers it was written for. A
+helpful comment turned the safety feature off. Neither bug is visible from the tree: the database
+rows, the JSON and the Rust all read correctly in isolation.
+
+**THE 20-MINUTE COLD START IS `run_to_completion(5, 250ms)`.** Iteration 288 measured startup-to-couch
+at 8m16s at ~500 clips and 18m11s at 14,828, called it "startup scales with the library", and raised
+the watchdog grace to 45 minutes — the second time the grace was raised to accommodate it. The cause
+is one line: `Database::backup` paced the SQLite online backup at 5 pages per 250 ms, the literal
+rusqlite doc example, copied without arithmetic. That is 80 KB/s. `take_snapshot` runs SYNCHRONOUSLY
+on the startup path, so the 84 MB library held the review port shut for ~16 minutes every launch, and
+since the periodic snapshot timer is 10 minutes — SHORTER than one snapshot took — a copy was
+essentially always running against the database reviewers were writing to. Measured fail-before:
+1,371 pages took **68.6 s** at the old pacing, which extrapolates to 18 minutes for the real library
+and matches 18m11s. At 4096 pages/step it is under a second. "Scales with the library" was the true
+observation and the wrong conclusion.
+
+**Spot checks bypassed the dialect filter.** They are injected after the queue's own filter, on a
+separate path, so they were the one remaining way to hand someone a dialect they do not speak — and
+the most damaging one, because a check is SCORED: an honest reviewer fails a test they had no way to
+pass and is recorded looking exactly like someone tapping "looks good" without listening.
+
+**A gate for the class, not the instance.** `reviewer-queues-live` computes, against the LIVE database
+and roster, what each NAMED reviewer would actually be served, and fails when anyone holding a link
+has nothing. `supervision-live` could not see this: the server answers 200 for an empty queue. The
+gate reads the dialect map out of `dialect.rs` rather than restating it, because the drift between
+map and reality IS the bug — and it caught a raw-string parsing error in its own reader that way.
+
+**Sweep at 01:39:** 36 gates, 32 PASS / 4 FAIL. `typecheck` was a real regression (the merged commit
+dropped `asr_provider` from `BackendSettings` and left it in two fixtures); `python-policies` was this
+ledger being 4 commits stale; `ignored-real-model` was the WSL 7B server being down, which red-ed the
+whole leg and took six PASSING real-model tests with it — now split into its own env-probed leg;
+`spot-check-pool` remains genuinely RED at 22 of 24 keys and is owner-gated. `bench-budget` PASSED
+despite a concurrent GPU ingest job, and `test-rust` passed, confirming both earlier failures as
+environmental.
+
+**Still owner-gated:** the answer-key pool needs a few desktop adjudications to reach 24, and the
+Sorani backlog is 535 clips (1.2 h) against 13,777 Hawleri (34.0 h) — five Sorani-only reviewers will
+drain it in a sitting, so more Sorani material needs importing to keep them working.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

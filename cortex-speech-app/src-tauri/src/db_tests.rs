@@ -651,7 +651,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     }
 
     let ids = |limit: usize| -> Vec<String> {
-        db.list_spot_check_candidates(limit, "Sara", &std::collections::HashSet::new())
+        db.list_spot_check_candidates(limit, "Sara", &std::collections::HashSet::new(), None)
             .unwrap()
             .into_iter()
             .map(|(s, _)| s.id)
@@ -676,7 +676,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     // score a blind accept as perfect. Asserted against the row that came back rather than a
     // hardcoded string: the answer key must be right for EVERY candidate, not just whichever one
     // happens to sort first.
-    for (seg, expected) in db.list_spot_check_candidates(10, "Sara", &std::collections::HashSet::new()).unwrap() {
+    for (seg, expected) in db.list_spot_check_candidates(10, "Sara", &std::collections::HashSet::new(), None).unwrap() {
         assert_ne!(expected, seg.raw_transcript, "{} was graded against its own draft", seg.id);
         assert_eq!(
             Some(expected.as_str()),
@@ -699,7 +699,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     // Per REVIEWER, not global: two people meeting the same clip independently is the entire basis of
     // the agreement sample, so Sara's answer must not consume Hemn's.
     let hemn: Vec<String> = db
-        .list_spot_check_candidates(10, "Hemn", &std::collections::HashSet::new())
+        .list_spot_check_candidates(10, "Hemn", &std::collections::HashSet::new(), None)
         .unwrap()
         .into_iter()
         .map(|(s, _)| s.id)
@@ -3767,6 +3767,85 @@ fn review_queue_serves_the_oldest_work_first() {
         served,
         vec!["old-1".to_string(), "mid-1".to_string(), "new-1".to_string()],
         "the queue must hand out the oldest pending clip first: {served:?}"
+    );
+}
+
+#[test]
+fn a_spot_check_is_never_served_in_a_dialect_the_reviewer_cannot_judge() {
+    // Spot checks are injected on a path of their own, AFTER the queue's dialect filter — so they
+    // were the one remaining way to hand someone a dialect they do not speak, and the most damaging:
+    // a check is SCORED, so an honest reviewer fails a test they could not have passed and is
+    // recorded looking exactly like someone tapping "looks good" without listening.
+    let db = make_db();
+    let audio = tempfile::tempdir().unwrap();
+    let mut ids = Vec::new();
+    for (id, file) in [("haw", "KBHP-EP01.wav"), ("sor", "zar-01.wav")] {
+        // Real files: the candidate list refuses a key whose audio is gone, for its own good reason.
+        let path = if id == "haw" {
+            audio.path().join("sorani-hawleri").join(file)
+        } else {
+            audio.path().join("Kurdish Corpora").join("sorani").join("ZarPodcast").join(file)
+        };
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"RIFF").unwrap();
+        let mut seg = make_segment(id, path.to_str().unwrap());
+        seg.raw_transcript = "دەقی هەڵە".into();
+        seg.verified = true;
+        db.insert_segment(&seg).unwrap();
+        // Through the real decision path, so the answer key lands where a human edit leaves it.
+        db.record_human_decision(id, "edit", Some("دەقی ڕاست"), None).unwrap();
+        ids.push(id);
+    }
+    let candidates = |allowed: Option<&[String]>| -> Vec<String> {
+        db.list_spot_check_candidates(10, "Roza", &std::collections::HashSet::new(), allowed)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s.id)
+            .collect()
+    };
+    assert_eq!(candidates(None).len(), 2, "unrestricted: both clips are usable keys");
+    let sorani_only = vec![crate::dialect::SORANI.to_string()];
+    assert_eq!(
+        candidates(Some(&sorani_only)),
+        vec!["sor".to_string()],
+        "a Sorani-only reviewer must be graded on Sorani only"
+    );
+}
+
+#[test]
+fn a_snapshot_of_a_real_sized_library_does_not_take_minutes() {
+    // MEASURED 2026-08-17: `backup` paced itself at 5 pages per 250 ms — the rusqlite doc example,
+    // copied without arithmetic. That is 80 KB/s, so the owner's 84 MB library took ~18 minutes per
+    // snapshot. `take_snapshot` runs synchronously at startup, so EVERY launch held the reviewer
+    // port shut for a quarter of an hour, and the 10-minute snapshot timer meant a copy was almost
+    // always running against the live database.
+    //
+    // The size assertion is the load-bearing half: a handful of pages finishes fast under either
+    // pacing, so without it this test would pass while the bug was fully present.
+    let db = make_db();
+    let mut seg = make_segment("bulk", "/audio/bulk.wav");
+    seg.raw_transcript = "ک".repeat(4000); // ~4 KB of text per row, so page count climbs quickly
+    for i in 0..600 {
+        seg.id = format!("bulk-{i}");
+        db.insert_segment(&seg).unwrap();
+    }
+    let pages: i64 = db.connection().query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+    assert!(pages >= 1000, "the fixture must be big enough for pacing to matter, got {pages} pages");
+
+    // Bound to a name: a temporary TempDir is dropped at the end of the statement that made it, which
+    // deletes the directory out from under the backup.
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("snap.db");
+    let started = std::time::Instant::now();
+    db.backup(&dest).unwrap();
+    let elapsed = started.elapsed();
+
+    // Old pacing needed >= pages/5 * 250 ms — at least 50 s for 1000 pages. New pacing is well under
+    // a second. The budget is deliberately loose so a busy CI box cannot flake it; anything near the
+    // old behaviour misses it by orders of magnitude.
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "backing up {pages} pages took {elapsed:?} — the per-step pacing has regressed"
     );
 }
 
