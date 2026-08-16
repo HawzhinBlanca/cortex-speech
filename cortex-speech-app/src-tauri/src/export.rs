@@ -101,11 +101,18 @@ struct ExportSegmentRecord {
     training_grade: String,
     training_ready: bool,
     training_reasons: Vec<String>,
+    /// Dialect of the source recording (owner instruction 2026-08-16), from the explicit map in
+    /// `dialect.rs` — e.g. every KBHP episode is Hawleri. `None` for an unmapped source: an absent
+    /// label is honest, a guessed one silently poisons every per-dialect split and fairness number
+    /// computed from the dataset. Derived from the ORIGINAL path (the map keys on the source), then
+    /// the path itself is sanitized to a basename below.
+    dialect: Option<&'static str>,
 }
 
 impl ExportSegmentRecord {
     fn new(segment: &SpeechSegment) -> Self {
         let report = quality::training_grade_for_segment(segment);
+        let dialect = crate::dialect::dialect_of(&segment.audio_path);
         // Privacy: never publish the curator's absolute filesystem path — it embeds the
         // OS username and drive layout. Emit only the basename, like the HF exporter.
         let mut sanitized = segment.clone();
@@ -121,6 +128,7 @@ impl ExportSegmentRecord {
             training_grade: report.grade,
             training_ready: report.training_ready,
             training_reasons: report.reasons,
+            dialect,
         }
     }
 }
@@ -980,6 +988,7 @@ pub fn export_huggingface_dataset(
                     "training_ready",
                     "transcript_source",
                     "training_reasons",
+                    "dialect",
                 ])?;
 
                 let mut total_exported_dur = 0.0;
@@ -1136,6 +1145,7 @@ pub fn export_huggingface_dataset(
                             training_ready_str,
                             grade.transcript_source.as_str(),
                             hf_reasons.as_ref(),
+                            crate::dialect::dialect_of(&seg.audio_path).unwrap_or(""),
                         ])?;
 
                         total_exported_dur += clip_dur_ms as f64 / 1000.0;
@@ -1335,6 +1345,7 @@ number verbalization), and diacritics are left untouched.
                 "training_grade": {"dtype": "string", "_type": "Value"},
                 "training_ready": {"dtype": "int64", "_type": "Value"},
                 "transcript_source": {"dtype": "string", "_type": "Value"},
+                "dialect": {"dtype": "string", "_type": "Value"},
                 "training_reasons": {"dtype": "string", "_type": "Value"},
             },
             "splits": {
@@ -1448,6 +1459,7 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 "training_grade",
                 "training_ready",
                 "training_reasons",
+                "dialect",
             ])?;
 
             for seg in segments {
@@ -1483,6 +1495,7 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                     grade.grade.as_str(),
                     if grade.training_ready { "1" } else { "0" },
                     reasons_cell.as_ref(),
+                    crate::dialect::dialect_of(&seg.audio_path).unwrap_or(""),
                 ])?;
             }
             wtr.flush()?;
@@ -1565,6 +1578,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
         Field::new("training_grade", DataType::Utf8, false),
         Field::new("training_ready", DataType::Boolean, false),
         Field::new("training_reasons", DataType::Utf8, false),
+        Field::new("dialect", DataType::Utf8, true),
     ]));
 
     let grade_reports: Vec<TrainingGradeReport> = segments.iter().map(quality::training_grade_for_segment).collect();
@@ -1589,6 +1603,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
     let training_grade: StringArray = grade_reports.iter().map(|report| Some(report.grade.as_str())).collect();
     let training_ready: BooleanArray = grade_reports.iter().map(|report| Some(report.training_ready)).collect();
     let training_reasons: StringArray = grade_reasons.iter().map(|reasons| Some(reasons.as_str())).collect();
+    let dialect: StringArray = segments.iter().map(|s| crate::dialect::dialect_of(&s.audio_path)).collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -1608,6 +1623,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
             Arc::new(training_grade),
             Arc::new(training_ready),
             Arc::new(training_reasons),
+            Arc::new(dialect),
         ],
     )
     .map_err(|e| crate::error::AppError::Other(format!("Parquet batch build failed: {e}")))?;

@@ -6,7 +6,7 @@ confirm is marked as such. Fixes that need a rebuild are deferred to after revie
 ## Resolved today
 
 ### C: drive reached 0 bytes free — the snapshot safety net was off for hours
-The owner's separate dataset project (`D:\Hawzhin Kurdish Datasets 2026\From Web`,
+The owner's separate dataset project (a separate owner-managed dataset project on another drive,
 `ingest.py aranemini/central-kurdish-audiobook-raw --workers 32`) downloads into the default
 HuggingFace cache, which lived on **C:**. It reached 627 GB and filled the system drive at a
 measured **121.7 GB/hour**.

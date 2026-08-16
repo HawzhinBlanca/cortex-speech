@@ -187,7 +187,7 @@ locally, with explicit consent for any diagnostic export.
 The current phone-sized state is readable, RTL-correct, and uses an alert role, but it is a large dead
 end: it says to ask for a new link and offers no action, owner/contact context, or retry path.
 
-![Current mobile expired-link state](C:/Users/Wareen/.codex/visualizations/2026/08/05/019fd36f-9878-73d0-b5d0-1532c3cb85ba/cortex-true10-audit-20260809/01-remote-review-expired-mobile.png)
+_(screenshot: Current mobile expired-link state — kept locally, not tracked)_
 
 Add a safe recovery affordance that matches the deployment model: retry if the session may be
 temporarily unavailable; otherwise show the reviewer name/owner instruction and a one-tap way to copy a

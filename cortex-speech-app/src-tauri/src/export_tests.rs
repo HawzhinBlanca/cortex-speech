@@ -2260,3 +2260,23 @@ fn three_unequal_recordings_still_fill_all_three_splits() {
         assert!(per.get(name).copied().unwrap_or(0) > 0, "{name} is EMPTY: {per:?}");
     }
 }
+
+#[test]
+fn export_records_carry_the_source_dialect_and_never_guess_one() {
+    // Owner instruction 2026-08-16: KBHP is Hawleri, and the label rides every export format so the
+    // dataset can be split by dialect (the fairness work depends on it). An UNMAPPED source exports
+    // null — an absent label is honest, a guessed one poisons every per-dialect number downstream.
+    let mut kbhp = sample_segment("kbhp-clip");
+    kbhp.audio_path = r"D:\corpora\sorani-hawleri\KBHP\KBHP-EP07.wav".to_string();
+    let mut unmapped = sample_segment("mystery-clip");
+    unmapped.audio_path = r"D:\somewhere\nameless-recording.wav".to_string();
+
+    let records = export_records(&[kbhp, unmapped]);
+    let as_json: Vec<serde_json::Value> = records.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+
+    assert_eq!(as_json[0]["dialect"], "hawleri", "a mapped source must ship its dialect");
+    assert!(as_json[1]["dialect"].is_null(), "an unmapped source must ship null, never a guess");
+    // The label must come from the ORIGINAL path: by the time the record is serialized, audio_path
+    // has been sanitized to a basename for privacy, and folder-keyed corpora would lose their key.
+    assert_eq!(as_json[0]["audioPath"], "KBHP-EP07.wav", "path stays privacy-sanitized");
+}

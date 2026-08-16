@@ -80,39 +80,6 @@ task_pool_legacy = []
 name = "tiny_http_fork"
 path = "src/lib.rs"
 
-[[example]]
-name = "hello-world"
-path = "examples/hello-world.rs"
-required-features = ["log"]
-
-[[example]]
-name = "php-cgi"
-path = "examples/php-cgi.rs"
-required-features = ["log"]
-
-[[example]]
-name = "readme-example"
-path = "examples/readme-example.rs"
-required-features = ["log"]
-
-[[example]]
-name = "serve-root"
-path = "examples/serve-root.rs"
-required-features = ["log"]
-
-[[example]]
-name = "ssl"
-path = "examples/ssl.rs"
-required-features = [
-    "log",
-    "ssl",
-]
-
-[[example]]
-name = "websockets"
-path = "examples/websockets.rs"
-required-features = ["log"]
-
 [[test]]
 name = "cve_2026_66752"
 path = "tests/cve_2026_66752.rs"

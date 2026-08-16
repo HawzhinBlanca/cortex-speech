@@ -3828,11 +3828,23 @@ fn review_queue_never_serves_a_clip_whose_audio_file_is_gone() {
 #[test]
 fn segment_pages_use_stable_keysets_and_lightweight_rows() {
     let db = make_db();
-    for id in ["a", "b", "c", "d", "e"] {
+    // PINNED timestamps, newest-first by construction. `insert_segment` stamps created_at = now at
+    // one-second resolution, so five rapid inserts USUALLY share one second and the id tiebreak
+    // yields a,b,c,d,e — but when the wall clock ticks mid-insert the rows split across two seconds
+    // and "newest" reorders them. That is exactly how this test failed twice and passed twice across
+    // four otherwise-identical sweep runs on 2026-08-16. A test about ORDERING must own its clock.
+    for (id, created) in [
+        ("a", "2026-01-01 10:00:05"),
+        ("b", "2026-01-01 10:00:04"),
+        ("c", "2026-01-01 10:00:03"),
+        ("d", "2026-01-01 10:00:02"),
+        ("e", "2026-01-01 10:00:01"),
+    ] {
         let mut segment = make_segment(id, &format!("/{id}.wav"));
         segment.alignment_json = Some(r#"{"version":1,"words":[]}"#.into());
         segment.evidence_json = Some(r#"{"large":"payload"}"#.into());
-        db.insert_segment(&segment).unwrap();
+        segment.created_at = Some(created.to_string());
+        db.insert_segment_full(&segment).unwrap();
     }
 
     let first = db.get_segments_page(None, None, "newest", 2, None).unwrap();

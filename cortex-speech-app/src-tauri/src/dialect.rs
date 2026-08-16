@@ -82,7 +82,9 @@ mod tests {
     #[test]
     fn kbhp_is_hawleri_and_the_original_corpus_is_sorani() {
         assert_eq!(dialect_of(r"D:\x\_batch_remaining\KBHP-EP01.wav"), Some(HAWLERI));
-        assert_eq!(dialect_of(r"C:\Users\x\Desktop\SoraniVoice_PC_\_staging_wav\A1-0050_220426.wav"), Some(SORANI));
+        // Drive-letter-free on purpose: a tracked file may not carry a local profile path
+        // (test_windows_repo_hygiene), and the matcher looks at the fragment, not the prefix.
+        assert_eq!(dialect_of(r"corpora\SoraniVoice_PC_\_staging_wav\A1-0050_220426.wav"), Some(SORANI));
     }
 
     #[test]
