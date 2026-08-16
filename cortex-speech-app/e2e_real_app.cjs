@@ -401,8 +401,14 @@ async function run() {
  * persist nothing.
  */
 async function reviewOverHttp(page, draftText) {
-  console.log('==> Couch Review over real HTTP...');
-  const base = `http://127.0.0.1:${COUCH_PORT}`;
+  console.log('==> Couch Review over real HTTPS...');
+  // The couch server is TLS on every interface with a self-signed rcgen certificate. This is a
+  // LOCALHOST liveness/behaviour probe against a disposable instance, not an authentication
+  // decision, so certificate verification is disabled for THIS PROCESS. Sixth member of the
+  // transport-blind class (2026-08-17): the harness spoke plain http at a TLS listener, the server
+  // logged InvalidContentType, and the gate failed as "fetch failed".
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  const base = `https://127.0.0.1:${COUCH_PORT}`;
   const REVIEWER = 'E2E Harness';
   // EVERY request here is bounded. Measured the hard way on run 2 of the 3x stability check: the
   // post-stop probe below is a fetch whose whole purpose is to find NOBODY listening, and a bare
